@@ -46,6 +46,12 @@ let
           optional. These load in addition to the auto per-user token file.
         '';
       };
+      environment = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        example = lib.literalExpression ''{ TERM = "xterm-256color"; }'';
+        description = "Extra (non-secret) environment variables for this agent's service. Merged over the default HOME.";
+      };
     };
   };
 
@@ -156,7 +162,7 @@ in
         wants = [ "network-online.target" ];
         # System services get a minimal PATH; give the agent an explicit toolset.
         path = [ cfg.package pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ] ++ cfg.extraPackages;
-        environment.HOME = "/home/${name}";
+        environment = { HOME = "/home/${name}"; } // u.environment;
         serviceConfig = {
           User = name;
           # tmux daemonizes and returns; keep the unit "active" and let ExecStop

@@ -104,6 +104,7 @@ All under `services.claude-box`:
 | `users.<name>.extraGroups` | `[]` | Extra groups for the user. |
 | `users.<name>.extraArgs` | `[]` | Extra args appended to `claude`. |
 | `users.<name>.environmentFiles` | `[]` | Extra `EnvironmentFile` paths for this agent. |
+| `users.<name>.environment` | `{}` | Extra (non-secret) env vars for this agent's service. |
 | `sudoAllowlist` | `[]` | Passwordless sudo commands granted to every agent. |
 | `extraPackages` | `[]` | Packages placed on each agent's PATH. |
 | `environmentFiles` | `[]` | Extra `EnvironmentFile` paths applied to every agent. |

@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate module & VM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Show flake metadata
+        run: nix flake metadata
+
+      # Fast eval gates first — surface option/type errors before any build.
+      - name: Evaluate VM & qcow derivations
+        run: |
+          nix eval --raw .#nixosConfigurations.vm.config.system.build.vm.drvPath
+          echo
+          nix eval --raw .#packages.x86_64-linux.vm.drvPath
+          echo
+
+      # Asserts the multi-user example generates a service per agent.
+      - name: Check multi-user generation
+        run: nix build -L .#checks.x86_64-linux.multi-user && cat result
+
+      # Full closure build — the real "module is usable" proof.
+      - name: Build VM system closure
+        run: nix build -L .#checks.x86_64-linux.vm-closure
