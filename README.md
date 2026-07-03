@@ -126,9 +126,8 @@ All under `services.claude-box`:
 ## Notes
 
 - `claude-code` is unfree; the module allows just that package (overridable).
-- Uses [`nixos-generators`](https://github.com/nix-community/nixos-generators)
-  for the qcow2 image (upstreamed into nixpkgs 25.05 as
-  `nixos-rebuild build-image`; migration is a possible future cleanup).
+- The qcow2 image uses the native nixpkgs image API (`system.build.images`,
+  upstreamed in NixOS 25.05) — no extra flake inputs.
 
 ## License
 

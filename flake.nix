@@ -3,13 +3,9 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nixos-generators = {
-      url = "github:nix-community/nixos-generators";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
-  outputs = { self, nixpkgs, nixos-generators, ... }:
+  outputs = { self, nixpkgs, ... }:
     let
       system = "x86_64-linux";
     in
@@ -27,14 +23,13 @@
         modules = [ self.nixosModules.claude-box ./hosts/vm.nix ];
       };
 
-      # Standalone qcow2 image: nix build .#vm  ->  result/nixos.qcow2
+      # Standalone qcow2 image (BIOS boot), built via the image API upstreamed
+      # into nixpkgs (NixOS 25.05+): nix build .#vm  ->  result/*.qcow2
+      # The `qemu` variant extends the fs/bootloader-free vm config with its own
+      # partition table + GRUB, so the base config stays usable for build-vm.
       packages.${system} =
         let
-          image = nixos-generators.nixosGenerate {
-            inherit system;
-            format = "qcow";
-            modules = [ self.nixosModules.claude-box ./hosts/vm.nix ];
-          };
+          image = self.nixosConfigurations.vm.config.system.build.images.qemu;
         in
         {
           vm = image;
