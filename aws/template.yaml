@@ -149,7 +149,7 @@ Resources:
                   User = "agent";
                   Restart = "always";
                   RestartSec = "5s";
-                  ExecStart = "${!pkgs.ttyd}/bin/ttyd -p 7681 -i 127.0.0.1 -c claude:${!webPassword} -t titleFixed=claude-box ${!pkgs.tmux}/bin/tmux -L claude-box attach -t main";
+                  ExecStart = "${!pkgs.ttyd}/bin/ttyd --writable -p 7681 -i 127.0.0.1 -c claude:${!webPassword} -t titleFixed=claude-box ${!pkgs.tmux}/bin/tmux -L claude-box attach -t main";
                 };
               };
 

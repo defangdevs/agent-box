@@ -138,6 +138,28 @@ jobs:
             exit 1
           fi
 
+      - name: Smoke test — WebSocket upgrade
+        run: |
+          url='${{ steps.outputs.outputs.web_url }}'
+          # A successful upgrade returns 101 Switching Protocols. Anything else
+          # (401 = auth not reaching ttyd through Caddy, 502 = Caddy can't proxy the
+          # upgrade, 000 = network) means the browser terminal will disconnect.
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --http1.1 --max-time 10 \
+            -u "claude:${{ steps.pw.outputs.value }}" \
+            -H "Connection: Upgrade" \
+            -H "Upgrade: websocket" \
+            -H "Sec-WebSocket-Version: 13" \
+            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            -H "Sec-WebSocket-Protocol: tty" \
+            "${url}ws" || true)
+          echo "WebSocket upgrade attempt -> HTTP $code"
+          if [ "$code" = "101" ]; then
+            echo "::notice::WebSocket upgrade succeeded (101 Switching Protocols)."
+          else
+            echo "::error::WebSocket upgrade failed (got $code, expected 101). Terminal will show 'disconnected'."
+            exit 1
+          fi
+
       - name: Destroy stack
         # Push runs (no inputs) always destroy; dispatched runs honor inputs.destroy.
         if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.destroy) }}
