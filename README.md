@@ -1,8 +1,8 @@
 # claude-box
 
 Reproducible, multi-user [Claude Code](https://claude.com/claude-code) agent
-sandboxes for NixOS — on bare metal or as a VM image, from one declarative
-config.
+sandboxes — one click on AWS, on bare metal, or as a VM image, from one
+declarative config. (Built on NixOS.)
 
 Each agent is an **unprivileged user** running Claude Code inside a persistent
 `tmux` session with `--dangerously-skip-permissions --remote-control`. The only
