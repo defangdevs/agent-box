@@ -1,6 +1,11 @@
 name: Deploy test (CFN create + destroy)
 
 on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'aws/template.yaml'
+      - '.github/workflows/deploy-test.yml'
   workflow_dispatch:
     inputs:
       region:
@@ -26,7 +31,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-test-${{ inputs.region }}
+  group: deploy-test-${{ inputs.region || 'us-east-1' }}
   cancel-in-progress: false
 
 jobs:
@@ -36,7 +41,7 @@ jobs:
     environment: ${{ vars.AWS_ENVIRONMENT || 'defang-claude-box' }}
     timeout-minutes: 30
     env:
-      AWS_REGION: ${{ inputs.region }}
+      AWS_REGION: ${{ inputs.region || 'us-east-1' }}
       ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
       STACK_NAME: claude-box-e2e-${{ github.run_id }}
     steps:
@@ -70,7 +75,7 @@ jobs:
             --template-body "file://aws/template.yaml" \
             --parameters \
               "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
-              "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type }}" \
+              "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't3.small' }}" \
             --on-failure DELETE \
             --tags "Key=Purpose,Value=claude-box-e2e" "Key=RunId,Value=${{ github.run_id }}"
           echo "::notice::Waiting for stack ${STACK_NAME} to reach CREATE_COMPLETE (up to 30 min)..."
@@ -118,7 +123,8 @@ jobs:
           fi
 
       - name: Destroy stack
-        if: ${{ always() && inputs.destroy }}
+        # Default destroy=true on push (no inputs); dispatched runs can flip via input.
+        if: ${{ always() && (inputs.destroy == null || inputs.destroy == true) }}
         run: |
           # Idempotent — succeeds even if the stack was already auto-deleted by --on-failure DELETE.
           echo "Deleting $STACK_NAME..."
@@ -126,7 +132,7 @@ jobs:
           aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
 
       - name: Flag kept stack
-        if: ${{ always() && !inputs.destroy }}
+        if: ${{ always() && inputs.destroy == false }}
         run: |
           echo "::warning::Stack '$STACK_NAME' was kept (destroy=false). It's still billing."
           echo "::warning::Delete manually: aws cloudformation delete-stack --stack-name $STACK_NAME --region $AWS_REGION"
