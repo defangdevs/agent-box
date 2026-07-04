@@ -1,0 +1,132 @@
+name: Deploy test (CFN create + destroy)
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: Region to deploy into (must be in the template's RegionMap)
+        type: choice
+        options:
+          - us-east-1
+          - us-west-2
+          - eu-central-1
+          - eu-west-1
+        default: us-east-1
+      instance_type:
+        description: EC2 instance type
+        type: string
+        default: t3.small
+      destroy:
+        description: Delete the stack at the end (uncheck to keep it up for debugging)
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-test-${{ inputs.region }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-test:
+    runs-on: ubuntu-latest
+    # Fork? Override with a repo-scoped var AWS_ENVIRONMENT, or edit the fallback.
+    environment: ${{ vars.AWS_ENVIRONMENT || 'defang-claude-box' }}
+    timeout-minutes: 30
+    env:
+      AWS_REGION: ${{ inputs.region }}
+      ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      STACK_NAME: claude-box-e2e-${{ github.run_id }}
+    steps:
+      - name: Sanity-check required variables
+        run: |
+          missing=()
+          [ -n "$ROLE_ARN" ] || missing+=("AWS_ROLE_ARN")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing repo variable(s): ${missing[*]}. See aws/README.md."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate WebPassword
+        id: pw
+        run: |
+          # 48 hex chars — well within the template's AllowedPattern.
+          echo "value=$(openssl rand -hex 24)" >> "$GITHUB_OUTPUT"
+
+      - name: Create stack
+        run: |
+          aws cloudformation create-stack \
+            --stack-name "$STACK_NAME" \
+            --template-body "file://aws/template.yaml" \
+            --parameters \
+              "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
+              "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type }}" \
+            --on-failure DELETE \
+            --tags "Key=Purpose,Value=claude-box-e2e" "Key=RunId,Value=${{ github.run_id }}"
+          echo "::notice::Waiting for stack ${STACK_NAME} to reach CREATE_COMPLETE (up to 30 min)..."
+          aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
+
+      - name: Fetch outputs
+        id: outputs
+        run: |
+          web_url=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`WebURL`].OutputValue | [0]' --output text)
+          public_ip=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`PublicIP`].OutputValue | [0]' --output text)
+          echo "web_url=$web_url"   >> "$GITHUB_OUTPUT"
+          echo "public_ip=$public_ip" >> "$GITHUB_OUTPUT"
+          echo "::notice::Stack up. WebURL=$web_url  PublicIP=$public_ip"
+
+      - name: Smoke test — expect 401 Basic-Auth challenge
+        run: |
+          url='${{ steps.outputs.outputs.web_url }}'
+          # NixOS boot + nixos-rebuild + Caddy ACME can add 5-10 min after CFN reports done.
+          for i in $(seq 1 60); do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$url" || true)
+            echo "[$i/60] GET $url -> $code"
+            if [ "$code" = "401" ]; then
+              echo "::notice::Got 401 (Basic-Auth challenge) — Caddy + ttyd are up."
+              break
+            fi
+            sleep 10
+          done
+          if [ "$code" != "401" ]; then
+            echo "::error::Never got a 401 from $url after 10 min."
+            exit 1
+          fi
+
+      - name: Smoke test — authenticate and verify ttyd is serving
+        run: |
+          url='${{ steps.outputs.outputs.web_url }}'
+          body=$(curl -sS --max-time 15 -u "claude:${{ steps.pw.outputs.value }}" "$url")
+          if echo "$body" | grep -qi "ttyd\|terminal"; then
+            echo "::notice::ttyd HTML served correctly."
+          else
+            echo "::error::Authenticated but response body doesn't look like ttyd:"
+            echo "$body" | head -20
+            exit 1
+          fi
+
+      - name: Destroy stack
+        if: ${{ always() && inputs.destroy }}
+        run: |
+          # Idempotent — succeeds even if the stack was already auto-deleted by --on-failure DELETE.
+          echo "Deleting $STACK_NAME..."
+          aws cloudformation delete-stack --stack-name "$STACK_NAME"
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
+
+      - name: Flag kept stack
+        if: ${{ always() && !inputs.destroy }}
+        run: |
+          echo "::warning::Stack '$STACK_NAME' was kept (destroy=false). It's still billing."
+          echo "::warning::Delete manually: aws cloudformation delete-stack --stack-name $STACK_NAME --region $AWS_REGION"
