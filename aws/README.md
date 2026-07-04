@@ -93,6 +93,21 @@ defaults to `PublicIpv4: false` (IPv6-only, ~$0/mo for the address).
 Users whose clients don't have IPv6 (corporate nets, coffee-shop WiFi)
 set `PublicIpv4: true` at launch to allocate an EIP.
 
+### Spot by default (persistent + stop)
+
+`UseSpot` defaults to `true` because cost is the whole point. The spot
+options can't sit on `AWS::EC2::Instance` (it has no `InstanceMarketOptions`),
+so they ride on a conditional `AWS::EC2::LaunchTemplate` that the instance
+references only when `UseSpot=true`. We use a **persistent** request with
+`InstanceInterruptionBehavior: stop`: on interruption AWS stops (not
+terminates) the instance and restarts the *same* instance in the *same AZ*
+when capacity returns, so the root EBS, the ENI's IPv6, and the on-disk TLS
+cert all survive. What does not survive is the live tmux session (RAM is
+lost on any stop). Risk: if that one AZ+type pool stays capacity-starved,
+the box stays stopped until it frees up - pick a deep pool. No `MaxPrice` is
+set, so the cap is the on-demand rate. The E2E deploy-test forces
+`UseSpot=false` so CI doesn't depend on spot capacity.
+
 ### Race condition: EIP association vs boot
 
 In our custom subnet, `MapPublicIpOnLaunch` is false, so the instance

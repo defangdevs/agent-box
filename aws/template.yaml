@@ -5,6 +5,39 @@ AWSTemplateFormatVersion: '2010-09-09'
 # token is part of the URL. Anyone with cloudformation:DescribeStacks on this
 # stack can see it; treat that as the same trust boundary as the shared secret.
 Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Terminal access
+        Parameters:
+          - WebPassword
+      - Label:
+          default: Compute and cost
+        Parameters:
+          - InstanceType
+          - UseSpot
+          - PublicIpv4
+      - Label:
+          default: Advanced (rarely needed)
+        Parameters:
+          - AllowCidr
+          - ClaudeBoxRev
+          - ClaudeBoxSha256
+    ParameterLabels:
+      WebPassword:
+        default: Web terminal token (goes in the URL)
+      InstanceType:
+        default: EC2 instance type
+      UseSpot:
+        default: Use a Spot instance (cheaper)
+      PublicIpv4:
+        default: Allocate a public IPv4 (costs ~$3.60/mo)
+      AllowCidr:
+        default: IPv4 CIDR allowed to reach 22/443
+      ClaudeBoxRev:
+        default: claude-box git rev
+      ClaudeBoxSha256:
+        default: claude-box tarball sha256
   cfn-lint:
     config:
       ignore_checks:
@@ -40,6 +73,19 @@ Parameters:
       true: allocate an Elastic IP for a stable IPv4. ~$3.60/mo per AWS's
       2024 IPv4 pricing (charged for any public IPv4, EIP or not).
 
+  UseSpot:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      true (default): run as a persistent Spot instance (~70-90% cheaper).
+      On a Spot interruption AWS stops the instance and restarts the SAME
+      instance in the SAME AZ when capacity returns, so the root volume,
+      IPv6 address, and TLS cert all survive. The live tmux session does
+      not (RAM is lost on any stop). Risk: if this AZ+type pool stays
+      capacity-starved, the box stays stopped until it frees up.
+      false: on-demand (always available, full price).
+
   WebPassword:
     Type: String
     NoEcho: true
@@ -74,6 +120,7 @@ Parameters:
 
 Conditions:
   UseIpv4: !Equals [!Ref PublicIpv4, 'true']
+  UseSpotCond: !Equals [!Ref UseSpot, 'true']
 
 Mappings:
   # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py - do not edit by hand)
@@ -217,6 +264,21 @@ Resources:
       NetworkInterfaceId: !Ref NetworkInterface
       AllocationId: !GetAtt EIP.AllocationId
 
+  # Carries the persistent-Spot-with-stop options. On a Spot interruption AWS
+  # stops (does not terminate) the instance and restarts the SAME instance in
+  # the SAME AZ when capacity returns, so root EBS + IPv6 + TLS cert survive.
+  # No MaxPrice, so the cap is the on-demand rate.
+  SpotLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: UseSpotCond
+    Properties:
+      LaunchTemplateData:
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            SpotInstanceType: persistent
+            InstanceInterruptionBehavior: stop
+
   Instance:
     Type: AWS::EC2::Instance
     # In IPv4 mode: wait for EIPAssoc so the instance has a public IPv4 the
@@ -236,6 +298,13 @@ Resources:
     Properties:
       InstanceType: !Ref InstanceType
       ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
+      # Spot options must ride on a launch template - AWS::EC2::Instance has no
+      # InstanceMarketOptions of its own. Referenced only when UseSpot=true.
+      LaunchTemplate: !If
+        - UseSpotCond
+        - LaunchTemplateId: !Ref SpotLaunchTemplate
+          Version: !GetAtt SpotLaunchTemplate.LatestVersionNumber
+        - !Ref AWS::NoValue
       NetworkInterfaces:
         - NetworkInterfaceId: !Ref NetworkInterface
           DeviceIndex: 0

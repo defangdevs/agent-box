@@ -72,12 +72,14 @@ jobs:
         id: create
         run: |
           # GH Actions runners are IPv4-only, so this test forces PublicIpv4=true
-          # even though the template's default is IPv6-only.
+          # even though the template's default is IPv6-only. UseSpot=false keeps
+          # the smoke test deterministic (no dependence on Spot capacity).
           aws cloudformation create-stack \
             --stack-name "$STACK_NAME" \
             --template-body "file://aws/template.yaml" \
             --parameters \
               "ParameterKey=PublicIpv4,ParameterValue=true" \
+              "ParameterKey=UseSpot,ParameterValue=false" \
               "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
               "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't3.small' }}" \
             --on-failure DO_NOTHING \
