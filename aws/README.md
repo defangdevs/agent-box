@@ -159,10 +159,13 @@ keys).
 ### Prerequisites (forking this repo)
 
 The workflow is self-bootstrapping — it upserts the bucket, its
-public-access configuration, and the `s3:GetObject` policy on
-`template.yaml` every run. It reads all deploy config from **repo-level
-Actions variables** (Settings > Secrets and variables > Actions >
-Variables). None are secrets; they're just fork-specific.
+public-access configuration, and the `s3:GetObject` policy (covering both
+`template.yaml` and `module-*.tar.gz`) every run. It also mirrors the pinned
+module tarball to `s3://<bucket>/module-<ClaudeBoxRev>.tar.gz` so an IPv6-only
+box can fetch it over the S3 dual-stack endpoint — github.com is IPv4-only and
+AWS NAT64 needs a NAT Gateway (see `ModuleBaseUrl` in the template). It reads
+all deploy config from **repo-level Actions variables** (Settings > Secrets and
+variables > Actions > Variables). None are secrets; they're just fork-specific.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
@@ -172,12 +175,16 @@ Variables). None are secrets; they're just fork-specific.
 | `AWS_REGION` | no | Region for the bucket + AWS API calls. Defaults to `us-east-1`. |
 
 Role permissions needed: `s3:CreateBucket`, `s3:PutPublicAccessBlock`,
-`s3:PutBucketPolicy`, `s3:PutObject`, and `cloudformation:ValidateTemplate`.
-The E2E deploy-test workflow additionally needs `cloudformation:CreateStack`,
-`cloudformation:DeleteStack`, `cloudformation:DescribeStacks`, and the EC2
-create/delete permissions used by the template - including
-`ec2:CreateLaunchTemplate` / `ec2:DeleteLaunchTemplate` (Spot options) and
-`ec2:DescribeSpotInstanceRequests` / `ec2:CancelSpotInstanceRequests` (so
+`s3:PutBucketPolicy`, `s3:PutObject`, `s3:GetObject` (the mirror skips
+re-upload if the object already exists), and `cloudformation:ValidateTemplate`.
+The E2E deploy-test workflow uses the same role, so it also needs the S3
+permissions above (it mirrors the module before creating the stack) plus
+`cloudformation:CreateStack`, `cloudformation:DeleteStack`,
+`cloudformation:DescribeStacks`, `ec2:GetConsoleOutput` (to assert amazon-init
+provisioned the box — this is how the IPv6-only leg verifies success without
+connecting), and the EC2 create/delete permissions used by the template -
+including `ec2:CreateLaunchTemplate` / `ec2:DeleteLaunchTemplate` (Spot options)
+and `ec2:DescribeSpotInstanceRequests` / `ec2:CancelSpotInstanceRequests` (so
 teardown can cancel the persistent Spot request before deleting the stack).
 
 The GitHub environment listed in `CLAUDE_BOX_ENVIRONMENT` must exist — create it
@@ -192,8 +199,20 @@ curl -I "https://${CLAUDE_BOX_BUCKET}.s3.amazonaws.com/template.yaml"
 
 ## End-to-end deploy test
 
-`.github/workflows/deploy-test.yml` (manual trigger) creates a real
-CloudFormation stack, waits for the browser URL to return the expected
-`401` Basic-Auth challenge, then deletes the stack. Use it as smoke test
-after changing the template. Toggle `destroy: false` on the dispatch
-inputs to keep the stack up for hands-on debugging.
+`.github/workflows/deploy-test.yml` (on push to the template + manual trigger)
+creates real CloudFormation stacks and deletes them at the end. It runs two
+legs in parallel:
+
+- **ipv4-full** — forces `PublicIpv4=true` (+ Spot); GitHub runners are
+  IPv4-only, so this is the only leg that can actually reach the box. It runs
+  the full connectivity smoke tests (token URL serves ttyd over HTTPS, a
+  wrong-token path returns 404, the WebSocket upgrade returns 101).
+- **ipv6-outputs** — exercises the DEFAULT IPv6-only path. The runner can't
+  connect over IPv6, so it asserts the stack reaches `CREATE_COMPLETE` and its
+  outputs are populated (catches blank `PrimaryIpv6Address` bugs).
+
+Both legs then assert, from the **serial console** (`ec2:GetConsoleOutput`),
+that `amazon-init` finished — i.e. the box actually provisioned from user-data.
+`CREATE_COMPLETE` fires before amazon-init runs, so this is the only signal
+that the IPv6-only module fetch + `nixos-rebuild` succeeded. Toggle
+`destroy: false` on the dispatch inputs to keep a stack up for debugging.

@@ -24,6 +24,7 @@ Metadata:
           - AllowCidr
           - ClaudeBoxRev
           - ClaudeBoxSha256
+          - ModuleBaseUrl
     ParameterLabels:
       WebPassword:
         default: Web terminal token (blank = auto-generated)
@@ -41,6 +42,8 @@ Metadata:
         default: claude-box git rev
       ClaudeBoxSha256:
         default: claude-box tarball sha256
+      ModuleBaseUrl:
+        default: Dual-stack base URL for the module tarball
   cfn-lint:
     config:
       ignore_checks:
@@ -132,6 +135,18 @@ Parameters:
     Description: >-
       Nix base-32 sha256 of the module tarball at ClaudeBoxRev. Regenerate via
       `nix-prefetch-url --unpack https://github.com/defangdevs/claude-box/archive/<REV>.tar.gz`.
+      (The S3 mirror serves the identical archive, so this NAR hash is unchanged.)
+
+  ModuleBaseUrl:
+    Type: String
+    Default: https://defang-claude-box.s3.dualstack.us-east-1.amazonaws.com
+    Description: >-
+      Base URL that serves the module tarball as module-<ClaudeBoxRev>.tar.gz
+      over a DUAL-STACK (IPv6-reachable) transport. github.com is IPv4-only, and
+      an IPv6-only box can only reach IPv4 via NAT64 - which on AWS requires a
+      NAT Gateway. So we fetch from an S3 dual-stack endpoint (reachable over
+      native IPv6 through the Internet Gateway) instead. Forks: point this at
+      your own bucket populated by publish-template.yml.
 
 Conditions:
   UseIpv4: !Equals [!Ref PublicIpv4, 'true']
@@ -162,6 +177,9 @@ Resources:
       CidrBlock: 10.42.0.0/16
       EnableDnsSupport: true
       EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
 
   VpcIpv6:
     Type: AWS::EC2::VPCCidrBlock
@@ -171,6 +189,10 @@ Resources:
 
   Igw:
     Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
 
   IgwAttach:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -189,15 +211,23 @@ Resources:
         - 0
         - !Cidr [!Select [0, !GetAtt Vpc.Ipv6CidrBlocks], 1, 64]
       AssignIpv6AddressOnCreation: true
-      # DNS64: the VPC resolver returns synthesized AAAA in 64:ff9b::/96 for
-      # IPv4-only hostnames (github.com etc.). Combined with the NAT64 route
-      # below, an IPv6-only instance can reach IPv4-only upstreams via the IGW.
-      EnableDns64: true
+      # No DNS64/NAT64: on AWS, NAT64 translation only happens at a NAT Gateway
+      # (the IGW does NOT translate 64:ff9b::/96). We deliberately avoid a NAT
+      # Gateway, so every first-boot dependency is fetched over native IPv6 from
+      # dual-stack hosts (S3 dual-stack mirror, cache.nixos.org, Let's Encrypt,
+      # sslip.io). With no NAT64 translator, enabling DNS64 would only synthesize
+      # AAAA that black-hole at the IGW, so we leave it off to fail fast instead.
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
 
   RouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
 
   RouteV4:
     Type: AWS::EC2::Route
@@ -215,17 +245,6 @@ Resources:
       DestinationIpv6CidrBlock: ::/0
       GatewayId: !Ref Igw
 
-  # NAT64: IGW translates traffic to 64:ff9b::/96 into IPv4 automatically
-  # (since Nov 2023). Together with EnableDns64 on the subnet, this lets an
-  # IPv6-only instance reach IPv4-only sites like github.com.
-  RouteNat64:
-    Type: AWS::EC2::Route
-    DependsOn: IgwAttach
-    Properties:
-      RouteTableId: !Ref RouteTable
-      DestinationIpv6CidrBlock: 64:ff9b::/96
-      GatewayId: !Ref Igw
-
   SubnetRouteAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
@@ -237,6 +256,9 @@ Resources:
     Properties:
       GroupDescription: 'claude-box: 443 (web terminal) + 22 (SSH), v4 + v6'
       VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 443
@@ -271,12 +293,18 @@ Resources:
       EnablePrimaryIpv6: true
       GroupSet:
         - !GetAtt SecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
 
   EIP:
     Type: AWS::EC2::EIP
     Condition: UseIpv4
     Properties:
       Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
 
   EIPAssoc:
     Type: AWS::EC2::EIPAssociation
@@ -293,6 +321,11 @@ Resources:
     Type: AWS::EC2::LaunchTemplate
     Condition: UseSpotCond
     Properties:
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: !Ref AWS::StackName
       LaunchTemplateData:
         InstanceMarketOptions:
           MarketType: spot
@@ -302,9 +335,9 @@ Resources:
 
   Instance:
     Type: AWS::EC2::Instance
-    # Routing must exist before boot so egress works. Even IPv6-only instances
-    # reach IPv4-only GitHub via the subnet's DNS64 + NAT64 route, so no public
-    # IPv4 is needed to fetch the claude-box tarball during amazon-init.
+    # Routing must exist before boot so egress works. The module tarball and
+    # every other first-boot dependency are dual-stack, so an IPv6-only box
+    # fetches them over native IPv6 via the IGW - no public IPv4, no NAT64.
     # Do NOT DependsOn EIPAssoc: it's conditional (UseIpv4), and DependsOn on an
     # excluded resource makes CFN reject the whole template in IPv6-only mode
     # ("Unresolved resource dependencies [EIPAssoc]"). The EIP is inbound-only
@@ -330,7 +363,7 @@ Resources:
         HttpPutResponseHopLimit: 2
       Tags:
         - Key: Name
-          Value: claude-box
+          Value: !Ref AWS::StackName
       UserData:
         Fn::Base64:
           Fn::Sub:
@@ -338,7 +371,9 @@ Resources:
               { config, pkgs, lib, modulesPath, ... }:
               let
                 claude-box = builtins.fetchTarball {
-                  url = "https://github.com/defangdevs/claude-box/archive/${ClaudeBoxRev}.tar.gz";
+                  # Dual-stack S3 mirror, not github (IPv4-only): an IPv6-only
+                  # box has no NAT64 path to github without a NAT Gateway.
+                  url = "${ModuleBaseUrl}/module-${ClaudeBoxRev}.tar.gz";
                   sha256 = "${ClaudeBoxSha256}";
                 };
                 hostname = "${WebHostname}";

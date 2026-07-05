@@ -37,18 +37,39 @@ concurrency:
 jobs:
   deploy-test:
     runs-on: ubuntu-latest
+    # Two legs run in PARALLEL:
+    #  - ipv4-full: GH runners are IPv4-only, so this is the only leg that can
+    #    actually reach the box; it forces PublicIpv4=true (+ Spot, the trickier
+    #    path) and runs the full connectivity smoke tests.
+    #  - ipv6-outputs: exercises the DEFAULT IPv6-only path. The runner can't
+    #    connect over IPv6, so this leg only asserts the stack reaches
+    #    CREATE_COMPLETE and its outputs populate. That still catches template
+    #    resolution bugs (e.g. the old EIPAssoc dependency) and empty-GetAtt bugs
+    #    (e.g. a blank PrimaryIpv6Address -> "https://.sslip.io/").
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: ipv4-full
+            public_ipv4: "true"
+            use_spot: "true"
+          - leg: ipv6-outputs
+            public_ipv4: "false"
+            use_spot: "false"
     # Fork? Override with a repo-scoped var CLAUDE_BOX_ENVIRONMENT, or edit the fallback.
     environment: ${{ vars.CLAUDE_BOX_ENVIRONMENT || 'defang-claude-box' }}
     timeout-minutes: 30
     env:
       AWS_REGION: ${{ inputs.region || 'us-east-1' }}
       ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
-      STACK_NAME: claude-box-e2e-${{ github.run_id }}
+      BUCKET: ${{ vars.CLAUDE_BOX_BUCKET }}
+      STACK_NAME: claude-box-e2e-${{ matrix.leg }}-${{ github.run_id }}
     steps:
       - name: Sanity-check required variables
         run: |
           missing=()
           [ -n "$ROLE_ARN" ] || missing+=("AWS_ROLE_ARN")
+          [ -n "$BUCKET" ]   || missing+=("CLAUDE_BOX_BUCKET")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::Missing repo variable(s): ${missing[*]}. See aws/README.md."
             exit 1
@@ -62,6 +83,13 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Mirror module tarball to S3 (dual-stack)
+        # The template's default ModuleBaseUrl points at this bucket. Ensure the
+        # module-<rev>.tar.gz the box fetches at first boot exists, independent of
+        # whether publish-template.yml has run for this rev yet (same trigger, so
+        # ordering isn't guaranteed). Idempotent.
+        run: BUCKET="$BUCKET" bash scripts/mirror_module_to_s3.sh
+
       - name: Generate WebPassword (URL-safe path token)
         id: pw
         run: |
@@ -71,16 +99,13 @@ jobs:
       - name: Create stack
         id: create
         run: |
-          # GH Actions runners are IPv4-only, so this test forces PublicIpv4=true
-          # even though the template's default is IPv6-only. UseSpot=true on
-          # purpose: Spot (launch template + persistent request + cancel-on-
-          # teardown) is the trickier path, so that's what we want covered.
+          # PublicIpv4 / UseSpot come from the matrix leg (see the job comment).
           aws cloudformation create-stack \
             --stack-name "$STACK_NAME" \
             --template-body "file://aws/template.yaml" \
             --parameters \
-              "ParameterKey=PublicIpv4,ParameterValue=true" \
-              "ParameterKey=UseSpot,ParameterValue=true" \
+              "ParameterKey=PublicIpv4,ParameterValue=${{ matrix.public_ipv4 }}" \
+              "ParameterKey=UseSpot,ParameterValue=${{ matrix.use_spot }}" \
               "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
               "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't3.small' }}" \
             --on-failure DO_NOTHING \
@@ -108,11 +133,74 @@ jobs:
             --query 'Stacks[0].Outputs[?OutputKey==`WebURL`].OutputValue | [0]' --output text)
           public_ip=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
             --query 'Stacks[0].Outputs[?OutputKey==`PublicAddress`].OutputValue | [0]' --output text)
+          instance_id=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue | [0]' --output text)
           echo "web_url=$web_url"   >> "$GITHUB_OUTPUT"
           echo "public_ip=$public_ip" >> "$GITHUB_OUTPUT"
-          echo "::notice::Stack up. WebURL=$web_url  PublicIP=$public_ip"
+          echo "instance_id=$instance_id" >> "$GITHUB_OUTPUT"
+          echo "::notice::Stack up. WebURL=$web_url  PublicIP=$public_ip  InstanceId=$instance_id"
+
+      - name: Assert outputs are populated
+        run: |
+          # Runs on BOTH legs. This is the whole point of the ipv6-outputs leg,
+          # which can't connect over IPv6 to run the smoke tests below.
+          ip='${{ steps.outputs.outputs.public_ip }}'
+          url='${{ steps.outputs.outputs.web_url }}'
+          fail=0
+          if [ -z "$ip" ] || [ "$ip" = "None" ]; then
+            echo "::error::PublicAddress output is empty."; fail=1
+          fi
+          # The host must be present between https:// and .sslip.io. Catches a
+          # blank PrimaryIpv6Address, which renders WebURL as https://.sslip.io/<token>/.
+          rest=${url#https://}
+          host=${rest%%.sslip.io*}
+          if [ -z "$host" ]; then
+            echo "::error::WebURL host is blank: $url"; fail=1
+          fi
+          if [ "$fail" = 0 ]; then
+            echo "::notice::Outputs OK - PublicAddress=$ip host=$host"
+          fi
+          exit $fail
+
+      - name: Assert amazon-init provisioned the box (serial console)
+        # Runs on BOTH legs, including IPv6-only where the runner can't connect
+        # over the network. CFN CREATE_COMPLETE does NOT wait for amazon-init
+        # (there's no CreationPolicy), so we confirm first-boot provisioning by
+        # reading the serial console: systemd prints "Finished ... EC2 userdata
+        # on startup" on success and "Failed to start ... EC2 userdata on
+        # startup" on failure. THIS is the check that catches the IPv6-only
+        # module-fetch failure the ipv4-full leg structurally cannot (that leg
+        # has a public IPv4 and reaches IPv4-only hosts directly).
+        run: |
+          iid='${{ steps.outputs.outputs.instance_id }}'
+          if [ -z "$iid" ] || [ "$iid" = "None" ]; then
+            echo "::error::No InstanceId output to inspect."; exit 1
+          fi
+          fail_re='Failed to start.*Reconfigure the system from EC2 userdata'
+          ok_re='(Finished|Started).*Reconfigure the system from EC2 userdata'
+          # nixos-rebuild during amazon-init can take a few minutes; console
+          # output on Nitro instances is near-real-time. Poll up to ~12 min.
+          for i in $(seq 1 48); do
+            out=$(aws ec2 get-console-output --instance-id "$iid" --latest \
+              --query Output --output text 2>/dev/null || true)
+            if printf '%s' "$out" | grep -qE "$fail_re"; then
+              echo "::error::amazon-init FAILED - box did not provision (module fetch / nixos-rebuild)."
+              printf '%s\n' "$out" | grep -iE 'amazon-init|EC2 userdata|Reconfigure|fetchTarball|error|refused|unreachable|timed out' | tail -30
+              exit 1
+            fi
+            if printf '%s' "$out" | grep -qE "$ok_re"; then
+              echo "::notice::amazon-init finished - box provisioned from user-data."
+              exit 0
+            fi
+            echo "[$i/48] provisioning not yet confirmed from console; waiting..."
+            sleep 15
+          done
+          echo "::error::Timed out waiting for amazon-init to finish (console tail below)."
+          printf '%s\n' "$out" | tail -40
+          exit 1
 
       - name: Smoke test — wait for the token URL to serve ttyd HTML
+        if: matrix.public_ipv4 == 'true'
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
           # NixOS boot + nixos-rebuild + Caddy ACME can add 2-10 min after CFN reports done.
@@ -131,6 +219,7 @@ jobs:
           fi
 
       - name: Smoke test — verify wrong-token URL returns 404
+        if: matrix.public_ipv4 == 'true'
         run: |
           # Path other than /$TOKEN/* must NOT reach ttyd.
           host=$(echo '${{ steps.outputs.outputs.web_url }}' | awk -F/ '{print $3}')
@@ -143,6 +232,7 @@ jobs:
           fi
 
       - name: Smoke test — verify ttyd HTML body
+        if: matrix.public_ipv4 == 'true'
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
           body=$(curl -sS --max-time 15 "$url")
@@ -155,6 +245,7 @@ jobs:
           fi
 
       - name: Smoke test — WebSocket upgrade
+        if: matrix.public_ipv4 == 'true'
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
           # 101 = Switching Protocols (success). Anything else means the browser

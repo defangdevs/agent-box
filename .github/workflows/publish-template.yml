@@ -76,19 +76,11 @@ jobs:
             --public-access-block-configuration \
               'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=false,RestrictPublicBuckets=false'
 
-          aws s3api put-bucket-policy --bucket "$BUCKET" --policy "$(cat <<POLICY
-          {
-            "Version": "2012-10-17",
-            "Statement": [{
-              "Sid": "PublicReadTemplate",
-              "Effect": "Allow",
-              "Principal": "*",
-              "Action": "s3:GetObject",
-              "Resource": "arn:aws:s3:::${BUCKET}/${OBJECT_KEY}"
-            }]
-          }
-          POLICY
-          )"
+      - name: Mirror module tarball to S3 (dual-stack) + set public-read policy
+        # Owns the bucket policy (template.yaml + module-*.tar.gz) and uploads the
+        # module archive the IPv6-only box fetches at first boot. See the script
+        # header for why github can't be fetched directly.
+        run: BUCKET="$BUCKET" bash scripts/mirror_module_to_s3.sh
 
       - name: Upload to S3
         run: |
