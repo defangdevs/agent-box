@@ -134,7 +134,7 @@ All under `services.claude-box`:
 | `package` | `pkgs.claude-code` | Claude Code package to run. |
 | `users.<name>.skipPermissions` | `true` | Pass `--dangerously-skip-permissions`. |
 | `users.<name>.remoteControl` | `true` | Pass `--remote-control`. |
-| `users.<name>.remoteControlName` | `<name>` | Remote Control session name. |
+| `users.<name>.remoteControlName` | `<name>@<host>` | Remote Control session name (null → `<user>@<fqdnOrHostName>`, so you can tell boxes apart in the apps). |
 | `users.<name>.workingDirectory` | `/home/<name>` | Agent startup directory. |
 | `users.<name>.extraGroups` | `[]` | Extra groups for the user. |
 | `users.<name>.extraArgs` | `[]` | Extra args appended to `claude`. |

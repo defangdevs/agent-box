@@ -16,9 +16,14 @@ let
         description = "Pass --remote-control so the session is drivable from the Claude apps.";
       };
       remoteControlName = lib.mkOption {
-        type = lib.types.str;
-        default = name;
-        description = "Remote Control session name. Keep it shell-safe (no spaces/quotes).";
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Remote Control session name, used to correlate the session to this box
+          from the Claude apps. Keep it shell-safe (no spaces/quotes). When null,
+          defaults to "<user>@<fqdnOrHostName>" (falls back to the bare hostname
+          when networking.domain is unset).
+        '';
       };
       workingDirectory = lib.mkOption {
         type = lib.types.str;
@@ -57,10 +62,14 @@ let
 
   mkStart = name: u:
     let
+      sessionName =
+        if u.remoteControlName != null
+        then u.remoteControlName
+        else "${name}@${config.networking.fqdnOrHostName}";
       claudeCmd = lib.concatStringsSep " " (
         [ (lib.getExe cfg.package) ]
         ++ lib.optional u.skipPermissions "--dangerously-skip-permissions"
-        ++ lib.optionals u.remoteControl [ "--remote-control" u.remoteControlName ]
+        ++ lib.optionals u.remoteControl [ "--remote-control" sessionName ]
         ++ u.extraArgs
       );
     in
