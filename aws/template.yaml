@@ -48,7 +48,8 @@ Metadata:
 
 Description: >
   claude-box - 1-click NixOS host running Claude Code inside a persistent tmux
-  session, accessed through a browser terminal (Caddy + ttyd).
+  session. Reach it through a browser terminal (Caddy + ttyd) or drive it from
+  the Claude desktop and mobile apps via Remote Control.
   Source: https://github.com/defangdevs/claude-box
 
 Parameters:
@@ -295,20 +296,16 @@ Resources:
 
   Instance:
     Type: AWS::EC2::Instance
-    # In IPv4 mode: wait for EIPAssoc so the instance has a public IPv4 the
-    # moment it starts booting. Otherwise amazon-init can't reach GitHub
-    # (github.com is IPv4-only) to fetch the claude-box module tarball.
-    # EIPAssoc is conditional, but CFN correctly skips the wait when the
-    # condition is false. cfn-lint's E3005 is over-eager here.
-    Metadata:
-      cfn-lint:
-        config:
-          ignore_checks:
-            - E3005
+    # Routing must exist before boot so egress works. Even IPv6-only instances
+    # reach IPv4-only GitHub via the subnet's DNS64 + NAT64 route, so no public
+    # IPv4 is needed to fetch the claude-box tarball during amazon-init.
+    # Do NOT DependsOn EIPAssoc: it's conditional (UseIpv4), and DependsOn on an
+    # excluded resource makes CFN reject the whole template in IPv6-only mode
+    # ("Unresolved resource dependencies [EIPAssoc]"). The EIP is inbound-only
+    # and associates in parallel, well before Caddy's ACME step needs it.
     DependsOn:
       - IgwAttach
       - SubnetRouteAssoc
-      - EIPAssoc
     Properties:
       InstanceType: !Ref InstanceType
       ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
