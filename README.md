@@ -168,6 +168,11 @@ All under `services.claude-box`:
 - The qcow2 image uses the native nixpkgs image API (`system.build.images`,
   upstreamed in NixOS 25.05) — no extra flake inputs.
 
+## Docs
+
+Maintainer and continuity notes live in the
+[project wiki](https://github.com/defangdevs/claude-box/wiki).
+
 ## License
 
 MIT — see [LICENSE](./LICENSE). Note this license covers the flake/module only;
