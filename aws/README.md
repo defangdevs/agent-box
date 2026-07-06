@@ -159,12 +159,11 @@ keys).
 ### Prerequisites (forking this repo)
 
 The workflow is self-bootstrapping — it upserts the bucket, its
-public-access configuration, and the `s3:GetObject` policy (covering both
-`template.yaml` and `module-*.tar.gz`) every run. It also mirrors the pinned
-module tarball to `s3://<bucket>/module-<ClaudeBoxRev>.tar.gz` so an IPv6-only
-box can fetch it over the S3 dual-stack endpoint — github.com is IPv4-only and
-AWS NAT64 needs a NAT Gateway (see `ModuleBaseUrl` in the template). It reads
-all deploy config from **repo-level Actions variables** (Settings > Secrets and
+public-access configuration, and an `s3:GetObject` policy scoped to
+`template.yaml` (the only object in the bucket) every run. The module itself
+is fetched by the box direct from `raw.githubusercontent.com` at first boot
+— that host is dual-stack, so an IPv6-only box needs no NAT64. It reads all
+deploy config from **repo-level Actions variables** (Settings > Secrets and
 variables > Actions > Variables). None are secrets; they're just fork-specific.
 
 | Variable | Required | Purpose |
@@ -175,11 +174,9 @@ variables > Actions > Variables). None are secrets; they're just fork-specific.
 | `AWS_REGION` | no | Region for the bucket + AWS API calls. Defaults to `us-east-1`. |
 
 Role permissions needed: `s3:CreateBucket`, `s3:PutPublicAccessBlock`,
-`s3:PutBucketPolicy`, `s3:PutObject`, `s3:GetObject` (the mirror skips
-re-upload if the object already exists), and `cloudformation:ValidateTemplate`.
-The E2E deploy-test workflow uses the same role, so it also needs the S3
-permissions above (it mirrors the module before creating the stack) plus
-`cloudformation:CreateStack`, `cloudformation:DeleteStack`,
+`s3:PutBucketPolicy`, `s3:PutObject`, and `cloudformation:ValidateTemplate`.
+The E2E deploy-test workflow uses the same role but doesn't touch S3; it
+needs `cloudformation:CreateStack`, `cloudformation:DeleteStack`,
 `cloudformation:DescribeStacks`, `ec2:GetConsoleOutput` (to assert amazon-init
 provisioned the box — this is how the IPv6-only leg verifies success without
 connecting), and the EC2 create/delete permissions used by the template -

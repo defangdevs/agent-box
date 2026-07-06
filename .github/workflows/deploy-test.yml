@@ -62,16 +62,12 @@ jobs:
     env:
       AWS_REGION: ${{ inputs.region || 'us-east-1' }}
       ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
-      BUCKET: ${{ vars.CLAUDE_BOX_BUCKET }}
       STACK_NAME: claude-box-e2e-${{ matrix.leg }}-${{ github.run_id }}
     steps:
       - name: Sanity-check required variables
         run: |
-          missing=()
-          [ -n "$ROLE_ARN" ] || missing+=("AWS_ROLE_ARN")
-          [ -n "$BUCKET" ]   || missing+=("CLAUDE_BOX_BUCKET")
-          if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error::Missing repo variable(s): ${missing[*]}. See aws/README.md."
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::error::Missing repo variable: AWS_ROLE_ARN. See aws/README.md."
             exit 1
           fi
 
@@ -82,13 +78,6 @@ jobs:
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Mirror module tarball to S3 (dual-stack)
-        # The template's default ModuleBaseUrl points at this bucket. Ensure the
-        # module-<rev>.tar.gz the box fetches at first boot exists, independent of
-        # whether publish-template.yml has run for this rev yet (same trigger, so
-        # ordering isn't guaranteed). Idempotent.
-        run: BUCKET="$BUCKET" bash scripts/mirror_module_to_s3.sh
 
       - name: Generate WebPassword (URL-safe path token)
         id: pw
