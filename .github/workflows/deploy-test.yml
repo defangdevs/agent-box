@@ -166,18 +166,21 @@ jobs:
         # Runs on BOTH legs, including IPv6-only where the runner can't connect
         # over the network. CFN CREATE_COMPLETE does NOT wait for amazon-init
         # (there's no CreationPolicy), so we confirm first-boot provisioning by
-        # reading the serial console: systemd prints "Finished ... EC2 userdata
-        # on startup" on success and "Failed to start ... EC2 userdata on
-        # startup" on failure. THIS is the check that catches the IPv6-only
-        # module-fetch failure the ipv4-full leg structurally cannot (that leg
-        # has a public IPv4 and reaches IPv4-only hosts directly).
+        # reading the serial console. systemd logs the amazon-init unit either by
+        # its Description ("Finished ... Reconfigure the system from EC2 userdata
+        # on startup") or by its unit id ("Started amazon-init.service") depending
+        # on the boot - match both. Failure shows "Failed to start ..." or the
+        # unit reporting a non-zero exit. THIS is the check that catches the
+        # IPv6-only module-fetch failure the ipv4-full leg structurally cannot
+        # (that leg has a public IPv4 and reaches IPv4-only hosts directly).
         run: |
           iid='${{ steps.outputs.outputs.instance_id }}'
           if [ -z "$iid" ] || [ "$iid" = "None" ]; then
             echo "::error::No InstanceId output to inspect."; exit 1
           fi
-          fail_re='Failed to start.*Reconfigure the system from EC2 userdata'
-          ok_re='(Finished|Started).*Reconfigure the system from EC2 userdata'
+          unit='(Reconfigure the system from EC2 userdata|amazon-init\.service)'
+          fail_re="(Failed to start.*$unit|amazon-init\.service: (Failed|Main process exited))"
+          ok_re="(Finished|Started).*$unit"
           # nixos-rebuild during amazon-init can take a few minutes; console
           # output on Nitro instances is near-real-time. Poll up to ~12 min.
           for i in $(seq 1 48); do
