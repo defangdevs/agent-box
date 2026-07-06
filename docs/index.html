@@ -166,11 +166,14 @@
         <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml">Launch &rarr;</a>
       </div>
     </div>
+    <div class="note" id="no-ipv6-note" hidden>
+      <strong>We didn't detect IPv6 on your network</strong> &mdash; the Launch buttons above have been adjusted to allocate a public IPv4 (~$3.60/month) so the box will be reachable from here. If you know you do have IPv6 (or don't mind trying without), uncheck <code>PublicIpv4</code> on the CloudFormation form before launching.
+    </div>
     <div class="note">
       <strong>You don't need to make up a password.</strong> Every Launch button already has a random one filled in for you. Keep it, type your own, or clear it to have one generated automatically. Pick a size and launch. The box takes about 2&ndash;3 minutes to start. When it's ready, your private link (with the password already built in) appears under <strong>Outputs</strong> in the AWS console &mdash; open it, finish the one-time Claude sign-in, and you're in.
     </div>
     <div class="note">
-      <strong>If your link won't open:</strong> the box uses a modern, free type of internet address that most home connections support, but some office and public Wi-Fi networks can't reach it. If your link never loads, launch again and set <code>PublicIpv4</code> to <code>true</code> &mdash; that adds an address every network can reach, for about $3.60/month.
+      <strong>Modern internet address by default.</strong> The box uses a free, IPv6 address that most home connections support, but some office and public Wi-Fi networks can't reach it. We check your browser on this page &mdash; if we can't reach the IPv6 internet from here, the Launch button above will automatically switch to IPv4 (~$3.60/month) so the box will actually be reachable.
     </div>
   </div>
 </section>
@@ -209,6 +212,38 @@
       // Fresh token each time the user actually launches (covers new-tab too).
       a.addEventListener('pointerdown', function () { apply(a); });
     });
+  })();
+
+  // Detect whether this browser has real IPv6 connectivity. If not, force
+  // PublicIpv4=true on every Launch link — the default IPv6-only box would
+  // be unreachable from this network. Uses a v6-only hostname (no A record):
+  // a completed fetch proves working v6; abort/network error means no v6.
+  // Non-blocking; user is free to click through before this settles.
+  (async function () {
+    const controller = new AbortController();
+    const t = setTimeout(function () { controller.abort(); }, 2500);
+    let hasV6 = false;
+    try {
+      await fetch('https://ipv6.icanhazip.com/', {
+        method: 'GET',
+        mode: 'no-cors',
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      hasV6 = true;
+    } catch (_) { /* no v6 route, DNS failure, or timeout */ }
+    clearTimeout(t);
+    if (hasV6) return;
+    document.querySelectorAll('a.launch').forEach(function (a) {
+      const base = (a.dataset.base || a.getAttribute('href')) + '&param_PublicIpv4=true';
+      a.dataset.base = base;
+      // Refresh href so right-click / open-in-new-tab picks up the flag;
+      // the existing pointerdown handler will re-derive with a fresh password
+      // token when the user actually clicks.
+      a.setAttribute('href', base);
+    });
+    const note = document.getElementById('no-ipv6-note');
+    if (note) note.hidden = false;
   })();
 </script>
 
