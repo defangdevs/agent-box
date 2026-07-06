@@ -3,8 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noai,noimageai">
 <title>claude-box &mdash; sandboxed Claude Code agents, one click away</title>
-<meta name="description" content="Reproducible, multi-user Claude Code agent sandboxes. 1-click AWS launch, bare-metal module, or VM image.">
+<meta name="description" content="A private, sandboxed Claude Code agent for you and your team. Launch it in your own AWS account with one click.">
 <style>
   :root {
     --bg: #0d1117;
@@ -110,7 +111,7 @@
 <header class="hero">
   <div class="wrap">
     <div class="logo"><span class="box">&#9635;</span> claude-box</div>
-    <p class="tagline">Reproducible, multi-user <a href="https://claude.com/claude-code">Claude Code</a> agent sandboxes &mdash; one click on AWS, on bare metal, or as a VM image.</p>
+    <p class="tagline">A private, sandboxed <a href="https://claude.com/claude-code">Claude Code</a> agent for you and your team &mdash; launch it in your own AWS account with one click.</p>
     <div class="cta">
       <a class="btn primary" href="#launch">Launch on AWS</a>
       <a class="btn ghost" href="https://github.com/defangdevs/claude-box">View on GitHub</a>
@@ -177,24 +178,8 @@
 <section>
   <div class="wrap">
     <h2>Other ways to run</h2>
-    <p class="sub">The AWS template just imports the same NixOS module you'd use anywhere.</p>
-    <h3>Bare metal / existing NixOS host</h3>
-    <pre><code>{
-  imports = [ inputs.claude-box.nixosModules.claude-box ];
-
-  services.claude-box = {
-    enable = true;
-    users = {
-      alice = { };
-      bob   = { remoteControlName = "bob-box"; };
-    };
-    # The ONLY elevated powers the agents get -- keep it tight.
-    sudoAllowlist = [ "/run/current-system/sw/bin/systemctl reload caddy.service" ];
-    extraPackages = with pkgs; [ git ripgrep jq ];
-  };
-}</code></pre>
-    <h3 style="margin-top:26px">VM image</h3>
-    <pre><code>nix build github:defangdevs/claude-box#vm   # -&gt; qcow2 disk image</code></pre>
+    <p class="sub">If your team already has its own server, or prefers a downloadable virtual-machine image, the same setup is available for your IT team to install.</p>
+    <p style="color: var(--muted); margin: 0;">Setup instructions live in the <a href="https://github.com/defangdevs/claude-box">project repository</a>.</p>
   </div>
 </section>
 
