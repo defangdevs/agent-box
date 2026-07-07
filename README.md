@@ -90,8 +90,11 @@ Then `sudo nixos-rebuild switch`. Each user gets a `claude-box-<name>.service`.
 Claude sign-in:
 
 ```bash
-sudo -u alice tmux -L claude-box attach -t main
+sudo -u alice env TMUX_TMPDIR=/run/claude-box-alice tmux -L claude-box attach -t main
 ```
+
+`TMUX_TMPDIR` is required: the agent service runs with `PrivateTmp`, so its
+tmux control socket lives under `/run/claude-box-<user>` rather than `/tmp`.
 
 Credentials live in that user's `~/.claude` — per-user runtime state, never
 baked into the config.

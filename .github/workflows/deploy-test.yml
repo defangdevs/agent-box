@@ -258,6 +258,25 @@ jobs:
             exit 1
           fi
 
+      - name: Smoke test — tmux session is live (not just ttyd reachable)
+        if: matrix.public_ipv4 == 'true'
+        run: |
+          # 101 above only proves ttyd upgrades the socket; it says nothing about
+          # whether `tmux attach` found a session. Attach for real and assert the
+          # terminal isn't showing tmux's "no sessions". Retries because the
+          # agent's claude session can take a moment to come up after boot.
+          python3 -m pip install --quiet websocket-client
+          url='${{ steps.outputs.outputs.web_url }}'
+          for i in $(seq 1 12); do
+            if python3 scripts/ws_smoke.py "$url"; then
+              exit 0
+            fi
+            echo "[$i/12] no live session yet; retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Browser terminal never attached to a live tmux session."
+          exit 1
+
       - name: Destroy stack
         # Push runs (no inputs) always destroy; dispatched runs honor inputs.destroy.
         if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.destroy) }}

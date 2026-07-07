@@ -16,7 +16,8 @@ EC2 with a browser terminal (Caddy + ttyd).
 - Uses EC2 user-data as a NixOS configuration: imports the pinned
   `claude-box` module + adds Caddy (TLS-ALPN-01 only) + a `ttyd` systemd
   service that binds to `127.0.0.1:7681` and attaches to `agent`'s tmux
-  session (`tmux -L claude-box -t main`).
+  session (`TMUX_TMPDIR=/run/claude-box-agent tmux -L claude-box -t main` —
+  the socket lives under `/run` because the agent runs with `PrivateTmp`).
 - **URL path-token auth** (not HTTP Basic Auth). ttyd runs `-b /<token>/`,
   Caddy 404s anything without the prefix. See "Design decisions" below.
 - The hostname `<addr>.sslip.io` is derived at CFN time via `Fn::Split ':'

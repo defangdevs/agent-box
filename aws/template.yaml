@@ -400,6 +400,10 @@ Resources:
                   after = [ "claude-box-agent.service" "network-online.target" ];
                   wants = [ "network-online.target" ];
                   wantedBy = [ "multi-user.target" ];
+                  # Must match the agent service's TMUX_TMPDIR so `tmux attach`
+                  # finds the control socket. The agent runs with PrivateTmp, so
+                  # the socket lives under /run (not the private /tmp).
+                  environment.TMUX_TMPDIR = "/run/claude-box-agent";
                   serviceConfig = {
                     User = "agent";
                     Restart = "always";

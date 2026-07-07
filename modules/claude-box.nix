@@ -211,7 +211,13 @@ in
         wants = [ "network-online.target" ];
         # System services get a minimal PATH; give the agent an explicit toolset.
         path = [ cfg.package pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ] ++ cfg.extraPackages;
-        environment = { HOME = "/home/${name}"; } // u.environment;
+        # TMUX_TMPDIR puts the control socket under the /run RuntimeDirectory
+        # below instead of /tmp. PrivateTmp (in serviceConfig) gives this unit a
+        # PRIVATE /tmp, so a socket there would be invisible to the separate
+        # process that attaches (the AWS ttyd service, or `sudo -u <name> tmux`).
+        # /run/claude-box-<name> is a normal host path both sides can reach.
+        # Attach with: env TMUX_TMPDIR=/run/claude-box-<name> tmux -L claude-box attach -t main
+        environment = { HOME = "/home/${name}"; TMUX_TMPDIR = "/run/claude-box-${name}"; } // u.environment;
         serviceConfig = {
           User = name;
           # ExecStart's mkStart supervises the tmux session and stays live for
@@ -223,6 +229,13 @@ in
           RestartSec = "2s";
           ExecStart = mkStart name u;
           ExecStop = "${pkgs.tmux}/bin/tmux -L claude-box kill-session -t main";
+          # Holds the tmux control socket (see TMUX_TMPDIR above). 0700 so only
+          # the agent user can reach its own socket; ExecStop/attachers run as
+          # the same user. Persist across restarts so an in-flight attach isn't
+          # racing the dir's teardown when Restart=always cycles claude.
+          RuntimeDirectory = "claude-box-${name}";
+          RuntimeDirectoryMode = "0700";
+          RuntimeDirectoryPreserve = true;
           # Custom tokens (GH_TOKEN, etc.) land here. The '-' makes the per-user
           # file optional so the agent starts even before any token is dropped in.
           EnvironmentFile = cfg.environmentFiles
