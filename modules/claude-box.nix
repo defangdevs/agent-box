@@ -8,12 +8,31 @@ let
       skipPermissions = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Pass --dangerously-skip-permissions (full autonomy, no approval prompts).";
+        description = ''
+          Pass --dangerously-skip-permissions to claude, i.e. the agent has
+          full autonomy inside its shell with no in-tool approval prompts.
+          Default is `true` because claude-box is designed to be a HEADLESS
+          agent runner — no human sits at the prompt to answer questions.
+
+          This is autonomy INSIDE claude-code, not an OS sandbox. The OS
+          sandbox is the unprivileged user, the systemd hardening this
+          module applies, and the tight sudoAllowlist. Set false if you
+          want each tool invocation to block for approval (only sensible
+          on a box with a human attached).
+        '';
       };
       remoteControl = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Pass --remote-control so the session is drivable from the Claude apps.";
+        description = ''
+          Pass --remote-control so the session is drivable from the Claude
+          desktop and mobile apps. Default `true` because "drive it from
+          your phone" is one of the module's headline features.
+
+          Set false to disable remote-app control for this user — then the
+          agent is only reachable through the local tmux session (or the
+          ttyd browser terminal in the AWS variant).
+        '';
       };
       remoteControlName = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
@@ -66,11 +85,14 @@ let
         if u.remoteControlName != null
         then u.remoteControlName
         else "${name}@${config.networking.fqdnOrHostName}";
+      # Every user-provided arg gets individually shell-escaped so a
+      # remoteControlName or extraArgs element containing whitespace or shell
+      # metacharacters can't inject into the tmux new-session command below.
       claudeCmd = lib.concatStringsSep " " (
-        [ (lib.getExe cfg.package) ]
+        [ (lib.escapeShellArg (lib.getExe cfg.package)) ]
         ++ lib.optional u.skipPermissions "--dangerously-skip-permissions"
-        ++ lib.optionals u.remoteControl [ "--remote-control" sessionName ]
-        ++ u.extraArgs
+        ++ lib.optionals u.remoteControl [ "--remote-control" (lib.escapeShellArg sessionName) ]
+        ++ (map lib.escapeShellArg u.extraArgs)
       );
     in
     pkgs.writeShellScript "claude-box-${name}-start" ''
@@ -156,7 +178,16 @@ in
     assertions = [{
       assertion = cfg.users != { };
       message = "services.claude-box.enable is true but no users are defined in services.claude-box.users.";
-    }];
+    }] ++ (lib.mapAttrsToList (name: u: {
+      # Cheap sanity check on the one string that lands verbatim in a shell
+      # command; deeper escaping happens in mkStart via lib.escapeShellArg.
+      assertion = u.remoteControlName == null || (
+        u.remoteControlName != ""
+        && !(lib.hasInfix "\n" u.remoteControlName)
+        && !(lib.hasInfix "\r" u.remoteControlName)
+      );
+      message = "services.claude-box.users.${name}.remoteControlName must be non-empty and free of newlines.";
+    }) cfg.users);
 
     # Claude Code is unfree; allow just it (host can override).
     nixpkgs.config.allowUnfreePredicate =
@@ -197,16 +228,48 @@ in
           EnvironmentFile = cfg.environmentFiles
             ++ [ "-${cfg.tokenDir}/${name}.env" ]
             ++ u.environmentFiles;
+
+          # Systemd hardening. The OS boundary has to stay meaningful even
+          # though the agent runs `--dangerously-skip-permissions` inside its
+          # own claude-code layer — this is the containment claude-code
+          # deliberately opts out of.
+          PrivateTmp = true;
+          PrivateDevices = true;              # keeps pty subsystem; blocks /dev/mem etc.
+          ProtectSystem = "strict";           # entire fs read-only except explicit RW paths
+          ReadWritePaths = [ "/home/${name}" ];
+          ProtectKernelTunables = true;
+          ProtectKernelModules = true;
+          ProtectControlGroups = true;
+          ProtectClock = true;
+          RestrictSUIDSGID = true;
+          RestrictRealtime = true;
+          LockPersonality = true;
+          # NoNewPrivileges would break the sudoAllowlist escape hatch (sudo
+          # is setuid root; NNP blocks the euid transition). Enable it only
+          # when the allowlist is empty — with a non-empty allowlist we've
+          # traded some containment for scoped elevation as a host choice.
+          NoNewPrivileges = cfg.sudoAllowlist == [ ];
         };
       }
     ) cfg.users;
 
-    systemd.tmpfiles.rules =
-      lib.mkIf cfg.manageTokenDir [ "d ${cfg.tokenDir} 0755 root root - -" ];
+    systemd.tmpfiles.rules = lib.mkIf cfg.manageTokenDir [
+      # The dir itself is only ever traversed by root (systemd reads
+      # EnvironmentFile= as root, before the service process starts as the
+      # agent user), so 0700 is enough. Was 0755, which leaked filenames
+      # (= usernames) to anyone on the box.
+      "d ${cfg.tokenDir} 0700 root root - -"
+      # Also enforce 0600 on any existing *.env files so a hand-created file
+      # with lax perms gets corrected on next tmpfiles run.
+      "Z ${cfg.tokenDir}/*.env 0600 root root - -"
+    ];
 
     security.sudo.extraRules = lib.mkIf (cfg.sudoAllowlist != [ ]) [{
       users = lib.attrNames cfg.users;
-      commands = map (command: { inherit command; options = [ "NOPASSWD" "SETENV" ]; }) cfg.sudoAllowlist;
+      # NOPASSWD only — no SETENV. SETENV lets the caller alter env vars
+      # visible to the sudo'd command, which broadens the surface for no
+      # gain given the allowlist is meant to be tight and command-scoped.
+      commands = map (command: { inherit command; options = [ "NOPASSWD" ]; }) cfg.sudoAllowlist;
     }];
   };
 }

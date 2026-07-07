@@ -163,19 +163,59 @@ All under `services.claude-box`:
 
 ## Security model
 
-- **Unprivileged by default.** Agents run as normal users, not root — this is
-  the OS-level sandbox boundary, and it's separate from Claude's own approval
-  prompts. (`skipPermissions` defaults to `true`, i.e. *no* in-tool prompts;
-  that's autonomy inside Claude Code, not OS privilege — see the heads-up
-  below.) Running non-root also matters because Claude Code refuses
-  `--dangerously-skip-permissions` as root.
-- **Scoped elevation.** `sudoAllowlist` is the entire set of root-capable
-  actions; there is no blanket sudo.
-- **Isolation.** For a skip-permissions agent, prefer the VM target — a KVM
-  guest is a far stronger blast-radius boundary than a container.
-- **Heads-up.** `--dangerously-skip-permissions` grants full autonomy with no
-  approval prompts. Claude Code's own guidance recommends it only for sandboxes;
-  scope `sudoAllowlist` accordingly and treat each agent host as such.
+The module treats each agent as an untrusted process running inside its own
+unprivileged user account, on a machine the operator already treats as a
+sandbox host (VM, throwaway EC2 box, etc.). The OS layer is what contains a
+compromised agent — Claude Code's in-tool approval prompts are *deliberately
+off* by default (`skipPermissions = true`), so nothing in claude-code itself
+gates arbitrary command execution as the agent user.
+
+**What the module gives you:**
+
+- **Unprivileged agent user.** Not root. Claude Code itself refuses to run
+  `--dangerously-skip-permissions` as root, so this is enforced from two
+  sides.
+- **Systemd hardening on every agent service:** `PrivateTmp`,
+  `PrivateDevices` (keeps pty, blocks `/dev/mem` and friends),
+  `ProtectSystem=strict` (root filesystem read-only, only `/home/<name>`
+  writable via `ReadWritePaths`), `ProtectKernelTunables/Modules/`
+  `ControlGroups/Clock`, `RestrictSUIDSGID`, `RestrictRealtime`,
+  `LockPersonality`. `NoNewPrivileges=true` is applied automatically when
+  `sudoAllowlist` is empty; a non-empty allowlist keeps NNP off (sudo is
+  setuid and needs the euid transition) — a deliberate trade of a bit of
+  containment for scoped elevation.
+- **Tight sudo:** whatever's in `sudoAllowlist` is the entire root-capable
+  surface. `NOPASSWD` only — no `SETENV`, no blanket sudo, no ALL.
+- **Root-scoped secrets dir:** `/etc/claude-box` is `0700 root:root`.
+  Systemd reads the per-agent `<user>.env` files as root before dropping
+  into the agent's UID, so the agent process itself never traverses the
+  directory. `Z … 0600 root root` tmpfiles rule enforces the mode of any
+  file inside on every rebuild.
+
+**Deliberate defaults that stay ON:**
+
+- `skipPermissions = true` — a headless agent runner with per-tool
+  approval prompts and no human to answer them is useless. Flip to
+  `false` per-user if you actually have a human at the terminal.
+- `remoteControl = true` — this is the "drive it from your phone"
+  feature. Flip to `false` per-user if you don't want the session
+  reachable from the Claude apps.
+
+**Tradeoffs the module can't fully paper over:**
+
+- **Persistent `/home/<name>` across sessions.** SSH keys, git creds,
+  dotfiles, session state — anything the agent writes accumulates.
+  Treat each agent home as untrusted; back up or wipe with intent.
+- **Secrets as env vars.** Anything in `<user>.env` becomes an env
+  var in the agent's process and its children. Env vars can leak via
+  `/proc/<pid>/environ`, coredumps, or child-process inheritance.
+  Systemd's `LoadCredential=` (files under `$CREDENTIALS_DIRECTORY`)
+  is a possible future improvement if the tools running under the
+  agent actually read from there.
+- **`--dangerously-skip-permissions`** grants full autonomy inside
+  claude-code. Prefer the VM target for anything you'd not lose
+  sleep over an attacker doing as the agent user — a KVM guest is a
+  much stronger blast-radius boundary than a container.
 
 ## Notes
 
