@@ -36,7 +36,7 @@ Metadata:
       PublicIpv4:
         default: Allocate a public IPv4 (costs ~$3.60/mo)
       AllowCidr:
-        default: IPv4 CIDR allowed to reach 22/443
+        default: IPv4 CIDR allowed to reach 443
       ClaudeBoxRev:
         default: claude-box git rev
       ClaudeBoxSha256:
@@ -121,7 +121,7 @@ Parameters:
     Default: 0.0.0.0/0
     AllowedPattern: ^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$
     Description: >-
-      IPv4 CIDR allowed to reach 22/443. Default is open. IPv6 ingress is
+      IPv4 CIDR allowed to reach 443. Default is open. IPv6 ingress is
       always ::/0 - restrict at the SG level after launch if needed.
 
   ClaudeBoxRev:
@@ -247,7 +247,7 @@ Resources:
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: 'claude-box: 443 (web terminal) + 22 (SSH), v4 + v6'
+      GroupDescription: 'claude-box: 443 (web terminal), v4 + v6'
       VpcId: !Ref Vpc
       Tags:
         - Key: Name
@@ -263,16 +263,6 @@ Resources:
           ToPort: 443
           CidrIpv6: ::/0
           Description: Web terminal (Caddy) v6
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: !Ref AllowCidr
-          Description: SSH v4
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIpv6: ::/0
-          Description: SSH v6
 
   # NetworkInterface: created explicitly so we can Fn::GetAtt.PrimaryIpv6Address.
   # EnablePrimaryIpv6 is REQUIRED for that GetAtt to return a value: without a
@@ -385,7 +375,7 @@ Resources:
                   };
                 };
 
-                networking.firewall.allowedTCPPorts = [ 22 443 ];
+                networking.firewall.allowedTCPPorts = [ 443 ];
 
                 services.caddy = {
                   enable = true;
