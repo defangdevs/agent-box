@@ -55,17 +55,20 @@ Description: >
 Parameters:
   InstanceType:
     Type: String
-    Default: t3.small
+    Default: t4g.small
     AllowedValues:
-      - t3.small
-      - t3.medium
-      - t3.large
-      - t3.xlarge
-      - m6i.large
-      - m6i.xlarge
-      - c6i.large
+      - t4g.small
+      - t4g.medium
+      - t4g.large
+      - t4g.xlarge
+      - m7g.large
+      - m7g.xlarge
+      - c7g.large
     Description: >-
-      EC2 instance type. t3.small (~2 GB RAM) is fine for a single light agent.
+      EC2 instance type. All choices are Graviton (aarch64) — cheaper than
+      the x86 equivalents and paired with an aarch64 NixOS AMI in the
+      RegionMap below. t4g.small (~2 GB RAM, ~$0.017/hr) is fine for a
+      single light agent.
 
   PublicIpv4:
     Type: String
@@ -123,7 +126,7 @@ Parameters:
 
   ClaudeBoxRev:
     Type: String
-    Default: 4a678e1ad94eeb644b6119ce9b39605e6013dec7
+    Default: 8d220c5d08bf0f410b68200a4b642dc19bfab438
     Description: >-
       Git rev of defangdevs/claude-box. The module (a single .nix file) is
       fetched from raw.githubusercontent.com at this rev - that host is
@@ -132,7 +135,7 @@ Parameters:
 
   ClaudeBoxSha256:
     Type: String
-    Default: 164jp7fgbi874z24d5408v23lkxsndyx65sv3iggr686lm3pf7in
+    Default: 1d9fjcf4wvyglbnlvki94ifslj8rkimkfw54h7375gahpv8qb8kq
     Description: >-
       Nix base-32 sha256 of modules/claude-box.nix at ClaudeBoxRev. Regenerate via
       `nix-prefetch-url https://raw.githubusercontent.com/defangdevs/claude-box/<REV>/modules/claude-box.nix`
@@ -148,13 +151,13 @@ Mappings:
   # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py — do not edit by hand)
   RegionMap:
     us-east-1:
-      AMI: ami-0ed5f0aab536e0ee2
+      AMI: ami-0d5c505545effc95c
     us-west-2:
-      AMI: ami-0e78db03e0a4e1eb0
+      AMI: ami-0b1109b091092c6fe
     eu-central-1:
-      AMI: ami-01be8b1976c890db4
+      AMI: ami-07406de5e8a7ef0f3
     eu-west-1:
-      AMI: ami-0db2fcbe936c18ad4
+      AMI: ami-0550ccab171a40b19
   # END AMI MAP
 
 Resources:

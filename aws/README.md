@@ -143,8 +143,8 @@ auth). AMIs are garbage-collected ~90d after publication, so the template's
 
 `scripts/refresh_amis.py` regenerates the block between the `BEGIN AMI MAP`
 / `END AMI MAP` markers in `template.yaml`. It targets the NixOS 25.11
-channel, x86_64, and only the 4 regions we support today (us-east-1,
-us-west-2, eu-central-1, eu-west-1).
+channel, `aarch64-linux` (Graviton), and only the 4 regions we support
+today (us-east-1, us-west-2, eu-central-1, eu-west-1).
 
 CI runs it weekly via `.github/workflows/refresh-amis.yml` and pushes a
 commit if anything changed.

@@ -38,8 +38,9 @@ in NA/EU do; corporate/coffee-shop nets often don't). If IPv6 isn't reachable
 for you, set `PublicIpv4: true` at launch — allocates an EIP, adds $3.60/mo,
 works everywhere.
 
-Costs: ~$0.02/hr for `t3.small` on-demand + $0/hr for the Elastic IP while
-attached (~$3.60/mo if you keep it up). Terminate the stack to stop billing.
+Costs: ~$0.017/hr for `t4g.small` (Graviton/aarch64) on-demand + $0/hr for
+the Elastic IP while attached (~$3.60/mo if you keep it up). Terminate the
+stack to stop billing.
 
 Template source: [`aws/template.yaml`](./aws/template.yaml).
 See [`aws/README.md`](./aws/README.md) for the region → AMI refresh workflow

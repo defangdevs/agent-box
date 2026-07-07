@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 REGIONS = ["us-east-1", "us-west-2", "eu-central-1", "eu-west-1"]
-CHANNEL_PATTERN = re.compile(r"^nixos/25\.11\..*x86_64-linux$")
+CHANNEL_PATTERN = re.compile(r"^nixos/25\.11\..*aarch64-linux$")
 IMAGES_URL = "https://nixos.github.io/amis/images.json"
 TEMPLATE = Path(__file__).parent.parent / "aws" / "template.yaml"
 
