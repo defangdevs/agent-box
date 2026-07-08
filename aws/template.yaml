@@ -272,7 +272,7 @@ Resources:
   # NetworkInterface: created explicitly so we can Fn::GetAtt.PrimaryIpv6Address.
   # EnablePrimaryIpv6 is REQUIRED for that GetAtt to return a value: without a
   # designated primary IPv6, Ipv6AddressCount still assigns an address but
-  # PrimaryIpv6Address resolves to empty -> "https://.sslip.io/" + blank output.
+  # PrimaryIpv6Address resolves to empty -> "https://agent@.sslip.io/".
   NetworkInterface:
     Type: AWS::EC2::NetworkInterface
     Properties:

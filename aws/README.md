@@ -218,11 +218,18 @@ Verify with a `workflow_dispatch` run of `Publish CFN template to S3`, then:
 curl -I "https://${CLAUDE_BOX_BUCKET}.s3.amazonaws.com/template.yaml"
 ```
 
+## Pull request validation
+
+`.github/workflows/aws-ci.yml` runs on pull requests that touch the AWS
+template, launch page, browser-terminal smoke helper, or related workflows. It
+does not create AWS resources; it runs `cfn-lint aws/template.yaml` and compiles
+`scripts/ws_smoke.py` so template/auth-helper changes get fast PR feedback.
+
 ## End-to-end deploy test
 
-`.github/workflows/deploy-test.yml` (on push to the template + manual trigger)
-creates real CloudFormation stacks and deletes them at the end. It runs two
-legs in parallel:
+`.github/workflows/deploy-test.yml` (on push to the template or WebSocket smoke
+helper + manual trigger) creates real CloudFormation stacks and deletes them at
+the end. It runs two legs in parallel:
 
 - **ipv4-full** - forces `PublicIpv4=true` (+ Spot); GitHub runners are
   IPv4-only, so this is the only leg that can actually reach the box. It runs
