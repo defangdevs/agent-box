@@ -341,7 +341,10 @@ in
         # visible without a rebuild. It must be in the unit's PATH (not just a
         # BASH_ENV hook): agent CLIs commonly snapshot their startup PATH and re-export
         # it in every tool shell, clobbering anything BASH_ENV prepended.
-        path = [ "/home/${name}/.nix-profile/bin" agent.package pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ] ++ cfg.extraPackages;
+        # NOTE: `path` entries go through makeBinPath, which appends /bin —
+        # so list the profile ROOT, not its bin dir ('.../bin' became the
+        # nonexistent '.../bin/bin' and silently dropped nix-profile tools).
+        path = [ "/home/${name}/.nix-profile" agent.package pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ] ++ cfg.extraPackages;
         # TMUX_TMPDIR puts the control socket under the /run RuntimeDirectory
         # below instead of /tmp. PrivateTmp (in serviceConfig) gives this unit a
         # PRIVATE /tmp, so a socket there would be invisible to the separate
