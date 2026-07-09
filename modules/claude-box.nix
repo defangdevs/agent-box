@@ -462,8 +462,13 @@ in
       # First-boot only: drop in a Caddyfile with the ttyd virtual host and a
       # comment explaining how to add more. If the file already exists (e.g.
       # a local box with its own hand-crafted blocks), leave it alone.
-      system.activationScripts.claude-box-caddyfile-seed.text = ''
+      # stringAfter users/groups: unordered snippets sort alphabetically, so a
+      # plain .text ran BEFORE the caddy user existed on a fresh box and the
+      # chown failed, failing activation. /var/lib/caddy must be created here
+      # too — Caddy's StateDirectory= only makes it at first service start.
+      system.activationScripts.claude-box-caddyfile-seed = lib.stringAfter [ "users" "groups" ] ''
         if [ ! -s /var/lib/caddy/Caddyfile ]; then
+          install -d -m 0755 -o caddy -g caddy /var/lib/caddy
           install -m 0664 -o caddy -g caddy /dev/null /var/lib/caddy/Caddyfile
           cat > /var/lib/caddy/Caddyfile <<'CADDYFILE_EOF'
         # Edit me. Reload with: sudo systemctl reload caddy.service
@@ -472,7 +477,9 @@ in
 
         (acme_alpn_only) {
           tls {
-            issuer acme { disable_http_challenge }
+            issuer acme {
+              disable_http_challenge
+            }
           }
         }
 
