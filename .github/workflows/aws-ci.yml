@@ -1,0 +1,37 @@
+name: AWS template CI
+
+on:
+  push:
+    branches: [ master ]
+    paths: &aws-ci-paths
+      - 'aws/template.yaml'
+      - 'docs/index.html'
+      - 'scripts/ws_smoke.py'
+      - '.github/workflows/aws-ci.yml'
+      - '.github/workflows/deploy-test.yml'
+  pull_request:
+    paths: *aws-ci-paths
+  workflow_dispatch:
+
+concurrency:
+  group: aws-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate AWS template and smoke helper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install cfn-lint
+        run: python3 -m pip install --quiet cfn-lint
+
+      - name: Validate CloudFormation template
+        run: cfn-lint aws/template.yaml
+
+      - name: Compile WebSocket smoke helper
+        run: python3 -m py_compile scripts/ws_smoke.py

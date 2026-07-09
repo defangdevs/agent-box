@@ -5,6 +5,7 @@ on:
     branches: [ master ]
     paths:
       - 'aws/template.yaml'
+      - 'scripts/ws_smoke.py'
       - '.github/workflows/deploy-test.yml'
   workflow_dispatch:
     inputs:
@@ -47,7 +48,7 @@ jobs:
     #    connect over IPv6, so this leg only asserts the stack reaches
     #    CREATE_COMPLETE and its outputs populate. That still catches template
     #    resolution bugs (e.g. the old EIPAssoc dependency) and empty-GetAtt bugs
-    #    (e.g. a blank PrimaryIpv6Address -> "https://.sslip.io/").
+    #    (e.g. a blank PrimaryIpv6Address -> "https://agent@.sslip.io/").
     strategy:
       fail-fast: false
       matrix:
@@ -81,7 +82,7 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Generate WebPassword (URL-safe path token)
+      - name: Generate WebPassword
         id: pw
         run: |
           # 48 hex chars — matches the template's AllowedPattern [A-Za-z0-9._~-]{16,64}.
@@ -141,10 +142,12 @@ jobs:
           if [ -z "$ip" ] || [ "$ip" = "None" ]; then
             echo "::error::PublicAddress output is empty."; fail=1
           fi
-          # The host must be present between https:// and .sslip.io. Catches a
-          # blank PrimaryIpv6Address, which renders WebURL as https://.sslip.io/<token>/.
+          # The host must be present after the non-secret username. Catches a
+          # blank PrimaryIpv6Address, which renders WebURL as https://agent@.sslip.io/.
           rest=${url#https://}
-          host=${rest%%.sslip.io*}
+          authority=${rest%%/*}
+          host=${authority#*@}
+          host=${host%.sslip.io}
           if [ -z "$host" ]; then
             echo "::error::WebURL host is blank: $url"; fail=1
           fi
@@ -193,43 +196,50 @@ jobs:
           printf '%s\n' "$out" | tail -40
           exit 1
 
-      - name: Smoke test — wait for the token URL to serve ttyd HTML
+      - name: Smoke test — wait for authenticated terminal URL to serve ttyd HTML
         if: matrix.public_ipv4 == 'true'
+        env:
+          WEB_PASSWORD: ${{ steps.pw.outputs.value }}
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
+          terminal_url="${url/https:\/\/agent@/https:\/\/}"
           # NixOS boot + nixos-rebuild + Caddy ACME can add 2-10 min after CFN reports done.
           for i in $(seq 1 60); do
-            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$url" || true)
-            echo "[$i/60] GET $url -> $code"
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 \
+              -u "agent:${WEB_PASSWORD}" "$terminal_url" || true)
+            echo "[$i/60] authenticated GET $terminal_url -> $code"
             if [ "$code" = "200" ]; then
-              echo "::notice::Token URL is serving (HTTP 200) - Caddy + ttyd are up."
+              echo "::notice::Authenticated terminal URL is serving (HTTP 200) - Caddy + ttyd are up."
               break
             fi
             sleep 10
           done
           if [ "$code" != "200" ]; then
-            echo "::error::Never got 200 from $url after 10 min."
+            echo "::error::Never got 200 from $terminal_url after 10 min."
             exit 1
           fi
 
-      - name: Smoke test — verify wrong-token URL returns 404
+      - name: Smoke test — verify unauthenticated URL returns 401
         if: matrix.public_ipv4 == 'true'
         run: |
-          # Path other than /$TOKEN/* must NOT reach ttyd.
-          host=$(echo '${{ steps.outputs.outputs.web_url }}' | awk -F/ '{print $3}')
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 5 "https://$host/" || true)
-          if [ "$code" = "404" ]; then
-            echo "::notice::Bare host returns 404 as expected (token path required)."
+          url='${{ steps.outputs.outputs.web_url }}'
+          terminal_url="${url/https:\/\/agent@/https:\/\/}"
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 5 "$terminal_url" || true)
+          if [ "$code" = "401" ]; then
+            echo "::notice::Unauthenticated terminal URL returns 401 as expected."
           else
-            echo "::error::Expected 404 at https://$host/ (no token), got $code."
+            echo "::error::Expected 401 at $terminal_url (no Basic auth), got $code."
             exit 1
           fi
 
       - name: Smoke test — verify ttyd HTML body
         if: matrix.public_ipv4 == 'true'
+        env:
+          WEB_PASSWORD: ${{ steps.pw.outputs.value }}
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
-          body=$(curl -sS --max-time 15 "$url")
+          terminal_url="${url/https:\/\/agent@/https:\/\/}"
+          body=$(curl -sS --max-time 15 -u "agent:${WEB_PASSWORD}" "$terminal_url")
           if echo "$body" | grep -qi "ttyd\|terminal"; then
             echo "::notice::ttyd HTML served correctly."
           else
@@ -240,18 +250,24 @@ jobs:
 
       - name: Smoke test — WebSocket upgrade
         if: matrix.public_ipv4 == 'true'
+        env:
+          WEB_PASSWORD: ${{ steps.pw.outputs.value }}
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
+          terminal_url="${url/https:\/\/agent@/https:\/\/}"
+          cookie_jar=$(mktemp)
+          curl -sS -o /dev/null --max-time 15 -u "agent:${WEB_PASSWORD}" -c "$cookie_jar" "$terminal_url"
           # 101 = Switching Protocols (success). Anything else means the browser
-          # terminal will show 'disconnected'. No Basic Auth needed - the token
-          # is in the path.
+          # terminal will show 'disconnected'. Browsers send cookies on the
+          # upgrade request, so this proves the Basic-auth bootstrap cookie works.
           code=$(curl -sS -o /dev/null -w "%{http_code}" --http1.1 --max-time 10 \
+            -b "$cookie_jar" \
             -H "Connection: Upgrade" \
             -H "Upgrade: websocket" \
             -H "Sec-WebSocket-Version: 13" \
             -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
             -H "Sec-WebSocket-Protocol: tty" \
-            "${url}ws" || true)
+            "${terminal_url}ws" || true)
           echo "WebSocket upgrade attempt -> HTTP $code"
           if [ "$code" = "101" ]; then
             echo "::notice::WebSocket upgrade succeeded (101 Switching Protocols)."
@@ -262,6 +278,8 @@ jobs:
 
       - name: Smoke test — tmux session is live (not just ttyd reachable)
         if: matrix.public_ipv4 == 'true'
+        env:
+          WEB_PASSWORD: ${{ steps.pw.outputs.value }}
         run: |
           # 101 above only proves ttyd upgrades the socket; it says nothing about
           # whether `tmux attach` found a session. Attach for real and assert the
@@ -270,7 +288,7 @@ jobs:
           python3 -m pip install --quiet websocket-client
           url='${{ steps.outputs.outputs.web_url }}'
           for i in $(seq 1 12); do
-            if python3 scripts/ws_smoke.py "$url"; then
+            if python3 scripts/ws_smoke.py "$url" "$WEB_PASSWORD"; then
               exit 0
             fi
             echo "[$i/12] no live session yet; retrying in 10s..."
