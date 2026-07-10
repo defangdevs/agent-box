@@ -51,9 +51,14 @@ in NA/EU do; corporate/coffee-shop nets often don't). If IPv6 isn't reachable
 for you, set `PublicIpv4: true` at launch — allocates an EIP, adds $3.60/mo,
 works everywhere.
 
-Costs: ~$0.017/hr for `t4g.small` (Graviton/aarch64) on-demand + $0/hr for
+Costs: ~$0.017/hr for `t4g.small` (Graviton/aarch64) on-demand + ~$2.40/mo
+for the default 30 GiB gp3 root volume (`RootVolumeSize`) + $0/hr for
 the Elastic IP while attached (~$3.60/mo if you keep it up). Terminate the
 stack to stop billing.
+
+Out of disk anyway? Enlarge the volume from the EC2 console (Volumes ->
+Modify) and reboot the instance — NixOS grows the partition and filesystem
+on boot. The box also garbage-collects the nix store automatically.
 
 **Root shell via SSM Session Manager.** The template ships no SSH key; the
 browser terminal is an unprivileged `agent` user. For a root path onto the
