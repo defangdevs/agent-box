@@ -12,6 +12,7 @@ Metadata:
           default: Compute and cost
         Parameters:
           - InstanceType
+          - RootVolumeSize
           - UseSpot
           - PublicIpv4
       - Label:
@@ -28,6 +29,8 @@ Metadata:
         default: Agent CLI
       InstanceType:
         default: EC2 instance type
+      RootVolumeSize:
+        default: Root volume size (GiB)
       UseSpot:
         default: Use a Spot instance (cheaper)
       PublicIpv4:
@@ -75,6 +78,20 @@ Parameters:
       the x86 equivalents and paired with an aarch64 NixOS AMI in the
       RegionMap below. t4g.small (~2 GB RAM, ~$0.017/hr) is fine for a
       single light agent.
+
+  RootVolumeSize:
+    Type: Number
+    Default: 30
+    MinValue: 8
+    MaxValue: 1024
+    Description: >-
+      Root EBS volume size in GiB (gp3, ~$0.08/GiB-month). The NixOS AMI's
+      own snapshot is only a few GiB and the nix store grows with every
+      rebuild/self-update, so keep real headroom. NixOS grows the partition
+      and filesystem to fill the volume on every boot, which also means you
+      can enlarge the volume of a RUNNING box later (EC2 console -> Volumes
+      -> Modify) and simply reboot the instance to claim the space — no
+      in-instance steps. EBS cannot shrink a volume.
 
   PublicIpv4:
     Type: String
@@ -389,6 +406,18 @@ Resources:
     Properties:
       InstanceType: !Ref InstanceType
       ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
+      # Root volume. DeviceName must match the AMI's RootDeviceName
+      # (/dev/xvda on official NixOS AMIs) — a mismatch would silently
+      # attach a SECOND volume instead of sizing the root. NixOS grows the
+      # partition + filesystem to fill the volume on boot, so this parameter
+      # (and later console enlargements followed by a reboot) needs no
+      # in-instance tooling.
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
       # IamInstanceProfile takes the profile *name* (not ARN); AWS::NoValue
       # when EnableSsm=false so the whole IAM stack is skipped and the launch
       # form does not display CAPABILITY_IAM.
@@ -487,6 +516,22 @@ Resources:
                     chmod 0600 /var/lib/claude-box-web/password-hash
                   fi
                 '';
+
+                # Disk watchdog. The nix store grows on every rebuild /
+                # self-update and a full root wedges the whole box, agent
+                # included — GC is the recovery nobody is around to run.
+                # min-free/max-free additionally trigger GC mid-build when
+                # free space dips, which is exactly when it matters.
+                nix.gc = {
+                  automatic = true;
+                  options = "--delete-older-than 7d";
+                };
+                nix.settings = {
+                  min-free = 1073741824;  # start GC below 1 GiB free
+                  max-free = 5368709120;  # ... and free up to 5 GiB
+                };
+                # The journal otherwise defaults to 10% of the filesystem.
+                services.journald.extraConfig = "SystemMaxUse=200M";
 
                 # Don't re-apply user-data on every reboot - protects local edits.
                 systemd.services.amazon-init.enable = lib.mkForce false;

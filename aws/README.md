@@ -43,6 +43,33 @@ choose Claude Code or Codex.
   ["Root access via SSM Session Manager"](#root-access-via-ssm-session-manager)
   below. Opt out with `EnableSsm=false` to skip the IAM resources and the
   launch console's CAPABILITY_IAM acknowledgment.
+- Sizes the root volume via `RootVolumeSize` (default 30 GiB gp3) and keeps
+  it from filling up. See ["Disk headroom"](#disk-headroom) below.
+
+### Disk headroom
+
+The NixOS AMI's own snapshot is only a few GiB, and the nix store grows with
+every `nixos-rebuild` — including agent-triggered self-updates — so an
+unsized root volume eventually wedges the whole box: a full root means no
+journal, no rebuilds, and usually a stuck agent, on a box where nobody is
+around to run garbage collection by hand.
+
+Three layers keep that from happening:
+
+- **`RootVolumeSize` parameter** (default 30 GiB, gp3, ~$0.08/GiB-month).
+  The `BlockDeviceMappings` device name must match the AMI's
+  `RootDeviceName` (`/dev/xvda` on official NixOS AMIs); a mismatch would
+  silently attach a second volume instead of sizing the root.
+- **Automatic nix GC**: `nix.gc.automatic` prunes generations older than 7
+  days on a timer, and `nix.settings.min-free`/`max-free` trigger GC
+  mid-build whenever free space dips below 1 GiB (freeing up to 5 GiB) —
+  the case that matters, since rebuilds are what eat the disk. The journal
+  is capped at 200M (`SystemMaxUse`), as it otherwise claims 10% of the fs.
+- **Grow-on-boot**: NixOS's amazon image expands the partition and
+  filesystem to fill the volume on every boot, not just the first. So a
+  running box that still fills up needs no in-instance tooling: enlarge the
+  volume in the EC2 console (Volumes -> Modify), then reboot the instance.
+  EBS cannot shrink volumes, only grow them.
 
 ### Root access via SSM Session Manager
 
