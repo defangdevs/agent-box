@@ -41,6 +41,13 @@ choose Claude Code or Codex.
 
 ### WebPassword storage
 
+`WebPassword` is required (16-64 chars). Even Claude Code stacks that intend to
+drive the box from the Claude apps via Remote Control need it: the first
+`claude login` still runs in the browser terminal, and Remote Control only
+takes over after that credential lands on disk. AWS masks the field once
+entered and it isn't emitted in stack outputs, so callers must save it out of
+band — the launch page copy leads with this.
+
 `WebPassword` is marked `NoEcho` and is not emitted in stack Outputs. It still
 exists as plaintext in the substituted EC2 user-data, and the current
 implementation interpolates it into first-boot Nix/systemd material so Caddy can

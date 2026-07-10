@@ -22,7 +22,7 @@ Metadata:
           - ClaudeBoxSha256
     ParameterLabels:
       WebPassword:
-        default: Web terminal password (blank = auto-generated)
+        default: Web terminal password (16-64 chars — save it, AWS masks it)
       Agent:
         default: Agent CLI
       InstanceType:
@@ -106,7 +106,11 @@ Parameters:
       Shared secret for the browser terminal. Log in with username "agent" and
       this password; Caddy then sets an HttpOnly Secure cookie so the WebSocket
       upgrade can authenticate without putting the secret in the URL. Use 16-64
-      chars from [A-Za-z0-9._~-].
+      chars from [A-Za-z0-9._~-]. AWS masks this field with dots after you type
+      it and never emits it in stack outputs, so save it somewhere before you
+      launch — there is no way to recover it later. Even Claude Code stacks
+      that plan to drive the box via Remote Control need this the first time,
+      to complete `claude login` in the browser terminal.
 
   AllowCidr:
     Type: String
@@ -420,7 +424,7 @@ Outputs:
   WebURL:
     Description: >-
       Browser terminal for the selected agent. Claude Code deployments are also
-      drivable from the Claude apps via Remote Control.
+      drivable from the Claude apps via Remote Control after the first login.
       First load takes ~2-3 minutes while the instance provisions and Caddy
       issues an ACME cert. The URL includes the non-secret username (which is
       also the terminal's path — the site root is an index of terminals);
@@ -433,6 +437,14 @@ Outputs:
           - !Join
               - '-'
               - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
+
+  RemoteControlSession:
+    Description: >-
+      Claude Remote Control session name. After finishing `claude login` once
+      in the browser terminal, the Claude desktop / mobile apps can drive this
+      session directly (sign in with the same Claude account). Only meaningful
+      when Agent=claude; Codex has no Remote Control channel.
+    Value: !Ref AWS::StackName
 
   PublicAddress:
     Description: Elastic IP (IPv4 mode) or primary IPv6 (IPv6 mode).
