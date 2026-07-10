@@ -22,7 +22,7 @@ Metadata:
           - ClaudeBoxSha256
     ParameterLabels:
       WebPassword:
-        default: Web terminal password (blank = no browser terminal)
+        default: Web terminal password (16-64 chars — save it, AWS masks it)
       Agent:
         default: Agent CLI
       InstanceType:
@@ -98,19 +98,19 @@ Parameters:
 
   WebPassword:
     Type: String
-    Default: ''
     NoEcho: true
+    MinLength: 16
     MaxLength: 64
-    AllowedPattern: ^$|^[A-Za-z0-9._~-]{16,64}$
+    AllowedPattern: ^[A-Za-z0-9._~-]{16,64}$
     Description: >-
       Shared secret for the browser terminal. Log in with username "agent" and
       this password; Caddy then sets an HttpOnly Secure cookie so the WebSocket
       upgrade can authenticate without putting the secret in the URL. Use 16-64
-      chars from [A-Za-z0-9._~-], or leave BLANK to skip the browser terminal
-      entirely (the box is then reachable only via Claude Remote Control, and
-      only when Agent=claude). AWS masks this field with dots after you type
+      chars from [A-Za-z0-9._~-]. AWS masks this field with dots after you type
       it and never emits it in stack outputs, so save it somewhere before you
-      launch — there is no way to recover it later.
+      launch — there is no way to recover it later. Even Claude Code stacks
+      that plan to drive the box via Remote Control need this the first time,
+      to complete `claude login` in the browser terminal.
 
   AllowCidr:
     Type: String
@@ -143,24 +143,9 @@ Parameters:
       (no unpack; we fetch the file, not a tarball). See ClaudeBoxRev for
       why there is no Default here.
 
-Rules:
-  # Codex has no Remote Control channel, so its only interactive path is the
-  # browser terminal. A passwordless Codex box would be unreachable — fail at
-  # the quick-create form with an actionable message rather than deploying a
-  # useless stack.
-  CodexRequiresWebPassword:
-    RuleCondition: !Equals [!Ref Agent, 'codex']
-    Assertions:
-      - Assert: !Not [!Equals [!Ref WebPassword, '']]
-        AssertDescription: >-
-          Codex needs the browser terminal (it has no Remote Control channel).
-          Set WebPassword to a 16-64 char string, or switch Agent to claude to
-          launch a Remote-Control-only box.
-
 Conditions:
   UseIpv4: !Equals [!Ref PublicIpv4, 'true']
   UseSpotCond: !Equals [!Ref UseSpot, 'true']
-  WebEnabled: !Not [!Equals [!Ref WebPassword, '']]
 
 Mappings:
   # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py — do not edit by hand)
@@ -377,13 +362,6 @@ Resources:
                 };
                 hostname = "${WebHostname}";
                 webPassword = "${WebPassword}";
-                # Blank WebPassword = no browser terminal. The module's `web`
-                # block stays disabled, no activation script runs, and only
-                # Claude Remote Control can reach the box (Codex is blocked by
-                # a CFN Rule at launch time). Keeping the branch inside Nix
-                # instead of !If-splicing the whole config block keeps the
-                # user-data readable and lets `nix eval` catch typos both ways.
-                webEnabled = webPassword != "";
               in {
                 imports = [
                   "${!modulesPath}/virtualisation/amazon-image.nix"
@@ -396,10 +374,8 @@ Resources:
                   users.agent = {
                     environment = { TERM = "xterm-256color"; };
                     remoteControlName = "${StackName}";
-                  } // lib.optionalAttrs webEnabled {
                     web.passwordHashFile = "/var/lib/claude-box-web/password-hash";
                   };
-                } // lib.optionalAttrs webEnabled {
                   web = {
                     enable = true;
                     domain = hostname;
@@ -419,19 +395,17 @@ Resources:
                 # later — update-users-groups.pl then writes /etc/passwd and
                 # /etc/group 0600, nsncd can't read them, and every NSS lookup
                 # (User= resolution, chown by name) fails until reboot.
-                system.activationScripts.claude-web-password-hash = lib.mkIf webEnabled {
-                  text = ''
-                    install -d -m 0700 /var/lib/claude-box-web
-                    if [ ! -s /var/lib/claude-box-web/password-hash ]; then
-                      (
-                        umask 077
-                        ${!pkgs.caddy}/bin/caddy hash-password --plaintext ${!lib.escapeShellArg webPassword} \
-                          > /var/lib/claude-box-web/password-hash
-                      )
-                      chmod 0600 /var/lib/claude-box-web/password-hash
-                    fi
-                  '';
-                };
+                system.activationScripts.claude-web-password-hash.text = ''
+                  install -d -m 0700 /var/lib/claude-box-web
+                  if [ ! -s /var/lib/claude-box-web/password-hash ]; then
+                    (
+                      umask 077
+                      ${!pkgs.caddy}/bin/caddy hash-password --plaintext ${!lib.escapeShellArg webPassword} \
+                        > /var/lib/claude-box-web/password-hash
+                    )
+                    chmod 0600 /var/lib/claude-box-web/password-hash
+                  fi
+                '';
 
                 # Don't re-apply user-data on every reboot - protects local edits.
                 systemd.services.amazon-init.enable = lib.mkForce false;
@@ -448,10 +422,9 @@ Resources:
 
 Outputs:
   WebURL:
-    Condition: WebEnabled
     Description: >-
       Browser terminal for the selected agent. Claude Code deployments are also
-      drivable from the Claude apps via Remote Control.
+      drivable from the Claude apps via Remote Control after the first login.
       First load takes ~2-3 minutes while the instance provisions and Caddy
       issues an ACME cert. The URL includes the non-secret username (which is
       also the terminal's path — the site root is an index of terminals);
@@ -467,9 +440,9 @@ Outputs:
 
   RemoteControlSession:
     Description: >-
-      Claude Remote Control session name. Sign in to the Claude desktop or
-      mobile app with the same account you use for Claude Code, then pick this
-      session to drive the agent — no browser terminal needed. Only meaningful
+      Claude Remote Control session name. After finishing `claude login` once
+      in the browser terminal, the Claude desktop / mobile apps can drive this
+      session directly (sign in with the same Claude account). Only meaningful
       when Agent=claude; Codex has no Remote Control channel.
     Value: !Ref AWS::StackName
 

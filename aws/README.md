@@ -39,7 +39,14 @@ choose Claude Code or Codex.
 - Disables `amazon-init` after the first successful apply so local edits to
   `/etc/nixos/configuration.nix` survive reboots.
 
-### WebPassword storage (and the blank-password path)
+### WebPassword storage
+
+`WebPassword` is required (16-64 chars). Even Claude Code stacks that intend to
+drive the box from the Claude apps via Remote Control need it: the first
+`claude login` still runs in the browser terminal, and Remote Control only
+takes over after that credential lands on disk. AWS masks the field once
+entered and it isn't emitted in stack outputs, so callers must save it out of
+band — the launch page copy leads with this.
 
 `WebPassword` is marked `NoEcho` and is not emitted in stack Outputs. It still
 exists as plaintext in the substituted EC2 user-data, and the current
@@ -57,16 +64,6 @@ plus a random cookie secret (`WEB_COOKIE_SECRET_AGENT`) to
 `/run/claude-box-web/env` (`0600`), and Caddy reads that environment file. The
 cookie secret is generated on the instance and stored separately at
 `/var/lib/claude-box-web/cookie-secret-agent` (`0700` parent directory).
-
-`WebPassword` may also be left **blank** at launch — the user-data then sets
-`webEnabled = false` and the `services.claude-box.web` block is not emitted at
-all, so no Caddy config, no ttyd unit, no activation script, no port 443
-listener. The box is reachable only via Claude Remote Control (session name =
-CFN stack name). Because Codex has no Remote Control channel, a top-level CFN
-`Rules` block rejects `Agent=codex` + blank `WebPassword` at the quick-create
-form with an actionable message rather than deploying an unreachable stack.
-Stack Outputs match: `WebURL` is emitted only when `WebEnabled`, and
-`RemoteControlSession` (the stack name) is always emitted.
 
 ## Design decisions & gotchas
 
