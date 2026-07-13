@@ -1220,7 +1220,10 @@ in
             </style>
             <main>
               <h1>Terminals</h1>
-              ${lib.concatMapStringsSep "\n      " (n: ''<div class="row"><a class="term" href="https://${n}@${cfg.web.domain}/${n}/">${n}</a><a class="gear" href="https://${n}@${cfg.web.domain}/${n}/settings/" title="${n} settings" aria-label="${n} settings">&#9881;</a></div>'') terminalUsers}
+              ${/* No ${n}@ userinfo in these hrefs: Chrome answers the basic-auth
+                    challenge with URL userinfo + an EMPTY password and never shows
+                    a password prompt (issue 56). */
+                lib.concatMapStringsSep "\n      " (n: ''<div class="row"><a class="term" href="https://${cfg.web.domain}/${n}/">${n}</a><a class="gear" href="https://${cfg.web.domain}/${n}/settings/" title="${n} settings" aria-label="${n} settings">&#9881;</a></div>'') terminalUsers}
             </main>
             PICKER_HTML 200
         }

@@ -38,8 +38,8 @@ Let's Encrypt cert against `<eip>.sslip.io`.
 Choose `Agent` (`claude` or `codex`), set a `WebPassword` (16+ chars from
 `[A-Za-z0-9._~-]`), pick an instance size, launch. The template creates its own
 IPv6-enabled VPC/subnet so nothing on the account has to be pre-configured. The
-stack Outputs show `https://agent@<v6-or-v4>.sslip.io/agent/` - open it, enter your
-`WebPassword` when prompted, complete the selected agent's one-time sign-in, done.
+stack Outputs show `https://<v6-or-v4>.sslip.io/agent/` - open it, sign in as
+`agent` with your `WebPassword`, complete the selected agent's one-time sign-in, done.
 The CloudFormation stack name is also used as the Claude Remote Control session
 name; rename the stack before launch if you want a friendlier label in the
 Claude apps.
