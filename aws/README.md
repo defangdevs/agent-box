@@ -25,9 +25,11 @@ choose Claude Code or Codex.
   lets browser WebSocket upgrades authenticate with that cookie. ttyd still
   binds only to localhost. The site root serves an unauthenticated index page
   listing the configured terminals (just `agent` on this template).
-- The stack output URL includes the non-secret username as
-  `https://agent@<host>.sslip.io/agent/` so browsers can go straight to the
-  password prompt without putting the password in the URL.
+- The stack output URL is `https://<host>.sslip.io/agent/`; sign in as `agent`
+  with the `WebPassword`. The URL deliberately carries no `agent@` userinfo:
+  Chrome answers the auth challenge with URL userinfo plus an empty password,
+  and credentials typed into the prompt cannot override the URL-embedded
+  identity (issue 56).
 - The CloudFormation stack name becomes the Claude Remote Control session name.
   Rename the stack before launch if you want a friendlier label in the Claude
   apps; post-deploy, this can still be changed in the NixOS config.

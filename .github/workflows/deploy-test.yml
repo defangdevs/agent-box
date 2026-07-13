@@ -51,7 +51,7 @@ jobs:
     #    connect over IPv6, so this leg only asserts the stack reaches
     #    CREATE_COMPLETE and its outputs populate. That still catches template
     #    resolution bugs (e.g. the old EIPAssoc dependency) and empty-GetAtt bugs
-    #    (e.g. a blank PrimaryIpv6Address -> "https://agent@.sslip.io/").
+    #    (e.g. a blank PrimaryIpv6Address -> "https://.sslip.io/").
     strategy:
       fail-fast: false
       matrix:
@@ -162,12 +162,16 @@ jobs:
           if [ -z "$ip" ] || [ "$ip" = "None" ]; then
             echo "::error::PublicAddress output is empty."; fail=1
           fi
-          # The host must be present after the non-secret username. Catches a
-          # blank PrimaryIpv6Address, which renders WebURL as https://agent@.sslip.io/.
+          # The host must be present. Catches a blank PrimaryIpv6Address, which
+          # renders WebURL as https://.sslip.io/. Also reject any userinfo in the
+          # authority: Chrome answers the auth challenge with URL userinfo + an
+          # EMPTY password, and typed credentials can't override it (issue 56).
           rest=${url#https://}
           authority=${rest%%/*}
-          host=${authority#*@}
-          host=${host%.sslip.io}
+          case "$authority" in *@*)
+            echo "::error::WebURL must not contain userinfo (user@): $url"; fail=1 ;;
+          esac
+          host=${authority%.sslip.io}
           if [ -z "$host" ]; then
             echo "::error::WebURL host is blank: $url"; fail=1
           fi
@@ -240,7 +244,7 @@ jobs:
           WEB_PASSWORD: ${{ steps.pw.outputs.value }}
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
-          terminal_url="${url/https:\/\/agent@/https:\/\/}"
+          terminal_url="$url"
           # NixOS boot + nixos-rebuild + Caddy ACME can add 2-10 min after CFN reports done.
           for i in $(seq 1 60); do
             code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 \
@@ -261,7 +265,7 @@ jobs:
         if: matrix.public_ipv4 == 'true'
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
-          terminal_url="${url/https:\/\/agent@/https:\/\/}"
+          terminal_url="$url"
           code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 5 "$terminal_url" || true)
           if [ "$code" = "401" ]; then
             echo "::notice::Unauthenticated terminal URL returns 401 as expected."
@@ -274,13 +278,18 @@ jobs:
         if: matrix.public_ipv4 == 'true'
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
-          terminal_url="${url/https:\/\/agent@/https:\/\/}"
+          terminal_url="$url"
           root_url="${terminal_url%agent/}"
           body=$(curl -sS --max-time 10 "$root_url" || true)
-          if echo "$body" | grep -q 'href="https://agent@[^"]*/agent/"'; then
-            echo "::notice::Root picker links the agent terminal with the username prefilled."
+          if echo "$body" | grep -q 'href="https://[^/"]*@'; then
+            echo "::error::Picker at $root_url embeds URL userinfo (user@) in an href — Chrome auto-sends an empty password and typed credentials can't override it (issue 56):"
+            echo "$body" | head -20
+            exit 1
+          fi
+          if echo "$body" | grep -q 'href="https://[^"]*/agent/"'; then
+            echo "::notice::Root picker links the agent terminal (no credentials in the URL)."
           else
-            echo "::error::Picker at $root_url doesn't link to https://agent@.../agent/:"
+            echo "::error::Picker at $root_url doesn't link to https://<host>/agent/:"
             echo "$body" | head -20
             exit 1
           fi
@@ -291,7 +300,7 @@ jobs:
           WEB_PASSWORD: ${{ steps.pw.outputs.value }}
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
-          terminal_url="${url/https:\/\/agent@/https:\/\/}"
+          terminal_url="$url"
           body=$(curl -sS --max-time 15 -u "agent:${WEB_PASSWORD}" "$terminal_url")
           if echo "$body" | grep -qi "ttyd\|terminal"; then
             echo "::notice::ttyd HTML served correctly."
@@ -307,7 +316,7 @@ jobs:
           WEB_PASSWORD: ${{ steps.pw.outputs.value }}
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
-          terminal_url="${url/https:\/\/agent@/https:\/\/}"
+          terminal_url="$url"
           cookie_jar=$(mktemp)
           curl -sS -o /dev/null --max-time 15 -u "agent:${WEB_PASSWORD}" -c "$cookie_jar" "$terminal_url"
           # 101 = Switching Protocols (success). Anything else means the browser
