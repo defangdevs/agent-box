@@ -2,8 +2,9 @@
 //
 // The picker (and the CFN WebURL output) must never embed URL userinfo
 // (https://user@host/...): Chrome answers the basic-auth challenge with the
-// userinfo username plus an EMPTY password, fails, and never shows a password
-// prompt — locking users out of the terminal with the "correct password".
+// userinfo username plus an EMPTY password, and credentials typed into the
+// prompt cannot override the URL-embedded identity — locking users out of
+// the terminal with the "correct password".
 
 import { test, expect } from '@playwright/test';
 

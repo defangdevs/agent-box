@@ -566,7 +566,8 @@ Outputs:
       issues an ACME cert. Sign in with username "agent" and the WebPassword
       chosen at deployment time. (The URL deliberately carries no user@
       prefix: Chrome answers the auth challenge with URL userinfo plus an
-      EMPTY password and then never shows a password prompt — issue 56.)
+      EMPTY password, and credentials typed into the prompt cannot override
+      the URL-embedded identity — issue 56.)
     Value: !Sub
       - "https://${Host}.sslip.io/agent/"
       - Host: !If

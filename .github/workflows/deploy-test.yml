@@ -165,7 +165,7 @@ jobs:
           # The host must be present. Catches a blank PrimaryIpv6Address, which
           # renders WebURL as https://.sslip.io/. Also reject any userinfo in the
           # authority: Chrome answers the auth challenge with URL userinfo + an
-          # EMPTY password and never prompts (issue 56).
+          # EMPTY password, and typed credentials can't override it (issue 56).
           rest=${url#https://}
           authority=${rest%%/*}
           case "$authority" in *@*)
@@ -282,7 +282,7 @@ jobs:
           root_url="${terminal_url%agent/}"
           body=$(curl -sS --max-time 10 "$root_url" || true)
           if echo "$body" | grep -q 'href="https://[^/"]*@'; then
-            echo "::error::Picker at $root_url embeds URL userinfo (user@) in an href — Chrome auto-sends an empty password and never prompts (issue 56):"
+            echo "::error::Picker at $root_url embeds URL userinfo (user@) in an href — Chrome auto-sends an empty password and typed credentials can't override it (issue 56):"
             echo "$body" | head -20
             exit 1
           fi
