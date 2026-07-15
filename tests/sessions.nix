@@ -125,7 +125,10 @@
     # The runtime-created session runs INSIDE the hardened agent unit's
     # cgroup: the tmux server is a child of the supervisor, so systemd
     # sandboxing covers sessions added long after boot.
-    server_pid = machine.succeed(tmux('display -p -t =helper "#{pid}"')).strip()
+    # NOTE the "=helper:" (trailing colon): display/capture take a target-
+    # PANE, and a bare "=name" only resolves when that session is tmux's
+    # idea of the current one — otherwise it silently expands to "" (rc 0).
+    server_pid = machine.succeed(tmux('display -p -t "=helper:" "#{pid}"')).strip()
     machine.succeed(f"grep -q claude-box-agent.service /proc/{server_pid}/cgroup")
 
     # ls shows both sessions with their agents.
@@ -134,10 +137,14 @@
     assert "codex" in listing, listing
 
     # --- restart semantics: killed listed sessions come back --------------
-    sid = machine.succeed(tmux('display -p -t =main "#{session_id}"')).strip()
+    # Compare pane PIDs, not session ids: killing the LAST session also ends
+    # the tmux server, and a fresh server restarts session-id numbering, so
+    # ids can repeat. A recreated session always has a new pane process.
+    old_pane = machine.succeed(tmux('display -p -t "=main:" "#{pane_pid}"')).strip()
+    assert old_pane, "pane_pid of main must not be empty"
     machine.succeed(tmux("kill-session -t =main"))
     machine.wait_until_succeeds(
-        tmux('display -p -t =main "#{session_id}"') + f" | grep -vx '{sid}'",
+        tmux('display -p -t "=main:" "#{pane_pid}"') + f" | grep . | grep -vx '{old_pane}'",
         timeout=60,
     )
 
