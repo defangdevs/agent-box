@@ -176,12 +176,14 @@ let
           (*) echo "agent '$agent' is not installed (installed: $AGENTS)" >&2; exit 2 ;;
         esac
         ensure_file
+        # `--` after --args: jq otherwise still option-parses positional
+        # args, so a dashed extra arg like --model would error out.
         jq_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
           '.sessions[$n] = {agent: $a, skipPermissions: true, remoteControl: true,
                             remoteControlName: null,
                             workingDirectory: (if $c == "" then null else $c end),
                             extraArgs: $ARGS.positional}' \
-          --args "$@"
+          --args -- "$@"
         echo "session '$name' ($agent) added — the supervisor starts it within ~2s"
         ;;
       rm)
