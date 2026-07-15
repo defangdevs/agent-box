@@ -520,16 +520,18 @@ Resources:
                     remoteControlName = "${StackName}";
                     web.passwordHashFile = "/var/lib/claude-box-web/password-hash";
                     # AGENTS.md content from the CFN AgentsMd parameter, spliced
-                    # as-is into a Nix indented string. Content lines land at
-                    # column 0 (matching the CFN sub position), so Nix's
-                    # dedent leaves them untouched. The default references
-                    # $CLAUDE_BOX_URL, which the module exports in the agent's
-                    # systemd env — the agent can `echo` it in the terminal.
-                    # The module skips seeding when the target file already
-                    # exists, so this is safe to (re)apply.
+                    # as-is into a Nix indented string. The next line's leading
+                    # 14 spaces exactly match the YAML block-scalar indent, so
+                    # after YAML strips them the sub token lands at column 0 —
+                    # multi-line AgentsMd values then splice with each line at
+                    # column 0, and Nix's dedent leaves them untouched. The
+                    # default references $CLAUDE_BOX_URL, which the module
+                    # exports in the agent's systemd env — the agent can echo
+                    # it in the terminal. The module skips seeding when the
+                    # target file already exists, so this is safe to reapply.
                     agentsMd = ''
-${AgentsMd}
-'';
+              ${AgentsMd}
+              '';
                   };
                   web = {
                     enable = true;
