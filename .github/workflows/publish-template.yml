@@ -22,18 +22,18 @@ jobs:
     # Fork this repo? Configure these under Settings > Secrets and variables >
     # Actions > Variables (repo-level, not secrets — none of these are sensitive).
     # See aws/README.md.
-    # Fork? Override with a repo-scoped var CLAUDE_BOX_ENVIRONMENT, or edit the fallback.
-    environment: ${{ vars.CLAUDE_BOX_ENVIRONMENT || 'defang-claude-box' }}
+    # Fork? Override with a repo-scoped var AGENT_BOX_ENVIRONMENT, or edit the fallback.
+    environment: ${{ vars.AGENT_BOX_ENVIRONMENT || 'defang-agent-box' }}
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-      BUCKET: ${{ vars.CLAUDE_BOX_BUCKET }}
+      BUCKET: ${{ vars.AGENT_BOX_BUCKET }}
       OBJECT_KEY: template.yaml
       ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
     steps:
       - name: Sanity-check required variables
         run: |
           missing=()
-          [ -n "$BUCKET" ]   || missing+=("CLAUDE_BOX_BUCKET")
+          [ -n "$BUCKET" ]   || missing+=("AGENT_BOX_BUCKET")
           [ -n "$ROLE_ARN" ] || missing+=("AWS_ROLE_ARN")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::Missing repo variable(s): ${missing[*]}. Set under Settings > Actions > Variables. See aws/README.md."
@@ -49,19 +49,19 @@ jobs:
 
       - name: Inject pinned Rev + Sha256 defaults for the 1-click copy
         # The source template deliberately ships without Default: values for
-        # ClaudeBoxRev / ClaudeBoxSha256 (see the param's Description) — the
+        # AgentBoxRev / AgentBoxSha256 (see the param's Description) — the
         # 1-click Launch buttons need them pre-filled, so we inject the current
         # master commit + its module sha256 as the S3 template's defaults.
         run: |
           rev="${{ github.sha }}"
-          sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/claude-box.nix" \
+          sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/agent-box.nix" \
             | openssl dgst -sha256 -binary | base64)"
           echo "Rev: $rev"
           echo "Sha: $sha"
           awk -v rev="$rev" -v sha="$sha" '
-            /^  ClaudeBoxRev:$/     { rf=1; print; next }
+            /^  AgentBoxRev:$/     { rf=1; print; next }
             rf && /^    Type:/      { print; print "    Default: " rev; rf=0; next }
-            /^  ClaudeBoxSha256:$/  { sf=1; print; next }
+            /^  AgentBoxSha256:$/  { sf=1; print; next }
             sf && /^    Type:/      { print; print "    Default: " sha; sf=0; next }
             { print }
           ' aws/template.yaml > aws/template.filled.yaml
@@ -110,7 +110,7 @@ jobs:
           {
             "Version": "2012-10-17",
             "Statement": [{
-              "Sid": "PublicReadClaudeBoxTemplate",
+              "Sid": "PublicReadAgentBoxTemplate",
               "Effect": "Allow",
               "Principal": "*",
               "Action": "s3:GetObject",

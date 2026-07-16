@@ -1,4 +1,4 @@
-# claude-box
+# agent-box
 
 Reproducible, multi-user coding-agent sandboxes - one click on AWS, on bare
 metal, or as a VM image, from one declarative config. (Built on NixOS.)
@@ -16,10 +16,13 @@ Supported agents:
 | Claude Code | `pkgs.claude-code` | `--dangerously-skip-permissions` | Supports Claude Remote Control. |
 | Codex | `pkgs.codex` | `--dangerously-bypass-approvals-and-sandbox` | Browser terminal access; Codex app-server/remote wiring is future work. |
 
-**Name note.** `claude-box` still works as the module and service namespace for
-compatibility, but the repo has outgrown that name. A better name would be
-`agent-box`: short, literal, and broad enough for Claude Code, Codex, and future
-terminal-native agents.
+**Name note.** This project was renamed from `claude-box` to `agent-box`
+(issue 70) — short, literal, and broad enough for Claude Code, Codex, and
+future terminal-native agents. Old GitHub links redirect. Boxes deployed
+before the rename keep running, but cannot self-update across it (their
+baked config fetches the module by its old path and sets the old
+`services.claude-box` options) — launch a fresh stack to move. Hosts you
+rebuild yourself migrate live state automatically on the first switch.
 
 ## 1-click AWS launch
 
@@ -30,10 +33,10 @@ Let's Encrypt cert against `<eip>.sslip.io`.
 
 | Region | Launch |
 | --- | --- |
-| us-east-1 (N. Virginia) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
-| us-west-2 (Oregon) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
-| eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
-| eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
+| us-east-1 (N. Virginia) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
+| us-west-2 (Oregon) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
+| eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
+| eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
 
 Choose `Agent` (`claude` or `codex`), set a `WebPassword` (16+ chars from
 `[A-Za-z0-9._~-]`), pick an instance size, launch. The agent runs as the
@@ -75,7 +78,7 @@ details.
 
 **Updating the box.** Click "Update box" on the settings page (the gear icon
 next to your terminal), or ask the agent in its terminal to run
-`sudo systemctl start claude-box-update.service` — a root oneshot (alongside
+`sudo systemctl start agent-box-update.service` — a root oneshot (alongside
 the caddy reload, the only sudo the agent holds) that fast-forwards the box
 to this repo's latest master, advances the agent-CLI pin to the newest
 nixos-unstable channel release (so `claude` / `codex` stay current even
@@ -84,7 +87,7 @@ though the box itself tracks a stable NixOS release), and runs
 rebuild restarts changed agent services, which kills their running sessions.
 Anything that is not a fast-forward of the running revision is refused.
 Verifying releases against an offline signing key is tracked in
-[issue 46](https://github.com/defangdevs/claude-box/issues/46).
+[issue 46](https://github.com/defangdevs/agent-box/issues/46).
 
 Template source: [`aws/template.yaml`](./aws/template.yaml).
 See [`aws/README.md`](./aws/README.md) for the region -> AMI refresh workflow
@@ -103,7 +106,7 @@ Add the flake as an input and import the module:
 ```nix
 # flake.nix (your host)
 {
-  inputs.claude-box.url = "github:defangdevs/claude-box";
+  inputs.agent-box.url = "github:defangdevs/agent-box";
   # ...
 }
 ```
@@ -112,9 +115,9 @@ Add the flake as an input and import the module:
 # configuration.nix
 { pkgs, ... }:
 {
-  imports = [ inputs.claude-box.nixosModules.claude-box ];
+  imports = [ inputs.agent-box.nixosModules.agent-box ];
 
-  services.claude-box = {
+  services.agent-box = {
     enable = true;
     agent = "claude"; # or "codex"
     users = {
@@ -137,7 +140,7 @@ Add the flake as an input and import the module:
 }
 ```
 
-Then `sudo nixos-rebuild switch`. Each user gets a `claude-box-<name>.service`.
+Then `sudo nixos-rebuild switch`. Each user gets an `agent-box-<name>.service`.
 
 **First login (per user):** attach to the session and complete the one-time
 agent sign-in:
@@ -181,20 +184,20 @@ the session on a dialog that Remote Control can't answer.
 A linux user account and an agent CLI are decoupled: each user runs one or
 more **sessions**, and each session is one agent (Claude Code or Codex) in
 its own tmux session, all supervised by that user's single hardened
-`claude-box-<name>.service`. All supported agent CLIs are installed
+`agent-box-<name>.service`. All supported agent CLIs are installed
 regardless of what any session runs (`installAgents`).
 
 Sessions are **runtime data**. The Nix config above only seeds
-`~/.config/claude-box/sessions.json` on first boot; after that the file is
+`~/.config/agent-box/sessions.json` on first boot; after that the file is
 authoritative and a rebuild never clobbers runtime changes. Create and
 destroy sessions as the user — no sudo, no `nixos-rebuild`:
 
 ```bash
-claude-box-session ls                        # NAME AGENT STATE
-claude-box-session add review --agent codex  # starts within ~2s
-claude-box-session add scratch --cwd ~/proj -- --model opus
-claude-box-session restart review
-claude-box-session rm review                 # delist + kill
+agent-box-session ls                        # NAME AGENT STATE
+agent-box-session add review --agent codex  # starts within ~2s
+agent-box-session add scratch --cwd ~/proj -- --model opus
+agent-box-session restart review
+agent-box-session rm review                 # delist + kill
 ```
 
 The settings page (web setups) has the same controls, and agents can spawn
@@ -213,9 +216,9 @@ stay gone.
 Build from the same config:
 
 ```bash
-nix build github:defangdevs/claude-box#vm   # -> qcow2 disk image
+nix build github:defangdevs/agent-box#vm   # -> qcow2 disk image
 # or run a throwaway QEMU VM locally:
-nixos-rebuild build-vm --flake github:defangdevs/claude-box#vm && ./result/bin/run-*-vm
+nixos-rebuild build-vm --flake github:defangdevs/agent-box#vm && ./result/bin/run-*-vm
 ```
 
 The bundled `hosts/vm.nix` provisions a single `agent` user with console
@@ -223,14 +226,14 @@ autologin (change the initial password on first boot).
 
 ## Adding custom tokens (no rebuild)
 
-Each agent auto-loads `/etc/claude-box/<user>.env` if it exists. Drop a token in
+Each agent auto-loads `/etc/agent-box/<user>.env` if it exists. Drop a token in
 and restart the unit:
 
 ```bash
-sudo install -m600 /dev/stdin /etc/claude-box/alice.env <<'EOF'
+sudo install -m600 /dev/stdin /etc/agent-box/alice.env <<'EOF'
 GH_TOKEN=ghp_xxx
 EOF
-sudo systemctl restart claude-box-alice
+sudo systemctl restart agent-box-alice
 ```
 
 The file is read by systemd as root and exported into the agent's environment,
@@ -239,7 +242,7 @@ sops-nix, etc.) use `environmentFiles` instead.
 
 ## Options
 
-All under `services.claude-box`:
+All under `services.agent-box`:
 
 | Option | Default | Description |
 | --- | --- | --- |
@@ -248,7 +251,7 @@ All under `services.claude-box`:
 | `package` | selected agent default | Override package to run for every agent user. |
 | `installAgents` | all supported | Agent CLIs installed on the box (independent of what sessions run). |
 | `users.<name>.sessions.<s>.*` | `{}` | Seed sessions (first boot only): per session `agent`, `skipPermissions`, `remoteControl`, `remoteControlName`, `workingDirectory`, `extraArgs`. Empty = the legacy per-user options below seed a session named `main`. |
-| `users.<name>.agent` | `null` | Agent for the default `main` session; null uses `services.claude-box.agent`. |
+| `users.<name>.agent` | `null` | Agent for the default `main` session; null uses `services.agent-box.agent`. |
 | `users.<name>.skipPermissions` | `true` | Pass the selected agent's autonomy flag. |
 | `users.<name>.remoteControl` | `true` | Pass Claude's `--remote-control` when `agent = "claude"`; ignored for Codex. |
 | `users.<name>.remoteControlName` | `<name>@<host>` | Claude Remote Control session name (null -> `<user>@<fqdnOrHostName>` for `main`, `<user>-<session>@<fqdnOrHostName>` for other sessions). Ignored for Codex. |
@@ -260,7 +263,7 @@ All under `services.claude-box`:
 | `sudoAllowlist` | `[]` | Passwordless sudo commands granted to every agent. |
 | `extraPackages` | `[]` | Packages placed on each agent's PATH. |
 | `environmentFiles` | `[]` | Extra `EnvironmentFile` paths applied to every agent. |
-| `tokenDir` | `/etc/claude-box` | Where per-agent `<user>.env` token files live. |
+| `tokenDir` | `/etc/agent-box` | Where per-agent `<user>.env` token files live. |
 | `manageTokenDir` | `true` | Create `tokenDir` (root-owned) via tmpfiles. |
 | `protectMemory` | `true` | zram swap (zstd, sized to RAM), earlyoom, and `OOMScoreAdjust=500` on agent units, so runaway agent memory gets its process killed (and auto-restarted) instead of livelocking the whole box. All knobs are `mkDefault` - tune or disable pieces from the host config. |
 
@@ -288,7 +291,7 @@ arbitrary command execution as the agent user.
   containment for scoped elevation.
 - **Tight sudo:** whatever's in `sudoAllowlist` is the entire root-capable
   surface. `NOPASSWD` only - no `SETENV`, no blanket sudo, no ALL.
-- **Root-scoped secrets dir:** `/etc/claude-box` is `0700 root:root`.
+- **Root-scoped secrets dir:** `/etc/agent-box` is `0700 root:root`.
   Systemd reads the per-agent `<user>.env` files as root before dropping
   into the agent's UID, so the agent process itself never traverses the
   directory. `Z … 0600 root root` tmpfiles rule enforces the mode of any
@@ -326,14 +329,14 @@ arbitrary command execution as the agent user.
 - The qcow2 image uses the native nixpkgs image API (`system.build.images`,
   upstreamed in NixOS 25.05) - no extra flake inputs.
 - Future work: switching the agent on a running instance should likely be a
-  small NixOS config change (`services.claude-box.agent = ...`) plus
+  small NixOS config change (`services.agent-box.agent = ...`) plus
   `nixos-rebuild switch` and a service restart, but the UX still needs a tidy
   operator command because credentials and live tmux state are agent-specific.
 
 ## Docs
 
 Maintainer and continuity notes live in the
-[project wiki](https://github.com/defangdevs/claude-box/wiki).
+[project wiki](https://github.com/defangdevs/agent-box/wiki).
 
 ## License
 

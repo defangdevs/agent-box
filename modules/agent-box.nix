@@ -1,7 +1,7 @@
 # CONTRACT: this module must remain a SINGLE self-contained file. Deployed
 # boxes fetch exactly this one file and import it from a bare store path —
-# aws/template.yaml's user-data and claude-box-update.service both
-# `builtins.fetchurl` .../modules/claude-box.nix and pin one sha256. Any
+# aws/template.yaml's user-data and agent-box-update.service both
+# `builtins.fetchurl` .../modules/agent-box.nix and pin one sha256. Any
 # `./sibling` reference (readFile, import, path interpolation) evaluates
 # against the lone store file, fails first-boot amazon-init *silently*
 # (journal-only), and bricks self-update on every already-deployed box
@@ -9,7 +9,7 @@
 { config, lib, pkgs, ... }:
 
 let
-  cfg = config.services.claude-box;
+  cfg = config.services.agent-box;
   supportedAgents = [ "claude" "codex" ];
   tmuxSocketName = "agent-box";
   runtimeDirectory = name: "agent-box-${name}";
@@ -21,21 +21,21 @@ let
   # multi-agent box, codex could rewrite claude's keys and restart claude's
   # agent). systemd creates each socket 0660 <user>:caddy, so only that user
   # and the caddy reverse-proxy can connect.
-  settingsSocketDir = "/run/claude-box-settings";
+  settingsSocketDir = "/run/agent-box-settings";
   settingsSocketOf = name: "${settingsSocketDir}/${name}.sock";
   # The per-user secrets file the settings page (issue #36) manages. User-
   # owned, 0600, loaded (optionally) by the agent unit's EnvironmentFile.
-  userEnvFile = name: "/home/${name}/.config/claude-box/env";
+  userEnvFile = name: "/home/${name}/.config/agent-box/env";
 
   # Reload command is granted when web is enabled so the agent can add a
   # virtual host and reload without root — pooled with the user-supplied
   # sudoAllowlist so NoNewPrivileges + sudo rules see the same list.
   caddyReloadCmd = "/run/current-system/sw/bin/systemctl reload caddy.service";
-  updateStartCmd = "/run/current-system/sw/bin/systemctl start claude-box-update.service";
+  updateStartCmd = "/run/current-system/sw/bin/systemctl start agent-box-update.service";
   # --no-block variant for the settings page's Update button: the daemon must
   # answer the HTTP request before the rebuild (possibly) restarts the daemon
   # itself. A separate literal because sudoers matches argv exactly.
-  updateStartNoBlockCmd = "/run/current-system/sw/bin/systemctl start --no-block claude-box-update.service";
+  updateStartNoBlockCmd = "/run/current-system/sw/bin/systemctl start --no-block agent-box-update.service";
   effectiveSudoAllowlist =
     cfg.sudoAllowlist
     ++ lib.optional cfg.web.enable caddyReloadCmd
@@ -69,9 +69,9 @@ let
   # Sessions are RUNTIME data (issue #59): the Nix-declared
   # users.<name>.sessions (or the legacy per-user agent/… options, which
   # stand in for a single session named "main") only SEED
-  # ~/.config/claude-box/sessions.json on first boot. Afterwards the file is
+  # ~/.config/agent-box/sessions.json on first boot. Afterwards the file is
   # authoritative and sessions are created/destroyed WITHOUT a rebuild —
-  # via the claude-box-session CLI or the settings page. The supervisor
+  # via the agent-box-session CLI or the settings page. The supervisor
   # (mkStart) reconciles tmux sessions against the file and builds each
   # agent command at runtime, so per-agent flag logic lives in that script.
   seedSessions = name: u:
@@ -83,7 +83,7 @@ let
       };
     };
   sessionsSeedFile = name: u:
-    pkgs.writeText "claude-box-${name}-sessions.json" (builtins.toJSON {
+    pkgs.writeText "agent-box-${name}-sessions.json" (builtins.toJSON {
       version = 1;
       sessions = lib.mapAttrs (sname: s: {
         agent = if s.agent != null then s.agent else cfg.agent;
@@ -96,26 +96,26 @@ let
           else "/home/${name}";
       }) (seedSessions name u);
     });
-  userSessionsFile = name: "/home/${name}/.config/claude-box/sessions.json";
+  userSessionsFile = name: "/home/${name}/.config/agent-box/sessions.json";
 
   # Runtime session CRUD, shipped on every PATH. Runs as the calling agent
   # user: edits the user-owned sessions.json (the supervisor reconciles
   # within ~2s) and talks only to the user's own tmux server. No sudo, no
   # rebuild — the whole point of issue #59.
-  sessionCli = pkgs.writeShellScriptBin "claude-box-session" ''
+  sessionCli = pkgs.writeShellScriptBin "agent-box-session" ''
     set -eu
     JQ=${pkgs.jq}/bin/jq
-    FILE="$HOME/.config/claude-box/sessions.json"
+    FILE="$HOME/.config/agent-box/sessions.json"
     AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " cfg.installAgents)}
     DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
     export TMUX_TMPDIR="''${TMUX_TMPDIR:-/run/agent-box-$USER}"
 
     t() { ${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} "$@"; }
     usage() {
-      echo "usage: claude-box-session ls"
-      echo "       claude-box-session add NAME [--agent AGENT] [--cwd DIR] [-- EXTRA_ARGS...]"
-      echo "       claude-box-session rm NAME"
-      echo "       claude-box-session restart NAME"
+      echo "usage: agent-box-session ls"
+      echo "       agent-box-session add NAME [--agent AGENT] [--cwd DIR] [-- EXTRA_ARGS...]"
+      echo "       agent-box-session rm NAME"
+      echo "       agent-box-session restart NAME"
       echo "agents: $AGENTS (default: $DEFAULT_AGENT)"
       echo "Listed sessions are (re)started by the per-user supervisor within ~2s."
       echo "Attach: tmux -L ${tmuxSocketName} attach -t NAME, or the browser terminal /<user>/?arg=NAME"
@@ -209,7 +209,7 @@ let
 
   # One session = one agent CLI in one tmux session. These options are the
   # FIRST-BOOT SEED only (see users.<name>.sessions); at runtime the same
-  # fields live as JSON in ~/.config/claude-box/sessions.json.
+  # fields live as JSON in ~/.config/agent-box/sessions.json.
   sessionOpts = {
     options = {
       agent = lib.mkOption {
@@ -217,8 +217,8 @@ let
         default = null;
         description = ''
           Agent CLI this session runs. When null, uses
-          services.claude-box.agent. Must be listed in
-          services.claude-box.installAgents.
+          services.agent-box.agent. Must be listed in
+          services.agent-box.installAgents.
         '';
       };
       skipPermissions = lib.mkOption {
@@ -265,10 +265,10 @@ let
           Session names must match [A-Za-z0-9_-]+.
 
           Sessions are RUNTIME data: this option is written to
-          ~/.config/claude-box/sessions.json ONLY when that file does not
+          ~/.config/agent-box/sessions.json ONLY when that file does not
           exist yet (first boot). Afterwards the file is authoritative, and
           sessions are added/removed/restarted without a rebuild via the
-          claude-box-session CLI or the settings page. A later rebuild never
+          agent-box-session CLI or the settings page. A later rebuild never
           clobbers runtime changes.
 
           When empty (the default), the per-user agent / skipPermissions /
@@ -281,7 +281,7 @@ let
         default = null;
         description = ''
           Agent CLI to run for this user's default "main" session. When
-          null, uses services.claude-box.agent. Ignored when
+          null, uses services.agent-box.agent. Ignored when
           users.<name>.sessions is set (set the agent per session there).
         '';
       };
@@ -291,7 +291,7 @@ let
         description = ''
           Pass the selected agent's autonomy flag, i.e. the agent has full
           autonomy inside its shell with no in-tool approval prompts.
-          Default is `true` because claude-box is designed to be a HEADLESS
+          Default is `true` because agent-box is designed to be a HEADLESS
           agent runner — no human sits at the prompt to answer questions.
 
           This is autonomy INSIDE the agent CLI, not an OS sandbox. The OS
@@ -364,8 +364,8 @@ let
         default = null;
         example = lib.literalExpression ''
           '''
-            # claude-box
-            Your terminal is at $CLAUDE_BOX_URL — `echo` it to print.
+            # agent-box
+            Your terminal is at $AGENT_BOX_URL — `echo` it to print.
           '''
         '';
         description = ''
@@ -377,7 +377,7 @@ let
           AGENTS.md is the cross-vendor agent-instructions convention
           read natively by codex and opencode, and by claude-code as a
           fallback when CLAUDE.md is absent. The agent's systemd env
-          exports CLAUDE_BOX_URL whenever this user has a browser
+          exports AGENT_BOX_URL whenever this user has a browser
           terminal (see web.passwordHashFile), so an AGENTS.md that
           references that variable lets the agent answer "where am I
           reachable?" without hard-coding the URL.
@@ -386,10 +386,10 @@ let
       web.passwordHashFile = lib.mkOption {
         type = lib.types.nullOr lib.types.path;
         default = null;
-        example = "/var/lib/claude-box-web/password-hash-${name}";
+        example = "/var/lib/agent-box-web/password-hash-${name}";
         description = ''
           Give this user a browser terminal (requires
-          services.claude-box.web.enable). Path to a file containing a bcrypt
+          services.agent-box.web.enable). Path to a file containing a bcrypt
           hash produced by `caddy hash-password`; the terminal is served at
           https://<web.domain>/${name}/ behind basic auth whose username is
           this linux user name and whose password is the one behind this
@@ -401,7 +401,7 @@ let
           user-name order starting at 7681. The top-level Caddyfile is
           module-managed, so adding/removing terminal users is a
           nixos-rebuild away — check the assigned ports with
-          `systemctl cat claude-web-terminal-<user>`.
+          `systemctl cat agent-web-terminal-<user>`.
         '';
       };
     };
@@ -412,7 +412,7 @@ let
   # of this script, so they all inherit the unit's systemd sandboxing. The
   # loop is ensure-only: missing listed sessions are (re)created, but the
   # supervisor never kills. Destroy goes through the CRUD paths
-  # (claude-box-session rm / settings page), which delist AND kill — so a
+  # (agent-box-session rm / settings page), which delist AND kill — so a
   # removed entry stays gone, and an ad-hoc `tmux new` session is left alone.
   mkStart = name: u:
     let
@@ -423,14 +423,14 @@ let
       ) cfg.installAgents;
       # AGENTS.md — cross-vendor agent-instructions file (codex, opencode
       # native; claude-code as CLAUDE.md fallback). Content lives in the Nix
-      # store so no in-shell quoting; $CLAUDE_BOX_URL and other $refs in the
+      # store so no in-shell quoting; $AGENT_BOX_URL and other $refs in the
       # content stay literal for the agent to expand at read time. Seeded
       # per session in start_session below.
       agentsMdFile =
         if u.agentsMd == null then null
-        else pkgs.writeText "claude-box-${name}-agents.md" u.agentsMd;
+        else pkgs.writeText "agent-box-${name}-agents.md" u.agentsMd;
     in
-    pkgs.writeShellScript "claude-box-${name}-start" ''
+    pkgs.writeShellScript "agent-box-${name}-start" ''
       set -u
       JQ=${pkgs.jq}/bin/jq
       TMUX="${pkgs.tmux}/bin/tmux -L ${tmuxSocketName}"
@@ -439,7 +439,7 @@ let
       # First boot only: seed the Nix-declared sessions. The file is RUNTIME
       # data afterwards — a rebuild must never clobber sessions the user
       # added or removed while the box was live.
-      mkdir -p ${home}/.config/claude-box
+      mkdir -p ${home}/.config/agent-box
       if [ ! -s "$SESSIONS_FILE" ]; then
         install -m 0600 ${sessionsSeedFile name u} "$SESSIONS_FILE"
       fi
@@ -561,7 +561,7 @@ ${lib.optionalString (agentsMdFile != null) ''
     '';
 in
 {
-  options.services.claude-box = {
+  options.services.agent-box = {
     enable = lib.mkEnableOption "reproducible multi-user coding agent host";
 
     agent = lib.mkOption {
@@ -583,7 +583,7 @@ in
       description = ''
         Agent CLIs installed on the box — system PATH and every agent unit's
         PATH — independently of what any session currently runs, so a
-        runtime `claude-box-session add --agent codex` needs no rebuild.
+        runtime `agent-box-session add --agent codex` needs no rebuild.
         Sessions may only use agents listed here. Default: all supported
         agents.
       '';
@@ -622,7 +622,7 @@ in
 
     tokenDir = lib.mkOption {
       type = lib.types.str;
-      default = "/etc/claude-box";
+      default = "/etc/agent-box";
       description = ''
         Directory holding optional per-agent token files. Each agent
         auto-loads <tokenDir>/<user>.env if it exists — so adding a token like
@@ -662,7 +662,7 @@ in
         An unauthenticated picker page at / lists them. The top-level
         Caddyfile is module-managed (regenerated every rebuild); each agent
         user's own virtual hosts live in ~/sites/*.caddy (a symlink to
-        /var/lib/claude-box-sites/<user>/, which caddy can read) and land
+        /var/lib/agent-box-sites/<user>/, which caddy can read) and land
         with `sudo systemctl reload caddy.service`
       '';
 
@@ -681,7 +681,7 @@ in
         type = lib.types.str;
         default = "agent";
         description = ''
-          Which services.claude-box.users entry administers Caddy: it is
+          Which services.agent-box.users entry administers Caddy: it is
           added to the caddy group (so it can edit /var/lib/caddy/Caddyfile)
           and granted passwordless sudo for `systemctl reload caddy.service`.
           Which users get a browser terminal is separate — set
@@ -710,7 +710,7 @@ in
       enable = lib.mkEnableOption ''
         an agent-triggerable self-update service. When enabled, every agent
         user's sudo allowlist gains exactly
-        `systemctl start claude-box-update.service` (plus its --no-block
+        `systemctl start agent-box-update.service` (plus its --no-block
         variant, used by the settings page's Update button) — a root oneshot
         that fast-forwards the box to the upstream repo's latest
         default-branch commit by rewriting `pinFile` (and, when agentNixpkgs
@@ -728,7 +728,7 @@ in
 
       repo = lib.mkOption {
         type = lib.types.str;
-        default = "defangdevs/claude-box";
+        default = "defangdevs/agent-box";
         description = "GitHub owner/repo the update service pulls from.";
       };
 
@@ -746,7 +746,7 @@ in
 
       pinFile = lib.mkOption {
         type = lib.types.str;
-        default = "/etc/nixos/claude-box-pin.nix";
+        default = "/etc/nixos/agent-box-pin.nix";
         description = ''
           File the updater atomically rewrites with
           `{ rev = "..."; sha256 = "..."; }`. The host configuration must
@@ -787,7 +787,7 @@ in
 
       agentPinFile = lib.mkOption {
         type = lib.types.str;
-        default = "/etc/nixos/claude-box-agent-pin.nix";
+        default = "/etc/nixos/agent-box-agent-pin.nix";
         description = ''
           File the updater atomically rewrites with
           `{ url = "..."; sha256 = "..."; }` — the latest nixos-unstable
@@ -800,10 +800,10 @@ in
   config = lib.mkIf cfg.enable (lib.mkMerge [{
     assertions = [{
       assertion = cfg.users != { };
-      message = "services.claude-box.enable is true but no users are defined in services.claude-box.users.";
+      message = "services.agent-box.enable is true but no users are defined in services.agent-box.users.";
     } {
       assertion = cfg.installAgents != [ ];
-      message = "services.claude-box.installAgents must not be empty.";
+      message = "services.agent-box.installAgents must not be empty.";
     }] ++ lib.concatLists (lib.mapAttrsToList (name: u:
       lib.concatLists (lib.mapAttrsToList (sname: s: [
         {
@@ -811,11 +811,11 @@ in
           # the same regex is enforced at runtime by the supervisor, the CLI
           # and the settings daemon.
           assertion = builtins.match "[A-Za-z0-9_-]+" sname != null;
-          message = "services.claude-box.users.${name}: session name \"${sname}\" must match [A-Za-z0-9_-]+.";
+          message = "services.agent-box.users.${name}: session name \"${sname}\" must match [A-Za-z0-9_-]+.";
         }
         {
           assertion = builtins.elem (if s.agent != null then s.agent else cfg.agent) cfg.installAgents;
-          message = "services.claude-box.users.${name}: session \"${sname}\" uses agent \"${if s.agent != null then s.agent else cfg.agent}\", which is not in services.claude-box.installAgents.";
+          message = "services.agent-box.users.${name}: session \"${sname}\" uses agent \"${if s.agent != null then s.agent else cfg.agent}\", which is not in services.agent-box.installAgents.";
         }
         {
           # Cheap sanity check on a string that lands in a shell command;
@@ -825,7 +825,7 @@ in
             && !(lib.hasInfix "\n" s.remoteControlName)
             && !(lib.hasInfix "\r" s.remoteControlName)
           );
-          message = "services.claude-box.users.${name}: session \"${sname}\"'s remoteControlName must be non-empty and free of newlines.";
+          message = "services.agent-box.users.${name}: session \"${sname}\"'s remoteControlName must be non-empty and free of newlines.";
         }
       ]) (seedSessions name u))) cfg.users);
 
@@ -851,7 +851,7 @@ in
       (lib.unique (installedAgentPackages ++ [ pkgs.tmux pkgs.which sessionCli ] ++ cfg.extraPackages));
 
     systemd.services = lib.mapAttrs' (name: u:
-      lib.nameValuePair "claude-box-${name}" {
+      lib.nameValuePair "agent-box-${name}" {
         description = "Coding agent sessions (tmux) for ${name}";
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
@@ -882,7 +882,7 @@ in
         # /run/agent-box-<name> is a normal host path both sides can reach.
         # Attach with: env TMUX_TMPDIR=/run/agent-box-<name> tmux -L agent-box attach -t main
         #
-        # CLAUDE_BOX_URL: the user's browser-terminal URL, exported only when
+        # AGENT_BOX_URL: the user's browser-terminal URL, exported only when
         # this user actually has a terminal (web.enable + web.passwordHashFile).
         # An AGENTS.md (see users.<name>.agentsMd) can reference it so any
         # agent — claude-code, codex, opencode — can answer "where am I
@@ -891,7 +891,7 @@ in
         environment =
           { HOME = "/home/${name}"; TMUX_TMPDIR = "/run/${runtimeDirectory name}"; }
           // (lib.optionalAttrs (cfg.web.enable && u.web.passwordHashFile != null) {
-            CLAUDE_BOX_URL = "https://${cfg.web.domain}/${name}/";
+            AGENT_BOX_URL = "https://${cfg.web.domain}/${name}/";
           })
           // u.environment;
         serviceConfig = {
@@ -917,13 +917,13 @@ in
           # Custom tokens (GH_TOKEN, etc.) land here. The '-' makes the per-user
           # file optional so the agent starts even before any token is dropped in.
           # The self-serve settings page (issue #36) writes the user-owned
-          # ~/.config/claude-box/env; it's listed here (also '-'-optional) so an
+          # ~/.config/agent-box/env; it's listed here (also '-'-optional) so an
           # end user can add secrets through the browser without a rebuild and
           # without typing them into the agent chat/terminal. Restarting the
           # agent (settings-page "Apply") reloads this env.
           EnvironmentFile = cfg.environmentFiles
             ++ [ "-${cfg.tokenDir}/${name}.env" ]
-            ++ [ "-/home/${name}/.config/claude-box/env" ]
+            ++ [ "-/home/${name}/.config/agent-box/env" ]
             ++ u.environmentFiles;
 
           # Systemd hardening. The OS boundary has to stay meaningful even
@@ -966,6 +966,32 @@ in
       # with lax perms gets corrected on next tmpfiles run.
       "Z ${cfg.tokenDir}/*.env 0600 root root - -"
     ];
+
+    # One-shot migration for boxes crossing the claude-box -> agent-box
+    # rename (issue 70): live state — the web password hash + cookie
+    # secrets, per-user caddy snippet dirs, the settings page's env +
+    # sessions.json, dropped-in token files, and the self-update pin
+    # files — moves from the old-name paths exactly once. No-op on fresh
+    # boxes and after migration. Runs before switch-to-configuration
+    # applies tmpfiles/units, but tolerate a pre-created empty target dir
+    # anyway (rmdir only succeeds when empty, so real state never loses).
+    system.activationScripts.agent-box-rename-migration = lib.stringAfter [ "users" "groups" ] (''
+      _abox_migrate() {
+        [ -e "$1" ] || return 0
+        [ ! -d "$2" ] || rmdir "$2" 2>/dev/null || true
+        [ -e "$2" ] || mv -T "$1" "$2"
+      }
+      _abox_migrate /var/lib/claude-box-web   /var/lib/agent-box-web
+      _abox_migrate /var/lib/claude-box-sites /var/lib/agent-box-sites
+      _abox_migrate /etc/claude-box           ${lib.escapeShellArg cfg.tokenDir}
+    ''
+    + lib.optionalString cfg.selfUpdate.enable ''
+      _abox_migrate /etc/nixos/claude-box-pin.nix       ${lib.escapeShellArg cfg.selfUpdate.pinFile}
+      _abox_migrate /etc/nixos/claude-box-agent-pin.nix ${lib.escapeShellArg cfg.selfUpdate.agentPinFile}
+    ''
+    + lib.concatMapStrings (name: ''
+      _abox_migrate /home/${name}/.config/claude-box /home/${name}/.config/agent-box
+    '') (lib.attrNames cfg.users));
 
     security.sudo.extraRules = lib.mkIf (effectiveSudoAllowlist != [ ]) [{
       users = lib.attrNames cfg.users;
@@ -1018,14 +1044,14 @@ in
     systemd.oomd.enable = lib.mkDefault false;
   }) (lib.mkIf cfg.selfUpdate.enable {
     # Agent-triggerable box update. The agents' only power here is the
-    # allowlisted `sudo systemctl start claude-box-update.service` (see
+    # allowlisted `sudo systemctl start agent-box-update.service` (see
     # updateStartCmd) — a trigger with no arguments, so everything below
     # (source repo, pin file, rebuild) is fixed at build time and immutable
     # in the store. Verifying releases against an offline signing key is
-    # tracked upstream (defangdevs/claude-box issue 46); until then this
+    # tracked upstream (defangdevs/agent-box issue 46); until then this
     # trusts the pinned repo as GitHub serves it.
-    systemd.services.claude-box-update = {
-      description = "Fast-forward claude-box to upstream HEAD and rebuild";
+    systemd.services.agent-box-update = {
+      description = "Fast-forward agent-box to upstream HEAD and rebuild";
       # No wantedBy — on-demand only, via the agents' sudo rule (or root).
       path = [ pkgs.curl pkgs.jq pkgs.openssl pkgs.coreutils pkgs.util-linux pkgs.nix ];
       environment = {
@@ -1078,7 +1104,7 @@ in
         if [ "$update_module" = 1 ]; then
           module="$(mktemp)"
           trap 'rm -f "$module"' EXIT
-          curl -fsSL "https://raw.githubusercontent.com/$REPO/$target/modules/claude-box.nix" -o "$module"
+          curl -fsSL "https://raw.githubusercontent.com/$REPO/$target/modules/agent-box.nix" -o "$module"
           sha="sha256-$(openssl dgst -sha256 -binary "$module" | base64)"
           if [ -e "$PIN_FILE" ]; then
             cp "$PIN_FILE" "$PIN_FILE.prev"
@@ -1099,9 +1125,9 @@ in
           mv "$AGENT_PIN_FILE.tmp" "$AGENT_PIN_FILE"
         fi
 
-        wall "claude-box: updating (module: $REPO@$target, agent nixpkgs: $release) — agent sessions will restart if their services changed." || true
+        wall "agent-box: updating (module: $REPO@$target, agent nixpkgs: $release) — agent sessions will restart if their services changed." || true
         if /run/current-system/sw/bin/nixos-rebuild switch; then
-          wall "claude-box: update to $target applied." || true
+          wall "agent-box: update to $target applied." || true
         else
           # Roll back exactly the pins this run touched so the next trigger
           # retries cleanly instead of believing the failed state is current.
@@ -1119,7 +1145,7 @@ in
               rm -f "$AGENT_PIN_FILE"
             fi
           fi
-          wall "claude-box: update to $target FAILED — pins rolled back, system unchanged. See: journalctl -u claude-box-update" || true
+          wall "agent-box: update to $target FAILED — pins rolled back, system unchanged. See: journalctl -u agent-box-update" || true
           exit 1
         fi
       '';
@@ -1137,7 +1163,7 @@ in
       hashFileOf = n: toString cfg.users.${n}.web.passwordHashFile;
       # The settings daemon script (issue #36). Python-3-stdlib only — no
       # third-party deps — so it stays tiny and auditable. Runs as the agent
-      # user; writes ~/.config/claude-box/env (0600) and restarts the agent by
+      # user; writes ~/.config/agent-box/env (0600) and restarts the agent by
       # killing its tmux session. Full rationale in the script header below.
       #
       # INLINE ON PURPOSE (issue #51): deployed boxes fetch this module as a
@@ -1145,13 +1171,13 @@ in
       # cannot live in a ./sibling. If you edit it, keep it free of the two
       # Nix indented-string specials (two consecutive single-quotes, and
       # dollar-brace) or escape them per the Nix manual.
-      settingsDaemon = pkgs.writers.writePython3Bin "claude-box-settings" {
+      settingsDaemon = pkgs.writers.writePython3Bin "agent-box-settings" {
         # No external libraries; skip flake8 style gate (the script is
         # formatted for readability, not lint-perfection) but keep syntax
         # checking that writePython3Bin does by compiling.
         flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" ];
       } ''
-        # Per-user settings daemon for claude-box (issue #36).
+        # Per-user settings daemon for agent-box (issue #36).
         # (Run via pkgs.writers.writePython3Bin, which supplies the interpreter
         # shebang; no #! line here so it stays lint-clean.)
         #
@@ -1160,13 +1186,13 @@ in
         # privilege boundary. One instance per web-terminal user, bound to
         # 127.0.0.1:<port>; Caddy reverse-proxies https://<domain>/<user>/settings*
         # to it INSIDE that user's existing basic-auth block, so there is no new
-        # auth surface (see modules/claude-box.nix).
+        # auth surface (see modules/agent-box.nix).
         #
         # Purpose: let the end user add/remove agent secrets (GH_TOKEN,
         # ANTHROPIC_API_KEY, ...) WITHOUT a nixos-rebuild and WITHOUT ever typing the
         # secret into the agent chat/terminal (which would leak into the transcript,
         # tmux scrollback, and model context). The secret path is
-        # browser -> TLS (Caddy) -> this daemon -> ~/.config/claude-box/env (0600).
+        # browser -> TLS (Caddy) -> this daemon -> ~/.config/agent-box/env (0600).
         #
         # The UI lists key NAMES only; it never renders a stored value. "Apply"
         # kills the user's tmux sessions (same uid, via the PrivateTmp socket
@@ -1188,21 +1214,21 @@ in
         # daemon on a pre-bound unix socket (0660 <user>:caddy — only the user and
         # the caddy reverse-proxy can connect; localhost TCP was reachable by every
         # local user). Without LISTEN_FDS (dev rigs, e2e runs) it falls back to
-        # binding 127.0.0.1:$CLAUDE_BOX_SETTINGS_PORT itself.
+        # binding 127.0.0.1:$AGENT_BOX_SETTINGS_PORT itself.
         #
         # Configuration comes from the environment (set by the systemd unit):
-        #   CLAUDE_BOX_SETTINGS_USER      the linux user name (display only)
-        #   CLAUDE_BOX_SETTINGS_ENV_FILE  path to the env file to manage
-        #   CLAUDE_BOX_SETTINGS_BASE      URL base path, e.g. /alice/settings
-        #   CLAUDE_BOX_SETTINGS_PORT      dev fallback TCP port on 127.0.0.1
+        #   AGENT_BOX_SETTINGS_USER      the linux user name (display only)
+        #   AGENT_BOX_SETTINGS_ENV_FILE  path to the env file to manage
+        #   AGENT_BOX_SETTINGS_BASE      URL base path, e.g. /alice/settings
+        #   AGENT_BOX_SETTINGS_PORT      dev fallback TCP port on 127.0.0.1
         #                                 (ignored when socket-activated)
-        #   CLAUDE_BOX_TMUX_SOCKET        tmux -L socket name (e.g. agent-box)
-        #   CLAUDE_BOX_TMUX_TMPDIR        TMUX_TMPDIR the agent's socket lives under
-        #   CLAUDE_BOX_TMUX_BIN           absolute path to the tmux binary
-        #   CLAUDE_BOX_SESSIONS_FILE      path to the user's sessions.json
-        #   CLAUDE_BOX_SESSIONS_PUBLIC    unauthenticated names-only list path
-        #   CLAUDE_BOX_AGENTS             comma-separated installed agent CLIs
-        #   CLAUDE_BOX_DEFAULT_AGENT      agent preselected in the add form
+        #   AGENT_BOX_TMUX_SOCKET        tmux -L socket name (e.g. agent-box)
+        #   AGENT_BOX_TMUX_TMPDIR        TMUX_TMPDIR the agent's socket lives under
+        #   AGENT_BOX_TMUX_BIN           absolute path to the tmux binary
+        #   AGENT_BOX_SESSIONS_FILE      path to the user's sessions.json
+        #   AGENT_BOX_SESSIONS_PUBLIC    unauthenticated names-only list path
+        #   AGENT_BOX_AGENTS             comma-separated installed agent CLIs
+        #   AGENT_BOX_DEFAULT_AGENT      agent preselected in the add form
 
         import html
         import http.server
@@ -1215,25 +1241,25 @@ in
         import tempfile
         import urllib.parse
 
-        USER = os.environ.get("CLAUDE_BOX_SETTINGS_USER", "agent")
-        ENV_FILE = os.environ["CLAUDE_BOX_SETTINGS_ENV_FILE"]
-        BASE = os.environ.get("CLAUDE_BOX_SETTINGS_BASE", "/settings").rstrip("/")
-        PORT = int(os.environ.get("CLAUDE_BOX_SETTINGS_PORT", "8080"))
-        TMUX_SOCKET = os.environ.get("CLAUDE_BOX_TMUX_SOCKET", "agent-box")
-        TMUX_TMPDIR = os.environ.get("CLAUDE_BOX_TMUX_TMPDIR", "")
-        TMUX_BIN = os.environ.get("CLAUDE_BOX_TMUX_BIN", "tmux")
+        USER = os.environ.get("AGENT_BOX_SETTINGS_USER", "agent")
+        ENV_FILE = os.environ["AGENT_BOX_SETTINGS_ENV_FILE"]
+        BASE = os.environ.get("AGENT_BOX_SETTINGS_BASE", "/settings").rstrip("/")
+        PORT = int(os.environ.get("AGENT_BOX_SETTINGS_PORT", "8080"))
+        TMUX_SOCKET = os.environ.get("AGENT_BOX_TMUX_SOCKET", "agent-box")
+        TMUX_TMPDIR = os.environ.get("AGENT_BOX_TMUX_TMPDIR", "")
+        TMUX_BIN = os.environ.get("AGENT_BOX_TMUX_BIN", "tmux")
         # Sessions (issue 59): the daemon is the web CRUD surface for the
         # user-owned sessions.json; the supervisor inside the agent unit
         # reconciles tmux against it (starts within ~2s). The daemon only
         # ever writes the file and kills the user's own tmux sessions.
-        SESSIONS_FILE = os.environ.get("CLAUDE_BOX_SESSIONS_FILE", "")
+        SESSIONS_FILE = os.environ.get("AGENT_BOX_SESSIONS_FILE", "")
         # Unauthenticated names-only listing path (feeds the flat picker).
-        SESSIONS_PUBLIC = os.environ.get("CLAUDE_BOX_SESSIONS_PUBLIC", "")
-        AGENTS = [a for a in os.environ.get("CLAUDE_BOX_AGENTS", "claude").split(",") if a]
-        DEFAULT_AGENT = os.environ.get("CLAUDE_BOX_DEFAULT_AGENT", "claude")
+        SESSIONS_PUBLIC = os.environ.get("AGENT_BOX_SESSIONS_PUBLIC", "")
+        AGENTS = [a for a in os.environ.get("AGENT_BOX_AGENTS", "claude").split(",") if a]
+        DEFAULT_AGENT = os.environ.get("AGENT_BOX_DEFAULT_AGENT", "claude")
         # Full sudo command line that triggers the box update (issue 54). Empty
         # when selfUpdate is off, which hides the Update card and 404s the route.
-        UPDATE_CMD = os.environ.get("CLAUDE_BOX_UPDATE_CMD", "")
+        UPDATE_CMD = os.environ.get("AGENT_BOX_UPDATE_CMD", "")
 
         # Env var names: POSIX-ish. Must start with a letter or underscore and
         # contain only letters, digits, underscores. This is what a shell / systemd
@@ -1301,7 +1327,7 @@ in
             try:
                 os.fchmod(fd, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write("# Managed by claude-box settings page. KEY=value, one per line.\n")
+                    fh.write("# Managed by agent-box settings page. KEY=value, one per line.\n")
                     fh.write("# Do not add secrets by hand here unless you know what you are doing.\n")
                     for key, val in pairs:
                         fh.write(f"{key}={val}\n")
@@ -1568,7 +1594,7 @@ in
 
         UPDATE_ROW = """<li>
                 <span class="dz"><strong>Update box</strong>
-                <span class="note">Fetches the latest claude-box release and agent
+                <span class="note">Fetches the latest agent-box release and agent
                 CLI versions, then rebuilds the system. Takes a few minutes; sessions
                 restart if their software changed.</span></span>
                 <form method="post" action="{base}/update"
@@ -1775,7 +1801,7 @@ in
 
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            server_version = "claude-box-settings/1"
+            server_version = "agent-box-settings/1"
 
             def _under_base(self, path):
                 """True if request path is BASE or under BASE. Caddy strips nothing,
@@ -1949,7 +1975,7 @@ in
                 )
                 server.socket = socket.socket(fileno=SD_LISTEN_FDS_START)
                 # server_bind() never ran; set the attributes it would have set.
-                server.server_name = "claude-box-settings"
+                server.server_name = "agent-box-settings"
                 server.server_port = 0
                 return server
             # Dev fallback for LAN rigs / e2e runs outside the module.
@@ -1969,7 +1995,7 @@ in
       # Strict allowlist on the client-supplied argument: session-name
       # charset AND an existing tmux session; anything else prints the live
       # list and exits (ttyd spawns a fresh instance per connection).
-      attachScript = name: pkgs.writeShellScript "claude-box-${name}-attach" ''
+      attachScript = name: pkgs.writeShellScript "agent-box-${name}-attach" ''
         set -u
         T="${pkgs.tmux}/bin/tmux -L ${tmuxSocketName}"
         want="''${1:-}"
@@ -1980,7 +2006,7 @@ in
           fi
           echo "no session named '$want'. Live sessions:"
           $T list-sessions -F '  #S' 2>/dev/null || echo "  (none)"
-          echo "create it with: claude-box-session add $want"
+          echo "create it with: agent-box-session add $want"
           sleep 5
           exit 1
         fi
@@ -2145,24 +2171,24 @@ in
       # (one per agent user, since the Caddyfile `import` directive rejects
       # multi-wildcard globs like `*/*.caddy`) pick up snippet files. Each
       # agent user has a caddy-readable directory at
-      # /var/lib/claude-box-sites/<user>/ symlinked from ~/sites, so the agent
+      # /var/lib/agent-box-sites/<user>/ symlinked from ~/sites, so the agent
       # can add a virtual host by writing ~/sites/<something>.caddy and
       # running `sudo systemctl reload caddy.service`. No nixos-rebuild
       # needed. Snippets should REVERSE-PROXY to a localhost port rather than
       # serve files from $HOME — caddy.service runs with ProtectHome=true and
       # can't read /home. See the comment block at the top of the rendered
       # file below (agents will read that from the running box).
-      managedCaddyfile = pkgs.writeText "claude-box-caddyfile" (''
-        # This file is module-managed by services.claude-box — edits here get
+      managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (''
+        # This file is module-managed by services.agent-box — edits here get
         # OVERWRITTEN on the next nixos-rebuild. To add your own virtual host,
         # drop a *.caddy snippet into ~/sites/ (which is a symlink into
-        # /var/lib/claude-box-sites/<you>/, a caddy-readable location) and
+        # /var/lib/agent-box-sites/<you>/, a caddy-readable location) and
         # reload with: sudo systemctl reload caddy.service
         #
         # Recommended snippet shape — reverse-proxy to a localhost port your
         # agent runs, NOT `file_server /home/<you>/...`. caddy.service has
         # ProtectHome=true, so it cannot read files under /home; use file_server
-        # only against a path outside /home (e.g. /var/lib/claude-box-sites/<you>/public):
+        # only against a path outside /home (e.g. /var/lib/agent-box-sites/<you>/public):
         #
         #     foo.example.com {
         #       import acme_alpn_only    # Let's Encrypt via TLS-ALPN-01
@@ -2201,11 +2227,11 @@ in
         # One import per user: Caddyfile's `import` directive only accepts a
         # single `*` per pattern, so we can't collapse this to `*/*.caddy`.
       ''
-      + lib.concatMapStringsSep "" (name: "import /var/lib/claude-box-sites/${name}/*.caddy\n") (lib.attrNames cfg.users));
+      + lib.concatMapStringsSep "" (name: "import /var/lib/agent-box-sites/${name}/*.caddy\n") (lib.attrNames cfg.users));
 
       # Reads each terminal user's (already-hashed) password from their
       # passwordHashFile, mints a persistent per-user cookie secret if
-      # absent, and writes everything into /run/claude-box-web/env for Caddy
+      # absent, and writes everything into /run/agent-box-web/env for Caddy
       # to consume as environment variables (WEB_PASSWORD_HASH_<USER> /
       # WEB_COOKIE_SECRET_<USER>). Runs BEFORE caddy every boot.
       webAuthSecretsService = {
@@ -2220,18 +2246,18 @@ in
         script = ''
           set -euo pipefail
           umask 077
-          tmp="$(mktemp /run/claude-box-web/env.XXXXXX)"
+          tmp="$(mktemp /run/agent-box-web/env.XXXXXX)"
         '' + lib.concatMapStrings (name: ''
-          if [ ! -s /var/lib/claude-box-web/cookie-secret-${name} ]; then
-            openssl rand -hex 32 > /var/lib/claude-box-web/cookie-secret-${name}
+          if [ ! -s /var/lib/agent-box-web/cookie-secret-${name} ]; then
+            openssl rand -hex 32 > /var/lib/agent-box-web/cookie-secret-${name}
           fi
           {
-            printf 'WEB_COOKIE_SECRET_${envName name}=%s\n' "$(cat /var/lib/claude-box-web/cookie-secret-${name})"
+            printf 'WEB_COOKIE_SECRET_${envName name}=%s\n' "$(cat /var/lib/agent-box-web/cookie-secret-${name})"
             printf 'WEB_PASSWORD_HASH_${envName name}=%s\n' "$(cat ${lib.escapeShellArg (hashFileOf name)})"
           } >> "$tmp"
         '') terminalUsers + ''
           chmod 0600 "$tmp"
-          mv "$tmp" /run/claude-box-web/env
+          mv "$tmp" /run/agent-box-web/env
         '';
       };
     in
@@ -2240,50 +2266,50 @@ in
         {
           assertion = cfg.users ? ${webUser};
           message =
-            "services.claude-box.web.user = \"${webUser}\" but that user "
-            + "isn't defined in services.claude-box.users.";
+            "services.agent-box.web.user = \"${webUser}\" but that user "
+            + "isn't defined in services.agent-box.users.";
         }
         {
           assertion = terminalUsers != [ ];
           message =
-            "services.claude-box.web.enable is true but no user has "
+            "services.agent-box.web.enable is true but no user has "
             + "web.passwordHashFile set, so no terminal would be served.";
         }
         {
           assertion = lib.length (lib.unique (map envName terminalUsers)) == lib.length terminalUsers;
           message =
-            "services.claude-box: web-terminal user names must stay distinct "
+            "services.agent-box: web-terminal user names must stay distinct "
             + "after sanitizing to env-var form ([A-Z0-9_]).";
         }
       ];
 
       # The top-level Caddyfile is module-managed (see managedCaddyfile above);
       # each agent user's own virtual hosts live in per-user snippet files at
-      # /var/lib/claude-box-sites/<user>/*.caddy, symlinked into their $HOME
+      # /var/lib/agent-box-sites/<user>/*.caddy, symlinked into their $HOME
       # as ~/sites/. Reload via the sudo rule added to effectiveSudoAllowlist.
 
       networking.firewall.allowedTCPPorts = [ 443 ];
 
       systemd.tmpfiles.rules = [
-        "d /var/lib/claude-box-web 0700 root root - -"
-        "d /run/claude-box-web 0700 root root - -"
+        "d /var/lib/agent-box-web 0700 root root - -"
+        "d /run/agent-box-web 0700 root root - -"
         # Snippet dirs: parent is world-traversable so caddy (primary group
         # `caddy`) can reach the per-user subdirectories, which are 0750
         # <user>:caddy — the user writes, caddy reads, other agent users on
-        # the box can't peek. Kept OUTSIDE /var/lib/claude-box-web (0700) so
+        # the box can't peek. Kept OUTSIDE /var/lib/agent-box-web (0700) so
         # caddy's `import` can traverse without loosening the secrets dir.
-        "d /var/lib/claude-box-sites 0755 root root - -"
+        "d /var/lib/agent-box-sites 0755 root root - -"
         # Settings daemon sockets live here (issue #49). World-traversable is
         # fine: the per-user socket files themselves are 0660 <user>:caddy
         # (created by systemd, see systemd.sockets below), and connecting
         # requires write permission on the socket file.
         "d ${settingsSocketDir} 0755 root root - -"
       ] ++ lib.concatMap (name: [
-        "d /var/lib/claude-box-sites/${name} 0750 ${name} caddy - -"
+        "d /var/lib/agent-box-sites/${name} 0750 ${name} caddy - -"
         # ~/sites -> the caddy-readable snippet dir. L+ replaces a stale
         # symlink/file if the target differs from ours (idempotent across
         # renames). Users edit through this link and never touch /var/lib.
-        "L+ /home/${name}/sites - - - - /var/lib/claude-box-sites/${name}"
+        "L+ /home/${name}/sites - - - - /var/lib/agent-box-sites/${name}"
       ]) (lib.attrNames cfg.users)
       # The settings page's env dir, per terminal user. User-owned 0700 so
       # only the agent user (and root) can read it; the settings daemon runs
@@ -2291,14 +2317,14 @@ in
       # and the agent unit's optional EnvironmentFile both have a stable path
       # even before the user saves any key.
       ++ lib.map (name:
-        "d /home/${name}/.config/claude-box 0700 ${name} ${name} - -"
+        "d /home/${name}/.config/agent-box 0700 ${name} ${name} - -"
       ) terminalUsers;
 
       services.caddy = {
         enable = true;
         # Module-managed. Store path is world-readable but holds only ENV
         # placeholders, no secrets. Per-user extensions land via the trailing
-        # `import /var/lib/claude-box-sites/*/*.caddy`.
+        # `import /var/lib/agent-box-sites/*/*.caddy`.
         configFile = managedCaddyfile;
       };
 
@@ -2308,7 +2334,7 @@ in
       # first request also 401s but is not counted.
       services.fail2ban = lib.mkIf cfg.web.fail2ban {
         enable = true;
-        jails.claude-web-auth = {
+        jails.agent-web-auth = {
           filter.Definition = {
             failregex = ''^.*"logger":"http\.log\.access".*"client_ip":"<HOST>".*"Authorization":\["REDACTED"\].*"status":401'';
             journalmatch = "_SYSTEMD_UNIT=caddy.service";
@@ -2329,11 +2355,11 @@ in
       # TMUX_TMPDIR must match the agent unit's RuntimeDirectory (the agent
       # runs with PrivateTmp, so the socket lives in /run, not /tmp).
       systemd.services = {
-        claude-web-auth-secrets = webAuthSecretsService;
-        caddy.serviceConfig.EnvironmentFile = "/run/claude-box-web/env";
-      } // lib.listToAttrs (map (name: lib.nameValuePair "claude-web-terminal-${name}" {
+        agent-web-auth-secrets = webAuthSecretsService;
+        caddy.serviceConfig.EnvironmentFile = "/run/agent-box-web/env";
+      } // lib.listToAttrs (map (name: lib.nameValuePair "agent-web-terminal-${name}" {
         description = "Browser terminal (ttyd) attached to ${name}'s tmux";
-        after = [ "claude-box-${name}.service" "network-online.target" ];
+        after = [ "agent-box-${name}.service" "network-online.target" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
         environment.TMUX_TMPDIR = "/run/${runtimeDirectory name}";
@@ -2357,42 +2383,42 @@ in
       }) terminalUsers)
       # Settings daemon (issue #36), one per terminal user. Runs AS the agent
       # user (no root, no privilege boundary): it only writes that user's own
-      # ~/.config/claude-box/env and kills that user's own tmux session. The
+      # ~/.config/agent-box/env and kills that user's own tmux session. The
       # agent unit's Restart=always then reloads it with the fresh env.
       # Listens via socket activation on the systemd-owned unix socket
       # (issue #49) — the same-named .socket unit below; requires/after kept
       # explicit per this repo's explicit-over-implied-config convention.
-      // lib.listToAttrs (map (name: lib.nameValuePair "claude-box-settings-${name}" {
+      // lib.listToAttrs (map (name: lib.nameValuePair "agent-box-settings-${name}" {
         description = "Per-user secrets settings page for ${name}";
-        after = [ "network-online.target" "claude-box-settings-${name}.socket" ];
-        requires = [ "claude-box-settings-${name}.socket" ];
+        after = [ "network-online.target" "agent-box-settings-${name}.socket" ];
+        requires = [ "agent-box-settings-${name}.socket" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
         # TMUX_TMPDIR must match the agent unit's RuntimeDirectory so the
         # daemon can reach the (PrivateTmp) tmux socket to restart the agent.
         environment = {
           TMUX_TMPDIR = "/run/${runtimeDirectory name}";
-          CLAUDE_BOX_SETTINGS_USER = name;
-          CLAUDE_BOX_SETTINGS_ENV_FILE = userEnvFile name;
-          CLAUDE_BOX_SETTINGS_BASE = settingsBaseOf name;
-          CLAUDE_BOX_TMUX_SOCKET = tmuxSocketName;
-          CLAUDE_BOX_TMUX_TMPDIR = "/run/${runtimeDirectory name}";
-          CLAUDE_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
-          CLAUDE_BOX_SESSIONS_FILE = userSessionsFile name;
-          CLAUDE_BOX_SESSIONS_PUBLIC = "/${name}/sessions.json";
-          CLAUDE_BOX_AGENTS = lib.concatStringsSep "," cfg.installAgents;
-          CLAUDE_BOX_DEFAULT_AGENT = cfg.agent;
+          AGENT_BOX_SETTINGS_USER = name;
+          AGENT_BOX_SETTINGS_ENV_FILE = userEnvFile name;
+          AGENT_BOX_SETTINGS_BASE = settingsBaseOf name;
+          AGENT_BOX_TMUX_SOCKET = tmuxSocketName;
+          AGENT_BOX_TMUX_TMPDIR = "/run/${runtimeDirectory name}";
+          AGENT_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
+          AGENT_BOX_SESSIONS_FILE = userSessionsFile name;
+          AGENT_BOX_SESSIONS_PUBLIC = "/${name}/sessions.json";
+          AGENT_BOX_AGENTS = lib.concatStringsSep "," cfg.installAgents;
+          AGENT_BOX_DEFAULT_AGENT = cfg.agent;
         } // lib.optionalAttrs cfg.selfUpdate.enable {
           # --no-block so the daemon's HTTP response goes out before the
           # rebuild (possibly) restarts the daemon itself.
-          CLAUDE_BOX_UPDATE_CMD = "/run/wrappers/bin/sudo -n ${updateStartNoBlockCmd}";
+          AGENT_BOX_UPDATE_CMD = "/run/wrappers/bin/sudo -n ${updateStartNoBlockCmd}";
         };
         serviceConfig = {
           User = name;
           Restart = "always";
           RestartSec = "5s";
-          ExecStart = "${settingsDaemon}/bin/claude-box-settings";
-          # Hardening: the daemon needs to write ~/.config/claude-box and run
+          ExecStart = "${settingsDaemon}/bin/agent-box-settings";
+          # Hardening: the daemon needs to write ~/.config/agent-box and run
           # tmux against the /run socket dir, nothing else.
           ProtectSystem = "strict";
           ReadWritePaths = [ "/home/${name}" "/run/${runtimeDirectory name}" ];
@@ -2419,7 +2445,7 @@ in
       # can connect — unlike the previous 127.0.0.1:<port> listener, which
       # every local user could reach. The daemon adopts the socket through
       # socket activation (LISTEN_FDS, fd 3).
-      systemd.sockets = lib.listToAttrs (map (name: lib.nameValuePair "claude-box-settings-${name}" {
+      systemd.sockets = lib.listToAttrs (map (name: lib.nameValuePair "agent-box-settings-${name}" {
         description = "Settings page socket for ${name}";
         wantedBy = [ "sockets.target" ];
         socketConfig = {

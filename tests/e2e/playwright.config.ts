@@ -1,6 +1,6 @@
 // Playwright config for the browser e2e tests (issue #36 settings page).
 //
-// These tests run against a LIVE claude-box web instance (a LAN rig or a
+// These tests run against a LIVE agent-box web instance (a LAN rig or a
 // deployed box) — they are not part of the sandboxed `nix flake check` VM
 // tests. Point them at an instance with:
 //
