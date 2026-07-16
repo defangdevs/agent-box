@@ -6,7 +6,7 @@
 # this file only declares the agent service and console conveniences.
 { pkgs, ... }:
 {
-  services.claude-box = {
+  services.agent-box = {
     enable = true;
     agent = "claude";
     users.agent = { };

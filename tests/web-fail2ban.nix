@@ -6,19 +6,19 @@
 # services.caddy.configFile with a minimal `tls internal` file (no ACME in
 # the sandbox). Doesn't exercise ttyd — only caddy + fail2ban — so it stays
 # green even when ttyd is broken in nixpkgs.
-{ claude-box }:
+{ agent-box }:
 {
-  name = "claude-box-web-fail2ban";
+  name = "agent-box-web-fail2ban";
   node.pkgsReadOnly = false;
 
   nodes.machine = { pkgs, lib, ... }: {
-    imports = [ claude-box ];
+    imports = [ agent-box ];
     virtualisation.memorySize = 2048;
-    services.claude-box = {
+    services.agent-box = {
       enable = true;
       agent = "claude";
       users.agent = {
-        web.passwordHashFile = "/var/lib/claude-box-web/password-hash";
+        web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
       };
       web = {
         enable = true;
@@ -29,21 +29,21 @@
     system.stateVersion = "25.05";
 
     # Materialize the password hash (subshell so the umask doesn't leak).
-    system.activationScripts.claude-web-password-hash.text = ''
-      install -d -m 0700 /var/lib/claude-box-web
-      if [ ! -s /var/lib/claude-box-web/password-hash ]; then
+    system.activationScripts.agent-web-password-hash.text = ''
+      install -d -m 0700 /var/lib/agent-box-web
+      if [ ! -s /var/lib/agent-box-web/password-hash ]; then
         (
           umask 077
           ${pkgs.caddy}/bin/caddy hash-password --plaintext testpassword \
-            > /var/lib/claude-box-web/password-hash
+            > /var/lib/agent-box-web/password-hash
         )
-        chmod 0600 /var/lib/claude-box-web/password-hash
+        chmod 0600 /var/lib/agent-box-web/password-hash
       fi
     '';
 
     # Swap the module-managed Caddyfile for a minimal `tls internal` one; the
     # sandbox has no ACME. Same env placeholder the module wires up, so the
-    # claude-web-auth-secrets prep still feeds this vhost.
+    # agent-web-auth-secrets prep still feeds this vhost.
     services.caddy.configFile = lib.mkForce (pkgs.writeText "Caddyfile" ''
       box.test {
         log
@@ -80,7 +80,7 @@
         client.succeed(f"{curl} -o /dev/null -u agent:wrong{i} https://box.test/")
 
     machine.wait_until_succeeds(
-        f"fail2ban-client status claude-web-auth | grep -q '{client_ip}'",
+        f"fail2ban-client status agent-web-auth | grep -q '{client_ip}'",
         timeout=60,
     )
 
@@ -88,6 +88,6 @@
     client.fail(f"{curl} -m 5 -o /dev/null -u agent:testpassword https://box.test/")
 
     # The credential-less 401 a browser gets before prompting is NOT counted
-    print(machine.succeed("fail2ban-client status claude-web-auth"))
+    print(machine.succeed("fail2ban-client status agent-web-auth"))
   '';
 }

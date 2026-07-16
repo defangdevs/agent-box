@@ -45,7 +45,7 @@ jobs:
         run: nix build -L .#checks.x86_64-linux.multi-user && cat result
 
       # Eval-only guard for issue 51: deployed boxes (CFN user-data +
-      # self-update) fetch modules/claude-box.nix as a single file, so any
+      # self-update) fetch modules/agent-box.nix as a single file, so any
       # ./sibling reference breaks first boot. Catch it here, not post-merge.
       - name: Check module evaluates as a single file
         run: nix build -L .#checks.x86_64-linux.module-single-file && cat result
@@ -85,7 +85,7 @@ jobs:
         run: nix build -L .#checks.x86_64-linux.memory-protection
 
       # Interactive VM test (issue 59): runtime session CRUD — seeded main
-      # session, claude-box-session add/rm as the user with no sudo and no
+      # session, agent-box-session add/rm as the user with no sudo and no
       # rebuild, cgroup containment of runtime-created sessions, and the
       # public names-only sessions.json feeding the flat picker.
       - name: Run sessions VM test

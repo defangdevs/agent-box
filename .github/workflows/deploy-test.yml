@@ -62,13 +62,13 @@ jobs:
           - leg: ipv6-outputs
             public_ipv4: "false"
             use_spot: "false"
-    # Fork? Override with a repo-scoped var CLAUDE_BOX_ENVIRONMENT, or edit the fallback.
-    environment: ${{ vars.CLAUDE_BOX_ENVIRONMENT || 'defang-claude-box' }}
+    # Fork? Override with a repo-scoped var AGENT_BOX_ENVIRONMENT, or edit the fallback.
+    environment: ${{ vars.AGENT_BOX_ENVIRONMENT || 'defang-agent-box' }}
     timeout-minutes: 30
     env:
       AWS_REGION: ${{ inputs.region || 'us-west-2' }}
       ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
-      STACK_NAME: claude-box-e2e-${{ matrix.leg }}-${{ github.run_id }}
+      STACK_NAME: agent-box-e2e-${{ matrix.leg }}-${{ github.run_id }}
     steps:
       - name: Sanity-check required variables
         run: |
@@ -91,7 +91,7 @@ jobs:
           # 48 hex chars — matches the template's AllowedPattern [A-Za-z0-9._~-]{16,64}.
           echo "value=$(openssl rand -hex 24)" >> "$GITHUB_OUTPUT"
 
-      - name: Compute module pin (ClaudeBoxRev + ClaudeBoxSha256)
+      - name: Compute module pin (AgentBoxRev + AgentBoxSha256)
         id: pin
         # The source template intentionally has no Default: for these — see
         # publish-template.yml for the same computation on the S3 path. Here
@@ -99,11 +99,11 @@ jobs:
         # exercises the module content that just landed.
         run: |
           rev="${{ github.sha }}"
-          sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/claude-box.nix" \
+          sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/agent-box.nix" \
             | openssl dgst -sha256 -binary | base64)"
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "::notice::Pinned ClaudeBoxRev=$rev ClaudeBoxSha256=$sha"
+          echo "::notice::Pinned AgentBoxRev=$rev AgentBoxSha256=$sha"
 
       - name: Create stack
         id: create
@@ -117,11 +117,11 @@ jobs:
               "ParameterKey=UseSpot,ParameterValue=${{ matrix.use_spot }}" \
               "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
               "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't4g.small' }}" \
-              "ParameterKey=ClaudeBoxRev,ParameterValue=${{ steps.pin.outputs.rev }}" \
-              "ParameterKey=ClaudeBoxSha256,ParameterValue=${{ steps.pin.outputs.sha }}" \
+              "ParameterKey=AgentBoxRev,ParameterValue=${{ steps.pin.outputs.rev }}" \
+              "ParameterKey=AgentBoxSha256,ParameterValue=${{ steps.pin.outputs.sha }}" \
             --on-failure DO_NOTHING \
             --capabilities CAPABILITY_IAM \
-            --tags "Key=Purpose,Value=claude-box-e2e" "Key=RunId,Value=${{ github.run_id }}"
+            --tags "Key=Purpose,Value=agent-box-e2e" "Key=RunId,Value=${{ github.run_id }}"
           echo "::notice::Waiting for stack ${STACK_NAME} to reach CREATE_COMPLETE (up to 30 min)..."
           aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
 

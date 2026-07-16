@@ -25,8 +25,8 @@ Metadata:
         Parameters:
           - AllowCidr
           - EnableSsm
-          - ClaudeBoxRev
-          - ClaudeBoxSha256
+          - AgentBoxRev
+          - AgentBoxSha256
     ParameterLabels:
       WebPassword:
         default: Web terminal password (16-64 chars — save it, AWS masks it)
@@ -48,16 +48,16 @@ Metadata:
         default: Enable SSM Session Manager root access
       AgentsMd:
         default: AGENTS.md seeded on first agent start
-      ClaudeBoxRev:
-        default: claude-box git rev
-      ClaudeBoxSha256:
-        default: claude-box module sha256
+      AgentBoxRev:
+        default: agent-box git rev
+      AgentBoxSha256:
+        default: agent-box module sha256
 Description: >
-  claude-box - 1-click NixOS host running a coding agent inside a persistent
+  agent-box - 1-click NixOS host running a coding agent inside a persistent
   tmux session. Choose Claude Code or Codex at deployment time. Reach it through
   a browser terminal (Caddy + ttyd); Claude Code sessions can also be driven
   from the Claude desktop and mobile apps via Remote Control.
-  Source: https://github.com/defangdevs/claude-box
+  Source: https://github.com/defangdevs/agent-box
 
 Parameters:
   Agent:
@@ -156,10 +156,10 @@ Parameters:
   AgentsMd:
     Type: String
     Default: |-
-      # claude-box
+      # agent-box
 
-      You are running inside a claude-box deployment. Your browser terminal is
-      reachable at $CLAUDE_BOX_URL (run `echo $CLAUDE_BOX_URL` to print it).
+      You are running inside an agent-box deployment. Your browser terminal is
+      reachable at $AGENT_BOX_URL (run `echo $AGENT_BOX_URL` to print it).
       Share that URL with anyone who needs to view or take over your session;
       the sign-in username is your own login name (`whoami`) and the password
       was set at deploy time.
@@ -168,15 +168,15 @@ Parameters:
       (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
 
       Update the box's software with:
-      `sudo systemctl start claude-box-update.service`
+      `sudo systemctl start agent-box-update.service`
       (kills the running tmux session — save context first).
     Description: >-
       Content seeded to the agent user's ~/AGENTS.md on first agent start
       (skipped if the file already exists). AGENTS.md is the cross-vendor agent-
       instructions convention read natively by codex and opencode, and by
       claude-code as a CLAUDE.md fallback. The default references
-      $CLAUDE_BOX_URL, which the agent's systemd env sets to this box's
-      browser-terminal URL; `echo $CLAUDE_BOX_URL` in the terminal prints it.
+      $AGENT_BOX_URL, which the agent's systemd env sets to this box's
+      browser-terminal URL; `echo $AGENT_BOX_URL` in the terminal prints it.
       Blank to skip seeding entirely. Content is embedded into user-data as a
       Nix indented string, so avoid the sequences `${` and `''` in the body —
       Nix will otherwise try to antiquote / close the string mid-file. Plain
@@ -211,10 +211,10 @@ Parameters:
       false: no instance profile, no SSM session access, no CAPABILITY_IAM
       prompt.
 
-  ClaudeBoxRev:
+  AgentBoxRev:
     Type: String
     Description: >-
-      Git commit sha of defangdevs/claude-box. The module (a single .nix file)
+      Git commit sha of defangdevs/agent-box. The module (a single .nix file)
       is fetched from raw.githubusercontent.com at this ref - that host is
       dual-stack (IPv6-reachable), so an IPv6-only box needs no NAT64 path.
       github.com itself is IPv4-only and can't be used directly. No Default:
@@ -224,14 +224,14 @@ Parameters:
       this template, into which publish-template.yml injects a Default for
       both fields at every master push.
 
-  ClaudeBoxSha256:
+  AgentBoxSha256:
     Type: String
     Description: >-
-      Nix sha256 of modules/claude-box.nix at ClaudeBoxRev (SRI form:
-      sha256-<base64>). Must match ClaudeBoxRev's content exactly.
+      Nix sha256 of modules/agent-box.nix at AgentBoxRev (SRI form:
+      sha256-<base64>). Must match AgentBoxRev's content exactly.
       Regenerate with `nix store prefetch-file
-      https://raw.githubusercontent.com/defangdevs/claude-box/<REV>/modules/claude-box.nix`
-      (no unpack; we fetch the file, not a tarball). See ClaudeBoxRev for
+      https://raw.githubusercontent.com/defangdevs/agent-box/<REV>/modules/agent-box.nix`
+      (no unpack; we fetch the file, not a tarball). See AgentBoxRev for
       why there is no Default here.
 
 Conditions:
@@ -339,7 +339,7 @@ Resources:
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: 'claude-box: 443 (web terminal), v4 + v6'
+      GroupDescription: 'agent-box: 443 (web terminal), v4 + v6'
       VpcId: !Ref Vpc
       Tags:
         - Key: Name
@@ -498,29 +498,29 @@ Resources:
               { config, pkgs, lib, modulesPath, ... }:
               let
                 # Module pin. First boot uses the launch-time parameters; after
-                # that, claude-box-update.service (see selfUpdate below) owns
+                # that, agent-box-update.service (see selfUpdate below) owns
                 # the pin file and rewrites it to fast-forward the box, so the
                 # same configuration.nix keeps working across updates without
                 # being edited.
                 pin =
-                  if builtins.pathExists /etc/nixos/claude-box-pin.nix
-                  then import /etc/nixos/claude-box-pin.nix
-                  else { rev = "${ClaudeBoxRev}"; sha256 = "${ClaudeBoxSha256}"; };
+                  if builtins.pathExists /etc/nixos/agent-box-pin.nix
+                  then import /etc/nixos/agent-box-pin.nix
+                  else { rev = "${AgentBoxRev}"; sha256 = "${AgentBoxSha256}"; };
                 # Agent-CLI pin: a nixos-unstable channel-release snapshot that
                 # only the agent packages (claude-code, codex) resolve from.
                 # Absent on first boot (agents ship from the module's own
-                # nixpkgs); claude-box-update.service writes it on the first
+                # nixpkgs); agent-box-update.service writes it on the first
                 # update, after which agent CLIs track nixos-unstable instead
                 # of the AMI's release channel.
                 agentPin =
-                  if builtins.pathExists /etc/nixos/claude-box-agent-pin.nix
-                  then import /etc/nixos/claude-box-agent-pin.nix
+                  if builtins.pathExists /etc/nixos/agent-box-agent-pin.nix
+                  then import /etc/nixos/agent-box-agent-pin.nix
                   else null;
                 # raw.githubusercontent.com is dual-stack (has AAAA); github.com
                 # is IPv4-only, so an IPv6-only box would need NAT64 for it.
                 # The module is a single file, so no tarball unpack needed.
-                claude-box-module = builtins.fetchurl {
-                  url = "https://raw.githubusercontent.com/defangdevs/claude-box/${!pin.rev}/modules/claude-box.nix";
+                agent-box-module = builtins.fetchurl {
+                  url = "https://raw.githubusercontent.com/defangdevs/agent-box/${!pin.rev}/modules/agent-box.nix";
                   sha256 = pin.sha256;
                 };
                 hostname = "${WebHostname}";
@@ -528,23 +528,23 @@ Resources:
               in {
                 imports = [
                   "${!modulesPath}/virtualisation/amazon-image.nix"
-                  claude-box-module
+                  agent-box-module
                 ];
 
-                services.claude-box = {
+                services.agent-box = {
                   enable = true;
                   agent = "${Agent}";
                   users."${UserName}" = {
                     environment = { TERM = "xterm-256color"; };
                     remoteControlName = "${UserName}@${StackName}";
-                    web.passwordHashFile = "/var/lib/claude-box-web/password-hash";
+                    web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
                     # AGENTS.md content from the CFN AgentsMd parameter, spliced
                     # as-is into a Nix indented string. The next line's leading
                     # 14 spaces exactly match the YAML block-scalar indent, so
                     # after YAML strips them the sub token lands at column 0 —
                     # multi-line AgentsMd values then splice with each line at
                     # column 0, and Nix's dedent leaves them untouched. The
-                    # default references $CLAUDE_BOX_URL, which the module
+                    # default references $AGENT_BOX_URL, which the module
                     # exports in the agent's systemd env — the agent can echo
                     # it in the terminal. The module skips seeding when the
                     # target file already exists, so this is safe to reapply.
@@ -558,7 +558,7 @@ Resources:
                     user = "${UserName}";
                   };
                   # Lets the agent update the box on request:
-                  #   sudo systemctl start claude-box-update.service
+                  #   sudo systemctl start agent-box-update.service
                   # fast-forwards the pin above to upstream HEAD and rebuilds.
                   selfUpdate = {
                     enable = true;
@@ -571,7 +571,7 @@ Resources:
                 # BEFORE any service reads it. Activation scripts run at
                 # nixos-rebuild switch time (first boot from user-data), before
                 # systemd units start — perfect ordering for the module's
-                # claude-web-auth-secrets service, which reads the hash. The
+                # agent-web-auth-secrets service, which reads the hash. The
                 # file lives outside /nix/store so the plaintext-derived hash
                 # doesn't end up in a world-readable store path.
                 # Subshell: activation snippets share one shell, so a bare
@@ -579,15 +579,15 @@ Resources:
                 # later — update-users-groups.pl then writes /etc/passwd and
                 # /etc/group 0600, nsncd can't read them, and every NSS lookup
                 # (User= resolution, chown by name) fails until reboot.
-                system.activationScripts.claude-web-password-hash.text = ''
-                  install -d -m 0700 /var/lib/claude-box-web
-                  if [ ! -s /var/lib/claude-box-web/password-hash ]; then
+                system.activationScripts.agent-web-password-hash.text = ''
+                  install -d -m 0700 /var/lib/agent-box-web
+                  if [ ! -s /var/lib/agent-box-web/password-hash ]; then
                     (
                       umask 077
                       ${!pkgs.caddy}/bin/caddy hash-password --plaintext ${!lib.escapeShellArg webPassword} \
-                        > /var/lib/claude-box-web/password-hash
+                        > /var/lib/agent-box-web/password-hash
                     )
-                    chmod 0600 /var/lib/claude-box-web/password-hash
+                    chmod 0600 /var/lib/agent-box-web/password-hash
                   fi
                 '';
 

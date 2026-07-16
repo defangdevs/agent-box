@@ -1,6 +1,6 @@
 # AWS deployment (`aws/`)
 
-CloudFormation template that provisions a single-agent claude-box host on
+CloudFormation template that provisions a single-agent agent-box host on
 EC2 with a browser terminal (Caddy + ttyd). The deployment form lets the user
 choose Claude Code or Codex.
 
@@ -14,7 +14,7 @@ choose Claude Code or Codex.
   IPv6-only default does not require NAT64/DNS64.
 - Launches one EC2 instance from the latest NixOS 25.11 AMI for the region.
 - Uses EC2 user-data as a NixOS configuration: imports the pinned
-  `claude-box` module, sets `services.claude-box.agent` from the `Agent`
+  `agent-box` module, sets `services.agent-box.agent` from the `Agent`
   parameter, and enables the module's web terminal (Caddy, TLS-ALPN-01 only,
   plus a per-user `ttyd` on `127.0.0.1:7681` that attaches to `agent`'s tmux
   session; `TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box -t main` - the
@@ -109,17 +109,17 @@ first boot.
 
 ### Updating a deployed box (user- or agent-triggered)
 
-The launch-time `ClaudeBoxRev`/`ClaudeBoxSha256` parameters pin the module for
+The launch-time `AgentBoxRev`/`AgentBoxSha256` parameters pin the module for
 the FIRST boot only. The generated `/etc/nixos/configuration.nix` prefers
-`/etc/nixos/claude-box-pin.nix` when that file exists, and
-`claude-box-update.service` — a root oneshot enabled via the module's
+`/etc/nixos/agent-box-pin.nix` when that file exists, and
+`agent-box-update.service` — a root oneshot enabled via the module's
 `selfUpdate` option — owns that file: it resolves upstream master's HEAD,
 verifies it is strictly ahead of the running revision (history rewrites and
 downgrade replays are refused), hash-pins the fetched module, rewrites the pin
 file atomically, and runs `nixos-rebuild switch`. On rebuild failure the pins
 roll back and the running system is unchanged.
 
-The same run also advances `/etc/nixos/claude-box-agent-pin.nix` — a second
+The same run also advances `/etc/nixos/agent-box-agent-pin.nix` — a second
 pin, holding the latest nixos-unstable channel-release tarball — from which
 only the agent CLI packages (`claude-code`, `codex`) are resolved. The box
 itself stays on its release channel; the fast-moving agent CLIs track
@@ -128,7 +128,7 @@ giving up reproducibility (the pin is URL + hash, and Hydra has the binaries).
 
 Two triggers, both privilege-checked the same way: the "Update box" button on
 each user's settings page, and the agent running
-`sudo systemctl start claude-box-update.service` in its terminal — the
+`sudo systemctl start agent-box-update.service` in its terminal — the
 sudoers entries match those literal commands, so no arguments, environment
 or paths cross the privilege boundary; the caller can only say "go". Save
 any working context first: the rebuild restarts changed agent services,
@@ -136,7 +136,7 @@ killing their sessions mid-update.
 
 The updater trusts the pinned GitHub repo as published (TLS + hash-pinning of
 what it fetched). Signature verification against an offline key is tracked in
-[issue 46](https://github.com/defangdevs/claude-box/issues/46).
+[issue 46](https://github.com/defangdevs/agent-box/issues/46).
 
 ### WebPassword storage
 
@@ -156,13 +156,13 @@ boundary.
 
 Caddy does not compare the plaintext password at request time. On first boot an
 activation script runs `caddy hash-password` and stores only the bcrypt hash at
-`/var/lib/claude-box-web/password-hash` (the file the module's
+`/var/lib/agent-box-web/password-hash` (the file the module's
 `users.agent.web.passwordHashFile` points at). On every boot
-`claude-web-auth-secrets.service` writes that hash (`WEB_PASSWORD_HASH_AGENT`)
+`agent-web-auth-secrets.service` writes that hash (`WEB_PASSWORD_HASH_AGENT`)
 plus a random cookie secret (`WEB_COOKIE_SECRET_AGENT`) to
-`/run/claude-box-web/env` (`0600`), and Caddy reads that environment file. The
+`/run/agent-box-web/env` (`0600`), and Caddy reads that environment file. The
 cookie secret is generated on the instance and stored separately at
-`/var/lib/claude-box-web/cookie-secret-agent` (`0700` parent directory).
+`/var/lib/agent-box-web/cookie-secret-agent` (`0700` parent directory).
 
 ## Design decisions & gotchas
 
@@ -307,9 +307,9 @@ variables > Actions > Variables). None are secrets; they're just fork-specific.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `AWS_ROLE_ARN` | yes | IAM role assumed via OIDC. Trust policy must allow the GitHub environment named in `CLAUDE_BOX_ENVIRONMENT`. |
-| `CLAUDE_BOX_BUCKET` | yes | S3 bucket name to publish `template.yaml` into. Global namespace. |
-| `CLAUDE_BOX_ENVIRONMENT` | no | GitHub Actions environment name. Defaults to `defang-claude-box` (must be repo-scoped since env-scoped is a chicken-and-egg). Set to any name your role's trust policy accepts. |
+| `AWS_ROLE_ARN` | yes | IAM role assumed via OIDC. Trust policy must allow the GitHub environment named in `AGENT_BOX_ENVIRONMENT`. |
+| `AGENT_BOX_BUCKET` | yes | S3 bucket name to publish `template.yaml` into. Global namespace. |
+| `AGENT_BOX_ENVIRONMENT` | no | GitHub Actions environment name. Defaults to `defang-agent-box` (must be repo-scoped since env-scoped is a chicken-and-egg). Set to any name your role's trust policy accepts. |
 | `AWS_REGION` | no | Region for the bucket + AWS API calls. Defaults to `us-east-1`. |
 
 Role permissions needed: `s3:CreateBucket`, `s3:PutPublicAccessBlock`,
@@ -323,14 +323,14 @@ including `ec2:CreateLaunchTemplate` / `ec2:DeleteLaunchTemplate` (Spot options)
 and `ec2:DescribeSpotInstanceRequests` / `ec2:CancelSpotInstanceRequests` (so
 teardown can cancel the persistent Spot request before deleting the stack).
 
-The GitHub environment listed in `CLAUDE_BOX_ENVIRONMENT` must exist - create it
+The GitHub environment listed in `AGENT_BOX_ENVIRONMENT` must exist - create it
 via `gh api --method PUT repos/<owner>/<repo>/environments/<name>` or the
 repo settings UI. No secrets attached; it's just the deployment gate.
 
 Verify with a `workflow_dispatch` run of `Publish CFN template to S3`, then:
 
 ```bash
-curl -I "https://${CLAUDE_BOX_BUCKET}.s3.amazonaws.com/template.yaml"
+curl -I "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/template.yaml"
 ```
 
 ## Pull request validation

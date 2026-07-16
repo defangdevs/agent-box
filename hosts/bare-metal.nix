@@ -5,8 +5,8 @@
 # (and the module) from your configuration.nix / flake:
 #
 #   imports = [
-#     inputs.claude-box.nixosModules.claude-box
-#     ./claude-box/hosts/bare-metal.nix    # or just copy the block below
+#     inputs.agent-box.nixosModules.agent-box
+#     ./agent-box/hosts/bare-metal.nix    # or just copy the block below
 #   ];
 #
 # First boot per user: `tmux -L agent-box attach -t main` as that user (or
@@ -15,14 +15,14 @@
 # into this config.
 { pkgs, ... }:
 {
-  services.claude-box = {
+  services.agent-box = {
     enable = true;
     agent = "claude";
 
     users = {
       # One account, two agents (issue 59): sessions are runtime data seeded
       # from here on FIRST BOOT only — add/remove more later with
-      # `claude-box-session add/rm` or the settings page, no rebuild needed.
+      # `agent-box-session add/rm` or the settings page, no rebuild needed.
       alice = {
         sessions = {
           main = { };                    # box default agent (claude)
@@ -50,11 +50,11 @@
   };
 
   # Custom tokens in the agent's env (like GH_TOKEN in this sandbox) — no rebuild:
-  #   sudo install -m600 /dev/stdin /etc/claude-box/alice.env <<'EOF'
+  #   sudo install -m600 /dev/stdin /etc/agent-box/alice.env <<'EOF'
   #   GH_TOKEN=ghp_xxx
   #   ANTHROPIC_LOG=info
   #   EOF
-  #   sudo systemctl restart claude-box-alice
+  #   sudo systemctl restart agent-box-alice
   # For Nix-managed secret paths instead, set (per user or globally):
-  #   services.claude-box.users.alice.environmentFiles = [ "/run/secrets/alice.env" ];
+  #   services.agent-box.users.alice.environmentFiles = [ "/run/secrets/alice.env" ];
 }
