@@ -42,31 +42,45 @@ jobs:
 
       - uses: actions/checkout@v5
 
+      - uses: cachix/install-nix-action@v31
+
       - name: Validate template locally
         run: |
           pip install --quiet cfn-lint
           cfn-lint aws/template.yaml
 
-      - name: Inject pinned Rev + Sha256 defaults for the 1-click copy
+      - name: Inject pinned defaults for the 1-click copy
         # The source template deliberately ships without Default: values for
-        # AgentBoxRev / AgentBoxSha256 (see the param's Description) — the
-        # 1-click Launch buttons need them pre-filled, so we inject the current
-        # master commit + its module sha256 as the S3 template's defaults.
+        # AgentBoxRev / AgentBoxSha256 and AgentNixpkgsUrl /
+        # AgentNixpkgsSha256 (see the params' Descriptions) — the 1-click
+        # Launch buttons need them pre-filled, so we inject pinned values into
+        # only the S3 template copy.
         run: |
           rev="${{ github.sha }}"
           sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/agent-box.nix" \
             | openssl dgst -sha256 -binary | base64)"
+          agentRelease="$(curl -fsSLo /dev/null -w '%{url_effective}' https://channels.nixos.org/nixos-unstable)"
+          agentUrl="${agentRelease%/}/nixexprs.tar.xz"
+          agentSha="$(nix-prefetch-url --unpack "$agentUrl")"
           echo "Rev: $rev"
           echo "Sha: $sha"
-          awk -v rev="$rev" -v sha="$sha" '
+          echo "AgentUrl: $agentUrl"
+          echo "AgentSha: $agentSha"
+          awk -v rev="$rev" -v sha="$sha" -v agentUrl="$agentUrl" -v agentSha="$agentSha" '
             /^  AgentBoxRev:$/     { rf=1; print; next }
             rf && /^    Type:/      { print; print "    Default: " rev; rf=0; next }
             /^  AgentBoxSha256:$/  { sf=1; print; next }
             sf && /^    Type:/      { print; print "    Default: " sha; sf=0; next }
+            /^  AgentNixpkgsUrl:$/   { sf2=1; print; next }
+            sf2 && /^    Type:/       { print; print "    Default: " agentUrl; sf2=0; next }
+            /^  AgentNixpkgsSha256:$/  { sf3=1; print; next }
+            sf3 && /^    Type:/       { print; print "    Default: " agentSha; sf3=0; next }
             { print }
           ' aws/template.yaml > aws/template.filled.yaml
           if ! grep -qxF "    Default: $rev" aws/template.filled.yaml \
-             || ! grep -qxF "    Default: $sha" aws/template.filled.yaml; then
+             || ! grep -qxF "    Default: $sha" aws/template.filled.yaml \
+             || ! grep -qxF "    Default: $agentUrl" aws/template.filled.yaml \
+             || ! grep -qxF "    Default: $agentSha" aws/template.filled.yaml; then
             echo "::error::Default injection failed — expected lines not present in filled template."
             diff aws/template.yaml aws/template.filled.yaml || true
             exit 1
