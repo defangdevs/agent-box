@@ -16,14 +16,6 @@ Supported agents:
 | Claude Code | `pkgs.claude-code` | `--dangerously-skip-permissions` | Supports Claude Remote Control. |
 | Codex | `pkgs.codex` | `--dangerously-bypass-approvals-and-sandbox` | Browser terminal access; Codex app-server/remote wiring is future work. |
 
-**Name note.** This project was renamed from `claude-box` to `agent-box`
-(issue 70) — short, literal, and broad enough for Claude Code, Codex, and
-future terminal-native agents. Old GitHub links redirect. Boxes deployed
-before the rename keep running, but cannot self-update across it (their
-baked config fetches the module by its old path and sets the old
-`services.claude-box` options) — launch a fresh stack to move. Hosts you
-rebuild yourself migrate live state automatically on the first switch.
-
 ## 1-click AWS launch
 
 Provisions one EC2 instance (NixOS 25.11) with the module + a browser terminal
@@ -53,15 +45,27 @@ avoid the ~$3.60/mo public-IPv4 charge that AWS bills for *every* public IPv4,
 elastic or not. Works if your client has IPv6 connectivity (most consumer ISPs
 in NA/EU do; corporate/coffee-shop nets often don't). If IPv6 isn't reachable
 for you, set `PublicIpv4: true` at launch — allocates an EIP, adds $3.60/mo,
-works everywhere.
+works everywhere. IPv6-only boxes still reach IPv4-only sites — notably
+`github.com` — through a free public DNS64/NAT64 service
+([nat64.net](https://nat64.net)), on by default. Traffic to IPv4-only hosts
+transits the NAT64 operator's gateways (TLS and SSH stay end-to-end encrypted
+and authenticated); set `Nat64: false` to opt out, at the price of the box
+not reaching IPv4-only hosts.
 
-Costs: ~$0.034/hr for the default `t4g.medium` (Graviton/aarch64, 2 vCPU /
-4 GiB) on-demand — the picker lists vCPU/RAM per size, and `t4g.small`
-(~$0.017/hr) works for a single light agent though its 2 GiB is tight during
-self-update rebuilds — plus ~$2.40/mo for the default 30 GiB gp3 root volume
-(`RootVolumeSize`). Networking is $0/mo in the default IPv6-only mode; with
-`PublicIpv4: true` the Elastic IP adds ~$3.60/mo (the per-public-IPv4 charge
-from the cost note above). Terminate the stack to stop billing.
+Costs, all-in, running 24/7: the default is a **persistent Spot** instance
+(`UseSpot`) — on a Spot interruption AWS stops and later restarts the *same*
+instance, so the disk, IPv6 address, and TLS cert survive (a live tmux
+session doesn't; RAM is lost on any stop). Spot for the default `t4g.medium`
+(Graviton/aarch64, 2 vCPU / 4 GiB) is currently $0.018–0.024/hr across the
+four launch regions — **~$16–20/mo** including the ~$2.40/mo default 30 GiB
+gp3 root volume (`RootVolumeSize`). `t4g.small` on Spot lands around
+**~$7–10/mo** all-in and works for a single light agent, though its 2 GiB is
+tight during self-update rebuilds. Spot runs ~50–60% below on-demand for
+these types (small Graviton instances don't see the deep 70–90% Spot
+discounts); `UseSpot: false` gets you on-demand `t4g.medium` at ~$0.034/hr
+(~$27/mo all-in). Networking is $0/mo in the default IPv6-only mode; with
+`PublicIpv4: true` the Elastic IP adds ~$3.60/mo. Terminate the stack to
+stop billing.
 
 Out of disk anyway? Enlarge the volume from the EC2 console (Volumes ->
 Modify) and reboot the instance — NixOS grows the partition and filesystem
@@ -102,6 +106,22 @@ and the S3-hosting setup.
 Turns a hand-tuned, single-user, bare-metal agent setup into something others
 can stand up identically - either as per-person accounts on a shared host or as
 disposable, snapshot-able KVM guests.
+
+**Why not just a container?** Three properties containers don't give you:
+
+- **Blast radius.** The 1-click path puts each team on a *real VM in their
+  own AWS account* — a hypervisor boundary rather than a shared kernel, and
+  no code, tokens, or transcripts leave their org. The whole box is
+  disposable from the CloudFormation console.
+- **Persistence and multi-tenancy.** This is a long-lived box, not an
+  ephemeral sandbox: agents keep working in persistent tmux sessions while
+  you're away, state survives reconnects and reboots, and several people (or
+  several agents per person) share one host under separate unprivileged
+  accounts with systemd-hardened services — see the security model below.
+- **One config, three targets.** The same declarative NixOS module produces
+  the cloud box, the bare-metal multi-user host, and the qcow2 VM image,
+  and a deployed box can fast-forward itself to this repo's latest release
+  on request — no image rebuild pipeline.
 
 ## Quick start (bare metal, multiple users)
 
@@ -296,6 +316,14 @@ arbitrary command execution as the agent user.
   containment for scoped elevation.
 - **Tight sudo:** whatever's in `sudoAllowlist` is the entire root-capable
   surface. `NOPASSWD` only - no `SETENV`, no blanket sudo, no ALL.
+- **Nothing anonymous, brute-force damping (web deployments):** every path
+  on the vhost — terminal, session manager, settings — sits behind the
+  login (the CI tests assert the 401s), the password hash is bcrypt via
+  Caddy, and a fail2ban jail bans IPs that repeatedly fail it (default on,
+  `web.fail2ban`; it only counts requests that actually carried
+  credentials). Discovery isn't assumed to be hard — the ACME cert for
+  `<ip>.sslip.io` lands in public CT logs minutes after launch — auth is
+  simply required everywhere.
 - **Root-scoped secrets dir:** `/etc/agent-box` is `0700 root:root`.
   Systemd reads the per-agent `<user>.env` files as root before dropping
   into the agent's UID, so the agent process itself never traverses the
@@ -322,6 +350,13 @@ arbitrary command execution as the agent user.
   Systemd's `LoadCredential=` (files under `$CREDENTIALS_DIRECTORY`)
   is a possible future improvement if the tools running under the
   agent actually read from there.
+- **A prompt-injected agent can spend whatever you gave it.** Everything
+  the agent user can read — env tokens, `~/.ssh`, logged-in CLIs — it can
+  also use or exfiltrate if hostile content it processes (a web page, an
+  issue, a dependency README) hijacks it. No sandbox changes that; it only
+  contains the damage to what those credentials allow. Scope tokens to the
+  repos and roles the agent actually needs, and size each key by what it
+  could do in an attacker's hands.
 - **Agent autonomy flags** grant full autonomy inside the agent CLI. Prefer the
   VM target for anything you'd not lose sleep over an attacker doing as the
   agent user - a KVM guest is a
