@@ -341,9 +341,8 @@ arbitrary command execution as the agent user.
   on the vhost — terminal workspace, per-session terminals, settings — sits
   behind the
   login (the CI tests assert the 401s), new password hashes use Caddy's
-  recommended Argon2id algorithm (legacy bcrypt hashes remain accepted until
-  the password changes), and a fail2ban jail bans IPs that repeatedly fail it
-  (default on, `web.fail2ban`; it only counts requests that actually carried
+  recommended Argon2id algorithm, and a fail2ban jail bans IPs that repeatedly
+  fail it (default on, `web.fail2ban`; it only counts requests that actually carried
   credentials). Discovery isn't assumed to be hard — the ACME cert for
   `<ip>.sslip.io` lands in public CT logs minutes after launch — auth is
   simply required everywhere.

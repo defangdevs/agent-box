@@ -55,7 +55,8 @@
       if [ ! -s /var/lib/agent-box-web/password-hash ]; then
         (
           umask 077
-          ${pkgs.caddy}/bin/caddy hash-password --plaintext testpassword \
+          ${pkgs.caddy}/bin/caddy hash-password --algorithm argon2id \
+            --plaintext testpassword \
             > /var/lib/agent-box-web/password-hash
         )
         chmod 0600 /var/lib/agent-box-web/password-hash
@@ -68,7 +69,7 @@
         tls internal
         handle /agent/settings* {
           route {
-            basic_auth bcrypt agent {
+            basic_auth argon2id agent {
               agent {$WEB_PASSWORD_HASH_AGENT}
             }
             reverse_proxy unix//run/agent-box-settings/agent.sock
@@ -76,7 +77,7 @@
         }
         handle {
           route {
-            basic_auth bcrypt agent {
+            basic_auth argon2id agent {
               agent {$WEB_PASSWORD_HASH_AGENT}
             }
             reverse_proxy unix//run/agent-box-settings/agent.sock

@@ -445,8 +445,8 @@ let
         description = ''
           Give this user a browser terminal (requires
           services.agent-box.web.enable). Path to a file containing an
-          Argon2id (recommended) or legacy bcrypt hash produced by `caddy
-          hash-password`; the terminal is served at
+          Argon2id hash produced by `caddy hash-password --algorithm
+          argon2id`; the terminal is served at
           https://<web.domain>/${name}/ behind basic auth whose username is
           this linux user name and whose password is the one behind this
           hash. Root-owned, 0600, outside the Nix store so the plaintext
@@ -1287,14 +1287,10 @@ in
       # hash (or any other path).
       passwordHelperOf = name:
         pkgs.writers.writePython3Bin "agent-box-password-${name}" {
-          libraries = [
-            pkgs.python3Packages.argon2-cffi
-            pkgs.python3Packages.bcrypt
-          ];
+          libraries = [ pkgs.python3Packages.argon2-cffi ];
           flakeIgnore = [ "E501" "E302" "E305" ];
         } ''
           import argon2
-          import bcrypt
           import fcntl
           import json
           import os
@@ -1310,7 +1306,6 @@ in
           ENV_SUFFIX = ${builtins.toJSON (envName name)}
           CADDY = ${builtins.toJSON "${pkgs.caddy}/bin/caddy"}
           SYSTEMCTL = "/run/current-system/sw/bin/systemctl"
-          NEW_HASH_ALGORITHM = "argon2id"
 
 
           def fail(code, message):
@@ -1352,33 +1347,26 @@ in
 
 
           def password_matches(password, encoded):
-              """Verify both legacy bcrypt and current Argon2id hashes."""
-              if encoded.startswith(b"$argon2id$"):
-                  try:
-                      return argon2.PasswordHasher().verify(
-                          encoded.decode("ascii"), password
-                      )
-                  except argon2.exceptions.VerifyMismatchError:
-                      return False
-                  except (
-                      argon2.exceptions.InvalidHashError,
-                      argon2.exceptions.VerificationError,
-                      UnicodeError,
-                  ):
-                      fail(5, "could not validate current password")
-              if encoded.startswith((b"$2a$", b"$2b$", b"$2y$")):
-                  try:
-                      return bcrypt.checkpw(password.encode("utf-8"), encoded)
-                  except (UnicodeError, ValueError):
-                      fail(5, "could not validate current password")
-              fail(5, "unsupported current password hash")
+              """Verify the Argon2id hash consumed by Caddy."""
+              try:
+                  return argon2.PasswordHasher().verify(
+                      encoded.decode("ascii"), password
+                  )
+              except argon2.exceptions.VerifyMismatchError:
+                  return False
+              except (
+                  argon2.exceptions.InvalidHashError,
+                  argon2.exceptions.VerificationError,
+                  UnicodeError,
+              ):
+                  fail(5, "could not validate current password")
 
 
           def hash_password(password):
               """Use Caddy's recommended algorithm and parameter defaults."""
               try:
                   proc = subprocess.run(
-                      [CADDY, "hash-password", "--algorithm", NEW_HASH_ALGORITHM],
+                      [CADDY, "hash-password", "--algorithm", "argon2id"],
                       input=(password + "\n").encode("utf-8"),
                       check=True,
                       stdout=subprocess.PIPE,
@@ -1395,7 +1383,6 @@ in
           def update_auth_env(new_hash, new_cookie):
               """Replace this user's values in Caddy's runtime env."""
               replacements = {
-                  "WEB_PASSWORD_ALGORITHM_" + ENV_SUFFIX: NEW_HASH_ALGORITHM,
                   "WEB_PASSWORD_HASH_" + ENV_SUFFIX: new_hash,
                   "WEB_COOKIE_SECRET_" + ENV_SUFFIX: new_cookie,
               }
@@ -2956,7 +2943,7 @@ in
           }
           handle {
             route {
-              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
+              basic_auth argon2id ${name} {
                 ${name} {$WEB_PASSWORD_HASH_${envName name}}
               }
               header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -2971,7 +2958,7 @@ in
           }
           handle {
             route {
-              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
+              basic_auth argon2id ${name} {
                 ${name} {$WEB_PASSWORD_HASH_${envName name}}
               }
               header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -3001,7 +2988,7 @@ in
           }
           handle {
             route {
-              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
+              basic_auth argon2id ${name} {
                 ${name} {$WEB_PASSWORD_HASH_${envName name}}
               }
               header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -3080,9 +3067,8 @@ in
       # Reads each terminal user's (already-hashed) password from their
       # passwordHashFile, mints a persistent per-user cookie secret if
       # absent, and writes everything into /run/agent-box-web/env for Caddy
-      # to consume as environment variables (WEB_PASSWORD_ALGORITHM_<USER> /
-      # WEB_PASSWORD_HASH_<USER> / WEB_COOKIE_SECRET_<USER>). Runs BEFORE
-      # caddy every boot.
+      # to consume as environment variables (WEB_PASSWORD_HASH_<USER> /
+      # WEB_COOKIE_SECRET_<USER>). Runs BEFORE caddy every boot.
       webAuthSecretsService = {
         description = "Prepare browser terminal auth env for Caddy";
         before = [ "caddy.service" ];
@@ -3100,16 +3086,9 @@ in
           if [ ! -s /var/lib/agent-box-web/cookie-secret-${name} ]; then
             openssl rand -hex 32 > /var/lib/agent-box-web/cookie-secret-${name}
           fi
-          hash="$(cat ${lib.escapeShellArg (hashFileOf name)})"
-          case "$hash" in
-            '$argon2id$'*) algorithm=argon2id ;;
-            '$2a$'*|'$2b$'*|'$2y$'*) algorithm=bcrypt ;;
-            *) echo "unsupported password hash for ${name}" >&2; exit 1 ;;
-          esac
           {
             printf 'WEB_COOKIE_SECRET_${envName name}=%s\n' "$(cat /var/lib/agent-box-web/cookie-secret-${name})"
-            printf 'WEB_PASSWORD_ALGORITHM_${envName name}=%s\n' "$algorithm"
-            printf 'WEB_PASSWORD_HASH_${envName name}=%s\n' "$hash"
+            printf 'WEB_PASSWORD_HASH_${envName name}=%s\n' "$(cat ${lib.escapeShellArg (hashFileOf name)})"
           } >> "$tmp"
         '') terminalUsers + ''
           chmod 0600 "$tmp"

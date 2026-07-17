@@ -160,9 +160,8 @@ activation script runs `caddy hash-password --algorithm argon2id` and stores
 only the Argon2id hash at
 `/var/lib/agent-box-web/password-hash` (the file the module's
 `users.agent.web.passwordHashFile` points at). On every boot
-`agent-web-auth-secrets.service` writes that hash and its detected algorithm
-(`WEB_PASSWORD_HASH_AGENT` / `WEB_PASSWORD_ALGORITHM_AGENT`) plus a random
-cookie secret (`WEB_COOKIE_SECRET_AGENT`) to
+`agent-web-auth-secrets.service` writes that hash (`WEB_PASSWORD_HASH_AGENT`)
+plus a random cookie secret (`WEB_COOKIE_SECRET_AGENT`) to
 `/run/agent-box-web/env` (`0600`), and Caddy reads that environment file. The
 cookie secret is generated on the instance and stored separately at
 `/var/lib/agent-box-web/cookie-secret-agent` (`0700` parent directory).

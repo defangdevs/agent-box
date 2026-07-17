@@ -57,7 +57,8 @@
       if [ ! -s /var/lib/agent-box-web/password-hash ]; then
         (
           umask 077
-          ${pkgs.caddy}/bin/caddy hash-password --plaintext testpassword \
+          ${pkgs.caddy}/bin/caddy hash-password --algorithm argon2id \
+            --plaintext testpassword \
             > /var/lib/agent-box-web/password-hash
         )
         chmod 0600 /var/lib/agent-box-web/password-hash
@@ -79,7 +80,7 @@
           }
           handle {
             route {
-              basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+              basic_auth argon2id agent {
                 agent {$WEB_PASSWORD_HASH_AGENT}
               }
               header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -97,7 +98,7 @@
           }
           handle {
             route {
-              basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+              basic_auth argon2id agent {
                 agent {$WEB_PASSWORD_HASH_AGENT}
               }
               header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -394,7 +395,7 @@
     machine.wait_for_unit("caddy.service")
     new_hash = machine.succeed("cat /var/lib/agent-box-web/password-hash")
     assert new_hash != old_hash
-    assert new_hash.startswith("$argon2id$"), "new hashes should use Argon2id"
+    assert new_hash.startswith("$argon2id$"), "hash should remain Argon2id"
     assert machine.succeed("cat /var/lib/agent-box-web/cookie-secret-agent") != old_cookie
     machine.succeed(
         "stat -c '%U %G %a' /var/lib/agent-box-web/password-hash "
