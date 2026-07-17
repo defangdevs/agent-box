@@ -288,8 +288,11 @@ let
         default = null;
         description = ''
           Remote Control session name. When null, defaults to
-          "<user>@<fqdnOrHostName>" for the session named "main" and
-          "<user>-<session>@<fqdnOrHostName>" otherwise.
+          "<user>@<host>" for the session named "main" and
+          "<user>-<session>@<host>" otherwise, where <host> is
+          networking.fqdnOrHostName, or the live kernel hostname when that
+          is empty at build time. When no hostname is resolvable the "@<host>"
+          suffix is omitted (just "<user>" / "<user>-<session>").
         '';
       };
       workingDirectory = lib.mkOption {
@@ -377,8 +380,9 @@ let
         description = ''
           Remote Control session name, used to correlate the session to this box
           from the Claude apps. Keep it shell-safe (no spaces/quotes). When null,
-          defaults to "<user>@<fqdnOrHostName>" (falls back to the bare hostname
-          when networking.domain is unset).
+          defaults to "<user>@<host>", where <host> is networking.fqdnOrHostName,
+          or the live kernel hostname when that is empty at build time; the
+          "@<host>" suffix is omitted entirely when no hostname is resolvable.
         '';
       };
       workingDirectory = lib.mkOption {
@@ -585,8 +589,24 @@ ${agentBinCases}          *) return 1 ;;
         fi
         if [ "$agent" = claude ] && [ "$rc" = true ]; then
           if [ -z "$rcname" ]; then
-            rcname="${name}@${fqdn}"
-            [ "$sname" = main ] || rcname="${name}-$sname@${fqdn}"
+            # Host suffix for the derived "<user>[-<session>]@<host>" name.
+            # ${fqdn} is config.networking.fqdnOrHostName, fixed at build
+            # time — but it is "" when networking.hostName is unset, which
+            # used to leave a dangling trailing "@" (e.g. "agent-devs@").
+            # Fall back to the live kernel hostname, and drop "@<host>"
+            # entirely when even that is empty rather than emitting a bare
+            # "@". read is a bash builtin, so this needs nothing on PATH.
+            host=${fqdn}
+            if [ -z "$host" ] && [ -r /proc/sys/kernel/hostname ]; then
+              read -r host < /proc/sys/kernel/hostname || host=
+            fi
+            rcbase=${name}
+            [ "$sname" = main ] || rcbase=${name}-$sname
+            if [ -n "$host" ]; then
+              rcname="$rcbase@$host"
+            else
+              rcname="$rcbase"
+            fi
           fi
           cmd="$cmd --remote-control $(printf '%q' "$rcname")"
         fi
