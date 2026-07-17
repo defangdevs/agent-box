@@ -3,6 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Yes, this page was written by a coding agent — running on agent-box,
+     which is also where most of the repo was built and reviewed. The noai
+     tag below isn't self-loathing; we just extend crawlers the courtesy of
+     asking first. -->
 <meta name="robots" content="noai,noimageai">
 <title>agent-box &mdash; sandboxed coding agents, one click away</title>
 <meta name="description" content="A private, sandboxed Claude Code or Codex agent for you and your team. Launch it in your own AWS account with one click.">
@@ -139,7 +143,7 @@
     <div class="features">
       <div class="feature">
         <h3>Locked down by default</h3>
-        <p>Each agent runs in its own restricted account and can't touch the rest of the machine &mdash; it only gets the specific extra powers you choose to grant.</p>
+        <p>Each agent runs in its own restricted account and can't touch the rest of the machine &mdash; it only gets the specific extra powers you choose to grant. The agent's own approval prompts are <em>off</em> by default: the sandbox, not the agent, is the containment. <a href="https://github.com/defangdevs/agent-box#security-model">Read the security model &rarr;</a></p>
       </div>
       <div class="feature">
         <h3>Works in your browser</h3>
@@ -150,12 +154,12 @@
         <p>Pick Claude Code or Codex when you launch. The same NixOS module, terminal, and sandboxing model support both.</p>
       </div>
       <div class="feature">
-        <h3>Keeps your keys safe</h3>
-        <p>Any API keys or tokens you add stay private &mdash; kept out of shared settings and never baked into saved images.</p>
+        <h3>Keeps your keys where you put them</h3>
+        <p>API keys and tokens live in a root-only file on your box &mdash; out of shared settings, never baked into saved images. The agent can use whatever you hand it, so grant tokens scoped to what it should do.</p>
       </div>
       <div class="feature">
-        <h3>Low cost</h3>
-        <p>Runs lean and skips an optional AWS network fee by default, so a small box typically costs only a few dollars a month. Shut it down anytime to stop charges.</p>
+        <h3>Honest cost</h3>
+        <p>Runs on a Spot instance with no network fees by default: a small box is ~$7&ndash;10/month all-in, the default size ~$16&ndash;20/month, on-demand a bit more. Terminate anytime to stop charges.</p>
       </div>
     </div>
   </div>
@@ -190,7 +194,7 @@
       <strong>Set a password you'll remember.</strong> On the AWS form, type any 16&ndash;64 character password into <code>WebPassword</code> &mdash; that's what you'll use to log into the browser terminal. AWS masks it with dots after you type it and never shows it again, so save it somewhere before you launch. Choose Claude Code or Codex, pick a size, rename the stack if you want a friendlier Claude app label, and launch. The box takes about 2&ndash;3 minutes to start; your browser link then appears under <strong>Outputs</strong> in the AWS console &mdash; open it, enter the password, finish the selected agent's one-time sign-in, and you're in. (Claude Code stacks can drive the box from the Claude desktop / mobile app via <strong>Remote Control</strong> after the first browser login &mdash; the session name is <code>&lt;UserName&gt;@&lt;stack name&gt;</code>, <code>agent@agent-box</code> by default.)
     </div>
     <div class="note">
-      <strong>The optional ~$3.60/month, explained.</strong> By default the box skips the one thing AWS charges for on the network side &mdash; a public IPv4 address &mdash; so connectivity costs $0/month, using a free IPv6 address instead. That works fine if the networks you connect from support IPv6 (most home connections do). Checking <code>PublicIpv4</code> on the AWS form adds a stable IPv4 for ~$3.60/month; it's worth paying for if you'll open the box from offices or public Wi-Fi (which often lack IPv6), or if the box itself needs to reach IPv4-only sites &mdash; notably <code>github.com</code>, which an IPv6-only box can't clone from or push to. We check your browser on this page and switch the Launch buttons to IPv4 automatically if we can't reach the IPv6 internet from here.
+      <strong>The optional ~$3.60/month, explained.</strong> By default the box skips the one thing AWS charges for on the network side &mdash; a public IPv4 address &mdash; so connectivity costs $0/month, using a free IPv6 address instead. That works fine if the networks you connect from support IPv6 (most home connections do). Checking <code>PublicIpv4</code> on the AWS form adds a stable IPv4 for ~$3.60/month; it's worth paying for if you'll open the box from offices or public Wi-Fi, which often lack IPv6. The box itself reaches IPv4-only sites either way: in IPv6-only mode, traffic to them &mdash; notably <code>github.com</code> &mdash; goes through a free public NAT64 relay (<a href="https://nat64.net">nat64.net</a>). TLS and SSH stay end-to-end encrypted, but if you'd rather not route through a third party, launch with <code>Nat64</code> unchecked or pay for the IPv4. We check your browser on this page and switch the Launch buttons to IPv4 automatically if we can't reach the IPv6 internet from here.
     </div>
   </div>
 </section>
@@ -208,21 +212,24 @@
     <a href="https://github.com/defangdevs/agent-box">github.com/defangdevs/agent-box</a>
     &nbsp;&middot;&nbsp; <a href="https://github.com/defangdevs/agent-box/wiki">Wiki</a>
     &nbsp;&middot;&nbsp; MIT-licensed &nbsp;&middot;&nbsp; supports Claude Code and Codex
+    <br>Dogfood note: this page &mdash; and most of this project &mdash; was written, tested, and shipped by a coding agent running on agent-box.
   </div>
 </footer>
 
 <script>
   // Detect whether this browser has real IPv6 connectivity. If not, force
   // PublicIpv4=true on every Launch link — the default IPv6-only box would
-  // be unreachable from this network. Uses a v6-only hostname (no A record):
-  // a completed fetch proves working v6; abort/network error means no v6.
-  // Non-blocking; user is free to click through before this settles.
+  // be unreachable from this network. Fetches Cloudflare's resolver by IPv6
+  // literal (their 1.1.1.1 cert carries IP SANs, incl. this address), so no
+  // DNS is involved: a completed fetch proves a working v6 route;
+  // abort/network error means no v6. Non-blocking; user is free to click
+  // through before this settles.
   (async function () {
     const controller = new AbortController();
     const t = setTimeout(function () { controller.abort(); }, 2500);
     let hasV6 = false;
     try {
-      await fetch('https://ipv6.icanhazip.com/', {
+      await fetch('https://[2606:4700:4700::1111]/', {
         method: 'GET',
         mode: 'no-cors',
         cache: 'no-store',

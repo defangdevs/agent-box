@@ -16,6 +16,7 @@ Metadata:
           - RootVolumeSize
           - UseSpot
           - PublicIpv4
+          - Nat64
       - Label:
           default: Agent instructions
         Parameters:
@@ -44,6 +45,8 @@ Metadata:
         default: Use a Spot instance (cheaper)
       PublicIpv4:
         default: Allocate a public IPv4 (costs ~$3.60/mo)
+      Nat64:
+        default: "IPv6-only mode: reach IPv4-only sites (github.com) via public NAT64"
       AllowCidr:
         default: IPv4 CIDR allowed to reach 443
       EnableSsm:
@@ -132,12 +135,28 @@ Parameters:
       true: allocate an Elastic IP for a stable IPv4. ~$3.60/mo per AWS's
       2024 IPv4 pricing (charged for any public IPv4, EIP or not).
 
+  Nat64:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Only relevant when PublicIpv4=false. true (default): the IPv6-only box
+      resolves names through a free public DNS64/NAT64 service (nat64.net),
+      so IPv4-only sites — notably github.com — stay reachable. Traffic to
+      IPv4-only hosts transits the NAT64 operator's gateways; TLS and SSH
+      remain end-to-end encrypted and authenticated, but if you'd rather not
+      route through a third party, set false (the box then cannot reach
+      IPv4-only hosts) or use PublicIpv4=true instead. Ignored when
+      PublicIpv4=true.
+
   UseSpot:
     Type: String
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: >-
-      true (default): run as a persistent Spot instance (~70-90% cheaper).
+      true (default): run as a persistent Spot instance (currently ~50-60%
+      cheaper for t4g in the four launch regions — the deep 70-90% Spot
+      discounts don't apply to these small Graviton types).
       On a Spot interruption AWS stops the instance and restarts the SAME
       instance in the SAME AZ when capacity returns, so the root volume,
       IPv6 address, and TLS cert all survive. The live tmux session does
@@ -265,6 +284,9 @@ Parameters:
 Conditions:
   UseIpv4: !Equals [!Ref PublicIpv4, 'true']
   UseSpotCond: !Equals [!Ref UseSpot, 'true']
+  UseNat64: !And
+    - !Not [!Condition UseIpv4]
+    - !Equals [!Ref Nat64, 'true']
   UseSsm: !Equals [!Ref EnableSsm, 'true']
 
 Mappings:
@@ -550,7 +572,8 @@ Resources:
                   else if "${AgentNixpkgsUrl}" == "" then null
                   else { url = "${AgentNixpkgsUrl}"; sha256 = "${AgentNixpkgsSha256}"; };
                 # raw.githubusercontent.com is dual-stack (has AAAA); github.com
-                # is IPv4-only, so an IPv6-only box would need NAT64 for it.
+                # is IPv4-only — IPv6-only boxes reach it via the Nat64
+                # parameter's public DNS64/NAT64 (spliced in below).
                 # The module is a single file, so no tarball unpack needed.
                 agent-box-module = builtins.fetchurl {
                   url = "https://raw.githubusercontent.com/defangdevs/agent-box/${!pin.rev}/modules/agent-box.nix";
@@ -600,6 +623,7 @@ Resources:
                   };
                 };
 
+              ${Nat64Config}
                 # Materialize passwordHashFile from the plaintext CFN parameter
                 # BEFORE any service reads it. Activation scripts run at
                 # nixos-rebuild switch time (first boot from user-data), before
@@ -652,6 +676,20 @@ Resources:
                       - '-'
                       - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
               StackName: !Ref AWS::StackName
+              # Spliced at column 0 (the placeholder's leading 14 spaces are
+              # the YAML block-scalar indent) — Nix ignores indentation.
+              Nat64Config: !If
+                - UseNat64
+                - |
+                  # IPv6-only box: resolve through public DNS64 (nat64.net), whose
+                  # NAT64 gateways relay traffic to IPv4-only hosts — notably
+                  # github.com. TLS and SSH stay end-to-end; relaunch with
+                  # Nat64=false (or PublicIpv4=true) to avoid the third-party hop.
+                  # "~." routes ALL lookups here, overriding the VPC per-link DNS.
+                  services.resolved.enable = true;
+                  services.resolved.domains = [ "~." ];
+                  networking.nameservers = [ "2a00:1098:2b::1" "2a00:1098:2c::1" "2a01:4f8:c2c:123f::1" ];
+                - ''
 
 Outputs:
   WebURL:

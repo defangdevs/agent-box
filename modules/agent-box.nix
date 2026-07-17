@@ -896,6 +896,20 @@ in
     # List settings merge, so hosts can still extend this.
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
+    # `git clone https://github.com/...` authenticates with the user's
+    # GH_TOKEN out of the box: gh's credential helper reads it from the
+    # environment (the token files above export it into agent sessions).
+    # System-level /etc/gitconfig, so it works in every session without
+    # touching the user's ~/.gitconfig; no token, no envs -> helper emits
+    # nothing and git proceeds anonymously.
+    programs.git = {
+      enable = true;
+      config = {
+        credential."https://github.com".helper = "!${pkgs.gh}/bin/gh auth git-credential";
+        credential."https://gist.github.com".helper = "!${pkgs.gh}/bin/gh auth git-credential";
+      };
+    };
+
     users.users = lib.mapAttrs (name: u: {
       isNormalUser = true;
       home = "/home/${name}";
@@ -928,7 +942,7 @@ in
         # it `nix profile add` is unreachable from agent tool shells.
         path = [ "/home/${name}/.nix-profile" config.nix.package ]
           ++ agentRuntimePackages
-          ++ [ pkgs.bashInteractive pkgs.coreutils pkgs.git ]
+          ++ [ pkgs.bashInteractive pkgs.coreutils pkgs.git pkgs.gh ]
           ++ lib.optional (effectiveSudoAllowlist != [ ]) "/run/wrappers";
         # TMUX_TMPDIR puts the control socket under the /run RuntimeDirectory
         # below instead of /tmp. PrivateTmp (in serviceConfig) gives this unit a
