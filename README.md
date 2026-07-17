@@ -166,22 +166,20 @@ by seeding the acceptance flags into `~/.claude.json` and
 `~/.claude/settings.json` before each start. Without that, a fresh box parks
 the session on a dialog that Remote Control can't answer.
 
-**Claude Code quirks to know about first-time login in the browser terminal:**
+**Claude Code first login in the browser terminal:** Claude Code 2.1.113
+made long URLs clickable across terminal rows using OSC 8 hyperlinks, and
+2.1.126 added terminal code paste when a browser cannot reach a local OAuth
+callback (see the
+[Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)).
+Current agent-box builds resolve Claude Code from the pinned nixos-unstable
+snapshot and include both fixes; no resize or callback-relay workaround is
+needed. If an older deployed box still shows the legacy flow, update it from
+the settings page or run `sudo systemctl start agent-box-update.service`, then
+retry `claude auth login`.
 
-- **The login URL may not be clickable at narrow browser widths.** The URL
-  claude-code prints is ~400 chars; if your browser terminal is narrower
-  than that, xterm.js wraps it across multiple rows and its link detector
-  truncates the match somewhere in the middle. Fix is merged upstream in
-  [xtermjs/xterm.js PR 6017](https://github.com/xtermjs/xterm.js/pull/6017)
-  but not yet in a tagged xterm.js release, so it hasn't reached nixpkgs'
-  ttyd. Until it lands: widen the browser window or zoom out (Cmd/Ctrl `-`)
-  before running `claude auth login` so the URL fits on one row; then click
-  it. Resizing after emission can make it worse (a related fix is in
-  [xtermjs/xterm.js PR 5810](https://github.com/xtermjs/xterm.js/pull/5810)).
-- **Pasting the auth code gives no visible feedback** — claude-code hides
-  the code input like a password. Paste it, press Enter, and it should
-  print `Login successful.`. If you're not sure the paste landed, that's
-  by design; just Enter.
+The auth code input is hidden like a password, so pasting gives no visible
+feedback. Paste the code, press Enter, and Claude Code should print
+`Login successful.`.
 
 ## Sessions (any user can run any agent — no rebuild)
 
