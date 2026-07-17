@@ -51,10 +51,13 @@ jobs:
 
       - name: Inject pinned defaults for the 1-click copy
         # The source template deliberately ships without Default: values for
-        # AgentBoxRev / AgentBoxSha256 and AgentNixpkgsUrl /
-        # AgentNixpkgsSha256 (see the params' Descriptions) — the 1-click
-        # Launch buttons need them pre-filled, so we inject pinned values into
-        # only the S3 template copy.
+        # AgentBoxRev / AgentBoxSha256 (see the params' Descriptions), and
+        # with empty Defaults for AgentNixpkgsUrl / AgentNixpkgsSha256 (so
+        # source-template launches like deploy-test fall back to the AMI
+        # channel) — the 1-click Launch buttons need real values pre-filled,
+        # so we inject pinned values into only the S3 template copy: the
+        # AgentBox pair gets a Default inserted, the AgentNixpkgs pair gets
+        # its empty Default replaced.
         run: |
           rev="${{ github.sha }}"
           sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/agent-box.nix" \
@@ -72,9 +75,9 @@ jobs:
             /^  AgentBoxSha256:$/  { sf=1; print; next }
             sf && /^    Type:/      { print; print "    Default: " sha; sf=0; next }
             /^  AgentNixpkgsUrl:$/   { sf2=1; print; next }
-            sf2 && /^    Type:/       { print; print "    Default: " agentUrl; sf2=0; next }
+            sf2 && /^    Default:/    { print "    Default: " agentUrl; sf2=0; next }
             /^  AgentNixpkgsSha256:$/  { sf3=1; print; next }
-            sf3 && /^    Type:/       { print; print "    Default: " agentSha; sf3=0; next }
+            sf3 && /^    Default:/    { print "    Default: " agentSha; sf3=0; next }
             { print }
           ' aws/template.yaml > aws/template.filled.yaml
           if ! grep -qxF "    Default: $rev" aws/template.filled.yaml \

@@ -245,19 +245,22 @@ Parameters:
 
   AgentNixpkgsUrl:
     Type: String
+    Default: ''
     Description: >-
       Immutable nixos-unstable channel-release tarball to use for agent CLI
       packages (claude-code, codex). The S3-published 1-click template gets a
-      fresh Default injected by publish-template.yml. The source template has
-      no Default on purpose: AgentNixpkgsUrl + AgentNixpkgsSha256 are a pinned
-      pair, and `builtins.fetchTarball` hard-fails on drift.
+      fresh Default injected by publish-template.yml; empty (the source
+      template's default, used by deploy-test) falls back to the AMI channel.
+      When set, AgentNixpkgsUrl + AgentNixpkgsSha256 are a pinned pair, and
+      `builtins.fetchTarball` hard-fails on drift.
 
   AgentNixpkgsSha256:
     Type: String
+    Default: ''
     Description: >-
       Unpacked Nix sha256 of AgentNixpkgsUrl (the output of
       `nix-prefetch-url --unpack <AgentNixpkgsUrl>`). Must match
-      AgentNixpkgsUrl exactly.
+      AgentNixpkgsUrl exactly; leave empty when AgentNixpkgsUrl is empty.
 
 Conditions:
   UseIpv4: !Equals [!Ref PublicIpv4, 'true']
@@ -537,9 +540,14 @@ Resources:
                 # only the agent packages (claude-code, codex) resolve from.
                 # First boot uses the launch-time parameters; after that,
                 # agent-box-update.service owns the pin file and advances it.
+                # Empty URL (source-template launches, e.g. deploy-test) means
+                # no pin: null falls back to the AMI channel instead of
+                # handing builtins.fetchTarball a blank URL and bricking
+                # first boot (amazon-init failures are journal-only).
                 agentPin =
                   if builtins.pathExists /etc/nixos/agent-box-agent-pin.nix
                   then import /etc/nixos/agent-box-agent-pin.nix
+                  else if "${AgentNixpkgsUrl}" == "" then null
                   else { url = "${AgentNixpkgsUrl}"; sha256 = "${AgentNixpkgsSha256}"; };
                 # raw.githubusercontent.com is dual-stack (has AAAA); github.com
                 # is IPv4-only, so an IPv6-only box would need NAT64 for it.
