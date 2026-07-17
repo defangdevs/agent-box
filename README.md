@@ -86,6 +86,12 @@ one CAPABILITY_IAM checkbox to the Launch Stack form; opt out with
 [aws/README.md](./aws/README.md#root-access-via-ssm-session-manager) for
 details.
 
+**Changing the web password.** Open the settings page (the gear icon next to
+the terminal), choose **Change password**, and enter the current password plus
+the new password twice. The new password follows the launch-time 16&ndash;64
+character policy. Saving replaces the root-owned bcrypt hash, reloads Caddy,
+and signs out every browser by rotating the authentication-cookie secret.
+
 **Updating the box.** Click "Update box" on the settings page (the gear icon
 next to your terminal; the card also shows the running agent-box rev, linked
 to its GitHub commit), or ask the agent in its terminal to run
