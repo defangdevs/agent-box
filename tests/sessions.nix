@@ -118,6 +118,14 @@
     machine.succeed("su -s /bin/sh agent -c 'test -x /home/agent/.codex/packages/standalone/current/codex'")
     machine.succeed("test -x /run/current-system/sw/bin/bwrap")
 
+    # HTTPS github clones authenticate via GH_TOKEN: gh's credential helper
+    # is wired system-wide, and gh itself is on the agent unit's PATH.
+    machine.succeed(
+        "su -s /bin/sh agent -c "
+        "'git config --get credential.https://github.com.helper' | grep -q 'gh auth git-credential'"
+    )
+    machine.succeed("systemctl cat agent-box-agent | grep -q -- '-gh-'")
+
     # --- runtime add: no sudo, no rebuild ---------------------------------
     machine.succeed(
         "su -s /bin/sh agent -c 'agent-box-session add helper --agent codex'"
