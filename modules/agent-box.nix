@@ -54,7 +54,7 @@ let
     - Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
       (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
     - Secrets go in ~/.config/agent-box/env (KEY=value, one per line) or the
-      settings page, and load on the next session (re)start. GH_TOKEN is read
+      settings page, and load on the next session (re)start, eg. GH_TOKEN is read
       automatically, so `git clone https://github.com/...` just works.
     - Manage your own sessions without a rebuild:
       `agent-box-session ls|add|rm|restart`. `add` takes an optional name plus
