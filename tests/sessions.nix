@@ -406,6 +406,72 @@
         "| grep -o '/nix/store/[^ ]*agent-box-agent-attach')"
     )
 
+    # Working-directory picker (issue 131): the add-session form browses the
+    # user's home one directory level at a time via a read-only JSON endpoint,
+    # and a session can be anchored in a chosen directory.
+    with subtest("session working-directory picker + add-with-cwd"):
+        machine.succeed("su -s /bin/sh agent -c 'mkdir -p /home/agent/work/repo'")
+
+        # "~" lists home's immediate children (including the fresh work/), a
+        # deeper path lists that directory's children, and both report ok.
+        dirs = client.succeed(
+            f"{curl} -u agent:testpassword 'https://box.test/sessions/dirs?path=~'"
+        )
+        assert '"ok": true' in dirs, dirs
+        assert '"work"' in dirs, dirs
+        sub = client.succeed(
+            f"{curl} -u agent:testpassword 'https://box.test/sessions/dirs?path=~/work'"
+        )
+        assert '"repo"' in sub, sub
+
+        # The listing is confined to $HOME: a ../ climb-out and an absolute
+        # path outside home are both refused (ok:false, no entries leaked).
+        for bad in ["~/../../etc", "/etc"]:
+            escaped = client.succeed(
+                f"{curl} -u agent:testpassword 'https://box.test/sessions/dirs?path={bad}'"
+            )
+            assert '"ok": false' in escaped, escaped
+            assert '"dirs": []' in escaped, escaped
+
+        # Add a session anchored in ~/work/repo: it is stored as an absolute
+        # path and the supervisor starts the agent in that directory.
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "-d 'name=wd&agent=claude&cwd=~/work/repo' "
+            "https://box.test/sessions/add | grep -x 303"
+        )
+        machine.succeed(
+            "jq -e '.sessions.wd.workingDirectory == \"/home/agent/work/repo\"' "
+            "/home/agent/.config/agent-box/sessions.json"
+        )
+        machine.wait_until_succeeds(tmux("has-session -t =wd"), timeout=60)
+        machine.wait_until_succeeds(
+            tmux('display -p -t "=wd:" "#{pane_current_path}"')
+            + " | grep -x /home/agent/work/repo",
+            timeout=60,
+        )
+
+        # A non-existent directory, or one outside $HOME, is a 400 (tmux -c
+        # would fail on a missing cwd) and no session is created.
+        for bad in ["~/nope", "/etc"]:
+            client.succeed(
+                f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+                f"-d 'name=wdbad&agent=claude&cwd={bad}' "
+                "https://box.test/sessions/add | grep -x 400"
+            )
+        machine.succeed(
+            "jq -e '(.sessions.wdbad // null) == null' "
+            "/home/agent/.config/agent-box/sessions.json"
+        )
+
+        # Clean up so the migration subtest starts from a known session set.
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /dev/null "
+            "-d 'name=wd' https://box.test/sessions/delete"
+        )
+        machine.succeed("sleep 6")
+        machine.fail(tmux("has-session -t =wd"))
+
     # Rename migration (issue 70): re-running activation moves old-name
     # (claude-box) state to the agent-box paths exactly once, and never
     # clobbers live new-name state.
