@@ -317,11 +317,12 @@ All under `services.agent-box`:
 | `agent` | `"claude"` | Default agent CLI: `"claude"` or `"codex"`. |
 | `package` | selected agent default | Override package to run for every agent user. |
 | `installAgents` | all supported | Agent CLIs installed on the box (independent of what sessions run). |
+| `remoteControlHost` | `fqdnOrHostName` | Host label for the `@<host>` suffix of auto-derived Remote Control names. Empty -> falls back to the public `web.domain`, then the live kernel hostname. The AWS image sets it to the box's public sslip.io host. |
 | `users.<name>.sessions.<s>.*` | `{}` | Seed sessions (first boot only): per session `agent`, `skipPermissions`, `remoteControl`, `remoteControlName`, `workingDirectory`, `extraArgs`. Empty = the legacy per-user options below seed a session named `main`. |
 | `users.<name>.agent` | `null` | Agent for the default `main` session; null uses `services.agent-box.agent`. |
 | `users.<name>.skipPermissions` | `true` | Pass the selected agent's autonomy flag. |
 | `users.<name>.remoteControl` | `true` | Pass Claude's `--remote-control` when `agent = "claude"`; ignored for Codex. |
-| `users.<name>.remoteControlName` | `<name>@<host>` | Claude Remote Control session name (null -> `<user>@<fqdnOrHostName>` for `main`, `<user>-<session>@<fqdnOrHostName>` for other sessions). Ignored for Codex. |
+| `users.<name>.remoteControlName` | `<name>-main@<host>` | Claude Remote Control session name (null -> `<user>-<session>@<host>`, where `<host>` is `remoteControlHost`). Ignored for Codex. |
 | `users.<name>.workingDirectory` | `/home/<name>` | Agent startup directory. |
 | `users.<name>.extraGroups` | `[]` | Extra groups for the user. |
 | `users.<name>.extraArgs` | `[]` | Extra args appended to the selected agent CLI. |
