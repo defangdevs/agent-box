@@ -183,32 +183,21 @@ Parameters:
 
   AgentsMd:
     Type: String
-    Default: |-
-      # agent-box
-
-      You are running inside an agent-box deployment. Your browser terminal is
-      reachable at $AGENT_BOX_URL (run `echo $AGENT_BOX_URL` to print it).
-      Share that URL with anyone who needs to view or take over your session;
-      the sign-in username is your own login name (`whoami`) and the password
-      was set at deploy time.
-
-      Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
-      (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
-
-      Update the box's software with:
-      `sudo systemctl start agent-box-update.service`
-      (kills the running tmux session — save context first).
+    Default: ""
     Description: >-
-      Content seeded to the agent user's ~/AGENTS.md on first agent start
-      (skipped if the file already exists). AGENTS.md is the cross-vendor agent-
-      instructions convention read natively by codex and opencode, and by
-      claude-code as a CLAUDE.md fallback. The default references
-      $AGENT_BOX_URL, which the agent's systemd env sets to this box's
-      browser-terminal URL; `echo $AGENT_BOX_URL` in the terminal prints it.
-      Blank to skip seeding entirely. Content is embedded into user-data as a
-      Nix indented string, so avoid the sequences `${` and `''` in the body —
-      Nix will otherwise try to antiquote / close the string mid-file. Plain
-      $VAR (no braces) is fine.
+      Deployment-specific instructions APPENDED to agent-box's built-in
+      default AGENTS.md, which the module always seeds to the agent user's
+      ~/AGENTS.md on first agent start (skipped if the file already exists).
+      The built-in default already covers the generic guidance — browser-
+      terminal URL ($AGENT_BOX_URL), installing tools with nix, self-update —
+      so leave this blank unless you have EC2/CloudFormation-specific notes to
+      add (they land below the default). Blank (the default) seeds just the
+      built-in default. AGENTS.md is the cross-vendor agent-instructions
+      convention read natively by codex and opencode, and by claude-code as a
+      CLAUDE.md fallback. Content is embedded into user-data as a Nix indented
+      string, so avoid the sequences `${` and `''` in the body — Nix will
+      otherwise try to antiquote / close the string mid-file. Plain $VAR (no
+      braces) is fine.
 
   AllowCidr:
     Type: String
@@ -623,16 +612,18 @@ Resources:
                     environment = { TERM = "xterm-256color"; };
                     remoteControlName = "${UserName}@${StackName}";
                     web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
-                    # AGENTS.md content from the CFN AgentsMd parameter, spliced
-                    # as-is into a Nix indented string. The next line's leading
-                    # 14 spaces exactly match the YAML block-scalar indent, so
-                    # after YAML strips them the sub token lands at column 0 —
-                    # multi-line AgentsMd values then splice with each line at
-                    # column 0, and Nix's dedent leaves them untouched. The
-                    # default references $AGENT_BOX_URL, which the module
-                    # exports in the agent's systemd env — the agent can echo
-                    # it in the terminal. The module skips seeding when the
-                    # target file already exists, so this is safe to reapply.
+                    # The AGENTS.md ADDENDUM from the CFN AgentsMd parameter,
+                    # spliced as-is into a Nix indented string; the module
+                    # appends it below its built-in default AGENTS.md. The next
+                    # line's leading 14 spaces exactly match the YAML block-
+                    # scalar indent, so after YAML strips them the sub token
+                    # lands at column 0 — multi-line AgentsMd values then splice
+                    # with each line at column 0, and Nix's dedent leaves them
+                    # untouched. Empty AgentsMd (the default) splices to a lone
+                    # "\n", which the module treats as whitespace-only and
+                    # appends nothing, so the built-in default is seeded as-is.
+                    # The module skips seeding when the target file already
+                    # exists, so this is safe to reapply.
                     agentsMd = ''
               ${AgentsMd}
               '';

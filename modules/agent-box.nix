@@ -16,6 +16,30 @@ let
   # tmux session, for manual investigation/clean-up. "shell" is always
   # available (nothing to install), so it is appended, never filtered.
   sessionKinds = agents: agents ++ [ "shell" ];
+  # Base AGENTS.md content seeded into every non-shell session's working
+  # directory (see users.<name>.agentsMd). This is the generic, deployment-
+  # independent half; users.<name>.agentsMd is APPENDED to it, so callers add
+  # deployment-specific notes (e.g. aws/template.yaml's AgentsMd parameter for
+  # EC2/CloudFormation specifics) without re-stating the common text. Kept
+  # verbatim in sync with that template default — the two must only differ by
+  # such appended specifics. $AGENT_BOX_URL (no braces) stays literal for the
+  # agent to expand at read time; Nix only antiquotes ''${...}''.
+  defaultAgentsMd = ''
+    # agent-box
+
+    You are running inside an agent-box deployment. Your browser terminal is
+    reachable at $AGENT_BOX_URL (run `echo $AGENT_BOX_URL` to print it).
+    Share that URL with anyone who needs to view or take over your session;
+    the sign-in username is your own login name (`whoami`) and the password
+    was set at deploy time.
+
+    Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
+    (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
+
+    Update the box's software with:
+    `sudo systemctl start agent-box-update.service`
+    (kills the running tmux session — save context first).
+  '';
   tmuxSocketName = "agent-box";
   runtimeDirectory = name: "agent-box-${name}";
   # ttyd port base; ports are assigned in sorted user-name order (see
@@ -419,27 +443,35 @@ let
       };
       agentsMd = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
-        default = null;
+        default = "";
         example = lib.literalExpression ''
           '''
-            # agent-box
-            Your terminal is at $AGENT_BOX_URL — `echo` it to print.
+            ## This deployment
+            Deployed via CloudFormation stack "my-stack"; update it from the
+            AWS console's Update button, not just the self-update service.
           '''
         '';
         description = ''
-          Content seeded to <workingDirectory>/AGENTS.md on agent start,
-          IFF that file does not already exist — so the agent's own
-          edits or a repo checkout in workingDirectory never get
-          clobbered. Null (default) writes nothing. Sessions with
-          agent = "shell" are never seeded (no agent reads it there).
+          Deployment-specific instructions APPENDED to the built-in default
+          AGENTS.md (the generic agent-box guidance: browser-terminal URL,
+          installing tools with nix, self-update). The concatenation is
+          seeded to <workingDirectory>/AGENTS.md on agent start, IFF that
+          file does not already exist — so the agent's own edits or a repo
+          checkout in workingDirectory never get clobbered.
 
-          AGENTS.md is the cross-vendor agent-instructions convention
-          read natively by codex and opencode, and by claude-code as a
-          fallback when CLAUDE.md is absent. The agent's systemd env
-          exports AGENT_BOX_URL whenever this user has a browser
-          terminal (see web.passwordHashFile), so an AGENTS.md that
-          references that variable lets the agent answer "where am I
-          reachable?" without hard-coding the URL.
+          The default "" (or any whitespace-only value) appends nothing, so
+          the built-in default is seeded as-is. Set null to opt out of seeding
+          entirely (write no AGENTS.md).
+          Sessions with agent = "shell" are never seeded (no agent reads it
+          there).
+
+          AGENTS.md is the cross-vendor agent-instructions convention read
+          natively by codex and opencode, and by claude-code as a fallback
+          when CLAUDE.md is absent. The agent's systemd env exports
+          AGENT_BOX_URL whenever this user has a browser terminal (see
+          web.passwordHashFile), so an AGENTS.md that references that variable
+          lets the agent answer "where am I reachable?" without hard-coding
+          the URL.
         '';
       };
       web.passwordHashFile = lib.mkOption {
@@ -489,9 +521,16 @@ let
       # store so no in-shell quoting; $AGENT_BOX_URL and other $refs in the
       # content stay literal for the agent to expand at read time. Seeded
       # per session in start_session below.
+      # null opts out entirely; otherwise seed the built-in default with the
+      # per-user addendum appended. A whitespace-only addendum (incl. the ""
+      # default and the lone "\n" that aws/template.yaml's block-scalar splice
+      # yields for an empty AgentsMd) appends nothing — the base is seeded as-is.
       agentsMdFile =
         if u.agentsMd == null then null
-        else pkgs.writeText "agent-box-${name}-agents.md" u.agentsMd;
+        else pkgs.writeText "agent-box-${name}-agents.md"
+          (defaultAgentsMd
+            + lib.optionalString (builtins.match "[[:space:]]*" u.agentsMd == null)
+              "\n${u.agentsMd}");
     in
     pkgs.writeShellScript "agent-box-${name}-start" ''
       set -u
