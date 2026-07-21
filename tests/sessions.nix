@@ -38,6 +38,10 @@
     services.agent-box = {
       enable = true;
       agent = "claude";
+      # Leave the host label unset so auto-derived Remote Control names fall
+      # back to the public web.domain rather than the internal kernel
+      # hostname (issue: derived names showed the internal EC2 fqdn).
+      remoteControlHost = "";
       users.agent = {
         web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
       };
@@ -122,6 +126,19 @@
         "jq -e '.sessions.main.agent == \"claude\"' "
         "/home/agent/.config/agent-box/sessions.json"
     )
+
+    # With remoteControlHost unset, the auto-derived "<user>-<session>@<host>"
+    # Remote Control name takes its host suffix from the public web.domain,
+    # NOT the internal kernel hostname — and every session (including "main")
+    # gets the "-<session>" suffix (no "main" special case). The supervisor
+    # bakes both into its start script, so assert those literals.
+    start_script = machine.succeed(
+        "systemctl show agent-box-agent --property=ExecStart --value "
+        "| grep -o '/nix/store/[^ ;]*-agent-box-agent-start'"
+    ).strip()
+    script_body = machine.succeed(f"cat {start_script}")
+    assert "host=box.test" in script_body, script_body
+    assert "rcname=agent-$sname" in script_body, script_body
 
     # Both agent CLIs are installed even though no session uses codex yet
     # (installAgents defaults to all supported agents).
