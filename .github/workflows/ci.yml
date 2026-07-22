@@ -72,6 +72,12 @@ jobs:
       - name: Check downloads route in generated Caddyfile
         run: nix build -L .#checks.x86_64-linux.download-route && cat result
 
+      # Eval/build check (issue 101): the webhook ingress route exists, comes
+      # before the /<user>/* catch-all, and carries NO basic_auth — GitHub
+      # cannot authenticate, so an auth gate there silently drops deliveries.
+      - name: Check webhook route in generated Caddyfile
+        run: nix build -L .#checks.x86_64-linux.webhook-route && cat result
+
       # Full closure build — the real "module is usable" proof.
       - name: Build VM system closure
         run: nix build -L .#checks.x86_64-linux.vm-closure
@@ -114,6 +120,12 @@ jobs:
       #                     session, agent-box-session add/rm with no sudo and
       #                     no rebuild, cgroup containment, root session
       #                     manager page behind auth
+      #   webhook           (issue 101) the default-on webhook receiver —
+      #                     socket-activated 0660 <user>:caddy ingress, the
+      #                     unauthenticated public path beside a still-401ing
+      #                     vhost, HMAC accept/reject (404 before any secret
+      #                     exists), IPC fan-out into a session peer applying
+      #                     its own filter, and the discovery surface
       - name: Run VM tests
         run: |
           nix build -L --keep-going --max-jobs 3 \
@@ -122,4 +134,5 @@ jobs:
             .#checks.x86_64-linux.download-files \
             .#checks.x86_64-linux.settings-page \
             .#checks.x86_64-linux.memory-protection \
-            .#checks.x86_64-linux.sessions
+            .#checks.x86_64-linux.sessions \
+            .#checks.x86_64-linux.webhook

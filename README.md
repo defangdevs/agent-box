@@ -278,6 +278,47 @@ tells the agent about this route, so "send me that file" just works. For
 unauthenticated sharing, an agent can instead run its own web service and
 expose it via `~/sites` (see the seeded `AGENTS.md`).
 
+## Webhooks: the agent gets told, instead of polling (web setups)
+
+An agent waiting on CI, a review, or a teammate's push otherwise loops on
+`gh pr checks` and `sleep` — slow, and it burns context re-reading state it
+already had. Each web user instead gets a webhook endpoint whose deliveries
+land **in the session** as messages:
+
+```bash
+agent-box-webhook setup                     # mint an HMAC secret, print the URL
+# register that URL + secret in the repo (Settings -> Webhooks -> Add webhook)
+agent-box-webhook subscribe OWNER/REPO --note "PR 42: waiting on CI"
+agent-box-webhook ls                        # what this session listens to
+```
+
+On by default (`webhook.enable`), needs `web.enable`. How it fits together:
+
+- A **receiver-only daemon** per web user (`agent-box-webhook-<user>`) owns a
+  socket-activated UNIX ingress at `/run/agent-box-webhook/<user>.sock`, bound
+  `0660 <user>:caddy` by systemd — the same isolation model as the settings
+  socket. It keeps the box's one endpoint up regardless of which sessions exist.
+- Caddy reverse-proxies `https://<domain>/<user>/webhook` there **without basic
+  auth**: GitHub can't authenticate, so the per-source **HMAC-SHA256** check is
+  the trust boundary. Nothing is reachable until a user runs
+  `agent-box-webhook setup` — with no source configured every POST is answered
+  `404`, and a configured source rejects anything unsigned (`401`).
+- The daemon verifies once, then fans each event out over IPC to that user's
+  sessions. Subscriptions are **per session** and expire (1h by default), so a
+  straggler can't wake a session whose context is long gone. Payload text is
+  truncated and marked `⟪UNTRUSTED⟫` — the agent is told to read it as data.
+- Claude Code sessions additionally get `webhook_subscribe` /
+  `webhook_unsubscribe` / `webhook_subscriptions` as MCP tools, from the
+  [local-channels](https://github.com/defangdevs/local-channels) `local-webhook`
+  plugin (enabled non-interactively via seeded `~/.claude/settings.json`). The
+  CLI and the tools share one subscription list, so Codex and shell sessions are
+  not second-class.
+
+Any sender that HMAC-signs its raw body works, not just GitHub —
+`agent-box-webhook setup stripe` adds a second source at
+`/<user>/webhook/stripe`. Set `services.agent-box.webhook.enable = false` to
+omit the daemon, socket, and public path entirely.
+
 ## VM image
 
 Build from the same config:
@@ -329,6 +370,8 @@ All under `services.agent-box`:
 | `sudoAllowlist` | `[]` | Passwordless sudo commands granted to every agent. |
 | `extraPackages` | `[]` | Packages placed on each agent's PATH. |
 | `environmentFiles` | `[]` | Extra `EnvironmentFile` paths applied to every agent. |
+| `webhook.enable` | `true` | Per-user webhook receiver (see above): an unauthenticated `/<user>/webhook` ingress whose HMAC-verified deliveries reach that user's agent sessions, plus the `agent-box-webhook` CLI. No-op without `web.enable`; inert until a user runs `agent-box-webhook setup`. |
+| `webhook.repo` / `.rev` / `.sha256` | pinned `defangdevs/local-channels` | Source and pin of the `local-webhook` script the daemon and CLI run. |
 | `protectMemory` | `true` | zram swap (zstd, sized to RAM), earlyoom, and `OOMScoreAdjust=500` on agent units, so runaway agent memory gets its process killed (and auto-restarted) instead of livelocking the whole box. All knobs are `mkDefault` - tune or disable pieces from the host config. |
 
 ## Security model
@@ -355,16 +398,27 @@ arbitrary command execution as the agent user.
   containment for scoped elevation.
 - **Tight sudo:** whatever's in `sudoAllowlist` is the entire root-capable
   surface. `NOPASSWD` only - no `SETENV`, no blanket sudo, no ALL.
-- **Nothing anonymous, brute-force damping (web deployments):** every path
-  on the vhost — terminal workspace, per-session terminals, settings, and the
-  `/<user>/downloads/` file drop — sits behind the
-  login (the CI tests assert the 401s), new password hashes use Caddy's
-  recommended Argon2id algorithm (legacy bcrypt hashes remain accepted until
-  the password changes), and a fail2ban jail bans IPs that repeatedly fail it
-  (default on, `web.fail2ban`; it only counts requests that actually carried
-  credentials). Discovery isn't assumed to be hard — the ACME cert for
-  `<ip>.sslip.io` lands in public CT logs minutes after launch — auth is
-  simply required everywhere.
+- **Login on everything a human reaches, brute-force damping (web
+  deployments):** the terminal workspace, per-session terminals, settings, and
+  the `/<user>/downloads/` file drop all sit behind the login (the CI tests
+  assert the 401s), new password hashes use Caddy's recommended Argon2id
+  algorithm (legacy bcrypt hashes remain accepted until the password changes),
+  and a fail2ban jail bans IPs that repeatedly fail it (default on,
+  `web.fail2ban`; it only counts requests that actually carried credentials).
+  Discovery isn't assumed to be hard — the ACME cert for `<ip>.sslip.io` lands
+  in public CT logs minutes after launch — so auth is required, not relied on
+  being unguessable.
+- **One deliberate exception: `/<user>/webhook`.** Webhook senders can't do
+  basic auth, so that path is served without it and a per-source
+  **HMAC-SHA256** signature over the raw body is the trust boundary instead
+  (see [Webhooks](#webhooks-the-agent-gets-told-instead-of-polling-web-setups)).
+  It fails closed in both directions: with no source configured every POST gets
+  `404`, and a configured source rejects anything whose signature doesn't
+  verify with `401` — so a box where nobody ran `agent-box-webhook setup`
+  accepts nothing at all. A bad-signature `401` also can't feed the fail2ban
+  jail into banning a real sender: the jail's regex requires an `Authorization`
+  header on the request, and webhook senders don't send one. Set
+  `webhook.enable = false` to remove the path.
 - **User-scoped secrets file:** each user's tokens live in their own
   `~/.config/agent-box/env` (0600, inside the 0700 `~/.config/agent-box`),
   written only by that user's settings daemon / `agent-box-session env` —
