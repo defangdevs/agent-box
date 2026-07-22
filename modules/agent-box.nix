@@ -238,8 +238,8 @@ let
       sessions = lib.mapAttrs (sname: s: {
         agent = if s.agent != null then s.agent else cfg.agent;
         inherit (s) skipPermissions remoteControl extraArgs;
-        # null → the supervisor derives "<user>@<fqdn>" (main) or
-        # "<user>-<session>@<fqdn>" at start time.
+        # null → the supervisor derives "<user>-<session>@<host>" at
+        # start time (see remoteControlHost).
         remoteControlName = s.remoteControlName;
         workingDirectory =
           if s.workingDirectory != null then s.workingDirectory
@@ -414,11 +414,12 @@ let
         default = null;
         description = ''
           Remote Control session name. When null, defaults to
-          "<user>@<host>" for the session named "main" and
-          "<user>-<session>@<host>" otherwise, where <host> is
-          networking.fqdnOrHostName, or the live kernel hostname when that
-          is empty at build time. When no hostname is resolvable the "@<host>"
-          suffix is omitted (just "<user>" / "<user>-<session>").
+          "<user>-<session>@<host>", where <host> is
+          services.agent-box.remoteControlHost (fqdnOrHostName by default,
+          the public sslip.io host on the AWS image), else the public
+          services.agent-box.web.domain, else the live kernel hostname when
+          both are empty at build time. When no host is resolvable the
+          "@<host>" suffix is omitted (just "<user>-<session>").
         '';
       };
       workingDirectory = lib.mkOption {
@@ -505,10 +506,12 @@ let
         default = null;
         description = ''
           Remote Control session name, used to correlate the session to this box
-          from the Claude apps. Keep it shell-safe (no spaces/quotes). When null,
-          defaults to "<user>@<host>", where <host> is networking.fqdnOrHostName,
-          or the live kernel hostname when that is empty at build time; the
-          "@<host>" suffix is omitted entirely when no hostname is resolvable.
+          from the Claude apps. Keep it shell-safe (no spaces/quotes). This seeds
+          the "main" session; when null it defaults to "<user>-main@<host>",
+          where <host> is services.agent-box.remoteControlHost (fqdnOrHostName by
+          default, the public sslip.io host on the AWS image), else the public
+          web.domain, else the live kernel hostname when both are empty at build
+          time; the "@<host>" suffix is omitted when no host is resolvable.
         '';
       };
       workingDirectory = lib.mkOption {
@@ -611,7 +614,17 @@ let
   mkStart = name: u:
     let
       home = "/home/${name}";
-      fqdn = config.networking.fqdnOrHostName;
+      # Host suffix for auto-derived Remote Control names. Prefer an explicit
+      # remoteControlHost; otherwise the box's PUBLIC web domain — the name
+      # you actually reach the box at (sslip.io on AWS, custom DNS on bare
+      # metal) — which is far more useful in the Claude apps than the internal
+      # kernel hostname the supervisor would otherwise fall back to (an EC2
+      # box's is ip-10-x-x-x.<region>.compute.internal). Guarded on web.enable
+      # because web.domain has no default and errors if read while unset.
+      hostLabel =
+        if cfg.remoteControlHost != "" then cfg.remoteControlHost
+        else if cfg.web.enable && cfg.web.domain != "" then cfg.web.domain
+        else "";
       agentBinCases = lib.concatMapStrings (a:
         "          ${a}) printf '%s\\n' ${lib.escapeShellArg (lib.getExe (agentPackage a))} ;;\n"
       ) cfg.installAgents
@@ -730,24 +743,22 @@ ${agentBinCases}          *) return 1 ;;
         fi
         if [ "$agent" = claude ] && [ "$rc" = true ]; then
           if [ -z "$rcname" ]; then
-            # Host suffix for the derived "<user>[-<session>]@<host>" name.
-            # ${fqdn} is config.networking.fqdnOrHostName, fixed at build
-            # time — but it is "" when networking.hostName is unset, which
-            # used to leave a dangling trailing "@" (e.g. "agent-devs@").
-            # Fall back to the live kernel hostname, and drop "@<host>"
-            # entirely when even that is empty rather than emitting a bare
+            # Host suffix for the derived "<user>-<session>@<host>" name.
+            # ${hostLabel} is baked at build time: remoteControlHost if set
+            # (the CloudFormation stack name on the AWS image), else the
+            # public web.domain — the address the box is actually reachable
+            # at. Fall back to the live kernel hostname only if both are
+            # empty; that kernel name is the INTERNAL fqdn on a cloud box
+            # (ip-10-x-x-x.<region>.compute.internal), which is why the public
+            # web.domain is preferred above it. Drop "@<host>" entirely when
+            # even the kernel name is empty rather than emitting a dangling
             # "@". read is a bash builtin, so this needs nothing on PATH.
-            host=${fqdn}
+            host=${hostLabel}
             if [ -z "$host" ] && [ -r /proc/sys/kernel/hostname ]; then
               read -r host < /proc/sys/kernel/hostname || host=
             fi
-            rcbase=${name}
-            [ "$sname" = main ] || rcbase=${name}-$sname
-            if [ -n "$host" ]; then
-              rcname="$rcbase@$host"
-            else
-              rcname="$rcbase"
-            fi
+            rcname=${name}-$sname
+            [ -z "$host" ] || rcname="$rcname@$host"
           fi
           cmd="$cmd --remote-control $(printf '%q' "$rcname")"
         fi
@@ -828,6 +839,24 @@ in
         runtime `agent-box-session add --agent codex` needs no rebuild.
         Sessions may only use agents listed here. Default: all supported
         agents.
+      '';
+    };
+
+    remoteControlHost = lib.mkOption {
+      type = lib.types.str;
+      default = config.networking.fqdnOrHostName;
+      defaultText = lib.literalExpression "config.networking.fqdnOrHostName";
+      example = "my-agent-box";
+      description = ''
+        Host label used as the "@<host>" suffix of auto-derived Remote
+        Control session names (see users.<name>.sessions.<name>.remoteControlName).
+        Defaults to the box's fqdnOrHostName; the AWS image sets it to the
+        box's public sslip.io host so a box is identifiable AND reachable in
+        the Claude apps even when networking.hostName is unset. When empty,
+        the name falls back to the public web.domain (the address the box is
+        reachable at), and only if that is also unset to the live kernel
+        hostname at start time — which on a cloud box is the internal,
+        non-routable fqdn.
       '';
     };
 
@@ -2402,9 +2431,6 @@ in
               <form method="post" action="{action_base}/sessions/add">
                 <input type="hidden" name="back" value="settings">
                 <div class="row">
-                  <input type="text" name="name" placeholder="name (optional — auto from agent)"
-                         pattern="[A-Za-z0-9_-]+"
-                         title="Optional. Letters, digits, dash and underscore; blank auto-names from the agent">
                   <select name="agent">{agents}</select>
                   <span class="combo">
                     <input type="text" name="cwd" value="~" class="cwd"
@@ -2444,9 +2470,6 @@ in
         <div id="session-editor" class="editor">
           <form method="post" action="{action_base}/sessions/add">
             <div class="row">
-              <input type="text" name="name" placeholder="name (optional — auto from agent)"
-                     pattern="[A-Za-z0-9_-]+"
-                     title="Optional. Letters, digits, dash and underscore; blank auto-names from the agent">
               <select name="agent">{agents}</select>
               <span class="combo">
                 <input type="text" name="cwd" value="~" class="cwd"
@@ -3533,18 +3556,10 @@ in
                     back_page = self._sess_page(form)
                     # Error pages re-render the page the form came from.
                     render = render_home if (HOME and back_page == SESS_PAGE) else render_page
-                    name = (form.get("name", [""])[0]).strip()
                     agent = (form.get("agent", [""])[0]).strip() or DEFAULT_AGENT
                     if agent not in AGENTS:
                         self._send_html(
                             render("Unknown agent. Available: " + ", ".join(AGENTS)),
-                            status=400,
-                        )
-                        return
-                    if name and not SESSION_RE.match(name):
-                        self._send_html(
-                            render("Invalid session name. Use letters, digits, "
-                                   "dash and underscore (max 32 chars)."),
                             status=400,
                         )
                         return
@@ -3558,18 +3573,12 @@ in
                         self._send_html(render(str(exc)), status=400)
                         return
                     sessions = read_sessions()
-                    # Blank name → derive one from the agent (issue: autogen names).
-                    if not name:
-                        name = gen_session_name(agent, sessions)
-                    if name in sessions:
-                        # Silently overwriting would reset the stored config
-                        # (agent, cwd, extraArgs) to defaults — issue 100.
-                        self._send_html(
-                            render("Session '%s' already exists. Delete it "
-                                   "first, or use Restart to bounce it." % name),
-                            status=409,
-                        )
-                        return
+                    # The name is always auto-derived from the agent — there is no
+                    # name field in the form. Users rarely care what a session is
+                    # called (rename at runtime via /rename), so autogen spares them
+                    # inventing one AND guarantees a unique key, so no collision or
+                    # accidental-overwrite (issue 100) is possible here.
+                    name = gen_session_name(agent, sessions)
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,
@@ -3579,8 +3588,8 @@ in
                         "extraArgs": [],
                     }
                     write_sessions(sessions)
-                    # On the workspace, land on the new session's tab (name is
-                    # SESSION_RE-validated, so URL-safe as-is).
+                    # On the workspace, land on the new session's tab (gen_session_name
+                    # returns a SESSION_RE-shaped name, so it is URL-safe as-is).
                     query = "ok=session_added"
                     if HOME and back_page == SESS_PAGE:
                         query += "&tab=" + name

@@ -84,7 +84,7 @@ Parameters:
       Linux user the agent CLI runs as. Doubles as the browser-terminal
       sign-in username (the basic-auth username picks the terminal), the
       /<user>/ path in the WebURL, the home directory (/home/<user>), and
-      the <user>@<stack> Remote Control session name. Lowercase letters,
+      the <user>-main@<host> Remote Control session name. Lowercase letters,
       digits, "_" and "-", starting with a letter or "_", max 31 chars.
 
   # The picker annotates each value with vCPU/RAM because the CloudFormation
@@ -625,9 +625,15 @@ Resources:
                 services.agent-box = {
                   enable = true;
                   agent = "${Agent}";
+                  # Host suffix for auto-derived Remote Control names. Use the
+                  # box's PUBLIC address (the sslip.io hostname the box is
+                  # actually reached at) rather than networking.hostName (unset
+                  # on the AWS image) or the internal EC2 fqdn. Every session —
+                  # the seeded "main" and any added at runtime — is then
+                  # identifiable in the Claude apps as "<user>-<session>@<host>".
+                  remoteControlHost = hostname;
                   users."${UserName}" = {
                     environment = { TERM = "xterm-256color"; };
-                    remoteControlName = "${UserName}@${StackName}";
                     web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
                     # The AGENTS.md ADDENDUM from the CFN AgentsMd parameter,
                     # spliced as-is into a Nix indented string; the module
@@ -731,7 +737,6 @@ Resources:
                       - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
               WebPasswordBase64:
                 Fn::Base64: !Ref WebPassword
-              StackName: !Ref AWS::StackName
               # First-boot health signal (issue 106): tell CloudFormation the
               # user-data config actually APPLIED. This unit only exists once
               # the rebuild switched into this config, which is exactly the
@@ -797,12 +802,19 @@ Outputs:
 
   RemoteControlSession:
     Description: >-
-      Claude Remote Control session name (<UserName>@<stack name>). After
-      finishing `claude login` once in the browser terminal, the Claude
-      desktop / mobile apps can drive this session directly (sign in with the
-      same Claude account). Only meaningful when Agent=claude; Codex has no
-      Remote Control channel.
-    Value: !Sub ${UserName}@${AWS::StackName}
+      Claude Remote Control session name (<UserName>-main@<host>.sslip.io, the
+      box's public address). After finishing `claude login` once in the browser
+      terminal, the Claude desktop / mobile apps can drive this session directly
+      (sign in with the same Claude account). Only meaningful when Agent=claude;
+      Codex has no Remote Control channel.
+    Value: !Sub
+      - "${UserName}-main@${Host}.sslip.io"
+      - Host: !If
+          - UseIpv4
+          - !Ref EIP
+          - !Join
+              - '-'
+              - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
 
   PublicAddress:
     Description: Elastic IP (IPv4 mode) or primary IPv6 (IPv6 mode).

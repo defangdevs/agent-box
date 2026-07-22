@@ -34,10 +34,12 @@ choose Claude Code or Codex.
   `user@` userinfo: Chrome answers the auth challenge with URL userinfo plus
   an empty password, and credentials typed into the prompt cannot override
   the URL-embedded identity (issue 56).
-- `<UserName>@<stack name>` becomes the Claude Remote Control session name
-  (default user: `agent`). Rename the stack before launch if you want a
-  friendlier label in the Claude apps; post-deploy, this can still be changed
-  in the NixOS config.
+- `<UserName>-main@<host>.sslip.io` becomes the Claude Remote Control session
+  name (default user: `agent`), where `<host>.sslip.io` is the box's public
+  address — so the box is identifiable and reachable in the Claude apps.
+  Sessions added at runtime derive the same way (`<UserName>-<session>@...`).
+  Override per user via `remoteControlName`, or box-wide via
+  `services.agent-box.remoteControlHost`, in the NixOS config post-deploy.
 - The hostname `<addr>.sslip.io` is derived at CFN time via `Fn::Split ':'
   + Fn::Join '-'` on the NetworkInterface's PrimaryIpv6Address (IPv6 mode)
   or the EIP address (IPv4 mode). Consecutive `::` becomes an empty split

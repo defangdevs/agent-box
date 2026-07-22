@@ -38,6 +38,10 @@
     services.agent-box = {
       enable = true;
       agent = "claude";
+      # Leave the host label unset so auto-derived Remote Control names fall
+      # back to the public web.domain rather than the internal kernel
+      # hostname (issue: derived names showed the internal EC2 fqdn).
+      remoteControlHost = "";
       users.agent = {
         web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
       };
@@ -122,6 +126,19 @@
         "jq -e '.sessions.main.agent == \"claude\"' "
         "/home/agent/.config/agent-box/sessions.json"
     )
+
+    # With remoteControlHost unset, the auto-derived "<user>-<session>@<host>"
+    # Remote Control name takes its host suffix from the public web.domain,
+    # NOT the internal kernel hostname — and every session (including "main")
+    # gets the "-<session>" suffix (no "main" special case). The supervisor
+    # bakes both into its start script, so assert those literals.
+    start_script = machine.succeed(
+        "systemctl show agent-box-agent --property=ExecStart --value "
+        "| grep -o '/nix/store/[^ ;]*-agent-box-agent-start'"
+    ).strip()
+    script_body = machine.succeed(f"cat {start_script}")
+    assert "host=box.test" in script_body, script_body
+    assert "rcname=agent-$sname" in script_body, script_body
 
     # Both agent CLIs are installed even though no session uses codex yet
     # (installAgents defaults to all supported agents).
@@ -311,66 +328,46 @@
     assert "workingDirectory" not in root_page, root_page
 
     # The root page's CRUD routes (behind auth) can add a session; the
-    # workspace redirect lands on the new session's tab. Assert the raw
-    # Location header (h2 lowercases it, CRLF line ends — no grep -x):
-    # what the daemon EMITS is the contract, curl's %{redirect_url}
-    # resolution is not.
+    # workspace redirect lands on the new session's tab. The name is always
+    # auto-derived from the agent (there is no name field in the form): with
+    # no session literally named "claude" yet, the first claude add lands on
+    # the bare-agent-name tab. Assert the raw Location header (h2 lowercases
+    # it, CRLF line ends — no grep -x): what the daemon EMITS is the contract,
+    # curl's %{redirect_url} resolution is not. Any submitted "name" field is
+    # ignored, so passing a bogus one changes nothing.
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -D - "
-        "-d 'name=web&agent=claude' "
-        "https://box.test/sessions/add "
-        "| grep -i '^location: /?ok=session_added&tab=web'"
-    )
-    machine.wait_until_succeeds(tmux("has-session -t =web"), timeout=60)
-
-    # A duplicate add via the web is a 409 and the stored config survives
-    # (a silent overwrite would reset it to defaults — issue 100).
-    client.succeed(
-        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
-        "-d 'name=web&agent=codex' "
-        "https://box.test/sessions/add | grep -x 409"
-    )
-    machine.succeed(
-        "jq -e '.sessions.web.agent == \"claude\"' "
-        "/home/agent/.config/agent-box/sessions.json"
-    )
-
-    # ?tab= selects a tab server-side (the no-JS switching path): the web
-    # tab is current and its live pane iframes its ttyd URL.
-    tab_page = client.succeed(f"{curl} -u agent:testpassword 'https://box.test/?tab=web'")
-    assert 'data-tab="web" href="/?tab=web" aria-current="page"' in tab_page, tab_page
-    assert 'src="/agent/?arg=web"' in tab_page, tab_page
-    # main is still a tab, just not the current one.
-    assert 'data-tab="main" href="/?tab=main">' in tab_page, tab_page
-
-    # A blank name auto-derives from the agent: no session is literally
-    # "claude" yet, so the new one lands on the bare-agent-name tab.
-    client.succeed(
-        f"{curl} -u agent:testpassword -o /dev/null -D - "
-        "-d 'name=&agent=claude' "
+        "-d 'name=ignored&agent=claude' "
         "https://box.test/sessions/add "
         "| grep -i '^location: /?ok=session_added&tab=claude'"
     )
     machine.wait_until_succeeds(tmux("has-session -t =claude"), timeout=60)
+    machine.succeed(
+        "jq -e '.sessions.claude.agent == \"claude\"' "
+        "/home/agent/.config/agent-box/sessions.json"
+    )
+
+    # ?tab= selects a tab server-side (the no-JS switching path): the new
+    # tab is current and its live pane iframes its ttyd URL.
+    tab_page = client.succeed(f"{curl} -u agent:testpassword 'https://box.test/?tab=claude'")
+    assert 'data-tab="claude" href="/?tab=claude" aria-current="page"' in tab_page, tab_page
+    assert 'src="/agent/?arg=claude"' in tab_page, tab_page
+    # main is still a tab, just not the current one.
+    assert 'data-tab="main" href="/?tab=main">' in tab_page, tab_page
+
+    # Delete it (delist + kill) so "claude" is free again for later subtests.
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
         "-d 'name=claude' "
         "https://box.test/sessions/delete | grep -x 303"
     )
-
-    # ...and delete it again (delist + kill).
-    client.succeed(
-        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
-        "-d 'name=web' "
-        "https://box.test/sessions/delete | grep -x 303"
-    )
     machine.succeed("sleep 6")
-    machine.fail(tmux("has-session -t =web"))
+    machine.fail(tmux("has-session -t =claude"))
 
     # Session CRUD is rejected without credentials.
     client.succeed(
         f"{curl} -o /dev/null -w '%{{http_code}}' "
-        "-d 'name=pwn&agent=claude' "
+        "-d 'agent=claude' "
         "https://box.test/sessions/add | grep -x 401"
     )
 
@@ -378,7 +375,7 @@
     # old settings-path routes remain gone)...
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
-        "-d 'name=web2&agent=claude' "
+        "-d 'agent=claude' "
         "https://box.test/agent/settings/sessions/add | grep -x 404"
     )
     # ...but the settings page renders the session manager again (the root
@@ -433,44 +430,46 @@
             assert '"ok": false' in escaped, escaped
             assert '"dirs": []' in escaped, escaped
 
-        # Add a session anchored in ~/work/repo: it is stored as an absolute
-        # path and the supervisor starts the agent in that directory.
-        client.succeed(
-            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
-            "-d 'name=wd&agent=claude&cwd=~/work/repo' "
-            "https://box.test/sessions/add | grep -x 303"
-        )
-        machine.succeed(
-            "jq -e '.sessions.wd.workingDirectory == \"/home/agent/work/repo\"' "
-            "/home/agent/.config/agent-box/sessions.json"
-        )
-        machine.wait_until_succeeds(tmux("has-session -t =wd"), timeout=60)
-        machine.wait_until_succeeds(
-            tmux('display -p -t "=wd:" "#{pane_current_path}"')
-            + " | grep -x /home/agent/work/repo",
-            timeout=60,
-        )
-
         # A non-existent directory, or one outside $HOME, is a 400 (tmux -c
-        # would fail on a missing cwd) and no session is created.
+        # would fail on a missing cwd) and no session is created. "claude"
+        # was deleted above, so a rejected add must leave it absent.
         for bad in ["~/nope", "/etc"]:
             client.succeed(
                 f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
-                f"-d 'name=wdbad&agent=claude&cwd={bad}' "
+                f"-d 'agent=claude&cwd={bad}' "
                 "https://box.test/sessions/add | grep -x 400"
             )
         machine.succeed(
-            "jq -e '(.sessions.wdbad // null) == null' "
+            "jq -e '(.sessions.claude // null) == null' "
             "/home/agent/.config/agent-box/sessions.json"
+        )
+
+        # Add a session anchored in ~/work/repo: the name auto-derives to the
+        # bare "claude" (free again), it is stored as an absolute path, and the
+        # supervisor starts the agent in that directory.
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "-d 'agent=claude&cwd=~/work/repo' "
+            "https://box.test/sessions/add | grep -x 303"
+        )
+        machine.succeed(
+            "jq -e '.sessions.claude.workingDirectory == \"/home/agent/work/repo\"' "
+            "/home/agent/.config/agent-box/sessions.json"
+        )
+        machine.wait_until_succeeds(tmux("has-session -t =claude"), timeout=60)
+        machine.wait_until_succeeds(
+            tmux('display -p -t "=claude:" "#{pane_current_path}"')
+            + " | grep -x /home/agent/work/repo",
+            timeout=60,
         )
 
         # Clean up so the migration subtest starts from a known session set.
         client.succeed(
             f"{curl} -u agent:testpassword -o /dev/null "
-            "-d 'name=wd' https://box.test/sessions/delete"
+            "-d 'name=claude' https://box.test/sessions/delete"
         )
         machine.succeed("sleep 6")
-        machine.fail(tmux("has-session -t =wd"))
+        machine.fail(tmux("has-session -t =claude"))
 
     # Rename migration (issue 70): re-running activation moves old-name
     # (claude-box) state to the agent-box paths exactly once, and never
