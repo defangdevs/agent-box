@@ -2431,9 +2431,6 @@ in
               <form method="post" action="{action_base}/sessions/add">
                 <input type="hidden" name="back" value="settings">
                 <div class="row">
-                  <input type="text" name="name" placeholder="name (optional — auto from agent)"
-                         pattern="[A-Za-z0-9_-]+"
-                         title="Optional. Letters, digits, dash and underscore; blank auto-names from the agent">
                   <select name="agent">{agents}</select>
                   <span class="combo">
                     <input type="text" name="cwd" value="~" class="cwd"
@@ -2473,9 +2470,6 @@ in
         <div id="session-editor" class="editor">
           <form method="post" action="{action_base}/sessions/add">
             <div class="row">
-              <input type="text" name="name" placeholder="name (optional — auto from agent)"
-                     pattern="[A-Za-z0-9_-]+"
-                     title="Optional. Letters, digits, dash and underscore; blank auto-names from the agent">
               <select name="agent">{agents}</select>
               <span class="combo">
                 <input type="text" name="cwd" value="~" class="cwd"
@@ -3562,18 +3556,10 @@ in
                     back_page = self._sess_page(form)
                     # Error pages re-render the page the form came from.
                     render = render_home if (HOME and back_page == SESS_PAGE) else render_page
-                    name = (form.get("name", [""])[0]).strip()
                     agent = (form.get("agent", [""])[0]).strip() or DEFAULT_AGENT
                     if agent not in AGENTS:
                         self._send_html(
                             render("Unknown agent. Available: " + ", ".join(AGENTS)),
-                            status=400,
-                        )
-                        return
-                    if name and not SESSION_RE.match(name):
-                        self._send_html(
-                            render("Invalid session name. Use letters, digits, "
-                                   "dash and underscore (max 32 chars)."),
                             status=400,
                         )
                         return
@@ -3587,18 +3573,12 @@ in
                         self._send_html(render(str(exc)), status=400)
                         return
                     sessions = read_sessions()
-                    # Blank name → derive one from the agent (issue: autogen names).
-                    if not name:
-                        name = gen_session_name(agent, sessions)
-                    if name in sessions:
-                        # Silently overwriting would reset the stored config
-                        # (agent, cwd, extraArgs) to defaults — issue 100.
-                        self._send_html(
-                            render("Session '%s' already exists. Delete it "
-                                   "first, or use Restart to bounce it." % name),
-                            status=409,
-                        )
-                        return
+                    # The name is always auto-derived from the agent — there is no
+                    # name field in the form. Users rarely care what a session is
+                    # called (rename at runtime via /rename), so autogen spares them
+                    # inventing one AND guarantees a unique key, so no collision or
+                    # accidental-overwrite (issue 100) is possible here.
+                    name = gen_session_name(agent, sessions)
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,
@@ -3608,8 +3588,8 @@ in
                         "extraArgs": [],
                     }
                     write_sessions(sessions)
-                    # On the workspace, land on the new session's tab (name is
-                    # SESSION_RE-validated, so URL-safe as-is).
+                    # On the workspace, land on the new session's tab (gen_session_name
+                    # returns a SESSION_RE-shaped name, so it is URL-safe as-is).
                     query = "ok=session_added"
                     if HOME and back_page == SESS_PAGE:
                         query += "&tab=" + name
