@@ -36,6 +36,20 @@
           default = image;
         };
 
+      # `nix run .#assemble` — regenerate the committed modules/agent-box.nix
+      # from modules/agent-box.nix.in + modules/src/*. Run from the repo root;
+      # edits the working tree in place.
+      apps.${system}.assemble =
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          type = "app";
+          program = "${pkgs.writeShellScript "agent-box-assemble" ''
+            exec ${pkgs.python3}/bin/python3 "$PWD/bin/assemble-module.py" "$@"
+          ''}";
+        };
+
       # CI validation entrypoints (`nix build .#checks.x86_64-linux.<name>`).
       # NOTE: prefer these over `nix flake check` — the VM nixosConfiguration is
       # intentionally bootloader/filesystem-free (the generator supplies them),
@@ -193,6 +207,29 @@
                 sys.config.system.build.toplevel.drvPath;
             } ''
               printf 'single-file eval OK: %s\n' "$evaluated" > "$out"
+            '';
+
+          # modules/agent-box.nix is GENERATED from modules/agent-box.nix.in +
+          # modules/src/* by bin/assemble-module.py (issue #140). Re-run the
+          # generator in --check mode and fail (printing a diff) if the
+          # committed file is stale — this is what lets us split the source for
+          # tooling while still shipping the one self-contained fetched file.
+          module-generated-up-to-date =
+            pkgs.runCommand "agent-box-module-generated-up-to-date"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                assembler = ./bin/assemble-module.py;
+                template = ./modules/agent-box.nix.in;
+                committed = ./modules/agent-box.nix;
+                srcDir = ./modules/src;
+              } ''
+              install -d repo/bin repo/modules
+              cp "$assembler" repo/bin/assemble-module.py
+              cp "$template" repo/modules/agent-box.nix.in
+              cp "$committed" repo/modules/agent-box.nix
+              cp -r "$srcDir" repo/modules/src
+              python3 repo/bin/assemble-module.py --check --repo repo
+              touch "$out"
             '';
         };
     };
