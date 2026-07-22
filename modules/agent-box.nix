@@ -1826,6 +1826,73 @@ in
         # land in tmux -t targets and URLs).
         SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
+        # The agent user's home. A session's working directory defaults to it
+        # and the working-directory picker (below) browses within it: the
+        # daemon runs AS the user with ProtectHome=false, so it could read the
+        # whole tree, but a session only ever runs somewhere the user owns and
+        # confining the picker to $HOME keeps the web surface from doubling as
+        # a filesystem browser. systemd sets $HOME for User=; fall back to the
+        # passwd entry so a bare dev invocation still resolves it.
+        HOME_DIR = os.path.realpath(
+            os.environ.get("HOME") or os.path.expanduser("~" + USER)
+        )
+
+
+        def resolve_browse_dir(raw):
+            """Map a user-typed directory prefix to an absolute path CONFINED
+            to HOME_DIR, or None if it escapes. "", "~" and "~/" mean HOME;
+            "~/x" and absolute paths are honoured; anything else is relative to
+            HOME. Only the directory portion is resolved — the caller lists its
+            immediate children. realpath collapses .. and symlinks BEFORE the
+            containment check, so neither can climb out of HOME."""
+            raw = (raw or "").strip()
+            if raw in ("", "~", "~/"):
+                return HOME_DIR
+            if raw.startswith("~/"):
+                candidate = os.path.join(HOME_DIR, raw[2:])
+            elif raw.startswith("/"):
+                candidate = raw
+            else:
+                candidate = os.path.join(HOME_DIR, raw)
+            candidate = os.path.realpath(candidate)
+            if candidate == HOME_DIR or candidate.startswith(HOME_DIR + os.sep):
+                return candidate
+            return None
+
+
+        def list_subdirs(abs_dir):
+            """Immediate subdirectory names of abs_dir, sorted case-folded and
+            capped. is_dir() follows symlinks (a symlinked checkout is a valid
+            cwd); an unreadable or non-directory path yields []."""
+            try:
+                entries = list(os.scandir(abs_dir))
+            except OSError:
+                return []
+            names = []
+            for entry in entries:
+                try:
+                    if entry.is_dir():
+                        names.append(entry.name)
+                except OSError:
+                    continue
+            names.sort(key=str.lower)
+            return names[:500]
+
+
+        def resolve_session_cwd(raw):
+            """Turn the add form's working-directory field into the value
+            stored in sessions.json, or raise ValueError with a user-facing
+            message. HOME (the "~" default) is stored as None so the supervisor
+            keeps its default-to-home behaviour and the file stays portable;
+            any other directory is stored as an absolute path. The path must
+            already exist — tmux new-session -c fails on a missing cwd."""
+            abs_dir = resolve_browse_dir(raw)
+            if abs_dir is None:
+                raise ValueError("Working directory must be inside your home directory.")
+            if not os.path.isdir(abs_dir):
+                raise ValueError("Working directory does not exist: %s" % raw.strip())
+            return None if abs_dir == HOME_DIR else abs_dir
+
 
         def valid_password(password):
             """Accept password-manager symbols; form fields cannot contain LF/CR."""
@@ -2238,6 +2305,24 @@ in
           input[type=text] { width: 200px; max-width: 100%; }
           input[type=password] { width: 280px; max-width: 100%; }
           .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+          /* Working-directory combobox (issue #131): the input plus an
+             absolutely-positioned suggestions list the daemon fills one
+             directory level at a time. */
+          .combo { position: relative; display: inline-block; }
+          input.cwd { width: 260px; max-width: 100%;
+                      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+          .ac { position: absolute; z-index: 20; left: 0; top: calc(100% + 4px);
+                margin: 0; padding: 4px; list-style: none; min-width: 100%;
+                max-width: 360px; max-height: 220px; overflow-y: auto;
+                background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+                box-shadow: 0 8px 24px rgba(1,4,9,.6); }
+          .ac[hidden] { display: none; }
+          .ac li { padding: 5px 10px; border-radius: 6px; cursor: pointer;
+                   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                   font-size: 13px; color: #e6edf3; white-space: nowrap; }
+          .ac li:hover, .ac li[aria-selected=true] { background: #30363d; }
+          .ac li.empty { color: #8b949e; cursor: default; }
+          .ac li.empty:hover { background: transparent; }
           .fields { display: grid; grid-template-columns: 1fr; gap: 12px; }
           .field { display: flex; flex-direction: column; align-items: flex-start;
                    gap: 4px; color: #8b949e; font-size: 13px; }
@@ -2301,8 +2386,20 @@ in
                          pattern="[A-Za-z0-9_-]+"
                          title="Optional. Letters, digits, dash and underscore; blank auto-names from the agent">
                   <select name="agent">{agents}</select>
+                  <span class="combo">
+                    <input type="text" name="cwd" value="~" class="cwd"
+                           placeholder="~" autocomplete="off" autocapitalize="off"
+                           autocorrect="off" spellcheck="false"
+                           data-dir-input data-dir-base="{action_base}"
+                           aria-label="Working directory" aria-autocomplete="list"
+                           title="Working directory (starts in your home directory)">
+                    <ul class="ac" hidden></ul>
+                  </span>
                   <button type="submit" class="btn">Add session</button>
                 </div>
+                <p class="note">Working directory &mdash; where the agent
+                starts. Defaults to your home directory (<code>~</code>); type
+                to browse folders one level at a time.</p>
               </form>
             </div>
             <div id="sessions-list">{sessions}</div>
@@ -2331,8 +2428,20 @@ in
                      pattern="[A-Za-z0-9_-]+"
                      title="Optional. Letters, digits, dash and underscore; blank auto-names from the agent">
               <select name="agent">{agents}</select>
+              <span class="combo">
+                <input type="text" name="cwd" value="~" class="cwd"
+                       placeholder="~" autocomplete="off" autocapitalize="off"
+                       autocorrect="off" spellcheck="false"
+                       data-dir-input data-dir-base="{action_base}"
+                       aria-label="Working directory" aria-autocomplete="list"
+                       title="Working directory (starts in your home directory)">
+                <ul class="ac" hidden></ul>
+              </span>
               <button type="submit" class="btn">Add session</button>
             </div>
+            <p class="note">Working directory &mdash; where the agent starts.
+            Defaults to your home directory (<code>~</code>); type to browse
+            folders one level at a time.</p>
           </form>
         </div>
         <div id="msg-slot">{message}</div>
@@ -2858,6 +2967,143 @@ in
             post().then(function (t) { afterPost(t); startPolling(8); });
           });
 
+          // Working-directory autocomplete (issue #131). The add-session cwd
+          // field browses the filesystem one level at a time: the daemon lists
+          // the children of whatever directory the text names so far (up to
+          // the last "/"), and the client filters those by the trailing
+          // fragment. Picking an entry appends "<name>/" and re-fetches, so
+          // the next level appears — like tab-completing a path. Everything is
+          // event-delegated so it survives the DOM swaps applyDoc() does; each
+          // input carries its own tiny state on the element.
+          function acList(input) {
+            var combo = input.closest ? input.closest(".combo") : null;
+            return combo ? combo.querySelector(".ac") : null;
+          }
+          function acSplit(v) {
+            // Directory portion (browsed) and trailing fragment (filter).
+            var slash = v.lastIndexOf("/");
+            if (slash < 0) { return { dir: "~", frag: v === "~" ? "" : v }; }
+            return { dir: v.slice(0, slash) || "/", frag: v.slice(slash + 1) };
+          }
+          function acJoin(dir, name) {
+            return (dir === "/" ? "/" : dir + "/") + name;
+          }
+          function acClose(input) {
+            var ul = acList(input);
+            if (ul) { ul.hidden = true; ul.innerHTML = ""; }
+            var st = input._dir;
+            if (st) { st.active = -1; }
+          }
+          function acRender(input) {
+            var ul = acList(input);
+            var st = input._dir;
+            if (!ul || !st) { return; }
+            var frag = acSplit(input.value).frag.toLowerCase();
+            var matches = st.entries.filter(function (n) {
+              return n.toLowerCase().indexOf(frag) === 0;
+            });
+            ul.innerHTML = "";
+            st.active = -1;
+            if (!st.entries.length) {
+              var e = document.createElement("li");
+              e.className = "empty";
+              e.textContent = "No subfolders here";
+              ul.appendChild(e);
+              ul.hidden = false;
+              return;
+            }
+            if (!matches.length) { ul.hidden = true; return; }
+            matches.slice(0, 200).forEach(function (name) {
+              var li = document.createElement("li");
+              li.setAttribute("role", "option");
+              li.setAttribute("data-name", name);
+              li.textContent = name + "/";
+              ul.appendChild(li);
+            });
+            ul.hidden = false;
+          }
+          function acFetch(input) {
+            var st = input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 });
+            var dir = acSplit(input.value).dir;
+            if (dir === st.dir) { acRender(input); return; }
+            var base = input.getAttribute("data-dir-base") || "";
+            var my = ++st.seq;
+            fetch(base + "/sessions/dirs?path=" + encodeURIComponent(dir), {
+              headers: { "Accept": "application/json" }
+            })
+              .then(function (r) { return r.json(); })
+              .then(function (res) {
+                if (my !== st.seq) { return; } // a newer keystroke won
+                st.dir = dir;
+                st.entries = (res && res.dirs) || [];
+                acRender(input);
+              })
+              .catch(function () { acClose(input); });
+          }
+          function acItems(input) {
+            var ul = acList(input);
+            return ul ? [].slice.call(ul.querySelectorAll("li[data-name]")) : [];
+          }
+          function acHighlight(input, idx) {
+            var items = acItems(input);
+            var st = input._dir;
+            if (!items.length || !st) { return; }
+            if (idx < 0) { idx = items.length - 1; }
+            if (idx >= items.length) { idx = 0; }
+            items.forEach(function (li, i) {
+              if (i === idx) { li.setAttribute("aria-selected", "true"); li.scrollIntoView({ block: "nearest" }); }
+              else { li.removeAttribute("aria-selected"); }
+            });
+            st.active = idx;
+          }
+          function acApply(input, li) {
+            var dir = acSplit(input.value).dir;
+            input.value = acJoin(dir, li.getAttribute("data-name")) + "/";
+            input.focus();
+            acFetch(input); // reveal the next level
+          }
+          var acTimer = null;
+          document.addEventListener("input", function (e) {
+            var input = e.target;
+            if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+            if (acTimer) { window.clearTimeout(acTimer); }
+            acTimer = window.setTimeout(function () { acTimer = null; acFetch(input); }, 120);
+          });
+          document.addEventListener("focusin", function (e) {
+            var input = e.target;
+            if (input && input.hasAttribute && input.hasAttribute("data-dir-input")) { acFetch(input); }
+          });
+          document.addEventListener("focusout", function (e) {
+            var input = e.target;
+            if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+            // Delay so a mousedown-selected item still registers its click.
+            window.setTimeout(function () { acClose(input); }, 150);
+          });
+          document.addEventListener("keydown", function (e) {
+            var input = e.target;
+            if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+            var ul = acList(input);
+            var open = ul && !ul.hidden;
+            var st = input._dir;
+            if (e.key === "ArrowDown") { e.preventDefault(); if (open) { acHighlight(input, (st ? st.active : -1) + 1); } else { acFetch(input); } }
+            else if (e.key === "ArrowUp") { if (open) { e.preventDefault(); acHighlight(input, (st ? st.active : 0) - 1); } }
+            else if (e.key === "Enter") {
+              var items = acItems(input);
+              if (open && st && st.active >= 0 && items[st.active]) {
+                e.preventDefault(); // accept the suggestion, don't submit yet
+                acApply(input, items[st.active]);
+              }
+            } else if (e.key === "Escape") { if (open) { e.preventDefault(); acClose(input); } }
+          });
+          document.addEventListener("mousedown", function (e) {
+            var li = e.target && e.target.closest ? e.target.closest(".ac li[data-name]") : null;
+            if (!li) { return; }
+            e.preventDefault(); // keep focus on the input (no focusout close)
+            var combo = li.closest(".combo");
+            var input = combo ? combo.querySelector("[data-dir-input]") : null;
+            if (input) { acApply(input, li); }
+          });
+
           checkForUpdate();
           // Land in the terminal: focus the server-selected tab's pane.
           if (wsActive()) { wsSelect(wsActive(), true); }
@@ -2888,6 +3134,19 @@ in
             return '<ul class="tbl"><li class="tbl-head">Name</li>' + body + "</ul>"
 
 
+        def display_cwd(value):
+            """Compact working-directory label for a session row: "~" for the
+            default (stored None), and an absolute path is shown home-relative
+            (~/foo) when it sits under HOME."""
+            if not value:
+                return "~"
+            if value == HOME_DIR:
+                return "~"
+            if value.startswith(HOME_DIR + os.sep):
+                return "~/" + value[len(HOME_DIR) + 1:]
+            return value
+
+
         def render_sessions():
             entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
             base = html.escape(SESS_BASE)
@@ -2900,6 +3159,7 @@ in
                 for name in sorted(entries):
                     safe = html.escape(name)
                     agent = html.escape(str(entries[name].get("agent") or "?"))
+                    cwd = html.escape(display_cwd(entries[name].get("workingDirectory")))
                     state = "live" if name in live else "starting"
                     items.append(
                         # The name deep-links into the terminal via ttyd's
@@ -2908,6 +3168,7 @@ in
                         f'<li><span class="nm">'
                         f'<a class="sess" href="/{user}/?arg={safe}"><code>{safe}</code></a>'
                         f'<span class="meta">{agent}</span>'
+                        f'<span class="meta" title="Working directory"><code>{cwd}</code></span>'
                         f'<span class="state" data-state="{state}">{state}</span></span>'
                         f'<span class="acts">'
                         f'<form class="inline" method="post" action="{base}/sessions/restart" '
@@ -3109,6 +3370,20 @@ in
             def do_GET(self):
                 parsed = urllib.parse.urlparse(self.path)
                 params = urllib.parse.parse_qs(parsed.query)
+                # Working-directory autocomplete (issue #131): the add-session
+                # form asks the daemon to list one directory level at a time,
+                # so the browser never sees the filesystem — only the confined
+                # child names for the level being typed. GET-only, read-only,
+                # no state change (so no CSRF concern); auth is Caddy's job for
+                # the whole vhost. Handled before the BASE routing below since
+                # in HOME mode SESS_BASE is "" and this path is not under BASE.
+                if parsed.path.rstrip("/") == SESS_BASE + "/sessions/dirs":
+                    abs_dir = resolve_browse_dir(params.get("path", [""])[0])
+                    if abs_dir is None:
+                        self._send_json({"ok": False, "dirs": []})
+                    else:
+                        self._send_json({"ok": True, "dirs": list_subdirs(abs_dir)})
+                    return
                 message = ""
                 if "ok" in params:
                     message = self.OK_MESSAGES.get(params["ok"][0], "")
@@ -3253,6 +3528,15 @@ in
                             status=400,
                         )
                         return
+                    # Working directory (issue #131): the field defaults to
+                    # "~" (home); resolve_session_cwd stores that as None (the
+                    # supervisor's default) and any other path as an absolute
+                    # directory it has confirmed exists inside HOME.
+                    try:
+                        cwd = resolve_session_cwd(form.get("cwd", [""])[0])
+                    except ValueError as exc:
+                        self._send_html(render(str(exc)), status=400)
+                        return
                     sessions = read_sessions()
                     # Blank name → derive one from the agent (issue: autogen names).
                     if not name:
@@ -3271,7 +3555,7 @@ in
                         "skipPermissions": True,
                         "remoteControl": True,
                         "remoteControlName": None,
-                        "workingDirectory": None,
+                        "workingDirectory": cwd,
                         "extraArgs": [],
                     }
                     write_sessions(sessions)

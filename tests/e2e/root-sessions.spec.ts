@@ -123,6 +123,37 @@ test('add a session from the tab bar, switch tabs, delete it on the settings pag
   await expect(row).toHaveCount(0);
 });
 
+test('the working-directory picker suggests folders one level at a time', async ({ browser }) => {
+  const page = await authedPage(browser);
+  await page.goto('/');
+  await openSessionEditor(page, 'New session');
+
+  // The field defaults to the home directory.
+  const cwd = page.locator('#session-editor input[name="cwd"]');
+  await expect(cwd).toHaveValue('~');
+
+  // Focusing it lists home's folders; every option is a directory (trailing /).
+  await cwd.click();
+  const list = page.locator('#session-editor .ac');
+  await expect(list).toBeVisible();
+  const first = list.locator('li[data-name]').first();
+  await expect(first).toBeVisible();
+  expect((await first.textContent())?.endsWith('/')).toBeTruthy();
+
+  // Picking a folder drills in: the value gains "<name>/" (the trailing slash
+  // is what lets typing continue at the next level) and the list refreshes to
+  // that folder's own children.
+  const picked = (await first.getAttribute('data-name'))!;
+  await first.click();
+  await expect(cwd).toHaveValue(`~/${picked}/`);
+  await expect(list).toBeVisible();
+
+  // Escape closes the dropdown without disturbing the chosen path.
+  await cwd.press('Escape');
+  await expect(list).toBeHidden();
+  await expect(cwd).toHaveValue(`~/${picked}/`);
+});
+
 test('settings link on the root page reaches the settings page, which manages sessions', async ({ browser }) => {
   const page = await authedPage(browser);
   await page.goto('/');
