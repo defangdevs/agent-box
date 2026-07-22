@@ -50,6 +50,12 @@ jobs:
       - name: Check module evaluates as a single file
         run: nix build -L .#checks.x86_64-linux.module-single-file && cat result
 
+      # Issue 140: modules/agent-box.nix is generated from the .in template +
+      # modules/src/*. Fail (with a diff) if a source edit wasn't followed by
+      # `nix run .#assemble`, so the committed single file never drifts.
+      - name: Check generated module is up to date
+        run: nix build -L .#checks.x86_64-linux.module-generated-up-to-date && cat result
+
       # Eval/build check (issue 132): the module's generated Caddyfile carries
       # the authenticated /<user>/downloads/ file-server route.
       - name: Check downloads route in generated Caddyfile

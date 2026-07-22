@@ -1,3 +1,4 @@
 __pycache__/
 tests/e2e/test-results/
 result
+result-*
