@@ -18,58 +18,74 @@ Supported agents:
 
 ## 1-click AWS launch
 
-Provisions one AWS Lightsail instance running NixOS with the module + a
-browser terminal (Caddy -> ttyd) already wired up, priced as **one flat
-monthly bundle** (compute + SSD + static IPv4 + a multi-TB transfer
-allowance). Lightsail has no NixOS blueprint, so the box boots the Ubuntu
-24.04 blueprint and converts itself to NixOS in-place on first boot with
-[nixos-infect](https://github.com/elitak/nixos-infect); expect the first
-launch to take ~10-20 minutes while the conversion and the first
-`nixos-rebuild switch` run and Caddy issues a Let's Encrypt cert against
-`<static-ip>.sslip.io`.
+Provisions one EC2 instance (NixOS 25.11) with the module + a browser terminal
+(Caddy -> ttyd) already wired up. First load takes ~2-3 minutes while the AMI
+provisions, `nixos-rebuild switch` applies the config, and Caddy issues a
+Let's Encrypt cert against `<eip>.sslip.io`.
 
 | Region | Launch |
 | --- | --- |
-| us-east-1 (N. Virginia) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml) |
-| us-west-2 (Oregon) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml) |
-| eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml) |
-| eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml) |
+| us-east-1 (N. Virginia) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
+| us-west-2 (Oregon) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
+| eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
+| eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
 
 Choose `Agent` (`claude` or `codex`), set a `WebPassword` (any 16&ndash;64
-characters, including password-manager symbols), pick a bundle size,
+characters, including password-manager symbols), pick an instance size,
 launch. The stack reports
 CREATE_COMPLETE only after the box phones home from its first successful
-rebuild — a first boot that goes wrong rolls the
+rebuild — a first boot that goes wrong (issue 106 has one way) rolls the
 stack back visibly instead of leaving a green stack with a dead URL. The agent runs as the
-`UserName` linux user (default `agent`). Lightsail manages the networking, so
-nothing on the account has to be pre-configured. The
-stack Outputs show `https://<ip>.sslip.io/<UserName>/` - open it, sign in
+`UserName` linux user (default `agent`). The template creates its own
+IPv6-enabled VPC/subnet so nothing on the account has to be pre-configured. The
+stack Outputs show `https://<v6-or-v4>.sslip.io/<UserName>/` - open it, sign in
 as the `UserName` with your `WebPassword`, complete the selected agent's
 one-time sign-in, done. `<UserName>@<stack name>` is used as the Claude Remote
 Control session name; rename the stack before launch if you want a friendlier
 label in the Claude apps.
 
-**Cost.** The bundle price is the whole bill — no separate EBS, transfer, or
-public-IPv4 line items. The default `small_3_0` (2 vCPU / 2 GiB / 60 GiB SSD)
-is **$12/mo flat**; bundles range from `micro_3_0` (1 GiB, $7/mo) to
-`xlarge_3_0` (16 GiB, $84/mo). 2 GiB is tight while `nixos-rebuild` evaluates
-a self-update — the template adds a 3 GiB swap file to carry it, so updates
-are slow rather than fatal; pick `medium_3_0` (4 GiB, $24/mo) for comfortable
-rebuild headroom. The attached static IPv4 is included, and the URL survives
-a stop/start (a live tmux session doesn't; RAM is lost on any stop). Delete
-the stack to stop billing.
+**Cost note (Feb-2024 AWS IPv4 pricing).** The default is **IPv6-only** to
+avoid the ~$3.60/mo public-IPv4 charge that AWS bills for *every* public IPv4,
+elastic or not. Works if your client has IPv6 connectivity (most consumer ISPs
+in NA/EU do; corporate/coffee-shop nets often don't). If IPv6 isn't reachable
+for you, set `PublicIpv4: true` at launch — allocates an EIP, adds $3.60/mo,
+works everywhere. IPv6-only boxes still reach IPv4-only sites — notably
+`github.com` — through a free public DNS64/NAT64 service
+([nat64.net](https://nat64.net)), on by default. Traffic to IPv4-only hosts
+transits the NAT64 operator's gateways (TLS and SSH stay end-to-end encrypted
+and authenticated); set `Nat64: false` to opt out, at the price of the box
+not reaching IPv4-only hosts.
 
-Out of disk? Lightsail bundles have a fixed SSD — snapshot the instance and
-restore onto a larger bundle to grow. The box also garbage-collects the nix
-store automatically.
+Costs, all-in, running 24/7: the default is a **persistent Spot** instance
+(`UseSpot`) — on a Spot interruption AWS stops and later restarts the *same*
+instance, so the disk, IPv6 address, and TLS cert survive (a live tmux
+session doesn't; RAM is lost on any stop). Spot for the default `t4g.medium`
+(Graviton/aarch64, 2 vCPU / 4 GiB) is currently $0.018–0.024/hr across the
+four launch regions — **~$16–20/mo** including the ~$2.40/mo default 30 GiB
+gp3 root volume (`RootVolumeSize`). `t4g.small` on Spot lands around
+**~$7–10/mo** all-in and works for a single light agent, though its 2 GiB is
+tight during self-update rebuilds. Spot runs ~50–60% below on-demand for
+these types (small Graviton instances don't see the deep 70–90% Spot
+discounts); `UseSpot: false` gets you on-demand `t4g.medium` at ~$0.034/hr
+(~$27/mo all-in). Networking is $0/mo in the default IPv6-only mode; with
+`PublicIpv4: true` the Elastic IP adds ~$3.60/mo. Terminate the stack to
+stop billing.
 
-**Root shell for debugging.** The browser terminal is an unprivileged `agent`
-user. For a root path onto the box (e.g. to inspect a failed first-boot
-conversion — logs land in `/var/log/agent-box-infect.log`), the template
-leaves port 22 open by default (`DebugSsh`) for key-only root SSH with the
-Lightsail default key: download it from the Lightsail console (Account ->
-SSH keys), then `ssh -i <key> root@<static-ip>`. Password auth stays off;
-set `DebugSsh=false` at launch to keep 22 closed.
+Out of disk anyway? Enlarge the volume from the EC2 console (Volumes ->
+Modify) and reboot the instance — NixOS grows the partition and filesystem
+on boot. The box also garbage-collects the nix store automatically.
+
+**Root shell via SSM Session Manager.** The template ships no SSH key; the
+browser terminal is an unprivileged `agent` user. For a root path onto the
+box (e.g. to inspect `amazon-init` on a failed first boot, which is
+journal-only and invisible to `get-console-output`), the default template
+attaches an IAM instance profile with `AmazonSSMManagedInstanceCore`. Open
+a shell via the AWS console (Systems Manager -> Session Manager) or
+`aws ssm start-session --target <InstanceId>`, then `sudo -i`. This adds
+one CAPABILITY_IAM checkbox to the Launch Stack form; opt out with
+`EnableSsm=false` to skip it. See
+[aws/README.md](./aws/README.md#root-access-via-ssm-session-manager) for
+details.
 
 **Changing the web password.** Open the settings page (the gear icon next to
 the terminal), choose **Change password**, and enter the current password plus
@@ -92,36 +108,9 @@ Anything that is not a fast-forward of the running revision is refused.
 Verifying releases against an offline signing key is tracked in
 [issue 46](https://github.com/defangdevs/agent-box/issues/46).
 
-Template source: [`aws/lightsail-template.yaml`](./aws/lightsail-template.yaml).
-See [`aws/README.md`](./aws/README.md) for design notes and the S3-hosting
-setup.
-
-### Alternative: EC2 template (Spot, IPv6-only)
-
-The original EC2 template is still published, for accounts that want EC2's
-flexibility: arbitrary instance types, Spot pricing, IaC-native VPC
-networking, root access via SSM Session Manager, and an EBS root volume that
-can grow in place.
-
-| Region | Launch |
-| --- | --- |
-| us-east-1 (N. Virginia) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
-| us-west-2 (Oregon) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
-| eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
-| eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
-
-It boots a NixOS 25.11 AMI directly (no conversion step; first load ~2-3
-minutes) and defaults to a **persistent Spot** `t4g.medium` on an
-**IPv6-only** network — ~$16-20/mo all-in, dodging AWS's ~$3.60/mo
-public-IPv4 charge. Set `PublicIpv4: true` at launch if your client has no
-IPv6 connectivity (corporate/coffee-shop networks often don't; adds the
-$3.60/mo EIP), and `UseSpot: false` for on-demand (~$27/mo all-in, no
-interruption risk). IPv6-only boxes reach IPv4-only hosts through a free
-public DNS64/NAT64 service ([nat64.net](https://nat64.net)); set
-`Nat64: false` to opt out. The full cost breakdown, the Spot
-stop-not-terminate behavior, SSM root access, and the other design notes
-live in [aws/README.md](./aws/README.md); template source:
-[`aws/template.yaml`](./aws/template.yaml).
+Template source: [`aws/template.yaml`](./aws/template.yaml).
+See [`aws/README.md`](./aws/README.md) for the region -> AMI refresh workflow
+and the S3-hosting setup.
 
 ## Why
 

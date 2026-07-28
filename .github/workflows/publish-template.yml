@@ -5,7 +5,6 @@ on:
     branches: [ master ]
     paths:
       - 'aws/template.yaml'
-      - 'aws/lightsail-template.yaml'
       - '.github/workflows/publish-template.yml'
   workflow_dispatch:
 
@@ -28,10 +27,7 @@ jobs:
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
       BUCKET: ${{ vars.AGENT_BOX_BUCKET }}
-      # Both templates ship from the same bucket: lightsail-template.yaml is
-      # the default the README's Launch buttons point at, template.yaml is the
-      # EC2 alternative.
-      TEMPLATES: lightsail-template.yaml template.yaml
+      OBJECT_KEY: template.yaml
       ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
     steps:
       - name: Sanity-check required variables
@@ -48,21 +44,20 @@ jobs:
 
       - uses: cachix/install-nix-action@v31
 
-      - name: Validate templates locally
+      - name: Validate template locally
         run: |
           pip install --quiet cfn-lint
-          cfn-lint aws/template.yaml aws/lightsail-template.yaml
+          cfn-lint aws/template.yaml
 
-      - name: Inject pinned defaults for the 1-click copies
-        # The source templates deliberately ship without Default: values for
+      - name: Inject pinned defaults for the 1-click copy
+        # The source template deliberately ships without Default: values for
         # AgentBoxRev / AgentBoxSha256 (see the params' Descriptions), and
         # with empty Defaults for AgentNixpkgsUrl / AgentNixpkgsSha256 (so
-        # source-template launches like deploy-test fall back to the base
+        # source-template launches like deploy-test fall back to the AMI
         # channel) — the 1-click Launch buttons need real values pre-filled,
-        # so we inject pinned values into only the S3 template copies: the
+        # so we inject pinned values into only the S3 template copy: the
         # AgentBox pair gets a Default inserted, the AgentNixpkgs pair gets
-        # its empty Default replaced. Both templates declare the four
-        # parameters with identical layout, so one awk serves both.
+        # its empty Default replaced.
         run: |
           rev="${{ github.sha }}"
           sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/agent-box.nix" \
@@ -74,28 +69,26 @@ jobs:
           echo "Sha: $sha"
           echo "AgentUrl: $agentUrl"
           echo "AgentSha: $agentSha"
-          for t in $TEMPLATES; do
-            awk -v rev="$rev" -v sha="$sha" -v agentUrl="$agentUrl" -v agentSha="$agentSha" '
-              /^  AgentBoxRev:$/     { rf=1; print; next }
-              rf && /^    Type:/      { print; print "    Default: " rev; rf=0; next }
-              /^  AgentBoxSha256:$/  { sf=1; print; next }
-              sf && /^    Type:/      { print; print "    Default: " sha; sf=0; next }
-              /^  AgentNixpkgsUrl:$/   { sf2=1; print; next }
-              sf2 && /^    Default:/    { print "    Default: " agentUrl; sf2=0; next }
-              /^  AgentNixpkgsSha256:$/  { sf3=1; print; next }
-              sf3 && /^    Default:/    { print "    Default: " agentSha; sf3=0; next }
-              { print }
-            ' "aws/$t" > "aws/filled-$t"
-            if ! grep -qxF "    Default: $rev" "aws/filled-$t" \
-               || ! grep -qxF "    Default: $sha" "aws/filled-$t" \
-               || ! grep -qxF "    Default: $agentUrl" "aws/filled-$t" \
-               || ! grep -qxF "    Default: $agentSha" "aws/filled-$t"; then
-              echo "::error::Default injection failed for $t — expected lines not present in filled template."
-              diff "aws/$t" "aws/filled-$t" || true
-              exit 1
-            fi
-            cfn-lint "aws/filled-$t"
-          done
+          awk -v rev="$rev" -v sha="$sha" -v agentUrl="$agentUrl" -v agentSha="$agentSha" '
+            /^  AgentBoxRev:$/     { rf=1; print; next }
+            rf && /^    Type:/      { print; print "    Default: " rev; rf=0; next }
+            /^  AgentBoxSha256:$/  { sf=1; print; next }
+            sf && /^    Type:/      { print; print "    Default: " sha; sf=0; next }
+            /^  AgentNixpkgsUrl:$/   { sf2=1; print; next }
+            sf2 && /^    Default:/    { print "    Default: " agentUrl; sf2=0; next }
+            /^  AgentNixpkgsSha256:$/  { sf3=1; print; next }
+            sf3 && /^    Default:/    { print "    Default: " agentSha; sf3=0; next }
+            { print }
+          ' aws/template.yaml > aws/template.filled.yaml
+          if ! grep -qxF "    Default: $rev" aws/template.filled.yaml \
+             || ! grep -qxF "    Default: $sha" aws/template.filled.yaml \
+             || ! grep -qxF "    Default: $agentUrl" aws/template.filled.yaml \
+             || ! grep -qxF "    Default: $agentSha" aws/template.filled.yaml; then
+            echo "::error::Default injection failed — expected lines not present in filled template."
+            diff aws/template.yaml aws/template.filled.yaml || true
+            exit 1
+          fi
+          cfn-lint aws/template.filled.yaml
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -103,13 +96,10 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Validate templates with CloudFormation
-        run: |
-          for t in $TEMPLATES; do
-            aws cloudformation validate-template --template-body "file://aws/filled-$t"
-          done
+      - name: Validate template with CloudFormation
+        run: aws cloudformation validate-template --template-body "file://aws/template.filled.yaml"
 
-      - name: Upsert bucket + public-read policy on the templates
+      - name: Upsert bucket + public-read policy on template.yaml
         run: |
           if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
             echo "Bucket $BUCKET already exists."
@@ -129,12 +119,10 @@ jobs:
             --public-access-block-configuration \
               'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=false,RestrictPublicBuckets=false'
 
-          # Public-read on the two template objects only — CloudFormation's
-          # Launch Stack UI requires an S3 URL for templateURL. The module
-          # itself is fetched by the box direct from raw.githubusercontent.com
-          # (dual-stack), so this bucket carries no other public assets. One
-          # policy covers both objects (a single PutBucketPolicy replaces the
-          # whole document, so the two templates must not fight over it).
+          # Public-read on template.yaml only — CloudFormation's Launch Stack UI
+          # requires an S3 URL for templateURL. The module itself is fetched by
+          # the box direct from raw.githubusercontent.com (dual-stack), so this
+          # bucket carries no other public assets.
           aws s3api put-bucket-policy --bucket "$BUCKET" --policy "$(cat <<POLICY
           {
             "Version": "2012-10-17",
@@ -143,10 +131,7 @@ jobs:
               "Effect": "Allow",
               "Principal": "*",
               "Action": "s3:GetObject",
-              "Resource": [
-                "arn:aws:s3:::${BUCKET}/lightsail-template.yaml",
-                "arn:aws:s3:::${BUCKET}/template.yaml"
-              ]
+              "Resource": "arn:aws:s3:::${BUCKET}/template.yaml"
             }]
           }
           POLICY
@@ -154,9 +139,7 @@ jobs:
 
       - name: Upload to S3
         run: |
-          for t in $TEMPLATES; do
-            aws s3 cp "aws/filled-$t" "s3://${BUCKET}/${t}" \
-              --content-type "application/x-yaml" \
-              --cache-control "no-cache, max-age=0"
-            echo "::notice::Published to https://${BUCKET}.s3.amazonaws.com/${t}"
-          done
+          aws s3 cp aws/template.filled.yaml "s3://${BUCKET}/${OBJECT_KEY}" \
+            --content-type "application/x-yaml" \
+            --cache-control "no-cache, max-age=0"
+          echo "::notice::Published to https://${BUCKET}.s3.amazonaws.com/${OBJECT_KEY}"

@@ -15,7 +15,7 @@ Keep the module self-contained: deployed boxes fetch `modules/agent-box.nix` as 
 - `nix build -L .#checks.x86_64-linux.multi-user` runs the quick module/configuration assertion.
 - `nix build -L .#checks.x86_64-linux.module-single-file` verifies standalone module evaluation.
 - `nix build -L .#checks.x86_64-linux.<name>` runs an individual VM test such as `sessions` or `settings-page`.
-- `cfn-lint aws/template.yaml aws/lightsail-template.yaml` validates the CloudFormation templates.
+- `cfn-lint aws/template.yaml` validates the CloudFormation template.
 
 Prefer targeted checks over `nix flake check`; the intentionally filesystem-free VM configuration makes the latter unsuitable. Live browser tests require `E2E_BASE_URL` and `E2E_PASSWORD`; run `playwright test -c tests/e2e` after provisioning the nixpkgs Playwright browsers described in the config.
 
