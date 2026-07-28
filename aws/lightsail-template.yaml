@@ -179,9 +179,11 @@ Parameters:
       `ssh -i <key> root@<static-ip>`). Lightsail has no SSM Session Manager,
       and after the NixOS conversion the browser-based SSH console (which logs
       in as the Ubuntu "ubuntu" user) no longer works, so this key-only root
-      path is the debug hatch for a broken first boot — nixos-infect logs land
-      in /var/log/agent-box-infect.log. Password auth is disabled either way.
-      false: leave 22 closed.
+      path is the debug hatch for a broken first boot. Debug files:
+      /var/log/agent-box-userdata-started (proof the launch script ran at
+      all), /var/log/agent-box-infect.log (bootstrap + nixos-infect output),
+      /var/log/cloud-init-output.log (cloud-init's own view). Password auth
+      is disabled either way. false: leave 22 closed.
 
   NixChannel:
     Type: String
@@ -283,11 +285,24 @@ Resources:
       UserData:
         Fn::Sub:
           - |
-            #!/usr/bin/env bash
+            #!/bin/sh
             # agent-box Lightsail bootstrap: turn this Ubuntu box into a NixOS
             # agent-box with nixos-infect. Runs once, as root, via Lightsail's
-            # launch-script mechanism. All output is teed to a log so a failed
-            # conversion is debuggable over SSH (DebugSsh=true).
+            # launch-script mechanism.
+            #
+            # Lightsail does not reliably execute the launch script with the
+            # shebang's interpreter (the docs' own examples are bare command
+            # lists run as root by a wrapper), and the real bootstrap needs
+            # bash — under dash its process substitution is a fatal syntax
+            # error before anything is logged. So this prologue is strictly
+            # POSIX sh: leave a breadcrumb proving user-data ran, write the
+            # bash payload to disk unexpanded (quoted heredoc), and run it
+            # with bash explicitly.
+            date > /var/log/agent-box-userdata-started
+            cat > /root/agent-box-bootstrap.sh <<'AGENTBOX_BOOTSTRAP'
+            #!/usr/bin/env bash
+            # All output is teed to a log so a failed conversion is
+            # debuggable over SSH (DebugSsh=true).
             set -euxo pipefail
             exec > >(tee /var/log/agent-box-infect.log) 2>&1
 
@@ -493,6 +508,9 @@ Resources:
             #    root fs to `nixos`, and the script reboots into NixOS at the end.
             curl -fsSL "https://raw.githubusercontent.com/elitak/nixos-infect/${NixosInfectRev}/nixos-infect" -o /root/nixos-infect
             NO_SWAP=1 PROVIDER=lightsail NIX_CHANNEL="${NixChannel}" bash /root/nixos-infect
+            AGENTBOX_BOOTSTRAP
+            chmod 700 /root/agent-box-bootstrap.sh
+            /bin/bash /root/agent-box-bootstrap.sh
           - WebPasswordBase64:
               Fn::Base64: !Ref WebPassword
             StackName: !Ref AWS::StackName

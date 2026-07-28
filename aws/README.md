@@ -343,8 +343,20 @@ in-place on first boot with [`nixos-infect`](https://github.com/elitak/nixos-inf
   `GetAtt StaticIp.IpAddress`.
 - **Debug access is root SSH with the Lightsail default key** (`DebugSsh=true`
   opens 22), not SSM — Lightsail has no Session Manager, and after infection the
-  console's browser-SSH (which logs in as `ubuntu`) stops working. Infect logs
-  land in `/var/log/agent-box-infect.log`.
+  console's browser-SSH (which logs in as `ubuntu`) stops working. Debug
+  trail on the box: `/var/log/agent-box-userdata-started` (the launch script
+  ran at all), `/var/log/agent-box-infect.log` (bootstrap + infect output),
+  `/var/log/cloud-init-output.log` (cloud-init's view).
+- **The `UserData` needs an sh-safe prologue.** Lightsail's launch-script
+  mechanism does not reliably execute the payload with its shebang's
+  interpreter (the Lightsail docs' examples are bare command lists run "as
+  root" by a wrapper). The bootstrap needs bash — under dash its `exec > >(tee
+  …)` is a fatal syntax error *before anything is logged*, which presents as
+  "stack stuck on the first-boot WaitCondition, box still stock Ubuntu, no log
+  files". So the launch script is a strictly POSIX prologue that writes the
+  real bash payload to `/root/agent-box-bootstrap.sh` via a quoted heredoc and
+  runs it with `bash` explicitly — correct regardless of which shell Lightsail
+  uses to run the launch script.
 
 ### Deploying (CLI)
 
