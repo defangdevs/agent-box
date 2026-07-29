@@ -26,6 +26,10 @@ jobs:
   validate:
     name: Validate module & VM
     runs-on: ubuntu-latest
+    # A hung VM test otherwise burns the runner for GitHub's 360-minute
+    # default (a sessions-test hang once ran ~60 min before dying). Green
+    # runs finish in well under 10, so 25 is generous headroom.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
 
@@ -82,35 +86,40 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - name: Run web fail2ban VM test
-        run: nix build -L .#checks.x86_64-linux.web-fail2ban
-
-      # Interactive VM test: an agent user adds a virtual host at runtime by
-      # writing a snippet to ~/sites/ and reloading caddy — no rebuild.
-      - name: Run self-serve domain VM test
-        run: nix build -L .#checks.x86_64-linux.self-serve-domain
-
-      # Interactive VM test (issue 132): the per-user ~/downloads dir is served
-      # at /<user>/downloads/ behind the terminal's auth — perms/symlink, the
-      # auth gate, file serving, and the browsable index.
-      - name: Run download files VM test
-        run: nix build -L .#checks.x86_64-linux.download-files
-
-      # Interactive VM test: the settings page stores a secret through the
-      # browser and the agent unit picks it up (was added in PR 43 but never
-      # wired into CI).
-      - name: Run settings page VM test
-        run: nix build -L .#checks.x86_64-linux.settings-page
-
-      # Interactive VM test (issue 62): protectMemory — zram swap up,
-      # OOMScoreAdjust on the agent unit, earlyoom kills a memory hog
-      # while the box stays responsive.
-      - name: Run memory protection VM test
-        run: nix build -L .#checks.x86_64-linux.memory-protection
-
-      # Interactive VM test (issue 59): runtime session CRUD — seeded main
-      # session, agent-box-session add/rm as the user with no sudo and no
-      # rebuild, cgroup containment of runtime-created sessions, and the
-      # root session manager page (with its /sessions/* routes) behind auth.
-      - name: Run sessions VM test
-        run: nix build -L .#checks.x86_64-linux.sessions
+      # The interactive VM tests, in one nix invocation so independent
+      # derivations build CONCURRENTLY (as separate steps they serialize
+      # twice over: per-step, and via nix's default max-jobs=1). Ran
+      # back-to-back they took ~8 min of the job's ~10; concurrently they
+      # bound the job at roughly the slowest wave (~3-4 min).
+      #   --max-jobs 3: ubuntu-latest has 4 vCPUs / 16 GiB and web-fail2ban
+      #     boots TWO qemu nodes — 6 tests at once would thrash and trade
+      #     the saved minutes back as flaky timeouts.
+      #   --keep-going: one red test doesn't hide the others' results (the
+      #     failing drv is still named in the log).
+      # What each check covers:
+      #   web-fail2ban      brute-forcing the web terminal's basic auth gets
+      #                     the client banned
+      #   self-serve-domain an agent user adds a virtual host at runtime by
+      #                     writing a snippet to ~/sites/ and reloading caddy
+      #                     — no rebuild
+      #   download-files    (issue 132) per-user ~/downloads served at
+      #                     /<user>/downloads/ behind the terminal's auth —
+      #                     perms/symlink, auth gate, serving, browsable index
+      #   settings-page     the settings page stores a secret through the
+      #                     browser and the agent unit picks it up
+      #   memory-protection (issue 62) protectMemory — zram swap up,
+      #                     OOMScoreAdjust on the agent unit, earlyoom kills
+      #                     a memory hog while the box stays responsive
+      #   sessions          (issue 59) runtime session CRUD — seeded main
+      #                     session, agent-box-session add/rm with no sudo and
+      #                     no rebuild, cgroup containment, root session
+      #                     manager page behind auth
+      - name: Run VM tests
+        run: |
+          nix build -L --keep-going --max-jobs 3 \
+            .#checks.x86_64-linux.web-fail2ban \
+            .#checks.x86_64-linux.self-serve-domain \
+            .#checks.x86_64-linux.download-files \
+            .#checks.x86_64-linux.settings-page \
+            .#checks.x86_64-linux.memory-protection \
+            .#checks.x86_64-linux.sessions
