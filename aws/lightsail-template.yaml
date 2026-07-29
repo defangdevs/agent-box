@@ -82,7 +82,7 @@ Parameters:
       Linux user the agent CLI runs as. Doubles as the browser-terminal
       sign-in username (the basic-auth username picks the terminal), the
       /<user>/ path in the WebURL, the home directory (/home/<user>), and
-      the <user>@<stack> Remote Control session name. Lowercase letters,
+      the <user>-<session>@<host> Remote Control session name. Lowercase letters,
       digits, "_" and "-", starting with a letter or "_", max 31 chars.
 
   # The picker annotates each value with vCPU/RAM/price because the
@@ -385,9 +385,16 @@ Resources:
               services.agent-box = {
                 enable = true;
                 agent = "${Agent}";
+                # Host suffix for auto-derived Remote Control names. Use the
+                # box's PUBLIC address (the sslip.io hostname the box is
+                # actually reached at) rather than the stack name, which says
+                # nothing about how to reach the box. Every session — the
+                # seeded "main" and any added at runtime — is then identifiable
+                # in the Claude apps as "<user>-<session>@<host>". Mirrors the
+                # EC2 template.
+                remoteControlHost = hostname;
                 users."${UserName}" = {
                   environment = { TERM = "xterm-256color"; };
-                  remoteControlName = "${UserName}@${StackName}";
                   web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
                   # AGENTS.md addendum from the CFN AgentsMd parameter, spliced
                   # into a Nix indented string; the module appends it below its
@@ -495,7 +502,6 @@ Resources:
             NO_SWAP=1 PROVIDER=lightsail NIX_CHANNEL="${NixChannel}" bash /root/nixos-infect
           - WebPasswordBase64:
               Fn::Base64: !Ref WebPassword
-            StackName: !Ref AWS::StackName
             # stateVersion wants "25.05", not "nixos-25.05" — strip the prefix.
             NixChannelVersion: !Select [1, !Split ['-', !Ref NixChannel]]
             FirstBootHandle: !Ref FirstBootHandle
@@ -545,12 +551,14 @@ Outputs:
 
   RemoteControlSession:
     Description: >-
-      Claude Remote Control session name (<UserName>@<stack name>). After
-      finishing `claude login` once in the browser terminal, the Claude
-      desktop / mobile apps can drive this session directly (sign in with the
-      same Claude account). Only meaningful when Agent=claude; Codex has no
-      Remote Control channel.
-    Value: !Sub '${UserName}@${AWS::StackName}'
+      Claude Remote Control session name (<UserName>-main@<host>.sslip.io, the
+      box's public address). After finishing `claude login` once in the browser
+      terminal, the Claude desktop / mobile apps can drive this session directly
+      (sign in with the same Claude account). Only meaningful when Agent=claude;
+      Codex has no Remote Control channel.
+    Value: !Sub
+      - '${UserName}-main@${Host}.sslip.io'
+      - Host: !Join ['-', !Split ['.', !GetAtt StaticIp.IpAddress]]
 
   PublicAddress:
     Description: Attached static IPv4 address.

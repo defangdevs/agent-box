@@ -40,9 +40,9 @@ stack back visibly instead of leaving a green stack with a dead URL. The agent r
 IPv6-enabled VPC/subnet so nothing on the account has to be pre-configured. The
 stack Outputs show `https://<v6-or-v4>.sslip.io/<UserName>/` - open it, sign in
 as the `UserName` with your `WebPassword`, complete the selected agent's
-one-time sign-in, done. `<UserName>@<stack name>` is used as the Claude Remote
-Control session name; rename the stack before launch if you want a friendlier
-label in the Claude apps.
+one-time sign-in, done. `<UserName>-main@<host>.sslip.io` is used as the Claude
+Remote Control session name - the box's public address, so the entry in the
+Claude apps doubles as the address you reach it at.
 
 **Cost note (Feb-2024 AWS IPv4 pricing).** The default is **IPv6-only** to
 avoid the ~$3.60/mo public-IPv4 charge that AWS bills for *every* public IPv4,
