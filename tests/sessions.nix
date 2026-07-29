@@ -136,9 +136,11 @@
         "systemctl show agent-box-agent --property=ExecStart --value "
         "| grep -o '/nix/store/[^ ;]*-agent-box-agent-start'"
     ).strip()
-    script_body = machine.succeed(f"cat {start_script}")
-    assert "host=box.test" in script_body, script_body
-    assert "rcname=agent-$sname" in script_body, script_body
+    # grep -F IN the guest rather than cat-ing the script body back to the
+    # driver: streaming the multi-KB supervisor through the backdoor console
+    # wedged the test driver (test hung until its 3600s global timeout, twice)
+    machine.succeed(f"grep -qF 'host=box.test' {start_script}")
+    machine.succeed(f"grep -qF 'rcname=agent-$sname' {start_script}")
 
     # Both agent CLIs are installed even though no session uses codex yet
     # (installAgents defaults to all supported agents).
