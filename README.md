@@ -293,18 +293,16 @@ autologin (change the initial password on first boot).
 
 ## Adding custom tokens (no rebuild)
 
-Each agent auto-loads `/etc/agent-box/<user>.env` if it exists. Drop a token in
-and restart the unit:
+Tokens live in the user-owned `~/.config/agent-box/env` (0600), managed
+through the settings page's Secrets card or from a shell:
 
 ```bash
-sudo install -m600 /dev/stdin /etc/agent-box/alice.env <<'EOF'
-GH_TOKEN=ghp_xxx
-EOF
-sudo systemctl restart agent-box-alice
+sudo -u alice agent-box-session env set GH_TOKEN ghp_xxx
 ```
 
-The file is read by systemd as root and exported into the agent's environment,
-so secrets stay out of the Nix store. For Nix-managed secret paths (agenix,
+The supervisor's spawn wrapper re-reads the file at every session (re)start,
+so a new token applies on the next respawn — no unit restart, no rebuild, and
+secrets stay out of the Nix store. For Nix-managed secret paths (agenix,
 sops-nix, etc.) use `environmentFiles` instead.
 
 ## Options
@@ -331,8 +329,6 @@ All under `services.agent-box`:
 | `sudoAllowlist` | `[]` | Passwordless sudo commands granted to every agent. |
 | `extraPackages` | `[]` | Packages placed on each agent's PATH. |
 | `environmentFiles` | `[]` | Extra `EnvironmentFile` paths applied to every agent. |
-| `tokenDir` | `/etc/agent-box` | Where per-agent `<user>.env` token files live. |
-| `manageTokenDir` | `true` | Create `tokenDir` (root-owned) via tmpfiles. |
 | `protectMemory` | `true` | zram swap (zstd, sized to RAM), earlyoom, and `OOMScoreAdjust=500` on agent units, so runaway agent memory gets its process killed (and auto-restarted) instead of livelocking the whole box. All knobs are `mkDefault` - tune or disable pieces from the host config. |
 
 ## Security model
@@ -369,11 +365,11 @@ arbitrary command execution as the agent user.
   credentials). Discovery isn't assumed to be hard — the ACME cert for
   `<ip>.sslip.io` lands in public CT logs minutes after launch — auth is
   simply required everywhere.
-- **Root-scoped secrets dir:** `/etc/agent-box` is `0700 root:root`.
-  Systemd reads the per-agent `<user>.env` files as root before dropping
-  into the agent's UID, so the agent process itself never traverses the
-  directory. `Z … 0600 root root` tmpfiles rule enforces the mode of any
-  file inside on every rebuild.
+- **User-scoped secrets file:** each user's tokens live in their own
+  `~/.config/agent-box/env` (0600, inside the 0700 `~/.config/agent-box`),
+  written only by that user's settings daemon / `agent-box-session env` —
+  other agent users on the box can't read it, and values are exported into
+  sessions at spawn time rather than stored anywhere world-readable.
 
 **Deliberate defaults that stay ON:**
 

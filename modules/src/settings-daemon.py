@@ -402,8 +402,8 @@ def restart_all():
     supervisor (the unit's main process, our own uid). systemd then
     tears the session tree down and Restart=always brings the unit
     back with freshly read EnvironmentFiles — unit env is a
-    start-time snapshot, so this is the only lever that applies
-    root-dropped tokenDir changes (issue 89). Per-session restarts
+    start-time snapshot, so this is the lever that applies changes to
+    host-configured environmentFiles (issue 89). Per-session restarts
     stay cheap: the spawn wrapper re-reads the user env file anyway.
     Dev rigs without the unit fall back to bouncing the sessions."""
     pids = find_supervisor_pids()
