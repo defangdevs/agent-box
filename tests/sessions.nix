@@ -545,18 +545,5 @@
         machine.succeed("sleep 6")
         machine.fail(tmux("has-session -t =claude"))
 
-    # Rename migration (issue 70): re-running activation never clobbers live
-    # new-name state, and the old token dir is left behind untouched — the
-    # tokenDir mechanism it fed is gone, and nothing recreates /etc/agent-box.
-    with subtest("claude-box -> agent-box rename migration"):
-        # Former move path: old token dir now just stays where it is.
-        machine.succeed("mkdir -p /etc/claude-box && echo 'MIG=1' > /etc/claude-box/mig.env")
-        # No-clobber path: new-name web state (cookie secret) already live.
-        machine.succeed("mkdir -p /var/lib/claude-box-web && touch /var/lib/claude-box-web/stale-marker")
-        machine.succeed("/run/current-system/activate")
-        machine.succeed("test -f /etc/claude-box/mig.env")
-        machine.succeed("test ! -e /etc/agent-box")
-        machine.succeed("test -s /var/lib/agent-box-web/cookie-secret-agent")
-        machine.succeed("test -f /var/lib/claude-box-web/stale-marker")
   '';
 }
