@@ -3469,6 +3469,12 @@ in
                 parsed = urllib.parse.urlparse(self.path)
                 path = parsed.path.rstrip("/")
                 if not self._same_origin():
+                    # Drain the request body BEFORE answering: replying 403 and
+                    # closing with unread body bytes in flight races the reverse
+                    # proxy's write — caddy sees EPIPE on the socket and turns
+                    # the 403 into a 502 (intermittent; caught by the settings-page
+                    # VM test under concurrent-CI load, PR #152).
+                    self._read_form()
                     self._send_html(
                         "<h1>403</h1><p>Cross-site request blocked.</p>",
                         status=403,
