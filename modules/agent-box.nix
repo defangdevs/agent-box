@@ -137,7 +137,11 @@ let
   # Stable read-only path the seeded ~/AGENTS.md @imports. Refreshed on every
   # `nixos-rebuild switch` (i.e. every box update); readable but not writable
   # under ProtectSystem=strict.
-  canonicalAgentsPath = name: "/etc/agent-box/AGENTS.${name}.md";
+  # NOT under tokenDir (/etc/agent-box): that dir is tmpfiles'd 0700 root:root
+  # (the agent user could not traverse to its own guide), and pre-populating
+  # it would break the rename migration's rmdir-if-empty guard — a claude-box
+  # box crossing the rename would silently keep its tokens at the old path.
+  canonicalAgentsPath = name: "/etc/agent-box-guides/AGENTS.${name}.md";
   tmuxSocketName = "agent-box";
   runtimeDirectory = name: "agent-box-${name}";
   # ttyd port base; ports are assigned in sorted user-name order (see
@@ -1502,13 +1506,14 @@ in
 
     environment.systemPackages = agentRuntimePackages;
 
-    # Canonical, read-only agent guide per user at /etc/agent-box/AGENTS.<user>.md.
+    # Canonical, read-only agent guide per user at /etc/agent-box-guides/
+    # AGENTS.<user>.md (see canonicalAgentsPath for why not tokenDir).
     # environment.etc symlinks are relinked by `nixos-rebuild switch` (which the
     # self-update service runs), so this always tracks the current module while
     # the seeded ~/AGENTS.md — which @imports this path — stays editable. Skipped
     # for users that opted out of seeding (agentsMd = null).
     environment.etc = lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (name: u:
-      lib.optional (u.agentsMd != null) (lib.nameValuePair "agent-box/AGENTS.${name}.md" {
+      lib.optional (u.agentsMd != null) (lib.nameValuePair "agent-box-guides/AGENTS.${name}.md" {
         source = canonicalAgentsMd name u;
         mode = "0444";
       })
