@@ -137,7 +137,7 @@ let
   # Stable read-only path the seeded ~/AGENTS.md @imports. Refreshed on every
   # `nixos-rebuild switch` (i.e. every box update); readable but not writable
   # under ProtectSystem=strict.
-  # NOT under tokenDir (/etc/agent-box): that dir is tmpfiles'd 0700 root:root
+  # NOT under /etc/agent-box (the former tokenDir): that dir was 0700 root:root
   # (the agent user could not traverse to its own guide), and pre-populating
   # it would break the rename migration's rmdir-if-empty guard — a claude-box
   # box crossing the rename would silently keep its tokens at the old path.
@@ -1184,23 +1184,6 @@ in
       description = "Extra systemd EnvironmentFile paths applied to every agent (see per-user environmentFiles).";
     };
 
-    tokenDir = lib.mkOption {
-      type = lib.types.str;
-      default = "/etc/agent-box";
-      description = ''
-        Directory holding optional per-agent token files. Each agent
-        auto-loads <tokenDir>/<user>.env if it exists — so adding a token like
-        GH_TOKEN is just: drop a KEY=value line into that file (mode 600), no
-        rebuild required.
-      '';
-    };
-
-    manageTokenDir = lib.mkOption {
-      type = lib.types.bool;
-      default = true;
-      description = "Create tokenDir (root-owned) via tmpfiles so token files can be dropped in.";
-    };
-
     protectMemory = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -1507,7 +1490,7 @@ in
     environment.systemPackages = agentRuntimePackages;
 
     # Canonical, read-only agent guide per user at /etc/agent-box-guides/
-    # AGENTS.<user>.md (see canonicalAgentsPath for why not tokenDir).
+    # AGENTS.<user>.md (see canonicalAgentsPath for why not /etc/agent-box).
     # environment.etc symlinks are relinked by `nixos-rebuild switch` (which the
     # self-update service runs), so this always tracks the current module while
     # the seeded ~/AGENTS.md — which @imports this path — stays editable. Skipped
@@ -1582,22 +1565,17 @@ in
           RuntimeDirectory = runtimeDirectory name;
           RuntimeDirectoryMode = "0700";
           RuntimeDirectoryPreserve = true;
-          # Custom tokens (GH_TOKEN, etc.) land here. The '-' makes the per-user
-          # file optional so the agent starts even before any token is dropped in.
           # NOTE: the settings page's user-owned ~/.config/agent-box/env is
           # deliberately NOT listed here. Unit env is a snapshot from unit
           # start, and sessions are respawned by the long-lived supervisor —
           # so browser-added secrets never reached restarted sessions, and
           # deleted keys never left (issue 89). The supervisor's env-exec
-          # wrapper reads that file at every session spawn instead. The
-          # tokenDir file stays unit-level: it's root-owned 0600, which the
-          # agent user can't read at spawn time — the settings page's
-          # "Restart all" bounces this whole unit (the daemon SIGTERMs the
-          # supervisor, its own uid; Restart=always below), so token drops
-          # apply there without sudo.
-          EnvironmentFile = cfg.environmentFiles
-            ++ [ "-${cfg.tokenDir}/${name}.env" ]
-            ++ u.environmentFiles;
+          # wrapper reads that file at every session spawn instead; tokens
+          # (GH_TOKEN, etc.) go there too, via the settings page or
+          # `agent-box-session env set`, applying at next session spawn with
+          # no unit bounce. (The former root-dropped tokenDir/<user>.env
+          # unit-level file is gone — one env mechanism instead of two.)
+          EnvironmentFile = cfg.environmentFiles ++ u.environmentFiles;
 
           # Systemd hardening. The OS boundary has to stay meaningful even
           # though the agent runs with its in-tool approval prompts disabled.
@@ -1629,25 +1607,16 @@ in
       }
     ) cfg.users;
 
-    systemd.tmpfiles.rules = lib.mkIf cfg.manageTokenDir [
-      # The dir itself is only ever traversed by root (systemd reads
-      # EnvironmentFile= as root, before the service process starts as the
-      # agent user), so 0700 is enough. Was 0755, which leaked filenames
-      # (= usernames) to anyone on the box.
-      "d ${cfg.tokenDir} 0700 root root - -"
-      # Also enforce 0600 on any existing *.env files so a hand-created file
-      # with lax perms gets corrected on next tmpfiles run.
-      "Z ${cfg.tokenDir}/*.env 0600 root root - -"
-    ];
-
     # One-shot migration for boxes crossing the claude-box -> agent-box
     # rename (issue 70): live state — the web password hash + cookie
     # secrets, per-user caddy snippet dirs, the settings page's env +
-    # sessions.json, dropped-in token files, and the self-update AGENT
-    # pin — moves from the old-name paths exactly once. No-op on fresh
-    # boxes and after migration. Runs before switch-to-configuration
-    # applies tmpfiles/units, but tolerate a pre-created empty target dir
+    # sessions.json, and the self-update AGENT pin — moves from the
+    # old-name paths exactly once. No-op on fresh boxes and after
+    # migration. Runs before switch-to-configuration applies
+    # tmpfiles/units, but tolerate a pre-created empty target dir
     # anyway (rmdir only succeeds when empty, so real state never loses).
+    # (/etc/claude-box token files are NOT migrated anymore: the root-
+    # dropped tokenDir mechanism they fed is gone — see EnvironmentFile.)
     system.activationScripts.agent-box-rename-migration = lib.stringAfter [ "users" "groups" ] (''
       _abox_migrate() {
         [ -e "$1" ] || return 0
@@ -1656,7 +1625,6 @@ in
       }
       _abox_migrate /var/lib/claude-box-web   /var/lib/agent-box-web
       _abox_migrate /var/lib/claude-box-sites /var/lib/agent-box-sites
-      _abox_migrate /etc/claude-box           ${lib.escapeShellArg cfg.tokenDir}
     ''
     + lib.optionalString cfg.selfUpdate.enable ''
       # The MODULE pin is deliberately NOT migrated: an old pin file holds a
@@ -2461,8 +2429,8 @@ in
             supervisor (the unit's main process, our own uid). systemd then
             tears the session tree down and Restart=always brings the unit
             back with freshly read EnvironmentFiles — unit env is a
-            start-time snapshot, so this is the only lever that applies
-            root-dropped tokenDir changes (issue 89). Per-session restarts
+            start-time snapshot, so this is the lever that applies changes to
+            host-configured environmentFiles (issue 89). Per-session restarts
             stay cheap: the spawn wrapper re-reads the user env file anyway.
             Dev rigs without the unit fall back to bouncing the sessions."""
             pids = find_supervisor_pids()

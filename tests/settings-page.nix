@@ -285,8 +285,9 @@
         machine.succeed(agent_env + " | grep -qx 'UI_KEEP=stays'")
 
     # ...and "Restart all" bounces the WHOLE unit (the daemon SIGTERMs the
-    # supervisor — no sudo), so unit-level EnvironmentFiles like tokenDir
-    # are re-read, and a DELETED key is gone from the next spawn. UI_KEEP
+    # supervisor — no sudo), so unit-level EnvironmentFiles (the host's
+    # environmentFiles) are re-read, and a DELETED key is gone from the next
+    # spawn. UI_KEEP
     # doubles as the exec sentinel: the same read that proves it arrived
     # must show UI_SECRET absent.
     with subtest("restart-all bounces the unit; deleted env leaves"):

@@ -49,12 +49,10 @@
     extraPackages = with pkgs; [ git ripgrep jq ];
   };
 
-  # Custom tokens in the agent's env (like GH_TOKEN in this sandbox) — no rebuild:
-  #   sudo install -m600 /dev/stdin /etc/agent-box/alice.env <<'EOF'
-  #   GH_TOKEN=ghp_xxx
-  #   ANTHROPIC_LOG=info
-  #   EOF
-  #   sudo systemctl restart agent-box-alice
+  # Custom tokens in the agent's env (like GH_TOKEN in this sandbox) — no
+  # rebuild, applied at the next session spawn:
+  #   sudo -u alice agent-box-session env set GH_TOKEN ghp_xxx
+  # (or through the settings page's Secrets card in the browser terminal).
   # For Nix-managed secret paths instead, set (per user or globally):
   #   services.agent-box.users.alice.environmentFiles = [ "/run/secrets/alice.env" ];
 }
