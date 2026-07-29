@@ -132,13 +132,15 @@
     # NOT the internal kernel hostname — and every session (including "main")
     # gets the "-<session>" suffix (no "main" special case). The supervisor
     # bakes both into its start script, so assert those literals.
+    # head -n1: `systemctl show --value` prints BOTH path= and argv[]=, so the
+    # grep -o matches the store path twice. Without it, interpolating the
+    # two-line value below makes the second line its own shell command — the
+    # backdoor shell EXECUTES the supervisor script as root and never returns
+    # (the CI hang on this PR's first three runs).
     start_script = machine.succeed(
         "systemctl show agent-box-agent --property=ExecStart --value "
-        "| grep -o '/nix/store/[^ ;]*-agent-box-agent-start'"
+        "| grep -o '/nix/store/[^ ;]*-agent-box-agent-start' | head -n1"
     ).strip()
-    # grep -F IN the guest rather than cat-ing the script body back to the
-    # driver: streaming the multi-KB supervisor through the backdoor console
-    # wedged the test driver (test hung until its 3600s global timeout, twice)
     machine.succeed(f"grep -qF 'host=box.test' {start_script}")
     machine.succeed(f"grep -qF 'rcname=agent-$sname' {start_script}")
 
