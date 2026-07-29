@@ -84,8 +84,14 @@
         timeout=60,
     )
 
-    # Banned: connection no longer completes
-    client.fail(f"{curl} -m 5 -o /dev/null -u agent:testpassword https://box.test/")
+    # Banned: connection no longer completes. Retry-until-refused rather than
+    # a single fail(): the status listing above appears BEFORE fail2ban's ban
+    # action has inserted the firewall rule, so one immediate curl can still
+    # slip through that gap (seen under CI load in PR #152).
+    client.wait_until_fails(
+        f"{curl} -m 5 -o /dev/null -u agent:testpassword https://box.test/",
+        timeout=60,
+    )
 
     # The credential-less 401 a browser gets before prompting is NOT counted
     print(machine.succeed("fail2ban-client status agent-web-auth"))
