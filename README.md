@@ -45,9 +45,9 @@ stack back visibly instead of leaving a green stack with a dead URL. The agent r
 nothing on the account has to be pre-configured. The
 stack Outputs show `https://<ip>.sslip.io/<UserName>/` - open it, sign in
 as the `UserName` with your `WebPassword`, complete the selected agent's
-one-time sign-in, done. `<UserName>@<stack name>` is used as the Claude Remote
-Control session name; rename the stack before launch if you want a friendlier
-label in the Claude apps.
+one-time sign-in, done. `<UserName>-main@<host>.sslip.io` is used as the Claude
+Remote Control session name - the box's public address, so the entry in the
+Claude apps doubles as the address you reach it at.
 
 **Cost.** The bundle price is the whole bill — no separate EBS, transfer, or
 public-IPv4 line items. The default `small_3_0` (2 vCPU / 2 GiB / 60 GiB SSD)
