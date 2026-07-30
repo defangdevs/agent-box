@@ -157,8 +157,10 @@
     unit_path = machine.succeed(
         "systemctl show agent-box-agent -p Environment --value"
     ).split("PATH=")[1].split()[0]
-    for tool in ["curl", "awk", "tar", "gzip", "xz", "diff", "patch",
-                 "less", "ps", "rg", "jq"]:
+    for tool in ["curl", "wget", "awk", "tar", "gzip", "bzip2", "xz", "zip",
+                 "unzip", "diff", "patch", "less", "file", "ps", "killall",
+                 "lsblk", "ssh", "rsync", "ping", "ip", "dig", "nc",
+                 "openssl", "gpg", "python3", "nano", "rg", "jq"]:
         machine.succeed(
             f"su -s /bin/sh agent -c 'PATH={unit_path} command -v {tool}'"
         )

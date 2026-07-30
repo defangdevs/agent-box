@@ -244,18 +244,38 @@ let
   #
   # This is ergonomics, not containment: every binary on the box is already
   # reachable from a session by absolute path, so PATH was never a boundary.
-  # It is still a curated list rather than the whole system path, which
-  # keeps `ssh`/`nc`-shaped tools off the default PATH as a deliberate
-  # choice rather than an accident.
+  # Withholding a tool does not stop an agent using it — it just provokes a
+  # `nix profile add` round trip first. So the target is a PATH that looks
+  # like a stock Ubuntu/RHEL server, which is what agents are trained to
+  # expect, rather than a minimal set defended tool by tool.
   agentBaseTools = [
-    pkgs.curl                 # fetch URLs, probe local services, read EC2 IMDS
+    # text / data
     pkgs.gawk                 # the most common shell idiom after grep/sed
-    pkgs.gnutar pkgs.gzip pkgs.xz   # `curl -L ... | tar xz`, rotated logs
     pkgs.diffutils pkgs.gnupatch    # compare generated vs committed, apply patches
     pkgs.less                 # git's default pager; without it `git log` fails in a TTY
-    pkgs.procps               # ps/pgrep/kill/free: self-diagnosis, no shell user behind us
-    pkgs.ripgrep              # already in the store via both agent CLIs
+    pkgs.file                 # identify a blob before cat'ing a binary into context
     pkgs.jq                   # every JSON workflow; all three example hosts add it by hand
+    pkgs.ripgrep              # already in the store via both agent CLIs
+    # archives
+    pkgs.gnutar pkgs.gzip pkgs.bzip2 pkgs.xz pkgs.zip pkgs.unzip
+    # network
+    pkgs.curl pkgs.wget       # fetch URLs, probe local services, read EC2 IMDS
+    pkgs.openssh              # git's ssh remotes invoke `ssh` by bare name
+    pkgs.rsync
+    pkgs.iputils pkgs.iproute2      # ping, ip, ss
+    pkgs.dnsutils             # dig, nslookup
+    pkgs.netcat-gnu           # nc
+    pkgs.openssl pkgs.gnupg
+    # process / system
+    pkgs.procps               # ps/pgrep/kill/free: self-diagnosis, no shell user behind us
+    pkgs.psmisc               # killall, pstree, fuser
+    pkgs.util-linux           # lsblk, dmesg, column, hexdump, script
+    # runtime + editor: both are present on a stock Ubuntu/RHEL box, and an
+    # agent that finds them missing installs them anyway. python3 is the one
+    # genuinely large entry here (~120 MB marginal) — drop it from this list
+    # if closure size matters more than matching a distro.
+    pkgs.python3
+    pkgs.nano
   ];
 
   agentRuntimePackages = lib.unique (
