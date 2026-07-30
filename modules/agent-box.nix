@@ -204,7 +204,7 @@ let
   # (0660 <user>:caddy — same model as the settings socket, issue #49) and fans
   # HMAC-verified deliveries out to that user's sessions over IPC. Caddy
   # reverse-proxies the public path /<user>/webhook here WITHOUT auth: GitHub
-  # can't authenticate, so webhook.mjs's per-source HMAC check is the only trust
+  # can't authenticate, so webhook.py's per-source HMAC check is the only trust
   # boundary. State (sources.json + secrets, per-session filters) lives under
   # the user's home, shared between the daemon and that user's session peers.
   # The endpoint rides the per-user Caddy vhost and the daemon serves a
@@ -220,7 +220,7 @@ let
   # Public path Caddy routes to that user's ingress. Also what the user
   # registers in the provider (GitHub: Settings -> Webhooks -> Payload URL).
   webhookPathOf = name: "/${name}/webhook";
-  # webhook.mjs pinned by rev+hash and fetched as ONE FILE from
+  # webhook.py pinned by rev+hash and fetched as ONE FILE from
   # raw.githubusercontent — the same host and mechanism agent-box.nix itself is
   # deployed with (issue #51), so an IPv6-only box reaches it through NAT64 and
   # no unpack step is needed on a journal-only first boot. The plugin is a
@@ -229,17 +229,19 @@ let
   # extraKnownMarketplaces below). Lazy: only forced when webhookEnabled
   # references it.
   localWebhookScript = builtins.fetchurl {
-    url = "https://raw.githubusercontent.com/${cfg.webhook.repo}/${cfg.webhook.rev}/local-webhook/webhook.mjs";
+    url = "https://raw.githubusercontent.com/${cfg.webhook.repo}/${cfg.webhook.rev}/local-webhook/webhook.py";
     sha256 = cfg.webhook.sha256;
   };
-  webhookNode = "${pkgs.nodejs-slim}/bin/node";
+  # 0.8.0 ported the plugin from node to the python3 already in
+  # agentBaseTools, dropping the box's only nodejs dependency (issue #101).
+  webhookPython = "${pkgs.python3}/bin/python3";
   # Per-session webhook identity, passed to `tmux new-session -e` so it lands in
   # the SESSION environment — inherited by the agent AND by anything the agent
   # runs in that pane, which is what makes `agent-box-webhook` work with no
   # arguments. The daemon fans every verified delivery out to all of this user's
   # sessions; each keeps its own subscription filter keyed on
   # LOCAL_WEBHOOK_SESSION, so subscriptions never leak between sessions.
-  # LOCAL_WEBHOOK_PORT=0 makes any webhook.mjs started here a pure IPC peer: the
+  # LOCAL_WEBHOOK_PORT=0 makes any webhook.py started here a pure IPC peer: the
   # daemon owns the ingress and a session must never steal it. Session names are
   # validated [A-Za-z0-9_-] by the reconcile loop before start_session sees them.
   webhookSessionEnvArgs = name:
@@ -644,13 +646,13 @@ let
   # a codex session, a shell session, or a script had no way to subscribe. This
   # wrapper adds the two things the plugin cannot know — the box's public
   # endpoint URL and how to mint a source secret — and delegates topic routing
-  # straight to webhook.mjs's own CLI, so there is one implementation of the
+  # straight to webhook.py's own CLI, so there is one implementation of the
   # TTL/renew semantics. Runs as the calling agent user against its own state
   # dir; no sudo, no rebuild.
   webhookCli = pkgs.writeShellScriptBin "agent-box-webhook" ''
     set -eu
     JQ=${pkgs.jq}/bin/jq
-    NODE=${webhookNode}
+    PY=${webhookPython}
     SCRIPT=${localWebhookScript}
     # The supervisor puts these in every session's tmux environment; the
     # fallbacks keep the CLI usable from a stray login shell or a cron job.
@@ -716,11 +718,11 @@ let
     cmd="''${1:-}"; shift || true
     case "$cmd" in
       subscribe|unsubscribe|ls|subscriptions|status)
-        # webhook.mjs owns topic parsing, TTL/renew semantics and the filter
+        # webhook.py owns topic parsing, TTL/renew semantics and the filter
         # file — including the per-session LOCAL_WEBHOOK_SESSION scope, which
         # the supervisor already put in this session's environment.
         ensure_state
-        exec "$NODE" "$SCRIPT" "$cmd" "$@"
+        exec "$PY" "$SCRIPT" "$cmd" "$@"
         ;;
       url)
         url="$(endpoint)"
@@ -1688,9 +1690,9 @@ in
       };
       rev = lib.mkOption {
         type = lib.types.str;
-        default = "dd8a57982f8a9d2318658a63d425442ca7134e80";
+        default = "5d6c9323b8695b3d4189a8b74ef7adc520cd91bc";
         description = ''
-          Pinned local-channels commit whose local-webhook/webhook.mjs the
+          Pinned local-channels commit whose local-webhook/webhook.py the
           receiver daemon and the agent-box-webhook CLI run. Claude sessions
           load the plugin from the same repo as a channel, but claude clones
           the marketplace itself and tracks its default branch — this pin only
@@ -1699,11 +1701,11 @@ in
       };
       sha256 = lib.mkOption {
         type = lib.types.str;
-        # builtins.fetchurl hash of local-webhook/webhook.mjs at `rev`:
-        #   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.mjs
+        # builtins.fetchurl hash of local-webhook/webhook.py at `rev`:
+        #   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.py
         # then `nix hash convert --hash-algo sha256 --to sri <base32>`.
-        default = "sha256-scQ1bGrCs/z2kB1zQYLvugOTapIZsvpgYOzTGOP/Yz4=";
-        description = "builtins.fetchurl hash of the pinned local-webhook/webhook.mjs.";
+        default = "sha256-o0aPM6PuFkUkTrGXCwe44KEjjUh+aJqvGu4wB6SfCVE=";
+        description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
       };
     };
 
@@ -1887,9 +1889,8 @@ in
         path = [ "/home/${name}/.nix-profile" config.nix.package ]
           ++ agentRuntimePackages
           ++ [ pkgs.bashInteractive pkgs.coreutils pkgs.git pkgs.gh ]
-          # local-webhook's .mcp.json runs a bare `node` (issue #101); claude
-          # doesn't put one on PATH, so provide one when the channel is on.
-          ++ lib.optional webhookEnabled pkgs.nodejs-slim
+          # local-webhook's .mcp.json runs a bare `python3` (issue #101), which
+          # agentBaseTools already puts on PATH — no extra runtime needed.
           ++ lib.optional (effectiveSudoAllowlist != [ ]) "/run/wrappers";
         # TMUX_TMPDIR puts the control socket under the /run RuntimeDirectory
         # below instead of /tmp. PrivateTmp (in serviceConfig) gives this unit a
@@ -4344,10 +4345,10 @@ in
 
       # ${"$"}{name}'s webhook receiver (issue #101): the local-webhook daemon's
       # UNIX-socket ingress, reached UNAUTHENTICATED — GitHub (and most senders)
-      # cannot do basic auth, so webhook.mjs's per-source HMAC check is the trust
+      # cannot do basic auth, so webhook.py's per-source HMAC check is the trust
       # boundary, not Caddy. A separate block, emitted BEFORE the terminal one,
       # so it is both more specific than /<user>/* and first in the file, and it
-      # carries no basic_auth. webhook.mjs still answers a bad signature with
+      # carries no basic_auth. webhook.py still answers a bad signature with
       # 401, but the fail2ban failregex below also requires an Authorization
       # header on the request — which no webhook sender sends — so a misconfigured
       # or hostile sender cannot get an IP banned out of the terminal's jail.
@@ -4356,7 +4357,7 @@ in
       # Nix strips). `agent-box-webhook url` prints the URL to register:
       # https://<domain>/<user>/webhook — a bare POST maps to the default source,
       # /<user>/webhook/<source> selects a named one, and strip_prefix means
-      # /<user>/webhook/github reaches webhook.mjs as /github.
+      # /<user>/webhook/github reaches webhook.py as /github.
       webhookCaddyBlock = name: lib.optionalString webhookEnabled ''
         handle ${webhookPathOf name}* {
           uri strip_prefix ${webhookPathOf name}
@@ -4796,7 +4797,7 @@ in
         };
       }) terminalUsers)
       # Webhook receiver daemon (issue #101), one per terminal user, gated on
-      # webhook.enable. Runs webhook.mjs in RECEIVER_ONLY mode as the agent
+      # webhook.enable. Runs webhook.py in RECEIVER_ONLY mode as the agent
       # user: owns the socket-activated UNIX ingress (the same-named .socket
       # below) and fans HMAC-verified deliveries out to that user's sessions
       # over IPC, with no MCP session of its own.
@@ -4815,7 +4816,7 @@ in
           User = name;
           Restart = "always";
           RestartSec = "5s";
-          ExecStart = "${webhookNode} ${localWebhookScript}";
+          ExecStart = "${webhookPython} ${localWebhookScript}";
           # systemd passes the ingress socket on fd 3 (LISTEN_FDS) and wires
           # stdin to /dev/null; RECEIVER_ONLY tolerates that (no MCP stdio).
           StandardInput = "null";

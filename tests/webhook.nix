@@ -17,7 +17,7 @@
 #     default-on safe;
 #   - the daemon then fans the verified event out over IPC to that user's
 #     session peers, each applying its OWN subscription filter — asserted with
-#     a stand-in peer (a plain webhook.mjs on stdio, which is exactly what
+#     a stand-in peer (a plain webhook.py on stdio, which is exactly what
 #     claude runs as the plugin's MCP server) that must print the channel
 #     notification for a subscribed topic and stay silent for one nobody
 #     subscribed to;
@@ -195,24 +195,24 @@
     )
 
     # --- a stand-in session peer ------------------------------------------
-    # Exactly what claude runs as the plugin's MCP server: the same webhook.mjs
+    # Exactly what claude runs as the plugin's MCP server: the same webhook.py
     # on stdio, PORT=0 so it never takes the ingress. Its stdout is the channel
     # stream. Both the interpreter and the script come from the daemon unit's
     # own ExecStart, so the test cannot drift from the pinned pair.
     exec_start = machine.succeed(
         "systemctl show -p ExecStart --value agent-box-webhook-agent.service"
     )
-    node = machine.succeed(
+    python = machine.succeed(
         "systemctl show -p ExecStart --value agent-box-webhook-agent.service"
-        " | grep -o '/nix/store/[^ ;]*/bin/node' | head -1"
+        " | grep -o '/nix/store/[^ ;]*/bin/python3' | head -1"
     ).strip()
     script = machine.succeed(
         "systemctl show -p ExecStart --value agent-box-webhook-agent.service"
-        " | grep -o '/nix/store/[^ ;]*webhook.mjs' | head -1"
+        " | grep -o '/nix/store/[^ ;]*webhook.py' | head -1"
     ).strip()
-    assert node and script, exec_start
+    assert python and script, exec_start
     # systemd-run so the driver isn't left waiting on a backgrounded shell.
-    # `sleep | node` keeps stdin OPEN: webhook.mjs treats stdin EOF as its
+    # `sleep | python3` keeps stdin OPEN: webhook.py treats stdin EOF as its
     # session closing and exits, which is right for claude and wrong here.
     # Absolute paths throughout — a transient unit gets systemd's stock PATH
     # (/usr/bin:/bin:...), where NixOS has no `sleep`; an unfound sleep closes
@@ -222,7 +222,7 @@
         "systemd-run --unit=webhook-peer --uid=agent --setenv=HOME=/home/agent"
         " --setenv=LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " --setenv=LOCAL_WEBHOOK_SESSION=agent-main --setenv=LOCAL_WEBHOOK_PORT=0"
-        f" {sw}/sh -c '{sw}/sleep 600 | {node} {script} > /tmp/peer.log 2>&1'"
+        f" {sw}/sh -c '{sw}/sleep 600 | {python} {script} > /tmp/peer.log 2>&1'"
     )
     # Fail loudly if the peer died on startup instead of silently timing out on
     # the socket wait below.
