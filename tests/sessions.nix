@@ -150,6 +150,18 @@
     machine.succeed("test -x /run/current-system/sw/bin/codex")
     machine.succeed("su -s /bin/sh agent -c 'test -x /home/agent/.codex/packages/standalone/current/codex'")
     machine.succeed("test -x /run/current-system/sw/bin/bwrap")
+    # Tools agents assume exist resolve by bare name in agent tool shells.
+    # Assert against the UNIT's PATH, not via as_agent(): that runs under su,
+    # which gets the full system path and would pass even when the unit PATH
+    # is missing them (the bug this guards against).
+    unit_path = machine.succeed(
+        "systemctl show agent-box-agent -p Environment --value"
+    ).split("PATH=")[1].split()[0]
+    for tool in ["curl", "awk", "tar", "gzip", "xz", "diff", "patch",
+                 "less", "ps", "rg", "jq"]:
+        machine.succeed(
+            f"su -s /bin/sh agent -c 'PATH={unit_path} command -v {tool}'"
+        )
 
     # HTTPS github clones authenticate via GH_TOKEN: gh's credential helper
     # is wired system-wide, and gh itself is on the agent unit's PATH.

@@ -233,9 +233,35 @@ let
   installedAgentPackages = map agentPackage cfg.installAgents;
   installedCodexPackage = lib.optional (builtins.elem "codex" cfg.installAgents) (agentPackage "codex");
 
+  # Tools agents assume exist. Nearly all of these are already installed on
+  # any NixOS host (system-path.nix's requiredPackages) — but the agent unit
+  # runs with the curated PATH below, which does not include
+  # /run/current-system/sw/bin, so `curl`/`tar`/`awk` came back "command not
+  # found" on a box that visibly has them. Listing them here costs ~nothing
+  # (the store paths are already in the system closure) and makes them
+  # resolve by bare name in agent tool shells, which are non-login shells
+  # and so never re-source /etc/set-environment.
+  #
+  # This is ergonomics, not containment: every binary on the box is already
+  # reachable from a session by absolute path, so PATH was never a boundary.
+  # It is still a curated list rather than the whole system path, which
+  # keeps `ssh`/`nc`-shaped tools off the default PATH as a deliberate
+  # choice rather than an accident.
+  agentBaseTools = [
+    pkgs.curl                 # fetch URLs, probe local services, read EC2 IMDS
+    pkgs.gawk                 # the most common shell idiom after grep/sed
+    pkgs.gnutar pkgs.gzip pkgs.xz   # `curl -L ... | tar xz`, rotated logs
+    pkgs.diffutils pkgs.gnupatch    # compare generated vs committed, apply patches
+    pkgs.less                 # git's default pager; without it `git log` fails in a TTY
+    pkgs.procps               # ps/pgrep/kill/free: self-diagnosis, no shell user behind us
+    pkgs.ripgrep              # already in the store via both agent CLIs
+    pkgs.jq                   # every JSON workflow; all three example hosts add it by hand
+  ];
+
   agentRuntimePackages = lib.unique (
     installedAgentPackages
     ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli ]
+    ++ agentBaseTools
     ++ cfg.extraPackages
   );
   # Sessions are RUNTIME data (issue #59): the Nix-declared
