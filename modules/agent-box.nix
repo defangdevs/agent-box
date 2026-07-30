@@ -1688,7 +1688,7 @@ in
       };
       rev = lib.mkOption {
         type = lib.types.str;
-        default = "0149a449641d289209c781809662aa9b51ae0d10";
+        default = "dd8a57982f8a9d2318658a63d425442ca7134e80";
         description = ''
           Pinned local-channels commit whose local-webhook/webhook.mjs the
           receiver daemon and the agent-box-webhook CLI run. Claude sessions
