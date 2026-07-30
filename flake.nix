@@ -165,6 +165,66 @@
               printf 'downloads route present in generated Caddyfile\n' > "$out"
             '';
 
+          # Interactive VM test (issue #101): the per-user webhook receiver, ON
+          # BY DEFAULT. Socket-activated 0660 <user>:caddy ingress, the
+          # unauthenticated public path next to a still-401ing vhost, HMAC
+          # accept/reject (and 404 before any secret exists — why default-on is
+          # safe), IPC fan-out into a stand-in session peer applying its own
+          # filter, and the discovery surface (CLI on PATH,
+          # AGENT_BOX_WEBHOOK_URL, per-session LOCAL_WEBHOOK_SESSION, seeded
+          # claude plugin settings).
+          webhook = pkgs.testers.runNixOSTest
+            (import ./tests/webhook.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Guard (issue #101): the module's REAL generated Caddyfile (the VM
+          # test above swaps in a `tls internal` stand-in) must route the
+          # webhook path to the user's ingress socket, BEFORE the /<user>/*
+          # catch-all and with no basic_auth in that handle — GitHub cannot
+          # authenticate, so an auth gate here means silently dropped
+          # deliveries. Cheap: realises only the tiny rendered config.
+          webhook-route =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "webhook.test";
+                        user = "agent";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-webhook-route-ok"
+              { caddyfile = sys.config.services.caddy.configFile; } ''
+              # The handle and its ENTIRE body — three lines, then the closing
+              # brace at the handle's own indentation. Asserting the whole body
+              # is what makes "no basic_auth in here" meaningful: grepping the
+              # file at large would hit the terminal/settings blocks, which are
+              # supposed to have one.
+              grep -A3 -F 'handle /agent/webhook* {' "$caddyfile" > block
+              grep -qF 'uri strip_prefix /agent/webhook' block
+              grep -qF 'reverse_proxy unix//run/agent-box-webhook/agent.sock' block
+              grep -qxF '  }' block
+              ! grep -q basic_auth block
+              # Ordering: Caddy prefers the more specific matcher, but keep the
+              # emitted order honest too — the webhook handle must come first.
+              wh=$(grep -n 'handle /agent/webhook\*' "$caddyfile" | cut -d: -f1)
+              catchall=$(grep -n 'handle /agent/\* {' "$caddyfile" | cut -d: -f1)
+              [ "$wh" -lt "$catchall" ]
+              printf 'unauthenticated webhook route present in generated Caddyfile\n' > "$out"
+            '';
+
           # Regression guard (issue #51): deployed boxes fetch
           # modules/agent-box.nix as a SINGLE file — the CFN user-data and
           # agent-box-update.service both fetchurl just that path — so the
