@@ -214,12 +214,19 @@
     # systemd-run so the driver isn't left waiting on a backgrounded shell.
     # `sleep | node` keeps stdin OPEN: webhook.mjs treats stdin EOF as its
     # session closing and exits, which is right for claude and wrong here.
+    # Absolute paths throughout — a transient unit gets systemd's stock PATH
+    # (/usr/bin:/bin:...), where NixOS has no `sleep`; an unfound sleep closes
+    # the pipe at once and the peer exits before it can register.
+    sw = "/run/current-system/sw/bin"
     machine.succeed(
         "systemd-run --unit=webhook-peer --uid=agent --setenv=HOME=/home/agent"
         " --setenv=LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " --setenv=LOCAL_WEBHOOK_SESSION=agent-main --setenv=LOCAL_WEBHOOK_PORT=0"
-        f" /bin/sh -c 'sleep 600 | {node} {script} > /tmp/peer.log 2>&1'"
+        f" {sw}/sh -c '{sw}/sleep 600 | {node} {script} > /tmp/peer.log 2>&1'"
     )
+    # Fail loudly if the peer died on startup instead of silently timing out on
+    # the socket wait below.
+    machine.succeed("systemctl is-active webhook-peer.service")
     # The peer registers a per-PID IPC socket; that is what the daemon fans to.
     machine.wait_until_succeeds(
         "ls /home/agent/.local/state/local-webhook/instances/*.sock", timeout=30
