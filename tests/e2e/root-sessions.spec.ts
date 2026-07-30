@@ -123,6 +123,62 @@ test('add a session from the tab bar, switch tabs, delete it on the settings pag
   await expect(row).toHaveCount(0);
 });
 
+// The tab bar's x kills a live agent and sits a few pixels from the session
+// name, so it arms on the first click (a red "Close?" pill) and only closes on
+// the second. Covers all three legs of that guard: the first click is inert,
+// the armed state gives way to a click elsewhere and to its own timeout, and
+// the second click actually closes.
+test('the tab close button arms first and only closes on a second click', async ({ browser }) => {
+  const page = await authedPage(browser);
+  await page.goto('/');
+
+  // Add a session to close, so the test never touches "main". The name is
+  // auto-derived by the daemon, so take whichever tab is new.
+  const tabNames = () =>
+    page.locator('#tab-bar .tab[data-tab]')
+      .evaluateAll((els) => els.map((e) => e.getAttribute('data-tab') as string));
+  const before = await tabNames();
+  await openSessionEditor(page, 'New session');
+  await page.locator('#session-editor button[type="submit"]').click();
+  await expect.poll(async () => (await tabNames()).length).toBe(before.length + 1);
+  const name = (await tabNames()).find((n) => !before.includes(n)) as string;
+
+  const tab = page.locator(`#tab-bar .tab[data-tab="${name}"]`);
+  const x = page.locator(`#tab-bar .tab-x[data-close="${name}"]`);
+  await expect(x).toHaveText('×');
+
+  // First click only arms: the session is still there, and the whole tab
+  // tints so it is obvious which session is at stake.
+  await x.click();
+  await expect(x).toHaveText('Close?');
+  await expect(page.locator('#tab-bar .tab-wrap.arm')).toHaveCount(1);
+  await expect(tab).toHaveCount(1);
+
+  // A click elsewhere disarms — a stray first click never stays loaded.
+  await page.locator('#tab-bar .tab[data-tab="main"]').click();
+  await expect(x).toHaveText('×');
+  await expect(tab).toHaveCount(1);
+
+  // A double-click is not a considered confirmation (SETTLE_MS): it arms
+  // and stops there, rather than arming and immediately closing.
+  await x.dblclick();
+  await expect(x).toHaveText('Close?');
+  await expect(tab).toHaveCount(1);
+
+  // Nor does it stay armed indefinitely (ARM_MS in settings.js).
+  await expect(x).toHaveText('×', { timeout: 10_000 });
+  await expect(tab).toHaveCount(1);
+
+  // Second click while armed: the tab and its pane go away.
+  await x.click();
+  await expect(x).toHaveText('Close?');
+  await page.waitForTimeout(500);   // past SETTLE_MS, well inside ARM_MS
+  await x.click();
+  await expect(page.locator('.msg')).toHaveText(/Session deleted/);
+  await expect(tab).toHaveCount(0);
+  await expect(page.locator(`#panes .pane[data-pane="${name}"]`)).toHaveCount(0);
+});
+
 test('the working-directory picker suggests folders one level at a time', async ({ browser }) => {
   const page = await authedPage(browser);
   await page.goto('/');

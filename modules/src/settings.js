@@ -290,6 +290,79 @@
     wsSelect(t.getAttribute("data-tab"), true);
   });
 
+  // Two-click close on the tab bar's x. Closing kills a live agent and
+  // the button sits a few pixels from the session name, so the first
+  // click only ARMS it (red "Close?" pill, see .tab-x.arm) and the
+  // second lets the form submit for real — a confirm() dialog would be
+  // both heavier and skipped entirely when scripting is off, whereas
+  // here no-JS simply keeps the plain one-click POST.
+  //
+  // Anything that could leave a loaded gun on screen disarms: a
+  // timeout, Escape, tabbing away, arming another tab, or any click
+  // elsewhere. A tab-bar re-render (polling swaps #tab-bar wholesale)
+  // detaches the button, which the isConnected check absorbs.
+  var ARM_MS = 4000;   // long enough to read the pill and aim at it
+  var SETTLE_MS = 350; // a double-click is not a considered confirmation
+  var armedX = null;
+  var armedAt = 0;
+  var armTimer = null;
+  function wrapOf(b) { return b.closest ? b.closest(".tab-wrap") : null; }
+  function clearArm() {
+    if (armTimer) { window.clearTimeout(armTimer); armTimer = null; }
+    var b = armedX;
+    armedX = null;
+    return b;
+  }
+  function disarmX() {
+    var b = clearArm();
+    if (!b || !b.isConnected) { return; }
+    var label = "Close " + b.getAttribute("data-close");
+    var w = wrapOf(b);
+    if (w) { w.classList.remove("arm"); }
+    b.classList.remove("arm");
+    b.textContent = "×";
+    b.setAttribute("aria-label", label);
+    b.setAttribute("title", label);
+  }
+  function armX(b) {
+    disarmX();
+    var hint = "Click again to close " + b.getAttribute("data-close");
+    var w = wrapOf(b);
+    armedX = b;
+    armedAt = Date.now();
+    if (w) { w.classList.add("arm"); }
+    b.classList.add("arm");
+    b.textContent = "Close?";
+    b.setAttribute("aria-label", hint);
+    b.setAttribute("title", hint);
+    armTimer = window.setTimeout(disarmX, ARM_MS);
+  }
+  document.addEventListener("click", function (e) {
+    var x = e.target && e.target.closest ? e.target.closest("#tab-bar .tab-x") : null;
+    // Second click on the armed button: fall through with no
+    // preventDefault so the form submits (the submit handler below
+    // upgrades it to fetch + patch, like every other form here). Only
+    // the timer is dropped — the pill stays red until the patched tab
+    // bar comes back, so the click has visible effect in flight.
+    // Too soon after arming it is the tail of a double-click, not a
+    // decision: swallow it and stay armed.
+    if (x && x === armedX) {
+      if (Date.now() - armedAt < SETTLE_MS) { e.preventDefault(); return; }
+      clearArm();
+      return;
+    }
+    disarmX();
+    if (!x) { return; }
+    e.preventDefault();
+    armX(x);
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") { disarmX(); }
+  });
+  document.addEventListener("focusout", function (e) {
+    if (armedX && e.target === armedX) { disarmX(); }
+  });
+
   // The editors render expanded (no-JS fallback); collapse them once
   // JS is live so the page opens in list-only, GitHub-style form.
   ["secret-editor", "session-editor", "password-editor"].forEach(function (id) {

@@ -896,15 +896,31 @@ def render_tabs(names, live, selected):
     """The workspace tab bar. File order, not sorted: sessions.json
     preserves insertion order, so a new session appears as the
     rightmost tab, like any terminal app. The dot-only .state span
-    reuses the list styling (its ::before is the dot)."""
+    reuses the list styling (its ::before is the dot).
+
+    Each tab carries a close (x) button posting to the same
+    /sessions/delete route the settings page uses (no back= field, so
+    it redirects to the workspace). The button is a SIBLING of the tab
+    link, not a child: a <form> inside an <a> is invalid markup, and
+    keeping them apart also stops the tab-select click delegation from
+    swallowing the close click. Closing kills a live agent and the
+    button sits a few pixels from the session name, so SCRIPT arms it
+    on the first click and only submits on the second."""
     items = []
+    base = html.escape(SESS_BASE)
     for name in names:
         safe = html.escape(name)
         cur = ' aria-current="page"' if name == selected else ""
         state = "live" if name in live else "starting"
         items.append(
+            f'<span class="tab-wrap">'
             f'<a class="tab" data-tab="{safe}" href="/?tab={safe}"{cur}>'
             f'<span class="state" data-state="{state}"></span>{safe}</a>'
+            f'<form class="tab-close" method="post" action="{base}/sessions/delete">'
+            f'<input type="hidden" name="name" value="{safe}">'
+            f'<button type="submit" class="tab-x" data-close="{safe}" '
+            f'aria-label="Close {safe}" title="Close {safe}">&times;</button>'
+            f'</form></span>'
         )
     if not items:
         items.append('<span class="tab-empty">No sessions yet.</span>')

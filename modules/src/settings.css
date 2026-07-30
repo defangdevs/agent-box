@@ -101,13 +101,41 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
 .tabs { display: flex; align-items: flex-end; gap: 2px; flex: none;
         padding: 8px 8px 0; background: #010409;
         border-bottom: 1px solid #30363d; overflow-x: auto; }
-.tab { display: inline-flex; align-items: center; padding: 6px 14px 8px;
+.tab { display: inline-flex; align-items: center; padding: 6px 32px 8px 14px;
        font-size: 13px; color: #8b949e; text-decoration: none;
        border: 1px solid transparent; border-bottom: 0;
        border-radius: 8px 8px 0 0; white-space: nowrap; }
 .tab:hover { color: #e6edf3; }
 .tab[aria-current] { background: #0d1117; border-color: #30363d;
                      color: #e6edf3; }
+/* Close (x) button, absolutely placed over the tab's extra right
+   padding so it reads as part of the tab while staying a DOM sibling
+   of the link (see render_tabs). Dim until hovered — always visible
+   rather than hover-only, because touch has no hover. .arm is the
+   armed state SCRIPT sets on the first click: a red "Close?" pill
+   growing leftwards over the name, so the second click is clearly a
+   confirmation and never mistaken for a plain tab switch. */
+.tab-wrap { position: relative; display: flex; }
+.tab-wrap:hover .tab { color: #e6edf3; }
+/* The armed tab tints too: the pill necessarily covers the tail of a
+   short name, so the tab itself has to say which session is at stake.
+   Only the (already 1px, transparent) border changes colour, so
+   nothing moves under the cursor between the two clicks. */
+.tab-wrap.arm .tab { background: rgba(248,81,73,.12); border-color: #f85149;
+                     color: #e6edf3; }
+.tab-close { margin: 0; }
+.tab-x { position: absolute; top: 6px; right: 6px; bottom: 8px; width: 18px;
+         display: flex; align-items: center; justify-content: center;
+         padding: 0; border: 0; border-radius: 5px; background: transparent;
+         font: inherit; font-size: 15px; line-height: 1; color: #6e7681;
+         cursor: pointer; }
+.tab-x:hover { background: #30363d; color: #e6edf3; }
+.tab-x.arm { width: auto; padding: 0 7px; font-size: 11px; font-weight: 600;
+             background: #da3633; color: #fff;
+             /* Fades the name out under the pill, so the overlap reads
+                as deliberate rather than as clipped text. */
+             box-shadow: -7px 0 9px 3px rgba(9,12,17,.92); }
+.tab-x.arm:hover { background: #f85149; }
 .tab-empty { color: #8b949e; font-size: 13px; padding: 6px 8px 8px; }
 .tabs .btn.add { margin: 0 4px 6px; padding: 2px 9px; }
 .tabs .spacer { flex: 1; }

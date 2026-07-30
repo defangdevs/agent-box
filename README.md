@@ -245,11 +245,15 @@ agent-box-session rm review                 # delist + kill
 
 The site root (web setups) is the terminal itself — `https://<domain>/` is
 a tabbed workspace, one tab per session, behind the same login as the
-terminal (add sessions from the tab bar; restart/delete on the settings
-page) — and agents can spawn sibling sessions themselves (it's just a file
-edit on their own account — handy for "have Codex cross-check this").
+terminal (add and close sessions from the tab bar — the tab's `×` arms on
+the first click and only closes on the second; restart/delete also on the
+settings page) — and agents can spawn sibling sessions themselves (it's just
+a file edit on their own account — handy for "have Codex cross-check this").
 
 ![Tabbed terminal workspace: one tab per session](docs/workspace-tabs.png)
+
+![Closing a session from its tab: the × arms on the first click and only
+closes on the second](docs/workspace-tab-close.png)
 
 Attach locally with `tmux -L agent-box attach -t <session>` (see
 `TMUX_TMPDIR` note above). In the browser, every tab is also a
