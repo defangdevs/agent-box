@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+## Operating Context
+
+Assume the user is talking to you through Remote Control and has no shell access to the box. They cannot run a command you suggest, paste its output back, open a file to look at it, or inspect `result/` — you are their only way to reach the machine. So run the commands yourself rather than handing them a list to try, read the files you need instead of asking what they contain, and quote the output that matters instead of telling them where to find it. When something can only be resolved on the host, resolve it; when it genuinely cannot, say so plainly rather than delegating it back to them.
+
 ## Project Structure & Module Organization
 
 `modules/agent-box.nix` is the portable NixOS module and the repository's main implementation. It is **generated** — do not edit it by hand. The sources are `modules/agent-box.nix.in` (the Nix template) plus the assets under `modules/src/` (e.g. the settings daemon), stitched together by `bin/assemble-module.py` via `@@include:...@@` markers. `flake.nix` exposes the module, VM image, and CI checks. Host examples live in `hosts/`; AWS deployment configuration and operational notes are in `aws/`. Put NixOS integration tests in `tests/*.nix`, live browser tests in `tests/e2e/*.spec.ts`, maintenance utilities in `scripts/`, and website images or static content in `docs/`.
