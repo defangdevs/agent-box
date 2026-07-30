@@ -204,6 +204,12 @@ let
   # rest is forwarded to `app-server daemon start` (the -c autonomy overrides
   # seeded below, plus any extraArgs).
   codexRemoteControl = pkgs.writeShellScript "agent-box-codex-remote-control" ''
+    # The pid-managed daemon backend records and probes its app-server child by
+    # shelling out to a bare `ps`, so procps has to be reachable regardless of
+    # how the agent unit's PATH is curated. Without it every start dies with
+    # "failed to invoke ps for pid-managed app server" and no control socket is
+    # ever created — appended, so a session's own PATH still wins.
+    PATH=$PATH:${pkgs.procps}/bin
     codex=$1; shift
     stop() { "$codex" app-server daemon stop >/dev/null 2>&1 || true; }
     # A daemon left over from an earlier start would make ours a no-op and

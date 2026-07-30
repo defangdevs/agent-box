@@ -217,8 +217,11 @@
     # assert the wrapper runs and passes the autonomy -c overrides (the
     # subcommand rejects the TUI's --dangerously-bypass flag, so skipPermissions
     # rides in as -c approval_policy / sandbox_mode instead).
+    # pgrep runs as ROOT (not via as_agent): `-u agent` then filters out the
+    # invoking shell, whose own command line contains the pattern — as the
+    # agent it self-matched and "succeeded" with the wrapper long dead.
     helper_cmdline = machine.wait_until_succeeds(
-        as_agent("pgrep -u agent -af agent-box-codex-remote-control"), timeout=60
+        "pgrep -u agent -af agent-box-codex-remote-control", timeout=60
     )
     assert "-c approval_policy=never" in helper_cmdline, helper_cmdline
     assert "-c sandbox_mode=danger-full-access" in helper_cmdline, helper_cmdline
