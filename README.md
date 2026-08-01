@@ -14,7 +14,7 @@ Supported agents:
 | Agent | Package | Autonomy flag used by `skipPermissions = true` | Notes |
 | --- | --- | --- | --- |
 | Claude Code | `pkgs.claude-code` | `--dangerously-skip-permissions` | Supports Claude Remote Control. |
-| Codex | `pkgs.codex` | `--dangerously-bypass-approvals-and-sandbox` | Browser terminal, plus Remote Control via the `codex remote-control` daemon (`remoteControl = true`). |
+| Codex | `pkgs.codex` | `--dangerously-bypass-approvals-and-sandbox` | Per session, *either* the TUI in the browser terminal *or* Remote Control via the `codex remote-control` daemon (`remoteControl = true`) - not both. |
 
 ## 1-click AWS launch
 
@@ -216,6 +216,30 @@ legacy flow, update it from the settings page or run
 The auth code input is hidden like a password, so pasting gives no visible
 feedback. Paste the code, press Enter, and Claude Code should print
 `Login successful.`.
+
+**Codex first login and pairing the Codex apps:** a Codex session with
+`remoteControl = true` runs the app-server daemon, *not* a TUI - so its tab is
+a status view and there is nothing to type into. Sign in from any other shell
+on the box (another terminal tab, or
+`agent-box-session add sh --agent shell`):
+
+```bash
+codex login --device-auth   # prints a URL + one-time code; expires in 15 min
+codex remote-control pair   # prints the short-lived pairing code for the apps
+```
+
+Use `--device-auth`. Plain `codex login` starts a callback server on
+`localhost:1455`, which the browser on your laptop cannot reach. Until sign-in
+completes, `codex remote-control pair` fails with `remote control pairing is
+unavailable until enrollment completes` - that error means "not signed in".
+The session's status pane reports which of the two steps is outstanding and
+confirms when sign-in lands.
+
+The Codex apps label the box with the name the daemon reports, which Codex
+takes from `gethostname(2)` with no env var, config key or flag to override it.
+agent-box therefore runs the daemon in a private UTS namespace whose hostname
+is the box's public address, so it appears as e.g. `1-2-3-4.sslip.io` rather
+than an internal cloud hostname. `remoteControlName` remains Claude-only.
 
 ## Sessions (any user can run any agent — no rebuild)
 
