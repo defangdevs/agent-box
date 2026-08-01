@@ -3075,13 +3075,41 @@ in
           .tabs { display: flex; align-items: flex-end; gap: 2px; flex: none;
                   padding: 8px 8px 0; background: #010409;
                   border-bottom: 1px solid #30363d; overflow-x: auto; }
-          .tab { display: inline-flex; align-items: center; padding: 6px 14px 8px;
+          .tab { display: inline-flex; align-items: center; padding: 6px 32px 8px 14px;
                  font-size: 13px; color: #8b949e; text-decoration: none;
                  border: 1px solid transparent; border-bottom: 0;
                  border-radius: 8px 8px 0 0; white-space: nowrap; }
           .tab:hover { color: #e6edf3; }
           .tab[aria-current] { background: #0d1117; border-color: #30363d;
                                color: #e6edf3; }
+          /* Close (x) button, absolutely placed over the tab's extra right
+             padding so it reads as part of the tab while staying a DOM sibling
+             of the link (see render_tabs). Dim until hovered — always visible
+             rather than hover-only, because touch has no hover. .arm is the
+             armed state SCRIPT sets on the first click: a red "Close?" pill
+             growing leftwards over the name, so the second click is clearly a
+             confirmation and never mistaken for a plain tab switch. */
+          .tab-wrap { position: relative; display: flex; }
+          .tab-wrap:hover .tab { color: #e6edf3; }
+          /* The armed tab tints too: the pill necessarily covers the tail of a
+             short name, so the tab itself has to say which session is at stake.
+             Only the (already 1px, transparent) border changes colour, so
+             nothing moves under the cursor between the two clicks. */
+          .tab-wrap.arm .tab { background: rgba(248,81,73,.12); border-color: #f85149;
+                               color: #e6edf3; }
+          .tab-close { margin: 0; }
+          .tab-x { position: absolute; top: 6px; right: 6px; bottom: 8px; width: 18px;
+                   display: flex; align-items: center; justify-content: center;
+                   padding: 0; border: 0; border-radius: 5px; background: transparent;
+                   font: inherit; font-size: 15px; line-height: 1; color: #6e7681;
+                   cursor: pointer; }
+          .tab-x:hover { background: #30363d; color: #e6edf3; }
+          .tab-x.arm { width: auto; padding: 0 7px; font-size: 11px; font-weight: 600;
+                       background: #da3633; color: #fff;
+                       /* Fades the name out under the pill, so the overlap reads
+                          as deliberate rather than as clipped text. */
+                       box-shadow: -7px 0 9px 3px rgba(9,12,17,.92); }
+          .tab-x.arm:hover { background: #f85149; }
           .tab-empty { color: #8b949e; font-size: 13px; padding: 6px 8px 8px; }
           .tabs .btn.add { margin: 0 4px 6px; padding: 2px 9px; }
           .tabs .spacer { flex: 1; }
@@ -3619,6 +3647,79 @@ in
             wsSelect(t.getAttribute("data-tab"), true);
           });
 
+          // Two-click close on the tab bar's x. Closing kills a live agent and
+          // the button sits a few pixels from the session name, so the first
+          // click only ARMS it (red "Close?" pill, see .tab-x.arm) and the
+          // second lets the form submit for real — a confirm() dialog would be
+          // both heavier and skipped entirely when scripting is off, whereas
+          // here no-JS simply keeps the plain one-click POST.
+          //
+          // Anything that could leave a loaded gun on screen disarms: a
+          // timeout, Escape, tabbing away, arming another tab, or any click
+          // elsewhere. A tab-bar re-render (polling swaps #tab-bar wholesale)
+          // detaches the button, which the isConnected check absorbs.
+          var ARM_MS = 4000;   // long enough to read the pill and aim at it
+          var SETTLE_MS = 350; // a double-click is not a considered confirmation
+          var armedX = null;
+          var armedAt = 0;
+          var armTimer = null;
+          function wrapOf(b) { return b.closest ? b.closest(".tab-wrap") : null; }
+          function clearArm() {
+            if (armTimer) { window.clearTimeout(armTimer); armTimer = null; }
+            var b = armedX;
+            armedX = null;
+            return b;
+          }
+          function disarmX() {
+            var b = clearArm();
+            if (!b || !b.isConnected) { return; }
+            var label = "Close " + b.getAttribute("data-close");
+            var w = wrapOf(b);
+            if (w) { w.classList.remove("arm"); }
+            b.classList.remove("arm");
+            b.textContent = "×";
+            b.setAttribute("aria-label", label);
+            b.setAttribute("title", label);
+          }
+          function armX(b) {
+            disarmX();
+            var hint = "Click again to close " + b.getAttribute("data-close");
+            var w = wrapOf(b);
+            armedX = b;
+            armedAt = Date.now();
+            if (w) { w.classList.add("arm"); }
+            b.classList.add("arm");
+            b.textContent = "Close?";
+            b.setAttribute("aria-label", hint);
+            b.setAttribute("title", hint);
+            armTimer = window.setTimeout(disarmX, ARM_MS);
+          }
+          document.addEventListener("click", function (e) {
+            var x = e.target && e.target.closest ? e.target.closest("#tab-bar .tab-x") : null;
+            // Second click on the armed button: fall through with no
+            // preventDefault so the form submits (the submit handler below
+            // upgrades it to fetch + patch, like every other form here). Only
+            // the timer is dropped — the pill stays red until the patched tab
+            // bar comes back, so the click has visible effect in flight.
+            // Too soon after arming it is the tail of a double-click, not a
+            // decision: swallow it and stay armed.
+            if (x && x === armedX) {
+              if (Date.now() - armedAt < SETTLE_MS) { e.preventDefault(); return; }
+              clearArm();
+              return;
+            }
+            disarmX();
+            if (!x) { return; }
+            e.preventDefault();
+            armX(x);
+          });
+          document.addEventListener("keydown", function (e) {
+            if (e.key === "Escape") { disarmX(); }
+          });
+          document.addEventListener("focusout", function (e) {
+            if (armedX && e.target === armedX) { disarmX(); }
+          });
+
           // The editors render expanded (no-JS fallback); collapse them once
           // JS is live so the page opens in list-only, GitHub-style form.
           ["secret-editor", "session-editor", "password-editor"].forEach(function (id) {
@@ -3973,15 +4074,31 @@ in
             """The workspace tab bar. File order, not sorted: sessions.json
             preserves insertion order, so a new session appears as the
             rightmost tab, like any terminal app. The dot-only .state span
-            reuses the list styling (its ::before is the dot)."""
+            reuses the list styling (its ::before is the dot).
+
+            Each tab carries a close (x) button posting to the same
+            /sessions/delete route the settings page uses (no back= field, so
+            it redirects to the workspace). The button is a SIBLING of the tab
+            link, not a child: a <form> inside an <a> is invalid markup, and
+            keeping them apart also stops the tab-select click delegation from
+            swallowing the close click. Closing kills a live agent and the
+            button sits a few pixels from the session name, so SCRIPT arms it
+            on the first click and only submits on the second."""
             items = []
+            base = html.escape(SESS_BASE)
             for name in names:
                 safe = html.escape(name)
                 cur = ' aria-current="page"' if name == selected else ""
                 state = "live" if name in live else "starting"
                 items.append(
+                    f'<span class="tab-wrap">'
                     f'<a class="tab" data-tab="{safe}" href="/?tab={safe}"{cur}>'
                     f'<span class="state" data-state="{state}"></span>{safe}</a>'
+                    f'<form class="tab-close" method="post" action="{base}/sessions/delete">'
+                    f'<input type="hidden" name="name" value="{safe}">'
+                    f'<button type="submit" class="tab-x" data-close="{safe}" '
+                    f'aria-label="Close {safe}" title="Close {safe}">&times;</button>'
+                    f'</form></span>'
                 )
             if not items:
                 items.append('<span class="tab-empty">No sessions yet.</span>')

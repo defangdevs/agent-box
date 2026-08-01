@@ -419,6 +419,13 @@
     assert 'src="/agent/?arg=main"' in root_page, root_page
     assert "workingDirectory" not in root_page, root_page
 
+    # Each tab carries a close (x) posting to the same /sessions/delete
+    # route the settings page uses — a sibling form, since a <form> inside
+    # the tab <a> would be invalid markup. The two-click arming that keeps
+    # a stray click from killing a session is client-side (tests/e2e).
+    assert '<form class="tab-close" method="post" action="/sessions/delete">' in root_page, root_page
+    assert 'class="tab-x" data-close="main" aria-label="Close main"' in root_page, root_page
+
     # The root page's CRUD routes (behind auth) can add a session; the
     # workspace redirect lands on the new session's tab. The name is always
     # auto-derived from the agent (there is no name field in the form): with
