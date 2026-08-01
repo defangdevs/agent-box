@@ -249,6 +249,9 @@ terminal (add and close sessions from the tab bar — the tab's `×` arms on
 the first click and only closes on the second; restart/delete also on the
 settings page) — and agents can spawn sibling sessions themselves (it's just
 a file edit on their own account — handy for "have Codex cross-check this").
+Open pages follow along live: a session added or removed anywhere — the CLI,
+an agent, a second browser tab — appears or disappears in the tab bar (and in
+the settings list) within a second, without a reload.
 
 ![Tabbed terminal workspace: one tab per session](docs/workspace-tabs.png)
 

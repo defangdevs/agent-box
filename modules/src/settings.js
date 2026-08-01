@@ -44,6 +44,20 @@
       .then(function (t) { applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]); wsSync(); })
       .catch(function () {});
   }
+  // Coalescing wrapper for the live feed, which can report a burst of
+  // changes (a session added, then coming live a beat later): one
+  // re-fetch shortly after the last of them, instead of one each.
+  // Deliberately not an in-flight guard — a request that never settles
+  // would wedge every later refresh, which is the exact staleness this
+  // whole feed exists to prevent.
+  var refreshTimer = null;
+  function scheduleRefresh() {
+    if (refreshTimer) { return; }
+    refreshTimer = window.setTimeout(function () {
+      refreshTimer = null;
+      pollPageOnce();
+    }, 150);
+  }
 
   // After "Update box": watch the update oneshot from `baseline` (its
   // start time before we triggered) until a strictly newer run
@@ -205,7 +219,88 @@
         });
     }, 2500);
   }
-  function startPolling(n) { pollLeft = n; schedulePoll(); }
+  // The burst poll is the no-feed fallback for "starting" → "live"; with
+  // the live feed attached the daemon reports that transition itself.
+  function startPolling(n) {
+    if (liveFeed) { return; }
+    pollLeft = n;
+    schedulePoll();
+  }
+
+  // Live session feed. Sessions also change from OUTSIDE this page — the
+  // agent-box-session CLI, an agent adding a helper for itself, another
+  // browser tab, the supervisor bringing a listed session up — and the
+  // page used to see none of that until a reload. The daemon streams a
+  // fingerprint of the session state; whenever it differs from the one
+  // this HTML was rendered with, re-fetch and patch (same swap the form
+  // posts do). The fingerprint, not the state itself, is what travels:
+  // rendering stays server-side and nothing sensitive crosses the feed.
+  var liveFeed = false;
+  var probeTimer = null, probeEvery = 0;
+  var NO_FEED_MS = 5000;    // no stream: the fingerprint poll IS the feed
+  var BACKSTOP_MS = 30000;  // stream up: slow re-check, so nothing can stick
+  function liveUpdates() {
+    var meta = document.querySelector('meta[name="agent-box-events"]');
+    var url = meta && meta.getAttribute("content");
+    if (!url) { return; }
+    var seen = meta.getAttribute("data-fp") || "";
+    function saw(fp) {
+      if (!fp || fp === seen) { return; }
+      seen = fp;
+      scheduleRefresh();
+    }
+    // One-shot fingerprint: a small JSON reply that only costs a page
+    // re-fetch when it actually moved.
+    function probe() {
+      fetch(url + "?poll=1", { headers: { "Accept": "application/json" } })
+        .then(function (r) { return r.json(); })
+        .then(function (s) { saw(s && s.fp); })
+        .catch(function () {});
+    }
+    // Probing keeps running even with the stream up, just slowly: a
+    // stream can die in ways neither end notices (a proxy dropping an
+    // idle connection, a laptop resuming from sleep), and a workspace
+    // that silently stopped updating is the bug this all fixes. Paused
+    // while the tab is hidden — nothing to repaint there — with a probe
+    // on the way back, which is also the resume-from-sleep catch-up.
+    function setProbe(ms) {
+      if (probeEvery === ms) { return; }
+      probeEvery = ms;
+      if (probeTimer) { window.clearInterval(probeTimer); }
+      probeTimer = window.setInterval(function () {
+        if (!document.hidden) { probe(); }
+      }, ms);
+    }
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) { probe(); }
+    });
+    setProbe(NO_FEED_MS);
+    if (!window.EventSource) { return; }
+    // One stream per page. It is another multiplexed h2 stream on any
+    // real box (Caddy always serves TLS); only a plain-HTTP dev rig
+    // spends a whole connection out of the browser's per-origin six on
+    // it, alongside each pane's terminal WebSocket.
+    var es = new EventSource(url);
+    es.onopen = function () {
+      liveFeed = true;
+      setProbe(BACKSTOP_MS);
+    };
+    es.addEventListener("sessions", function (e) {
+      var s = null;
+      try { s = JSON.parse(e.data); } catch (err) { return; }
+      saw(s && s.fp);
+    });
+    es.onerror = function () {
+      // A dropped stream reconnects on its own (a box update restarts
+      // the daemon under us, routinely) and the daemon replays the
+      // current fingerprint on connect. CLOSED means it could not be
+      // established at all — too many streams open, or a proxy that
+      // will not stream — and per spec it never retries, so the poll
+      // goes back to being the feed.
+      liveFeed = false;
+      if (es.readyState === EventSource.CLOSED) { setProbe(NO_FEED_MS); }
+    };
+  }
 
   // Tabbed terminal workspace (the HOME root page, issue #119). The
   // server renders tabs as plain ?tab= links and only the selected
@@ -585,7 +680,10 @@
   });
 
   checkForUpdate();
+  liveUpdates();
   // Land in the terminal: focus the server-selected tab's pane.
   if (wsActive()) { wsSelect(wsActive(), true); }
+  // Still armed for the moment before the feed reports itself open; it
+  // no-ops from then on.
   startPolling(8);
 })();

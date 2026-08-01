@@ -2495,17 +2495,21 @@ in
         #   AGENT_BOX_PASSWORD_CMD       no-argument sudo command that verifies
         #                                 and replaces this user's web password
 
+        import hashlib
         import html
         import http.server
         import json
         import os
         import re
         import secrets
+        import select
         import signal
         import socket
         import subprocess
         import sys
         import tempfile
+        import threading
+        import time
         import urllib.parse
 
         USER = os.environ.get("AGENT_BOX_SETTINGS_USER", "agent")
@@ -2780,6 +2784,9 @@ in
                 raise
 
 
+        _tmux_error_at = -1e9   # monotonic stamp of the last logged tmux OSError
+
+
         def tmux(*args):
             """Run a tmux command against the user's own server; None on OSError."""
             env = dict(os.environ)
@@ -2794,8 +2801,15 @@ in
                     text=True,
                 )
             except OSError as exc:
-                # Missing/unrunnable tmux binary must not 500 the request.
-                sys.stderr.write("tmux: %s\n" % exc)
+                # Missing/unrunnable tmux binary must not 500 the request. Rate
+                # limited: the live feed's watcher runs this every second while a
+                # page is open, and a permanently broken binary would otherwise
+                # fill the journal with the same line.
+                global _tmux_error_at
+                now = time.monotonic()
+                if now - _tmux_error_at > 60:
+                    _tmux_error_at = now
+                    sys.stderr.write("tmux: %s\n" % exc)
                 return None
 
 
@@ -2933,6 +2947,121 @@ in
             return payload
 
 
+        # --- Live session feed -----------------------------------------------
+        # Sessions change from outside whichever page you happen to be looking
+        # at: the agent-box-session CLI, an agent adding its own helper, a
+        # second browser tab, or the supervisor bringing a listed session up.
+        # Both pages used to learn about that from their OWN posts plus a short
+        # poll burst only, so anything else stayed invisible until a reload.
+        #
+        # {SESS_BASE}/sessions/events fixes that with a Server-Sent Events
+        # stream: one frame per change, carrying a fingerprint of the session
+        # state. The page compares it with what it last rendered and, when they
+        # differ, re-fetches itself and patches the tab bar / session list in
+        # place (the same swap its own form posts do). Only the digest crosses
+        # the stream — never session data, so nothing here can leak argv, cwd
+        # or env. Same route prefix as the rest of session CRUD, hence the same
+        # auth gate; ?poll=1 returns the fingerprint as plain JSON for clients
+        # that cannot hold a stream open.
+        EVENTS_TICK = 1.0         # how often the watcher samples session state
+        EVENTS_SLICE = 1.0        # how often a stream re-checks that its client is there
+        EVENTS_KEEPALIVE = 20.0   # comment frame so idle proxies keep the stream
+        EVENTS_MAX_STREAMS = 8    # a stream costs a thread; past this, clients poll
+
+
+        def session_view():
+            """The session state the pages actually render: order, name, agent,
+            working directory, live-or-starting.
+
+            Deliberately not the whole of sessions.json — the supervisor folds
+            bookkeeping into that file (hasRun, boxSessionId, clearing
+            initialPrompt on first spawn) and those rewrites must not read as a
+            change worth re-rendering for.
+            """
+            entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
+            live = live_sessions()
+            return [
+                [
+                    name,
+                    str(entries[name].get("agent") or "?"),
+                    str(entries[name].get("workingDirectory") or ""),
+                    name in live,
+                ]
+                for name in entries
+            ]
+
+
+        def session_fingerprint():
+            """Short digest of session_view(): the token the feed pushes and the
+            page compares against the state it was rendered from."""
+            raw = json.dumps(session_view(), separators=(",", ":")).encode("utf-8")
+            return hashlib.sha256(raw).hexdigest()[:16]
+
+
+        class SessionWatcher:
+            """One sampler thread shared by every open stream.
+
+            A sample forks `tmux list-sessions`, so sampling per client would
+            scale with open browser tabs; instead a single thread samples while
+            at least one stream is connected and hands them all the same
+            fingerprint through a condition variable. With nothing connected the
+            thread exits, so an idle box spawns nothing at all.
+            """
+
+            def __init__(self):
+                self.cond = threading.Condition()
+                self.fingerprint = ""
+                self.seq = 0
+                self.streams = 0
+                self.thread = None
+
+            def subscribe(self):
+                """Reserve a stream slot. Returns (sequence, fingerprint) to start
+                from, or None when EVENTS_MAX_STREAMS are already open. The
+                fingerprint is empty until the first sample lands."""
+                with self.cond:
+                    if self.streams >= EVENTS_MAX_STREAMS:
+                        return None
+                    self.streams += 1
+                    if self.thread is None:
+                        self.thread = threading.Thread(target=self._sample, daemon=True)
+                        self.thread.start()
+                    return self.seq, self.fingerprint
+
+            def release(self):
+                with self.cond:
+                    self.streams -= 1
+
+            def wait(self, seq, timeout):
+                """Block until the fingerprint changes or timeout expires, then
+                return (sequence, fingerprint). An unchanged sequence means the
+                caller timed out and should send a keep-alive."""
+                with self.cond:
+                    if self.seq == seq:
+                        self.cond.wait(timeout)
+                    return self.seq, self.fingerprint
+
+            def _sample(self):
+                while True:
+                    with self.cond:
+                        if not self.streams:
+                            # Last stream left: stop sampling. Holding the lock
+                            # across the check makes this safe against a
+                            # subscribe() racing in to start a fresh thread.
+                            self.thread = None
+                            return
+                    current = session_fingerprint()
+                    with self.cond:
+                        if current != self.fingerprint:
+                            self.fingerprint = current
+                            self.seq += 1
+                            self.cond.notify_all()
+                    time.sleep(EVENTS_TICK)
+
+
+        WATCHER = SessionWatcher()
+
+
         def change_password(previous, new):
             """Ask the root helper to verify and rotate the web credentials.
 
@@ -2968,6 +3097,7 @@ in
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="robots" content="noindex">
+        <meta name="agent-box-events" content="{events}" data-fp="{fp}">
         <title>{title}</title>
         """
 
@@ -3401,6 +3531,20 @@ in
               .then(function (t) { applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]); wsSync(); })
               .catch(function () {});
           }
+          // Coalescing wrapper for the live feed, which can report a burst of
+          // changes (a session added, then coming live a beat later): one
+          // re-fetch shortly after the last of them, instead of one each.
+          // Deliberately not an in-flight guard — a request that never settles
+          // would wedge every later refresh, which is the exact staleness this
+          // whole feed exists to prevent.
+          var refreshTimer = null;
+          function scheduleRefresh() {
+            if (refreshTimer) { return; }
+            refreshTimer = window.setTimeout(function () {
+              refreshTimer = null;
+              pollPageOnce();
+            }, 150);
+          }
 
           // After "Update box": watch the update oneshot from `baseline` (its
           // start time before we triggered) until a strictly newer run
@@ -3562,7 +3706,88 @@ in
                 });
             }, 2500);
           }
-          function startPolling(n) { pollLeft = n; schedulePoll(); }
+          // The burst poll is the no-feed fallback for "starting" → "live"; with
+          // the live feed attached the daemon reports that transition itself.
+          function startPolling(n) {
+            if (liveFeed) { return; }
+            pollLeft = n;
+            schedulePoll();
+          }
+
+          // Live session feed. Sessions also change from OUTSIDE this page — the
+          // agent-box-session CLI, an agent adding a helper for itself, another
+          // browser tab, the supervisor bringing a listed session up — and the
+          // page used to see none of that until a reload. The daemon streams a
+          // fingerprint of the session state; whenever it differs from the one
+          // this HTML was rendered with, re-fetch and patch (same swap the form
+          // posts do). The fingerprint, not the state itself, is what travels:
+          // rendering stays server-side and nothing sensitive crosses the feed.
+          var liveFeed = false;
+          var probeTimer = null, probeEvery = 0;
+          var NO_FEED_MS = 5000;    // no stream: the fingerprint poll IS the feed
+          var BACKSTOP_MS = 30000;  // stream up: slow re-check, so nothing can stick
+          function liveUpdates() {
+            var meta = document.querySelector('meta[name="agent-box-events"]');
+            var url = meta && meta.getAttribute("content");
+            if (!url) { return; }
+            var seen = meta.getAttribute("data-fp") || "";
+            function saw(fp) {
+              if (!fp || fp === seen) { return; }
+              seen = fp;
+              scheduleRefresh();
+            }
+            // One-shot fingerprint: a small JSON reply that only costs a page
+            // re-fetch when it actually moved.
+            function probe() {
+              fetch(url + "?poll=1", { headers: { "Accept": "application/json" } })
+                .then(function (r) { return r.json(); })
+                .then(function (s) { saw(s && s.fp); })
+                .catch(function () {});
+            }
+            // Probing keeps running even with the stream up, just slowly: a
+            // stream can die in ways neither end notices (a proxy dropping an
+            // idle connection, a laptop resuming from sleep), and a workspace
+            // that silently stopped updating is the bug this all fixes. Paused
+            // while the tab is hidden — nothing to repaint there — with a probe
+            // on the way back, which is also the resume-from-sleep catch-up.
+            function setProbe(ms) {
+              if (probeEvery === ms) { return; }
+              probeEvery = ms;
+              if (probeTimer) { window.clearInterval(probeTimer); }
+              probeTimer = window.setInterval(function () {
+                if (!document.hidden) { probe(); }
+              }, ms);
+            }
+            document.addEventListener("visibilitychange", function () {
+              if (!document.hidden) { probe(); }
+            });
+            setProbe(NO_FEED_MS);
+            if (!window.EventSource) { return; }
+            // One stream per page. It is another multiplexed h2 stream on any
+            // real box (Caddy always serves TLS); only a plain-HTTP dev rig
+            // spends a whole connection out of the browser's per-origin six on
+            // it, alongside each pane's terminal WebSocket.
+            var es = new EventSource(url);
+            es.onopen = function () {
+              liveFeed = true;
+              setProbe(BACKSTOP_MS);
+            };
+            es.addEventListener("sessions", function (e) {
+              var s = null;
+              try { s = JSON.parse(e.data); } catch (err) { return; }
+              saw(s && s.fp);
+            });
+            es.onerror = function () {
+              // A dropped stream reconnects on its own (a box update restarts
+              // the daemon under us, routinely) and the daemon replays the
+              // current fingerprint on connect. CLOSED means it could not be
+              // established at all — too many streams open, or a proxy that
+              // will not stream — and per spec it never retries, so the poll
+              // goes back to being the feed.
+              liveFeed = false;
+              if (es.readyState === EventSource.CLOSED) { setProbe(NO_FEED_MS); }
+            };
+          }
 
           // Tabbed terminal workspace (the HOME root page, issue #119). The
           // server renders tabs as plain ?tab= links and only the selected
@@ -3942,8 +4167,11 @@ in
           });
 
           checkForUpdate();
+          liveUpdates();
           // Land in the terminal: focus the server-selected tab's pane.
           if (wsActive()) { wsSelect(wsActive(), true); }
+          // Still armed for the moment before the feed reports itself open; it
+          // no-ops from then on.
           startPolling(8);
         })();
         </script>
@@ -4124,10 +4352,22 @@ in
                     f'allow="clipboard-read; clipboard-write"></iframe>')
 
 
+        def render_head(title):
+            """Page head, carrying the live feed's handle: where to stream from,
+            and the fingerprint of the state this HTML was rendered from — so a
+            change landing between render and stream-connect is not missed (the
+            first frame simply disagrees with data-fp and triggers a refresh)."""
+            return HEAD_TPL.format(
+                title=title,
+                events=html.escape(SESS_BASE + "/sessions/events"),
+                fp=session_fingerprint(),
+            )
+
+
         def render_page(message=""):
             msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
             return (
-                HEAD_TPL.format(title="Settings &mdash; " + html.escape(USER))
+                render_head("Settings &mdash; " + html.escape(USER))
                 + STYLE
                 + BODY.format(
                     user=html.escape(USER),
@@ -4158,7 +4398,7 @@ in
             live = live_sessions()
             msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
             return (
-                HEAD_TPL.format(title="Agent Box &mdash; " + html.escape(USER))
+                render_head("Agent Box &mdash; " + html.escape(USER))
                 + STYLE
                 + HOME_BODY.format(
                     base=html.escape(BASE),
@@ -4201,6 +4441,93 @@ in
                 self.end_headers()
                 self.wfile.write(data)
 
+            def _peer_gone(self):
+                """True once the client has closed its end of a stream.
+
+                Server-Sent Events are one-way, so anything readable is EOF (or
+                a pipelined request that will never be answered on this
+                connection) — either way the stream is over. Checked between
+                waits because otherwise a thread sits on the condition variable
+                until its next keep-alive write finally fails, holding a slot
+                against EVENTS_MAX_STREAMS long after the tab closed.
+                """
+                try:
+                    readable, _, _ = select.select([self.connection], [], [], 0)
+                except (OSError, ValueError):
+                    return True
+                if not readable:
+                    return False
+                try:
+                    return not self.connection.recv(1, socket.MSG_PEEK)
+                except (BlockingIOError, InterruptedError):
+                    return False
+                except OSError:
+                    return True
+
+            def _send_event(self, fingerprint):
+                payload = json.dumps({"fp": fingerprint}).encode("utf-8")
+                self.wfile.write(b"event: sessions\ndata: " + payload + b"\n\n")
+
+            def _send_events(self):
+                """Stream session-state changes as Server-Sent Events.
+
+                Held open for the life of the page, so it costs one thread —
+                capped at EVENTS_MAX_STREAMS, past which the client keeps its
+                polling fallback rather than pinning threads here. Frames are
+                `event: sessions` with a fingerprint payload; a `:` comment
+                every EVENTS_KEEPALIVE seconds keeps idle intermediaries (and
+                the write that notices a vanished client) alive.
+                """
+                start = WATCHER.subscribe()
+                if start is None:
+                    self._send_json({"ok": False, "reason": "busy"}, status=503)
+                    return
+                seq, known = start
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    # Caddy streams text/event-stream unbuffered on its own; the
+                    # header is for any other proxy the user puts in front (nginx
+                    # buffers proxied responses by default, which would stall this).
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.end_headers()
+                    # Reconnect delay for the browser, and an immediate byte so it
+                    # marks the stream open instead of waiting for the first change.
+                    self.wfile.write(b"retry: 3000\n\n")
+                    # Replay the current fingerprint straight away: state can have
+                    # moved between rendering the page and connecting here, and a
+                    # watcher already running for another tab would have counted
+                    # that change before this stream existed. The client ignores a
+                    # fingerprint it is already showing. Empty only while the first
+                    # sample is still pending, which lands within EVENTS_TICK.
+                    if known:
+                        self._send_event(known)
+                    self.wfile.flush()
+                    quiet = 0.0
+                    while True:
+                        latest, fingerprint = WATCHER.wait(seq, EVENTS_SLICE)
+                        if self._peer_gone():
+                            return
+                        if latest != seq:
+                            seq = latest
+                            quiet = 0.0
+                            self._send_event(fingerprint)
+                        else:
+                            quiet += EVENTS_SLICE
+                            if quiet < EVENTS_KEEPALIVE:
+                                continue
+                            quiet = 0.0
+                            self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+                    # The page navigated away or the socket died: nothing to
+                    # report, the client reconnects if it still wants the feed.
+                    pass
+                finally:
+                    WATCHER.release()
+
             def _redirect(self, query="", page=None):
                 target = (page or BASE + "/") + (("?" + query) if query else "")
                 self.send_response(303)
@@ -4236,6 +4563,18 @@ in
                         self._send_json({"ok": False, "dirs": []})
                     else:
                         self._send_json({"ok": True, "dirs": list_subdirs(abs_dir)})
+                    return
+                # Live session feed: routed here for the same reasons as the
+                # picker above (SESS_BASE is "" in HOME mode, so this path is not
+                # under BASE; GET-only and read-only, so no CSRF concern — and it
+                # discloses nothing but a digest). ?poll=1 answers with the same
+                # fingerprint as a one-shot JSON reply, for a client that could
+                # not establish the stream.
+                if parsed.path.rstrip("/") == SESS_BASE + "/sessions/events":
+                    if params.get("poll"):
+                        self._send_json({"fp": session_fingerprint()})
+                    else:
+                        self._send_events()
                     return
                 message = ""
                 if "ok" in params:

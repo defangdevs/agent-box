@@ -20,6 +20,8 @@
 #     on the vhost is served unauthenticated anymore (the old picker and its
 #     public sessions.json are gone),
 #   - session CRUD on the settings page (back=settings redirects there),
+#   - the live session feed both pages follow (Server-Sent Events through
+#     Caddy, plus the one-shot fingerprint its no-stream fallback polls),
 #   - ttyd running with --url-arg so /<user>/?arg=<session> deep links work.
 #
 # Like the other tests, lib.mkForce-swaps the module Caddyfile for a minimal
@@ -96,6 +98,7 @@
 
   testScript = ''
     import base64
+    import json
     import re
     import shlex
 
@@ -590,6 +593,58 @@
         )
         machine.succeed("sleep 6")
         machine.fail(tmux("has-session -t =claude"))
+
+    # Live session feed: sessions change from outside whichever page is open
+    # — the CLI, an agent adding a helper for itself, another browser tab —
+    # and both pages follow along instead of going stale until a reload. The
+    # daemon streams a fingerprint of the session state; the page re-fetches
+    # itself when it moves. Asserted end to end THROUGH CADDY, because a
+    # stream that only works when curled at the unix socket direct would
+    # leave the UI exactly as stale as before.
+    with subtest("the session feed streams changes through Caddy"):
+        # Auth-gated like every other route on the vhost.
+        client.succeed(
+            f"{curl} -o /dev/null -w '%{{http_code}}' "
+            "https://box.test/sessions/events | grep -x 401"
+        )
+        # Both pages carry the feed's handle: where to stream from, plus the
+        # fingerprint of the state they were rendered with (so a change
+        # landing before the stream connects is not missed).
+        for page_url in ["https://box.test/", "https://box.test/agent/settings/"]:
+            feed_page = client.succeed(f"{curl} -u agent:testpassword {page_url}")
+            assert 'name="agent-box-events" content="/sessions/events"' in feed_page, feed_page
+            assert re.search(r'data-fp="[0-9a-f]{16}"', feed_page), feed_page
+
+        # Hold a stream open from the client VM. Its first frame replays the
+        # fingerprint of the state as it stands now — the baseline a later
+        # frame has to differ from, so that merely receiving a frame cannot
+        # pass this test.
+        client.succeed(
+            f"nohup {curl} -N --max-time 120 -u agent:testpassword "
+            "https://box.test/sessions/events > /tmp/feed.txt 2>&1 < /dev/null &"
+        )
+        client.wait_until_succeeds("grep -q '^data:' /tmp/feed.txt", timeout=60)
+        baseline = json.loads(
+            client.succeed("grep -m1 '^data:' /tmp/feed.txt").split("data:", 1)[1]
+        )["fp"]
+
+        # Create a session the way everything outside the browser does.
+        machine.succeed(
+            "su -s /bin/sh agent -c 'agent-box-session add feedtest --agent claude'"
+        )
+        client.wait_until_succeeds(
+            f"grep '^data:' /tmp/feed.txt | grep -qv {baseline}", timeout=60
+        )
+        # The one-shot fingerprint (what a client that cannot hold a stream
+        # open polls instead) moves with it.
+        polled = json.loads(
+            client.succeed(
+                f"{curl} -u agent:testpassword 'https://box.test/sessions/events?poll=1'"
+            )
+        )["fp"]
+        assert polled != baseline, polled
+
+        machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm feedtest'")
 
   '';
 }
