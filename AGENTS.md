@@ -13,12 +13,14 @@ Keep the module self-contained: deployed boxes fetch `modules/agent-box.nix` as 
 ## Build, Test, and Development Commands
 
 - `nix run .#assemble` regenerates `modules/agent-box.nix` from `modules/agent-box.nix.in` + `modules/src/` (run from the repo root after editing either).
-- `nix build -L .#checks.x86_64-linux.module-generated-up-to-date` verifies the committed module matches its sources.
+- `nix build -L .#checks.<system>.module-generated-up-to-date` verifies the committed module matches its sources (`<system>` is your host's, e.g. `aarch64-linux`).
 - `nix flake metadata` validates flake inputs and basic evaluation.
-- `nix build .#vm` builds the bootable qcow2 image under `result/`.
-- `nix build -L .#checks.x86_64-linux.multi-user` runs the quick module/configuration assertion.
-- `nix build -L .#checks.x86_64-linux.module-single-file` verifies standalone module evaluation.
+- `nix build .#packages.x86_64-linux.vm` builds the bootable qcow2 image under `result/`.
+- `nix build -L .#checks.<system>.multi-user` runs the quick module/configuration assertion.
+- `nix build -L .#checks.<system>.module-single-file` verifies standalone module evaluation.
 - `nix build -L .#checks.x86_64-linux.<name>` runs an individual VM test such as `sessions` or `settings-page`.
+
+The eval-level checks (`multi-user`, `module-single-file`, `download-route`, `webhook-route`, `module-generated-up-to-date`) and `nix run .#assemble` are exposed for both `x86_64-linux` and `aarch64-linux`, so they run natively on a Graviton box like the deployed fleet. The qcow2 image and the interactive `runNixOSTest` checks are `x86_64-linux`-only: a NixOS test needs a same-arch KVM guest, so building them from another arch would fall back to unusably slow TCG. Widen `vmSystems` in `flake.nix` to offer them elsewhere.
 - `cfn-lint aws/template.yaml` validates the CloudFormation template.
 
 Prefer targeted checks over `nix flake check`; the intentionally filesystem-free VM configuration makes the latter unsuitable. Live browser tests require `E2E_BASE_URL` and `E2E_PASSWORD`; run `playwright test -c tests/e2e` after provisioning the nixpkgs Playwright browsers described in the config.

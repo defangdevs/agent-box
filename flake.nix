@@ -7,7 +7,19 @@
 
   outputs = { self, nixpkgs, ... }:
     let
-      system = "x86_64-linux";
+      # The module itself is arch-agnostic, and the deployed fleet is aarch64
+      # (aws/template.yaml offers Graviton instances only), so the cheap
+      # eval-level checks and the assemble app are exposed for both — a
+      # maintainer on an ARM box can run them natively.
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      eachSystem = nixpkgs.lib.genAttrs systems;
+
+      # The qcow2 image (BIOS/GRUB partitioning) and the interactive
+      # runNixOSTest checks stay pinned here: a NixOS test needs a same-arch
+      # guest to get KVM, so cross-arch it is unbuildable without emulation.
+      # To offer them elsewhere, add the system to `vmSystems`.
+      imageSystem = "x86_64-linux";
+      vmSystems = [ imageSystem ];
     in
     {
       # The portable module. Import into any NixOS host:
@@ -19,7 +31,7 @@
       #   nixos-rebuild build-vm --flake .#vm
       # (build-vm injects boot/filesystem, so this stays hardware-free).
       nixosConfigurations.vm = nixpkgs.lib.nixosSystem {
-        inherit system;
+        system = imageSystem;
         modules = [ self.nixosModules.agent-box ./hosts/vm.nix ];
       };
 
@@ -27,7 +39,7 @@
       # into nixpkgs (NixOS 25.05+): nix build .#vm  ->  result/*.qcow2
       # The `qemu` variant extends the fs/bootloader-free vm config with its own
       # partition table + GRUB, so the base config stays usable for build-vm.
-      packages.${system} =
+      packages.${imageSystem} =
         let
           image = self.nixosConfigurations.vm.config.system.build.images.qemu;
         in
@@ -39,22 +51,24 @@
       # `nix run .#assemble` — regenerate the committed modules/agent-box.nix
       # from modules/agent-box.nix.in + modules/src/*. Run from the repo root;
       # edits the working tree in place.
-      apps.${system}.assemble =
+      apps = eachSystem (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          type = "app";
-          program = "${pkgs.writeShellScript "agent-box-assemble" ''
-            exec ${pkgs.python3}/bin/python3 "$PWD/bin/assemble-module.py" "$@"
-          ''}";
-        };
+          assemble = {
+            type = "app";
+            program = "${pkgs.writeShellScript "agent-box-assemble" ''
+              exec ${pkgs.python3}/bin/python3 "$PWD/bin/assemble-module.py" "$@"
+            ''}";
+          };
+        });
 
-      # CI validation entrypoints (`nix build .#checks.x86_64-linux.<name>`).
+      # CI validation entrypoints (`nix build .#checks.<system>.<name>`).
       # NOTE: prefer these over `nix flake check` — the VM nixosConfiguration is
       # intentionally bootloader/filesystem-free (the generator supplies them),
       # so its `toplevel` (which flake check builds) does not evaluate.
-      checks.${system} =
+      checks = eachSystem (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
 
@@ -80,56 +94,8 @@
               printf 'generated services: %s\n' ${nixpkgs.lib.escapeShellArg (toString wanted)} > "$out"
             '';
 
-          # Full closure build of the VM config — the "is it actually usable"
-          # proof (compiles the system agents would run in).
-          vm-closure = self.nixosConfigurations.vm.config.system.build.vm;
-
-          # Interactive VM test: wrong-password basic-auth attempts on the web
-          # terminal get the client IP banned. Needs KVM (or slow TCG); CI
-          # enables /dev/kvm before building this.
-          web-fail2ban = pkgs.testers.runNixOSTest
-            (import ./tests/web-fail2ban.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test: an agent user drops a snippet into ~/sites/
-          # and reloads caddy via the sudoAllowlist rule; the new vhost
-          # serves without any nixos-rebuild.
-          self-serve-domain = pkgs.testers.runNixOSTest
-            (import ./tests/self-serve-domain.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test: the per-user settings page (issue #36) adds a
-          # secret through the browser (behind basic auth), writes the
-          # user-owned 0600 env file, lists key names only, and the agent unit
-          # picks the file up as an optional EnvironmentFile — no rebuild.
-          settings-page = pkgs.testers.runNixOSTest
-            (import ./tests/settings-page.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test (issue 62): protectMemory defaults — zram
-          # swap active, agent unit's OOMScoreAdjust applied, and earlyoom
-          # kills a runaway memory hog while the box stays responsive
-          # (instead of the swapless refault livelock that froze a deployed
-          # 2 GB box for hours).
-          memory-protection = pkgs.testers.runNixOSTest
-            (import ./tests/memory-protection.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test (issue #59): sessions are runtime data — the
-          # seeded "main" session starts, `agent-box-session add/rm` brings a
-          # second agent up and down as the user (no sudo, no rebuild), the
-          # runtime session lives inside the hardened unit's cgroup, and the
-          # settings daemon serves the root session manager page plus its
-          # CRUD routes, all behind the web auth gate.
-          sessions = pkgs.testers.runNixOSTest
-            (import ./tests/sessions.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test (issue #132): each web user's ~/downloads
-          # file-drop dir is served behind the terminal's basic auth at
-          # /<user>/downloads/, so an agent can hand a produced file to the
-          # user as a URL — perms/symlink, caddy reachability, and the auth
-          # gate.
-          download-files = pkgs.testers.runNixOSTest
-            (import ./tests/download-files.nix { agent-box = self.nixosModules.agent-box; });
-
           # Guard (issue #132): the module's REAL generated Caddyfile (the VM
-          # test above swaps in a `tls internal` stand-in) must carry the
+          # test below swaps in a `tls internal` stand-in) must carry the
           # authenticated downloads route for a web user — the handle, the
           # strip_prefix, and file_server rooted at the caddy-readable backing
           # dir. Cheap: realises only the tiny rendered config + a grep.
@@ -165,19 +131,8 @@
               printf 'downloads route present in generated Caddyfile\n' > "$out"
             '';
 
-          # Interactive VM test (issue #101): the per-user webhook receiver, ON
-          # BY DEFAULT. Socket-activated 0660 <user>:caddy ingress, the
-          # unauthenticated public path next to a still-401ing vhost, HMAC
-          # accept/reject (and 404 before any secret exists — why default-on is
-          # safe), IPC fan-out into a stand-in session peer applying its own
-          # filter, and the discovery surface (CLI on PATH,
-          # AGENT_BOX_WEBHOOK_URL, per-session LOCAL_WEBHOOK_SESSION, seeded
-          # claude plugin settings).
-          webhook = pkgs.testers.runNixOSTest
-            (import ./tests/webhook.nix { agent-box = self.nixosModules.agent-box; });
-
           # Guard (issue #101): the module's REAL generated Caddyfile (the VM
-          # test above swaps in a `tls internal` stand-in) must route the
+          # test below swaps in a `tls internal` stand-in) must route the
           # webhook path to the user's ingress socket, BEFORE the /<user>/*
           # catch-all and with no basic_auth in that handle — GitHub cannot
           # authenticate, so an auth gate here means silently dropped
@@ -291,6 +246,70 @@
               python3 repo/bin/assemble-module.py --check --repo repo
               touch "$out"
             '';
-        };
+        }
+        # Everything below boots a guest, so it only exists for `vmSystems`:
+        # runNixOSTest wants a same-arch KVM guest (cross-arch falls back to
+        # TCG, which is too slow to be useful), and vm-closure builds the
+        # imageSystem-pinned nixosConfigurations.vm.
+        // nixpkgs.lib.optionalAttrs (builtins.elem system vmSystems) {
+          # Full closure build of the VM config — the "is it actually usable"
+          # proof (compiles the system agents would run in).
+          vm-closure = self.nixosConfigurations.vm.config.system.build.vm;
+
+          # Interactive VM test: wrong-password basic-auth attempts on the web
+          # terminal get the client IP banned. Needs KVM (or slow TCG); CI
+          # enables /dev/kvm before building this.
+          web-fail2ban = pkgs.testers.runNixOSTest
+            (import ./tests/web-fail2ban.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test: an agent user drops a snippet into ~/sites/
+          # and reloads caddy via the sudoAllowlist rule; the new vhost
+          # serves without any nixos-rebuild.
+          self-serve-domain = pkgs.testers.runNixOSTest
+            (import ./tests/self-serve-domain.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test: the per-user settings page (issue #36) adds a
+          # secret through the browser (behind basic auth), writes the
+          # user-owned 0600 env file, lists key names only, and the agent unit
+          # picks the file up as an optional EnvironmentFile — no rebuild.
+          settings-page = pkgs.testers.runNixOSTest
+            (import ./tests/settings-page.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue 62): protectMemory defaults — zram
+          # swap active, agent unit's OOMScoreAdjust applied, and earlyoom
+          # kills a runaway memory hog while the box stays responsive
+          # (instead of the swapless refault livelock that froze a deployed
+          # 2 GB box for hours).
+          memory-protection = pkgs.testers.runNixOSTest
+            (import ./tests/memory-protection.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue #59): sessions are runtime data — the
+          # seeded "main" session starts, `agent-box-session add/rm` brings a
+          # second agent up and down as the user (no sudo, no rebuild), the
+          # runtime session lives inside the hardened unit's cgroup, and the
+          # settings daemon serves the root session manager page plus its
+          # CRUD routes, all behind the web auth gate.
+          sessions = pkgs.testers.runNixOSTest
+            (import ./tests/sessions.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue #132): each web user's ~/downloads
+          # file-drop dir is served behind the terminal's basic auth at
+          # /<user>/downloads/, so an agent can hand a produced file to the
+          # user as a URL — perms/symlink, caddy reachability, and the auth
+          # gate.
+          download-files = pkgs.testers.runNixOSTest
+            (import ./tests/download-files.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue #101): the per-user webhook receiver, ON
+          # BY DEFAULT. Socket-activated 0660 <user>:caddy ingress, the
+          # unauthenticated public path next to a still-401ing vhost, HMAC
+          # accept/reject (and 404 before any secret exists — why default-on is
+          # safe), IPC fan-out into a stand-in session peer applying its own
+          # filter, and the discovery surface (CLI on PATH,
+          # AGENT_BOX_WEBHOOK_URL, per-session LOCAL_WEBHOOK_SESSION, seeded
+          # claude plugin settings).
+          webhook = pkgs.testers.runNixOSTest
+            (import ./tests/webhook.nix { agent-box = self.nixosModules.agent-box; });
+        });
     };
 }
