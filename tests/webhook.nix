@@ -303,6 +303,66 @@
     machine.sleep(3)
     machine.fail("grep -q 'someone/unrelated' /tmp/peer.log")
 
+    # --- dispatch: a standing watch spawns a fresh session (0.9.0, #1) ------
+    # A deliver_to:"subagent" subscription goes to the SHARED dispatch file,
+    # pinned by default, and does not touch the session's own filter.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/agent-box --deliver-to subagent"
+        " --note 'standing watch: triage'"
+    )
+    machine.succeed(
+        "jq -e '.topics[0].topic == \"github:defangdevs/agent-box\""
+        " and .topics[0].ttlHours == 0'"
+        " /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+    # The daemon advertises the spawn wiring, so subscribe could warn if the
+    # unit ever lost LOCAL_WEBHOOK_SPAWN_CMD.
+    machine.succeed(
+        "systemctl show -p Environment agent-box-webhook-agent.service"
+        " | grep -q 'LOCAL_WEBHOOK_SPAWN_CMD=/nix/store/'"
+    )
+    machine.succeed("jq -e '.spawn == true' /home/agent/.local/state/local-webhook/receiver.json")
+
+    # A signed delivery on the watched repo → a fresh hook-* session appears in
+    # sessions.json, primed with the framed event text plus the trusted
+    # preamble, and the supervisor starts it as a real tmux session.
+    client.succeed(
+        f"{post} -H 'x-hub-signature-256: sha256={sig}' "
+        f"https://box.test/agent/webhook/github | grep -x 200"
+    )
+    machine.wait_until_succeeds(
+        "jq -e '.sessions | keys | map(select(startswith(\"hook-\"))) | length == 1'"
+        " /home/agent/.config/agent-box/sessions.json",
+        timeout=60,
+    )
+    hook_prompt = machine.succeed(
+        "jq -r '.sessions | to_entries[] | select(.key | startswith(\"hook-\"))"
+        " | .value.initialPrompt' /home/agent/.config/agent-box/sessions.json"
+    )
+    assert "UNTRUSTED webhook:github" in hook_prompt, hook_prompt
+    assert "defangdevs/agent-box" in hook_prompt, hook_prompt
+    assert "standing watch: triage" in hook_prompt, hook_prompt
+    assert "webhook dispatcher" in hook_prompt, hook_prompt   # trusted preamble
+    assert "agent-box-session rm hook-" in hook_prompt, hook_prompt  # cleanup duty
+    # The key names the repo, so the tab is readable: hook-defangdevs-agent-box-XXXX.
+    machine.succeed(
+        "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-agent-box-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    machine.wait_until_succeeds(
+        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
+        " list-sessions -F '#S' | grep -q '^hook-'",
+        timeout=60,
+    )
+
+    # The event that spawned the watch session was NOT also a session delivery
+    # for the peer (its filter has someone else's repo) — dispatch and session
+    # routing stay independent.
+    machine.fail("grep -q 'standing watch: triage' /tmp/peer.log")
+
     # The daemon is the ingress owner and survives every delivery — the box's
     # endpoint must not depend on which sessions happen to be alive.
     machine.succeed("systemctl is-active agent-box-webhook-agent.service")
