@@ -804,18 +804,35 @@ EOF
     usage() {
       cat <<'USAGE'
     usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
+                                             [--deliver-to session|subagent]
                                              [--renew-on-event] [--ignore-sender LOGIN]...
-           agent-box-webhook unsubscribe TOPIC
+           agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent]
            agent-box-webhook ls
            agent-box-webhook status
            agent-box-webhook url
            agent-box-webhook setup [SOURCE]
 
-    Route webhook events into THIS session instead of polling for them. TOPIC is
+    Route webhook events to an agent instead of polling for them. TOPIC is
     "source:key" — a bare "owner/repo" means github:owner/repo, "owner/*" and "*"
-    also work. Deliveries arrive as messages in the session; --note says why you
-    subscribed and is echoed under each one, so a later session still has the
-    context. Subscriptions expire (default 1h; --ttl 0 pins one forever).
+    also work. --note says why you subscribed and is echoed under every delivery,
+    so a later session still has the context.
+
+    Two delivery shapes:
+      --deliver-to session   (default) events arrive as messages in THIS
+                             session. Per session, expires after 1h — --ttl
+                             HOURS for a longer wait, --renew-on-event to reset
+                             the clock on every delivery. Avoid --ttl 0 here: a
+                             pinned topic interrupts whatever session is active,
+                             indefinitely.
+      --deliver-to subagent  standing watch, for events no session owns (new
+                             issues/PRs, CI on a repo nobody is working on).
+                             Each matching event batch spawns a FRESH hook-*
+                             session primed with the event text; bursts coalesce
+                             into one. SHARED across sessions and pinned (--ttl
+                             0) by default; `ls` shows these under "dispatch".
+
+    --ignore-sender LOGIN mutes echoes of that sender's own comments and pushes
+    ("@self" is $LOCAL_WEBHOOK_SELF); CI-outcome events are delivered anyway.
 
     One-time per box, to make deliveries possible at all:
       agent-box-webhook setup      # mints the HMAC secret, prints URL + secret
@@ -929,6 +946,10 @@ EOF
 
     Then route the events you care about into this session:
       agent-box-webhook subscribe OWNER/REPO --note "why you care"
+
+    Or, for events no session owns, a standing watch that spawns a fresh
+    session per event batch instead of interrupting this one:
+      agent-box-webhook subscribe OWNER/REPO --deliver-to subagent --note "triage"
     EOF
         ;;
       ""|-h|--help|help) usage ;;

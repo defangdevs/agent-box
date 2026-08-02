@@ -119,6 +119,11 @@
     # The CLI is on the agent's PATH and the endpoint URL is in its
     # environment, so an agent can find both without being told a hostname.
     machine.succeed("test -x /run/current-system/sw/bin/agent-box-webhook")
+    # `--help` is the only description of the CLI an agent gets, so it has to
+    # keep documenting BOTH delivery shapes — the wrapper forwards flags to
+    # webhook.py verbatim, which is exactly how its usage() went stale before.
+    machine.succeed("agent-box-webhook --help | grep -q -- '--deliver-to subagent'")
+    machine.succeed("agent-box-webhook --help | grep -q -- '--ignore-sender'")
     machine.succeed(
         "systemctl show -p Environment agent-box-agent.service | grep -q agent-box-webhook/bin"
     )
