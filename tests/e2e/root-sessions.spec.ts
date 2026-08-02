@@ -11,7 +11,9 @@
 //     userinfo plus an EMPTY password, and typed credentials can't override),
 //   - client-side tab switching that keeps background panes mounted,
 //   - the add-session flow from the tab bar (new tab appears and activates),
-//   - session restart/delete on the settings page, incl. the confirm() guard.
+//   - session restart/delete on the settings page, incl. the confirm() guard,
+//   - the live feed: sessions created or deleted elsewhere show up in an
+//     already-open page without a reload.
 //
 // See playwright.config.ts for the E2E_* environment contract.
 
@@ -218,6 +220,58 @@ test('settings link on the root page reaches the settings page, which manages se
   // The session manager moved here from the old root list page (issue 119).
   await expect(page.locator('#session-editor')).toHaveCount(1);
   await expect(page.getByRole('heading', { name: 'Sessions', exact: true })).toBeVisible();
+});
+
+// Sessions change from outside whichever page is open — the
+// agent-box-session CLI, an agent adding a helper for itself, a second
+// browser tab — and the page has to follow along rather than go stale until
+// somebody reloads it. The daemon streams a fingerprint of the session state
+// and the page re-fetches when it moves. Driven here through the HTTP API,
+// which is what all those out-of-band writers look like to an open page.
+test('a session created and deleted elsewhere appears and goes without a reload', async ({ browser }) => {
+  const ctx = await browser.newContext({
+    httpCredentials: { username: USER, password: PASSWORD },
+  });
+  const page = await ctx.newPage();
+  await page.goto('/');
+  await expect(page.locator('#tab-bar .tab[data-tab="main"]')).toBeVisible();
+
+  // Created without touching the open page at all. The name is auto-derived,
+  // so take it from the redirect the daemon answers with.
+  const added = await ctx.request.post('/sessions/add', {
+    form: { cwd: '~' },
+    maxRedirects: 0,
+  });
+  expect(added.status()).toBe(303);
+  const name = new URL(added.headers()['location'], 'http://x')
+    .searchParams.get('tab') as string;
+  expect(name).toBeTruthy();
+
+  const tab = page.locator(`#tab-bar .tab[data-tab="${name}"]`);
+  await expect(tab).toBeVisible({ timeout: 15_000 });
+
+  // ...and the settings list, open in its own page, follows the same change.
+  // Match the session link exactly: every row also names its agent, and the
+  // auto-derived session name IS an agent name.
+  const settings = await ctx.newPage();
+  await settings.goto(`/${USER}/settings/`);
+  const row = settings.locator('#sessions-list a.sess')
+    .filter({ hasText: new RegExp(`^${name}$`) });
+  await expect(row).toHaveCount(1);
+
+  // Deleted the same way: the tab goes without a reload either.
+  const removed = await ctx.request.post('/sessions/delete', {
+    form: { name },
+    maxRedirects: 0,
+  });
+  expect(removed.status()).toBe(303);
+  await expect(tab).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.locator(`#panes .pane[data-pane="${name}"]`)).toHaveCount(0);
+  await expect(row).toHaveCount(0, { timeout: 15_000 });
+
+  // None of that was a page load: the workspace patched itself in place.
+  expect(await page.evaluate(() => performance.getEntriesByType('navigation').length)).toBe(1);
+  await ctx.close();
 });
 
 test('settings page links to the agent-box repository', async ({ browser }) => {
