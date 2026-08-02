@@ -299,17 +299,104 @@ let
     # "failed to invoke ps for pid-managed app server" and no control socket is
     # ever created — appended, so a session's own PATH still wins.
     PATH=$PATH:${pkgs.procps}/bin
+    # The name the Codex apps label this box with ("serverName") comes straight
+    # from gethostname(2): codex exposes no env var, config key or flag for it
+    # (HOSTNAME does not even appear in the binary, and every candidate -c key
+    # is rejected by --strict-config). On a cloud box the kernel name is the
+    # INTERNAL fqdn (ip-10-x-x-x.<region>.compute.internal), which is useless in
+    # the apps — so when a public host label is configured, re-exec inside a
+    # private UTS namespace whose hostname is that label. An UNPRIVILEGED user
+    # namespace suffices: --keep-caps grants CAP_SYS_ADMIN inside the new
+    # namespace ONLY (the uid is unchanged, and the caps confer nothing
+    # outside), and unshare execs in place, so this stays the session's
+    # foreground pid and the trap below still tears the daemon down. The daemon
+    # inherits the namespace and keeps it alive after it detaches.
+    # /proc/sys/kernel/hostname is read-only under ProtectKernelTunables, so
+    # setting it needs a real sethostname(2) caller rather than a shell
+    # redirect. $1 is that label (empty = keep the kernel name).
+    rcname=$1; shift
+    if [ -n "$rcname" ] && [ -z "''${AGENT_BOX_CODEX_UTS:-}" ]; then
+      export AGENT_BOX_CODEX_UTS=1
+      exec ${pkgs.util-linux}/bin/unshare --user --map-current-user --keep-caps --uts \
+        ${pkgs.runtimeShell} -c \
+        '${pkgs.unixtools.hostname}/bin/hostname "$1" || exit 1; shift; exec "$@"' \
+        -- "$rcname" "$0" "$rcname" "$@"
+    fi
     codex=$1; shift
     stop() { "$codex" app-server daemon stop >/dev/null 2>&1 || true; }
     # A daemon left over from an earlier start would make ours a no-op and
     # leave us supervising nothing, so clear it first, then own a fresh one.
     stop
     trap 'stop; exit 0' HUP INT TERM
-    "$codex" app-server daemon start "$@" || { stop; exit 1; }
-    "$codex" app-server daemon enable-remote-control >/dev/null || { stop; exit 1; }
+    # This wrapper is the session's foreground command, so its stdout IS what
+    # the browser terminal shows. Without the banners below the pane is a lone
+    # line of daemon-start JSON and then silence forever, with no hint that the
+    # session is healthy, that it is not a codex prompt, or that Remote Control
+    # cannot enroll until someone signs in (issue #159).
+    hr() { printf '%s\n' "────────────────────────────────────────────────────────────"; }
+    signed_in() { "$codex" login status >/dev/null 2>&1; }
+    banner_signin() {
+      cat <<EOF
+
+  ✗ Not signed in — Remote Control cannot enroll yet.
+    ("codex remote-control pair" fails until this is done.)
+
+    This box is headless, so use device auth; plain \`codex login\`
+    serves a localhost URL your browser cannot reach:
+
+        codex login --device-auth
+
+    Then pair the Codex desktop/mobile app:
+
+        codex remote-control pair
+
+    Run both from any shell on the box — open another terminal tab,
+    or: agent-box-session add sh --agent shell
+EOF
+    }
+    banner_ready() {
+      cat <<EOF
+
+  ✓ Signed in. Pair a Codex desktop/mobile app with:
+
+        codex remote-control pair
+
+    The pairing code is short-lived — re-run it for a fresh one.
+EOF
+    }
+    daemon_failed() {
+      cat >&2 <<EOF
+
+  Codex Remote Control daemon failed to $1.
+  Log: ''${CODEX_HOME:-$HOME/.codex}/app-server-daemon/app-server.stderr.log
+  The shell you are dropped into is a post-mortem, not the session;
+  restart from the settings page once the cause is fixed.
+EOF
+    }
+    # Daemon-start chatter is a JSON blob that means nothing to a human; keep it
+    # in the log the failure path points at rather than as the pane's first
+    # impression.
+    "$codex" app-server daemon start "$@" >/dev/null || { daemon_failed "start"; stop; exit 1; }
+    "$codex" app-server daemon enable-remote-control >/dev/null \
+      || { daemon_failed "enable remote control"; stop; exit 1; }
+    hr
+    printf '%s\n' "  agent-box: codex Remote Control daemon is running."
+    printf '%s\n' "  This pane is a status view, not a codex prompt — typing does nothing."
+    printf '%s\n' "  Machine name in the Codex apps: $(uname -n)"
+    hr
+    if signed_in; then banner_ready; else banner_signin; fi
     # `sleep & wait` (not a bare sleep) so a signal interrupts the wait at
     # once and the trap fires without waiting the interval out.
+    was_signed_in=false
+    signed_in && was_signed_in=true
     while "$codex" app-server daemon version >/dev/null 2>&1; do
+      # Sign-in happens in ANOTHER tab, so poll for the transition and confirm
+      # it here — otherwise the pane still reads "not signed in" long after it
+      # stopped being true, and the user has no idea pairing is now unblocked.
+      if [ "$was_signed_in" = false ] && signed_in; then
+        was_signed_in=true
+        banner_ready
+      fi
       sleep 5 & wait $!
     done
   '';
@@ -1373,21 +1460,23 @@ ${agentBinCases}          *) return 1 ;;
               # `--remote-control <name>` flag on its normal TUI. So a
               # remote-controlled codex session runs a DIFFERENT program: the
               # foreground supervisor wrapper (the daemon itself detaches —
-              # see codexRemoteControl), which takes the codex binary as its
-              # first arg and forwards the rest to
+              # see codexRemoteControl), which takes the host label and then
+              # the codex binary as its first two args and forwards the rest to
               # `app-server daemon start`. That subcommand rejects
               # --dangerously-bypass-approvals-and-sandbox, so honour
               # skipPermissions via the two -c overrides that flag sets
               # (codex's documented config-override path). A bare value that
               # isn't valid TOML is taken as a string literal, so no quoting is
-              # needed. remoteControlName is claude-only — the codex daemon
-              # derives its own machine name from the hostname. Pairing the
+              # needed. remoteControlName is claude-only: the codex daemon takes
+              # its machine name from gethostname(2) with no override, so the
+              # wrapper gives it ${hostLabel} through a private UTS namespace
+              # instead (see codexRemoteControl). Pairing the
               # Codex apps to a running daemon uses `codex remote-control
               # pair`; the standalone-path shim seeded above is what lets the
               # Nix codex serve as the app-server. The daemon takes no
               # positional prompt and has no TUI transcript to resume, so the
               # kickoff/resume wiring below does not apply to it.
-              cmd="$(printf '%q' ${codexRemoteControl}) $cmd"
+              cmd="$(printf '%q' ${codexRemoteControl}) ${lib.escapeShellArg hostLabel} $cmd"
               if [ "$skip" = true ]; then
                 cmd="$cmd -c approval_policy=never -c sandbox_mode=danger-full-access"
               fi
