@@ -338,6 +338,13 @@ On by default (`webhook.enable`), needs `web.enable`. How it fits together:
   sessions. Subscriptions are **per session** and expire (1h by default), so a
   straggler can't wake a session whose context is long gone. Payload text is
   truncated and marked `⟪UNTRUSTED⟫` — the agent is told to read it as data.
+- **Standing watches** (`--deliver-to subagent`): for events no session owns —
+  new issues, new PRs, CI on a repo nobody is working on — a shared, pinned
+  subscription makes the daemon spawn a **fresh `hook-*` session** primed with
+  the event text instead of interrupting whichever session is active. Bursts
+  coalesce into one session; concurrent spawns are capped, and the wrapper
+  refuses to accumulate more than a handful of live `hook-*` sessions. The
+  spawned session's prompt tells it to remove itself when done.
 - Claude Code sessions additionally get `webhook_subscribe` /
   `webhook_unsubscribe` / `webhook_subscriptions` as MCP tools, from the
   [local-channels](https://github.com/defangdevs/local-channels) `local-webhook`
