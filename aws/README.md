@@ -216,7 +216,8 @@ that immediately fails cert validation.
 GitHub Pages or `raw.githubusercontent.com` are rejected with
 "TemplateURL must be a supported URL." That's why the publish-template
 workflow syncs to S3, and the README's Launch Stack links point at
-`https://<bucket>.s3.amazonaws.com/template.yaml`.
+`https://<bucket>.s3.amazonaws.com/lightsail-template.yaml` (default) and
+`https://<bucket>.s3.amazonaws.com/template.yaml` (EC2 alternative).
 
 ### Why the template creates its own VPC
 
@@ -447,14 +448,16 @@ repo settings UI. No secrets attached; it's just the deployment gate.
 Verify with a `workflow_dispatch` run of `Publish CFN template to S3`, then:
 
 ```bash
+curl -I "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/lightsail-template.yaml"
 curl -I "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/template.yaml"
 ```
 
 ## Pull request validation
 
 `.github/workflows/aws-ci.yml` runs on pull requests that touch the AWS
-template, launch page, browser-terminal smoke helper, or related workflows. It
-does not create AWS resources; it runs `cfn-lint aws/template.yaml` and compiles
+templates, launch page, browser-terminal smoke helper, or related workflows. It
+does not create AWS resources; it runs
+`cfn-lint aws/template.yaml aws/lightsail-template.yaml` and compiles
 `scripts/ws_smoke.py` so template/auth-helper changes get fast PR feedback.
 
 ## End-to-end deploy test
