@@ -329,6 +329,13 @@
     # A signed delivery on the watched repo → a fresh hook-* session appears in
     # sessions.json, primed with the framed event text plus the trusted
     # preamble, and the supervisor starts it as a real tmux session.
+    #
+    # The supervisor is STOPPED for the delivery: it consumes a kickoff prompt
+    # within ~2s of spawning (mark_started nulls initialPrompt), so asserting
+    # the prompt via sessions.json is a race otherwise (lost on master run
+    # 30740226645). With it stopped, the wrapper's write is the only actor;
+    # restarting it afterwards proves the spawn + consumption half.
+    machine.succeed("systemctl stop agent-box-agent.service")
     client.succeed(
         f"{post} -H 'x-hub-signature-256: sha256={sig}' "
         f"https://box.test/agent/webhook/github | grep -x 200"
@@ -352,9 +359,17 @@
         "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-agent-box-\"))'"
         " /home/agent/.config/agent-box/sessions.json"
     )
+    # Supervisor back up: it starts the hook session and consumes the prompt.
+    machine.succeed("systemctl start agent-box-agent.service")
     machine.wait_until_succeeds(
         "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
         " list-sessions -F '#S' | grep -q '^hook-'",
+        timeout=60,
+    )
+    machine.wait_until_succeeds(
+        "jq -e '.sessions | to_entries[] | select(.key | startswith(\"hook-\"))"
+        " | .value | (.hasRun == true and .initialPrompt == null)'"
+        " /home/agent/.config/agent-box/sessions.json",
         timeout=60,
     )
 
