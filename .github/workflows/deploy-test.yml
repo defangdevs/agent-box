@@ -77,7 +77,9 @@ jobs:
             use_spot: "false"
     # Fork? Override with a repo-scoped var AGENT_BOX_ENVIRONMENT, or edit the fallback.
     environment: ${{ vars.AGENT_BOX_ENVIRONMENT || 'defang-agent-box' }}
-    timeout-minutes: 30
+    # Room for one FirstBootDone-timeout retry (issue 112): two create waits
+    # (the WaitCondition alone is 15 min) + a delete + the post-create asserts.
+    timeout-minutes: 60
     env:
       AWS_REGION: ${{ inputs.region || 'us-west-2' }}
       ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
@@ -129,22 +131,66 @@ jobs:
         id: create
         run: |
           # PublicIpv4 / UseSpot come from the matrix leg (see the job comment).
-          aws cloudformation create-stack \
-            --stack-name "$STACK_NAME" \
-            --template-body "file://aws/template.yaml" \
-            --parameters \
-              "ParameterKey=PublicIpv4,ParameterValue=${{ matrix.public_ipv4 }}" \
-              "ParameterKey=UseSpot,ParameterValue=${{ (inputs.use_spot == true && matrix.public_ipv4 == 'true') && 'true' || matrix.use_spot }}" \
-              "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
-              "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't4g.small (2 vCPU / 2 GiB)' }}" \
-              "ParameterKey=EnableSsm,ParameterValue=${{ matrix.public_ipv4 }}" \
-              "ParameterKey=AgentBoxRev,ParameterValue=${{ steps.pin.outputs.rev }}" \
-              "ParameterKey=AgentBoxSha256,ParameterValue=${{ steps.pin.outputs.sha }}" \
-            --on-failure DO_NOTHING \
-            --capabilities CAPABILITY_IAM \
-            --tags "Key=Purpose,Value=agent-box-e2e" "Key=RunId,Value=${{ github.run_id }}"
-          echo "::notice::Waiting for stack ${STACK_NAME} to reach CREATE_COMPLETE (up to 30 min)..."
-          aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
+          create() {
+            aws cloudformation create-stack \
+              --stack-name "$STACK_NAME" \
+              --template-body "file://aws/template.yaml" \
+              --parameters \
+                "ParameterKey=PublicIpv4,ParameterValue=${{ matrix.public_ipv4 }}" \
+                "ParameterKey=UseSpot,ParameterValue=${{ (inputs.use_spot == true && matrix.public_ipv4 == 'true') && 'true' || matrix.use_spot }}" \
+                "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
+                "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't4g.small (2 vCPU / 2 GiB)' }}" \
+                "ParameterKey=EnableSsm,ParameterValue=${{ matrix.public_ipv4 }}" \
+                "ParameterKey=AgentBoxRev,ParameterValue=${{ steps.pin.outputs.rev }}" \
+                "ParameterKey=AgentBoxSha256,ParameterValue=${{ steps.pin.outputs.sha }}" \
+              --on-failure DO_NOTHING \
+              --capabilities CAPABILITY_IAM \
+              --tags "Key=Purpose,Value=agent-box-e2e" "Key=RunId,Value=${{ github.run_id }}"
+            echo "::notice::Waiting for stack ${STACK_NAME} to reach CREATE_COMPLETE..."
+            aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
+          }
+          if create; then exit 0; fi
+
+          # Retry ONCE, and only for the known-intermittent first-boot flake
+          # (issue 112): the box occasionally comes up unprovisioned (issue 84,
+          # fetch-ec2-metadata failing open), so FirstBootDone never signals
+          # and the WaitCondition times out. Any other failure (template bug,
+          # quota, IAM) stays a hard failure — retrying those would only mask
+          # them. NOTE for issue 84: grab the failed instance's serial console
+          # BEFORE deleting the stack; this evidence is otherwise destroyed,
+          # and the ipv6-outputs leg has no other diagnostic path (no SSM).
+          reason=$(aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
+            --query 'StackEvents[?LogicalResourceId==`FirstBootDone` && ResourceStatus==`CREATE_FAILED`].ResourceStatusReason | [0]' \
+            --output text 2>/dev/null || true)
+          case "$reason" in
+            *"WaitCondition timed out"*) ;;
+            *) echo "::error::Stack creation failed for a reason other than the FirstBootDone timeout; not retrying."; exit 1 ;;
+          esac
+          iid=$(aws cloudformation describe-stack-resources --stack-name "$STACK_NAME" \
+            --logical-resource-id Instance \
+            --query 'StackResources[0].PhysicalResourceId' --output text 2>/dev/null || true)
+          if [ -n "$iid" ] && [ "$iid" != "None" ]; then
+            echo "::group::Serial console of the FAILED first attempt ($iid) — issue 84 evidence"
+            aws ec2 get-console-output --instance-id "$iid" --latest \
+              --query Output --output text || true
+            echo "::endgroup::"
+          fi
+          # Persistent Spot requests can re-open and snag stack deletion (same
+          # hazard the Destroy step guards); cancel best-effort here too so a
+          # Spot dispatch run can't wedge the retry.
+          if [ -n "$iid" ] && [ "$iid" != "None" ]; then
+            sirs=$(aws ec2 describe-spot-instance-requests \
+              --filters "Name=instance-id,Values=$iid" \
+              --query 'SpotInstanceRequests[].SpotInstanceRequestId' \
+              --output text 2>/dev/null || true)
+            if [ -n "$sirs" ]; then
+              aws ec2 cancel-spot-instance-requests --spot-instance-request-ids $sirs || true
+            fi
+          fi
+          echo "::warning::FirstBootDone timed out (issue 112 flake); deleting the failed stack and retrying once."
+          aws cloudformation delete-stack --stack-name "$STACK_NAME"
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+          create
 
       - name: Dump failed stack events
         if: failure() && steps.create.outcome == 'failure'
