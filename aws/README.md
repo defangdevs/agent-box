@@ -1,13 +1,16 @@
 # AWS deployment (`aws/`)
 
-CloudFormation template that provisions a single-agent agent-box host on
-EC2 with a browser terminal (Caddy + ttyd). The deployment form lets the user
-choose Claude Code or Codex.
+CloudFormation templates that provision a single-agent agent-box host with a
+browser terminal (Caddy + ttyd). The deployment form lets the user choose
+Claude Code or Codex.
 
-- `template.yaml` - the EC2 template. Source of truth; anything else is derived.
-- `lightsail-template.yaml` - an alternative that runs the same agent-box on
-  **AWS Lightsail** for one flat monthly bundle price. See
+- `lightsail-template.yaml` - the **default** template (the README's Launch
+  buttons point here): agent-box on **AWS Lightsail** for one flat monthly
+  bundle price. See
   ["Lightsail variant"](#lightsail-variant-lightsail-templateyaml) below.
+- `template.yaml` - the EC2 alternative (Spot pricing, IPv6-only networking,
+  SSM root access, resizable EBS). Most of this document describes it; the
+  Lightsail section covers what differs.
 
 ## What the template does
 
@@ -213,7 +216,8 @@ that immediately fails cert validation.
 GitHub Pages or `raw.githubusercontent.com` are rejected with
 "TemplateURL must be a supported URL." That's why the publish-template
 workflow syncs to S3, and the README's Launch Stack links point at
-`https://<bucket>.s3.amazonaws.com/template.yaml`.
+`https://<bucket>.s3.amazonaws.com/lightsail-template.yaml` (default) and
+`https://<bucket>.s3.amazonaws.com/template.yaml` (EC2 alternative).
 
 ### Why the template creates its own VPC
 
@@ -350,9 +354,11 @@ in-place on first boot with [`nixos-infect`](https://github.com/elitak/nixos-inf
 
 ### Deploying (CLI)
 
-The 1-click S3 publish path is not wired up for this template yet (see
-below), so deploy it directly. `AgentBoxRev`/`AgentBoxSha256` are a pinned
-pair, exactly as for the EC2 template:
+The 1-click Launch buttons in the top-level README use the S3-published copy
+of this template (pinned defaults injected by `publish-template.yml`, see
+["Publishing to S3"](#publishing-to-s3)). To deploy a working-tree copy
+directly, note `AgentBoxRev`/`AgentBoxSha256` are a pinned pair, exactly as
+for the EC2 template:
 
 ```bash
 REV=$(git rev-parse HEAD)   # or any pushed agent-box commit
@@ -379,16 +385,11 @@ bundle's initial closure build is slow) and then emits `WebURL`,
 `cfn-lint` passes and the generated `configuration.nix` parses as valid Nix
 (both checked in PR CI via `aws-ci.yml`). The end-to-end `nixos-infect`
 bootstrap has **not** yet been exercised by an automated live deploy — treat a
-first real launch as the acceptance test. Follow-ups before this is
-first-class:
+first real launch as the acceptance test. Remaining follow-up:
 
 - A Lightsail leg in `deploy-test.yml` (create stack, assert `WebURL` reachable
   over IPv4, tear down). GitHub runners are IPv4-only and Lightsail is
   IPv4-native, so unlike the EC2 IPv6-only leg this can smoke-test the live URL.
-- S3 publish + a Launch button. `publish-template.yml` currently publishes only
-  `template.yaml` and scopes the bucket policy to that one object; publishing a
-  second template means covering both objects in one policy (the two must not
-  fight over `PutBucketPolicy`). Deferred to keep this PR's diff focused.
 
 ## Refreshing the AMI map
 
@@ -406,16 +407,17 @@ commit if anything changed.
 
 ## Publishing to S3
 
-CloudFormation's `templateURL` accepts only S3 URLs, so the template lives
-at `s3://defang-agent-box/template.yaml`. `.github/workflows/publish-template.yml`
-handles the upload on every push to `master` via GitHub OIDC (no static AWS
-keys).
+CloudFormation's `templateURL` accepts only S3 URLs, so the templates live
+at `s3://defang-agent-box/lightsail-template.yaml` (the default Launch
+buttons) and `s3://defang-agent-box/template.yaml` (the EC2 alternative).
+`.github/workflows/publish-template.yml` uploads both on every push to
+`master` via GitHub OIDC (no static AWS keys).
 
 ### Prerequisites (forking this repo)
 
 The workflow is self-bootstrapping - it upserts the bucket, its
-public-access configuration, and an `s3:GetObject` policy scoped to
-`template.yaml` (the only object in the bucket) every run. The module itself
+public-access configuration, and an `s3:GetObject` policy scoped to the two
+template objects (the only objects in the bucket) every run. The module itself
 is fetched by the box direct from `raw.githubusercontent.com` at first boot;
 that host is dual-stack, so an IPv6-only box needs no NAT64. It reads all
 deploy config from **repo-level Actions variables** (Settings > Secrets and
@@ -424,7 +426,7 @@ variables > Actions > Variables). None are secrets; they're just fork-specific.
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `AWS_ROLE_ARN` | yes | IAM role assumed via OIDC. Trust policy must allow the GitHub environment named in `AGENT_BOX_ENVIRONMENT`. |
-| `AGENT_BOX_BUCKET` | yes | S3 bucket name to publish `template.yaml` into. Global namespace. |
+| `AGENT_BOX_BUCKET` | yes | S3 bucket name to publish the templates into. Global namespace. |
 | `AGENT_BOX_ENVIRONMENT` | no | GitHub Actions environment name. Defaults to `defang-agent-box` (must be repo-scoped since env-scoped is a chicken-and-egg). Set to any name your role's trust policy accepts. |
 | `AWS_REGION` | no | Region for the bucket + AWS API calls. Defaults to `us-east-1`. |
 
@@ -446,14 +448,16 @@ repo settings UI. No secrets attached; it's just the deployment gate.
 Verify with a `workflow_dispatch` run of `Publish CFN template to S3`, then:
 
 ```bash
+curl -I "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/lightsail-template.yaml"
 curl -I "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/template.yaml"
 ```
 
 ## Pull request validation
 
 `.github/workflows/aws-ci.yml` runs on pull requests that touch the AWS
-template, launch page, browser-terminal smoke helper, or related workflows. It
-does not create AWS resources; it runs `cfn-lint aws/template.yaml` and compiles
+templates, launch page, browser-terminal smoke helper, or related workflows. It
+does not create AWS resources; it runs
+`cfn-lint aws/template.yaml aws/lightsail-template.yaml` and compiles
 `scripts/ws_smoke.py` so template/auth-helper changes get fast PR feedback.
 
 ## End-to-end deploy test

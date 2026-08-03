@@ -159,7 +159,7 @@
       </div>
       <div class="feature">
         <h3>Honest cost</h3>
-        <p>Runs on a Spot instance with no network fees by default: a small box is ~$7&ndash;10/month all-in, the default size ~$16&ndash;20/month, on-demand a bit more. Terminate anytime to stop charges.</p>
+        <p>One flat monthly price &mdash; compute, disk, a stable address, and traffic all included, nothing metered on top: $12/month for the default size, $7/month for the smallest. Delete anytime to stop charges.</p>
       </div>
     </div>
   </div>
@@ -172,26 +172,26 @@
     <div class="regions">
       <div class="region">
         <div><div class="name">N. Virginia</div><div class="code">us-east-1</div></div>
-        <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml">Launch &rarr;</a>
+        <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml">Launch &rarr;</a>
       </div>
       <div class="region">
         <div><div class="name">Oregon</div><div class="code">us-west-2</div></div>
-        <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml">Launch &rarr;</a>
+        <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml">Launch &rarr;</a>
       </div>
       <div class="region">
         <div><div class="name">Frankfurt</div><div class="code">eu-central-1</div></div>
-        <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml">Launch &rarr;</a>
+        <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml">Launch &rarr;</a>
       </div>
       <div class="region">
         <div><div class="name">Ireland</div><div class="code">eu-west-1</div></div>
-        <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml">Launch &rarr;</a>
+        <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml">Launch &rarr;</a>
       </div>
     </div>
     <div class="note">
-      <strong>Set a password you'll remember.</strong> On the AWS form, type any 16&ndash;64 character password into <code>WebPassword</code> &mdash; that's what you'll use to log into the browser terminal. AWS masks it with dots after you type it and never shows it again, so save it somewhere before you launch. Choose Claude Code or Codex, pick a size, rename the stack if you want a friendlier Claude app label, and launch. The box takes about 2&ndash;3 minutes to start; your browser link then appears under <strong>Outputs</strong> in the AWS console &mdash; open it, enter the password, finish the selected agent's one-time sign-in, and you're in. (Claude Code stacks can drive the box from the Claude desktop / mobile app via <strong>Remote Control</strong> after the first browser login &mdash; the session name is <code>&lt;UserName&gt;@&lt;stack name&gt;</code>, <code>agent@agent-box</code> by default.)
+      <strong>Set a password you'll remember.</strong> On the AWS form, type any 16&ndash;64 character password into <code>WebPassword</code> &mdash; that's what you'll use to log into the browser terminal. AWS masks it with dots after you type it and never shows it again, so save it somewhere before you launch. Choose Claude Code or Codex, pick a size, and launch. The box takes about 10&ndash;20 minutes to set up the first time (it installs NixOS on itself before the terminal comes up); your browser link then appears under <strong>Outputs</strong> in the AWS console &mdash; open it, enter the password, finish the selected agent's one-time sign-in, and you're in. (Claude Code stacks can drive the box from the Claude desktop / mobile app via <strong>Remote Control</strong> after the first browser login &mdash; the session name is <code>&lt;UserName&gt;-main@&lt;host&gt;.sslip.io</code>, the box's own public address &mdash; so the entry in the Claude apps doubles as the address you reach it at.)
     </div>
     <div class="note">
-      <strong>The optional ~$3.60/month, explained.</strong> By default the box skips the one thing AWS charges for on the network side &mdash; a public IPv4 address &mdash; so connectivity costs $0/month, using a free IPv6 address instead. That works fine if the networks you connect from support IPv6 (most home connections do), but offices and public Wi-Fi often don't. Checking <code>PublicIpv4</code> on the AWS form adds a stable IPv4 for ~$3.60/month. <span id="no-ipv6-note" hidden><strong>Your current network can't reach IPv6-only servers, so the Launch buttons above have been adjusted to include <code>PublicIpv4</code>.</strong> Uncheck it on the CloudFormation form only if you'll connect from a network with IPv6.</span> The box itself reaches IPv4-only sites either way: in IPv6-only mode, traffic to them &mdash; notably <code>github.com</code> &mdash; goes through a free public NAT64 relay (<a href="https://nat64.net">nat64.net</a>). TLS and SSH stay end-to-end encrypted, but if you'd rather not route through a third party, launch with <code>Nat64</code> unchecked or pay for the IPv4.
+      <strong>Prefer EC2?</strong> The default above runs on AWS Lightsail for one flat monthly price. An EC2 variant &mdash; Spot pricing, IPv6-only networking, resizable disk &mdash; is <a href="https://github.com/defangdevs/agent-box#alternative-ec2-template-spot-ipv6-only">available in the repository</a>.
     </div>
   </div>
 </section>
@@ -212,37 +212,6 @@
     <br>Dogfood note: this page &mdash; and most of this project &mdash; was written, tested, and shipped by a coding agent running on agent-box.
   </div>
 </footer>
-
-<script>
-  // Detect whether this browser has real IPv6 connectivity. If not, force
-  // PublicIpv4=true on every Launch link — the default IPv6-only box would
-  // be unreachable from this network. Fetches Cloudflare's resolver by IPv6
-  // literal (their 1.1.1.1 cert carries IP SANs, incl. this address), so no
-  // DNS is involved: a completed fetch proves a working v6 route;
-  // abort/network error means no v6. Non-blocking; user is free to click
-  // through before this settles.
-  (async function () {
-    const controller = new AbortController();
-    const t = setTimeout(function () { controller.abort(); }, 2500);
-    let hasV6 = false;
-    try {
-      await fetch('https://[2606:4700:4700::1111]/', {
-        method: 'GET',
-        mode: 'no-cors',
-        cache: 'no-store',
-        signal: controller.signal,
-      });
-      hasV6 = true;
-    } catch (_) { /* no v6 route, DNS failure, or timeout */ }
-    clearTimeout(t);
-    if (hasV6) return;
-    document.querySelectorAll('a.launch').forEach(function (a) {
-      a.setAttribute('href', a.getAttribute('href') + '&param_PublicIpv4=true');
-    });
-    const note = document.getElementById('no-ipv6-note');
-    if (note) note.hidden = false;
-  })();
-</script>
 
 </body>
 </html>
