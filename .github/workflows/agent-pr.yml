@@ -1,0 +1,170 @@
+name: Agent (PR)
+
+# PR-triggered agentic loop. Opt-in per PR via the `agent-fix` label: the agent
+# runs this repo's own checks against the PR head, fixes what it can, and pushes
+# the fix back to the PR branch. Output is always a commit on someone's PR — never
+# a push to master.
+#
+# Why label-gated rather than every push: each run spends API tokens and ~10 min
+# of runner time on the nix store (see the Cachix note below). Running on every
+# `synchronize` would burn both on PRs that are already green.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  # One agent per PR. A new push supersedes an in-flight run — otherwise two
+  # agents race to push to the same branch.
+  group: agent-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write        # push the fix commit to the PR branch
+  pull-requests: write   # post the summary comment
+  # Deliberately NOT actions:write — the agent must not be able to dispatch
+  # workflows (that's the elevated identity the AMI publisher needs, issue TBD).
+
+jobs:
+  agent:
+    name: Agent fixes the PR
+    runs-on: ubuntu-latest
+    # Well under GitHub's 360-minute default. A confused agent should die, not
+    # occupy the runner for six hours.
+    timeout-minutes: 30
+    env:
+      # The `secrets` context is NOT available in a step-level `if:` — only
+      # `env` is. Hoisting them here is what makes the Cachix step's guard work.
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      CACHIX_CACHE: ${{ vars.CACHIX_CACHE }}
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'github-actions[bot]' &&
+      contains(github.event.pull_request.labels.*.name, 'agent-fix')
+      # First clause: fork PRs get a read-only token and NO secrets, so the agent
+      # cannot run at all. `pull_request_target` would grant both alongside
+      # untrusted PR content — the standard way this pattern gets a repo
+      # compromised. Fork PRs are explicitly out of scope; handle them by hand.
+      #
+      # Second clause: loop guard. Today GITHUB_TOKEN-authored events don't
+      # trigger workflows, so this is belt-and-braces — but the moment any job
+      # here moves to a PAT or GitHub App, this clause is the only thing stopping
+      # a self-review cascade. Do not remove it.
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The PR head, not the merge commit — we need a real branch to push to.
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      # Without a shared store the agent spends most of its budget rebuilding
+      # the VM closure from scratch instead of thinking (CI's ~10min is almost
+      # all store). Optional: skipped cleanly when the secret is unset.
+      - name: Set up Cachix
+        if: env.CACHIX_AUTH_TOKEN != '' && env.CACHIX_CACHE != ''
+        uses: cachix/cachix-action@v15
+        with:
+          name: ${{ env.CACHIX_CACHE }}
+          authToken: ${{ env.CACHIX_AUTH_TOKEN }}
+
+      # Same rule as ci.yml: ubuntu-latest has KVM but /dev/kvm is root-only, and
+      # the qemu inside the nix build isn't root.
+      - name: Enable KVM for the test driver
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install Claude Code
+        # Pinned rather than @latest: an agent whose harness changes underneath it
+        # is an unreproducible CI job.
+        run: npm install -g @anthropic-ai/claude-code@2.1.0
+
+      - name: Run the agent
+        env:
+          # Prefer a subscription OAuth token if present (no metered API billing);
+          # fall back to an API key. Set exactly one — both set is an auth error.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          # --dangerously-skip-permissions is appropriate here and only here: the
+          # runner is ephemeral and wiped, the token is scoped to this repo, and
+          # there is no human to answer a prompt. Do not copy this flag onto a
+          # long-lived box.
+          claude -p --model claude-opus-5 --dangerously-skip-permissions <<'PROMPT'
+          You are fixing a pull request in the defangdevs/agent-box repository. Read
+          AGENTS.md first — it is binding, especially the rule that
+          modules/agent-box.nix is GENERATED and must never be hand-edited.
+
+          Scope, in order:
+
+          1. `git diff origin/$BASE_REF...HEAD --stat` to see what this PR touches.
+          2. If the diff touches modules/agent-box.nix.in, modules/src/, or
+             bin/assemble-module.py, run `nix run .#assemble` and commit the
+             regenerated modules/agent-box.nix. The
+             `module-generated-up-to-date` check fails on drift.
+          3. Run the flake checks relevant to the diff — start with the fast
+             eval-level ones (`nix build -L .#checks.x86_64-linux.multi-user`,
+             `module-single-file`, `module-generated-up-to-date`,
+             `download-route`, `webhook-route`), then any VM test whose
+             behaviour the diff plausibly changes. Do not run the whole VM
+             suite unless the diff warrants it; it costs most of your budget.
+          4. Fix what is broken. Add regression coverage for behavioural fixes,
+             per AGENTS.md.
+
+          Bounds you must respect:
+
+          - Touch only files this PR already touches, plus tests/ and the
+            generated module. Do not refactor, tidy, or fix unrelated things you
+            notice — file an issue for those with `gh issue create` and move on.
+          - Do not amend, rebase, or force-push. Leave your work as uncommitted
+            changes in the working tree; a later step commits and pushes it.
+          - Do not push to master. Do not merge or close anything.
+          - If the checks pass and there is nothing to fix, say so and stop —
+            do not invent work.
+
+          Finish by writing a short plain-prose summary to $GITHUB_STEP_SUMMARY:
+          what you ran, what you changed, and anything you deliberately left
+          alone. Lead with the outcome. The reader did not watch you work.
+          PROMPT
+
+      - name: Commit and push the fix
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes — nothing to push."
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m "fix(ci): agent fixes for PR #${PR_NUMBER}
+
+          Applied by .github/workflows/agent-pr.yml. See the run summary for
+          what was changed and why."
+          # No --force: if the branch moved under us, fail loudly rather than
+          # clobbering a human's commit. The concurrency group makes this rare.
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          gh pr comment "$PR_NUMBER" --body "Pushed an agent fix to this branch. See the [run summary](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for what changed."

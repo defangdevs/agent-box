@@ -1,0 +1,161 @@
+name: Agent triage
+
+# Weekly (or on demand) queue maintenance. The goal is to REDUCE the queue, not
+# to bump it: every action below either removes an item, makes an unlabeled item
+# routable, or replaces a vague issue with one that has a concrete next step.
+#
+# What this deliberately does NOT do: post "is this still relevant?" pings. A
+# stale-bot ping moves nothing and trains everyone to ignore the bot.
+#
+# Cron caveat: GitHub disables scheduled workflows after 60 days with no repo
+# activity. This repo commits weekly (refresh-amis), so it stays alive — but
+# that is the reason, not luck. Offset from refresh-amis (06:17 Mon) to avoid
+# two bot pushes racing on the same clone.
+
+on:
+  schedule:
+    - cron: '41 7 * * 1'   # Mondays 07:41 UTC. Switch to '41 7 * * *' for daily.
+  workflow_dispatch:
+    inputs:
+      max_items:
+        description: Maximum queue items to act on in this run
+        type: string
+        default: '8'
+      dry_run:
+        description: Report the plan without applying labels, comments, or closes
+        type: boolean
+        default: false
+
+concurrency:
+  # Never two triage runs at once — they would race to claim the same issues.
+  group: agent-triage
+  cancel-in-progress: false
+
+permissions:
+  issues: write          # label, comment, close
+  pull-requests: write   # label and comment on stale PRs
+  contents: read         # read the tree to verify fix claims — NOT write
+
+jobs:
+  triage:
+    name: Triage the queue
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history: rule 1 below requires finding the commit that
+          # implemented an issue, which a shallow clone cannot do.
+          fetch-depth: 0
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.0
+
+      - name: Run triage
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAX_ITEMS: ${{ inputs.max_items || '8' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          claude -p --model claude-opus-5 --dangerously-skip-permissions <<'PROMPT'
+          You are doing queue maintenance on defangdevs/agent-box. Read AGENTS.md
+          first. You have `gh` authenticated and a full git clone of master.
+
+          Respect $MAX_ITEMS as a hard cap on items you ACT on (a label, a
+          comment, or a close each count as acting on one item). If $DRY_RUN is
+          "true", do all the investigation and write the plan to the summary, but
+          apply nothing.
+
+          ## Claim before you work
+
+          Before acting on an item, add the label `agent-triaged` to it. That
+          label is how the next run knows not to redo this. Skip any item that
+          already has `agent-triaged` unless it has had human activity since.
+          Never act on an item labelled `pinned`, `wontfix`, or `needs-decision`.
+
+          ## The five actions, in priority order
+
+          Work down this list. Higher rules are worth more than lower ones — a
+          close beats a label beats a comment. Stop when you hit $MAX_ITEMS.
+
+          **1. Close issues the code already fixed.** For each open issue, search
+          history for the change that implemented it:
+          `git log --oneline --grep="issue #<n>" --grep="(#<n>)" -E -i`
+          A commit reference alone is NOT sufficient — grep matches substrings
+          (`#9` matches `#96`). You must also confirm the behaviour actually
+          exists in the current tree by reading the relevant file. If both hold,
+          comment with the commit SHA, the file and line where the behaviour now
+          lives, and one sentence on why the issue is satisfied, then close as
+          completed. If a follow-up issue tracks defects in that same feature,
+          link it in the closing comment rather than leaving the original open.
+          If you cannot cite BOTH a commit and current code, do not close —
+          drop to rule 4 instead.
+
+          Known candidate to check first: issue #103 (Codex remote control)
+          looks implemented by 7dfc053 via PR #134, with `remoteControl` in the
+          module and the README. Verify that yourself rather than trusting this
+          note, and check whether #159 is the right follow-up to link.
+
+          **2. Label the unlabeled.** Roughly a quarter of open issues carry no
+          label, which means they are unroutable. Assign exactly one type label
+          from the set already in use — `bug`, `feature`, `enhancement`, `task`,
+          `documentation` — based on what the issue asks for, not how it is
+          worded. Add `good first issue` only when the fix is a single file and
+          needs no design decision. Do not invent new labels.
+
+          **3. Dispose of stale PRs.** For each open PR with no update in 7+ days:
+          - A draft PR whose title marks it as a backup or snapshot is a parking
+            spot from an earlier session. Comment asking whether it is still
+            needed as a backup and what would have to be true to close it, then
+            label it `stale`. Do not close it — you cannot know what it is
+            protecting.
+          - A non-draft PR: check whether its base has moved under it
+            (`git log --oneline origin/master ^origin/<head-ref>`), whether its
+            checks are red (`gh pr checks <n>`), and whether it conflicts. Post
+            the SPECIFIC blocker — "needs a rebase, master moved 14 commits" or
+            "the `sessions` check has been red since <sha>" — not a status
+            request.
+
+          **4. Turn vague issues into actionable ones.** For an issue with no
+          activity in 14+ days, post the smallest concrete next step you can
+          establish by reading the code: the exact command that reproduces it,
+          the file where the fix belongs, or the specific decision a human has to
+          make before anyone can start. If the blocker is a decision rather than
+          work, say what the options are with a recommendation, and label it
+          `needs-decision` so later runs leave it alone. One comment per issue,
+          and only when you have something a reader could act on — an empty
+          "still open?" comment is worse than silence.
+
+          **5. Flag near-duplicates.** If two issues describe the same
+          underlying problem, comment on the newer one linking the older and say
+          which you would keep. Never close a duplicate yourself — that is a
+          judgment call about which framing is better, and it is cheap for a
+          human to confirm.
+
+          ## Bounds
+
+          - Never edit or push code. Never touch master. This job has no write
+            access to contents; if you find a bug worth fixing, file an issue
+            (per AGENTS.md) or note it in the summary.
+          - File issues in the repo that owns the fix — `defangdevs/local-channels`
+            for local-webhook behaviour — and cross-link.
+          - Do not reopen anything, do not edit issue titles or bodies written by
+            a human, and do not assign people.
+          - If an action does not clearly fit one of the five rules, skip it and
+            say why in the summary. Silence is a valid outcome for a clean queue.
+
+          Finish with a plain-prose summary to $GITHUB_STEP_SUMMARY: what you
+          closed and on what evidence, what you labelled, what you commented on,
+          and what you deliberately left alone. Lead with the outcome. Write it
+          for someone who has not looked at the queue in a week and did not watch
+          you work — spell out issue numbers with their titles, not bare numbers.
+          PROMPT
