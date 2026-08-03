@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write   # push AMI-map bump directly to master
+  actions: write    # dispatch publish-template.yml (see "Publish the bump" below)
 
 concurrency:
   group: refresh-amis
@@ -24,9 +25,11 @@ jobs:
         run: python3 scripts/refresh_amis.py
 
       - name: Commit if changed
+        id: commit
         run: |
           if git diff --quiet aws/template.yaml; then
             echo "No AMI changes."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git config user.name  'github-actions[bot]'
@@ -34,3 +37,25 @@ jobs:
           git add aws/template.yaml
           git commit -m "Refresh NixOS AMI map (25.11)"
           git push
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      # Commits pushed with GITHUB_TOKEN do not trigger workflows, so the push
+      # above never fired publish-template.yml (which watches pushes touching
+      # aws/template.yaml) — the refreshed AMI map stayed on master and never
+      # reached the S3 template the 1-click Launch buttons serve. That is not
+      # theoretical: 5542d8f (2026-07-06) landed the only AMI bump so far, and
+      # there is no publish run for it in 60 runs going back to 2026-07-04.
+      #
+      # Dispatching explicitly closes the loop while keeping this job on
+      # GITHUB_TOKEN. The alternative — pushing under a PAT or GitHub App so the
+      # push itself triggers downstream workflows — would also give the AMI bump
+      # a review gate, but it re-enables workflow cascades for every job sharing
+      # that identity. Not worth it for a job whose output is a generated map.
+      #
+      # publish-template.yml runs `cfn-lint aws/template.yaml` before uploading,
+      # so the dispatched run validates the map it is about to publish.
+      - name: Publish the bump
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run publish-template.yml --ref "$GITHUB_REF_NAME"
