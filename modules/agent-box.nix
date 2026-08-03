@@ -120,7 +120,10 @@ let
     Matching events then spawn a FRESH `hook-*` session primed with the event
     text; bursts coalesce into one session instead of one each. Standing
     watches are SHARED across sessions and never expire by default
-    (`agent-box-webhook ls` shows them under `dispatch`). A spawned session's
+    (`agent-box-webhook ls` shows them under `dispatch`). A watch will not
+    double up on work you already own: a CI event spawns only when it reports a
+    FAILURE, and never while a live session is subscribed to that topic — but a
+    new issue or someone else's PR always spawns, whoever is subscribed. A spawned session's
     prompt tells it to remove itself (`agent-box-session rm NAME`) when done —
     if stale `hook-*` sessions pile up, clean them the same way.
 
@@ -830,6 +833,9 @@ EOF
                              session primed with the event text; bursts coalesce
                              into one. SHARED across sessions and pinned (--ttl
                              0) by default; `ls` shows these under "dispatch".
+                             A CI event spawns only if it reports a FAILURE, and
+                             never while a live session is subscribed to that
+                             topic; new issues and others' PRs always spawn.
 
     --ignore-sender LOGIN mutes echoes of that sender's own comments and pushes
     ("@self" is $LOCAL_WEBHOOK_SELF); CI-outcome events are delivered anyway.
@@ -1955,7 +1961,7 @@ in
       };
       rev = lib.mkOption {
         type = lib.types.str;
-        default = "b80b7a27903e9a0af19d5f9ed52f2467cce79a67";
+        default = "efa253166074789ece9709e4a1e3a4be58801166";
         description = ''
           Pinned local-channels commit whose local-webhook/webhook.py the
           receiver daemon and the agent-box-webhook CLI run. Claude sessions
@@ -1969,7 +1975,7 @@ in
         # builtins.fetchurl hash of local-webhook/webhook.py at `rev`:
         #   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.py
         # then `nix hash convert --hash-algo sha256 --to sri <base32>`.
-        default = "sha256-TtxcW1Mn7kZ54Dc/5qkWmkWwR0/aw7IGnoqz3k32GEg=";
+        default = "sha256-qHVF398YAwiIqbYG2/HY+hVzY4HF4saiasdZHAXngIM=";
         description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
       };
     };
