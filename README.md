@@ -18,7 +18,7 @@ Supported agents:
 
 ## 1-click AWS launch
 
-Provisions one EC2 instance (NixOS 25.11) with the module + a browser terminal
+Provisions one EC2 instance (NixOS 26.05) with the module + a browser terminal
 (Caddy -> ttyd) already wired up. First load takes ~2-3 minutes while the AMI
 provisions, `nixos-rebuild switch` applies the config, and Caddy issues a
 Let's Encrypt cert against `<eip>.sslip.io`.

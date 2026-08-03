@@ -35,7 +35,7 @@ jobs:
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add aws/template.yaml
-          git commit -m "Refresh NixOS AMI map (25.11)"
+          git commit -m "Refresh NixOS AMI map (26.05)"
           git push
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
