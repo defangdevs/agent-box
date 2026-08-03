@@ -232,9 +232,12 @@
     # Fail loudly if the peer died on startup instead of silently timing out on
     # the socket wait below.
     machine.succeed("systemctl is-active webhook-peer.service")
-    # The peer registers a per-PID IPC socket; that is what the daemon fans to.
+    # The peer registers an IPC socket; that is what the daemon fans to. Since
+    # local-webhook 0.10.0 the name is "<filter key>.<pid>.sock" — the key is
+    # how the ingress owner resolves a live peer to its subscriptions before
+    # spawning a standing-watch session (asserted below).
     machine.wait_until_succeeds(
-        "ls /home/agent/.local/state/local-webhook/instances/*.sock", timeout=30
+        "ls /home/agent/.local/state/local-webhook/instances/agent-main.*.sock", timeout=30
     )
 
     # --- deliveries --------------------------------------------------------
@@ -331,6 +334,35 @@
     )
     machine.succeed("jq -e '.spawn == true' /home/agent/.local/state/local-webhook/receiver.json")
 
+    # --- dispatch brake: a live session that owns the topic (0.10.0, #10) ----
+    # The peer session is subscribed to this very repo (pinned, above), so it is
+    # already getting this CI failure. A standing watch is for events NOBODY
+    # owns, so it must NOT also spawn an agent — that is what put three hook-*
+    # sessions on one PR. The suppression is logged, because a silently skipped
+    # spawn is indistinguishable from a watch that stopped working (#170).
+    client.succeed(
+        f"{post} -H 'x-hub-signature-256: sha256={sig}' "
+        f"https://box.test/agent/webhook/github | grep -x 200"
+    )
+    machine.wait_until_succeeds(
+        "journalctl -u agent-box-webhook-agent --no-pager"
+        " | grep -q 'not spawning for workflow_run on defangdevs/agent-box'",
+        timeout=30,
+    )
+    machine.fail(
+        "jq -e '.sessions | keys | map(select(startswith(\"hook-\"))) | length > 0'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+
+    # Hand the topic back: with no live session subscribed, the same delivery is
+    # the watch's job again.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook unsubscribe defangdevs/agent-box"
+    )
+
     # A signed delivery on the watched repo → a fresh hook-* session appears in
     # sessions.json, primed with the framed event text plus the trusted
     # preamble, and the supervisor starts it as a real tmux session.
@@ -379,8 +411,9 @@
     )
 
     # The event that spawned the watch session was NOT also a session delivery
-    # for the peer (its filter has someone else's repo) — dispatch and session
-    # routing stay independent.
+    # for the peer (it handed the topic back above) — dispatch and session
+    # routing stay independent, and the dispatch note never leaks into a
+    # session's channel.
     machine.fail("grep -q 'standing watch: triage' /tmp/peer.log")
 
     # The daemon is the ingress owner and survives every delivery — the box's
