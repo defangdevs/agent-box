@@ -3109,9 +3109,11 @@ in
 
         def find_supervisor_pids():
             """PIDs of this user's session supervisor — the agent unit's main
-            process (the mkStart store script). Matched by an argv element
-            ending in "agent-box-<user>-start", restricted to our own uid."""
-            marker = "agent-box-%s-start" % USER
+            process (the shared src/supervisor.sh store script; issue #154 Phase 2
+            made it user-independent, so the uid restriction below is what scopes
+            the match to OUR unit). Matched by an argv element ending in
+            "agent-box-supervisor"."""
+            marker = "agent-box-supervisor"
             uid = os.getuid()
             pids = []
             for entry in os.listdir("/proc"):
