@@ -266,6 +266,103 @@
     assert "--agent shell" not in full_pane, full_pane
     assert "codex login --device-auth" not in full_pane, full_pane
 
+    # --- rejected credentials re-authenticate with no keystroke (issue 187) ---
+    # `codex login status` is a LOCAL check — credentials the backend has
+    # already invalidated still report "logged in", so the sign-in guard
+    # (correctly) declines and PAIRING is what returns HTTP 401. The pane used
+    # to dump that JSON-RPC blob and wait for a user who had to know the
+    # undocumented `login` word to recover.
+    #
+    # A real server-side rejection is not producible in the sandbox (no
+    # network), so drive the supervisor wrapper straight against a stub codex.
+    # `app-server daemon version` fails in the stub, which ends the wrapper's
+    # health loop instead of blocking the test; the "" first argument skips the
+    # UTS re-exec, which is not what this asserts.
+    wrapper = re.search(
+        r"/nix/store/\S*agent-box-codex-remote-control", helper_cmdline
+    ).group(0)
+    machine.succeed(
+        "cat > /tmp/stub-codex <<'EOF'\n"
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >> /tmp/stub/log\n'
+        'case "$*" in\n'
+        '"app-server daemon version") exit 1 ;;\n'
+        '"login status") test -f /tmp/stub/loggedin ;;\n'
+        '"login --device-auth")\n'
+        "  touch /tmp/stub/loggedin\n"
+        "  test -f /tmp/stub/persist || rm -f /tmp/stub/stale\n"
+        '  echo "Successfully logged in" ;;\n'
+        '"logout") rm -f /tmp/stub/loggedin ;;\n'
+        '"remote-control pair")\n'
+        '  test -f /tmp/stub/loggedin || { echo "not signed in" >&2; exit 1; }\n'
+        # Single-quoted printf, not echo: the real error embeds a JSON body, and
+        # whether `echo` eats the backslashes of an escaped one is shell-
+        # dependent — the pane greps that JSON for the message it shows.
+        "  if test -f /tmp/stub/stale; then\n"
+        "    printf '%s\\n' 'Error: remoteControl/pairing/start failed: remote"
+        " control server refresh failed: HTTP 401 Unauthorized, cf-ray: test,"
+        ' body: {"error":{"message":"Your authentication token has been'
+        ' invalidated. Please try signing in again.","type":'
+        '"invalid_request_error","code":"token_invalidated"},"status":401}'
+        "' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
+        "  if test -f /tmp/stub/offline; then\n"
+        "    printf '%s\\n' 'Error: remoteControl/pairing/start failed: error"
+        " sending request: tcp connect error: Connection refused (os error"
+        " 111)' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
+        '  echo "Pairing code: TEST-PAIR" ;;\n'
+        "esac\n"
+        "EOF"
+    )
+    machine.succeed("chmod 0755 /tmp/stub-codex")
+
+    def run_pane(*markers):
+        machine.succeed("rm -rf /tmp/stub && install -d -m 0777 /tmp/stub")
+        for marker in markers:
+            machine.succeed(f"touch /tmp/stub/{marker}")
+        machine.succeed(
+            as_agent(f"{wrapper} '' /tmp/stub-codex > /tmp/stub/out 2>&1 || true")
+        )
+        return (
+            machine.succeed("cat /tmp/stub/out"),
+            machine.succeed("cat /tmp/stub/log"),
+        )
+
+    # Invalidated token: the pane explains itself in the server's own words,
+    # drops the dead credentials, runs the device flow and pairs — all without a
+    # keystroke, and without showing anyone an HTTP status line.
+    stale_out, stale_calls = run_pane("loggedin", "stale")
+    assert "rejected this box's stored credentials" in stale_out, stale_out
+    assert "authentication token has been invalidated" in stale_out, stale_out
+    assert "HTTP 401" not in stale_out, stale_out
+    assert "Press Enter to try again" not in stale_out, stale_out
+    assert "Pairing code: TEST-PAIR" in stale_out, stale_out
+    assert "logout" in stale_calls, stale_calls
+    assert "login --device-auth" in stale_calls, stale_calls
+    # A rejection short-circuits the enrollment-race retries: one failed pair,
+    # then one that succeeds after signing in. Not three failures in six seconds.
+    assert stale_calls.count("remote-control pair") == 2, stale_calls
+
+    # Credentials that stay rejected after a fresh sign-in are an account
+    # problem, so the pane says so ONCE and stops — a logout/device-auth spin
+    # would make the box unusable.
+    hopeless_out, hopeless_calls = run_pane("loggedin", "stale", "persist")
+    assert "still rejects the credentials" in hopeless_out, hopeless_out
+    assert hopeless_calls.count("logout") == 1, hopeless_calls
+    assert hopeless_calls.count("login --device-auth") == 1, hopeless_calls
+
+    # A pairing failure that is NOT about auth keeps the old behaviour: retry
+    # (enrollment races clear on their own), report, offer Enter — and never
+    # drop working credentials.
+    offline_out, offline_calls = run_pane("loggedin", "offline")
+    assert "Could not mint a pairing code" in offline_out, offline_out
+    assert "Press Enter to try again" in offline_out, offline_out
+    assert "logout" not in offline_calls, offline_calls
+    assert offline_calls.count("remote-control pair") == 3, offline_calls
+
     # Re-adding an existing name errors out and must not clobber the stored
     # config (issue 100): helper keeps its codex agent.
     machine.fail(
