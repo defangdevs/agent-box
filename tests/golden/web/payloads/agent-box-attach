@@ -1,6 +1,8 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
 set -u
-T="/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7b/bin/tmux -T hyperlinks -L agent-box"
+# tmux and head resolve from the web-terminal unit's PATH; the socket name
+# is the module-wide constant.
+T="tmux -T hyperlinks -L agent-box"
 want="${1:-}"
 case "$want" in (*[!A-Za-z0-9_-]*) want="" ;; esac
 if [ -n "$want" ]; then
@@ -17,7 +19,7 @@ fi
 if $T has-session -t "=main" 2>/dev/null; then
   exec $T attach -t "=main"
 fi
-first="$($T list-sessions -F '#S' 2>/dev/null | /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin/head -n 1)"
+first="$($T list-sessions -F '#S' 2>/dev/null | head -n 1)"
 if [ -n "$first" ]; then
   exec $T attach -t "=$first"
 fi

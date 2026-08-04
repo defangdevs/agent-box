@@ -1,11 +1,14 @@
     set -eu
-    JQ=${pkgs.jq}/bin/jq
+    # jq/tmux resolve from PATH (system packages + every agent unit's PATH);
+    # the installed-agent list and default come from the AGENT_BOX_* env the
+    # generated wrapper exports (issue #154, Phase 2).
+    JQ=jq
     FILE="$HOME/.config/agent-box/sessions.json"
-    AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " (sessionKinds cfg.installAgents))}
-    DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
-    export TMUX_TMPDIR="''${TMUX_TMPDIR:-/run/agent-box-$USER}"
+    AGENTS="${AGENT_BOX_AGENTS:?}"
+    DEFAULT_AGENT="${AGENT_BOX_DEFAULT_AGENT:?}"
+    export TMUX_TMPDIR="${TMUX_TMPDIR:-/run/agent-box-$USER}"
 
-    t() { ${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} "$@"; }
+    t() { tmux -L agent-box "$@"; }
     usage() {
       echo "usage: agent-box-session ls"
       echo "       agent-box-session add [NAME] [--agent AGENT] [--cwd DIR]"
@@ -17,7 +20,7 @@
       echo "--prompt kicks the session off with a task (first spawn only); a later"
       echo "respawn resumes the prior transcript instead of redoing it."
       echo "Listed sessions are (re)started by the per-user supervisor within ~2s."
-      echo "Attach: tmux -L ${tmuxSocketName} attach -t NAME, or the browser terminal /<user>/?arg=NAME"
+      echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
     }
     valid_name() {
       case "$1" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
@@ -54,7 +57,7 @@
       done
     }
 
-    cmd="''${1:-}"; shift || true
+    cmd="${1:-}"; shift || true
     case "$cmd" in
       ls)
         live="$(t list-sessions -F '#S' 2>/dev/null || true)"
@@ -79,17 +82,17 @@
         # NAME is optional and positional: a leading non-flag arg is the name,
         # otherwise the name is auto-derived from the agent below.
         name=""
-        case "''${1:-}" in
+        case "${1:-}" in
           ""|-*) ;;
           *) name="$1"; shift; valid_name "$name" || { usage >&2; exit 2; } ;;
         esac
         agent="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
         while [ $# -gt 0 ]; do
           case "$1" in
-            --agent) agent="''${2:?--agent needs a value}"; shift 2 ;;
-            --cwd) cwd="''${2:?--cwd needs a value}"; shift 2 ;;
-            --prompt) prompt="''${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
-            --resume-prompt) rprompt="''${2?--resume-prompt needs a value}"; has_rprompt=1; shift 2 ;;
+            --agent) agent="${2:?--agent needs a value}"; shift 2 ;;
+            --cwd) cwd="${2:?--cwd needs a value}"; shift 2 ;;
+            --prompt) prompt="${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
+            --resume-prompt) rprompt="${2?--resume-prompt needs a value}"; has_rprompt=1; shift 2 ;;
             --) shift; break ;;
             *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
           esac
@@ -130,7 +133,7 @@
         fi
         ;;
       rm)
-        name="''${1:-}"
+        name="${1:-}"
         valid_name "$name" || { usage >&2; exit 2; }
         ensure_file
         jq_edit --arg n "$name" 'del(.sessions[$n])'
@@ -138,14 +141,14 @@
         echo "session '$name' removed"
         ;;
       restart)
-        if [ "''${1:-}" = "--all" ]; then
+        if [ "${1:-}" = "--all" ]; then
           ensure_file
           "$JQ" -r '.sessions | keys[]' "$FILE" | while IFS= read -r n; do
             [ -n "$n" ] && t kill-session -t "=$n" 2>/dev/null || true
           done
           echo "all sessions killed — the supervisor restarts each within ~2s (re-reading env)"
         else
-          name="''${1:-}"
+          name="${1:-}"
           valid_name "$name" || { usage >&2; exit 2; }
           t kill-session -t "=$name"
           echo "session '$name' killed — the supervisor restarts it within ~2s if still listed"
@@ -171,7 +174,7 @@
             if [ -f "$ENV_FILE" ]; then
               while IFS= read -r line; do
                 case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-                ek="''${line%%=*}"
+                ek="${line%%=*}"
                 valid_key "$ek" || continue
                 [ "$ek" = "$1" ] && continue
                 printf '%s\n' "$line"
@@ -181,18 +184,18 @@
           } > "$tmp"
           chmod 600 "$tmp"; mv "$tmp" "$ENV_FILE"
         }
-        sub="''${1:-}"; shift || true
+        sub="${1:-}"; shift || true
         case "$sub" in
           ls)
             [ -f "$ENV_FILE" ] || exit 0
             while IFS= read -r line; do
               case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-              k="''${line%%=*}"
+              k="${line%%=*}"
               valid_key "$k" && printf '%s\n' "$k"
             done < "$ENV_FILE" | sort -u
             ;;
           set)
-            k="''${1:-}"; v="''${2-}"
+            k="${1:-}"; v="${2-}"
             valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
             case "$v" in (*"
 "*) echo "value may not contain a newline" >&2; exit 2 ;; esac
@@ -200,7 +203,7 @@
             echo "env '$k' set — applies on the next session (re)start ('agent-box-session restart --all')"
             ;;
           rm)
-            k="''${1:-}"
+            k="${1:-}"
             valid_key "$k" || { usage >&2; exit 2; }
             [ -f "$ENV_FILE" ] || exit 0
             env_rewrite "$k"
