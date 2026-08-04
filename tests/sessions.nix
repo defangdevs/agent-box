@@ -136,8 +136,10 @@
     # With remoteControlHost unset, the auto-derived "<user>-<session>@<host>"
     # Remote Control name takes its host suffix from the public web.domain,
     # NOT the internal kernel hostname — and every session (including "main")
-    # gets the "-<session>" suffix (no "main" special case). The supervisor
-    # bakes both into its start script, so assert those literals.
+    # gets the "-<session>" suffix (no "main" special case). Since issue #154
+    # Phase 2 the supervisor is a shared user-independent script: the host
+    # label rides the unit environment and the name derivation uses $USER,
+    # so assert the env var plus the script's derivation line.
     # head -n1: `systemctl show --value` prints BOTH path= and argv[]=, so the
     # grep -o matches the store path twice. Without it, interpolating the
     # two-line value below makes the second line its own shell command — the
@@ -145,10 +147,13 @@
     # (the CI hang on this PR's first three runs).
     start_script = machine.succeed(
         "systemctl show agent-box-agent --property=ExecStart --value "
-        "| grep -o '/nix/store/[^ ;]*-agent-box-agent-start' | head -n1"
+        "| grep -o '/nix/store/[^ ;]*-agent-box-supervisor' | head -n1"
     ).strip()
-    machine.succeed(f"grep -qF 'host=box.test' {start_script}")
-    machine.succeed(f"grep -qF 'rcname=agent-$sname' {start_script}")
+    machine.succeed(
+        "systemctl show agent-box-agent -p Environment --value "
+        "| grep -qF 'AGENT_BOX_HOST_LABEL=box.test'"
+    )
+    machine.succeed(f"grep -qF 'rcname=$USER-$sname' {start_script}")
 
     # Both agent CLIs are installed even though no session uses codex yet
     # (installAgents defaults to all supported agents).
