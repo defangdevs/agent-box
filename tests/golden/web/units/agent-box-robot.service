@@ -1,0 +1,40 @@
+[Unit]
+After=network-online.target
+Description=Coding agent sessions (tmux) for robot
+Wants=network-online.target
+
+[Service]
+Environment="AGENT_BOX_URL=https://golden.example.org/robot/"
+Environment="AGENT_BOX_WEBHOOK_URL=https://golden.example.org/robot/webhook"
+Environment="HOME=/home/robot"
+Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-67/lib/locale/locale-archive"
+Environment="PATH=/home/robot/.nix-profile/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nix-2.34.8/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-claude-code-2.1.206/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-codex-0.144.1/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bubblewrap-0.11.2/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7b/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-which-2.25/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-session/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gawk-5.4.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-diffutils-3.12/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-patch-2.8/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-less-704/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-file-5.48/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ripgrep-15.1.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnutar-1.35/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gzip-1.14/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bzip2-1.0.8-bin/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-xz-5.8.3-bin/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-zip-3.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-unzip-6.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-curl-8.21.0-bin/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-wget-1.25.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-openssh-10.3p1/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-rsync-3.4.4/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-iputils-20250605/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-iproute2-7.1.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bind-9.20.24-dnsutils/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-netcat-gnu-0.7.1/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-openssl-3.6.3-bin/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnupg-2.4.9/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-procps-4.0.6/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-psmisc-23.7/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.6/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nano-9.1/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-git-2.54.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-interactive-5.3p9/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-git-2.54.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gh-2.96.0/bin:/run/wrappers/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.10.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261/bin:/home/robot/.nix-profile/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nix-2.34.8/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-claude-code-2.1.206/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-codex-0.144.1/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bubblewrap-0.11.2/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7b/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-which-2.25/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-session/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gawk-5.4.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-diffutils-3.12/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-patch-2.8/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-less-704/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-file-5.48/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ripgrep-15.1.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnutar-1.35/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gzip-1.14/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bzip2-1.0.8-bin/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-xz-5.8.3-bin/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-zip-3.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-unzip-6.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-curl-8.21.0-bin/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-wget-1.25.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-openssh-10.3p1/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-rsync-3.4.4/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-iputils-20250605/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-iproute2-7.1.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bind-9.20.24-dnsutils/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-netcat-gnu-0.7.1/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-openssl-3.6.3-bin/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnupg-2.4.9/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-procps-4.0.6/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-psmisc-23.7/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.6/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nano-9.1/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-git-2.54.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-interactive-5.3p9/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-git-2.54.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gh-2.96.0/sbin:/run/wrappers/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.10.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261/sbin"
+Environment="TMUX_TMPDIR=/run/agent-box-robot"
+Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026b/share/zoneinfo"
+ExecStart=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-robot-start
+ExecStop=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7b/bin/tmux -L agent-box kill-server
+LockPersonality=true
+NoNewPrivileges=false
+OOMScoreAdjust=500
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/home/robot
+Restart=always
+RestartSec=2s
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RuntimeDirectory=agent-box-robot
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=true
+Type=exec
+User=robot
+
+[Install]
+WantedBy=multi-user.target
+
+# X-Golden-wantedBy: multi-user.target

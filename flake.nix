@@ -20,6 +20,70 @@
       # To offer them elsewhere, add the system to `vmSystems`.
       imageSystem = "x86_64-linux";
       vmSystems = [ imageSystem ];
+
+      # Golden behavior snapshot (issue #154, Phase 0): every module-generated
+      # systemd unit, published /etc file, tmpfiles rule and script payload
+      # from the two golden configurations, with store hashes normalized to a
+      # fixed placeholder. The committed copy lives at tests/golden/; the
+      # golden-snapshot check below diffs the two, so the portability refactor
+      # (phases 1-3) provably keeps the rendered configuration byte-stable —
+      # an intentional change is made visible by regenerating the fixture
+      # (`nix run .#update-golden`) and reviewing that diff in the PR.
+      goldenSnapshotFor = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          lib = nixpkgs.lib;
+          # Evaluated for the CHECK's system (not pinned to imageSystem like
+          # nixosConfigurations.vm) so the snapshot builds natively on both CI
+          # (x86_64) and the deployed aarch64 fleet; hash normalization makes
+          # the rendered fixture identical across systems, and on
+          # x86_64-linux the vm entry IS nixosConfigurations.vm's eval.
+          configs = {
+            vm = [ self.nixosModules.agent-box ./hosts/vm.nix ];
+            # hosts/vm.nix never enables web/selfUpdate; the overlay pins the
+            # whole Caddy/ttyd/settings/webhook/self-update surface too.
+            web = [ self.nixosModules.agent-box ./hosts/vm.nix ./tests/golden-web.nix ];
+          };
+          unitFilter = n:
+            builtins.match "(agent-box|agent-web|caddy|fail2ban|earlyoom).*" n != null;
+          # /etc content the module owns or materially shapes. The fail2ban
+          # dir entries (filter.d/, action.d/) are upstream package trees and
+          # deliberately excluded; the module's own filter and the jail
+          # settings land in the files below.
+          etcFilter = n:
+            builtins.match
+              "agent-box-guides/.*|caddy/caddy_config|fail2ban/(fail2ban|jail)\\.local|fail2ban/filter\\.d/agent-web-auth\\.conf|sudoers"
+              n != null;
+          manifestOf = modules:
+            let sys = nixpkgs.lib.nixosSystem { inherit system modules; }; in
+            {
+              # Unit text is an eval-time string; wantedBy/requiredBy are
+              # realized as .wants/.requires symlinks and would be invisible
+              # in it, so they ride along explicitly.
+              units = lib.mapAttrs
+                (n: u: {
+                  inherit (u) text;
+                  wantedBy = lib.naturalSort u.wantedBy;
+                  requiredBy = lib.naturalSort u.requiredBy;
+                })
+                (lib.filterAttrs (n: u: unitFilter n && (u.text or null) != null)
+                  sys.config.systemd.units);
+              etc = lib.mapAttrs (n: e: "${e.source}")
+                (lib.filterAttrs (n: e: etcFilter n) sys.config.environment.etc);
+              tmpfiles = builtins.filter (r: lib.hasInfix "agent-box" r)
+                sys.config.systemd.tmpfiles.rules;
+            };
+          # The manifest string keeps its Nix string context, so building it
+          # realizes everything the captured texts reference — which is what
+          # lets the builder dereference the generated payload scripts
+          # (supervisor, session CLI, attach script, ...) inside the sandbox.
+          manifest = pkgs.writeText "agent-box-golden-manifest.json"
+            (builtins.toJSON (lib.mapAttrs (_: manifestOf) configs));
+        in
+        pkgs.runCommand "agent-box-golden-snapshot"
+          { nativeBuildInputs = [ pkgs.python3 ]; inherit manifest; } ''
+          python3 ${./bin/golden-snapshot.py} "$manifest" "$out"
+        '';
     in
     {
       # The portable module. Import into any NixOS host:
@@ -39,14 +103,22 @@
       # into nixpkgs (NixOS 25.05+): nix build .#vm  ->  result/*.qcow2
       # The `qemu` variant extends the fs/bootloader-free vm config with its own
       # partition table + GRUB, so the base config stays usable for build-vm.
-      packages.${imageSystem} =
-        let
-          image = self.nixosConfigurations.vm.config.system.build.images.qemu;
-        in
+      packages = eachSystem (system:
         {
-          vm = image;
-          default = image;
-        };
+          # Rendered golden snapshot (issue #154) — input of the
+          # golden-snapshot check, materialized into tests/golden by
+          # `nix run .#update-golden`.
+          golden-snapshot = goldenSnapshotFor system;
+        }
+        // nixpkgs.lib.optionalAttrs (system == imageSystem) (
+          let
+            image = self.nixosConfigurations.vm.config.system.build.images.qemu;
+          in
+          {
+            vm = image;
+            default = image;
+          }
+        ));
 
       # `nix run .#assemble` — regenerate the committed modules/agent-box.nix
       # from modules/agent-box.nix.in + modules/src/*. Run from the repo root;
@@ -60,6 +132,21 @@
             type = "app";
             program = "${pkgs.writeShellScript "agent-box-assemble" ''
               exec ${pkgs.python3}/bin/python3 "$PWD/bin/assemble-module.py" "$@"
+            ''}";
+          };
+
+          # `nix run .#update-golden` — regenerate the committed golden
+          # fixture (tests/golden) after an INTENTIONAL behavior change; the
+          # resulting diff is the reviewable statement of what changed. Run
+          # from the repo root; edits the working tree in place.
+          update-golden = {
+            type = "app";
+            program = "${pkgs.writeShellScript "agent-box-update-golden" ''
+              set -euo pipefail
+              out=$(nix build --no-link --print-out-paths "$PWD#golden-snapshot")
+              rm -rf "$PWD/tests/golden"
+              cp -rT --no-preserve=mode,ownership,timestamps "$out" "$PWD/tests/golden"
+              echo "wrote tests/golden from $out — review the diff and commit"
             ''}";
           };
         });
@@ -229,6 +316,33 @@
           # generator in --check mode and fail (printing a diff) if the
           # committed file is stale — this is what lets us split the source for
           # tooling while still shipping the one self-contained fetched file.
+          # Behavior lock for the portability refactor (issue #154, Phase 0):
+          # the committed tests/golden fixture must byte-match the freshly
+          # rendered snapshot of every module-generated unit/etc/tmpfiles/
+          # script payload (store hashes normalized). Fails on ANY change to
+          # rendered output — including a nixpkgs bump. When the change is
+          # intended, regenerate with `nix run .#update-golden` and commit
+          # the reviewed diff.
+          golden-snapshot =
+            pkgs.runCommand "agent-box-golden-snapshot-ok"
+              {
+                fixture = builtins.path {
+                  path = ./tests/golden;
+                  name = "agent-box-golden-fixture";
+                };
+                snapshot = self.packages.${system}.golden-snapshot;
+              } ''
+              if diff -ru "$fixture" "$snapshot"; then
+                printf 'golden snapshot matches tests/golden\n' > "$out"
+              else
+                echo
+                echo "rendered configuration diverged from the committed golden fixture."
+                echo "If this change is INTENDED: nix run .#update-golden, review the"
+                echo "tests/golden diff, and commit it with the change."
+                exit 1
+              fi
+            '';
+
           module-generated-up-to-date =
             pkgs.runCommand "agent-box-module-generated-up-to-date"
               {
