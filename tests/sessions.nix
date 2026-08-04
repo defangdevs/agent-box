@@ -278,9 +278,13 @@
     # `app-server daemon version` fails in the stub, which ends the wrapper's
     # health loop instead of blocking the test; the "" first argument skips the
     # UTS re-exec, which is not what this asserts.
-    wrapper = re.search(
+    # Assigned and asserted, not `re.search(...).group(0)`: the driver
+    # type-checks testScript, and a Match|None cannot be subscripted there.
+    wrapper_match = re.search(
         r"/nix/store/\S*agent-box-codex-remote-control", helper_cmdline
-    ).group(0)
+    )
+    assert wrapper_match, helper_cmdline
+    wrapper = wrapper_match.group(0)
     machine.succeed(
         "cat > /tmp/stub-codex <<'EOF'\n"
         "#!/bin/sh\n"
