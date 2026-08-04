@@ -525,10 +525,14 @@
 
     # ttyd serves per-session deep links: the unit runs with --url-arg.
     machine.succeed("systemctl cat agent-web-terminal-agent | grep -q -- --url-arg")
+    # The attach script is the shared agent-box-attach since issue #154
+    # Phase 2. `grep -o ... || echo missing`: an empty substitution would
+    # leave `grep -q` reading stdin — the backdoor shell then hangs the whole
+    # test until the CI timeout (exactly how the rename was first caught).
     machine.succeed(
         "grep -q -- '-T hyperlinks' "
-        "$(systemctl show agent-web-terminal-agent --property=ExecStart --value "
-        "| grep -o '/nix/store/[^ ]*agent-box-agent-attach')"
+        "$({ systemctl show agent-web-terminal-agent --property=ExecStart --value "
+        "| grep -o '/nix/store/[^ ]*-agent-box-attach' || echo /missing; } | head -n1)"
     )
 
     # Working-directory picker (issue 131): the add-session form browses the
