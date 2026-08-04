@@ -218,22 +218,29 @@ feedback. Paste the code, press Enter, and Claude Code should print
 `Login successful.`.
 
 **Codex first login and pairing the Codex apps:** a Codex session with
-`remoteControl = true` runs the app-server daemon, *not* a TUI - so its tab is
-a status view and there is nothing to type into. Sign in from any other shell
-on the box (another terminal tab, or
-`agent-box-session add sh --agent shell`):
+`remoteControl = true` runs the app-server daemon, *not* a TUI - but its tab
+drives the whole onboarding, so there is nothing to run by hand and no second
+session to open. On a logged-out box the pane starts the device-code sign-in
+itself and prints the URL plus the one-time code (valid 15 min); open the link
+on any device, enter the code, and the pane goes straight on to print the
+pairing code for the Codex desktop/mobile app. Pairing codes are short-lived -
+**press Enter in the pane for a fresh one**. Enter also retries sign-in if it
+was abandoned. Typing `login` + Enter drops the stored credentials and signs in
+again - the recovery path when a box holds a stale token or the wrong account,
+where `codex login status` still succeeds but pairing keeps failing. Those two
+keys are all the pane's keyboard does; it is not a codex prompt.
 
-```bash
-codex login --device-auth   # prints a URL + one-time code; expires in 15 min
-codex remote-control pair   # prints the short-lived pairing code for the apps
-```
-
-Use `--device-auth`. Plain `codex login` starts a callback server on
+Sign-in has to be device auth: plain `codex login` starts a callback server on
 `localhost:1455`, which the browser on your laptop cannot reach. Until sign-in
-completes, `codex remote-control pair` fails with `remote control pairing is
-unavailable until enrollment completes` - that error means "not signed in".
-The session's status pane reports which of the two steps is outstanding and
-confirms when sign-in lands.
+completes, pairing fails with `remote control pairing is unavailable until
+enrollment completes` - that error means "not signed in". If you do sign in
+from elsewhere (a shell session, a seeded token), the pane notices within ~5s
+and pairs.
+
+`codex login --device-auth` deletes any stored credentials as it starts and
+does not restore them if the flow is abandoned, so the pane only ever runs it
+when the box is *not* signed in - which is also why you should not run it by
+hand on a working box.
 
 The Codex apps label the box with the name the daemon reports, which Codex
 takes from `gethostname(2)` with no env var, config key or flag to override it.
@@ -472,7 +479,8 @@ arbitrary command execution as the agent user.
   Code it adds `--remote-control`; for Codex it starts the local app-server
   daemon, enables Remote Control on it, and lets the relay connect once login
   and network are available instead of requiring either at daemon startup
-  (pair a box with `codex remote-control pair`). Flip to `false` per-user if
+  (the session pane then signs the box in and prints its pairing code — see
+  the Codex first-login section). Flip to `false` per-user if
   you don't want the session reachable from the agent's apps — then Codex runs
   its normal TUI, reachable via the browser terminal.
 
