@@ -1,0 +1,4 @@
+        handle ${webhookPathOf name}* {
+          uri strip_prefix ${webhookPathOf name}
+          reverse_proxy unix/${webhookSocketOf name}
+        }
