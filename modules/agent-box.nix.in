@@ -382,6 +382,40 @@ let
 EOF
       "$codex" login --device-auth
     }
+    # `login status` is a LOCAL check: it reports how ~/.codex/auth.json was
+    # minted, not whether the backend still honours it. Credentials the server
+    # has invalidated (password change, revoked session, expired refresh token)
+    # keep reporting "Logged in using ChatGPT", so signed_in() stays true,
+    # device_login() correctly declines, and PAIRING is the first thing that
+    # notices — with an HTTP 401 whose body names the reason. Recognise that
+    # shape so the pane can re-authenticate itself instead of printing the
+    # transport guts and waiting for a user who would have to know the
+    # undocumented `login` word to get out of it (issue 187). Deliberately
+    # narrow: enrollment races and network failures must NOT match, because
+    # retrying is the right answer for those and dropping credentials is not.
+    auth_rejected() {
+      # Shell globs, not grep: the agent unit's PATH is curated (coreutils, but
+      # no gnugrep), and a `grep: command not found` here would silently read as
+      # "not an auth failure" and quietly restore the old dead end.
+      case "$1" in
+        *token_invalidated*|*invalid_grant*|*"HTTP 401"*|*[Uu]nauthorized* \
+          |*"sign in again"*|*"signing in again"*) return 0 ;;
+      esac
+      return 1
+    }
+    # The only part of the JSON-RPC blob worth showing a human is the server's
+    # own message; the URL, cf-ray and status code belong in a bug report.
+    auth_reason() {
+      reason=$1
+      case "$reason" in
+        *'"message":"'*)
+          reason=''${reason#*'"message":"'}
+          reason=''${reason%%'"'*}
+          ;;
+        *) reason="the stored credentials were rejected" ;;
+      esac
+      printf '%s' "$reason"
+    }
     # A pairing code is what the Codex desktop/mobile apps ask for to adopt this
     # box, so mint it here too. The first attempt after a cold daemon start
     # races enrollment and fails with either "timed out waiting for
@@ -390,6 +424,9 @@ EOF
     # the error to the user. The last attempt re-enables Remote Control first:
     # enrollment cannot complete while logged out, so a daemon that came up
     # before sign-in needs the nudge once credentials exist.
+    #
+    # Exit status: 0 paired, 2 the credentials were rejected (caller
+    # re-authenticates), 1 anything else (already reported, retryable).
     pair() {
       attempt=0
       while [ "$attempt" -lt 3 ]; do
@@ -406,6 +443,9 @@ EOF
 EOF
           return 0
         fi
+        # Retrying a token the backend has rejected just prints the same 401
+        # three times over six seconds; hand it to the caller at once.
+        if auth_rejected "$pairout"; then return 2; fi
         sleep 2
       done
       printf '\n  ✗ Could not mint a pairing code:\n' >&2
@@ -417,10 +457,36 @@ EOF
     # on startup and on every Enter, so a session that is already paired, one
     # waiting on sign-in, and one whose code just expired all respond to the
     # same keystroke.
+    #
+    # Rejected credentials are the one failure Enter cannot fix on its own, so
+    # onboard fixes it: sign in again automatically. Guarded by a flag rather
+    # than run unconditionally — `logout` is destructive, and a backend
+    # answering 401 for some reason a fresh token won't cure would otherwise
+    # put the pane in a logout/device-auth spin. The flag clears on a
+    # successful pairing, so a token that expires later in the same pane's life
+    # still gets one automatic recovery.
+    relogin_tried=false
     onboard() {
       device_login || true
       if signed_in; then
-        pair || true
+        pair; pairrc=$?
+        if [ "$pairrc" -eq 0 ]; then
+          relogin_tried=false
+        elif [ "$pairrc" -eq 2 ] && [ "$relogin_tried" = false ]; then
+          relogin_tried=true
+          # No "signing in again" line here: device_login's own banner says
+          # exactly that, and says it right before the URL and code.
+          printf '\n  ✗ ChatGPT rejected this box'"'"'s stored credentials:\n'
+          printf '    %s\n' "$(auth_reason "$pairout")"
+          relogin
+        elif [ "$pairrc" -eq 2 ]; then
+          # Already re-authenticated once this cycle and still rejected: the
+          # account itself is the problem (wrong account, revoked access), which
+          # no amount of retrying here can tell apart. Say so instead of looping.
+          printf '\n  ✗ ChatGPT still rejects the credentials: %s\n' "$(auth_reason "$pairout")" >&2
+          printf '%s\n' "    Sign-in was already retried once. Type: login  to try again," >&2
+          printf '%s\n' "    or check that the account you signed in with has Codex access." >&2
+        fi
       else
         cat <<EOF
 
@@ -429,15 +495,19 @@ EOF
 EOF
       fi
     }
-    # Escape hatch for the one state Enter cannot fix: credentials that satisfy
-    # `login status` but are stale or belong to the wrong account, so pairing
-    # keeps failing and device_login keeps (correctly) declining to run. Dropping
-    # the credentials first is destructive, which is why it is behind a typed
-    # word instead of the Enter that mints pairing codes.
+    # Drop credentials that satisfy `login status` but the backend rejects (or
+    # that belong to the wrong account), so device_login stops declining and the
+    # device flow can run. Reached two ways: automatically from onboard when
+    # pairing came back 401, and by typing `login` — still worth keeping as a
+    # typed word, because the wrong-ACCOUNT case produces no error string to
+    # detect and only the user knows about it.
     relogin() {
-      printf '\n  Dropping stored credentials and signing in again.\n'
       "$codex" logout >/dev/null 2>&1 || true
       onboard
+      # The logout may be ALL that happened — a device flow the user walked away
+      # from leaves the box signed out. Say so, so the health loop's transition
+      # check notices whenever sign-in does complete.
+      signed_in || was_signed_in=false
     }
     daemon_failed() {
       cat >&2 <<EOF
@@ -481,7 +551,11 @@ EOF
         IFS= read -r -t 5 key; rc=$?
         if [ "$rc" -eq 0 ]; then
           case "$key" in
-            login|relogin|logout) relogin ;;
+            login|relogin|logout)
+              printf '\n  Dropping stored credentials and signing in again.\n'
+              relogin_tried=true
+              relogin
+              ;;
             *) onboard ;;
           esac
         elif [ "$rc" -le 128 ]; then
@@ -494,10 +568,15 @@ EOF
       # `agent-box-session env`-provided token), so poll for the transition and
       # pair on it — otherwise the pane sits on "not signed in" long after it
       # stopped being true and the user has no idea pairing is now unblocked.
+      # Short-circuited on purpose: once signed in this costs no `login status`
+      # subprocess every 5s. relogin() resets the flag when it leaves the box
+      # signed out, which is the only way it goes back to false.
       if [ "$was_signed_in" = false ] && signed_in; then
         was_signed_in=true
         printf '\n  ✓ Signed in.\n'
-        pair || true
+        # onboard, not a bare pair: it owns the rejected-credentials handling,
+        # and its device_login is a no-op now that signed_in() is true.
+        onboard
       fi
     done
   '';
