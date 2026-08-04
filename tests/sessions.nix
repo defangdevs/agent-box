@@ -324,7 +324,9 @@
         for marker in markers:
             machine.succeed(f"touch /tmp/stub/{marker}")
         machine.succeed(
-            as_agent(f"{wrapper} '' /tmp/stub-codex > /tmp/stub/out 2>&1 || true")
+            # The empty first argument is written with DOUBLE quotes: a bare
+            # pair of single quotes would end this Nix indented string here.
+            as_agent(f'{wrapper} "" /tmp/stub-codex > /tmp/stub/out 2>&1 || true')
         )
         return (
             machine.succeed("cat /tmp/stub/out"),
