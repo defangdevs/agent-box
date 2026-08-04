@@ -809,7 +809,8 @@ Outputs:
       terminal, the Claude desktop / mobile apps can drive this session directly
       (sign in with the same Claude account). Only meaningful when Agent=claude;
       Codex is remote-controlled too, but its `codex remote-control` daemon
-      names itself from the hostname (pair it with `codex remote-control pair`).
+      names itself from the hostname; its session tab signs the box in and
+      prints the pairing code for the Codex apps.
     Value: !Sub
       - "${UserName}-main@${Host}.sslip.io"
       - Host: !If

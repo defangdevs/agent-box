@@ -310,6 +310,12 @@ let
   # restarted, so no detached daemon is leaked. $1 is the codex binary; the
   # rest is forwarded to `app-server daemon start` (the -c autonomy overrides
   # seeded below, plus any extraArgs).
+  #
+  # The wrapper also DRIVES onboarding (issue 159): it runs the device-code
+  # sign-in and mints the pairing code in this pane. Printing the two commands
+  # and expecting the user to open a second (shell) session to paste them was
+  # the whole onboarding problem — a codex session is supposed to be usable
+  # from the pane it starts in.
   codexRemoteControl = pkgs.writeShellScript "agent-box-codex-remote-control" ''
     # The pid-managed daemon backend records and probes its app-server child by
     # shelling out to a bare `ps`, so procps has to be reachable regardless of
@@ -347,40 +353,91 @@ let
     stop
     trap 'stop; exit 0' HUP INT TERM
     # This wrapper is the session's foreground command, so its stdout IS what
-    # the browser terminal shows. Without the banners below the pane is a lone
-    # line of daemon-start JSON and then silence forever, with no hint that the
-    # session is healthy, that it is not a codex prompt, or that Remote Control
-    # cannot enroll until someone signs in (issue #159).
+    # the browser terminal shows, and its stdin IS the pane's keyboard. Without
+    # the output below the pane is a lone line of daemon-start JSON and then
+    # silence forever, with no hint that the session is healthy or that Remote
+    # Control cannot enroll until someone signs in (issue #159).
     hr() { printf '%s\n' "────────────────────────────────────────────────────────────"; }
     signed_in() { "$codex" login status >/dev/null 2>&1; }
-    banner_signin() {
+    # Run the sign-in HERE rather than printing the command for someone to paste
+    # into another session. This box is headless, so device auth is the only
+    # flow that works: plain `codex login` serves a localhost URL no outside
+    # browser can reach. codex prints the verification URL plus a one-time code
+    # (15 min) and blocks polling until the browser side finishes, which is
+    # exactly the foreground behaviour this pane wants.
+    #
+    # DANGER: `codex login --device-auth` REMOVES ~/.codex/auth.json as it
+    # starts and does not restore it if the flow is abandoned, so calling it on
+    # an already-signed-in box logs that box out. Never call it without the
+    # signed_in guard below. Supervision pauses while it blocks — a daemon that
+    # dies mid-login is noticed once the flow ends, which beats making sign-in
+    # someone else's job.
+    device_login() {
+      if signed_in; then return 0; fi
       cat <<EOF
 
-  ✗ Not signed in — Remote Control cannot enroll yet.
-    ("codex remote-control pair" fails until this is done.)
+  Signing this box in to ChatGPT — you do not need another terminal.
+  Open the link below on any device and enter the code it shows.
 
-    This box is headless, so use device auth; plain \`codex login\`
-    serves a localhost URL your browser cannot reach:
-
-        codex login --device-auth
-
-    Then pair the Codex desktop/mobile app:
-
-        codex remote-control pair
-
-    Run both from any shell on the box — open another terminal tab,
-    or: agent-box-session add sh --agent shell
 EOF
+      "$codex" login --device-auth
     }
-    banner_ready() {
-      cat <<EOF
-
-  ✓ Signed in. Pair a Codex desktop/mobile app with:
-
-        codex remote-control pair
-
-    The pairing code is short-lived — re-run it for a fresh one.
+    # A pairing code is what the Codex desktop/mobile apps ask for to adopt this
+    # box, so mint it here too. The first attempt after a cold daemon start
+    # races enrollment and fails with either "timed out waiting for
+    # remoteControl/pairing/start response" or "pairing is unavailable until
+    # enrollment completes"; both clear on a retry, so retry instead of handing
+    # the error to the user. The last attempt re-enables Remote Control first:
+    # enrollment cannot complete while logged out, so a daemon that came up
+    # before sign-in needs the nudge once credentials exist.
+    pair() {
+      attempt=0
+      while [ "$attempt" -lt 3 ]; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -eq 3 ]; then
+          "$codex" app-server daemon enable-remote-control >/dev/null 2>&1 || true
+        fi
+        if pairout=$("$codex" remote-control pair 2>&1); then
+          printf '\n  ✓ %s\n' "$pairout"
+          cat <<EOF
+    Enter it in the Codex desktop or mobile app to adopt this box
+    ("$(uname -n)"). Codes expire quickly — press Enter here for a
+    fresh one. Already paired? Nothing to do; ignore this code.
 EOF
+          return 0
+        fi
+        sleep 2
+      done
+      printf '\n  ✗ Could not mint a pairing code:\n' >&2
+      printf '%s\n' "$pairout" >&2
+      printf '%s\n' "    Press Enter to try again." >&2
+      return 1
+    }
+    # One key for "do whatever is next": sign in if logged out, then pair. Run
+    # on startup and on every Enter, so a session that is already paired, one
+    # waiting on sign-in, and one whose code just expired all respond to the
+    # same keystroke.
+    onboard() {
+      device_login || true
+      if signed_in; then
+        pair || true
+      else
+        cat <<EOF
+
+  ✗ Not signed in — Remote Control cannot enroll, so pairing will fail.
+    Press Enter to run the device-code sign-in again.
+EOF
+      fi
+    }
+    # Escape hatch for the one state Enter cannot fix: credentials that satisfy
+    # `login status` but are stale or belong to the wrong account, so pairing
+    # keeps failing and device_login keeps (correctly) declining to run. Dropping
+    # the credentials first is destructive, which is why it is behind a typed
+    # word instead of the Enter that mints pairing codes.
+    relogin() {
+      printf '\n  Dropping stored credentials and signing in again.\n'
+      "$codex" logout >/dev/null 2>&1 || true
+      onboard
     }
     daemon_failed() {
       cat >&2 <<EOF
@@ -399,23 +456,49 @@ EOF
       || { daemon_failed "enable remote control"; stop; exit 1; }
     hr
     printf '%s\n' "  agent-box: codex Remote Control daemon is running."
-    printf '%s\n' "  This pane is a status view, not a codex prompt — typing does nothing."
+    printf '%s\n' "  This pane is not a codex prompt — it signs the box in and pairs it."
     printf '%s\n' "  Machine name in the Codex apps: $(uname -n)"
     hr
-    if signed_in; then banner_ready; else banner_signin; fi
+    onboard
+    printf '\n%s\n' "  [Enter] fresh pairing code   ·   [type: login] sign in again"
     # `sleep & wait` (not a bare sleep) so a signal interrupts the wait at
     # once and the trap fires without waiting the interval out.
     was_signed_in=false
     signed_in && was_signed_in=true
+    # Read the keyboard only where there is one: with no terminal (a systemd
+    # unit, a pane fed from /dev/null) read returns EOF instantly and the health
+    # loop below would spin at full tilt.
+    keyboard=false
+    [ -t 0 ] && keyboard=true
     while "$codex" app-server daemon version >/dev/null 2>&1; do
-      # Sign-in happens in ANOTHER tab, so poll for the transition and confirm
-      # it here — otherwise the pane still reads "not signed in" long after it
-      # stopped being true, and the user has no idea pairing is now unblocked.
+      if [ "$keyboard" = true ]; then
+        # Enter re-runs onboard (fresh pairing code, or another sign-in attempt),
+        # which is why the interval is a read timeout rather than a sleep: the
+        # daemon health probe still runs every 5s either way. Exit >128 is that
+        # timeout; anything else is EOF (Ctrl-D, or the terminal went away), the
+        # same spin risk as having no terminal at all — so stop reading and fall
+        # back to sleeping, still supervising the daemon.
+        IFS= read -r -t 5 key; rc=$?
+        if [ "$rc" -eq 0 ]; then
+          case "$key" in
+            login|relogin|logout) relogin ;;
+            *) onboard ;;
+          esac
+        elif [ "$rc" -le 128 ]; then
+          keyboard=false
+        fi
+      else
+        sleep 5 & wait $!
+      fi
+      # Sign-in can still complete somewhere else (a shell session, an
+      # `agent-box-session env`-provided token), so poll for the transition and
+      # pair on it — otherwise the pane sits on "not signed in" long after it
+      # stopped being true and the user has no idea pairing is now unblocked.
       if [ "$was_signed_in" = false ] && signed_in; then
         was_signed_in=true
-        banner_ready
+        printf '\n  ✓ Signed in.\n'
+        pair || true
       fi
-      sleep 5 & wait $!
     done
   '';
 
@@ -1156,8 +1239,11 @@ $PROMPT"
           - codex: starts the local app-server daemon and enables Remote Control
             on it (issue 103) INSTEAD of the interactive TUI. The daemon starts
             even while logged out or offline; its relay connects once login and
-            network are available. Pair a running box with `codex remote-control
-            pair`. With false, codex runs its normal TUI, reachable only via the
+            network are available. The session's pane then drives onboarding
+            (issue 159): it runs the device-code sign-in when the box is logged
+            out and prints the app pairing code once it is not, so no second
+            shell session is needed. Enter in that pane mints a fresh pairing
+            code. With false, codex runs its normal TUI, reachable only via the
             browser terminal. The codex daemon is a per-user singleton (one
             control socket per user), so enable it on at most ONE codex session
             per user; two would fight over the same daemon.

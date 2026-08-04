@@ -250,6 +250,22 @@
         as_agent("codex app-server daemon version"), timeout=60
     )
 
+    # The pane DRIVES sign-in itself (issue 159): a logged-out box must run the
+    # device-code flow in this pane, not print commands for the user to paste
+    # into a second session — this VM has no Codex login, which is exactly that
+    # state. -S -50 because the codex sign-in output pushes the banner up.
+    helper_pane = machine.wait_until_succeeds(
+        tmux('capture-pane -p -S -50 -t "=helper:"')
+        + " | grep -F 'Signing this box in'",
+        timeout=90,
+    )
+    assert "you do not need another terminal" in helper_pane, helper_pane
+    # Regression guard on the old onboarding: no copy-paste command list, and no
+    # instruction to open a shell session to run it.
+    full_pane = machine.succeed(tmux('capture-pane -p -S -50 -t "=helper:"'))
+    assert "--agent shell" not in full_pane, full_pane
+    assert "codex login --device-auth" not in full_pane, full_pane
+
     # Re-adding an existing name errors out and must not clobber the stored
     # config (issue 100): helper keeps its codex agent.
     machine.fail(
