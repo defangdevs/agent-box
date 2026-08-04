@@ -1,0 +1,27 @@
+        # Anything else, including /: ${name}'s tabbed terminal workspace
+        # (one tab per session, panes iframing /${name}/?arg=<session>; plus
+        # the /sessions/* CRUD routes), served by the settings daemon behind
+        # the SAME cookie-or-basic auth as the terminal — session CRUD must
+        # never be reachable unauthenticated.
+        # This replaces the old unauthenticated picker (single-user boxes are
+        # the norm now); with it gone — and the public sessions.json it fed
+        # removed — nothing on this vhost is served without auth. Other
+        # users' terminals stay at /<user>/ as before. No userinfo in any
+        # href (issue 56): Chrome answers the basic-auth challenge with URL
+        # userinfo + an EMPTY password, and credentials typed into the
+        # prompt cannot override the URL-embedded identity.
+        handle {
+          @cookie_root header_regexp Cookie "(^|; )__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}(;|$)"
+          handle @cookie_root {
+            reverse_proxy unix/${settingsSocketOf name}
+          }
+          handle {
+            route {
+              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
+                ${name} {$WEB_PASSWORD_HASH_${envName name}}
+              }
+              header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              reverse_proxy unix/${settingsSocketOf name}
+            }
+          }
+        }
