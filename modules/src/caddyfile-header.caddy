@@ -1,0 +1,36 @@
+        # This file is module-managed by services.agent-box — edits here get
+        # OVERWRITTEN on the next nixos-rebuild. To add your own virtual host,
+        # drop a *.caddy snippet into ~/sites/ (which is a symlink into
+        # /var/lib/agent-box-sites/<you>/, a caddy-readable location) and
+        # reload with: sudo systemctl reload caddy.service
+        #
+        # Recommended snippet shape — reverse-proxy to a localhost port your
+        # agent runs, NOT `file_server /home/<you>/...`. caddy.service has
+        # ProtectHome=true, so it cannot read files under /home; use file_server
+        # only against a path outside /home (e.g. /var/lib/agent-box-sites/<you>/public):
+        #
+        #     foo.example.com {
+        #       import acme_alpn_only    # Let's Encrypt via TLS-ALPN-01
+        #       reverse_proxy 127.0.0.1:3000
+        #     }
+        #
+        # New hosts get a Let's Encrypt cert on first request as long as DNS
+        # for that hostname points at this box.
+
+        (acme_alpn_only) {
+          tls {
+            issuer acme {
+              disable_http_challenge
+            }
+          }
+        }
+
+        ${cfg.web.domain} {
+          # Access log to the journal — the fail2ban jail counts 401s here.
+          log
+          import acme_alpn_only
+          header {
+            Cache-Control "no-store"
+            X-Content-Type-Options "nosniff"
+          }
+
