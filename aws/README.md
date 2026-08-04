@@ -15,7 +15,7 @@ choose Claude Code or Codex.
   a single public subnet with a /64 IPv6 range, IGW + routes for v4 and
   v6. First-boot dependencies are fetched from dual-stack hosts, so the
   IPv6-only default does not require NAT64/DNS64.
-- Launches one EC2 instance from the latest NixOS 25.11 AMI for the region.
+- Launches one EC2 instance from the latest NixOS 26.05 AMI for the region.
 - Uses EC2 user-data as a NixOS configuration: imports the pinned
   `agent-box` module, sets `services.agent-box.agent` from the `Agent`
   parameter, and enables the module's web terminal (Caddy, TLS-ALPN-01 only,
@@ -397,7 +397,7 @@ auth). AMIs are garbage-collected ~90d after publication, so the template's
 `Mappings.RegionMap` block needs to be refreshed periodically.
 
 `scripts/refresh_amis.py` regenerates the block between the `BEGIN AMI MAP`
-/ `END AMI MAP` markers in `template.yaml`. It targets the NixOS 25.11
+/ `END AMI MAP` markers in `template.yaml`. It targets the NixOS 26.05
 channel, `aarch64-linux` (Graviton), and only the 4 regions we support
 today (us-east-1, us-west-2, eu-central-1, eu-west-1).
 
