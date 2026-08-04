@@ -1,12 +1,17 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+export AGENT_BOX_AGENTS='claude codex shell'
+export AGENT_BOX_DEFAULT_AGENT=claude
     set -eu
-    JQ=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin/jq
+    # jq/tmux resolve from PATH (system packages + every agent unit's PATH);
+    # the installed-agent list and default come from the AGENT_BOX_* env the
+    # generated wrapper exports (issue #154, Phase 2).
+    JQ=jq
     FILE="$HOME/.config/agent-box/sessions.json"
-    AGENTS='claude codex shell'
-    DEFAULT_AGENT=claude
+    AGENTS="${AGENT_BOX_AGENTS:?}"
+    DEFAULT_AGENT="${AGENT_BOX_DEFAULT_AGENT:?}"
     export TMUX_TMPDIR="${TMUX_TMPDIR:-/run/agent-box-$USER}"
 
-    t() { /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7b/bin/tmux -L agent-box "$@"; }
+    t() { tmux -L agent-box "$@"; }
     usage() {
       echo "usage: agent-box-session ls"
       echo "       agent-box-session add [NAME] [--agent AGENT] [--cwd DIR]"

@@ -1,64 +1,64 @@
-        # ${name}'s terminal. Cookie first — browsers refuse to attach basic
-        # auth credentials to WebSocket upgrades — then basic auth with the
-        # linux user name as the login name.
-        redir /${name} /${name}/
-        # ${name}'s settings page (issue #36). Same auth surface as the
-        # terminal (cookie-or-basic-auth, same user name), just a different
-        # upstream — the settings daemon over its user+caddy-only unix socket
-        # (issue #49). More specific than /${name}/* below, so Caddy routes
-        # it here first.
-        handle /${name}/settings* {
-          @cookie_settings_${name} header_regexp Cookie "(^|; )__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}(;|$)"
-          handle @cookie_settings_${name} {
-            reverse_proxy unix/${settingsSocketOf name}
-          }
-          handle {
-            route {
-              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
-                ${name} {$WEB_PASSWORD_HASH_${envName name}}
-              }
-              header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-              reverse_proxy unix/${settingsSocketOf name}
-            }
-          }
-        }
-        # ${name}'s file drop (issue #132): a browsable static index of
-        # ~/downloads, served from the caddy-readable /var/lib backing dir
-        # (caddy.service can't read /home). Same cookie-or-basic auth as the
-        # terminal, and MORE specific than /${name}/* below so Caddy routes it
-        # here first. The agent hands the user a ${name}/downloads/<file> URL.
-        redir /${name}/downloads /${name}/downloads/
-        handle /${name}/downloads/* {
-          @cookie_dl_${name} header_regexp Cookie "(^|; )__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}(;|$)"
-          handle @cookie_dl_${name} {
-            uri strip_prefix /${name}/downloads
-            root * ${downloadsDirOf name}
-            file_server browse
-          }
-          handle {
-            route {
-              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
-                ${name} {$WEB_PASSWORD_HASH_${envName name}}
-              }
-              header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-              uri strip_prefix /${name}/downloads
-              root * ${downloadsDirOf name}
-              file_server browse
-            }
-          }
-        }
-        handle /${name}/* {
-          @cookie_${name} header_regexp Cookie "(^|; )__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}(;|$)"
-          handle @cookie_${name} {
-            reverse_proxy 127.0.0.1:${toString portOf.${name}}
-          }
-          handle {
-            route {
-              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
-                ${name} {$WEB_PASSWORD_HASH_${envName name}}
-              }
-              header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-              reverse_proxy 127.0.0.1:${toString portOf.${name}}
-            }
-          }
-        }
+# @USER@'s terminal. Cookie first — browsers refuse to attach basic
+# auth credentials to WebSocket upgrades — then basic auth with the
+# linux user name as the login name.
+redir /@USER@ /@USER@/
+# @USER@'s settings page (issue #36). Same auth surface as the
+# terminal (cookie-or-basic-auth, same user name), just a different
+# upstream — the settings daemon over its user+caddy-only unix socket
+# (issue #49). More specific than /@USER@/* below, so Caddy routes
+# it here first.
+handle /@USER@/settings* {
+  @cookie_settings_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
+  handle @cookie_settings_@USER@ {
+    reverse_proxy unix/@SETTINGS_SOCKET@
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
+        @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      reverse_proxy unix/@SETTINGS_SOCKET@
+    }
+  }
+}
+# @USER@'s file drop (issue #132): a browsable static index of
+# ~/downloads, served from the caddy-readable /var/lib backing dir
+# (caddy.service can't read /home). Same cookie-or-basic auth as the
+# terminal, and MORE specific than /@USER@/* below so Caddy routes it
+# here first. The agent hands the user a @USER@/downloads/<file> URL.
+redir /@USER@/downloads /@USER@/downloads/
+handle /@USER@/downloads/* {
+  @cookie_dl_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
+  handle @cookie_dl_@USER@ {
+    uri strip_prefix /@USER@/downloads
+    root * @DOWNLOADS_DIR@
+    file_server browse
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
+        @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      uri strip_prefix /@USER@/downloads
+      root * @DOWNLOADS_DIR@
+      file_server browse
+    }
+  }
+}
+handle /@USER@/* {
+  @cookie_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
+  handle @cookie_@USER@ {
+    reverse_proxy 127.0.0.1:@TTYD_PORT@
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
+        @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      reverse_proxy 127.0.0.1:@TTYD_PORT@
+    }
+  }
+}

@@ -1,3 +1,4 @@
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
 set -u
 # One user-independent script (issue #154, Phase 2): everything user-
 # or host-specific arrives through the unit's environment (HOME, USER
@@ -384,3 +385,4 @@ while true; do
   done < <($JQ -r '.sessions | keys[]' "$SESSIONS_FILE" 2>/dev/null)
   sleep 2
 done
+
