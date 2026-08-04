@@ -1,0 +1,19 @@
+[DEFAULT]
+backend = systemd
+banaction = iptables-multiport
+banaction_allports = iptables-allports
+bantime = 10m
+ignoreip = 127.0.0.1/8 ::1 
+maxretry = 3
+
+[INCLUDES]
+before = paths-nixos.conf
+
+[agent-web-auth]
+backend = systemd
+bantime = 1h
+enabled = true
+filter = agent-web-auth
+findtime = 10m
+maxretry = 5
+port = http,https

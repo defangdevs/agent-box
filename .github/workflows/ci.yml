@@ -12,6 +12,10 @@ on:
       - 'modules/agent-box.nix.in'
       - 'modules/src/**'
       - 'bin/assemble-module.py'
+      # The golden behavior snapshot (issue #154): the fixture and its
+      # renderer must re-run the golden-snapshot check when either changes.
+      - 'bin/golden-snapshot.py'
+      - 'tests/golden/**'
       - 'flake.lock'
       - '.github/workflows/ci.yml'
   pull_request:
@@ -81,6 +85,13 @@ jobs:
       # Full closure build — the real "module is usable" proof.
       - name: Build VM system closure
         run: nix build -L .#checks.x86_64-linux.vm-closure
+
+      # Behavior lock for the portability refactor (issue #154, Phase 0):
+      # rendered units/etc/tmpfiles/payload scripts must byte-match the
+      # committed tests/golden fixture (store hashes normalized). Runs after
+      # vm-closure so the shared closure is already in the store.
+      - name: Check golden behavior snapshot
+        run: nix build -L .#checks.x86_64-linux.golden-snapshot && cat result
 
       # Interactive VM test: brute-forcing the web terminal's basic auth gets
       # the client banned. ubuntu-latest runners have KVM but /dev/kvm is

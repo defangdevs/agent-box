@@ -1,0 +1,210 @@
+# This file is module-managed by services.agent-box — edits here get
+# OVERWRITTEN on the next nixos-rebuild. To add your own virtual host,
+# drop a *.caddy snippet into ~/sites/ (which is a symlink into
+# /var/lib/agent-box-sites/<you>/, a caddy-readable location) and
+# reload with: sudo systemctl reload caddy.service
+#
+# Recommended snippet shape — reverse-proxy to a localhost port your
+# agent runs, NOT `file_server /home/<you>/...`. caddy.service has
+# ProtectHome=true, so it cannot read files under /home; use file_server
+# only against a path outside /home (e.g. /var/lib/agent-box-sites/<you>/public):
+#
+#     foo.example.com {
+#       import acme_alpn_only    # Let's Encrypt via TLS-ALPN-01
+#       reverse_proxy 127.0.0.1:3000
+#     }
+#
+# New hosts get a Let's Encrypt cert on first request as long as DNS
+# for that hostname points at this box.
+
+(acme_alpn_only) {
+  tls {
+    issuer acme {
+      disable_http_challenge
+    }
+  }
+}
+
+golden.example.org {
+  # Access log to the journal — the fail2ban jail counts 401s here.
+  log
+  import acme_alpn_only
+  header {
+    Cache-Control "no-store"
+    X-Content-Type-Options "nosniff"
+  }
+
+  handle /agent/webhook* {
+    uri strip_prefix /agent/webhook
+    reverse_proxy unix//run/agent-box-webhook/agent.sock
+  }
+  # agent's terminal. Cookie first — browsers refuse to attach basic
+  # auth credentials to WebSocket upgrades — then basic auth with the
+  # linux user name as the login name.
+  redir /agent /agent/
+  # agent's settings page (issue #36). Same auth surface as the
+  # terminal (cookie-or-basic-auth, same user name), just a different
+  # upstream — the settings daemon over its user+caddy-only unix socket
+  # (issue #49). More specific than /agent/* below, so Caddy routes
+  # it here first.
+  handle /agent/settings* {
+    @cookie_settings_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
+    handle @cookie_settings_agent {
+      reverse_proxy unix//run/agent-box-settings/agent.sock
+    }
+    handle {
+      route {
+        basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+          agent {$WEB_PASSWORD_HASH_AGENT}
+        }
+        header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+        reverse_proxy unix//run/agent-box-settings/agent.sock
+      }
+    }
+  }
+  # agent's file drop (issue #132): a browsable static index of
+  # ~/downloads, served from the caddy-readable /var/lib backing dir
+  # (caddy.service can't read /home). Same cookie-or-basic auth as the
+  # terminal, and MORE specific than /agent/* below so Caddy routes it
+  # here first. The agent hands the user a agent/downloads/<file> URL.
+  redir /agent/downloads /agent/downloads/
+  handle /agent/downloads/* {
+    @cookie_dl_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
+    handle @cookie_dl_agent {
+      uri strip_prefix /agent/downloads
+      root * /var/lib/agent-box-downloads/agent
+      file_server browse
+    }
+    handle {
+      route {
+        basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+          agent {$WEB_PASSWORD_HASH_AGENT}
+        }
+        header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+        uri strip_prefix /agent/downloads
+        root * /var/lib/agent-box-downloads/agent
+        file_server browse
+      }
+    }
+  }
+  handle /agent/* {
+    @cookie_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
+    handle @cookie_agent {
+      reverse_proxy 127.0.0.1:7681
+    }
+    handle {
+      route {
+        basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+          agent {$WEB_PASSWORD_HASH_AGENT}
+        }
+        header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+        reverse_proxy 127.0.0.1:7681
+      }
+    }
+  }
+
+  handle /robot/webhook* {
+    uri strip_prefix /robot/webhook
+    reverse_proxy unix//run/agent-box-webhook/robot.sock
+  }
+  # robot's terminal. Cookie first — browsers refuse to attach basic
+  # auth credentials to WebSocket upgrades — then basic auth with the
+  # linux user name as the login name.
+  redir /robot /robot/
+  # robot's settings page (issue #36). Same auth surface as the
+  # terminal (cookie-or-basic-auth, same user name), just a different
+  # upstream — the settings daemon over its user+caddy-only unix socket
+  # (issue #49). More specific than /robot/* below, so Caddy routes
+  # it here first.
+  handle /robot/settings* {
+    @cookie_settings_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
+    handle @cookie_settings_robot {
+      reverse_proxy unix//run/agent-box-settings/robot.sock
+    }
+    handle {
+      route {
+        basic_auth {$WEB_PASSWORD_ALGORITHM_ROBOT} robot {
+          robot {$WEB_PASSWORD_HASH_ROBOT}
+        }
+        header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+        reverse_proxy unix//run/agent-box-settings/robot.sock
+      }
+    }
+  }
+  # robot's file drop (issue #132): a browsable static index of
+  # ~/downloads, served from the caddy-readable /var/lib backing dir
+  # (caddy.service can't read /home). Same cookie-or-basic auth as the
+  # terminal, and MORE specific than /robot/* below so Caddy routes it
+  # here first. The agent hands the user a robot/downloads/<file> URL.
+  redir /robot/downloads /robot/downloads/
+  handle /robot/downloads/* {
+    @cookie_dl_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
+    handle @cookie_dl_robot {
+      uri strip_prefix /robot/downloads
+      root * /var/lib/agent-box-downloads/robot
+      file_server browse
+    }
+    handle {
+      route {
+        basic_auth {$WEB_PASSWORD_ALGORITHM_ROBOT} robot {
+          robot {$WEB_PASSWORD_HASH_ROBOT}
+        }
+        header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+        uri strip_prefix /robot/downloads
+        root * /var/lib/agent-box-downloads/robot
+        file_server browse
+      }
+    }
+  }
+  handle /robot/* {
+    @cookie_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
+    handle @cookie_robot {
+      reverse_proxy 127.0.0.1:7682
+    }
+    handle {
+      route {
+        basic_auth {$WEB_PASSWORD_ALGORITHM_ROBOT} robot {
+          robot {$WEB_PASSWORD_HASH_ROBOT}
+        }
+        header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+        reverse_proxy 127.0.0.1:7682
+      }
+    }
+  }
+
+  # Anything else, including /: agent's tabbed terminal workspace
+  # (one tab per session, panes iframing /agent/?arg=<session>; plus
+  # the /sessions/* CRUD routes), served by the settings daemon behind
+  # the SAME cookie-or-basic auth as the terminal — session CRUD must
+  # never be reachable unauthenticated.
+  # This replaces the old unauthenticated picker (single-user boxes are
+  # the norm now); with it gone — and the public sessions.json it fed
+  # removed — nothing on this vhost is served without auth. Other
+  # users' terminals stay at /<user>/ as before. No userinfo in any
+  # href (issue 56): Chrome answers the basic-auth challenge with URL
+  # userinfo + an EMPTY password, and credentials typed into the
+  # prompt cannot override the URL-embedded identity.
+  handle {
+    @cookie_root header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
+    handle @cookie_root {
+      reverse_proxy unix//run/agent-box-settings/agent.sock
+    }
+    handle {
+      route {
+        basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+          agent {$WEB_PASSWORD_HASH_AGENT}
+        }
+        header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+        reverse_proxy unix//run/agent-box-settings/agent.sock
+      }
+    }
+  }
+}
+
+# Per-user snippet directories. Each agent user's ~/sites/ symlinks
+# here. Adding a file below and running `sudo systemctl reload
+# caddy.service` is the whole workflow — no nixos-rebuild required.
+# One import per user: Caddyfile's `import` directive only accepts a
+# single `*` per pattern, so we can't collapse this to `*/*.caddy`.
+import /var/lib/agent-box-sites/agent/*.caddy
+import /var/lib/agent-box-sites/robot/*.caddy

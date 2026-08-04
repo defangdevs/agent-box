@@ -1,0 +1,378 @@
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+      set -u
+      JQ=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin/jq
+      TMUX="/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7b/bin/tmux -L agent-box"
+      SESSIONS_FILE=/home/robot/.config/agent-box/sessions.json
+      # grep/find are NOT on the unit PATH (see the service's `path`); the
+      # transcript lookups below reference them by store path, as with jq/tmux.
+      GREP=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/bin/grep
+      FIND=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.10.0/bin/find
+
+      # First boot only: seed the Nix-declared sessions. The file is RUNTIME
+      # data afterwards — a rebuild must never clobber sessions the user
+      # added or removed while the box was live.
+      mkdir -p /home/robot/.config/agent-box
+      if [ ! -s "$SESSIONS_FILE" ]; then
+        install -m 0600 /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-robot-sessions.json "$SESSIONS_FILE"
+      fi
+
+# Codex remote-control pairing currently requires the standalone
+# installer layout at ~/.codex/packages/standalone/current/codex.
+# Mirror that fixed path to the Nix-provided Codex so pairing works
+# without a curl-installed second copy.
+mkdir -p /home/robot/.codex/packages/standalone/agent-box-current
+ln -sfn /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-codex-0.144.1/bin/codex \
+  /home/robot/.codex/packages/standalone/agent-box-current/codex
+ln -sfn agent-box-current /home/robot/.codex/packages/standalone/current
+
+
+      seed_json() {
+        # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
+        # if missing. A file jq can't parse is left untouched: the dialog
+        # comes back, but the agent still starts.
+        file=$1; shift
+        [ -s "$file" ] || printf '{}' > "$file"
+        if $JQ "$@" "$file" > "$file.seed-tmp" 2>/dev/null; then
+          mv "$file.seed-tmp" "$file"
+        else
+          rm -f "$file.seed-tmp"
+        fi
+      }
+
+      # Pre-accept claude-code's one-time startup dialogs. A fresh home
+      # otherwise parks the session on interactive prompts — the folder-trust
+      # dialog ("Is this a project you trust?") and, when running with
+      # --dangerously-skip-permissions, the Bypass Permissions warning (whose
+      # default answer is "No, exit"). On a headless box nobody is at the
+      # terminal to answer them, and Remote Control can't drive a session
+      # that is stuck on a dialog, so the ONLY interactive step left should
+      # be the one-time OAuth login. claude persists both acceptances in
+      # per-user state files, which it round-trips (read-modify-write), so
+      # values seeded before first launch survive login/onboarding:
+      #   ~/.claude.json          projects.<workdir>.hasTrustDialogAccepted
+      #   ~/.claude/settings.json skipDangerousModePermissionPrompt
+      # Runs before every claude session start (idempotent), which also
+      # covers upstream's occasional failure to persist an interactive
+      # acceptance (anthropics/claude-code issue 36403). Codex has no such
+      # dialogs. $1 = working directory, $2 = skipPermissions (true/false).
+      seed_claude_state() {
+        mkdir -p /home/robot/.claude
+        seed_json /home/robot/.claude.json --arg wd "$1" \
+          '.projects[$wd] = ((.projects[$wd] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})'
+        if [ "$2" = true ]; then
+          seed_json /home/robot/.claude/settings.json \
+            '.skipDangerousModePermissionPrompt = true'
+        fi
+# Webhook channel (issue #101): register the local-channels marketplace
+# and enable the local-webhook plugin non-interactively, so the session
+# loads it as an MCP channel with no /plugin prompt. These two keys are
+# exactly what `claude plugin marketplace add` + `claude plugin install`
+# write, verified against a live claude: extraKnownMarketplaces maps a
+# marketplace NAME (from the repo's marketplace.json, not the repo path)
+# to a source, and enabledPlugins is an OBJECT keyed
+# "<plugin>@<marketplace>" — not a list of records. With only these
+# seeded, the first session clones the marketplace, populates the plugin
+# cache and connects the MCP server on its own. Idempotent: plain
+# merges, so a hand `/plugin` change survives.
+seed_json /home/robot/.claude/settings.json \
+  --argjson mkt '{"local-channels":{"source":{"source":"github","repo":"defangdevs/local-channels"}}}' \
+  --argjson plug '{"local-webhook@local-channels":true}' \
+  '.extraKnownMarketplaces = ((.extraKnownMarketplaces // {}) + $mkt)
+   | .enabledPlugins = ((.enabledPlugins // {}) + $plug)'
+      }
+
+      agent_bin() {
+        case "$1" in
+          claude) printf '%s\n' /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-claude-code-2.1.206/bin/claude ;;
+          codex) printf '%s\n' /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-codex-0.144.1/bin/codex ;;
+          shell) printf '%s\n' /run/current-system/sw/bin/bash ;;
+          *) return 1 ;;
+        esac
+      }
+
+      # Deliver-once + resume bookkeeping. A session's kickoff prompt
+      # (initialPrompt) must fire on the FIRST spawn only; every later respawn
+      # (crash, clean exit, reboot, Spot stop→restart — all of which keep the
+      # on-disk transcript because /home is the persistent root EBS volume)
+      # must RESUME the prior transcript instead of redoing the task. We fold
+      # that state into sessions.json rather than a side file: after the first
+      # spawn mark_started sets hasRun, records the (possibly freshly minted)
+      # boxSessionId, and clears initialPrompt. boxSessionId is the STABLE id
+      # WE own across respawns — Claude consumes it directly as --session-id /
+      # --resume; for Codex (which mints its own id) we stamp it into the
+      # kickoff prompt so the transcript is findable by content (codex_rollout_uuid).
+      mark_started() {
+        # mark_started SESSION BOXID — best-effort; a failed rewrite just means
+        # the prompt re-fires next spawn, never a crash.
+        _tmp="$(mktemp "$SESSIONS_FILE.XXXXXX")" || return 0
+        if $JQ --arg s "$1" --arg b "$2" \
+             '(.sessions[$s]) |= (.hasRun = true | .boxSessionId = $b | .initialPrompt = null)' \
+             "$SESSIONS_FILE" > "$_tmp" 2>/dev/null; then
+          mv "$_tmp" "$SESSIONS_FILE"
+        else
+          rm -f "$_tmp"
+        fi
+      }
+
+      claude_has_transcript() {
+        # True when Claude has a saved conversation for this session id, so we
+        # can safely --resume it; else the caller starts fresh with --session-id
+        # (same id) instead of erroring on an unknown --resume target.
+        [ -n "$1" ] || return 1
+        $FIND /home/robot/.claude/projects -maxdepth 3 -name "$1.jsonl" 2>/dev/null \
+          | $GREP -q .
+      }
+
+      codex_rollout_uuid() {
+        # Echo the Codex session UUID whose rollout transcript carries our
+        # "[agent-box session <boxid>]" marker (newest wins if a prior resume
+        # forked the rollout). Empty when none match — the caller then starts a
+        # FRESH codex session rather than risk `resume --last` grabbing a
+        # sibling session's transcript in a shared working directory.
+        [ -n "$1" ] || return 0
+        d=/home/robot/.codex/sessions
+        [ -d "$d" ] || return 0
+        f="$($GREP -rlF "agent-box session $1" "$d" 2>/dev/null \
+              | while IFS= read -r p; do printf '%s\t%s\n' "$(stat -c %Y "$p" 2>/dev/null)" "$p"; done \
+              | sort -rn | head -n1 | cut -f2-)"
+        [ -n "$f" ] || return 0
+        b="${f##*/}"; b="${b%.jsonl}"
+        # rollout-<date>T<time>-<uuid>.jsonl: the UUID is the fixed trailing 36
+        # chars (8-4-4-4-12), robust against the dashes inside the timestamp.
+        printf '%s' "${b: -36}"
+      }
+
+      start_session() {
+        sname=$1
+        sjson="$($JQ -c --arg s "$sname" '.sessions[$s] // empty' "$SESSIONS_FILE")" || return 0
+        [ -n "$sjson" ] || return 0
+        agent="$($JQ -r '.agent // empty' <<<"$sjson")"
+        if ! bin="$(agent_bin "$agent")"; then
+          echo "session '$sname': agent '$agent' is not installed (see installAgents) — skipping" >&2
+          return 0
+        fi
+        wd="$($JQ -r '.workingDirectory // empty' <<<"$sjson")"
+        [ -n "$wd" ] || wd=/home/robot
+        skip="$($JQ -r 'if .skipPermissions == false then "false" else "true" end' <<<"$sjson")"
+        rc="$($JQ -r 'if .remoteControl == false then "false" else "true" end' <<<"$sjson")"
+        rcname="$($JQ -r '.remoteControlName // empty' <<<"$sjson")"
+        ip="$($JQ -r '.initialPrompt // ""' <<<"$sjson")"
+        rp="$($JQ -r '.resumePrompt // ""' <<<"$sjson")"
+        bid="$($JQ -r '.boxSessionId // ""' <<<"$sjson")"
+        hasrun="$($JQ -r 'if .hasRun == true then "true" else "false" end' <<<"$sjson")"
+        # Mint the stable box-session id on the first spawn if the file doesn't
+        # carry one (legacy/seed sessions, hand-edited files). /proc/.../uuid is
+        # the kernel's UUID source — a bash `read`, so nothing on PATH is needed
+        # and the value is a valid UUID for Claude's --session-id.
+        if [ -z "$bid" ] && [ -r /proc/sys/kernel/random/uuid ]; then
+          read -r bid < /proc/sys/kernel/random/uuid || bid=
+        fi
+        # Resume on every respawn (hasRun already set); the kickoff prompt fires
+        # only on the very first spawn. The default resume steer both continues
+        # unfinished work AND lets an already-finished task exit instead of
+        # looping — resumePrompt overrides it per session.
+        resuming=false; prompt="$ip"
+        if [ "$hasrun" = true ]; then
+          resuming=true
+          if [ -n "$rp" ]; then
+            prompt="$rp"
+          else
+            prompt="You were interrupted and automatically restarted (agent-box session $bid). Your previous transcript for this session has been resumed — review what you had already done, verify the current state, and continue from where you left off. If that work was already complete, say so briefly and stop rather than redoing it."
+          fi
+        fi
+
+        # Build the command with printf %q so runtime-provided fields
+        # (extraArgs, remoteControlName, cwd, prompts, ids) can't inject into
+        # the tmux command line — the runtime equivalent of lib.escapeShellArg.
+        cmd="$(printf '%q' "$bin")"
+        # extraArgs are appended by every branch below.
+        append_extra() {
+          while IFS= read -r xarg; do
+            cmd="$cmd $(printf '%q' "$xarg")"
+          done < <($JQ -r '.extraArgs // [] | .[]' <<<"$sjson")
+        }
+        case "$agent" in
+          claude)
+            [ "$skip" = true ] && cmd="$cmd --dangerously-skip-permissions"
+            if [ "$rc" = true ]; then
+              if [ -z "$rcname" ]; then
+                # Host suffix for the derived "<user>-<session>@<host>" name.
+                # nixos is baked at build time: remoteControlHost if set
+                # (the CloudFormation stack name on the AWS image), else the
+                # public web.domain — the address the box is actually reachable
+                # at. Fall back to the live kernel hostname only if both are
+                # empty; that kernel name is the INTERNAL fqdn on a cloud box
+                # (ip-10-x-x-x.<region>.compute.internal), which is why the public
+                # web.domain is preferred above it. Drop "@<host>" entirely when
+                # even the kernel name is empty rather than emitting a dangling
+                # "@". read is a bash builtin, so this needs nothing on PATH.
+                host=nixos
+                if [ -z "$host" ] && [ -r /proc/sys/kernel/hostname ]; then
+                  read -r host < /proc/sys/kernel/hostname || host=
+                fi
+                rcname=robot-$sname
+                [ -z "$host" ] || rcname="$rcname@$host"
+              fi
+              cmd="$cmd --remote-control $(printf '%q' "$rcname")"
+            fi
+            # Our own id: --resume it on respawn (exact, so concurrent sessions
+            # never cross), but only when a transcript actually exists — else
+            # reuse it as a fresh --session-id rather than erroring on resume.
+            if [ -n "$bid" ]; then
+              if [ "$resuming" = true ] && claude_has_transcript "$bid"; then
+                cmd="$cmd --resume $(printf '%q' "$bid")"
+              else
+                cmd="$cmd --session-id $(printf '%q' "$bid")"
+              fi
+            fi
+            append_extra
+            # End-of-options guard before the positional prompt. Several claude
+            # flags are VARIADIC (--channels, --add-dir, --allowedTools,
+            # --betas, ...), so a session whose extraArgs end in one swallow the
+            # prompt as one more value of that flag. The launch then dies in
+            # argument parsing before the TUI ever starts, and the error quotes
+            # our own prompt back as the offending value:
+            #   --channels entries must be tagged: You were interrupted and
+            #   automatically restarted (agent-box session <uuid>) ...
+            # "--" ends option parsing, so the prompt stays positional whatever
+            # extraArgs contain. Harmless when extraArgs are empty.
+            [ -n "$prompt" ] && cmd="$cmd -- $(printf '%q' "$prompt")"
+            ;;
+          codex)
+            if [ "$rc" = true ]; then
+              # Codex remote control uses a dedicated app-server daemon, not a
+              # TUI flag (issue 103), whereas claude takes a
+              # `--remote-control <name>` flag on its normal TUI. So a
+              # remote-controlled codex session runs a DIFFERENT program: the
+              # foreground supervisor wrapper (the daemon itself detaches —
+              # see codexRemoteControl), which takes the host label and then
+              # the codex binary as its first two args and forwards the rest to
+              # `app-server daemon start`. That subcommand rejects
+              # --dangerously-bypass-approvals-and-sandbox, so honour
+              # skipPermissions via the two -c overrides that flag sets
+              # (codex's documented config-override path). A bare value that
+              # isn't valid TOML is taken as a string literal, so no quoting is
+              # needed. remoteControlName is claude-only: the codex daemon takes
+              # its machine name from gethostname(2) with no override, so the
+              # wrapper gives it nixos through a private UTS namespace
+              # instead (see codexRemoteControl). Pairing the
+              # Codex apps to a running daemon uses `codex remote-control
+              # pair`; the standalone-path shim seeded above is what lets the
+              # Nix codex serve as the app-server. The daemon takes no
+              # positional prompt and has no TUI transcript to resume, so the
+              # kickoff/resume wiring below does not apply to it.
+              cmd="$(printf '%q' /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-codex-remote-control) nixos $cmd"
+              if [ "$skip" = true ]; then
+                cmd="$cmd -c approval_policy=never -c sandbox_mode=danger-full-access"
+              fi
+              append_extra
+            elif [ "$resuming" = true ]; then
+              # Find THIS session's transcript by our injected marker. A concrete
+              # match → resume it; no match → start fresh (never `resume --last`,
+              # which could grab a sibling session's transcript in a shared cwd).
+              target="$(codex_rollout_uuid "$bid")"
+              # "--" before the positionals for the same reason as claude's:
+              # codex's -i/--image takes MULTIPLE files, so extraArgs ending in
+              # it would otherwise eat the resume target and the prompt. Here
+              # "--" also protects the target, which `resume` reads as its first
+              # positional (SESSION_ID) and the prompt as its second.
+              if [ -n "$target" ]; then
+                cmd="$cmd resume"
+                [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+                append_extra
+                cmd="$cmd -- $(printf '%q' "$target")"
+                [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "$prompt")"
+              else
+                [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+                append_extra
+                [ -n "$prompt" ] && cmd="$cmd -- $(printf '%q' "[agent-box session $bid] $prompt")"
+              fi
+            else
+              [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+              append_extra
+              # Stamp the box id into the kickoff prompt so the transcript is
+              # findable on resume; skip the stamp when there's no prompt (an
+              # interactive session with no task shouldn't burn an opening turn).
+              # "--" as above: a trailing -i/--image in extraArgs would swallow
+              # the prompt and codex would open with no task at all.
+              if [ -n "$prompt" ]; then
+                cmd="$cmd -- $(printf '%q' "[agent-box session $bid] $prompt")"
+              fi
+            fi
+            ;;
+          shell)
+            append_extra
+            ;;
+          *)
+            # Unknown/future harness: pass the prompt positionally (the common
+            # convention) but skip id/resume wiring we can't verify.
+            append_extra
+            [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "$prompt")"
+            ;;
+        esac
+        if [ "$agent" = claude ]; then
+          # Upstream claude-code bug: the client persists only
+          # channelsEnabled to ~/.claude/remote-settings.json, losing the
+          # org's channel-plugin allowlist; the next launch trusts the stale
+          # cache and silently drops every channel notification. Clearing
+          # the cache before each claude launch forces a full policy fetch.
+          rm -f /home/robot/.claude/remote-settings.json
+          seed_claude_state "$wd" "$skip"
+        fi
+# Seed the minimal editable AGENTS.md (which @imports the read-only
+# canonical guide) IFF absent, so the agent's own edits or a repo
+# checkout there never get clobbered. Not for shell sessions: no agent
+# reads it there, and scratch dirs shouldn't get littered.
+if [ "$agent" != shell ] && [ ! -e "$wd/AGENTS.md" ]; then
+  mkdir -p "$wd"
+  install -m 0644 /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-robot-agents-pointer.md "$wd/AGENTS.md"
+fi
+        # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
+        # time, not unit start — then execs the agent (issue 89), so
+        # settings-page secrets land on the next session (re)start.
+        # `|| exec bash` gives a POST-MORTEM shell ONLY on non-zero agent
+        # exit — the dead session stays attachable for inspection and is NOT
+        # respawned over (the wrapper execs the agent, so the exit status
+        # is the agent's). A clean exit lets the session die; the reconcile
+        # loop below then starts a fresh agent within ~2s. Shell sessions
+        # get no post-mortem fallback — the command IS a shell, and exiting
+        # it should hand you a fresh one (via the reconcile loop), not a
+        # nested inspection bash.
+        postmortem=" || exec /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-interactive-5.3p9/bin/bash"
+        [ "$agent" = shell ] && postmortem=""
+        # A delete (settings page / agent-box-session rm: delist THEN kill) can
+        # land while this function is preparing the spawn — their kill hits the
+        # OLD session and this spawn would resurrect it as a live, delisted
+        # session the reconcile loop never kills (it tolerates unmanaged
+        # sessions on purpose): a permanent leak. Re-check the CURRENT file at
+        # the last moment, and verify again AFTER the spawn — a delist landing
+        # before the post-check is honored here by killing what we just
+        # started; one landing after it sees the session live and kills it
+        # itself. (Seen as a CI flake in the sessions VM test, run 30740226645.)
+        $JQ -e --arg s "$sname" '.sessions | has($s)' "$SESSIONS_FILE" >/dev/null 2>&1 || return 0
+        if $TMUX new-session -d -s "$sname" -c "$wd" -e LOCAL_WEBHOOK_SESSION="robot-$sname" -e LOCAL_WEBHOOK_STATE_DIR=/home/robot/.local/state/local-webhook -e LOCAL_WEBHOOK_PORT=0 \
+             "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-robot-env-exec $cmd$postmortem"; then
+          if ! $JQ -e --arg s "$sname" '.sessions | has($s)' "$SESSIONS_FILE" >/dev/null 2>&1; then
+            $TMUX kill-session -t "=$sname" 2>/dev/null || true
+            return 0
+          fi
+          # First spawn only: persist the id + hasRun and consume the kickoff
+          # prompt, so the next respawn resumes instead of redoing the task.
+          # (Ordered after the delist post-check: mark_started's jq assignment
+          # would otherwise re-create a just-deleted session as a stub entry.)
+          [ "$resuming" = true ] || mark_started "$sname" "$bid"
+        fi
+      }
+
+      # Reconcile forever; systemd stop tears the whole tree down (ExecStop
+      # kill-server + cgroup kill), Restart=always revives a crashed loop.
+      while true; do
+        while IFS= read -r sname; do
+          case "$sname" in
+            (*[!A-Za-z0-9_-]*|"") continue ;;
+          esac
+          $TMUX has-session -t "=$sname" 2>/dev/null || start_session "$sname"
+        done < <($JQ -r '.sessions | keys[]' "$SESSIONS_FILE" 2>/dev/null)
+        sleep 2
+      done
+
