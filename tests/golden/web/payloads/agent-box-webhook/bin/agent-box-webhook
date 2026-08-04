@@ -1,8 +1,12 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+export AGENT_BOX_WEBHOOK_SCRIPT=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-webhook.py
 set -eu
-JQ=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin/jq
-PY=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.6/bin/python3
-SCRIPT=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-webhook.py
+# jq/python3/coreutils resolve from PATH (system packages); the pinned
+# webhook.py store path comes from the env the generated wrapper exports
+# (issue #154, Phase 2).
+JQ=jq
+PY=python3
+SCRIPT="${AGENT_BOX_WEBHOOK_SCRIPT:?}"
 # The supervisor puts these in every session's tmux environment; the
 # fallbacks keep the CLI usable from a stray login shell or a cron job.
 STATE_DIR="${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
@@ -129,14 +133,14 @@ case "$cmd" in
       note="already configured — reusing the existing secret"
     else
       # 32 hex chars from the kernel CSPRNG; GitHub accepts any string.
-      secret="$(/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin/od -An -tx1 -N16 /dev/urandom | /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin/tr -d ' \n')"
+      secret="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
       umask 077
       printf '%s' "$secret" > "$STATE_DIR/$src.secret"
       note="secret written to $STATE_DIR/$src.secret (0600)"
       # Merge, never clobber: another source may already be configured, and
       # defaultSource must keep pointing at whatever was set up first.
       [ -f "$SOURCES" ] || printf '{"sources":{}}\n' > "$SOURCES"
-      tmp="$(/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin/mktemp "$SOURCES.XXXXXX")"
+      tmp="$(mktemp "$SOURCES.XXXXXX")"
       if "$JQ" --arg s "$src" \
            '.sources = ((.sources // {}) + {($s): (((.sources // {})[$s]) // {} | .secretFile = ($s + ".secret"))})
             | .defaultSource = (.defaultSource // $s)' "$SOURCES" > "$tmp"; then

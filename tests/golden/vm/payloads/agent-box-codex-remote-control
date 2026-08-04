@@ -1,10 +1,9 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
     # The pid-managed daemon backend records and probes its app-server child by
-    # shelling out to a bare `ps`, so procps has to be reachable regardless of
-    # how the agent unit's PATH is curated. Without it every start dies with
-    # "failed to invoke ps for pid-managed app server" and no control socket is
-    # ever created — appended, so a session's own PATH still wins.
-    PATH=$PATH:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-procps-4.0.6/bin
+    # shelling out to a bare `ps` — procps sits on the agent unit's PATH
+    # (agentBaseTools), which every session inherits. Without it every start
+    # dies with "failed to invoke ps for pid-managed app server" and no
+    # control socket is ever created.
     # The name the Codex apps label this box with ("serverName") comes straight
     # from gethostname(2): codex exposes no env var, config key or flag for it
     # (HOSTNAME does not even appear in the binary, and every candidate -c key
@@ -23,9 +22,9 @@
     rcname=$1; shift
     if [ -n "$rcname" ] && [ -z "${AGENT_BOX_CODEX_UTS:-}" ]; then
       export AGENT_BOX_CODEX_UTS=1
-      exec /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/unshare --user --map-current-user --keep-caps --uts \
-        /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash -c \
-        '/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-hostname-hostname-debian-3.25/bin/hostname "$1" || exit 1; shift; exec "$@"' \
+      exec unshare --user --map-current-user --keep-caps --uts \
+        bash -c \
+        '"${AGENT_BOX_HOSTNAME_BIN:-hostname}" "$1" || exit 1; shift; exec "$@"' \
         -- "$rcname" "$0" "$rcname" "$@"
     fi
     codex=$1; shift
@@ -91,8 +90,8 @@ EOF
       reason=$1
       case "$reason" in
         *'"message":"'*)
-          reason=${reason#*'"message":"'}
-          reason=${reason%%'"'*}
+          reason=''${reason#*'"message":"'}
+          reason=''${reason%%'"'*}
           ;;
         *) reason="the stored credentials were rejected" ;;
       esac

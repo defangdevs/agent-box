@@ -1,9 +1,8 @@
     # The pid-managed daemon backend records and probes its app-server child by
-    # shelling out to a bare `ps`, so procps has to be reachable regardless of
-    # how the agent unit's PATH is curated. Without it every start dies with
-    # "failed to invoke ps for pid-managed app server" and no control socket is
-    # ever created — appended, so a session's own PATH still wins.
-    PATH=$PATH:${pkgs.procps}/bin
+    # shelling out to a bare `ps` — procps sits on the agent unit's PATH
+    # (agentBaseTools), which every session inherits. Without it every start
+    # dies with "failed to invoke ps for pid-managed app server" and no
+    # control socket is ever created.
     # The name the Codex apps label this box with ("serverName") comes straight
     # from gethostname(2): codex exposes no env var, config key or flag for it
     # (HOSTNAME does not even appear in the binary, and every candidate -c key
@@ -20,11 +19,11 @@
     # setting it needs a real sethostname(2) caller rather than a shell
     # redirect. $1 is that label (empty = keep the kernel name).
     rcname=$1; shift
-    if [ -n "$rcname" ] && [ -z "''${AGENT_BOX_CODEX_UTS:-}" ]; then
+    if [ -n "$rcname" ] && [ -z "${AGENT_BOX_CODEX_UTS:-}" ]; then
       export AGENT_BOX_CODEX_UTS=1
-      exec ${pkgs.util-linux}/bin/unshare --user --map-current-user --keep-caps --uts \
-        ${pkgs.runtimeShell} -c \
-        '${pkgs.unixtools.hostname}/bin/hostname "$1" || exit 1; shift; exec "$@"' \
+      exec unshare --user --map-current-user --keep-caps --uts \
+        bash -c \
+        '"${AGENT_BOX_HOSTNAME_BIN:-hostname}" "$1" || exit 1; shift; exec "$@"' \
         -- "$rcname" "$0" "$rcname" "$@"
     fi
     codex=$1; shift
@@ -194,7 +193,7 @@ EOF
       cat >&2 <<EOF
 
   Codex Remote Control daemon failed to $1.
-  Log: ''${CODEX_HOME:-$HOME/.codex}/app-server-daemon/app-server.stderr.log
+  Log: ${CODEX_HOME:-$HOME/.codex}/app-server-daemon/app-server.stderr.log
   The shell you are dropped into is a post-mortem, not the session;
   restart from the settings page once the cause is fixed.
 EOF

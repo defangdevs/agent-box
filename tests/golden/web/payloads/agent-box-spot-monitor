@@ -1,18 +1,20 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
 set -u
-CURL="/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-curl-8.21.0-bin/bin/curl -sS --max-time 3"
+# Binaries resolve from the unit's PATH; who to notify and how long to
+# wait come from the AGENT_BOX_* env the unit sets (issue #154, Phase 2).
+CURL="curl -sS --max-time 3"
 IMDS=http://169.254.169.254/latest
-TMUX=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7b/bin/tmux
-JQ=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin/jq
-RUNUSER=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/runuser
-SYSTEMCTL=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261/bin/systemctl
-ENV=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin/env
-SYNC=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin/sync
+TMUX=tmux
+JQ=jq
+RUNUSER=runuser
+SYSTEMCTL=systemctl
+ENV=env
+SYNC=sync
 SOCK=agent-box
-USERS='agent robot'
-GRACE=75
-POLL=5
-MSG='⚠️ SPOT INTERRUPTION: AWS will stop this box within ~2 minutes and this in-memory session will be lost (the box restarts later with the SAME disk, IP, and TLS cert). Save any important working context, decisions, and next steps to disk under your home NOW (e.g. update your MEMORY/notes files) so you can resume after restart.'
+USERS="${AGENT_BOX_USERS:?}"
+GRACE="${AGENT_BOX_GRACE:?}"
+POLL="${AGENT_BOX_POLL:?}"
+MSG="${AGENT_BOX_MSG:?}"
 
 # Fresh IMDSv2 session token (v1 may be disabled). Prints nothing
 # and returns non-zero if IMDS is unreachable.

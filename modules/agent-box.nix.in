@@ -24,8 +24,18 @@ let
   # verbatim in sync with that template default — the two must only differ by
   # such appended specifics. $AGENT_BOX_URL (no braces) stays literal for the
   # agent to expand at read time; Nix only antiquotes ''${...}''.
-  defaultAgentsMd = ''
-@@include-verbatim:src/default-agents.md@@
+  # src/default-agents.md is plain markdown (issue #154, Phase 2); the one
+  # bound value is the optional webhook section. Its @WEBHOOK_SECTION@ token
+  # sits flush against the next heading, so the disabled case leaves no
+  # stray blank line and the enabled case supplies its own trailing one.
+  defaultAgentsMd = lib.replaceStrings
+    [ "@WEBHOOK_SECTION@" ]
+    [ (lib.optionalString webhookEnabled ''
+      @@include:src/default-agents-webhook.md@@
+
+    '') ]
+    ''
+    @@include:src/default-agents.md@@
   '';
   # The canonical guide is published READ-ONLY under /etc (see
   # environment.etc below) rather than seeded into $HOME. environment.etc
@@ -105,22 +115,6 @@ let
   # 0.8.0 ported the plugin from node to the python3 already in
   # agentBaseTools, dropping the box's only nodejs dependency (issue #101).
   webhookPython = "${pkgs.python3}/bin/python3";
-  # Per-session webhook identity, passed to `tmux new-session -e` so it lands in
-  # the SESSION environment — inherited by the agent AND by anything the agent
-  # runs in that pane, which is what makes `agent-box-webhook` work with no
-  # arguments. The daemon fans every verified delivery out to all of this user's
-  # sessions; each keeps its own subscription filter keyed on
-  # LOCAL_WEBHOOK_SESSION, so subscriptions never leak between sessions.
-  # LOCAL_WEBHOOK_PORT=0 makes any webhook.py started here a pure IPC peer: the
-  # daemon owns the ingress and a session must never steal it. Session names are
-  # validated [A-Za-z0-9_-] by the reconcile loop before start_session sees them.
-  webhookSessionEnvArgs = name:
-    lib.optionalString webhookEnabled (
-      "-e LOCAL_WEBHOOK_SESSION=\"${name}-$sname\""
-      + " -e LOCAL_WEBHOOK_STATE_DIR=${webhookStateDirOf name}"
-      + " -e LOCAL_WEBHOOK_PORT=0"
-    );
-
   # Session-spawn env loader (issue 89). Sessions are (re)created by the
   # long-lived supervisor inside the agent unit, so a unit-level
   # EnvironmentFile= snapshot of the user's env file goes stale the moment
@@ -133,8 +127,8 @@ let
   # shell metacharacters can't break or inject anything; one pair of
   # surrounding quotes is stripped to match how systemd read the same
   # file before. Key charset mirrors the settings daemon's KEY_RE.
-  envExecWrapper = name: pkgs.writeShellScript "agent-box-${name}-env-exec" ''
-@@include-verbatim:src/env-exec.sh@@
+  envExecWrapper = pkgs.writeShellScript "agent-box-env-exec" ''
+    @@include:src/env-exec.sh@@
   '';
 
   # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
@@ -166,7 +160,7 @@ let
   # the whole onboarding problem — a codex session is supposed to be usable
   # from the pane it starts in.
   codexRemoteControl = pkgs.writeShellScript "agent-box-codex-remote-control" ''
-@@include-verbatim:src/codex-remote-control.sh@@
+@@include:src/codex-remote-control.sh@@
   '';
 
   # Reload command is granted when web is enabled so the agent can add a
@@ -310,9 +304,14 @@ let
   # user: edits the user-owned sessions.json (the supervisor reconciles
   # within ~2s) and talks only to the user's own tmux server. No sudo, no
   # rebuild — the whole point of issue #59.
-  sessionCli = pkgs.writeShellScriptBin "agent-box-session" ''
-@@include-verbatim:src/session-cli.sh@@
-  '';
+  # The generated wrapper only injects module config as AGENT_BOX_* env;
+  # the body (src/session-cli.sh) is backend-neutral (issue #154, Phase 2).
+  sessionCli = pkgs.writeShellScriptBin "agent-box-session" (''
+    export AGENT_BOX_AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " (sessionKinds cfg.installAgents))}
+    export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+  '' + ''
+@@include:src/session-cli.sh@@
+  '');
 
   # Webhook self-service, shipped on every PATH when webhookEnabled (issue #101).
   # The plugin's MCP tools only exist inside a claude session that loaded it, so
@@ -322,9 +321,13 @@ let
   # straight to webhook.py's own CLI, so there is one implementation of the
   # TTL/renew semantics. Runs as the calling agent user against its own state
   # dir; no sudo, no rebuild.
-  webhookCli = pkgs.writeShellScriptBin "agent-box-webhook" ''
-@@include-verbatim:src/webhook-cli.sh@@
-  '';
+  # As with sessionCli: the wrapper pins the fetched webhook.py store path
+  # through env, the body is backend-neutral (issue #154, Phase 2).
+  webhookCli = pkgs.writeShellScriptBin "agent-box-webhook" (''
+    export AGENT_BOX_WEBHOOK_SCRIPT=${localWebhookScript}
+  '' + ''
+    @@include:src/webhook-cli.sh@@
+  '');
 
   # Dispatch target for standing watches (local-channels#1): the receiver
   # daemon runs this as LOCAL_WEBHOOK_SPAWN_CMD when a delivery matches a
@@ -336,7 +339,7 @@ let
   # slowly fill the box with idle hook sessions if spawned agents fail to
   # clean up after themselves.
   webhookSpawn = pkgs.writeShellScriptBin "agent-box-webhook-spawn" ''
-@@include-verbatim:src/webhook-spawn.sh@@
+@@include:src/webhook-spawn.sh@@
   '';
 
   # Declared standing-watch policy (webhook.watchPolicy), rendered once into
@@ -651,6 +654,51 @@ let
     };
   };
 
+  # Host suffix for auto-derived Remote Control names. Prefer an explicit
+  # remoteControlHost; otherwise the box's PUBLIC web domain — the name
+  # you actually reach the box at (sslip.io on AWS, custom DNS on bare
+  # metal) — which is far more useful in the Claude apps than the internal
+  # kernel hostname the supervisor would otherwise fall back to (an EC2
+  # box's is ip-10-x-x-x.<region>.compute.internal). Guarded on web.enable
+  # because web.domain has no default and errors if read while unset.
+  hostLabel =
+    if cfg.remoteControlHost != "" then cfg.remoteControlHost
+    else if cfg.web.enable && cfg.web.domain != "" then cfg.web.domain
+    else "";
+  # "name=/path" pairs the supervisor's agent_bin() resolves sessions
+  # against (AGENT_BOX_AGENT_BINS). "shell" (issue #113): the user's login
+  # shell as a pseudo-agent — always resolvable, independent of
+  # installAgents. Store and shell paths never contain whitespace.
+  agentBinsFor = name:
+    lib.concatStringsSep " " (
+      map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
+      ++ [ "shell=${utils.toShellPath config.users.users.${name}.shell}" ]
+    );
+  # AGENTS.md — cross-vendor agent-instructions file (codex, opencode
+  # native; claude-code as CLAUDE.md fallback). What we SEED into $HOME is
+  # deliberately minimal and EDITABLE: a short notes header plus a claude
+  # `@import` of the read-only canonical guide at canonicalAgentsPath, so
+  # the up-to-date guidance is pulled in at load time without ever
+  # overwriting the agent's own edits. The canonical file itself is
+  # published via environment.etc and refreshed on every box update.
+  # null (agentsMd = null) opts out of seeding entirely.
+  # NOTE: claude-code expands `@path` imports; codex does not, so on a
+  # codex session the import line shows literally — the guide then has to
+  # be read explicitly from canonicalAgentsPath.
+  agentsMdPointer = name: u:
+    if u.agentsMd == null then null
+    else pkgs.writeText "agent-box-${name}-agents-pointer.md" ''
+      # agent-box — your notes
+
+      This file is yours to edit; anything you add here persists across
+      restarts. The canonical agent-box guide (environment, secrets,
+      serving files, self-update) is read-only and auto-updated on every
+      box update — it is imported below and also readable directly at
+      ${canonicalAgentsPath name}.
+
+      @${canonicalAgentsPath name}
+    '';
+
   # The per-user SUPERVISOR (issue #59). One hardened unit per user; the tmux
   # server and every session — including ones added at runtime — are children
   # of this script, so they all inherit the unit's systemd sandboxing. The
@@ -658,54 +706,12 @@ let
   # supervisor never kills. Destroy goes through the CRUD paths
   # (agent-box-session rm / settings page), which delist AND kill — so a
   # removed entry stays gone, and an ad-hoc `tmux new` session is left alone.
-  mkStart = name: u:
-    let
-      home = "/home/${name}";
-      # Host suffix for auto-derived Remote Control names. Prefer an explicit
-      # remoteControlHost; otherwise the box's PUBLIC web domain — the name
-      # you actually reach the box at (sslip.io on AWS, custom DNS on bare
-      # metal) — which is far more useful in the Claude apps than the internal
-      # kernel hostname the supervisor would otherwise fall back to (an EC2
-      # box's is ip-10-x-x-x.<region>.compute.internal). Guarded on web.enable
-      # because web.domain has no default and errors if read while unset.
-      hostLabel =
-        if cfg.remoteControlHost != "" then cfg.remoteControlHost
-        else if cfg.web.enable && cfg.web.domain != "" then cfg.web.domain
-        else "";
-      agentBinCases = lib.concatMapStrings (a:
-        "          ${a}) printf '%s\\n' ${lib.escapeShellArg (lib.getExe (agentPackage a))} ;;\n"
-      ) cfg.installAgents
-      # "shell" (issue #113): the user's login shell as a pseudo-agent —
-      # always resolvable, independent of installAgents.
-      + "          shell) printf '%s\\n' ${lib.escapeShellArg (utils.toShellPath config.users.users.${name}.shell)} ;;\n";
-      # AGENTS.md — cross-vendor agent-instructions file (codex, opencode
-      # native; claude-code as CLAUDE.md fallback). What we SEED into $HOME is
-      # deliberately minimal and EDITABLE: a short notes header plus a claude
-      # `@import` of the read-only canonical guide at canonicalAgentsPath, so
-      # the up-to-date guidance is pulled in at load time without ever
-      # overwriting the agent's own edits. The canonical file itself is
-      # published via environment.etc and refreshed on every box update.
-      # null (agentsMd = null) opts out of seeding entirely.
-      # NOTE: claude-code expands `@path` imports; codex does not, so on a
-      # codex session the import line shows literally — the guide then has to
-      # be read explicitly from canonicalAgentsPath.
-      agentsMdPointer =
-        if u.agentsMd == null then null
-        else pkgs.writeText "agent-box-${name}-agents-pointer.md" ''
-          # agent-box — your notes
-
-          This file is yours to edit; anything you add here persists across
-          restarts. The canonical agent-box guide (environment, secrets,
-          serving files, self-update) is read-only and auto-updated on every
-          box update — it is imported below and also readable directly at
-          ${canonicalAgentsPath name}.
-
-          @${canonicalAgentsPath name}
-        '';
-    in
-    pkgs.writeShellScript "agent-box-${name}-start" ''
-@@include-verbatim:src/supervisor.sh@@
-    '';
+  # ONE user-independent script (issue #154, Phase 2): every per-user value
+  # reaches it through the unit's environment — see the AGENT_BOX_* variables
+  # on the agent unit below.
+  supervisorScript = pkgs.writeShellScript "agent-box-supervisor" ''
+    @@include:src/supervisor.sh@@
+  '';
 in
 {
   options.services.agent-box = {
@@ -1191,7 +1197,7 @@ in
         }
         {
           # Cheap sanity check on a string that lands in a shell command;
-          # deeper escaping happens at runtime via printf %q in mkStart.
+          # deeper escaping happens at runtime via printf %q in the supervisor.
           assertion = s.remoteControlName == null || (
             s.remoteControlName != ""
             && !(lib.hasInfix "\n" s.remoteControlName)
@@ -1294,7 +1300,41 @@ in
         # reachable?" without hard-coding the URL, which is useful because
         # the hostname is a spot-restart away from changing.
         environment =
-          { HOME = "/home/${name}"; TMUX_TMPDIR = "/run/${runtimeDirectory name}"; }
+          { HOME = "/home/${name}"; TMUX_TMPDIR = "/run/${runtimeDirectory name}";
+            # Everything user- or host-specific the supervisor script needs
+            # (issue #154, Phase 2 — src/supervisor.sh is user-independent;
+            # these variables are its whole contract with the module):
+            AGENT_BOX_SESSIONS_SEED = "${sessionsSeedFile name u}";
+            AGENT_BOX_AGENT_BINS = agentBinsFor name;
+            AGENT_BOX_ENV_EXEC = "${envExecWrapper}";
+            AGENT_BOX_CODEX_RC = "${codexRemoteControl}";
+            # Clean-exit bookkeeping for the spawn epilogue (issue #167).
+            # Still per-user (it edits THIS user's sessions.json), so the
+            # user-independent script takes its path from the environment.
+            AGENT_BOX_MARK_STOPPED = "${markStopped name}";
+            # grep/find are deliberately not on this unit's PATH (see
+            # agentBaseTools), so the supervisor's transcript lookups get
+            # pinned binaries instead (the AGENT_BOX_*_BIN convention).
+            AGENT_BOX_GREP_BIN = "${pkgs.gnugrep}/bin/grep";
+            AGENT_BOX_FIND_BIN = "${pkgs.findutils}/bin/find";
+            # For the codex remote-control wrapper's UTS-namespace re-exec
+            # (src/codex-remote-control.sh): `hostname` is not part of
+            # agentBaseTools either.
+            AGENT_BOX_HOSTNAME_BIN = "${pkgs.unixtools.hostname}/bin/hostname";
+          }
+          // (lib.optionalAttrs (hostLabel != "") {
+            # Host suffix for auto-derived Remote Control session names.
+            AGENT_BOX_HOST_LABEL = hostLabel;
+          })
+          // (lib.optionalAttrs (agentsMdPointer name u != null) {
+            # Seeded-AGENTS.md pointer file; unset = agentsMd null opt-out.
+            AGENT_BOX_AGENTS_POINTER = "${agentsMdPointer name u}";
+          })
+          // (lib.optionalAttrs webhookEnabled {
+            # Doubles as the supervisor's "webhook receiver is live" flag
+            # (per-session LOCAL_WEBHOOK_* env + claude plugin seeding).
+            AGENT_BOX_WEBHOOK_REPO = cfg.webhook.repo;
+          })
           // (lib.optionalAttrs (cfg.web.enable && u.web.passwordHashFile != null) {
             AGENT_BOX_URL = "https://${cfg.web.domain}/${name}/";
             # Same idea for the webhook ingress (issue #101): the public URL to
@@ -1307,14 +1347,14 @@ in
           // u.environment;
         serviceConfig = {
           User = name;
-          # ExecStart's mkStart is the session supervisor (issue #59): it
-          # reconciles tmux sessions against the user-owned sessions.json
-          # forever. Individual session restarts happen inside the loop;
+          # ExecStart is the session supervisor (issue #59): it reconciles
+          # tmux sessions against the user-owned sessions.json forever.
+          # Individual session restarts happen inside the loop;
           # Restart=always only backstops a crashed supervisor.
           Type = "exec";
           Restart = "always";
           RestartSec = "2s";
-          ExecStart = mkStart name u;
+          ExecStart = supervisorScript;
           # Stopping the unit stops every session: kill the whole per-user
           # tmux server (the supervisor loop dies with the cgroup).
           ExecStop = "${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} kill-server";
@@ -1451,7 +1491,7 @@ in
       };
       serviceConfig.Type = "oneshot";
       script = ''
-@@include-verbatim:src/update.sh@@
+        @@include:src/update.sh@@
       '';
     };
   }) (lib.mkIf (cfg.enable && cfg.web.enable) (
@@ -1485,9 +1525,22 @@ in
             pkgs.python3Packages.bcrypt
           ];
           flakeIgnore = [ "E501" "E302" "E305" ];
-        } ''
-@@include-verbatim:src/password-helper.py@@
-        '';
+        } (''
+          @@include:src/password-helper.py@@
+        '' + ''
+
+          # Per-user constants, compiled into the store script on purpose
+          # (issue #154, Phase 2 exception): the helper runs via sudo, so the
+          # caller must never be able to redirect the root-privileged writes
+          # — env-provided paths would be exactly that primitive.
+          HASH_FILE = ${builtins.toJSON (hashFileOf name)}
+          COOKIE_FILE = ${builtins.toJSON "/var/lib/agent-box-web/cookie-secret-${name}"}
+          ENV_SUFFIX = ${builtins.toJSON (envName name)}
+          CADDY = ${builtins.toJSON "${pkgs.caddy}/bin/caddy"}
+
+          if __name__ == "__main__":
+              main()
+        '');
       passwordHelperCmdOf = name:
         "${passwordHelperOf name}/bin/agent-box-password-${name}";
       # The settings daemon script (issue #36). Python-3-stdlib only — no
@@ -1517,8 +1570,8 @@ in
       # ttyd/xterm supports OSC 8, but xterm-256color cannot advertise that
       # through terminfo. Tell tmux explicitly so it forwards stored
       # hyperlinks instead of redrawing only their visible labels.
-      attachScript = name: pkgs.writeShellScript "agent-box-${name}-attach" ''
-@@include-verbatim:src/attach.sh@@
+      attachScript = pkgs.writeShellScript "agent-box-attach" ''
+        @@include:src/attach.sh@@
       '';
       # Per-user env var suffix for the Caddyfile placeholders; linux user
       # names may contain chars that are invalid in env var names.
@@ -1545,16 +1598,30 @@ in
       # https://<domain>/<user>/webhook — a bare POST maps to the default source,
       # /<user>/webhook/<source> selects a named one, and strip_prefix means
       # /<user>/webhook/github reaches webhook.py as /github.
-      webhookCaddyBlock = name: lib.optionalString webhookEnabled ''
-@@include-verbatim:src/caddyfile-webhook.caddy@@
+      # The Caddyfile fragments under src/ are plain templates with @TOKEN@
+      # placeholders (no Nix antiquotes — issue #154, Phase 2); the
+      # replaceStrings calls below are the one place the per-user values are
+      # bound, and double as the placeholder contract for the future native
+      # renderer (Phase 4).
+      webhookCaddyBlock = name: lib.optionalString webhookEnabled
+        (lib.replaceStrings
+          [ "@WEBHOOK_PATH@" "@WEBHOOK_SOCKET@" ]
+          [ (webhookPathOf name) (webhookSocketOf name) ] ''
+        @@include:src/caddyfile-webhook.caddy@@
+      '');
+
+      terminalCaddyBlock = name:
+        lib.replaceStrings
+          [ "@USER@" "@USER_ENV@" "@SETTINGS_SOCKET@" "@DOWNLOADS_DIR@" "@TTYD_PORT@" ]
+          [ name (envName name) (settingsSocketOf name) (downloadsDirOf name) (toString portOf.${name}) ] ''
+        @@include:src/caddyfile-terminal.caddy@@
       '';
 
-      terminalCaddyBlock = name: ''
-@@include-verbatim:src/caddyfile-terminal.caddy@@
-      '';
-
-      rootBlock = name: ''
-@@include-verbatim:src/caddyfile-root.caddy@@
+      rootBlock = name:
+        lib.replaceStrings
+          [ "@USER@" "@USER_ENV@" "@SETTINGS_SOCKET@" ]
+          [ name (envName name) (settingsSocketOf name) ] ''
+        @@include:src/caddyfile-root.caddy@@
       '';
 
       # Rendered Caddyfile. Module-managed (regenerated every rebuild) — safe
@@ -1572,8 +1639,9 @@ in
       # serve files from $HOME — caddy.service runs with ProtectHome=true and
       # can't read /home. See the comment block at the top of the rendered
       # file below (agents will read that from the running box).
-      managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (''
-@@include-verbatim:src/caddyfile-header.caddy@@
+      managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
+      lib.replaceStrings [ "@DOMAIN@" ] [ cfg.web.domain ] ''
+        @@include:src/caddyfile-header.caddy@@
       ''
       + lib.concatMapStringsSep "\n"
           (name: indent "  " (webhookCaddyBlock name + terminalCaddyBlock name)) terminalUsers
@@ -1756,6 +1824,10 @@ in
         after = [ "agent-box-${name}.service" "network-online.target" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
+        # The attach script (src/attach.sh) resolves tmux from this PATH
+        # instead of a baked store path (issue #154, Phase 2); head comes
+        # from the coreutils already on every unit's default PATH.
+        path = [ pkgs.tmux ];
         environment.TMUX_TMPDIR = "/run/${runtimeDirectory name}";
         serviceConfig = {
           User = name;
@@ -1772,7 +1844,7 @@ in
             "-b" "/${name}"
             "-t" "disableLeaveAlert=true"
             "-t" "titleFixed=${name}@${cfg.web.domain}"
-            (toString (attachScript name))
+            (toString attachScript)
           ];
         };
       }) terminalUsers)
@@ -1867,6 +1939,10 @@ in
         requires = [ "agent-box-webhook-${name}.socket" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
+        # The spawn wrapper (src/webhook-spawn.sh) runs as this unit's child
+        # and resolves jq/coreutils/agent-box-session from this PATH instead
+        # of baked store paths (issue #154, Phase 2).
+        path = [ pkgs.jq pkgs.coreutils sessionCli ];
         environment = {
           LOCAL_WEBHOOK_RECEIVER_ONLY = "1";
           LOCAL_WEBHOOK_STATE_DIR = webhookStateDirOf name;
@@ -1957,8 +2033,20 @@ in
         Restart = "on-failure";
         RestartSec = "5s";
         ExecStart = pkgs.writeShellScript "agent-box-spot-monitor" ''
-@@include-verbatim:src/spot-monitor.sh@@
+          @@include:src/spot-monitor.sh@@
         '';
+      };
+      # src/spot-monitor.sh resolves its binaries from this PATH and its
+      # config from AGENT_BOX_* env (issue #154, Phase 2).
+      path = [ pkgs.curl pkgs.tmux pkgs.jq pkgs.util-linux pkgs.systemd pkgs.coreutils ];
+      environment = {
+        AGENT_BOX_USERS = lib.concatStringsSep " " (lib.attrNames cfg.users);
+        AGENT_BOX_GRACE = toString cfg.spotInterruption.gracePeriod;
+        AGENT_BOX_POLL = toString cfg.spotInterruption.pollInterval;
+        # systemd expands % specifiers inside Environment= values; escape
+        # them so a host-set message with a literal % survives (the old
+        # baked-into-the-script path never went through systemd parsing).
+        AGENT_BOX_MSG = lib.replaceStrings [ "%" ] [ "%%" ] cfg.spotInterruption.message;
       };
     };
   })]);
