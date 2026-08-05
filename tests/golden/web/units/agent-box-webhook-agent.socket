@@ -1,0 +1,16 @@
+[Unit]
+Description=Webhook ingress socket for agent
+
+[Socket]
+ListenStream=/run/agent-box-webhook/agent.sock
+SocketGroup=caddy
+SocketMode=0660
+SocketUser=agent
+
+
+
+
+[Install]
+WantedBy=sockets.target
+
+# X-Golden-wantedBy: sockets.target

@@ -17,6 +17,7 @@ Keep the module self-contained: deployed boxes fetch `modules/agent-box.nix` as 
 - `nix flake metadata` validates flake inputs and basic evaluation.
 - `nix build .#packages.x86_64-linux.vm` builds the bootable qcow2 image under `result/`.
 - `nix build -L .#checks.<system>.multi-user` runs the quick module/configuration assertion.
+- `nix build -L .#checks.<system>.golden-snapshot` verifies the rendered configuration (every generated unit, /etc file, tmpfiles rule and script payload, store hashes normalized) still byte-matches the committed `tests/golden/` fixture — the behavior lock for the issue #154 portability refactor. After an INTENTIONAL behavior change (or a flake.lock bump, which changes store path names), run `nix run .#update-golden` and commit the reviewed `tests/golden/` diff together with the change.
 - `nix build -L .#checks.<system>.module-single-file` verifies standalone module evaluation.
 - `nix build -L .#checks.x86_64-linux.<name>` runs an individual VM test such as `sessions` or `settings-page`.
 

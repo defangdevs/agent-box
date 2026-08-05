@@ -1,0 +1,5 @@
+[Definition]
+dbfile = /var/lib/fail2ban/fail2ban.sqlite3
+logtarget = SYSLOG
+pidfile = /run/fail2ban/fail2ban.pid
+socket = /run/fail2ban/fail2ban.sock
