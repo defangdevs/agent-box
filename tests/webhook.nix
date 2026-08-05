@@ -396,6 +396,31 @@
         "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-agent-box-\"))'"
         " /home/agent/.config/agent-box/sessions.json"
     )
+    # --- the spawned session OWNS what it was spawned for (#192) ------------
+    # The wrapper seeds the new session's subscription file BEFORE the session
+    # exists, so the brake above has an owner to find for the NEXT event on
+    # that repo. Without it a dispatched session is subscribed to nothing, and
+    # the several events one failing run emits (check_run.completed, then
+    # workflow_run a minute later) each spawn their own agent on the same run.
+    hook_name = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    hook_filter = f"/home/agent/.local/state/local-webhook/filter.agent-{hook_name}.json"
+    # Unpinned and renewOnEvent: ownership holds while events keep arriving and
+    # lapses after silence, so a session that forgets to remove itself neither
+    # owns the repo forever nor keeps getting interrupted for it.
+    machine.succeed(
+        "jq -e '.enabled == true and .ttlHours > 0 and (.topics | length) == 1"
+        " and .topics[0].topic == \"github:defangdevs/agent-box\""
+        " and .topics[0].renewOnEvent == true"
+        " and (.topics[0].note | contains(\"seeded at spawn\"))'"
+        f" {hook_filter}"
+    )
+    # ...and the session is told, so it neither re-subscribes nor assumes that
+    # being spawned means nobody else is on this.
+    assert "already subscribed to github:defangdevs/agent-box" in hook_prompt, hook_prompt
+
     # Supervisor back up: it starts the hook session and consumes the prompt.
     machine.succeed("systemctl start agent-box-agent.service")
     machine.wait_until_succeeds(
@@ -415,6 +440,68 @@
     # routing stay independent, and the dispatch note never leaks into a
     # session's channel.
     machine.fail("grep -q 'standing watch: triage' /tmp/peer.log")
+
+    # End to end, the shape that put two sessions on one failing run: with the
+    # dispatched session's peer live, the SAME CI failure is now owned and
+    # spawns nothing — it arrives in that session's channel instead. The
+    # stand-in peer plays the hook session's plugin MCP server, which the VM's
+    # agent stub never starts.
+    machine.succeed(
+        "systemd-run --unit=webhook-peer-hook --uid=agent --setenv=HOME=/home/agent"
+        " --setenv=LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        f" --setenv=LOCAL_WEBHOOK_SESSION=agent-{hook_name} --setenv=LOCAL_WEBHOOK_PORT=0"
+        f" {sw}/sh -c '{sw}/sleep 600 | {python} {script} > /tmp/hook-peer.log 2>&1'"
+    )
+    machine.succeed("systemctl is-active webhook-peer-hook.service")
+    machine.wait_until_succeeds(
+        f"ls /home/agent/.local/state/local-webhook/instances/agent-{hook_name}.*.sock",
+        timeout=30,
+    )
+    client.succeed(
+        f"{post} -H 'x-hub-signature-256: sha256={sig}' "
+        f"https://box.test/agent/webhook/github | grep -x 200"
+    )
+    # The named suppression is the primary evidence: had the brake missed, the
+    # duplicate would be a coalesced spawn 60s later (the dispatcher's window),
+    # not a second session the assertion below could catch immediately.
+    machine.wait_until_succeeds(
+        "journalctl -u agent-box-webhook-agent --no-pager"
+        f" | grep -q 'session agent-{hook_name} is subscribed to it'",
+        timeout=30,
+    )
+    machine.succeed(
+        "jq -e '[.sessions | keys[] | select(startswith(\"hook-\"))] | length == 1'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    machine.wait_until_succeeds(
+        "grep -q 'defangdevs/agent-box' /tmp/hook-peer.log", timeout=30
+    )
+    machine.succeed("grep -q 'seeded at spawn' /tmp/hook-peer.log")
+    machine.succeed("systemctl stop webhook-peer-hook.service")
+
+    # The seed is the event's own key, never the topic that matched it: a
+    # wildcard watch must not hand one session ownership of a whole org. Driving
+    # the wrapper directly also proves it needs nothing from the daemon but its
+    # environment. Nothing below depends on the extra session it creates.
+    spawn_cmd = machine.succeed(
+        "systemctl show -p Environment agent-box-webhook-agent.service"
+        " | grep -o '/nix/store/[^ ]*agent-box-webhook-spawn' | head -1"
+    ).strip()
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/elsewhere"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    other = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-elsewhere-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        "jq -e '.topics[0].topic == \"github:defangdevs/elsewhere\"'"
+        f" /home/agent/.local/state/local-webhook/filter.agent-{other}.json"
+    )
 
     # The daemon is the ingress owner and survives every delivery — the box's
     # endpoint must not depend on which sessions happen to be alive.
