@@ -47,7 +47,9 @@ let
 
     - Only your home directory is writable — the rest of the filesystem is
       read-only (systemd ProtectSystem=strict). Do all work under $HOME;
-      writes elsewhere fail with a read-only-filesystem error.
+      writes elsewhere fail with a read-only-filesystem error. The one
+      exception is ~/sites, a symlink out to a caddy-readable dir that is
+      writable too (see "Serving a web app publicly").
     - $HOME is SHARED by every one of your tmux sessions (they all run as the
       same user and start in $HOME). For parallel work in one repo use
       `git worktree` or separate subdirectories, so concurrent sessions don't
@@ -2365,7 +2367,14 @@ in
           PrivateTmp = true;
           PrivateDevices = true;              # keeps pty subsystem; blocks /dev/mem etc.
           ProtectSystem = "strict";           # entire fs read-only except explicit RW paths
-          ReadWritePaths = [ "/home/${name}" ];
+          # ~/sites is a SYMLINK to /var/lib/agent-box-sites/<name>, so a write
+          # through it resolves outside /home and ProtectSystem=strict denied it
+          # with EROFS — the self-serve vhost flow the guide documents was
+          # impossible from inside the agent's own namespace. ReadWritePaths
+          # matches on the resolved path, so the target has to be listed too.
+          # The dir is tmpfiles-created (sysinit, well before this unit), so it
+          # always exists by unit start and needs no `-` prefix.
+          ReadWritePaths = [ "/home/${name}" "/var/lib/agent-box-sites/${name}" ];
           ProtectKernelTunables = true;
           ProtectKernelModules = true;
           ProtectControlGroups = true;

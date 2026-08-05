@@ -61,6 +61,7 @@
   testScript = ''
     start_all()
     machine.wait_for_unit("caddy.service")
+    machine.wait_for_unit("agent-box-agent.service")
     client.wait_for_unit("multi-user.target")
     machine_ip = machine.succeed("ip -4 -o addr show eth1 | head -1").split()[3].split("/")[0]
 
@@ -75,10 +76,28 @@
         "stat -c '%U:%G %a' /var/lib/agent-box-sites/agent | grep -x 'agent:caddy 750'"
     )
 
+    # The snippet dir must be writable in the AGENT UNIT's mount namespace, not
+    # just to the agent uid. ~/sites resolves to /var/lib/agent-box-sites/agent,
+    # outside the ReadWritePaths of ProtectSystem=strict — so the documented
+    # flow returned EROFS for every real agent while this test (which used to
+    # write as plain `sudo -u agent` from the driver's root namespace) passed.
+    machine.succeed(
+        "systemctl show agent-box-agent --property=ReadWritePaths --value "
+        "| grep -q /var/lib/agent-box-sites/agent"
+    )
+
     # The agent writes a new vhost snippet through the ~/sites symlink — never
     # touches /var/lib directly. `tls internal` sidesteps ACME in the sandbox.
+    # nsenter joins the running unit's mount namespace so the write is subject
+    # to the same read-only remount a tool shell inside the session gets;
+    # runuser then drops to the agent uid for the ownership check below.
+    agent_pid = machine.succeed(
+        "systemctl show -p MainPID --value agent-box-agent.service"
+    ).strip()
+    assert agent_pid not in ("", "0"), "agent unit has no main PID"
     machine.succeed(
-        "sudo -u agent tee /home/agent/sites/mysite.caddy > /dev/null <<'CFG'\n"
+        f"nsenter -t {agent_pid} -m -- runuser -u agent -- "
+        "tee /home/agent/sites/mysite.caddy > /dev/null <<'CFG'\n"
         "mysite.test {\n"
         "  tls internal\n"
         "  respond \"hello from mysite\" 200\n"
