@@ -133,6 +133,16 @@ let
     (`agent-box-session rm NAME`) when done — if stale `hook-*` sessions pile
     up, clean them the same way.
 
+    A watch can carry payload rules (`--when` / `--drop`, JSON predicates over
+    payload paths) that replace the failure-only default with its own spawn
+    policy — see `agent-box-webhook --help`. The box's standing watch on its
+    own repos is governed that way from the NixOS config
+    (`services.agent-box.webhook.watchPolicy`), re-applied whenever the
+    receiver daemon starts: don't hand-edit a governed entry (its note says
+    so), and don't mute a HUMAN's login on a watch to silence close/merge
+    echoes — the rules already drop those while keeping the person's new
+    issues and PRs spawning.
+
     One-time per box, so deliveries can arrive at all:
 
         agent-box-webhook setup   # prints the endpoint URL + a fresh HMAC secret
@@ -977,6 +987,7 @@ EOF
     usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
                                              [--deliver-to session|subagent]
                                              [--renew-on-event] [--ignore-sender LOGIN]...
+                                             [--when JSON] [--drop JSON]
            agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent]
            agent-box-webhook ls
            agent-box-webhook status
@@ -1009,6 +1020,17 @@ EOF
 
     --ignore-sender LOGIN mutes echoes of that sender's own comments and pushes
     ("@self" is $LOCAL_WEBHOOK_SELF); CI-outcome events are delivered anyway.
+
+    --when / --drop attach payload rules to the subscription: deliver (or
+    spawn) ONLY events matching --when, never those matching --drop. Rules are
+    JSON — {"any"/"all": [...]} over {"path": "a.b.c", "in"/"notIn": [values]}
+    leaves. A subscription with rules sets its own policy: the failure-only CI
+    brake steps aside for it, and sender muting belongs INSIDE the rules
+    ({"path": "sender.login", "notIn": [...]}) rather than --ignore-sender.
+    NOTE: rules on the box's own standing watches may be managed declaratively
+    (services.agent-box.webhook.watchPolicy) and re-applied whenever the
+    receiver daemon starts — such entries say so in their note; change the
+    NixOS config, not the entry.
 
     One-time per box, to make deliveries possible at all:
       agent-box-webhook setup      # mints the HMAC secret, prints URL + secret
@@ -1231,6 +1253,60 @@ agent-box-webhook ls).}"
     exec ${sessionCli}/bin/agent-box-session add "$name" --prompt "$preamble
 
 $PROMPT"
+  '';
+
+  # Declared standing-watch policy (webhook.watchPolicy), rendered once into
+  # the store and enforced onto each user's filter.dispatch.json by the
+  # receiver daemon's ExecStartPre. Upgrade-only by design: the module governs
+  # rules on watches sessions created, it never creates a watch — so the
+  # default (the box's own-repos policy) is inert anywhere no such watch
+  # exists. Runs as the user; a policy failure must never keep the receiver
+  # down, so every branch here exits 0.
+  webhookWatchPolicyFile = pkgs.writeText "agent-box-webhook-watch-policy.json"
+    (builtins.toJSON cfg.webhook.watchPolicy);
+  webhookPolicyApply = pkgs.writeShellScript "agent-box-webhook-policy-apply" ''
+    set -eu
+    JQ=${pkgs.jq}/bin/jq
+    FILE="''${LOCAL_WEBHOOK_STATE_DIR:?}/filter.dispatch.json"
+    POLICY=${webhookWatchPolicyFile}
+    if [ ! -s "$FILE" ]; then
+      echo "agent-box-webhook-policy: no dispatch file yet; nothing to govern" >&2
+      exit 0
+    fi
+    # For every entry whose topic is declared: the declaration REPLACES the
+    # managed fields (when/drop/ignoreSenders/note) wholesale — partial merges
+    # would let config and state drift apart. Runtime fields (ttlHours,
+    # renewOnEvent, timestamps) stay the entry's own. Bare-string topics
+    # normalize to the object form webhook.py itself writes.
+    tmp="$FILE.policy.$$"
+    if "$JQ" --slurpfile pol "$POLICY" '
+          $pol[0] as $p
+          | .topics = [ (.topics // [])[]
+              | (if type == "string" then {topic: .} else . end)
+              | (if type == "object" then (.topic // "") else "" end) as $t
+              | if $t != "" and ($p | has($t)) then
+                  $p[$t] as $r
+                  | del(.when, .drop, .ignoreSenders)
+                  | (if $r.when != null then .when = $r.when else . end)
+                  | (if $r.drop != null then .drop = $r.drop else . end)
+                  | (if (($r.ignoreSenders // []) | length) > 0 then .ignoreSenders = $r.ignoreSenders else . end)
+                  | (if $r.note != null then .note = $r.note else . end)
+                else . end ]
+        ' "$FILE" > "$tmp"; then
+      ${pkgs.coreutils}/bin/mv -f "$tmp" "$FILE"
+      # Say which watches are governed — and when none is, that the policy is
+      # idle: a rule that silently applied to nothing reads like a rule that
+      # worked (#170).
+      "$JQ" -r --slurpfile pol "$POLICY" '
+            [ .topics[] | if type == "string" then . else (.topic // "") end ] as $subs
+            | [ ($pol[0] | keys[]) | select(. as $t | $subs | index($t)) ]
+            | if length > 0 then "agent-box-webhook-policy: enforced declared rules on " + join(", ")
+              else "agent-box-webhook-policy: no declared topic is subscribed; policy idle" end
+          ' "$FILE" >&2
+    else
+      ${pkgs.coreutils}/bin/rm -f "$tmp"
+      echo "agent-box-webhook-policy: could not rewrite $FILE; receiver starts with it unchanged" >&2
+    fi
   '';
 
   # One session = one agent CLI in one tmux session. These options are the
@@ -2199,7 +2275,7 @@ in
       };
       rev = lib.mkOption {
         type = lib.types.str;
-        default = "aec22b5878b19dca12de5c954e86302cd6c7bdd8";
+        default = "74a99dd86804c9a53bd4bfdf66f9815d9df13e92";
         description = ''
           Pinned local-channels commit whose local-webhook/webhook.py the
           receiver daemon and the agent-box-webhook CLI run. Claude sessions
@@ -2213,8 +2289,102 @@ in
         # builtins.fetchurl hash of local-webhook/webhook.py at `rev`:
         #   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.py
         # then `nix hash convert --hash-algo sha256 --to sri <base32>`.
-        default = "sha256-fZKy5jCsn3bom9F4E3dqW7N7x9ky+IM4NXFzLLSBOtU=";
+        default = "sha256-wzbIZoC4681JARV/xJ5DLd4kYjnOomN2Z4FUGlwvk+E=";
         description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
+      };
+      watchPolicy = lib.mkOption {
+        type = lib.types.attrsOf (lib.types.submodule {
+          options = {
+            when = lib.mkOption {
+              type = lib.types.nullOr lib.types.attrs;
+              default = null;
+              description = ''
+                Payload predicate the watch accepts events by (local-webhook
+                0.11.0 `when`): `{any/all: [...]}` over
+                `{path, in/notIn: [values]}` leaves. null declares no `when`.
+              '';
+            };
+            drop = lib.mkOption {
+              type = lib.types.nullOr lib.types.attrs;
+              default = null;
+              description = ''
+                Payload predicate the watch refuses events by (`drop`,
+                evaluated first, wins over `when`). null declares no `drop`.
+              '';
+            };
+            ignoreSenders = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = ''
+                Sender mute for the entry; the default (empty) CLEARS any
+                ad-hoc mute on the governed entry. With rules, sender policy
+                belongs inside the predicate ({path: "sender.login",
+                notIn: [...]}), where it can be scoped to echo-shaped events
+                instead of silencing a person's every event — the blunt trade
+                that once muted a human's new issues to stop their close
+                buttons (#197).
+              '';
+            };
+            note = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Replacement note for the entry; null keeps whatever note it has.";
+            };
+          };
+        });
+        # The default governs the standing watch agents are told to keep on
+        # the box's own repos, IF one exists. Current policy: spawn a triage
+        # session for issues/PRs entering the queue (opened/reopened) unless
+        # the box's own login created them, and for terminal CI failures
+        # whoever triggered the run; everything else — closes, merges, pushes,
+        # green or in-flight CI — is not worth a session. On a box whose
+        # sessions never subscribed a defangdevs watch this default matches no
+        # entry and does nothing; set it to { } to opt out entirely.
+        default = {
+          "github:defangdevs/*" = {
+            note = "standing watch: unowned defangdevs activity (new issues, outside PRs, failing CI) — "
+              + "rules managed by services.agent-box.webhook.watchPolicy and re-applied when the "
+              + "receiver daemon starts, so edit the NixOS config, not this entry";
+            when =
+              let
+                # local-webhook's CI_FAILURE_STATES, spelled out here on
+                # purpose: which conclusions deserve a session is THIS repo's
+                # policy now (local-channels#13 keeps mechanism upstream).
+                ciFailure = [ "failure" "timed_out" "action_required" "startup_failure" "stale" "error" ];
+              in
+              {
+                any = [
+                  {
+                    all = [
+                      { path = "action"; "in" = [ "opened" "reopened" ]; }
+                      { path = "sender.login"; notIn = [ "defangdevs" ]; }
+                    ];
+                  }
+                  { path = "workflow_run.conclusion"; "in" = ciFailure; }
+                  { path = "workflow_job.conclusion"; "in" = ciFailure; }
+                  { path = "check_run.conclusion"; "in" = ciFailure; }
+                  { path = "check_suite.conclusion"; "in" = ciFailure; }
+                  { path = "deployment_status.state"; "in" = [ "error" "failure" ]; }
+                  { path = "state"; "in" = [ "error" "failure" ]; }
+                ];
+              };
+          };
+        };
+        description = ''
+          Declarative policy for standing watches (#197), keyed by exact
+          topic. The module never creates a watch: sessions do that
+          (`agent-box-webhook subscribe --deliver-to subagent`). What this
+          option owns is the POLICY on such a watch — before each user's
+          receiver daemon starts, the declared when/drop/ignoreSenders/note
+          are enforced onto the matching entry in that user's
+          filter.dispatch.json (other entries and the entry's own
+          topic/ttl/timestamps untouched), replacing whatever ad-hoc rules a
+          session left there. A watch carrying when/drop sets its own spawn
+          policy: local-webhook's built-in failures-only CI brake steps aside
+          for it, and every event the rules decline is logged by the daemon,
+          so a deliberate drop stays distinguishable from a watch that broke
+          (#170). Requires local-webhook >= 0.11.0 (the webhook.rev pin).
+        '';
       };
     };
 
@@ -5804,6 +5974,11 @@ in
           User = name;
           Restart = "always";
           RestartSec = "5s";
+          # Enforce the declared watch policy (webhook.watchPolicy) onto this
+          # user's filter.dispatch.json before the receiver starts routing.
+          # Runs as User (no "+" prefix); exits 0 on every path, because a
+          # policy hiccup must not take the box's one ingress down with it.
+          ExecStartPre = "${webhookPolicyApply}";
           ExecStart = "${webhookPython} ${localWebhookScript}";
           # systemd passes the ingress socket on fd 3 (LISTEN_FDS) and wires
           # stdin to /dev/null; RECEIVER_ONLY tolerates that (no MCP stdio).

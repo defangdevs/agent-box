@@ -54,6 +54,25 @@
         fail2ban = false;
       };
       # webhook.enable is deliberately NOT set: this test asserts the DEFAULT.
+      # Watch policy (#197) for the SECOND standing watch below. The first
+      # watch (defangdevs/agent-box) deliberately stays rule-less, so the
+      # legacy failures-only brake keeps its own coverage next to this.
+      webhook.watchPolicy = {
+        "github:defangdevs/local-channels" = {
+          note = "managed: rules watch (test)";
+          when = {
+            any = [
+              {
+                all = [
+                  { path = "action"; "in" = [ "opened" "reopened" ]; }
+                  { path = "sender.login"; notIn = [ "box-bot" ]; }
+                ];
+              }
+              { path = "workflow_run.conclusion"; "in" = [ "failure" ]; }
+            ];
+          };
+        };
+      };
     };
     system.stateVersion = "25.05";
 
@@ -535,6 +554,94 @@
     machine.succeed(
         "jq -e '.topics[0].topic == \"github:defangdevs/elsewhere\"'"
         f" /home/agent/.local/state/local-webhook/filter.agent-{other}.json"
+    )
+
+    # --- watchPolicy: declared rules govern a standing watch (#197) ---------
+    # The module manages POLICY for watches sessions create, never the watches
+    # themselves: at daemon start an ExecStartPre enforces the declared
+    # when/drop/ignoreSenders/note onto the matching filter.dispatch.json
+    # entry. Subscribe the watch with ad-hoc state (a sender mute, a stale
+    # note), restart, and the declaration replaces it.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/local-channels --deliver-to subagent"
+        " --note 'to be governed' --ignore-sender human"
+    )
+    machine.succeed("systemctl restart agent-box-webhook-agent.service")
+    machine.wait_for_unit("agent-box-webhook-agent.service")
+    machine.wait_until_succeeds(
+        "journalctl -u agent-box-webhook-agent --no-pager"
+        " | grep -q 'enforced declared rules on github:defangdevs/local-channels'",
+        timeout=30,
+    )
+    # Rules present, the ad-hoc sender mute cleared (sender policy lives inside
+    # the rules — muting the human outright is the trade #197 exists to end),
+    # note replaced; runtime fields (pinned ttl) kept.
+    machine.succeed(
+        "jq -e '.topics[] | select(.topic == \"github:defangdevs/local-channels\")"
+        " | (.when.any | length == 2) and (has(\"ignoreSenders\") | not)"
+        " and .note == \"managed: rules watch (test)\" and .ttlHours == 0'"
+        " /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+    # ...while the rule-less agent-box watch was left exactly alone.
+    machine.succeed(
+        "jq -e '.topics[] | select(.topic == \"github:defangdevs/agent-box\")"
+        " | (has(\"when\") or has(\"drop\")) | not'"
+        " /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+
+    # Behavior, end to end: a close echo is declined by the rules — logged, so
+    # a deliberate drop stays distinguishable from a broken watch (#170) — and
+    # an outsider's opened issue still spawns a triage session.
+    client.succeed(
+        "cat > /tmp/lc-closed.json <<'EOF'\n"
+        '{"action":"closed","pull_request":{"number":3,"title":"done",'
+        '"html_url":"https://box.test/pr/3"},'
+        '"repository":{"full_name":"defangdevs/local-channels"},"sender":{"login":"human"}}\n'
+        "EOF"
+    )
+    sig_lc1 = client.succeed(
+        f"openssl dgst -sha256 -hmac {secret} -r /tmp/lc-closed.json | cut -d' ' -f1"
+    ).strip()
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST"
+        " -H 'content-type: application/json' -H 'x-github-event: pull_request'"
+        " -H 'x-github-delivery: test-lc-closed'"
+        f" -H 'x-hub-signature-256: sha256={sig_lc1}' --data-binary @/tmp/lc-closed.json"
+        " https://box.test/agent/webhook/github | grep -x 200"
+    )
+    machine.wait_until_succeeds(
+        "journalctl -u agent-box-webhook-agent --no-pager"
+        " | grep -q 'not spawning for pull_request on defangdevs/local-channels'",
+        timeout=30,
+    )
+    machine.fail(
+        "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-local-chan\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    client.succeed(
+        "cat > /tmp/lc-opened.json <<'EOF'\n"
+        '{"action":"opened","issue":{"number":21,"title":"found a bug",'
+        '"html_url":"https://box.test/issue/21"},'
+        '"repository":{"full_name":"defangdevs/local-channels"},"sender":{"login":"human"}}\n'
+        "EOF"
+    )
+    sig_lc2 = client.succeed(
+        f"openssl dgst -sha256 -hmac {secret} -r /tmp/lc-opened.json | cut -d' ' -f1"
+    ).strip()
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST"
+        " -H 'content-type: application/json' -H 'x-github-event: issues'"
+        " -H 'x-github-delivery: test-lc-opened'"
+        f" -H 'x-hub-signature-256: sha256={sig_lc2}' --data-binary @/tmp/lc-opened.json"
+        " https://box.test/agent/webhook/github | grep -x 200"
+    )
+    machine.wait_until_succeeds(
+        "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-local-chan\"))'"
+        " /home/agent/.config/agent-box/sessions.json",
+        timeout=60,
     )
 
     # The daemon is the ingress owner and survives every delivery — the box's
