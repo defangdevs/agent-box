@@ -3645,7 +3645,13 @@ in
         # re-renders with the other terminal); SCRIPT upgrades that to
         # client-side switching with background tabs kept attached. Session
         # CRUD beyond "add" lives on the settings page.
+        #
+        # The add/delete banner is the FIRST element, above the tab bar (issue
+        # #188): it is page-level feedback, and sitting between the tabs and
+        # the panes it both prised the tab bar away from the terminal it labels
+        # and read as a message from the session in that pane.
         HOME_BODY = """<body class="ws">
+        <div id="msg-slot">{message}</div>
         <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}">
           {tabs}
           <button type="button" class="btn add" data-toggle="session-editor"
@@ -3677,7 +3683,6 @@ in
             folders one level at a time.</p>
           </form>
         </div>
-        <div id="msg-slot">{message}</div>
         <div class="panes" id="panes">{pane}</div>
         </body>
         </html>

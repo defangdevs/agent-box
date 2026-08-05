@@ -438,6 +438,17 @@
     assert 'src="/agent/?arg=main"' in root_page, root_page
     assert "workingDirectory" not in root_page, root_page
 
+    # The add/delete banner is page-level feedback, so it renders ABOVE the
+    # tab bar (issue 188) — below the tabs it read as a message from the
+    # terminal in the pane underneath it. An empty slot when there is no
+    # message, so the tabs stay flush with the top of the viewport.
+    assert '<div id="msg-slot"></div>' in root_page, root_page
+    ok_page = client.succeed(
+        f"{curl} -u agent:testpassword 'https://box.test/?ok=session_added'"
+    )
+    assert "Session added" in ok_page, ok_page
+    assert ok_page.index('class="msg"') < ok_page.index('id="tab-bar"'), ok_page
+
     # Each tab carries a close (x) posting to the same /sessions/delete
     # route the settings page uses — a sibling form, since a <form> inside
     # the tab <a> would be invalid markup. The two-click arming that keeps
