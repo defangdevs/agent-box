@@ -26,6 +26,15 @@
     machine.wait_for_unit("agent-box-agent.service")
     machine.wait_for_unit("earlyoom.service")
 
+    # This is the only test that runs with web.enable off (the default), so it
+    # is also the guard for the ~/sites ReadWritePaths entry: the snippet dir is
+    # tmpfiles-created only when web is on, and listing it unconditionally made
+    # namespace setup fail with 226/NAMESPACE — the unit above never started.
+    machine.fail(
+        "systemctl show agent-box-agent --property=ReadWritePaths --value "
+        "| grep -q agent-box-sites"
+    )
+
     # zram swap is active and sized to RAM (memoryPercent = 100)
     print(machine.succeed("swapon --show"))
     machine.succeed("swapon --show=NAME --noheadings | grep -q zram0")

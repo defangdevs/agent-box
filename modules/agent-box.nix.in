@@ -2369,8 +2369,14 @@ in
           # impossible from inside the agent's own namespace. ReadWritePaths
           # matches on the resolved path, so the target has to be listed too.
           # The dir is tmpfiles-created (sysinit, well before this unit), so it
-          # always exists by unit start and needs no `-` prefix.
-          ReadWritePaths = [ "/home/${name}" "/var/lib/agent-box-sites/${name}" ];
+          # always exists by unit start and needs no `-` prefix — but ONLY when
+          # web.enable is on, since that is what gates the tmpfiles rule. Listing
+          # it unconditionally fails the whole namespace setup with 226/NAMESPACE
+          # on a default (web-less) box, so the unit never starts at all: no `-`
+          # here, an explicit guard instead, so a dir that is genuinely missing
+          # while web is on stays loud rather than silently reverting to EROFS.
+          ReadWritePaths = [ "/home/${name}" ]
+            ++ lib.optional cfg.web.enable "/var/lib/agent-box-sites/${name}";
           ProtectKernelTunables = true;
           ProtectKernelModules = true;
           ProtectControlGroups = true;
