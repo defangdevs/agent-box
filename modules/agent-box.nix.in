@@ -2099,7 +2099,7 @@ in
       };
       rev = lib.mkOption {
         type = lib.types.str;
-        default = "efa253166074789ece9709e4a1e3a4be58801166";
+        default = "aec22b5878b19dca12de5c954e86302cd6c7bdd8";
         description = ''
           Pinned local-channels commit whose local-webhook/webhook.py the
           receiver daemon and the agent-box-webhook CLI run. Claude sessions
@@ -2113,7 +2113,7 @@ in
         # builtins.fetchurl hash of local-webhook/webhook.py at `rev`:
         #   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.py
         # then `nix hash convert --hash-algo sha256 --to sri <base32>`.
-        default = "sha256-qHVF398YAwiIqbYG2/HY+hVzY4HF4saiasdZHAXngIM=";
+        default = "sha256-fZKy5jCsn3bom9F4E3dqW7N7x9ky+IM4NXFzLLSBOtU=";
         description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
       };
     };

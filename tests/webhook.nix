@@ -363,6 +363,40 @@
         " agent-box-webhook unsubscribe defangdevs/agent-box"
     )
 
+    # --- dispatch brake: a green run is not news (local-channels 0.10.1) -----
+    # Nobody owns the topic now and this sender is on no ignore list, so the
+    # OUTCOME is the only thing that can hold the spawn back. Pinned webhook.py
+    # before 0.10.1 read the outcome only to decide whether a CI event could
+    # override an ignored sender, and started a session per green build: one
+    # merge to master cost four hook-* sessions that each concluded "nothing to
+    # do", with the four-session cap then standing between a real failure and
+    # its triage.
+    client.succeed(
+        "cat > /tmp/green.json <<'EOF'\n"
+        '{"action":"completed","workflow_run":{"name":"CI","conclusion":"success",'
+        '"head_branch":"master","html_url":"https://box.test/run/2"},'
+        '"repository":{"full_name":"defangdevs/agent-box"},"sender":{"login":"someone"}}\n'
+        "EOF"
+    )
+    sig_green = client.succeed(
+        f"openssl dgst -sha256 -hmac {secret} -r /tmp/green.json | cut -d' ' -f1"
+    ).strip()
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST"
+        " -H 'content-type: application/json' -H 'x-github-event: workflow_run'"
+        " -H 'x-github-delivery: test-green'"
+        f" -H 'x-hub-signature-256: sha256={sig_green}' --data-binary @/tmp/green.json"
+        " https://box.test/agent/webhook/github | grep -x 200"
+    )
+    machine.wait_until_succeeds(
+        "journalctl -u agent-box-webhook-agent --no-pager | grep -q 'no failing outcome'",
+        timeout=30,
+    )
+    machine.fail(
+        "jq -e '.sessions | keys | map(select(startswith(\"hook-\"))) | length > 0'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+
     # A signed delivery on the watched repo → a fresh hook-* session appears in
     # sessions.json, primed with the framed event text plus the trusted
     # preamble, and the supervisor starts it as a real tmux session.
