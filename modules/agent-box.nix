@@ -2103,7 +2103,7 @@ in
       };
       rev = lib.mkOption {
         type = lib.types.str;
-        default = "efa253166074789ece9709e4a1e3a4be58801166";
+        default = "aec22b5878b19dca12de5c954e86302cd6c7bdd8";
         description = ''
           Pinned local-channels commit whose local-webhook/webhook.py the
           receiver daemon and the agent-box-webhook CLI run. Claude sessions
@@ -2117,7 +2117,7 @@ in
         # builtins.fetchurl hash of local-webhook/webhook.py at `rev`:
         #   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.py
         # then `nix hash convert --hash-algo sha256 --to sri <base32>`.
-        default = "sha256-qHVF398YAwiIqbYG2/HY+hVzY4HF4saiasdZHAXngIM=";
+        default = "sha256-fZKy5jCsn3bom9F4E3dqW7N7x9ky+IM4NXFzLLSBOtU=";
         description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
       };
     };
@@ -2373,8 +2373,14 @@ in
           # impossible from inside the agent's own namespace. ReadWritePaths
           # matches on the resolved path, so the target has to be listed too.
           # The dir is tmpfiles-created (sysinit, well before this unit), so it
-          # always exists by unit start and needs no `-` prefix.
-          ReadWritePaths = [ "/home/${name}" "/var/lib/agent-box-sites/${name}" ];
+          # always exists by unit start and needs no `-` prefix — but ONLY when
+          # web.enable is on, since that is what gates the tmpfiles rule. Listing
+          # it unconditionally fails the whole namespace setup with 226/NAMESPACE
+          # on a default (web-less) box, so the unit never starts at all: no `-`
+          # here, an explicit guard instead, so a dir that is genuinely missing
+          # while web is on stays loud rather than silently reverting to EROFS.
+          ReadWritePaths = [ "/home/${name}" ]
+            ++ lib.optional cfg.web.enable "/var/lib/agent-box-sites/${name}";
           ProtectKernelTunables = true;
           ProtectKernelModules = true;
           ProtectControlGroups = true;
