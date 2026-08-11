@@ -236,10 +236,20 @@ itself and prints the URL plus the one-time code (valid 15 min); open the link
 on any device, enter the code, and the pane goes straight on to print the
 pairing code for the Codex desktop/mobile app. Pairing codes are short-lived -
 **press Enter in the pane for a fresh one**. Enter also retries sign-in if it
-was abandoned. Typing `login` + Enter drops the stored credentials and signs in
-again - the recovery path when a box holds a stale token or the wrong account,
-where `codex login status` still succeeds but pairing keeps failing. Those two
-keys are all the pane's keyboard does; it is not a codex prompt.
+was abandoned. Those two keys are all the pane's keyboard does; it is not a
+codex prompt.
+
+Credentials the ChatGPT backend has invalidated (password change, revoked
+session, expired refresh token) need no keys at all: `codex login status` is a
+local check and keeps reporting "logged in", so pairing is what discovers the
+`401 token_invalidated`, and the pane then drops the dead credentials and re-runs
+the device flow by itself - printing the server's own explanation, not the HTTP
+transcript. That happens once per cycle; if a *fresh* sign-in is rejected too,
+the account is the problem (wrong account, no Codex access) and the pane says so
+instead of looping. Typing `login` + Enter forces the same logout-and-sign-in by
+hand - still worth having, because signing in as the wrong account produces no
+error to detect. Pairing failures that are *not* about auth (an enrollment race
+just after boot, no network) are retried and never drop working credentials.
 
 Sign-in has to be device auth: plain `codex login` starts a callback server on
 `localhost:1455`, which the browser on your laptop cannot reach. Until sign-in
