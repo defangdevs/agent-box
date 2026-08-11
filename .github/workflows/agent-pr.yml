@@ -37,19 +37,23 @@ jobs:
       # `env` is. Hoisting them here is what makes the Cachix step's guard work.
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
       CACHIX_CACHE: ${{ vars.CACHIX_CACHE }}
+    # First clause below: fork PRs get a read-only token and NO secrets, so the
+    # agent cannot run at all. `pull_request_target` would grant both alongside
+    # untrusted PR content — the standard way this pattern gets a repo
+    # compromised. Fork PRs are explicitly out of scope; handle them by hand.
+    #
+    # Second clause: loop guard. Today GITHUB_TOKEN-authored events don't
+    # trigger workflows, so this is belt-and-braces — but the moment any job
+    # here moves to a PAT or GitHub App, this clause is the only thing stopping
+    # a self-review cascade. Do not remove it.
+    #
+    # These comments sit ABOVE the `if:` deliberately: `>-` is a folded scalar,
+    # so `#` lines placed under it are folded into the expression as literal
+    # text rather than treated as comments, and the workflow fails to parse.
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.actor != 'github-actions[bot]' &&
       contains(github.event.pull_request.labels.*.name, 'agent-fix')
-      # First clause: fork PRs get a read-only token and NO secrets, so the agent
-      # cannot run at all. `pull_request_target` would grant both alongside
-      # untrusted PR content — the standard way this pattern gets a repo
-      # compromised. Fork PRs are explicitly out of scope; handle them by hand.
-      #
-      # Second clause: loop guard. Today GITHUB_TOKEN-authored events don't
-      # trigger workflows, so this is belt-and-braces — but the moment any job
-      # here moves to a PAT or GitHub App, this clause is the only thing stopping
-      # a self-review cascade. Do not remove it.
 
     steps:
       - uses: actions/checkout@v5
@@ -151,6 +155,10 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Via env, not interpolated into the script below: a branch name is
+          # attacker-chosen text, and `${{ }}` inside a `run:` is substituted
+          # before the shell sees it, so a crafted name would execute.
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
           if git diff --quiet && git diff --cached --quiet; then
@@ -166,5 +174,5 @@ jobs:
           what was changed and why."
           # No --force: if the branch moved under us, fail loudly rather than
           # clobbering a human's commit. The concurrency group makes this rare.
-          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          git push origin "HEAD:$HEAD_REF"
           gh pr comment "$PR_NUMBER" --body "Pushed an agent fix to this branch. See the [run summary](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for what changed."
