@@ -1736,16 +1736,21 @@ ${agentBinCases}          *) return 1 ;;
               # match → resume it; no match → start fresh (never `resume --last`,
               # which could grab a sibling session's transcript in a shared cwd).
               target="$(codex_rollout_uuid "$bid")"
+              # "--" before the positionals for the same reason as claude's:
+              # codex's -i/--image takes MULTIPLE files, so extraArgs ending in
+              # it would otherwise eat the resume target and the prompt. Here
+              # "--" also protects the target, which `resume` reads as its first
+              # positional (SESSION_ID) and the prompt as its second.
               if [ -n "$target" ]; then
                 cmd="$cmd resume"
                 [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
                 append_extra
-                cmd="$cmd $(printf '%q' "$target")"
+                cmd="$cmd -- $(printf '%q' "$target")"
                 [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "$prompt")"
               else
                 [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
                 append_extra
-                [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "[agent-box session $bid] $prompt")"
+                [ -n "$prompt" ] && cmd="$cmd -- $(printf '%q' "[agent-box session $bid] $prompt")"
               fi
             else
               [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
@@ -1753,8 +1758,10 @@ ${agentBinCases}          *) return 1 ;;
               # Stamp the box id into the kickoff prompt so the transcript is
               # findable on resume; skip the stamp when there's no prompt (an
               # interactive session with no task shouldn't burn an opening turn).
+              # "--" as above: a trailing -i/--image in extraArgs would swallow
+              # the prompt and codex would open with no task at all.
               if [ -n "$prompt" ]; then
-                cmd="$cmd $(printf '%q' "[agent-box session $bid] $prompt")"
+                cmd="$cmd -- $(printf '%q' "[agent-box session $bid] $prompt")"
               fi
             fi
             ;;

@@ -423,6 +423,47 @@
         ), variadic_cmdline
         machine.succeed(as_agent("agent-box-session rm variadic"))
 
+    with subtest("codex: same guard, and it also protects the resume target"):
+        # codex's one variadic option is `-i/--image <FILE>...`, so extraArgs
+        # ending in it swallow the prompt exactly as --channels did for claude
+        # (verified against codex 0.146.0: `codex exec -i x.png "say ok"` reads
+        # NO prompt, `codex exec -i x.png -- "say ok"` reads it).
+        png = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42m"
+               "NkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
+        machine.succeed(as_agent(f"echo {png} | base64 -d > /home/agent/shot.png"))
+        # Written straight into sessions.json instead of through
+        # `agent-box-session add`: the CLI always writes remoteControl=true, and
+        # a remote-controlled codex session runs the app-server daemon, which
+        # takes no positional prompt at all — remoteControl=false is what puts
+        # the prompt on a command line. One write, so the supervisor's first
+        # spawn already sees the final config (no add-then-edit race).
+        machine.succeed(
+            as_agent(
+                'jq \'.sessions.vcodex = {agent: "codex", skipPermissions: true, '
+                'remoteControl: false, remoteControlName: null, '
+                'workingDirectory: null, extraArgs: ["-i", "/home/agent/shot.png"], '
+                'initialPrompt: "do the codex thing", resumePrompt: null, '
+                f"boxSessionId: null, hasRun: false}}' {sfile} > {sfile}.t "
+                f"&& mv {sfile}.t {sfile}"
+            )
+        )
+        machine.wait_until_succeeds(tmux("has-session -t =vcodex"), timeout=60)
+        # tmux records the pane's start command when the session is created, so
+        # this reads what the supervisor BUILT and does not depend on codex
+        # still running (a logged-out TUI may or may not stay up). The prompt is
+        # printf %q-escaped on the way in and tmux escapes it again on the way
+        # out, so compare with every backslash dropped rather than guessing how
+        # many layers survive.
+        codex_start_cmd = machine.wait_until_succeeds(
+            tmux('list-panes -t "=vcodex" -F "#{pane_start_command}"'), timeout=60
+        )
+        unescaped = codex_start_cmd.replace("\\", "")
+        assert (
+            "-i /home/agent/shot.png -- [agent-box session" in unescaped
+        ), codex_start_cmd
+        assert "do the codex thing" in unescaped, codex_start_cmd
+        machine.succeed(as_agent("agent-box-session rm vcodex"))
+
     # --- env CLI writes the same file the settings page + wrapper use -----
     with subtest("env set/ls/rm on ~/.config/agent-box/env"):
         machine.succeed("su -s /bin/sh agent -c 'agent-box-session env set MY_TOKEN sekret'")
