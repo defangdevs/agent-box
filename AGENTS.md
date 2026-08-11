@@ -4,6 +4,15 @@
 
 Assume the user is talking to you through Remote Control and has no shell access to the box. They cannot run a command you suggest, paste its output back, open a file to look at it, or inspect `result/` — you are their only way to reach the machine. So run the commands yourself rather than handing them a list to try, read the files you need instead of asking what they contain, and quote the output that matters instead of telling them where to find it. When something can only be resolved on the host, resolve it; when it genuinely cannot, say so plainly rather than delegating it back to them.
 
+## Documentation Map
+
+Read the [wiki](https://github.com/defangdevs/agent-box/wiki) before you design anything, and add to it when you settle a question that outlives your change. It carries the durable docs that this file does not:
+
+- **[Users-vs-Sessions](https://github.com/defangdevs/agent-box/wiki/Users-vs-Sessions)** — the rule for adding a Linux user versus a session, and the proof that a session cannot be a security boundary (a sibling session's `/proc/<pid>/environ` and the shared tmux server). Any feature that implies per-session isolation is a design error; check this page first.
+- **[Development](https://github.com/defangdevs/agent-box/wiki/Development)** — CI behavior: which paths trigger it, how the `docs/` landing page publishes, and the generated-module drift check.
+
+This file owns repo conventions; the wiki owns design rationale and maintainer notes. Host-specific setup belongs in neither — `PATH`, git identity, token paths and one box's migration history describe a deployment, so they go in that host's own config repo.
+
 ## Project Structure & Module Organization
 
 `modules/agent-box.nix` is the portable NixOS module and the repository's main implementation. It is **generated** — do not edit it by hand. The sources are `modules/agent-box.nix.in` (the Nix template) plus the assets under `modules/src/` (e.g. the settings daemon), stitched together by `bin/assemble-module.py` via `@@include:...@@` markers. `flake.nix` exposes the module, VM image, and CI checks. Host examples live in `hosts/`; AWS deployment configuration and operational notes are in `aws/`. Put NixOS integration tests in `tests/*.nix`, live browser tests in `tests/e2e/*.spec.ts`, maintenance utilities in `scripts/`, and website images or static content in `docs/`.
