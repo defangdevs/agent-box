@@ -296,6 +296,13 @@ deep-linkable standalone terminal at
 post-mortem shell open instead of being respawned over; delisted sessions
 stay gone.
 
+**New user or new session?** A user is the trust boundary; a session is a
+unit of work, and sessions of one user are *not* isolated from each other.
+The decision rule, the measurements behind it, and what "1 user = 1
+project" is worth are in
+[Users vs sessions](https://github.com/defangdevs/agent-box/wiki/Users-vs-Sessions)
+in the wiki.
+
 ## Downloading files the agent produced (web setups)
 
 Files an agent writes live on its own disk, which isn't trivially reachable
