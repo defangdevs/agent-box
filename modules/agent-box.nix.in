@@ -1687,7 +1687,17 @@ ${agentBinCases}          *) return 1 ;;
               fi
             fi
             append_extra
-            [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "$prompt")"
+            # End-of-options guard before the positional prompt. Several claude
+            # flags are VARIADIC (--channels, --add-dir, --allowedTools,
+            # --betas, ...), so a session whose extraArgs end in one swallow the
+            # prompt as one more value of that flag. The launch then dies in
+            # argument parsing before the TUI ever starts, and the error quotes
+            # our own prompt back as the offending value:
+            #   --channels entries must be tagged: You were interrupted and
+            #   automatically restarted (agent-box session <uuid>) ...
+            # "--" ends option parsing, so the prompt stays positional whatever
+            # extraArgs contain. Harmless when extraArgs are empty.
+            [ -n "$prompt" ] && cmd="$cmd -- $(printf '%q' "$prompt")"
             ;;
           codex)
             if [ "$rc" = true ]; then

@@ -394,6 +394,35 @@
         )
         machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm task1'")
 
+    # --- a variadic extraArg must not swallow the prompt ------------------
+    with subtest("trailing variadic extraArg does not eat the kickoff prompt"):
+        # Several claude flags take MULTIPLE values (--channels, --add-dir,
+        # --allowedTools, --betas ...). With the prompt appended straight after
+        # extraArgs, claude read it as one more value of the last flag and died
+        # in argument parsing before the TUI started — on the office box a
+        # resumed session failed with "--channels entries must be tagged: You
+        # were interrupted and automatically restarted (agent-box session
+        # <uuid>)", the supervisor's own resume prompt quoted back at it. The
+        # supervisor now closes the option list with "--" first. --add-dir
+        # stands in for --channels here: same variadic shape, but it needs no
+        # plugin marketplace in the VM.
+        machine.succeed(
+            as_agent(
+                "agent-box-session add variadic --agent claude "
+                "--prompt 'do the variadic thing' -- --add-dir /home/agent"
+            )
+        )
+        machine.wait_until_succeeds(tmux("has-session -t =variadic"), timeout=60)
+        # pgrep runs as ROOT (not via as_agent): as the agent the invoking
+        # shell's own command line self-matches the pattern.
+        variadic_cmdline = machine.wait_until_succeeds(
+            "pgrep -u agent -af add-dir", timeout=60
+        )
+        assert (
+            "--add-dir /home/agent -- do the variadic thing" in variadic_cmdline
+        ), variadic_cmdline
+        machine.succeed(as_agent("agent-box-session rm variadic"))
+
     # --- env CLI writes the same file the settings page + wrapper use -----
     with subtest("env set/ls/rm on ~/.config/agent-box/env"):
         machine.succeed("su -s /bin/sh agent -c 'agent-box-session env set MY_TOKEN sekret'")
