@@ -3834,15 +3834,21 @@ in
           .update-state[data-state=blocked] { color: #f85149; }
           .editor { border: 1px solid #30363d; border-radius: 8px; background: #161b22;
                     padding: 14px 16px; margin: 12px 0 0; }
-          input, select { font: inherit; font-size: 13px; padding: 6px 10px;
-                          border-radius: 6px; border: 1px solid #30363d;
-                          background: #0d1117; color: #e6edf3; }
+          input, select, textarea { box-sizing: border-box; font: inherit; font-size: 13px;
+                                    padding: 6px 10px; border-radius: 6px;
+                                    border: 1px solid #30363d; background: #0d1117;
+                                    color: #e6edf3; }
           input[type=text] { width: 200px; max-width: 100%; }
           input[type=password] { width: 280px; max-width: 100%; }
+          textarea { width: 100%; resize: vertical; }
           .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+          .new-session-row { align-items: flex-end; }
+          .prompt-row { margin-top: 12px; }
           /* Working-directory combobox (issue #131): the input plus an
              absolutely-positioned suggestions list the daemon fills one
              directory level at a time. */
+          .cwd-control { display: flex; flex-direction: column; gap: 4px;
+                         color: #8b949e; font-size: 13px; }
           .combo { position: relative; display: inline-block; }
           input.cwd { width: 260px; max-width: 100%;
                       font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -3927,6 +3933,31 @@ in
         </style>
         """
 
+        # Shared by the settings-page and workspace add forms so their layout,
+        # accessibility, and autocomplete behaviour cannot drift apart.
+        NEW_SESSION_FIELDS_TPL = """<div class="row new-session-row">
+          <select name="agent">{agents}</select>
+          <span class="cwd-control">
+            <label for="new-session-cwd">Working directory</label>
+            <span class="combo">
+              <input id="new-session-cwd" type="text" name="cwd" value="~" class="cwd"
+                     placeholder="~" autocomplete="off" autocapitalize="off"
+                     autocorrect="off" spellcheck="false"
+                     data-dir-input data-dir-base="{action_base}"
+                     aria-label="Working directory" aria-autocomplete="list"
+                     title="Working directory (starts in your home directory)">
+              <ul class="ac" hidden></ul>
+            </span>
+          </span>
+          <button type="submit" class="btn">Add session</button>
+        </div>
+        <p class="note">Where the agent starts. Defaults to your home directory
+        (<code>~</code>); type to browse folders one level at a time.</p>
+        <div class="row prompt-row">
+          <textarea name="prompt" rows="2"
+                    placeholder="kickoff prompt (optional) &mdash; the task to start on; a respawn resumes it"></textarea>
+        </div>"""
+
         # The session manager <section> on the settings page (every user,
         # including the primary one — the HOME root page is the tabbed
         # terminal workspace, not a manager). {action_base} is SESS_BASE, so
@@ -3944,26 +3975,7 @@ in
             <div id="session-editor" class="editor">
               <form method="post" action="{action_base}/sessions/add">
                 <input type="hidden" name="back" value="settings">
-                <div class="row">
-                  <select name="agent">{agents}</select>
-                  <span class="combo">
-                    <input type="text" name="cwd" value="~" class="cwd"
-                           placeholder="~" autocomplete="off" autocapitalize="off"
-                           autocorrect="off" spellcheck="false"
-                           data-dir-input data-dir-base="{action_base}"
-                           aria-label="Working directory" aria-autocomplete="list"
-                           title="Working directory (starts in your home directory)">
-                    <ul class="ac" hidden></ul>
-                  </span>
-                  <button type="submit" class="btn">Add session</button>
-                </div>
-                <div class="row">
-                  <textarea name="prompt" rows="2"
-                            placeholder="kickoff prompt (optional) &mdash; the task to start on; a respawn resumes it"></textarea>
-                </div>
-                <p class="note">Working directory &mdash; where the agent
-                starts. Defaults to your home directory (<code>~</code>); type
-                to browse folders one level at a time.</p>
+                {new_session_fields}
               </form>
             </div>
             <div id="sessions-list">{sessions}</div>
@@ -3993,26 +4005,7 @@ in
         </nav>
         <div id="session-editor" class="editor">
           <form method="post" action="{action_base}/sessions/add">
-            <div class="row">
-              <select name="agent">{agents}</select>
-              <span class="combo">
-                <input type="text" name="cwd" value="~" class="cwd"
-                       placeholder="~" autocomplete="off" autocapitalize="off"
-                       autocorrect="off" spellcheck="false"
-                       data-dir-input data-dir-base="{action_base}"
-                       aria-label="Working directory" aria-autocomplete="list"
-                       title="Working directory (starts in your home directory)">
-                <ul class="ac" hidden></ul>
-              </span>
-              <button type="submit" class="btn">Add session</button>
-            </div>
-            <div class="row">
-              <textarea name="prompt" rows="2"
-                        placeholder="kickoff prompt (optional) &mdash; the task to start on; a respawn resumes it"></textarea>
-            </div>
-            <p class="note">Working directory &mdash; where the agent starts.
-            Defaults to your home directory (<code>~</code>); type to browse
-            folders one level at a time.</p>
+            {new_session_fields}
           </form>
         </div>
         <div class="panes" id="panes">{pane}</div>
@@ -4969,8 +4962,15 @@ in
         def render_sessions_section():
             return SESSIONS_SECTION_TPL.format(
                 action_base=html.escape(SESS_BASE),
-                agents=render_agent_options(),
+                new_session_fields=render_new_session_fields(),
                 sessions=render_sessions(),
+            )
+
+
+        def render_new_session_fields():
+            return NEW_SESSION_FIELDS_TPL.format(
+                action_base=html.escape(SESS_BASE),
+                agents=render_agent_options(),
             )
 
 
@@ -5084,7 +5084,7 @@ in
                     term_base="/%s/" % urllib.parse.quote(USER, safe=""),
                     tabs=render_tabs(names, live, selected),
                     pane=render_pane(selected, live),
-                    agents=render_agent_options(),
+                    new_session_fields=render_new_session_fields(),
                     message=msg_html,
                 )
                 + SCRIPT
@@ -5408,7 +5408,10 @@ in
                     # Optional kickoff prompt (first spawn only; the supervisor
                     # clears it and resumes on later respawns). boxSessionId is
                     # left null so the supervisor mints a real UUID at spawn.
-                    prompt = form.get("prompt", [""])[0].strip()
+                    # Browsers submit textarea line endings as CRLF; normalize them
+                    # before this value reaches the agent as one argv element.
+                    prompt = form.get("prompt", [""])[0].replace("\r\n", "\n")
+                    prompt = prompt.replace("\r", "\n").strip()
                     sessions = read_sessions()
                     # The name is always auto-derived from the agent — there is no
                     # name field in the form. Users rarely care what a session is
