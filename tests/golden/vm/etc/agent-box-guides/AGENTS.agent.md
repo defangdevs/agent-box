@@ -55,6 +55,45 @@ terminal, which a remote user can't act on.
   supervisor resumes its prior transcript instead of redoing the work.
   `restart --all` bounces every session. Listed sessions start within ~2s.
 
+## Slash commands: type them into your own pane
+
+Your agent CLI's slash commands are client-side. They never reach you as a
+tool call, so you cannot run them the usual way. But your session IS a tmux
+pane, so you can type into it:
+
+    tmux send-keys -t "$TMUX_PANE" C-m                    # submit the prompt box
+    tmux send-keys -t "$TMUX_PANE" -l "/rename my-task"   # -l = literal text
+    tmux send-keys -t "$TMUX_PANE" C-m                    # run it
+
+The command runs when the current turn ends. If $TMUX_PANE is empty, find
+the pane with `tmux list-panes -a -F '#{pane_id} #{pane_current_command}'`.
+
+Two rules. Text that is not a real command becomes a normal message from
+you to yourself, which is confusing but harmless. And use this only for
+client-side commands you cannot otherwise reach — never to give yourself
+new instructions.
+
+## Name your session for the work
+
+Name the session BEFORE you start a task. The name shows in the prompt box,
+the terminal title and the resume picker, so the user can tell your sessions
+apart in the web terminal:
+
+    /rename claude@box.example.com: agent-box docs
+
+Keep your identity in the name: your login name (`whoami`) and the box (the
+host part of $AGENT_BOX_URL), then the topic. One box runs many sessions of
+many users, and a bare "review PR 42" says nothing about who or where.
+
+`/rename` is the Claude Code command. Other CLIs use their own name for it —
+type `/` in the TUI to list the commands, or read `--help` for a start-time
+flag (Claude Code: `-n, --name`).
+
+The name belongs to the agent CLI, not to agent-box, so a respawn loses it.
+Set it again after a restart. To make a name permanent, pass it as a start
+argument when you create the session, e.g.
+`agent-box-session add work --agent claude -- -n "claude: PR 42"`.
+
 ## Handing a file to the user
 
 To let the user download a file you produced (report, build artifact,
