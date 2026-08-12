@@ -351,12 +351,18 @@
                 template = ./modules/agent-box.nix.in;
                 committed = ./modules/agent-box.nix;
                 srcDir = ./modules/src;
+                # The mascot mark (issue #185) lives with the website it also
+                # serves as a favicon, and the settings daemon embeds those
+                # same bytes — so this one asset outside modules/src is part
+                # of the module's source set too.
+                mark = ./docs/potato.svg;
               } ''
-              install -d repo/bin repo/modules
+              install -d repo/bin repo/modules repo/docs
               cp "$assembler" repo/bin/assemble-module.py
               cp "$template" repo/modules/agent-box.nix.in
               cp "$committed" repo/modules/agent-box.nix
               cp -r "$srcDir" repo/modules/src
+              cp "$mark" repo/docs/potato.svg
               python3 repo/bin/assemble-module.py --check --repo repo
               touch "$out"
             '';

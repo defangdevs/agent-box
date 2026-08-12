@@ -646,6 +646,24 @@ def change_password(previous, new):
         return 5
 
 
+# The mascot (issue #185): a potato wired to an aperture optic. Embedded
+# from docs/potato.svg at assemble time, so the landing page and a live
+# box cannot drift to two different marks — that file is the one source,
+# this is the only copy of it that can ship (a deployed box fetches the
+# module as a SINGLE file, so it cannot serve a sibling asset).
+#
+# Whimsy belongs on human surfaces only: nothing about the mascot goes
+# near the agent's spawn preamble, where it would cost tokens on every
+# session and read as an instruction.
+POTATO_SVG = """\
+@@include:../../docs/potato.svg@@
+"""
+# ... and as a favicon. Inline data: URI rather than a route, so the page
+# stays self-contained and the tab icon needs no second request. Before
+# this the workspace tab was blank, which made several open boxes
+# indistinguishable.
+FAVICON = "data:image/svg+xml," + urllib.parse.quote(POTATO_SVG)
+
 # Page skeleton. HEAD_TPL and BODY go through str.format (hence no
 # literal braces in them); STYLE and SCRIPT are plain strings so CSS/JS
 # braces need no doubling. The layout mirrors GitHub's environment-
@@ -660,6 +678,7 @@ HEAD_TPL = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <meta name="agent-box-events" content="{events}" data-fp="{fp}">
+<link rel="icon" href="{favicon}">
 <title>{title}</title>
 """
 
@@ -776,7 +795,7 @@ BODY = """<main>
     GitHub
   </a>
   <a class="back" href="/">&larr; terminal</a>
-  <h1>Settings for {user}</h1>
+  <h1><span class="mark">{mark}</span>Settings for {user}</h1>
   <div id="msg-slot">{message}</div>
   {sessions_section}
   <section>
@@ -1090,6 +1109,7 @@ def render_head(title):
         title=title,
         events=html.escape(SESS_BASE + "/sessions/events"),
         fp=session_fingerprint(),
+        favicon=html.escape(FAVICON, quote=True),
     )
 
 
@@ -1101,6 +1121,7 @@ def render_page(message=""):
         + BODY.format(
             user=html.escape(USER),
             base=html.escape(BASE),
+            mark=POTATO_SVG,
             keys=render_keys(read_keys()),
             # Every user, primary included: the HOME root page is the
             # terminal workspace, so session CRUD lives here.

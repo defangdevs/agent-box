@@ -123,6 +123,13 @@
                             boxSessionId: (if $bid == "" then null else $bid end),
                             hasRun: false}' \
           --args -- "$@"
+        # The mascot (issue #185) marks the closest thing this CLI has to
+        # "an agent just started". Small on purpose: this runs in webhook
+        # spawns and scripts too, and nothing parses the lines below it.
+        printf '%s\n' \
+            "   .-~~-." \
+            "  ( (o) )" \
+            "   \`-~~-'"
         if [ "$has_prompt" = 1 ]; then
           echo "session '$name' ($agent) added with a kickoff prompt — the supervisor starts it within ~2s"
         else

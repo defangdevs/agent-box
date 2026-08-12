@@ -12,6 +12,9 @@ on:
       - 'modules/agent-box.nix.in'
       - 'modules/src/**'
       - 'bin/assemble-module.py'
+      # The mascot mark (issue #185) is embedded into the settings daemon at
+      # assemble time, so it is a module source as much as a website asset.
+      - 'docs/potato.svg'
       # The golden behavior snapshot (issue #154): the fixture and its
       # renderer must re-run the golden-snapshot check when either changes.
       - 'bin/golden-snapshot.py'
