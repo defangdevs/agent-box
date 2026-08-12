@@ -11,12 +11,15 @@
       echo "       agent-box-session add [NAME] [--agent AGENT] [--cwd DIR]"
       echo "                             [--prompt TEXT] [--resume-prompt TEXT] [-- EXTRA_ARGS...]"
       echo "       agent-box-session rm NAME"
+      echo "       agent-box-session stop NAME"
       echo "       agent-box-session restart NAME | --all"
       echo "       agent-box-session env ls | set KEY VALUE | rm KEY"
       echo "agents: $AGENTS (default: $DEFAULT_AGENT)"
       echo "--prompt kicks the session off with a task (first spawn only); a later"
       echo "respawn resumes the prior transcript instead of redoing it."
       echo "Listed sessions are (re)started by the per-user supervisor within ~2s."
+      echo "stop parks a session (no respawn; an agent quitting cleanly does the"
+      echo "same) until 'restart NAME' revives it; rm delists it for good."
       echo "Attach: tmux -L ${tmuxSocketName} attach -t NAME, or the browser terminal /<user>/?arg=NAME"
     }
     valid_name() {
@@ -60,9 +63,8 @@
         live="$(t list-sessions -F '#S' 2>/dev/null || true)"
         printf '%-24s %-8s %s\n' NAME AGENT STATE
         if [ -s "$FILE" ]; then
-          "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?")] | @tsv' "$FILE" \
-          | while IFS="$(printf '\t')" read -r n a; do
-            state=starting
+          "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$FILE" \
+          | while IFS="$(printf '\t')" read -r n a state; do
             printf '%s\n' "$live" | grep -qxF "$n" && state=live
             printf '%-24s %-8s %s\n' "$n" "$a" "$state"
           done
@@ -144,9 +146,28 @@
         t kill-session -t "=$name" 2>/dev/null || true
         echo "session '$name' removed"
         ;;
+      stop)
+        # Park a listed session (issue #167): flag it stopped FIRST so the
+        # supervisor's post-spawn re-check catches a spawn racing this kill,
+        # then take the live session down. The entry (agent, cwd, transcript
+        # id) stays listed for a later 'restart' to revive.
+        name="''${1:-}"
+        valid_name "$name" || { usage >&2; exit 2; }
+        ensure_file
+        if ! taken "$name"; then
+          echo "no such session: '$name' (see agent-box-session ls)" >&2
+          exit 2
+        fi
+        jq_edit --arg n "$name" '.sessions[$n].stopped = true'
+        t kill-session -t "=$name" 2>/dev/null || true
+        echo "session '$name' stopped — still listed, not respawned; 'agent-box-session restart $name' revives it"
+        ;;
       restart)
+        # Clearing the stopped flag makes restart double as the revive verb
+        # for parked sessions; kill-session tolerates one with nothing live.
         if [ "''${1:-}" = "--all" ]; then
           ensure_file
+          jq_edit 'del(.sessions[].stopped)'
           "$JQ" -r '.sessions | keys[]' "$FILE" | while IFS= read -r n; do
             [ -n "$n" ] && t kill-session -t "=$n" 2>/dev/null || true
           done
@@ -154,8 +175,18 @@
         else
           name="''${1:-}"
           valid_name "$name" || { usage >&2; exit 2; }
-          t kill-session -t "=$name"
-          echo "session '$name' killed — the supervisor restarts it within ~2s if still listed"
+          ensure_file
+          if taken "$name"; then
+            jq_edit --arg n "$name" 'del(.sessions[$n].stopped)'
+            # || true: a stopped session has no live tmux session to kill.
+            t kill-session -t "=$name" 2>/dev/null || true
+            echo "session '$name' killed — the supervisor restarts it within ~2s"
+          else
+            # Unlisted (hand-started) session: the kill is all there is, and
+            # its own error covers the name-typo case.
+            t kill-session -t "=$name"
+            echo "session '$name' killed — unlisted, so nothing restarts it"
+          fi
         fi
         ;;
       env)

@@ -42,6 +42,8 @@ a.sess:hover { text-decoration: underline; }
                  border-radius: 50%; background: currentColor; margin-right: 5px; }
 .state[data-state=live] { color: #3fb950; }
 .state[data-state=starting] { color: #d29922; }
+/* stopped = parked on purpose (clean agent exit / stop), not pending */
+.state[data-state=stopped] { color: #8b949e; }
 .btn { font: inherit; font-size: 13px; font-weight: 500; padding: 5px 14px;
        border-radius: 6px; border: 1px solid #30363d; background: #21262d;
        color: #e6edf3; cursor: pointer; white-space: nowrap; }

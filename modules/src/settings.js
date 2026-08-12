@@ -316,13 +316,28 @@
     var bar = tabBar();
     return bar ? bar.querySelector('.tab[data-tab="' + name + '"]') : null;
   }
-  function tabLive(name) {
+  function tabState(name) {
     var t = tabEl(name);
-    return !!(t && t.querySelector("[data-state=live]"));
+    var s = t ? t.querySelector("[data-state]") : null;
+    return s ? s.getAttribute("data-state") : "";
+  }
+  function tabLive(name) { return tabState(name) === "live"; }
+  function placeholderText(name) {
+    // Mirrors render_pane: a stopped session is not coming up on its
+    // own, so don't promise that it is starting.
+    return tabState(name) === "stopped"
+      ? name + " is stopped — Restart on the settings page revives it."
+      : name + " is starting…";
   }
   function ensurePane(name) {
     var cur = document.querySelector('#panes .pane[data-pane="' + name + '"]');
-    if (cur && (cur.tagName === "IFRAME" || !tabLive(name))) { return cur; }
+    // Keep an existing iframe as-is; keep a placeholder only while the
+    // state it was rendered for holds (starting ↔ stopped flips re-render;
+    // data-ph is stamped by render_pane and by the branch below).
+    var ph = tabState(name) === "stopped" ? "stopped" : "starting";
+    if (cur && (cur.tagName === "IFRAME" ||
+        (!tabLive(name) &&
+         (cur.getAttribute("data-ph") || "starting") === ph))) { return cur; }
     var el;
     if (tabLive(name)) {
       el = document.createElement("iframe");
@@ -333,7 +348,8 @@
       el.className = "pane";
     } else {
       el = document.createElement("div");
-      el.textContent = name + " is starting…";
+      el.textContent = placeholderText(name);
+      el.setAttribute("data-ph", ph);
       el.className = "pane placeholder";
     }
     el.setAttribute("data-pane", name);

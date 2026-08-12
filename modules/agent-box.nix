@@ -71,12 +71,15 @@ let
       settings page); they load on the next session (re)start — e.g. GH_TOKEN is
       read automatically, so `git clone https://github.com/...` just works.
     - Manage your own sessions without a rebuild:
-      `agent-box-session ls|add|rm|restart`. `add` takes an optional name plus
-      `--agent claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` — use it
-      to fan out work, add a reviewer agent, or open a plain shell. The kickoff
-      prompt fires once: a later respawn (crash, reboot, Spot restart) resumes
-      that session's transcript instead of redoing the work. `restart --all`
-      bounces every session. Listed sessions start within ~2s.
+      `agent-box-session ls|add|rm|stop|restart`. `add` takes an optional name
+      plus `--agent claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` —
+      use it to fan out work, add a reviewer agent, or open a plain shell. The
+      kickoff prompt fires once: a later respawn (crash, reboot, Spot restart)
+      resumes that session's transcript instead of redoing the work. An agent
+      quitting cleanly (`/quit`) or `stop NAME` parks a session — still listed,
+      not respawned — until `restart NAME` revives it; `rm` delists it for
+      good. `restart --all` bounces every session. Listed sessions start
+      within ~2s.
 
     ## Slash commands: type them into your own pane
 
@@ -329,6 +332,42 @@ let
       done < "$FILE"
     fi
     exec "$@"
+  '';
+
+  # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
+  # quit, so the pane records stopped=true and the supervisor leaves the
+  # session down. See src/mark-stopped.sh for the exact semantics.
+  markStopped = name: pkgs.writeShellScript "agent-box-${name}-mark-stopped" ''
+    # Pane epilogue for a CLEAN agent exit (status 0 — /quit, Ctrl+D: an
+    # exit somebody asked for). Records stopped=true on this session's
+    # sessions.json entry so the supervisor's reconcile loop leaves the
+    # session down instead of respawning-and-resuming it (issue #167).
+    # Crashes never reach this (non-zero exit takes the post-mortem bash
+    # branch), and kill-session / reboot / Spot stop end the pane without
+    # running any epilogue — those still respawn. $1 = session name.
+    FILE=${lib.escapeShellArg (userSessionsFile name)}
+    JQ=${pkgs.jq}/bin/jq
+    CU=${pkgs.coreutils}/bin
+    [ -n "''${1:-}" ] && [ -s "$FILE" ] || exit 0
+    # Verified write, retried: on an agent that exits within its first
+    # seconds, the supervisor's mark_started rewrite can race this one
+    # (both are tmp+mv, last writer wins). Re-read until the flag stuck.
+    # A session delisted meanwhile is left alone rather than re-created.
+    for _ in 1 2 3; do
+      tmp="$("$CU"/mktemp "$FILE.XXXXXX")" || exit 0
+      if "$JQ" --arg s "$1" \
+           'if .sessions | has($s) then .sessions[$s].stopped = true else . end' \
+           "$FILE" > "$tmp" 2>/dev/null; then
+        "$CU"/mv "$tmp" "$FILE"
+      else
+        "$CU"/rm -f "$tmp"
+      fi
+      "$JQ" -e --arg s "$1" \
+        '(.sessions | has($s) | not) or (.sessions[$s].stopped == true)' \
+        "$FILE" >/dev/null 2>&1 && exit 0
+      "$CU"/sleep 1
+    done
+    exit 0
   '';
 
   # Codex Remote Control supervisor (issue 103). Unlike claude's
@@ -772,12 +811,15 @@ EOF
       echo "       agent-box-session add [NAME] [--agent AGENT] [--cwd DIR]"
       echo "                             [--prompt TEXT] [--resume-prompt TEXT] [-- EXTRA_ARGS...]"
       echo "       agent-box-session rm NAME"
+      echo "       agent-box-session stop NAME"
       echo "       agent-box-session restart NAME | --all"
       echo "       agent-box-session env ls | set KEY VALUE | rm KEY"
       echo "agents: $AGENTS (default: $DEFAULT_AGENT)"
       echo "--prompt kicks the session off with a task (first spawn only); a later"
       echo "respawn resumes the prior transcript instead of redoing it."
       echo "Listed sessions are (re)started by the per-user supervisor within ~2s."
+      echo "stop parks a session (no respawn; an agent quitting cleanly does the"
+      echo "same) until 'restart NAME' revives it; rm delists it for good."
       echo "Attach: tmux -L ${tmuxSocketName} attach -t NAME, or the browser terminal /<user>/?arg=NAME"
     }
     valid_name() {
@@ -821,9 +863,8 @@ EOF
         live="$(t list-sessions -F '#S' 2>/dev/null || true)"
         printf '%-24s %-8s %s\n' NAME AGENT STATE
         if [ -s "$FILE" ]; then
-          "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?")] | @tsv' "$FILE" \
-          | while IFS="$(printf '\t')" read -r n a; do
-            state=starting
+          "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$FILE" \
+          | while IFS="$(printf '\t')" read -r n a state; do
             printf '%s\n' "$live" | grep -qxF "$n" && state=live
             printf '%-24s %-8s %s\n' "$n" "$a" "$state"
           done
@@ -905,9 +946,28 @@ EOF
         t kill-session -t "=$name" 2>/dev/null || true
         echo "session '$name' removed"
         ;;
+      stop)
+        # Park a listed session (issue #167): flag it stopped FIRST so the
+        # supervisor's post-spawn re-check catches a spawn racing this kill,
+        # then take the live session down. The entry (agent, cwd, transcript
+        # id) stays listed for a later 'restart' to revive.
+        name="''${1:-}"
+        valid_name "$name" || { usage >&2; exit 2; }
+        ensure_file
+        if ! taken "$name"; then
+          echo "no such session: '$name' (see agent-box-session ls)" >&2
+          exit 2
+        fi
+        jq_edit --arg n "$name" '.sessions[$n].stopped = true'
+        t kill-session -t "=$name" 2>/dev/null || true
+        echo "session '$name' stopped — still listed, not respawned; 'agent-box-session restart $name' revives it"
+        ;;
       restart)
+        # Clearing the stopped flag makes restart double as the revive verb
+        # for parked sessions; kill-session tolerates one with nothing live.
         if [ "''${1:-}" = "--all" ]; then
           ensure_file
+          jq_edit 'del(.sessions[].stopped)'
           "$JQ" -r '.sessions | keys[]' "$FILE" | while IFS= read -r n; do
             [ -n "$n" ] && t kill-session -t "=$n" 2>/dev/null || true
           done
@@ -915,8 +975,18 @@ EOF
         else
           name="''${1:-}"
           valid_name "$name" || { usage >&2; exit 2; }
-          t kill-session -t "=$name"
-          echo "session '$name' killed — the supervisor restarts it within ~2s if still listed"
+          ensure_file
+          if taken "$name"; then
+            jq_edit --arg n "$name" 'del(.sessions[$n].stopped)'
+            # || true: a stopped session has no live tmux session to kill.
+            t kill-session -t "=$name" 2>/dev/null || true
+            echo "session '$name' killed — the supervisor restarts it within ~2s"
+          else
+            # Unlisted (hand-started) session: the kill is all there is, and
+            # its own error covers the name-typo case.
+            t kill-session -t "=$name"
+            echo "session '$name' killed — unlisted, so nothing restarts it"
+          fi
         fi
         ;;
       env)
@@ -1974,29 +2044,49 @@ ${lib.optionalString (agentsMdPointer != null) ''
 ''}        # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
         # time, not unit start — then execs the agent (issue 89), so
         # settings-page secrets land on the next session (re)start.
-        # `|| exec bash` gives a POST-MORTEM shell ONLY on non-zero agent
-        # exit — the dead session stays attachable for inspection and is NOT
-        # respawned over (the wrapper execs the agent, so the exit status
-        # is the agent's). A clean exit lets the session die; the reconcile
-        # loop below then starts a fresh agent within ~2s. Shell sessions
-        # get no post-mortem fallback — the command IS a shell, and exiting
-        # it should hand you a fresh one (via the reconcile loop), not a
-        # nested inspection bash.
-        postmortem=" || exec ${pkgs.bashInteractive}/bin/bash"
-        [ "$agent" = shell ] && postmortem=""
-        # A delete (settings page / agent-box-session rm: delist THEN kill) can
-        # land while this function is preparing the spawn — their kill hits the
-        # OLD session and this spawn would resurrect it as a live, delisted
-        # session the reconcile loop never kills (it tolerates unmanaged
-        # sessions on purpose): a permanent leak. Re-check the CURRENT file at
-        # the last moment, and verify again AFTER the spawn — a delist landing
-        # before the post-check is honored here by killing what we just
-        # started; one landing after it sees the session live and kills it
-        # itself. (Seen as a CI flake in the sessions VM test, run 30740226645.)
-        $JQ -e --arg s "$sname" '.sessions | has($s)' "$SESSIONS_FILE" >/dev/null 2>&1 || return 0
+        # The epilogue then sorts the agent's exit (the wrapper execs the
+        # agent, so the exit status is the agent's) into the three cases:
+        #   exit 0 — somebody ASKED it to quit (/quit, Ctrl+D): record
+        #     stopped=true so the reconcile loop leaves the session down
+        #     instead of respawning-and-resuming it (issue #167);
+        #     `agent-box-session restart` clears the flag and revives it.
+        #   non-zero — a POST-MORTEM shell: the dead session stays
+        #     attachable for inspection and is NOT respawned over.
+        #   killed (restart, reboot, Spot stop) — the pane ends without
+        #     reaching either branch, so the reconcile loop respawns it.
+        # Two session kinds opt out of the parking branch:
+        #   codex + remoteControl — the pane runs the RC daemon wrapper,
+        #     whose health loop falls off its end with status 0 when the
+        #     daemon dies. That is a crash to respawn over (self-heal, as
+        #     before #167), not a quit somebody asked for; nothing
+        #     interactive in that pane can even ask to quit.
+        #   shell — the command IS a shell, exiting it should hand you a
+        #     fresh one (via the reconcile loop), not a nested inspection
+        #     bash or a parked session; leave one closed with detach or
+        #     `agent-box-session stop`.
+        epilogue=" && ${markStopped name} $(printf '%q' "$sname") || exec ${pkgs.bashInteractive}/bin/bash"
+        [ "$agent" = codex ] && [ "$rc" = true ] && epilogue=" || exec ${pkgs.bashInteractive}/bin/bash"
+        [ "$agent" = shell ] && epilogue=""
+        # A delete (settings page / agent-box-session rm: delist THEN kill) or
+        # a stop (agent-box-session stop: flag THEN kill) can land while this
+        # function is preparing the spawn — their kill hits the OLD session
+        # and this spawn would resurrect it as a live session the reconcile
+        # loop never kills (it tolerates unmanaged sessions on purpose, and
+        # skips stopped ones): a permanent leak. Re-check the CURRENT file at
+        # the last moment, and verify again AFTER the spawn — a delist/stop
+        # landing before the post-check is honored here by killing what we
+        # just started; one landing after it sees the session live and kills
+        # it itself. (Seen as a CI flake in the sessions VM test, run
+        # 30740226645.)
+        listed() {
+          $JQ -e --arg s "$sname" \
+            '.sessions | has($s) and (.[$s].stopped != true)' \
+            "$SESSIONS_FILE" >/dev/null 2>&1
+        }
+        listed || return 0
         if $TMUX new-session -d -s "$sname" -c "$wd" ${webhookSessionEnvArgs name} \
-             "${envExecWrapper name} $cmd$postmortem"; then
-          if ! $JQ -e --arg s "$sname" '.sessions | has($s)' "$SESSIONS_FILE" >/dev/null 2>&1; then
+             "${envExecWrapper name} $cmd$epilogue"; then
+          if ! listed; then
             $TMUX kill-session -t "=$sname" 2>/dev/null || true
             return 0
           fi
@@ -2010,13 +2100,15 @@ ${lib.optionalString (agentsMdPointer != null) ''
 
       # Reconcile forever; systemd stop tears the whole tree down (ExecStop
       # kill-server + cgroup kill), Restart=always revives a crashed loop.
+      # Sessions flagged stopped (a clean agent exit, or agent-box-session
+      # stop) stay listed but are left down until a restart clears the flag.
       while true; do
         while IFS= read -r sname; do
           case "$sname" in
             (*[!A-Za-z0-9_-]*|"") continue ;;
           esac
           $TMUX has-session -t "=$sname" 2>/dev/null || start_session "$sname"
-        done < <($JQ -r '.sessions | keys[]' "$SESSIONS_FILE" 2>/dev/null)
+        done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$SESSIONS_FILE" 2>/dev/null)
         sleep 2
       done
     '';
@@ -3571,8 +3663,14 @@ in
 
         def session_counts():
             """How many configured sessions are currently live — the signal the
-            page watches to confirm a 'Restart all' has bounced and recovered."""
-            configured = [n for n in read_sessions() if SESSION_RE.match(n)]
+            page watches to confirm a 'Restart all' has bounced and recovered.
+            Stopped sessions are excluded on both sides: the supervisor will not
+            bring them up, so counting them would hold 'live < configured' (and
+            the page's restart spinner) open forever."""
+            configured = [
+                n for n, v in read_sessions().items()
+                if SESSION_RE.match(n) and not v.get("stopped")
+            ]
             live = live_sessions()
             return {
                 "configured": len(configured),
@@ -3614,7 +3712,7 @@ in
 
         def session_view():
             """The session state the pages actually render: order, name, agent,
-            working directory, live-or-starting.
+            working directory, live-or-starting, stopped.
 
             Deliberately not the whole of sessions.json — the supervisor folds
             bookkeeping into that file (hasRun, boxSessionId, clearing
@@ -3629,6 +3727,7 @@ in
                     str(entries[name].get("agent") or "?"),
                     str(entries[name].get("workingDirectory") or ""),
                     name in live,
+                    bool(entries[name].get("stopped")),
                 ]
                 for name in entries
             ]
@@ -3829,6 +3928,8 @@ in
                            border-radius: 50%; background: currentColor; margin-right: 5px; }
           .state[data-state=live] { color: #3fb950; }
           .state[data-state=starting] { color: #d29922; }
+          /* stopped = parked on purpose (clean agent exit / stop), not pending */
+          .state[data-state=stopped] { color: #8b949e; }
           .btn { font: inherit; font-size: 13px; font-weight: 500; padding: 5px 14px;
                  border-radius: 6px; border: 1px solid #30363d; background: #21262d;
                  color: #e6edf3; cursor: pointer; white-space: nowrap; }
@@ -4488,13 +4589,28 @@ in
             var bar = tabBar();
             return bar ? bar.querySelector('.tab[data-tab="' + name + '"]') : null;
           }
-          function tabLive(name) {
+          function tabState(name) {
             var t = tabEl(name);
-            return !!(t && t.querySelector("[data-state=live]"));
+            var s = t ? t.querySelector("[data-state]") : null;
+            return s ? s.getAttribute("data-state") : "";
+          }
+          function tabLive(name) { return tabState(name) === "live"; }
+          function placeholderText(name) {
+            // Mirrors render_pane: a stopped session is not coming up on its
+            // own, so don't promise that it is starting.
+            return tabState(name) === "stopped"
+              ? name + " is stopped — Restart on the settings page revives it."
+              : name + " is starting…";
           }
           function ensurePane(name) {
             var cur = document.querySelector('#panes .pane[data-pane="' + name + '"]');
-            if (cur && (cur.tagName === "IFRAME" || !tabLive(name))) { return cur; }
+            // Keep an existing iframe as-is; keep a placeholder only while the
+            // state it was rendered for holds (starting ↔ stopped flips re-render;
+            // data-ph is stamped by render_pane and by the branch below).
+            var ph = tabState(name) === "stopped" ? "stopped" : "starting";
+            if (cur && (cur.tagName === "IFRAME" ||
+                (!tabLive(name) &&
+                 (cur.getAttribute("data-ph") || "starting") === ph))) { return cur; }
             var el;
             if (tabLive(name)) {
               el = document.createElement("iframe");
@@ -4505,7 +4621,8 @@ in
               el.className = "pane";
             } else {
               el = document.createElement("div");
-              el.textContent = name + " is starting…";
+              el.textContent = placeholderText(name);
+              el.setAttribute("data-ph", ph);
               el.className = "pane placeholder";
             }
             el.setAttribute("data-pane", name);
@@ -4910,7 +5027,14 @@ in
                     safe = html.escape(name)
                     agent = html.escape(str(entries[name].get("agent") or "?"))
                     cwd = html.escape(display_cwd(entries[name].get("workingDirectory")))
-                    state = "live" if name in live else "starting"
+                    # stopped = listed but deliberately down (clean agent exit or
+                    # agent-box-session stop); the Restart button revives it.
+                    if name in live:
+                        state = "live"
+                    elif entries[name].get("stopped"):
+                        state = "stopped"
+                    else:
+                        state = "starting"
                     items.append(
                         # The name deep-links into the terminal via ttyd's
                         # ?arg= session selector. No userinfo in the href
@@ -4990,7 +5114,7 @@ in
             )
 
 
-        def render_tabs(names, live, selected):
+        def render_tabs(names, live, stopped, selected):
             """The workspace tab bar. File order, not sorted: sessions.json
             preserves insertion order, so a new session appears as the
             rightmost tab, like any terminal app. The dot-only .state span
@@ -5009,7 +5133,12 @@ in
             for name in names:
                 safe = html.escape(name)
                 cur = ' aria-current="page"' if name == selected else ""
-                state = "live" if name in live else "starting"
+                if name in live:
+                    state = "live"
+                elif name in stopped:
+                    state = "stopped"
+                else:
+                    state = "starting"
                 items.append(
                     f'<span class="tab-wrap">'
                     f'<a class="tab" data-tab="{safe}" href="/?tab={safe}"{cur}>'
@@ -5025,18 +5154,25 @@ in
             return "".join(items)
 
 
-        def render_pane(selected, live):
+        def render_pane(selected, live, stopped):
             """The server-rendered pane: only the SELECTED session, and only
             when its tmux session is already live — the ttyd attach wrapper
             greets a not-yet-started session with an error and exits, so a
             starting session gets a placeholder instead (SCRIPT swaps in the
-            iframe once the state flips; without JS, reloading does)."""
+            iframe once the state flips; without JS, reloading does). A stopped
+            session gets an honest placeholder: nothing is coming up until a
+            restart revives it."""
             if selected is None:
                 return '<div class="pane placeholder active">No session selected.</div>'
             safe = html.escape(selected)
+            if selected in stopped and selected not in live:
+                return (f'<div class="pane placeholder active" data-pane="{safe}" '
+                        f'data-ph="stopped">{safe} is stopped &mdash; Restart on '
+                        f'the settings page revives it.</div>')
             if selected not in live:
-                return (f'<div class="pane placeholder active" data-pane="{safe}">'
-                        f'{safe} is starting&hellip; reload in a few seconds.</div>')
+                return (f'<div class="pane placeholder active" data-pane="{safe}" '
+                        f'data-ph="starting">{safe} is starting&hellip; '
+                        f'reload in a few seconds.</div>')
             user = urllib.parse.quote(USER, safe="")
             # SESSION_RE names are URL-safe as-is.
             return (f'<iframe class="pane active" data-pane="{safe}" '
@@ -5090,6 +5226,7 @@ in
             if selected not in entries:
                 selected = "main" if "main" in entries else (names[0] if names else None)
             live = live_sessions()
+            stopped = {n for n, v in entries.items() if v.get("stopped")}
             msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
             return (
                 render_head("Agent Box &mdash; " + html.escape(USER))
@@ -5098,8 +5235,8 @@ in
                     base=html.escape(BASE),
                     action_base=html.escape(SESS_BASE),
                     term_base="/%s/" % urllib.parse.quote(USER, safe=""),
-                    tabs=render_tabs(names, live, selected),
-                    pane=render_pane(selected, live),
+                    tabs=render_tabs(names, live, stopped, selected),
+                    pane=render_pane(selected, live, stopped),
                     new_session_fields=render_new_session_fields(),
                     message=msg_html,
                 )
@@ -5465,6 +5602,14 @@ in
                 elif path == SESS_BASE + "/sessions/restart":
                     name = (form.get("name", [""])[0]).strip()
                     if SESSION_RE.match(name):
+                        # Restart doubles as the revive verb for a stopped session
+                        # (clean agent exit or agent-box-session stop, issue #167):
+                        # the stopped flag is what keeps the supervisor away, so
+                        # clear it before the kill.
+                        sessions = read_sessions()
+                        entry = sessions.get(name)
+                        if entry is not None and entry.pop("stopped", None) is not None:
+                            write_sessions(sessions)
                         kill_session(name)
                     self._redirect("ok=session_restarted", self._sess_page(form))
                 elif path == BASE + "/restart":

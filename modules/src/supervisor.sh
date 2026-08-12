@@ -329,29 +329,49 @@ ${lib.optionalString (agentsMdPointer != null) ''
 ''}        # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
         # time, not unit start — then execs the agent (issue 89), so
         # settings-page secrets land on the next session (re)start.
-        # `|| exec bash` gives a POST-MORTEM shell ONLY on non-zero agent
-        # exit — the dead session stays attachable for inspection and is NOT
-        # respawned over (the wrapper execs the agent, so the exit status
-        # is the agent's). A clean exit lets the session die; the reconcile
-        # loop below then starts a fresh agent within ~2s. Shell sessions
-        # get no post-mortem fallback — the command IS a shell, and exiting
-        # it should hand you a fresh one (via the reconcile loop), not a
-        # nested inspection bash.
-        postmortem=" || exec ${pkgs.bashInteractive}/bin/bash"
-        [ "$agent" = shell ] && postmortem=""
-        # A delete (settings page / agent-box-session rm: delist THEN kill) can
-        # land while this function is preparing the spawn — their kill hits the
-        # OLD session and this spawn would resurrect it as a live, delisted
-        # session the reconcile loop never kills (it tolerates unmanaged
-        # sessions on purpose): a permanent leak. Re-check the CURRENT file at
-        # the last moment, and verify again AFTER the spawn — a delist landing
-        # before the post-check is honored here by killing what we just
-        # started; one landing after it sees the session live and kills it
-        # itself. (Seen as a CI flake in the sessions VM test, run 30740226645.)
-        $JQ -e --arg s "$sname" '.sessions | has($s)' "$SESSIONS_FILE" >/dev/null 2>&1 || return 0
+        # The epilogue then sorts the agent's exit (the wrapper execs the
+        # agent, so the exit status is the agent's) into the three cases:
+        #   exit 0 — somebody ASKED it to quit (/quit, Ctrl+D): record
+        #     stopped=true so the reconcile loop leaves the session down
+        #     instead of respawning-and-resuming it (issue #167);
+        #     `agent-box-session restart` clears the flag and revives it.
+        #   non-zero — a POST-MORTEM shell: the dead session stays
+        #     attachable for inspection and is NOT respawned over.
+        #   killed (restart, reboot, Spot stop) — the pane ends without
+        #     reaching either branch, so the reconcile loop respawns it.
+        # Two session kinds opt out of the parking branch:
+        #   codex + remoteControl — the pane runs the RC daemon wrapper,
+        #     whose health loop falls off its end with status 0 when the
+        #     daemon dies. That is a crash to respawn over (self-heal, as
+        #     before #167), not a quit somebody asked for; nothing
+        #     interactive in that pane can even ask to quit.
+        #   shell — the command IS a shell, exiting it should hand you a
+        #     fresh one (via the reconcile loop), not a nested inspection
+        #     bash or a parked session; leave one closed with detach or
+        #     `agent-box-session stop`.
+        epilogue=" && ${markStopped name} $(printf '%q' "$sname") || exec ${pkgs.bashInteractive}/bin/bash"
+        [ "$agent" = codex ] && [ "$rc" = true ] && epilogue=" || exec ${pkgs.bashInteractive}/bin/bash"
+        [ "$agent" = shell ] && epilogue=""
+        # A delete (settings page / agent-box-session rm: delist THEN kill) or
+        # a stop (agent-box-session stop: flag THEN kill) can land while this
+        # function is preparing the spawn — their kill hits the OLD session
+        # and this spawn would resurrect it as a live session the reconcile
+        # loop never kills (it tolerates unmanaged sessions on purpose, and
+        # skips stopped ones): a permanent leak. Re-check the CURRENT file at
+        # the last moment, and verify again AFTER the spawn — a delist/stop
+        # landing before the post-check is honored here by killing what we
+        # just started; one landing after it sees the session live and kills
+        # it itself. (Seen as a CI flake in the sessions VM test, run
+        # 30740226645.)
+        listed() {
+          $JQ -e --arg s "$sname" \
+            '.sessions | has($s) and (.[$s].stopped != true)' \
+            "$SESSIONS_FILE" >/dev/null 2>&1
+        }
+        listed || return 0
         if $TMUX new-session -d -s "$sname" -c "$wd" ${webhookSessionEnvArgs name} \
-             "${envExecWrapper name} $cmd$postmortem"; then
-          if ! $JQ -e --arg s "$sname" '.sessions | has($s)' "$SESSIONS_FILE" >/dev/null 2>&1; then
+             "${envExecWrapper name} $cmd$epilogue"; then
+          if ! listed; then
             $TMUX kill-session -t "=$sname" 2>/dev/null || true
             return 0
           fi
@@ -365,12 +385,14 @@ ${lib.optionalString (agentsMdPointer != null) ''
 
       # Reconcile forever; systemd stop tears the whole tree down (ExecStop
       # kill-server + cgroup kill), Restart=always revives a crashed loop.
+      # Sessions flagged stopped (a clean agent exit, or agent-box-session
+      # stop) stay listed but are left down until a restart clears the flag.
       while true; do
         while IFS= read -r sname; do
           case "$sname" in
             (*[!A-Za-z0-9_-]*|"") continue ;;
           esac
           $TMUX has-session -t "=$sname" 2>/dev/null || start_session "$sname"
-        done < <($JQ -r '.sessions | keys[]' "$SESSIONS_FILE" 2>/dev/null)
+        done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$SESSIONS_FILE" 2>/dev/null)
         sleep 2
       done
