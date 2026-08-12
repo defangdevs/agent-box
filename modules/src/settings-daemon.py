@@ -668,6 +668,31 @@ STYLE = """<style>
 </style>
 """
 
+# Shared by the settings-page and workspace add forms so their layout,
+# accessibility, and autocomplete behaviour cannot drift apart.
+NEW_SESSION_FIELDS_TPL = """<div class="row new-session-row">
+  <select name="agent">{agents}</select>
+  <span class="cwd-control">
+    <label for="new-session-cwd">Working directory</label>
+    <span class="combo">
+      <input id="new-session-cwd" type="text" name="cwd" value="~" class="cwd"
+             placeholder="~" autocomplete="off" autocapitalize="off"
+             autocorrect="off" spellcheck="false"
+             data-dir-input data-dir-base="{action_base}"
+             aria-label="Working directory" aria-autocomplete="list"
+             title="Working directory (starts in your home directory)">
+      <ul class="ac" hidden></ul>
+    </span>
+  </span>
+  <button type="submit" class="btn">Add session</button>
+</div>
+<p class="note">Where the agent starts. Defaults to your home directory
+(<code>~</code>); type to browse folders one level at a time.</p>
+<div class="row prompt-row">
+  <textarea name="prompt" rows="2"
+            placeholder="kickoff prompt (optional) &mdash; the task to start on; a respawn resumes it"></textarea>
+</div>"""
+
 # The session manager <section> on the settings page (every user,
 # including the primary one — the HOME root page is the tabbed
 # terminal workspace, not a manager). {action_base} is SESS_BASE, so
@@ -685,26 +710,7 @@ SESSIONS_SECTION_TPL = """<section>
     <div id="session-editor" class="editor">
       <form method="post" action="{action_base}/sessions/add">
         <input type="hidden" name="back" value="settings">
-        <div class="row">
-          <select name="agent">{agents}</select>
-          <span class="combo">
-            <input type="text" name="cwd" value="~" class="cwd"
-                   placeholder="~" autocomplete="off" autocapitalize="off"
-                   autocorrect="off" spellcheck="false"
-                   data-dir-input data-dir-base="{action_base}"
-                   aria-label="Working directory" aria-autocomplete="list"
-                   title="Working directory (starts in your home directory)">
-            <ul class="ac" hidden></ul>
-          </span>
-          <button type="submit" class="btn">Add session</button>
-        </div>
-        <div class="row">
-          <textarea name="prompt" rows="2"
-                    placeholder="kickoff prompt (optional) &mdash; the task to start on; a respawn resumes it"></textarea>
-        </div>
-        <p class="note">Working directory &mdash; where the agent
-        starts. Defaults to your home directory (<code>~</code>); type
-        to browse folders one level at a time.</p>
+        {new_session_fields}
       </form>
     </div>
     <div id="sessions-list">{sessions}</div>
@@ -734,26 +740,7 @@ HOME_BODY = """<body class="ws">
 </nav>
 <div id="session-editor" class="editor">
   <form method="post" action="{action_base}/sessions/add">
-    <div class="row">
-      <select name="agent">{agents}</select>
-      <span class="combo">
-        <input type="text" name="cwd" value="~" class="cwd"
-               placeholder="~" autocomplete="off" autocapitalize="off"
-               autocorrect="off" spellcheck="false"
-               data-dir-input data-dir-base="{action_base}"
-               aria-label="Working directory" aria-autocomplete="list"
-               title="Working directory (starts in your home directory)">
-        <ul class="ac" hidden></ul>
-      </span>
-      <button type="submit" class="btn">Add session</button>
-    </div>
-    <div class="row">
-      <textarea name="prompt" rows="2"
-                placeholder="kickoff prompt (optional) &mdash; the task to start on; a respawn resumes it"></textarea>
-    </div>
-    <p class="note">Working directory &mdash; where the agent starts.
-    Defaults to your home directory (<code>~</code>); type to browse
-    folders one level at a time.</p>
+    {new_session_fields}
   </form>
 </div>
 <div class="panes" id="panes">{pane}</div>
@@ -1022,8 +1009,15 @@ def render_update_line():
 def render_sessions_section():
     return SESSIONS_SECTION_TPL.format(
         action_base=html.escape(SESS_BASE),
-        agents=render_agent_options(),
+        new_session_fields=render_new_session_fields(),
         sessions=render_sessions(),
+    )
+
+
+def render_new_session_fields():
+    return NEW_SESSION_FIELDS_TPL.format(
+        action_base=html.escape(SESS_BASE),
+        agents=render_agent_options(),
     )
 
 
@@ -1135,7 +1129,7 @@ def render_home(message="", selected=None):
             term_base="/%s/" % urllib.parse.quote(USER, safe=""),
             tabs=render_tabs(names, live, selected),
             pane=render_pane(selected, live),
-            agents=render_agent_options(),
+            new_session_fields=render_new_session_fields(),
             message=msg_html,
         )
         + SCRIPT
