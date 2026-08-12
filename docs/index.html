@@ -9,6 +9,11 @@
      asking first. -->
 <meta name="robots" content="noai,noimageai">
 <title>agent-box &mdash; sandboxed coding agents, one click away</title>
+<!-- The mascot (issue #185). This file is the ONE source of the mark: the
+     settings daemon embeds these same bytes as its favicon at assemble
+     time (see modules/src/settings-daemon.py), so the tab icon on a live
+     box and the logo here can never drift apart. -->
+<link rel="icon" href="potato.svg">
 <meta name="description" content="A private, sandboxed Claude Code or Codex agent for you and your team. Launch it in your own AWS account with one click.">
 <style>
   :root {
@@ -51,12 +56,7 @@
     display: inline-flex; align-items: center; gap: 12px;
     font-size: 40px; font-weight: 800; letter-spacing: -0.02em;
   }
-  .logo .box {
-    width: 40px; height: 40px; border-radius: 9px;
-    background: linear-gradient(135deg, var(--accent), #b95a3c);
-    display: inline-flex; align-items: center; justify-content: center;
-    font-size: 22px;
-  }
+  .logo .spud { width: 58px; height: 58px; display: block; }
   .tagline { color: var(--muted); font-size: 19px; max-width: 620px; margin: 18px auto 0; }
   .cta { margin-top: 32px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
   .btn {
@@ -108,6 +108,7 @@
     .features, .regions { grid-template-columns: 1fr; }
     header.hero { padding: 60px 0 44px; }
     .logo { font-size: 32px; }
+    .logo .spud { width: 38px; height: 38px; }
   }
 </style>
 </head>
@@ -115,7 +116,7 @@
 
 <header class="hero">
   <div class="wrap">
-    <div class="logo"><span class="box">&#9635;</span> agent-box</div>
+    <div class="logo"><img class="spud" src="potato.svg" alt=""> agent-box</div>
     <p class="tagline">A private, sandboxed Claude Code or Codex agent for you and your team &mdash; launch it in your own AWS account with one click.</p>
     <div class="cta">
       <a class="btn primary" href="#launch">Launch on AWS</a>

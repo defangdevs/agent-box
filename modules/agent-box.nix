@@ -868,6 +868,13 @@ EOF
                             boxSessionId: (if $bid == "" then null else $bid end),
                             hasRun: false}' \
           --args -- "$@"
+        # The mascot (issue #185) marks the closest thing this CLI has to
+        # "an agent just started". Small on purpose: this runs in webhook
+        # spawns and scripts too, and nothing parses the lines below it.
+        printf '%s\n' \
+            "   .-~~-." \
+            "  ( (o) )" \
+            "   \`-~~-'"
         if [ "$has_prompt" = 1 ]; then
           echo "session '$name' ($agent) added with a kickoff prompt — the supervisor starts it within ~2s"
         else
@@ -3704,6 +3711,45 @@ in
                 return 5
 
 
+        # The mascot (issue #185): a potato wired to an aperture optic. Embedded
+        # from docs/potato.svg at assemble time, so the landing page and a live
+        # box cannot drift to two different marks — that file is the one source,
+        # this is the only copy of it that can ship (a deployed box fetches the
+        # module as a SINGLE file, so it cannot serve a sibling asset).
+        #
+        # Whimsy belongs on human surfaces only: nothing about the mascot goes
+        # near the agent's spawn preamble, where it would cost tokens on every
+        # session and read as an instruction.
+        POTATO_SVG = """\
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" aria-hidden="true">
+          <g transform="rotate(-18 16 16)">
+            <path fill="#a87c4c" d="M2.6 18.4C1.4 12 7 6.6 15.8 5.8c6-.6 11.4.8 14.6 3.7 3.1 2.8 3.7 6.5 1.7 9.7-2.1 3.4-7 5.9-12.8 6.3-8.8.7-15.2-1.6-16.7-7.1z"/>
+            <path fill="#d3aa76" d="M4.6 17.4C3.5 12.2 8.5 7.9 16.2 7.1c5.4-.5 10.3.7 13 3.1 2.6 2.3 3.1 5.3 1.4 7.9-1.8 2.9-6 4.9-11.2 5.3-7.8.7-13.6-1.4-14.8-6z"/>
+            <g fill="#7f5c33" opacity=".45">
+              <ellipse cx="9.4" cy="13.4" rx="1.8" ry="1.1" transform="rotate(-25 9.4 13.4)"/>
+              <ellipse cx="13.2" cy="20.6" rx="1.3" ry=".9" transform="rotate(-25 13.2 20.6)"/>
+              <ellipse cx="7" cy="19" rx="1.1" ry=".8" transform="rotate(-25 7 19)"/>
+            </g>
+            <g stroke="#7d9c3e" stroke-width="1.2" stroke-linecap="round">
+              <path d="M11.6 7.4 10 5"/>
+              <path d="M16.2 6.8 15.8 4.4"/>
+              <path d="M7.4 9.6 5 8.2"/>
+            </g>
+          </g>
+          <circle cx="21.4" cy="16.6" r="6" fill="#79838a"/>
+          <circle cx="21.4" cy="16.6" r="4.7" fill="#c3c9cd"/>
+          <circle cx="21.4" cy="16.6" r="3.2" fill="#3a3f44"/>
+          <circle cx="21.4" cy="16.6" r="2" fill="#ffd21e"/>
+          <circle cx="21.4" cy="16.6" r=".85" fill="#4a3a00"/>
+          <circle cx="25.3" cy="12.4" r="1" fill="#e8372a"/>
+        </svg>
+        """
+        # ... and as a favicon. Inline data: URI rather than a route, so the page
+        # stays self-contained and the tab icon needs no second request. Before
+        # this the workspace tab was blank, which made several open boxes
+        # indistinguishable.
+        FAVICON = "data:image/svg+xml," + urllib.parse.quote(POTATO_SVG)
+
         # Page skeleton. HEAD_TPL and BODY go through str.format (hence no
         # literal braces in them); STYLE and SCRIPT are plain strings so CSS/JS
         # braces need no doubling. The layout mirrors GitHub's environment-
@@ -3718,6 +3764,7 @@ in
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="robots" content="noindex">
         <meta name="agent-box-events" content="{events}" data-fp="{fp}">
+        <link rel="icon" href="{favicon}">
         <title>{title}</title>
         """
 
@@ -3725,7 +3772,11 @@ in
           body { margin: 0; min-height: 100vh; background: #0d1117; color: #e6edf3;
                  font: 14px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
           main { max-width: 720px; margin: 0 auto; padding: 32px 20px 48px; }
-          h1 { font-size: 24px; font-weight: 600; margin: 8px 0 4px; }
+          h1 { font-size: 24px; font-weight: 600; margin: 8px 0 4px;
+               display: flex; align-items: center; gap: 10px; }
+          /* The mascot (issue #185) — the same mark as the favicon and the landing
+             page, so the three surfaces read as one identity. */
+          .mark svg { width: 28px; height: 28px; display: block; }
           h2 { font-size: 16px; font-weight: 600; margin: 0; }
           section { margin: 28px 0; }
           .sec-head { display: flex; align-items: center; justify-content: space-between;
@@ -3984,7 +4035,7 @@ in
             GitHub
           </a>
           <a class="back" href="/">&larr; terminal</a>
-          <h1>Settings for {user}</h1>
+          <h1><span class="mark">{mark}</span>Settings for {user}</h1>
           <div id="msg-slot">{message}</div>
           {sessions_section}
           <section>
@@ -4986,6 +5037,7 @@ in
                 title=title,
                 events=html.escape(SESS_BASE + "/sessions/events"),
                 fp=session_fingerprint(),
+                favicon=html.escape(FAVICON, quote=True),
             )
 
 
@@ -4997,6 +5049,7 @@ in
                 + BODY.format(
                     user=html.escape(USER),
                     base=html.escape(BASE),
+                    mark=POTATO_SVG,
                     keys=render_keys(read_keys()),
                     # Every user, primary included: the HOME root page is the
                     # terminal workspace, so session CRUD lives here.
@@ -5462,12 +5515,29 @@ in
       attachScript = name: pkgs.writeShellScript "agent-box-${name}-attach" ''
         set -u
         T="${pkgs.tmux}/bin/tmux -T hyperlinks -L ${tmuxSocketName}"
+        # The mascot (issue #185), for the two dead ends below: both are
+        # full-screen "nothing to attach to" moments, so the art costs
+        # nothing and softens a failure. printf per line, not a heredoc:
+        # this script is embedded in a Nix indented string, where a
+        # heredoc terminator would ride on the dedent.
+        potato() {
+          printf '%s\n' \
+            "             .-~~~~~~~~~~~~-." \
+            "  >=--.___.-~                ~-." \
+            "        ,~   .         .-~~~-.  ~." \
+            "       |    .   .      | (o) |    |" \
+            "        \`~.       .    \`-~~~-' .~'" \
+            "  >=--.___\`-._              _.-'" \
+            "             \`~-..........-~'" \
+            ""
+        }
         want="''${1:-}"
         case "$want" in (*[!A-Za-z0-9_-]*) want="" ;; esac
         if [ -n "$want" ]; then
           if $T has-session -t "=$want" 2>/dev/null; then
             exec $T attach -t "=$want"
           fi
+          potato
           echo "no session named '$want'. Live sessions:"
           $T list-sessions -F '  #S' 2>/dev/null || echo "  (none)"
           echo "create it with: agent-box-session add $want"
@@ -5482,6 +5552,7 @@ in
         if [ -n "$first" ]; then
           exec $T attach -t "=$first"
         fi
+        potato
         echo "no live sessions yet — the supervisor may still be starting them."
         sleep 5
         exit 1
