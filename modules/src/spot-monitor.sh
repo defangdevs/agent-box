@@ -1,105 +1,107 @@
-          set -u
-          CURL="${pkgs.curl}/bin/curl -sS --max-time 3"
-          IMDS=http://169.254.169.254/latest
-          TMUX=${pkgs.tmux}/bin/tmux
-          JQ=${pkgs.jq}/bin/jq
-          RUNUSER=${pkgs.util-linux}/bin/runuser
-          SYSTEMCTL=${pkgs.systemd}/bin/systemctl
-          ENV=${pkgs.coreutils}/bin/env
-          SYNC=${pkgs.coreutils}/bin/sync
-          SOCK=${tmuxSocketName}
-          USERS=${lib.escapeShellArg (lib.concatStringsSep " " (lib.attrNames cfg.users))}
-          GRACE=${toString cfg.spotInterruption.gracePeriod}
-          POLL=${toString cfg.spotInterruption.pollInterval}
-          MSG=${lib.escapeShellArg cfg.spotInterruption.message}
+set -u
+# Binaries resolve from the unit's PATH; who to notify and how long to
+# wait come from the AGENT_BOX_* env the unit sets (issue #154, Phase 2).
+CURL="curl -sS --max-time 3"
+IMDS=http://169.254.169.254/latest
+TMUX=tmux
+JQ=jq
+RUNUSER=runuser
+SYSTEMCTL=systemctl
+ENV=env
+SYNC=sync
+SOCK=agent-box
+USERS="${AGENT_BOX_USERS:?}"
+GRACE="${AGENT_BOX_GRACE:?}"
+POLL="${AGENT_BOX_POLL:?}"
+MSG="${AGENT_BOX_MSG:?}"
 
-          # Fresh IMDSv2 session token (v1 may be disabled). Prints nothing
-          # and returns non-zero if IMDS is unreachable.
-          imds_token() {
-            $CURL -X PUT "$IMDS/api/token" \
-              -H "X-aws-ec2-metadata-token-ttl-seconds: 300"
-          }
-          imds_get() { # imds_get TOKEN PATH
-            $CURL -H "X-aws-ec2-metadata-token: $1" "$IMDS/$2"
-          }
-          imds_code() { # imds_code TOKEN PATH -> HTTP status only
-            $CURL -o /dev/null -w '%{http_code}' \
-              -H "X-aws-ec2-metadata-token: $1" "$IMDS/$2"
-          }
+# Fresh IMDSv2 session token (v1 may be disabled). Prints nothing
+# and returns non-zero if IMDS is unreachable.
+imds_token() {
+  $CURL -X PUT "$IMDS/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 300"
+}
+imds_get() { # imds_get TOKEN PATH
+  $CURL -H "X-aws-ec2-metadata-token: $1" "$IMDS/$2"
+}
+imds_code() { # imds_code TOKEN PATH -> HTTP status only
+  $CURL -o /dev/null -w '%{http_code}' \
+    -H "X-aws-ec2-metadata-token: $1" "$IMDS/$2"
+}
 
-          # Run tmux against a user's own control socket, AS that user.
-          user_tmux() { # user_tmux USER ARGS...
-            u=$1; shift
-            $RUNUSER -u "$u" -- \
-              "$ENV" TMUX_TMPDIR="/run/agent-box-$u" "$TMUX" -L "$SOCK" "$@"
-          }
+# Run tmux against a user's own control socket, AS that user.
+user_tmux() { # user_tmux USER ARGS...
+  u=$1; shift
+  $RUNUSER -u "$u" -- \
+    "$ENV" TMUX_TMPDIR="/run/agent-box-$u" "$TMUX" -L "$SOCK" "$@"
+}
 
-          notify_user() {
-            u=$1
-            sf="/home/$u/.config/agent-box/sessions.json"
-            user_tmux "$u" list-sessions -F '#{session_name}' 2>/dev/null \
-            | while IFS= read -r s; do
-                agent=$($JQ -r --arg s "$s" \
-                  '.sessions[$s].agent // ""' "$sf" 2>/dev/null)
-                # Target "=NAME:" — an EXACT session match resolved to its
-                # active pane. Bare "=NAME" is a session target that send-keys
-                # rejects as a pane ("can't find pane"); plain "NAME" would
-                # prefix-match (session "dev" could hit "devs").
-                if [ "$agent" = shell ]; then
-                  # A shell EXECUTES typed text as a command, so prefix '#' to
-                  # make the notice a harmless no-op comment the operator still
-                  # sees in scrollback. No Escape: there is no in-flight
-                  # generation to interrupt in a shell, and Escape+'#' would
-                  # trigger readline's meta bindings.
-                  user_tmux "$u" send-keys -t "=$s:" -l -- "# $MSG" \
-                    && user_tmux "$u" send-keys -t "=$s:" Enter
-                  continue
-                fi
-                # Agent session. A single Escape interrupts any in-flight
-                # generation/tool call so the notice is handled NOW instead of
-                # queued behind a long operation that may outlast the ~2 min
-                # window. Only one — a double Escape opens claude's history
-                # picker. Then a short settle before typing: sent too fast, the
-                # TUI (still returning to its prompt) swallows the first chars.
-                user_tmux "$u" send-keys -t "=$s:" Escape
-                sleep 1
-                # -l types MSG literally; a separate Enter submits it.
-                user_tmux "$u" send-keys -t "=$s:" -l -- "$MSG" \
-                  && user_tmux "$u" send-keys -t "=$s:" Enter
-              done
-          }
+notify_user() {
+  u=$1
+  sf="/home/$u/.config/agent-box/sessions.json"
+  user_tmux "$u" list-sessions -F '#{session_name}' 2>/dev/null \
+  | while IFS= read -r s; do
+      agent=$($JQ -r --arg s "$s" \
+        '.sessions[$s].agent // ""' "$sf" 2>/dev/null)
+      # Target "=NAME:" — an EXACT session match resolved to its
+      # active pane. Bare "=NAME" is a session target that send-keys
+      # rejects as a pane ("can't find pane"); plain "NAME" would
+      # prefix-match (session "dev" could hit "devs").
+      if [ "$agent" = shell ]; then
+        # A shell EXECUTES typed text as a command, so prefix '#' to
+        # make the notice a harmless no-op comment the operator still
+        # sees in scrollback. No Escape: there is no in-flight
+        # generation to interrupt in a shell, and Escape+'#' would
+        # trigger readline's meta bindings.
+        user_tmux "$u" send-keys -t "=$s:" -l -- "# $MSG" \
+          && user_tmux "$u" send-keys -t "=$s:" Enter
+        continue
+      fi
+      # Agent session. A single Escape interrupts any in-flight
+      # generation/tool call so the notice is handled NOW instead of
+      # queued behind a long operation that may outlast the ~2 min
+      # window. Only one — a double Escape opens claude's history
+      # picker. Then a short settle before typing: sent too fast, the
+      # TUI (still returning to its prompt) swallows the first chars.
+      user_tmux "$u" send-keys -t "=$s:" Escape
+      sleep 1
+      # -l types MSG literally; a separate Enter submits it.
+      user_tmux "$u" send-keys -t "=$s:" -l -- "$MSG" \
+        && user_tmux "$u" send-keys -t "=$s:" Enter
+    done
+}
 
-          # Startup gate: only Spot instances can be interrupted. Exit 0 (no
-          # restart) when this is on-demand, or when IMDS is unreachable (a
-          # dev rig with the option left enabled).
-          tok=$(imds_token) || { echo "spot-monitor: IMDS unreachable; nothing to monitor" >&2; exit 0; }
-          [ -n "$tok" ] || { echo "spot-monitor: no IMDS token; nothing to monitor" >&2; exit 0; }
-          lifecycle=$(imds_get "$tok" meta-data/instance-life-cycle)
-          if [ "$lifecycle" != spot ]; then
-            echo "spot-monitor: instance-life-cycle=''${lifecycle:-unknown}, not spot; nothing to monitor" >&2
-            exit 0
-          fi
-          echo "spot-monitor: watching IMDS for interruption (poll ''${POLL}s, grace ''${GRACE}s)" >&2
+# Startup gate: only Spot instances can be interrupted. Exit 0 (no
+# restart) when this is on-demand, or when IMDS is unreachable (a
+# dev rig with the option left enabled).
+tok=$(imds_token) || { echo "spot-monitor: IMDS unreachable; nothing to monitor" >&2; exit 0; }
+[ -n "$tok" ] || { echo "spot-monitor: no IMDS token; nothing to monitor" >&2; exit 0; }
+lifecycle=$(imds_get "$tok" meta-data/instance-life-cycle)
+if [ "$lifecycle" != spot ]; then
+  echo "spot-monitor: instance-life-cycle=${lifecycle:-unknown}, not spot; nothing to monitor" >&2
+  exit 0
+fi
+echo "spot-monitor: watching IMDS for interruption (poll ${POLL}s, grace ${GRACE}s)" >&2
 
-          while true; do
-            # Token TTL is 300s but re-minting each loop is cheap and robust
-            # to expiry; skip this round if IMDS momentarily hiccups.
-            tok=$(imds_token) && [ -n "$tok" ] || { sleep "$POLL"; continue; }
-            # 404 until an interruption is scheduled; 200 = committed (~2 min).
-            if [ "$(imds_code "$tok" meta-data/spot/instance-action)" = 200 ]; then
-              action=$(imds_get "$tok" meta-data/spot/instance-action)
-              echo "spot-monitor: interruption scheduled ($action) — notifying agents" >&2
-              for u in $USERS; do notify_user "$u"; done
-              $SYNC
-              echo "spot-monitor: waiting ''${GRACE}s for agents to save context" >&2
-              sleep "$GRACE"
-              echo "spot-monitor: stopping agent units (no respawn)" >&2
-              for u in $USERS; do
-                $SYSTEMCTL stop "agent-box-$u.service" || true
-              done
-              $SYNC
-              echo "spot-monitor: prepared; leaving the stop to AWS (preserves persistent-Spot auto-restart)" >&2
-              exit 0
-            fi
-            sleep "$POLL"
-          done
+while true; do
+  # Token TTL is 300s but re-minting each loop is cheap and robust
+  # to expiry; skip this round if IMDS momentarily hiccups.
+  tok=$(imds_token) && [ -n "$tok" ] || { sleep "$POLL"; continue; }
+  # 404 until an interruption is scheduled; 200 = committed (~2 min).
+  if [ "$(imds_code "$tok" meta-data/spot/instance-action)" = 200 ]; then
+    action=$(imds_get "$tok" meta-data/spot/instance-action)
+    echo "spot-monitor: interruption scheduled ($action) — notifying agents" >&2
+    for u in $USERS; do notify_user "$u"; done
+    $SYNC
+    echo "spot-monitor: waiting ${GRACE}s for agents to save context" >&2
+    sleep "$GRACE"
+    echo "spot-monitor: stopping agent units (no respawn)" >&2
+    for u in $USERS; do
+      $SYSTEMCTL stop "agent-box-$u.service" || true
+    done
+    $SYNC
+    echo "spot-monitor: prepared; leaving the stop to AWS (preserves persistent-Spot auto-restart)" >&2
+    exit 0
+  fi
+  sleep "$POLL"
+done
