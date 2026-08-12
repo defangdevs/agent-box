@@ -5355,7 +5355,10 @@ in
                     # Optional kickoff prompt (first spawn only; the supervisor
                     # clears it and resumes on later respawns). boxSessionId is
                     # left null so the supervisor mints a real UUID at spawn.
-                    prompt = form.get("prompt", [""])[0].strip()
+                    # Browsers submit textarea line endings as CRLF; normalize them
+                    # before this value reaches the agent as one argv element.
+                    prompt = form.get("prompt", [""])[0].replace("\r\n", "\n")
+                    prompt = prompt.replace("\r", "\n").strip()
                     sessions = read_sessions()
                     # The name is always auto-derived from the agent — there is no
                     # name field in the form. Users rarely care what a session is
