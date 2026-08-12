@@ -476,8 +476,8 @@ EOF
       reason=$1
       case "$reason" in
         *'"message":"'*)
-          reason='''''${reason#*'"message":"'}
-          reason='''''${reason%%'"'*}
+          reason=''${reason#*'"message":"'}
+          reason=''${reason%%'"'*}
           ;;
         *) reason="the stored credentials were rejected" ;;
       esac
