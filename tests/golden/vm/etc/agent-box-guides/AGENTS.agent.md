@@ -40,12 +40,15 @@ to the terminal, which a remote user can't act on.
   settings page); they load on the next session (re)start — e.g. GH_TOKEN is
   read automatically, so `git clone https://github.com/...` just works.
 - Manage your own sessions without a rebuild:
-  `agent-box-session ls|add|rm|restart`. `add` takes an optional name plus
-  `--agent claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` — use it
-  to fan out work, add a reviewer agent, or open a plain shell. The kickoff
-  prompt fires once: a later respawn (crash, reboot, Spot restart) resumes
-  that session's transcript instead of redoing the work. `restart --all`
-  bounces every session. Listed sessions start within ~2s.
+  `agent-box-session ls|add|rm|stop|restart`. `add` takes an optional name
+  plus `--agent claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` —
+  use it to fan out work, add a reviewer agent, or open a plain shell. The
+  kickoff prompt fires once: a later respawn (crash, reboot, Spot restart)
+  resumes that session's transcript instead of redoing the work. An agent
+  quitting cleanly (`/quit`) or `stop NAME` parks a session — still listed,
+  not respawned — until `restart NAME` revives it; `rm` delists it for
+  good. `restart --all` bounces every session. Listed sessions start
+  within ~2s.
 
 ## Slash commands: type them into your own pane
 

@@ -137,6 +137,13 @@ let
 @@include-verbatim:src/env-exec.sh@@
   '';
 
+  # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
+  # quit, so the pane records stopped=true and the supervisor leaves the
+  # session down. See src/mark-stopped.sh for the exact semantics.
+  markStopped = name: pkgs.writeShellScript "agent-box-${name}-mark-stopped" ''
+@@include-verbatim:src/mark-stopped.sh@@
+  '';
+
   # Codex Remote Control supervisor (issue 103). Unlike claude's
   # `--remote-control` TUI flag, codex uses a dedicated app-server daemon.
   # `remote-control start` eagerly connects to the backend and fails before

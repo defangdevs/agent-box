@@ -9,6 +9,9 @@
 #     cgroup (the tmux server is a child of the supervisor),
 #   - the supervisor recreating a killed listed session (restart semantics)
 #     and NOT recreating a delisted one (destroy semantics),
+#   - stop semantics (issue 167): a clean agent exit (or agent-box-session
+#     stop) parks the session — listed, flagged stopped, left down — and
+#     restart clears the flag and revives it,
 #   - both agent CLIs installed regardless of what sessions run
 #     (installAgents default),
 #   - browser tmux clients advertise OSC 8 support, preserving a long hidden
@@ -585,6 +588,36 @@
         machine.wait_until_succeeds(
             tmux('display -p -t "=main:" "#{pane_pid}"') + f" | grep . | grep -vx '{old_all}'",
             timeout=60,
+        )
+
+    # --- stop semantics (issue 167): parked, not respawned ----------------
+    with subtest("clean agent exit parks the session instead of respawning"):
+        # `claude --help` exits 0 — the same clean exit /quit produces, minus
+        # the TUI. The pane epilogue must record stopped=true and the
+        # reconcile loop must then leave the session down (before #167 it
+        # respawned-and-resumed every clean exit within ~2s).
+        machine.succeed(as_agent("agent-box-session add quitter -- --help"))
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions.quitter.stopped == true' {sfile}", timeout=120
+        )
+        machine.wait_until_fails(tmux("has-session -t =quitter"), timeout=60)
+        machine.succeed("sleep 6")  # a few supervisor ticks
+        machine.fail(tmux("has-session -t =quitter"))
+        ls_out = machine.succeed(as_agent("agent-box-session ls"))
+        assert re.search(r"^quitter\s+claude\s+stopped", ls_out, re.M), ls_out
+        machine.succeed(as_agent("agent-box-session rm quitter"))
+
+    with subtest("stop parks a listed session; restart revives it"):
+        machine.succeed(as_agent("agent-box-session stop main"))
+        machine.succeed(f"jq -e '.sessions.main.stopped == true' {sfile}")
+        machine.wait_until_fails(tmux("has-session -t =main"), timeout=60)
+        machine.succeed("sleep 6")  # a few supervisor ticks
+        machine.fail(tmux("has-session -t =main"))
+        # restart clears the flag and the supervisor brings it back.
+        machine.succeed(as_agent("agent-box-session restart main"))
+        machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=60)
+        machine.succeed(
+            f"jq -e '.sessions.main | has(\"stopped\") | not' {sfile}"
         )
 
     # --- web surface -------------------------------------------------------

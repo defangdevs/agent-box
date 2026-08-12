@@ -490,8 +490,14 @@ def update_service_state():
 
 def session_counts():
     """How many configured sessions are currently live — the signal the
-    page watches to confirm a 'Restart all' has bounced and recovered."""
-    configured = [n for n in read_sessions() if SESSION_RE.match(n)]
+    page watches to confirm a 'Restart all' has bounced and recovered.
+    Stopped sessions are excluded on both sides: the supervisor will not
+    bring them up, so counting them would hold 'live < configured' (and
+    the page's restart spinner) open forever."""
+    configured = [
+        n for n, v in read_sessions().items()
+        if SESSION_RE.match(n) and not v.get("stopped")
+    ]
     live = live_sessions()
     return {
         "configured": len(configured),
@@ -533,7 +539,7 @@ EVENTS_MAX_STREAMS = 8    # a stream costs a thread; past this, clients poll
 
 def session_view():
     """The session state the pages actually render: order, name, agent,
-    working directory, live-or-starting.
+    working directory, live-or-starting, stopped.
 
     Deliberately not the whole of sessions.json — the supervisor folds
     bookkeeping into that file (hasRun, boxSessionId, clearing
@@ -548,6 +554,7 @@ def session_view():
             str(entries[name].get("agent") or "?"),
             str(entries[name].get("workingDirectory") or ""),
             name in live,
+            bool(entries[name].get("stopped")),
         ]
         for name in entries
     ]
@@ -960,7 +967,14 @@ def render_sessions():
             safe = html.escape(name)
             agent = html.escape(str(entries[name].get("agent") or "?"))
             cwd = html.escape(display_cwd(entries[name].get("workingDirectory")))
-            state = "live" if name in live else "starting"
+            # stopped = listed but deliberately down (clean agent exit or
+            # agent-box-session stop); the Restart button revives it.
+            if name in live:
+                state = "live"
+            elif entries[name].get("stopped"):
+                state = "stopped"
+            else:
+                state = "starting"
             items.append(
                 # The name deep-links into the terminal via ttyd's
                 # ?arg= session selector. No userinfo in the href
@@ -1040,7 +1054,7 @@ def render_new_session_fields():
     )
 
 
-def render_tabs(names, live, selected):
+def render_tabs(names, live, stopped, selected):
     """The workspace tab bar. File order, not sorted: sessions.json
     preserves insertion order, so a new session appears as the
     rightmost tab, like any terminal app. The dot-only .state span
@@ -1059,7 +1073,12 @@ def render_tabs(names, live, selected):
     for name in names:
         safe = html.escape(name)
         cur = ' aria-current="page"' if name == selected else ""
-        state = "live" if name in live else "starting"
+        if name in live:
+            state = "live"
+        elif name in stopped:
+            state = "stopped"
+        else:
+            state = "starting"
         items.append(
             f'<span class="tab-wrap">'
             f'<a class="tab" data-tab="{safe}" href="/?tab={safe}"{cur}>'
@@ -1075,18 +1094,25 @@ def render_tabs(names, live, selected):
     return "".join(items)
 
 
-def render_pane(selected, live):
+def render_pane(selected, live, stopped):
     """The server-rendered pane: only the SELECTED session, and only
     when its tmux session is already live — the ttyd attach wrapper
     greets a not-yet-started session with an error and exits, so a
     starting session gets a placeholder instead (SCRIPT swaps in the
-    iframe once the state flips; without JS, reloading does)."""
+    iframe once the state flips; without JS, reloading does). A stopped
+    session gets an honest placeholder: nothing is coming up until a
+    restart revives it."""
     if selected is None:
         return '<div class="pane placeholder active">No session selected.</div>'
     safe = html.escape(selected)
+    if selected in stopped and selected not in live:
+        return (f'<div class="pane placeholder active" data-pane="{safe}" '
+                f'data-ph="stopped">{safe} is stopped &mdash; Restart on '
+                f'the settings page revives it.</div>')
     if selected not in live:
-        return (f'<div class="pane placeholder active" data-pane="{safe}">'
-                f'{safe} is starting&hellip; reload in a few seconds.</div>')
+        return (f'<div class="pane placeholder active" data-pane="{safe}" '
+                f'data-ph="starting">{safe} is starting&hellip; '
+                f'reload in a few seconds.</div>')
     user = urllib.parse.quote(USER, safe="")
     # SESSION_RE names are URL-safe as-is.
     return (f'<iframe class="pane active" data-pane="{safe}" '
@@ -1140,6 +1166,7 @@ def render_home(message="", selected=None):
     if selected not in entries:
         selected = "main" if "main" in entries else (names[0] if names else None)
     live = live_sessions()
+    stopped = {n for n, v in entries.items() if v.get("stopped")}
     msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
     return (
         render_head("Agent Box &mdash; " + html.escape(USER))
@@ -1148,8 +1175,8 @@ def render_home(message="", selected=None):
             base=html.escape(BASE),
             action_base=html.escape(SESS_BASE),
             term_base="/%s/" % urllib.parse.quote(USER, safe=""),
-            tabs=render_tabs(names, live, selected),
-            pane=render_pane(selected, live),
+            tabs=render_tabs(names, live, stopped, selected),
+            pane=render_pane(selected, live, stopped),
             new_session_fields=render_new_session_fields(),
             message=msg_html,
         )
@@ -1515,6 +1542,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == SESS_BASE + "/sessions/restart":
             name = (form.get("name", [""])[0]).strip()
             if SESSION_RE.match(name):
+                # Restart doubles as the revive verb for a stopped session
+                # (clean agent exit or agent-box-session stop, issue #167):
+                # the stopped flag is what keeps the supervisor away, so
+                # clear it before the kill.
+                sessions = read_sessions()
+                entry = sessions.get(name)
+                if entry is not None and entry.pop("stopped", None) is not None:
+                    write_sessions(sessions)
                 kill_session(name)
             self._redirect("ok=session_restarted", self._sess_page(form))
         elif path == BASE + "/restart":
