@@ -33,6 +33,9 @@ golden.example.org {
     Cache-Control "no-store"
     X-Content-Type-Options "nosniff"
   }
+  # This fragment ends INSIDE the block on purpose: the module appends one
+  # webhook + terminal block per user (and the root block), then the closing
+  # brace. Nothing is missing here.
 
   handle /agent/webhook* {
     uri strip_prefix /agent/webhook

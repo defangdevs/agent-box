@@ -1,261 +1,261 @@
-    # The pid-managed daemon backend records and probes its app-server child by
-    # shelling out to a bare `ps` — procps sits on the agent unit's PATH
-    # (agentBaseTools), which every session inherits. Without it every start
-    # dies with "failed to invoke ps for pid-managed app server" and no
-    # control socket is ever created.
-    # The name the Codex apps label this box with ("serverName") comes straight
-    # from gethostname(2): codex exposes no env var, config key or flag for it
-    # (HOSTNAME does not even appear in the binary, and every candidate -c key
-    # is rejected by --strict-config). On a cloud box the kernel name is the
-    # INTERNAL fqdn (ip-10-x-x-x.<region>.compute.internal), which is useless in
-    # the apps — so when a public host label is configured, re-exec inside a
-    # private UTS namespace whose hostname is that label. An UNPRIVILEGED user
-    # namespace suffices: --keep-caps grants CAP_SYS_ADMIN inside the new
-    # namespace ONLY (the uid is unchanged, and the caps confer nothing
-    # outside), and unshare execs in place, so this stays the session's
-    # foreground pid and the trap below still tears the daemon down. The daemon
-    # inherits the namespace and keeps it alive after it detaches.
-    # /proc/sys/kernel/hostname is read-only under ProtectKernelTunables, so
-    # setting it needs a real sethostname(2) caller rather than a shell
-    # redirect. $1 is that label (empty = keep the kernel name).
-    rcname=$1; shift
-    if [ -n "$rcname" ] && [ -z "${AGENT_BOX_CODEX_UTS:-}" ]; then
-      export AGENT_BOX_CODEX_UTS=1
-      exec unshare --user --map-current-user --keep-caps --uts \
-        bash -c \
-        '"${AGENT_BOX_HOSTNAME_BIN:-hostname}" "$1" || exit 1; shift; exec "$@"' \
-        -- "$rcname" "$0" "$rcname" "$@"
-    fi
-    codex=$1; shift
-    stop() { "$codex" app-server daemon stop >/dev/null 2>&1 || true; }
-    # A daemon left over from an earlier start would make ours a no-op and
-    # leave us supervising nothing, so clear it first, then own a fresh one.
-    stop
-    trap 'stop; exit 0' HUP INT TERM
-    # This wrapper is the session's foreground command, so its stdout IS what
-    # the browser terminal shows, and its stdin IS the pane's keyboard. Without
-    # the output below the pane is a lone line of daemon-start JSON and then
-    # silence forever, with no hint that the session is healthy or that Remote
-    # Control cannot enroll until someone signs in (issue #159).
-    hr() { printf '%s\n' "────────────────────────────────────────────────────────────"; }
-    signed_in() { "$codex" login status >/dev/null 2>&1; }
-    # Run the sign-in HERE rather than printing the command for someone to paste
-    # into another session. This box is headless, so device auth is the only
-    # flow that works: plain `codex login` serves a localhost URL no outside
-    # browser can reach. codex prints the verification URL plus a one-time code
-    # (15 min) and blocks polling until the browser side finishes, which is
-    # exactly the foreground behaviour this pane wants.
-    #
-    # DANGER: `codex login --device-auth` REMOVES ~/.codex/auth.json as it
-    # starts and does not restore it if the flow is abandoned, so calling it on
-    # an already-signed-in box logs that box out. Never call it without the
-    # signed_in guard below. Supervision pauses while it blocks — a daemon that
-    # dies mid-login is noticed once the flow ends, which beats making sign-in
-    # someone else's job.
-    device_login() {
-      if signed_in; then return 0; fi
-      cat <<EOF
+# The pid-managed daemon backend records and probes its app-server child by
+# shelling out to a bare `ps` — procps sits on the agent unit's PATH
+# (agentBaseTools), which every session inherits. Without it every start
+# dies with "failed to invoke ps for pid-managed app server" and no
+# control socket is ever created.
+# The name the Codex apps label this box with ("serverName") comes straight
+# from gethostname(2): codex exposes no env var, config key or flag for it
+# (HOSTNAME does not even appear in the binary, and every candidate -c key
+# is rejected by --strict-config). On a cloud box the kernel name is the
+# INTERNAL fqdn (ip-10-x-x-x.<region>.compute.internal), which is useless in
+# the apps — so when a public host label is configured, re-exec inside a
+# private UTS namespace whose hostname is that label. An UNPRIVILEGED user
+# namespace suffices: --keep-caps grants CAP_SYS_ADMIN inside the new
+# namespace ONLY (the uid is unchanged, and the caps confer nothing
+# outside), and unshare execs in place, so this stays the session's
+# foreground pid and the trap below still tears the daemon down. The daemon
+# inherits the namespace and keeps it alive after it detaches.
+# /proc/sys/kernel/hostname is read-only under ProtectKernelTunables, so
+# setting it needs a real sethostname(2) caller rather than a shell
+# redirect. $1 is that label (empty = keep the kernel name).
+rcname=$1; shift
+if [ -n "$rcname" ] && [ -z "${AGENT_BOX_CODEX_UTS:-}" ]; then
+  export AGENT_BOX_CODEX_UTS=1
+  exec unshare --user --map-current-user --keep-caps --uts \
+    bash -c \
+    '"${AGENT_BOX_HOSTNAME_BIN:-hostname}" "$1" || exit 1; shift; exec "$@"' \
+    -- "$rcname" "$0" "$rcname" "$@"
+fi
+codex=$1; shift
+stop() { "$codex" app-server daemon stop >/dev/null 2>&1 || true; }
+# A daemon left over from an earlier start would make ours a no-op and
+# leave us supervising nothing, so clear it first, then own a fresh one.
+stop
+trap 'stop; exit 0' HUP INT TERM
+# This wrapper is the session's foreground command, so its stdout IS what
+# the browser terminal shows, and its stdin IS the pane's keyboard. Without
+# the output below the pane is a lone line of daemon-start JSON and then
+# silence forever, with no hint that the session is healthy or that Remote
+# Control cannot enroll until someone signs in (issue #159).
+hr() { printf '%s\n' "────────────────────────────────────────────────────────────"; }
+signed_in() { "$codex" login status >/dev/null 2>&1; }
+# Run the sign-in HERE rather than printing the command for someone to paste
+# into another session. This box is headless, so device auth is the only
+# flow that works: plain `codex login` serves a localhost URL no outside
+# browser can reach. codex prints the verification URL plus a one-time code
+# (15 min) and blocks polling until the browser side finishes, which is
+# exactly the foreground behaviour this pane wants.
+#
+# DANGER: `codex login --device-auth` REMOVES ~/.codex/auth.json as it
+# starts and does not restore it if the flow is abandoned, so calling it on
+# an already-signed-in box logs that box out. Never call it without the
+# signed_in guard below. Supervision pauses while it blocks — a daemon that
+# dies mid-login is noticed once the flow ends, which beats making sign-in
+# someone else's job.
+device_login() {
+  if signed_in; then return 0; fi
+  cat <<EOF
 
   Signing this box in to ChatGPT — you do not need another terminal.
   Open the link below on any device and enter the code it shows.
 
 EOF
-      "$codex" login --device-auth
-    }
-    # `login status` is a LOCAL check: it reports how ~/.codex/auth.json was
-    # minted, not whether the backend still honours it. Credentials the server
-    # has invalidated (password change, revoked session, expired refresh token)
-    # keep reporting "Logged in using ChatGPT", so signed_in() stays true,
-    # device_login() correctly declines, and PAIRING is the first thing that
-    # notices — with an HTTP 401 whose body names the reason. Recognise that
-    # shape so the pane can re-authenticate itself instead of printing the
-    # transport guts and waiting for a user who would have to know the
-    # undocumented `login` word to get out of it (issue 187). Deliberately
-    # narrow: enrollment races and network failures must NOT match, because
-    # retrying is the right answer for those and dropping credentials is not.
-    auth_rejected() {
-      # Shell globs, not grep: the agent unit's PATH is curated (coreutils, but
-      # no gnugrep), and a `grep: command not found` here would silently read as
-      # "not an auth failure" and quietly restore the old dead end.
-      case "$1" in
-        *token_invalidated*|*invalid_grant*|*"HTTP 401"*|*[Uu]nauthorized* \
-          |*"sign in again"*|*"signing in again"*) return 0 ;;
-      esac
-      return 1
-    }
-    # The only part of the JSON-RPC blob worth showing a human is the server's
-    # own message; the URL, cf-ray and status code belong in a bug report.
-    auth_reason() {
-      reason=$1
-      case "$reason" in
-        *'"message":"'*)
-          reason=${reason#*'"message":"'}
-          reason=${reason%%'"'*}
-          ;;
-        *) reason="the stored credentials were rejected" ;;
-      esac
-      printf '%s' "$reason"
-    }
-    # A pairing code is what the Codex desktop/mobile apps ask for to adopt this
-    # box, so mint it here too. The first attempt after a cold daemon start
-    # races enrollment and fails with either "timed out waiting for
-    # remoteControl/pairing/start response" or "pairing is unavailable until
-    # enrollment completes"; both clear on a retry, so retry instead of handing
-    # the error to the user. The last attempt re-enables Remote Control first:
-    # enrollment cannot complete while logged out, so a daemon that came up
-    # before sign-in needs the nudge once credentials exist.
-    #
-    # Exit status: 0 paired, 2 the credentials were rejected (caller
-    # re-authenticates), 1 anything else (already reported, retryable).
-    pair() {
-      attempt=0
-      while [ "$attempt" -lt 3 ]; do
-        attempt=$((attempt + 1))
-        if [ "$attempt" -eq 3 ]; then
-          "$codex" app-server daemon enable-remote-control >/dev/null 2>&1 || true
-        fi
-        if pairout=$("$codex" remote-control pair 2>&1); then
-          printf '\n  ✓ %s\n' "$pairout"
-          cat <<EOF
+  "$codex" login --device-auth
+}
+# `login status` is a LOCAL check: it reports how ~/.codex/auth.json was
+# minted, not whether the backend still honours it. Credentials the server
+# has invalidated (password change, revoked session, expired refresh token)
+# keep reporting "Logged in using ChatGPT", so signed_in() stays true,
+# device_login() correctly declines, and PAIRING is the first thing that
+# notices — with an HTTP 401 whose body names the reason. Recognise that
+# shape so the pane can re-authenticate itself instead of printing the
+# transport guts and waiting for a user who would have to know the
+# undocumented `login` word to get out of it (issue 187). Deliberately
+# narrow: enrollment races and network failures must NOT match, because
+# retrying is the right answer for those and dropping credentials is not.
+auth_rejected() {
+  # Shell globs, not grep: the agent unit's PATH is curated (coreutils, but
+  # no gnugrep), and a `grep: command not found` here would silently read as
+  # "not an auth failure" and quietly restore the old dead end.
+  case "$1" in
+    *token_invalidated*|*invalid_grant*|*"HTTP 401"*|*[Uu]nauthorized* \
+      |*"sign in again"*|*"signing in again"*) return 0 ;;
+  esac
+  return 1
+}
+# The only part of the JSON-RPC blob worth showing a human is the server's
+# own message; the URL, cf-ray and status code belong in a bug report.
+auth_reason() {
+  reason=$1
+  case "$reason" in
+    *'"message":"'*)
+      reason=${reason#*'"message":"'}
+      reason=${reason%%'"'*}
+      ;;
+    *) reason="the stored credentials were rejected" ;;
+  esac
+  printf '%s' "$reason"
+}
+# A pairing code is what the Codex desktop/mobile apps ask for to adopt this
+# box, so mint it here too. The first attempt after a cold daemon start
+# races enrollment and fails with either "timed out waiting for
+# remoteControl/pairing/start response" or "pairing is unavailable until
+# enrollment completes"; both clear on a retry, so retry instead of handing
+# the error to the user. The last attempt re-enables Remote Control first:
+# enrollment cannot complete while logged out, so a daemon that came up
+# before sign-in needs the nudge once credentials exist.
+#
+# Exit status: 0 paired, 2 the credentials were rejected (caller
+# re-authenticates), 1 anything else (already reported, retryable).
+pair() {
+  attempt=0
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -eq 3 ]; then
+      "$codex" app-server daemon enable-remote-control >/dev/null 2>&1 || true
+    fi
+    if pairout=$("$codex" remote-control pair 2>&1); then
+      printf '\n  ✓ %s\n' "$pairout"
+      cat <<EOF
     Enter it in the Codex desktop or mobile app to adopt this box
     ("$(uname -n)"). Codes expire quickly — press Enter here for a
     fresh one. Already paired? Nothing to do; ignore this code.
 EOF
-          return 0
-        fi
-        # Retrying a token the backend has rejected just prints the same 401
-        # three times over six seconds; hand it to the caller at once.
-        if auth_rejected "$pairout"; then return 2; fi
-        sleep 2
-      done
-      printf '\n  ✗ Could not mint a pairing code:\n' >&2
-      printf '%s\n' "$pairout" >&2
-      printf '%s\n' "    Press Enter to try again." >&2
-      return 1
-    }
-    # One key for "do whatever is next": sign in if logged out, then pair. Run
-    # on startup and on every Enter, so a session that is already paired, one
-    # waiting on sign-in, and one whose code just expired all respond to the
-    # same keystroke.
-    #
-    # Rejected credentials are the one failure Enter cannot fix on its own, so
-    # onboard fixes it: sign in again automatically. Guarded by a flag rather
-    # than run unconditionally — `logout` is destructive, and a backend
-    # answering 401 for some reason a fresh token won't cure would otherwise
-    # put the pane in a logout/device-auth spin. The flag clears on a
-    # successful pairing, so a token that expires later in the same pane's life
-    # still gets one automatic recovery.
-    relogin_tried=false
-    onboard() {
-      device_login || true
-      if signed_in; then
-        pair; pairrc=$?
-        if [ "$pairrc" -eq 0 ]; then
-          relogin_tried=false
-        elif [ "$pairrc" -eq 2 ] && [ "$relogin_tried" = false ]; then
-          relogin_tried=true
-          # No "signing in again" line here: device_login's own banner says
-          # exactly that, and says it right before the URL and code.
-          printf '\n  ✗ ChatGPT rejected this box'"'"'s stored credentials:\n'
-          printf '    %s\n' "$(auth_reason "$pairout")"
-          relogin
-        elif [ "$pairrc" -eq 2 ]; then
-          # Already re-authenticated once this cycle and still rejected: the
-          # account itself is the problem (wrong account, revoked access), which
-          # no amount of retrying here can tell apart. Say so instead of looping.
-          printf '\n  ✗ ChatGPT still rejects the credentials: %s\n' "$(auth_reason "$pairout")" >&2
-          printf '%s\n' "    Sign-in was already retried once. Type: login  to try again," >&2
-          printf '%s\n' "    or check that the account you signed in with has Codex access." >&2
-        fi
-      else
-        cat <<EOF
+      return 0
+    fi
+    # Retrying a token the backend has rejected just prints the same 401
+    # three times over six seconds; hand it to the caller at once.
+    if auth_rejected "$pairout"; then return 2; fi
+    sleep 2
+  done
+  printf '\n  ✗ Could not mint a pairing code:\n' >&2
+  printf '%s\n' "$pairout" >&2
+  printf '%s\n' "    Press Enter to try again." >&2
+  return 1
+}
+# One key for "do whatever is next": sign in if logged out, then pair. Run
+# on startup and on every Enter, so a session that is already paired, one
+# waiting on sign-in, and one whose code just expired all respond to the
+# same keystroke.
+#
+# Rejected credentials are the one failure Enter cannot fix on its own, so
+# onboard fixes it: sign in again automatically. Guarded by a flag rather
+# than run unconditionally — `logout` is destructive, and a backend
+# answering 401 for some reason a fresh token won't cure would otherwise
+# put the pane in a logout/device-auth spin. The flag clears on a
+# successful pairing, so a token that expires later in the same pane's life
+# still gets one automatic recovery.
+relogin_tried=false
+onboard() {
+  device_login || true
+  if signed_in; then
+    pair; pairrc=$?
+    if [ "$pairrc" -eq 0 ]; then
+      relogin_tried=false
+    elif [ "$pairrc" -eq 2 ] && [ "$relogin_tried" = false ]; then
+      relogin_tried=true
+      # No "signing in again" line here: device_login's own banner says
+      # exactly that, and says it right before the URL and code.
+      printf '\n  ✗ ChatGPT rejected this box'"'"'s stored credentials:\n'
+      printf '    %s\n' "$(auth_reason "$pairout")"
+      relogin
+    elif [ "$pairrc" -eq 2 ]; then
+      # Already re-authenticated once this cycle and still rejected: the
+      # account itself is the problem (wrong account, revoked access), which
+      # no amount of retrying here can tell apart. Say so instead of looping.
+      printf '\n  ✗ ChatGPT still rejects the credentials: %s\n' "$(auth_reason "$pairout")" >&2
+      printf '%s\n' "    Sign-in was already retried once. Type: login  to try again," >&2
+      printf '%s\n' "    or check that the account you signed in with has Codex access." >&2
+    fi
+  else
+    cat <<EOF
 
   ✗ Not signed in — Remote Control cannot enroll, so pairing will fail.
     Press Enter to run the device-code sign-in again.
 EOF
-      fi
-    }
-    # Drop credentials that satisfy `login status` but the backend rejects (or
-    # that belong to the wrong account), so device_login stops declining and the
-    # device flow can run. Reached two ways: automatically from onboard when
-    # pairing came back 401, and by typing `login` — still worth keeping as a
-    # typed word, because the wrong-ACCOUNT case produces no error string to
-    # detect and only the user knows about it.
-    relogin() {
-      "$codex" logout >/dev/null 2>&1 || true
-      onboard
-      # The logout may be ALL that happened — a device flow the user walked away
-      # from leaves the box signed out. Say so, so the health loop's transition
-      # check notices whenever sign-in does complete.
-      signed_in || was_signed_in=false
-    }
-    daemon_failed() {
-      cat >&2 <<EOF
+  fi
+}
+# Drop credentials that satisfy `login status` but the backend rejects (or
+# that belong to the wrong account), so device_login stops declining and the
+# device flow can run. Reached two ways: automatically from onboard when
+# pairing came back 401, and by typing `login` — still worth keeping as a
+# typed word, because the wrong-ACCOUNT case produces no error string to
+# detect and only the user knows about it.
+relogin() {
+  "$codex" logout >/dev/null 2>&1 || true
+  onboard
+  # The logout may be ALL that happened — a device flow the user walked away
+  # from leaves the box signed out. Say so, so the health loop's transition
+  # check notices whenever sign-in does complete.
+  signed_in || was_signed_in=false
+}
+daemon_failed() {
+  cat >&2 <<EOF
 
   Codex Remote Control daemon failed to $1.
   Log: ${CODEX_HOME:-$HOME/.codex}/app-server-daemon/app-server.stderr.log
   The shell you are dropped into is a post-mortem, not the session;
   restart from the settings page once the cause is fixed.
 EOF
-    }
-    # Daemon-start chatter is a JSON blob that means nothing to a human; keep it
-    # in the log the failure path points at rather than as the pane's first
-    # impression.
-    "$codex" app-server daemon start "$@" >/dev/null || { daemon_failed "start"; stop; exit 1; }
-    "$codex" app-server daemon enable-remote-control >/dev/null \
-      || { daemon_failed "enable remote control"; stop; exit 1; }
-    hr
-    printf '%s\n' "  agent-box: codex Remote Control daemon is running."
-    printf '%s\n' "  This pane is not a codex prompt — it signs the box in and pairs it."
-    printf '%s\n' "  Machine name in the Codex apps: $(uname -n)"
-    hr
+}
+# Daemon-start chatter is a JSON blob that means nothing to a human; keep it
+# in the log the failure path points at rather than as the pane's first
+# impression.
+"$codex" app-server daemon start "$@" >/dev/null || { daemon_failed "start"; stop; exit 1; }
+"$codex" app-server daemon enable-remote-control >/dev/null \
+  || { daemon_failed "enable remote control"; stop; exit 1; }
+hr
+printf '%s\n' "  agent-box: codex Remote Control daemon is running."
+printf '%s\n' "  This pane is not a codex prompt — it signs the box in and pairs it."
+printf '%s\n' "  Machine name in the Codex apps: $(uname -n)"
+hr
+onboard
+printf '\n%s\n' "  [Enter] fresh pairing code   ·   [type: login] sign in again"
+# `sleep & wait` (not a bare sleep) so a signal interrupts the wait at
+# once and the trap fires without waiting the interval out.
+was_signed_in=false
+signed_in && was_signed_in=true
+# Read the keyboard only where there is one: with no terminal (a systemd
+# unit, a pane fed from /dev/null) read returns EOF instantly and the health
+# loop below would spin at full tilt.
+keyboard=false
+[ -t 0 ] && keyboard=true
+while "$codex" app-server daemon version >/dev/null 2>&1; do
+  if [ "$keyboard" = true ]; then
+    # Enter re-runs onboard (fresh pairing code, or another sign-in attempt),
+    # which is why the interval is a read timeout rather than a sleep: the
+    # daemon health probe still runs every 5s either way. Exit >128 is that
+    # timeout; anything else is EOF (Ctrl-D, or the terminal went away), the
+    # same spin risk as having no terminal at all — so stop reading and fall
+    # back to sleeping, still supervising the daemon.
+    IFS= read -r -t 5 key; rc=$?
+    if [ "$rc" -eq 0 ]; then
+      case "$key" in
+        login|relogin|logout)
+          printf '\n  Dropping stored credentials and signing in again.\n'
+          relogin_tried=true
+          relogin
+          ;;
+        *) onboard ;;
+      esac
+    elif [ "$rc" -le 128 ]; then
+      keyboard=false
+    fi
+  else
+    sleep 5 & wait $!
+  fi
+  # Sign-in can still complete somewhere else (a shell session, an
+  # `agent-box-session env`-provided token), so poll for the transition and
+  # pair on it — otherwise the pane sits on "not signed in" long after it
+  # stopped being true and the user has no idea pairing is now unblocked.
+  # Short-circuited on purpose: once signed in this costs no `login status`
+  # subprocess every 5s. relogin() resets the flag when it leaves the box
+  # signed out, which is the only way it goes back to false.
+  if [ "$was_signed_in" = false ] && signed_in; then
+    was_signed_in=true
+    printf '\n  ✓ Signed in.\n'
+    # onboard, not a bare pair: it owns the rejected-credentials handling,
+    # and its device_login is a no-op now that signed_in() is true.
     onboard
-    printf '\n%s\n' "  [Enter] fresh pairing code   ·   [type: login] sign in again"
-    # `sleep & wait` (not a bare sleep) so a signal interrupts the wait at
-    # once and the trap fires without waiting the interval out.
-    was_signed_in=false
-    signed_in && was_signed_in=true
-    # Read the keyboard only where there is one: with no terminal (a systemd
-    # unit, a pane fed from /dev/null) read returns EOF instantly and the health
-    # loop below would spin at full tilt.
-    keyboard=false
-    [ -t 0 ] && keyboard=true
-    while "$codex" app-server daemon version >/dev/null 2>&1; do
-      if [ "$keyboard" = true ]; then
-        # Enter re-runs onboard (fresh pairing code, or another sign-in attempt),
-        # which is why the interval is a read timeout rather than a sleep: the
-        # daemon health probe still runs every 5s either way. Exit >128 is that
-        # timeout; anything else is EOF (Ctrl-D, or the terminal went away), the
-        # same spin risk as having no terminal at all — so stop reading and fall
-        # back to sleeping, still supervising the daemon.
-        IFS= read -r -t 5 key; rc=$?
-        if [ "$rc" -eq 0 ]; then
-          case "$key" in
-            login|relogin|logout)
-              printf '\n  Dropping stored credentials and signing in again.\n'
-              relogin_tried=true
-              relogin
-              ;;
-            *) onboard ;;
-          esac
-        elif [ "$rc" -le 128 ]; then
-          keyboard=false
-        fi
-      else
-        sleep 5 & wait $!
-      fi
-      # Sign-in can still complete somewhere else (a shell session, an
-      # `agent-box-session env`-provided token), so poll for the transition and
-      # pair on it — otherwise the pane sits on "not signed in" long after it
-      # stopped being true and the user has no idea pairing is now unblocked.
-      # Short-circuited on purpose: once signed in this costs no `login status`
-      # subprocess every 5s. relogin() resets the flag when it leaves the box
-      # signed out, which is the only way it goes back to false.
-      if [ "$was_signed_in" = false ] && signed_in; then
-        was_signed_in=true
-        printf '\n  ✓ Signed in.\n'
-        # onboard, not a bare pair: it owns the rejected-credentials handling,
-        # and its device_login is a no-op now that signed_in() is true.
-        onboard
-      fi
-    done
+  fi
+done
