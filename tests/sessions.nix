@@ -12,6 +12,10 @@
 #   - stop semantics (issue 167): a clean agent exit (or agent-box-session
 #     stop) parks the session — listed, flagged stopped, left down — and
 #     restart clears the flag and revives it,
+#   - the claude SessionStart writeback keeping boxSessionId on the session
+#     claude is really writing, so a respawn after /clear does not resume the
+#     cleared transcript — and ignoring a nested claude that fires the same
+#     hook,
 #   - both agent CLIs installed regardless of what sessions run
 #     (installAgents default),
 #   - browser tmux clients advertise OSC 8 support, preserving a long hidden
@@ -624,6 +628,81 @@
         machine.succeed(
             f"jq -e '.sessions.main | has(\"stopped\") | not' {sfile}"
         )
+
+    # --- boxSessionId follows /clear --------------------------------------
+    # The supervisor pins boxSessionId on the first spawn and resumes it
+    # forever after, but claude mints a NEW session id on /clear and leaves
+    # the old transcript behind. Without the SessionStart writeback hook the
+    # next respawn resumed the conversation the user had just cleared.
+    # claude cannot reach a session in the sandbox (no login), so the hook is
+    # driven directly, with the process tree it gates on rebuilt around it.
+    with subtest("SessionStart hook re-pins boxSessionId to the live session"):
+        settings = "/home/agent/.claude/settings.json"
+        cmds = machine.wait_until_succeeds(
+            "jq -r '[.hooks.SessionStart[]?.hooks[]?.command] | join(\" \")' " + settings,
+            timeout=60,
+        )
+        assert cmds.count("session-id-writeback") == 1, cmds
+        hook = [c for c in cmds.split() if "session-id-writeback" in c][0]
+
+        # tmux new-session -e puts the session name in the pane environment,
+        # which is the only way a hook (a child of the agent) can learn it.
+        env = machine.succeed(tmux('show-environment -t "=main" AGENT_BOX_SESSION'))
+        assert env.strip() == "AGENT_BOX_SESSION=main", env
+
+        # The gate accepts only the pane's OWN agent, identified as the
+        # nearest claude ancestor whose parent is the launcher the supervisor
+        # handed to tmux — that launcher's command string always carries the
+        # env-exec wrapper path.
+        unit_env = machine.succeed(
+            "systemctl show agent-box-agent.service -p Environment --value"
+        )
+        marker = [w.split("=", 1)[1] for w in unit_env.split() if w.startswith("AGENT_BOX_ENV_EXEC=")][0]
+        machine.succeed(
+            "mkdir -p /tmp/fakebin && "
+            # a stand-in for the agent process: all the gate reads is that its
+            # command line says claude and what its parent's says
+            "printf '#!/bin/sh\\neval \"$FAKE_HOOK\"\\n' > /tmp/fakebin/claude && "
+            "chmod 755 /tmp/fakebin/claude && chmod 755 /tmp/fakebin"
+        )
+        payload = json.dumps({"session_id": "aaaaaaaa-0000-0000-0000-00000000000f",
+                              "hook_event_name": "SessionStart", "source": "clear"})
+        # launcher frame kept alive by a trailing command, exactly as the
+        # spawn epilogue (`... && mark-stopped || exec bash`) keeps the real
+        # one from exec-ing itself away
+        pane = f"sh -c \"true '{marker}'; /tmp/fakebin/claude; true\""
+        before = machine.succeed(f"jq -r '.sessions.main.boxSessionId' {sfile}").strip()
+
+        machine.succeed(as_agent(
+            f"echo {shlex.quote(payload)} | FAKE_HOOK={hook} AGENT_BOX_SESSION=main {pane}"
+        ))
+        after = machine.succeed(f"jq -r '.sessions.main.boxSessionId' {sfile}").strip()
+        assert after == "aaaaaaaa-0000-0000-0000-00000000000f", f"{before} -> {after}"
+
+        # A `claude -p` an agent runs from its own tool call fires
+        # SessionStart too. Pinning THAT id would repoint the session at a
+        # one-shot transcript, so a claude below the pane's agent is ignored.
+        nested = json.dumps({"session_id": "bbbbbbbb-0000-0000-0000-00000000000f",
+                             "hook_event_name": "SessionStart", "source": "startup"})
+        machine.succeed(
+            "printf '#!/bin/sh\\nFAKE_HOOK=%s exec /tmp/fakebin/claude\\n' "
+            f"{hook} > /tmp/fakebin/nested && chmod 755 /tmp/fakebin/nested"
+        )
+        machine.succeed(as_agent(
+            f"echo {shlex.quote(nested)} | FAKE_HOOK=/tmp/fakebin/nested AGENT_BOX_SESSION=main {pane}"
+        ))
+        machine.succeed(
+            f"jq -e '.sessions.main.boxSessionId == \"aaaaaaaa-0000-0000-0000-00000000000f\"' {sfile}"
+        )
+
+        # Re-seeded on every spawn: a respawn must not stack duplicates.
+        machine.succeed(as_agent("agent-box-session restart main"))
+        machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=60)
+        cmds = machine.wait_until_succeeds(
+            "jq -r '[.hooks.SessionStart[]?.hooks[]?.command] | join(\" \")' " + settings,
+            timeout=60,
+        )
+        assert cmds.count("session-id-writeback") == 1, cmds
 
     # --- web surface -------------------------------------------------------
     machine_ip = machine.succeed("ip -4 -o addr show eth1 | head -1").split()[3].split("/")[0]

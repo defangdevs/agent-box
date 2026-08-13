@@ -138,6 +138,14 @@ let
 @@include-verbatim:src/mark-stopped.sh@@
   '';
 
+  # claude SessionStart hook: re-pin boxSessionId to the session id claude
+  # is really writing, so /clear is not undone by the next respawn. See
+  # src/session-id-writeback.sh for the ancestry gate that keeps a nested
+  # `claude -p` from repointing the session.
+  sessionIdWriteback = name: pkgs.writeShellScript "agent-box-${name}-session-id-writeback" ''
+@@include-verbatim:src/session-id-writeback.sh@@
+  '';
+
   # Codex Remote Control supervisor (issue 103). Unlike claude's
   # `--remote-control` TUI flag, codex uses a dedicated app-server daemon.
   # `remote-control start` eagerly connects to the backend and fails before
@@ -1335,6 +1343,10 @@ in
             # Still per-user (it edits THIS user's sessions.json), so the
             # user-independent script takes its path from the environment.
             AGENT_BOX_MARK_STOPPED = "${markStopped name}";
+            # claude SessionStart hook (same per-user reasoning as
+            # AGENT_BOX_MARK_STOPPED): the supervisor registers it in this
+            # user's ~/.claude/settings.json before every claude spawn.
+            AGENT_BOX_SESSION_WRITEBACK = "${sessionIdWriteback name}";
             # grep/find are deliberately not on this unit's PATH (see
             # agentBaseTools), so the supervisor's transcript lookups get
             # pinned binaries instead (the AGENT_BOX_*_BIN convention).

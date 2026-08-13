@@ -68,6 +68,26 @@ seed_claude_state() {
   # seeded, the first session clones the marketplace, populates the
   # plugin cache and connects the MCP server on its own. Idempotent:
   # plain merges, so a hand `/plugin` change survives.
+  # Keep boxSessionId honest across /clear (see
+  # src/session-id-writeback.sh). claude reports the live session id at
+  # every SessionStart; without this hook the pin only ever held the id
+  # minted on the first spawn, so a respawn after a /clear resumed the
+  # transcript the user had just cleared.
+  #
+  # Registered per spawn and idempotent: drop any entry we installed
+  # before (matched on the script's fixed basename suffix, so a store
+  # path that moved with a rebuild is replaced, not duplicated), then
+  # append the current one. Hooks the user added by hand survive.
+  if [ -n "${AGENT_BOX_SESSION_WRITEBACK:-}" ]; then
+    seed_json "$HOME"/.claude/settings.json \
+      --arg cmd "$AGENT_BOX_SESSION_WRITEBACK" \
+      '.hooks.SessionStart = (((.hooks.SessionStart // [])
+         | map(.hooks = ((.hooks // [])
+             | map(select((.command // "")
+                 | contains("session-id-writeback") | not))))
+         | map(select((.hooks // []) | length > 0)))
+       + [{hooks: [{type: "command", command: $cmd}]}])'
+  fi
   if [ -n "${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
     seed_json "$HOME"/.claude/settings.json \
       --arg whrepo "$AGENT_BOX_WEBHOOK_REPO" \
@@ -480,7 +500,11 @@ start_session() {
   if [ -n "${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
     whargs="-e LOCAL_WEBHOOK_SESSION=$USER-$sname -e LOCAL_WEBHOOK_STATE_DIR=$HOME/.local/state/local-webhook -e LOCAL_WEBHOOK_PORT=0"
   fi
-  if $TMUX new-session -d -s "$sname" -c "$wd" $whargs \
+  # AGENT_BOX_SESSION names the session to everything running in the pane.
+  # The SessionStart hook needs it to know WHICH entry to re-pin, and it
+  # has to arrive the same way as the webhook identity above: a hook runs
+  # as a child of the agent, so only the session environment reaches it.
+  if $TMUX new-session -d -s "$sname" -c "$wd" -e AGENT_BOX_SESSION="$sname" $whargs \
        "${AGENT_BOX_ENV_EXEC:?} $cmd$epilogue"; then
     if ! listed; then
       $TMUX kill-session -t "=$sname" 2>/dev/null || true

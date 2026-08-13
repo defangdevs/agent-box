@@ -363,6 +363,139 @@ let
     exit 0
   '';
 
+  # claude SessionStart hook: re-pin boxSessionId to the session id claude
+  # is really writing, so /clear is not undone by the next respawn. See
+  # src/session-id-writeback.sh for the ancestry gate that keeps a nested
+  # `claude -p` from repointing the session.
+  sessionIdWriteback = name: pkgs.writeShellScript "agent-box-${name}-session-id-writeback" ''
+    # SessionStart hook: keep boxSessionId pointing at the transcript the
+    # agent is ACTUALLY writing.
+    #
+    # The supervisor mints boxSessionId once, on the first spawn, and
+    # resumes it forever after. claude does not honour that pin: /clear
+    # starts a NEW session id and a NEW transcript, leaving the old file
+    # untouched on disk. Nothing wrote the new id back, so the next
+    # respawn (crash, restart, reboot, Spot stop) passed --resume <old
+    # id> and restored the conversation the user had just cleared, with
+    # the resume prologue on top of it. /resume-ing to a different
+    # session had the same effect. This hook closes that gap: claude
+    # reports the live session id at every SessionStart, and we store it.
+    #
+    # WHY THE ANCESTRY GATE. This hook is registered in the user-level
+    # ~/.claude/settings.json, so it fires for EVERY claude this user
+    # runs — including a `claude -p` an agent starts from its own Bash
+    # tool inside the pane (verified: those fire SessionStart too, with
+    # source "startup"). Writing that throwaway id back would repoint
+    # the session at a one-shot transcript — a worse failure than the
+    # bug being fixed. So a write is accepted only from the pane's OWN
+    # agent process, identified structurally:
+    #
+    #   hook -> [ ...shell... ] -> nearest claude ancestor -> its parent
+    #
+    # The pane's agent is the direct child of the `bash -c` the
+    # supervisor handed to tmux, whose command string always contains
+    # the env-exec wrapper path. A nested claude's parent is the tool
+    # shell (or whatever launched it) instead, which never carries that
+    # store path. Walking to the NEAREST claude ancestor (not the first
+    # marker we can find) is what makes the two cases differ: a nested
+    # claude sits below the session's claude, so an unbounded walk would
+    # reach the pane launcher and wrongly accept.
+    #
+    # Failure is always silent and always exit 0 — a SessionStart hook
+    # that errors is noise in the user's transcript, and every path here
+    # is best-effort bookkeeping, never a reason to disturb a session.
+    FILE=${lib.escapeShellArg (userSessionsFile name)}
+    JQ=${pkgs.jq}/bin/jq
+    CU=${pkgs.coreutils}/bin
+    # The pane launcher's fingerprint. Same store path for every user and
+    # every session, and it cannot appear in an unrelated command line.
+    MARKER=${envExecWrapper}
+
+    # Drain the payload FIRST, before any gate can exit. claude writes the
+    # hook input to our stdin, so a hook that exits without reading hands
+    # the writer EPIPE — and every claude this user runs OUTSIDE a managed
+    # session (the AGENT_BOX_SESSION gate below) takes exactly that path.
+    # Same pipefail/EPIPE shape as issue #219, on the other side of the
+    # pipe.
+    payload="$("$CU"/cat 2>/dev/null)" || payload=""
+
+    # tmux new-session -e puts this in the SESSION environment, so the
+    # agent and everything it runs inherit it (same mechanism as
+    # LOCAL_WEBHOOK_SESSION). Unset means claude was started outside a
+    # managed session — nothing to record.
+    sname="''${AGENT_BOX_SESSION:-}"
+    [ -n "$sname" ] || exit 0
+    case "$sname" in (*[!A-Za-z0-9_-]*) exit 0 ;; esac
+
+    sid="$(printf '%s' "$payload" | "$JQ" -r '.session_id // empty' 2>/dev/null)" || exit 0
+    [ -n "$sid" ] || exit 0
+    [ -s "$FILE" ] || exit 0
+
+    # /proc readers, in bash builtins where possible: this runs on the
+    # startup path of every session, and the hook's PATH is claude's, not
+    # ours. Command substitution drops the NULs in cmdline, joining argv
+    # into one string — fine, we only ever substring-match it.
+    ppid_of() {
+      while read -r _k _v _rest; do
+        [ "$_k" = PPid: ] && { printf '%s' "$_v"; return 0; }
+      done < /proc/"$1"/status 2>/dev/null
+      return 1
+    }
+    cmdline_of() { "$CU"/tr '\0' ' ' < /proc/"$1"/cmdline 2>/dev/null; }
+
+    # Nearest claude ancestor. Skip any frame whose command line carries
+    # THIS script's path: claude may run the hook through an
+    # intermediate `sh -c`, and our own store path contains "claude"
+    # (agent-box-<user>-session-id-writeback lives beside the rest), so
+    # an unguarded match would stop on the wrapper and reject a
+    # perfectly good write. 16 frames is far past any real nesting.
+    agent=""
+    p="$PPID"
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+      { [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ]; } || break
+      _cmd="$(cmdline_of "$p")"
+      case "$_cmd" in
+        (*"$0"*) : ;;
+        (*claude*) agent="$p"; break ;;
+      esac
+      p="$(ppid_of "$p")" || break
+    done
+    [ -n "$agent" ] || exit 0
+    parent="$(ppid_of "$agent")" || exit 0
+    case "$(cmdline_of "$parent")" in
+      (*"$MARKER"*) : ;;
+      (*) exit 0 ;;
+    esac
+
+    # Nothing to do when the pin is already right — the common case
+    # (first spawn seeds it via --session-id, a respawn resumes it), and
+    # skipping the write keeps this off mark_started's toes.
+    "$JQ" -e --arg s "$sname" --arg id "$sid" \
+      '.sessions[$s].boxSessionId == $id' "$FILE" >/dev/null 2>&1 && exit 0
+
+    # has($s) so a session delisted mid-flight is not re-created as a
+    # stub, and agent=="claude" so a hand-run claude inside a shell
+    # session cannot pin an id on an entry that never resumes one.
+    for _ in 1 2 3; do
+      tmp="$("$CU"/mktemp "$FILE.XXXXXX")" || exit 0
+      if "$JQ" --arg s "$sname" --arg id "$sid" \
+           'if (.sessions | has($s)) and (.sessions[$s].agent == "claude")
+            then .sessions[$s].boxSessionId = $id else . end' \
+           "$FILE" > "$tmp" 2>/dev/null; then
+        "$CU"/mv "$tmp" "$FILE"
+      else
+        "$CU"/rm -f "$tmp"
+      fi
+      "$JQ" -e --arg s "$sname" --arg id "$sid" \
+        '(.sessions | has($s) | not)
+         or (.sessions[$s].agent != "claude")
+         or (.sessions[$s].boxSessionId == $id)' \
+        "$FILE" >/dev/null 2>&1 && exit 0
+      "$CU"/sleep 1
+    done
+    exit 0
+  '';
+
   # Codex Remote Control supervisor (issue 103). Unlike claude's
   # `--remote-control` TUI flag, codex uses a dedicated app-server daemon.
   # `remote-control start` eagerly connects to the backend and fails before
@@ -1912,6 +2045,26 @@ $PROMPT"
       # seeded, the first session clones the marketplace, populates the
       # plugin cache and connects the MCP server on its own. Idempotent:
       # plain merges, so a hand `/plugin` change survives.
+      # Keep boxSessionId honest across /clear (see
+      # src/session-id-writeback.sh). claude reports the live session id at
+      # every SessionStart; without this hook the pin only ever held the id
+      # minted on the first spawn, so a respawn after a /clear resumed the
+      # transcript the user had just cleared.
+      #
+      # Registered per spawn and idempotent: drop any entry we installed
+      # before (matched on the script's fixed basename suffix, so a store
+      # path that moved with a rebuild is replaced, not duplicated), then
+      # append the current one. Hooks the user added by hand survive.
+      if [ -n "''${AGENT_BOX_SESSION_WRITEBACK:-}" ]; then
+        seed_json "$HOME"/.claude/settings.json \
+          --arg cmd "$AGENT_BOX_SESSION_WRITEBACK" \
+          '.hooks.SessionStart = (((.hooks.SessionStart // [])
+             | map(.hooks = ((.hooks // [])
+                 | map(select((.command // "")
+                     | contains("session-id-writeback") | not))))
+             | map(select((.hooks // []) | length > 0)))
+           + [{hooks: [{type: "command", command: $cmd}]}])'
+      fi
       if [ -n "''${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
         seed_json "$HOME"/.claude/settings.json \
           --arg whrepo "$AGENT_BOX_WEBHOOK_REPO" \
@@ -2324,7 +2477,11 @@ $PROMPT"
       if [ -n "''${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
         whargs="-e LOCAL_WEBHOOK_SESSION=$USER-$sname -e LOCAL_WEBHOOK_STATE_DIR=$HOME/.local/state/local-webhook -e LOCAL_WEBHOOK_PORT=0"
       fi
-      if $TMUX new-session -d -s "$sname" -c "$wd" $whargs \
+      # AGENT_BOX_SESSION names the session to everything running in the pane.
+      # The SessionStart hook needs it to know WHICH entry to re-pin, and it
+      # has to arrive the same way as the webhook identity above: a hook runs
+      # as a child of the agent, so only the session environment reaches it.
+      if $TMUX new-session -d -s "$sname" -c "$wd" -e AGENT_BOX_SESSION="$sname" $whargs \
            "''${AGENT_BOX_ENV_EXEC:?} $cmd$epilogue"; then
         if ! listed; then
           $TMUX kill-session -t "=$sname" 2>/dev/null || true
@@ -2975,6 +3132,10 @@ in
             # Still per-user (it edits THIS user's sessions.json), so the
             # user-independent script takes its path from the environment.
             AGENT_BOX_MARK_STOPPED = "${markStopped name}";
+            # claude SessionStart hook (same per-user reasoning as
+            # AGENT_BOX_MARK_STOPPED): the supervisor registers it in this
+            # user's ~/.claude/settings.json before every claude spawn.
+            AGENT_BOX_SESSION_WRITEBACK = "${sessionIdWriteback name}";
             # grep/find are deliberately not on this unit's PATH (see
             # agentBaseTools), so the supervisor's transcript lookups get
             # pinned binaries instead (the AGENT_BOX_*_BIN convention).
