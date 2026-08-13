@@ -63,6 +63,11 @@ NOTE: rules on the box's own standing watches may be managed declaratively
 receiver daemon starts — such entries say so in their note; change the
 NixOS config, not the entry.
 
+`status` prints JSON, and warns on stderr when the local-webhook a SESSION
+loads is not the version this box pins, or when a live session predates
+scoped instance sockets. Either one blinds the standing-watch ownership
+brake, and neither is visible anywhere else (issue #193).
+
 One-time per box, to make deliveries possible at all:
   agent-box-webhook setup      # mints the HMAC secret, prints URL + secret
 then register that URL + secret in the sender (GitHub: repo Settings ->
@@ -100,14 +105,104 @@ secret_of() {
   "$JQ" -r --arg s "$1" '.sources[$s].secret // empty' "$SOURCES" 2>/dev/null || true
 }
 
+# Which webhook.py the SESSIONS run, versus the one the box pins (issue #193).
+# Two copies exist by design: the receiver daemon and this CLI run the pinned
+# store path, while a claude session loads the plugin from claude's own cache,
+# which claude clones and updates on its own schedule. Skew there is not
+# cosmetic — a pre-0.10.0 peer names its IPC socket "<pid>.sock" instead of
+# "<key>.<pid>.sock", which parses to no filter key, so the dispatch ownership
+# brake sees no live session at all and one failing run spawns a session per CI
+# event again (#192). The plugin fails that way deliberately (a mixed-version
+# state dir loses the suppression rather than misapplying it), which is right,
+# and which is exactly why the box has to say so: a brake that quietly does
+# nothing reads like a brake that works (#170).
+PLUGINS="$HOME/.claude/plugins/installed_plugins.json"
+
+plugin_versions() {
+  # Versions of the local-webhook plugin claude has installed, newest-listed
+  # first, one per line. All scopes: a project-scope install shadows the user
+  # one, so reporting only "user" could name a copy no session loads.
+  [ -f "$PLUGINS" ] || return 0
+  "$JQ" -r '[.plugins["local-webhook@local-channels"] // [] | .[] | .version // empty]
+            | unique | .[]' "$PLUGINS" 2>/dev/null || true
+}
+
+peer_kinds() {
+  # One word per LIVE session peer, from its instance socket name — which is
+  # the only thing the dispatch brake has to go on:
+  #   keyed   "<key>.<pid>.sock"  claims filter.<key>.json — its own subscriptions
+  #   shared  ".<pid>.sock"       empty key, so it claims the shared filter.json
+  #   legacy  "<pid>.sock"        pre-0.10.0: parses to no key, claims NOTHING
+  # Liveness is checked per pid, like peer_scopes_live(): broadcast() only
+  # unlinks a socket after a failed connect, so a crashed peer's socket
+  # outlives it and would otherwise count as a live session. /proc rather than
+  # `kill -0`, which cannot tell "no such process" from "not yours to signal"
+  # — the plugin counts the second as alive, and so must this.
+  for sock in "$STATE_DIR"/instances/*.sock "$STATE_DIR"/instances/.*.sock; do
+    [ -S "$sock" ] || continue
+    base="${sock##*/}"; base="${base%.sock}"
+    pid="${base##*.}"
+    case "$pid" in (""|*[!0-9]*) continue ;; esac
+    [ -d "/proc/$pid" ] || continue
+    if [ "$base" = "$pid" ]; then printf 'legacy\n'
+    elif [ "${base%.*}" = "" ]; then printf 'shared\n'
+    else printf 'keyed\n'; fi
+  done
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
-  subscribe|unsubscribe|ls|subscriptions|status)
+  subscribe|unsubscribe|ls|subscriptions)
     # webhook.py owns topic parsing, TTL/renew semantics and the filter
     # file — including the per-session LOCAL_WEBHOOK_SESSION scope, which
     # the supervisor already put in this session's environment.
     ensure_state
     exec "$PY" "$SCRIPT" "$cmd" "$@"
+    ;;
+  status)
+    # Same status webhook.py prints (its own version is the pin, since this
+    # wrapper runs the pinned script), plus the two facts only the box can
+    # see: what a NEW session would load, and what the live ones DID load.
+    ensure_state
+    out="$("$PY" "$SCRIPT" status "$@")" || exit $?
+    pinned="$(printf '%s' "$out" | "$JQ" -r '.version // ""')"
+    installed="$(plugin_versions | tr '\n' ' ')"; installed="${installed% }"
+    keyed=0; shared=0; legacy=0
+    # Word-splitting is the point here — peer_kinds emits one bare word per
+    # live peer and nothing else.
+    for kind in $(peer_kinds); do
+      case "$kind" in
+        (keyed) keyed=$((keyed + 1)) ;;
+        (shared) shared=$((shared + 1)) ;;
+        (legacy) legacy=$((legacy + 1)) ;;
+      esac
+    done
+    printf '%s' "$out" | "$JQ" \
+      --arg installed "$installed" --arg pf "$PLUGINS" \
+      --argjson keyed "$keyed" --argjson shared "$shared" --argjson legacy "$legacy" '
+        .plugin = {sessionVersions: ($installed | if . == "" then [] else split(" ") end),
+                   installedFrom: $pf}
+        | .peers = {live: ($keyed + $shared + $legacy),
+                    keyed: $keyed, shared: $shared, legacy: $legacy}'
+    # Warnings on stderr only, and only when something is wrong: status stays
+    # valid JSON on stdout for a caller that parses it, and a healthy box says
+    # nothing at all.
+    if [ -z "$installed" ]; then
+      echo "agent-box-webhook: cannot tell which local-webhook a session loads" \
+           "($PLUGINS is missing) — if sessions run one, its version is unverified (issue #193)" >&2
+    elif [ -n "$pinned" ] && [ "$installed" != "$pinned" ]; then
+      echo "agent-box-webhook: version skew — sessions load local-webhook $installed," \
+           "this box pins $pinned. A new session will not match the receiver daemon." \
+           "Cure: claude plugin marketplace update local-channels &&" \
+           "claude plugin update local-webhook@local-channels (issue #193)" >&2
+    fi
+    if [ "$legacy" -gt 0 ]; then
+      echo "agent-box-webhook: $legacy live session peer(s) name their socket the pre-0.10.0" \
+           "way, so they claim no subscriptions at all. The dispatch ownership brake cannot see" \
+           "those sessions, and a failing run can spawn one hook session per CI event (issue" \
+           "#192). Updating the plugin does not reach them — a session loads its interpreter" \
+           "once — so restart them: agent-box-session restart NAME" >&2
+    fi
     ;;
   url)
     url="$(endpoint)"

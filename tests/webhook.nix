@@ -117,6 +117,8 @@
   };
 
   testScript = ''
+    import json
+
     start_all()
     machine.wait_for_unit("caddy.service")
     machine.wait_for_unit("agent-box-agent.service")
@@ -258,6 +260,92 @@
     machine.wait_until_succeeds(
         "ls /home/agent/.local/state/local-webhook/instances/agent-main.*.sock", timeout=30
     )
+
+    # --- status reports version skew (issue #193) ---------------------------
+    # Two copies of webhook.py run on a box: the pinned one (daemon + CLI) and
+    # whatever claude's plugin cache holds for the sessions. Skew there silently
+    # removes the standing-watch ownership brake — a pre-0.10.0 peer names its
+    # socket "<pid>.sock", which parses to no filter key, so no live session is
+    # visible and one failing run spawns a session per CI event (#192). status
+    # is the only place that says so, so assert it does.
+    hookenv = (
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+    )
+    def status(expect_warning=None):
+        # stdout must stay parseable JSON whatever the verdict is; warnings go
+        # to stderr so a caller that pipes status into jq is unaffected.
+        out = machine.succeed(f"{hookenv} agent-box-webhook status 2>/tmp/status.err")
+        err = machine.succeed("cat /tmp/status.err")
+        if expect_warning is None:
+            assert err.strip() == "", f"expected a quiet status, got: {err}"
+        else:
+            assert expect_warning in err, f"expected {expect_warning!r} in: {err}"
+        return json.loads(out)
+
+    # The live stand-in peer is keyed, so the brake can see it.
+    st = status(expect_warning="cannot tell which local-webhook a session loads")
+    assert st["peers"] == {"live": 1, "keyed": 1, "shared": 0, "legacy": 0}, st["peers"]
+    assert st["plugin"]["sessionVersions"] == [], st["plugin"]
+    pinned = st["version"]
+
+    # A session cache that matches the pin: nothing to report at all.
+    machine.succeed(
+        "mkdir -p /home/agent/.claude/plugins &&"
+        " jq -n --arg v '%s' '{version: 2, plugins: {\"local-webhook@local-channels\":"
+        " [{scope: \"user\", version: $v, installPath: (\"/cache/\" + $v)}]}}'"
+        " > /home/agent/.claude/plugins/installed_plugins.json &&"
+        " chown -R agent:users /home/agent/.claude" % pinned
+    )
+    st = status()
+    assert st["plugin"]["sessionVersions"] == [pinned], st["plugin"]
+
+    # A cache that does not: name both versions and the cure.
+    machine.succeed(
+        "jq '.plugins[\"local-webhook@local-channels\"][0].version = \"0.0.1\"'"
+        " /home/agent/.claude/plugins/installed_plugins.json > /tmp/ip.json &&"
+        " mv /tmp/ip.json /home/agent/.claude/plugins/installed_plugins.json &&"
+        " chown agent:users /home/agent/.claude/plugins/installed_plugins.json"
+    )
+    st = status(expect_warning="version skew")
+    assert st["plugin"]["sessionVersions"] == ["0.0.1"], st["plugin"]
+    machine.succeed("grep -q 'claude plugin update local-webhook' /tmp/status.err")
+    machine.succeed(f"grep -q 'pins {pinned}' /tmp/status.err")
+
+    # A live peer with a pre-0.10.0 socket name is invisible to the brake, and
+    # a plugin update cannot fix it — only restarting that session can. pid 1 is
+    # the liveness stand-in; a dead pid's leftover socket must NOT count, which
+    # the next assertion pins down.
+    machine.succeed(
+        "jq '.plugins[\"local-webhook@local-channels\"][0].version = \"%s\"'"
+        " /home/agent/.claude/plugins/installed_plugins.json > /tmp/ip.json &&"
+        " mv /tmp/ip.json /home/agent/.claude/plugins/installed_plugins.json &&"
+        " chown agent:users /home/agent/.claude/plugins/installed_plugins.json" % pinned
+    )
+    inst = "/home/agent/.local/state/local-webhook/instances"
+    # A bound AF_UNIX socket leaves its file behind when the process exits, so
+    # the pid in the NAME is what liveness turns on, not this helper's own life.
+    machine.succeed(
+        "cat > /tmp/bind.py <<'PYEOF'\n"
+        "import socket, sys\n"
+        "s = socket.socket(socket.AF_UNIX)\n"
+        "s.bind(sys.argv[1])\n"
+        "PYEOF"
+    )
+    machine.succeed(f"sudo -u agent {python} /tmp/bind.py {inst}/1.sock")
+    st = status(expect_warning="pre-0.10.0 way")
+    assert st["peers"] == {"live": 2, "keyed": 1, "shared": 0, "legacy": 1}, st["peers"]
+    machine.succeed("grep -q 'agent-box-session restart' /tmp/status.err")
+
+    # A socket whose owner is gone is not a session: a crashed peer's socket
+    # survives until the next failed delivery, and counting it would report a
+    # session watching something. 4194305 is above the default pid_max, so
+    # nothing can hold it.
+    machine.succeed(f"sudo -u agent mv {inst}/1.sock {inst}/4194305.sock")
+    st = status()
+    assert st["peers"] == {"live": 1, "keyed": 1, "shared": 0, "legacy": 0}, st["peers"]
+    machine.succeed(f"rm -f {inst}/4194305.sock")
 
     # --- deliveries --------------------------------------------------------
     # A GitHub-shaped workflow_run on the subscribed repo, signed correctly.
