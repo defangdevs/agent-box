@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Environment="AGENT_BOX_AGENTS_POINTER=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-robot-agents-pointer.md"
 Environment="AGENT_BOX_AGENT_BINS=claude=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-claude-code-2.1.206/bin/claude codex=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-codex-0.144.1/bin/codex shell=/run/current-system/sw/bin/bash"
+Environment="AGENT_BOX_CLAUDE_SETTINGS=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-claude-hook-settings.json"
 Environment="AGENT_BOX_CODEX_RC=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-codex-remote-control"
 Environment="AGENT_BOX_ENV_EXEC=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-env-exec"
 Environment="AGENT_BOX_FIND_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.10.0/bin/find"

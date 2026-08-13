@@ -2103,6 +2103,34 @@ $PROMPT"
       if [ -z "$bid" ] && [ -r /proc/sys/kernel/random/uuid ]; then
         read -r bid < /proc/sys/kernel/random/uuid || bid=
       fi
+      # /clear rotation (issue #223): claude's live session id can rotate away
+      # from the id this session was last launched with — /clear keeps the
+      # process (and its Remote Control registration) but starts a NEW
+      # transcript under a new uuid. The SessionStart hook (injected via
+      # AGENT_BOX_CLAUDE_SETTINGS below) records that live id, keyed by the
+      # launch id it finds in the pane environment. Follow the record here:
+      # without it, `--resume "$bid"` resurrects the pre-/clear transcript the
+      # user explicitly cleared away and orphans the conversation that replaced
+      # it — and the Claude apps, which thread Remote Control by NAME, then
+      # interleave both conversations in one app thread. The charset check
+      # doubles as glob-safety for claude_has_transcript's -name lookup; the
+      # adopted id is persisted below via mark_started, so sessions.json tracks
+      # the rotation and each record chains one hop at most.
+      rotated=false
+      if [ "$agent" = claude ] && [ "$hasrun" = true ] && [ -n "$bid" ] \
+         && [ -r "$HOME/.local/state/agent-box/live-session-id/$bid" ]; then
+        live=""
+        read -r live < "$HOME/.local/state/agent-box/live-session-id/$bid" || live=""
+        case "$live" in
+          (*[!0-9a-fA-F-]*) live="" ;;
+          (????????-????-????-????-????????????) ;;
+          (*) live="" ;;
+        esac
+        if [ -n "$live" ] && [ "$live" != "$bid" ] && claude_has_transcript "$live"; then
+          bid="$live"
+          rotated=true
+        fi
+      fi
       # Resume on every respawn (hasRun already set); the kickoff prompt fires
       # only on the very first spawn. The default resume steer both continues
       # unfinished work AND lets an already-finished task exit instead of
@@ -2152,6 +2180,12 @@ $PROMPT"
             fi
             cmd="$cmd --remote-control $(printf '%q' "$rcname")"
           fi
+          # The SessionStart hook that records the live session id (see the
+          # /clear-rotation block above). ADDITIONAL settings only: claude
+          # merges the file on top of the user/project settings.json, which
+          # stay untouched, so only supervisor-spawned sessions carry the hook.
+          [ -n "''${AGENT_BOX_CLAUDE_SETTINGS:-}" ] \
+            && cmd="$cmd --settings $(printf '%q' "$AGENT_BOX_CLAUDE_SETTINGS")"
           # Our own id: --resume it on respawn (exact, so concurrent sessions
           # never cross), but only when a transcript actually exists — else
           # reuse it as a fresh --session-id rather than erroring on resume.
@@ -2324,17 +2358,25 @@ $PROMPT"
       if [ -n "''${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
         whargs="-e LOCAL_WEBHOOK_SESSION=$USER-$sname -e LOCAL_WEBHOOK_STATE_DIR=$HOME/.local/state/local-webhook -e LOCAL_WEBHOOK_PORT=0"
       fi
+      # AGENT_BOX_SESSION_ID rides the same session environment: it is the
+      # launch id the SessionStart hook keys its live-id record by (the
+      # /clear-rotation block above). Quoted on its own — unlike $whargs it
+      # is runtime data from sessions.json, not supervisor-built tokens.
       if $TMUX new-session -d -s "$sname" -c "$wd" $whargs \
+           -e AGENT_BOX_SESSION_ID="$bid" \
            "''${AGENT_BOX_ENV_EXEC:?} $cmd$epilogue"; then
         if ! listed; then
           $TMUX kill-session -t "=$sname" 2>/dev/null || true
           return 0
         fi
-        # First spawn only: persist the id + hasRun and consume the kickoff
-        # prompt, so the next respawn resumes instead of redoing the task.
+        # First spawn: persist the id + hasRun and consume the kickoff prompt,
+        # so the next respawn resumes instead of redoing the task. Rotated
+        # respawn (issue #223): persist the adopted live id the same way.
         # (Ordered after the delist post-check: mark_started's jq assignment
         # would otherwise re-create a just-deleted session as a stub entry.)
-        [ "$resuming" = true ] || mark_started "$sname" "$bid"
+        if [ "$resuming" != true ] || [ "$rotated" = true ]; then
+          mark_started "$sname" "$bid"
+        fi
       fi
     }
 
@@ -2352,6 +2394,63 @@ $PROMPT"
       sleep 2
     done
   '';
+
+  # /clear rotation bookkeeping (issue #223). A SessionStart hook records
+  # the live claude session id — /clear rotates it mid-process — keyed by
+  # the launch id the supervisor put in the pane environment, so the next
+  # respawn resumes the conversation the user actually had, not the
+  # pre-/clear transcript boxSessionId still points at. Injected per spawn
+  # via claude's `--settings` flag (additional settings, merged on top):
+  # the user's own settings.json is never touched, sessions outside the
+  # supervisor never run the hook, and a rebuild rolls both files forward
+  # atomically with the supervisor that consumes the records.
+  claudeSessionStartHook = pkgs.writeShellScript "agent-box-claude-session-start-hook" ''
+    set -u
+    # SessionStart hook for supervisor-spawned claude sessions (issue #223).
+    # /clear rotates claude's live session id mid-process: the running process
+    # keeps its Remote Control registration but starts a NEW transcript under a
+    # new uuid, while sessions.json still holds the id the spawn was launched
+    # with. The next respawn would then `--resume` the pre-/clear transcript —
+    # resurrecting the conversation the user explicitly cleared away and
+    # orphaning the one that replaced it. So on every SessionStart (startup,
+    # resume, clear, compact — stdin carries the hook's JSON payload) record the
+    # live session id, keyed by the LAUNCH id the supervisor put in the pane
+    # environment; the supervisor follows that record on the next respawn.
+    #
+    # A hook must never break a session, and SessionStart stdout is shown to the
+    # user: any missing/invalid input is a SILENT no-op (also the case outside a
+    # supervised session, where AGENT_BOX_SESSION_ID is absent). Validation is
+    # glob-only — grep is deliberately not on the pane PATH (agentBaseTools) —
+    # and doubles as filename-safety for the launch id, which names the record.
+    valid_uuid() {
+      case "$1" in
+        (*[!0-9a-fA-F-]*) return 1 ;;
+        (????????-????-????-????-????????????) return 0 ;;
+      esac
+      return 1
+    }
+    # Drain stdin BEFORE any gate can exit (the #220/#222 lesson): claude is
+    # still writing the payload, and an early exit would slam the pipe shut
+    # under it. Unreachable-in-practice gates are exactly the ones that bite.
+    payload="$(cat 2>/dev/null)" || payload=""
+    box="''${AGENT_BOX_SESSION_ID:-}"
+    valid_uuid "$box" || exit 0
+    sid="$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)" || exit 0
+    valid_uuid "$sid" || exit 0
+    d="$HOME/.local/state/agent-box/live-session-id"
+    mkdir -p "$d" 2>/dev/null || exit 0
+    if printf '%s\n' "$sid" > "$d/$box.tmp" 2>/dev/null; then
+      mv -f "$d/$box.tmp" "$d/$box" 2>/dev/null || rm -f "$d/$box.tmp"
+    else
+      rm -f "$d/$box.tmp"
+    fi
+    exit 0
+  '';
+  claudeHookSettings = pkgs.writeText "agent-box-claude-hook-settings.json" (builtins.toJSON {
+    hooks.SessionStart = [
+      { hooks = [ { type = "command"; command = "${claudeSessionStartHook}"; } ]; }
+    ];
+  });
 in
 {
   options.services.agent-box = {
@@ -2971,6 +3070,9 @@ in
             AGENT_BOX_AGENT_BINS = agentBinsFor name;
             AGENT_BOX_ENV_EXEC = "${envExecWrapper}";
             AGENT_BOX_CODEX_RC = "${codexRemoteControl}";
+            # Hook settings for claude spawns — the /clear-rotation record
+            # (issue #223) the supervisor follows on respawn.
+            AGENT_BOX_CLAUDE_SETTINGS = "${claudeHookSettings}";
             # Clean-exit bookkeeping for the spawn epilogue (issue #167).
             # Still per-user (it edits THIS user's sessions.json), so the
             # user-independent script takes its path from the environment.

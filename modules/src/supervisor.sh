@@ -259,6 +259,34 @@ start_session() {
   if [ -z "$bid" ] && [ -r /proc/sys/kernel/random/uuid ]; then
     read -r bid < /proc/sys/kernel/random/uuid || bid=
   fi
+  # /clear rotation (issue #223): claude's live session id can rotate away
+  # from the id this session was last launched with — /clear keeps the
+  # process (and its Remote Control registration) but starts a NEW
+  # transcript under a new uuid. The SessionStart hook (injected via
+  # AGENT_BOX_CLAUDE_SETTINGS below) records that live id, keyed by the
+  # launch id it finds in the pane environment. Follow the record here:
+  # without it, `--resume "$bid"` resurrects the pre-/clear transcript the
+  # user explicitly cleared away and orphans the conversation that replaced
+  # it — and the Claude apps, which thread Remote Control by NAME, then
+  # interleave both conversations in one app thread. The charset check
+  # doubles as glob-safety for claude_has_transcript's -name lookup; the
+  # adopted id is persisted below via mark_started, so sessions.json tracks
+  # the rotation and each record chains one hop at most.
+  rotated=false
+  if [ "$agent" = claude ] && [ "$hasrun" = true ] && [ -n "$bid" ] \
+     && [ -r "$HOME/.local/state/agent-box/live-session-id/$bid" ]; then
+    live=""
+    read -r live < "$HOME/.local/state/agent-box/live-session-id/$bid" || live=""
+    case "$live" in
+      (*[!0-9a-fA-F-]*) live="" ;;
+      (????????-????-????-????-????????????) ;;
+      (*) live="" ;;
+    esac
+    if [ -n "$live" ] && [ "$live" != "$bid" ] && claude_has_transcript "$live"; then
+      bid="$live"
+      rotated=true
+    fi
+  fi
   # Resume on every respawn (hasRun already set); the kickoff prompt fires
   # only on the very first spawn. The default resume steer both continues
   # unfinished work AND lets an already-finished task exit instead of
@@ -308,6 +336,12 @@ start_session() {
         fi
         cmd="$cmd --remote-control $(printf '%q' "$rcname")"
       fi
+      # The SessionStart hook that records the live session id (see the
+      # /clear-rotation block above). ADDITIONAL settings only: claude
+      # merges the file on top of the user/project settings.json, which
+      # stay untouched, so only supervisor-spawned sessions carry the hook.
+      [ -n "${AGENT_BOX_CLAUDE_SETTINGS:-}" ] \
+        && cmd="$cmd --settings $(printf '%q' "$AGENT_BOX_CLAUDE_SETTINGS")"
       # Our own id: --resume it on respawn (exact, so concurrent sessions
       # never cross), but only when a transcript actually exists — else
       # reuse it as a fresh --session-id rather than erroring on resume.
@@ -480,17 +514,25 @@ start_session() {
   if [ -n "${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
     whargs="-e LOCAL_WEBHOOK_SESSION=$USER-$sname -e LOCAL_WEBHOOK_STATE_DIR=$HOME/.local/state/local-webhook -e LOCAL_WEBHOOK_PORT=0"
   fi
+  # AGENT_BOX_SESSION_ID rides the same session environment: it is the
+  # launch id the SessionStart hook keys its live-id record by (the
+  # /clear-rotation block above). Quoted on its own — unlike $whargs it
+  # is runtime data from sessions.json, not supervisor-built tokens.
   if $TMUX new-session -d -s "$sname" -c "$wd" $whargs \
+       -e AGENT_BOX_SESSION_ID="$bid" \
        "${AGENT_BOX_ENV_EXEC:?} $cmd$epilogue"; then
     if ! listed; then
       $TMUX kill-session -t "=$sname" 2>/dev/null || true
       return 0
     fi
-    # First spawn only: persist the id + hasRun and consume the kickoff
-    # prompt, so the next respawn resumes instead of redoing the task.
+    # First spawn: persist the id + hasRun and consume the kickoff prompt,
+    # so the next respawn resumes instead of redoing the task. Rotated
+    # respawn (issue #223): persist the adopted live id the same way.
     # (Ordered after the delist post-check: mark_started's jq assignment
     # would otherwise re-create a just-deleted session as a stub entry.)
-    [ "$resuming" = true ] || mark_started "$sname" "$bid"
+    if [ "$resuming" != true ] || [ "$rotated" = true ]; then
+      mark_started "$sname" "$bid"
+    fi
   fi
 }
 

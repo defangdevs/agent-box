@@ -1,0 +1,42 @@
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+set -u
+# SessionStart hook for supervisor-spawned claude sessions (issue #223).
+# /clear rotates claude's live session id mid-process: the running process
+# keeps its Remote Control registration but starts a NEW transcript under a
+# new uuid, while sessions.json still holds the id the spawn was launched
+# with. The next respawn would then `--resume` the pre-/clear transcript —
+# resurrecting the conversation the user explicitly cleared away and
+# orphaning the one that replaced it. So on every SessionStart (startup,
+# resume, clear, compact — stdin carries the hook's JSON payload) record the
+# live session id, keyed by the LAUNCH id the supervisor put in the pane
+# environment; the supervisor follows that record on the next respawn.
+#
+# A hook must never break a session, and SessionStart stdout is shown to the
+# user: any missing/invalid input is a SILENT no-op (also the case outside a
+# supervised session, where AGENT_BOX_SESSION_ID is absent). Validation is
+# glob-only — grep is deliberately not on the pane PATH (agentBaseTools) —
+# and doubles as filename-safety for the launch id, which names the record.
+valid_uuid() {
+  case "$1" in
+    (*[!0-9a-fA-F-]*) return 1 ;;
+    (????????-????-????-????-????????????) return 0 ;;
+  esac
+  return 1
+}
+# Drain stdin BEFORE any gate can exit (the #220/#222 lesson): claude is
+# still writing the payload, and an early exit would slam the pipe shut
+# under it. Unreachable-in-practice gates are exactly the ones that bite.
+payload="$(cat 2>/dev/null)" || payload=""
+box="${AGENT_BOX_SESSION_ID:-}"
+valid_uuid "$box" || exit 0
+sid="$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)" || exit 0
+valid_uuid "$sid" || exit 0
+d="$HOME/.local/state/agent-box/live-session-id"
+mkdir -p "$d" 2>/dev/null || exit 0
+if printf '%s\n' "$sid" > "$d/$box.tmp" 2>/dev/null; then
+  mv -f "$d/$box.tmp" "$d/$box" 2>/dev/null || rm -f "$d/$box.tmp"
+else
+  rm -f "$d/$box.tmp"
+fi
+exit 0
+

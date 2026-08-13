@@ -712,6 +712,24 @@ let
   supervisorScript = pkgs.writeShellScript "agent-box-supervisor" ''
     @@include:src/supervisor.sh@@
   '';
+
+  # /clear rotation bookkeeping (issue #223). A SessionStart hook records
+  # the live claude session id — /clear rotates it mid-process — keyed by
+  # the launch id the supervisor put in the pane environment, so the next
+  # respawn resumes the conversation the user actually had, not the
+  # pre-/clear transcript boxSessionId still points at. Injected per spawn
+  # via claude's `--settings` flag (additional settings, merged on top):
+  # the user's own settings.json is never touched, sessions outside the
+  # supervisor never run the hook, and a rebuild rolls both files forward
+  # atomically with the supervisor that consumes the records.
+  claudeSessionStartHook = pkgs.writeShellScript "agent-box-claude-session-start-hook" ''
+    @@include:src/claude-session-start-hook.sh@@
+  '';
+  claudeHookSettings = pkgs.writeText "agent-box-claude-hook-settings.json" (builtins.toJSON {
+    hooks.SessionStart = [
+      { hooks = [ { type = "command"; command = "${claudeSessionStartHook}"; } ]; }
+    ];
+  });
 in
 {
   options.services.agent-box = {
@@ -1331,6 +1349,9 @@ in
             AGENT_BOX_AGENT_BINS = agentBinsFor name;
             AGENT_BOX_ENV_EXEC = "${envExecWrapper}";
             AGENT_BOX_CODEX_RC = "${codexRemoteControl}";
+            # Hook settings for claude spawns — the /clear-rotation record
+            # (issue #223) the supervisor follows on respawn.
+            AGENT_BOX_CLAUDE_SETTINGS = "${claudeHookSettings}";
             # Clean-exit bookkeeping for the spawn epilogue (issue #167).
             # Still per-user (it edits THIS user's sessions.json), so the
             # user-independent script takes its path from the environment.
