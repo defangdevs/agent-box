@@ -367,18 +367,17 @@
               touch "$out"
             '';
 
-          # The per-user secrets file is written and read by the settings
-          # daemon in Python and read (and rewritten, through the session
-          # CLI) by the shell. It is systemd env-file syntax, so a value may
-          # be quoted and span lines — a PEM certificate or key, issue 212 —
-          # and a divergence between the two readers raises nothing: it
-          # silently truncates a stored secret at its first newline. This
-          # runs both against the same values. Cheap and arch-independent,
-          # unlike the VM tests that cover the same ground.
+          # The per-user secrets file holds systemd env-file syntax, so a
+          # value may be quoted and span lines (a PEM certificate or key,
+          # issue 212). A value that does not survive its own encoding comes
+          # back TRUNCATED rather than raising, so every shape one can take
+          # is written and read back here — through the library the settings
+          # page uses and through the CLI the shell callers use. Cheap and
+          # arch-independent, unlike the VM tests covering the same ground.
           env-file-format =
             pkgs.runCommand "agent-box-env-file-format"
               {
-                nativeBuildInputs = [ pkgs.python3 pkgs.bash ];
+                nativeBuildInputs = [ pkgs.python3 ];
                 srcDir = ./modules/src;
                 harness = ./tests/env-file-format.py;
               } ''

@@ -1,34 +1,28 @@
 #!/usr/bin/env python3
-"""Pin the two implementations of the env-file format to each other (issue 212).
+"""Round-trip check for the env-file format (issue 212).
 
-The per-user secrets file (~/.config/agent-box/env) is written and read by
-the settings daemon in Python (parse_env / encode_value in
-modules/src/settings-daemon.py) and read — and, through the session CLI,
-rewritten — by the shell in modules/src/env-file.sh. The file is systemd
-env-file syntax, so a value may be quoted and span lines; a divergence
-between the two readers does not raise anything, it silently truncates a
-stored secret at its first newline.
+The per-user secrets file (~/.config/agent-box/env) holds systemd env-file
+syntax, so a value may be quoted and span lines — that is how a PEM (an x509
+certificate, a private key) is stored. Its one implementation is
+modules/src/env-file.py: the settings daemon splices it in, and so does
+modules/src/env-cli.py, the helper the session-spawn wrapper and
+`agent-box-session env` call.
 
-This check writes each value with the Python writer, then asserts that both
-readers give the value back byte-exact, and that both writers agree on the
-encoding. It also parses a set of hand-written files (the shapes a human or
-an older agent-box wrote) that the readers must not choke on.
+Nothing here raises on a bad round trip in production — a value that does not
+survive its own encoding comes back truncated — so this asserts it directly:
+every shape a stored secret can take is written, read back, and compared.
+The CLI is exercised too, since NUL-framed output is the contract the shell
+callers depend on.
 
 Run: python3 tests/env-file-format.py DIR
-where DIR holds settings-daemon.py and env-file.sh. Prints a summary and
-exits non-zero on the first divergence.
+where DIR is modules/src. Prints a summary and exits non-zero on the first
+divergence.
 """
-import importlib.util
 import os
+import re
 import subprocess
 import sys
 import tempfile
-
-HEADER = (
-    "# Managed by agent-box settings page. KEY=value, systemd env-file\n"
-    "# syntax: a quoted value may span lines (PEM keys, certificates).\n"
-    "# Do not add secrets by hand here unless you know what you are doing.\n"
-)
 
 PEM = (
     "-----BEGIN RSA PRIVATE KEY-----\n"
@@ -73,7 +67,7 @@ HANDWRITTEN = [
     ("9BAD=x\nGOOD=y\n", [("GOOD", "y")]),
     ("A='single quoted'\n", [("A", "single quoted")]),
     ('A="multi\nline"\nB=2\n', [("A", "multi\nline"), ("B", "2")]),
-    # Unbalanced quote: a pre-212 file could hold one inside a value, so
+    # Unbalanced quote: only a pre-212 file can hold one inside a value, so
     # the reader falls back to the old line format rather than losing keys.
     ('A="unterminated\nB=2\n', [("A", '"unterminated'), ("B", "2")]),
     ('A=a"b\nB=2\n', [("A", 'a"b'), ("B", "2")]),
@@ -88,44 +82,49 @@ HANDWRITTEN = [
     ('A="a"b"c"\n', [("A", "abc")]),               # adjacent segments join
 ]
 
-
-def load_daemon(directory):
-    """Import modules/src/settings-daemon.py without starting a server."""
-    os.environ.setdefault("AGENT_BOX_SETTINGS_ENV_FILE", "/dev/null")
-    path = os.path.join(directory, "settings-daemon.py")
-    spec = importlib.util.spec_from_file_location("settings_daemon", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+MARKER = re.compile(r"^\s*@@include:(?P<path>[^@]+)@@\s*$", re.M)
 
 
-def shell(directory, script, *args):
-    return subprocess.run(
-        ["bash", "-c", f". {directory}/env-file.sh\n{script}", "bash", *args],
-        capture_output=True, check=True,
-    ).stdout.decode()
+def load_lib(directory):
+    """Exec modules/src/env-file.py, which is a spliced-in fragment."""
+    namespace = {"re": re, "os": os, "tempfile": tempfile}
+    with open(os.path.join(directory, "env-file.py")) as fh:
+        exec(fh.read(), namespace)  # noqa: S102 — the point of the check
+    return namespace
 
 
-def shell_parse(directory, path):
-    """Parse `path` with env-file.sh; NUL-delimited so values keep newlines."""
-    out = shell(
-        directory,
-        f"emit() {{ printf '%s\\0%s\\0' \"$1\" \"$2\"; }}\nenv_parse {path!r} emit",
-    )
-    parts = out.split("\0")[:-1]
+def build_cli(directory, target):
+    """Resolve env-cli.py's include the way bin/assemble-module.py does."""
+    with open(os.path.join(directory, "env-cli.py")) as fh:
+        text = fh.read()
+
+    def splice(match):
+        with open(os.path.join(directory, match.group("path"))) as fh:
+            return fh.read().rstrip("\n")
+
+    with open(target, "w") as fh:
+        fh.write(MARKER.sub(splice, text))
+    return target
+
+
+def cli(script, *args):
+    return subprocess.run([sys.executable, script, *args],
+                          capture_output=True, check=True).stdout
+
+
+def cli_pairs(script, path):
+    """Read pairs back through the CLI's NUL framing (the shell contract)."""
+    parts = cli(script, "read", path).decode().split("\0")[:-1]
     return list(zip(parts[0::2], parts[1::2]))
-
-
-def shell_quote(directory, value):
-    return shell(directory, 'env_quote "$1"\nprintf %s "$ENV_QUOTED"', value)
 
 
 def main():
     directory = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
-    daemon = load_daemon(directory)
-    failures = []
+    lib = load_lib(directory)
     tmpdir = tempfile.mkdtemp()
     env_path = os.path.join(tmpdir, "env")
+    script = build_cli(directory, os.path.join(tmpdir, "env-cli.py"))
+    failures = []
 
     def check(name, want, got):
         if want != got:
@@ -135,25 +134,36 @@ def main():
         # Surrounded by ordinary pairs: a value that runs off its own record
         # eats them, which is exactly what used to happen.
         pairs = [("BEFORE", "before"), (f"K{i}", value), ("AFTER", "after")]
-        encoded = daemon.encode_value(value)
-        text = HEADER + "".join(f"{k}={daemon.encode_value(v)}\n" for k, v in pairs)
-        with open(env_path, "w") as fh:
-            fh.write(text)
-        check(f"python reader, value {i} ({encoded!r})", pairs, daemon.parse_env(text))
-        check(f"shell reader, value {i} ({encoded!r})", pairs, shell_parse(directory, env_path))
-        check(f"writers disagree, value {i}", encoded, shell_quote(directory, value))
+        encoded = lib["encode_value"](value)
+        lib["write_pairs"](env_path, pairs)
+        check(f"round trip, value {i} ({encoded!r})", pairs, lib["read_pairs"](env_path))
+        check(f"CLI read, value {i} ({encoded!r})", pairs, cli_pairs(script, env_path))
+        # Rewriting one key must leave every other value intact — the save
+        # that used to make the truncation permanent.
+        lib["set_key"](env_path, "AFTER", "rewritten")
+        check(f"survives a later save, value {i}", value, dict(lib["read_pairs"](env_path))[f"K{i}"])
+        check(f"CLI ls, value {i}", ["AFTER", "BEFORE", f"K{i}"],
+              cli(script, "ls", env_path).decode().split())
 
     for text, want in HANDWRITTEN:
         with open(env_path, "w") as fh:
             fh.write(text)
-        check(f"python reader, hand-written {text!r}", want, daemon.parse_env(text))
-        check(f"shell reader, hand-written {text!r}", want, shell_parse(directory, env_path))
+        check(f"hand-written {text!r}", want, lib["parse_env"](text))
+        check(f"CLI read, hand-written {text!r}", want, cli_pairs(script, env_path))
+
+    # The CLI's own edits go through the same writer the page uses.
+    os.unlink(env_path)
+    cli(script, "set", env_path, "CERT", PEM)
+    cli(script, "set", env_path, "TOKEN", "plain")
+    cli(script, "rm", env_path, "TOKEN")
+    check("CLI set/rm", [("CERT", PEM)], lib["read_pairs"](env_path))
+    check("CLI writes 0600", 0o600, os.stat(env_path).st_mode & 0o777)
 
     if failures:
         print("env-file format divergence:\n\n" + "\n\n".join(failures), file=sys.stderr)
         return 1
     print(f"env-file format: {len(VALUES)} values + {len(HANDWRITTEN)} hand-written "
-          "files agree across the Python and shell implementations")
+          "files round-trip through the library and the CLI")
     return 0
 
 

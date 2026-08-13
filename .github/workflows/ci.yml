@@ -77,12 +77,11 @@ jobs:
       - name: Check generated module is up to date
         run: nix build -L .#checks.x86_64-linux.module-generated-up-to-date && cat result
 
-      # Issue 212: the per-user secrets file is parsed by the settings daemon
-      # (Python) and by the spawn wrapper / session CLI (shell). A quoted
-      # value may span lines, and a divergence between the two readers
-      # truncates a stored secret silently, so both are run over the same
-      # values here.
-      - name: Check env-file format agrees across implementations
+      # Issue 212: a value in the per-user secrets file may be quoted and
+      # span lines (a PEM certificate or key). One that does not survive its
+      # own encoding comes back truncated instead of raising, so every shape
+      # one can take is written and read back here.
+      - name: Check env-file format round-trips
         run: nix build -L .#checks.x86_64-linux.env-file-format && cat result
 
       # Eval/build check (issue 132): the module's generated Caddyfile carries
