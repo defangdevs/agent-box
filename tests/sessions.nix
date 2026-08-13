@@ -757,7 +757,7 @@
     machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=60)
 
     # ttyd serves per-session deep links: the unit runs with --url-arg.
-    machine.succeed("systemctl cat agent-web-terminal-agent | grep -q -- --url-arg")
+    machine.succeed("systemctl cat agent-web-terminal-agent | grep -- --url-arg >/dev/null")
     # The attach script is the shared agent-box-attach since issue #154
     # Phase 2. `grep -o ... || echo missing`: an empty substitution would
     # leave `grep -q` reading stdin — the backdoor shell then hangs the whole

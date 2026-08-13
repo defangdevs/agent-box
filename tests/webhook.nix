@@ -749,7 +749,7 @@
     # unit, and nothing above should have to survive that.
     machine.succeed(
         "systemctl show -p Environment agent-box-agent.service"
-        " | grep -q 'AGENT_BOX_WEBHOOK_PINNED_SCRIPT=/nix/store/'"
+        " | grep 'AGENT_BOX_WEBHOOK_PINNED_SCRIPT=/nix/store/' >/dev/null"
     )
     set_cache_version("0.0.1")
     machine.succeed("rm -f /home/agent/.claude/plugins/.agent-box-plugin-sync")
@@ -758,14 +758,14 @@
     # It notices, and names both versions.
     machine.wait_until_succeeds(
         "journalctl -u agent-box-agent --no-pager"
-        f" | grep -q 'cache 0.0.1 is older than the pinned {pinned} — refreshing'",
+        f" | grep 'cache 0.0.1 is older than the pinned {pinned} — refreshing' >/dev/null",
         timeout=60,
     )
     # This VM has no route to GitHub, so the refresh fails — and that must be a
     # logged line, not a session that never starts.
     machine.wait_until_succeeds(
         "journalctl -u agent-box-agent --no-pager"
-        " | grep -q 'could not refresh the cache'",
+        " | grep 'could not refresh the cache' >/dev/null",
         timeout=120,
     )
     machine.succeed("systemctl is-active agent-box-agent.service")
@@ -779,7 +779,7 @@
     machine.succeed("systemctl restart agent-box-agent.service")
     machine.wait_for_unit("agent-box-agent.service")
     machine.wait_until_succeeds(
-        "journalctl -u agent-box-agent --no-pager | grep -q 'not retrying yet'",
+        "journalctl -u agent-box-agent --no-pager | grep 'not retrying yet' >/dev/null",
         timeout=60,
     )
 
