@@ -143,14 +143,14 @@
     # `--help` is the only description of the CLI an agent gets, so it has to
     # keep documenting BOTH delivery shapes — the wrapper forwards flags to
     # webhook.py verbatim, which is exactly how its usage() went stale before.
-    machine.succeed("agent-box-webhook --help | grep -q -- '--deliver-to subagent'")
-    machine.succeed("agent-box-webhook --help | grep -q -- '--ignore-sender'")
+    machine.succeed("agent-box-webhook --help | grep -- '--deliver-to subagent' >/dev/null")
+    machine.succeed("agent-box-webhook --help | grep -- '--ignore-sender' >/dev/null")
     machine.succeed(
-        "systemctl show -p Environment agent-box-agent.service | grep -q agent-box-webhook/bin"
+        "systemctl show -p Environment agent-box-agent.service | grep agent-box-webhook/bin >/dev/null"
     )
     machine.succeed(
         "systemctl show -p Environment agent-box-agent.service"
-        " | grep -q 'AGENT_BOX_WEBHOOK_URL=https://box.test/agent/webhook'"
+        " | grep 'AGENT_BOX_WEBHOOK_URL=https://box.test/agent/webhook' >/dev/null"
     )
     # The supervisor gives each tmux session its own subscription scope, so a
     # bare `agent-box-webhook subscribe` in that session cannot leak into a
@@ -437,7 +437,7 @@
     # unit ever lost LOCAL_WEBHOOK_SPAWN_CMD.
     machine.succeed(
         "systemctl show -p Environment agent-box-webhook-agent.service"
-        " | grep -q 'LOCAL_WEBHOOK_SPAWN_CMD=/nix/store/'"
+        " | grep 'LOCAL_WEBHOOK_SPAWN_CMD=/nix/store/' >/dev/null"
     )
     machine.succeed("jq -e '.spawn == true' /home/agent/.local/state/local-webhook/receiver.json")
 
@@ -453,7 +453,7 @@
     )
     machine.wait_until_succeeds(
         "journalctl -u agent-box-webhook-agent --no-pager"
-        " | grep -q 'not spawning for workflow_run on defangdevs/agent-box'",
+        " | grep 'not spawning for workflow_run on defangdevs/agent-box' >/dev/null",
         timeout=30,
     )
     machine.fail(
@@ -496,7 +496,7 @@
         " https://box.test/agent/webhook/github | grep -x 200"
     )
     machine.wait_until_succeeds(
-        "journalctl -u agent-box-webhook-agent --no-pager | grep -q 'no failing outcome'",
+        "journalctl -u agent-box-webhook-agent --no-pager | grep 'no failing outcome' >/dev/null",
         timeout=30,
     )
     machine.fail(
@@ -566,7 +566,7 @@
     machine.succeed("systemctl start agent-box-agent.service")
     machine.wait_until_succeeds(
         "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
-        " list-sessions -F '#S' | grep -q '^hook-'",
+        " list-sessions -F '#S' | grep '^hook-' >/dev/null",
         timeout=60,
     )
     machine.wait_until_succeeds(
@@ -607,7 +607,7 @@
     # not a second session the assertion below could catch immediately.
     machine.wait_until_succeeds(
         "journalctl -u agent-box-webhook-agent --no-pager"
-        f" | grep -q 'session agent-{hook_name} is subscribed to it'",
+        f" | grep 'session agent-{hook_name} is subscribed to it' >/dev/null",
         timeout=30,
     )
     machine.succeed(
@@ -661,7 +661,7 @@
     machine.wait_for_unit("agent-box-webhook-agent.service")
     machine.wait_until_succeeds(
         "journalctl -u agent-box-webhook-agent --no-pager"
-        " | grep -q 'enforced declared rules on github:defangdevs/local-channels'",
+        " | grep 'enforced declared rules on github:defangdevs/local-channels' >/dev/null",
         timeout=30,
     )
     # Rules present, the ad-hoc sender mute cleared (sender policy lives inside
@@ -702,7 +702,7 @@
     )
     machine.wait_until_succeeds(
         "journalctl -u agent-box-webhook-agent --no-pager"
-        " | grep -q 'not spawning for pull_request on defangdevs/local-channels'",
+        " | grep 'not spawning for pull_request on defangdevs/local-channels' >/dev/null",
         timeout=30,
     )
     machine.fail(

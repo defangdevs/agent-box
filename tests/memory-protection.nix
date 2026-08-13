@@ -32,12 +32,12 @@
     # namespace setup fail with 226/NAMESPACE — the unit above never started.
     machine.fail(
         "systemctl show agent-box-agent --property=ReadWritePaths --value "
-        "| grep -q agent-box-sites"
+        "| grep agent-box-sites >/dev/null"
     )
 
     # zram swap is active and sized to RAM (memoryPercent = 100)
     print(machine.succeed("swapon --show"))
-    machine.succeed("swapon --show=NAME --noheadings | grep -q zram0")
+    machine.succeed("swapon --show=NAME --noheadings | grep zram0 >/dev/null")
 
     # the zram sysctl tuning landed
     assert machine.succeed("sysctl -n vm.swappiness").strip() == "180"
@@ -63,7 +63,7 @@
 
     # earlyoom notices the pressure and SIGTERM/SIGKILLs the hog...
     machine.wait_until_succeeds(
-        "journalctl -u earlyoom.service | grep -E 'sending SIG(TERM|KILL) to process' | grep -q tail",
+        "journalctl -u earlyoom.service | grep -E 'sending SIG(TERM|KILL) to process' | grep tail >/dev/null",
         timeout=180,
     )
     machine.wait_until_fails("pgrep -x tail", timeout=60)
