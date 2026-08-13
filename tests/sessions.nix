@@ -575,6 +575,81 @@
         assert "do the codex thing" in unescaped, codex_start_cmd
         machine.succeed(as_agent("agent-box-session rm vcodex"))
 
+    # --- /clear rotation: respawn follows the recorded live id ------------
+    with subtest("/clear rotation: respawn resumes the recorded live id"):
+        # /clear rotates claude's live session id mid-process (issue #223):
+        # the process keeps running (and keeps its Remote Control name) but
+        # writes a NEW transcript under a new uuid, while sessions.json
+        # still holds the launch id. The SessionStart hook records
+        # live-id-by-launch-id; a respawn must resume the RECORDED id — not
+        # resurrect the pre-/clear transcript — and persist the adopted id.
+        machine.succeed(
+            as_agent(
+                "agent-box-session add rot --agent claude --prompt 'do the rotation thing'"
+            )
+        )
+        machine.wait_until_succeeds(tmux("has-session -t =rot"), timeout=60)
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions.rot.hasRun == true' {sfile}", timeout=60
+        )
+        rot_bid = machine.succeed(
+            f"jq -r '.sessions.rot.boxSessionId' {sfile}"
+        ).strip()
+        # The spawn hands the launch id to the pane environment (the hook's
+        # key) and the hook settings file to claude via --settings; recover
+        # the hook script's store path from the live command line rather
+        # than hardcoding it.
+        machine.succeed(
+            tmux('show-environment -t "=rot" AGENT_BOX_SESSION_ID')
+            + f" | grep -qx AGENT_BOX_SESSION_ID={rot_bid}"
+        )
+        rot_cmdline = machine.wait_until_succeeds(
+            "pgrep -u agent -af agent-box-claude-hook-settings", timeout=60
+        )
+        settings_m = re.search(
+            r"--settings (\S*agent-box-claude-hook-settings\S*)", rot_cmdline
+        )
+        assert settings_m, rot_cmdline
+        hook = machine.succeed(
+            f"jq -r '.hooks.SessionStart[0].hooks[0].command' {settings_m.group(1)}"
+        ).strip()
+        # Drive the REAL hook exactly as claude does on /clear: SessionStart
+        # payload on stdin, launch id in the environment.
+        rotated = "12345678-9abc-4def-8123-456789abcdef"
+        payload = json.dumps(
+            {"session_id": rotated, "hook_event_name": "SessionStart", "source": "clear"}
+        )
+        machine.succeed(
+            as_agent(
+                f"printf %s {shlex.quote(payload)} | "
+                f"AGENT_BOX_SESSION_ID={rot_bid} {hook}"
+            )
+        )
+        machine.succeed(
+            f"grep -qx {rotated} "
+            f"/home/agent/.local/state/agent-box/live-session-id/{rot_bid}"
+        )
+        # The rotated transcript must exist (claude_has_transcript gates the
+        # switch) — a real /clear always leaves one behind.
+        machine.succeed(
+            "install -D -o agent /dev/null "
+            f"/home/agent/.claude/projects/-home-agent/{rotated}.jsonl"
+        )
+        machine.succeed(tmux("kill-session -t =rot"))
+        # As in the codex subtest, read what the supervisor BUILT from the
+        # recorded pane start command — it must not depend on claude
+        # surviving its (unauthenticated) resume attempt.
+        rot_start_cmd = machine.wait_until_succeeds(
+            tmux('list-panes -t "=rot" -F "#{pane_start_command}"'), timeout=60
+        )
+        assert f"--resume {rotated}" in rot_start_cmd.replace("\\", ""), rot_start_cmd
+        # The adopted id is persisted, so the NEXT respawn needs no record.
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions.rot.boxSessionId == \"{rotated}\"' {sfile}",
+            timeout=60,
+        )
+        machine.succeed(as_agent("agent-box-session rm rot"))
+
     # --- env CLI writes the same file the settings page + wrapper use -----
     with subtest("env set/ls/rm on ~/.config/agent-box/env"):
         machine.succeed("su -s /bin/sh agent -c 'agent-box-session env set MY_TOKEN sekret'")
