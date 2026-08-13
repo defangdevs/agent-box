@@ -64,9 +64,11 @@ receiver daemon starts — such entries say so in their note; change the
 NixOS config, not the entry.
 
 `status` prints JSON, and warns on stderr when the local-webhook a SESSION
-loads is not the version this box pins, or when a live session predates
-scoped instance sockets. Either one blinds the standing-watch ownership
-brake, and neither is visible anywhere else (issue #193).
+loads is OLDER than the version this box pins, or when a live session
+predates scoped instance sockets. Either one blinds the standing-watch
+ownership brake, and neither is visible anywhere else (issue #193). A cache
+NEWER than the pin is normal — claude tracks the marketplace's default
+branch — and is reported in the JSON (`plugin.skew`) without a warning.
 
 One-time per box, to make deliveries possible at all:
   agent-box-webhook setup      # mints the HMAC secret, prints URL + secret
@@ -177,23 +179,42 @@ case "$cmd" in
         (legacy) legacy=$((legacy + 1)) ;;
       esac
     done
+    # Which side of the pin the cache sits on. Only "older" is a fault: claude
+    # tracks the marketplace's default branch, so a cache AHEAD of the pin is
+    # the normal state between pin bumps, and calling that an error every time
+    # would train everyone to ignore the line that matters.
+    # The OLDEST installed copy decides: a project-scope install shadows the
+    # user one, and the stalest is the one that can break the brake.
+    skew=none
+    if [ -z "$installed" ]; then
+      skew=unknown
+    elif [ -n "$pinned" ]; then
+      oldest="$(printf '%s\n' $installed | sort -V | head -1)"
+      if [ "$oldest" = "$pinned" ]; then
+        skew=none
+      elif [ "$(printf '%s\n%s\n' "$oldest" "$pinned" | sort -V | head -1)" = "$oldest" ]; then
+        skew=older
+      else
+        skew=newer
+      fi
+    fi
     printf '%s' "$out" | "$JQ" \
-      --arg installed "$installed" --arg pf "$PLUGINS" \
+      --arg installed "$installed" --arg pf "$PLUGINS" --arg skew "$skew" \
       --argjson keyed "$keyed" --argjson shared "$shared" --argjson legacy "$legacy" '
         .plugin = {sessionVersions: ($installed | if . == "" then [] else split(" ") end),
-                   installedFrom: $pf}
+                   pinnedVersion: .version, skew: $skew, installedFrom: $pf}
         | .peers = {live: ($keyed + $shared + $legacy),
                     keyed: $keyed, shared: $shared, legacy: $legacy}'
     # Warnings on stderr only, and only when something is wrong: status stays
     # valid JSON on stdout for a caller that parses it, and a healthy box says
     # nothing at all.
-    if [ -z "$installed" ]; then
+    if [ "$skew" = unknown ]; then
       echo "agent-box-webhook: cannot tell which local-webhook a session loads" \
            "($PLUGINS is missing) — if sessions run one, its version is unverified (issue #193)" >&2
-    elif [ -n "$pinned" ] && [ "$installed" != "$pinned" ]; then
+    elif [ "$skew" = older ]; then
       echo "agent-box-webhook: version skew — sessions load local-webhook $installed," \
-           "this box pins $pinned. A new session will not match the receiver daemon." \
-           "Cure: claude plugin marketplace update local-channels &&" \
+           "OLDER than the pinned $pinned. webhook.syncSessionPlugin normally cures this at the" \
+           "next session start; by hand: claude plugin marketplace update local-channels &&" \
            "claude plugin update local-webhook@local-channels (issue #193)" >&2
     fi
     if [ "$legacy" -gt 0 ]; then
