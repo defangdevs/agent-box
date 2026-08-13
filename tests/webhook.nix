@@ -300,29 +300,38 @@
     )
     st = status()
     assert st["plugin"]["sessionVersions"] == [pinned], st["plugin"]
+    assert st["plugin"]["skew"] == "none", st["plugin"]
+    assert st["plugin"]["pinnedVersion"] == pinned, st["plugin"]
 
-    # A cache that does not: name both versions and the cure.
-    machine.succeed(
-        "jq '.plugins[\"local-webhook@local-channels\"][0].version = \"0.0.1\"'"
-        " /home/agent/.claude/plugins/installed_plugins.json > /tmp/ip.json &&"
-        " mv /tmp/ip.json /home/agent/.claude/plugins/installed_plugins.json &&"
-        " chown agent:users /home/agent/.claude/plugins/installed_plugins.json"
-    )
+    def set_cache_version(v):
+        machine.succeed(
+            "jq '.plugins[\"local-webhook@local-channels\"][0].version = \"%s\"'"
+            " /home/agent/.claude/plugins/installed_plugins.json > /tmp/ip.json &&"
+            " mv /tmp/ip.json /home/agent/.claude/plugins/installed_plugins.json &&"
+            " chown agent:users /home/agent/.claude/plugins/installed_plugins.json" % v
+        )
+
+    # A cache OLDER than the pin is a fault: name both versions and the cure.
+    set_cache_version("0.0.1")
     st = status(expect_warning="version skew")
     assert st["plugin"]["sessionVersions"] == ["0.0.1"], st["plugin"]
+    assert st["plugin"]["skew"] == "older", st["plugin"]
     machine.succeed("grep -q 'claude plugin update local-webhook' /tmp/status.err")
-    machine.succeed(f"grep -q 'pins {pinned}' /tmp/status.err")
+    machine.succeed(f"grep -q 'OLDER than the pinned {pinned}' /tmp/status.err")
+
+    # A cache AHEAD of the pin is the normal state between pin bumps — claude
+    # tracks the marketplace's default branch — so it is reported in the JSON
+    # and NOT warned about. Warning on it would train everyone to ignore the
+    # line that matters.
+    set_cache_version("99.0.0")
+    st = status()
+    assert st["plugin"]["skew"] == "newer", st["plugin"]
 
     # A live peer with a pre-0.10.0 socket name is invisible to the brake, and
     # a plugin update cannot fix it — only restarting that session can. pid 1 is
     # the liveness stand-in; a dead pid's leftover socket must NOT count, which
     # the next assertion pins down.
-    machine.succeed(
-        "jq '.plugins[\"local-webhook@local-channels\"][0].version = \"%s\"'"
-        " /home/agent/.claude/plugins/installed_plugins.json > /tmp/ip.json &&"
-        " mv /tmp/ip.json /home/agent/.claude/plugins/installed_plugins.json &&"
-        " chown agent:users /home/agent/.claude/plugins/installed_plugins.json" % pinned
-    )
+    set_cache_version(pinned)
     inst = "/home/agent/.local/state/local-webhook/instances"
     # A bound AF_UNIX socket leaves its file behind when the process exits, so
     # the pid in the NAME is what liveness turns on, not this helper's own life.
@@ -729,6 +738,48 @@
     machine.wait_until_succeeds(
         "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-local-chan\"))'"
         " /home/agent/.config/agent-box/sessions.json",
+        timeout=60,
+    )
+
+    # --- syncSessionPlugin: a stale session cache is refreshed at session start
+    # (issue #193, option 2) --------------------------------------------------
+    # The supervisor compares claude's plugin cache against the PINNED version
+    # before starting a claude session — the only moment that can matter, since
+    # a session loads its interpreter once. Asserted last: it restarts the agent
+    # unit, and nothing above should have to survive that.
+    machine.succeed(
+        "systemctl show -p Environment agent-box-agent.service"
+        " | grep -q 'AGENT_BOX_WEBHOOK_PINNED_SCRIPT=/nix/store/'"
+    )
+    set_cache_version("0.0.1")
+    machine.succeed("rm -f /home/agent/.claude/plugins/.agent-box-plugin-sync")
+    machine.succeed("systemctl restart agent-box-agent.service")
+    machine.wait_for_unit("agent-box-agent.service")
+    # It notices, and names both versions.
+    machine.wait_until_succeeds(
+        "journalctl -u agent-box-agent --no-pager"
+        f" | grep -q 'cache 0.0.1 is older than the pinned {pinned} — refreshing'",
+        timeout=60,
+    )
+    # This VM has no route to GitHub, so the refresh fails — and that must be a
+    # logged line, not a session that never starts.
+    machine.wait_until_succeeds(
+        "journalctl -u agent-box-agent --no-pager"
+        " | grep -q 'could not refresh the cache'",
+        timeout=120,
+    )
+    machine.succeed("systemctl is-active agent-box-agent.service")
+    # The attempt is stamped, so the next session start inside the retry window
+    # does not pay the timeout again. A box whose claude keeps exiting restarts
+    # sessions in a loop; without this the loop would be a loop of timeouts.
+    machine.succeed(
+        "grep -q '^%s ' /home/agent/.claude/plugins/.agent-box-plugin-sync" % pinned
+    )
+    machine.succeed("journalctl --rotate --vacuum-time=1s")
+    machine.succeed("systemctl restart agent-box-agent.service")
+    machine.wait_for_unit("agent-box-agent.service")
+    machine.wait_until_succeeds(
+        "journalctl -u agent-box-agent --no-pager | grep -q 'not retrying yet'",
         timeout=60,
     )
 
