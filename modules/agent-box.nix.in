@@ -124,9 +124,11 @@ let
   # single live source for those keys (it is deliberately NOT in the
   # unit's EnvironmentFile, so a DELETED key disappears on restart too).
   # Values are exported literally — never eval'd — so a secret full of
-  # shell metacharacters can't break or inject anything; one pair of
-  # surrounding quotes is stripped to match how systemd read the same
-  # file before. Key charset mirrors the settings daemon's KEY_RE.
+  # shell metacharacters can't break or inject anything. The file is read
+  # with systemd's own env-file grammar (src/env-file.sh), so a quoted
+  # value spanning several lines — a PEM certificate or private key, issue
+  # 212 — arrives byte-exact instead of truncated at its first newline.
+  # Key charset mirrors the settings daemon's KEY_RE.
   envExecWrapper = pkgs.writeShellScript "agent-box-env-exec" ''
     @@include:src/env-exec.sh@@
   '';

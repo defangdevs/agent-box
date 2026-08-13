@@ -586,6 +586,41 @@
         machine.succeed("su -s /bin/sh agent -c 'agent-box-session env rm MY_TOKEN'")
         machine.fail("grep -q MY_TOKEN /home/agent/.config/agent-box/env")
 
+    # --- env CLI: multi-line values (issue 212) ---------------------------
+    # A PEM key or certificate cannot be one line. The CLI used to refuse it
+    # outright; now it stores the value double-quoted, which is what systemd
+    # and the spawn wrapper both read back as a single value.
+    with subtest("env set stores a multi-line value as one quoted pair"):
+        # No trailing newline in the fixture, so "$(cat ...)" — how a shell
+        # naturally passes a key file — is byte-identical to it.
+        machine.succeed(
+            "su -s /bin/sh agent -c 'printf %b "
+            "\"-----BEGIN CERTIFICATE-----\\nbG9uZ2VyIHRoYW4gb25lIGxpbmU=\\n"
+            "-----END CERTIFICATE-----\" > /tmp/cert.pem'"
+        )
+        machine.succeed(
+            "su -s /bin/sh agent -c "
+            "'agent-box-session env set CERT \"$(cat /tmp/cert.pem)\"'"
+        )
+        machine.succeed("su -s /bin/sh agent -c 'agent-box-session env set PLAIN plainvalue'")
+        # One pair, quoted; the body line's "=" padding is not a second key.
+        env_ls = machine.succeed("su -s /bin/sh agent -c 'agent-box-session env ls'")
+        assert sorted(env_ls.split()) == ["CERT", "PLAIN"], env_ls
+        machine.succeed(
+            "grep -c '^CERT=\"-----BEGIN CERTIFICATE-----$' "
+            "/home/agent/.config/agent-box/env | grep -x 1"
+        )
+        # systemd reads it back whole, and a later rm of another key leaves
+        # it intact (the rewrite parses quotes instead of splitting lines).
+        machine.succeed("su -s /bin/sh agent -c 'agent-box-session env rm PLAIN'")
+        machine.succeed(
+            "systemd-run --quiet --wait --pipe --collect "
+            "-p EnvironmentFile=/home/agent/.config/agent-box/env "
+            "/bin/sh -c 'printf %s \"$CERT\"' > /tmp/cert-from-systemd"
+        )
+        machine.succeed("cmp /tmp/cert.pem /tmp/cert-from-systemd")
+        machine.succeed("su -s /bin/sh agent -c 'agent-box-session env rm CERT'")
+
     # --- restart --all bounces every listed session -----------------------
     with subtest("restart --all"):
         old_all = machine.succeed(tmux('display -p -t "=main:" "#{pane_pid}"')).strip()

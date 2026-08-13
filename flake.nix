@@ -366,6 +366,24 @@
               python3 repo/bin/assemble-module.py --check --repo repo
               touch "$out"
             '';
+
+          # The per-user secrets file is written and read by the settings
+          # daemon in Python and read (and rewritten, through the session
+          # CLI) by the shell. It is systemd env-file syntax, so a value may
+          # be quoted and span lines — a PEM certificate or key, issue 212 —
+          # and a divergence between the two readers raises nothing: it
+          # silently truncates a stored secret at its first newline. This
+          # runs both against the same values. Cheap and arch-independent,
+          # unlike the VM tests that cover the same ground.
+          env-file-format =
+            pkgs.runCommand "agent-box-env-file-format"
+              {
+                nativeBuildInputs = [ pkgs.python3 pkgs.bash ];
+                srcDir = ./modules/src;
+                harness = ./tests/env-file-format.py;
+              } ''
+              python3 "$harness" "$srcDir" > "$out"
+            '';
         }
         # Everything below boots a guest, so it only exists for `vmSystems`:
         # runNixOSTest wants a same-arch KVM guest (cross-arch falls back to

@@ -19,6 +19,9 @@ on:
       # renderer must re-run the golden-snapshot check when either changes.
       - 'bin/golden-snapshot.py'
       - 'tests/golden/**'
+      # Same reason as modules/src: the env-file format harness (issue 212)
+      # is a check input that is not a *.nix file.
+      - 'tests/env-file-format.py'
       - 'flake.lock'
       - '.github/workflows/ci.yml'
   pull_request:
@@ -73,6 +76,14 @@ jobs:
       # `nix run .#assemble`, so the committed single file never drifts.
       - name: Check generated module is up to date
         run: nix build -L .#checks.x86_64-linux.module-generated-up-to-date && cat result
+
+      # Issue 212: the per-user secrets file is parsed by the settings daemon
+      # (Python) and by the spawn wrapper / session CLI (shell). A quoted
+      # value may span lines, and a divergence between the two readers
+      # truncates a stored secret silently, so both are run over the same
+      # values here.
+      - name: Check env-file format agrees across implementations
+        run: nix build -L .#checks.x86_64-linux.env-file-format && cat result
 
       # Eval/build check (issue 132): the module's generated Caddyfile carries
       # the authenticated /<user>/downloads/ file-server route.

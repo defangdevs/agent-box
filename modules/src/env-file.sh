@@ -1,7 +1,3 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
-# The per-user secrets file the settings page and `agent-box-session env`
-# manage. Runs inside the user's session, so $HOME names it directly.
-FILE="$HOME/.config/agent-box/env"
 # Reader/writer for the per-user secrets file (~/.config/agent-box/env),
 # shared by the session-spawn env loader (src/env-exec.sh) and by
 # `agent-box-session env` (src/session-cli.sh).
@@ -181,9 +177,3 @@ env_parse_legacy() {
     env_emit "$2" "$_lkey" "$_lval"
   done < "$1"
 }
-# Exported literally — never eval'd, never re-split — so a secret full of
-# shell metacharacters, or a multi-line PEM, arrives byte-exact.
-env_export() { export "$1=$2"; }
-env_parse "$FILE" env_export
-exec "$@"
-

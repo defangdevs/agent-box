@@ -72,6 +72,14 @@ input, select, textarea { box-sizing: border-box; font: inherit; font-size: 13px
 input[type=text] { width: 200px; max-width: 100%; }
 input[type=password] { width: 280px; max-width: 100%; }
 textarea { width: 100%; resize: vertical; }
+/* Multi-line secret (a PEM certificate or key): monospace so the base64
+   body and the BEGIN/END markers line up, and roomy enough to see one. */
+textarea.secret-multi { margin-top: 8px; font-family: ui-monospace, SFMono-Regular,
+                        Menlo, Consolas, monospace; font-size: 12px; }
+/* Link-styled button: an action inside running .note text. */
+.linkbtn { font: inherit; font-size: 13px; padding: 0; border: 0;
+           background: none; color: #58a6ff; cursor: pointer; }
+.linkbtn:hover { text-decoration: underline; }
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .new-session-row { align-items: flex-end; }
 .prompt-row { margin-top: 12px; }

@@ -481,17 +481,42 @@
     if (el) { el.hidden = true; }
   });
 
+  // The secret value has two fields with the same name (issue 212): the
+  // masked single-line input, and a textarea for a value that cannot fit on
+  // one line at all — a PEM certificate or private key. Whichever is not in
+  // use is hidden AND disabled, so the browser submits exactly one.
+  function secretField(form) {
+    return form.querySelector("[name=value]:not([disabled])");
+  }
+  function secretMulti(form, on) {
+    var single = form.querySelector("input[name=value]");
+    var area = form.querySelector("textarea[name=value]");
+    var btn = form.querySelector("[data-multiline]");
+    if (!single || !area) { return; }
+    // Carry what was typed across, so switching never loses a paste.
+    if (on) { area.value = single.value; } else { single.value = area.value; }
+    single.hidden = single.disabled = on;
+    area.hidden = area.disabled = !on;
+    if (btn) { btn.textContent = on ? "Single-line value" : "Multi-line value"; }
+    secretField(form).focus();
+  }
+
   document.addEventListener("click", function (e) {
-    var t = e.target && e.target.closest ? e.target.closest("[data-toggle],[data-edit]") : null;
+    var t = e.target && e.target.closest
+      ? e.target.closest("[data-toggle],[data-edit],[data-multiline]") : null;
     if (!t) { return; }
     var form = document.getElementById("secret-form");
+    if (t.hasAttribute("data-multiline")) {
+      secretMulti(form, form.querySelector("textarea[name=value]").hidden);
+      return;
+    }
     if (t.hasAttribute("data-edit")) {
       document.getElementById("secret-editor").hidden = false;
       form.reset();
       var key = form.querySelector("input[name=key]");
       key.value = t.getAttribute("data-edit");
       key.readOnly = true;
-      form.querySelector("input[name=value]").focus();
+      secretField(form).focus();
       return;
     }
     var el = document.getElementById(t.getAttribute("data-toggle"));

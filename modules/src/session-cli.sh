@@ -33,6 +33,7 @@ valid_key() {
   # env-exec wrapper: letters/digits/underscore, not starting with a digit.
   case "$1" in (*[!A-Za-z0-9_]*|""|[0-9]*) return 1 ;; esac
 }
+@@include:env-file.sh@@
 ensure_file() {
   mkdir -p "$(dirname "$FILE")"
   [ -s "$FILE" ] || printf '{"version":1,"sessions":{}}\n' > "$FILE"
@@ -199,44 +200,46 @@ case "$cmd" in
     # the settings page, which never surfaces a stored secret).
     ENV_FILE="$HOME/.config/agent-box/env"
     env_header() {
-      printf '# Managed by agent-box settings page. KEY=value, one per line.\n'
+      printf '# Managed by agent-box settings page. KEY=value, systemd env-file\n'
+      printf '# syntax: a quoted value may span lines (PEM keys, certificates).\n'
       printf '# Do not add secrets by hand here unless you know what you are doing.\n'
+    }
+    env_print_key() { printf '%s\n' "$1"; }
+    env_copy() {
+      # env_parse callback for env_rewrite: re-emit every pair but DROP_KEY,
+      # re-encoding the value so a quoted (possibly multi-line) one survives
+      # the rewrite instead of being truncated at its first newline.
+      if [ "$1" != "$DROP_KEY" ]; then
+        env_quote "$2"
+        printf '%s=%s\n' "$1" "$ENV_QUOTED"
+      fi
     }
     env_rewrite() {
       # env_rewrite DROP_KEY [APPEND_KEY APPEND_VALUE] — atomically rewrite
-      # ENV_FILE dropping DROP_KEY, keeping every other valid KEY=value, then
+      # ENV_FILE dropping DROP_KEY, keeping every other valid pair, then
       # optionally appending a fresh pair.
+      DROP_KEY="$1"
       mkdir -p "$(dirname "$ENV_FILE")"
       tmp="$(mktemp "$ENV_FILE.XXXXXX")"
       { env_header
-        if [ -f "$ENV_FILE" ]; then
-          while IFS= read -r line; do
-            case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-            ek="${line%%=*}"
-            valid_key "$ek" || continue
-            [ "$ek" = "$1" ] && continue
-            printf '%s\n' "$line"
-          done < "$ENV_FILE"
+        env_parse "$ENV_FILE" env_copy
+        if [ $# -ge 3 ]; then
+          env_quote "$3"
+          printf '%s=%s\n' "$2" "$ENV_QUOTED"
         fi
-        if [ $# -ge 3 ]; then printf '%s=%s\n' "$2" "$3"; fi
       } > "$tmp"
       chmod 600 "$tmp"; mv "$tmp" "$ENV_FILE"
     }
     sub="${1:-}"; shift || true
     case "$sub" in
       ls)
-        [ -f "$ENV_FILE" ] || exit 0
-        while IFS= read -r line; do
-          case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-          k="${line%%=*}"
-          valid_key "$k" && printf '%s\n' "$k"
-        done < "$ENV_FILE" | sort -u
+        env_parse "$ENV_FILE" env_print_key | sort -u
         ;;
       set)
         k="${1:-}"; v="${2-}"
         valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
-        case "$v" in (*"
-"*) echo "value may not contain a newline" >&2; exit 2 ;; esac
+        # A newline is allowed (issue 212): env_quote stores such a value
+        # double-quoted, which systemd and the spawn wrapper read as one.
         env_rewrite "$k" "$k" "$v"
         echo "env '$k' set — applies on the next session (re)start ('agent-box-session restart --all')"
         ;;

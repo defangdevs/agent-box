@@ -304,26 +304,198 @@ let
   # single live source for those keys (it is deliberately NOT in the
   # unit's EnvironmentFile, so a DELETED key disappears on restart too).
   # Values are exported literally — never eval'd — so a secret full of
-  # shell metacharacters can't break or inject anything; one pair of
-  # surrounding quotes is stripped to match how systemd read the same
-  # file before. Key charset mirrors the settings daemon's KEY_RE.
+  # shell metacharacters can't break or inject anything. The file is read
+  # with systemd's own env-file grammar (src/env-file.sh), so a quoted
+  # value spanning several lines — a PEM certificate or private key, issue
+  # 212 — arrives byte-exact instead of truncated at its first newline.
+  # Key charset mirrors the settings daemon's KEY_RE.
   envExecWrapper = pkgs.writeShellScript "agent-box-env-exec" ''
     # The per-user secrets file the settings page and `agent-box-session env`
     # manage. Runs inside the user's session, so $HOME names it directly.
     FILE="$HOME/.config/agent-box/env"
-    if [ -r "$FILE" ]; then
-      while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-        key=''${line%%=*}
-        case "$key" in (*[!A-Za-z0-9_]*|""|[0-9]*) continue ;; esac
-        val=''${line#*=}
-        case "$val" in
-          \"*\") val=''${val#\"}; val=''${val%\"} ;;
-          \'*\') val=''${val#\'}; val=''${val%\'} ;;
+    # Reader/writer for the per-user secrets file (~/.config/agent-box/env),
+    # shared by the session-spawn env loader (src/env-exec.sh) and by
+    # `agent-box-session env` (src/session-cli.sh).
+    #
+    # The file is systemd env-file syntax, NOT one KEY=value per line: a quoted
+    # value may span lines, which is how a PEM (an x509 certificate, a private
+    # key) is stored (issue 212). A line-based reader gets all three of these
+    # wrong — it truncates the value at the first newline, writes that
+    # truncation back on the next rewrite, and mistakes a base64 body line
+    # ending in "=" padding for another pair, so key material surfaces as a
+    # variable NAME. So the reader below mirrors the states of systemd's own
+    # parser (src/basic/env-file.c); src/settings-daemon.py's parse_env is the
+    # same machine in Python, and the two must stay in step.
+    #
+    #   env_parse FILE CALLBACK   calls CALLBACK KEY VALUE for every valid pair
+    #   env_quote VALUE           sets ENV_QUOTED to VALUE encoded for the file
+    #
+    # Values never reach the shell as code: no eval in either helper.
+    ENV_NL='
+    '
+    ENV_TAB=$(printf '\t')
+    ENV_CR=$(printf '\r')
+
+    env_quote() {
+      # Bare when the value is made only of characters that carry no meaning to
+      # the parser (base64, hex, URLs and ordinary tokens all qualify), so
+      # rewriting one key does not churn every other line of an existing file.
+      # Anything else — a space, a newline, a quote, a backslash, non-ASCII —
+      # takes the double-quoted form, where systemd unescapes \\ and \" and
+      # treats a newline as an ordinary character.
+      case $1 in
+        '''|*[!A-Za-z0-9_.:/@%+=,-]*) ;;
+        *) ENV_QUOTED=$1; return 0 ;;
+      esac
+      _qout=''${1//\\/\\\\}
+      _qout=''${_qout//\"/\\\"}
+      ENV_QUOTED='"'$_qout'"'
+    }
+
+    env_emit() {
+      # env_emit CALLBACK KEY VALUE — drop keys the loader would not export
+      # anyway; charset mirrors the settings daemon's KEY_RE.
+      case $2 in
+        '''|*[!A-Za-z0-9_]*|[0-9]*) return 0 ;;
+      esac
+      "$1" "$2" "$3"
+    }
+
+    env_parse() {
+      # env_parse FILE CALLBACK — walk FILE character by character, calling
+      # CALLBACK KEY VALUE for each pair. A missing or unreadable file simply
+      # has no pairs; an unterminated quote drops its own pair (systemd rejects
+      # the whole file).
+      _pfile=$1
+      _pcb=$2
+      [ -r "$_pfile" ] || return 0
+      # The trailing "x" survives the newline-stripping of command
+      # substitution, so a value's final newline is not silently eaten.
+      _pdata=$(cat "$_pfile"; printf x)
+      _pdata=''${_pdata%x}
+      case $_pdata in
+        *"$ENV_NL") ;;
+        *) _pdata=$_pdata$ENV_NL ;;
+      esac
+      _pstate=pre_key
+      _pkey='''
+      _pval='''
+      # Pairs are collected, not emitted as they complete: whether the file is
+      # readable at all is only known at EOF (see the unterminated-quote case
+      # below), and a callback cannot be taken back.
+      _pkeys=()
+      _pvals=()
+      # Whitespace held back: the trailing whitespace of an UNQUOTED value is
+      # dropped at end of line, but the same run in front of more content (or
+      # inside quotes) belongs to the value.
+      _pws='''
+      # Indexed access, not ''${data#?} slicing: the latter is a pattern match
+      # against the whole remainder and turns a 2 kB PEM into a 1.5-second
+      # spawn (measured), while this stays in the tens of milliseconds.
+      _plen=''${#_pdata}
+      _pi=0
+      while [ "$_pi" -lt "$_plen" ]; do
+        _pc=''${_pdata:_pi:1}
+        _pi=$((_pi + 1))
+        case $_pstate in
+          pre_key)
+            case $_pc in
+              '#'|';') _pstate=comment ;;
+              ' '|"$ENV_TAB"|"$ENV_NL"|"$ENV_CR") ;;
+              *) _pstate=key; _pkey=$_pc ;;
+            esac ;;
+          key)
+            case $_pc in
+              "$ENV_NL"|"$ENV_CR") _pstate=pre_key ;;
+              '=') _pstate=pre_value; _pval='''; _pws=''' ;;
+              *) _pkey=$_pkey$_pc ;;
+            esac ;;
+          pre_value|value)
+            case $_pc in
+              "$ENV_NL"|"$ENV_CR")
+                _pkeys+=("$_pkey"); _pvals+=("$_pval"); _pstate=pre_key ;;
+              "'") _pstate=single ;;
+              '"') _pstate=double ;;
+              '\') _pstate=value_escape ;;
+              ' '|"$ENV_TAB")
+                if [ "$_pstate" = value ]; then _pws=$_pws$_pc; fi ;;
+              *) _pstate=value; _pval=$_pval$_pws$_pc; _pws=''' ;;
+            esac ;;
+          value_escape)
+            _pstate=value
+            case $_pc in
+              "$ENV_NL"|"$ENV_CR") ;;
+              *) _pval=$_pval$_pws$_pc; _pws=''' ;;
+            esac ;;
+          single)
+            case $_pc in
+              "'") _pstate=pre_value ;;
+              '\') _pstate=single_escape ;;
+              *) _pval=$_pval$_pws$_pc; _pws=''' ;;
+            esac ;;
+          double)
+            case $_pc in
+              '"') _pstate=pre_value ;;
+              '\') _pstate=double_escape ;;
+              *) _pval=$_pval$_pws$_pc; _pws=''' ;;
+            esac ;;
+          single_escape|double_escape)
+            case $_pstate in
+              single_escape) _pstate=single ;;
+              *) _pstate=double ;;
+            esac
+            # Only the shell-special characters lose their backslash; every
+            # other escape keeps it, and backslash-newline is a continuation.
+            case $_pc in
+              '"'|'\'|'`'|'$') _pval=$_pval$_pws$_pc; _pws=''' ;;
+              "$ENV_NL"|"$ENV_CR") ;;
+              *) _pval=$_pval$_pws'\'$_pc; _pws=''' ;;
+            esac ;;
+          comment)
+            case $_pc in
+              '\') _pstate=comment_escape ;;
+              "$ENV_NL"|"$ENV_CR") _pstate=pre_key ;;
+            esac ;;
+          comment_escape) _pstate=comment ;;
         esac
-        export "$key=$val"
-      done < "$FILE"
-    fi
+      done
+      case $_pstate in
+        single|double|single_escape|double_escape)
+          # Unterminated quote — systemd rejects such a file outright. Before
+          # issue 212 nothing quoted anything, so a stored value could hold a
+          # lone quote; parsing that file strictly would make it (and every key
+          # after it) silently vanish, which is the very failure this change
+          # exists to remove. Read it the way the pre-212 loader did instead;
+          # the next write re-encodes it in the quoted form.
+          env_parse_legacy "$_pfile" "$_pcb"
+          return 0 ;;
+      esac
+      _pn=''${#_pkeys[@]}
+      _pi=0
+      while [ "$_pi" -lt "$_pn" ]; do
+        env_emit "$_pcb" "''${_pkeys[_pi]}" "''${_pvals[_pi]}"
+        _pi=$((_pi + 1))
+      done
+    }
+
+    env_parse_legacy() {
+      # env_parse_legacy FILE CALLBACK — the pre-212 one-pair-per-line reader,
+      # kept as the migration path for a file whose quotes do not balance.
+      while IFS= read -r _lline || [ -n "$_lline" ]; do
+        case $_lline in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
+        _lkey=''${_lline%%=*}
+        _lval=''${_lline#*=}
+        case $_lval in
+          \"*\") _lval=''${_lval#\"}; _lval=''${_lval%\"} ;;
+          \'*\') _lval=''${_lval#\'}; _lval=''${_lval%\'} ;;
+        esac
+        env_emit "$2" "$_lkey" "$_lval"
+      done < "$1"
+    }
+    # Exported literally — never eval'd, never re-split — so a secret full of
+    # shell metacharacters, or a multi-line PEM, arrives byte-exact.
+    env_export() { export "$1=$2"; }
+    env_parse "$FILE" env_export
     exec "$@"
   '';
 
@@ -830,6 +1002,185 @@ valid_key() {
   # env-exec wrapper: letters/digits/underscore, not starting with a digit.
   case "$1" in (*[!A-Za-z0-9_]*|""|[0-9]*) return 1 ;; esac
 }
+# Reader/writer for the per-user secrets file (~/.config/agent-box/env),
+# shared by the session-spawn env loader (src/env-exec.sh) and by
+# `agent-box-session env` (src/session-cli.sh).
+#
+# The file is systemd env-file syntax, NOT one KEY=value per line: a quoted
+# value may span lines, which is how a PEM (an x509 certificate, a private
+# key) is stored (issue 212). A line-based reader gets all three of these
+# wrong — it truncates the value at the first newline, writes that
+# truncation back on the next rewrite, and mistakes a base64 body line
+# ending in "=" padding for another pair, so key material surfaces as a
+# variable NAME. So the reader below mirrors the states of systemd's own
+# parser (src/basic/env-file.c); src/settings-daemon.py's parse_env is the
+# same machine in Python, and the two must stay in step.
+#
+#   env_parse FILE CALLBACK   calls CALLBACK KEY VALUE for every valid pair
+#   env_quote VALUE           sets ENV_QUOTED to VALUE encoded for the file
+#
+# Values never reach the shell as code: no eval in either helper.
+ENV_NL='
+'
+ENV_TAB=$(printf '\t')
+ENV_CR=$(printf '\r')
+
+env_quote() {
+  # Bare when the value is made only of characters that carry no meaning to
+  # the parser (base64, hex, URLs and ordinary tokens all qualify), so
+  # rewriting one key does not churn every other line of an existing file.
+  # Anything else — a space, a newline, a quote, a backslash, non-ASCII —
+  # takes the double-quoted form, where systemd unescapes \\ and \" and
+  # treats a newline as an ordinary character.
+  case $1 in
+    '''|*[!A-Za-z0-9_.:/@%+=,-]*) ;;
+    *) ENV_QUOTED=$1; return 0 ;;
+  esac
+  _qout=''${1//\\/\\\\}
+  _qout=''${_qout//\"/\\\"}
+  ENV_QUOTED='"'$_qout'"'
+}
+
+env_emit() {
+  # env_emit CALLBACK KEY VALUE — drop keys the loader would not export
+  # anyway; charset mirrors the settings daemon's KEY_RE.
+  case $2 in
+    '''|*[!A-Za-z0-9_]*|[0-9]*) return 0 ;;
+  esac
+  "$1" "$2" "$3"
+}
+
+env_parse() {
+  # env_parse FILE CALLBACK — walk FILE character by character, calling
+  # CALLBACK KEY VALUE for each pair. A missing or unreadable file simply
+  # has no pairs; an unterminated quote drops its own pair (systemd rejects
+  # the whole file).
+  _pfile=$1
+  _pcb=$2
+  [ -r "$_pfile" ] || return 0
+  # The trailing "x" survives the newline-stripping of command
+  # substitution, so a value's final newline is not silently eaten.
+  _pdata=$(cat "$_pfile"; printf x)
+  _pdata=''${_pdata%x}
+  case $_pdata in
+    *"$ENV_NL") ;;
+    *) _pdata=$_pdata$ENV_NL ;;
+  esac
+  _pstate=pre_key
+  _pkey='''
+  _pval='''
+  # Pairs are collected, not emitted as they complete: whether the file is
+  # readable at all is only known at EOF (see the unterminated-quote case
+  # below), and a callback cannot be taken back.
+  _pkeys=()
+  _pvals=()
+  # Whitespace held back: the trailing whitespace of an UNQUOTED value is
+  # dropped at end of line, but the same run in front of more content (or
+  # inside quotes) belongs to the value.
+  _pws='''
+  # Indexed access, not ''${data#?} slicing: the latter is a pattern match
+  # against the whole remainder and turns a 2 kB PEM into a 1.5-second
+  # spawn (measured), while this stays in the tens of milliseconds.
+  _plen=''${#_pdata}
+  _pi=0
+  while [ "$_pi" -lt "$_plen" ]; do
+    _pc=''${_pdata:_pi:1}
+    _pi=$((_pi + 1))
+    case $_pstate in
+      pre_key)
+        case $_pc in
+          '#'|';') _pstate=comment ;;
+          ' '|"$ENV_TAB"|"$ENV_NL"|"$ENV_CR") ;;
+          *) _pstate=key; _pkey=$_pc ;;
+        esac ;;
+      key)
+        case $_pc in
+          "$ENV_NL"|"$ENV_CR") _pstate=pre_key ;;
+          '=') _pstate=pre_value; _pval='''; _pws=''' ;;
+          *) _pkey=$_pkey$_pc ;;
+        esac ;;
+      pre_value|value)
+        case $_pc in
+          "$ENV_NL"|"$ENV_CR")
+            _pkeys+=("$_pkey"); _pvals+=("$_pval"); _pstate=pre_key ;;
+          "'") _pstate=single ;;
+          '"') _pstate=double ;;
+          '\') _pstate=value_escape ;;
+          ' '|"$ENV_TAB")
+            if [ "$_pstate" = value ]; then _pws=$_pws$_pc; fi ;;
+          *) _pstate=value; _pval=$_pval$_pws$_pc; _pws=''' ;;
+        esac ;;
+      value_escape)
+        _pstate=value
+        case $_pc in
+          "$ENV_NL"|"$ENV_CR") ;;
+          *) _pval=$_pval$_pws$_pc; _pws=''' ;;
+        esac ;;
+      single)
+        case $_pc in
+          "'") _pstate=pre_value ;;
+          '\') _pstate=single_escape ;;
+          *) _pval=$_pval$_pws$_pc; _pws=''' ;;
+        esac ;;
+      double)
+        case $_pc in
+          '"') _pstate=pre_value ;;
+          '\') _pstate=double_escape ;;
+          *) _pval=$_pval$_pws$_pc; _pws=''' ;;
+        esac ;;
+      single_escape|double_escape)
+        case $_pstate in
+          single_escape) _pstate=single ;;
+          *) _pstate=double ;;
+        esac
+        # Only the shell-special characters lose their backslash; every
+        # other escape keeps it, and backslash-newline is a continuation.
+        case $_pc in
+          '"'|'\'|'`'|'$') _pval=$_pval$_pws$_pc; _pws=''' ;;
+          "$ENV_NL"|"$ENV_CR") ;;
+          *) _pval=$_pval$_pws'\'$_pc; _pws=''' ;;
+        esac ;;
+      comment)
+        case $_pc in
+          '\') _pstate=comment_escape ;;
+          "$ENV_NL"|"$ENV_CR") _pstate=pre_key ;;
+        esac ;;
+      comment_escape) _pstate=comment ;;
+    esac
+  done
+  case $_pstate in
+    single|double|single_escape|double_escape)
+      # Unterminated quote — systemd rejects such a file outright. Before
+      # issue 212 nothing quoted anything, so a stored value could hold a
+      # lone quote; parsing that file strictly would make it (and every key
+      # after it) silently vanish, which is the very failure this change
+      # exists to remove. Read it the way the pre-212 loader did instead;
+      # the next write re-encodes it in the quoted form.
+      env_parse_legacy "$_pfile" "$_pcb"
+      return 0 ;;
+  esac
+  _pn=''${#_pkeys[@]}
+  _pi=0
+  while [ "$_pi" -lt "$_pn" ]; do
+    env_emit "$_pcb" "''${_pkeys[_pi]}" "''${_pvals[_pi]}"
+    _pi=$((_pi + 1))
+  done
+}
+
+env_parse_legacy() {
+  # env_parse_legacy FILE CALLBACK — the pre-212 one-pair-per-line reader,
+  # kept as the migration path for a file whose quotes do not balance.
+  while IFS= read -r _lline || [ -n "$_lline" ]; do
+    case $_lline in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
+    _lkey=''${_lline%%=*}
+    _lval=''${_lline#*=}
+    case $_lval in
+      \"*\") _lval=''${_lval#\"}; _lval=''${_lval%\"} ;;
+      \'*\') _lval=''${_lval#\'}; _lval=''${_lval%\'} ;;
+    esac
+    env_emit "$2" "$_lkey" "$_lval"
+  done < "$1"
+}
 ensure_file() {
   mkdir -p "$(dirname "$FILE")"
   [ -s "$FILE" ] || printf '{"version":1,"sessions":{}}\n' > "$FILE"
@@ -996,44 +1347,46 @@ case "$cmd" in
     # the settings page, which never surfaces a stored secret).
     ENV_FILE="$HOME/.config/agent-box/env"
     env_header() {
-      printf '# Managed by agent-box settings page. KEY=value, one per line.\n'
+      printf '# Managed by agent-box settings page. KEY=value, systemd env-file\n'
+      printf '# syntax: a quoted value may span lines (PEM keys, certificates).\n'
       printf '# Do not add secrets by hand here unless you know what you are doing.\n'
+    }
+    env_print_key() { printf '%s\n' "$1"; }
+    env_copy() {
+      # env_parse callback for env_rewrite: re-emit every pair but DROP_KEY,
+      # re-encoding the value so a quoted (possibly multi-line) one survives
+      # the rewrite instead of being truncated at its first newline.
+      if [ "$1" != "$DROP_KEY" ]; then
+        env_quote "$2"
+        printf '%s=%s\n' "$1" "$ENV_QUOTED"
+      fi
     }
     env_rewrite() {
       # env_rewrite DROP_KEY [APPEND_KEY APPEND_VALUE] — atomically rewrite
-      # ENV_FILE dropping DROP_KEY, keeping every other valid KEY=value, then
+      # ENV_FILE dropping DROP_KEY, keeping every other valid pair, then
       # optionally appending a fresh pair.
+      DROP_KEY="$1"
       mkdir -p "$(dirname "$ENV_FILE")"
       tmp="$(mktemp "$ENV_FILE.XXXXXX")"
       { env_header
-        if [ -f "$ENV_FILE" ]; then
-          while IFS= read -r line; do
-            case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-            ek="''${line%%=*}"
-            valid_key "$ek" || continue
-            [ "$ek" = "$1" ] && continue
-            printf '%s\n' "$line"
-          done < "$ENV_FILE"
+        env_parse "$ENV_FILE" env_copy
+        if [ $# -ge 3 ]; then
+          env_quote "$3"
+          printf '%s=%s\n' "$2" "$ENV_QUOTED"
         fi
-        if [ $# -ge 3 ]; then printf '%s=%s\n' "$2" "$3"; fi
       } > "$tmp"
       chmod 600 "$tmp"; mv "$tmp" "$ENV_FILE"
     }
     sub="''${1:-}"; shift || true
     case "$sub" in
       ls)
-        [ -f "$ENV_FILE" ] || exit 0
-        while IFS= read -r line; do
-          case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-          k="''${line%%=*}"
-          valid_key "$k" && printf '%s\n' "$k"
-        done < "$ENV_FILE" | sort -u
+        env_parse "$ENV_FILE" env_print_key | sort -u
         ;;
       set)
         k="''${1:-}"; v="''${2-}"
         valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
-        case "$v" in (*"
-"*) echo "value may not contain a newline" >&2; exit 2 ;; esac
+        # A newline is allowed (issue 212): env_quote stores such a value
+        # double-quoted, which systemd and the spawn wrapper read as one.
         env_rewrite "$k" "$k" "$v"
         echo "env '$k' set — applies on the next session (re)start ('agent-box-session restart --all')"
         ;;
@@ -3380,6 +3733,15 @@ in
         # contain only letters, digits, underscores. This is what a shell / systemd
         # EnvironmentFile will accept as a variable name.
         KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        # Env values that need no quoting in the file (see encode_value): the
+        # characters systemd's env-file parser gives no meaning to, which covers
+        # base64, hex, URLs and ordinary tokens. Matched with fullmatch, never
+        # search/match: "$" would also match in front of a value's trailing
+        # newline, and writing THAT bare would drop the newline on the next read.
+        PLAIN_VALUE_RE = re.compile(r"[A-Za-z0-9_.:/@%+=,-]+")
+        # The characters that lose their backslash inside a quoted value —
+        # systemd's SHELL_NEED_ESCAPE (see parse_env).
+        SHELL_NEED_ESCAPE = "\"\\`$"
         # Session names: same charset the supervisor and CLI enforce (they
         # land in tmux -t targets and URLs).
         SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
@@ -3459,49 +3821,154 @@ in
             )
 
 
+        def parse_env(text):
+            """Parse env-file `text` into a list of (key, value) pairs.
+
+            The file is systemd env-file syntax (src/basic/env-file.c), NOT one
+            KEY=value per line: a quoted value may SPAN LINES, which is how a PEM
+            (an x509 certificate, a private key) is stored (issue 212). Splitting on
+            lines instead got all three of these wrong — it truncated the value at
+            its first newline, wrote that truncation back on the next save, and read
+            a base64 body line ending in "=" padding as another pair, so key
+            material surfaced in the UI as a variable NAME.
+
+            So this mirrors systemd's own state machine; modules/src/env-file.sh is
+            the same machine in shell (for the spawn wrapper and the session CLI),
+            and the two must stay in step. Pairs whose key the loader would not
+            export are dropped here.
+            """
+            pairs = []
+            state = "pre_key"
+            key = value = ws = ""
+            for ch in text if text.endswith("\n") else text + "\n":
+                newline = ch in "\n\r"
+                if state == "pre_key":
+                    if ch in "#;":
+                        state = "comment"
+                    elif ch not in " \t\n\r":
+                        state, key = "key", ch
+                elif state == "key":
+                    if newline:
+                        state = "pre_key"          # no "=" on the line: not a pair
+                    elif ch == "=":
+                        state, value, ws = "pre_value", "", ""
+                    else:
+                        key += ch
+                elif state in ("pre_value", "value"):
+                    if newline:
+                        pairs.append((key, value))
+                        state = "pre_key"
+                    elif ch == "'":
+                        state = "single"
+                    elif ch == '"':
+                        state = "double"
+                    elif ch == "\\":
+                        state = "value_escape"
+                    elif ch in " \t":
+                        # Trailing whitespace of an UNQUOTED value is dropped at end
+                        # of line; the same run in front of more content is kept.
+                        if state == "value":
+                            ws += ch
+                    else:
+                        state, value, ws = "value", value + ws + ch, ""
+                elif state == "value_escape":
+                    state = "value"
+                    if not newline:
+                        value, ws = value + ws + ch, ""
+                elif state in ("single", "double"):
+                    if ch == ("'" if state == "single" else '"'):
+                        state = "pre_value"
+                    elif ch == "\\":
+                        state += "_escape"
+                    else:
+                        value, ws = value + ws + ch, ""
+                elif state in ("single_escape", "double_escape"):
+                    state = state[: -len("_escape")]
+                    # Only the shell-special characters lose their backslash; every
+                    # other escape keeps it, and backslash-newline is a continuation.
+                    if ch in SHELL_NEED_ESCAPE:
+                        value, ws = value + ws + ch, ""
+                    elif not newline:
+                        value, ws = value + ws + "\\" + ch, ""
+                elif state == "comment":
+                    if ch == "\\":
+                        state = "comment_escape"
+                    elif newline:
+                        state = "pre_key"
+                elif state == "comment_escape":
+                    state = "comment"
+            if state in ("single", "double", "single_escape", "double_escape"):
+                # Unterminated quote — systemd rejects such a file outright. Before
+                # issue 212 nothing quoted anything, so a stored value could hold a
+                # lone quote; parsing that file strictly would make it (and every
+                # key after it) silently vanish, which is the very failure this
+                # change exists to remove. Read it the way the pre-212 code did
+                # instead; the next write re-encodes it in the quoted form.
+                return parse_env_legacy(text)
+            return [(k, v) for (k, v) in pairs if KEY_RE.match(k)]
+
+
+        def parse_env_legacy(text):
+            """Read `text` as the pre-212 one-pair-per-line format.
+
+            Migration path only, for a file whose quotes do not balance (see
+            parse_env). Mirrors what the old reader did, surrounding quotes and
+            all. env_parse_legacy in env-file.sh is the same function in shell.
+            """
+            pairs = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                pairs.append((key.strip(), value))
+            return [(k, v) for (k, v) in pairs if KEY_RE.match(k)]
+
+
+        def encode_value(value):
+            """Encode `value` for the env file, quoting it when it needs quoting.
+
+            A value made only of characters the parser gives no meaning to stays
+            bare (base64, hex, URLs and ordinary tokens all qualify), so rewriting
+            one key does not churn every other line of an existing file. Anything
+            else — a space, a newline, a quote, a backslash, non-ASCII — takes the
+            double-quoted form, where systemd unescapes \\\\ and \\" and treats a
+            newline as an ordinary character. Mirrors env_quote in env-file.sh.
+            """
+            if PLAIN_VALUE_RE.fullmatch(value):
+                return value
+            return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
         def read_keys():
             """Return the sorted list of KEY names currently in the env file.
 
             Values are intentionally never returned — the UI must not be able to
             surface a stored secret.
             """
-            keys = []
-            try:
-                with open(ENV_FILE, "r", encoding="utf-8") as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        key = line.split("=", 1)[0].strip()
-                        if KEY_RE.match(key):
-                            keys.append(key)
-            except FileNotFoundError:
-                pass
             # De-dup preserving the last occurrence's position is unnecessary; names
             # are what matter, so sort for a stable UI.
-            return sorted(set(keys))
+            return sorted({key for (key, _) in parse_env(read_env())})
+
+
+        def read_env():
+            """Return the env file's text ("" when it does not exist yet)."""
+            try:
+                with open(ENV_FILE, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except FileNotFoundError:
+                return ""
 
 
         def load_pairs():
-            """Return an ordered dict-ish list of (key, rawvalue) for rewriting.
+            """Return an ordered list of (key, value) for rewriting.
 
             Used only internally when mutating the file; values never leave the
             process.
             """
-            pairs = []
-            try:
-                with open(ENV_FILE, "r", encoding="utf-8") as fh:
-                    for line in fh:
-                        stripped = line.strip()
-                        if not stripped or stripped.startswith("#") or "=" not in stripped:
-                            continue
-                        key, val = stripped.split("=", 1)
-                        key = key.strip()
-                        if KEY_RE.match(key):
-                            pairs.append((key, val))
-            except FileNotFoundError:
-                pass
-            return pairs
+            return parse_env(read_env())
 
 
         def write_pairs(pairs):
@@ -3516,10 +3983,13 @@ in
             try:
                 os.fchmod(fd, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write("# Managed by agent-box settings page. KEY=value, one per line.\n")
+                    # Kept byte-identical to env_header in src/session-cli.sh, the
+                    # other writer of this file.
+                    fh.write("# Managed by agent-box settings page. KEY=value, systemd env-file\n")
+                    fh.write("# syntax: a quoted value may span lines (PEM keys, certificates).\n")
                     fh.write("# Do not add secrets by hand here unless you know what you are doing.\n")
                     for key, val in pairs:
-                        fh.write(f"{key}={val}\n")
+                        fh.write(f"{key}={encode_value(val)}\n")
                 os.replace(tmp, ENV_FILE)
             except BaseException:
                 try:
@@ -4045,6 +4515,14 @@ in
           input[type=text] { width: 200px; max-width: 100%; }
           input[type=password] { width: 280px; max-width: 100%; }
           textarea { width: 100%; resize: vertical; }
+          /* Multi-line secret (a PEM certificate or key): monospace so the base64
+             body and the BEGIN/END markers line up, and roomy enough to see one. */
+          textarea.secret-multi { margin-top: 8px; font-family: ui-monospace, SFMono-Regular,
+                                  Menlo, Consolas, monospace; font-size: 12px; }
+          /* Link-styled button: an action inside running .note text. */
+          .linkbtn { font: inherit; font-size: 13px; padding: 0; border: 0;
+                     background: none; color: #58a6ff; cursor: pointer; }
+          .linkbtn:hover { text-decoration: underline; }
           .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
           .new-session-row { align-items: flex-end; }
           .prompt-row { margin-top: 12px; }
@@ -4254,8 +4732,21 @@ in
                   <input type="password" name="value" placeholder="value" autocomplete="off" required>
                   <button type="submit" class="btn">Save</button>
                 </div>
+                <!-- Multi-line alternative to the masked field (issue 212): a PEM
+                     certificate or private key cannot go through a single-line
+                     input at all. Both fields are named "value"; the inactive one
+                     is disabled, so exactly one is ever submitted, and the masked
+                     one stays the default (the switch below needs JavaScript,
+                     like the editor toggles). -->
+                <textarea name="value" class="secret-multi" rows="6" required hidden disabled
+                          autocomplete="off" spellcheck="false"
+                          placeholder="-----BEGIN CERTIFICATE-----"></textarea>
                 <p class="note">The value is write-only &mdash; saving replaces any
-                existing value for that key. This page never displays stored values.</p>
+                existing value for that key. This page never displays stored values.
+                <button type="button" class="linkbtn" data-multiline>Multi-line
+                value</button> for a certificate or key &mdash; it is stored exactly
+                as pasted, and unlike the masked field it is visible while you
+                type.</p>
               </form>
             </div>
             <div id="secrets-list">{keys}</div>
@@ -4841,17 +5332,42 @@ in
             if (el) { el.hidden = true; }
           });
 
+          // The secret value has two fields with the same name (issue 212): the
+          // masked single-line input, and a textarea for a value that cannot fit on
+          // one line at all — a PEM certificate or private key. Whichever is not in
+          // use is hidden AND disabled, so the browser submits exactly one.
+          function secretField(form) {
+            return form.querySelector("[name=value]:not([disabled])");
+          }
+          function secretMulti(form, on) {
+            var single = form.querySelector("input[name=value]");
+            var area = form.querySelector("textarea[name=value]");
+            var btn = form.querySelector("[data-multiline]");
+            if (!single || !area) { return; }
+            // Carry what was typed across, so switching never loses a paste.
+            if (on) { area.value = single.value; } else { single.value = area.value; }
+            single.hidden = single.disabled = on;
+            area.hidden = area.disabled = !on;
+            if (btn) { btn.textContent = on ? "Single-line value" : "Multi-line value"; }
+            secretField(form).focus();
+          }
+
           document.addEventListener("click", function (e) {
-            var t = e.target && e.target.closest ? e.target.closest("[data-toggle],[data-edit]") : null;
+            var t = e.target && e.target.closest
+              ? e.target.closest("[data-toggle],[data-edit],[data-multiline]") : null;
             if (!t) { return; }
             var form = document.getElementById("secret-form");
+            if (t.hasAttribute("data-multiline")) {
+              secretMulti(form, form.querySelector("textarea[name=value]").hidden);
+              return;
+            }
             if (t.hasAttribute("data-edit")) {
               document.getElementById("secret-editor").hidden = false;
               form.reset();
               var key = form.querySelector("input[name=key]");
               key.value = t.getAttribute("data-edit");
               key.readOnly = true;
-              form.querySelector("input[name=value]").focus();
+              secretField(form).focus();
               return;
             }
             var el = document.getElementById(t.getAttribute("data-toggle"));
@@ -5610,11 +6126,22 @@ in
                     self._redirect("ok=password_changed")
                 elif path == BASE + "/set":
                     key = (form.get("key", [""])[0]).strip()
-                    value = form.get("value", [""])[0]
+                    # Browsers submit CRLF line breaks from the multi-line field (a
+                    # textarea), the same normalization the kickoff prompt gets
+                    # below. Nothing else is trimmed: a PEM's trailing newline is
+                    # part of the value and the agent gets the bytes as pasted.
+                    value = form.get("value", [""])[0].replace("\r\n", "\n")
                     if not KEY_RE.match(key):
                         self._send_html(
                             render_page("Invalid key name. Use letters, digits and "
                                         "underscores; do not start with a digit."),
+                            status=400,
+                        )
+                        return
+                    if "\0" in value:
+                        # Neither the file format nor execve() can carry one.
+                        self._send_html(
+                            render_page("Value cannot contain a NUL byte."),
                             status=400,
                         )
                         return
