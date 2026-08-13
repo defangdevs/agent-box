@@ -1133,9 +1133,11 @@ esac
     NixOS config, not the entry.
 
     `status` prints JSON, and warns on stderr when the local-webhook a SESSION
-    loads is not the version this box pins, or when a live session predates
-    scoped instance sockets. Either one blinds the standing-watch ownership
-    brake, and neither is visible anywhere else (issue #193).
+    loads is OLDER than the version this box pins, or when a live session
+    predates scoped instance sockets. Either one blinds the standing-watch
+    ownership brake, and neither is visible anywhere else (issue #193). A cache
+    NEWER than the pin is normal — claude tracks the marketplace's default
+    branch — and is reported in the JSON (`plugin.skew`) without a warning.
 
     One-time per box, to make deliveries possible at all:
       agent-box-webhook setup      # mints the HMAC secret, prints URL + secret
@@ -1246,23 +1248,42 @@ esac
             (legacy) legacy=$((legacy + 1)) ;;
           esac
         done
+        # Which side of the pin the cache sits on. Only "older" is a fault: claude
+        # tracks the marketplace's default branch, so a cache AHEAD of the pin is
+        # the normal state between pin bumps, and calling that an error every time
+        # would train everyone to ignore the line that matters.
+        # The OLDEST installed copy decides: a project-scope install shadows the
+        # user one, and the stalest is the one that can break the brake.
+        skew=none
+        if [ -z "$installed" ]; then
+          skew=unknown
+        elif [ -n "$pinned" ]; then
+          oldest="$(printf '%s\n' $installed | sort -V | head -1)"
+          if [ "$oldest" = "$pinned" ]; then
+            skew=none
+          elif [ "$(printf '%s\n%s\n' "$oldest" "$pinned" | sort -V | head -1)" = "$oldest" ]; then
+            skew=older
+          else
+            skew=newer
+          fi
+        fi
         printf '%s' "$out" | "$JQ" \
-          --arg installed "$installed" --arg pf "$PLUGINS" \
+          --arg installed "$installed" --arg pf "$PLUGINS" --arg skew "$skew" \
           --argjson keyed "$keyed" --argjson shared "$shared" --argjson legacy "$legacy" '
             .plugin = {sessionVersions: ($installed | if . == "" then [] else split(" ") end),
-                       installedFrom: $pf}
+                       pinnedVersion: .version, skew: $skew, installedFrom: $pf}
             | .peers = {live: ($keyed + $shared + $legacy),
                         keyed: $keyed, shared: $shared, legacy: $legacy}'
         # Warnings on stderr only, and only when something is wrong: status stays
         # valid JSON on stdout for a caller that parses it, and a healthy box says
         # nothing at all.
-        if [ -z "$installed" ]; then
+        if [ "$skew" = unknown ]; then
           echo "agent-box-webhook: cannot tell which local-webhook a session loads" \
                "($PLUGINS is missing) — if sessions run one, its version is unverified (issue #193)" >&2
-        elif [ -n "$pinned" ] && [ "$installed" != "$pinned" ]; then
+        elif [ "$skew" = older ]; then
           echo "agent-box-webhook: version skew — sessions load local-webhook $installed," \
-               "this box pins $pinned. A new session will not match the receiver daemon." \
-               "Cure: claude plugin marketplace update local-channels &&" \
+               "OLDER than the pinned $pinned. webhook.syncSessionPlugin normally cures this at the" \
+               "next session start; by hand: claude plugin marketplace update local-channels &&" \
                "claude plugin update local-webhook@local-channels (issue #193)" >&2
         fi
         if [ "$legacy" -gt 0 ]; then
@@ -1898,6 +1919,90 @@ $PROMPT"
           '.extraKnownMarketplaces = ((.extraKnownMarketplaces // {})
              + {"local-channels": {source: {source: "github", repo: $whrepo}}})
            | .enabledPlugins = ((.enabledPlugins // {}) + $plug)'
+        sync_webhook_plugin
+      fi
+    }
+
+    # Keep the local-webhook a SESSION loads in step with the one the box PINS
+    # (issue #193). Two copies run here: the receiver daemon and the
+    # agent-box-webhook CLI run webhook.rev's store path, while a claude session
+    # loads claude's own plugin cache — and claude only refreshes that on an
+    # explicit `plugin update`. Drift there is invisible and expensive: a
+    # pre-0.10.0 peer names its IPC socket "<pid>.sock" instead of
+    # "<key>.<pid>.sock", which parses to no filter key, so the dispatch ownership
+    # brake sees no live session and one failing run spawns a hook session per CI
+    # event (#192). This box ran daemon 0.11.1 against a cache of 0.3.0 for nine
+    # days with no symptom.
+    #
+    # Session start is the only moment that can fix it: a session loads its
+    # interpreter once, so updating the cache under a RUNNING session does nothing
+    # (that case is what `agent-box-webhook status` reports). Deliberately narrow:
+    #
+    #   - Only when the cache is OLDER than the pin. A newer cache is normal —
+    #     claude tracks the marketplace's default branch, which moves ahead of
+    #     webhook.rev between pin bumps — and `claude plugin update` could not
+    #     install an older version anyway.
+    #   - Nothing installed yet: leave it. The seeded settings above make claude
+    #     clone the marketplace and install on first launch, and that lands on the
+    #     default branch, which is never older than the pin.
+    #   - Best effort. An offline box, a rate-limited marketplace or a claude that
+    #     changed its CLI must never keep a session from starting; the session
+    #     just starts with what it has, and says so.
+    sync_webhook_plugin() {
+      script="''${AGENT_BOX_WEBHOOK_PINNED_SCRIPT:-}"
+      { [ -n "$script" ] && [ -r "$script" ]; } || return 0
+      # Read the pinned VERSION with the shell alone: grep and sed are NOT on this
+      # unit's PATH (see agentBaseTools), and pinning two more binaries through the
+      # environment for one line would be worse than this loop.
+      pinned=""
+      while IFS= read -r line; do
+        case "$line" in
+          ("VERSION = '"*)
+            pinned="''${line#VERSION = \'}"; pinned="''${pinned%%\'*}"; break ;;
+        esac
+      done < "$script"
+      [ -n "$pinned" ] || return 0
+
+      installed="$HOME/.claude/plugins/installed_plugins.json"
+      [ -s "$installed" ] || return 0
+      # The OLDEST installed copy across scopes: a project-scope install shadows
+      # the user one, and the stalest is the one that can break the brake.
+      have="$("$JQ" -r '[.plugins["local-webhook@local-channels"] // [] | .[] | .version // empty] | .[]' \
+                "$installed" 2>/dev/null | sort -V | head -1)"
+      [ -n "$have" ] || return 0
+      [ "$have" = "$pinned" ] && return 0
+      # sort -V puts the lower version first; if that is not $have, the cache is
+      # already at or ahead of the pin and there is nothing to do.
+      [ "$(printf '%s\n%s\n' "$have" "$pinned" | sort -V | head -1)" = "$have" ] || return 0
+
+      # One attempt per pin per retry window. Without this, a box that cannot
+      # reach GitHub would pay the timeout on every session start — and the
+      # supervisor restarts a crashed session, so "every start" can mean a loop.
+      marker="$HOME/.claude/plugins/.agent-box-plugin-sync"
+      now="$(date +%s)"
+      retry="''${AGENT_BOX_WEBHOOK_SYNC_RETRY_S:-3600}"
+      if [ -s "$marker" ]; then
+        read -r mver mts _rest < "$marker" || true
+        case "''${mts:-x}" in (""|*[!0-9]*) mts=0 ;; esac
+        if [ "''${mver:-}" = "$pinned" ] && [ $((now - mts)) -lt "$retry" ]; then
+          echo "local-webhook plugin: cache $have is older than the pinned $pinned;" \
+               "last refresh attempt $((now - mts))s ago, not retrying yet (issue 193)" >&2
+          return 0
+        fi
+      fi
+      printf '%s %s\n' "$pinned" "$now" > "$marker"
+
+      cbin="$(agent_bin claude)" || return 0
+      echo "local-webhook plugin: cache $have is older than the pinned $pinned — refreshing" \
+           "before this session starts, so its peer is visible to the dispatch brake (issue 193)" >&2
+      if "$cbin" plugin marketplace update local-channels >/dev/null 2>&1 \
+           && "$cbin" plugin update local-webhook@local-channels >/dev/null 2>&1; then
+        now_have="$("$JQ" -r '[.plugins["local-webhook@local-channels"] // [] | .[] | .version // empty] | .[]' \
+                      "$installed" 2>/dev/null | sort -V | head -1)"
+        echo "local-webhook plugin: cache is now ''${now_have:-unknown} (pinned $pinned)" >&2
+      else
+        echo "local-webhook plugin: could not refresh the cache (offline, or claude's plugin CLI" \
+             "changed); this session starts on $have — 'agent-box-webhook status' will keep saying so" >&2
       fi
     }
 
@@ -2542,6 +2647,29 @@ in
         default = "sha256-nYzmBNrW+ZtulPUKsDqxkMl4DCUMHqSttqfZTxa98mY=";
         description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
       };
+      syncSessionPlugin = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Before a claude session starts, refresh claude's own local-webhook
+          plugin cache when it is OLDER than the version `rev` pins.
+
+          The daemon runs the pinned webhook.py; a session loads claude's
+          plugin cache, which claude refreshes only on an explicit
+          `claude plugin update`. A cache old enough to predate scoped instance
+          sockets (0.10.0) makes every live session invisible to the dispatch
+          ownership brake, so one failing run spawns a hook session per CI
+          event — silently (issue #193).
+
+          Only OLDER caches are touched: claude tracks the marketplace's
+          default branch, which legitimately runs ahead of `rev` between pin
+          bumps. Best effort — an offline box logs and starts the session
+          anyway — and at most one attempt per pin per hour, so a box that
+          cannot reach GitHub does not pay a timeout on every session start.
+          A running session keeps the interpreter it loaded, whatever this
+          does; `agent-box-webhook status` reports that case.
+        '';
+      };
       watchPolicy = lib.mkOption {
         type = lib.types.attrsOf (lib.types.submodule {
           options = {
@@ -2869,6 +2997,14 @@ in
             # Doubles as the supervisor's "webhook receiver is live" flag
             # (per-session LOCAL_WEBHOOK_* env + claude plugin seeding).
             AGENT_BOX_WEBHOOK_REPO = cfg.webhook.repo;
+          })
+          // (lib.optionalAttrs (webhookEnabled && cfg.webhook.syncSessionPlugin) {
+            # Presence = "keep the session's plugin cache off the floor"
+            # (webhook.syncSessionPlugin, issue #193). The supervisor reads the
+            # pinned VERSION out of this file to compare against claude's cache
+            # — the path, not the version, so nothing has to read the fetched
+            # file at eval time.
+            AGENT_BOX_WEBHOOK_PINNED_SCRIPT = "${localWebhookScript}";
           })
           // (lib.optionalAttrs (cfg.web.enable && u.web.passwordHashFile != null) {
             AGENT_BOX_URL = "https://${cfg.web.domain}/${name}/";

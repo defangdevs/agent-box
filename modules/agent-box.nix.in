@@ -1007,6 +1007,29 @@ in
         default = "sha256-nYzmBNrW+ZtulPUKsDqxkMl4DCUMHqSttqfZTxa98mY=";
         description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
       };
+      syncSessionPlugin = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Before a claude session starts, refresh claude's own local-webhook
+          plugin cache when it is OLDER than the version `rev` pins.
+
+          The daemon runs the pinned webhook.py; a session loads claude's
+          plugin cache, which claude refreshes only on an explicit
+          `claude plugin update`. A cache old enough to predate scoped instance
+          sockets (0.10.0) makes every live session invisible to the dispatch
+          ownership brake, so one failing run spawns a hook session per CI
+          event — silently (issue #193).
+
+          Only OLDER caches are touched: claude tracks the marketplace's
+          default branch, which legitimately runs ahead of `rev` between pin
+          bumps. Best effort — an offline box logs and starts the session
+          anyway — and at most one attempt per pin per hour, so a box that
+          cannot reach GitHub does not pay a timeout on every session start.
+          A running session keeps the interpreter it loaded, whatever this
+          does; `agent-box-webhook status` reports that case.
+        '';
+      };
       watchPolicy = lib.mkOption {
         type = lib.types.attrsOf (lib.types.submodule {
           options = {
@@ -1334,6 +1357,14 @@ in
             # Doubles as the supervisor's "webhook receiver is live" flag
             # (per-session LOCAL_WEBHOOK_* env + claude plugin seeding).
             AGENT_BOX_WEBHOOK_REPO = cfg.webhook.repo;
+          })
+          // (lib.optionalAttrs (webhookEnabled && cfg.webhook.syncSessionPlugin) {
+            # Presence = "keep the session's plugin cache off the floor"
+            # (webhook.syncSessionPlugin, issue #193). The supervisor reads the
+            # pinned VERSION out of this file to compare against claude's cache
+            # — the path, not the version, so nothing has to read the fetched
+            # file at eval time.
+            AGENT_BOX_WEBHOOK_PINNED_SCRIPT = "${localWebhookScript}";
           })
           // (lib.optionalAttrs (cfg.web.enable && u.web.passwordHashFile != null) {
             AGENT_BOX_URL = "https://${cfg.web.domain}/${name}/";
