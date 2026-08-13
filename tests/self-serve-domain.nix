@@ -83,7 +83,7 @@
     # write as plain `sudo -u agent` from the driver's root namespace) passed.
     machine.succeed(
         "systemctl show agent-box-agent --property=ReadWritePaths --value "
-        "| grep -q /var/lib/agent-box-sites/agent"
+        "| grep /var/lib/agent-box-sites/agent >/dev/null"
     )
 
     # The agent writes a new vhost snippet through the ~/sites symlink — never
@@ -115,7 +115,7 @@
     # invoke sudo even though the sudoers rule permits the command.
     machine.succeed(
         "systemctl show agent-box-agent --property=Environment "
-        "| grep -q '/run/wrappers/bin'"
+        "| grep '/run/wrappers/bin' >/dev/null"
     )
 
     # Reload caddy via the sudo rule (NOPASSWD).
@@ -127,6 +127,6 @@
 
     # New vhost actually serves.
     curl = f"curl -sk --resolve mysite.test:443:{machine_ip}"
-    client.wait_until_succeeds(f"{curl} https://mysite.test/ | grep -q 'hello from mysite'", timeout=30)
+    client.wait_until_succeeds(f"{curl} https://mysite.test/ | grep 'hello from mysite' >/dev/null", timeout=30)
   '';
 }

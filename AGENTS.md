@@ -43,6 +43,8 @@ Follow existing formatting: two-space indentation for Nix and TypeScript, four s
 
 Use `pkgs.testers.runNixOSTest` for service and VM behavior; name tests after the capability under test. Use Playwright `*.spec.ts` files only for behavior requiring a real browser or deployed instance. Add regression coverage with each behavioral fix. There is no numeric coverage threshold; CI expects every relevant named flake check to pass.
 
+Never end a test pipeline with `grep -q`. The driver runs each command under `set -euo pipefail`, and `grep -q` exits on the FIRST match — the producer upstream then gets EPIPE, and its non-zero status fails the whole assertion even though the pattern matched (a `must succeed` that reports exit 123 with `write error: Broken pipe` in the log). Write `… | grep PATTERN >/dev/null` instead, which drains the input, or capture to a file first and grep the file. `grep -q` is safe only with a file operand.
+
 ## Filing Issues
 
 When you hit something wrong — a bug, a design gap, a stale doc, a flaky check, surprising behavior you had to work around — **file an issue**, then carry on with what you were doing. Do it even when you are mid-task on something unrelated, even when you already worked around it, and even when it is small: a session transcript is not a bug tracker, and the next agent starts with none of your context.

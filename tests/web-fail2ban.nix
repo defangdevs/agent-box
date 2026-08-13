@@ -73,14 +73,14 @@
     curl = f"curl -sk --resolve box.test:443:{machine_ip}"
 
     # Correct password works and doesn't score against the jail
-    client.succeed(f"{curl} -u agent:testpassword https://box.test/ | grep -q ok")
+    client.succeed(f"{curl} -u agent:testpassword https://box.test/ | grep ok >/dev/null")
 
     # Five wrong-password attempts trip maxretry
     for i in range(5):
         client.succeed(f"{curl} -o /dev/null -u agent:wrong{i} https://box.test/")
 
     machine.wait_until_succeeds(
-        f"fail2ban-client status agent-web-auth | grep -q '{client_ip}'",
+        f"fail2ban-client status agent-web-auth | grep '{client_ip}' >/dev/null",
         timeout=60,
     )
 

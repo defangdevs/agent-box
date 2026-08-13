@@ -151,7 +151,7 @@
     ).strip()
     machine.succeed(
         "systemctl show agent-box-agent -p Environment --value "
-        "| grep -qF 'AGENT_BOX_HOST_LABEL=box.test'"
+        "| grep -F 'AGENT_BOX_HOST_LABEL=box.test' >/dev/null"
     )
     machine.succeed(f"grep -qF 'rcname=$USER-$sname' {start_script}")
 
@@ -180,9 +180,9 @@
     # is wired system-wide, and gh itself is on the agent unit's PATH.
     machine.succeed(
         "su -s /bin/sh agent -c "
-        "'git config --get credential.https://github.com.helper' | grep -q 'gh auth git-credential'"
+        "'git config --get credential.https://github.com.helper' | grep 'gh auth git-credential' >/dev/null"
     )
-    machine.succeed("systemctl cat agent-box-agent | grep -q -- '-gh-'")
+    machine.succeed("systemctl cat agent-box-agent | grep -- '-gh-' >/dev/null")
 
     # Claude emits its long OAuth URL inside one complete OSC 8 sequence.
     # tmux stores that metadata, but redraws plain text unless the attaching
@@ -757,7 +757,7 @@
     machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=60)
 
     # ttyd serves per-session deep links: the unit runs with --url-arg.
-    machine.succeed("systemctl cat agent-web-terminal-agent | grep -q -- --url-arg")
+    machine.succeed("systemctl cat agent-web-terminal-agent | grep -- --url-arg >/dev/null")
     # The attach script is the shared agent-box-attach since issue #154
     # Phase 2. `grep -o ... || echo missing`: an empty substitution would
     # leave `grep -q` reading stdin — the backdoor shell then hangs the whole
@@ -875,7 +875,7 @@
             "su -s /bin/sh agent -c 'agent-box-session add feedtest --agent claude'"
         )
         client.wait_until_succeeds(
-            f"grep '^data:' /tmp/feed.txt | grep -qv {baseline}", timeout=60
+            f"grep '^data:' /tmp/feed.txt | grep -v {baseline} >/dev/null", timeout=60
         )
         # The one-shot fingerprint (what a client that cannot hold a stream
         # open polls instead) moves with it.

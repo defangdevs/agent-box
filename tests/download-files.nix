@@ -117,7 +117,7 @@
 
     # With the right password the file downloads intact.
     client.wait_until_succeeds(
-        f"{curl} -u agent:testpassword https://box.test/agent/downloads/report.txt | grep -q 'hello from the box'",
+        f"{curl} -u agent:testpassword https://box.test/agent/downloads/report.txt | grep 'hello from the box' >/dev/null",
         timeout=30,
     )
 
@@ -125,7 +125,8 @@
     # Capture the (multi-KB) listing to a file before grepping: piping a large
     # body into `grep -q` makes grep close the pipe on first match, and the
     # resulting curl write-error (exit 23) trips the driver's pipefail even
-    # though the match succeeded.
+    # though the match succeeded. Same reason every piped grep in tests/ drops
+    # `-q` for `>/dev/null` — see AGENTS.md, Testing Guidelines.
     client.succeed(
         f"{curl} -u agent:testpassword https://box.test/agent/downloads/ -o /tmp/index.html"
     )

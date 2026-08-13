@@ -141,7 +141,7 @@
     machine.succeed(
         "stat -c '%U %G %a' /run/agent-box-settings/agent.sock | grep -x 'agent caddy 660'"
     )
-    machine.fail("ss -tln | grep -q ':7781'")
+    machine.fail("ss -tln | grep ':7781' >/dev/null")
 
     sock_curl = "curl -s --max-time 10 --unix-socket /run/agent-box-settings/agent.sock"
 
@@ -241,7 +241,7 @@
     # the live source instead.
     machine.fail(
         "systemctl show agent-box-agent --property=EnvironmentFiles "
-        "| grep -q '/home/agent/.config/agent-box/env'"
+        "| grep '/home/agent/.config/agent-box/env' >/dev/null"
     )
 
     # Dump the environment of the main session's AGENT process. The pane
@@ -249,6 +249,9 @@
     # wrapper (and the agent it execs, same pid) is that shell's CHILD —
     # /proc environ is an exec-time snapshot, so the exports only show up
     # there. Empty output (no child yet) just fails the grep and retries.
+    # Grep this dump with `grep PATTERN >/dev/null`, never `grep -q`: -q closes
+    # the pipe on the first match, `tr` dies of EPIPE mid-dump, and pipefail
+    # reports exit 123 for an assertion that actually held (CI run 31745418148).
     agent_env = (
         tmux('display -p -t "=main:" "#{pane_pid}"')
         + " | xargs -I{} sh -c 'pgrep -P {} | head -1'"
@@ -280,9 +283,9 @@
             "-d 'name=main' https://box.test/sessions/restart | grep -x 303"
         )
         machine.wait_until_succeeds(
-            agent_env + " | grep -qx 'UI_SECRET=from-the-ui'", timeout=30
+            agent_env + " | grep -x 'UI_SECRET=from-the-ui' >/dev/null", timeout=30
         )
-        machine.succeed(agent_env + " | grep -qx 'UI_KEEP=stays'")
+        machine.succeed(agent_env + " | grep -x 'UI_KEEP=stays' >/dev/null")
 
     # ...and "Restart all" bounces the WHOLE unit (the daemon SIGTERMs the
     # supervisor — no sudo), so unit-level EnvironmentFiles (the host's
