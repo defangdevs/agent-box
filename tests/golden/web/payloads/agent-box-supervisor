@@ -537,6 +537,37 @@ start_session() {
   fi
 }
 
+# Sweep webhook filter files left by sessions that are no longer listed.
+# 'agent-box-session rm' and the settings page now prune their own, so this
+# is the backstop for the two paths that cannot: sessions delisted while the
+# unit was down, and every orphan that accumulated before the prune existed.
+# Startup only — the reconcile loop below runs every 2s and this reads a
+# directory; the set only changes on a delist, which both delete paths
+# already handle.
+#
+# Deliberately keyed on the sessions FILE, not on tmux liveness: a listed
+# session that is merely down (stopped, or between respawns) keeps its
+# subscriptions. Only "$USER-<name>" files are candidates, which leaves the
+# shared filter.dispatch.json (standing watches, not owned by any session)
+# and the bare filter.json untouched.
+sweep_orphan_filters() {
+  _sd="${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
+  [ -d "$_sd" ] || return 0
+  for _f in "$_sd"/filter."$USER"-*.json; do
+    [ -e "$_f" ] || continue
+    _n=${_f##*/filter."$USER"-}; _n=${_n%.json}
+    case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
+    # A file jq cannot answer for is left alone: a transient read error must
+    # not be read as "this session is gone" and unsubscribe a live session.
+    if $JQ -e --arg s "$_n" '.sessions | has($s)' "$SESSIONS_FILE" >/dev/null 2>&1; then
+      continue
+    elif $JQ -e . "$SESSIONS_FILE" >/dev/null 2>&1; then
+      rm -f "$_f"
+    fi
+  done
+}
+sweep_orphan_filters
+
 # Reconcile forever; systemd stop tears the whole tree down (ExecStop
 # kill-server + cgroup kill), Restart=always revives a crashed loop.
 # Sessions flagged stopped (a clean agent exit, or agent-box-session

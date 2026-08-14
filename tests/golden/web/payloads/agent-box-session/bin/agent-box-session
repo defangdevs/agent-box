@@ -40,6 +40,23 @@ ensure_file() {
   mkdir -p "$(dirname "$FILE")"
   [ -s "$FILE" ] || printf '{"version":1,"sessions":{}}\n' > "$FILE"
 }
+prune_filter() {
+  # Drop the delisted session's webhook filter file. webhook.py names it
+  # filter.<LOCAL_WEBHOOK_SESSION>.json and the supervisor sets that to
+  # "<user>-<session>" (webhookSessionEnvArgs); the spawn wrapper seeds one
+  # for every dispatched hook-* session, and webhook_subscribe writes one for
+  # any session that subscribes. Nothing removed them, so they accumulated
+  # one per session that ever existed (31 files for 3 live sessions).
+  #
+  # Only ever called for a name that has just been DELISTED. A live session's
+  # file must stay: session routing fails OPEN (webhook.py:682), so deleting
+  # it would not mute that session, it would hand it the whole bus. For the
+  # same reason removing a dead session's file is the right end state and not
+  # merely tidy — the name is reusable, and a later 'add' of the same name
+  # would otherwise inherit the dead session's subscriptions.
+  _sd="${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
+  rm -f "$_sd/filter.$(id -un)-$1.json"
+}
 jq_edit() {
   # jq_edit JQ_ARGS... — atomically rewrite FILE through jq.
   tmp="$(mktemp "$FILE.XXXXXX")"
@@ -150,6 +167,7 @@ case "$cmd" in
     ensure_file
     jq_edit --arg n "$name" 'del(.sessions[$n])'
     t kill-session -t "=$name" 2>/dev/null || true
+    prune_filter "$name"
     echo "session '$name' removed"
     ;;
   stop)

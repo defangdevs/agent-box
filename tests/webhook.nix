@@ -653,6 +653,46 @@
         f" /home/agent/.local/state/local-webhook/filter.agent-{other}.json"
     )
 
+    # --- filter files are cleaned up with their session -------------------
+    # Every spawned or subscribing session leaves a filter file, and nothing
+    # used to remove them: 31 files for 3 live sessions on the dev box. 'rm'
+    # delists AND prunes, so a name that is added again does not inherit the
+    # dead session's subscriptions.
+    # No LOCAL_WEBHOOK_STATE_DIR here on purpose: the CLI runs from a plain
+    # shell as often as from a session, so the $HOME fallback is the path
+    # that has to work.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        f" agent-box-session rm {other}"
+    )
+    machine.succeed(
+        f"test ! -e /home/agent/.local/state/local-webhook/filter.agent-{other}.json"
+    )
+    # ...and only that one. Pruning a LISTED session's file would not mute it
+    # — session routing fails open — it would subscribe it to the whole bus.
+    machine.succeed(f"test -e {hook_filter}")
+
+    # The supervisor sweeps what the delete paths could not: orphans left by a
+    # session delisted while the unit was down, and everything that piled up
+    # before the prune existed. Keyed on sessions.json, so a listed session
+    # that is merely down keeps its subscriptions, and the shared dispatch
+    # file (owned by no session) is never a candidate.
+    machine.succeed(
+        "install -m 0600 /dev/null"
+        " /home/agent/.local/state/local-webhook/filter.agent-ghost.json"
+        " && chown agent:users"
+        " /home/agent/.local/state/local-webhook/filter.agent-ghost.json"
+    )
+    machine.succeed("systemctl restart agent-box-agent.service")
+    machine.wait_until_succeeds(
+        "test ! -e /home/agent/.local/state/local-webhook/filter.agent-ghost.json",
+        timeout=60,
+    )
+    machine.succeed(f"test -e {hook_filter}")
+    machine.succeed(
+        "test -e /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+
     # --- watchPolicy: declared rules govern a standing watch (#197) ---------
     # The module manages POLICY for watches sessions create, never the watches
     # themselves: at daemon start an ExecStartPre enforces the declared

@@ -834,6 +834,23 @@ ensure_file() {
   mkdir -p "$(dirname "$FILE")"
   [ -s "$FILE" ] || printf '{"version":1,"sessions":{}}\n' > "$FILE"
 }
+prune_filter() {
+  # Drop the delisted session's webhook filter file. webhook.py names it
+  # filter.<LOCAL_WEBHOOK_SESSION>.json and the supervisor sets that to
+  # "<user>-<session>" (webhookSessionEnvArgs); the spawn wrapper seeds one
+  # for every dispatched hook-* session, and webhook_subscribe writes one for
+  # any session that subscribes. Nothing removed them, so they accumulated
+  # one per session that ever existed (31 files for 3 live sessions).
+  #
+  # Only ever called for a name that has just been DELISTED. A live session's
+  # file must stay: session routing fails OPEN (webhook.py:682), so deleting
+  # it would not mute that session, it would hand it the whole bus. For the
+  # same reason removing a dead session's file is the right end state and not
+  # merely tidy — the name is reusable, and a later 'add' of the same name
+  # would otherwise inherit the dead session's subscriptions.
+  _sd="''${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
+  rm -f "$_sd/filter.$(id -un)-$1.json"
+}
 jq_edit() {
   # jq_edit JQ_ARGS... — atomically rewrite FILE through jq.
   tmp="$(mktemp "$FILE.XXXXXX")"
@@ -944,6 +961,7 @@ case "$cmd" in
     ensure_file
     jq_edit --arg n "$name" 'del(.sessions[$n])'
     t kill-session -t "=$name" 2>/dev/null || true
+    prune_filter "$name"
     echo "session '$name' removed"
     ;;
   stop)
@@ -2379,6 +2397,37 @@ $PROMPT"
         fi
       fi
     }
+
+    # Sweep webhook filter files left by sessions that are no longer listed.
+    # 'agent-box-session rm' and the settings page now prune their own, so this
+    # is the backstop for the two paths that cannot: sessions delisted while the
+    # unit was down, and every orphan that accumulated before the prune existed.
+    # Startup only — the reconcile loop below runs every 2s and this reads a
+    # directory; the set only changes on a delist, which both delete paths
+    # already handle.
+    #
+    # Deliberately keyed on the sessions FILE, not on tmux liveness: a listed
+    # session that is merely down (stopped, or between respawns) keeps its
+    # subscriptions. Only "$USER-<name>" files are candidates, which leaves the
+    # shared filter.dispatch.json (standing watches, not owned by any session)
+    # and the bare filter.json untouched.
+    sweep_orphan_filters() {
+      _sd="''${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
+      [ -d "$_sd" ] || return 0
+      for _f in "$_sd"/filter."$USER"-*.json; do
+        [ -e "$_f" ] || continue
+        _n=''${_f##*/filter."$USER"-}; _n=''${_n%.json}
+        case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
+        # A file jq cannot answer for is left alone: a transient read error must
+        # not be read as "this session is gone" and unsubscribe a live session.
+        if $JQ -e --arg s "$_n" '.sessions | has($s)' "$SESSIONS_FILE" >/dev/null 2>&1; then
+          continue
+        elif $JQ -e . "$SESSIONS_FILE" >/dev/null 2>&1; then
+          rm -f "$_f"
+        fi
+      done
+    }
+    sweep_orphan_filters
 
     # Reconcile forever; systemd stop tears the whole tree down (ExecStop
     # kill-server + cgroup kill), Restart=always revives a crashed loop.
@@ -3978,6 +4027,24 @@ in
             listed in sessions.json (= restart); delisting first makes it stay
             gone (= destroy)."""
             tmux("kill-session", "-t", "=" + name)
+
+
+        def prune_filter(name):
+            """Drop a DELISTED session's webhook filter file — the same cleanup
+            'agent-box-session rm' does, for the settings page's delete button.
+            webhook.py reads filter.<LOCAL_WEBHOOK_SESSION>.json and the supervisor
+            sets that to "<user>-<session>".
+
+            Never call this for a session that is still listed: session routing
+            fails open, so removing a live session's file subscribes it to the whole
+            bus instead of muting it."""
+            state_dir = os.environ.get("LOCAL_WEBHOOK_STATE_DIR") or os.path.join(
+                HOME_DIR, ".local", "state", "local-webhook"
+            )
+            try:
+                os.remove(os.path.join(state_dir, "filter.%s-%s.json" % (USER, name)))
+            except OSError:
+                pass
 
 
         def find_supervisor_pids():
@@ -6018,6 +6085,7 @@ in
                         sessions.pop(name, None)
                         write_sessions(sessions)
                         kill_session(name)
+                        prune_filter(name)
                     self._redirect("ok=session_deleted", self._sess_page(form))
                 elif path == SESS_BASE + "/sessions/restart":
                     name = (form.get("name", [""])[0]).strip()
