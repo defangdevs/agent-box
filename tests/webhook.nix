@@ -874,11 +874,11 @@
     machine.succeed(f"test -e {main_filter}")
 
     # A filter file that does not parse is the state NO subscribe/unsubscribe
-    # verb can clear — webhook.py reports it as "broken filter" and every
+    # verb can clear — webhook.py reports it as "invalid" and every
     # topic-shaped fix needs a topic. The page still gets it off the box.
     machine.succeed(f"echo 'not json at all' > {main_filter}")
     page = machine.succeed(f"{settings_curl} {settings_page}")
-    assert "broken filter" in page, page
+    assert "broken" in page, page
     assert settings_post(forget_url, "name=main") == "303"
     machine.fail(f"test -e {main_filter}")
     machine.succeed(

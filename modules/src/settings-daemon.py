@@ -459,7 +459,7 @@ def prune_filter(name):
 
     Two callers, and they mean different things by it. Deleting a session
     prunes the file it leaves behind, which would otherwise go on claiming
-    its topics. The panel's "Delete filter file" removes the file of a
+    its topics. The panel's Unsubscribe all / Clear removes the file of a
     session that is still listed, unsubscribing it from everything at once:
     the only reachable cleanup for a filter that is broken, muted, or
     merely empty, since the CLI's verbs all take a topic that a file in
@@ -1255,14 +1255,17 @@ WEBHOOK_STATES = {
     # Every state but "listening" delivers nothing; the note says how it
     # got there, because "unsubscribed from everything" and "never
     # subscribed" invite different next moves.
-    "listening": ("listening", "Delete the filter file to drop every topic at once."),
+    #
+    # None of it names the filter FILE. That a subscription is a line in a
+    # JSON file is this daemon's business and webhook.py's; the operator
+    # reading the row is being told what the session receives.
+    "listening": ("listening", ""),
     "empty": ("no subscriptions", "Unsubscribed from everything. Receives nothing."),
-    "absent": ("never subscribed", "No filter file yet: receives nothing until "
-                                   "this session subscribes to something. Nothing "
-                                   "to clean up."),
-    "invalid": ("broken filter", "The filter file is present but does not parse, "
-                                 "so this session receives nothing. Subscribing "
-                                 "again rewrites it; deleting it starts over."),
+    "absent": ("never subscribed", "Receives nothing until this session "
+                                   "subscribes to something. Nothing to clean up."),
+    "invalid": ("broken", "This session's subscriptions cannot be read, so it "
+                          "receives nothing. Subscribing again rewrites them; "
+                          "Clear removes them."),
     "off": ("muted", "Delivery is switched off for this session."),
     "unknown": ("unreadable", "Could not read this session's subscriptions."),
 }
@@ -1288,9 +1291,9 @@ def render_subs_chip(subs, name):
 
 def render_session_subs(sub, name):
     """The fold under one session row: its topics, and the state line that
-    says why there are none. Its delete drops the whole filter file, which
-    is the only cleanup an empty or unparseable one has — unsubscribe takes
-    a topic, and neither of those has one to name."""
+    says why there are none. Its last row drops the whole filter file,
+    which is the only cleanup an empty or unparseable one has — the CLI's
+    unsubscribe takes a topic, and neither of those has one to name."""
     safe = html.escape(name)
     # Only the hint: the state's LABEL is already the chip on the summary
     # line, and a fold that opens onto the word it was folded under says
@@ -1309,21 +1312,31 @@ def render_session_subs(sub, name):
                 dispatch=False,
             ))
     if sub and sub["file"]:
+        # Two labels, because one word cannot be honest about both cases:
+        # a session with topics is being unsubscribed from them, and one
+        # without is having a leftover state cleared. Neither says "file".
         count = len(sub["topics"])
-        warn = (" It unsubscribes from %d topic%s."
-                % (count, "" if count == 1 else "s")) if count else ""
+        if count:
+            label = "Unsubscribe all"
+            ask = ("Unsubscribe %s from %d topic%s?"
+                   % (name, count, "" if count == 1 else "s"))
+        else:
+            label = "Clear"
+            ask = "Clear the leftover subscriptions of %s?" % name
         forget = (
             f'<form class="inline" method="post" action="{html.escape(BASE)}/webhooks/forget" '
-            f'onsubmit="return confirm(\'Delete the filter file of {safe}?{warn}\');">'
+            f'onsubmit="return confirm(\'{html.escape(ask, quote=True)}\');">'
             f'<input type="hidden" name="name" value="{safe}">'
             f'<button type="submit" class="btn small danger-btn" '
-            f'title="Delete {safe}\'s filter file">Delete filter file</button></form>'
+            f'title="{html.escape(ask, quote=True)}">{label}</button></form>'
         )
     else:
         forget = ""
+    # A listening session needs no hint: the topics are right above and
+    # the button says what it does, so the last row is just the action.
+    note = f'<span class="note wh-note">{html.escape(hint)}</span>' if hint else ""
     rows.append(
-        f'<li class="sub-state"><span class="nm wh">'
-        f'<span class="note wh-note">{html.escape(hint)}</span></span>'
+        f'<li class="sub-state"><span class="nm wh">{note}</span>'
         f'<span class="acts">{forget}</span></li>'
     )
     return '<ul class="tbl subs">' + "".join(rows) + "</ul>"
@@ -1700,7 +1713,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "update": "Box update started — the system rebuilds in the "
                   "background and this page may briefly go away.",
         "webhook_deleted": "Subscription deleted — it stops at the next delivery.",
-        "webhook_forgotten": "Filter file deleted — that session now receives nothing.",
+        "webhook_forgotten": "Subscriptions cleared — that session now receives nothing.",
         "webhook_kept": "Could not delete that subscription. It may already be gone.",
         "password_changed": "Password changed. Sign in with your new password.",
     }

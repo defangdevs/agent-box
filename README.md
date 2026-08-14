@@ -387,10 +387,12 @@ On by default (`webhook.enable`), needs `web.enable`. How it fits together:
   saying why each exists; the shared standing watches, which belong to no
   session, get their own panel. A session with no topics receives nothing, and
   its row says which kind of nothing it is: **no subscriptions** (unsubscribed
-  from everything), **never subscribed** (no filter file yet), **broken
-  filter** or **muted**. Unsubscribe takes a topic, and an empty or unparseable
-  filter has none to name, so the fold also offers **Delete filter file** —
-  which drops the whole thing and puts the session back to never subscribed.
+  from everything), **never subscribed** (it never asked), **broken** (its
+  subscriptions do not parse) or **muted**. Unsubscribe takes a topic, and an
+  empty or unparseable
+  one has none to name, so the fold also offers **Unsubscribe all** (or
+  **Clear**, when there is nothing left to unsubscribe from) — which puts the
+  session back to never subscribed.
 - Claude Code sessions additionally get `webhook_subscribe` /
   `webhook_unsubscribe` / `webhook_subscriptions` as MCP tools, from the
   [local-channels](https://github.com/defangdevs/local-channels) `local-webhook`
