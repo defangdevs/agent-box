@@ -389,6 +389,24 @@ def kill_session(name):
     tmux("kill-session", "-t", "=" + name)
 
 
+def prune_filter(name):
+    """Drop a DELISTED session's webhook filter file — the same cleanup
+    'agent-box-session rm' does, for the settings page's delete button.
+    webhook.py reads filter.<LOCAL_WEBHOOK_SESSION>.json and the supervisor
+    sets that to "<user>-<session>".
+
+    Never call this for a session that is still listed: session routing
+    fails open, so removing a live session's file subscribes it to the whole
+    bus instead of muting it."""
+    state_dir = os.environ.get("LOCAL_WEBHOOK_STATE_DIR") or os.path.join(
+        HOME_DIR, ".local", "state", "local-webhook"
+    )
+    try:
+        os.remove(os.path.join(state_dir, "filter.%s-%s.json" % (USER, name)))
+    except OSError:
+        pass
+
+
 def find_supervisor_pids():
     """PIDs of this user's session supervisor — the agent unit's main
     process (the shared src/supervisor.sh store script; issue #154 Phase 2
@@ -1540,6 +1558,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 sessions.pop(name, None)
                 write_sessions(sessions)
                 kill_session(name)
+                prune_filter(name)
             self._redirect("ok=session_deleted", self._sess_page(form))
         elif path == SESS_BASE + "/sessions/restart":
             name = (form.get("name", [""])[0]).strip()
