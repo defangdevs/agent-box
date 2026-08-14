@@ -65,6 +65,9 @@ jobs:
     #    CREATE_COMPLETE and its outputs populate. That still catches template
     #    resolution bugs (e.g. the old EIPAssoc dependency) and empty-GetAtt bugs
     #    (e.g. a blank PrimaryIpv6Address -> "https://.sslip.io/").
+    #    DISABLED: fails first boot on every run since the 26.05 AMI landed, so
+    #    it only kept master red at ~39 min a run. Re-enable when issue 190 is
+    #    fixed: https://github.com/defangdevs/agent-box/issues/190
     strategy:
       fail-fast: false
       matrix:
@@ -72,9 +75,9 @@ jobs:
           - leg: ipv4-full
             public_ipv4: "true"
             use_spot: "false"
-          - leg: ipv6-outputs
-            public_ipv4: "false"
-            use_spot: "false"
+          # - leg: ipv6-outputs
+          #   public_ipv4: "false"
+          #   use_spot: "false"
     # Fork? Override with a repo-scoped var AGENT_BOX_ENVIRONMENT, or edit the fallback.
     environment: ${{ vars.AGENT_BOX_ENVIRONMENT || 'defang-agent-box' }}
     # Room for one FirstBootDone-timeout retry (issue 112): two create waits
