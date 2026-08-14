@@ -1113,9 +1113,12 @@ esac
            agent-box-webhook setup [SOURCE]
 
     Route webhook events to an agent instead of polling for them. TOPIC is
-    "source:key" — a bare "owner/repo" means github:owner/repo, "owner/*" and "*"
-    also work. --note says why you subscribed and is echoed under every delivery,
-    so a later session still has the context.
+    "source:key" — a bare "owner/repo" means github:owner/repo, and "owner/*"
+    also works. There is no wildcard for a whole source or for everything
+    (local-webhook 0.13.0), so name a repo or a prefix. A session receives only
+    what it subscribed to: no filter file now means no deliveries, where before
+    0.13.0 it meant all of them. --note says why you subscribed and is echoed
+    under every delivery, so a later session still has the context.
 
     Two delivery shapes:
       --deliver-to session   (default) events arrive as messages in THIS
@@ -2778,7 +2781,7 @@ in
       };
       rev = lib.mkOption {
         type = lib.types.str;
-        default = "da4e333ab0f56b00937cb887bebe38d85a80421a";
+        default = "93c8dac37874bb1531a4d01b2fd6c3a00317718c";
         description = ''
           Pinned local-channels commit whose local-webhook/webhook.py the
           receiver daemon and the agent-box-webhook CLI run. Claude sessions
@@ -2792,7 +2795,7 @@ in
         # builtins.fetchurl hash of local-webhook/webhook.py at `rev`:
         #   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.py
         # then `nix hash convert --hash-algo sha256 --to sri <base32>`.
-        default = "sha256-RXIBp/LSfbhgrjZkcJQuf42QsfwC1xq05xeL26jFikE=";
+        default = "sha256-K/Vcmvqlbbiy49DkrYFDc+G35kvtQBqOzVUvBtPKVIk=";
         description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
       };
       syncSessionPlugin = lib.mkOption {

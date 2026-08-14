@@ -668,8 +668,11 @@
     machine.succeed(
         f"test ! -e /home/agent/.local/state/local-webhook/filter.agent-{other}.json"
     )
-    # ...and only that one. Pruning a LISTED session's file would not mute it
-    # — session routing fails open — it would subscribe it to the whole bus.
+    # ...and only that one: a listed session keeps its subscriptions. Before
+    # local-webhook 0.13.0 this was sharper than tidiness — session routing
+    # failed open, so pruning a LIVE session's file handed it the whole bus
+    # instead of muting it. Now an absent file means no deliveries, so the
+    # stake is just the lost subscription.
     machine.succeed(f"test -e {hook_filter}")
 
     # The supervisor sweeps what the delete paths could not: orphans left by a

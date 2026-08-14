@@ -28,9 +28,12 @@ usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
        agent-box-webhook setup [SOURCE]
 
 Route webhook events to an agent instead of polling for them. TOPIC is
-"source:key" — a bare "owner/repo" means github:owner/repo, "owner/*" and "*"
-also work. --note says why you subscribed and is echoed under every delivery,
-so a later session still has the context.
+"source:key" — a bare "owner/repo" means github:owner/repo, and "owner/*"
+also works. There is no wildcard for a whole source or for everything
+(local-webhook 0.13.0), so name a repo or a prefix. A session receives only
+what it subscribed to: no filter file now means no deliveries, where before
+0.13.0 it meant all of them. --note says why you subscribed and is echoed
+under every delivery, so a later session still has the context.
 
 Two delivery shapes:
   --deliver-to session   (default) events arrive as messages in THIS
