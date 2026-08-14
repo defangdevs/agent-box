@@ -784,6 +784,128 @@
         timeout=60,
     )
 
+    # --- the settings page shows and deletes subscriptions (#227) -----------
+    # Until now the only view of "what is subscribed" was per session, from
+    # inside that session. The panel is the box-wide one, for the operator:
+    # every session's topics, the shared standing watches, and a delete for
+    # each — reached over the settings daemon's unix socket exactly as caddy
+    # reaches it. The daemon shells out to the SAME pinned webhook.py, one
+    # invocation per session key, so nothing here re-implements the filter
+    # format.
+    machine.wait_for_unit("agent-box-settings-agent.socket")
+    settings_curl = (
+        "curl -s --max-time 20 --unix-socket /run/agent-box-settings/agent.sock"
+    )
+    settings_page = "http://localhost/agent/settings/"
+    unsubscribe_url = "http://localhost/agent/settings/webhooks/unsubscribe"
+    main_filter = "/home/agent/.local/state/local-webhook/filter.agent-main.json"
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/panel --note 'shown in the UI' --ttl 0"
+    )
+    page = machine.succeed(f"{settings_curl} {settings_page}")
+    for want in [
+        "github:defangdevs/panel",   # this session's own subscription...
+        "shown in the UI",           # ...and the note saying why it exists
+        "session main",
+        "standing watch",            # the shared dispatch entry
+        f"session {hook_name}",      # a spawned session's seeded topic
+    ]:
+        assert want in page, "%s missing from the subscriptions panel" % want
+
+    # Delete a session subscription. 303 back to the page, and the topic is
+    # gone from that session's filter file — the receiver re-reads it per
+    # delivery, so nothing needs restarting.
+    def settings_post(url, *fields, headers=""):
+        args = " ".join("-d '%s'" % f for f in fields)
+        return machine.succeed(
+            f"{settings_curl} -X POST -o /dev/null -w '%{{http_code}}'"
+            f" {headers} {args} {url}"
+        ).strip()
+
+    assert settings_post(
+        unsubscribe_url,
+        "topic=github:defangdevs/panel", "key=agent-main", "dispatch=",
+    ) == "303"
+    machine.succeed(
+        "jq -e '[.topics[].topic] | index(\"github:defangdevs/panel\") | not'"
+        f" {main_filter}"
+    )
+    # That was main's last topic, so its row now reads one of the empty
+    # states: a filter file that lists nothing.
+    page = machine.succeed(f"{settings_curl} {settings_page}")
+    assert "no subscriptions" in page, page
+    assert "Unsubscribed from everything" in page, page
+
+    # ...and with the file gone it reads the OTHER one. Both deliver nothing
+    # since local-webhook 0.13.0 — the "unfiltered, receives EVERY event"
+    # warning the fail-open era needed would now be a lie — but they are not
+    # the same row: one session has unsubscribed, the other has never asked.
+    machine.succeed(f"rm -f {main_filter}")
+    page = machine.succeed(f"{settings_curl} {settings_page}")
+    assert "never subscribed" in page, page
+    assert "no subscriptions" not in page, page
+    # Subscribing again rebuilds the file, so the state is not a dead end (and
+    # the collateral checks at the end of this leg have something to watch).
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/panel --note 'back again' --ttl 0"
+    )
+    machine.succeed(f"test -e {main_filter}")
+
+    # The same for a standing watch — the entry a flood most likely comes
+    # from, since each match spends a fresh session.
+    assert settings_post(
+        unsubscribe_url,
+        "topic=github:defangdevs/local-channels", "key=agent", "dispatch=1",
+    ) == "303"
+    machine.succeed(
+        "jq -e '[.topics[].topic] | index(\"github:defangdevs/local-channels\") | not'"
+        " /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+    # A key that names no session of this user's is refused outright, so a
+    # posted form can neither reach another user's state nor mint a file.
+    assert settings_post(
+        unsubscribe_url,
+        "topic=github:defangdevs/agent-box", "key=agent-ghost", "dispatch=",
+    ) == "303"
+    machine.fail(
+        "test -e /home/agent/.local/state/local-webhook/filter.agent-ghost.json"
+    )
+    # These routes mutate state, so they sit behind the same CSRF gate as the
+    # rest of the page (issue #117): what a browser labels cross-site is
+    # refused before the CLI is ever run.
+    assert settings_post(
+        unsubscribe_url,
+        "topic=github:defangdevs/agent-box", "key=agent", "dispatch=1",
+        headers="-H 'Sec-Fetch-Site: cross-site'",
+    ) == "403"
+    machine.succeed(
+        "jq -e '[.topics[].topic] | index(\"github:defangdevs/agent-box\")'"
+        " /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+
+    # Deleting a session through the page takes its filter file with it —
+    # #229's third prune path, the one only this route reaches. Session CRUD
+    # sits at /sessions/* for the primary web user (its daemon also serves the
+    # vhost root), which is the user this test runs as.
+    machine.succeed(f"test -e {hook_filter}")
+    assert settings_post(
+        "http://localhost/sessions/delete",
+        f"name={hook_name}", "back=settings",
+    ) == "303"
+    machine.wait_until_fails(f"test -e {hook_filter}", timeout=30)
+    # Only that session's: the live session's file and the shared dispatch
+    # file are never candidates.
+    machine.succeed(f"test -e {main_filter}")
+    machine.succeed(
+        "test -e /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+
     # --- syncSessionPlugin: a stale session cache is refreshed at session start
     # (issue #193, option 2) --------------------------------------------------
     # The supervisor compares claude's plugin cache against the PINNED version

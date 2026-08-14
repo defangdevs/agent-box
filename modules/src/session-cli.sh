@@ -46,11 +46,13 @@ prune_filter() {
   # one per session that ever existed (31 files for 3 live sessions).
   #
   # Only ever called for a name that has just been DELISTED. A live session's
-  # file must stay: session routing fails OPEN (webhook.py:682), so deleting
-  # it would not mute that session, it would hand it the whole bus. For the
-  # same reason removing a dead session's file is the right end state and not
-  # merely tidy — the name is reusable, and a later 'add' of the same name
-  # would otherwise inherit the dead session's subscriptions.
+  # file must stay: it IS that session's subscriptions, so deleting it
+  # silently unsubscribes a session that is still running. (Before
+  # local-webhook 0.13.0 it was worse than that — routing failed open, so the
+  # deletion handed that session the whole bus instead.) Removing a dead
+  # session's file is the right end state and not merely tidy: the name is
+  # reusable, and a later 'add' of the same name would otherwise inherit the
+  # dead session's subscriptions.
   _sd="${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
   rm -f "$_sd/filter.$(id -un)-$1.json"
 }

@@ -526,7 +526,8 @@
     var statusUrl = f.getAttribute("data-status");
 
     function afterPost(t) {
-      applyDoc(parseHTML(t), ["msg-slot", "secrets-list", "sessions-list", "tab-bar"]);
+      applyDoc(parseHTML(t),
+        ["msg-slot", "secrets-list", "sessions-list", "webhooks-list", "tab-bar"]);
       var ed = f.closest(".editor");
       if (ed) { f.reset(); ed.hidden = true; }
       if (addedSession && tabEl(addedSession)) { wsSelect(addedSession, true); }

@@ -56,6 +56,10 @@
 #   AGENT_BOX_DEFAULT_AGENT      agent preselected in the add form
 #   AGENT_BOX_PASSWORD_CMD       no-argument sudo command that verifies
 #                                 and replaces this user's web password
+#   AGENT_BOX_WEBHOOK_SCRIPT     pinned local-webhook webhook.py (empty =
+#                                 no webhook receiver, so no panel)
+#   AGENT_BOX_WEBHOOK_STATE_DIR  where its filter.*.json files live
+#   AGENT_BOX_WEBHOOK_PYTHON     interpreter for that script
 
 import hashlib
 import html
@@ -117,6 +121,18 @@ SYSTEMCTL = os.environ.get("AGENT_BOX_SYSTEMCTL", "")
 # as JSON on stdin, never argv or environment, and helper output is never
 # reflected into HTTP responses.
 PASSWORD_CMD = os.environ.get("AGENT_BOX_PASSWORD_CMD", "")
+# Webhook subscriptions panel (issue #227). The pinned local-webhook
+# script plus the state directory its filter files live in; both set by
+# the module only when the webhook receiver is enabled, so the panel and
+# its routes simply do not exist otherwise. The daemon never parses or
+# writes a filter file itself — it runs the script's own CLI, which owns
+# topic parsing, TTL stamping, the atomic replace and its lock.
+WEBHOOK_SCRIPT = os.environ.get("AGENT_BOX_WEBHOOK_SCRIPT", "")
+WEBHOOK_STATE_DIR = os.environ.get("AGENT_BOX_WEBHOOK_STATE_DIR", "")
+# Interpreter for the above. The daemon's own is a fine fallback for a
+# dev run; the module passes the same python the receiver unit uses.
+WEBHOOK_PYTHON = os.environ.get("AGENT_BOX_WEBHOOK_PYTHON", "") or sys.executable
+WEBHOOKS = bool(WEBHOOK_SCRIPT and WEBHOOK_STATE_DIR)
 
 # Env var names: POSIX-ish. Must start with a letter or underscore and
 # contain only letters, digits, underscores. This is what a shell / systemd
@@ -125,6 +141,13 @@ KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Session names: same charset the supervisor and CLI enforce (they
 # land in tmux -t targets and URLs).
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+# Subscription topics: "source:owner/repo", or the prefix "source:owner/*"
+# (local-webhook 0.13.0 dropped "*" and "source:*" as topics). The
+# panel only ever posts back a topic it just rendered, and the CLI is
+# exec'd as an argv list with no shell, so this is a sanity bound rather
+# than a quoting defence — it keeps a malformed form value from reaching
+# the subscription file at all.
+TOPIC_RE = re.compile(r"^[A-Za-z0-9_.:/*-]{1,128}$")
 
 # The agent user's home. A session's working directory defaults to it
 # and the working-directory picker (below) browses within it: the
@@ -389,22 +412,183 @@ def kill_session(name):
     tmux("kill-session", "-t", "=" + name)
 
 
+# --- Webhook subscriptions (issue #227) ------------------------------
+# Which webhooks are live, for which session, was readable only through
+# the MCP tools or the CLI — i.e. only from inside a session, and only
+# for THAT session. This is the same view for the operator, plus the
+# delete that a flood makes urgent.
+#
+# local-webhook scopes itself by $LOCAL_WEBHOOK_SESSION, and that is an
+# input rather than an identity: setting it per invocation is how one
+# process reads or edits another session's subscriptions. The daemon
+# runs as the user who owns those files, so no privilege is involved.
+#
+# Everything goes through the script's own CLI. The filter format is not
+# this daemon's contract to keep: TTL stamps, the atomic replace and the
+# in-process lock all live upstream, and a second writer here would be a
+# second implementation of them.
+_webhook_error_at = -1e9   # monotonic stamp of the last logged CLI failure
+
+
+def webhook_key(name):
+    """$LOCAL_WEBHOOK_SESSION for one session — what the supervisor puts
+    in that session's tmux environment, so it names the same filter file
+    the session itself writes. `name` empty means "no session": the user
+    key, which owns no session filter and is used only to read the shared
+    dispatch list."""
+    return ("%s-%s" % (USER, name)) if name else USER
+
+
+def webhook_state_dir():
+    """Where the filter files live. AGENT_BOX_WEBHOOK_STATE_DIR is the
+    module's answer and is set whenever a receiver exists; the rest is for
+    a dev run, or for a box whose receiver was turned off after sessions
+    had already left files behind."""
+    return (
+        WEBHOOK_STATE_DIR
+        or os.environ.get("LOCAL_WEBHOOK_STATE_DIR")
+        or os.path.join(HOME_DIR, ".local", "state", "local-webhook")
+    )
+
+
 def prune_filter(name):
     """Drop a DELISTED session's webhook filter file — the same cleanup
-    'agent-box-session rm' does, for the settings page's delete button.
-    webhook.py reads filter.<LOCAL_WEBHOOK_SESSION>.json and the supervisor
-    sets that to "<user>-<session>".
+    'agent-box-session rm' does (#229), for the settings page's delete
+    button. webhook.py reads filter.<LOCAL_WEBHOOK_SESSION>.json and the
+    supervisor sets that to "<user>-<session>".
 
-    Never call this for a session that is still listed: session routing
-    fails open, so removing a live session's file subscribes it to the whole
-    bus instead of muting it."""
-    state_dir = os.environ.get("LOCAL_WEBHOOK_STATE_DIR") or os.path.join(
-        HOME_DIR, ".local", "state", "local-webhook"
-    )
+    Only ever for a name that is already out of sessions.json: while a
+    session is listed its filter file is its subscriptions, and removing
+    it silently unsubscribes a session that is still running."""
+    if not SESSION_RE.match(name):
+        return
     try:
-        os.remove(os.path.join(state_dir, "filter.%s-%s.json" % (USER, name)))
+        os.remove(os.path.join(webhook_state_dir(), "filter.%s.json" % webhook_key(name)))
     except OSError:
-        pass
+        pass   # never existed (the session never subscribed), or already gone
+
+
+def webhook_cli(key, args):
+    """Run the pinned webhook.py CLI scoped to one session key.
+
+    Returns the completed process, or None if it could not run. PORT=0
+    keeps this a pure state-file client: a CLI invocation must never bind
+    the ingress the receiver daemon owns.
+    """
+    env = dict(os.environ)
+    env["LOCAL_WEBHOOK_STATE_DIR"] = WEBHOOK_STATE_DIR
+    env["LOCAL_WEBHOOK_SESSION"] = key
+    env["LOCAL_WEBHOOK_PORT"] = "0"
+    try:
+        return subprocess.run(
+            [WEBHOOK_PYTHON, WEBHOOK_SCRIPT] + list(args),
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Same rate limit as tmux(): a page render forks one of these per
+        # session, so a permanently broken pin must not fill the journal.
+        global _webhook_error_at
+        now = time.monotonic()
+        if now - _webhook_error_at > 60:
+            _webhook_error_at = now
+            sys.stderr.write("webhook: %s\n" % exc)
+        return None
+
+
+def webhook_subscriptions(key):
+    """The `subscriptions` view for one session key ({} on any problem).
+
+    Carries the session's own topics plus the shared dispatch list, each
+    entry already rendered with its note and expiry, plus filterState:
+    why the topic list looks the way it does (local-webhook 0.13.0).
+    """
+    proc = webhook_cli(key, ["subscriptions"])
+    if proc is None or proc.returncode != 0:
+        return {}
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def webhook_unsubscribe(key, topic, dispatch):
+    """Drop one topic. True when the CLI reported success."""
+    args = ["unsubscribe", topic]
+    if dispatch:
+        args += ["--deliver-to", "subagent"]
+    proc = webhook_cli(key, args)
+    return proc is not None and proc.returncode == 0
+
+
+def webhook_entries(data, dispatch):
+    """The topic entries of a `subscriptions` payload, session or
+    dispatch side, as a list of dicts."""
+    block = data.get("dispatch") if dispatch else data
+    if not isinstance(block, dict):
+        return []
+    topics = block.get("topics")
+    return [t for t in topics if isinstance(t, dict)] if isinstance(topics, list) else []
+
+
+def webhook_view():
+    """What the panel renders: per-session rows plus the shared standing
+    watches.
+
+    A session with no topics receives nothing, whatever put it in that
+    state — since local-webhook 0.13.0 there is no longer a way to be
+    subscribed to everything by accident. What still differs is WHY, and
+    an operator reading the row wants that:
+      listening  topics, listed
+      empty      subscribed once, then unsubscribed from everything
+      absent     no filter file — this session has never subscribed
+      invalid    a filter file that does not parse (a botched edit)
+      off        enabled:false, so nothing is delivered whatever it lists
+    """
+    names = sorted(n for n in read_sessions() if SESSION_RE.match(n))
+    live = live_sessions()
+    sessions = []
+    watches = []
+    seen_dispatch = False
+    for name in names:
+        data = webhook_subscriptions(webhook_key(name))
+        if not seen_dispatch and data:
+            watches = webhook_entries(data, dispatch=True)
+            seen_dispatch = True
+        topics = webhook_entries(data, dispatch=False)
+        if not data:
+            state = "unknown"
+        elif data.get("enabled") is False:
+            # The muted-everything flag. No tool writes it yet
+            # (local-channels#23), but the fan-out honours it, so a
+            # session carrying it is not listening whatever it lists.
+            state = "off"
+        elif topics:
+            state = "listening"
+        else:
+            # Empty for one of several reasons; take upstream's own word for
+            # which rather than restating the filter format here. "ok" means
+            # a real, parseable topic list that is simply empty, and
+            # "unconfigured" a file with no topics key at all — nothing is
+            # delivered either way, so they share a row label.
+            state = str(data.get("filterState") or "")
+            state = state if state in ("absent", "invalid") else "empty"
+        sessions.append({
+            "name": name,
+            "key": webhook_key(name),
+            "live": name in live,
+            "state": state,
+            "topics": topics,
+        })
+    if not seen_dispatch:
+        # No sessions, or none answered: the standing watches are shared
+        # and outlive every session, so read them under the user key.
+        watches = webhook_entries(webhook_subscriptions(webhook_key("")), dispatch=True)
+    return sessions, watches
 
 
 def find_supervisor_pids():
@@ -762,6 +946,20 @@ SESSIONS_SECTION_TPL = """<section>
     <div id="sessions-list">{sessions}</div>
   </section>"""
 
+# Webhook subscriptions (issue #227), settings page only: the workspace
+# root is a terminal, not a manager. Hidden entirely when the box serves
+# no webhook receiver.
+WEBHOOKS_SECTION_TPL = """<section>
+    <div class="sec-head">
+      <h2>Webhook subscriptions</h2>
+    </div>
+    <p class="note">Where incoming webhook events go. A <em>session</em>
+    subscription delivers into that session; a <em>standing watch</em> is
+    shared and starts a NEW session per event batch. Deleting one takes
+    effect on the next delivery &mdash; no restart.</p>
+    <div id="webhooks-list">{webhooks}</div>
+  </section>"""
+
 # Root page (HOME mode): a tabbed terminal workspace (issue #119) —
 # one tab per session, the active one shown in an iframe onto the
 # existing per-session ttyd URL (/<user>/?arg=<session>; same origin,
@@ -812,6 +1010,7 @@ BODY = """<main>
   <h1><span class="mark">{mark}</span>Settings for {user}</h1>
   <div id="msg-slot">{message}</div>
   {sessions_section}
+  {webhooks_section}
   <section>
     <div class="sec-head">
       <h2>Environment secrets</h2>
@@ -1022,6 +1221,99 @@ def render_sessions():
     return '<ul class="tbl"><li class="tbl-head">Session</li>' + body + "</ul>"
 
 
+WEBHOOK_STATES = {
+    # label, and the note the operator needs to read the row correctly.
+    # Every state here delivers nothing; the note says how it got there,
+    # because "unsubscribed from everything" and "never subscribed" invite
+    # different next moves.
+    "listening": ("listening", ""),
+    "empty": ("no subscriptions", "Unsubscribed from everything. Receives nothing."),
+    "absent": ("never subscribed", "No filter file yet: receives nothing until "
+                                   "this session subscribes to something."),
+    "invalid": ("broken filter", "The filter file is present but does not parse, "
+                                 "so this session receives nothing. Subscribing "
+                                 "again rewrites it."),
+    "off": ("muted", "Delivery is switched off for this session."),
+    "unknown": ("unreadable", "Could not read this session's subscriptions."),
+}
+
+
+def render_webhook_row(topic, meta, note, key, dispatch, deletable=True):
+    """One subscription row: what it is, why it exists, and its delete."""
+    base = html.escape(BASE)
+    safe_topic = html.escape(topic)
+    bits = "".join(
+        f'<span class="meta">{html.escape(b)}</span>' for b in meta if b
+    )
+    note_html = (
+        f'<span class="note wh-note">{html.escape(note)}</span>' if note else ""
+    )
+    if deletable:
+        acts = (
+            f'<form class="inline" method="post" action="{base}/webhooks/unsubscribe" '
+            f'onsubmit="return confirm(\'Delete the subscription to {safe_topic}?\');">'
+            f'<input type="hidden" name="topic" value="{safe_topic}">'
+            f'<input type="hidden" name="key" value="{html.escape(key)}">'
+            f'<input type="hidden" name="dispatch" value="{"1" if dispatch else ""}">'
+            f'<button type="submit" class="icon idanger" aria-label="Delete" '
+            f'title="Delete subscription to {safe_topic}">{ICON_TRASH}</button></form>'
+        )
+    else:
+        acts = ""
+    return (
+        f'<li><span class="nm wh"><code>{safe_topic}</code>{bits}{note_html}</span>'
+        f'<span class="acts">{acts}</span></li>'
+    )
+
+
+def render_webhooks():
+    sessions, watches = webhook_view()
+    rows = []
+    for entry in watches:
+        topic = str(entry.get("topic") or "")
+        if not topic:
+            continue
+        rows.append(render_webhook_row(
+            topic,
+            ["standing watch", str(entry.get("expiresIn") or "")],
+            str(entry.get("note") or ""),
+            # A standing watch is shared, so any key edits the same list.
+            webhook_key(""),
+            dispatch=True,
+        ))
+    for sess in sessions:
+        label, hint = WEBHOOK_STATES.get(sess["state"], WEBHOOK_STATES["unknown"])
+        if not sess["topics"]:
+            rows.append(render_webhook_row(
+                sess["name"],
+                ["session", label],
+                hint,
+                sess["key"],
+                dispatch=False,
+                # Nothing to unsubscribe from, so no button that would do
+                # nothing. Hushing a session that IS listening without
+                # dropping its topics needs a mute verb the mechanism does
+                # not have yet (local-channels#23).
+                deletable=False,
+            ))
+            continue
+        for entry in sess["topics"]:
+            topic = str(entry.get("topic") or "")
+            if not topic:
+                continue
+            rows.append(render_webhook_row(
+                topic,
+                ["session " + sess["name"], str(entry.get("expiresIn") or "")],
+                str(entry.get("note") or ""),
+                sess["key"],
+                dispatch=False,
+            ))
+    if not rows:
+        rows.append('<li class="empty">No sessions, and no standing watches.</li>')
+    return ('<ul class="tbl"><li class="tbl-head">Subscription</li>'
+            + "".join(rows) + "</ul>")
+
+
 def render_agent_options():
     items = []
     for agent in AGENTS:
@@ -1166,6 +1458,10 @@ def render_page(message=""):
             # Every user, primary included: the HOME root page is the
             # terminal workspace, so session CRUD lives here.
             sessions_section=render_sessions_section(),
+            webhooks_section=(
+                WEBHOOKS_SECTION_TPL.format(webhooks=render_webhooks())
+                if WEBHOOKS else ""
+            ),
             message=msg_html,
             password_section=(
                 PASSWORD_SECTION.format(base=html.escape(BASE))
@@ -1335,6 +1631,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "session_restarted": "Session restart requested.",
         "update": "Box update started — the system rebuilds in the "
                   "background and this page may briefly go away.",
+        "webhook_deleted": "Subscription deleted — it stops at the next delivery.",
+        "webhook_kept": "Could not delete that subscription. It may already be gone.",
         "password_changed": "Password changed. Sign in with your new password.",
     }
 
@@ -1558,6 +1856,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 sessions.pop(name, None)
                 write_sessions(sessions)
                 kill_session(name)
+                # Delisted and killed, so its filter file routes nothing —
+                # but it would go on claiming its topics against the standing
+                # watches until something removes it (#229).
                 prune_filter(name)
             self._redirect("ok=session_deleted", self._sess_page(form))
         elif path == SESS_BASE + "/sessions/restart":
@@ -1573,6 +1874,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     write_sessions(sessions)
                 kill_session(name)
             self._redirect("ok=session_restarted", self._sess_page(form))
+        elif path == BASE + "/webhooks/unsubscribe" and WEBHOOKS:
+            topic = (form.get("topic", [""])[0]).strip()
+            key = (form.get("key", [""])[0]).strip()
+            dispatch = bool(form.get("dispatch", [""])[0])
+            # The key names a filter file, so hold it to the shape the
+            # supervisor mints: this user, and one of this user's own
+            # sessions (or the bare user key, which only reads the shared
+            # dispatch list).
+            name = key[len(USER) + 1:] if key.startswith(USER + "-") else ""
+            known = key == USER or (SESSION_RE.match(name) and name in read_sessions())
+            if not (TOPIC_RE.match(topic) and known):
+                self._redirect("ok=webhook_kept")
+                return
+            ok = webhook_unsubscribe(key, topic, dispatch)
+            self._redirect("ok=webhook_deleted" if ok else "ok=webhook_kept")
         elif path == BASE + "/restart":
             # Full unit bounce (see restart_all): re-reads unit-level
             # EnvironmentFiles, which per-session restarts can't.
