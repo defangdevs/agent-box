@@ -380,13 +380,17 @@ On by default (`webhook.enable`), needs `web.enable`. How it fits together:
   coalesce into one session; concurrent spawns are capped, and the wrapper
   refuses to accumulate more than a handful of live `hook-*` sessions. The
   spawned session's prompt tells it to remove itself when done.
-- The **settings page** lists every subscription on the box — each session's
-  topics, the shared standing watches, and the note saying why each exists —
-  with a delete button per row, for when a watch turns into a flood. Until
-  then that state was readable only from inside a session, and only for that
-  session. A session with no topics receives nothing, and its row says which
-  kind of nothing it is: **no subscriptions** (unsubscribed from everything),
-  **never subscribed** (no filter file yet), or **broken filter**.
+- The **settings page** shows every subscription on the box, with a delete for
+  each — for when a watch turns into a flood. Until then that state was
+  readable only from inside a session, and only for that session. A session's
+  own topics fold open under that session's row in **Sessions**, with the note
+  saying why each exists; the shared standing watches, which belong to no
+  session, get their own panel. A session with no topics receives nothing, and
+  its row says which kind of nothing it is: **no subscriptions** (unsubscribed
+  from everything), **never subscribed** (no filter file yet), **broken
+  filter** or **muted**. Unsubscribe takes a topic, and an empty or unparseable
+  filter has none to name, so the fold also offers **Delete filter file** —
+  which drops the whole thing and puts the session back to never subscribed.
 - Claude Code sessions additionally get `webhook_subscribe` /
   `webhook_unsubscribe` / `webhook_subscriptions` as MCP tools, from the
   [local-channels](https://github.com/defangdevs/local-channels) `local-webhook`

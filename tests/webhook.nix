@@ -786,9 +786,10 @@
 
     # --- the settings page shows and deletes subscriptions (#227) -----------
     # Until now the only view of "what is subscribed" was per session, from
-    # inside that session. The panel is the box-wide one, for the operator:
-    # every session's topics, the shared standing watches, and a delete for
-    # each — reached over the settings daemon's unix socket exactly as caddy
+    # inside that session. The page is the box-wide one, for the operator:
+    # each session's topics folded under that session's own row, the shared
+    # standing watches in their own panel, and a delete for every one of
+    # them — reached over the settings daemon's unix socket exactly as caddy
     # reaches it. The daemon shells out to the SAME pinned webhook.py, one
     # invocation per session key, so nothing here re-implements the filter
     # format.
@@ -798,6 +799,7 @@
     )
     settings_page = "http://localhost/agent/settings/"
     unsubscribe_url = "http://localhost/agent/settings/webhooks/unsubscribe"
+    forget_url = "http://localhost/agent/settings/webhooks/forget"
     main_filter = "/home/agent/.local/state/local-webhook/filter.agent-main.json"
     machine.succeed(
         "sudo -u agent env HOME=/home/agent"
@@ -807,13 +809,18 @@
     )
     page = machine.succeed(f"{settings_curl} {settings_page}")
     for want in [
-        "github:defangdevs/panel",   # this session's own subscription...
-        "shown in the UI",           # ...and the note saying why it exists
-        "session main",
-        "standing watch",            # the shared dispatch entry
-        f"session {hook_name}",      # a spawned session's seeded topic
+        "github:defangdevs/panel",     # this session's own subscription...
+        "shown in the UI",             # ...and the note saying why it exists
+        'data-fold="subs-main"',       # folded under the session it delivers to
+        "1 subscription",              # and counted on that session's row
+        f'data-fold="subs-{hook_name}"',   # a spawned session's seeded topic
+        "Standing watch",              # the shared dispatch list, its own panel
     ]:
-        assert want in page, "%s missing from the subscriptions panel" % want
+        assert want in page, "%s missing from the settings page" % want
+    # The standing watches are NOT session-scoped, so they are the one thing
+    # that must not have moved into a session's fold.
+    watches = page.split("Standing watch")[-1]
+    assert "github:defangdevs/agent-box" in watches, watches
 
     # Delete a session subscription. 303 back to the page, and the topic is
     # gone from that session's filter file — the receiver re-reads it per
@@ -839,14 +846,23 @@
     assert "no subscriptions" in page, page
     assert "Unsubscribed from everything" in page, page
 
-    # ...and with the file gone it reads the OTHER one. Both deliver nothing
+    # An empty filter file names no topic, so unsubscribe has nothing to take
+    # hold of: deleting the FILE is the only cleanup left, and the page can do
+    # it. Afterwards the row reads the OTHER empty state. Both deliver nothing
     # since local-webhook 0.13.0 — the "unfiltered, receives EVERY event"
     # warning the fail-open era needed would now be a lie — but they are not
     # the same row: one session has unsubscribed, the other has never asked.
-    machine.succeed(f"rm -f {main_filter}")
+    assert settings_post(forget_url, "name=main") == "303"
+    machine.fail(f"test -e {main_filter}")
     page = machine.succeed(f"{settings_curl} {settings_page}")
     assert "never subscribed" in page, page
     assert "no subscriptions" not in page, page
+    # Nothing left to delete: the route says so rather than reporting a
+    # success it did not have.
+    assert "ok=webhook_kept" in machine.succeed(
+        f"{settings_curl} -X POST -o /dev/null -w '%{{redirect_url}}' -d 'name=main'"
+        f" {forget_url}"
+    )
     # Subscribing again rebuilds the file, so the state is not a dead end (and
     # the collateral checks at the end of this leg have something to watch).
     machine.succeed(
@@ -856,6 +872,21 @@
         " agent-box-webhook subscribe defangdevs/panel --note 'back again' --ttl 0"
     )
     machine.succeed(f"test -e {main_filter}")
+
+    # A filter file that does not parse is the state NO subscribe/unsubscribe
+    # verb can clear — webhook.py reports it as "broken filter" and every
+    # topic-shaped fix needs a topic. The page still gets it off the box.
+    machine.succeed(f"echo 'not json at all' > {main_filter}")
+    page = machine.succeed(f"{settings_curl} {settings_page}")
+    assert "broken filter" in page, page
+    assert settings_post(forget_url, "name=main") == "303"
+    machine.fail(f"test -e {main_filter}")
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/panel --note 'back again' --ttl 0"
+    )
 
     # The same for a standing watch — the entry a flood most likely comes
     # from, since each match spends a fresh session.
@@ -876,6 +907,14 @@
     machine.fail(
         "test -e /home/agent/.local/state/local-webhook/filter.agent-ghost.json"
     )
+    # Forget takes a session NAME, and it is held to the same bound: one of
+    # this user's own listed sessions. An unlisted name, and a name shaped
+    # like a path out of the state directory, both stop at the check.
+    assert settings_post(forget_url, "name=ghost") == "303"
+    assert settings_post(forget_url, "name=../../dispatch") == "303"
+    machine.succeed(
+        "test -e /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
     # These routes mutate state, so they sit behind the same CSRF gate as the
     # rest of the page (issue #117): what a browser labels cross-site is
     # refused before the CLI is ever run.
@@ -888,6 +927,10 @@
         "jq -e '[.topics[].topic] | index(\"github:defangdevs/agent-box\")'"
         " /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
+    assert settings_post(
+        forget_url, "name=main", headers="-H 'Sec-Fetch-Site: cross-site'",
+    ) == "403"
+    machine.succeed(f"test -e {main_filter}")
 
     # Deleting a session through the page takes its filter file with it —
     # #229's third prune path, the one only this route reaches. Session CRUD

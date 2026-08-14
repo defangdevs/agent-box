@@ -4,7 +4,19 @@
     ids.forEach(function (id) {
       var from = doc.getElementById(id);
       var to = document.getElementById(id);
-      if (from && to) { to.replaceWith(document.importNode(from, true)); }
+      if (!from || !to) { return; }
+      // Which rows the operator has folded open is state this HTML does
+      // not carry: the live feed replaces #sessions-list on every session
+      // change, so without this a subscription fold snaps shut under
+      // whoever just opened it. data-fold is the row's identity.
+      var open = {};
+      Array.prototype.forEach.call(
+        to.querySelectorAll("details[data-fold][open]"),
+        function (d) { open[d.getAttribute("data-fold")] = 1; });
+      Array.prototype.forEach.call(
+        from.querySelectorAll("details[data-fold]"),
+        function (d) { if (open[d.getAttribute("data-fold")]) { d.open = true; } });
+      to.replaceWith(document.importNode(from, true));
     });
   }
   function parseHTML(text) {

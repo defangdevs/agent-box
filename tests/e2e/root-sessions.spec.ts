@@ -116,11 +116,15 @@ test('add a session from the tab bar, switch tabs, delete it on the settings pag
   await page.goto(`/${USER}/settings/`);
   const row = page.locator('#sessions-list li', { hasText: name });
   await expect(row).toHaveCount(1);
+  // By the form it posts, not by button name: the row's webhook fold (#227)
+  // holds a "Delete filter file" button and one trash per subscription, all
+  // of which answer to a "Delete" accessible name.
+  const del = row.locator('form[action$="/sessions/delete"] button');
   page.once('dialog', (d) => d.dismiss());
-  await row.getByRole('button', { name: 'Delete' }).click();
+  await del.click();
   await expect(row).toHaveCount(1);
   page.once('dialog', (d) => d.accept());
-  await row.getByRole('button', { name: 'Delete' }).click();
+  await del.click();
   await expect(page.locator('.msg')).toHaveText(/Session deleted/);
   await expect(row).toHaveCount(0);
 });

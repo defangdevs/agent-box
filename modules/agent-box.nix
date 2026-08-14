@@ -4097,20 +4097,27 @@ in
 
 
         def prune_filter(name):
-            """Drop a DELISTED session's webhook filter file — the same cleanup
-            'agent-box-session rm' does (#229), for the settings page's delete
-            button. webhook.py reads filter.<LOCAL_WEBHOOK_SESSION>.json and the
-            supervisor sets that to "<user>-<session>".
+            """Drop one session's webhook filter file — the same cleanup
+            'agent-box-session rm' does (#229). webhook.py reads
+            filter.<LOCAL_WEBHOOK_SESSION>.json and the supervisor sets that to
+            "<user>-<session>". True when a file was there to remove.
 
-            Only ever for a name that is already out of sessions.json: while a
-            session is listed its filter file is its subscriptions, and removing
-            it silently unsubscribes a session that is still running."""
+            Two callers, and they mean different things by it. Deleting a session
+            prunes the file it leaves behind, which would otherwise go on claiming
+            its topics. The panel's "Delete filter file" removes the file of a
+            session that is still listed, unsubscribing it from everything at once:
+            the only reachable cleanup for a filter that is broken, muted, or
+            merely empty, since the CLI's verbs all take a topic that a file in
+            those states does not have. Safe since local-webhook 0.13.0 — a
+            session with no filter file receives nothing, so the worst case is
+            subscribing again."""
             if not SESSION_RE.match(name):
-                return
+                return False
             try:
                 os.remove(os.path.join(webhook_state_dir(), "filter.%s.json" % webhook_key(name)))
             except OSError:
-                pass   # never existed (the session never subscribed), or already gone
+                return False   # never existed (never subscribed), or already gone
+            return True
 
 
         def webhook_cli(key, args):
@@ -4181,8 +4188,10 @@ in
 
 
         def webhook_view():
-            """What the panel renders: per-session rows plus the shared standing
-            watches.
+            """What the page renders: each session's own subscriptions, keyed by
+            session name so the Sessions panel can fold them into that session's
+            row, plus the standing watches, which belong to no session and get a
+            panel of their own.
 
             A session with no topics receives nothing, whatever put it in that
             state — since local-webhook 0.13.0 there is no longer a way to be
@@ -4195,8 +4204,7 @@ in
               off        enabled:false, so nothing is delivered whatever it lists
             """
             names = sorted(n for n in read_sessions() if SESSION_RE.match(n))
-            live = live_sessions()
-            sessions = []
+            sessions = {}
             watches = []
             seen_dispatch = False
             for name in names:
@@ -4222,13 +4230,16 @@ in
                     # delivered either way, so they share a row label.
                     state = str(data.get("filterState") or "")
                     state = state if state in ("absent", "invalid") else "empty"
-                sessions.append({
+                sessions[name] = {
                     "name": name,
                     "key": webhook_key(name),
-                    "live": name in live,
                     "state": state,
                     "topics": topics,
-                })
+                    # Is there a filter file to remove? Every state but "absent"
+                    # has one; "unknown" means the CLI did not answer, so nothing
+                    # here can be said about it either way.
+                    "file": state not in ("absent", "unknown"),
+                }
             if not seen_dispatch:
                 # No sessions, or none answered: the standing watches are shared
                 # and outlive every session, so read them under the user key.
@@ -4598,13 +4609,39 @@ in
           a.sess { color: #58a6ff; text-decoration: none; }
           a.sess:hover { text-decoration: underline; }
           .acts { display: flex; align-items: center; gap: 4px; flex: none; }
-          /* Subscription rows (issue #227) wrap: a topic carries a session name, an
-             expiry and the note saying why it exists, which does not fit one line
-             on a phone. */
+          /* Subscription rows (issue #227) wrap: a topic carries an expiry and the
+             note saying why it exists, which does not fit one line on a phone. */
           .nm.wh { flex-wrap: wrap; row-gap: 2px; }
           .nm.wh code { color: #e6edf3; }
           .wh-note { flex-basis: 100%; margin: 0; font-size: 12px; }
+          /* A session row folds open onto its own subscriptions (issue #227), so
+             the <li> stops being the flex row and its <summary> becomes one. */
+          .tbl li.foldrow { display: block; padding: 0; }
+          .tbl li.foldrow summary { display: flex; align-items: center;
+                                    justify-content: space-between; gap: 12px;
+                                    padding: 10px 16px; cursor: pointer;
+                                    list-style: none; }
+          .tbl li.foldrow summary::-webkit-details-marker { display: none; }
+          .tbl li.foldrow summary:hover { background: #161b22; }
+          /* The name side wraps: the actions keep their width (flex: none), so on a
+             phone the chip would otherwise slide under the Restart button. */
+          .tbl li.foldrow summary .nm { flex-wrap: wrap; row-gap: 4px; }
+          /* Our own disclosure caret, since the native marker is dropped above.
+             Literal glyphs, not CSS escapes: this file is inlined into a Python
+             string, where a backslash escape would have to survive both. */
+          .tbl li.foldrow summary .nm::before { content: "▸"; color: #8b949e;
+                                                font-size: 11px; flex: none; }
+          .tbl li.foldrow details[open] summary .nm::before { content: "▾"; }
+          /* The fold body: an inset table with no border of its own, so its rows
+             read as belonging to the session above them. */
+          ul.tbl.subs { margin: 0; border: 0; border-radius: 0; background: #0d1117; }
+          ul.tbl.subs li { padding-left: 40px; }
           .meta { color: #8b949e; font-size: 12px; }
+          /* The webhook chip is a different KIND of fact from the agent name and
+             the cwd beside it — what the fold holds — so it gets its own pill
+             rather than joining the row's run of grey. */
+          .subs-chip { background: #21262d; border-radius: 10px; padding: 1px 8px;
+                       white-space: nowrap; }
           .state { font-size: 12px; color: #8b949e; }
           .state::before { content: ""; display: inline-block; width: 8px; height: 8px;
                            border-radius: 50%; background: currentColor; margin-right: 5px; }
@@ -4780,17 +4817,18 @@ in
             <div id="sessions-list">{sessions}</div>
           </section>"""
 
-        # Webhook subscriptions (issue #227), settings page only: the workspace
-        # root is a terminal, not a manager. Hidden entirely when the box serves
-        # no webhook receiver.
+        # Standing watches (issue #227), settings page only: the workspace root
+        # is a terminal, not a manager. Hidden entirely when the box serves no
+        # webhook receiver. A session's OWN subscriptions are not here — they
+        # fold open under that session's row in the panel above.
         WEBHOOKS_SECTION_TPL = """<section>
             <div class="sec-head">
-              <h2>Webhook subscriptions</h2>
+              <h2>Standing watches</h2>
             </div>
-            <p class="note">Where incoming webhook events go. A <em>session</em>
-            subscription delivers into that session; a <em>standing watch</em> is
-            shared and starts a NEW session per event batch. Deleting one takes
-            effect on the next delivery &mdash; no restart.</p>
+            <p class="note">A standing watch belongs to no session: a matching
+            event starts a NEW one. Subscriptions that deliver INTO a session are
+            listed under that session above. Deleting either takes effect on the
+            next delivery &mdash; no restart.</p>
             <div id="webhooks-list">{webhooks}</div>
           </section>"""
 
@@ -4974,7 +5012,19 @@ in
             ids.forEach(function (id) {
               var from = doc.getElementById(id);
               var to = document.getElementById(id);
-              if (from && to) { to.replaceWith(document.importNode(from, true)); }
+              if (!from || !to) { return; }
+              // Which rows the operator has folded open is state this HTML does
+              // not carry: the live feed replaces #sessions-list on every session
+              // change, so without this a subscription fold snaps shut under
+              // whoever just opened it. data-fold is the row's identity.
+              var open = {};
+              Array.prototype.forEach.call(
+                to.querySelectorAll("details[data-fold][open]"),
+                function (d) { open[d.getAttribute("data-fold")] = 1; });
+              Array.prototype.forEach.call(
+                from.querySelectorAll("details[data-fold]"),
+                function (d) { if (open[d.getAttribute("data-fold")]) { d.open = true; } });
+              to.replaceWith(document.importNode(from, true));
             });
           }
           function parseHTML(text) {
@@ -5712,7 +5762,11 @@ in
             return value
 
 
-        def render_sessions():
+        def render_sessions(subs=None):
+            """The Sessions panel. With `subs` (name -> webhook_view() entry) each
+            row folds open onto that session's own subscriptions: a subscription
+            is read as "what does THIS session receive", and a separate list of
+            rows tagged with a session name made the reader do that join by eye."""
             entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
             base = html.escape(SESS_BASE)
             user = urllib.parse.quote(USER, safe="")
@@ -5733,15 +5787,16 @@ in
                         state = "stopped"
                     else:
                         state = "starting"
-                    items.append(
+                    row = (
                         # The name deep-links into the terminal via ttyd's
                         # ?arg= session selector. No userinfo in the href
                         # (issue 56). SESSION_RE names are URL-safe as-is.
-                        f'<li><span class="nm">'
+                        f'<span class="nm">'
                         f'<a class="sess" href="/{user}/?arg={safe}"><code>{safe}</code></a>'
                         f'<span class="meta">{agent}</span>'
                         f'<span class="meta" title="Working directory"><code>{cwd}</code></span>'
-                        f'<span class="state" data-state="{state}">{state}</span></span>'
+                        f'<span class="state" data-state="{state}">{state}</span>'
+                        f'{render_subs_chip(subs, name)}</span>'
                         f'<span class="acts">'
                         f'<form class="inline" method="post" action="{base}/sessions/restart" '
                         f'onsubmit="return confirm(\'Restart {safe}? Unsaved in-flight work is lost.\');">'
@@ -5754,31 +5809,106 @@ in
                         f'<input type="hidden" name="back" value="settings">'
                         f'<button type="submit" class="icon idanger" aria-label="Delete" '
                         f'title="Delete {safe}">{ICON_TRASH}</button></form>'
-                        f'</span></li>'
+                        f'</span>'
                     )
+                    if subs is None:
+                        items.append(f"<li>{row}</li>")
+                    else:
+                        # data-fold is the handle the live feed's DOM swap restores
+                        # an open row by; without it every session state change
+                        # would shut a fold the operator had just opened.
+                        items.append(
+                            f'<li class="foldrow"><details data-fold="subs-{safe}">'
+                            f'<summary>{row}</summary>'
+                            f'{render_session_subs(subs.get(name), name)}'
+                            f'</details></li>'
+                        )
                 body = "".join(items)
             return '<ul class="tbl"><li class="tbl-head">Session</li>' + body + "</ul>"
 
 
         WEBHOOK_STATES = {
             # label, and the note the operator needs to read the row correctly.
-            # Every state here delivers nothing; the note says how it got there,
-            # because "unsubscribed from everything" and "never subscribed" invite
-            # different next moves.
-            "listening": ("listening", ""),
+            # Every state but "listening" delivers nothing; the note says how it
+            # got there, because "unsubscribed from everything" and "never
+            # subscribed" invite different next moves.
+            "listening": ("listening", "Delete the filter file to drop every topic at once."),
             "empty": ("no subscriptions", "Unsubscribed from everything. Receives nothing."),
             "absent": ("never subscribed", "No filter file yet: receives nothing until "
-                                           "this session subscribes to something."),
+                                           "this session subscribes to something. Nothing "
+                                           "to clean up."),
             "invalid": ("broken filter", "The filter file is present but does not parse, "
                                          "so this session receives nothing. Subscribing "
-                                         "again rewrites it."),
+                                         "again rewrites it; deleting it starts over."),
             "off": ("muted", "Delivery is switched off for this session."),
             "unknown": ("unreadable", "Could not read this session's subscriptions."),
         }
 
 
-        def render_webhook_row(topic, meta, note, key, dispatch, deletable=True):
-            """One subscription row: what it is, why it exists, and its delete."""
+        def render_subs_chip(subs, name):
+            """The one thing a session's row says about its webhooks while folded:
+            how many topics it receives, or which kind of nothing."""
+            if subs is None:
+                return ""
+            sub = subs.get(name)
+            if sub is None:
+                return ""
+            count = len(sub["topics"])
+            if sub["state"] == "listening":
+                label = "1 subscription" if count == 1 else "%d subscriptions" % count
+            else:
+                # A muted session HAS topics and receives none of them, so the
+                # count would be the one thing the row must not say.
+                label = WEBHOOK_STATES.get(sub["state"], WEBHOOK_STATES["unknown"])[0]
+            return f'<span class="meta subs-chip">{html.escape(label)}</span>'
+
+
+        def render_session_subs(sub, name):
+            """The fold under one session row: its topics, and the state line that
+            says why there are none. Its delete drops the whole filter file, which
+            is the only cleanup an empty or unparseable one has — unsubscribe takes
+            a topic, and neither of those has one to name."""
+            safe = html.escape(name)
+            # Only the hint: the state's LABEL is already the chip on the summary
+            # line, and a fold that opens onto the word it was folded under says
+            # nothing.
+            hint = WEBHOOK_STATES.get(
+                (sub or {}).get("state") or "unknown", WEBHOOK_STATES["unknown"])[1]
+            rows = []
+            for entry in (sub or {}).get("topics") or []:
+                topic = str(entry.get("topic") or "")
+                if topic:
+                    rows.append(render_webhook_row(
+                        topic,
+                        [str(entry.get("expiresIn") or "")],
+                        str(entry.get("note") or ""),
+                        sub["key"],
+                        dispatch=False,
+                    ))
+            if sub and sub["file"]:
+                count = len(sub["topics"])
+                warn = (" It unsubscribes from %d topic%s."
+                        % (count, "" if count == 1 else "s")) if count else ""
+                forget = (
+                    f'<form class="inline" method="post" action="{html.escape(BASE)}/webhooks/forget" '
+                    f'onsubmit="return confirm(\'Delete the filter file of {safe}?{warn}\');">'
+                    f'<input type="hidden" name="name" value="{safe}">'
+                    f'<button type="submit" class="btn small danger-btn" '
+                    f'title="Delete {safe}\'s filter file">Delete filter file</button></form>'
+                )
+            else:
+                forget = ""
+            rows.append(
+                f'<li class="sub-state"><span class="nm wh">'
+                f'<span class="note wh-note">{html.escape(hint)}</span></span>'
+                f'<span class="acts">{forget}</span></li>'
+            )
+            return '<ul class="tbl subs">' + "".join(rows) + "</ul>"
+
+
+        def render_webhook_row(topic, meta, note, key, dispatch):
+            """One subscription row: what it is, why it exists, and its delete.
+            Every row this renders names a topic, so every row can drop it."""
             base = html.escape(BASE)
             safe_topic = html.escape(topic)
             bits = "".join(
@@ -5787,26 +5917,25 @@ in
             note_html = (
                 f'<span class="note wh-note">{html.escape(note)}</span>' if note else ""
             )
-            if deletable:
-                acts = (
-                    f'<form class="inline" method="post" action="{base}/webhooks/unsubscribe" '
-                    f'onsubmit="return confirm(\'Delete the subscription to {safe_topic}?\');">'
-                    f'<input type="hidden" name="topic" value="{safe_topic}">'
-                    f'<input type="hidden" name="key" value="{html.escape(key)}">'
-                    f'<input type="hidden" name="dispatch" value="{"1" if dispatch else ""}">'
-                    f'<button type="submit" class="icon idanger" aria-label="Delete" '
-                    f'title="Delete subscription to {safe_topic}">{ICON_TRASH}</button></form>'
-                )
-            else:
-                acts = ""
             return (
                 f'<li><span class="nm wh"><code>{safe_topic}</code>{bits}{note_html}</span>'
-                f'<span class="acts">{acts}</span></li>'
+                f'<span class="acts">'
+                f'<form class="inline" method="post" action="{base}/webhooks/unsubscribe" '
+                f'onsubmit="return confirm(\'Delete the subscription to {safe_topic}?\');">'
+                f'<input type="hidden" name="topic" value="{safe_topic}">'
+                f'<input type="hidden" name="key" value="{html.escape(key)}">'
+                f'<input type="hidden" name="dispatch" value="{"1" if dispatch else ""}">'
+                f'<button type="submit" class="icon idanger" aria-label="Delete" '
+                f'title="Delete subscription to {safe_topic}">{ICON_TRASH}</button></form>'
+                f'</span></li>'
             )
 
 
-        def render_webhooks():
-            sessions, watches = webhook_view()
+        def render_webhooks(watches):
+            """The standing watches. Session subscriptions are NOT here: they
+            belong to a session and are folded into its row above. A standing
+            watch belongs to no session — it spawns one — so this list is where
+            it can be seen at all."""
             rows = []
             for entry in watches:
                 topic = str(entry.get("topic") or "")
@@ -5814,42 +5943,15 @@ in
                     continue
                 rows.append(render_webhook_row(
                     topic,
-                    ["standing watch", str(entry.get("expiresIn") or "")],
+                    [str(entry.get("expiresIn") or "")],
                     str(entry.get("note") or ""),
                     # A standing watch is shared, so any key edits the same list.
                     webhook_key(""),
                     dispatch=True,
                 ))
-            for sess in sessions:
-                label, hint = WEBHOOK_STATES.get(sess["state"], WEBHOOK_STATES["unknown"])
-                if not sess["topics"]:
-                    rows.append(render_webhook_row(
-                        sess["name"],
-                        ["session", label],
-                        hint,
-                        sess["key"],
-                        dispatch=False,
-                        # Nothing to unsubscribe from, so no button that would do
-                        # nothing. Hushing a session that IS listening without
-                        # dropping its topics needs a mute verb the mechanism does
-                        # not have yet (local-channels#23).
-                        deletable=False,
-                    ))
-                    continue
-                for entry in sess["topics"]:
-                    topic = str(entry.get("topic") or "")
-                    if not topic:
-                        continue
-                    rows.append(render_webhook_row(
-                        topic,
-                        ["session " + sess["name"], str(entry.get("expiresIn") or "")],
-                        str(entry.get("note") or ""),
-                        sess["key"],
-                        dispatch=False,
-                    ))
             if not rows:
-                rows.append('<li class="empty">No sessions, and no standing watches.</li>')
-            return ('<ul class="tbl"><li class="tbl-head">Subscription</li>'
+                rows.append('<li class="empty">No standing watches.</li>')
+            return ('<ul class="tbl"><li class="tbl-head">Standing watch</li>'
                     + "".join(rows) + "</ul>")
 
 
@@ -5890,11 +5992,11 @@ in
             )
 
 
-        def render_sessions_section():
+        def render_sessions_section(subs=None):
             return SESSIONS_SECTION_TPL.format(
                 action_base=html.escape(SESS_BASE),
                 new_session_fields=render_new_session_fields(),
-                sessions=render_sessions(),
+                sessions=render_sessions(subs),
             )
 
 
@@ -5986,6 +6088,10 @@ in
 
         def render_page(message=""):
             msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
+            # One pass over the subscription state per render, feeding both
+            # panels: it forks the pinned CLI once per session, so the Sessions
+            # rows and the standing watches must not each pay for their own.
+            subs, watches = webhook_view() if WEBHOOKS else (None, [])
             return (
                 render_head("Settings &mdash; " + html.escape(USER))
                 + STYLE
@@ -5996,9 +6102,9 @@ in
                     keys=render_keys(read_keys()),
                     # Every user, primary included: the HOME root page is the
                     # terminal workspace, so session CRUD lives here.
-                    sessions_section=render_sessions_section(),
+                    sessions_section=render_sessions_section(subs),
                     webhooks_section=(
-                        WEBHOOKS_SECTION_TPL.format(webhooks=render_webhooks())
+                        WEBHOOKS_SECTION_TPL.format(webhooks=render_webhooks(watches))
                         if WEBHOOKS else ""
                     ),
                     message=msg_html,
@@ -6171,6 +6277,7 @@ in
                 "update": "Box update started — the system rebuilds in the "
                           "background and this page may briefly go away.",
                 "webhook_deleted": "Subscription deleted — it stops at the next delivery.",
+                "webhook_forgotten": "Filter file deleted — that session now receives nothing.",
                 "webhook_kept": "Could not delete that subscription. It may already be gone.",
                 "password_changed": "Password changed. Sign in with your new password.",
             }
@@ -6428,6 +6535,16 @@ in
                         return
                     ok = webhook_unsubscribe(key, topic, dispatch)
                     self._redirect("ok=webhook_deleted" if ok else "ok=webhook_kept")
+                elif path == BASE + "/webhooks/forget" and WEBHOOKS:
+                    # Remove one session's whole filter file. Same bound as the
+                    # unsubscribe route: one of THIS user's own listed sessions,
+                    # so no invented name can reach a path outside them.
+                    name = (form.get("name", [""])[0]).strip()
+                    if not (SESSION_RE.match(name) and name in read_sessions()):
+                        self._redirect("ok=webhook_kept")
+                        return
+                    ok = prune_filter(name)
+                    self._redirect("ok=webhook_forgotten" if ok else "ok=webhook_kept")
                 elif path == BASE + "/restart":
                     # Full unit bounce (see restart_all): re-reads unit-level
                     # EnvironmentFiles, which per-session restarts can't.
