@@ -1,16 +1,20 @@
-Screenshots for issue #227 / PR #228 — the Webhook subscriptions panel on the
-settings page. Assets only, no code. Delete this branch once the PR is merged.
+Screenshots for issue #227 / PR #228 — webhook subscriptions on the settings
+page. Assets only, no code. Delete this branch once the PR is merged.
 
-Rendered from `modules/src/settings-daemon.py` at PR #228's head (aa0c1a5) with
+Rendered from `modules/src/settings-daemon.py` at PR #228's head (785de5c) with
 its `@@include` markers expanded, driving the same local-webhook 0.13.0
 `webhook.py` the module pins, in headless Chromium 151 at DPR 2.
 
+Since the review, a session's own subscriptions live in a fold under that
+session's row in **Sessions**; the standing watches, which belong to no
+session, keep a panel of their own.
+
 | file | state directory | what it shows |
 |---|---|---|
-| `panel-live-state.png` | this box's real one | the panel as it is right now |
-| `panel-all-row-states.png` | synthetic | all five row states plus two standing watches |
-| `panel-narrow-420px.png` | synthetic | 420 px viewport — notes wrap, no horizontal scroll |
-| `settings-page-in-context.png` | synthetic | where the panel sits between Sessions and Environment secrets |
+| `panel-live-state.png` | this box's real one | the two folds open on the box as it is right now |
+| `panel-all-row-states.png` | synthetic | every fold open: all five row states plus two standing watches |
+| `panel-narrow-420px.png` | synthetic | 420 px viewport — the chip wraps, no horizontal scroll |
+| `settings-page-in-context.png` | synthetic | the same page at rest: folded rows, each with its chip |
 
 `muted` and `broken filter` need a hand-written filter file, which is also the
 only way those states arise: no tool writes `enabled:false` yet
