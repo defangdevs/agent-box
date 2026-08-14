@@ -11,10 +11,10 @@ session, keep a panel of their own.
 
 | file | state directory | what it shows |
 |---|---|---|
-| `panel-live-state.png` | this box's real one | the two folds open on the box as it is right now |
-| `panel-all-row-states.png` | synthetic | every fold open: all five row states plus two standing watches |
-| `panel-narrow-420px.png` | synthetic | 420 px viewport — the chip wraps, no horizontal scroll |
-| `settings-page-in-context.png` | synthetic | the same page at rest: folded rows, each with its chip |
+| `panel-live-state-v2.png` | this box's real one | the two folds open on the box as it is right now |
+| `panel-all-row-states-v2.png` | synthetic | every fold open: all five row states plus two standing watches |
+| `panel-narrow-420px-v2.png` | synthetic | 420 px viewport — the chip wraps, no horizontal scroll |
+| `settings-page-in-context-v2.png` | synthetic | the same page at rest: folded rows, each with its chip |
 
 `muted` and `broken filter` need a hand-written filter file, which is also the
 only way those states arise: no tool writes `enabled:false` yet
