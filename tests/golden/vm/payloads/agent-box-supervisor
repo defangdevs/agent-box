@@ -312,6 +312,21 @@ start_session() {
       cmd="$cmd $(printf '%q' "$xarg")"
     done < <($JQ -r '.extraArgs // [] | .[]' <<<"$sjson")
   }
+  # Autonomy for the codex TUI arms. skipPermissions = true takes the
+  # documented flag. skipPermissions = false has to UNDO the box-wide default
+  # when services.agent-box.codexFullAccess wrote /etc/codex/config.toml
+  # (issue 234) — otherwise the session silently inherits full access from
+  # that system layer and the per-session opt-out means nothing. The unit
+  # exports AGENT_BOX_CODEX_FULL_ACCESS only when that file exists, because
+  # without it codex's own defaults (which depend on project trust) are the
+  # right answer and pinning would change them.
+  codex_autonomy() {
+    if [ "$skip" = true ]; then
+      cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+    elif [ -n "${AGENT_BOX_CODEX_FULL_ACCESS:-}" ]; then
+      cmd="$cmd -c approval_policy=on-request -c sandbox_mode=workspace-write"
+    fi
+  }
   case "$agent" in
     claude)
       [ "$skip" = true ] && cmd="$cmd --dangerously-skip-permissions"
@@ -380,7 +395,18 @@ start_session() {
         # skipPermissions via the two -c overrides that flag sets
         # (codex's documented config-override path). A bare value that
         # isn't valid TOML is taken as a string literal, so no quoting is
-        # needed. remoteControlName is claude-only: the codex daemon takes
+        # needed.
+        #
+        # WARNING: those overrides do NOT reach the app-server today (issue
+        # 234). `daemon start` parses them, then spawns the app-server with a
+        # fixed argv, so the process that serves every remote thread runs on
+        # the box's config alone — measured on a live box, and the reason a
+        # paired phone still asked for approvals. What actually applies is
+        # /etc/codex/config.toml (services.agent-box.codexFullAccess). The
+        # flags stay: they cost nothing and become correct the day upstream
+        # forwards them.
+        #
+        # remoteControlName is claude-only: the codex daemon takes
         # its machine name from gethostname(2) with no override, so the
         # wrapper gives it the host label through a private UTS namespace
         # instead (see codexRemoteControl). Pairing the
@@ -406,17 +432,17 @@ start_session() {
         # positional (SESSION_ID) and the prompt as its second.
         if [ -n "$target" ]; then
           cmd="$cmd resume"
-          [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+          codex_autonomy
           append_extra
           cmd="$cmd -- $(printf '%q' "$target")"
           [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "$prompt")"
         else
-          [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+          codex_autonomy
           append_extra
           [ -n "$prompt" ] && cmd="$cmd -- $(printf '%q' "[agent-box session $bid] $prompt")"
         fi
       else
-        [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+        codex_autonomy
         append_extra
         # Stamp the box id into the kickoff prompt so the transcript is
         # findable on resume; skip the stamp when there's no prompt (an

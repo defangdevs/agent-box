@@ -203,6 +203,10 @@ let
     else agentPkgs.codex;
   installedAgentPackages = map agentPackage cfg.installAgents;
   installedCodexPackage = lib.optional (builtins.elem "codex" cfg.installAgents) (agentPackage "codex");
+  # Box-wide codex autonomy is on only when codex is actually installed:
+  # /etc/codex/config.toml would otherwise configure a CLI that is not there
+  # (see the codexFullAccess option, issue 234).
+  codexFullAccess = cfg.codexFullAccess && builtins.elem "codex" cfg.installAgents;
 
   # Tools agents assume exist. Nearly all of these are already installed on
   # any NixOS host (system-path.nix's requiredPackages) — but the agent unit
@@ -760,6 +764,34 @@ in
       '';
     };
 
+    codexFullAccess = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Run codex with no approval prompts and no sandbox, box-wide, by
+        writing /etc/codex/config.toml (issue 234). The box IS the sandbox,
+        so an agent that stops to ask a human is a stalled agent.
+
+        This is a FILE, not a launch flag, because a remote-controlled codex
+        session is served by the app-server daemon — and
+        `codex app-server daemon start` accepts `-c key=value` but spawns
+        the app-server with a fixed argv, so those overrides never reach the
+        process that runs the threads. The daemon reads config.toml instead,
+        as does every other codex entry point (browser-terminal TUI,
+        `codex exec` from a shell session).
+
+        /etc/codex/config.toml is codex's SYSTEM layer: a user's own
+        ~/.codex/config.toml still overrides it, so this is a default and
+        not a lock. Ignored when codex is not in installAgents.
+
+        Per-session skipPermissions = false cannot undo this for a
+        remote-controlled codex session: the app-server daemon is one per
+        USER, shared by every remote thread, so there is nothing per-session
+        to override. The codex TUI arms do honour it — the supervisor pins
+        the restricted values back on the command line.
+      '';
+    };
+
     remoteControlHost = lib.mkOption {
       type = lib.types.str;
       default = config.networking.fqdnOrHostName;
@@ -1299,7 +1331,21 @@ in
         source = canonicalAgentsMd name u;
         mode = "0444";
       })
-    ) cfg.users));
+    ) cfg.users))
+    # Codex autonomy for the WHOLE box (issue 234, see codexFullAccess).
+    # codex reads /etc/codex/config.toml as its system layer, below the
+    # user's own ~/.codex/config.toml, so this sets a default a human can
+    # still override. It is the only way to reach the app-server daemon that
+    # serves remote-controlled codex sessions: that process is spawned with a
+    # fixed argv and never sees the supervisor's -c overrides. Both keys are
+    # required — default_permissions = ":danger-full-access" opens the
+    # filesystem and the network but leaves approval_policy at "on-request".
+    // lib.optionalAttrs codexFullAccess {
+      "codex/config.toml".text = ''
+        approval_policy = "never"
+        sandbox_mode = "danger-full-access"
+      '';
+    };
 
     systemd.services = lib.mapAttrs' (name: u:
       lib.nameValuePair "agent-box-${name}" {
@@ -1369,6 +1415,14 @@ in
           // (lib.optionalAttrs (hostLabel != "") {
             # Host suffix for auto-derived Remote Control session names.
             AGENT_BOX_HOST_LABEL = hostLabel;
+          })
+          // (lib.optionalAttrs codexFullAccess {
+            # /etc/codex/config.toml grants codex full access box-wide
+            # (issue 234). Set so a codex TUI session with
+            # skipPermissions = false can pin the restricted values back —
+            # the system layer is a default, not a lock. Unset means no such
+            # file, and codex's own defaults are what a session should get.
+            AGENT_BOX_CODEX_FULL_ACCESS = "1";
           })
           // (lib.optionalAttrs (agentsMdPointer name u != null) {
             # Seeded-AGENTS.md pointer file; unset = agentsMd null opt-out.

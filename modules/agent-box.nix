@@ -688,6 +688,10 @@ done
     else agentPkgs.codex;
   installedAgentPackages = map agentPackage cfg.installAgents;
   installedCodexPackage = lib.optional (builtins.elem "codex" cfg.installAgents) (agentPackage "codex");
+  # Box-wide codex autonomy is on only when codex is actually installed:
+  # /etc/codex/config.toml would otherwise configure a CLI that is not there
+  # (see the codexFullAccess option, issue 234).
+  codexFullAccess = cfg.codexFullAccess && builtins.elem "codex" cfg.installAgents;
 
   # Tools agents assume exist. Nearly all of these are already installed on
   # any NixOS host (system-path.nix's requiredPackages) — but the agent unit
@@ -2176,6 +2180,21 @@ $PROMPT"
           cmd="$cmd $(printf '%q' "$xarg")"
         done < <($JQ -r '.extraArgs // [] | .[]' <<<"$sjson")
       }
+      # Autonomy for the codex TUI arms. skipPermissions = true takes the
+      # documented flag. skipPermissions = false has to UNDO the box-wide default
+      # when services.agent-box.codexFullAccess wrote /etc/codex/config.toml
+      # (issue 234) — otherwise the session silently inherits full access from
+      # that system layer and the per-session opt-out means nothing. The unit
+      # exports AGENT_BOX_CODEX_FULL_ACCESS only when that file exists, because
+      # without it codex's own defaults (which depend on project trust) are the
+      # right answer and pinning would change them.
+      codex_autonomy() {
+        if [ "$skip" = true ]; then
+          cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+        elif [ -n "''${AGENT_BOX_CODEX_FULL_ACCESS:-}" ]; then
+          cmd="$cmd -c approval_policy=on-request -c sandbox_mode=workspace-write"
+        fi
+      }
       case "$agent" in
         claude)
           [ "$skip" = true ] && cmd="$cmd --dangerously-skip-permissions"
@@ -2244,7 +2263,18 @@ $PROMPT"
             # skipPermissions via the two -c overrides that flag sets
             # (codex's documented config-override path). A bare value that
             # isn't valid TOML is taken as a string literal, so no quoting is
-            # needed. remoteControlName is claude-only: the codex daemon takes
+            # needed.
+            #
+            # WARNING: those overrides do NOT reach the app-server today (issue
+            # 234). `daemon start` parses them, then spawns the app-server with a
+            # fixed argv, so the process that serves every remote thread runs on
+            # the box's config alone — measured on a live box, and the reason a
+            # paired phone still asked for approvals. What actually applies is
+            # /etc/codex/config.toml (services.agent-box.codexFullAccess). The
+            # flags stay: they cost nothing and become correct the day upstream
+            # forwards them.
+            #
+            # remoteControlName is claude-only: the codex daemon takes
             # its machine name from gethostname(2) with no override, so the
             # wrapper gives it the host label through a private UTS namespace
             # instead (see codexRemoteControl). Pairing the
@@ -2270,17 +2300,17 @@ $PROMPT"
             # positional (SESSION_ID) and the prompt as its second.
             if [ -n "$target" ]; then
               cmd="$cmd resume"
-              [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+              codex_autonomy
               append_extra
               cmd="$cmd -- $(printf '%q' "$target")"
               [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "$prompt")"
             else
-              [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+              codex_autonomy
               append_extra
               [ -n "$prompt" ] && cmd="$cmd -- $(printf '%q' "[agent-box session $bid] $prompt")"
             fi
           else
-            [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+            codex_autonomy
             append_extra
             # Stamp the box id into the kickoff prompt so the transcript is
             # findable on resume; skip the stamp when there's no prompt (an
@@ -2530,6 +2560,34 @@ in
         runtime `agent-box-session add --agent codex` needs no rebuild.
         Sessions may only use agents listed here. Default: all supported
         agents.
+      '';
+    };
+
+    codexFullAccess = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Run codex with no approval prompts and no sandbox, box-wide, by
+        writing /etc/codex/config.toml (issue 234). The box IS the sandbox,
+        so an agent that stops to ask a human is a stalled agent.
+
+        This is a FILE, not a launch flag, because a remote-controlled codex
+        session is served by the app-server daemon — and
+        `codex app-server daemon start` accepts `-c key=value` but spawns
+        the app-server with a fixed argv, so those overrides never reach the
+        process that runs the threads. The daemon reads config.toml instead,
+        as does every other codex entry point (browser-terminal TUI,
+        `codex exec` from a shell session).
+
+        /etc/codex/config.toml is codex's SYSTEM layer: a user's own
+        ~/.codex/config.toml still overrides it, so this is a default and
+        not a lock. Ignored when codex is not in installAgents.
+
+        Per-session skipPermissions = false cannot undo this for a
+        remote-controlled codex session: the app-server daemon is one per
+        USER, shared by every remote thread, so there is nothing per-session
+        to override. The codex TUI arms do honour it — the supervisor pins
+        the restricted values back on the command line.
       '';
     };
 
@@ -3072,7 +3130,21 @@ in
         source = canonicalAgentsMd name u;
         mode = "0444";
       })
-    ) cfg.users));
+    ) cfg.users))
+    # Codex autonomy for the WHOLE box (issue 234, see codexFullAccess).
+    # codex reads /etc/codex/config.toml as its system layer, below the
+    # user's own ~/.codex/config.toml, so this sets a default a human can
+    # still override. It is the only way to reach the app-server daemon that
+    # serves remote-controlled codex sessions: that process is spawned with a
+    # fixed argv and never sees the supervisor's -c overrides. Both keys are
+    # required — default_permissions = ":danger-full-access" opens the
+    # filesystem and the network but leaves approval_policy at "on-request".
+    // lib.optionalAttrs codexFullAccess {
+      "codex/config.toml".text = ''
+        approval_policy = "never"
+        sandbox_mode = "danger-full-access"
+      '';
+    };
 
     systemd.services = lib.mapAttrs' (name: u:
       lib.nameValuePair "agent-box-${name}" {
@@ -3142,6 +3214,14 @@ in
           // (lib.optionalAttrs (hostLabel != "") {
             # Host suffix for auto-derived Remote Control session names.
             AGENT_BOX_HOST_LABEL = hostLabel;
+          })
+          // (lib.optionalAttrs codexFullAccess {
+            # /etc/codex/config.toml grants codex full access box-wide
+            # (issue 234). Set so a codex TUI session with
+            # skipPermissions = false can pin the restricted values back —
+            # the system layer is a default, not a lock. Unset means no such
+            # file, and codex's own defaults are what a session should get.
+            AGENT_BOX_CODEX_FULL_ACCESS = "1";
           })
           // (lib.optionalAttrs (agentsMdPointer name u != null) {
             # Seeded-AGENTS.md pointer file; unset = agentsMd null opt-out.

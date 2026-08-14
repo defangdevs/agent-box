@@ -242,6 +242,8 @@
     # assert the wrapper runs and passes the autonomy -c overrides (the
     # subcommand rejects the TUI's --dangerously-bypass flag, so skipPermissions
     # rides in as -c approval_policy / sandbox_mode instead).
+    # Those overrides are NOT what makes a remote thread autonomous — see the
+    # /etc/codex/config.toml assertions below (issue 234).
     # pgrep runs as ROOT (not via as_agent): `-u agent` then filters out the
     # invoking shell, whose own command line contains the pattern — as the
     # agent it self-matched and "succeeded" with the wrapper long dead.
@@ -257,6 +259,37 @@
     machine.wait_until_succeeds(
         as_agent("codex app-server daemon version"), timeout=60
     )
+
+    # --- codex autonomy reaches the app-server (issue 234) ----------------
+    # The -c overrides above never arrive: `app-server daemon start` parses
+    # them and then spawns the app-server with a fixed argv. A phone paired to
+    # this daemon therefore kept asking for approvals while the wrapper
+    # assertions above passed. services.agent-box.codexFullAccess writes
+    # codex's SYSTEM config layer instead, which every codex entry point reads.
+    machine.succeed("grep -F 'approval_policy = \"never\"' /etc/codex/config.toml")
+    machine.succeed(
+        "grep -F 'sandbox_mode = \"danger-full-access\"' /etc/codex/config.toml"
+    )
+    # End-to-end, against the same binary the daemon runs: a thread that names
+    # no policy — what the Codex apps open — must come back fully autonomous.
+    # `thread/start` needs neither a login nor the network, so this works in
+    # the sandbox. The sleeps hold stdin open while the server answers; feeding
+    # both lines at once EOFs it before it replies.
+    init = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"clientInfo": {"name": "agent-box-test", "version": "0"}},
+    })
+    start = json.dumps({
+        "jsonrpc": "2.0", "id": 2, "method": "thread/start",
+        "params": {"ephemeral": True, "cwd": "/home/agent"},
+    })
+    thread = machine.succeed(as_agent(
+        "{ printf '%s\\n' " + shlex.quote(init)
+        + "; sleep 3; printf '%s\\n' " + shlex.quote(start)
+        + "; sleep 10; } | codex app-server --listen stdio:// 2>/dev/null"
+    ))
+    assert '"approvalPolicy":"never"' in thread, thread
+    assert '"dangerFullAccess"' in thread, thread
 
     # The pane DRIVES sign-in itself (issue 159): a logged-out box must run the
     # device-code flow in this pane, not print commands for the user to paste
@@ -574,6 +607,31 @@
         ), codex_start_cmd
         assert "do the codex thing" in unescaped, codex_start_cmd
         machine.succeed(as_agent("agent-box-session rm vcodex"))
+
+    with subtest("codex: skipPermissions=false survives the box-wide default"):
+        # /etc/codex/config.toml makes full access the BOX default (issue 234),
+        # so a session that opted out has to pin the restricted values back on
+        # the command line — otherwise the system layer silently grants it
+        # everything. Only the TUI arms can do this: the app-server daemon is
+        # one per user and takes no per-session config.
+        machine.succeed(
+            as_agent(
+                'jq \'.sessions.careful = {agent: "codex", skipPermissions: false, '
+                'remoteControl: false, remoteControlName: null, '
+                'workingDirectory: null, extraArgs: [], '
+                'initialPrompt: "do the careful thing", resumePrompt: null, '
+                f"boxSessionId: null, hasRun: false}}' {sfile} > {sfile}.t "
+                f"&& mv {sfile}.t {sfile}"
+            )
+        )
+        machine.wait_until_succeeds(tmux("has-session -t =careful"), timeout=60)
+        careful_cmd = machine.wait_until_succeeds(
+            tmux('list-panes -t "=careful" -F "#{pane_start_command}"'), timeout=60
+        )
+        assert "-c approval_policy=on-request" in careful_cmd, careful_cmd
+        assert "-c sandbox_mode=workspace-write" in careful_cmd, careful_cmd
+        assert "--dangerously-bypass-approvals-and-sandbox" not in careful_cmd, careful_cmd
+        machine.succeed(as_agent("agent-box-session rm careful"))
 
     # --- /clear rotation: respawn follows the recorded live id ------------
     with subtest("/clear rotation: respawn resumes the recorded live id"):
