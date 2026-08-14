@@ -52,7 +52,7 @@
           # settings land in the files below.
           etcFilter = n:
             builtins.match
-              "agent-box-guides/.*|caddy/caddy_config|fail2ban/(fail2ban|jail)\\.local|fail2ban/filter\\.d/agent-web-auth\\.conf|sudoers"
+              "agent-box-guides/.*|caddy/caddy_config|codex/config\\.toml|fail2ban/(fail2ban|jail)\\.local|fail2ban/filter\\.d/agent-web-auth\\.conf|sudoers"
               n != null;
           manifestOf = modules:
             let sys = nixpkgs.lib.nixosSystem { inherit system modules; }; in

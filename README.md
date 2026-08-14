@@ -429,6 +429,7 @@ All under `services.agent-box`:
 | `agent` | `"claude"` | Default agent CLI: `"claude"` or `"codex"`. |
 | `package` | selected agent default | Override package to run for every agent user. |
 | `installAgents` | all supported | Agent CLIs installed on the box (independent of what sessions run). |
+| `codexFullAccess` | `true` | Run codex with no approval prompts and no sandbox, box-wide, via `/etc/codex/config.toml`. The box is the sandbox. That file is codex's *system* config layer, so a user's own `~/.codex/config.toml` still overrides it — and it is the only path that reaches the app-server daemon behind a remote-controlled codex session. |
 | `remoteControlHost` | `fqdnOrHostName` | Host label for the `@<host>` suffix of auto-derived Remote Control names. Empty -> falls back to the public `web.domain`, then the live kernel hostname. The AWS image sets it to the box's public sslip.io host. |
 | `users.<name>.sessions.<s>.*` | `{}` | Seed sessions (first boot only): per session `agent`, `skipPermissions`, `remoteControl`, `remoteControlName`, `workingDirectory`, `extraArgs`. Empty = the legacy per-user options below seed a session named `main`. |
 | `users.<name>.agent` | `null` | Agent for the default `main` session; null uses `services.agent-box.agent`. |
