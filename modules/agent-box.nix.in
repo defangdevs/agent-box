@@ -1987,6 +1987,16 @@ in
           # manager (Caddy proxies it here behind the user's auth) and the
           # session CRUD routes move to /sessions/*.
           AGENT_BOX_HOME = "1";
+        } // lib.optionalAttrs webhookEnabled {
+          # Webhook subscriptions panel (issue #227). The daemon runs the
+          # pinned webhook.py's own CLI once per session, with
+          # LOCAL_WEBHOOK_SESSION set to that session's key, to list and
+          # delete subscriptions — so the panel cannot drift from the
+          # semantics the receiver and the in-session tools implement.
+          # Same script and interpreter the receiver unit runs.
+          AGENT_BOX_WEBHOOK_SCRIPT = localWebhookScript;
+          AGENT_BOX_WEBHOOK_PYTHON = webhookPython;
+          AGENT_BOX_WEBHOOK_STATE_DIR = webhookStateDirOf name;
         } // lib.optionalAttrs cfg.selfUpdate.enable {
           # --no-block so the daemon's HTTP response goes out before the
           # rebuild (possibly) restarts the daemon itself.

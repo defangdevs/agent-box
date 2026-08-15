@@ -36,7 +36,39 @@ li.empty { color: #8b949e; font-size: 13px; }
 a.sess { color: #58a6ff; text-decoration: none; }
 a.sess:hover { text-decoration: underline; }
 .acts { display: flex; align-items: center; gap: 4px; flex: none; }
+/* Subscription rows (issue #227) wrap: a topic carries an expiry and the
+   note saying why it exists, which does not fit one line on a phone. */
+.nm.wh { flex-wrap: wrap; row-gap: 2px; }
+.nm.wh code { color: #e6edf3; }
+.wh-note { flex-basis: 100%; margin: 0; font-size: 12px; }
+/* A session row folds open onto its own subscriptions (issue #227), so
+   the <li> stops being the flex row and its <summary> becomes one. */
+.tbl li.foldrow { display: block; padding: 0; }
+.tbl li.foldrow summary { display: flex; align-items: center;
+                          justify-content: space-between; gap: 12px;
+                          padding: 10px 16px; cursor: pointer;
+                          list-style: none; }
+.tbl li.foldrow summary::-webkit-details-marker { display: none; }
+.tbl li.foldrow summary:hover { background: #161b22; }
+/* The name side wraps: the actions keep their width (flex: none), so on a
+   phone the chip would otherwise slide under the Restart button. */
+.tbl li.foldrow summary .nm { flex-wrap: wrap; row-gap: 4px; }
+/* Our own disclosure caret, since the native marker is dropped above.
+   Literal glyphs, not CSS escapes: this file is inlined into a Python
+   string, where a backslash escape would have to survive both. */
+.tbl li.foldrow summary .nm::before { content: "▸"; color: #8b949e;
+                                      font-size: 11px; flex: none; }
+.tbl li.foldrow details[open] summary .nm::before { content: "▾"; }
+/* The fold body: an inset table with no border of its own, so its rows
+   read as belonging to the session above them. */
+ul.tbl.subs { margin: 0; border: 0; border-radius: 0; background: #0d1117; }
+ul.tbl.subs li { padding-left: 40px; }
 .meta { color: #8b949e; font-size: 12px; }
+/* The webhook chip is a different KIND of fact from the agent name and
+   the cwd beside it — what the fold holds — so it gets its own pill
+   rather than joining the row's run of grey. */
+.subs-chip { background: #21262d; border-radius: 10px; padding: 1px 8px;
+             white-space: nowrap; }
 .state { font-size: 12px; color: #8b949e; }
 .state::before { content: ""; display: inline-block; width: 8px; height: 8px;
                  border-radius: 50%; background: currentColor; margin-right: 5px; }
