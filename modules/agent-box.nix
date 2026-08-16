@@ -1496,6 +1496,21 @@ finish or remove this session rather than leaving it idle, and check what else \
 is running before duplicating someone's work (agent-box-session ls, \
 agent-box-webhook ls).}"
 
+# Extra agent-CLI args for hook sessions (webhook.hookSessionArgs), JSON in
+# the daemon unit's env — e.g. a cheaper model for triage work. Decoded here
+# into the add call's `--` tail, which the supervisor stores as extraArgs.
+extra=()
+if [ -n "''${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
+  while IFS= read -r arg; do
+    extra+=("$arg")
+  done < <("$JQ" -r '.[]' <<<"$AGENT_BOX_HOOK_SESSION_ARGS")
+fi
+
+if [ "''${#extra[@]}" -gt 0 ]; then
+  exec agent-box-session add "$name" --prompt "$preamble
+
+$PROMPT" -- "''${extra[@]}"
+fi
 exec agent-box-session add "$name" --prompt "$preamble
 
 $PROMPT"
@@ -2879,6 +2894,21 @@ in
           cannot reach GitHub does not pay a timeout on every session start.
           A running session keeps the interpreter it loaded, whatever this
           does; `agent-box-webhook status` reports that case.
+        '';
+      };
+      hookSessionArgs = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "--model" "sonnet" ];
+        description = ''
+          Extra agent-CLI arguments for the hook-* sessions the dispatcher
+          spawns for standing watches — appended after the session's normal
+          arguments, exactly like `agent-box-session add -- ARGS...` would.
+          The classic use is a cheaper model for triage work (issue #216):
+          `[ "--model" "sonnet" ]`. Applies only to dispatched hook-*
+          sessions; sessions people create keep their own arguments. The
+          args are agent-CLI-specific — pick ones the default agent
+          understands.
         '';
       };
       watchPolicy = lib.mkOption {
@@ -7268,6 +7298,10 @@ in
           # webhook.py coalesces bursts and caps concurrent spawns; the
           # wrapper additionally caps how many hook-* sessions may exist.
           LOCAL_WEBHOOK_SPAWN_CMD = "${webhookSpawn}/bin/agent-box-webhook-spawn";
+        } // lib.optionalAttrs (cfg.webhook.hookSessionArgs != [ ]) {
+          # JSON so multi-word args survive the env-var round trip; the
+          # spawn wrapper decodes with jq into the session's extraArgs.
+          AGENT_BOX_HOOK_SESSION_ARGS = builtins.toJSON cfg.webhook.hookSessionArgs;
         };
         serviceConfig = {
           User = name;
