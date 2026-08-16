@@ -54,6 +54,9 @@
         fail2ban = false;
       };
       # webhook.enable is deliberately NOT set: this test asserts the DEFAULT.
+      # Extra agent-CLI args for dispatched hook-* sessions; the spawn
+      # assertion below checks they land in the session's extraArgs.
+      webhook.hookSessionArgs = [ "--model" "sonnet" ];
       # Watch policy (#197) for the SECOND standing watch below. The first
       # watch (defangdevs/agent-box) deliberately stays rule-less, so the
       # legacy failures-only brake keeps its own coverage next to this.
@@ -544,6 +547,13 @@
     # The key names the repo, so the tab is readable: hook-defangdevs-agent-box-XXXX.
     machine.succeed(
         "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-agent-box-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    # webhook.hookSessionArgs reach the dispatched session as extraArgs, so
+    # the supervisor appends them to the agent command (--model sonnet here).
+    machine.succeed(
+        "jq -e '.sessions | to_entries[] | select(.key | startswith(\"hook-\"))"
+        " | .value.extraArgs == [\"--model\", \"sonnet\"]'"
         " /home/agent/.config/agent-box/sessions.json"
     )
     # --- the spawned session OWNS what it was spawned for (#192) ------------

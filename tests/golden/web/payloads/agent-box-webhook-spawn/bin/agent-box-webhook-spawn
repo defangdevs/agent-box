@@ -87,6 +87,21 @@ finish or remove this session rather than leaving it idle, and check what else \
 is running before duplicating someone's work (agent-box-session ls, \
 agent-box-webhook ls).}"
 
+# Extra agent-CLI args for hook sessions (webhook.hookSessionArgs), JSON in
+# the daemon unit's env — e.g. a cheaper model for triage work. Decoded here
+# into the add call's `--` tail, which the supervisor stores as extraArgs.
+extra=()
+if [ -n "${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
+  while IFS= read -r arg; do
+    extra+=("$arg")
+  done < <("$JQ" -r '.[]' <<<"$AGENT_BOX_HOOK_SESSION_ARGS")
+fi
+
+if [ "${#extra[@]}" -gt 0 ]; then
+  exec agent-box-session add "$name" --prompt "$preamble
+
+$PROMPT" -- "${extra[@]}"
+fi
 exec agent-box-session add "$name" --prompt "$preamble
 
 $PROMPT"
