@@ -10,6 +10,14 @@ TMUX="tmux -L agent-box"
 SESSIONS_FILE="$HOME/.config/agent-box/sessions.json"
 GREP="${AGENT_BOX_GREP_BIN:-grep}"
 FIND="${AGENT_BOX_FIND_BIN:-find}"
+# The webhook channel plugin, spelled once (issue #257): three places have to
+# agree on it — the settings seed (an enabledPlugins key), the plugin-cache
+# sync, and claude's --channels tag. The marketplace NAME comes from the
+# marketplace repo's own marketplace.json, so it is a literal here rather than
+# something derivable from AGENT_BOX_WEBHOOK_REPO (which names the repo that
+# marketplace is CLONED from, e.g. defangdevs/local-channels).
+WEBHOOK_MARKETPLACE=local-channels
+WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
 
 # First boot only: seed the Nix-declared sessions. The file is RUNTIME
 # data afterwards — a rebuild must never clobber sessions the user
@@ -72,10 +80,10 @@ seed_claude_state() {
   if [ -n "${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
     seed_json "$HOME"/.claude/settings.json \
       --arg whrepo "$AGENT_BOX_WEBHOOK_REPO" \
-      --argjson plug '{"local-webhook@local-channels":true}' \
+      --arg mkt "$WEBHOOK_MARKETPLACE" --arg ref "$WEBHOOK_PLUGIN_REF" \
       '.extraKnownMarketplaces = ((.extraKnownMarketplaces // {})
-         + {"local-channels": {source: {source: "github", repo: $whrepo}}})
-       | .enabledPlugins = ((.enabledPlugins // {}) + $plug)'
+         + {($mkt): {source: {source: "github", repo: $whrepo}}})
+       | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
     sync_webhook_plugin
   fi
 }
@@ -124,7 +132,8 @@ sync_webhook_plugin() {
   [ -s "$installed" ] || return 0
   # The OLDEST installed copy across scopes: a project-scope install shadows
   # the user one, and the stalest is the one that can break the brake.
-  have="$("$JQ" -r '[.plugins["local-webhook@local-channels"] // [] | .[] | .version // empty] | .[]' \
+  have="$("$JQ" -r --arg ref "$WEBHOOK_PLUGIN_REF" \
+            '[.plugins[$ref] // [] | .[] | .version // empty] | .[]' \
             "$installed" 2>/dev/null | sort -V | head -1)"
   [ -n "$have" ] || return 0
   [ "$have" = "$pinned" ] && return 0
@@ -152,9 +161,10 @@ sync_webhook_plugin() {
   cbin="$(agent_bin claude)" || return 0
   echo "local-webhook plugin: cache $have is older than the pinned $pinned — refreshing" \
        "before this session starts, so its peer is visible to the dispatch brake (issue 193)" >&2
-  if "$cbin" plugin marketplace update local-channels >/dev/null 2>&1 \
-       && "$cbin" plugin update local-webhook@local-channels >/dev/null 2>&1; then
-    now_have="$("$JQ" -r '[.plugins["local-webhook@local-channels"] // [] | .[] | .version // empty] | .[]' \
+  if "$cbin" plugin marketplace update "$WEBHOOK_MARKETPLACE" >/dev/null 2>&1 \
+       && "$cbin" plugin update "$WEBHOOK_PLUGIN_REF" >/dev/null 2>&1; then
+    now_have="$("$JQ" -r --arg ref "$WEBHOOK_PLUGIN_REF" \
+                  '[.plugins[$ref] // [] | .[] | .version // empty] | .[]' \
                   "$installed" 2>/dev/null | sort -V | head -1)"
     echo "local-webhook plugin: cache is now ${now_have:-unknown} (pinned $pinned)" >&2
   else
@@ -358,6 +368,23 @@ start_session() {
       # stay untouched, so only supervisor-spawned sessions carry the hook.
       [ -n "${AGENT_BOX_CLAUDE_SETTINGS:-}" ] \
         && cmd="$cmd --settings $(printf '%q' "$AGENT_BOX_CLAUDE_SETTINGS")"
+      # Turn the webhook channel ON for this session (issue #257). Seeding
+      # enabledPlugins (above) and allowedChannelPlugins (remote-settings.json)
+      # only makes the plugin loadable and NAMABLE; --channels is what makes
+      # claude accept its notifications/claude/channel messages. Without it a
+      # session connects the MCP server, answers webhook_subscribe happily, and
+      # then DROPS every event the receiver forwards to it — logging "Channel
+      # notifications skipped: server plugin:local-webhook:local-webhook not in
+      # --channels list for this session" and nothing else. That looked exactly
+      # like a quiet repo, so it went unnoticed for weeks: no delivery ever
+      # reached a live session, and only the dispatch path (--deliver-to
+      # subagent, which hands the event to a NEW session as its prompt) worked.
+      # The value is a TAGGED ref, plugin:<plugin>@<marketplace> — not the
+      # plugin:<plugin>:<server> id the skip message prints. Placed before
+      # append_extra so a session that names its own channels appends to (or
+      # overrides) ours rather than the other way round.
+      [ -n "${AGENT_BOX_WEBHOOK_REPO:-}" ] \
+        && cmd="$cmd --channels plugin:$WEBHOOK_PLUGIN_REF"
       # Our own id: --resume it on respawn (exact, so concurrent sessions
       # never cross), but only when a transcript actually exists — else
       # reuse it as a fresh --session-id rather than erroring on resume.

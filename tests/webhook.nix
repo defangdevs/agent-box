@@ -175,6 +175,21 @@
         " == \"defangdevs/local-channels\"' /home/agent/.claude/settings.json",
         timeout=60,
     )
+    # ... and the session is LAUNCHED with that channel active (issue #257).
+    # Loaded and allowlisted only makes the plugin namable; --channels is what
+    # makes claude accept the channel notifications the receiver forwards, so
+    # without this flag every delivery to a LIVE session is dropped on arrival
+    # — after the peer has already matched the filter and stamped it, which is
+    # why the failure looked like a quiet repo rather than a bug. Read from the
+    # pane's recorded start command, as in tests/sessions.nix: it is what the
+    # supervisor BUILT and does not need the (unauthenticated) claude to stay
+    # up. The tag is plugin:<plugin>@<marketplace>, not the server id.
+    machine.wait_until_succeeds(
+        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
+        ' list-panes -t "=main" -F "#{pane_start_command}"'
+        " | grep -F -- '--channels plugin:local-webhook@local-channels'",
+        timeout=60,
+    )
 
     curl = f"curl -sk --resolve box.test:443:{machine_ip}"
 
