@@ -23,11 +23,12 @@ import { test, expect, Browser, Page } from '@playwright/test';
 const USER = process.env.E2E_USER || 'claude';
 const PASSWORD = process.env.E2E_PASSWORD || '';
 
-// Unique per call so a leftover session from an aborted run can't cause a
-// false pass. Session-name charset is [A-Za-z0-9_-].
-let seq = 0;
-const uniqueSession = () =>
-  `e2e-${Date.now().toString(36)}-${seq++}`;
+// Session names are auto-derived by the daemon (the add form has no name
+// field since #210), so a test that adds one identifies it as "the tab that
+// was not there before".
+const tabNames = (page: Page): Promise<string[]> =>
+  page.locator('#tab-bar .tab[data-tab]')
+    .evaluateAll((els) => els.map((e) => e.getAttribute('data-tab') as string));
 
 test.beforeAll(() => {
   if (!process.env.E2E_BASE_URL) throw new Error('E2E_BASE_URL is required');
@@ -94,14 +95,16 @@ test('no root-page href embeds URL userinfo (user@host)', async ({ browser }) =>
 });
 
 test('add a session from the tab bar, switch tabs, delete it on the settings page', async ({ browser }) => {
-  const name = uniqueSession();
   const page = await authedPage(browser);
   await page.goto('/');
 
-  // Add: the new tab appears, becomes active, and gets a pane.
+  // Add: the new tab appears, becomes active, and gets a pane. The daemon
+  // names the session, so take whichever tab is new.
+  const before = await tabNames(page);
   await openSessionEditor(page, 'New session');
-  await page.locator('#session-editor input[name="name"]').fill(name);
   await page.locator('#session-editor button[type="submit"]').click();
+  await expect.poll(async () => (await tabNames(page)).length).toBe(before.length + 1);
+  const name = (await tabNames(page)).find((n) => !before.includes(n)) as string;
   const newTab = page.locator(`#tab-bar .tab[data-tab="${name}"]`);
   await expect(newTab).toHaveAttribute('aria-current', 'page');
   await expect(page.locator(`#panes iframe[src="/${USER}/?arg=${name}"]`))
@@ -141,17 +144,18 @@ test('add a session from the tab bar, switch tabs, delete it on the settings pag
 // drop every attached terminal. Checked on the workspace, where that cost is
 // real, and the tab stays put.
 test('the feedback banner can be dismissed without reloading the workspace', async ({ browser }) => {
-  const name = uniqueSession();
   const page = await authedPage(browser);
   await page.goto('/');
   await expect(page.locator(`#panes iframe[src="/${USER}/?arg=main"]`))
     .toBeVisible({ timeout: 30_000 });
 
+  const before = await tabNames(page);
   await openSessionEditor(page, 'New session');
-  await page.locator('#session-editor input[name="name"]').fill(name);
   await page.locator('#session-editor button[type="submit"]').click();
   const msg = page.locator('.msg');
   await expect(msg).toHaveText(/Session added/);
+  await expect.poll(async () => (await tabNames(page)).length).toBe(before.length + 1);
+  const name = (await tabNames(page)).find((n) => !before.includes(n)) as string;
 
   await msg.locator('.msg-x').click();
   await expect(msg).toHaveCount(0);
@@ -178,14 +182,11 @@ test('the tab close button arms first and only closes on a second click', async 
 
   // Add a session to close, so the test never touches "main". The name is
   // auto-derived by the daemon, so take whichever tab is new.
-  const tabNames = () =>
-    page.locator('#tab-bar .tab[data-tab]')
-      .evaluateAll((els) => els.map((e) => e.getAttribute('data-tab') as string));
-  const before = await tabNames();
+  const before = await tabNames(page);
   await openSessionEditor(page, 'New session');
   await page.locator('#session-editor button[type="submit"]').click();
-  await expect.poll(async () => (await tabNames()).length).toBe(before.length + 1);
-  const name = (await tabNames()).find((n) => !before.includes(n)) as string;
+  await expect.poll(async () => (await tabNames(page)).length).toBe(before.length + 1);
+  const name = (await tabNames(page)).find((n) => !before.includes(n)) as string;
 
   const tab = page.locator(`#tab-bar .tab[data-tab="${name}"]`);
   const x = page.locator(`#tab-bar .tab-x[data-close="${name}"]`);

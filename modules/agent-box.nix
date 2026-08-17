@@ -5900,6 +5900,13 @@ in
           // live (the ttyd attach wrapper errors out on a session that does
           // not exist yet).
           function tabBar() { return document.getElementById("tab-bar"); }
+          function tabNames() {
+            var bar = tabBar();
+            if (!bar) { return []; }
+            return [].slice.call(bar.querySelectorAll(".tab[data-tab]")).map(function (t) {
+              return t.getAttribute("data-tab");
+            });
+          }
           function tabEl(name) {
             var bar = tabBar();
             return bar ? bar.querySelector('.tab[data-tab="' + name + '"]') : null;
@@ -6128,12 +6135,16 @@ in
             e.preventDefault();
             var body = new URLSearchParams();
             new FormData(f).forEach(function (v, k) { body.append(k, v); });
-            // On the workspace, adding a session should focus its new tab —
-            // and a FAILED add (the fetched error page defaults aria-current)
+            // On the workspace, adding a session should focus its new tab. The
+            // name is auto-derived by the daemon, so the page only learns it
+            // from the answer: a successful add redirects to ?tab=<new name>,
+            // which the fetched page marks current. Snapshot the tabs first and
+            // trust that selection only when it names a tab that did not exist
+            // before — a FAILED add re-renders with the default tab current, and
             // must not yank the user off the tab they were on.
-            var addedSession =
+            var tabsBefore =
               (f.getAttribute("action") || "").endsWith("/sessions/add") && tabBar()
-                ? body.get("name") : null;
+                ? tabNames() : null;
             var wasActive = wsActive();
             var poll = f.getAttribute("data-poll");
             var statusUrl = f.getAttribute("data-status");
@@ -6143,7 +6154,8 @@ in
                 ["msg-slot", "secrets-list", "sessions-list", "webhooks-list", "tab-bar"]);
               var ed = f.closest(".editor");
               if (ed) { f.reset(); ed.hidden = true; }
-              if (addedSession && tabEl(addedSession)) { wsSelect(addedSession, true); }
+              var added = wsActive();   // the tab the fetched page marks current
+              if (tabsBefore && added && tabsBefore.indexOf(added) < 0) { wsSelect(added, true); }
               else if (wasActive && tabEl(wasActive)) { wsSelect(wasActive, false); }
               wsSync();
             }
