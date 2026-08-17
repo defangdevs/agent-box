@@ -1138,14 +1138,16 @@ in
         # The default governs the standing watch agents are told to keep on
         # the box's own repos, IF one exists. Current policy: spawn a triage
         # session for issues/PRs entering the queue (opened/reopened) unless
-        # the box's own login created them, and for terminal CI failures
-        # whoever triggered the run; everything else — closes, merges, pushes,
+        # the box's own login created them, for terminal CI failures whoever
+        # triggered the run, and for an issue or PR somebody ASSIGNS to the box
+        # (a work request, #253); everything else — closes, merges, pushes,
         # green or in-flight CI — is not worth a session. On a box whose
         # sessions never subscribed a defangdevs watch this default matches no
         # entry and does nothing; set it to { } to opt out entirely.
         default = {
           "github:defangdevs/*" = {
-            note = "standing watch: unowned defangdevs activity (new issues, outside PRs, failing CI) — "
+            note = "standing watch: unowned defangdevs activity (new issues, outside PRs, failing CI, "
+              + "issues/PRs assigned to this box) — "
               + "rules managed by services.agent-box.webhook.watchPolicy and re-applied when the "
               + "receiver daemon starts, so edit the NixOS config, not this entry";
             when =
@@ -1160,6 +1162,27 @@ in
                   {
                     all = [
                       { path = "action"; "in" = [ "opened" "reopened" ]; }
+                      { path = "sender.login"; notIn = [ "defangdevs" ]; }
+                    ];
+                  }
+                  # An issue or PR assigned to the box is a request to do the
+                  # work, not to triage it (#253); webhook-spawn.sh says so in
+                  # the preamble. Trusting the event needs no allowlist here,
+                  # because GitHub already restricts the actor: setting an
+                  # assignee needs Triage or above (REST: "Only users with
+                  # push access can add assignees to an issue. Assignees are
+                  # silently ignored otherwise."), so a drive-by user cannot
+                  # promote their own issue to work. Add
+                  # `{ path = "sender.login"; "in" = [ ... ]; }` if Triage is
+                  # ever granted more widely than the people who may say
+                  # "start". The assignee leaf is what keeps this narrow: an
+                  # assignment to a HUMAN is somebody else taking the work,
+                  # and must not wake a session. The sender leaf stops the box
+                  # from waking itself when it assigns an issue to itself.
+                  {
+                    all = [
+                      { path = "action"; "in" = [ "assigned" ]; }
+                      { path = "assignee.login"; "in" = [ "defangdevs" ]; }
                       { path = "sender.login"; notIn = [ "defangdevs" ]; }
                     ];
                   }
