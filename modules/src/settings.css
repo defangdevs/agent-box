@@ -135,9 +135,19 @@ input.cwd { width: 260px; max-width: 100%;
          gap: 4px; color: #8b949e; font-size: 13px; }
 .field input { box-sizing: border-box; width: 100%; }
 form.inline { display: inline; }
-.msg { padding: 10px 14px; border-radius: 8px; margin: 12px 0;
+.msg { display: flex; align-items: center; gap: 10px;
+       padding: 10px 14px; border-radius: 8px; margin: 12px 0;
        border: 1px solid rgba(63,185,80,.4); background: #10251a;
        color: #7ee787; font-size: 13px; }
+.msg-text { flex: 1; }
+/* Dismiss (x), issue #246. A link, so it also works without JS (see
+   render_msg); styled as a quiet button that only lights up on hover,
+   like the tab's own close control. */
+.msg-x { flex: none; display: flex; align-items: center; justify-content: center;
+         width: 20px; height: 20px; margin: -2px -4px -2px 0;
+         border-radius: 5px; color: #7ee787; opacity: .65;
+         font-size: 15px; line-height: 1; text-decoration: none; }
+.msg-x:hover { opacity: 1; background: rgba(63,185,80,.18); }
 /* Tabbed terminal workspace (the HOME root page, issue #119). The
    page is a fixed-viewport column: tab bar on top, terminal panes
    filling the rest. Panes are stacked and toggled with visibility

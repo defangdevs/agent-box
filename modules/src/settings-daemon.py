@@ -1761,6 +1761,30 @@ def render_tabs(names, live, stopped, selected):
     return "".join(items)
 
 
+def render_msg(message, page):
+    """The page-level feedback banner ("Session added", "Key saved"…),
+    with a dismiss (x) that works both ways: it is a LINK back to
+    `page` — the same page minus the ?ok= that produced the banner —
+    so a scriptless browser dismisses it by re-rendering, while SCRIPT
+    intercepts the click and only removes the element. That
+    distinction matters on the workspace, where an actual navigation
+    would tear down every attached terminal iframe.
+
+    Dismissal is manual only (issue #246). The banner sits in normal
+    flow, so its removal resizes the panes below it; a move the user
+    asked for reads as a response, the same move on a timer reads as
+    the page lurching on its own."""
+    if not message:
+        return ""
+    return (
+        f'<div class="msg" role="status">'
+        f'<span class="msg-text">{html.escape(message)}</span>'
+        f'<a class="msg-x" href="{html.escape(page, quote=True)}" '
+        f'aria-label="Dismiss" title="Dismiss">&times;</a>'
+        f'</div>'
+    )
+
+
 def render_pane(selected, live, stopped):
     """The server-rendered pane: only the SELECTED session, and only
     when its tmux session is already live — the ttyd attach wrapper
@@ -1806,7 +1830,7 @@ def render_head(title):
 
 
 def render_page(message=""):
-    msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
+    msg_html = render_msg(message, BASE + "/")
     # One pass over the subscription state per render, feeding both
     # panels: it forks the pinned CLI once per session, so the Sessions
     # rows and the standing watches must not each pay for their own.
@@ -1847,7 +1871,8 @@ def render_home(message="", selected=None):
         selected = "main" if "main" in entries else (names[0] if names else None)
     live = live_sessions()
     stopped = {n for n, v in entries.items() if v.get("stopped")}
-    msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
+    # Dismissing keeps the selected tab (SESSION_RE names are URL-safe).
+    msg_html = render_msg(message, "/?tab=" + selected if selected else "/")
     return (
         render_head("Agent Box &mdash; " + html.escape(USER))
         + STYLE
