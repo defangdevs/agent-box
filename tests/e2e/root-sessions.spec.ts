@@ -11,6 +11,7 @@
 //     userinfo plus an EMPTY password, and typed credentials can't override),
 //   - client-side tab switching that keeps background panes mounted,
 //   - the add-session flow from the tab bar (new tab appears and activates),
+//   - dismissing the feedback banner without reloading the workspace,
 //   - session restart/delete on the settings page, incl. the confirm() guard,
 //   - the live feed: sessions created or deleted elsewhere show up in an
 //     already-open page without a reload.
@@ -132,6 +133,38 @@ test('add a session from the tab bar, switch tabs, delete it on the settings pag
   await del.click();
   await expect(page.locator('.msg')).toHaveText(/Session deleted/);
   await expect(row).toHaveCount(0);
+});
+
+// The feedback banner is dismissible (issue #246). Its x is a link back to the
+// same page without the ?ok=, which is the scriptless path; the whole point of
+// the client-side handler is that it does NOT navigate — a reload here would
+// drop every attached terminal. Checked on the workspace, where that cost is
+// real, and the tab stays put.
+test('the feedback banner can be dismissed without reloading the workspace', async ({ browser }) => {
+  const name = uniqueSession();
+  const page = await authedPage(browser);
+  await page.goto('/');
+  await expect(page.locator(`#panes iframe[src="/${USER}/?arg=main"]`))
+    .toBeVisible({ timeout: 30_000 });
+
+  await openSessionEditor(page, 'New session');
+  await page.locator('#session-editor input[name="name"]').fill(name);
+  await page.locator('#session-editor button[type="submit"]').click();
+  const msg = page.locator('.msg');
+  await expect(msg).toHaveText(/Session added/);
+
+  await msg.locator('.msg-x').click();
+  await expect(msg).toHaveCount(0);
+  // No second navigation, so the panes were never torn down...
+  expect(await page.evaluate(() => performance.getEntriesByType('navigation').length)).toBe(1);
+  await expect(page.locator(`#panes .pane[data-pane="main"]`)).toHaveCount(1);
+  // ...and the ?ok= is gone, so a later reload does not raise it again while
+  // the selected tab survives.
+  const url = new URL(page.url());
+  expect(url.searchParams.get('ok')).toBeNull();
+  expect(url.searchParams.get('tab')).toBe(name);
+
+  await page.context().request.post('/sessions/delete', { form: { name } });
 });
 
 // The tab bar's x kills a live agent and sits a few pixels from the session

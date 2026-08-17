@@ -495,6 +495,22 @@
     if (armedX && e.target === armedX) { disarmX(); }
   });
 
+  // Dismissing the feedback banner ("Session added", "Key saved"…),
+  // issue #246. Its x is a link back to the same page without the ?ok=
+  // that raised it, which is how a scriptless browser dismisses; here
+  // the click is intercepted so the banner just goes away — navigating
+  // would reload the workspace and tear down every attached terminal.
+  // The URL is rewritten to that same ok-less address, so a later
+  // reload does not bring the dismissed banner back.
+  document.addEventListener("click", function (e) {
+    var x = e.target && e.target.closest ? e.target.closest(".msg-x") : null;
+    if (!x) { return; }
+    e.preventDefault();
+    var msg = x.closest(".msg");
+    if (msg) { msg.remove(); }
+    try { history.replaceState(null, "", x.getAttribute("href")); } catch (err) { /* opaque origin */ }
+  });
+
   // The editors render expanded (no-JS fallback); collapse them once
   // JS is live so the page opens in list-only, GitHub-style form.
   ["secret-editor", "session-editor", "password-editor"].forEach(function (id) {

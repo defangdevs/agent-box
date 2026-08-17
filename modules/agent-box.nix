@@ -4872,9 +4872,19 @@ in
                    gap: 4px; color: #8b949e; font-size: 13px; }
           .field input { box-sizing: border-box; width: 100%; }
           form.inline { display: inline; }
-          .msg { padding: 10px 14px; border-radius: 8px; margin: 12px 0;
+          .msg { display: flex; align-items: center; gap: 10px;
+                 padding: 10px 14px; border-radius: 8px; margin: 12px 0;
                  border: 1px solid rgba(63,185,80,.4); background: #10251a;
                  color: #7ee787; font-size: 13px; }
+          .msg-text { flex: 1; }
+          /* Dismiss (x), issue #246. A link, so it also works without JS (see
+             render_msg); styled as a quiet button that only lights up on hover,
+             like the tab's own close control. */
+          .msg-x { flex: none; display: flex; align-items: center; justify-content: center;
+                   width: 20px; height: 20px; margin: -2px -4px -2px 0;
+                   border-radius: 5px; color: #7ee787; opacity: .65;
+                   font-size: 15px; line-height: 1; text-decoration: none; }
+          .msg-x:hover { opacity: 1; background: rgba(63,185,80,.18); }
           /* Tabbed terminal workspace (the HOME root page, issue #119). The
              page is a fixed-viewport column: tab bar on top, terminal panes
              filling the rest. Panes are stacked and toggled with visibility
@@ -5677,6 +5687,22 @@ in
             if (armedX && e.target === armedX) { disarmX(); }
           });
 
+          // Dismissing the feedback banner ("Session added", "Key saved"…),
+          // issue #246. Its x is a link back to the same page without the ?ok=
+          // that raised it, which is how a scriptless browser dismisses; here
+          // the click is intercepted so the banner just goes away — navigating
+          // would reload the workspace and tear down every attached terminal.
+          // The URL is rewritten to that same ok-less address, so a later
+          // reload does not bring the dismissed banner back.
+          document.addEventListener("click", function (e) {
+            var x = e.target && e.target.closest ? e.target.closest(".msg-x") : null;
+            if (!x) { return; }
+            e.preventDefault();
+            var msg = x.closest(".msg");
+            if (msg) { msg.remove(); }
+            try { history.replaceState(null, "", x.getAttribute("href")); } catch (err) { /* opaque origin */ }
+          });
+
           // The editors render expanded (no-JS fallback); collapse them once
           // JS is live so the page opens in list-only, GitHub-style form.
           ["secret-editor", "session-editor", "password-editor"].forEach(function (id) {
@@ -6261,6 +6287,30 @@ in
             return "".join(items)
 
 
+        def render_msg(message, page):
+            """The page-level feedback banner ("Session added", "Key saved"…),
+            with a dismiss (x) that works both ways: it is a LINK back to
+            `page` — the same page minus the ?ok= that produced the banner —
+            so a scriptless browser dismisses it by re-rendering, while SCRIPT
+            intercepts the click and only removes the element. That
+            distinction matters on the workspace, where an actual navigation
+            would tear down every attached terminal iframe.
+
+            Dismissal is manual only (issue #246). The banner sits in normal
+            flow, so its removal resizes the panes below it; a move the user
+            asked for reads as a response, the same move on a timer reads as
+            the page lurching on its own."""
+            if not message:
+                return ""
+            return (
+                f'<div class="msg" role="status">'
+                f'<span class="msg-text">{html.escape(message)}</span>'
+                f'<a class="msg-x" href="{html.escape(page, quote=True)}" '
+                f'aria-label="Dismiss" title="Dismiss">&times;</a>'
+                f'</div>'
+            )
+
+
         def render_pane(selected, live, stopped):
             """The server-rendered pane: only the SELECTED session, and only
             when its tmux session is already live — the ttyd attach wrapper
@@ -6306,7 +6356,7 @@ in
 
 
         def render_page(message=""):
-            msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
+            msg_html = render_msg(message, BASE + "/")
             # One pass over the subscription state per render, feeding both
             # panels: it forks the pinned CLI once per session, so the Sessions
             # rows and the standing watches must not each pay for their own.
@@ -6347,7 +6397,8 @@ in
                 selected = "main" if "main" in entries else (names[0] if names else None)
             live = live_sessions()
             stopped = {n for n, v in entries.items() if v.get("stopped")}
-            msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
+            # Dismissing keeps the selected tab (SESSION_RE names are URL-safe).
+            msg_html = render_msg(message, "/?tab=" + selected if selected else "/")
             return (
                 render_head("Agent Box &mdash; " + html.escape(USER))
                 + STYLE

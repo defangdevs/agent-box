@@ -838,6 +838,18 @@
     assert "Session added" in ok_page, ok_page
     assert ok_page.index('class="msg"') < ok_page.index('id="tab-bar"'), ok_page
 
+    # The banner is dismissible (issue 246). Its x is a LINK back to the
+    # same page without the ?ok=, so a scriptless browser can clear it too
+    # (with JS the click only removes the element — navigating would reload
+    # the workspace and tear down every attached terminal). Dismissing on
+    # the workspace keeps the selected tab; on the settings page it goes
+    # back to that page's own address.
+    assert '<a class="msg-x" href="/?tab=main" aria-label="Dismiss"' in ok_page, ok_page
+    ok_settings = client.succeed(
+        f"{curl} -u agent:testpassword 'https://box.test/agent/settings/?ok=saved'"
+    )
+    assert '<a class="msg-x" href="/agent/settings/" aria-label="Dismiss"' in ok_settings, ok_settings
+
     # Each tab carries a close (x) posting to the same /sessions/delete
     # route the settings page uses — a sibling form, since a <form> inside
     # the tab <a> would be invalid markup. The two-click arming that keeps
