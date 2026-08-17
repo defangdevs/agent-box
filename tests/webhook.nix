@@ -950,6 +950,18 @@
     watches = page.split("Standing watch")[-1]
     assert "github:defangdevs/agent-box" in watches, watches
 
+    # A watch row says what a match DOES, not why someone subscribed (#259):
+    # the note is written for the session the watch spawns, so it belongs in
+    # that session's prompt — which the row now folds open onto, rendered by
+    # the dispatch script itself, note quoted inside it and the event-filled
+    # parts left as placeholders.
+    assert 'data-fold="watch-github:defangdevs/agent-box"' in watches, watches
+    assert "You are a fresh agent session started by" in watches, watches
+    assert "(&quot;standing watch: triage&quot;)" in watches, watches
+    assert "hook-&lt;key&gt;-&lt;hex&gt;" in watches, watches
+    # And the note is no longer a paragraph on the row itself.
+    assert 'wh-note">standing watch: triage' not in page, page
+
     # Delete a session subscription. 303 back to the page, and the topic is
     # gone from that session's filter file — the receiver re-reads it per
     # delivery, so nothing needs restarting.
