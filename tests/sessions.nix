@@ -1152,5 +1152,103 @@
 
         machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm feedtest'")
 
+    # Transcript download (issue #248): each agent keeps its conversation as
+    # a JSONL file under $HOME, and the session's row hands that file over.
+    # The path is resolved from the session RECORD, so the route serves the
+    # transcripts the panel lists and nothing else in the home directory.
+    with subtest("a session's transcript downloads from its row"):
+        # main has run, so the supervisor stamped its box session id into
+        # sessions.json; claude names the transcript after that id, under a
+        # directory of its own cwd mangling. The VM's claude has no
+        # credentials and never writes one, so stand it in.
+        box_id = machine.succeed(
+            "jq -r '.sessions.main.boxSessionId' "
+            "/home/agent/.config/agent-box/sessions.json"
+        ).strip()
+        assert re.match(r"^[0-9a-f-]{36}$", box_id), box_id
+        proj = "/home/agent/.claude/projects/-home-agent"
+        turn = '{"type":"user","text":"hello"}'
+
+        def seed(path, content, mode="0600"):
+            """Stand in a file the agent would have written: root-created and
+            handed over, at the 0600 a real transcript carries. NOT written as
+            the agent uid — the rotation subtest above seeded this same tree
+            with `install -D`, which leaves the parent dirs root-owned, so a
+            `su agent` redirect into them is EACCES. Only readability by the
+            settings daemon (which runs as the user) matters here."""
+            machine.succeed("printf '%s\\n' " + shlex.quote(content) + " > /tmp/seed")
+            machine.succeed(f"install -D -o agent -m {mode} /tmp/seed {path}")
+
+        seed(f"{proj}/{box_id}.jsonl", turn)
+
+        # The row offers it as a plain GET link (no form: nothing changes),
+        # and the route answers with the file itself, named after the
+        # session so a downloads folder full of them stays readable.
+        #
+        # Waited for, not asserted on the first render: transcript lookups are
+        # memoized per session for a few seconds, and the subtests above
+        # rendered this page moments ago — with no transcript to find then, so
+        # that answer is still cached here.
+        client.wait_until_succeeds(
+            f"{curl} -u agent:testpassword https://box.test/agent/settings/ "
+            "| grep 'transcript?name=main' >/dev/null",
+            timeout=60,
+        )
+        row_page = client.succeed(
+            f"{curl} -u agent:testpassword https://box.test/agent/settings/"
+        )
+        assert 'href="/sessions/transcript?name=main" download' in row_page, row_page
+        headers = client.succeed(
+            f"{curl} -u agent:testpassword -D - -o /tmp/tr.jsonl "
+            "'https://box.test/sessions/transcript?name=main'"
+        )
+        assert "application/x-ndjson" in headers, headers
+        assert f'filename="main-{box_id}.jsonl"' in headers, headers
+        assert client.succeed("cat /tmp/tr.jsonl").strip() == turn, headers
+
+        # /clear starts a NEW transcript under a new id and the SessionStart
+        # hook records the rotation (issue #223). The download follows that
+        # record, so what arrives is the conversation on screen and not the
+        # one the user cleared away. Retried: the lookup is memoized for a
+        # few seconds per session.
+        cleared = "11111111-2222-3333-4444-555555555555"
+        record_dir = "/home/agent/.local/state/agent-box/live-session-id"
+        seed(f"{proj}/{cleared}.jsonl", '{"type":"user","text":"after clear"}')
+        seed(f"{record_dir}/{box_id}", cleared, mode="0644")
+        client.wait_until_succeeds(
+            f"{curl} -u agent:testpassword -D - -o /dev/null "
+            "'https://box.test/sessions/transcript?name=main' "
+            f"| grep 'filename=\"main-{cleared}.jsonl\"' >/dev/null",
+            timeout=60,
+        )
+
+        # A session with no conversation to hand over (here a shell session,
+        # but equally a codex session started with no prompt to stamp) gets
+        # no button at all rather than one that 404s.
+        machine.succeed(as_agent("agent-box-session add shelltest --agent shell"))
+        client.wait_until_succeeds(
+            f"{curl} -u agent:testpassword https://box.test/agent/settings/ "
+            "| grep 'value=\"shelltest\"' >/dev/null",
+            timeout=60,
+        )
+        shell_page = client.succeed(
+            f"{curl} -u agent:testpassword https://box.test/agent/settings/"
+        )
+        assert "transcript?name=shelltest" not in shell_page, shell_page
+
+        # Only a listed session with a transcript is served, and the route
+        # is inside the same auth gate as the page that links to it.
+        for bad in ["shelltest", "ghost", "..%2F..%2Fetc%2Fpasswd", ""]:
+            client.succeed(
+                f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+                f"'https://box.test/sessions/transcript?name={bad}' | grep -x 404"
+            )
+        client.succeed(
+            f"{curl} -o /dev/null -w '%{{http_code}}' "
+            "'https://box.test/sessions/transcript?name=main' | grep -x 401"
+        )
+
+        machine.succeed(as_agent("agent-box-session rm shelltest"))
+
   '';
 }

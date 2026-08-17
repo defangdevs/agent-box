@@ -81,10 +81,13 @@ ul.tbl.subs li { padding-left: 40px; }
        color: #e6edf3; cursor: pointer; white-space: nowrap; }
 .btn:hover { background: #30363d; }
 .btn.small { padding: 3px 10px; font-size: 12px; }
-button.icon { display: inline-flex; padding: 5px 8px; background: transparent;
-              border: 0; border-radius: 6px; color: #8b949e; cursor: pointer; }
-button.icon:hover { background: #21262d; color: #e6edf3; }
-button.icon.idanger:hover { color: #f85149; background: rgba(248,81,73,.1); }
+/* Not button.icon: the transcript download (issue #248) is a GET, so it is
+   an <a> and has to sit in the same row of icons as the delete button. */
+.icon { display: inline-flex; padding: 5px 8px; background: transparent;
+        border: 0; border-radius: 6px; color: #8b949e; cursor: pointer;
+        text-decoration: none; }
+.icon:hover { background: #21262d; color: #e6edf3; }
+.icon.idanger:hover { color: #f85149; background: rgba(248,81,73,.1); }
 .danger-btn { color: #f85149; }
 .danger-btn:hover { background: #da3633; border-color: #f85149; color: #fff; }
 .tbl.danger { border-color: rgba(248,81,73,.4); }

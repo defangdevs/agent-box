@@ -305,6 +305,15 @@ Open pages follow along live: a session added or removed anywhere — the CLI,
 an agent, a second browser tab — appears or disappears in the tab bar (and in
 the settings list) within a second, without a reload.
 
+**Downloading a transcript.** Each session's row on the settings page carries
+a download button for that session's own conversation, as the JSONL file the
+agent CLI keeps under `$HOME` — for archiving a run, attaching it to a bug
+report, or reading it outside the box. It hands over the transcript the
+session is writing *now*: after `/clear`, that is the conversation on screen,
+not the one that was cleared away. A session with no transcript to point at
+has no button — a `shell` session, or a Codex session started with no prompt
+for the box to stamp its id into.
+
 ![Tabbed terminal workspace: one tab per session](docs/workspace-tabs.png)
 
 ![Closing a session from its tab: the × arms on the first click and only
