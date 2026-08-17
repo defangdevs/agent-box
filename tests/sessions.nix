@@ -952,6 +952,74 @@
     # (that restart killed main; the supervisor brings it back)
     machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=60)
 
+    # --- what the web surface says about a session that is DOWN (issue 241)
+    # A stopped session is listed and reachable from three places, and all
+    # three used to describe it as if it were merely late: the row offered
+    # "Restart" behind a prompt about losing work that is not running, and
+    # the row's terminal link (like the workspace pane, and like any tab
+    # opened before the session stopped) landed on the attach wrapper's dead
+    # end, which told the operator to CREATE a session that already exists.
+    with subtest("a stopped session is described as stopped, not as missing"):
+        machine.succeed(as_agent("agent-box-session stop main"))
+        machine.wait_until_fails(tmux("has-session -t =main"), timeout=60)
+
+        # The row: Start, and no "unsaved work is lost" confirm on the form
+        # that carries it (a live session keeps both).
+        stopped_page = client.succeed(
+            f"{curl} -u agent:testpassword https://box.test/agent/settings/"
+        )
+        # Just this row's own markup: from its terminal link to the delete
+        # form that closes it (the fold below a row carries forms of its own).
+        row = stopped_page[stopped_page.index('href="/agent/?arg=main"'):]
+        row = row[:row.index("/sessions/delete")]
+        assert 'data-state="stopped"' in row, row
+        assert ">Start</button>" in row, row
+        assert "confirm(" not in row, row
+
+        # The workspace pane says the same thing, and stamps the state it
+        # was built for so the page can tell a pane that has gone stale.
+        ws = client.succeed(f"{curl} -u agent:testpassword 'https://box.test/?tab=main'")
+        assert 'data-ph="stopped"' in ws, ws
+        assert "main is stopped" in ws, ws
+        assert 'src="/agent/?arg=main"' not in ws, ws
+
+        # The terminal dead end names the verb that actually revives it.
+        # Print the wrapper's path (see the grep -o note below) — running
+        # the substitution as the command would run the WRAPPER instead.
+        attach = machine.succeed(
+            "{ systemctl show agent-web-terminal-agent --property=ExecStart "
+            "--value | grep -o '/nix/store/[^ ]*-agent-box-attach' "
+            "|| echo /missing; } | head -n1"
+        ).strip()
+        assert attach != "/missing", attach
+
+        def dead_end(name):
+            return machine.succeed(as_agent(
+                "env TMUX_TMPDIR=/run/agent-box-agent "
+                f"AGENT_BOX_SESSIONS_FILE={sfile} "
+                f"{attach} {name} || true"
+            ))
+        down = dead_end("main")
+        assert "agent-box-session restart main" in down, down
+        assert "agent-box-session add main" not in down, down
+        # ...and a name the box really has never heard of still says add.
+        gone = dead_end("ghost")
+        assert "agent-box-session add ghost" in gone, gone
+
+        # Start it again from the same route the row posts to: the answer
+        # names what was done, and the supervisor brings the session back.
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /dev/null -D - "
+            "-d 'name=main&back=settings' "
+            "https://box.test/sessions/restart "
+            "| grep -i '^location: /agent/settings/?ok=session_started'"
+        )
+        machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=60)
+        live_ws = client.succeed(
+            f"{curl} -u agent:testpassword 'https://box.test/?tab=main'"
+        )
+        assert 'data-ph="live"' in live_ws, live_ws
+
     # ttyd serves per-session deep links: the unit runs with --url-arg.
     machine.succeed("systemctl cat agent-web-terminal-agent | grep -- --url-arg >/dev/null")
     # The attach script is the shared agent-box-attach since issue #154

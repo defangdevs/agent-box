@@ -338,18 +338,27 @@
     // Mirrors render_pane: a stopped session is not coming up on its
     // own, so don't promise that it is starting.
     return tabState(name) === "stopped"
-      ? name + " is stopped — Restart on the settings page revives it."
+      ? name + " is stopped — Start on the settings page revives it."
       : name + " is starting…";
+  }
+  function paneState(name) {
+    // The three states a pane is built for; data-ph records which one the
+    // mounted pane belongs to, on the iframe as much as on a placeholder.
+    if (tabLive(name)) { return "live"; }
+    return tabState(name) === "stopped" ? "stopped" : "starting";
   }
   function ensurePane(name) {
     var cur = document.querySelector('#panes .pane[data-pane="' + name + '"]');
-    // Keep an existing iframe as-is; keep a placeholder only while the
-    // state it was rendered for holds (starting ↔ stopped flips re-render;
-    // data-ph is stamped by render_pane and by the branch below).
-    var ph = tabState(name) === "stopped" ? "stopped" : "starting";
-    if (cur && (cur.tagName === "IFRAME" ||
-        (!tabLive(name) &&
-         (cur.getAttribute("data-ph") || "starting") === ph))) { return cur; }
+    // Keep a pane only while the state it was built for still holds. An
+    // iframe used to be exempt from that, so it outlived the session
+    // inside it: once a live session stopped (clean exit, or a stop from
+    // the CLI), the pane went on showing a terminal wired to a tmux
+    // session that no longer existed — the attach wrapper's "no session
+    // named X" dead end — and starting it again never swapped in a fresh
+    // iframe, which is what made a working Start look broken (issue #241).
+    var want = paneState(name);
+    // Panes rendered before this stamp existed are server-rendered iframes.
+    if (cur && (cur.getAttribute("data-ph") || "live") === want) { return cur; }
     var el;
     if (tabLive(name)) {
       el = document.createElement("iframe");
@@ -361,9 +370,9 @@
     } else {
       el = document.createElement("div");
       el.textContent = placeholderText(name);
-      el.setAttribute("data-ph", ph);
       el.className = "pane placeholder";
     }
+    el.setAttribute("data-ph", want);
     el.setAttribute("data-pane", name);
     if (cur) {
       if (cur.classList.contains("active")) { el.classList.add("active"); }
