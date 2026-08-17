@@ -3909,6 +3909,7 @@ in
         #   AGENT_BOX_WEBHOOK_STATE_DIR  where its filter.*.json files live
         #   AGENT_BOX_WEBHOOK_PYTHON     interpreter for that script
 
+        import glob
         import hashlib
         import html
         import http.server
@@ -4271,6 +4272,228 @@ in
             listed in sessions.json (= restart); delisting first makes it stay
             gone (= destroy)."""
             tmux("kill-session", "-t", "=" + name)
+
+
+        # --- Session transcripts (issue #248) --------------------------------
+        # Every agent keeps its conversation as a local JSONL file under $HOME, so
+        # handing one to the user is a file this daemon can already read — it runs as
+        # the owner, and the transcript is served from where the agent writes it.
+        # Nothing is copied into ~/downloads (issue #132): that dir is the agent's
+        # own hand-off drop, and a copy there would be a second, stale transcript
+        # with a lifetime nobody owns.
+        #
+        # What the daemon canNOT do is guess the filename from sessions.json. Its
+        # boxSessionId is the id the session was LAUNCHED with, and both agents move
+        # off it:
+        #   claude — /clear keeps the process but starts a NEW transcript under a new
+        #     uuid; the SessionStart hook records that live id, keyed by the launch id
+        #     (issue #223). Follow the record, exactly as the supervisor does when it
+        #     picks a --resume target.
+        #   codex — the rollout file is named after codex's own session uuid, which
+        #     the box never chooses. The supervisor finds it by the "agent-box
+        #     session <id>" marker it stamps into the kickoff prompt; same marker
+        #     here.
+        # So the file offered is the one a respawn would resume. Sessions whose
+        # transcript cannot be located (a codex session started with no prompt, hence
+        # no marker; a `shell` session; an agent the box knows no layout for) simply
+        # have no download button — see transcript_of.
+        CLAUDE_PROJECTS_DIR = os.path.join(HOME_DIR, ".claude", "projects")
+        CODEX_SESSIONS_DIR = os.path.join(HOME_DIR, ".codex", "sessions")
+        LIVE_ID_DIR = os.path.join(
+            HOME_DIR, ".local", "state", "agent-box", "live-session-id"
+        )
+        # Session ids, as claude's --session-id and the record filenames use them.
+        # Validated before it reaches a glob pattern or a path join, so it doubles as
+        # the path-safety check on a value read out of sessions.json.
+        UUID_RE = re.compile(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+            r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        )
+        # Codex rollout scan bounds. The marker sits in the first user turn, so the
+        # head of the file is enough; the file cap keeps one page render off a box
+        # with months of codex history (newest first, so the cap only ever drops
+        # rollouts far older than any listed session).
+        CODEX_HEAD_BYTES = 64 * 1024
+        CODEX_SCAN_MAX = 400
+        # The marker as it appears in a rollout: "[agent-box session <uuid>]" inside
+        # the JSON-encoded kickoff prompt, so the brackets are not worth matching.
+        CODEX_MARKER_RE = re.compile(rb"agent-box session ([0-9a-fA-F-]{36})")
+        # Transcript lookups are re-run on every render of the sessions panel, and
+        # the live feed re-renders it on every session state change. Memoize per box
+        # id for a few seconds: long enough to collapse a render burst, short enough
+        # that a /clear rotation or a fresh codex rollout shows up while the operator
+        # is still looking at the page.
+        TRANSCRIPT_TTL = 5.0
+        _transcript_cache = {}
+        _codex_index = (-1e9, {})
+
+
+        def claude_transcript(box_id):
+            """Path of the transcript claude would resume for this launch id, or
+            None. The live-id record is followed FIRST (one hop, like the
+            supervisor): after a /clear the launch id's transcript still exists but
+            is the conversation the user threw away."""
+            ids = []
+            live = read_live_id(box_id)
+            if live and live != box_id:
+                ids.append(live)
+            ids.append(box_id)
+            for sid in ids:
+                # <projects>/<mangled cwd>/<id>.jsonl. The mangling is claude's, so
+                # match on the id rather than recomputing the directory name; one
+                # extra level covers a deeper layout (the supervisor's find allows
+                # the same). The id is UUID-checked, so it carries no glob syntax.
+                hits = glob.glob(os.path.join(CLAUDE_PROJECTS_DIR, "*", sid + ".jsonl"))
+                hits += glob.glob(
+                    os.path.join(CLAUDE_PROJECTS_DIR, "*", "*", sid + ".jsonl")
+                )
+                newest = newest_file(hits)
+                if newest:
+                    return newest
+            return None
+
+
+        def codex_index():
+            """box session id -> the codex rollout carrying its marker, for every
+            rollout in the scan window.
+
+            Built in ONE pass and shared by every codex session on the page: asking
+            per session would re-read the same file heads once per row, and the
+            expensive case is the session with NO rollout, which can only be
+            answered by reading all of them. Newest first with setdefault, so a
+            resumed session — which forks the rollout under a new name, keeping the
+            marker — resolves to the fork still being written (the rule
+            codex_rollout_uuid in the supervisor resumes by)."""
+            global _codex_index
+            now = time.monotonic()
+            if now - _codex_index[0] < TRANSCRIPT_TTL:
+                return _codex_index[1]
+            index = {}
+            for path in newest_first(CODEX_SESSIONS_DIR)[:CODEX_SCAN_MAX]:
+                try:
+                    with open(path, "rb") as handle:
+                        head = handle.read(CODEX_HEAD_BYTES)
+                except OSError:
+                    continue
+                for match in CODEX_MARKER_RE.finditer(head):
+                    # Lower-cased on both sides: the marker carries whatever
+                    # sessions.json holds, and a UUID compares case-insensitively.
+                    index.setdefault(match.group(1).decode("ascii").lower(), path)
+            _codex_index = (now, index)
+            return index
+
+
+        def read_live_id(box_id):
+            """The live session id the SessionStart hook recorded for this launch
+            id, or None. Both ids are UUID-checked: box_id names the record file,
+            and the value read back names a transcript."""
+            if not UUID_RE.match(box_id or ""):
+                return None
+            try:
+                with open(os.path.join(LIVE_ID_DIR, box_id), "r", encoding="utf-8") as fh:
+                    value = fh.read(64).strip()
+            except OSError:
+                return None
+            return value if UUID_RE.match(value) else None
+
+
+        def newest_file(paths):
+            """The most recently modified of `paths`, skipping what cannot be
+            stat'ed (a transcript deleted between glob and stat)."""
+            best = None
+            best_mtime = None
+            for path in paths:
+                try:
+                    mtime = os.stat(path).st_mtime
+                except OSError:
+                    continue
+                if best_mtime is None or mtime > best_mtime:
+                    best, best_mtime = path, mtime
+            return best
+
+
+        def newest_first(root):
+            """Every .jsonl under `root`, most recently modified first. Codex nests
+            its rollouts by date (sessions/YYYY/MM/DD/rollout-*.jsonl), so this
+            walks rather than globbing a fixed depth."""
+            found = []
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in filenames:
+                    if not name.endswith(".jsonl"):
+                        continue
+                    path = os.path.join(dirpath, name)
+                    try:
+                        found.append((os.stat(path).st_mtime, path))
+                    except OSError:
+                        continue
+            found.sort(reverse=True)
+            return [path for _mtime, path in found]
+
+
+        def transcript_of(entry):
+            """(path, size) of one session's transcript, or None when there is
+            none to offer. `entry` is its sessions.json record — the caller has
+            already name-checked the session, and nothing here comes from the
+            request."""
+            box_id = str((entry or {}).get("boxSessionId") or "")
+            if not UUID_RE.match(box_id):
+                # Never spawned, or a hand-written record: no id, so no transcript
+                # can be attributed to this session (and guessing would hand over
+                # a sibling's conversation).
+                return None
+            agent = str((entry or {}).get("agent") or "")
+            now = time.monotonic()
+            cached = _transcript_cache.get(box_id)
+            if cached and now - cached[0] < TRANSCRIPT_TTL:
+                # A cache HIT does not refresh the stamp: renders can arrive faster
+                # than the TTL (the live feed re-renders on every state change), and
+                # a stamp pushed forward by each of them would pin the first answer
+                # for as long as the page stays open.
+                path = cached[1]
+            else:
+                if agent == "claude":
+                    path = claude_transcript(box_id)
+                elif agent == "codex":
+                    path = codex_index().get(box_id.lower())
+                else:
+                    # shell sessions have no conversation, and an agent whose
+                    # on-disk layout the box does not know is not worth a guess
+                    # (issue #80 adds one when opencode support lands).
+                    path = None
+                if len(_transcript_cache) > 256:
+                    # Sessions come and go (dispatched hook-* sessions especially),
+                    # so the keyspace grows for the life of the daemon. Nothing here
+                    # is worth an eviction policy: drop the lot and re-resolve.
+                    _transcript_cache.clear()
+                _transcript_cache[box_id] = (now, path)
+            if not path:
+                return None
+            try:
+                size = os.stat(path).st_size
+            except OSError:
+                return None
+            return path, size
+
+
+        def human_size(size):
+            """Byte count for a tooltip: whole KB/MB, since the point is only
+            whether this is a short conversation or a long one."""
+            if size < 1024:
+                return "%d B" % size
+            if size < 1024 * 1024:
+                return "%d KB" % round(size / 1024)
+            return "%.1f MB" % (size / (1024 * 1024))
+
+
+        def download_name(session, path):
+            """Filename the browser saves the transcript as: the SESSION's name
+            first (the only handle the operator recognises), then the agent's own
+            filename, whose id is what a bug report or a resume needs. Filtered to
+            a conservative charset so the value cannot break out of the
+            Content-Disposition quoting."""
+            stem = os.path.basename(path)
+            name = "%s-%s" % (session, stem)
+            return re.sub(r"[^A-Za-z0-9._-]", "_", name)[:200]
 
 
         # --- Webhook subscriptions (issue #227) ------------------------------
@@ -4870,10 +5093,13 @@ in
                  color: #e6edf3; cursor: pointer; white-space: nowrap; }
           .btn:hover { background: #30363d; }
           .btn.small { padding: 3px 10px; font-size: 12px; }
-          button.icon { display: inline-flex; padding: 5px 8px; background: transparent;
-                        border: 0; border-radius: 6px; color: #8b949e; cursor: pointer; }
-          button.icon:hover { background: #21262d; color: #e6edf3; }
-          button.icon.idanger:hover { color: #f85149; background: rgba(248,81,73,.1); }
+          /* Not button.icon: the transcript download (issue #248) is a GET, so it is
+             an <a> and has to sit in the same row of icons as the delete button. */
+          .icon { display: inline-flex; padding: 5px 8px; background: transparent;
+                  border: 0; border-radius: 6px; color: #8b949e; cursor: pointer;
+                  text-decoration: none; }
+          .icon:hover { background: #21262d; color: #e6edf3; }
+          .icon.idanger:hover { color: #f85149; background: rgba(248,81,73,.1); }
           .danger-btn { color: #f85149; }
           .danger-btn:hover { background: #da3633; border-color: #f85149; color: #fff; }
           .tbl.danger { border-color: rgba(248,81,73,.4); }
@@ -5212,6 +5438,12 @@ in
             '-.547.445-.758l8.61-8.61Zm.176 4.823L9.75 4.81l-6.286 6.287a.253.253 0 0 0-.064.108l'
             '-.558 1.953 1.953-.558a.253.253 0 0 0 .108-.064Zm1.238-3.763a.25.25 0 0 0-.354 0L10.811 '
             '3.75l1.439 1.44 1.263-1.263a.25.25 0 0 0 0-.354Z"/></svg>'
+        )
+        ICON_DOWNLOAD = (
+            '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+            '<path d="M7.47 10.78a.75.75 0 0 0 1.06 0l3.75-3.75a.749.749 0 0 0-.326-1.275.749.749 0 0 0'
+            '-.734.215L8.75 8.689V1.75a.75.75 0 0 0-1.5 0v6.939L4.78 5.97a.749.749 0 0 0-1.275.326.749'
+            '.749 0 0 0 .215.734ZM3.75 13a.75.75 0 0 0 0 1.5h8.5a.75.75 0 0 0 0-1.5Z"/></svg>'
         )
         ICON_TRASH = (
             '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
@@ -6030,6 +6262,23 @@ in
                         verb = "Restart"
                         guard = (f' onsubmit="return confirm(\'Restart {safe}? '
                                  f'Unsaved in-flight work is lost.\');"')
+                    # Download the session's own transcript (issue #248), when the
+                    # daemon can find one. A GET on a read-only route, so it is a
+                    # link and not a form — and no button at all for a session with
+                    # nothing to download, rather than one that 404s. download=
+                    # keeps the browser from rendering the JSONL in the tab. Safe
+                    # inside the row's <summary>: a click whose activation target is
+                    # the link never reaches the summary's own toggle (measured in
+                    # chromium, and the same rule the Restart button relies on).
+                    found = transcript_of(entries[name])
+                    if found:
+                        tip = "Download transcript (%s)" % human_size(found[1])
+                        download = (
+                            f'<a class="icon" href="{base}/sessions/transcript?name={safe}" '
+                            f'download aria-label="{tip}" title="{tip}">{ICON_DOWNLOAD}</a>'
+                        )
+                    else:
+                        download = ""
                     row = (
                         # The name deep-links into the terminal via ttyd's
                         # ?arg= session selector. No userinfo in the href
@@ -6041,6 +6290,7 @@ in
                         f'<span class="state" data-state="{state}">{state}</span>'
                         f'{render_subs_chip(subs, name)}</span>'
                         f'<span class="acts">'
+                        f'{download}'
                         f'<form class="inline" method="post" '
                         f'action="{base}/sessions/restart"{guard}>'
                         f'<input type="hidden" name="name" value="{safe}">'
@@ -6441,6 +6691,75 @@ in
                 self.end_headers()
                 self.wfile.write(data)
 
+            def _send_transcript(self, name):
+                """Stream one session's transcript to the browser as a download
+                (issue #248).
+
+                The path is resolved from the session RECORD, never from the
+                request: the only client input is a session name, which must match
+                SESSION_RE and be listed in sessions.json. So this route reads
+                exactly the transcripts the sessions panel lists and cannot be
+                pointed anywhere else in the home directory.
+
+                Content-Length is the size at open time and a live session keeps
+                appending, so send exactly that many bytes: writing past the
+                declared length would desync the connection, and a short read
+                (a rotated or truncated file) closes it instead of leaving the
+                client waiting for bytes that will not come.
+                """
+                entries = read_sessions()
+                if not SESSION_RE.match(name or "") or name not in entries:
+                    self._send_html("<h1>404</h1><p>No such session.</p>", status=404)
+                    return
+                found = transcript_of(entries[name])
+                if not found:
+                    # The panel offers no button in this case, so a request here is
+                    # a stale page or a hand-made URL: say which of the two states
+                    # it is rather than implying the session is unknown.
+                    self._send_html(
+                        "<h1>404</h1><p>No transcript found for this session yet.</p>",
+                        status=404,
+                    )
+                    return
+                path, size = found
+                try:
+                    handle = open(path, "rb")
+                except OSError:
+                    self._send_html("<h1>404</h1><p>Transcript is gone.</p>", status=404)
+                    return
+                with handle:
+                    self.send_response(200)
+                    # JSONL (one event per line), which is not application/json. An
+                    # explicit attachment disposition plus nosniff keeps it a
+                    # download in every browser rather than a rendered page.
+                    self.send_header("Content-Type", "application/x-ndjson")
+                    self.send_header("Content-Length", str(size))
+                    self.send_header(
+                        "Content-Disposition",
+                        'attachment; filename="%s"' % download_name(name, path),
+                    )
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    left = size
+                    while left > 0:
+                        chunk = handle.read(min(65536, left))
+                        if not chunk:
+                            # File shrank under us: the body is short, so the
+                            # connection must not be reused for another response.
+                            self.close_connection = True
+                            return
+                        try:
+                            self.wfile.write(chunk)
+                        except (BrokenPipeError, ConnectionResetError):
+                            # Cancelled download (a long transcript over a phone
+                            # link is easy to give up on). Expected, so it ends the
+                            # response instead of raising into the server's
+                            # handler and logging a traceback per cancel.
+                            self.close_connection = True
+                            return
+                        left -= len(chunk)
+
             def _peer_gone(self):
                 """True once the client has closed its end of a stream.
 
@@ -6574,6 +6893,12 @@ in
                 # discloses nothing but a digest). ?poll=1 answers with the same
                 # fingerprint as a one-shot JSON reply, for a client that could
                 # not establish the stream.
+                # Transcript download (issue #248): routed here with the two above
+                # for the same reasons — GET-only and read-only, so no CSRF concern,
+                # and in HOME mode SESS_BASE is "" so the path is not under BASE.
+                if parsed.path.rstrip("/") == SESS_BASE + "/sessions/transcript":
+                    self._send_transcript((params.get("name", [""])[0]).strip())
+                    return
                 if parsed.path.rstrip("/") == SESS_BASE + "/sessions/events":
                     if params.get("poll"):
                         self._send_json({"fp": session_fingerprint()})
