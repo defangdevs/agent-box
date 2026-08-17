@@ -818,6 +818,8 @@ usage() {
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
   echo "       agent-box-session env ls | set KEY VALUE | rm KEY"
+  echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters (a"
+  echo "longer name would be invisible in the web UI)."
   echo "agents: $AGENTS (default: $DEFAULT_AGENT)"
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
@@ -826,8 +828,26 @@ usage() {
   echo "same) until 'restart NAME' revives it; rm delists it for good."
   echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
 }
+# The settings daemon's SESSION_RE bounds a name at NAME_MAX and DROPS what
+# does not match, so a longer session runs, holds subscriptions and receives
+# events while having no row in the Sessions list and none in the webhook
+# panel — it cannot be attached, restarted or deleted from the web UI, and
+# its claimed topic silences a standing watch for a session nobody can see
+# (issue #236). Keep this number equal to the daemon's: it is the length
+# every name-minting path is allowed to reach (hook-<owner/repo>-<4 hex> for
+# GitHub's maxima), never a length names get shortened to fit.
+NAME_MAX=150
 valid_name() {
   case "$1" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
+}
+valid_new_name() {
+  # The length rule belongs on CREATION only — this is the one gate every
+  # creation path passes through (add, and the webhook spawn wrapper through
+  # it), so refusing here is what keeps such a name from existing. rm, stop
+  # and restart deliberately keep to the charset: a name minted before this
+  # bound existed, or written into sessions.json by hand, is invisible in the
+  # UI and the CLI is the only way left to get rid of it.
+  valid_name "$1" && [ "''${#1}" -le "$NAME_MAX" ]
 }
 valid_key() {
   # env var name charset — mirrors the settings daemon's KEY_RE and the
@@ -906,7 +926,7 @@ case "$cmd" in
     name=""
     case "''${1:-}" in
       ""|-*) ;;
-      *) name="$1"; shift; valid_name "$name" || { usage >&2; exit 2; } ;;
+      *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
     agent="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
     while [ $# -gt 0 ]; do
@@ -1429,12 +1449,34 @@ fi
 
 # hook-<key>-<4 hex>: the key names the repo/object the events belong to,
 # so the workspace tab is readable; it is payload-derived, so sanitize to
-# the session-name charset and cap the length. The suffix dodges collisions
-# with an existing session of the same name (add would refuse).
-san=$(printf '%s' "''${LOCAL_WEBHOOK_SPAWN_KEY:-event}" \
-  | tr -c 'A-Za-z0-9_-' '-' | cut -c1-24)
+# the session-name charset. The suffix dodges collisions with an existing
+# session of the same name (add would refuse).
+#
+# The key is NEVER shortened to fit. It used to be cut at 24 characters,
+# which made "hook-" + key + "-" + 4 hex reach 34 — past the 32 the settings
+# daemon rendered, so any repo with a 23-character owner/repo pair spawned a
+# session that ran, owned its topic and appeared nowhere in the web UI
+# (issue #236). Cutting it shorter would have been worse than the bug: two
+# repos sharing a prefix (a repo and its -staging twin) would collapse onto
+# the same name, and the tab would stop naming what it triages. The daemon's
+# bound is now what this line can emit for GitHub's maxima instead.
+#
+# A key too long even for that keeps its uniqueness rather than being cut:
+# the name drops the key entirely and the log says which key it was for.
+NAME_MAX=150
+san=$(printf '%s' "''${LOCAL_WEBHOOK_SPAWN_KEY:-event}" | tr -c 'A-Za-z0-9_-' '-')
 rand=$(od -An -N2 -tx2 /dev/urandom | tr -d ' \n')
 name="hook-''${san:-event}-$rand"
+if [ "''${#name}" -gt "$NAME_MAX" ]; then
+  name="hook-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+  # The key is printed unquoted on purpose: a single quote written directly
+  # before a shell parameter expansion is mis-escaped by assemble-module.py
+  # and reaches the generated module as broken Nix (agent-box#244).
+  echo "agent-box-webhook-spawn: this key does not fit a session name" \
+       "(max $NAME_MAX characters): ''${LOCAL_WEBHOOK_SPAWN_KEY:-event}" >&2
+  echo "agent-box-webhook-spawn: naming this session $name instead," \
+       "so its tab is anonymous but never ambiguous" >&2
+fi
 
 # A hook session OWNS what it was spawned for, and says so in the one place
 # the dispatcher reads: its own filter file, written BEFORE the session
@@ -1657,7 +1699,7 @@ $PROMPT"
           Seed sessions for this user — each is an agent CLI (or a plain
           login shell, agent = "shell") running in its own tmux session
           under the user's single supervised service.
-          Session names must match [A-Za-z0-9_-]+.
+          Session names must match [A-Za-z0-9_-]{1,150}.
 
           Sessions are RUNTIME data: this option is written to
           ~/.config/agent-box/sessions.json ONLY when that file does not
@@ -3090,10 +3132,12 @@ in
       lib.concatLists (lib.mapAttrsToList (sname: s: [
         {
           # Session names land in tmux -t targets, URLs and env-ish contexts;
-          # the same regex is enforced at runtime by the supervisor, the CLI
-          # and the settings daemon.
-          assertion = builtins.match "[A-Za-z0-9_-]+" sname != null;
-          message = "services.agent-box.users.${name}: session name \"${sname}\" must match [A-Za-z0-9_-]+.";
+          # the same rule is enforced at runtime by the supervisor, the CLI
+          # (valid_name) and the settings daemon (SESSION_RE). The length bound
+          # is the daemon's: it DROPS a longer name, so such a session would run
+          # with no row in the web UI at all (issue #236).
+          assertion = builtins.match "[A-Za-z0-9_-]{1,150}" sname != null;
+          message = "services.agent-box.users.${name}: session name \"${sname}\" must match [A-Za-z0-9_-]{1,150}.";
         }
         {
           assertion = builtins.elem (if s.agent != null then s.agent else cfg.agent) cfg.installAgents;
@@ -3894,8 +3938,21 @@ in
         # EnvironmentFile will accept as a variable name.
         KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
         # Session names: same charset the supervisor and CLI enforce (they
-        # land in tmux -t targets and URLs).
-        SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+        # land in tmux -t targets and URLs). Every render and publish path filters
+        # through this, so a name it rejects is not merely unlisted — that session
+        # has no tab, no delete/restart button and no subscriptions row, while it
+        # keeps running and receiving events (issue #236).
+        #
+        # The bound is therefore whatever the name-minting paths can emit, not a
+        # round number: the dispatch wrapper's hook-<source key>-<4 hex> reaches 150
+        # characters for GitHub's own maxima (39-character owner + "/" + 100-
+        # character repo). Shortening a name to fit is NOT an option — two repos
+        # sharing a prefix would collapse onto one name — so the UI stretches
+        # instead (the tab label ellipsizes, with the full name as its tooltip).
+        # Mirrored by the CLI's NAME_MAX and the module's session-name assertion;
+        # it stays far below what a filter.<user>-<session>.json filename allows.
+        NAME_MAX = 150
+        SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,%d}$" % NAME_MAX)
         # Subscription topics: "source:owner/repo", or the prefix "source:owner/*"
         # (local-webhook 0.13.0 dropped "*" and "source:*" as topics). The
         # panel only ever posts back a topic it just rendered, and the CLI is
@@ -4098,7 +4155,7 @@ in
                 if candidate not in sessions:
                     return candidate
             # Astronomically unlikely fallback: a longer token can't be taken.
-            return ("%s-%s" % (agent, secrets.token_hex(8)))[:32]
+            return ("%s-%s" % (agent, secrets.token_hex(8)))[:NAME_MAX]
 
 
         def write_sessions(sessions):
@@ -4833,6 +4890,13 @@ in
                  border: 1px solid transparent; border-bottom: 0;
                  border-radius: 8px 8px 0 0; white-space: nowrap; }
           .tab:hover { color: #e6edf3; }
+          /* A session name is bounded only by what a name-minting path can emit —
+             hook-<owner/repo>-<4 hex> reaches 150 characters — and names are never
+             shortened to fit (two repos sharing a prefix would collapse onto one
+             name, issue #236). So the LABEL is what gives: it ellipsizes, with the
+             full name in the tab's tooltip. Without this one long name pushes every
+             other tab out of the scrolling bar. */
+          .tab-name { overflow: hidden; text-overflow: ellipsis; max-width: 24ch; }
           .tab[aria-current] { background: #0d1117; border-color: #30363d;
                                color: #e6edf3; }
           /* Close (x) button, absolutely placed over the tab's extra right
@@ -6143,7 +6207,12 @@ in
             keeping them apart also stops the tab-select click delegation from
             swallowing the close click. Closing kills a live agent and the
             button sits a few pixels from the session name, so SCRIPT arms it
-            on the first click and only submits on the second."""
+            on the first click and only submits on the second.
+
+            The name gets its own span so a long one (a dispatched
+            hook-<owner/repo>-<hex> runs to 150 characters, and names are never
+            shortened to fit — issue #236) ellipsizes instead of pushing the
+            other tabs out of the bar; title carries it in full."""
             items = []
             base = html.escape(SESS_BASE)
             for name in names:
@@ -6157,8 +6226,10 @@ in
                     state = "starting"
                 items.append(
                     f'<span class="tab-wrap">'
-                    f'<a class="tab" data-tab="{safe}" href="/?tab={safe}"{cur}>'
-                    f'<span class="state" data-state="{state}"></span>{safe}</a>'
+                    f'<a class="tab" data-tab="{safe}" href="/?tab={safe}"{cur}'
+                    f' title="{safe}">'
+                    f'<span class="state" data-state="{state}"></span>'
+                    f'<span class="tab-name">{safe}</span></a>'
                     f'<form class="tab-close" method="post" action="{base}/sessions/delete">'
                     f'<input type="hidden" name="name" value="{safe}">'
                     f'<button type="submit" class="tab-x" data-close="{safe}" '

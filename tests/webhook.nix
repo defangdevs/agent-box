@@ -663,6 +663,57 @@
         f" /home/agent/.local/state/local-webhook/filter.agent-{other}.json"
     )
 
+    # A long key keeps its WHOLE name (issue #236). The key used to be cut at
+    # 24 sanitized characters, which overran the 32 the daemon renders —
+    # hook-defangdevs-local-channel-de2d is 34, so that session ran, owned its
+    # topic against the standing watch and appeared nowhere in the UI — and it
+    # also threw away what tells two repos sharing a prefix apart. Nothing is
+    # cut now; the daemon's bound is what this wrapper can emit.
+    def spawn_for(key):
+        machine.succeed(
+            "sudo -u agent env HOME=/home/agent"
+            " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+            f" LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY={key}"
+            " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+            f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+        )
+        spawned = machine.succeed(
+            "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-local-\"))'"
+            " /home/agent/.config/agent-box/sessions.json"
+        ).strip()
+        # The seed carries the full key either way; assert it before the name
+        # goes away with the session.
+        machine.succeed(
+            f"jq -e '.topics[0].topic == \"github:{key}\"'"
+            f" /home/agent/.local/state/local-webhook/filter.agent-{spawned}.json"
+        )
+        machine.succeed(
+            f"sudo -u agent env HOME=/home/agent agent-box-session rm {spawned}"
+        )
+        return spawned
+
+    # One at a time, so the hook-session cap is not the thing under test.
+    watched = spawn_for("defangdevs/local-channels")
+    twin = spawn_for("defangdevs/local-channels-staging")
+    assert watched.startswith("hook-defangdevs-local-channels-"), watched
+    assert twin.startswith("hook-defangdevs-local-channels-staging-"), twin
+
+    # A key too long even for that bound is not cut either: the name drops the
+    # key and keeps its uniqueness, and the log says which key it was for. An
+    # ambiguous tab is worse than an anonymous one.
+    huge = "defangdevs/" + "x" * 200
+    warn = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        f" LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY={huge}"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
+    )
+    assert "does not fit a session name" in warn, warn
+    anon = machine.succeed(
+        "jq -r '.sessions | keys[] | select(test(\"^hook-[0-9a-f]{8}$\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(f"sudo -u agent env HOME=/home/agent agent-box-session rm {anon}")
+
     # --- filter files are cleaned up with their session -------------------
     # Every spawned or subscribing session leaves a filter file, and nothing
     # used to remove them: 31 files for 3 live sessions on the dev box. 'rm'

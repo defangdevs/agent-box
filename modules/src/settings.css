@@ -150,6 +150,13 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
        border: 1px solid transparent; border-bottom: 0;
        border-radius: 8px 8px 0 0; white-space: nowrap; }
 .tab:hover { color: #e6edf3; }
+/* A session name is bounded only by what a name-minting path can emit —
+   hook-<owner/repo>-<4 hex> reaches 150 characters — and names are never
+   shortened to fit (two repos sharing a prefix would collapse onto one
+   name, issue #236). So the LABEL is what gives: it ellipsizes, with the
+   full name in the tab's tooltip. Without this one long name pushes every
+   other tab out of the scrolling bar. */
+.tab-name { overflow: hidden; text-overflow: ellipsis; max-width: 24ch; }
 .tab[aria-current] { background: #0d1117; border-color: #30363d;
                      color: #e6edf3; }
 /* Close (x) button, absolutely placed over the tab's extra right
