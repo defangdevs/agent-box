@@ -1256,10 +1256,13 @@ STYLE = """<style>
   .tbl li.foldrow summary .nm { flex-wrap: wrap; row-gap: 4px; }
   /* Our own disclosure caret, since the native marker is dropped above.
      Literal glyphs, not CSS escapes: this file is inlined into a Python
-     string, where a backslash escape would have to survive both. */
-  .tbl li.foldrow summary .nm::before { content: "▸"; color: #8b949e;
-                                        font-size: 11px; flex: none; }
-  .tbl li.foldrow details[open] summary .nm::before { content: "▾"; }
+     string, where a backslash escape would have to survive both.
+     The full-size triangles (U+25B6/U+25BC), not the SMALL ones: the small
+     pair is a hairline next to 14px row text, which read as no affordance
+     at all. Both have Emoji_Presentation=No, so no colour-emoji fallback. */
+  .tbl li.foldrow summary .nm::before { content: "▶"; color: #8b949e;
+                                        font-size: 12px; flex: none; }
+  .tbl li.foldrow details[open] summary .nm::before { content: "▼"; }
   /* The fold body: an inset table with no border of its own, so its rows
      read as belonging to the session above them. */
   ul.tbl.subs { margin: 0; border: 0; border-radius: 0; background: #0d1117; }
