@@ -20,12 +20,34 @@ fi
 
 # hook-<key>-<4 hex>: the key names the repo/object the events belong to,
 # so the workspace tab is readable; it is payload-derived, so sanitize to
-# the session-name charset and cap the length. The suffix dodges collisions
-# with an existing session of the same name (add would refuse).
-san=$(printf '%s' "${LOCAL_WEBHOOK_SPAWN_KEY:-event}" \
-  | tr -c 'A-Za-z0-9_-' '-' | cut -c1-24)
+# the session-name charset. The suffix dodges collisions with an existing
+# session of the same name (add would refuse).
+#
+# The key is NEVER shortened to fit. It used to be cut at 24 characters,
+# which made "hook-" + key + "-" + 4 hex reach 34 — past the 32 the settings
+# daemon rendered, so any repo with a 23-character owner/repo pair spawned a
+# session that ran, owned its topic and appeared nowhere in the web UI
+# (issue #236). Cutting it shorter would have been worse than the bug: two
+# repos sharing a prefix (a repo and its -staging twin) would collapse onto
+# the same name, and the tab would stop naming what it triages. The daemon's
+# bound is now what this line can emit for GitHub's maxima instead.
+#
+# A key too long even for that keeps its uniqueness rather than being cut:
+# the name drops the key entirely and the log says which key it was for.
+NAME_MAX=150
+san=$(printf '%s' "${LOCAL_WEBHOOK_SPAWN_KEY:-event}" | tr -c 'A-Za-z0-9_-' '-')
 rand=$(od -An -N2 -tx2 /dev/urandom | tr -d ' \n')
 name="hook-${san:-event}-$rand"
+if [ "${#name}" -gt "$NAME_MAX" ]; then
+  name="hook-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+  # The key is printed unquoted on purpose: a single quote written directly
+  # before a shell parameter expansion is mis-escaped by assemble-module.py
+  # and reaches the generated module as broken Nix (agent-box#244).
+  echo "agent-box-webhook-spawn: this key does not fit a session name" \
+       "(max $NAME_MAX characters): ${LOCAL_WEBHOOK_SPAWN_KEY:-event}" >&2
+  echo "agent-box-webhook-spawn: naming this session $name instead," \
+       "so its tab is anonymous but never ambiguous" >&2
+fi
 
 # A hook session OWNS what it was spawned for, and says so in the one place
 # the dispatcher reads: its own filter file, written BEFORE the session

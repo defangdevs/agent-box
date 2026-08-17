@@ -139,8 +139,21 @@ WEBHOOKS = bool(WEBHOOK_SCRIPT and WEBHOOK_STATE_DIR)
 # EnvironmentFile will accept as a variable name.
 KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Session names: same charset the supervisor and CLI enforce (they
-# land in tmux -t targets and URLs).
-SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+# land in tmux -t targets and URLs). Every render and publish path filters
+# through this, so a name it rejects is not merely unlisted — that session
+# has no tab, no delete/restart button and no subscriptions row, while it
+# keeps running and receiving events (issue #236).
+#
+# The bound is therefore whatever the name-minting paths can emit, not a
+# round number: the dispatch wrapper's hook-<source key>-<4 hex> reaches 150
+# characters for GitHub's own maxima (39-character owner + "/" + 100-
+# character repo). Shortening a name to fit is NOT an option — two repos
+# sharing a prefix would collapse onto one name — so the UI stretches
+# instead (the tab label ellipsizes, with the full name as its tooltip).
+# Mirrored by the CLI's NAME_MAX and the module's session-name assertion;
+# it stays far below what a filter.<user>-<session>.json filename allows.
+NAME_MAX = 150
+SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,%d}$" % NAME_MAX)
 # Subscription topics: "source:owner/repo", or the prefix "source:owner/*"
 # (local-webhook 0.13.0 dropped "*" and "source:*" as topics). The
 # panel only ever posts back a topic it just rendered, and the CLI is
@@ -343,7 +356,7 @@ def gen_session_name(agent, sessions):
         if candidate not in sessions:
             return candidate
     # Astronomically unlikely fallback: a longer token can't be taken.
-    return ("%s-%s" % (agent, secrets.token_hex(8)))[:32]
+    return ("%s-%s" % (agent, secrets.token_hex(8)))[:NAME_MAX]
 
 
 def write_sessions(sessions):
@@ -1456,7 +1469,12 @@ def render_tabs(names, live, stopped, selected):
     keeping them apart also stops the tab-select click delegation from
     swallowing the close click. Closing kills a live agent and the
     button sits a few pixels from the session name, so SCRIPT arms it
-    on the first click and only submits on the second."""
+    on the first click and only submits on the second.
+
+    The name gets its own span so a long one (a dispatched
+    hook-<owner/repo>-<hex> runs to 150 characters, and names are never
+    shortened to fit — issue #236) ellipsizes instead of pushing the
+    other tabs out of the bar; title carries it in full."""
     items = []
     base = html.escape(SESS_BASE)
     for name in names:
@@ -1470,8 +1488,10 @@ def render_tabs(names, live, stopped, selected):
             state = "starting"
         items.append(
             f'<span class="tab-wrap">'
-            f'<a class="tab" data-tab="{safe}" href="/?tab={safe}"{cur}>'
-            f'<span class="state" data-state="{state}"></span>{safe}</a>'
+            f'<a class="tab" data-tab="{safe}" href="/?tab={safe}"{cur}'
+            f' title="{safe}">'
+            f'<span class="state" data-state="{state}"></span>'
+            f'<span class="tab-name">{safe}</span></a>'
             f'<form class="tab-close" method="post" action="{base}/sessions/delete">'
             f'<input type="hidden" name="name" value="{safe}">'
             f'<button type="submit" class="tab-x" data-close="{safe}" '

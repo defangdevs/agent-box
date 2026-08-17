@@ -458,6 +458,51 @@
     machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm codex'")
     machine.succeed(f"su -s /bin/sh agent -c 'agent-box-session rm {suffixed}'")
 
+    # --- the name length the web UI can render (issue #236) ----------------
+    # The settings daemon filters every rendered name through SESSION_RE and
+    # DROPS the rest, so a name past its bound costs more than looks: the
+    # session runs, holds webhook subscriptions and receives events, yet has
+    # no row in the Sessions list and none in the subscriptions panel —
+    # nothing to delete, restart or attach in the UI. The bound is what the
+    # name-minting paths can emit (hook-<owner/repo>-<4 hex> reaches 150 for
+    # GitHub's maxima), NOT a length names are shortened to fit: two repos
+    # sharing a prefix would collapse onto one name. So a name well past the
+    # old 32 must be accepted end to end...
+    at_bound = "n" * 150
+    too_long = "n" * 151
+    machine.succeed(f"su -s /bin/sh agent -c 'agent-box-session add {at_bound}'")
+    machine.succeed(
+        f"jq -e '.sessions | has(\"{at_bound}\")' "
+        "/home/agent/.config/agent-box/sessions.json"
+    )
+    machine.succeed(f"su -s /bin/sh agent -c 'agent-box-session rm {at_bound}'")
+    # ...and past THAT the CLI says so instead of minting a session the UI
+    # would drop. valid_new_name is the gate every creation path shares (the
+    # webhook spawn wrapper adds through it).
+    add_out = machine.fail(
+        f"su -s /bin/sh agent -c 'agent-box-session add {too_long}' 2>&1"
+    )
+    assert "at most 150 characters" in add_out, add_out
+    machine.succeed(
+        f"jq -e '.sessions | has(\"{too_long}\") | not' "
+        "/home/agent/.config/agent-box/sessions.json"
+    )
+    # ...but the length rule is on the way IN only. A name that reached
+    # sessions.json before this bound existed — or by hand — is invisible in
+    # the web UI, so the CLI has to stay able to delete it: gating rm on the
+    # length too would leave that session unreachable from anywhere.
+    hand_edit = (
+        f"jq --arg n {too_long} '.sessions[$n] = {{\"agent\":\"claude\"}}' "
+        "$HOME/.config/agent-box/sessions.json > /tmp/long.json && "
+        "install -m 0600 /tmp/long.json $HOME/.config/agent-box/sessions.json"
+    )
+    machine.succeed("su -s /bin/sh agent -c " + shlex.quote(hand_edit))
+    machine.succeed(f"su -s /bin/sh agent -c 'agent-box-session rm {too_long}'")
+    machine.succeed(
+        f"jq -e '.sessions | has(\"{too_long}\") | not' "
+        "/home/agent/.config/agent-box/sessions.json"
+    )
+
     # --- shell pseudo-agent (issue 113): supervised plain login shell ------
     machine.succeed(
         "su -s /bin/sh agent -c 'agent-box-session add scratch --agent shell'"
@@ -826,7 +871,25 @@
     assert 'data-tab="claude" href="/?tab=claude" aria-current="page"' in tab_page, tab_page
     assert 'src="/agent/?arg=claude"' in tab_page, tab_page
     # main is still a tab, just not the current one.
-    assert 'data-tab="main" href="/?tab=main">' in tab_page, tab_page
+    assert 'data-tab="main" href="/?tab=main" title="main">' in tab_page, tab_page
+
+    # A dispatch-shaped long name renders as a tab (issue #236). The daemon
+    # used to bound a name at 32 and DROP the rest, so hook-<owner/repo>-<hex>
+    # for any repo over 23 characters had no tab, no close button and no
+    # subscriptions row while the session ran and owned its topic. Names are
+    # never shortened to fit — two repos sharing a prefix would collapse onto
+    # one name — so it is the LABEL that gives: its own span, ellipsized in
+    # CSS, with the full name as the tab's tooltip.
+    long_name = "hook-defangdevs-local-channels-de2d"
+    machine.succeed(
+        f"su -s /bin/sh agent -c 'agent-box-session add {long_name} --agent shell'"
+    )
+    long_page = client.succeed(f"{curl} -u agent:testpassword https://box.test/")
+    assert f'data-tab="{long_name}" href="/?tab={long_name}"' in long_page, long_page
+    assert f'title="{long_name}"' in long_page, long_page
+    assert f'<span class="tab-name">{long_name}</span>' in long_page, long_page
+    assert f'class="tab-x" data-close="{long_name}"' in long_page, long_page
+    machine.succeed(f"su -s /bin/sh agent -c 'agent-box-session rm {long_name}'")
 
     # Delete it (delist + kill) so "claude" is free again for later subtests.
     client.succeed(

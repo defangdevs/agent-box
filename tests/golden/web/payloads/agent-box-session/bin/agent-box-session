@@ -20,6 +20,8 @@ usage() {
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
   echo "       agent-box-session env ls | set KEY VALUE | rm KEY"
+  echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters (a"
+  echo "longer name would be invisible in the web UI)."
   echo "agents: $AGENTS (default: $DEFAULT_AGENT)"
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
@@ -28,8 +30,26 @@ usage() {
   echo "same) until 'restart NAME' revives it; rm delists it for good."
   echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
 }
+# The settings daemon's SESSION_RE bounds a name at NAME_MAX and DROPS what
+# does not match, so a longer session runs, holds subscriptions and receives
+# events while having no row in the Sessions list and none in the webhook
+# panel — it cannot be attached, restarted or deleted from the web UI, and
+# its claimed topic silences a standing watch for a session nobody can see
+# (issue #236). Keep this number equal to the daemon's: it is the length
+# every name-minting path is allowed to reach (hook-<owner/repo>-<4 hex> for
+# GitHub's maxima), never a length names get shortened to fit.
+NAME_MAX=150
 valid_name() {
   case "$1" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
+}
+valid_new_name() {
+  # The length rule belongs on CREATION only — this is the one gate every
+  # creation path passes through (add, and the webhook spawn wrapper through
+  # it), so refusing here is what keeps such a name from existing. rm, stop
+  # and restart deliberately keep to the charset: a name minted before this
+  # bound existed, or written into sessions.json by hand, is invisible in the
+  # UI and the CLI is the only way left to get rid of it.
+  valid_name "$1" && [ "${#1}" -le "$NAME_MAX" ]
 }
 valid_key() {
   # env var name charset — mirrors the settings daemon's KEY_RE and the
@@ -108,7 +128,7 @@ case "$cmd" in
     name=""
     case "${1:-}" in
       ""|-*) ;;
-      *) name="$1"; shift; valid_name "$name" || { usage >&2; exit 2; } ;;
+      *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
     agent="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
     while [ $# -gt 0 ]; do
