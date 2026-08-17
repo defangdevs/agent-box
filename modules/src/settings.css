@@ -63,6 +63,14 @@ a.sess:hover { text-decoration: underline; }
    read as belonging to the session above them. */
 ul.tbl.subs { margin: 0; border: 0; border-radius: 0; background: #0d1117; }
 ul.tbl.subs li { padding-left: 40px; }
+/* A standing watch folds open onto its launch prompt (issue #259) instead.
+   pre-wrap keeps the prompt's own blank line without a horizontal
+   scrollbar, and anywhere breaks the long URLs and topics inside it. */
+.wh-prompt { padding: 4px 16px 12px 40px; background: #0d1117; }
+.wh-prompt .note { margin: 0 0 6px; }
+.wh-prompt pre { margin: 0; font-size: 12px; line-height: 1.5;
+                 color: #8b949e; white-space: pre-wrap;
+                 overflow-wrap: anywhere; }
 .meta { color: #8b949e; font-size: 12px; }
 /* The webhook chip is a different KIND of fact from the agent name and
    the cwd beside it — what the fold holds — so it gets its own pill

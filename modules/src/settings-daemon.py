@@ -61,6 +61,7 @@
 #   AGENT_BOX_WEBHOOK_STATE_DIR  where its filter.*.json files live
 #   AGENT_BOX_WEBHOOK_PYTHON     interpreter for that script
 
+import functools
 import glob
 import hashlib
 import html
@@ -134,6 +135,11 @@ WEBHOOK_STATE_DIR = os.environ.get("AGENT_BOX_WEBHOOK_STATE_DIR", "")
 # dev run; the module passes the same python the receiver unit uses.
 WEBHOOK_PYTHON = os.environ.get("AGENT_BOX_WEBHOOK_PYTHON", "") or sys.executable
 WEBHOOKS = bool(WEBHOOK_SCRIPT and WEBHOOK_STATE_DIR)
+# The dispatch script the receiver runs on a match. Run here only in its
+# --preamble mode, which spawns nothing: it prints the prompt the next
+# match would start a session with, so the standing-watch panel shows what
+# a watch DOES instead of restating why it exists (#259).
+HOOK_SPAWN_CMD = os.environ.get("AGENT_BOX_HOOK_SPAWN_CMD", "")
 
 # Env var names: POSIX-ish. Must start with a letter or underscore and
 # contain only letters, digits, underscores. This is what a shell / systemd
@@ -766,6 +772,36 @@ def webhook_unsubscribe(key, topic, dispatch):
         args += ["--deliver-to", "subagent"]
     proc = webhook_cli(key, args)
     return proc is not None and proc.returncode == 0
+
+
+@functools.lru_cache(maxsize=64)
+def hook_preamble(topic, note):
+    """The prompt a match on this standing watch launches its session with.
+
+    Rendered by the dispatch script itself (--preamble), for the same
+    reason the panel shells out to webhook.py for everything else: the
+    text belongs to the thing that sends it. A copy here would drift, and
+    a prompt the box no longer sends is worse than no prompt at all.
+
+    Deterministic for a given (topic, note), so the per-second live feed
+    re-render costs one fork per watch per daemon lifetime. "" when the
+    module wired no command or the script failed — the caller then falls
+    back to printing the note.
+    """
+    if not HOOK_SPAWN_CMD:
+        return ""
+    try:
+        proc = subprocess.run(
+            [HOOK_SPAWN_CMD, "--preamble", topic, note],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write("webhook: preamble: %s\n" % exc)
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def webhook_entries(data, dispatch):
@@ -1613,9 +1649,13 @@ def render_session_subs(sub, name):
     return '<ul class="tbl subs">' + "".join(rows) + "</ul>"
 
 
-def render_webhook_row(topic, meta, note, key, dispatch):
+def render_webhook_row(topic, meta, note, key, dispatch, fold=""):
     """One subscription row: what it is, why it exists, and its delete.
-    Every row this renders names a topic, so every row can drop it."""
+    Every row this renders names a topic, so every row can drop it.
+
+    `fold` is text the row hides behind a disclosure — the launch prompt of
+    a standing watch (#259), which is too long to sit on the row itself and
+    too useful to leave off the page."""
     base = html.escape(BASE)
     safe_topic = html.escape(topic)
     bits = "".join(
@@ -1624,8 +1664,8 @@ def render_webhook_row(topic, meta, note, key, dispatch):
     note_html = (
         f'<span class="note wh-note">{html.escape(note)}</span>' if note else ""
     )
-    return (
-        f'<li><span class="nm wh"><code>{safe_topic}</code>{bits}{note_html}</span>'
+    row = (
+        f'<span class="nm wh"><code>{safe_topic}</code>{bits}{note_html}</span>'
         f'<span class="acts">'
         f'<form class="inline" method="post" action="{base}/webhooks/unsubscribe" '
         f'onsubmit="return confirm(\'Delete the subscription to {safe_topic}?\');">'
@@ -1634,7 +1674,22 @@ def render_webhook_row(topic, meta, note, key, dispatch):
         f'<input type="hidden" name="dispatch" value="{"1" if dispatch else ""}">'
         f'<button type="submit" class="icon idanger" aria-label="Delete" '
         f'title="Delete subscription to {safe_topic}">{ICON_TRASH}</button></form>'
-        f'</span></li>'
+        f'</span>'
+    )
+    if not fold:
+        return f"<li>{row}</li>"
+    # Same fold shape as a session row (data-fold and all, so the live
+    # feed's DOM swap restores an open one). The label inside says which
+    # parts of the prompt an event fills in; without it the placeholders
+    # read as text the session would really receive.
+    return (
+        f'<li class="foldrow"><details data-fold="watch-{safe_topic}">'
+        f'<summary title="Show the prompt a match launches">{row}</summary>'
+        f'<div class="wh-prompt"><p class="note">Launch prompt &mdash; what a '
+        f'matching event starts the new session with. The &lt;&hellip;&gt; parts '
+        f'come from the event.</p>'
+        f'<pre>{html.escape(fold)}</pre></div>'
+        f'</details></li>'
     )
 
 
@@ -1642,19 +1697,31 @@ def render_webhooks(watches):
     """The standing watches. Session subscriptions are NOT here: they
     belong to a session and are folded into its row above. A standing
     watch belongs to no session — it spawns one — so this list is where
-    it can be seen at all."""
+    it can be seen at all.
+
+    The note is NOT on the row (#259). A watch note is written for the
+    session the watch spawns — the dispatcher quotes it into that session's
+    prompt — so on the row it is a paragraph of someone else's briefing,
+    and the panel's own description already says what a standing watch is.
+    The fold carries the whole prompt instead, note included, in the frame
+    that explains why that wording exists."""
     rows = []
     for entry in watches:
         topic = str(entry.get("topic") or "")
         if not topic:
             continue
+        note = str(entry.get("note") or "")
+        prompt = hook_preamble(topic, note)
         rows.append(render_webhook_row(
             topic,
             [str(entry.get("expiresIn") or "")],
-            str(entry.get("note") or ""),
+            # Only when the prompt could not be rendered: then the note is
+            # the one thing left that says why this watch exists.
+            "" if prompt else note,
             # A standing watch is shared, so any key edits the same list.
             webhook_key(""),
             dispatch=True,
+            fold=prompt,
         ))
     if not rows:
         rows.append('<li class="empty">No standing watches.</li>')

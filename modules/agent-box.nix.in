@@ -2043,6 +2043,11 @@ in
           AGENT_BOX_WEBHOOK_SCRIPT = localWebhookScript;
           AGENT_BOX_WEBHOOK_PYTHON = webhookPython;
           AGENT_BOX_WEBHOOK_STATE_DIR = webhookStateDirOf name;
+          # Same script the receiver runs on a match, for its --preamble mode
+          # only: the standing-watch panel prints the prompt the next match
+          # would launch (#259). One text, one source — a copy in the daemon
+          # would drift from what the box actually sends.
+          AGENT_BOX_HOOK_SPAWN_CMD = "${webhookSpawn}/bin/agent-box-webhook-spawn";
         } // lib.optionalAttrs cfg.selfUpdate.enable {
           # --no-block so the daemon's HTTP response goes out before the
           # rebuild (possibly) restarts the daemon itself.
