@@ -1945,11 +1945,17 @@ in
         after = [ "agent-box-${name}.service" "network-online.target" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
-        # The attach script (src/attach.sh) resolves tmux from this PATH
-        # instead of a baked store path (issue #154, Phase 2); head comes
+        # The attach script (src/attach.sh) resolves tmux and jq from this
+        # PATH instead of baked store paths (issue #154, Phase 2); head comes
         # from the coreutils already on every unit's default PATH.
-        path = [ pkgs.tmux ];
-        environment.TMUX_TMPDIR = "/run/${runtimeDirectory name}";
+        path = [ pkgs.tmux pkgs.jq ];
+        environment = {
+          TMUX_TMPDIR = "/run/${runtimeDirectory name}";
+          # Read-only, and by the session's OWN user: what the attach
+          # script needs it for is telling a name this box has never heard
+          # of from one that is merely down (issue #241).
+          AGENT_BOX_SESSIONS_FILE = userSessionsFile name;
+        };
         serviceConfig = {
           User = name;
           Restart = "always";

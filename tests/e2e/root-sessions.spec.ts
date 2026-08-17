@@ -68,6 +68,11 @@ test('authenticated root shows the tab bar with main active and its terminal ifr
   // the iframe once the session is live.
   const frame = page.locator(`#panes iframe[src="/${USER}/?arg=main"]`);
   await expect(frame).toBeVisible({ timeout: 30_000 });
+  // Every pane records the session state it was built for, the iframe
+  // included. That stamp is what lets the page retire a terminal whose
+  // session has since stopped instead of leaving the dead one mounted
+  // (issue 241); losing it silently brings the stale pane back.
+  await expect(frame).toHaveAttribute('data-ph', 'live');
 });
 
 test('?tab= selects a tab server-side (the no-JS switching path)', async ({ browser }) => {

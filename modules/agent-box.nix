@@ -5456,18 +5456,27 @@ in
             // Mirrors render_pane: a stopped session is not coming up on its
             // own, so don't promise that it is starting.
             return tabState(name) === "stopped"
-              ? name + " is stopped — Restart on the settings page revives it."
+              ? name + " is stopped — Start on the settings page revives it."
               : name + " is starting…";
+          }
+          function paneState(name) {
+            // The three states a pane is built for; data-ph records which one the
+            // mounted pane belongs to, on the iframe as much as on a placeholder.
+            if (tabLive(name)) { return "live"; }
+            return tabState(name) === "stopped" ? "stopped" : "starting";
           }
           function ensurePane(name) {
             var cur = document.querySelector('#panes .pane[data-pane="' + name + '"]');
-            // Keep an existing iframe as-is; keep a placeholder only while the
-            // state it was rendered for holds (starting ↔ stopped flips re-render;
-            // data-ph is stamped by render_pane and by the branch below).
-            var ph = tabState(name) === "stopped" ? "stopped" : "starting";
-            if (cur && (cur.tagName === "IFRAME" ||
-                (!tabLive(name) &&
-                 (cur.getAttribute("data-ph") || "starting") === ph))) { return cur; }
+            // Keep a pane only while the state it was built for still holds. An
+            // iframe used to be exempt from that, so it outlived the session
+            // inside it: once a live session stopped (clean exit, or a stop from
+            // the CLI), the pane went on showing a terminal wired to a tmux
+            // session that no longer existed — the attach wrapper's "no session
+            // named X" dead end — and starting it again never swapped in a fresh
+            // iframe, which is what made a working Start look broken (issue #241).
+            var want = paneState(name);
+            // Panes rendered before this stamp existed are server-rendered iframes.
+            if (cur && (cur.getAttribute("data-ph") || "live") === want) { return cur; }
             var el;
             if (tabLive(name)) {
               el = document.createElement("iframe");
@@ -5479,9 +5488,9 @@ in
             } else {
               el = document.createElement("div");
               el.textContent = placeholderText(name);
-              el.setAttribute("data-ph", ph);
               el.className = "pane placeholder";
             }
+            el.setAttribute("data-ph", want);
             el.setAttribute("data-pane", name);
             if (cur) {
               if (cur.classList.contains("active")) { el.classList.add("active"); }
@@ -5890,13 +5899,24 @@ in
                     agent = html.escape(str(entries[name].get("agent") or "?"))
                     cwd = html.escape(display_cwd(entries[name].get("workingDirectory")))
                     # stopped = listed but deliberately down (clean agent exit or
-                    # agent-box-session stop); the Restart button revives it.
+                    # agent-box-session stop); the same route revives it.
                     if name in live:
                         state = "live"
                     elif entries[name].get("stopped"):
                         state = "stopped"
                     else:
                         state = "starting"
+                    # One route, two verbs: /sessions/restart clears the stopped
+                    # flag and kills the pane, so on a session that is already down
+                    # it only STARTS one. Nothing is running to lose there, and
+                    # calling that "Restart" behind a "work is lost" prompt asked
+                    # the operator to accept a risk that does not exist (#241).
+                    if state == "stopped":
+                        verb, guard = "Start", ""
+                    else:
+                        verb = "Restart"
+                        guard = (f' onsubmit="return confirm(\'Restart {safe}? '
+                                 f'Unsaved in-flight work is lost.\');"')
                     row = (
                         # The name deep-links into the terminal via ttyd's
                         # ?arg= session selector. No userinfo in the href
@@ -5908,11 +5928,11 @@ in
                         f'<span class="state" data-state="{state}">{state}</span>'
                         f'{render_subs_chip(subs, name)}</span>'
                         f'<span class="acts">'
-                        f'<form class="inline" method="post" action="{base}/sessions/restart" '
-                        f'onsubmit="return confirm(\'Restart {safe}? Unsaved in-flight work is lost.\');">'
+                        f'<form class="inline" method="post" '
+                        f'action="{base}/sessions/restart"{guard}>'
                         f'<input type="hidden" name="name" value="{safe}">'
                         f'<input type="hidden" name="back" value="settings">'
-                        f'<button type="submit" class="btn small">Restart</button></form>'
+                        f'<button type="submit" class="btn small">{verb}</button></form>'
                         f'<form class="inline" method="post" action="{base}/sessions/delete" '
                         f'onsubmit="return confirm(\'Delete session {safe}? Its live agent is killed.\');">'
                         f'<input type="hidden" name="name" value="{safe}">'
@@ -6177,13 +6197,18 @@ in
             starting session gets a placeholder instead (SCRIPT swaps in the
             iframe once the state flips; without JS, reloading does). A stopped
             session gets an honest placeholder: nothing is coming up until a
-            restart revives it."""
+            start revives it.
+
+            data-ph records which of the three states the pane was built for —
+            on the iframe too, so SCRIPT can tell a terminal that is still wired
+            to a live tmux session from one whose session has since gone (issue
+            #241)."""
             if selected is None:
                 return '<div class="pane placeholder active">No session selected.</div>'
             safe = html.escape(selected)
             if selected in stopped and selected not in live:
                 return (f'<div class="pane placeholder active" data-pane="{safe}" '
-                        f'data-ph="stopped">{safe} is stopped &mdash; Restart on '
+                        f'data-ph="stopped">{safe} is stopped &mdash; Start on '
                         f'the settings page revives it.</div>')
             if selected not in live:
                 return (f'<div class="pane placeholder active" data-pane="{safe}" '
@@ -6191,7 +6216,7 @@ in
                         f'reload in a few seconds.</div>')
             user = urllib.parse.quote(USER, safe="")
             # SESSION_RE names are URL-safe as-is.
-            return (f'<iframe class="pane active" data-pane="{safe}" '
+            return (f'<iframe class="pane active" data-pane="{safe}" data-ph="live" '
                     f'src="/{user}/?arg={safe}" title="{safe} terminal" '
                     f'allow="clipboard-read; clipboard-write"></iframe>')
 
@@ -6397,6 +6422,7 @@ in
                 "session_added": "Session added — it starts within a few seconds.",
                 "session_deleted": "Session deleted.",
                 "session_restarted": "Session restart requested.",
+                "session_started": "Session started — it comes up within a few seconds.",
                 "update": "Box update started — the system rebuilds in the "
                           "background and this page may briefly go away.",
                 "webhook_deleted": "Subscription deleted — it stops at the next delivery.",
@@ -6632,6 +6658,9 @@ in
                     self._redirect("ok=session_deleted", self._sess_page(form))
                 elif path == SESS_BASE + "/sessions/restart":
                     name = (form.get("name", [""])[0]).strip()
+                    # The row calls this route Start on a stopped session, so say
+                    # back what was actually done rather than "restart" (#241).
+                    ok = "ok=session_restarted"
                     if SESSION_RE.match(name):
                         # Restart doubles as the revive verb for a stopped session
                         # (clean agent exit or agent-box-session stop, issue #167):
@@ -6641,8 +6670,9 @@ in
                         entry = sessions.get(name)
                         if entry is not None and entry.pop("stopped", None) is not None:
                             write_sessions(sessions)
+                            ok = "ok=session_started"
                         kill_session(name)
-                    self._redirect("ok=session_restarted", self._sess_page(form))
+                    self._redirect(ok, self._sess_page(form))
                 elif path == BASE + "/webhooks/unsubscribe" and WEBHOOKS:
                     topic = (form.get("topic", [""])[0]).strip()
                     key = (form.get("key", [""])[0]).strip()
@@ -6734,9 +6764,12 @@ in
       # hyperlinks instead of redrawing only their visible labels.
       attachScript = pkgs.writeShellScript "agent-box-attach" ''
         set -u
-        # tmux and head resolve from the web-terminal unit's PATH; the socket name
-        # is the module-wide constant.
+        # tmux, jq and head resolve from the web-terminal unit's PATH; the socket
+        # name is the module-wide constant. The sessions registry arrives as unit
+        # environment (the same file the settings daemon and the supervisor read),
+        # so a dead end can tell a name this box knows from one it does not.
         T="tmux -T hyperlinks -L agent-box"
+        SESSIONS="''${AGENT_BOX_SESSIONS_FILE:-}"
         # The mascot (issue #185), for the two dead ends below: both are
         # full-screen "nothing to attach to" moments, so the art costs
         # nothing and softens a failure. printf per line, not a heredoc: the
@@ -6753,6 +6786,29 @@ in
             "             \`~-..........-~'" \
             ""
         }
+        # What to say about a requested name that has no tmux session. The
+        # registry is what tells the three cases apart, and every one of them used
+        # to get "create it with: agent-box-session add" — advice that FAILS on a
+        # name the registry already carries, which is what the settings page's
+        # session links hand you for any session that is not live (issue #241).
+        reg() {   # reg FILTER — ask jq about "$want", false on any error
+          [ -n "$SESSIONS" ] || return 1
+          jq -e --arg s "$want" "$1" "$SESSIONS" >/dev/null 2>&1
+        }
+        advice() {
+          if ! reg '.sessions | has($s)'; then
+            echo "no session named '$want' — nothing on this box is listed under that"
+            echo "name. Add one from the settings page, or run:"
+            echo "  agent-box-session add $want"
+          elif reg '.sessions[$s].stopped == true'; then
+            echo "session '$want' is stopped: it is still listed, but nothing will"
+            echo "bring it back on its own. Press Start on the settings page, or run:"
+            echo "  agent-box-session restart $want"
+          else
+            echo "session '$want' is starting — the supervisor spawns it within a few"
+            echo "seconds. Reload this page."
+          fi
+        }
         want="''${1:-}"
         case "$want" in (*[!A-Za-z0-9_-]*) want="" ;; esac
         if [ -n "$want" ]; then
@@ -6760,9 +6816,10 @@ in
             exec $T attach -t "=$want"
           fi
           potato
-          echo "no session named '$want'. Live sessions:"
+          advice
+          echo ""
+          echo "Live sessions:"
           $T list-sessions -F '  #S' 2>/dev/null || echo "  (none)"
-          echo "create it with: agent-box-session add $want"
           sleep 5
           exit 1
         fi
@@ -7160,11 +7217,17 @@ in
         after = [ "agent-box-${name}.service" "network-online.target" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
-        # The attach script (src/attach.sh) resolves tmux from this PATH
-        # instead of a baked store path (issue #154, Phase 2); head comes
+        # The attach script (src/attach.sh) resolves tmux and jq from this
+        # PATH instead of baked store paths (issue #154, Phase 2); head comes
         # from the coreutils already on every unit's default PATH.
-        path = [ pkgs.tmux ];
-        environment.TMUX_TMPDIR = "/run/${runtimeDirectory name}";
+        path = [ pkgs.tmux pkgs.jq ];
+        environment = {
+          TMUX_TMPDIR = "/run/${runtimeDirectory name}";
+          # Read-only, and by the session's OWN user: what the attach
+          # script needs it for is telling a name this box has never heard
+          # of from one that is merely down (issue #241).
+          AGENT_BOX_SESSIONS_FILE = userSessionsFile name;
+        };
         serviceConfig = {
           User = name;
           Restart = "always";

@@ -1203,13 +1203,24 @@ def render_sessions(subs=None):
             agent = html.escape(str(entries[name].get("agent") or "?"))
             cwd = html.escape(display_cwd(entries[name].get("workingDirectory")))
             # stopped = listed but deliberately down (clean agent exit or
-            # agent-box-session stop); the Restart button revives it.
+            # agent-box-session stop); the same route revives it.
             if name in live:
                 state = "live"
             elif entries[name].get("stopped"):
                 state = "stopped"
             else:
                 state = "starting"
+            # One route, two verbs: /sessions/restart clears the stopped
+            # flag and kills the pane, so on a session that is already down
+            # it only STARTS one. Nothing is running to lose there, and
+            # calling that "Restart" behind a "work is lost" prompt asked
+            # the operator to accept a risk that does not exist (#241).
+            if state == "stopped":
+                verb, guard = "Start", ""
+            else:
+                verb = "Restart"
+                guard = (f' onsubmit="return confirm(\'Restart {safe}? '
+                         f'Unsaved in-flight work is lost.\');"')
             row = (
                 # The name deep-links into the terminal via ttyd's
                 # ?arg= session selector. No userinfo in the href
@@ -1221,11 +1232,11 @@ def render_sessions(subs=None):
                 f'<span class="state" data-state="{state}">{state}</span>'
                 f'{render_subs_chip(subs, name)}</span>'
                 f'<span class="acts">'
-                f'<form class="inline" method="post" action="{base}/sessions/restart" '
-                f'onsubmit="return confirm(\'Restart {safe}? Unsaved in-flight work is lost.\');">'
+                f'<form class="inline" method="post" '
+                f'action="{base}/sessions/restart"{guard}>'
                 f'<input type="hidden" name="name" value="{safe}">'
                 f'<input type="hidden" name="back" value="settings">'
-                f'<button type="submit" class="btn small">Restart</button></form>'
+                f'<button type="submit" class="btn small">{verb}</button></form>'
                 f'<form class="inline" method="post" action="{base}/sessions/delete" '
                 f'onsubmit="return confirm(\'Delete session {safe}? Its live agent is killed.\');">'
                 f'<input type="hidden" name="name" value="{safe}">'
@@ -1490,13 +1501,18 @@ def render_pane(selected, live, stopped):
     starting session gets a placeholder instead (SCRIPT swaps in the
     iframe once the state flips; without JS, reloading does). A stopped
     session gets an honest placeholder: nothing is coming up until a
-    restart revives it."""
+    start revives it.
+
+    data-ph records which of the three states the pane was built for —
+    on the iframe too, so SCRIPT can tell a terminal that is still wired
+    to a live tmux session from one whose session has since gone (issue
+    #241)."""
     if selected is None:
         return '<div class="pane placeholder active">No session selected.</div>'
     safe = html.escape(selected)
     if selected in stopped and selected not in live:
         return (f'<div class="pane placeholder active" data-pane="{safe}" '
-                f'data-ph="stopped">{safe} is stopped &mdash; Restart on '
+                f'data-ph="stopped">{safe} is stopped &mdash; Start on '
                 f'the settings page revives it.</div>')
     if selected not in live:
         return (f'<div class="pane placeholder active" data-pane="{safe}" '
@@ -1504,7 +1520,7 @@ def render_pane(selected, live, stopped):
                 f'reload in a few seconds.</div>')
     user = urllib.parse.quote(USER, safe="")
     # SESSION_RE names are URL-safe as-is.
-    return (f'<iframe class="pane active" data-pane="{safe}" '
+    return (f'<iframe class="pane active" data-pane="{safe}" data-ph="live" '
             f'src="/{user}/?arg={safe}" title="{safe} terminal" '
             f'allow="clipboard-read; clipboard-write"></iframe>')
 
@@ -1710,6 +1726,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "session_added": "Session added — it starts within a few seconds.",
         "session_deleted": "Session deleted.",
         "session_restarted": "Session restart requested.",
+        "session_started": "Session started — it comes up within a few seconds.",
         "update": "Box update started — the system rebuilds in the "
                   "background and this page may briefly go away.",
         "webhook_deleted": "Subscription deleted — it stops at the next delivery.",
@@ -1945,6 +1962,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._redirect("ok=session_deleted", self._sess_page(form))
         elif path == SESS_BASE + "/sessions/restart":
             name = (form.get("name", [""])[0]).strip()
+            # The row calls this route Start on a stopped session, so say
+            # back what was actually done rather than "restart" (#241).
+            ok = "ok=session_restarted"
             if SESSION_RE.match(name):
                 # Restart doubles as the revive verb for a stopped session
                 # (clean agent exit or agent-box-session stop, issue #167):
@@ -1954,8 +1974,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 entry = sessions.get(name)
                 if entry is not None and entry.pop("stopped", None) is not None:
                     write_sessions(sessions)
+                    ok = "ok=session_started"
                 kill_session(name)
-            self._redirect("ok=session_restarted", self._sess_page(form))
+            self._redirect(ok, self._sess_page(form))
         elif path == BASE + "/webhooks/unsubscribe" and WEBHOOKS:
             topic = (form.get("topic", [""])[0]).strip()
             key = (form.get("key", [""])[0]).strip()
