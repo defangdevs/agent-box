@@ -921,11 +921,14 @@
         assert 'src="/agent/?arg=main"' not in ws, ws
 
         # The terminal dead end names the verb that actually revives it.
+        # Print the wrapper's path (see the grep -o note below) — running
+        # the substitution as the command would run the WRAPPER instead.
         attach = machine.succeed(
-            "$({ systemctl show agent-web-terminal-agent --property=ExecStart "
+            "{ systemctl show agent-web-terminal-agent --property=ExecStart "
             "--value | grep -o '/nix/store/[^ ]*-agent-box-attach' "
-            "|| echo /missing; } | head -n1)"
+            "|| echo /missing; } | head -n1"
         ).strip()
+        assert attach != "/missing", attach
 
         def dead_end(name):
             return machine.succeed(as_agent(
