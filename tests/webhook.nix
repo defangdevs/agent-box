@@ -1599,7 +1599,7 @@
         "mkdir -p /tmp/fakebin && cat > /tmp/fakebin/gh <<'EOF'\n"
         "#!/bin/sh\n"
         'echo "$@" >> /tmp/fakebin/calls\n'
-        'printf "%s\\n" "${FAKE_LOGIN:-box-bot}"\n'
+        'printf "%s\\n" "''${FAKE_LOGIN:-box-bot}"\n'
         "EOF\n"
         "chmod 755 /tmp/fakebin/gh && chmod 777 /tmp/fakebin"
     )
