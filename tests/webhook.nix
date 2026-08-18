@@ -185,13 +185,33 @@
     # means is a runtime question about the token this box holds, so there is a
     # command that answers it rather than a value baked in at deploy time.
     machine.succeed("test -x /run/current-system/sw/bin/agent-box-webhook-self")
+    # A session gets the identity from env-exec, the wrapper the supervisor
+    # runs between tmux and the agent — NOT from the tmux session environment,
+    # which only carries what `new-session -e` put there. So the session-side
+    # assertions run the real wrapper out of the agent unit's own environment.
+    env_exec = machine.succeed(
+        "systemctl show -p Environment --value agent-box-agent.service"
+        " | tr ' ' '\\n' | sed -n 's/^AGENT_BOX_ENV_EXEC=//p'"
+    ).strip()
+    assert env_exec.startswith("/nix/store/"), env_exec
+    machine.succeed(
+        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
+        ' list-panes -t "=main" -F "#{pane_start_command}"'
+        f" | grep -F -- {env_exec} >/dev/null"
+    )
+
+    def session_self():
+        # What a session's agent — and so its webhook peer — would see.
+        return machine.succeed(
+            "sudo -u agent env HOME=/home/agent"
+            " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+            f" {env_exec} sh -c 'echo \"$LOCAL_WEBHOOK_SELF\"'"
+        ).strip()
+
     # Nothing has resolved yet — no token, no network — and that stays quiet:
     # the variable is simply absent, exactly as on a box that never writes to
-    # GitHub. (The leg below gives it a token and watches it appear.)
-    machine.fail(
-        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
-        " show-environment -t main | grep LOCAL_WEBHOOK_SELF >/dev/null"
-    )
+    # GitHub. (The leg below gives it an identity and watches it appear.)
+    assert session_self() == "", session_self()
     # Claude loads the plugin from the seeded settings — in the object shape
     # `claude plugin install` writes, not a list of records.
     machine.wait_until_succeeds(
@@ -1681,16 +1701,23 @@
     # Back to the first token for the rest of the leg.
     machine.succeed(f"{with_gh} agent-box-webhook-self >/dev/null")
 
-    # A session picks it up: env-exec.sh resolves before it execs the agent, so
+    # A session picks it up: env-exec resolves before it execs the agent, so
     # the session's own webhook peer — the process that filters this session's
-    # deliveries — has the same answer the receiver does.
-    machine.succeed("systemctl restart agent-box-agent.service")
-    machine.wait_for_unit("agent-box-agent.service")
-    machine.wait_until_succeeds(
-        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
-        " show-environment -t main | grep -x 'LOCAL_WEBHOOK_SELF=box-bot'",
-        timeout=60,
+    # deliveries — has the same answer the receiver does. Asserted through the
+    # wrapper itself (see session_self above): the export lands in the agent's
+    # process environment, which is not something tmux can be asked about.
+    assert session_self() == "box-bot", session_self()
+    # An identity set in the env store is the user's own answer, and it beats
+    # the resolved one — the store is read first, and the resolver echoes back
+    # what it finds rather than looking anything up.
+    machine.succeed(
+        "sudo -u agent install -d -m 700 /home/agent/.config/agent-box"
+        " && printf 'LOCAL_WEBHOOK_SELF=hand-picked\\n'"
+        " | sudo -u agent tee /home/agent/.config/agent-box/env > /dev/null"
     )
+    assert session_self() == "hand-picked", session_self()
+    machine.succeed("sudo -u agent rm -f /home/agent/.config/agent-box/env")
+    assert session_self() == "box-bot", session_self()
 
     # ... and so does the receiver, which loads the same file as an
     # EnvironmentFile. Read from the running process, not `systemctl show -p
