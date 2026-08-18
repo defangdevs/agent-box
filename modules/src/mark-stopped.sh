@@ -8,12 +8,24 @@
     FILE=${lib.escapeShellArg (userSessionsFile name)}
     JQ=${pkgs.jq}/bin/jq
     CU=${pkgs.coreutils}/bin
+    # This script is generated with absolute store paths and runs with no PATH
+    # of its own, so the registry lock's flock is a store path too (issue
+    # #254; flock ships in util-linux only).
+    FLOCK=${pkgs.util-linux}/bin/flock
     [ -n "''${1:-}" ] && [ -s "$FILE" ] || exit 0
     # Verified write, retried: on an agent that exits within its first
     # seconds, the supervisor's mark_started rewrite can race this one
-    # (both are tmp+mv, last writer wins). Re-read until the flag stuck.
+    # (both are tmp+mv, last writer wins). The sidecar lock below makes each
+    # pass a read-modify-write no other writer can interleave — the loop stays
+    # as the backstop for the one case a lock cannot cover, a holder that times
+    # us out. Re-read until the flag stuck.
     # A session delisted meanwhile is left alone rather than re-created.
     for _ in 1 2 3; do
+      # Taken per pass, never across the sleep: the supervisor's reconcile
+      # loop takes the same lock, and parking it for a second would delay
+      # every session on the box. Nothing this script starts outlives it, so
+      # no child can carry the fd (and the lock) away.
+      { exec 9>>"$FILE.lock"; } 2>/dev/null && "$FLOCK" -w 10 9
       tmp="$("$CU"/mktemp "$FILE.XXXXXX")" || exit 0
       if "$JQ" --arg s "$1" \
            'if .sessions | has($s) then .sessions[$s].stopped = true else . end' \
@@ -25,6 +37,7 @@
       "$JQ" -e --arg s "$1" \
         '(.sessions | has($s) | not) or (.sessions[$s].stopped == true)' \
         "$FILE" >/dev/null 2>&1 && exit 0
+      exec 9>&- 2>/dev/null || true
       "$CU"/sleep 1
     done
     exit 0

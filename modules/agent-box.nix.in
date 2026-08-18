@@ -313,6 +313,13 @@ let
   sessionCli = pkgs.writeShellScriptBin "agent-box-session" (''
     export AGENT_BOX_AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " (sessionKinds cfg.installAgents))}
     export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+    # sessions.json lock (issue #254). Pinned in the WRAPPER, not in a unit
+    # environment like the supervisor's other AGENT_BOX_*_BIN pins: this CLI
+    # runs from every PATH there is — an SSH login shell, `su -c` from a
+    # script, an agent tool call, the webhook receiver unit (jq + coreutils +
+    # this CLI, no util-linux) — and a lock that only some writers take is not
+    # a lock. util-linux is the only package that ships flock.
+    export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
   '' + ''
 @@include:src/session-cli.sh@@
   '');
@@ -342,9 +349,15 @@ let
   # spawns; the cap here bounds ACCUMULATION instead, so a watched repo cannot
   # slowly fill the box with idle hook sessions if spawned agents fail to
   # clean up after themselves.
-  webhookSpawn = pkgs.writeShellScriptBin "agent-box-webhook-spawn" ''
+  webhookSpawn = pkgs.writeShellScriptBin "agent-box-webhook-spawn" (''
+    # Same pin as sessionCli, and for the same reason (issue #254): the
+    # receiver unit's PATH is jq + coreutils + the session CLI, so flock
+    # (util-linux) is not on it, and the hook-session cap check has to hold
+    # the registry lock through the add it decides on.
+    export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
+  '' + ''
 @@include:src/webhook-spawn.sh@@
-  '';
+  '');
 
   # Declared standing-watch policy (webhook.watchPolicy), rendered once into
   # the store and enforced onto each user's filter.dispatch.json by the
@@ -1463,6 +1476,12 @@ in
             # pinned binaries instead (the AGENT_BOX_*_BIN convention).
             AGENT_BOX_GREP_BIN = "${pkgs.gnugrep}/bin/grep";
             AGENT_BOX_FIND_BIN = "${pkgs.findutils}/bin/find";
+            # Same convention for the sessions.json lock (issue #254). flock
+            # ships in util-linux ONLY — agentBaseTools puts that on this
+            # unit's PATH, but the supervisor must not depend on a package
+            # list a host can override with extraPackages, and the other
+            # writers run from PATHs that do not have it at all.
+            AGENT_BOX_FLOCK_BIN = "${pkgs.util-linux}/bin/flock";
             # For the codex remote-control wrapper's UTS-namespace re-exec
             # (src/codex-remote-control.sh): `hostname` is not part of
             # agentBaseTools either.

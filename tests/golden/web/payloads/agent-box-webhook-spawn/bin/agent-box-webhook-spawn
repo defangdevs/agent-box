@@ -1,4 +1,9 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+# Same pin as sessionCli, and for the same reason (issue #254): the
+# receiver unit's PATH is jq + coreutils + the session CLI, so flock
+# (util-linux) is not on it, and the hook-session cap check has to hold
+# the registry lock through the add it decides on.
+export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock
 set -eu
 # jq/coreutils/agent-box-session resolve from the webhook daemon unit's
 # PATH (issue #154, Phase 2) — this script only ever runs as that unit's
@@ -54,6 +59,30 @@ fi
 
 PROMPT="$(cat)"
 [ -n "$PROMPT" ] || exit 0
+
+# The cap is a decision taken from a READ of the registry, and the add that
+# acts on it is a rename by another process, so the two have to be one
+# critical section or two dispatches can both pass a cap of 4 and land 5 hook
+# sessions (issue #254). The sidecar lock is held from here through the `exec`
+# into agent-box-session at the end of this script: the fd survives exec, and
+# AGENT_BOX_REGISTRY_LOCK_FD tells that CLI the lock is already ours so it
+# does not re-open fd 9 — which would first CLOSE this description and drop
+# the lock mid-decision.
+#
+# flock lives in util-linux only, which is NOT on the webhook receiver unit's
+# PATH (jq + coreutils + the session CLI), so the generated wrapper pins the
+# binary. Unset = no lock, and the spawn goes ahead regardless: a webhook
+# delivery must never be dropped for want of a lock.
+FLOCK="${AGENT_BOX_FLOCK_BIN:-}"
+if [ -n "$FLOCK" ] && { exec 9>>"$FILE.lock"; } 2>/dev/null; then
+  if "$FLOCK" -w 10 9; then
+    export AGENT_BOX_REGISTRY_LOCK_FD=9
+  else
+    echo "agent-box-webhook-spawn: sessions.json lock timed out;" \
+         "spawning unlocked (issue #254)" >&2
+    exec 9>&- 2>/dev/null || true
+  fi
+fi
 
 MAX="${AGENT_BOX_HOOK_SESSION_MAX:-4}"
 if [ -s "$FILE" ]; then

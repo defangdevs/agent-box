@@ -62,6 +62,8 @@
 #   AGENT_BOX_WEBHOOK_STATE_DIR  where its filter.*.json files live
 #   AGENT_BOX_WEBHOOK_PYTHON     interpreter for that script
 
+import contextlib
+import fcntl
 import functools
 import glob
 import hashlib
@@ -324,6 +326,63 @@ def set_key(key, value):
 def delete_key(key):
     pairs = [(k, v) for (k, v) in load_pairs() if k != key]
     write_pairs(pairs)
+
+
+@contextlib.contextmanager
+def sessions_lock():
+    """Serialize one read_sessions -> write_sessions pair (issue #254).
+
+    os.replace makes a READER see a whole document and nothing more: two
+    writers that start from the same base each publish a document that never
+    contained the other's edit, so a one-field update reverts every field the
+    other writer changed. That is not a theoretical race here — this daemon is
+    a ThreadingHTTPServer, so it races ITSELF as well as the supervisor, the
+    session CLI and the mark-stopped epilogue, and the loss it caused is
+    worse than a lost row: reverting hasRun / boxSessionId / the cleared
+    initialPrompt leaves a RUNNING session the supervisor treats as a first
+    spawn next time it dies, re-firing the kickoff prompt against a new id
+    and orphaning the transcript.
+
+    The lock is a SIDECAR file, never SESSIONS_FILE: every writer replaces
+    that inode by rename, so the inode a writer locked is not the one the next
+    writer takes. Same flock(2) primitive the shell writers use through
+    util-linux's flock(1), so all five writers serialize against each other.
+    fcntl precedent in this repo: password-helper.py's AUTH_ENV_LOCK.
+
+    Best effort by design: if the lock cannot be created or taken, the body
+    still runs — an unlockable registry must not make the web UI refuse to
+    add or delete a session.
+    """
+    lock = None
+    try:
+        directory = os.path.dirname(SESSIONS_FILE) or "."
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        # "a": create if absent, never truncate — the file is a lock, its
+        # contents are irrelevant and other holders keep their offsets.
+        lock = open(SESSIONS_FILE + ".lock", "a", encoding="utf-8")
+        # Bounded like the shell writers' `flock -w 10`: a request thread must
+        # never park forever behind a wedged holder. Timing out proceeds
+        # unlocked, which is the pre-#254 behavior rather than a new failure.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    lock.close()
+                    lock = None
+                    break
+                time.sleep(0.05)
+    except OSError:
+        if lock is not None:
+            lock.close()
+            lock = None
+    try:
+        yield
+    finally:
+        if lock is not None:
+            lock.close()
 
 
 def read_sessions():
@@ -3486,26 +3545,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # before this value reaches the agent as one argv element.
             prompt = form.get("prompt", [""])[0].replace("\r\n", "\n")
             prompt = prompt.replace("\r", "\n").strip()
-            sessions = read_sessions()
-            # The name is always auto-derived from the agent — there is no
-            # name field in the form. Users rarely care what a session is
-            # called (rename at runtime via /rename), so autogen spares them
-            # inventing one AND guarantees a unique key, so no collision or
-            # accidental-overwrite (issue 100) is possible here.
-            name = gen_session_name(agent, sessions, cwd)
-            sessions[name] = {
-                "agent": agent,
-                "skipPermissions": True,
-                "remoteControl": True,
-                "remoteControlName": None,
-                "workingDirectory": cwd,
-                "extraArgs": [],
-                "initialPrompt": prompt or None,
-                "resumePrompt": None,
-                "boxSessionId": None,
-                "hasRun": False,
-            }
-            write_sessions(sessions)
+            # Read, name and write as one step (issue #254): the uniqueness
+            # gen_session_name promises comes from the dict it was handed, so
+            # a concurrent add — from another browser tab, this daemon's own
+            # second thread, or the CLI — could pick the same free name, and
+            # the later rename would drop the earlier session outright.
+            with sessions_lock():
+                sessions = read_sessions()
+                # The name is always auto-derived from the agent — there is no
+                # name field in the form. Users rarely care what a session is
+                # called (rename at runtime via /rename), so autogen spares
+                # them inventing one AND guarantees a unique key, so no
+                # collision or accidental-overwrite (issue 100) is possible.
+                name = gen_session_name(agent, sessions, cwd)
+                sessions[name] = {
+                    "agent": agent,
+                    "skipPermissions": True,
+                    "remoteControl": True,
+                    "remoteControlName": None,
+                    "workingDirectory": cwd,
+                    "extraArgs": [],
+                    "initialPrompt": prompt or None,
+                    "resumePrompt": None,
+                    "boxSessionId": None,
+                    "hasRun": False,
+                }
+                write_sessions(sessions)
             # On the workspace, land on the new session's tab (gen_session_name
             # returns a SESSION_RE-shaped name, so it is URL-safe as-is).
             query = "ok=session_added"
@@ -3515,9 +3580,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == SESS_BASE + "/sessions/delete":
             name = (form.get("name", [""])[0]).strip()
             if SESSION_RE.match(name):
-                sessions = read_sessions()
-                sessions.pop(name, None)
-                write_sessions(sessions)
+                # Under the lock, so the delete cannot be reverted by another
+                # writer that read this file before it (issue #254) — a
+                # resurrected entry is a session the supervisor starts and no
+                # delete path knows about. The kill stays OUTSIDE: tmux is not
+                # this file, and nothing may hold the lock across a subprocess.
+                with sessions_lock():
+                    sessions = read_sessions()
+                    sessions.pop(name, None)
+                    write_sessions(sessions)
                 kill_session(name)
                 # Delisted and killed, so its filter file routes nothing —
                 # but it would go on claiming its topics against the standing
@@ -3534,11 +3605,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # (clean agent exit or agent-box-session stop, issue #167):
                 # the stopped flag is what keeps the supervisor away, so
                 # clear it before the kill.
-                sessions = read_sessions()
-                entry = sessions.get(name)
-                if entry is not None and entry.pop("stopped", None) is not None:
-                    write_sessions(sessions)
-                    ok = "ok=session_started"
+                # One flag on one entry, but the write publishes the WHOLE
+                # document, so without the lock this Start reverted every field
+                # another writer had changed since this read (issue #254):
+                # pressing it while a sibling session was first-spawning put
+                # back that session's hasRun=false and its already-consumed
+                # initialPrompt, and the supervisor then re-fired the kickoff
+                # prompt under a new id the next time that session died.
+                with sessions_lock():
+                    sessions = read_sessions()
+                    entry = sessions.get(name)
+                    if entry is not None and entry.pop("stopped", None) is not None:
+                        write_sessions(sessions)
+                        ok = "ok=session_started"
                 kill_session(name)
             self._redirect(ok, self._sess_page(form))
         elif path == BASE + "/webhooks/unsubscribe" and WEBHOOKS:

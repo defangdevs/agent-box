@@ -934,16 +934,30 @@
     # The add-session form carries an optional kickoff prompt through to
     # initialPrompt (first-spawn only, cleared on resume like the CLI). The
     # name is auto-derived and "claude" is free again, so assert on that key.
-    # Read initialPrompt right after the write, before the supervisor's next
-    # ~2s tick spawns the session and consumes the prompt.
+    #
+    # NOT read straight out of sessions.json after the POST: the supervisor
+    # spawns the session within ~2s and CONSUMES the prompt on that first
+    # spawn, so that read raced its own subject and only passed on a slow tick
+    # (issue #285). What the route stored is instead asserted on the two states
+    # that outlive the window — the prompt on the spawned pane's command line,
+    # and the consumed entry — each waited for.
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
         "-d 'agent=claude' --data-urlencode 'prompt=hello there' "
         "https://box.test/sessions/add | grep -x 303"
     )
-    machine.succeed(
-        "jq -e '.sessions.claude.initialPrompt == \"hello there\"' "
-        "/home/agent/.config/agent-box/sessions.json"
+    machine.wait_until_succeeds(tmux("has-session -t =claude"), timeout=60)
+    prompt_start_cmd = machine.wait_until_succeeds(
+        tmux('list-panes -t "=claude" -F "#{pane_start_command}"'), timeout=60
+    )
+    # printf %q on the way in, tmux escaping on the way out: compare with the
+    # backslashes dropped rather than guessing how many layers survive.
+    assert "hello there" in prompt_start_cmd.replace("\\", ""), prompt_start_cmd
+    machine.wait_until_succeeds(
+        "jq -e '.sessions.claude.hasRun == true "
+        "and .sessions.claude.initialPrompt == null' "
+        "/home/agent/.config/agent-box/sessions.json",
+        timeout=60,
     )
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
@@ -1342,6 +1356,152 @@
         )
 
         machine.succeed(as_agent("agent-box-session rm shelltest"))
+
+    # --- two writers of sessions.json (issue #254, tests from #285) --------
+    # Every writer of the registry rewrites the WHOLE document through
+    # tmp+rename. That makes a reader safe and says nothing about the interval
+    # between a writer's read and its rename, so before the sidecar lock a
+    # second writer's edit was reverted wholesale. The suite had no test with
+    # two writers at all (#285), which is why #254 lived on master.
+    #
+    # Both cases below run their timing-critical steps INSIDE the VM, in one
+    # shell: a driver round trip per step is tens of milliseconds, and the
+    # windows being raced are single-digit milliseconds wide.
+    with subtest("a delete racing the first spawn is never resurrected"):
+        # `rm` delists and kills; the supervisor is meanwhile finishing that
+        # session's first spawn and rewrites the entry to record hasRun, the
+        # box session id and the consumed prompt. Landing the delete inside
+        # that read-modify-write used to republish the deleted entry (or, with
+        # the delete already applied, CREATE it again as a stub — jq's `|=`
+        # assigns through a missing key). Either way the name is listed with
+        # nothing live, so the reconcile loop starts it again, forever, and no
+        # delete path knows it exists.
+        #
+        # shell sessions, not claude: the bookkeeping being raced is
+        # agent-independent, and 20 claude starts would only add memory
+        # pressure to a 2 GB VM. --prompt stays because the consumed prompt is
+        # one of the fields the racing write publishes.
+        race_script = r"""
+        set -u
+        sfile=/home/agent/.config/agent-box/sessions.json
+        export TMUX_TMPDIR=/run/agent-box-agent
+        for i in $(seq 1 20); do
+          agent-box-session add racer --agent shell --prompt 'race me' >/dev/null \
+            || { echo "iteration $i: add failed (a lost update dropped it?)" >&2; exit 1; }
+          # Busy-wait, no sleep: the window opens when the pane appears and is
+          # a few milliseconds wide, so the delete has to leave immediately.
+          # Bounded only so a session that never starts reports itself instead
+          # of spinning until the driver's own timeout.
+          spins=0
+          until tmux -L agent-box has-session -t =racer 2>/dev/null; do
+            spins=$((spins + 1))
+            [ $spins -lt 4000 ] \
+              || { echo "iteration $i: racer never started" >&2; exit 1; }
+          done
+          # Sweep the offset instead of hoping one lands right: the supervisor
+          # re-checks the file, then rewrites the entry, and which of those two
+          # the delete falls into decides WHICH bug it hits (a republished stale
+          # document, or an entry created from nothing by jq's assignment).
+          # 5 ms steps out to 95 ms cross both on some iteration.
+          sleep $(printf '0.%03d' $(( (i - 1) * 5 )))
+          agent-box-session rm racer >/dev/null || exit 1
+          # Long enough for a racing rewrite to land (milliseconds) — a
+          # resurrected entry then stays, because the reconcile loop only ever
+          # adds sessions back.
+          sleep 1
+          if jq -e '.sessions | has("racer")' "$sfile" >/dev/null; then
+            echo "iteration $i: racer came back after rm:" >&2
+            jq -c '.sessions.racer' "$sfile" >&2
+            exit 1
+          fi
+        done
+        # A resurrected entry is respawned within ~2s, so settle past a few
+        # ticks and check the tmux side too.
+        sleep 6
+        if jq -e '.sessions | has("racer")' "$sfile" >/dev/null; then
+          echo "racer is listed again after settling" >&2
+          exit 1
+        fi
+        if tmux -L agent-box has-session -t =racer 2>/dev/null; then
+          echo "racer is live again after settling" >&2
+          exit 1
+        fi
+        echo "20 add/rm races, no resurrect"
+        """
+        assert "no resurrect" in machine.succeed(as_agent(race_script))
+
+    with subtest("Start on one session cannot revert another's first spawn"):
+        # The worse consequence of a lost update: the reverted document is a
+        # whole document. Pressing Start (POST /sessions/restart) clears one
+        # flag on one entry, but republishing it over a supervisor rewrite put
+        # back another session's hasRun=false and its already-consumed
+        # initialPrompt — while that session was RUNNING. Nothing looks wrong
+        # until it next dies, when the supervisor treats it as a first spawn:
+        # new id, kickoff prompt fired a second time, previous transcript
+        # orphaned.
+        #
+        # Six sessions are first-spawning per round (two rounds) so there are
+        # twelve victim rewrites to hit, and the Start storm runs at the same
+        # time — one victim's odds are not a test, twelve of them are. Each POST
+        # needs the stopped flag present to write at all (the route is a no-op
+        # without it), so every worker re-parks the session first — which makes
+        # the storm the two real user actions it imitates: Start in the browser
+        # and `agent-box-session stop` in a terminal.
+        machine.succeed(as_agent("agent-box-session add parked --agent shell"))
+        machine.wait_until_succeeds(tmux("has-session -t =parked"), timeout=60)
+        machine.succeed(as_agent("agent-box-session stop parked"))
+        lost_update_script = r"""
+        set -u
+        sfile=/home/agent/.config/agent-box/sessions.json
+        sock=/run/agent-box-settings/agent.sock
+        export TMUX_TMPDIR=/run/agent-box-agent
+        names="lu1 lu2 lu3 lu4 lu5 lu6"
+        for round in 1 2; do
+          # The daemon is a ThreadingHTTPServer, so concurrent POSTs overlap
+          # each other as well as the supervisor.
+          for w in 1 2 3; do
+            ( r=0
+              while [ $r -lt 20 ]; do
+                r=$((r + 1))
+                agent-box-session stop parked >/dev/null 2>&1 || true
+                curl -s -o /dev/null --max-time 30 --unix-socket "$sock" \
+                  -d name=parked http://localhost/sessions/restart || true
+              done ) &
+          done
+          for n in $names; do
+            agent-box-session add $n --agent shell --prompt "kickoff $n" >/dev/null \
+              || { echo "round $round: add $n failed (a lost update dropped it?)" >&2; exit 1; }
+          done
+          for n in $names; do
+            waits=0
+            until tmux -L agent-box has-session -t "=$n" 2>/dev/null; do
+              waits=$((waits + 1))
+              [ $waits -lt 300 ] \
+                || { echo "round $round: $n never started" >&2; exit 1; }
+              sleep 0.2
+            done
+          done
+          wait
+          # The supervisor records the spawn right after creating the pane;
+          # settle past that before reading the result.
+          sleep 3
+          for n in $names; do
+            if ! jq -e --arg n "$n" \
+                 '.sessions[$n] | .hasRun == true and .initialPrompt == null' \
+                 "$sfile" >/dev/null; then
+              echo "round $round: $n lost its first-spawn record:" >&2
+              jq -c --arg n "$n" '.sessions[$n]' "$sfile" >&2
+              exit 1
+            fi
+          done
+          for n in $names; do
+            agent-box-session rm $n >/dev/null || exit 1
+          done
+        done
+        echo "2 rounds of 6 first spawns under a Start storm, no lost update"
+        """
+        assert "no lost update" in machine.succeed(as_agent(lost_update_script))
+        machine.succeed(as_agent("agent-box-session rm parked"))
 
   '';
 }

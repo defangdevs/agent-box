@@ -54,6 +54,30 @@ fi
 PROMPT="$(cat)"
 [ -n "$PROMPT" ] || exit 0
 
+# The cap is a decision taken from a READ of the registry, and the add that
+# acts on it is a rename by another process, so the two have to be one
+# critical section or two dispatches can both pass a cap of 4 and land 5 hook
+# sessions (issue #254). The sidecar lock is held from here through the `exec`
+# into agent-box-session at the end of this script: the fd survives exec, and
+# AGENT_BOX_REGISTRY_LOCK_FD tells that CLI the lock is already ours so it
+# does not re-open fd 9 — which would first CLOSE this description and drop
+# the lock mid-decision.
+#
+# flock lives in util-linux only, which is NOT on the webhook receiver unit's
+# PATH (jq + coreutils + the session CLI), so the generated wrapper pins the
+# binary. Unset = no lock, and the spawn goes ahead regardless: a webhook
+# delivery must never be dropped for want of a lock.
+FLOCK="${AGENT_BOX_FLOCK_BIN:-}"
+if [ -n "$FLOCK" ] && { exec 9>>"$FILE.lock"; } 2>/dev/null; then
+  if "$FLOCK" -w 10 9; then
+    export AGENT_BOX_REGISTRY_LOCK_FD=9
+  else
+    echo "agent-box-webhook-spawn: sessions.json lock timed out;" \
+         "spawning unlocked (issue #254)" >&2
+    exec 9>&- 2>/dev/null || true
+  fi
+fi
+
 MAX="${AGENT_BOX_HOOK_SESSION_MAX:-4}"
 if [ -s "$FILE" ]; then
   live=$("$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' "$FILE")

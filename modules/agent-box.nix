@@ -344,12 +344,24 @@ let
     FILE=${lib.escapeShellArg (userSessionsFile name)}
     JQ=${pkgs.jq}/bin/jq
     CU=${pkgs.coreutils}/bin
+    # This script is generated with absolute store paths and runs with no PATH
+    # of its own, so the registry lock's flock is a store path too (issue
+    # #254; flock ships in util-linux only).
+    FLOCK=${pkgs.util-linux}/bin/flock
     [ -n "''${1:-}" ] && [ -s "$FILE" ] || exit 0
     # Verified write, retried: on an agent that exits within its first
     # seconds, the supervisor's mark_started rewrite can race this one
-    # (both are tmp+mv, last writer wins). Re-read until the flag stuck.
+    # (both are tmp+mv, last writer wins). The sidecar lock below makes each
+    # pass a read-modify-write no other writer can interleave — the loop stays
+    # as the backstop for the one case a lock cannot cover, a holder that times
+    # us out. Re-read until the flag stuck.
     # A session delisted meanwhile is left alone rather than re-created.
     for _ in 1 2 3; do
+      # Taken per pass, never across the sleep: the supervisor's reconcile
+      # loop takes the same lock, and parking it for a second would delay
+      # every session on the box. Nothing this script starts outlives it, so
+      # no child can carry the fd (and the lock) away.
+      { exec 9>>"$FILE.lock"; } 2>/dev/null && "$FLOCK" -w 10 9
       tmp="$("$CU"/mktemp "$FILE.XXXXXX")" || exit 0
       if "$JQ" --arg s "$1" \
            'if .sessions | has($s) then .sessions[$s].stopped = true else . end' \
@@ -361,6 +373,7 @@ let
       "$JQ" -e --arg s "$1" \
         '(.sessions | has($s) | not) or (.sessions[$s].stopped == true)' \
         "$FILE" >/dev/null 2>&1 && exit 0
+      exec 9>&- 2>/dev/null || true
       "$CU"/sleep 1
     done
     exit 0
@@ -801,6 +814,13 @@ done
   sessionCli = pkgs.writeShellScriptBin "agent-box-session" (''
     export AGENT_BOX_AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " (sessionKinds cfg.installAgents))}
     export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+    # sessions.json lock (issue #254). Pinned in the WRAPPER, not in a unit
+    # environment like the supervisor's other AGENT_BOX_*_BIN pins: this CLI
+    # runs from every PATH there is — an SSH login shell, `su -c` from a
+    # script, an agent tool call, the webhook receiver unit (jq + coreutils +
+    # this CLI, no util-linux) — and a lock that only some writers take is not
+    # a lock. util-linux is the only package that ships flock.
+    export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
   '' + ''
 set -eu
 # jq/tmux resolve from PATH (system packages + every agent unit's PATH);
@@ -902,8 +922,53 @@ prune_filter() {
   _sd="''${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
   rm -f "$_sd/filter.$(id -un)-$1.json"
 }
+# Serialize the read-modify-write of the session registry (issue #254). Every
+# writer of this file — this CLI, the supervisor, the mark-stopped epilogue,
+# the settings daemon, the webhook spawn wrapper — replaces it by rename, so a
+# reader always gets a whole document but two writers that read the same base
+# each publish one that never contained the other's edit. Two writers of the
+# jq_edit shape below lost 96 of 300 updates when measured on the live box.
+# Hence a SIDECAR lock file: locking sessions.json itself would lock the inode
+# the next writer is about to replace, which is not the lock it takes.
+#
+# flock ships in util-linux ONLY, which is not on every PATH this CLI runs
+# from (a plain `su -c 'agent-box-session ...'` gets the system PATH, the
+# webhook receiver unit's PATH has jq + coreutils + this CLI and nothing
+# else), so the generated wrapper pins the binary — the AGENT_BOX_*_BIN
+# convention. Unset means no lock and no error: a session must still be
+# addable on a box whose module predates this.
+LOCK_FILE="$FILE.lock"
+FLOCK="''${AGENT_BOX_FLOCK_BIN:-}"
+_lock_depth=0
+registry_lock() {
+  # Two cases skip the open. Nesting: flock(2) conflicts between two open file
+  # descriptions of the SAME process, so re-locking inside a held section
+  # would deadlock (a caller wraps check-then-write around jq_edit, which
+  # locks too). Inherited: agent-box-webhook-spawn holds this lock across the
+  # `exec` into `add` so its hook-session cap check and the add are one step —
+  # it hands the fd over and says so through the environment, and re-opening
+  # would first CLOSE that fd and drop the lock it took.
+  _lock_depth=$((_lock_depth + 1))
+  [ "$_lock_depth" = 1 ] || return 0
+  [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
+  [ -n "$FLOCK" ] || return 0
+  { exec 9>>"$LOCK_FILE"; } 2>/dev/null || return 0
+  # -w so a wedged holder degrades to the old lost-update behaviour instead of
+  # hanging a CLI the user is waiting on.
+  "$FLOCK" -w 10 9 \
+    || echo "agent-box-session: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
+}
+registry_unlock() {
+  [ "$_lock_depth" -gt 0 ] || return 0
+  _lock_depth=$((_lock_depth - 1))
+  [ "$_lock_depth" = 0 ] || return 0
+  [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
+  exec 9>&- 2>/dev/null || true
+}
 jq_edit() {
-  # jq_edit JQ_ARGS... — atomically rewrite FILE through jq.
+  # jq_edit JQ_ARGS... — atomically rewrite FILE through jq, under the
+  # registry lock so the read and the rename are one step.
+  registry_lock
   tmp="$(mktemp "$FILE.XXXXXX")"
   if "$JQ" "$@" < "$FILE" > "$tmp"; then
     mv "$tmp" "$FILE"
@@ -911,6 +976,7 @@ jq_edit() {
     rm -f "$tmp"
     exit 1
   fi
+  registry_unlock
 }
 taken() { "$JQ" -e --arg n "$1" '.sessions | has($n)' "$FILE" >/dev/null; }
 gen_name() {
@@ -997,6 +1063,11 @@ case "$cmd" in
       (*) echo "agent '$agent' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
     ensure_file
+    # Name choice and write are one critical section (issue #254): gen_name
+    # and taken() both decide from a READ of the file, so two concurrent adds
+    # could pick the same free name and the second rename would drop the first
+    # session outright.
+    registry_lock
     [ -n "$name" ] || name="$(gen_name "$agent" "$cwd")"
     if taken "$name"; then
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
@@ -1021,6 +1092,7 @@ case "$cmd" in
                         boxSessionId: (if $bid == "" then null else $bid end),
                         hasRun: false}' \
       --args -- "$@"
+    registry_unlock
     # The mascot (issue #185) marks the closest thing this CLI has to
     # "an agent just started". Small on purpose: this runs in webhook
     # spawns and scripts too, and nothing parses the lines below it.
@@ -1051,11 +1123,17 @@ case "$cmd" in
     name="''${1:-}"
     valid_name "$name" || { usage >&2; exit 2; }
     ensure_file
+    # Existence check and flag write together (issue #254): jq's assignment
+    # CREATES a missing key, so a session deleted between the two came back as
+    # a stub {stopped: true} — listed forever, startable by nobody, and the
+    # name is then taken for a later add.
+    registry_lock
     if ! taken "$name"; then
       echo "no such session: '$name' (see agent-box-session ls)" >&2
       exit 2
     fi
     jq_edit --arg n "$name" '.sessions[$n].stopped = true'
+    registry_unlock
     kill_session "$name" || exit 1
     echo "session '$name' stopped — still listed, not respawned; 'agent-box-session restart $name' revives it"
     ;;
@@ -1073,13 +1151,18 @@ case "$cmd" in
       name="''${1:-}"
       valid_name "$name" || { usage >&2; exit 2; }
       ensure_file
+      # Listed-or-not decides which branch runs, so read it under the lock
+      # (issue #254) — the flag write must apply to the file the check saw.
+      registry_lock
       if taken "$name"; then
         jq_edit --arg n "$name" 'del(.sessions[$n].stopped)'
+        registry_unlock
         # A stopped session has no live tmux session to kill; kill_session
         # treats that "can't find session" as success.
         kill_session "$name" || exit 1
         echo "session '$name' killed — the supervisor restarts it within ~2s"
       else
+        registry_unlock
         # Unlisted (hand-started) session: the kill is all there is, and
         # its own error covers the name-typo case.
         t kill-session -t "=$name"
@@ -1481,7 +1564,13 @@ esac
   # spawns; the cap here bounds ACCUMULATION instead, so a watched repo cannot
   # slowly fill the box with idle hook sessions if spawned agents fail to
   # clean up after themselves.
-  webhookSpawn = pkgs.writeShellScriptBin "agent-box-webhook-spawn" ''
+  webhookSpawn = pkgs.writeShellScriptBin "agent-box-webhook-spawn" (''
+    # Same pin as sessionCli, and for the same reason (issue #254): the
+    # receiver unit's PATH is jq + coreutils + the session CLI, so flock
+    # (util-linux) is not on it, and the hook-session cap check has to hold
+    # the registry lock through the add it decides on.
+    export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
+  '' + ''
 set -eu
 # jq/coreutils/agent-box-session resolve from the webhook daemon unit's
 # PATH (issue #154, Phase 2) — this script only ever runs as that unit's
@@ -1537,6 +1626,30 @@ fi
 
 PROMPT="$(cat)"
 [ -n "$PROMPT" ] || exit 0
+
+# The cap is a decision taken from a READ of the registry, and the add that
+# acts on it is a rename by another process, so the two have to be one
+# critical section or two dispatches can both pass a cap of 4 and land 5 hook
+# sessions (issue #254). The sidecar lock is held from here through the `exec`
+# into agent-box-session at the end of this script: the fd survives exec, and
+# AGENT_BOX_REGISTRY_LOCK_FD tells that CLI the lock is already ours so it
+# does not re-open fd 9 — which would first CLOSE this description and drop
+# the lock mid-decision.
+#
+# flock lives in util-linux only, which is NOT on the webhook receiver unit's
+# PATH (jq + coreutils + the session CLI), so the generated wrapper pins the
+# binary. Unset = no lock, and the spawn goes ahead regardless: a webhook
+# delivery must never be dropped for want of a lock.
+FLOCK="''${AGENT_BOX_FLOCK_BIN:-}"
+if [ -n "$FLOCK" ] && { exec 9>>"$FILE.lock"; } 2>/dev/null; then
+  if "$FLOCK" -w 10 9; then
+    export AGENT_BOX_REGISTRY_LOCK_FD=9
+  else
+    echo "agent-box-webhook-spawn: sessions.json lock timed out;" \
+         "spawning unlocked (issue #254)" >&2
+    exec 9>&- 2>/dev/null || true
+  fi
+fi
 
 MAX="''${AGENT_BOX_HOOK_SESSION_MAX:-4}"
 if [ -s "$FILE" ]; then
@@ -1687,7 +1800,7 @@ fi
 exec agent-box-session add "$name" --prompt "$preamble
 
 $PROMPT"
-  '';
+  '');
 
   # Declared standing-watch policy (webhook.watchPolicy), rendered once into
   # the store and enforced onto each user's filter.dispatch.json by the
@@ -2068,6 +2181,7 @@ $PROMPT"
     SESSIONS_FILE="$HOME/.config/agent-box/sessions.json"
     GREP="''${AGENT_BOX_GREP_BIN:-grep}"
     FIND="''${AGENT_BOX_FIND_BIN:-find}"
+    FLOCK="''${AGENT_BOX_FLOCK_BIN:-}"
     # The webhook channel plugin, spelled once (issue #257): three places have to
     # agree on it — the settings seed (an enabledPlugins key), the plugin-cache
     # sync, and claude's --channels tag. The marketplace NAME comes from the
@@ -2251,6 +2365,50 @@ $PROMPT"
       ln -sfn agent-box-current "$HOME"/.codex/packages/standalone/current
     fi
 
+    # Serialize every read-modify-write of the session registry (issue #254).
+    # tmp+rename buys ONE guarantee — a reader never sees half a document — and
+    # says nothing about the interval between a writer's read and its rename: two
+    # writers that start from the same base each publish a document that never
+    # contained the other's edit, so a one-field update silently reverts every
+    # field the other writer changed. Measured on the live box: two writers of the
+    # shape used here lost 96 of 300 updates (32%). The registry has five writers
+    # in three languages (this loop, the session CLI, the mark-stopped epilogue,
+    # the settings daemon's three routes, the webhook spawn wrapper), so the lock
+    # is the only thing that makes the file's state a function of its edits.
+    #
+    # The lock is a SIDECAR file, never sessions.json itself: every writer here
+    # REPLACES that inode by rename, so a lock taken on the inode a writer read is
+    # not the lock the next writer takes.
+    #
+    # AGENT_BOX_FLOCK_BIN is pinned by the unit because flock ships in util-linux
+    # only (the AGENT_BOX_*_BIN convention, as for grep/find). Unset means "no
+    # lock, carry on": a box whose module predates this must still start sessions,
+    # and a missing lock must never be the reason a session does not spawn.
+    REGISTRY_LOCK="$SESSIONS_FILE.lock"
+    _lock_depth=0
+    registry_lock() {
+      # Nesting-safe on purpose: flock(2) conflicts between two open file
+      # DESCRIPTIONS, including two of the same process, so start_session — which
+      # holds the lock across the mark_started it calls — would otherwise block
+      # the supervisor against itself forever (verified: a second fd on the same
+      # file blocks).
+      _lock_depth=$((_lock_depth + 1))
+      [ "$_lock_depth" = 1 ] || return 0
+      [ -n "$FLOCK" ] || return 0
+      { exec 9>>"$REGISTRY_LOCK"; } 2>/dev/null || return 0
+      # -w: nothing may park the reconcile loop. If some writer holds the lock
+      # past the timeout (a stopped process, a full disk) this spawn proceeds
+      # unlocked — the pre-#254 behavior, not a new failure mode.
+      "$FLOCK" -w 10 9 \
+        || echo "supervisor: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
+    }
+    registry_unlock() {
+      [ "$_lock_depth" -gt 0 ] || return 0
+      _lock_depth=$((_lock_depth - 1))
+      [ "$_lock_depth" = 0 ] || return 0
+      exec 9>&- 2>/dev/null || true
+    }
+
     # Deliver-once + resume bookkeeping. A session's kickoff prompt
     # (initialPrompt) must fire on the FIRST spawn only; every later respawn
     # (crash, clean exit, reboot, Spot stop→restart — all of which keep the
@@ -2264,15 +2422,28 @@ $PROMPT"
     # kickoff prompt so the transcript is findable by content (codex_rollout_uuid).
     mark_started() {
       # mark_started SESSION BOXID — best-effort; a failed rewrite just means
-      # the prompt re-fires next spawn, never a crash.
-      _tmp="$(mktemp "$SESSIONS_FILE.XXXXXX")" || return 0
+      # the prompt re-fires next spawn, never a crash. Read and rename happen
+      # under the registry lock (issue #254); the caller normally holds it
+      # already, and registry_lock nests.
+      #
+      # `has` first, because this must only ever UPDATE: jq's `|=` on a missing
+      # key CREATES it (verified), so a session deleted while this spawn was
+      # preparing came back as a stub {hasRun, boxSessionId, initialPrompt} that
+      # the reconcile loop then started forever — a session nothing kills,
+      # because no delete path knows it exists. That is the resurrect half of
+      # #254; the lock is the lost-update half.
+      registry_lock
+      _tmp="$(mktemp "$SESSIONS_FILE.XXXXXX")" || { registry_unlock; return 0; }
       if $JQ --arg s "$1" --arg b "$2" \
-           '(.sessions[$s]) |= (.hasRun = true | .boxSessionId = $b | .initialPrompt = null)' \
+           'if .sessions | has($s)
+            then (.sessions[$s]) |= (.hasRun = true | .boxSessionId = $b | .initialPrompt = null)
+            else . end' \
            "$SESSIONS_FILE" > "$_tmp" 2>/dev/null; then
         mv "$_tmp" "$SESSIONS_FILE"
       else
         rm -f "$_tmp"
       fi
+      registry_unlock
     }
 
     claude_has_transcript() {
@@ -2610,7 +2781,15 @@ $PROMPT"
           '.sessions | has($s) and (.[$s].stopped != true)' \
           "$SESSIONS_FILE" >/dev/null 2>&1
       }
-      listed || return 0
+      # Pre-check, spawn, post-check and mark_started are ONE critical section
+      # (issue #254), so the post-check is exact: without the lock a delete could
+      # land between the post-check and mark_started, whose read-modify-write then
+      # republished the deleted entry. Everything slow is deliberately already
+      # done — seed_claude_state above can spend minutes inside `claude plugin
+      # marketplace update` over the network, and no lock may be held across
+      # that, so the section covers only reads and writes of this file.
+      registry_lock
+      listed || { registry_unlock; return 0; }
       # Per-session webhook identity, passed via `tmux new-session -e` so it
       # lands in the SESSION environment — inherited by the agent AND by
       # anything the agent runs in that pane, which is what makes
@@ -2630,10 +2809,15 @@ $PROMPT"
       # launch id the SessionStart hook keys its live-id record by (the
       # /clear-rotation block above). Quoted on its own — unlike $whargs it
       # is runtime data from sessions.json, not supervisor-built tokens.
+      # 9>&- closes the registry lock fd for this child: `new-session` STARTS the
+      # tmux server when none is running, and that server daemonizes and outlives
+      # us — inheriting the fd would hand it the lock forever and wedge every
+      # other writer (the lock lives on the open file description, not the pid).
       if $TMUX new-session -d -s "$sname" -c "$wd" $whargs \
            -e AGENT_BOX_SESSION_ID="$bid" \
-           "''${AGENT_BOX_ENV_EXEC:?} $cmd$epilogue"; then
+           "''${AGENT_BOX_ENV_EXEC:?} $cmd$epilogue" 9>&-; then
         if ! listed; then
+          registry_unlock
           $TMUX kill-session -t "=$sname" 2>/dev/null || true
           return 0
         fi
@@ -2646,6 +2830,7 @@ $PROMPT"
           mark_started "$sname" "$bid"
         fi
       fi
+      registry_unlock
     }
 
     # Sweep webhook filter files left by sessions that are no longer listed.
@@ -3479,6 +3664,12 @@ in
             # pinned binaries instead (the AGENT_BOX_*_BIN convention).
             AGENT_BOX_GREP_BIN = "${pkgs.gnugrep}/bin/grep";
             AGENT_BOX_FIND_BIN = "${pkgs.findutils}/bin/find";
+            # Same convention for the sessions.json lock (issue #254). flock
+            # ships in util-linux ONLY — agentBaseTools puts that on this
+            # unit's PATH, but the supervisor must not depend on a package
+            # list a host can override with extraPackages, and the other
+            # writers run from PATHs that do not have it at all.
+            AGENT_BOX_FLOCK_BIN = "${pkgs.util-linux}/bin/flock";
             # For the codex remote-control wrapper's UTS-namespace re-exec
             # (src/codex-remote-control.sh): `hostname` is not part of
             # agentBaseTools either.
@@ -4057,6 +4248,8 @@ in
         #   AGENT_BOX_WEBHOOK_STATE_DIR  where its filter.*.json files live
         #   AGENT_BOX_WEBHOOK_PYTHON     interpreter for that script
 
+        import contextlib
+        import fcntl
         import functools
         import glob
         import hashlib
@@ -4319,6 +4512,63 @@ in
         def delete_key(key):
             pairs = [(k, v) for (k, v) in load_pairs() if k != key]
             write_pairs(pairs)
+
+
+        @contextlib.contextmanager
+        def sessions_lock():
+            """Serialize one read_sessions -> write_sessions pair (issue #254).
+
+            os.replace makes a READER see a whole document and nothing more: two
+            writers that start from the same base each publish a document that never
+            contained the other's edit, so a one-field update reverts every field the
+            other writer changed. That is not a theoretical race here — this daemon is
+            a ThreadingHTTPServer, so it races ITSELF as well as the supervisor, the
+            session CLI and the mark-stopped epilogue, and the loss it caused is
+            worse than a lost row: reverting hasRun / boxSessionId / the cleared
+            initialPrompt leaves a RUNNING session the supervisor treats as a first
+            spawn next time it dies, re-firing the kickoff prompt against a new id
+            and orphaning the transcript.
+
+            The lock is a SIDECAR file, never SESSIONS_FILE: every writer replaces
+            that inode by rename, so the inode a writer locked is not the one the next
+            writer takes. Same flock(2) primitive the shell writers use through
+            util-linux's flock(1), so all five writers serialize against each other.
+            fcntl precedent in this repo: password-helper.py's AUTH_ENV_LOCK.
+
+            Best effort by design: if the lock cannot be created or taken, the body
+            still runs — an unlockable registry must not make the web UI refuse to
+            add or delete a session.
+            """
+            lock = None
+            try:
+                directory = os.path.dirname(SESSIONS_FILE) or "."
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                # "a": create if absent, never truncate — the file is a lock, its
+                # contents are irrelevant and other holders keep their offsets.
+                lock = open(SESSIONS_FILE + ".lock", "a", encoding="utf-8")
+                # Bounded like the shell writers' `flock -w 10`: a request thread must
+                # never park forever behind a wedged holder. Timing out proceeds
+                # unlocked, which is the pre-#254 behavior rather than a new failure.
+                deadline = time.monotonic() + 10
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            lock.close()
+                            lock = None
+                            break
+                        time.sleep(0.05)
+            except OSError:
+                if lock is not None:
+                    lock.close()
+                    lock = None
+            try:
+                yield
+            finally:
+                if lock is not None:
+                    lock.close()
 
 
         def read_sessions():
@@ -7481,26 +7731,32 @@ in
                     # before this value reaches the agent as one argv element.
                     prompt = form.get("prompt", [""])[0].replace("\r\n", "\n")
                     prompt = prompt.replace("\r", "\n").strip()
-                    sessions = read_sessions()
-                    # The name is always auto-derived from the agent — there is no
-                    # name field in the form. Users rarely care what a session is
-                    # called (rename at runtime via /rename), so autogen spares them
-                    # inventing one AND guarantees a unique key, so no collision or
-                    # accidental-overwrite (issue 100) is possible here.
-                    name = gen_session_name(agent, sessions, cwd)
-                    sessions[name] = {
-                        "agent": agent,
-                        "skipPermissions": True,
-                        "remoteControl": True,
-                        "remoteControlName": None,
-                        "workingDirectory": cwd,
-                        "extraArgs": [],
-                        "initialPrompt": prompt or None,
-                        "resumePrompt": None,
-                        "boxSessionId": None,
-                        "hasRun": False,
-                    }
-                    write_sessions(sessions)
+                    # Read, name and write as one step (issue #254): the uniqueness
+                    # gen_session_name promises comes from the dict it was handed, so
+                    # a concurrent add — from another browser tab, this daemon's own
+                    # second thread, or the CLI — could pick the same free name, and
+                    # the later rename would drop the earlier session outright.
+                    with sessions_lock():
+                        sessions = read_sessions()
+                        # The name is always auto-derived from the agent — there is no
+                        # name field in the form. Users rarely care what a session is
+                        # called (rename at runtime via /rename), so autogen spares
+                        # them inventing one AND guarantees a unique key, so no
+                        # collision or accidental-overwrite (issue 100) is possible.
+                        name = gen_session_name(agent, sessions, cwd)
+                        sessions[name] = {
+                            "agent": agent,
+                            "skipPermissions": True,
+                            "remoteControl": True,
+                            "remoteControlName": None,
+                            "workingDirectory": cwd,
+                            "extraArgs": [],
+                            "initialPrompt": prompt or None,
+                            "resumePrompt": None,
+                            "boxSessionId": None,
+                            "hasRun": False,
+                        }
+                        write_sessions(sessions)
                     # On the workspace, land on the new session's tab (gen_session_name
                     # returns a SESSION_RE-shaped name, so it is URL-safe as-is).
                     query = "ok=session_added"
@@ -7510,9 +7766,15 @@ in
                 elif path == SESS_BASE + "/sessions/delete":
                     name = (form.get("name", [""])[0]).strip()
                     if SESSION_RE.match(name):
-                        sessions = read_sessions()
-                        sessions.pop(name, None)
-                        write_sessions(sessions)
+                        # Under the lock, so the delete cannot be reverted by another
+                        # writer that read this file before it (issue #254) — a
+                        # resurrected entry is a session the supervisor starts and no
+                        # delete path knows about. The kill stays OUTSIDE: tmux is not
+                        # this file, and nothing may hold the lock across a subprocess.
+                        with sessions_lock():
+                            sessions = read_sessions()
+                            sessions.pop(name, None)
+                            write_sessions(sessions)
                         kill_session(name)
                         # Delisted and killed, so its filter file routes nothing —
                         # but it would go on claiming its topics against the standing
@@ -7529,11 +7791,19 @@ in
                         # (clean agent exit or agent-box-session stop, issue #167):
                         # the stopped flag is what keeps the supervisor away, so
                         # clear it before the kill.
-                        sessions = read_sessions()
-                        entry = sessions.get(name)
-                        if entry is not None and entry.pop("stopped", None) is not None:
-                            write_sessions(sessions)
-                            ok = "ok=session_started"
+                        # One flag on one entry, but the write publishes the WHOLE
+                        # document, so without the lock this Start reverted every field
+                        # another writer had changed since this read (issue #254):
+                        # pressing it while a sibling session was first-spawning put
+                        # back that session's hasRun=false and its already-consumed
+                        # initialPrompt, and the supervisor then re-fired the kickoff
+                        # prompt under a new id the next time that session died.
+                        with sessions_lock():
+                            sessions = read_sessions()
+                            entry = sessions.get(name)
+                            if entry is not None and entry.pop("stopped", None) is not None:
+                                write_sessions(sessions)
+                                ok = "ok=session_started"
                         kill_session(name)
                     self._redirect(ok, self._sess_page(form))
                 elif path == BASE + "/webhooks/unsubscribe" and WEBHOOKS:

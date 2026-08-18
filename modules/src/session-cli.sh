@@ -98,8 +98,53 @@ prune_filter() {
   _sd="${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
   rm -f "$_sd/filter.$(id -un)-$1.json"
 }
+# Serialize the read-modify-write of the session registry (issue #254). Every
+# writer of this file — this CLI, the supervisor, the mark-stopped epilogue,
+# the settings daemon, the webhook spawn wrapper — replaces it by rename, so a
+# reader always gets a whole document but two writers that read the same base
+# each publish one that never contained the other's edit. Two writers of the
+# jq_edit shape below lost 96 of 300 updates when measured on the live box.
+# Hence a SIDECAR lock file: locking sessions.json itself would lock the inode
+# the next writer is about to replace, which is not the lock it takes.
+#
+# flock ships in util-linux ONLY, which is not on every PATH this CLI runs
+# from (a plain `su -c 'agent-box-session ...'` gets the system PATH, the
+# webhook receiver unit's PATH has jq + coreutils + this CLI and nothing
+# else), so the generated wrapper pins the binary — the AGENT_BOX_*_BIN
+# convention. Unset means no lock and no error: a session must still be
+# addable on a box whose module predates this.
+LOCK_FILE="$FILE.lock"
+FLOCK="${AGENT_BOX_FLOCK_BIN:-}"
+_lock_depth=0
+registry_lock() {
+  # Two cases skip the open. Nesting: flock(2) conflicts between two open file
+  # descriptions of the SAME process, so re-locking inside a held section
+  # would deadlock (a caller wraps check-then-write around jq_edit, which
+  # locks too). Inherited: agent-box-webhook-spawn holds this lock across the
+  # `exec` into `add` so its hook-session cap check and the add are one step —
+  # it hands the fd over and says so through the environment, and re-opening
+  # would first CLOSE that fd and drop the lock it took.
+  _lock_depth=$((_lock_depth + 1))
+  [ "$_lock_depth" = 1 ] || return 0
+  [ "${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
+  [ -n "$FLOCK" ] || return 0
+  { exec 9>>"$LOCK_FILE"; } 2>/dev/null || return 0
+  # -w so a wedged holder degrades to the old lost-update behaviour instead of
+  # hanging a CLI the user is waiting on.
+  "$FLOCK" -w 10 9 \
+    || echo "agent-box-session: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
+}
+registry_unlock() {
+  [ "$_lock_depth" -gt 0 ] || return 0
+  _lock_depth=$((_lock_depth - 1))
+  [ "$_lock_depth" = 0 ] || return 0
+  [ "${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
+  exec 9>&- 2>/dev/null || true
+}
 jq_edit() {
-  # jq_edit JQ_ARGS... — atomically rewrite FILE through jq.
+  # jq_edit JQ_ARGS... — atomically rewrite FILE through jq, under the
+  # registry lock so the read and the rename are one step.
+  registry_lock
   tmp="$(mktemp "$FILE.XXXXXX")"
   if "$JQ" "$@" < "$FILE" > "$tmp"; then
     mv "$tmp" "$FILE"
@@ -107,6 +152,7 @@ jq_edit() {
     rm -f "$tmp"
     exit 1
   fi
+  registry_unlock
 }
 taken() { "$JQ" -e --arg n "$1" '.sessions | has($n)' "$FILE" >/dev/null; }
 gen_name() {
@@ -193,6 +239,11 @@ case "$cmd" in
       (*) echo "agent '$agent' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
     ensure_file
+    # Name choice and write are one critical section (issue #254): gen_name
+    # and taken() both decide from a READ of the file, so two concurrent adds
+    # could pick the same free name and the second rename would drop the first
+    # session outright.
+    registry_lock
     [ -n "$name" ] || name="$(gen_name "$agent" "$cwd")"
     if taken "$name"; then
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
@@ -217,6 +268,7 @@ case "$cmd" in
                         boxSessionId: (if $bid == "" then null else $bid end),
                         hasRun: false}' \
       --args -- "$@"
+    registry_unlock
     # The mascot (issue #185) marks the closest thing this CLI has to
     # "an agent just started". Small on purpose: this runs in webhook
     # spawns and scripts too, and nothing parses the lines below it.
@@ -247,11 +299,17 @@ case "$cmd" in
     name="${1:-}"
     valid_name "$name" || { usage >&2; exit 2; }
     ensure_file
+    # Existence check and flag write together (issue #254): jq's assignment
+    # CREATES a missing key, so a session deleted between the two came back as
+    # a stub {stopped: true} — listed forever, startable by nobody, and the
+    # name is then taken for a later add.
+    registry_lock
     if ! taken "$name"; then
       echo "no such session: '$name' (see agent-box-session ls)" >&2
       exit 2
     fi
     jq_edit --arg n "$name" '.sessions[$n].stopped = true'
+    registry_unlock
     kill_session "$name" || exit 1
     echo "session '$name' stopped — still listed, not respawned; 'agent-box-session restart $name' revives it"
     ;;
@@ -269,13 +327,18 @@ case "$cmd" in
       name="${1:-}"
       valid_name "$name" || { usage >&2; exit 2; }
       ensure_file
+      # Listed-or-not decides which branch runs, so read it under the lock
+      # (issue #254) — the flag write must apply to the file the check saw.
+      registry_lock
       if taken "$name"; then
         jq_edit --arg n "$name" 'del(.sessions[$n].stopped)'
+        registry_unlock
         # A stopped session has no live tmux session to kill; kill_session
         # treats that "can't find session" as success.
         kill_session "$name" || exit 1
         echo "session '$name' killed — the supervisor restarts it within ~2s"
       else
+        registry_unlock
         # Unlisted (hand-started) session: the kill is all there is, and
         # its own error covers the name-typo case.
         t kill-session -t "=$name"
