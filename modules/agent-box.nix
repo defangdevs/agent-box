@@ -3284,6 +3284,16 @@ in
       };
     };
 
+    # Without this, a mouse wheel scroll is forwarded to the foreground
+    # program as arrow-key presses instead of scrolling tmux's own pane
+    # history — tmux's default fallback for apps that don't handle the
+    # mouse themselves. System-wide /etc/tmux.conf so every user's tmux
+    # server picks it up without touching each ~/.tmux.conf.
+    programs.tmux = {
+      enable = true;
+      extraConfig = "set -g mouse on";
+    };
+
     users.users = lib.mapAttrs (name: u: {
       isNormalUser = true;
       home = "/home/${name}";
