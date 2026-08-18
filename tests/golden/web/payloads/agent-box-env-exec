@@ -15,5 +15,20 @@ if [ -r "$FILE" ]; then
     export "$key=$val"
   done < "$FILE"
 fi
+
+# The GitHub login this box acts as, for local-webhook's "@self" sender mute
+# (issue #261). Resolved HERE because this is the one process that holds the
+# token: the loop above just exported it, and the identity is a property of
+# that token, not of the deployment. A value the env store set wins (the
+# resolver echoes it straight back); otherwise the resolver answers from its
+# cache, and only calls GitHub when the token changed. Best effort — no token,
+# no network or no resolver leaves it unset, which is what a box that writes
+# nothing to GitHub wants anyway.
+if command -v agent-box-webhook-self >/dev/null 2>&1; then
+  _self=$(agent-box-webhook-self 2>/dev/null) || _self=""
+  [ -n "$_self" ] && export LOCAL_WEBHOOK_SELF="$_self"
+  unset _self
+fi
+
 exec "$@"
 
