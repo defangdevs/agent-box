@@ -295,6 +295,275 @@ let
   # 0.8.0 ported the plugin from node to the python3 already in
   # agentBaseTools, dropping the box's only nodejs dependency (issue #101).
   webhookPython = "${pkgs.python3}/bin/python3";
+  # The env file's format has ONE implementation (issue 212): src/env-file.py,
+  # which the settings daemon splices in directly and this helper wraps for
+  # the two shell callers below. A stored value may be quoted and span lines
+  # — a PEM certificate or private key — so reading the file means
+  # implementing systemd's env-file grammar, and a second copy of that
+  # grammar drifts silently: the symptom is a truncated secret, not an
+  # error. The cost of the choice is that python3 is in every box's closure,
+  # web stack or not; it already is, through agentBaseTools.
+  envFileCli = pkgs.writers.writePython3 "agent-box-env-file" {
+    # As with the settings daemon: no external libraries, syntax still
+    # compiled by the writer, style gate relaxed for readability.
+    flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" ];
+  } ''
+    # (Run via pkgs.writers.writePython3, which supplies the interpreter line.)
+    """Read and edit a user's ~/.config/agent-box/env from shell.
+
+    The session-spawn wrapper (src/env-exec.sh) and `agent-box-session env`
+    (src/session-cli.sh) both used to parse this file themselves, in shell. A
+    value may be quoted and span lines — a PEM certificate or key, issue 212 —
+    so each of them carried a copy of systemd's env-file grammar, and a drift
+    between the copies truncates a stored secret without raising anything. They
+    call this instead: one grammar, in src/env-file.py, shared with the settings
+    page that writes the file.
+
+        env-cli read PATH        every pair, NUL-separated: KEY \0 VALUE \0 ...
+        env-cli ls PATH          key names only, one per line (never a value)
+        env-cli set PATH KEY VAL replace KEY, atomically, mode 0600
+        env-cli rm PATH KEY      drop KEY
+
+    `read` is NUL-separated because a value may hold newlines; the caller
+    exports the pairs literally and must never eval them.
+    """
+    import os
+    import re
+    import sys
+    import tempfile
+
+    # The per-user secrets file (~/.config/agent-box/env): its one reader and
+    # its one writer. Spliced into src/settings-daemon.py (the settings page)
+    # and into src/env-cli.py (the CLI that the session-spawn wrapper and
+    # `agent-box-session env` call), so the format has exactly ONE
+    # implementation — a second one in shell drifted from this one silently,
+    # and a drift here truncates a stored secret rather than raising anything.
+    #
+    # The file is systemd env-file syntax (src/basic/env-file.c), NOT one
+    # KEY=value per line: a quoted value may SPAN LINES, which is how a PEM (an
+    # x509 certificate, a private key) is stored (issue 212). Splitting on lines
+    # got all three of these wrong — it truncated the value at its first
+    # newline, wrote that truncation back on the next save, and read a base64
+    # body line ending in "=" padding as another pair, so key material surfaced
+    # in the UI as a variable NAME.
+    #
+    # Callers get: parse_env / encode_value for the format itself, and
+    # read_pairs / write_pairs / set_key / delete_key for the file.
+
+    # Env var names: POSIX-ish. Must start with a letter or underscore and
+    # contain only letters, digits, underscores. This is what a shell / systemd
+    # EnvironmentFile will accept as a variable name.
+    KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    # Values that need no quoting: the characters systemd's parser gives no
+    # meaning to, which covers base64, hex, URLs and ordinary tokens. Matched
+    # with fullmatch, never search/match: "$" would also match in front of a
+    # value's trailing newline, and writing THAT bare would drop the newline on
+    # the next read.
+    PLAIN_VALUE_RE = re.compile(r"[A-Za-z0-9_.:/@%+=,-]+")
+    # The characters that lose their backslash inside a quoted value —
+    # systemd's SHELL_NEED_ESCAPE.
+    SHELL_NEED_ESCAPE = "\"\\`$"
+    ENV_HEADER = (
+        "# Managed by agent-box settings page. KEY=value, systemd env-file\n"
+        "# syntax: a quoted value may span lines (PEM keys, certificates).\n"
+        "# Do not add secrets by hand here unless you know what you are doing.\n"
+    )
+
+
+    def parse_env(text):
+        """Parse env-file `text` into a list of (key, value) pairs.
+
+        Mirrors the states of systemd's own parser, so no file systemd accepts
+        is read differently here. Pairs whose key a loader would not export are
+        dropped.
+        """
+        pairs = []
+        state = "pre_key"
+        key = value = ws = ""
+        for ch in text if text.endswith("\n") else text + "\n":
+            newline = ch in "\n\r"
+            if state == "pre_key":
+                if ch in "#;":
+                    state = "comment"
+                elif ch not in " \t\n\r":
+                    state, key = "key", ch
+            elif state == "key":
+                if newline:
+                    state = "pre_key"          # no "=" on the line: not a pair
+                elif ch == "=":
+                    state, value, ws = "pre_value", "", ""
+                else:
+                    key += ch
+            elif state in ("pre_value", "value"):
+                if newline:
+                    pairs.append((key, value))
+                    state = "pre_key"
+                elif ch == "'":
+                    state = "single"
+                elif ch == '"':
+                    state = "double"
+                elif ch == "\\":
+                    state = "value_escape"
+                elif ch in " \t":
+                    # Trailing whitespace of an UNQUOTED value is dropped at end
+                    # of line; the same run in front of more content is kept.
+                    if state == "value":
+                        ws += ch
+                else:
+                    state, value, ws = "value", value + ws + ch, ""
+            elif state == "value_escape":
+                state = "value"
+                if not newline:
+                    value, ws = value + ws + ch, ""
+            elif state in ("single", "double"):
+                if ch == ("'" if state == "single" else '"'):
+                    state = "pre_value"
+                elif ch == "\\":
+                    state += "_escape"
+                else:
+                    value, ws = value + ws + ch, ""
+            elif state in ("single_escape", "double_escape"):
+                state = state[: -len("_escape")]
+                # Only the shell-special characters lose their backslash; every
+                # other escape keeps it, and backslash-newline is a continuation.
+                if ch in SHELL_NEED_ESCAPE:
+                    value, ws = value + ws + ch, ""
+                elif not newline:
+                    value, ws = value + ws + "\\" + ch, ""
+            elif state == "comment":
+                if ch == "\\":
+                    state = "comment_escape"
+                elif newline:
+                    state = "pre_key"
+            elif state == "comment_escape":
+                state = "comment"
+        if state in ("single", "double", "single_escape", "double_escape"):
+            # Unterminated quote — systemd rejects such a file outright. Before
+            # issue 212 nothing quoted anything, so a stored value could hold a
+            # lone quote; parsing that file strictly would make it (and every
+            # key after it) silently vanish, which is the very failure this
+            # code exists to remove. Read it the way the pre-212 code did
+            # instead; the next write re-encodes it in the quoted form.
+            return parse_env_legacy(text)
+        return [(k, v) for (k, v) in pairs if KEY_RE.match(k)]
+
+
+    def parse_env_legacy(text):
+        """Read `text` as the pre-212 one-pair-per-line format.
+
+        Migration path only, for a file whose quotes do not balance (see
+        parse_env). Mirrors what the old reader did, surrounding quotes and all.
+        """
+        pairs = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            pairs.append((key.strip(), value))
+        return [(k, v) for (k, v) in pairs if KEY_RE.match(k)]
+
+
+    def encode_value(value):
+        """Encode `value` for the env file, quoting it when it needs quoting.
+
+        A plain value stays bare, so rewriting one key does not churn every
+        other line of an existing file. Anything else — a space, a newline, a
+        quote, a backslash, non-ASCII — takes the double-quoted form, where
+        systemd unescapes \\\\ and \\" and treats a newline as an ordinary
+        character.
+        """
+        if PLAIN_VALUE_RE.fullmatch(value):
+            return value
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+    def read_pairs(path):
+        """Return the file's (key, value) pairs; none when it does not exist."""
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except FileNotFoundError:
+            return []
+        return parse_env(text)
+
+
+    def write_pairs(path, pairs):
+        """Atomically write pairs to `path` at mode 0600.
+
+        Writes to a temp file in the same directory (so os.replace is atomic on
+        the same filesystem) then renames over the target.
+        """
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".env.")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(ENV_HEADER)
+                for key, value in pairs:
+                    fh.write(f"{key}={encode_value(value)}\n")
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+    def set_key(path, key, value):
+        """Replace `key` (keeping file order for the others) and rewrite."""
+        pairs = [(k, v) for (k, v) in read_pairs(path) if k != key]
+        pairs.append((key, value))
+        write_pairs(path, pairs)
+
+
+    def delete_key(path, key):
+        pairs = [(k, v) for (k, v) in read_pairs(path) if k != key]
+        write_pairs(path, pairs)
+
+
+    def main(argv):
+        if len(argv) < 3:
+            sys.stderr.write(__doc__)
+            return 2
+        command, path = argv[1], argv[2]
+        args = argv[3:]
+        if command == "read":
+            out = sys.stdout.buffer
+            for key, value in read_pairs(path):
+                out.write(key.encode() + b"\0" + value.encode() + b"\0")
+            out.flush()
+            return 0
+        if command == "ls":
+            # Names only, sorted — mirrors the settings page, which never
+            # surfaces a stored value.
+            for key in sorted({key for (key, _) in read_pairs(path)}):
+                print(key)
+            return 0
+        if command in ("set", "rm"):
+            if not args or not KEY_RE.match(args[0]):
+                sys.stderr.write(f"env: invalid key name {args[0] if args else '''!r}\n")
+                return 2
+            if command == "rm":
+                delete_key(path, args[0])
+            else:
+                if len(args) < 2:
+                    sys.stderr.write("env: set needs a value\n")
+                    return 2
+                set_key(path, args[0], args[1])
+            return 0
+        sys.stderr.write(f"env: unknown command {command!r}\n")
+        return 2
+
+
+    if __name__ == "__main__":
+        sys.exit(main(sys.argv))
+  '';
+
   # Session-spawn env loader (issue 89). Sessions are (re)created by the
   # long-lived supervisor inside the agent unit, so a unit-level
   # EnvironmentFile= snapshot of the user's env file goes stale the moment
@@ -304,28 +573,28 @@ let
   # single live source for those keys (it is deliberately NOT in the
   # unit's EnvironmentFile, so a DELETED key disappears on restart too).
   # Values are exported literally — never eval'd — so a secret full of
-  # shell metacharacters can't break or inject anything; one pair of
-  # surrounding quotes is stripped to match how systemd read the same
-  # file before. Key charset mirrors the settings daemon's KEY_RE.
-  envExecWrapper = pkgs.writeShellScript "agent-box-env-exec" ''
-    # The per-user secrets file the settings page and `agent-box-session env`
-    # manage. Runs inside the user's session, so $HOME names it directly.
-    FILE="$HOME/.config/agent-box/env"
-    if [ -r "$FILE" ]; then
-      while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-        key=''${line%%=*}
-        case "$key" in (*[!A-Za-z0-9_]*|""|[0-9]*) continue ;; esac
-        val=''${line#*=}
-        case "$val" in
-          \"*\") val=''${val#\"}; val=''${val%\"} ;;
-          \'*\') val=''${val#\'}; val=''${val%\'} ;;
-        esac
-        export "$key=$val"
-      done < "$FILE"
-    fi
-    exec "$@"
-  '';
+  # shell metacharacters can't break or inject anything. The parsing itself
+  # is envFileCli's, which is why a multi-line value survives the trip.
+  envExecWrapper = pkgs.writeShellScript "agent-box-env-exec" (''
+    AGENT_BOX_ENV_CLI=${envFileCli}
+  '' + ''
+# The per-user secrets file the settings page and `agent-box-session env`
+# manage. Runs inside the user's session, so $HOME names it directly.
+FILE="$HOME/.config/agent-box/env"
+# One pair per NUL-separated record, because a value may span lines: a PEM
+# certificate or private key (issue 212). $AGENT_BOX_ENV_CLI parses the file
+# with systemd's own env-file grammar — the settings page writes it with the
+# same code — and reports a problem on stderr; a session still starts, as it
+# always did when the file was missing or unreadable.
+if [ -r "$FILE" ]; then
+  while IFS= read -r -d ''' key && IFS= read -r -d ''' val; do
+    # Exported literally — never eval'd, never re-split — so a secret full
+    # of shell metacharacters arrives byte-exact.
+    export "$key=$val"
+  done < <("$AGENT_BOX_ENV_CLI" read "$FILE")
+fi
+exec "$@"
+  '');
 
   # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
   # quit, so the pane records stopped=true and the supervisor leaves the
@@ -798,6 +1067,7 @@ done
   sessionCli = pkgs.writeShellScriptBin "agent-box-session" (''
     export AGENT_BOX_AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " (sessionKinds cfg.installAgents))}
     export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+    export AGENT_BOX_ENV_CLI=${envFileCli}
   '' + ''
 set -eu
 # jq/tmux resolve from PATH (system packages + every agent unit's PATH);
@@ -1038,54 +1308,29 @@ case "$cmd" in
     # the env-exec wrapper reads at every session spawn. Applies on the next
     # (re)start — see 'restart'. ls shows KEYS only, never values (matching
     # the settings page, which never surfaces a stored secret).
+    #
+    # A value may span lines — a PEM certificate or private key, issue 212 —
+    # so reading and rewriting the file needs systemd's env-file grammar,
+    # not one pair per line. $AGENT_BOX_ENV_CLI is that grammar, shared with
+    # the settings page: parsing it here as well would be a second
+    # implementation to drift from it.
     ENV_FILE="$HOME/.config/agent-box/env"
-    env_header() {
-      printf '# Managed by agent-box settings page. KEY=value, one per line.\n'
-      printf '# Do not add secrets by hand here unless you know what you are doing.\n'
-    }
-    env_rewrite() {
-      # env_rewrite DROP_KEY [APPEND_KEY APPEND_VALUE] — atomically rewrite
-      # ENV_FILE dropping DROP_KEY, keeping every other valid KEY=value, then
-      # optionally appending a fresh pair.
-      mkdir -p "$(dirname "$ENV_FILE")"
-      tmp="$(mktemp "$ENV_FILE.XXXXXX")"
-      { env_header
-        if [ -f "$ENV_FILE" ]; then
-          while IFS= read -r line; do
-            case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-            ek="''${line%%=*}"
-            valid_key "$ek" || continue
-            [ "$ek" = "$1" ] && continue
-            printf '%s\n' "$line"
-          done < "$ENV_FILE"
-        fi
-        if [ $# -ge 3 ]; then printf '%s=%s\n' "$2" "$3"; fi
-      } > "$tmp"
-      chmod 600 "$tmp"; mv "$tmp" "$ENV_FILE"
-    }
     sub="''${1:-}"; shift || true
     case "$sub" in
       ls)
-        [ -f "$ENV_FILE" ] || exit 0
-        while IFS= read -r line; do
-          case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-          k="''${line%%=*}"
-          valid_key "$k" && printf '%s\n' "$k"
-        done < "$ENV_FILE" | sort -u
+        "$AGENT_BOX_ENV_CLI" ls "$ENV_FILE"
         ;;
       set)
         k="''${1:-}"; v="''${2-}"
         valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
-        case "$v" in (*"
-"*) echo "value may not contain a newline" >&2; exit 2 ;; esac
-        env_rewrite "$k" "$k" "$v"
+        "$AGENT_BOX_ENV_CLI" set "$ENV_FILE" "$k" "$v"
         echo "env '$k' set — applies on the next session (re)start ('agent-box-session restart --all')"
         ;;
       rm)
         k="''${1:-}"
         valid_key "$k" || { usage >&2; exit 2; }
         [ -f "$ENV_FILE" ] || exit 0
-        env_rewrite "$k"
+        "$AGENT_BOX_ENV_CLI" rm "$ENV_FILE" "$k"
         echo "env '$k' removed — applies on the next session (re)start ('agent-box-session restart --all')"
         ;;
       *) usage >&2; exit 2 ;;
@@ -4055,10 +4300,6 @@ in
         # a watch DOES instead of restating why it exists (#259).
         HOOK_SPAWN_CMD = os.environ.get("AGENT_BOX_HOOK_SPAWN_CMD", "")
 
-        # Env var names: POSIX-ish. Must start with a letter or underscore and
-        # contain only letters, digits, underscores. This is what a shell / systemd
-        # EnvironmentFile will accept as a variable name.
-        KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
         # Session names: same charset the supervisor and CLI enforce (they
         # land in tmux -t targets and URLs). Every render and publish path filters
         # through this, so a name it rejects is not merely unlisted — that session
@@ -4158,68 +4399,180 @@ in
             )
 
 
-        def read_keys():
-            """Return the sorted list of KEY names currently in the env file.
+        # The per-user secrets file (~/.config/agent-box/env): its one reader and
+        # its one writer. Spliced into src/settings-daemon.py (the settings page)
+        # and into src/env-cli.py (the CLI that the session-spawn wrapper and
+        # `agent-box-session env` call), so the format has exactly ONE
+        # implementation — a second one in shell drifted from this one silently,
+        # and a drift here truncates a stored secret rather than raising anything.
+        #
+        # The file is systemd env-file syntax (src/basic/env-file.c), NOT one
+        # KEY=value per line: a quoted value may SPAN LINES, which is how a PEM (an
+        # x509 certificate, a private key) is stored (issue 212). Splitting on lines
+        # got all three of these wrong — it truncated the value at its first
+        # newline, wrote that truncation back on the next save, and read a base64
+        # body line ending in "=" padding as another pair, so key material surfaced
+        # in the UI as a variable NAME.
+        #
+        # Callers get: parse_env / encode_value for the format itself, and
+        # read_pairs / write_pairs / set_key / delete_key for the file.
 
-            Values are intentionally never returned — the UI must not be able to
-            surface a stored secret.
-            """
-            keys = []
-            try:
-                with open(ENV_FILE, "r", encoding="utf-8") as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        key = line.split("=", 1)[0].strip()
-                        if KEY_RE.match(key):
-                            keys.append(key)
-            except FileNotFoundError:
-                pass
-            # De-dup preserving the last occurrence's position is unnecessary; names
-            # are what matter, so sort for a stable UI.
-            return sorted(set(keys))
+        # Env var names: POSIX-ish. Must start with a letter or underscore and
+        # contain only letters, digits, underscores. This is what a shell / systemd
+        # EnvironmentFile will accept as a variable name.
+        KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        # Values that need no quoting: the characters systemd's parser gives no
+        # meaning to, which covers base64, hex, URLs and ordinary tokens. Matched
+        # with fullmatch, never search/match: "$" would also match in front of a
+        # value's trailing newline, and writing THAT bare would drop the newline on
+        # the next read.
+        PLAIN_VALUE_RE = re.compile(r"[A-Za-z0-9_.:/@%+=,-]+")
+        # The characters that lose their backslash inside a quoted value —
+        # systemd's SHELL_NEED_ESCAPE.
+        SHELL_NEED_ESCAPE = "\"\\`$"
+        ENV_HEADER = (
+            "# Managed by agent-box settings page. KEY=value, systemd env-file\n"
+            "# syntax: a quoted value may span lines (PEM keys, certificates).\n"
+            "# Do not add secrets by hand here unless you know what you are doing.\n"
+        )
 
 
-        def load_pairs():
-            """Return an ordered dict-ish list of (key, rawvalue) for rewriting.
+        def parse_env(text):
+            """Parse env-file `text` into a list of (key, value) pairs.
 
-            Used only internally when mutating the file; values never leave the
-            process.
+            Mirrors the states of systemd's own parser, so no file systemd accepts
+            is read differently here. Pairs whose key a loader would not export are
+            dropped.
             """
             pairs = []
+            state = "pre_key"
+            key = value = ws = ""
+            for ch in text if text.endswith("\n") else text + "\n":
+                newline = ch in "\n\r"
+                if state == "pre_key":
+                    if ch in "#;":
+                        state = "comment"
+                    elif ch not in " \t\n\r":
+                        state, key = "key", ch
+                elif state == "key":
+                    if newline:
+                        state = "pre_key"          # no "=" on the line: not a pair
+                    elif ch == "=":
+                        state, value, ws = "pre_value", "", ""
+                    else:
+                        key += ch
+                elif state in ("pre_value", "value"):
+                    if newline:
+                        pairs.append((key, value))
+                        state = "pre_key"
+                    elif ch == "'":
+                        state = "single"
+                    elif ch == '"':
+                        state = "double"
+                    elif ch == "\\":
+                        state = "value_escape"
+                    elif ch in " \t":
+                        # Trailing whitespace of an UNQUOTED value is dropped at end
+                        # of line; the same run in front of more content is kept.
+                        if state == "value":
+                            ws += ch
+                    else:
+                        state, value, ws = "value", value + ws + ch, ""
+                elif state == "value_escape":
+                    state = "value"
+                    if not newline:
+                        value, ws = value + ws + ch, ""
+                elif state in ("single", "double"):
+                    if ch == ("'" if state == "single" else '"'):
+                        state = "pre_value"
+                    elif ch == "\\":
+                        state += "_escape"
+                    else:
+                        value, ws = value + ws + ch, ""
+                elif state in ("single_escape", "double_escape"):
+                    state = state[: -len("_escape")]
+                    # Only the shell-special characters lose their backslash; every
+                    # other escape keeps it, and backslash-newline is a continuation.
+                    if ch in SHELL_NEED_ESCAPE:
+                        value, ws = value + ws + ch, ""
+                    elif not newline:
+                        value, ws = value + ws + "\\" + ch, ""
+                elif state == "comment":
+                    if ch == "\\":
+                        state = "comment_escape"
+                    elif newline:
+                        state = "pre_key"
+                elif state == "comment_escape":
+                    state = "comment"
+            if state in ("single", "double", "single_escape", "double_escape"):
+                # Unterminated quote — systemd rejects such a file outright. Before
+                # issue 212 nothing quoted anything, so a stored value could hold a
+                # lone quote; parsing that file strictly would make it (and every
+                # key after it) silently vanish, which is the very failure this
+                # code exists to remove. Read it the way the pre-212 code did
+                # instead; the next write re-encodes it in the quoted form.
+                return parse_env_legacy(text)
+            return [(k, v) for (k, v) in pairs if KEY_RE.match(k)]
+
+
+        def parse_env_legacy(text):
+            """Read `text` as the pre-212 one-pair-per-line format.
+
+            Migration path only, for a file whose quotes do not balance (see
+            parse_env). Mirrors what the old reader did, surrounding quotes and all.
+            """
+            pairs = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                pairs.append((key.strip(), value))
+            return [(k, v) for (k, v) in pairs if KEY_RE.match(k)]
+
+
+        def encode_value(value):
+            """Encode `value` for the env file, quoting it when it needs quoting.
+
+            A plain value stays bare, so rewriting one key does not churn every
+            other line of an existing file. Anything else — a space, a newline, a
+            quote, a backslash, non-ASCII — takes the double-quoted form, where
+            systemd unescapes \\\\ and \\" and treats a newline as an ordinary
+            character.
+            """
+            if PLAIN_VALUE_RE.fullmatch(value):
+                return value
+            return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+        def read_pairs(path):
+            """Return the file's (key, value) pairs; none when it does not exist."""
             try:
-                with open(ENV_FILE, "r", encoding="utf-8") as fh:
-                    for line in fh:
-                        stripped = line.strip()
-                        if not stripped or stripped.startswith("#") or "=" not in stripped:
-                            continue
-                        key, val = stripped.split("=", 1)
-                        key = key.strip()
-                        if KEY_RE.match(key):
-                            pairs.append((key, val))
+                with open(path, "r", encoding="utf-8") as fh:
+                    text = fh.read()
             except FileNotFoundError:
-                pass
-            return pairs
+                return []
+            return parse_env(text)
 
 
-        def write_pairs(pairs):
-            """Atomically write pairs to ENV_FILE at mode 0600.
+        def write_pairs(path, pairs):
+            """Atomically write pairs to `path` at mode 0600.
 
             Writes to a temp file in the same directory (so os.replace is atomic on
             the same filesystem) then renames over the target.
             """
-            directory = os.path.dirname(ENV_FILE) or "."
+            directory = os.path.dirname(path) or "."
             os.makedirs(directory, mode=0o700, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=directory, prefix=".env.")
             try:
                 os.fchmod(fd, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write("# Managed by agent-box settings page. KEY=value, one per line.\n")
-                    fh.write("# Do not add secrets by hand here unless you know what you are doing.\n")
-                    for key, val in pairs:
-                        fh.write(f"{key}={val}\n")
-                os.replace(tmp, ENV_FILE)
+                    fh.write(ENV_HEADER)
+                    for key, value in pairs:
+                        fh.write(f"{key}={encode_value(value)}\n")
+                os.replace(tmp, path)
             except BaseException:
                 try:
                     os.unlink(tmp)
@@ -4228,15 +4581,29 @@ in
                 raise
 
 
-        def set_key(key, value):
-            pairs = [(k, v) for (k, v) in load_pairs() if k != key]
+        def set_key(path, key, value):
+            """Replace `key` (keeping file order for the others) and rewrite."""
+            pairs = [(k, v) for (k, v) in read_pairs(path) if k != key]
             pairs.append((key, value))
-            write_pairs(pairs)
+            write_pairs(path, pairs)
 
 
-        def delete_key(key):
-            pairs = [(k, v) for (k, v) in load_pairs() if k != key]
-            write_pairs(pairs)
+        def delete_key(path, key):
+            pairs = [(k, v) for (k, v) in read_pairs(path) if k != key]
+            write_pairs(path, pairs)
+
+
+        # Everything that touches the format itself lives in src/env-file.py above,
+        # which src/env-cli.py — the helper the session-spawn wrapper and
+        # `agent-box-session env` call — includes too. Only this one view of it is
+        # page-specific.
+        def read_keys():
+            """Return the sorted list of KEY names currently in the env file.
+
+            Values are intentionally never returned — the UI must not be able to
+            surface a stored secret.
+            """
+            return sorted({key for (key, _) in read_pairs(ENV_FILE)})
 
 
         def read_sessions():
@@ -5232,6 +5599,14 @@ in
           input[type=text] { width: 200px; max-width: 100%; }
           input[type=password] { width: 280px; max-width: 100%; }
           textarea { width: 100%; resize: vertical; }
+          /* Multi-line secret (a PEM certificate or key): monospace so the base64
+             body and the BEGIN/END markers line up, and roomy enough to see one. */
+          textarea.secret-multi { margin-top: 8px; font-family: ui-monospace, SFMono-Regular,
+                                  Menlo, Consolas, monospace; font-size: 12px; }
+          /* Link-styled button: an action inside running .note text. */
+          .linkbtn { font: inherit; font-size: 13px; padding: 0; border: 0;
+                     background: none; color: #58a6ff; cursor: pointer; }
+          .linkbtn:hover { text-decoration: underline; }
           .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
           .new-session-row { align-items: flex-end; }
           .prompt-row { margin-top: 12px; }
@@ -5474,8 +5849,21 @@ in
                   <input type="password" name="value" placeholder="value" autocomplete="off" required>
                   <button type="submit" class="btn">Save</button>
                 </div>
+                <!-- Multi-line alternative to the masked field (issue 212): a PEM
+                     certificate or private key cannot go through a single-line
+                     input at all. Both fields are named "value"; the inactive one
+                     is disabled, so exactly one is ever submitted, and the masked
+                     one stays the default (the switch below needs JavaScript,
+                     like the editor toggles). -->
+                <textarea name="value" class="secret-multi" rows="6" required hidden disabled
+                          autocomplete="off" spellcheck="false"
+                          placeholder="-----BEGIN CERTIFICATE-----"></textarea>
                 <p class="note">The value is write-only &mdash; saving replaces any
-                existing value for that key. This page never displays stored values.</p>
+                existing value for that key. This page never displays stored values.
+                <button type="button" class="linkbtn" data-multiline>Multi-line
+                value</button> for a certificate or key &mdash; it is stored exactly
+                as pasted, and unlike the masked field it is visible while you
+                type.</p>
               </form>
             </div>
             <div id="secrets-list">{keys}</div>
@@ -6111,17 +6499,42 @@ in
             if (el) { el.hidden = true; }
           });
 
+          // The secret value has two fields with the same name (issue 212): the
+          // masked single-line input, and a textarea for a value that cannot fit on
+          // one line at all — a PEM certificate or private key. Whichever is not in
+          // use is hidden AND disabled, so the browser submits exactly one.
+          function secretField(form) {
+            return form.querySelector("[name=value]:not([disabled])");
+          }
+          function secretMulti(form, on) {
+            var single = form.querySelector("input[name=value]");
+            var area = form.querySelector("textarea[name=value]");
+            var btn = form.querySelector("[data-multiline]");
+            if (!single || !area) { return; }
+            // Carry what was typed across, so switching never loses a paste.
+            if (on) { area.value = single.value; } else { single.value = area.value; }
+            single.hidden = single.disabled = on;
+            area.hidden = area.disabled = !on;
+            if (btn) { btn.textContent = on ? "Single-line value" : "Multi-line value"; }
+            secretField(form).focus();
+          }
+
           document.addEventListener("click", function (e) {
-            var t = e.target && e.target.closest ? e.target.closest("[data-toggle],[data-edit]") : null;
+            var t = e.target && e.target.closest
+              ? e.target.closest("[data-toggle],[data-edit],[data-multiline]") : null;
             if (!t) { return; }
             var form = document.getElementById("secret-form");
+            if (t.hasAttribute("data-multiline")) {
+              secretMulti(form, form.querySelector("textarea[name=value]").hidden);
+              return;
+            }
             if (t.hasAttribute("data-edit")) {
               document.getElementById("secret-editor").hidden = false;
               form.reset();
               var key = form.querySelector("input[name=key]");
               key.value = t.getAttribute("data-edit");
               key.readOnly = true;
-              form.querySelector("input[name=value]").focus();
+              secretField(form).focus();
               return;
             }
             var el = document.getElementById(t.getAttribute("data-toggle"));
@@ -7228,7 +7641,11 @@ in
                     self._redirect("ok=password_changed")
                 elif path == BASE + "/set":
                     key = (form.get("key", [""])[0]).strip()
-                    value = form.get("value", [""])[0]
+                    # Browsers submit CRLF line breaks from the multi-line field (a
+                    # textarea), the same normalization the kickoff prompt gets
+                    # below. Nothing else is trimmed: a PEM's trailing newline is
+                    # part of the value and the agent gets the bytes as pasted.
+                    value = form.get("value", [""])[0].replace("\r\n", "\n")
                     if not KEY_RE.match(key):
                         self._send_html(
                             render_page("Invalid key name. Use letters, digits and "
@@ -7236,12 +7653,19 @@ in
                             status=400,
                         )
                         return
-                    set_key(key, value)
+                    if "\0" in value:
+                        # Neither the file format nor execve() can carry one.
+                        self._send_html(
+                            render_page("Value cannot contain a NUL byte."),
+                            status=400,
+                        )
+                        return
+                    set_key(ENV_FILE, key, value)
                     self._redirect("ok=saved")
                 elif path == BASE + "/delete":
                     key = (form.get("key", [""])[0]).strip()
                     if KEY_RE.match(key):
-                        delete_key(key)
+                        delete_key(ENV_FILE, key)
                     self._redirect("ok=deleted")
                 elif path == SESS_BASE + "/sessions/add":
                     back_page = self._sess_page(form)

@@ -150,6 +150,37 @@ test('secret value input is a password field', async ({ browser }) => {
   await expect(addForm(page).locator('input[name="value"]')).toHaveAttribute('type', 'password');
 });
 
+// Issue 212: a certificate or private key cannot go through the masked
+// single-line input at all, so the card offers a textarea instead. Both
+// fields are named "value"; the switch must leave exactly one submittable,
+// and the stored pair must be the quoted, multi-line form.
+test('the multi-line switch stores a PEM as one quoted pair', async ({ browser }) => {
+  const key = uniqueKey();
+  const value =
+    '-----BEGIN CERTIFICATE-----\nbG9uZ2VyIHRoYW4gb25lIGxpbmU=\n-----END CERTIFICATE-----\n';
+  const page = await authedPage(browser);
+  await page.goto(SETTINGS_PATH);
+  await openSecretEditor(page);
+  await addForm(page).locator('input[name="key"]').fill(key);
+  await addForm(page).getByRole('button', { name: 'Multi-line value' }).click();
+  await expect(addForm(page).locator('input[name="value"]')).toBeDisabled();
+  await addForm(page).locator('textarea[name="value"]').fill(value);
+  await addForm(page).getByRole('button', { name: 'Save' }).click();
+  await expect(page.locator('.msg')).toHaveText(/Key saved/);
+  await expect(page.locator('li', { hasText: key })).toHaveCount(1);
+  // The body is never rendered — not as a value, and not (as it once was)
+  // as a secret NAME parsed out of a base64 line's "=" padding.
+  expect(await page.content()).not.toContain('bG9uZ2VyIHRoYW4gb25lIGxpbmU');
+
+  if (ENV_FILE) {
+    const content = fs.readFileSync(ENV_FILE, 'utf-8');
+    expect(content).toContain(`${key}="-----BEGIN CERTIFICATE-----\n`);
+    expect(content).toContain('-----END CERTIFICATE-----\n"\n');
+  }
+
+  await deleteKey(page, key);
+});
+
 test('HTML5 validation blocks an invalid key name', async ({ browser }) => {
   const page = await authedPage(browser);
   await page.goto(SETTINGS_PATH);

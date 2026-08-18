@@ -115,6 +115,22 @@ let
   # 0.8.0 ported the plugin from node to the python3 already in
   # agentBaseTools, dropping the box's only nodejs dependency (issue #101).
   webhookPython = "${pkgs.python3}/bin/python3";
+  # The env file's format has ONE implementation (issue 212): src/env-file.py,
+  # which the settings daemon splices in directly and this helper wraps for
+  # the two shell callers below. A stored value may be quoted and span lines
+  # — a PEM certificate or private key — so reading the file means
+  # implementing systemd's env-file grammar, and a second copy of that
+  # grammar drifts silently: the symptom is a truncated secret, not an
+  # error. The cost of the choice is that python3 is in every box's closure,
+  # web stack or not; it already is, through agentBaseTools.
+  envFileCli = pkgs.writers.writePython3 "agent-box-env-file" {
+    # As with the settings daemon: no external libraries, syntax still
+    # compiled by the writer, style gate relaxed for readability.
+    flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" ];
+  } ''
+    @@include:src/env-cli.py@@
+  '';
+
   # Session-spawn env loader (issue 89). Sessions are (re)created by the
   # long-lived supervisor inside the agent unit, so a unit-level
   # EnvironmentFile= snapshot of the user's env file goes stale the moment
@@ -124,12 +140,13 @@ let
   # single live source for those keys (it is deliberately NOT in the
   # unit's EnvironmentFile, so a DELETED key disappears on restart too).
   # Values are exported literally — never eval'd — so a secret full of
-  # shell metacharacters can't break or inject anything; one pair of
-  # surrounding quotes is stripped to match how systemd read the same
-  # file before. Key charset mirrors the settings daemon's KEY_RE.
-  envExecWrapper = pkgs.writeShellScript "agent-box-env-exec" ''
-    @@include:src/env-exec.sh@@
-  '';
+  # shell metacharacters can't break or inject anything. The parsing itself
+  # is envFileCli's, which is why a multi-line value survives the trip.
+  envExecWrapper = pkgs.writeShellScript "agent-box-env-exec" (''
+    AGENT_BOX_ENV_CLI=${envFileCli}
+  '' + ''
+@@include:src/env-exec.sh@@
+  '');
 
   # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
   # quit, so the pane records stopped=true and the supervisor leaves the
@@ -313,6 +330,7 @@ let
   sessionCli = pkgs.writeShellScriptBin "agent-box-session" (''
     export AGENT_BOX_AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " (sessionKinds cfg.installAgents))}
     export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+    export AGENT_BOX_ENV_CLI=${envFileCli}
   '' + ''
 @@include:src/session-cli.sh@@
   '');

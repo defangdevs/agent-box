@@ -434,7 +434,15 @@ through the settings page's Secrets card or from a shell:
 
 ```bash
 sudo -u alice agent-box-session env set GH_TOKEN ghp_xxx
+sudo -u alice agent-box-session env set CLIENT_CERT "$(cat client.pem)"
 ```
+
+A value may span lines — an x509 certificate or a private key. It is then
+stored double-quoted, which is [systemd env-file
+syntax](https://www.freedesktop.org/software/systemd/man/systemd.exec.html#EnvironmentFile=),
+so the file stays readable by systemd and by the spawn wrapper alike. On the
+settings page, the Secrets card's *Multi-line value* switch swaps the masked
+field for a text area to paste one into.
 
 The supervisor's spawn wrapper re-reads the file at every session (re)start,
 so a new token applies on the next respawn — no unit restart, no rebuild, and

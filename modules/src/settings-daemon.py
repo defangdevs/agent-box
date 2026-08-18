@@ -141,10 +141,6 @@ WEBHOOKS = bool(WEBHOOK_SCRIPT and WEBHOOK_STATE_DIR)
 # a watch DOES instead of restating why it exists (#259).
 HOOK_SPAWN_CMD = os.environ.get("AGENT_BOX_HOOK_SPAWN_CMD", "")
 
-# Env var names: POSIX-ish. Must start with a letter or underscore and
-# contain only letters, digits, underscores. This is what a shell / systemd
-# EnvironmentFile will accept as a variable name.
-KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Session names: same charset the supervisor and CLI enforce (they
 # land in tmux -t targets and URLs). Every render and publish path filters
 # through this, so a name it rejects is not merely unlisted — that session
@@ -244,85 +240,20 @@ def valid_password(password):
     )
 
 
+@@include:env-file.py@@
+
+
+# Everything that touches the format itself lives in src/env-file.py above,
+# which src/env-cli.py — the helper the session-spawn wrapper and
+# `agent-box-session env` call — includes too. Only this one view of it is
+# page-specific.
 def read_keys():
     """Return the sorted list of KEY names currently in the env file.
 
     Values are intentionally never returned — the UI must not be able to
     surface a stored secret.
     """
-    keys = []
-    try:
-        with open(ENV_FILE, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key = line.split("=", 1)[0].strip()
-                if KEY_RE.match(key):
-                    keys.append(key)
-    except FileNotFoundError:
-        pass
-    # De-dup preserving the last occurrence's position is unnecessary; names
-    # are what matter, so sort for a stable UI.
-    return sorted(set(keys))
-
-
-def load_pairs():
-    """Return an ordered dict-ish list of (key, rawvalue) for rewriting.
-
-    Used only internally when mutating the file; values never leave the
-    process.
-    """
-    pairs = []
-    try:
-        with open(ENV_FILE, "r", encoding="utf-8") as fh:
-            for line in fh:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#") or "=" not in stripped:
-                    continue
-                key, val = stripped.split("=", 1)
-                key = key.strip()
-                if KEY_RE.match(key):
-                    pairs.append((key, val))
-    except FileNotFoundError:
-        pass
-    return pairs
-
-
-def write_pairs(pairs):
-    """Atomically write pairs to ENV_FILE at mode 0600.
-
-    Writes to a temp file in the same directory (so os.replace is atomic on
-    the same filesystem) then renames over the target.
-    """
-    directory = os.path.dirname(ENV_FILE) or "."
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".env.")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write("# Managed by agent-box settings page. KEY=value, one per line.\n")
-            fh.write("# Do not add secrets by hand here unless you know what you are doing.\n")
-            for key, val in pairs:
-                fh.write(f"{key}={val}\n")
-        os.replace(tmp, ENV_FILE)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def set_key(key, value):
-    pairs = [(k, v) for (k, v) in load_pairs() if k != key]
-    pairs.append((key, value))
-    write_pairs(pairs)
-
-
-def delete_key(key):
-    pairs = [(k, v) for (k, v) in load_pairs() if k != key]
-    write_pairs(pairs)
+    return sorted({key for (key, _) in read_pairs(ENV_FILE)})
 
 
 def read_sessions():
@@ -1314,8 +1245,21 @@ BODY = """<main>
           <input type="password" name="value" placeholder="value" autocomplete="off" required>
           <button type="submit" class="btn">Save</button>
         </div>
+        <!-- Multi-line alternative to the masked field (issue 212): a PEM
+             certificate or private key cannot go through a single-line
+             input at all. Both fields are named "value"; the inactive one
+             is disabled, so exactly one is ever submitted, and the masked
+             one stays the default (the switch below needs JavaScript,
+             like the editor toggles). -->
+        <textarea name="value" class="secret-multi" rows="6" required hidden disabled
+                  autocomplete="off" spellcheck="false"
+                  placeholder="-----BEGIN CERTIFICATE-----"></textarea>
         <p class="note">The value is write-only &mdash; saving replaces any
-        existing value for that key. This page never displays stored values.</p>
+        existing value for that key. This page never displays stored values.
+        <button type="button" class="linkbtn" data-multiline>Multi-line
+        value</button> for a certificate or key &mdash; it is stored exactly
+        as pasted, and unlike the masked field it is visible while you
+        type.</p>
       </form>
     </div>
     <div id="secrets-list">{keys}</div>
@@ -2314,7 +2258,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._redirect("ok=password_changed")
         elif path == BASE + "/set":
             key = (form.get("key", [""])[0]).strip()
-            value = form.get("value", [""])[0]
+            # Browsers submit CRLF line breaks from the multi-line field (a
+            # textarea), the same normalization the kickoff prompt gets
+            # below. Nothing else is trimmed: a PEM's trailing newline is
+            # part of the value and the agent gets the bytes as pasted.
+            value = form.get("value", [""])[0].replace("\r\n", "\n")
             if not KEY_RE.match(key):
                 self._send_html(
                     render_page("Invalid key name. Use letters, digits and "
@@ -2322,12 +2270,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     status=400,
                 )
                 return
-            set_key(key, value)
+            if "\0" in value:
+                # Neither the file format nor execve() can carry one.
+                self._send_html(
+                    render_page("Value cannot contain a NUL byte."),
+                    status=400,
+                )
+                return
+            set_key(ENV_FILE, key, value)
             self._redirect("ok=saved")
         elif path == BASE + "/delete":
             key = (form.get("key", [""])[0]).strip()
             if KEY_RE.match(key):
-                delete_key(key)
+                delete_key(ENV_FILE, key)
             self._redirect("ok=deleted")
         elif path == SESS_BASE + "/sessions/add":
             back_page = self._sess_page(form)

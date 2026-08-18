@@ -52,6 +52,19 @@
     };
     system.stateVersion = "25.05";
 
+    # Issue 212 fixture: the shapes a one-pair-per-line reader got wrong —
+    # a value spanning lines, a base64 body line whose "=" padding parses
+    # as another KEY=value pair, and the two characters the quoted form has
+    # to escape. Kept as a file so neither the test nor curl has to carry
+    # it through a shell.
+    environment.etc."agent-box-test/multiline-secret".text = ''
+      -----BEGIN CERTIFICATE-----
+      MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1cGVuLXNlc2FtZQ==
+      dGhpcyBib2R5IGxpbmUgaGFzIG5vIHBhZGRpbmc
+      a "quoted" line and a \ backslash
+      -----END CERTIFICATE-----
+    '';
+
     system.activationScripts.agent-web-password-hash.text = ''
       install -d -m 0700 /var/lib/agent-box-web
       if [ ! -s /var/lib/agent-box-web/password-hash ]; then
@@ -315,6 +328,78 @@
             timeout=30,
         )
         machine.fail("grep -q '^UI_SECRET=' /tmp/agent-env")
+
+    # Issue 212: a secret may need MORE THAN ONE LINE — an x509 certificate,
+    # an SSH private key. The page used to accept such a POST with a 303 and
+    # then lose everything after the first newline: the session got a
+    # truncated secret, the next save of ANY key wrote that truncation back
+    # for good, and a base64 body line ending in "=" padding was read as
+    # another pair, so key material was rendered as a secret NAME. The value
+    # is now stored as one double-quoted systemd env-file pair.
+    with subtest("multi-line secret survives the file, systemd and a spawn"):
+        fixture = "/etc/agent-box-test/multiline-secret"
+        # Posted over the daemon's own socket: the value carries newlines
+        # and quotes, so it rides in a file rather than through a shell.
+        machine.succeed(
+            f"su -s /bin/sh agent -c '{sock_curl} -o /dev/null -w %{{http_code}} "
+            f"--data-urlencode key=PEM_KEY --data-urlencode value@{fixture} "
+            "http://localhost/agent/settings/set' | grep -x 303"
+        )
+        # One pair, quoted — not five lines, four of which are junk pairs.
+        machine.succeed(
+            "grep -c '^PEM_KEY=\"-----BEGIN CERTIFICATE-----$' "
+            "/home/agent/.config/agent-box/env | grep -x 1"
+        )
+        # Saving an unrelated key rewrites the whole file: the multi-line
+        # value has to survive its own reader.
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "-d 'key=UNRELATED&value=x' https://box.test/agent/settings/set | grep -x 303"
+        )
+        # The page still lists the NAME only. Before the fix a fragment of
+        # the key body was listed as a secret name of its own.
+        page212 = machine.succeed(
+            f"su -s /bin/sh agent -c '{sock_curl} http://localhost/agent/settings/'"
+        )
+        assert "PEM_KEY" in page212, "the multi-line key should be listed"
+        assert "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1cGVuLXNlc2FtZQ" not in page212, (
+            "key material must never be rendered, not even as a name"
+        )
+        # systemd's own env-file parser must read it back as ONE value —
+        # that compatibility is why the value is quoted rather than encoded.
+        machine.succeed(
+            "systemd-run --quiet --wait --pipe --collect "
+            "-p EnvironmentFile=/home/agent/.config/agent-box/env "
+            "/bin/sh -c 'printf %s \"$PEM_KEY\"' > /tmp/from-systemd"
+        )
+        machine.succeed(f"cmp /tmp/from-systemd {fixture}")
+        # And the spawn wrapper hands the session the same bytes, trailing
+        # newline included. /proc/<pid>/environ is NUL-separated, so the
+        # record is pulled out whole instead of split on newlines.
+        agent_pem = (
+            tmux('display -p -t "=main:" "#{pane_pid}"')
+            + " | xargs -I{} sh -c 'pgrep -P {} | head -1'"
+            + " | xargs -I{} sh -c \"grep -az '^PEM_KEY=' /proc/{}/environ\""
+            + " | tr -d '\\0' | sed '1s/^PEM_KEY=//' > /tmp/from-session"
+        )
+        wait_new_pane(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "-d 'name=main' https://box.test/sessions/restart | grep -x 303"
+        )
+        machine.wait_until_succeeds(
+            f"{agent_pem} && cmp -s /tmp/from-session {fixture}", timeout=60
+        )
+        # The session CLI reads and rewrites the same file: dropping another
+        # key must not truncate this one either.
+        env_ls = machine.succeed("su -s /bin/sh agent -c 'agent-box-session env ls'")
+        assert "PEM_KEY" in env_ls and "MIIBIjANBgkqhkiG" not in env_ls, env_ls
+        machine.succeed("su -s /bin/sh agent -c 'agent-box-session env rm UNRELATED'")
+        machine.succeed(
+            "systemd-run --quiet --wait --pipe --collect "
+            "-p EnvironmentFile=/home/agent/.config/agent-box/env "
+            "/bin/sh -c 'printf %s \"$PEM_KEY\"' > /tmp/from-systemd2"
+        )
+        machine.succeed(f"cmp /tmp/from-systemd2 {fixture}")
 
     # Issue 54: with selfUpdate enabled the page shows the Update card...
     assert "Update box" in page, "Update box card should be rendered when selfUpdate is on"

@@ -366,6 +366,23 @@
               python3 repo/bin/assemble-module.py --check --repo repo
               touch "$out"
             '';
+
+          # The per-user secrets file holds systemd env-file syntax, so a
+          # value may be quoted and span lines (a PEM certificate or key,
+          # issue 212). A value that does not survive its own encoding comes
+          # back TRUNCATED rather than raising, so every shape one can take
+          # is written and read back here — through the library the settings
+          # page uses and through the CLI the shell callers use. Cheap and
+          # arch-independent, unlike the VM tests covering the same ground.
+          env-file-format =
+            pkgs.runCommand "agent-box-env-file-format"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                srcDir = ./modules/src;
+                harness = ./tests/env-file-format.py;
+              } ''
+              python3 "$harness" "$srcDir" > "$out"
+            '';
         }
         # Everything below boots a guest, so it only exists for `vmSystems`:
         # runNixOSTest wants a same-arch KVM guest (cross-arch falls back to
