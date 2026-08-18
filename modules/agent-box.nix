@@ -810,9 +810,31 @@ JQ=jq
 FILE="$HOME/.config/agent-box/sessions.json"
 AGENTS="''${AGENT_BOX_AGENTS:?}"
 DEFAULT_AGENT="''${AGENT_BOX_DEFAULT_AGENT:?}"
-export TMUX_TMPDIR="''${TMUX_TMPDIR:-/run/agent-box-$USER}"
+# NOT ''${TMUX_TMPDIR:-...}: the socket dir is the agent unit's
+# RuntimeDirectory, never the caller's to choose (issue #268). Deferring to
+# an inherited value let any system-wide setting repoint the whole CLI at an
+# empty directory, where every verb finds no sessions and reports success --
+# `programs.tmux` with secureSocket on exports TMUX_TMPDIR through
+# /etc/profile, so an SSH login shell did exactly that.
+export TMUX_TMPDIR="/run/agent-box-''${USER:-$(id -un)}"
 
 t() { tmux -L agent-box "$@"; }
+
+# A kill that did not happen must never be reported as a removal (issue
+# #268): the entry leaves sessions.json while the session keeps running, and
+# nothing collects it afterwards -- the supervisor's reconcile loop is
+# ensure-only and never kills. But "already gone" is success for every caller
+# here, and it arrives two ways: no such session, or no server at all (killing
+# the LAST session takes the server down with it, so `restart main` on a
+# single-session box legitimately finds nothing). Ask tmux what is true now
+# instead of matching its error text, which differs by version.
+kill_session() {
+  kerr="$(t kill-session -t "=$1" 2>&1)" && return 0
+  t has-session -t "=$1" 2>/dev/null || return 0
+  echo "agent-box-session: could not kill tmux session '$1': $kerr" >&2
+  return 1
+}
+
 usage() {
   echo "usage: agent-box-session ls"
   echo "       agent-box-session add [NAME] [--agent AGENT] [--cwd DIR]"
@@ -989,7 +1011,7 @@ case "$cmd" in
     valid_name "$name" || { usage >&2; exit 2; }
     ensure_file
     jq_edit --arg n "$name" 'del(.sessions[$n])'
-    t kill-session -t "=$name" 2>/dev/null || true
+    kill_session "$name" || exit 1
     prune_filter "$name"
     echo "session '$name' removed"
     ;;
@@ -1006,7 +1028,7 @@ case "$cmd" in
       exit 2
     fi
     jq_edit --arg n "$name" '.sessions[$n].stopped = true'
-    t kill-session -t "=$name" 2>/dev/null || true
+    kill_session "$name" || exit 1
     echo "session '$name' stopped — still listed, not respawned; 'agent-box-session restart $name' revives it"
     ;;
   restart)
@@ -1016,7 +1038,7 @@ case "$cmd" in
       ensure_file
       jq_edit 'del(.sessions[].stopped)'
       "$JQ" -r '.sessions | keys[]' "$FILE" | while IFS= read -r n; do
-        [ -n "$n" ] && t kill-session -t "=$n" 2>/dev/null || true
+        [ -n "$n" ] && kill_session "$n" || true
       done
       echo "all sessions killed — the supervisor restarts each within ~2s (re-reading env)"
     else
@@ -1025,8 +1047,9 @@ case "$cmd" in
       ensure_file
       if taken "$name"; then
         jq_edit --arg n "$name" 'del(.sessions[$n].stopped)'
-        # || true: a stopped session has no live tmux session to kill.
-        t kill-session -t "=$name" 2>/dev/null || true
+        # A stopped session has no live tmux session to kill; kill_session
+        # treats that "can't find session" as success.
+        kill_session "$name" || exit 1
         echo "session '$name' killed — the supervisor restarts it within ~2s"
       else
         # Unlisted (hand-started) session: the kill is all there is, and
@@ -3285,6 +3308,16 @@ in
         credential."https://github.com".helper = "!${pkgs.gh}/bin/gh auth git-credential";
         credential."https://gist.github.com".helper = "!${pkgs.gh}/bin/gh auth git-credential";
       };
+    };
+
+    # Without this, a mouse wheel scroll is forwarded to the foreground
+    # program as arrow-key presses instead of scrolling tmux's own pane
+    # history — tmux's default fallback for apps that don't handle the
+    # mouse themselves. System-wide /etc/tmux.conf so every user's tmux
+    # server picks it up without touching each ~/.tmux.conf.
+    programs.tmux = {
+      enable = true;
+      extraConfig = "set -g mouse on";
     };
 
     users.users = lib.mapAttrs (name: u: {
@@ -5903,6 +5936,13 @@ in
           // live (the ttyd attach wrapper errors out on a session that does
           // not exist yet).
           function tabBar() { return document.getElementById("tab-bar"); }
+          function tabNames() {
+            var bar = tabBar();
+            if (!bar) { return []; }
+            return [].slice.call(bar.querySelectorAll(".tab[data-tab]")).map(function (t) {
+              return t.getAttribute("data-tab");
+            });
+          }
           function tabEl(name) {
             var bar = tabBar();
             return bar ? bar.querySelector('.tab[data-tab="' + name + '"]') : null;
@@ -6131,12 +6171,16 @@ in
             e.preventDefault();
             var body = new URLSearchParams();
             new FormData(f).forEach(function (v, k) { body.append(k, v); });
-            // On the workspace, adding a session should focus its new tab —
-            // and a FAILED add (the fetched error page defaults aria-current)
+            // On the workspace, adding a session should focus its new tab. The
+            // name is auto-derived by the daemon, so the page only learns it
+            // from the answer: a successful add redirects to ?tab=<new name>,
+            // which the fetched page marks current. Snapshot the tabs first and
+            // trust that selection only when it names a tab that did not exist
+            // before — a FAILED add re-renders with the default tab current, and
             // must not yank the user off the tab they were on.
-            var addedSession =
+            var tabsBefore =
               (f.getAttribute("action") || "").endsWith("/sessions/add") && tabBar()
-                ? body.get("name") : null;
+                ? tabNames() : null;
             var wasActive = wsActive();
             var poll = f.getAttribute("data-poll");
             var statusUrl = f.getAttribute("data-status");
@@ -6146,7 +6190,8 @@ in
                 ["msg-slot", "secrets-list", "sessions-list", "webhooks-list", "tab-bar"]);
               var ed = f.closest(".editor");
               if (ed) { f.reset(); ed.hidden = true; }
-              if (addedSession && tabEl(addedSession)) { wsSelect(addedSession, true); }
+              var added = wsActive();   // the tab the fetched page marks current
+              if (tabsBefore && added && tabsBefore.indexOf(added) < 0) { wsSelect(added, true); }
               else if (wasActive && tabEl(wasActive)) { wsSelect(wasActive, false); }
               wsSync();
             }

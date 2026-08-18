@@ -458,6 +458,25 @@
     machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm codex'")
     machine.succeed(f"su -s /bin/sh agent -c 'agent-box-session rm {suffixed}'")
 
+    # --- a hostile TMUX_TMPDIR must not disarm the CLI (issue #268) --------
+    # The CLI used to defer to an inherited TMUX_TMPDIR, so any system-wide
+    # setting (programs.tmux with secureSocket on exports one through
+    # /etc/profile) pointed it at an empty socket dir: every verb found no
+    # sessions, killed nothing, and still exited 0. The rest of this file
+    # cannot catch that — `su -s /bin/sh agent -c` is neither a login nor an
+    # interactive shell, so it never inherits one. Set it explicitly instead.
+    machine.succeed("su -s /bin/sh agent -c 'agent-box-session add hostile'")
+    machine.wait_until_succeeds(tmux("has-session -t =hostile"), timeout=60)
+    machine.succeed(
+        "su -s /bin/sh agent -c "
+        "'TMUX_TMPDIR=/run/user/1000 agent-box-session rm hostile'"
+    )
+    machine.fail(tmux("has-session -t =hostile"))
+    machine.succeed(
+        "jq -e '.sessions | has(\"hostile\") | not' "
+        "/home/agent/.config/agent-box/sessions.json"
+    )
+
     # --- the name length the web UI can render (issue #236) ----------------
     # The settings daemon filters every rendered name through SESSION_RE and
     # DROPS the rest, so a name past its bound costs more than looks: the
