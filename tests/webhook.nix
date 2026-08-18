@@ -713,6 +713,44 @@
     assert watched.startswith("hook-defangdevs-local-channels-"), watched
     assert twin.startswith("hook-defangdevs-local-channels-staging-"), twin
 
+    # --- issue #290: a per-user runtime override needs no rebuild -----------
+    # ~/.config/agent-box/env is the same file `agent-box-session env set`/the
+    # settings page already manage; a value there for
+    # AGENT_BOX_HOOK_SESSION_ARGS overrides the Nix-baked default above
+    # (--model sonnet), so any user can pick their own hook-session model by
+    # chatting with their agent, with no rebuild and no root.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-session env set AGENT_BOX_HOOK_SESSION_ARGS"
+        " '[\"--model\",\"haiku\"]'"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github"
+        " LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/override-probe"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    overridden = machine.succeed(
+        "jq -r '.sessions | keys[]"
+        " | select(startswith(\"hook-defangdevs-override-probe-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        f"jq -e '.sessions[\"{overridden}\"].extraArgs"
+        " == [\"--model\", \"haiku\"]'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {overridden}"
+    )
+    # Cleared afterwards so nothing downstream inherits this override.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-session env rm AGENT_BOX_HOOK_SESSION_ARGS"
+    )
+
     # An assignment is a work request, not a triage request (#253). The watch's
     # predicate decides WHICH assignments arrive (assignee = the box); this
     # wrapper decides what the session is TOLD, and a session told only to

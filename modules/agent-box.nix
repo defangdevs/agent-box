@@ -1648,8 +1648,30 @@ note="''${LOCAL_WEBHOOK_SPAWN_NOTE:+ (\"$LOCAL_WEBHOOK_SPAWN_NOTE\")}"
 preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded")"
 
 # Extra agent-CLI args for hook sessions (webhook.hookSessionArgs), JSON in
-# the daemon unit's env — e.g. a cheaper model for triage work. Decoded here
-# into the add call's `--` tail, which the supervisor stores as extraArgs.
+# the daemon unit's env — e.g. a cheaper model for triage work. A value for
+# the same key in ~/.config/agent-box/env — the file `agent-box-session env
+# set`/the settings page already manage — overrides it with no rebuild: any
+# user can run `agent-box-session env set AGENT_BOX_HOOK_SESSION_ARGS
+# '["--model","sonnet"]'` from chat to pick their own hook-session model
+# (issue #290). Same safe KEY=VALUE parse as the env-exec wrapper (#212);
+# only this one key is read, so nothing else in the file reaches this
+# process's environment. Decoded here into the add call's `--` tail, which
+# the supervisor stores as extraArgs.
+envfile="$HOME/.config/agent-box/env"
+if [ -r "$envfile" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
+    key=''${line%%=*}
+    [ "$key" = "AGENT_BOX_HOOK_SESSION_ARGS" ] || continue
+    val=''${line#*=}
+    case "$val" in
+      \"*\") val=''${val#\"}; val=''${val%\"} ;;
+      \'*\') val=''${val#\'}; val=''${val%\'} ;;
+    esac
+    AGENT_BOX_HOOK_SESSION_ARGS=$val
+  done < "$envfile"
+fi
+
 extra=()
 if [ -n "''${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   while IFS= read -r arg; do
@@ -3087,6 +3109,12 @@ in
           sessions; sessions people create keep their own arguments. The
           args are agent-CLI-specific — pick ones the default agent
           understands.
+
+          This is the fleet-wide default only. Any user can override it for
+          their own hook sessions at runtime, no rebuild, by chatting with
+          their agent: `agent-box-session env set AGENT_BOX_HOOK_SESSION_ARGS
+          '["--model","sonnet"]'` (issue #290) — the spawn wrapper re-reads
+          that file on every dispatch and prefers it over this option.
         '';
       };
       watchPolicy = lib.mkOption {
