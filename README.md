@@ -387,8 +387,10 @@ On by default (`webhook.enable`), needs `web.enable`. How it fits together:
   subscription makes the daemon spawn a **fresh `hook-*` session** primed with
   the event text instead of interrupting whichever session is active. Bursts
   coalesce into one session; concurrent spawns are capped, and the wrapper
-  refuses to accumulate more than a handful of live `hook-*` sessions. The
-  spawned session's prompt tells it to remove itself when done.
+  refuses to accumulate more than a handful of live `hook-*` sessions — counted
+  as sessions that are actually running, so a finished one frees its slot even
+  if nobody delisted it. The spawned session's prompt tells it to remove itself
+  when done.
 - The **settings page** shows every subscription on the box, with a delete for
   each — for when a watch turns into a flood. Until then that state was
   readable only from inside a session, and only for that session. A session's

@@ -74,9 +74,9 @@ let
       so its red CI spawns no sibling; a new issue or someone else's PR always
       spawns. Its prompt tells it to `agent-box-session rm NAME` when done — clean
       stale `hook-*` sessions the same way. That cleanup is load-bearing: at most 4
-      `hook-*` sessions may exist at once, and once that ceiling is reached EVERY
+      `hook-*` sessions may RUN at once, and once that ceiling is reached EVERY
       watch on the box is inert — a matching batch is refused and dropped, never
-      queued. So before you conclude a repo has been quiet, run `agent-box-webhook
+      queued. A stopped session frees its slot even before it is delisted. So before you conclude a repo has been quiet, run `agent-box-webhook
       status`: its `dispatch` object has the live count against the ceiling and the
       last batch the ceiling dropped.
 
@@ -1312,14 +1312,15 @@ esac
                              A spawned session is subscribed to the event's own
                              repo for it, so its own CI spawns no sibling.
                              THERE IS A CEILING: at most 4 hook-* sessions may
-                             exist at once (AGENT_BOX_HOOK_SESSION_MAX in the
+                             RUN at once (AGENT_BOX_HOOK_SESSION_MAX in the
                              receiver daemon's environment). Hook sessions are
-                             removed by the agent they start, so four that ended
-                             without running `agent-box-session rm NAME` wedge
-                             every watch on the box — a refused batch is DROPPED,
-                             never queued. `status` reports the live count, the
-                             ceiling and the last refusal, and `ls` says so too
-                             once the box is at the ceiling.
+                             removed by the agent they start, so four of them
+                             still running wedge every watch on the box — a
+                             refused batch is DROPPED, never queued. Stopping one
+                             frees its slot; `agent-box-session rm NAME` also
+                             delists it. `status` reports the count, the ceiling
+                             and the last refusal, and `ls` says so too once the
+                             box is at the ceiling.
 
     --ignore-sender LOGIN mutes echoes of that sender's own comments and pushes
     ("@self" is $LOCAL_WEBHOOK_SELF); CI-outcome events are delivered anyway.
@@ -1343,7 +1344,7 @@ esac
     branch — and is reported in the JSON (`plugin.skew`) without a warning.
 
     Its `dispatch` object is where to look when standing watches seem dead:
-    `hookSessions` is the live hook-* count against the ceiling, `lastRefusal`
+    `hookSessions` is the running hook-* count against the ceiling, `lastRefusal`
     is the batch the ceiling most recently dropped (with a running total), and
     `warning` — the same field `ls` sets when the receiver has no spawn command
     — is present exactly when a match right now would spawn nothing.
@@ -1432,19 +1433,29 @@ esac
 
     # ----------------------------------------------------- standing-watch cap ---
     # Standing watches are the one delivery shape with no session behind it, so
-    # when the spawn wrapper refuses a batch (too many hook-* sessions already
-    # exist) webhook.py drops it and NOBODY got those events. That refusal used to
+    # when the spawn wrapper refuses a batch (too many hook-* sessions running)
+    # webhook.py drops it and NOBODY got those events. That refusal used to
     # reach only the receiver daemon journal while every listing here still said
     # "subscribed" — four hook sessions whose agents forgot `agent-box-session rm`
     # made the whole box inert and it read like a quiet week (issue #170). These
     # three read the state the wrapper decides on, so `status` and `ls` can say it.
 
     hook_sessions() {
-      # Live hook-* sessions: the same file and the same query the wrapper counts
-      # (src/webhook-spawn.sh), so this is the number the ceiling is applied to.
+      # The capacity in use, counted the way the wrapper counts it
+      # (src/webhook-spawn.sh): a hook-* entry that is not `stopped` — running, or
+      # queued for the supervisor's reconcile loop to start within ~2s. A `stopped`
+      # entry is FREE capacity, so counting it here would report a healthy box as
+      # wedged (issue #280) — the same over-count that used to wedge it for real.
+      #
+      # The wrapper additionally counts live hook-* tmux panes that no entry
+      # claims, which needs the tmux binary its unit pins; this process has no such
+      # pin, and the divergence can only under-count. The wrapper stays the
+      # authority either way: when the two disagree, lastRefusal is the decision
+      # that was enforced.
       if [ -s "$SESSIONS" ]; then
-        "$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' \
-          "$SESSIONS" 2>/dev/null || printf '0'
+        "$JQ" -r '[.sessions | to_entries[]
+                   | select((.key | startswith("hook-")) and .value.stopped != true)]
+                  | length' "$SESSIONS" 2>/dev/null || printf '0'
       else
         printf '0'
       fi
@@ -1480,10 +1491,11 @@ esac
       # not. One wording in one place: two copies would drift, and this is the
       # sentence the reader acts on.
       [ "$1" -ge "$2" ] || return 0
-      printf '%s' "$1 of at most $2 hook-* sessions already exist, so every \
+      printf '%s' "$1 of at most $2 hook-* sessions are running, so every \
     standing watch is inert: a matching event batch is refused and DROPPED, never \
-    queued. Remove the finished ones (agent-box-session ls, then agent-box-session \
-    rm NAME), or raise AGENT_BOX_HOOK_SESSION_MAX on the receiver daemon unit."
+    queued. Free a slot (agent-box-session ls, then agent-box-session stop NAME, \
+    or agent-box-session rm NAME to delist it for good), or raise \
+    AGENT_BOX_HOOK_SESSION_MAX on the receiver daemon unit."
     }
 
     cmd="''${1:-}"; shift || true
@@ -1699,9 +1711,12 @@ esac
   # a fresh hook-* session via the sessions file, which the supervisor
   # reconciles within ~2s — the same no-sudo, no-rebuild path the
   # agent-box-session CLI uses. webhook.py already rate-limits and coalesces
-  # spawns; the cap here bounds ACCUMULATION instead, so a watched repo cannot
-  # slowly fill the box with idle hook sessions if spawned agents fail to
-  # clean up after themselves.
+  # spawns; the cap here bounds CONCURRENCY instead, so a watched repo cannot
+  # fill the box with idle hook sessions if spawned agents fail to clean up
+  # after themselves. It counts what is running (live hook-* tmux sessions plus
+  # entries the supervisor is about to start), never how many entries the
+  # registry accumulated — a finished session must not hold a slot forever
+  # (issue #280), which is why the receiver unit below pins AGENT_BOX_TMUX_BIN.
   webhookSpawn = pkgs.writeShellScriptBin "agent-box-webhook-spawn" (''
     # Same pin as sessionCli, and for the same reason (issue #254): the
     # receiver unit's PATH is jq + coreutils + the session CLI, so flock
@@ -1900,7 +1915,7 @@ if [ -n "$FLOCK" ] && { exec 9>>"$FILE.lock"; } 2>/dev/null; then
   fi
 fi
 
-# The ceiling on ACCUMULATED hook-* sessions, and the record it leaves.
+# The ceiling on CONCURRENT hook-* sessions, and the record it leaves.
 #
 # The cap itself is right — webhook.py rate-limits and coalesces spawns but
 # bounds nothing over time, so agents that forget their `agent-box-session rm`
@@ -1933,10 +1948,11 @@ case "$MAX" in
 esac
 
 record_refusal() {
-  # $1 = the live hook-* count that triggered the refusal. Best effort: a
-  # state file that cannot be written must not turn a dropped batch into a
-  # crashed spawner, so every failure here is silent and the journal line
-  # above stays the fallback.
+  # $1 = the used hook-* capacity that triggered the refusal — the same number
+  # the message above printed, which is what is running or queued to start and
+  # NOT the raw registry key count (issue #280). Best effort: a state file that
+  # cannot be written must not turn a dropped batch into a crashed spawner, so
+  # every failure here is silent and the journal line above stays the fallback.
   mkdir -p "$BOX_STATE" 2>/dev/null || return 0
   prev=0
   first=""
@@ -1951,7 +1967,7 @@ record_refusal() {
       --arg topic "''${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
       --arg key "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" \
       --argjson live "$1" --argjson max "$MAX" --argjson count "$((prev + 1))" \
-      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). The batch was DROPPED, not queued. Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max}
+      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). The batch was DROPPED, not queued. `live` is the capacity in use: hook-* sessions running or queued to start (agent-box#280). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max}
        + (if $topic == "" then {} else {topic: $topic} end)
        + (if $key == "" then {} else {key: $key} end)' \
       > "$REFUSED.$$" 2>/dev/null; then
@@ -1962,12 +1978,73 @@ record_refusal() {
   return 0
 }
 
+# tmux is deliberately NOT on the receiver unit's PATH (jq, coreutils and
+# agent-box-session are all of it), so the liveness probe below gets a pinned
+# binary through the unit environment instead — the AGENT_BOX_*_BIN convention
+# the supervisor and the settings daemon already use for the tools their PATH
+# withholds. Unset means "no probe", and the cap then falls back to counting
+# registry keys: over-counting drops a batch, while reading a failed probe as
+# "nothing is running" would uncap spawning altogether.
+TMUX_BIN="''${AGENT_BOX_TMUX_BIN:-tmux}"
+# The socket dir is the agent unit's RuntimeDirectory, derived here rather than
+# inherited (issue #268 — same rule and same value as src/session-cli.sh): an
+# ambient TMUX_TMPDIR, which `programs.tmux` with secureSocket exports through
+# /etc/profile, would point the probe at an empty directory where every hook
+# session looks finished and the cap would stop holding.
+export TMUX_TMPDIR="/run/agent-box-''${USER:-$(id -un)}"
+
+# Names of live hook-* tmux sessions on stdout, one per line. Exit 0 means the
+# answer can be trusted — including an empty one, which is what a box whose
+# tmux server is down legitimately reports. Exit 1 means tmux itself could not
+# be run, so the caller must not read that same empty output as "nothing is
+# running": `tmux -V` separates the two before the query.
+live_hook_sessions() {
+  "$TMUX_BIN" -V >/dev/null 2>&1 || return 1
+  "$TMUX_BIN" -L agent-box list-sessions -F '#S' 2>/dev/null || true
+}
+
 if [ -s "$FILE" ]; then
-  live=$("$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' "$FILE")
-  if [ "$live" -ge "$MAX" ]; then
-    echo "agent-box-webhook-spawn: $live hook-* sessions already exist (max $MAX);" \
-         "dropping this batch — remove finished ones with 'agent-box-session rm NAME'" >&2
-    record_refusal "$live"
+  # Registry keys: every hook-* entry, finished or not. This was the whole cap
+  # and is now only its fallback — nothing ever expires an entry (`stopped` is
+  # set by the pane epilogue, and only `agent-box-session rm` clears the key),
+  # so sessions that ended weeks ago kept holding dispatch capacity until four
+  # of them made every standing watch inert with nothing running (issue #280).
+  # The probe costs two tmux round trips, so it only runs once the keys claim
+  # we are full.
+  keys=$("$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' "$FILE")
+  used="$keys"
+  if [ "$keys" -ge "$MAX" ]; then
+    if panes=$(live_hook_sessions); then
+      # Capacity is held by what is running or about to run: a live hook-* tmux
+      # session, or a listed hook-* entry that is not `stopped` — the
+      # supervisor's reconcile loop (re)starts one of those within ~2s, so it is
+      # load even in the second before it has a pane. A `stopped` entry is free:
+      # nothing respawns it until someone runs `agent-box-session restart`.
+      #
+      # Both halves matter. The listed half keeps the brake honest when the
+      # probe reaches a live tmux but the wrong (or an empty) socket dir; the
+      # pane half counts agents no entry claims — hand-started ones, and any
+      # delisted while still running.
+      used=$(printf '%s\n' "$panes" | "$JQ" -R -s --slurpfile reg "$FILE" '
+        (split("\n") | map(select(startswith("hook-")))) as $panes
+        | ($reg[0].sessions // {} | to_entries
+           | map(select((.key | startswith("hook-")) and .value.stopped != true))
+           | map(.key)) as $listed
+        | $panes + $listed | unique | length')
+    else
+      echo "agent-box-webhook-spawn: cannot ask tmux which hook-* sessions are" \
+           "live ($TMUX_BIN did not run); counting all $keys registry entries" \
+           "instead, so a finished session still holds its slot" >&2
+    fi
+  fi
+  if [ "$used" -ge "$MAX" ]; then
+    echo "agent-box-webhook-spawn: $used hook-* sessions are running or queued to" \
+         "start (max $MAX); dropping this batch — 'agent-box-session ls' shows" \
+         "which; stopping one frees its slot and 'agent-box-session rm NAME'" \
+         "delists it for good" >&2
+    # The number recorded is the number refused on: `agent-box-webhook status`
+    # must report the capacity the wrapper applied, not a second opinion.
+    record_refusal "$used"
     echo "agent-box-webhook-spawn: recorded in $REFUSED;" \
          "'agent-box-webhook status' reports it" >&2
     exit 1
@@ -8799,11 +8876,21 @@ in
           # Standing watches (deliver_to:"subagent", local-channels#1): a
           # matching delivery spawns a fresh hook-* session for this user.
           # webhook.py coalesces bursts and caps concurrent spawns; the
-          # wrapper additionally caps how many hook-* sessions may exist.
+          # wrapper additionally caps how many hook-* sessions may RUN.
           LOCAL_WEBHOOK_SPAWN_CMD = "${webhookSpawn}/bin/agent-box-webhook-spawn";
           # webhook.hookSessionArgs is NOT here: the wrapper carries it, so
           # the settings page and the CLI resolve the same default this unit
           # would have handed only to its own child (#292).
+          #
+          # That cap counts live tmux sessions, and tmux is deliberately not on
+          # this unit's PATH (see `path` above — the wrapper needs jq, coreutils
+          # and the session CLI, nothing else). So it gets a pinned binary
+          # instead of a wider PATH: the AGENT_BOX_*_BIN convention the
+          # supervisor uses for grep/find and the settings daemon for tmux.
+          # Without it the wrapper cannot tell a finished hook session from a
+          # running one and falls back to counting registry entries — the very
+          # over-counting of issue #280.
+          AGENT_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
         };
         serviceConfig = {
           User = name;

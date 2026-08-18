@@ -5,6 +5,7 @@ Requires=agent-box-webhook-agent.socket
 Wants=network-online.target
 
 [Service]
+Environment="AGENT_BOX_TMUX_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7b/bin/tmux"
 Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-67/lib/locale/locale-archive"
 Environment="LOCAL_WEBHOOK_PORT=0"
 Environment="LOCAL_WEBHOOK_RECEIVER_ONLY=1"

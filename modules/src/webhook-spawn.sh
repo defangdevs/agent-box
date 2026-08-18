@@ -170,7 +170,7 @@ if [ -n "$FLOCK" ] && { exec 9>>"$FILE.lock"; } 2>/dev/null; then
   fi
 fi
 
-# The ceiling on ACCUMULATED hook-* sessions, and the record it leaves.
+# The ceiling on CONCURRENT hook-* sessions, and the record it leaves.
 #
 # The cap itself is right — webhook.py rate-limits and coalesces spawns but
 # bounds nothing over time, so agents that forget their `agent-box-session rm`
@@ -203,10 +203,11 @@ case "$MAX" in
 esac
 
 record_refusal() {
-  # $1 = the live hook-* count that triggered the refusal. Best effort: a
-  # state file that cannot be written must not turn a dropped batch into a
-  # crashed spawner, so every failure here is silent and the journal line
-  # above stays the fallback.
+  # $1 = the used hook-* capacity that triggered the refusal — the same number
+  # the message above printed, which is what is running or queued to start and
+  # NOT the raw registry key count (issue #280). Best effort: a state file that
+  # cannot be written must not turn a dropped batch into a crashed spawner, so
+  # every failure here is silent and the journal line above stays the fallback.
   mkdir -p "$BOX_STATE" 2>/dev/null || return 0
   prev=0
   first=""
@@ -221,7 +222,7 @@ record_refusal() {
       --arg topic "${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
       --arg key "${LOCAL_WEBHOOK_SPAWN_KEY:-}" \
       --argjson live "$1" --argjson max "$MAX" --argjson count "$((prev + 1))" \
-      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). The batch was DROPPED, not queued. Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max}
+      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). The batch was DROPPED, not queued. `live` is the capacity in use: hook-* sessions running or queued to start (agent-box#280). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max}
        + (if $topic == "" then {} else {topic: $topic} end)
        + (if $key == "" then {} else {key: $key} end)' \
       > "$REFUSED.$$" 2>/dev/null; then
@@ -232,12 +233,73 @@ record_refusal() {
   return 0
 }
 
+# tmux is deliberately NOT on the receiver unit's PATH (jq, coreutils and
+# agent-box-session are all of it), so the liveness probe below gets a pinned
+# binary through the unit environment instead — the AGENT_BOX_*_BIN convention
+# the supervisor and the settings daemon already use for the tools their PATH
+# withholds. Unset means "no probe", and the cap then falls back to counting
+# registry keys: over-counting drops a batch, while reading a failed probe as
+# "nothing is running" would uncap spawning altogether.
+TMUX_BIN="${AGENT_BOX_TMUX_BIN:-tmux}"
+# The socket dir is the agent unit's RuntimeDirectory, derived here rather than
+# inherited (issue #268 — same rule and same value as src/session-cli.sh): an
+# ambient TMUX_TMPDIR, which `programs.tmux` with secureSocket exports through
+# /etc/profile, would point the probe at an empty directory where every hook
+# session looks finished and the cap would stop holding.
+export TMUX_TMPDIR="/run/agent-box-${USER:-$(id -un)}"
+
+# Names of live hook-* tmux sessions on stdout, one per line. Exit 0 means the
+# answer can be trusted — including an empty one, which is what a box whose
+# tmux server is down legitimately reports. Exit 1 means tmux itself could not
+# be run, so the caller must not read that same empty output as "nothing is
+# running": `tmux -V` separates the two before the query.
+live_hook_sessions() {
+  "$TMUX_BIN" -V >/dev/null 2>&1 || return 1
+  "$TMUX_BIN" -L agent-box list-sessions -F '#S' 2>/dev/null || true
+}
+
 if [ -s "$FILE" ]; then
-  live=$("$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' "$FILE")
-  if [ "$live" -ge "$MAX" ]; then
-    echo "agent-box-webhook-spawn: $live hook-* sessions already exist (max $MAX);" \
-         "dropping this batch — remove finished ones with 'agent-box-session rm NAME'" >&2
-    record_refusal "$live"
+  # Registry keys: every hook-* entry, finished or not. This was the whole cap
+  # and is now only its fallback — nothing ever expires an entry (`stopped` is
+  # set by the pane epilogue, and only `agent-box-session rm` clears the key),
+  # so sessions that ended weeks ago kept holding dispatch capacity until four
+  # of them made every standing watch inert with nothing running (issue #280).
+  # The probe costs two tmux round trips, so it only runs once the keys claim
+  # we are full.
+  keys=$("$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' "$FILE")
+  used="$keys"
+  if [ "$keys" -ge "$MAX" ]; then
+    if panes=$(live_hook_sessions); then
+      # Capacity is held by what is running or about to run: a live hook-* tmux
+      # session, or a listed hook-* entry that is not `stopped` — the
+      # supervisor's reconcile loop (re)starts one of those within ~2s, so it is
+      # load even in the second before it has a pane. A `stopped` entry is free:
+      # nothing respawns it until someone runs `agent-box-session restart`.
+      #
+      # Both halves matter. The listed half keeps the brake honest when the
+      # probe reaches a live tmux but the wrong (or an empty) socket dir; the
+      # pane half counts agents no entry claims — hand-started ones, and any
+      # delisted while still running.
+      used=$(printf '%s\n' "$panes" | "$JQ" -R -s --slurpfile reg "$FILE" '
+        (split("\n") | map(select(startswith("hook-")))) as $panes
+        | ($reg[0].sessions // {} | to_entries
+           | map(select((.key | startswith("hook-")) and .value.stopped != true))
+           | map(.key)) as $listed
+        | $panes + $listed | unique | length')
+    else
+      echo "agent-box-webhook-spawn: cannot ask tmux which hook-* sessions are" \
+           "live ($TMUX_BIN did not run); counting all $keys registry entries" \
+           "instead, so a finished session still holds its slot" >&2
+    fi
+  fi
+  if [ "$used" -ge "$MAX" ]; then
+    echo "agent-box-webhook-spawn: $used hook-* sessions are running or queued to" \
+         "start (max $MAX); dropping this batch — 'agent-box-session ls' shows" \
+         "which; stopping one frees its slot and 'agent-box-session rm NAME'" \
+         "delists it for good" >&2
+    # The number recorded is the number refused on: `agent-box-webhook status`
+    # must report the capacity the wrapper applied, not a second opinion.
+    record_refusal "$used"
     echo "agent-box-webhook-spawn: recorded in $REFUSED;" \
          "'agent-box-webhook status' reports it" >&2
     exit 1

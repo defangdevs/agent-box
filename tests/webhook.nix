@@ -1162,48 +1162,6 @@
         "test -e /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
 
-    # --- syncSessionPlugin: a stale session cache is refreshed at session start
-    # (issue #193, option 2) --------------------------------------------------
-    # The supervisor compares claude's plugin cache against the PINNED version
-    # before starting a claude session — the only moment that can matter, since
-    # a session loads its interpreter once. Asserted last: it restarts the agent
-    # unit, and nothing above should have to survive that.
-    machine.succeed(
-        "systemctl show -p Environment agent-box-agent.service"
-        " | grep 'AGENT_BOX_WEBHOOK_PINNED_SCRIPT=/nix/store/' >/dev/null"
-    )
-    set_cache_version("0.0.1")
-    machine.succeed("rm -f /home/agent/.claude/plugins/.agent-box-plugin-sync")
-    machine.succeed("systemctl restart agent-box-agent.service")
-    machine.wait_for_unit("agent-box-agent.service")
-    # It notices, and names both versions.
-    machine.wait_until_succeeds(
-        "journalctl -u agent-box-agent --no-pager"
-        f" | grep 'cache 0.0.1 is older than the pinned {pinned} — refreshing' >/dev/null",
-        timeout=60,
-    )
-    # This VM has no route to GitHub, so the refresh fails — and that must be a
-    # logged line, not a session that never starts.
-    machine.wait_until_succeeds(
-        "journalctl -u agent-box-agent --no-pager"
-        " | grep 'could not refresh the cache' >/dev/null",
-        timeout=120,
-    )
-    machine.succeed("systemctl is-active agent-box-agent.service")
-    # The attempt is stamped, so the next session start inside the retry window
-    # does not pay the timeout again. A box whose claude keeps exiting restarts
-    # sessions in a loop; without this the loop would be a loop of timeouts.
-    machine.succeed(
-        "grep -q '^%s ' /home/agent/.claude/plugins/.agent-box-plugin-sync" % pinned
-    )
-    machine.succeed("journalctl --rotate --vacuum-time=1s")
-    machine.succeed("systemctl restart agent-box-agent.service")
-    machine.wait_for_unit("agent-box-agent.service")
-    machine.wait_until_succeeds(
-        "journalctl -u agent-box-agent --no-pager | grep 'not retrying yet' >/dev/null",
-        timeout=60,
-    )
-
     # --- the hook-session ceiling is visible, not merely enforced (#170) -----
     # A standing watch is the one delivery shape with no session behind it, so
     # when the spawn wrapper refuses a batch webhook.py drops it and NOBODY got
@@ -1223,7 +1181,7 @@
         )
         err = machine.succeed("cat /tmp/cap.err")
         if expect is None:
-            assert "hook-* sessions already exist" not in err, err
+            assert "hook-* sessions are running" not in err, err
         else:
             assert expect in err, err
         return json.loads(out)["dispatch"]
@@ -1240,10 +1198,14 @@
     assert "warning" not in d, d
 
     # The issue's own smallest reproduction: lower the ceiling under the hook
-    # sessions this test already accumulated, then drive the wrapper.
+    # sessions this test already accumulated, then drive the wrapper. Capacity
+    # is held by the entries that are not `stopped` (#280), which is every one
+    # of them here — nothing has been stopped yet, and the leg below is where
+    # a stopped entry and a running one are told apart.
     live = int(machine.succeed(
-        "jq '[.sessions | keys[] | select(startswith(\"hook-\"))] | length'"
-        " /home/agent/.config/agent-box/sessions.json"
+        "jq '[.sessions | to_entries[]"
+        " | select((.key | startswith(\"hook-\")) and .value.stopped != true)]"
+        " | length' /home/agent/.config/agent-box/sessions.json"
     ).strip())
     assert live >= 1, live
     drop_env = (
@@ -1257,6 +1219,16 @@
     rc, refusal_log = machine.execute(drop_env)
     assert rc == 1, (rc, refusal_log)
     assert "dropping this batch" in refusal_log, refusal_log
+    # What the refusal is recorded against is what it was refused ON: since
+    # #280 that is the capacity in USE — hook-* sessions running or queued to
+    # start — and no longer the raw key count. Nothing here is `stopped`, so
+    # the two numbers agree; the #280 leg below drives them apart and asserts
+    # the record follows the cap.
+    refused_line = [
+        ln for ln in refusal_log.splitlines() if "hook-* sessions are running" in ln
+    ][0]
+    refused_used = int(refused_line.split(":", 1)[1].split()[0])
+    assert refused_used == live, (refusal_log, live)
     # The batch is gone, not queued — no session, and the record is the only
     # thing left of it.
     machine.fail(
@@ -1265,7 +1237,7 @@
     )
     rec = json.loads(machine.succeed(f"cat {refused}"))
     assert rec["count"] == 1, rec
-    assert rec["live"] == live, (rec, live)
+    assert rec["live"] == refused_used, (rec, refusal_log)
     assert rec["max"] == 1, rec
     assert rec["topic"] == "github:defangdevs/*", rec
     assert rec["key"] == "defangdevs/dropped", rec
@@ -1276,7 +1248,7 @@
     # already sets for a receiver with no spawn command, so there is a single
     # place to look rather than two.
     d = dispatch_status(cap="AGENT_BOX_HOOK_SESSION_MAX=1",
-                        expect="hook-* sessions already exist")
+                        expect="hook-* sessions are running")
     assert d["hookSessions"] == {"live": live, "max": 1, "atCapacity": True}, d
     assert "DROPPED" in d["warning"], d
     assert "agent-box-session rm NAME" in d["warning"], d
@@ -1339,6 +1311,189 @@
         " /home/agent/.config/agent-box/sessions.json"
     ).strip()
     machine.succeed(f"sudo -u agent env HOME=/home/agent agent-box-session rm {typo}")
+
+    # --- the dispatch cap counts what RUNS, not registry keys (issue #280) ---
+    # The cap used to count hook-* keys in sessions.json, and nothing expires a
+    # key: `stopped` is written by the pane epilogue and only
+    # `agent-box-session rm` clears it. So sessions that had long since finished
+    # kept holding dispatch capacity — the origin box sat at 2 of 4 slots held
+    # by corpses with no hook-* tmux session alive at all — and at four every
+    # standing watch went inert, journal-only (#170). Capacity now follows what
+    # the box is running.
+    #
+    # The liveness probe needs tmux, which the receiver unit's PATH deliberately
+    # does not carry (jq, coreutils and the session CLI are all of it), so the
+    # module pins the binary through the unit environment instead — the
+    # AGENT_BOX_*_BIN convention. Asserted first: without it the wrapper cannot
+    # tell a finished hook session from a running one, and would fall straight
+    # back to the count this leg exists to replace.
+    recv_env = machine.succeed(
+        "systemctl show -p Environment --value agent-box-webhook-agent.service"
+        " | tr ' ' '\\n'"
+    ).split("\n")
+    recv_path = [v.strip('"') for v in recv_env if v.startswith("PATH=")][0]
+    recv_tmux = [
+        v.strip('"') for v in recv_env if v.startswith("AGENT_BOX_TMUX_BIN=")
+    ][0]
+    tmux_bin = recv_tmux.split("=", 1)[1]
+    machine.fail(f"env -i {recv_path} {sw}/sh -c 'command -v tmux'")
+    machine.succeed(f"test -x {tmux_bin}")
+
+    # The wrapper is driven with exactly that environment — the receiver's own
+    # PATH plus the pinned binary — so what the cap can observe here is what it
+    # can observe in production.
+    def cap_spawn(key, maximum, tmux=None, want=True):
+        cmd = (
+            f"sudo -u agent env -i HOME=/home/agent {recv_path}"
+            f" {tmux if tmux else recv_tmux}"
+            f" AGENT_BOX_HOOK_SESSION_MAX={maximum}"
+            " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+            " LOCAL_WEBHOOK_SPAWN_SOURCE=github"
+            f" LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/{key}"
+            f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
+        )
+        return machine.succeed(cmd) if want else machine.fail(cmd)
+
+    def cap_session(key):
+        return machine.succeed(
+            "jq -r '.sessions | keys[]"
+            f" | select(startswith(\"hook-defangdevs-{key}-\"))'"
+            " /home/agent/.config/agent-box/sessions.json"
+        ).strip()
+
+    # Delist what the legs above left, so the arithmetic below is only about
+    # the sessions this one creates.
+    for stale in machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).split():
+        machine.succeed(
+            f"sudo -u agent env HOME=/home/agent agent-box-session rm {stale}"
+        )
+    hook_ls = (
+        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
+        " list-sessions -F '#S'"
+    )
+    hook_keys = (
+        "jq '[.sessions | keys[] | select(startswith(\"hook-\"))] | length'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    assert machine.succeed(hook_keys).strip() == "0"
+
+    # One hook session running, one finished: the shape that wedged the watch.
+    cap_spawn("capbusy", 2)
+    busy = cap_session("capbusy")
+    machine.wait_until_succeeds(f"{hook_ls} | grep -x {busy} >/dev/null", timeout=60)
+    # The probe also has to work from where the receiver runs it, not just from
+    # a login shell: ProtectSystem=strict leaves /run read-only, which does not
+    # stop a tmux CLIENT connecting to the socket there, but a mount namespace
+    # that hid the agent unit's RuntimeDirectory would.
+    machine.succeed(
+        "systemd-run --wait --pipe --uid=agent"
+        " --property=ProtectSystem=strict --property=ProtectHome=false"
+        " --property=ReadWritePaths=/home/agent --property=PrivateDevices=true"
+        " --setenv=TMUX_TMPDIR=/run/agent-box-agent"
+        f" {tmux_bin} -L agent-box list-sessions -F '#S'"
+        f" | grep -x {busy} >/dev/null"
+    )
+    cap_spawn("capdone", 2)
+    done = cap_session("capdone")
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session stop {done}"
+    )
+    machine.succeed(
+        f"jq -e '.sessions[\"{done}\"].stopped == true'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+
+    # Two hook-* keys at MAX=2, only one of them running. The old count dropped
+    # this batch for good; the new one spends the slot the finished session was
+    # sitting on. (Asserted, not assumed: a stray coalesced dispatch landing
+    # here would otherwise turn the arithmetic below into a puzzle.)
+    assert machine.succeed(hook_keys).strip() == "2"
+    cap_spawn("capfree", 2)
+    free = cap_session("capfree")
+    machine.wait_until_succeeds(f"{hook_ls} | grep -x {free} >/dev/null", timeout=60)
+
+    # ...and the brake is not simply gone: the SAME cap, with both slots now
+    # genuinely running, still drops the batch and says so — the only
+    # difference between this call and the one above is liveness, which is
+    # therefore worth restating as this assertion's precondition.
+    machine.succeed(f"{hook_ls} | grep -x {busy} >/dev/null")
+    machine.succeed(f"{hook_ls} | grep -x {free} >/dev/null")
+    drop = cap_spawn("capblocked", 2, want=False)
+    assert "2 hook-* sessions are running or queued to start" in drop, drop
+    # And the record #170 leaves carries THAT number, not the key count it
+    # replaced: three hook-* entries are listed here and the wrapper refused on
+    # the two that are running. One number, decided once, reported everywhere.
+    assert "recorded in" in drop, drop
+    blocked_rec = json.loads(machine.succeed(f"cat {refused}"))
+    assert blocked_rec["live"] == 2, (blocked_rec, drop)
+    assert blocked_rec["max"] == 2, blocked_rec
+    assert blocked_rec["key"] == "defangdevs/capblocked", blocked_rec
+    machine.fail(
+        "jq -e '.sessions | keys[]"
+        " | select(startswith(\"hook-defangdevs-capblocked\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+
+    # A probe that cannot run must not read as "nothing is running": it falls
+    # back to the old key count, which drops a batch it might have allowed
+    # (three keys, MAX=3) rather than uncapping spawns altogether. The same
+    # call with the pinned tmux working sees two live sessions and spawns.
+    assert machine.succeed(hook_keys).strip() == "3"
+    blind = cap_spawn(
+        "capnoprobe", 3, tmux="AGENT_BOX_TMUX_BIN=/nonexistent/tmux", want=False
+    )
+    assert "cannot ask tmux" in blind, blind
+    cap_spawn("capprobe", 3)
+    probe = cap_session("capprobe")
+    for name in [busy, done, free, probe]:
+        machine.succeed(
+            f"sudo -u agent env HOME=/home/agent agent-box-session rm {name}"
+        )
+
+    # --- syncSessionPlugin: a stale session cache is refreshed at session start
+    # (issue #193, option 2) --------------------------------------------------
+    # The supervisor compares claude's plugin cache against the PINNED version
+    # before starting a claude session — the only moment that can matter, since
+    # a session loads its interpreter once. Asserted last: it restarts the agent
+    # unit, and nothing above should have to survive that.
+    machine.succeed(
+        "systemctl show -p Environment agent-box-agent.service"
+        " | grep 'AGENT_BOX_WEBHOOK_PINNED_SCRIPT=/nix/store/' >/dev/null"
+    )
+    set_cache_version("0.0.1")
+    machine.succeed("rm -f /home/agent/.claude/plugins/.agent-box-plugin-sync")
+    machine.succeed("systemctl restart agent-box-agent.service")
+    machine.wait_for_unit("agent-box-agent.service")
+    # It notices, and names both versions.
+    machine.wait_until_succeeds(
+        "journalctl -u agent-box-agent --no-pager"
+        f" | grep 'cache 0.0.1 is older than the pinned {pinned} — refreshing' >/dev/null",
+        timeout=60,
+    )
+    # This VM has no route to GitHub, so the refresh fails — and that must be a
+    # logged line, not a session that never starts.
+    machine.wait_until_succeeds(
+        "journalctl -u agent-box-agent --no-pager"
+        " | grep 'could not refresh the cache' >/dev/null",
+        timeout=120,
+    )
+    machine.succeed("systemctl is-active agent-box-agent.service")
+    # The attempt is stamped, so the next session start inside the retry window
+    # does not pay the timeout again. A box whose claude keeps exiting restarts
+    # sessions in a loop; without this the loop would be a loop of timeouts.
+    machine.succeed(
+        "grep -q '^%s ' /home/agent/.claude/plugins/.agent-box-plugin-sync" % pinned
+    )
+    machine.succeed("journalctl --rotate --vacuum-time=1s")
+    machine.succeed("systemctl restart agent-box-agent.service")
+    machine.wait_for_unit("agent-box-agent.service")
+    machine.wait_until_succeeds(
+        "journalctl -u agent-box-agent --no-pager | grep 'not retrying yet' >/dev/null",
+        timeout=60,
+    )
 
     # The daemon is the ingress owner and survives every delivery — the box's
     # endpoint must not depend on which sessions happen to be alive.
