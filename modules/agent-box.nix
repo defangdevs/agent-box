@@ -807,9 +807,31 @@ JQ=jq
 FILE="$HOME/.config/agent-box/sessions.json"
 AGENTS="''${AGENT_BOX_AGENTS:?}"
 DEFAULT_AGENT="''${AGENT_BOX_DEFAULT_AGENT:?}"
-export TMUX_TMPDIR="''${TMUX_TMPDIR:-/run/agent-box-$USER}"
+# NOT ''${TMUX_TMPDIR:-...}: the socket dir is the agent unit's
+# RuntimeDirectory, never the caller's to choose (issue #268). Deferring to
+# an inherited value let any system-wide setting repoint the whole CLI at an
+# empty directory, where every verb finds no sessions and reports success --
+# `programs.tmux` with secureSocket on exports TMUX_TMPDIR through
+# /etc/profile, so an SSH login shell did exactly that.
+export TMUX_TMPDIR="/run/agent-box-''${USER:-$(id -un)}"
 
 t() { tmux -L agent-box "$@"; }
+
+# A kill that did not happen must never be reported as a removal (issue
+# #268). "can't find session" is the one benign failure -- the session is
+# already gone, which is what every caller here wanted anyway. Anything else
+# (no server on this socket, an unreachable one) leaves the session running
+# while its entry disappears from sessions.json, and nothing cleans that up
+# afterwards: the supervisor's reconcile loop is ensure-only and never kills.
+kill_session() {
+  kerr="$(t kill-session -t "=$1" 2>&1)" && return 0
+  case "$kerr" in
+    *"can't find session"*) return 0 ;;
+  esac
+  echo "agent-box-session: could not kill tmux session '$1': $kerr" >&2
+  return 1
+}
+
 usage() {
   echo "usage: agent-box-session ls"
   echo "       agent-box-session add [NAME] [--agent AGENT] [--cwd DIR]"
@@ -986,7 +1008,7 @@ case "$cmd" in
     valid_name "$name" || { usage >&2; exit 2; }
     ensure_file
     jq_edit --arg n "$name" 'del(.sessions[$n])'
-    t kill-session -t "=$name" 2>/dev/null || true
+    kill_session "$name" || exit 1
     prune_filter "$name"
     echo "session '$name' removed"
     ;;
@@ -1003,7 +1025,7 @@ case "$cmd" in
       exit 2
     fi
     jq_edit --arg n "$name" '.sessions[$n].stopped = true'
-    t kill-session -t "=$name" 2>/dev/null || true
+    kill_session "$name" || exit 1
     echo "session '$name' stopped — still listed, not respawned; 'agent-box-session restart $name' revives it"
     ;;
   restart)
@@ -1013,7 +1035,7 @@ case "$cmd" in
       ensure_file
       jq_edit 'del(.sessions[].stopped)'
       "$JQ" -r '.sessions | keys[]' "$FILE" | while IFS= read -r n; do
-        [ -n "$n" ] && t kill-session -t "=$n" 2>/dev/null || true
+        [ -n "$n" ] && kill_session "$n" || true
       done
       echo "all sessions killed — the supervisor restarts each within ~2s (re-reading env)"
     else
@@ -1022,8 +1044,9 @@ case "$cmd" in
       ensure_file
       if taken "$name"; then
         jq_edit --arg n "$name" 'del(.sessions[$n].stopped)'
-        # || true: a stopped session has no live tmux session to kill.
-        t kill-session -t "=$name" 2>/dev/null || true
+        # A stopped session has no live tmux session to kill; kill_session
+        # treats that "can't find session" as success.
+        kill_session "$name" || exit 1
         echo "session '$name' killed — the supervisor restarts it within ~2s"
       else
         # Unlisted (hand-started) session: the kill is all there is, and
