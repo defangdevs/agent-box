@@ -1093,6 +1093,12 @@ in
           sessions; sessions people create keep their own arguments. The
           args are agent-CLI-specific — pick ones the default agent
           understands.
+
+          This is the fleet-wide default only. Any user can override it for
+          their own hook sessions at runtime, no rebuild, by chatting with
+          their agent: `agent-box-session env set AGENT_BOX_HOOK_SESSION_ARGS
+          '["--model","sonnet"]'` (issue #290) — the spawn wrapper re-reads
+          that file on every dispatch and prefers it over this option.
         '';
       };
       watchPolicy = lib.mkOption {
