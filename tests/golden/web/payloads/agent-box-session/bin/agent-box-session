@@ -113,11 +113,39 @@ jq_edit() {
 }
 taken() { "$JQ" -e --arg n "$1" '.sessions | has($n)' "$FILE" >/dev/null; }
 gen_name() {
-  # gen_name AGENT — echo a unique session name derived from AGENT: the
-  # bare name when free ("claude"), else a short random suffix
-  # ("claude-a3f9"). Callers pass a validated agent, itself a valid name.
+  # gen_name AGENT [CWD] — echo a unique session name derived from AGENT: the
+  # bare name when free ("claude"), else the working directory's own name
+  # ("portal", then "portal-2"). Callers pass a validated agent, itself a
+  # valid name; CWD is whatever the caller will store, so it is untrusted
+  # text and gets folded into the name charset here.
+  #
+  # A random "claude-a3f9" named nothing an operator could recognise, and the
+  # web UI's row shows only name, agent, cwd and state — so two auto-named
+  # claude sessions under one project tree were indistinguishable and the
+  # wrong transcript got downloaded (issue #277). The directory name is the
+  # one fact that says WHERE this session works.
   a="$1"
   taken "$a" || { printf '%s' "$a"; return; }
+  # HOME is deliberately not used: its basename is the user's own name, which
+  # says nothing (every default session sits there), so those keep the hex.
+  base="${2:-}"
+  [ "$base" != "$HOME" ] || base=""
+  base="${base%/}"
+  base="${base##*/}"
+  base="${base//[!A-Za-z0-9_-]/-}"     # bash-only, like the $RANDOM below
+  base="${base#-}"
+  base="${base%-}"
+  if [ -n "$base" ] && [ "${#base}" -le "$((NAME_MAX - 2))" ]; then
+    taken "$base" || { printf '%s' "$base"; return; }
+    n=2
+    while [ "$n" -le 9 ]; do
+      cand="$base-$n"
+      taken "$cand" || { printf '%s' "$cand"; return; }
+      n=$((n + 1))
+    done
+  fi
+  # Last resort: no usable directory name, or nine sessions already work in
+  # that directory. Random cannot collide the way a tenth "-N" guess would.
   while :; do
     cand="$a-$(printf '%04x' $((RANDOM % 65536)))"
     taken "$cand" || { printf '%s' "$cand"; return; }
@@ -168,7 +196,7 @@ case "$cmd" in
       (*) echo "agent '$agent' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
     ensure_file
-    [ -n "$name" ] || name="$(gen_name "$agent")"
+    [ -n "$name" ] || name="$(gen_name "$agent" "$cwd")"
     if taken "$name"; then
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2

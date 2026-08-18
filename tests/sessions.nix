@@ -1123,6 +1123,45 @@
             timeout=60,
         )
 
+        # A SECOND session in that directory is named after the DIRECTORY
+        # (issue #277): "claude" is taken now, and a random "claude-a3f9" named
+        # nothing an operator could recognise in a row. Both creation paths
+        # mint names, so both are asserted — the daemon's gen_session_name and
+        # the CLI's gen_name must agree.
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "-d 'agent=claude&cwd=~/work/repo' "
+            "https://box.test/sessions/add | grep -x 303"
+        )
+        machine.succeed(
+            "jq -e '.sessions.repo.workingDirectory == \"/home/agent/work/repo\"' "
+            "/home/agent/.config/agent-box/sessions.json"
+        )
+        machine.succeed(as_agent(
+            "agent-box-session add --agent claude --cwd /home/agent/work/repo"
+        ))
+        machine.succeed(
+            "jq -e '.sessions | has(\"repo-2\")' "
+            "/home/agent/.config/agent-box/sessions.json"
+        )
+        # A session in HOME keeps the random suffix: home's basename is the
+        # user's own name, which says nothing about the work.
+        machine.succeed(as_agent("agent-box-session add --agent claude"))
+        machine.succeed(
+            "jq -e '[.sessions | keys[] | select(startswith(\"claude-\"))] "
+            "| length == 1' /home/agent/.config/agent-box/sessions.json"
+        )
+        for extra in ["repo", "repo-2"]:
+            client.succeed(
+                f"{curl} -u agent:testpassword -o /dev/null "
+                f"-d 'name={extra}' https://box.test/sessions/delete"
+            )
+        suffixed = machine.succeed(
+            "jq -r '.sessions | keys[] | select(startswith(\"claude-\"))' "
+            "/home/agent/.config/agent-box/sessions.json"
+        ).strip()
+        machine.succeed(as_agent(f"agent-box-session rm {suffixed}"))
+
         # Clean up so the migration subtest starts from a known session set.
         client.succeed(
             f"{curl} -u agent:testpassword -o /dev/null "
@@ -1198,7 +1237,8 @@
         ).strip()
         assert re.match(r"^[0-9a-f-]{36}$", box_id), box_id
         proj = "/home/agent/.claude/projects/-home-agent"
-        turn = '{"type":"user","text":"hello"}'
+        turn = ('{"type":"user","message":{"role":"user",'
+                '"content":"audit the vendored openauth fork"}}')
 
         def seed(path, content, mode="0600"):
             """Stand in a file the agent would have written: root-created and
@@ -1229,6 +1269,18 @@
             f"{curl} -u agent:testpassword https://box.test/agent/settings/"
         )
         assert 'href="/sessions/transcript?name=main" download' in row_page, row_page
+
+        # The row says WHICH conversation it holds, and so does the tooltip:
+        # the opening prompt, the size, and when the file was last appended to
+        # (issue #277). Two claude rows under one project tree used to read
+        # identically — name, agent, cwd, state and nothing else — so the wrong
+        # transcript got downloaded. The prompt is text the operator typed, so
+        # it must arrive ESCAPED in both attributes.
+        assert 'class="meta topic"' in row_page, row_page
+        assert "audit the vendored openauth fork" in row_page, row_page
+        assert ('title="Download transcript '
+                "&quot;audit the vendored openauth fork&quot; (") in row_page, row_page
+        assert "last written " in row_page, row_page
         headers = client.succeed(
             f"{curl} -u agent:testpassword -D - -o /tmp/tr.jsonl "
             "'https://box.test/sessions/transcript?name=main'"
@@ -1244,7 +1296,9 @@
         # few seconds per session.
         cleared = "11111111-2222-3333-4444-555555555555"
         record_dir = "/home/agent/.local/state/agent-box/live-session-id"
-        seed(f"{proj}/{cleared}.jsonl", '{"type":"user","text":"after clear"}')
+        seed(f"{proj}/{cleared}.jsonl",
+             '{"type":"user","message":{"role":"user",'
+             '"content":"after the clear"}}')
         seed(f"{record_dir}/{box_id}", cleared, mode="0644")
         client.wait_until_succeeds(
             f"{curl} -u agent:testpassword -D - -o /dev/null "
@@ -1252,6 +1306,14 @@
             f"| grep 'filename=\"main-{cleared}.jsonl\"' >/dev/null",
             timeout=60,
         )
+
+        # The row's label follows that rotation too: it must advertise the
+        # conversation the button hands over, never the one /clear replaced.
+        rotated_page = client.succeed(
+            f"{curl} -u agent:testpassword https://box.test/agent/settings/"
+        )
+        assert "after the clear" in rotated_page, rotated_page
+        assert "audit the vendored openauth fork" not in rotated_page, rotated_page
 
         # A session with no conversation to hand over (here a shell session,
         # but equally a codex session started with no prompt to stamp) gets

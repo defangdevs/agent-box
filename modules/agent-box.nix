@@ -914,11 +914,39 @@ jq_edit() {
 }
 taken() { "$JQ" -e --arg n "$1" '.sessions | has($n)' "$FILE" >/dev/null; }
 gen_name() {
-  # gen_name AGENT — echo a unique session name derived from AGENT: the
-  # bare name when free ("claude"), else a short random suffix
-  # ("claude-a3f9"). Callers pass a validated agent, itself a valid name.
+  # gen_name AGENT [CWD] — echo a unique session name derived from AGENT: the
+  # bare name when free ("claude"), else the working directory's own name
+  # ("portal", then "portal-2"). Callers pass a validated agent, itself a
+  # valid name; CWD is whatever the caller will store, so it is untrusted
+  # text and gets folded into the name charset here.
+  #
+  # A random "claude-a3f9" named nothing an operator could recognise, and the
+  # web UI's row shows only name, agent, cwd and state — so two auto-named
+  # claude sessions under one project tree were indistinguishable and the
+  # wrong transcript got downloaded (issue #277). The directory name is the
+  # one fact that says WHERE this session works.
   a="$1"
   taken "$a" || { printf '%s' "$a"; return; }
+  # HOME is deliberately not used: its basename is the user's own name, which
+  # says nothing (every default session sits there), so those keep the hex.
+  base="''${2:-}"
+  [ "$base" != "$HOME" ] || base=""
+  base="''${base%/}"
+  base="''${base##*/}"
+  base="''${base//[!A-Za-z0-9_-]/-}"     # bash-only, like the $RANDOM below
+  base="''${base#-}"
+  base="''${base%-}"
+  if [ -n "$base" ] && [ "''${#base}" -le "$((NAME_MAX - 2))" ]; then
+    taken "$base" || { printf '%s' "$base"; return; }
+    n=2
+    while [ "$n" -le 9 ]; do
+      cand="$base-$n"
+      taken "$cand" || { printf '%s' "$cand"; return; }
+      n=$((n + 1))
+    done
+  fi
+  # Last resort: no usable directory name, or nine sessions already work in
+  # that directory. Random cannot collide the way a tenth "-N" guess would.
   while :; do
     cand="$a-$(printf '%04x' $((RANDOM % 65536)))"
     taken "$cand" || { printf '%s' "$cand"; return; }
@@ -969,7 +997,7 @@ case "$cmd" in
       (*) echo "agent '$agent' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
     ensure_file
-    [ -n "$name" ] || name="$(gen_name "$agent")"
+    [ -n "$name" ] || name="$(gen_name "$agent" "$cwd")"
     if taken "$name"; then
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
@@ -4286,18 +4314,36 @@ in
             return result
 
 
-        def gen_session_name(agent, sessions):
-            """Auto-generate a unique session name from the agent CLI name.
+        def gen_session_name(agent, sessions, cwd=None):
+            """Auto-generate a unique session name from the agent and its directory.
 
-            The first session for an agent gets the bare name ("claude"); a
-            later one that would collide gets a short random suffix
-            ("claude-a3f9") to stay unique yet readable. Users rarely care what
-            a session is called (rename at runtime via /rename), so this spares
-            them inventing one. `agent` is always one of AGENTS (or "shell"),
-            so it already matches SESSION_RE.
+            The first session for an agent gets the bare name ("claude"); a later one
+            that would collide is named after the directory it works in ("portal",
+            then "portal-2"). Users rarely care what a session is called (rename at
+            runtime via /rename), so this spares them inventing one — but the name is
+            also all a row shows about WHICH session it is, and a random "claude-a3f9"
+            said nothing, so two auto-named sessions under one project tree were
+            indistinguishable and the wrong transcript got downloaded (issue #277).
+
+            `agent` is always one of AGENTS (or "shell"), so it already matches
+            SESSION_RE; `cwd` is None for home (whose basename is the user's own name
+            and names nothing) or an absolute path this daemon has resolved. Keeping
+            the mirror in session-cli.sh's gen_name in step is deliberate: both
+            creation paths must name a session the same way.
             """
             if agent not in sessions:
                 return agent
+            base = re.sub(r"[^A-Za-z0-9_-]", "-", os.path.basename((cwd or "").rstrip("/")))
+            base = base.strip("-")
+            if base and len(base) <= NAME_MAX - 2:
+                if base not in sessions:
+                    return base
+                for suffix in range(2, 10):
+                    candidate = "%s-%d" % (base, suffix)
+                    if candidate not in sessions:
+                        return candidate
+            # No usable directory name, or nine sessions already work in that one:
+            # random cannot collide the way a tenth "-N" guess would.
             for _ in range(1000):
                 candidate = "%s-%s" % (agent, secrets.token_hex(2))
                 if candidate not in sessions:
@@ -4567,10 +4613,10 @@ in
             if not path:
                 return None
             try:
-                size = os.stat(path).st_size
+                info = os.stat(path)
             except OSError:
                 return None
-            return path, size
+            return path, info.st_size, info.st_mtime
 
 
         def human_size(size):
@@ -4581,6 +4627,92 @@ in
             if size < 1024 * 1024:
                 return "%d KB" % round(size / 1024)
             return "%.1f MB" % (size / (1024 * 1024))
+
+
+        # --- What conversation a row holds (issue #277) -----------------------
+        # A row showed four things: name, agent, working directory and state. None of
+        # them says what the conversation IS, so two claude rows under one project
+        # tree read identically — and gen_name mints names like "claude-5109" that
+        # mean nothing on their own. An operator downloaded one session's transcript
+        # while wanting another's. The file the row already resolves for its size
+        # answers it: what the conversation was asked first.
+        TOPIC_SCAN_BYTES = 256 * 1024   # a long first tool result can precede turn one
+        TOPIC_MAX = 72                  # a row is one line, not a paragraph
+        _topic_cache = {}
+
+
+        def elide(text, limit):
+            """`text` cut to `limit`, on a word boundary when there is one, with an
+            ellipsis so a truncated prompt does not read as a complete one."""
+            if len(text) <= limit:
+                return text
+            cut = text[:limit - 1]
+            space = cut.rfind(" ")
+            if space >= limit // 2:
+                cut = cut[:space]
+            return cut.rstrip(" ,.;:-") + "\u2026"
+
+
+        def transcript_topic(path, size):
+            """The opening user turn of a transcript, or "" when it has none yet.
+
+            A found topic is cached for the life of the daemon: a transcript only ever
+            grows, and its FIRST turn cannot change. NOT finding one is cached against
+            the size instead, so the answer refreshes as the file grows (a session that
+            has not been asked anything yet, or a codex rollout, whose records this
+            does not model) without re-reading it on every render — and the live feed
+            re-renders the panel on every session state change.
+            """
+            cached = _topic_cache.get(path)
+            if cached and (cached[1] or cached[0] == size):
+                return cached[1]
+            try:
+                with open(path, "rb") as handle:
+                    head = handle.read(TOPIC_SCAN_BYTES)
+            except OSError:
+                return ""
+            topic = ""
+            for line in head.splitlines():
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    # The agent can be mid-write on the last line, and a codex rollout
+                    # carries records this does not model. Neither is worth a label.
+                    continue
+                if not isinstance(record, dict) or record.get("isSidechain"):
+                    continue
+                message = record.get("message")
+                if not isinstance(message, dict):
+                    continue
+                if record.get("type") != "user" and message.get("role") != "user":
+                    continue
+                body = message.get("content")
+                if isinstance(body, list):
+                    # Content blocks: keep the text ones, drop images and tool results.
+                    body = " ".join(
+                        part.get("text", "") for part in body if isinstance(part, dict)
+                    )
+                if not isinstance(body, str):
+                    continue
+                text = " ".join(body.split())
+                # /clear opens the next segment with the slash command itself, wrapped
+                # in the local-command caveat; the operator's own prompt follows it.
+                if not text or "<local-command" in text or "<command-" in text:
+                    continue
+                topic = elide(text, TOPIC_MAX)
+                break
+            if len(_topic_cache) > 256:
+                # Same reasoning as _transcript_cache: the keyspace grows with every
+                # session that ever ran, and nothing here is worth an eviction policy.
+                _topic_cache.clear()
+            _topic_cache[path] = (size, topic)
+            return topic
+
+
+        def when_written(mtime):
+            """Local "MM-DD HH:MM" for a tooltip. The operator is choosing between
+            conversations from this week, so the day matters and the year does not."""
+            return time.strftime("%m-%d %H:%M", time.localtime(mtime))
 
 
         def download_name(session, path):
@@ -5215,6 +5347,11 @@ in
                            color: #8b949e; white-space: pre-wrap;
                            overflow-wrap: anywhere; }
           .meta { color: #8b949e; font-size: 12px; }
+          /* The conversation's opening prompt on a session row (issue #277):
+             ellipsized, because it must identify the row without pushing the
+             row's own actions off the line. */
+          .topic { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            max-width: 34ch; font-style: italic; }
           /* The webhook chip is a different KIND of fact from the agent name and
              the cwd beside it — what the fold holds — so it gets its own pill
              rather than joining the row's run of grey. */
@@ -6448,14 +6585,33 @@ in
                     # the link never reaches the summary's own toggle (measured in
                     # chromium, and the same rule the Restart button relies on).
                     found = transcript_of(entries[name])
+                    topic = transcript_topic(found[0], found[1]) if found else ""
                     if found:
-                        tip = "Download transcript (%s)" % human_size(found[1])
+                        # Both halves of "which conversation is this": the opening
+                        # prompt and when the file was last appended to. html.escape
+                        # is not decoration here — the topic is a prompt the operator
+                        # typed, so it reaches an attribute as data (issue #277).
+                        detail = "%s, last written %s" % (
+                            human_size(found[1]), when_written(found[2]))
+                        if topic:
+                            tip = 'Download transcript "%s" (%s)' % (topic, detail)
+                        else:
+                            tip = "Download transcript (%s)" % detail
+                        tip = html.escape(tip)
                         download = (
                             f'<a class="icon" href="{base}/sessions/transcript?name={safe}" '
                             f'download aria-label="{tip}" title="{tip}">{ICON_DOWNLOAD}</a>'
                         )
                     else:
                         download = ""
+                    # The same answer on the row itself, so choosing does not need a
+                    # hover: CSS ellipsizes it rather than pushing the actions out.
+                    if topic:
+                        shown = html.escape(topic)
+                        subject = ('<span class="meta topic" title="Conversation: '
+                                   f'{shown}">{shown}</span>')
+                    else:
+                        subject = ""
                     row = (
                         # The name deep-links into the terminal via ttyd's
                         # ?arg= session selector. No userinfo in the href
@@ -6464,6 +6620,7 @@ in
                         f'<a class="sess" href="/{user}/?arg={safe}"><code>{safe}</code></a>'
                         f'<span class="meta">{agent}</span>'
                         f'<span class="meta" title="Working directory"><code>{cwd}</code></span>'
+                        f'{subject}'
                         f'<span class="state" data-state="{state}">{state}</span>'
                         f'{render_subs_chip(subs, name)}</span>'
                         f'<span class="acts">'
@@ -6954,7 +7111,7 @@ in
                         status=404,
                     )
                     return
-                path, size = found
+                path, size, _mtime = found
                 try:
                     handle = open(path, "rb")
                 except OSError:
@@ -7302,7 +7459,7 @@ in
                     # called (rename at runtime via /rename), so autogen spares them
                     # inventing one AND guarantees a unique key, so no collision or
                     # accidental-overwrite (issue 100) is possible here.
-                    name = gen_session_name(agent, sessions)
+                    name = gen_session_name(agent, sessions, cwd)
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,
