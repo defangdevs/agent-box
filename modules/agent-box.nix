@@ -338,11 +338,13 @@ let
     # token: the loop above just exported it, and the identity is a property of
     # that token, not of the deployment. A value the env store set wins (the
     # resolver echoes it straight back); otherwise the resolver answers from its
-    # cache, and only calls GitHub when the token changed. Best effort — no token,
-    # no network or no resolver leaves it unset, which is what a box that writes
-    # nothing to GitHub wants anyway.
+    # cache, and only calls GitHub when the token changed. --throttled because
+    # this runs at EVERY session start: one failed lookup per token per hour is
+    # enough, and a session must not wait on a network timeout to begin. Best
+    # effort — no token, no network or no resolver leaves it unset, which is what
+    # a box that writes nothing to GitHub wants anyway.
     if command -v agent-box-webhook-self >/dev/null 2>&1; then
-      _self=$(agent-box-webhook-self 2>/dev/null) || _self=""
+      _self=$(agent-box-webhook-self --throttled 2>/dev/null) || _self=""
       [ -n "$_self" ] && export LOCAL_WEBHOOK_SELF="$_self"
       unset _self
     fi
@@ -1755,22 +1757,28 @@ set -u
 
 usage() {
   cat <<'EOF'
-usage: agent-box-webhook-self [--refresh]
+usage: agent-box-webhook-self [--refresh] [--throttled]
 
 Print the GitHub login this box acts as — the account whose token it comments,
 pushes and edits issues with — and cache it for the webhook receiver and for
 new sessions. Resolved with `gh api user`, from the token in THIS environment.
 
---refresh  re-resolve even when the cached answer still matches the token.
+--refresh    re-resolve even when the cached answer still matches the token.
+--throttled  skip the lookup when a recent one for this same token already
+             failed. For the session-start path, which must not pay a network
+             timeout on every respawn; a person asking directly always gets a
+             real attempt.
 
 Exits 1 with no output when there is no token, no network, or no gh.
 EOF
 }
 
 REFRESH=0
+THROTTLED=0
 for a in "$@"; do
   case "$a" in
     --refresh) REFRESH=1 ;;
+    --throttled) THROTTLED=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -1780,7 +1788,11 @@ STATE_DIR="''${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
 FILE="$STATE_DIR/self.env"
 # Failed lookups are stamped so an offline box does not pay a timeout at every
 # session start. Same shape as the plugin-cache sync: at most one attempt per
-# token per hour, and a token change retries immediately.
+# token per hour, and a token change retries immediately. The stamp is only
+# READ under --throttled: it exists for the automatic caller, and a person (or
+# a test) who runs this directly has just done something about the failure —
+# fixed the token, plugged in the network — so refusing to look for another
+# hour would answer the wrong question.
 STAMP="$STATE_DIR/.self-attempt"
 RETRY_S=3600
 
@@ -1818,10 +1830,11 @@ if [ "$REFRESH" = 0 ] && [ -n "$cached" ] && [ "$cached_fp" = "$fp" ]; then
   exit 0
 fi
 
-# Nothing usable is cached for THIS token. Ask GitHub, unless a recent attempt
-# for the same token already failed.
+# Nothing usable is cached for THIS token. Ask GitHub, unless this is the
+# throttled path and a recent attempt for the same token already failed.
 tried=""
 tried_fp=""
+why="a recent lookup for this token already failed"
 if [ -r "$STAMP" ]; then
   read -r tried tried_fp < "$STAMP" || true
 fi
@@ -1829,16 +1842,18 @@ fi
 # can hand-edit, and shell arithmetic re-evaluates whatever a variable holds.
 case "$tried" in (*[!0-9]*|"") tried=0 ;; esac
 now=$(date +%s 2>/dev/null || echo 0)
-if [ "$REFRESH" = 0 ] && [ "$tried_fp" = "$fp" ] && [ "$tried" -gt 0 ] \
-   && [ "$((now - tried))" -lt "$RETRY_S" ]; then
+if [ "$THROTTLED" = 1 ] && [ "$REFRESH" = 0 ] && [ "$tried_fp" = "$fp" ] \
+   && [ "$tried" -gt 0 ] && [ "$((now - tried))" -lt "$RETRY_S" ]; then
   login=""
 elif command -v gh >/dev/null 2>&1; then
   # gh, not curl: it resolves the token the same way every other tool on this
   # box does — $GH_TOKEN, then $GITHUB_TOKEN, then its own stored credentials —
   # so the answer describes the identity the agent actually pushes with.
   login=$(timeout 8 gh api user --jq .login 2>/dev/null | tr -d '\r' | head -1)
+  [ -n "$login" ] || why="gh api user answered nothing (no token, or GitHub unreachable)"
 else
   login=""
+  why="no gh on PATH"
 fi
 
 if valid "''${login:-}"; then
@@ -1865,9 +1880,11 @@ fi
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 printf '%s %s\n' "$now" "$fp" > "$STAMP" 2>/dev/null || true
 if [ -n "$cached" ]; then
+  echo "agent-box-webhook-self: $why; keeping the last known login" >&2
   printf '%s\n' "$cached"
   exit 0
 fi
+echo "agent-box-webhook-self: $why; \"@self\" will match nobody" >&2
 exit 1
   '';
 
