@@ -75,6 +75,11 @@ ul.tbl.subs li { padding-left: 40px; }
                  color: #8b949e; white-space: pre-wrap;
                  overflow-wrap: anywhere; }
 .meta { color: #8b949e; font-size: 12px; }
+/* The conversation's opening prompt on a session row (issue #277):
+   ellipsized, because it must identify the row without pushing the
+   row's own actions off the line. */
+.topic { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 34ch; font-style: italic; }
 /* The webhook chip is a different KIND of fact from the agent name and
    the cwd beside it — what the fold holds — so it gets its own pill
    rather than joining the row's run of grey. */
