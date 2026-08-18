@@ -20,16 +20,16 @@ export TMUX_TMPDIR="/run/agent-box-${USER:-$(id -un)}"
 t() { tmux -L agent-box "$@"; }
 
 # A kill that did not happen must never be reported as a removal (issue
-# #268). "can't find session" is the one benign failure -- the session is
-# already gone, which is what every caller here wanted anyway. Anything else
-# (no server on this socket, an unreachable one) leaves the session running
-# while its entry disappears from sessions.json, and nothing cleans that up
-# afterwards: the supervisor's reconcile loop is ensure-only and never kills.
+# #268): the entry leaves sessions.json while the session keeps running, and
+# nothing collects it afterwards -- the supervisor's reconcile loop is
+# ensure-only and never kills. But "already gone" is success for every caller
+# here, and it arrives two ways: no such session, or no server at all (killing
+# the LAST session takes the server down with it, so `restart main` on a
+# single-session box legitimately finds nothing). Ask tmux what is true now
+# instead of matching its error text, which differs by version.
 kill_session() {
   kerr="$(t kill-session -t "=$1" 2>&1)" && return 0
-  case "$kerr" in
-    *"can't find session"*) return 0 ;;
-  esac
+  t has-session -t "=$1" 2>/dev/null || return 0
   echo "agent-box-session: could not kill tmux session '$1': $kerr" >&2
   return 1
 }
