@@ -10,6 +10,7 @@ TMUX="tmux -L agent-box"
 SESSIONS_FILE="$HOME/.config/agent-box/sessions.json"
 GREP="${AGENT_BOX_GREP_BIN:-grep}"
 FIND="${AGENT_BOX_FIND_BIN:-find}"
+FLOCK="${AGENT_BOX_FLOCK_BIN:-}"
 # The webhook channel plugin, spelled once (issue #257): three places have to
 # agree on it — the settings seed (an enabledPlugins key), the plugin-cache
 # sync, and claude's --channels tag. The marketplace NAME comes from the
@@ -193,6 +194,50 @@ if cbin="$(agent_bin codex)"; then
   ln -sfn agent-box-current "$HOME"/.codex/packages/standalone/current
 fi
 
+# Serialize every read-modify-write of the session registry (issue #254).
+# tmp+rename buys ONE guarantee — a reader never sees half a document — and
+# says nothing about the interval between a writer's read and its rename: two
+# writers that start from the same base each publish a document that never
+# contained the other's edit, so a one-field update silently reverts every
+# field the other writer changed. Measured on the live box: two writers of the
+# shape used here lost 96 of 300 updates (32%). The registry has five writers
+# in three languages (this loop, the session CLI, the mark-stopped epilogue,
+# the settings daemon's three routes, the webhook spawn wrapper), so the lock
+# is the only thing that makes the file's state a function of its edits.
+#
+# The lock is a SIDECAR file, never sessions.json itself: every writer here
+# REPLACES that inode by rename, so a lock taken on the inode a writer read is
+# not the lock the next writer takes.
+#
+# AGENT_BOX_FLOCK_BIN is pinned by the unit because flock ships in util-linux
+# only (the AGENT_BOX_*_BIN convention, as for grep/find). Unset means "no
+# lock, carry on": a box whose module predates this must still start sessions,
+# and a missing lock must never be the reason a session does not spawn.
+REGISTRY_LOCK="$SESSIONS_FILE.lock"
+_lock_depth=0
+registry_lock() {
+  # Nesting-safe on purpose: flock(2) conflicts between two open file
+  # DESCRIPTIONS, including two of the same process, so start_session — which
+  # holds the lock across the mark_started it calls — would otherwise block
+  # the supervisor against itself forever (verified: a second fd on the same
+  # file blocks).
+  _lock_depth=$((_lock_depth + 1))
+  [ "$_lock_depth" = 1 ] || return 0
+  [ -n "$FLOCK" ] || return 0
+  { exec 9>>"$REGISTRY_LOCK"; } 2>/dev/null || return 0
+  # -w: nothing may park the reconcile loop. If some writer holds the lock
+  # past the timeout (a stopped process, a full disk) this spawn proceeds
+  # unlocked — the pre-#254 behavior, not a new failure mode.
+  "$FLOCK" -w 10 9 \
+    || echo "supervisor: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
+}
+registry_unlock() {
+  [ "$_lock_depth" -gt 0 ] || return 0
+  _lock_depth=$((_lock_depth - 1))
+  [ "$_lock_depth" = 0 ] || return 0
+  exec 9>&- 2>/dev/null || true
+}
+
 # Deliver-once + resume bookkeeping. A session's kickoff prompt
 # (initialPrompt) must fire on the FIRST spawn only; every later respawn
 # (crash, clean exit, reboot, Spot stop→restart — all of which keep the
@@ -206,15 +251,28 @@ fi
 # kickoff prompt so the transcript is findable by content (codex_rollout_uuid).
 mark_started() {
   # mark_started SESSION BOXID — best-effort; a failed rewrite just means
-  # the prompt re-fires next spawn, never a crash.
-  _tmp="$(mktemp "$SESSIONS_FILE.XXXXXX")" || return 0
+  # the prompt re-fires next spawn, never a crash. Read and rename happen
+  # under the registry lock (issue #254); the caller normally holds it
+  # already, and registry_lock nests.
+  #
+  # `has` first, because this must only ever UPDATE: jq's `|=` on a missing
+  # key CREATES it (verified), so a session deleted while this spawn was
+  # preparing came back as a stub {hasRun, boxSessionId, initialPrompt} that
+  # the reconcile loop then started forever — a session nothing kills,
+  # because no delete path knows it exists. That is the resurrect half of
+  # #254; the lock is the lost-update half.
+  registry_lock
+  _tmp="$(mktemp "$SESSIONS_FILE.XXXXXX")" || { registry_unlock; return 0; }
   if $JQ --arg s "$1" --arg b "$2" \
-       '(.sessions[$s]) |= (.hasRun = true | .boxSessionId = $b | .initialPrompt = null)' \
+       'if .sessions | has($s)
+        then (.sessions[$s]) |= (.hasRun = true | .boxSessionId = $b | .initialPrompt = null)
+        else . end' \
        "$SESSIONS_FILE" > "$_tmp" 2>/dev/null; then
     mv "$_tmp" "$SESSIONS_FILE"
   else
     rm -f "$_tmp"
   fi
+  registry_unlock
 }
 
 claude_has_transcript() {
@@ -552,7 +610,15 @@ start_session() {
       '.sessions | has($s) and (.[$s].stopped != true)' \
       "$SESSIONS_FILE" >/dev/null 2>&1
   }
-  listed || return 0
+  # Pre-check, spawn, post-check and mark_started are ONE critical section
+  # (issue #254), so the post-check is exact: without the lock a delete could
+  # land between the post-check and mark_started, whose read-modify-write then
+  # republished the deleted entry. Everything slow is deliberately already
+  # done — seed_claude_state above can spend minutes inside `claude plugin
+  # marketplace update` over the network, and no lock may be held across
+  # that, so the section covers only reads and writes of this file.
+  registry_lock
+  listed || { registry_unlock; return 0; }
   # Per-session webhook identity, passed via `tmux new-session -e` so it
   # lands in the SESSION environment — inherited by the agent AND by
   # anything the agent runs in that pane, which is what makes
@@ -572,10 +638,15 @@ start_session() {
   # launch id the SessionStart hook keys its live-id record by (the
   # /clear-rotation block above). Quoted on its own — unlike $whargs it
   # is runtime data from sessions.json, not supervisor-built tokens.
+  # 9>&- closes the registry lock fd for this child: `new-session` STARTS the
+  # tmux server when none is running, and that server daemonizes and outlives
+  # us — inheriting the fd would hand it the lock forever and wedge every
+  # other writer (the lock lives on the open file description, not the pid).
   if $TMUX new-session -d -s "$sname" -c "$wd" $whargs \
        -e AGENT_BOX_SESSION_ID="$bid" \
-       "${AGENT_BOX_ENV_EXEC:?} $cmd$epilogue"; then
+       "${AGENT_BOX_ENV_EXEC:?} $cmd$epilogue" 9>&-; then
     if ! listed; then
+      registry_unlock
       $TMUX kill-session -t "=$sname" 2>/dev/null || true
       return 0
     fi
@@ -588,6 +659,7 @@ start_session() {
       mark_started "$sname" "$bid"
     fi
   fi
+  registry_unlock
 }
 
 # Sweep webhook filter files left by sessions that are no longer listed.
