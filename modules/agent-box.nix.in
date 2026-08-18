@@ -1349,8 +1349,18 @@ in
     # history — tmux's default fallback for apps that don't handle the
     # mouse themselves. System-wide /etc/tmux.conf so every user's tmux
     # server picks it up without touching each ~/.tmux.conf.
+    #
+    # secureSocket must stay false: its default (true) exports TMUX_TMPDIR
+    # via environment.variables (/etc/set-environment, sourced by
+    # /etc/profile in an SSH login shell) pointing at $XDG_RUNTIME_DIR.
+    # session-cli.sh honors an inherited TMUX_TMPDIR
+    # (${TMUX_TMPDIR:-/run/agent-box-$USER}), so that redirected every
+    # `agent-box-session` command a human runs over SSH to an empty socket
+    # dir — ls/rm/stop/restart all silently no-op against the real
+    # sessions (found investigating issue #267).
     programs.tmux = {
       enable = true;
+      secureSocket = false;
       extraConfig = "set -g mouse on";
     };
 
