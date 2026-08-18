@@ -1327,14 +1327,18 @@
     # AGENT_BOX_*_BIN convention. Asserted first: without it the wrapper cannot
     # tell a finished hook session from a running one, and would fall straight
     # back to the count this leg exists to replace.
-    recv_env = machine.succeed(
-        "systemctl show -p Environment --value agent-box-webhook-agent.service"
-        " | tr ' ' '\\n'"
-    ).split("\n")
-    recv_path = [v.strip('"') for v in recv_env if v.startswith("PATH=")][0]
-    recv_tmux = [
-        v.strip('"') for v in recv_env if v.startswith("AGENT_BOX_TMUX_BIN=")
-    ][0]
+    # One assignment per line, unquoted first: systemd only quotes a value that
+    # needs it (hookSessionArgs' JSON does), and the quotes would otherwise ride
+    # along into the env this leg builds.
+    recv_env = [
+        v.strip('"')
+        for v in machine.succeed(
+            "systemctl show -p Environment --value agent-box-webhook-agent.service"
+            " | tr ' ' '\\n'"
+        ).split("\n")
+    ]
+    recv_path = [v for v in recv_env if v.startswith("PATH=")][0]
+    recv_tmux = [v for v in recv_env if v.startswith("AGENT_BOX_TMUX_BIN=")][0]
     tmux_bin = recv_tmux.split("=", 1)[1]
     machine.fail(f"env -i {recv_path} {sw}/sh -c 'command -v tmux'")
     machine.succeed(f"test -x {tmux_bin}")
