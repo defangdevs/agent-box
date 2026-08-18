@@ -1327,6 +1327,7 @@
     # AGENT_BOX_*_BIN convention. Asserted first: without it the wrapper cannot
     # tell a finished hook session from a running one, and would fall straight
     # back to the count this leg exists to replace.
+    #
     # One assignment per line, unquoted first: systemd only quotes a value that
     # needs it (hookSessionArgs' JSON does), and the quotes would otherwise ride
     # along into the env this leg builds.
@@ -1400,8 +1401,12 @@
         f" {tmux_bin} -L agent-box list-sessions -F '#S'"
         f" | grep -x {busy} >/dev/null"
     )
+    # The second one is stopped only once it has really started, so "finished
+    # entry with no pane" is the state under test and not a spawn still in
+    # flight.
     cap_spawn("capdone", 2)
     done = cap_session("capdone")
+    machine.wait_until_succeeds(f"{hook_ls} | grep -x {done} >/dev/null", timeout=60)
     machine.succeed(
         f"sudo -u agent env HOME=/home/agent agent-box-session stop {done}"
     )
@@ -1409,6 +1414,7 @@
         f"jq -e '.sessions[\"{done}\"].stopped == true'"
         " /home/agent/.config/agent-box/sessions.json"
     )
+    machine.wait_until_fails(f"{hook_ls} | grep -x {done} >/dev/null", timeout=60)
 
     # Two hook-* keys at MAX=2, only one of them running. The old count dropped
     # this batch for good; the new one spends the slot the finished session was
