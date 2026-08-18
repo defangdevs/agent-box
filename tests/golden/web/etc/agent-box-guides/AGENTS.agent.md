@@ -18,7 +18,10 @@ to the terminal, which a remote user can't act on.
   a web app publicly").
 - $HOME is SHARED by every one of your tmux sessions (same user, all start
   in $HOME). For parallel work in one repo use `git worktree` or separate
-  subdirectories, so concurrent sessions don't clobber each other.
+  subdirectories, so concurrent sessions don't clobber each other. Once a
+  worktree's work is committed and pushed, remove it with
+  `git worktree remove PATH` — a stale one left behind just clutters
+  `git worktree list` and confuses whichever session finds it next.
 - Sessions live in RAM: a reboot loses them, so persist anything worth
   keeping to disk under $HOME. An agent that exits with an error drops you
   into a shell for inspection; a clean exit is respawned within ~2s.
