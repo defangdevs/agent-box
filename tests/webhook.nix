@@ -75,6 +75,20 @@
             ];
           };
         };
+        # A second governed watch, for the substring leaves (local-webhook
+        # 0.14.0). Its own topic on purpose: the spawn name is derived from the
+        # key, so sharing local-channels' topic would collide with the session
+        # the opened-issue case above already spawned.
+        "github:defangdevs/mention-demo" = {
+          note = "managed: mention watch (test)";
+          when = {
+            all = [
+              { path = "action"; "in" = [ "created" "edited" ]; }
+              { path = "sender.login"; notIn = [ "box-bot" ]; }
+              { path = "comment.body"; contains = [ "@box-bot" ]; }
+            ];
+          };
+        };
       };
     };
     system.stateVersion = "25.05";
@@ -910,6 +924,13 @@
         " agent-box-webhook subscribe defangdevs/local-channels --deliver-to subagent"
         " --note 'to be governed' --ignore-sender human"
     )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/mention-demo --deliver-to subagent"
+        " --note 'to be governed too'"
+    )
     machine.succeed("systemctl restart agent-box-webhook-agent.service")
     machine.wait_for_unit("agent-box-webhook-agent.service")
     machine.wait_until_succeeds(
@@ -983,6 +1004,80 @@
         "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-local-chan\"))'"
         " /home/agent/.config/agent-box/sessions.json",
         timeout=60,
+    )
+
+    # --- a mention in free text spawns a session (#296) ----------------------
+    # The rule the box's own default watch carries: being addressed by name is
+    # a work request, the form a human reaches for by reflex. It needs
+    # local-webhook 0.14.0's `contains` leaf, because a mention lives inside
+    # comment.body with no structured field beside it, so no in/notIn list of
+    # whole values can ever name it (local-channels#33). Until it existed the
+    # watch declined every comment, and an "@box rebase" reached nobody unless
+    # a live session happened to hold the topic.
+    machine.succeed(
+        "jq -e '.topics[] | select(.topic == \"github:defangdevs/mention-demo\")"
+        " | .when.all[2].contains == [\"@box-bot\"]'"
+        " /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+
+    def post_comment(name, body, sender):
+        client.succeed(
+            "cat > /tmp/" + name + ".json <<'EOF'\n"
+            '{"action":"created","issue":{"number":42,"title":"a pr"},'
+            '"comment":{"body":"' + body + '"},'
+            '"repository":{"full_name":"defangdevs/mention-demo"},'
+            '"sender":{"login":"' + sender + '"}}\n'
+            "EOF"
+        )
+        sig = client.succeed(
+            "openssl dgst -sha256 -hmac " + secret + " -r /tmp/" + name
+            + ".json | cut -d' ' -f1"
+        ).strip()
+        client.succeed(
+            curl + " -o /dev/null -w '%{http_code}' -X POST"
+            " -H 'content-type: application/json' -H 'x-github-event: issue_comment'"
+            " -H 'x-github-delivery: test-" + name + "'"
+            " -H 'x-hub-signature-256: sha256=" + sig + "'"
+            " --data-binary @/tmp/" + name + ".json"
+            " https://box.test/agent/webhook/github | grep -x 200"
+        )
+
+    declined = (
+        "journalctl -u agent-box-webhook-agent --no-pager"
+        " | grep -c 'not spawning for issue_comment on defangdevs/mention-demo'"
+    )
+
+    # An ordinary comment is not a request, and the decline is said out loud so
+    # it stays distinguishable from a watch that broke (#170).
+    post_comment("mention-plain", "looks good to me", "human")
+    machine.wait_until_succeeds('test "$(' + declined + ')" -ge 1', timeout=30)
+    machine.fail(
+        "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-mention\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+
+    # Same event shape, one substring different — and in the wrong case, which
+    # must not matter: GitHub logins are case-insensitive and so is the leaf.
+    post_comment("mention-hit", "@BOX-BOT please rebase", "human")
+    machine.wait_until_succeeds(
+        "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-mention\"))'"
+        " /home/agent/.config/agent-box/sessions.json",
+        timeout=60,
+    )
+
+    # The box quotes the request back when it answers, so without the sender
+    # leaf every reply would spawn a session that replies again. The echo is
+    # declined at the same stage as the plain comment: a second log line, and
+    # no second spawn behind it.
+    post_comment("mention-echo", "done, @box-bot out", "box-bot")
+    machine.wait_until_succeeds('test "$(' + declined + ')" -ge 2', timeout=30)
+
+    mention_session = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-mention\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent agent-box-session rm " + mention_session
     )
 
     # --- the settings page shows and deletes subscriptions (#227) -----------
