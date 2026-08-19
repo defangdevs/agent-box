@@ -186,11 +186,14 @@
             ];
           };
           services = multiUser.config.systemd.services;
-          # issue #154 Phase 3: "agent-box@" is the systemd %i template unit
-          # itself; each configured user additionally gets its own
-          # "agent-box@<user>" drop-in (enablement, at minimum) rather than a
-          # flat "agent-box-<user>" unit.
-          wanted = [ "agent-box@" "agent-box@alice" "agent-box@bob" "agent-box@coder" "agent-box@ci" ];
+          # issue #154 Phase 3: "agent-box@" is the systemd %i template unit,
+          # shipped verbatim via systemd.packages (not a systemd.services
+          # Nix declaration — a template-level drop-in there was found to
+          # silently never merge into any real instance, so all host-level
+          # content moved onto the per-instance declaration below). Each
+          # configured user gets its own "agent-box@<user>" drop-in instead
+          # of a flat "agent-box-<user>" unit.
+          wanted = [ "agent-box@alice" "agent-box@bob" "agent-box@coder" "agent-box@ci" ];
           missing = builtins.filter (n: ! builtins.hasAttr n services) wanted;
         in
         {
