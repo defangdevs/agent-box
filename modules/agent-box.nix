@@ -3320,7 +3320,7 @@ in
       };
       rev = lib.mkOption {
         type = lib.types.str;
-        default = "93c8dac37874bb1531a4d01b2fd6c3a00317718c";
+        default = "a24a2d4d91356b0674df8c5e23b288a8d83dfd2b";
         description = ''
           Pinned local-channels commit whose local-webhook/webhook.py the
           receiver daemon and the agent-box-webhook CLI run. Claude sessions
@@ -3334,7 +3334,7 @@ in
         # builtins.fetchurl hash of local-webhook/webhook.py at `rev`:
         #   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.py
         # then `nix hash convert --hash-algo sha256 --to sri <base32>`.
-        default = "sha256-K/Vcmvqlbbiy49DkrYFDc+G35kvtQBqOzVUvBtPKVIk=";
+        default = "sha256-JHW7hFG9Q3VdZedxvpq2ZwFlJOOWBz18+ELE5We7aLA=";
         description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
       };
       syncSessionPlugin = lib.mkOption {
@@ -3433,7 +3433,7 @@ in
         default = {
           "github:defangdevs/*" = {
             note = "standing watch: unowned defangdevs activity (new issues, outside PRs, failing CI, "
-              + "issues/PRs assigned to this box) — "
+              + "issues/PRs assigned to this box, comments that mention it) — "
               + "rules managed by services.agent-box.webhook.watchPolicy and re-applied when the "
               + "receiver daemon starts, so edit the NixOS config, not this entry";
             when =
@@ -3472,6 +3472,33 @@ in
                       { path = "sender.login"; notIn = [ "defangdevs" ]; }
                     ];
                   }
+                  # Being addressed by name is the most direct work request
+                  # there is, and the one a human reaches for by reflex (#296).
+                  # Assignment above already spawns for the same reason (#253);
+                  # this is that request in the form people actually type. It
+                  # needs local-webhook >= 0.14.0, because a mention lives
+                  # inside free text with no structured field beside it, so no
+                  # in/notIn list of whole values can ever name it
+                  # (local-channels#33). Matching is case-insensitive there, so
+                  # "@DefangDevs" counts.
+                  #
+                  # The sender leaf is load-bearing, not decoration: the box
+                  # quotes the request back when it answers, so without it every
+                  # reply would spawn another session, which would reply again.
+                  #
+                  # Unlike the assignment clause, GitHub restricts nothing here
+                  # — anyone who may comment may type the mention. On a private
+                  # repo that is the same trust set that may open an issue, and
+                  # the opened/reopened clause already spawns for those, so this
+                  # widens nothing on the box's own repos. Revisit it before
+                  # pointing a watch at a PUBLIC repo, where the two sets differ.
+                  {
+                    all = [
+                      { path = "action"; "in" = [ "created" "edited" ]; }
+                      { path = "sender.login"; notIn = [ "defangdevs" ]; }
+                      { path = "comment.body"; contains = [ "@defangdevs" ]; }
+                    ];
+                  }
                   { path = "workflow_run.conclusion"; "in" = ciFailure; }
                   { path = "workflow_job.conclusion"; "in" = ciFailure; }
                   { path = "check_run.conclusion"; "in" = ciFailure; }
@@ -3495,7 +3522,9 @@ in
           policy: local-webhook's built-in failures-only CI brake steps aside
           for it, and every event the rules decline is logged by the daemon,
           so a deliberate drop stays distinguishable from a watch that broke
-          (#170). Requires local-webhook >= 0.11.0 (the webhook.rev pin).
+          (#170). Requires local-webhook >= 0.11.0 (the webhook.rev pin),
+          or >= 0.14.0 for the contains/notContains substring leaves the
+          default's mention rule uses.
         '';
       };
     };
