@@ -23,6 +23,13 @@
 
   testScript = ''
     machine.wait_for_unit("multi-user.target")
+    # TEMPORARY DIAGNOSTIC (agent-box#154 Phase 3 CI investigation) — remove
+    # before merge. Printing the fully-merged unit systemd actually loaded,
+    # since eval/local-build both show the correct ExecStart but the real
+    # boot keeps reporting "Unable to locate executable 'agent-box-supervisor'".
+    machine.sleep(5)
+    print(machine.succeed("systemctl cat agent-box@agent.service 2>&1 || true"))
+    print(machine.succeed("systemctl show agent-box@agent.service --no-pager -p ExecStart -p ExecStop -p Environment -p LoadState -p LoadError 2>&1 || true"))
     machine.wait_for_unit("agent-box@agent.service")
     machine.wait_for_unit("earlyoom.service")
 
