@@ -360,6 +360,20 @@ let
     # NAME it, because that is the half of "what does this watch launch" the
     # page could not show before (issue #292). Same value sessionCli exports.
     export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+  '' + lib.optionalString (cfg.webhook.hookSessionArgs != [ ]) ''
+    # The fleet-wide default for hook-session args (webhook.hookSessionArgs),
+    # JSON so multi-word args survive the round trip; the script decodes it
+    # with jq into the session's extraArgs.
+    #
+    # It belongs HERE and not in the receiver unit's environment, where it
+    # used to live: only the daemon's own child could see it there, so the
+    # settings page and a hand-run --preamble both reported "no extra
+    # arguments" on a box whose NixOS config had set a model (#292). Every
+    # caller now resolves the same default — and the per-user env file still
+    # overrides it, because the script reads that file after this (#290).
+    # Unset when the list is empty, so "nothing set" stays distinguishable
+    # from "set to nothing".
+    export AGENT_BOX_HOOK_SESSION_ARGS=${lib.escapeShellArg (builtins.toJSON cfg.webhook.hookSessionArgs)}
   '' + ''
 @@include:src/webhook-spawn.sh@@
   '');
@@ -2159,10 +2173,9 @@ in
           # webhook.py coalesces bursts and caps concurrent spawns; the
           # wrapper additionally caps how many hook-* sessions may exist.
           LOCAL_WEBHOOK_SPAWN_CMD = "${webhookSpawn}/bin/agent-box-webhook-spawn";
-        } // lib.optionalAttrs (cfg.webhook.hookSessionArgs != [ ]) {
-          # JSON so multi-word args survive the env-var round trip; the
-          # spawn wrapper decodes with jq into the session's extraArgs.
-          AGENT_BOX_HOOK_SESSION_ARGS = builtins.toJSON cfg.webhook.hookSessionArgs;
+          # webhook.hookSessionArgs is NOT here: the wrapper carries it, so
+          # the settings page and the CLI resolve the same default this unit
+          # would have handed only to its own child (#292).
         };
         serviceConfig = {
           User = name;
