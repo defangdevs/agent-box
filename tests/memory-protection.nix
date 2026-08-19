@@ -41,6 +41,17 @@
     print(machine.succeed("readlink -f /etc/systemd/system/agent-box@.service.d/overrides.conf 2>&1 || echo NO_REAL_TARGET"))
     print(machine.succeed("journalctl -b --no-pager 2>&1 | grep -i 'agent-box@' || echo NO_JOURNAL_MENTIONS"))
     print(machine.succeed("systemctl cat agent-box@agent.service 2>&1 || true"))
+    # The on-disk drop-in is provably correct (confirmed above) yet the unit
+    # keeps resolving the bare name from the very first restart at boot —
+    # testing whether systemd loaded the unit BEFORE indexing this drop-in
+    # and never re-merged it since (Restart=always reuses the SAME loaded
+    # config, it doesn't re-read files per restart).
+    print(machine.succeed("systemctl daemon-reload 2>&1 || true"))
+    print(machine.succeed("systemctl show agent-box@agent.service --no-pager -p ExecStart 2>&1 || true"))
+    machine.succeed("systemctl reset-failed agent-box@agent.service || true")
+    machine.succeed("systemctl restart agent-box@agent.service || true")
+    machine.sleep(2)
+    print(machine.succeed("systemctl show agent-box@agent.service --no-pager -p ExecStart -p ActiveState -p SubState 2>&1 || true"))
     print(machine.succeed("systemctl show agent-box@agent.service --no-pager -p ExecStart -p ExecStop -p Environment -p LoadState -p LoadError 2>&1 || true"))
     machine.wait_for_unit("agent-box@agent.service")
     machine.wait_for_unit("earlyoom.service")
