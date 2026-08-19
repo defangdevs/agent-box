@@ -181,6 +181,37 @@
         "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
         " show-environment -t main | grep -x 'LOCAL_WEBHOOK_PORT=0'"
     )
+    # The identity resolver ships next to the CLI (issue #261): who "@self"
+    # means is a runtime question about the token this box holds, so there is a
+    # command that answers it rather than a value baked in at deploy time.
+    machine.succeed("test -x /run/current-system/sw/bin/agent-box-webhook-self")
+    # A session gets the identity from env-exec, the wrapper the supervisor
+    # runs between tmux and the agent — NOT from the tmux session environment,
+    # which only carries what `new-session -e` put there. So the session-side
+    # assertions run the real wrapper out of the agent unit's own environment.
+    env_exec = machine.succeed(
+        "systemctl show -p Environment --value agent-box-agent.service"
+        " | tr ' ' '\\n' | sed -n 's/^AGENT_BOX_ENV_EXEC=//p'"
+    ).strip()
+    assert env_exec.startswith("/nix/store/"), env_exec
+    machine.succeed(
+        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
+        ' list-panes -t "=main" -F "#{pane_start_command}"'
+        f" | grep -F -- {env_exec} >/dev/null"
+    )
+
+    def session_self():
+        # What a session's agent — and so its webhook peer — would see.
+        return machine.succeed(
+            "sudo -u agent env HOME=/home/agent"
+            " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+            f" {env_exec} sh -c 'echo \"$LOCAL_WEBHOOK_SELF\"'"
+        ).strip()
+
+    # Nothing has resolved yet — no token, no network — and that stays quiet:
+    # the variable is simply absent, exactly as on a box that never writes to
+    # GitHub. (The leg below gives it an identity and watches it appear.)
+    assert session_self() == "", session_self()
     # Claude loads the plugin from the seeded settings — in the object shape
     # `claude plugin install` writes, not a list of records.
     machine.wait_until_succeeds(
@@ -1567,6 +1598,200 @@
         machine.succeed(
             f"sudo -u agent env HOME=/home/agent agent-box-session rm {name}"
         )
+
+    # --- who "@self" is, resolved at runtime (issue #261) -------------------
+    # webhook-spawn.sh seeds every dispatched hook-* session with exactly
+    # ignoreSenders ["@self"], and webhook.py resolves that against
+    # LOCAL_WEBHOOK_SELF — which nothing set, so the mute was inert and a hook
+    # session heard its own comments come back. The identity cannot be declared
+    # at deploy time: it is a property of whatever GitHub token the user's
+    # environment carries, and the settings page can swap that token for a
+    # different account at any moment. So a resolver derives it from the token,
+    # caches it keyed by a FINGERPRINT of that token, and both readers — the
+    # session (via env-exec) and the receiver (via EnvironmentFile) — take it
+    # from there.
+    #
+    # `gh` is stubbed because this VM has no route to GitHub; everything else
+    # on this leg is the real path.
+    state = "/home/agent/.local/state/local-webhook"
+    selfenv = f"{state}/self.env"
+    # In the agent's own HOME, with an absolute interpreter from the system
+    # profile: a stub the agent cannot execute would fail INSIDE the resolver,
+    # where gh's stderr is deliberately silenced, and look like "no token".
+    fakebin = "/home/agent/fakebin"
+    machine.succeed(
+        f"sudo -u agent mkdir -p {fakebin}"
+        f" && sudo -u agent tee {fakebin}/gh > /dev/null <<'EOF'\n"
+        f"#!{sw}/sh\n"
+        f'echo "$@" >> {fakebin}/calls\n'
+        'printf "%s\\n" "''${FAKE_LOGIN:-box-bot}"\n'
+        "EOF\n"
+        f"sudo -u agent chmod 755 {fakebin}/gh"
+    )
+    # The stub answers when the agent runs it — asserted here, so a broken stub
+    # cannot masquerade as a broken resolver below.
+    machine.succeed(
+        f"sudo -u agent {fakebin}/gh api user --jq .login | grep -x box-bot >/dev/null"
+    )
+    machine.succeed(f"sudo -u agent rm -f {fakebin}/calls")
+    resolve = (
+        "sudo -u agent env HOME=/home/agent"
+        f" LOCAL_WEBHOOK_STATE_DIR={state}"
+    )
+    with_gh = f"{resolve} PATH={fakebin}:$PATH"
+
+    # First resolution: asks GitHub once, answers with the login, and leaves an
+    # env-file behind — a login is not a secret, so it is world-readable.
+    assert machine.succeed(f"{with_gh} agent-box-webhook-self").strip() == "box-bot"
+    machine.succeed(f"grep -x 'LOCAL_WEBHOOK_SELF=box-bot' {selfenv} >/dev/null")
+    machine.succeed(f"grep -x '# fp=[0-9a-f]*' {selfenv} >/dev/null")
+    machine.succeed(f"stat -c '%U %a' {selfenv} | grep -x 'agent 644'")
+    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == "1"
+
+    # Same token, so the cached answer stands — without gh on PATH at all,
+    # which is what keeps this off the session-start path in the normal case.
+    assert machine.succeed(f"{resolve} agent-box-webhook-self").strip() == "box-bot"
+    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == "1"
+
+    # A DIFFERENT token is a different account until proven otherwise: the
+    # fingerprint no longer matches, so it re-resolves rather than trusting the
+    # cache. This is the case a deploy-time option gets silently wrong.
+    assert machine.succeed(
+        f"{with_gh} GH_TOKEN=second FAKE_LOGIN=other-bot agent-box-webhook-self"
+    ).strip() == "other-bot"
+    machine.succeed(f"grep -x 'LOCAL_WEBHOOK_SELF=other-bot' {selfenv} >/dev/null")
+    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == "2"
+
+    # An explicit LOCAL_WEBHOOK_SELF answers the question itself: echoed back,
+    # no lookup, and the cache is left alone (it describes the token, not this
+    # one-off override).
+    assert machine.succeed(
+        f"{with_gh} LOCAL_WEBHOOK_SELF=someone-else agent-box-webhook-self"
+    ).strip() == "someone-else"
+    machine.succeed(f"grep -x 'LOCAL_WEBHOOK_SELF=other-bot' {selfenv} >/dev/null")
+    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == "2"
+
+    # No gh and a token nothing has resolved: the last known identity beats no
+    # identity — the box did not stop being that account because GitHub was
+    # unreachable — and the failed attempt is stamped.
+    assert machine.succeed(
+        f"{resolve} GH_TOKEN=third agent-box-webhook-self"
+    ).strip() == "other-bot"
+    machine.succeed(f"test -s {state}/.self-attempt")
+    # That stamp is honored ONLY under --throttled, which is how env-exec calls
+    # it: at every session start, so an offline box must not pay a network
+    # timeout per respawn. Same token, gh now reachable, and it still does not
+    # ask — it answers from the last known login instead.
+    before = machine.succeed(f"wc -l < {fakebin}/calls").strip()
+    assert machine.succeed(
+        f"{with_gh} GH_TOKEN=third agent-box-webhook-self --throttled"
+    ).strip() == "other-bot"
+    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == before
+    # A person (or this test) asking directly always gets a real attempt: the
+    # throttle is for the automatic caller, and whoever runs the command has
+    # just done something about the failure. This is not hypothetical — the
+    # session that starts at boot stamps a failed lookup on any box without a
+    # token, and without this rule every later call would inherit that silence
+    # for an hour.
+    assert machine.succeed(
+        f"{with_gh} GH_TOKEN=third FAKE_LOGIN=third-bot agent-box-webhook-self"
+    ).strip() == "third-bot"
+    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() != before
+
+    # Back to the first token for the rest of the leg.
+    machine.succeed(f"{with_gh} agent-box-webhook-self >/dev/null")
+
+    # A session picks it up: env-exec resolves before it execs the agent, so
+    # the session's own webhook peer — the process that filters this session's
+    # deliveries — has the same answer the receiver does. Asserted through the
+    # wrapper itself (see session_self above): the export lands in the agent's
+    # process environment, which is not something tmux can be asked about.
+    assert session_self() == "box-bot", session_self()
+    # An identity set in the env store is the user's own answer, and it beats
+    # the resolved one — the store is read first, and the resolver echoes back
+    # what it finds rather than looking anything up.
+    machine.succeed(
+        "sudo -u agent install -d -m 700 /home/agent/.config/agent-box"
+        " && printf 'LOCAL_WEBHOOK_SELF=hand-picked\\n'"
+        " | sudo -u agent tee /home/agent/.config/agent-box/env > /dev/null"
+    )
+    assert session_self() == "hand-picked", session_self()
+    machine.succeed("sudo -u agent rm -f /home/agent/.config/agent-box/env")
+    assert session_self() == "box-bot", session_self()
+
+    # ... and so does the receiver, which loads the same file as an
+    # EnvironmentFile. Read from the running process, not `systemctl show -p
+    # Environment`: that property lists Environment= only, and the whole point
+    # here is the value that arrives from the file.
+    machine.succeed("systemctl restart agent-box-webhook-agent.service")
+    machine.wait_for_unit("agent-box-webhook-agent.service")
+    machine.wait_until_succeeds(
+        "tr '\\0' '\\n'"
+        " < /proc/$(systemctl show -p MainPID --value agent-box-webhook-agent.service)/environ"
+        " | grep -x 'LOCAL_WEBHOOK_SELF=box-bot' >/dev/null",
+        timeout=30,
+    )
+
+    # --- and now the mute actually mutes ------------------------------------
+    # Driven through a second stand-in peer, because the peer is the process
+    # that filters session deliveries and it reads the value once at startup.
+    # The value comes from the running DAEMON, not a literal, so this cannot
+    # pass on a box where the resolution never reached anyone.
+    self_login = machine.succeed(
+        "tr '\\0' '\\n'"
+        " < /proc/$(systemctl show -p MainPID --value agent-box-webhook-agent.service)/environ"
+        " | sed -n 's/^LOCAL_WEBHOOK_SELF=//p'"
+    ).strip()
+    assert self_login == "box-bot", self_login
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        f" LOCAL_WEBHOOK_STATE_DIR={state}"
+        " LOCAL_WEBHOOK_SESSION=agent-echo"
+        " agent-box-webhook subscribe defangdevs/echo --note 'echo mute (#261)'"
+        " --ignore-sender @self --ttl 0"
+    )
+    machine.succeed(
+        "systemd-run --unit=webhook-echo-peer --uid=agent --setenv=HOME=/home/agent"
+        f" --setenv=LOCAL_WEBHOOK_STATE_DIR={state}"
+        " --setenv=LOCAL_WEBHOOK_SESSION=agent-echo --setenv=LOCAL_WEBHOOK_PORT=0"
+        f" --setenv=LOCAL_WEBHOOK_SELF={self_login}"
+        f" {sw}/sh -c '{sw}/sleep 600 | {python} {script} > /tmp/echo-peer.log 2>&1'"
+    )
+    machine.wait_until_succeeds(f"ls {inst}/agent-echo.*.sock", timeout=30)
+
+    def post_issue(name, sender, delivery):
+        # A non-CI event on purpose: CI outcomes override an ignore list by
+        # design, so they cannot show whether the list resolved at all.
+        client.succeed(
+            f"cat > /tmp/{name}.json <<'EOF'\n"
+            '{"action":"opened","issue":{"number":7,"title":"echo",'
+            '"html_url":"https://box.test/i/7"},'
+            '"repository":{"full_name":"defangdevs/echo"},'
+            f'"sender":{{"login":"{sender}"}}}}\n'
+            "EOF"
+        )
+        sig_e = client.succeed(
+            f"openssl dgst -sha256 -hmac {secret} -r /tmp/{name}.json | cut -d' ' -f1"
+        ).strip()
+        client.succeed(
+            f"{curl} -o /dev/null -w '%{{http_code}}' -X POST"
+            " -H 'content-type: application/json' -H 'x-github-event: issues'"
+            f" -H 'x-github-delivery: {delivery}'"
+            f" -H 'x-hub-signature-256: sha256={sig_e}' --data-binary @/tmp/{name}.json"
+            " https://box.test/agent/webhook/github | grep -x 200"
+        )
+
+    # The box's own action: accepted at the ingress, dropped at the filter.
+    post_issue("echo-self", self_login, "test-echo-self")
+    machine.sleep(3)
+    machine.fail("grep -q 'defangdevs/echo' /tmp/echo-peer.log")
+    # Anyone else on the same topic still gets through, so the mute is a sender
+    # rule and not a dead subscription.
+    post_issue("echo-other", "someone", "test-echo-other")
+    machine.wait_until_succeeds(
+        "grep -q 'defangdevs/echo' /tmp/echo-peer.log", timeout=30
+    )
+    machine.succeed("systemctl stop webhook-echo-peer.service")
 
     # --- syncSessionPlugin: a stale session cache is refreshed at session start
     # (issue #193, option 2) --------------------------------------------------

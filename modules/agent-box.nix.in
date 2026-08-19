@@ -258,7 +258,7 @@ let
     ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
-    ++ lib.optional webhookEnabled webhookCli
+    ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli ]
     ++ agentBaseTools
     ++ cfg.extraPackages
   );
@@ -342,6 +342,14 @@ let
   '' + ''
     @@include:src/webhook-cli.sh@@
   '');
+
+  # Who this box acts as on GitHub (issue #261), resolved at RUNTIME from the
+  # token the user's environment carries — the settings page can swap that for
+  # a different account at any time, so the identity cannot be a module option.
+  # Shipped on PATH so a human can ask the same question the plumbing asks.
+  webhookSelfCli = pkgs.writeShellScriptBin "agent-box-webhook-self" ''
+@@include:src/webhook-self.sh@@
+  '';
 
   # Dispatch target for standing watches (local-channels#1): the receiver
   # daemon runs this as LOCAL_WEBHOOK_SPAWN_CMD when a delivery matches a
@@ -2231,6 +2239,17 @@ in
           # user's filter.dispatch.json before the receiver starts routing.
           # Runs as User (no "+" prefix); exits 0 on every path, because a
           # policy hiccup must not take the box's one ingress down with it.
+          # LOCAL_WEBHOOK_SELF: who this box acts as, so "@self" in a standing
+          # watch's ignoreSenders resolves (issue #261). Written by
+          # agent-box-webhook-self from the token in a SESSION's environment —
+          # the only place that token exists — which is why this is a file the
+          # receiver reads and not a value the module declares: the identity
+          # follows the token, and the token arrives (and is swapped) at
+          # runtime. Optional ("-"): absent before the first session resolves
+          # it, and on a box whose user never gives the agent a token. Loaded
+          # at start, so a re-resolved login reaches the daemon on its next
+          # restart; sessions pick it up as they respawn.
+          EnvironmentFile = "-${webhookStateDirOf name}/self.env";
           ExecStartPre = "${webhookPolicyApply}";
           ExecStart = "${webhookPython} ${localWebhookScript}";
           # systemd passes the ingress socket on fd 3 (LISTEN_FDS) and wires

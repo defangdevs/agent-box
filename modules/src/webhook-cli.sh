@@ -68,7 +68,9 @@ Two delivery shapes:
                          box is at the ceiling.
 
 --ignore-sender LOGIN mutes echoes of that sender's own comments and pushes
-("@self" is $LOCAL_WEBHOOK_SELF); CI-outcome events are delivered anyway.
+("@self" is $LOCAL_WEBHOOK_SELF — the login this box acts as, resolved from
+this environment's GitHub token by `agent-box-webhook-self`; with no token and
+no cached answer it matches nobody); CI-outcome events are delivered anyway.
 
 --when / --drop attach payload rules to the subscription: deliver (or
 spawn) ONLY events matching --when, never those matching --drop. Rules are
