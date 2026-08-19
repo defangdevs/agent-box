@@ -3966,6 +3966,23 @@ in
         # as environment.PATH on the per-instance drop-in for exactly this
         # reason — see the note there.
         ExecSearchPath = agentBoxExecSearchPath;
+        # BELT AND SUSPENDERS, not redundant: PR #295 CI kept failing with
+        # "Unable to locate executable 'agent-box-supervisor'" even after
+        # ExecSearchPath and every Environment=PATH= in scope were verified
+        # (both by eval and by reading the actually-built unit file) to
+        # correctly include the supervisor's store path — something about
+        # bare-name resolution for a %i template instance's ExecStart isn't
+        # behaving per the documented ExecSearchPath/$PATH precedence rule
+        # in practice, and it wasn't worth chasing further against a
+        # mechanism the design itself flagged as the more speculative of
+        # the two decisions. A list value renders as one line per element
+        # (systemd-lib.nix's generic attrsToSection), so this is the
+        # standard reset-then-reassign idiom — "" clears the verbatim
+        # unit's own bare `ExecStart=agent-box-supervisor`/
+        # `ExecStop=tmux …` entirely, then the real absolute path replaces
+        # it, with zero dependency on any search-path resolution at all.
+        ExecStart = [ "" "${supervisorScript}/bin/agent-box-supervisor" ];
+        ExecStop = [ "" "${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} kill-server" ];
         # NOTE: the settings page's user-owned ~/.config/agent-box/env is
         # deliberately NOT listed here (nor in the per-user env file).
         # See the original issue 89 rationale: unit env is a start-time
