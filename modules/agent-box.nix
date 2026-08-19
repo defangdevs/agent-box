@@ -8682,9 +8682,13 @@ in
           AGENT_BOX_WEB_DOMAIN = cfg.web.domain;
           PATH = lib.mkForce (lib.makeBinPath [ pkgs.tmux pkgs.jq attachScript pkgs.ttyd ]);
         };
+        # agent-box-attach is given as an absolute path here (not left bare
+        # for ttyd's own PATH-based exec, unlike the verbatim unit text)
+        # for the same reason ExecStart itself is absolute below: no
+        # dependency on any search-path resolution being merged correctly.
         serviceConfig.ExecStart = [
           ""
-          ''${pkgs.ttyd}/bin/ttyd --writable --url-arg -p ''${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} agent-box-attach''
+          ''${pkgs.ttyd}/bin/ttyd --writable --url-arg -p ''${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} ${attachScript}/bin/agent-box-attach''
         ];
       }) terminalUsers))
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-box-settings@${name}" {
