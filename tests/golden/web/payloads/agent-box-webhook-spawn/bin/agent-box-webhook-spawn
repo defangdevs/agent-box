@@ -181,12 +181,76 @@ if [ -n "$FLOCK" ] && { exec 9>>"$FILE.lock"; } 2>/dev/null; then
   fi
 fi
 
+# The ceiling on ACCUMULATED hook-* sessions, and the record it leaves.
+#
+# The cap itself is right — webhook.py rate-limits and coalesces spawns but
+# bounds nothing over time, so agents that forget their `agent-box-session rm`
+# would otherwise fill the box. What was wrong is where the news went: on the
+# refusal below webhook.py DROPS the batch (deliberately — retrying a broken
+# spawner would loop), and for a standing watch there is no session peer that
+# received those events anyway, so the loss is total. Its only trace was the
+# receiver daemon's journal, while `agent-box-webhook ls` and `status` kept
+# reporting a healthy subscription: four wedged hook sessions made every watch
+# on the box inert, and that reads exactly like a quiet repo (issue #170).
+#
+# So a refusal is written down where the CLI can find it, next to the other
+# per-user agent-box state. Cumulative, never cleared: the dropped batches do
+# not come back, so "5 dropped, the last one 20 minutes ago" is the standing
+# fact an agent needs, not something to forget on the next successful spawn.
+BOX_STATE="$HOME/.local/state/agent-box"
+REFUSED="$BOX_STATE/webhook-spawn-refused.json"
+
 MAX="${AGENT_BOX_HOOK_SESSION_MAX:-4}"
+# A knob that is documented (agent-box-webhook --help) is a knob someone will
+# typo, and an unusable value must not take the standing watches down with it:
+# `[ n -ge foo ]` is a fatal error under set -e, which would refuse every batch
+# for a reason nobody could see.
+case "$MAX" in
+  (""|*[!0-9]*)
+    echo "agent-box-webhook-spawn: AGENT_BOX_HOOK_SESSION_MAX is not a number" \
+         "($MAX); using 4" >&2
+    MAX=4
+    ;;
+esac
+
+record_refusal() {
+  # $1 = the live hook-* count that triggered the refusal. Best effort: a
+  # state file that cannot be written must not turn a dropped batch into a
+  # crashed spawner, so every failure here is silent and the journal line
+  # above stays the fallback.
+  mkdir -p "$BOX_STATE" 2>/dev/null || return 0
+  prev=0
+  first=""
+  if [ -s "$REFUSED" ]; then
+    prev=$("$JQ" -r '.count // 0' "$REFUSED" 2>/dev/null) || prev=0
+    first=$("$JQ" -r '.firstAt // empty' "$REFUSED" 2>/dev/null) || first=""
+  fi
+  case "$prev" in (""|*[!0-9]*) prev=0 ;; esac
+  at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  [ -n "$first" ] || first="$at"
+  if "$JQ" -n --arg at "$at" --arg first "$first" \
+      --arg topic "${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
+      --arg key "${LOCAL_WEBHOOK_SPAWN_KEY:-}" \
+      --argjson live "$1" --argjson max "$MAX" --argjson count "$((prev + 1))" \
+      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). The batch was DROPPED, not queued. Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max}
+       + (if $topic == "" then {} else {topic: $topic} end)
+       + (if $key == "" then {} else {key: $key} end)' \
+      > "$REFUSED.$$" 2>/dev/null; then
+    mv -f "$REFUSED.$$" "$REFUSED" 2>/dev/null || rm -f "$REFUSED.$$"
+  else
+    rm -f "$REFUSED.$$"
+  fi
+  return 0
+}
+
 if [ -s "$FILE" ]; then
   live=$("$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' "$FILE")
   if [ "$live" -ge "$MAX" ]; then
     echo "agent-box-webhook-spawn: $live hook-* sessions already exist (max $MAX);" \
          "dropping this batch — remove finished ones with 'agent-box-session rm NAME'" >&2
+    record_refusal "$live"
+    echo "agent-box-webhook-spawn: recorded in $REFUSED;" \
+         "'agent-box-webhook status' reports it" >&2
     exit 1
   fi
 fi

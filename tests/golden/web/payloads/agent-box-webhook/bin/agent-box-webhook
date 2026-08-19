@@ -14,6 +14,11 @@ SOURCES="$STATE_DIR/sources.json"
 export LOCAL_WEBHOOK_STATE_DIR="$STATE_DIR"
 # Never let a CLI invocation bind the ingress the daemon owns.
 export LOCAL_WEBHOOK_PORT=0
+# The box's own per-user state, not local-webhook's: the session registry the
+# hook-* ceiling is counted from, and where the spawn wrapper writes down a
+# batch it refused (issue #170). Both are read-only here.
+SESSIONS="$HOME/.config/agent-box/sessions.json"
+HOOK_REFUSED="$HOME/.local/state/agent-box/webhook-spawn-refused.json"
 
 usage() {
   cat <<'USAGE'
@@ -53,6 +58,15 @@ Two delivery shapes:
                          topic; new issues and others' PRs always spawn.
                          A spawned session is subscribed to the event's own
                          repo for it, so its own CI spawns no sibling.
+                         THERE IS A CEILING: at most 4 hook-* sessions may
+                         exist at once (AGENT_BOX_HOOK_SESSION_MAX in the
+                         receiver daemon's environment). Hook sessions are
+                         removed by the agent they start, so four that ended
+                         without running `agent-box-session rm NAME` wedge
+                         every watch on the box — a refused batch is DROPPED,
+                         never queued. `status` reports the live count, the
+                         ceiling and the last refusal, and `ls` says so too
+                         once the box is at the ceiling.
 
 --ignore-sender LOGIN mutes echoes of that sender's own comments and pushes
 ("@self" is $LOCAL_WEBHOOK_SELF); CI-outcome events are delivered anyway.
@@ -74,6 +88,12 @@ predates scoped instance sockets. Either one blinds the standing-watch
 ownership brake, and neither is visible anywhere else (issue #193). A cache
 NEWER than the pin is normal — claude tracks the marketplace's default
 branch — and is reported in the JSON (`plugin.skew`) without a warning.
+
+Its `dispatch` object is where to look when standing watches seem dead:
+`hookSessions` is the live hook-* count against the ceiling, `lastRefusal`
+is the batch the ceiling most recently dropped (with a running total), and
+`warning` — the same field `ls` sets when the receiver has no spawn command
+— is present exactly when a match right now would spawn nothing.
 
 One-time per box, to make deliveries possible at all:
   agent-box-webhook setup      # mints the HMAC secret, prints URL + secret
@@ -157,14 +177,83 @@ peer_kinds() {
   done
 }
 
+# ----------------------------------------------------- standing-watch cap ---
+# Standing watches are the one delivery shape with no session behind it, so
+# when the spawn wrapper refuses a batch (too many hook-* sessions already
+# exist) webhook.py drops it and NOBODY got those events. That refusal used to
+# reach only the receiver daemon journal while every listing here still said
+# "subscribed" — four hook sessions whose agents forgot `agent-box-session rm`
+# made the whole box inert and it read like a quiet week (issue #170). These
+# three read the state the wrapper decides on, so `status` and `ls` can say it.
+
+hook_sessions() {
+  # Live hook-* sessions: the same file and the same query the wrapper counts
+  # (src/webhook-spawn.sh), so this is the number the ceiling is applied to.
+  if [ -s "$SESSIONS" ]; then
+    "$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' \
+      "$SESSIONS" 2>/dev/null || printf '0'
+  else
+    printf '0'
+  fi
+}
+
+hook_max() {
+  # The ceiling itself. It is an env knob on the RECEIVER daemon unit, whose
+  # environment this process does not share, so a box that raised it there and
+  # nowhere else would read the built-in here. That is why a recorded refusal
+  # carries the cap the wrapper actually applied: when the two disagree,
+  # lastRefusal.max is the one that was enforced. Unset on both sides — the
+  # normal case — makes them the same number.
+  m="${AGENT_BOX_HOOK_SESSION_MAX:-4}"
+  case "$m" in (""|*[!0-9]*) m=4 ;; esac
+  printf '%s' "$m"
+}
+
+dispatch_topics() {
+  # How many standing watches exist. The shared dispatch filter is webhook.py's
+  # file and its format; this only counts entries, so that nothing warns about
+  # a ceiling on a box that dispatches nothing.
+  f="$STATE_DIR/filter.dispatch.json"
+  if [ -s "$f" ]; then
+    "$JQ" -r '(.topics // []) | length' "$f" 2>/dev/null || printf '0'
+  else
+    printf '0'
+  fi
+}
+
+hook_capacity_warning() {
+  # hook_capacity_warning LIVE MAX — the one sentence `status` and `ls` both
+  # print when the ceiling has made the watches inert, and nothing when it has
+  # not. One wording in one place: two copies would drift, and this is the
+  # sentence the reader acts on.
+  [ "$1" -ge "$2" ] || return 0
+  printf '%s' "$1 of at most $2 hook-* sessions already exist, so every \
+standing watch is inert: a matching event batch is refused and DROPPED, never \
+queued. Remove the finished ones (agent-box-session ls, then agent-box-session \
+rm NAME), or raise AGENT_BOX_HOOK_SESSION_MAX on the receiver daemon unit."
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
-  subscribe|unsubscribe|ls|subscriptions)
+  subscribe|unsubscribe)
     # webhook.py owns topic parsing, TTL/renew semantics and the filter
     # file — including the per-session LOCAL_WEBHOOK_SESSION scope, which
     # the supervisor already put in this session's environment.
     ensure_state
     exec "$PY" "$SCRIPT" "$cmd" "$@"
+    ;;
+  ls|subscriptions)
+    # Same delegation, deliberately not exec'd: a listing of standing watches
+    # is exactly where a wedged box has to say it is wedged (issue #170).
+    # stdout stays byte-for-byte webhook.py's, so a caller parsing the listing
+    # is unaffected; the line goes to stderr like every other warning here.
+    ensure_state
+    "$PY" "$SCRIPT" "$cmd" "$@"
+    if [ "$(dispatch_topics)" -gt 0 ]; then
+      w="$(hook_capacity_warning "$(hook_sessions)" "$(hook_max)")"
+      [ -z "$w" ] || echo "agent-box-webhook: $w Run" \
+        "'agent-box-webhook status' for the last refused batch." >&2
+    fi
     ;;
   status)
     # Same status webhook.py prints (its own version is the pin, since this
@@ -203,13 +292,54 @@ case "$cmd" in
         skew=newer
       fi
     fi
+    # ...and the third: whether a standing watch could spawn anything at all
+    # (issue #170). dispatchTopicCount says how many are subscribed; it does
+    # not say that the box is at its hook-* ceiling, which drops every match.
+    hlive="$(hook_sessions)"
+    hmax="$(hook_max)"
+    dtopics="$(printf '%s' "$out" | "$JQ" -r '.dispatchTopicCount // 0')"
+    refusal=null
+    if [ -s "$HOOK_REFUSED" ]; then
+      refusal="$("$JQ" -c . "$HOOK_REFUSED" 2>/dev/null)" || refusal=null
+      [ -n "$refusal" ] || refusal=null
+    fi
+    # ONE field answers one question — "would a match spawn a session right
+    # now?" — so there is a single place to look. webhook.py already sets
+    # dispatch.warning in the `ls` listing for the no-spawn-command case, so
+    # this reuses that name and that meaning instead of opening a second
+    # channel; the two causes are mutually exclusive (no spawner at all beats
+    # a full one). Nothing is said when a match would spawn.
+    dwarn=""
+    if [ "$dtopics" -gt 0 ]; then
+      # "unknown" is a receiver that has advertised nothing (no receiver.json,
+      # so probably not running). Never claim its spawn command is missing on
+      # that evidence — webhook.py does not either — but the ceiling below is
+      # true whether or not the daemon is up, so it is still reported.
+      spawn="$(printf '%s' "$out" \
+        | "$JQ" -r 'if .receiver == null then "unknown"
+                    elif .receiver.spawn then "yes" else "no" end')"
+      if [ "$spawn" = no ]; then
+        dwarn="receiver daemon has no LOCAL_WEBHOOK_SPAWN_CMD configured; dispatch topics are inert"
+      else
+        dwarn="$(hook_capacity_warning "$hlive" "$hmax")"
+      fi
+    fi
     printf '%s' "$out" | "$JQ" \
       --arg installed "$installed" --arg pf "$PLUGINS" --arg skew "$skew" \
-      --argjson keyed "$keyed" --argjson shared "$shared" --argjson legacy "$legacy" '
+      --argjson keyed "$keyed" --argjson shared "$shared" --argjson legacy "$legacy" \
+      --argjson hlive "$hlive" --argjson hmax "$hmax" --argjson refusal "$refusal" \
+      --arg dwarn "$dwarn" '
         .plugin = {sessionVersions: ($installed | if . == "" then [] else split(" ") end),
                    pinnedVersion: .version, skew: $skew, installedFrom: $pf}
         | .peers = {live: ($keyed + $shared + $legacy),
-                    keyed: $keyed, shared: $shared, legacy: $legacy}'
+                    keyed: $keyed, shared: $shared, legacy: $legacy}
+        | .dispatch = ({topicCount: .dispatchTopicCount,
+                        spawnCommand: (if .receiver == null then null
+                                       else .receiver.spawn == true end),
+                        hookSessions: {live: $hlive, max: $hmax,
+                                       atCapacity: ($hlive >= $hmax)},
+                        lastRefusal: $refusal}
+                       + (if $dwarn == "" then {} else {warning: $dwarn} end))'
     # Warnings on stderr only, and only when something is wrong: status stays
     # valid JSON on stdout for a caller that parses it, and a healthy box says
     # nothing at all.
@@ -221,6 +351,9 @@ case "$cmd" in
            "OLDER than the pinned $pinned. webhook.syncSessionPlugin normally cures this at the" \
            "next session start; by hand: claude plugin marketplace update local-channels &&" \
            "claude plugin update local-webhook@local-channels (issue #193)" >&2
+    fi
+    if [ -n "$dwarn" ]; then
+      echo "agent-box-webhook: $dwarn" >&2
     fi
     if [ "$legacy" -gt 0 ]; then
       echo "agent-box-webhook: $legacy live session peer(s) name their socket the pre-0.10.0" \
