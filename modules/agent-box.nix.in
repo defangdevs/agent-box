@@ -355,6 +355,11 @@ let
     # (util-linux) is not on it, and the hook-session cap check has to hold
     # the registry lock through the add it decides on.
     export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
+    # Which agent a match really starts. The spawn calls `agent-box-session
+    # add` with no --agent, so it is the box default — and --preamble has to
+    # NAME it, because that is the half of "what does this watch launch" the
+    # page could not show before (issue #292). Same value sessionCli exports.
+    export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
   '' + ''
 @@include:src/webhook-spawn.sh@@
   '');

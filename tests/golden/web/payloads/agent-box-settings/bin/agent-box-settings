@@ -938,19 +938,39 @@ def webhook_unsubscribe(key, topic, dispatch):
     return proc is not None and proc.returncode == 0
 
 
+def hook_args_stamp():
+    """(mtime_ns, size) of the env file, or None when there is none.
+
+    Part of hook_preamble's cache key. The dispatch script reports the
+    hook-session arguments that file can override (#292), so its output is
+    no longer a function of (topic, note) alone: an `agent-box-session env
+    set` between two renders changes which model the page should show, and
+    a cached answer would keep naming the old one for the life of the
+    daemon. One stat per render is cheap; the fork it guards is not.
+    """
+    try:
+        info = os.stat(ENV_FILE)
+    except OSError:
+        return None
+    return (info.st_mtime_ns, info.st_size)
+
+
 @functools.lru_cache(maxsize=64)
-def hook_preamble(topic, note):
-    """The prompt a match on this standing watch launches its session with.
+def hook_preamble(topic, note, stamp):
+    """What a match on this standing watch launches: the launch command,
+    then the prompt the new session is given.
 
     Rendered by the dispatch script itself (--preamble), for the same
     reason the panel shells out to webhook.py for everything else: the
     text belongs to the thing that sends it. A copy here would drift, and
     a prompt the box no longer sends is worse than no prompt at all.
 
-    Deterministic for a given (topic, note), so the per-second live feed
-    re-render costs one fork per watch per daemon lifetime. "" when the
-    module wired no command or the script failed — the caller then falls
-    back to printing the note.
+    `stamp` is hook_args_stamp() — not read here, only keyed on, so a
+    changed env file renders fresh instead of serving the old model. For a
+    given (topic, note, stamp) the answer is deterministic, so the
+    per-second live feed re-render still costs one fork per watch per
+    edit. "" when the module wired no command or the script failed — the
+    caller then falls back to printing the note.
     """
     if not HOOK_SPAWN_CMD:
         return ""
@@ -2842,9 +2862,9 @@ def render_webhook_row(topic, meta, note, key, dispatch, fold=""):
     """One subscription row: what it is, why it exists, and its delete.
     Every row this renders names a topic, so every row can drop it.
 
-    `fold` is text the row hides behind a disclosure — the launch prompt of
-    a standing watch (#259), which is too long to sit on the row itself and
-    too useful to leave off the page."""
+    `fold` is text the row hides behind a disclosure — what a standing watch
+    launches (#259): the agent CLI and its arguments, then the prompt. Too
+    long to sit on the row itself and too useful to leave off the page."""
     base = html.escape(BASE)
     safe_topic = html.escape(topic)
     bits = "".join(
@@ -2873,10 +2893,10 @@ def render_webhook_row(topic, meta, note, key, dispatch, fold=""):
     # read as text the session would really receive.
     return (
         f'<li class="foldrow"><details data-fold="watch-{safe_topic}">'
-        f'<summary title="Show the prompt a match launches">{row}</summary>'
-        f'<div class="wh-prompt"><p class="note">Launch prompt &mdash; what a '
-        f'matching event starts the new session with. The &lt;&hellip;&gt; parts '
-        f'come from the event.</p>'
+        f'<summary title="Show what a match launches">{row}</summary>'
+        f'<div class="wh-prompt"><p class="note">What a matching event starts '
+        f'&mdash; the launch command, then the prompt the new session is given. '
+        f'The &lt;&hellip;&gt; parts come from the event.</p>'
         f'<pre>{html.escape(fold)}</pre></div>'
         f'</details></li>'
     )
@@ -2895,12 +2915,13 @@ def render_webhooks(watches):
     The fold carries the whole prompt instead, note included, in the frame
     that explains why that wording exists."""
     rows = []
+    stamp = hook_args_stamp()
     for entry in watches:
         topic = str(entry.get("topic") or "")
         if not topic:
             continue
         note = str(entry.get("note") or "")
-        prompt = hook_preamble(topic, note)
+        prompt = hook_preamble(topic, note, stamp)
         rows.append(render_webhook_row(
             topic,
             [str(entry.get("expiresIn") or "")],

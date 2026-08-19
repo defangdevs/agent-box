@@ -745,11 +745,46 @@
     machine.succeed(
         f"sudo -u agent env HOME=/home/agent agent-box-session rm {overridden}"
     )
+
+    # --- issue #292: --preamble says what a match LAUNCHES ------------------
+    # The override above is invisible unless something reports it: the prompt
+    # is only half of what a delivery starts, and the other half is what picks
+    # the model. --preamble is the one place that can say so without a second
+    # copy to drift, and the settings page shows it by shelling out here.
+    launch = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        f" {spawn_cmd} --preamble 'github:defangdevs/*' 'why this watch exists'"
+    )
+    # The agent is named, not implied: the spawn passes no --agent, so a match
+    # starts the box default, and "which model does the watch use" is not
+    # answerable from the prompt alone.
+    assert "claude --model haiku" in launch, launch
+    # ...and WHERE that came from, so the reader knows which of the two levers
+    # is in force.
+    assert "AGENT_BOX_HOOK_SESSION_ARGS in /home/agent/.config/agent-box/env" \
+        in launch, launch
+    # ...and how to change it, which is the whole point: no rebuild, no root.
+    assert "agent-box-session env set AGENT_BOX_HOOK_SESSION_ARGS" in launch, launch
+    # The prompt is still there, below the launch command.
+    assert "webhook dispatcher" in launch, launch
+
     # Cleared afterwards so nothing downstream inherits this override.
     machine.succeed(
         "sudo -u agent env HOME=/home/agent"
         " agent-box-session env rm AGENT_BOX_HOOK_SESSION_ARGS"
     )
+    # With the override gone the NixOS option is what a match uses, and the
+    # report names that source instead — the two levers never read alike.
+    launch = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        # No note argument: two adjacent single quotes would END this Nix
+        # string, and the report under test does not depend on the note.
+        f" {spawn_cmd} --preamble 'github:defangdevs/*'"
+    )
+    assert "claude --model sonnet" in launch, launch
+    # The SOURCE line, not the closing sentence that names the option either
+    # way: the report has to distinguish the two levers, not just mention them.
+    assert "come from services.agent-box.webhook.hookSessionArgs" in launch, launch
 
     # An assignment is a work request, not a triage request (#253). The watch's
     # predicate decides WHICH assignments arrive (assignee = the box); this

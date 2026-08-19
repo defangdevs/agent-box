@@ -1570,6 +1570,11 @@ esac
     # (util-linux) is not on it, and the hook-session cap check has to hold
     # the registry lock through the add it decides on.
     export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
+    # Which agent a match really starts. The spawn calls `agent-box-session
+    # add` with no --agent, so it is the box default — and --preamble has to
+    # NAME it, because that is the half of "what does this watch launch" the
+    # page could not show before (issue #292). Same value sessionCli exports.
+    export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
   '' + ''
 set -eu
 # jq/coreutils/agent-box-session resolve from the webhook daemon unit's
@@ -1611,12 +1616,104 @@ is running before duplicating someone's work (agent-box-session ls, \
 agent-box-webhook ls).}"
 }
 
-# --preamble TOPIC [NOTE]: print the prompt a match on TOPIC would launch and
-# spawn nothing. Everything a delivery decides is left as a <placeholder>: the
-# event key names the session and the topic it owns, and the batch text is
-# what arms the assignment sentence. Reads no stdin and touches no state, so
-# the settings daemon can run it per render.
+# Extra agent-CLI args for hook sessions (webhook.hookSessionArgs), JSON in
+# the daemon unit's env — e.g. a cheaper model for triage work. A value for
+# the same key in ~/.config/agent-box/env — the file `agent-box-session env
+# set`/the settings page already manage — overrides it with no rebuild: any
+# user can set that key to a JSON array of arguments and pick their own
+# hook-session model from chat (issue #290). Same safe KEY=VALUE parse as the
+# env-exec wrapper (#212); only this one key is read, so nothing else in the
+# file reaches this process's environment.
+#
+# Resolved HERE, above the --preamble exit, because BOTH readers need it: a
+# real spawn decodes it into the add call's `--` tail (which the supervisor
+# stores as extraArgs), and --preamble reports it. Nothing on the box used to
+# say which agent CLI a standing watch starts or on which model, so answering
+# "does the watch use sonnet?" meant reading this source plus the receiver
+# unit's environment — and the override that #290 added was invisible to the
+# operator it was added for (issue #292).
+#   extra[]           the resolved args
+#   hook_args_source  where they came from, for the --preamble report
+hook_args_file="$HOME/.config/agent-box/env"
+hook_args_source=""
+if [ -n "''${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
+  hook_args_source="services.agent-box.webhook.hookSessionArgs (NixOS config)"
+fi
+if [ -r "$hook_args_file" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
+    key=''${line%%=*}
+    [ "$key" = "AGENT_BOX_HOOK_SESSION_ARGS" ] || continue
+    val=''${line#*=}
+    case "$val" in
+      \"*\") val=''${val#\"}; val=''${val%\"} ;;
+      \'*\') val=''${val#\'}; val=''${val%\'} ;;
+    esac
+    AGENT_BOX_HOOK_SESSION_ARGS=$val
+    hook_args_source="AGENT_BOX_HOOK_SESSION_ARGS in $hook_args_file"
+  done < "$hook_args_file"
+fi
+
+extra=()
+if [ -n "''${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
+  # A hand-edited value that is not a JSON array of strings must not take the
+  # delivery down with it: say so where the operator will look (--preamble,
+  # and the journal) and start the session on the agent CLI's own defaults.
+  if hook_args_decoded=$("$JQ" -r '.[]' <<<"$AGENT_BOX_HOOK_SESSION_ARGS" 2>/dev/null); then
+    if [ -n "$hook_args_decoded" ]; then
+      while IFS= read -r arg; do
+        extra+=("$arg")
+      done <<<"$hook_args_decoded"
+    fi
+  else
+    hook_args_source="$hook_args_source — IGNORED, not a JSON array of strings"
+    echo "agent-box-webhook-spawn: AGENT_BOX_HOOK_SESSION_ARGS is not a JSON" \
+         "array of strings; starting this session with no extra args" >&2
+  fi
+fi
+
+# The launch COMMAND a match starts, printed by --preamble above the prompt.
+# The prompt is only half of what a delivery starts; the other half decides
+# which agent runs it and on which model, and that half had no surface at all
+# (issue #292). Same rule as the preamble itself: the text belongs to the
+# thing that sends it, so the settings page shells out here rather than
+# keeping a copy that would drift.
+#
+# The agent is never chosen here — the spawn calls `agent-box-session add`
+# with no --agent — so the box default is what a match really starts. The
+# wrapper exports it for exactly this line; unset only in a hand-run script.
+render_launch() {
+  # The example is a variable so the copy-paste line keeps the shell quoting
+  # the user needs: the value is JSON, and bare brackets and quotes would not
+  # survive their shell.
+  hook_args_example="'[\"--model\",\"sonnet\"]'"
+  printf 'Launch command — what a match starts, with the prompt below:\n'
+  printf '  %s' "''${AGENT_BOX_DEFAULT_AGENT:-<the box default agent>}"
+  if [ "''${#extra[@]}" -gt 0 ]; then printf ' %s' "''${extra[@]}"; fi
+  printf '\n'
+  if [ -n "$hook_args_source" ]; then
+    printf 'The arguments after the agent come from %s.\n' "$hook_args_source"
+  else
+    printf '%s\n' "No extra arguments are set, so the session starts on the \
+agent CLI defaults (for claude, your default model)."
+  fi
+  printf '%s\n' "Change them for every LATER hook session — no rebuild, no \
+root, running sessions keep the arguments they started with:"
+  printf '  agent-box-session env set AGENT_BOX_HOOK_SESSION_ARGS %s\n' \
+    "$hook_args_example"
+  printf '%s\n' "That file wins over the NixOS option \
+services.agent-box.webhook.hookSessionArgs, which is the fallback."
+}
+
+# --preamble TOPIC [NOTE]: print what a match on TOPIC would launch — the
+# launch command first, then the prompt — and spawn nothing. Everything a
+# delivery decides is left as a <placeholder>: the event key names the session
+# and the topic it owns, and the batch text is what arms the assignment
+# sentence. Reads no stdin and writes no state, so the settings daemon can run
+# it per render; it does READ the env file above, which is the point (#292).
 if [ "''${1:-}" = "--preamble" ]; then
+  render_launch
+  printf '\n'
   render_preamble "''${2:-?}" "''${3:+ (\"$3\")}" \
     " <armed only when a batch line reads as an assignment: $assignment_text>" \
     "hook-<key>-<hex>" "<source>:<key>"
@@ -1759,38 +1856,6 @@ esac
 topic="''${LOCAL_WEBHOOK_SPAWN_TOPIC:-?}"
 note="''${LOCAL_WEBHOOK_SPAWN_NOTE:+ (\"$LOCAL_WEBHOOK_SPAWN_NOTE\")}"
 preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded")"
-
-# Extra agent-CLI args for hook sessions (webhook.hookSessionArgs), JSON in
-# the daemon unit's env — e.g. a cheaper model for triage work. A value for
-# the same key in ~/.config/agent-box/env — the file `agent-box-session env
-# set`/the settings page already manage — overrides it with no rebuild: any
-# user can run `agent-box-session env set AGENT_BOX_HOOK_SESSION_ARGS
-# '["--model","sonnet"]'` from chat to pick their own hook-session model
-# (issue #290). Same safe KEY=VALUE parse as the env-exec wrapper (#212);
-# only this one key is read, so nothing else in the file reaches this
-# process's environment. Decoded here into the add call's `--` tail, which
-# the supervisor stores as extraArgs.
-envfile="$HOME/.config/agent-box/env"
-if [ -r "$envfile" ]; then
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-    key=''${line%%=*}
-    [ "$key" = "AGENT_BOX_HOOK_SESSION_ARGS" ] || continue
-    val=''${line#*=}
-    case "$val" in
-      \"*\") val=''${val#\"}; val=''${val%\"} ;;
-      \'*\') val=''${val#\'}; val=''${val%\'} ;;
-    esac
-    AGENT_BOX_HOOK_SESSION_ARGS=$val
-  done < "$envfile"
-fi
-
-extra=()
-if [ -n "''${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
-  while IFS= read -r arg; do
-    extra+=("$arg")
-  done < <("$JQ" -r '.[]' <<<"$AGENT_BOX_HOOK_SESSION_ARGS")
-fi
 
 if [ "''${#extra[@]}" -gt 0 ]; then
   exec agent-box-session add "$name" --prompt "$preamble
@@ -5124,19 +5189,39 @@ in
             return proc is not None and proc.returncode == 0
 
 
+        def hook_args_stamp():
+            """(mtime_ns, size) of the env file, or None when there is none.
+
+            Part of hook_preamble's cache key. The dispatch script reports the
+            hook-session arguments that file can override (#292), so its output is
+            no longer a function of (topic, note) alone: an `agent-box-session env
+            set` between two renders changes which model the page should show, and
+            a cached answer would keep naming the old one for the life of the
+            daemon. One stat per render is cheap; the fork it guards is not.
+            """
+            try:
+                info = os.stat(ENV_FILE)
+            except OSError:
+                return None
+            return (info.st_mtime_ns, info.st_size)
+
+
         @functools.lru_cache(maxsize=64)
-        def hook_preamble(topic, note):
-            """The prompt a match on this standing watch launches its session with.
+        def hook_preamble(topic, note, stamp):
+            """What a match on this standing watch launches: the launch command,
+            then the prompt the new session is given.
 
             Rendered by the dispatch script itself (--preamble), for the same
             reason the panel shells out to webhook.py for everything else: the
             text belongs to the thing that sends it. A copy here would drift, and
             a prompt the box no longer sends is worse than no prompt at all.
 
-            Deterministic for a given (topic, note), so the per-second live feed
-            re-render costs one fork per watch per daemon lifetime. "" when the
-            module wired no command or the script failed — the caller then falls
-            back to printing the note.
+            `stamp` is hook_args_stamp() — not read here, only keyed on, so a
+            changed env file renders fresh instead of serving the old model. For a
+            given (topic, note, stamp) the answer is deterministic, so the
+            per-second live feed re-render still costs one fork per watch per
+            edit. "" when the module wired no command or the script failed — the
+            caller then falls back to printing the note.
             """
             if not HOOK_SPAWN_CMD:
                 return ""
@@ -7028,9 +7113,9 @@ in
             """One subscription row: what it is, why it exists, and its delete.
             Every row this renders names a topic, so every row can drop it.
 
-            `fold` is text the row hides behind a disclosure — the launch prompt of
-            a standing watch (#259), which is too long to sit on the row itself and
-            too useful to leave off the page."""
+            `fold` is text the row hides behind a disclosure — what a standing watch
+            launches (#259): the agent CLI and its arguments, then the prompt. Too
+            long to sit on the row itself and too useful to leave off the page."""
             base = html.escape(BASE)
             safe_topic = html.escape(topic)
             bits = "".join(
@@ -7059,10 +7144,10 @@ in
             # read as text the session would really receive.
             return (
                 f'<li class="foldrow"><details data-fold="watch-{safe_topic}">'
-                f'<summary title="Show the prompt a match launches">{row}</summary>'
-                f'<div class="wh-prompt"><p class="note">Launch prompt &mdash; what a '
-                f'matching event starts the new session with. The &lt;&hellip;&gt; parts '
-                f'come from the event.</p>'
+                f'<summary title="Show what a match launches">{row}</summary>'
+                f'<div class="wh-prompt"><p class="note">What a matching event starts '
+                f'&mdash; the launch command, then the prompt the new session is given. '
+                f'The &lt;&hellip;&gt; parts come from the event.</p>'
                 f'<pre>{html.escape(fold)}</pre></div>'
                 f'</details></li>'
             )
@@ -7081,12 +7166,13 @@ in
             The fold carries the whole prompt instead, note included, in the frame
             that explains why that wording exists."""
             rows = []
+            stamp = hook_args_stamp()
             for entry in watches:
                 topic = str(entry.get("topic") or "")
                 if not topic:
                     continue
                 note = str(entry.get("note") or "")
-                prompt = hook_preamble(topic, note)
+                prompt = hook_preamble(topic, note, stamp)
                 rows.append(render_webhook_row(
                     topic,
                     [str(entry.get("expiresIn") or "")],
