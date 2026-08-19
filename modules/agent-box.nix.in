@@ -294,8 +294,11 @@ let
         workingDirectory =
           if s.workingDirectory != null then s.workingDirectory
           else "/home/${name}";
-        # Runtime state the supervisor manages; seeded so a declared kickoff
-        # prompt fires once and hasRun exists from the start.
+        # The supervisor's own bookkeeping, mirrored here for one more
+        # release (issue #282): it keeps these in
+        # ~/.local/state/agent-box/session/<name>.json now and reads the
+        # registry copy only as a migration fallback. Seeded so a declared
+        # kickoff prompt fires once.
         initialPrompt = s.initialPrompt;
         resumePrompt = s.resumePrompt;
         boxSessionId = null;
@@ -752,11 +755,12 @@ let
     @@include:src/supervisor.sh@@
   '';
 
-  # /clear rotation bookkeeping (issue #223). A SessionStart hook records
-  # the live claude session id — /clear rotates it mid-process — keyed by
-  # the launch id the supervisor put in the pane environment, so the next
-  # respawn resumes the conversation the user actually had, not the
-  # pre-/clear transcript boxSessionId still points at. Injected per spawn
+  # Segment-rotation bookkeeping (issue #223). A SessionStart hook records
+  # the live claude session id — a clear, a compact or a resume rotates it
+  # mid-process — keyed by the launch id the supervisor put in the pane
+  # environment, so the next respawn resumes the conversation the user
+  # actually had, not the segment it was launched with and rotated away
+  # from. Injected per spawn
   # via claude's `--settings` flag (additional settings, merged on top):
   # the user's own settings.json is never touched, sessions outside the
   # supervisor never run the hook, and a rebuild rolls both files forward
@@ -1515,7 +1519,7 @@ in
             AGENT_BOX_AGENT_BINS = agentBinsFor name;
             AGENT_BOX_ENV_EXEC = "${envExecWrapper}";
             AGENT_BOX_CODEX_RC = "${codexRemoteControl}";
-            # Hook settings for claude spawns — the /clear-rotation record
+            # Hook settings for claude spawns — the segment-rotation record
             # (issue #223) the supervisor follows on respawn.
             AGENT_BOX_CLAUDE_SETTINGS = "${claudeHookSettings}";
             # Clean-exit bookkeeping for the spawn epilogue (issue #167).

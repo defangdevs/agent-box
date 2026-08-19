@@ -336,11 +336,16 @@ def sessions_lock():
     contained the other's edit, so a one-field update reverts every field the
     other writer changed. That is not a theoretical race here — this daemon is
     a ThreadingHTTPServer, so it races ITSELF as well as the supervisor, the
-    session CLI and the mark-stopped epilogue, and the loss it caused is
+    session CLI and the mark-stopped epilogue, and the loss it caused was
     worse than a lost row: reverting hasRun / boxSessionId / the cleared
-    initialPrompt leaves a RUNNING session the supervisor treats as a first
-    spawn next time it dies, re-firing the kickoff prompt against a new id
-    and orphaning the transcript.
+    initialPrompt left a RUNNING session the supervisor treated as a first
+    spawn next time it died, re-firing the kickoff prompt against a new id
+    and orphaning the transcript. That particular cost is being taken off
+    the table separately (issue #282): the supervisor keeps its own
+    observations in ~/.local/state/agent-box/session/ and reads the registry
+    copy only as a migration fallback, so what a lost update here can revert
+    is intent — which the operator can see and re-state — and not the record
+    of a conversation. The lock stays either way: intent is worth as much.
 
     The lock is a SIDECAR file, never SESSIONS_FILE: every writer replaces
     that inode by rename, so the inode a writer locked is not the one the next
@@ -517,13 +522,14 @@ def kill_session(name):
 # own hand-off drop, and a copy there would be a second, stale transcript
 # with a lifetime nobody owns.
 #
-# What the daemon canNOT do is guess the filename from sessions.json. Its
-# boxSessionId is the id the session was LAUNCHED with, and both agents move
-# off it:
-#   claude — /clear keeps the process but starts a NEW transcript under a new
-#     uuid; the SessionStart hook records that live id, keyed by the launch id
-#     (issue #223). Follow the record, exactly as the supervisor does when it
-#     picks a --resume target.
+# What the daemon canNOT do is guess the filename from a launch id alone.
+# That id — read from the supervisor's session state, with sessions.json's
+# boxSessionId as the migration fallback (issue #282) — names the SEGMENT the
+# session was last launched with, and both agents move off it:
+#   claude — a clear, a compact or a resume keeps the process but opens a NEW
+#     transcript under a new uuid; the SessionStart hook records that live id,
+#     keyed by the launch id (issue #223). Follow the record, exactly as the
+#     supervisor does when it picks a --resume target.
 #   codex — the rollout file is named after codex's own session uuid, which
 #     the box never chooses. The supervisor finds it by the "agent-box
 #     session <id>" marker it stamps into the kickoff prompt; same marker
@@ -536,6 +542,9 @@ CLAUDE_PROJECTS_DIR = os.path.join(HOME_DIR, ".claude", "projects")
 CODEX_SESSIONS_DIR = os.path.join(HOME_DIR, ".codex", "sessions")
 LIVE_ID_DIR = os.path.join(
     HOME_DIR, ".local", "state", "agent-box", "live-session-id"
+)
+SESSION_STATE_DIR = os.path.join(
+    HOME_DIR, ".local", "state", "agent-box", "session"
 )
 # Session ids, as claude's --session-id and the record filenames use them.
 # Validated before it reaches a glob pattern or a path join, so it doubles as
@@ -556,7 +565,7 @@ CODEX_MARKER_RE = re.compile(rb"agent-box session ([0-9a-fA-F-]{36})")
 # Transcript lookups are re-run on every render of the sessions panel, and
 # the live feed re-renders it on every session state change. Memoize per box
 # id for a few seconds: long enough to collapse a render burst, short enough
-# that a /clear rotation or a fresh codex rollout shows up while the operator
+# that a segment rotation or a fresh codex rollout shows up while the operator
 # is still looking at the page.
 TRANSCRIPT_TTL = 5.0
 _transcript_cache = {}
@@ -566,8 +575,9 @@ _codex_index = (-1e9, {})
 def claude_transcript(box_id):
     """Path of the transcript claude would resume for this launch id, or
     None. The live-id record is followed FIRST (one hop, like the
-    supervisor): after a /clear the launch id's transcript still exists but
-    is the conversation the user threw away."""
+    supervisor): after a rotation — a clear, a compact or a resume — the
+    launch id's transcript still exists, but it is the segment the session
+    moved off."""
     ids = []
     live = read_live_id(box_id)
     if live and live != box_id:
@@ -618,6 +628,46 @@ def codex_index():
     return index
 
 
+def session_state_path(name):
+    """Path of one session's supervisor-owned state file (issue #282), or
+    None for a name this daemon will not touch.
+
+    The one place this daemon spells that path — the supervisor's
+    session_state_file and `agent-box-session`'s accessor of the same name
+    are the other two. The key is the session NAME for now, which is a label
+    and not an identity (it is meant to become editable, and it is minted
+    from a file that can be stale); the key it should grow into is one a
+    harness mints (issue #284). Routing every reader and writer through here
+    is what keeps that re-key to one function per program.
+
+    SESSION_RE is the path-safety check as well as the naming rule: the name
+    reaches a path join, and callers take it from sessions.json."""
+    return (
+        os.path.join(SESSION_STATE_DIR, name + ".json")
+        if SESSION_RE.match(name or "")
+        else None
+    )
+
+
+def read_launch_id(name):
+    """The id this session was last LAUNCHED with, per the supervisor's own
+    record, or None when it has never recorded one.
+
+    Attempt the read and handle the miss: the file is absent for a session
+    that has not spawned yet, and for one that last spawned before #282
+    shipped — the caller falls back to the registry copy for both."""
+    path = session_state_path(name)
+    if path is None:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            value = json.load(fh).get("launchSessionId")
+    except (OSError, ValueError, AttributeError):
+        return None
+    value = value if isinstance(value, str) else ""
+    return value if UUID_RE.match(value) else None
+
+
 def read_live_id(box_id):
     """The live session id the SessionStart hook recorded for this launch
     id, or None. Both ids are UUID-checked: box_id names the record file,
@@ -665,12 +715,16 @@ def newest_first(root):
     return [path for _mtime, path in found]
 
 
-def transcript_of(entry):
+def transcript_of(name, entry):
     """(path, size) of one session's transcript, or None when there is
-    none to offer. `entry` is its sessions.json record — the caller has
-    already name-checked the session, and nothing here comes from the
-    request."""
-    box_id = str((entry or {}).get("boxSessionId") or "")
+    none to offer. `name` and `entry` are its key and record in
+    sessions.json — the caller has already name-checked the session, and
+    nothing here comes from the request.
+
+    The launch id comes from the supervisor's own state file, falling back
+    to the registry copy for a session that last spawned before #282 (and
+    for the id `agent-box-session add` mints up front)."""
+    box_id = read_launch_id(name) or str((entry or {}).get("boxSessionId") or "")
     if not UUID_RE.match(box_id):
         # Never spawned, or a hand-written record: no id, so no transcript
         # can be attributed to this session (and guessing would hand over
@@ -786,7 +840,7 @@ def transcript_topic(path, size):
         if not isinstance(body, str):
             continue
         text = " ".join(body.split())
-        # /clear opens the next segment with the slash command itself, wrapped
+        # A clear opens the next segment with the slash command itself, wrapped
         # in the local-command caveat; the operator's own prompt follows it.
         if not text or "<local-command" in text or "<command-" in text:
             continue
@@ -1211,10 +1265,10 @@ def session_view():
     """The session state the pages actually render: order, name, agent,
     working directory, live-or-starting, stopped.
 
-    Deliberately not the whole of sessions.json — the supervisor folds
-    bookkeeping into that file (hasRun, boxSessionId, clearing
-    initialPrompt on first spawn) and those rewrites must not read as a
-    change worth re-rendering for.
+    Deliberately not the whole of sessions.json — the supervisor still
+    mirrors its bookkeeping into that file for one release (hasRun,
+    boxSessionId, clearing initialPrompt on first spawn; issue #282) and
+    those rewrites must not read as a change worth re-rendering for.
     """
     entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
     live = live_sessions()
@@ -1690,7 +1744,7 @@ def render_sessions(subs=None):
             # inside the row's <summary>: a click whose activation target is
             # the link never reaches the summary's own toggle (measured in
             # chromium, and the same rule the Restart button relies on).
-            found = transcript_of(entries[name])
+            found = transcript_of(name, entries[name])
             topic = transcript_topic(found[0], found[1]) if found else ""
             if found:
                 # Both halves of "which conversation is this": the opening
@@ -2208,7 +2262,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not SESSION_RE.match(name or "") or name not in entries:
             self._send_html("<h1>404</h1><p>No such session.</p>", status=404)
             return
-        found = transcript_of(entries[name])
+        found = transcript_of(name, entries[name])
         if not found:
             # The panel offers no button in this case, so a request here is
             # a stale page or a hand-made URL: say which of the two states
@@ -2555,7 +2609,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             # Optional kickoff prompt (first spawn only; the supervisor
             # clears it and resumes on later respawns). boxSessionId is
-            # left null so the supervisor mints a real UUID at spawn.
+            # left null so the supervisor mints a real UUID at spawn — and
+            # keeps it in its own state file from then on, these two fields
+            # being the migration copy it stops writing next release
+            # (issue #282).
             # Browsers submit textarea line endings as CRLF; normalize them
             # before this value reaches the agent as one argv element.
             prompt = form.get("prompt", [""])[0].replace("\r\n", "\n")
@@ -2609,6 +2666,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # but it would go on claiming its topics against the standing
                 # watches until something removes it (#229).
                 prune_filter(name)
+                # Same for the supervisor's record of what this session was
+                # last launched with: an OPTIMISATION only (the supervisor
+                # sweeps the directory against the registry every tick,
+                # because no delete path is guaranteed to run), but it closes
+                # the window in which a re-used name inherits the dead
+                # session's launch id — and with it its transcript (#282).
+                state_path = session_state_path(name)
+                if state_path:
+                    try:
+                        os.remove(state_path)
+                    except OSError:
+                        pass
             self._redirect("ok=session_deleted", self._sess_page(form))
         elif path == SESS_BASE + "/sessions/restart":
             name = (form.get("name", [""])[0]).strip()
