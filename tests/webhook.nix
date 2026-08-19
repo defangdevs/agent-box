@@ -1197,6 +1197,16 @@
     assert d["hookSessions"]["atCapacity"] is False, d
     assert "warning" not in d, d
 
+    # The session the settings page deleted just above has to be gone from
+    # tmux as well, not only from the registry: since #280 a hook-* pane that
+    # no entry claims is counted too, so a delete still in flight would make
+    # the arithmetic below off by one.
+    machine.wait_until_fails(
+        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
+        f" list-sessions -F '#S' | grep -x {hook_name} >/dev/null",
+        timeout=60,
+    )
+
     # The issue's own smallest reproduction: lower the ceiling under the hook
     # sessions this test already accumulated, then drive the wrapper. Capacity
     # is held by the entries that are not `stopped` (#280), which is every one
