@@ -1036,9 +1036,15 @@
         # The terminal dead end names the verb that actually revives it.
         # Print the wrapper's path (see the grep -o note below) — running
         # the substitution as the command would run the WRAPPER instead.
+        # Pattern ends in "/bin/agent-box-attach", not just
+        # "-agent-box-attach": the writeShellScriptBin derivation
+        # DIRECTORY also ends in that suffix, one path segment before the
+        # real script — matching only the shorter suffix would extract
+        # the directory, and `{attach} {name}` below would then try to
+        # exec a directory.
         attach = machine.succeed(
             "{ systemctl show agent-web-terminal@agent --property=ExecStart "
-            "--value | grep -o '/nix/store/[^ ]*-agent-box-attach' "
+            "--value | grep -o '/nix/store/[^ ]*/bin/agent-box-attach' "
             "|| echo /missing; } | head -n1"
         ).strip()
         assert attach != "/missing", attach
@@ -1079,7 +1085,7 @@
     machine.succeed(
         "grep -q -- '-T hyperlinks' "
         "$({ systemctl show agent-web-terminal@agent --property=ExecStart --value "
-        "| grep -o '/nix/store/[^ ]*-agent-box-attach' || echo /missing; } | head -n1)"
+        "| grep -o '/nix/store/[^ ]*/bin/agent-box-attach' || echo /missing; } | head -n1)"
     )
 
     # Working-directory picker (issue 131): the add-session form browses the

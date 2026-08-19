@@ -254,19 +254,25 @@
     # Exactly what claude runs as the plugin's MCP server: the same webhook.py
     # on stdio, PORT=0 so it never takes the ingress. Its stdout is the channel
     # stream. Both the interpreter and the script come from the daemon unit's
-    # own ExecStart, so the test cannot drift from the pinned pair.
-    exec_start = machine.succeed(
+    # ExecStart -> the bare-execable wrapper it names -> that wrapper's own
+    # body (issue #154 Phase 3 moved the webhookPython/localWebhookScript
+    # invocation off the unit text and into agent-box-webhook-receiver's
+    # `exec` line specifically so the shared unit file wouldn't tie to
+    # this Nix build — so the pinned pair now lives one hop further away
+    # than ExecStart), so the test still cannot drift from the pinned pair.
+    receiver_bin = machine.succeed(
         "systemctl show -p ExecStart --value agent-box-webhook@agent.service"
-    )
+        " | grep -o '/nix/store/[^ ;]*/bin/agent-box-webhook-receiver' | head -1"
+    ).strip()
+    assert receiver_bin, "could not find agent-box-webhook-receiver in ExecStart"
+    receiver_src = machine.succeed(f"cat {receiver_bin}")
     python = machine.succeed(
-        "systemctl show -p ExecStart --value agent-box-webhook@agent.service"
-        " | grep -o '/nix/store/[^ ;]*/bin/python3' | head -1"
+        f"grep -o '/nix/store/[^ ]*/bin/python3' {receiver_bin} | head -1"
     ).strip()
     script = machine.succeed(
-        "systemctl show -p ExecStart --value agent-box-webhook@agent.service"
-        " | grep -o '/nix/store/[^ ;]*webhook.py' | head -1"
+        f"grep -o '/nix/store/[^ ]*webhook.py' {receiver_bin} | head -1"
     ).strip()
-    assert python and script, exec_start
+    assert python and script, receiver_src
     # systemd-run so the driver isn't left waiting on a backgrounded shell.
     # `sleep | python3` keeps stdin OPEN: webhook.py treats stdin EOF as its
     # session closing and exits, which is right for claude and wrong here.
