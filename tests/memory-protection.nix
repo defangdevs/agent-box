@@ -28,6 +28,18 @@
     # since eval/local-build both show the correct ExecStart but the real
     # boot keeps reporting "Unable to locate executable 'agent-box-supervisor'".
     machine.sleep(5)
+    # systemctl cat proved the template-level "agent-box@.service.d/" drop-in
+    # never gets merged (only the base unit + the per-instance drop-in show
+    # up), which contradicts systemd.unit(5)'s documented "instance .d/ THEN
+    # template .d/" lookup — check the filesystem directly to see whether
+    # the directory is actually missing (a render/link bug on our side) or
+    # present-but-ignored (a systemd-side surprise), and look for any
+    # drop-in load warning in the journal we might have missed.
+    print(machine.succeed("ls -la /etc/systemd/system/ | grep 'agent-box@' || echo NO_AGENT_BOX_AT_ENTRIES"))
+    print(machine.succeed("ls -la /etc/systemd/system/agent-box@.service.d/ 2>&1 || echo TEMPLATE_DROPIN_DIR_MISSING"))
+    print(machine.succeed("cat /etc/systemd/system/agent-box@.service.d/overrides.conf 2>&1 || echo TEMPLATE_DROPIN_FILE_MISSING"))
+    print(machine.succeed("readlink -f /etc/systemd/system/agent-box@.service.d/overrides.conf 2>&1 || echo NO_REAL_TARGET"))
+    print(machine.succeed("journalctl -b --no-pager 2>&1 | grep -i 'agent-box@' || echo NO_JOURNAL_MENTIONS"))
     print(machine.succeed("systemctl cat agent-box@agent.service 2>&1 || true"))
     print(machine.succeed("systemctl show agent-box@agent.service --no-pager -p ExecStart -p ExecStop -p Environment -p LoadState -p LoadError 2>&1 || true"))
     machine.wait_for_unit("agent-box@agent.service")
