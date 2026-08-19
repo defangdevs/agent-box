@@ -84,6 +84,26 @@ let
       @@include:src/units/agent-box-webhook@.socket@@
     ''} $out/etc/systemd/system/agent-box-webhook@.socket
   '';
+  # Shared by the "agent-box@" host-level ExecSearchPath (below) and the
+  # per-user "agent-box@<name>" instance drop-in's environment.PATH — they
+  # MUST be the same value. Per systemd.exec(5): "ExecSearchPath= overrides
+  # $PATH IF $PATH is not supplied by the user through Environment=,
+  # EnvironmentFile= or PassEnvironment=" — an explicit $PATH ANYWHERE
+  # disables ExecSearchPath outright. NixOS renders an implicit default
+  # Environment=PATH=<coreutils/findutils/gnugrep/gnused/systemd only> for
+  # ANY declared systemd.services.<name> submodule instance — even our
+  # near-empty per-instance "agent-box@<name>" override — and that
+  # instance-level drop-in loads after the template-level one, so its
+  # short default $PATH wins and silently disables ExecSearchPath (caught
+  # by PR #295 CI: "Unable to locate executable 'agent-box-supervisor'").
+  # Repeating the real PATH there, so it's the LAST word for that key too,
+  # is the fix — not a nice-to-have.
+  agentBoxExecSearchPath = lib.makeBinPath (
+    [ "/home/%i/.nix-profile" config.nix.package supervisorScript ]
+    ++ agentRuntimePackages
+    ++ [ pkgs.bashInteractive pkgs.coreutils pkgs.git pkgs.gh pkgs.tmux ]
+    ++ lib.optional (effectiveSudoAllowlist != [ ]) "/run/wrappers"
+  );
   tmuxSocketName = "agent-box";
   runtimeDirectory = name: "agent-box-${name}";
   # ttyd port base; ports are assigned in sorted user-name order (see
@@ -1576,12 +1596,14 @@ in
         # agent-box-supervisor`/`ExecStop=tmux …` — systemd's OWN exec
         # lookup, independent of the process's runtime $PATH above (which
         # matters for the supervisor's own internal tmux/jq/etc calls).
-        ExecSearchPath = lib.makeBinPath (
-          [ "/home/%i/.nix-profile" config.nix.package supervisorScript ]
-          ++ agentRuntimePackages
-          ++ [ pkgs.bashInteractive pkgs.coreutils pkgs.git pkgs.gh pkgs.tmux ]
-          ++ lib.optional (effectiveSudoAllowlist != [ ]) "/run/wrappers"
-        );
+        # NOTE: per systemd.exec(5), "ExecSearchPath= overrides $PATH IF
+        # $PATH is not supplied by the user through Environment=,
+        # EnvironmentFile= or PassEnvironment=" — i.e. an explicit $PATH
+        # anywhere DISABLES ExecSearchPath outright, it does not just lose
+        # a merge. agentBoxExecSearchPath (below) has to also be repeated
+        # as environment.PATH on the per-instance drop-in for exactly this
+        # reason — see the note there.
+        ExecSearchPath = agentBoxExecSearchPath;
         # NOTE: the settings page's user-owned ~/.config/agent-box/env is
         # deliberately NOT listed here (nor in the per-user env file).
         # See the original issue 89 rationale: unit env is a start-time
@@ -1627,8 +1649,21 @@ in
     # below for why a per-instance `wantedBy` on an asDropin unit doesn't
     # actually start anything.
     // (lib.mapAttrs' (name: u: lib.nameValuePair "agent-box@${name}" (
-      { overrideStrategy = "asDropin"; }
-      // lib.optionalAttrs (u.environment != { }) { environment = u.environment; }
+      { overrideStrategy = "asDropin";
+        # environment.PATH MUST be set here even when u.environment is {}
+        # — NixOS's OWN systemd module sets a default Environment=PATH=
+        # <coreutils/findutils/gnugrep/gnused/systemd only> for ANY
+        # declared systemd.services.<name> instance at PLAIN priority (see
+        # agentBoxExecSearchPath's comment) — not mkDefault, so a same-
+        # priority definition here conflicts outright without mkForce.
+        # Left unfixed, that short default renders in THIS (last-applied)
+        # drop-in and silently disables the host-level ExecSearchPath.
+        # u.environment is merged on top so a host can still override PATH
+        # itself if it really wants to (mkForce only beats the module's
+        # own default, not an explicit host definition — lib.mkMerge would
+        # be needed if that ever needs to be adjustable per-priority).
+        environment = { PATH = lib.mkForce agentBoxExecSearchPath; } // u.environment;
+      }
       // lib.optionalAttrs (u.environmentFiles != [ ]) {
         serviceConfig.EnvironmentFile = u.environmentFiles;
       }
