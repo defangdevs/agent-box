@@ -1,0 +1,8 @@
+[Unit]
+Description=Settings page socket for %i
+
+[Socket]
+ListenStream=/run/agent-box-settings/%i.sock
+SocketUser=%i
+SocketGroup=caddy
+SocketMode=0660

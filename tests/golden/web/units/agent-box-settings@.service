@@ -1,52 +1,18 @@
 [Unit]
-After=network-online.target agent-box-settings-robot.socket
-Description=Per-user secrets settings page for robot
-Requires=agent-box-settings-robot.socket
-Wants=network-online.target
 
 [Service]
 Environment="AGENT_BOX_AGENTS=claude,codex,shell"
 Environment="AGENT_BOX_DEFAULT_AGENT=claude"
 Environment="AGENT_BOX_HOOK_SPAWN_CMD=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook-spawn/bin/agent-box-webhook-spawn"
-Environment="AGENT_BOX_PASSWORD_CMD=/run/wrappers/bin/sudo -n /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-password-robot/bin/agent-box-password-robot"
 Environment="AGENT_BOX_REPO=defangdevs/agent-box"
 Environment="AGENT_BOX_REV=0000000000000000000000000000000000000000"
-Environment="AGENT_BOX_SESSIONS_FILE=/home/robot/.config/agent-box/sessions.json"
-Environment="AGENT_BOX_SETTINGS_BASE=/robot/settings"
-Environment="AGENT_BOX_SETTINGS_ENV_FILE=/home/robot/.config/agent-box/env"
-Environment="AGENT_BOX_SETTINGS_USER=robot"
 Environment="AGENT_BOX_SYSTEMCTL=/run/current-system/sw/bin/systemctl"
 Environment="AGENT_BOX_TMUX_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7b/bin/tmux"
-Environment="AGENT_BOX_TMUX_SOCKET=agent-box"
-Environment="AGENT_BOX_TMUX_TMPDIR=/run/agent-box-robot"
 Environment="AGENT_BOX_UPDATE_CMD=/run/wrappers/bin/sudo -n /run/current-system/sw/bin/systemctl start --no-block agent-box-update.service"
 Environment="AGENT_BOX_UPDATE_UNIT=agent-box-update.service"
 Environment="AGENT_BOX_WEBHOOK_PYTHON=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.6/bin/python3"
 Environment="AGENT_BOX_WEBHOOK_SCRIPT=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-webhook.py"
-Environment="AGENT_BOX_WEBHOOK_STATE_DIR=/home/robot/.local/state/local-webhook"
 Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-67/lib/locale/locale-archive"
 Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.10.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.10.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261/sbin"
-Environment="TMUX_TMPDIR=/run/agent-box-robot"
 Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026b/share/zoneinfo"
-ExecStart=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-settings/bin/agent-box-settings
-LockPersonality=true
-NoNewPrivileges=false
-PrivateDevices=true
-ProtectControlGroups=true
-ProtectHome=false
-ProtectKernelModules=true
-ProtectKernelTunables=true
-ProtectSystem=strict
-ReadWritePaths=/home/robot
-ReadWritePaths=/run/agent-box-robot
-ReadWritePaths=/var/lib/agent-box-web
-Restart=always
-RestartSec=5s
-RestrictRealtime=true
-RestrictSUIDSGID=true
-User=robot
-
-[Install]
-WantedBy=multi-user.target
-
-# X-Golden-wantedBy: multi-user.target
+ExecSearchPath=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-settings/bin

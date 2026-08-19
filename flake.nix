@@ -52,7 +52,12 @@
           # settings land in the files below.
           etcFilter = n:
             builtins.match
-              "agent-box-guides/.*|caddy/caddy_config|codex/config\\.toml|fail2ban/(fail2ban|jail)\\.local|fail2ban/filter\\.d/agent-web-auth\\.conf|sudoers"
+              # agent-box/units/*.env (issue #154 Phase 3): the per-user
+              # generated env files the "%i" template units' EnvironmentFile=
+              # reads — the payload capture below only scans Nix-visible
+              # `environment` attrs, so these plain-text files are the review
+              # surface for what moved out of that attrset.
+              "agent-box-guides/.*|agent-box/units/.*|caddy/caddy_config|codex/config\\.toml|fail2ban/(fail2ban|jail)\\.local|fail2ban/filter\\.d/agent-web-auth\\.conf|sudoers"
               n != null;
           manifestOf = modules:
             let sys = nixpkgs.lib.nixosSystem { inherit system modules; }; in
@@ -171,7 +176,11 @@
             ];
           };
           services = multiUser.config.systemd.services;
-          wanted = [ "agent-box-alice" "agent-box-bob" "agent-box-coder" "agent-box-ci" ];
+          # issue #154 Phase 3: "agent-box@" is the systemd %i template unit
+          # itself; each configured user additionally gets its own
+          # "agent-box@<user>" drop-in (enablement, at minimum) rather than a
+          # flat "agent-box-<user>" unit.
+          wanted = [ "agent-box@" "agent-box@alice" "agent-box@bob" "agent-box@coder" "agent-box@ci" ];
           missing = builtins.filter (n: ! builtins.hasAttr n services) wanted;
         in
         {

@@ -1,0 +1,29 @@
+[Unit]
+Description=Webhook receiver daemon (local-webhook) for %i
+After=network-online.target agent-box-webhook@%i.socket
+Requires=agent-box-webhook@%i.socket
+Wants=network-online.target
+
+[Service]
+User=%i
+Restart=always
+RestartSec=5s
+Environment=LOCAL_WEBHOOK_RECEIVER_ONLY=1
+Environment=LOCAL_WEBHOOK_STATE_DIR=/home/%i/.local/state/local-webhook
+Environment=LOCAL_WEBHOOK_PORT=0
+EnvironmentFile=-/etc/agent-box/units/agent-box-webhook-%i.env
+EnvironmentFile=-/etc/agent-box/units/agent-box-webhook-%i.local.env
+ExecStartPre=agent-box-webhook-policy-apply
+ExecStart=agent-box-webhook-receiver
+StandardInput=null
+ProtectSystem=strict
+ReadWritePaths=/home/%i
+ProtectHome=false
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+NoNewPrivileges=true

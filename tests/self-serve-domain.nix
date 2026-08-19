@@ -61,7 +61,7 @@
   testScript = ''
     start_all()
     machine.wait_for_unit("caddy.service")
-    machine.wait_for_unit("agent-box-agent.service")
+    machine.wait_for_unit("agent-box@agent.service")
     client.wait_for_unit("multi-user.target")
     machine_ip = machine.succeed("ip -4 -o addr show eth1 | head -1").split()[3].split("/")[0]
 
@@ -82,7 +82,7 @@
     # flow returned EROFS for every real agent while this test (which used to
     # write as plain `sudo -u agent` from the driver's root namespace) passed.
     machine.succeed(
-        "systemctl show agent-box-agent --property=ReadWritePaths --value "
+        "systemctl show agent-box@agent --property=ReadWritePaths --value "
         "| grep /var/lib/agent-box-sites/agent >/dev/null"
     )
 
@@ -92,7 +92,7 @@
     # to the same read-only remount a tool shell inside the session gets;
     # runuser then drops to the agent uid for the ownership check below.
     agent_pid = machine.succeed(
-        "systemctl show -p MainPID --value agent-box-agent.service"
+        "systemctl show -p MainPID --value agent-box@agent.service"
     ).strip()
     assert agent_pid not in ("", "0"), "agent unit has no main PID"
     machine.succeed(
@@ -114,7 +114,7 @@
     # sudo wrapper, without which shells started by the agent CLI can't
     # invoke sudo even though the sudoers rule permits the command.
     machine.succeed(
-        "systemctl show agent-box-agent --property=Environment "
+        "systemctl show agent-box@agent --property=Environment "
         "| grep '/run/wrappers/bin' >/dev/null"
     )
 

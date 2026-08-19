@@ -124,20 +124,20 @@
 
     start_all()
     machine.wait_for_unit("caddy.service")
-    machine.wait_for_unit("agent-box-agent.service")
+    machine.wait_for_unit("agent-box@agent.service")
     client.wait_for_unit("multi-user.target")
     machine_ip = machine.succeed("ip -4 -o addr show eth1 | head -1").split()[3].split("/")[0]
 
     # --- default-on: the units exist without anyone setting webhook.enable ---
-    machine.wait_for_unit("agent-box-webhook-agent.socket")
-    machine.wait_for_unit("agent-box-webhook-agent.service")
+    machine.wait_for_unit("agent-box-webhook@agent.socket")
+    machine.wait_for_unit("agent-box-webhook@agent.service")
     # Socket ownership is the isolation boundary: the user and caddy, nobody
     # else. systemd (root) binds it before the daemon starts, and the daemon
     # adopts that fd rather than binding a path or a port itself.
     machine.succeed(
         "stat -c '%U:%G %a' /run/agent-box-webhook/agent.sock | grep -x 'agent:caddy 660'"
     )
-    machine.succeed("systemctl show -p User --value agent-box-webhook-agent.service | grep -x agent")
+    machine.succeed("systemctl show -p User --value agent-box-webhook@agent.service | grep -x agent")
 
     # --- discovery surface -------------------------------------------------
     # The CLI is on the agent's PATH and the endpoint URL is in its
@@ -149,10 +149,10 @@
     machine.succeed("agent-box-webhook --help | grep -- '--deliver-to subagent' >/dev/null")
     machine.succeed("agent-box-webhook --help | grep -- '--ignore-sender' >/dev/null")
     machine.succeed(
-        "systemctl show -p Environment agent-box-agent.service | grep agent-box-webhook/bin >/dev/null"
+        "systemctl show -p Environment agent-box@agent.service | grep agent-box-webhook/bin >/dev/null"
     )
     machine.succeed(
-        "systemctl show -p Environment agent-box-agent.service"
+        "systemctl show -p Environment agent-box@agent.service"
         " | grep 'AGENT_BOX_WEBHOOK_URL=https://box.test/agent/webhook' >/dev/null"
     )
     # The supervisor gives each tmux session its own subscription scope, so a
@@ -244,14 +244,14 @@
     # stream. Both the interpreter and the script come from the daemon unit's
     # own ExecStart, so the test cannot drift from the pinned pair.
     exec_start = machine.succeed(
-        "systemctl show -p ExecStart --value agent-box-webhook-agent.service"
+        "systemctl show -p ExecStart --value agent-box-webhook@agent.service"
     )
     python = machine.succeed(
-        "systemctl show -p ExecStart --value agent-box-webhook-agent.service"
+        "systemctl show -p ExecStart --value agent-box-webhook@agent.service"
         " | grep -o '/nix/store/[^ ;]*/bin/python3' | head -1"
     ).strip()
     script = machine.succeed(
-        "systemctl show -p ExecStart --value agent-box-webhook-agent.service"
+        "systemctl show -p ExecStart --value agent-box-webhook@agent.service"
         " | grep -o '/nix/store/[^ ;]*webhook.py' | head -1"
     ).strip()
     assert python and script, exec_start
@@ -463,7 +463,7 @@
     # The daemon advertises the spawn wiring, so subscribe could warn if the
     # unit ever lost LOCAL_WEBHOOK_SPAWN_CMD.
     machine.succeed(
-        "systemctl show -p Environment agent-box-webhook-agent.service"
+        "systemctl show -p Environment agent-box-webhook@agent.service"
         " | grep 'LOCAL_WEBHOOK_SPAWN_CMD=/nix/store/' >/dev/null"
     )
     machine.succeed("jq -e '.spawn == true' /home/agent/.local/state/local-webhook/receiver.json")
@@ -479,7 +479,7 @@
         f"https://box.test/agent/webhook/github | grep -x 200"
     )
     machine.wait_until_succeeds(
-        "journalctl -u agent-box-webhook-agent --no-pager"
+        "journalctl -u agent-box-webhook@agent --no-pager"
         " | grep 'not spawning for workflow_run on defangdevs/agent-box' >/dev/null",
         timeout=30,
     )
@@ -523,7 +523,7 @@
         " https://box.test/agent/webhook/github | grep -x 200"
     )
     machine.wait_until_succeeds(
-        "journalctl -u agent-box-webhook-agent --no-pager | grep 'no failing outcome' >/dev/null",
+        "journalctl -u agent-box-webhook@agent --no-pager | grep 'no failing outcome' >/dev/null",
         timeout=30,
     )
     machine.fail(
@@ -540,7 +540,7 @@
     # the prompt via sessions.json is a race otherwise (lost on master run
     # 30740226645). With it stopped, the wrapper's write is the only actor;
     # restarting it afterwards proves the spawn + consumption half.
-    machine.succeed("systemctl stop agent-box-agent.service")
+    machine.succeed("systemctl stop agent-box@agent.service")
     client.succeed(
         f"{post} -H 'x-hub-signature-256: sha256={sig}' "
         f"https://box.test/agent/webhook/github | grep -x 200"
@@ -597,7 +597,7 @@
     assert "already subscribed to github:defangdevs/agent-box" in hook_prompt, hook_prompt
 
     # Supervisor back up: it starts the hook session and consumes the prompt.
-    machine.succeed("systemctl start agent-box-agent.service")
+    machine.succeed("systemctl start agent-box@agent.service")
     machine.wait_until_succeeds(
         "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
         " list-sessions -F '#S' | grep '^hook-' >/dev/null",
@@ -640,7 +640,7 @@
     # duplicate would be a coalesced spawn 60s later (the dispatcher's window),
     # not a second session the assertion below could catch immediately.
     machine.wait_until_succeeds(
-        "journalctl -u agent-box-webhook-agent --no-pager"
+        "journalctl -u agent-box-webhook@agent --no-pager"
         f" | grep 'session agent-{hook_name} is subscribed to it' >/dev/null",
         timeout=30,
     )
@@ -659,7 +659,7 @@
     # the wrapper directly also proves it needs nothing from the daemon but its
     # environment. Nothing below depends on the extra session it creates.
     spawn_cmd = machine.succeed(
-        "systemctl show -p Environment agent-box-webhook-agent.service"
+        "systemctl show -p Environment agent-box-webhook@agent.service"
         " | grep -o '/nix/store/[^ ]*agent-box-webhook-spawn' | head -1"
     ).strip()
     machine.succeed(
@@ -887,7 +887,7 @@
         " && chown agent:users"
         " /home/agent/.local/state/local-webhook/filter.agent-ghost.json"
     )
-    machine.succeed("systemctl restart agent-box-agent.service")
+    machine.succeed("systemctl restart agent-box@agent.service")
     machine.wait_until_succeeds(
         "test ! -e /home/agent/.local/state/local-webhook/filter.agent-ghost.json",
         timeout=60,
@@ -910,10 +910,10 @@
         " agent-box-webhook subscribe defangdevs/local-channels --deliver-to subagent"
         " --note 'to be governed' --ignore-sender human"
     )
-    machine.succeed("systemctl restart agent-box-webhook-agent.service")
-    machine.wait_for_unit("agent-box-webhook-agent.service")
+    machine.succeed("systemctl restart agent-box-webhook@agent.service")
+    machine.wait_for_unit("agent-box-webhook@agent.service")
     machine.wait_until_succeeds(
-        "journalctl -u agent-box-webhook-agent --no-pager"
+        "journalctl -u agent-box-webhook@agent --no-pager"
         " | grep 'enforced declared rules on github:defangdevs/local-channels' >/dev/null",
         timeout=30,
     )
@@ -954,7 +954,7 @@
         " https://box.test/agent/webhook/github | grep -x 200"
     )
     machine.wait_until_succeeds(
-        "journalctl -u agent-box-webhook-agent --no-pager"
+        "journalctl -u agent-box-webhook@agent --no-pager"
         " | grep 'not spawning for pull_request on defangdevs/local-channels' >/dev/null",
         timeout=30,
     )
@@ -994,7 +994,7 @@
     # reaches it. The daemon shells out to the SAME pinned webhook.py, one
     # invocation per session key, so nothing here re-implements the filter
     # format.
-    machine.wait_for_unit("agent-box-settings-agent.socket")
+    machine.wait_for_unit("agent-box-settings@agent.socket")
     settings_curl = (
         "curl -s --max-time 20 --unix-socket /run/agent-box-settings/agent.sock"
     )
@@ -1169,27 +1169,27 @@
     # a session loads its interpreter once. Asserted last: it restarts the agent
     # unit, and nothing above should have to survive that.
     machine.succeed(
-        "systemctl show -p Environment agent-box-agent.service"
+        "systemctl show -p Environment agent-box@agent.service"
         " | grep 'AGENT_BOX_WEBHOOK_PINNED_SCRIPT=/nix/store/' >/dev/null"
     )
     set_cache_version("0.0.1")
     machine.succeed("rm -f /home/agent/.claude/plugins/.agent-box-plugin-sync")
-    machine.succeed("systemctl restart agent-box-agent.service")
-    machine.wait_for_unit("agent-box-agent.service")
+    machine.succeed("systemctl restart agent-box@agent.service")
+    machine.wait_for_unit("agent-box@agent.service")
     # It notices, and names both versions.
     machine.wait_until_succeeds(
-        "journalctl -u agent-box-agent --no-pager"
+        "journalctl -u agent-box@agent --no-pager"
         f" | grep 'cache 0.0.1 is older than the pinned {pinned} — refreshing' >/dev/null",
         timeout=60,
     )
     # This VM has no route to GitHub, so the refresh fails — and that must be a
     # logged line, not a session that never starts.
     machine.wait_until_succeeds(
-        "journalctl -u agent-box-agent --no-pager"
+        "journalctl -u agent-box@agent --no-pager"
         " | grep 'could not refresh the cache' >/dev/null",
         timeout=120,
     )
-    machine.succeed("systemctl is-active agent-box-agent.service")
+    machine.succeed("systemctl is-active agent-box@agent.service")
     # The attempt is stamped, so the next session start inside the retry window
     # does not pay the timeout again. A box whose claude keeps exiting restarts
     # sessions in a loop; without this the loop would be a loop of timeouts.
@@ -1197,15 +1197,15 @@
         "grep -q '^%s ' /home/agent/.claude/plugins/.agent-box-plugin-sync" % pinned
     )
     machine.succeed("journalctl --rotate --vacuum-time=1s")
-    machine.succeed("systemctl restart agent-box-agent.service")
-    machine.wait_for_unit("agent-box-agent.service")
+    machine.succeed("systemctl restart agent-box@agent.service")
+    machine.wait_for_unit("agent-box@agent.service")
     machine.wait_until_succeeds(
-        "journalctl -u agent-box-agent --no-pager | grep 'not retrying yet' >/dev/null",
+        "journalctl -u agent-box@agent --no-pager | grep 'not retrying yet' >/dev/null",
         timeout=60,
     )
 
     # The daemon is the ingress owner and survives every delivery — the box's
     # endpoint must not depend on which sessions happen to be alive.
-    machine.succeed("systemctl is-active agent-box-webhook-agent.service")
+    machine.succeed("systemctl is-active agent-box-webhook@agent.service")
   '';
 }

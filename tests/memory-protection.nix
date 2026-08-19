@@ -23,7 +23,7 @@
 
   testScript = ''
     machine.wait_for_unit("multi-user.target")
-    machine.wait_for_unit("agent-box-agent.service")
+    machine.wait_for_unit("agent-box@agent.service")
     machine.wait_for_unit("earlyoom.service")
 
     # This is the only test that runs with web.enable off (the default), so it
@@ -31,7 +31,7 @@
     # tmpfiles-created only when web is on, and listing it unconditionally made
     # namespace setup fail with 226/NAMESPACE — the unit above never started.
     machine.fail(
-        "systemctl show agent-box-agent --property=ReadWritePaths --value "
+        "systemctl show agent-box@agent --property=ReadWritePaths --value "
         "| grep agent-box-sites >/dev/null"
     )
 
@@ -45,7 +45,7 @@
 
     # the agent unit's main process runs with the raised OOM score
     main_pid = machine.succeed(
-        "systemctl show -p MainPID --value agent-box-agent.service"
+        "systemctl show -p MainPID --value agent-box@agent.service"
     ).strip()
     assert main_pid != "0", "agent unit has no main PID"
     adj = machine.succeed(f"cat /proc/{main_pid}/oom_score_adj").strip()
@@ -70,7 +70,7 @@
 
     # ...and the box came through responsive, management plane intact.
     machine.succeed("systemctl is-active earlyoom.service")
-    machine.succeed("systemctl is-active agent-box-agent.service")
+    machine.succeed("systemctl is-active agent-box@agent.service")
     print(machine.succeed("journalctl -u earlyoom.service | tail -20"))
   '';
 }

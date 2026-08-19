@@ -106,8 +106,8 @@
     import shlex
 
     start_all()
-    machine.wait_for_unit("agent-box-agent.service")
-    machine.wait_for_unit("agent-box-settings-agent.service")
+    machine.wait_for_unit("agent-box@agent.service")
+    machine.wait_for_unit("agent-box-settings@agent.service")
     machine.wait_for_unit("caddy.service")
     client.wait_for_unit("multi-user.target")
 
@@ -146,11 +146,11 @@
     # backdoor shell EXECUTES the supervisor script as root and never returns
     # (the CI hang on this PR's first three runs).
     start_script = machine.succeed(
-        "systemctl show agent-box-agent --property=ExecStart --value "
+        "systemctl show agent-box@agent --property=ExecStart --value "
         "| grep -o '/nix/store/[^ ;]*-agent-box-supervisor' | head -n1"
     ).strip()
     machine.succeed(
-        "systemctl show agent-box-agent -p Environment --value "
+        "systemctl show agent-box@agent -p Environment --value "
         "| grep -F 'AGENT_BOX_HOST_LABEL=box.test' >/dev/null"
     )
     machine.succeed(f"grep -qF 'rcname=$USER-$sname' {start_script}")
@@ -166,7 +166,7 @@
     # which gets the full system path and would pass even when the unit PATH
     # is missing them (the bug this guards against).
     unit_path = machine.succeed(
-        "systemctl show agent-box-agent -p Environment --value"
+        "systemctl show agent-box@agent -p Environment --value"
     ).split("PATH=")[1].split()[0]
     for tool in ["curl", "wget", "awk", "tar", "gzip", "bzip2", "xz", "zip",
                  "unzip", "diff", "patch", "less", "file", "ps", "killall",
@@ -182,7 +182,7 @@
         "su -s /bin/sh agent -c "
         "'git config --get credential.https://github.com.helper' | grep 'gh auth git-credential' >/dev/null"
     )
-    machine.succeed("systemctl cat agent-box-agent | grep -- '-gh-' >/dev/null")
+    machine.succeed("systemctl cat agent-box@agent | grep -- '-gh-' >/dev/null")
 
     # Claude emits its long OAuth URL inside one complete OSC 8 sequence.
     # tmux stores that metadata, but redraws plain text unless the attaching
@@ -427,7 +427,7 @@
     # PANE, and a bare "=name" only resolves when that session is tmux's
     # idea of the current one — otherwise it silently expands to "" (rc 0).
     server_pid = machine.succeed(tmux('display -p -t "=helper:" "#{pid}"')).strip()
-    machine.succeed(f"grep -q agent-box-agent.service /proc/{server_pid}/cgroup")
+    machine.succeed(f"grep -q agent-box@agent.service /proc/{server_pid}/cgroup")
 
     # ls shows both sessions with their agents.
     listing = machine.succeed("su -s /bin/sh agent -c 'agent-box-session ls'")
@@ -1032,7 +1032,7 @@
         # Print the wrapper's path (see the grep -o note below) — running
         # the substitution as the command would run the WRAPPER instead.
         attach = machine.succeed(
-            "{ systemctl show agent-web-terminal-agent --property=ExecStart "
+            "{ systemctl show agent-web-terminal@agent --property=ExecStart "
             "--value | grep -o '/nix/store/[^ ]*-agent-box-attach' "
             "|| echo /missing; } | head -n1"
         ).strip()
@@ -1066,14 +1066,14 @@
         assert 'data-ph="live"' in live_ws, live_ws
 
     # ttyd serves per-session deep links: the unit runs with --url-arg.
-    machine.succeed("systemctl cat agent-web-terminal-agent | grep -- --url-arg >/dev/null")
+    machine.succeed("systemctl cat agent-web-terminal@agent | grep -- --url-arg >/dev/null")
     # The attach script is the shared agent-box-attach since issue #154
     # Phase 2. `grep -o ... || echo missing`: an empty substitution would
     # leave `grep -q` reading stdin — the backdoor shell then hangs the whole
     # test until the CI timeout (exactly how the rename was first caught).
     machine.succeed(
         "grep -q -- '-T hyperlinks' "
-        "$({ systemctl show agent-web-terminal-agent --property=ExecStart --value "
+        "$({ systemctl show agent-web-terminal@agent --property=ExecStart --value "
         "| grep -o '/nix/store/[^ ]*-agent-box-attach' || echo /missing; } | head -n1)"
     )
 
