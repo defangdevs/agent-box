@@ -249,22 +249,136 @@ let
   agentBoxUnitsPackage = pkgs.runCommand "agent-box-units" { } ''
     mkdir -p $out/etc/systemd/system
     install -m444 ${pkgs.writeText "agent-box@.service" ''
-      @@include:src/units/agent-box@.service@@
+      [Unit]
+      Description=Coding agent sessions (tmux) for %i
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=exec
+      User=%i
+      Restart=always
+      RestartSec=2s
+      ExecStart=agent-box-supervisor
+      ExecStop=tmux -L agent-box kill-server
+      RuntimeDirectory=agent-box-%i
+      RuntimeDirectoryMode=0700
+      RuntimeDirectoryPreserve=yes
+      Environment=HOME=/home/%i
+      Environment=TMUX_TMPDIR=/run/agent-box-%i
+      EnvironmentFile=-/etc/agent-box/units/%i.env
+      EnvironmentFile=-/etc/agent-box/units/%i.local.env
+      PrivateTmp=true
+      PrivateDevices=true
+      ProtectSystem=strict
+      ReadWritePaths=/home/%i
+      ProtectKernelTunables=true
+      ProtectKernelModules=true
+      ProtectControlGroups=true
+      ProtectClock=true
+      RestrictSUIDSGID=true
+      RestrictRealtime=true
+      LockPersonality=true
     ''} $out/etc/systemd/system/agent-box@.service
     install -m444 ${pkgs.writeText "agent-web-terminal@.service" ''
-      @@include:src/units/agent-web-terminal@.service@@
+      [Unit]
+      Description=Browser terminal (ttyd) attached to %i's tmux
+      After=agent-box@%i.service network-online.target
+      Wants=network-online.target
+
+      [Service]
+      User=%i
+      Restart=always
+      RestartSec=5s
+      Environment=TMUX_TMPDIR=/run/agent-box-%i
+      Environment=AGENT_BOX_SESSIONS_FILE=/home/%i/.config/agent-box/sessions.json
+      EnvironmentFile=-/etc/agent-box/units/agent-web-terminal-%i.env
+      EnvironmentFile=-/etc/agent-box/units/agent-web-terminal-%i.local.env
+      ExecStart=ttyd --writable --url-arg -p ''${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} agent-box-attach
     ''} $out/etc/systemd/system/agent-web-terminal@.service
     install -m444 ${pkgs.writeText "agent-box-settings@.service" ''
-      @@include:src/units/agent-box-settings@.service@@
+      [Unit]
+      Description=Per-user secrets settings page for %i
+      After=network-online.target agent-box-settings@%i.socket
+      Requires=agent-box-settings@%i.socket
+      Wants=network-online.target
+
+      [Service]
+      User=%i
+      Restart=always
+      RestartSec=5s
+      Environment=TMUX_TMPDIR=/run/agent-box-%i
+      Environment=AGENT_BOX_SETTINGS_USER=%i
+      Environment=AGENT_BOX_SETTINGS_ENV_FILE=/home/%i/.config/agent-box/env
+      Environment=AGENT_BOX_SETTINGS_BASE=/%i/settings
+      Environment=AGENT_BOX_TMUX_SOCKET=agent-box
+      Environment=AGENT_BOX_TMUX_TMPDIR=/run/agent-box-%i
+      Environment=AGENT_BOX_SESSIONS_FILE=/home/%i/.config/agent-box/sessions.json
+      EnvironmentFile=-/etc/agent-box/units/agent-box-settings-%i.env
+      EnvironmentFile=-/etc/agent-box/units/agent-box-settings-%i.local.env
+      ExecStart=agent-box-settings
+      ProtectSystem=strict
+      ReadWritePaths=/home/%i /run/agent-box-%i /var/lib/agent-box-web
+      ProtectHome=false
+      PrivateDevices=true
+      ProtectKernelTunables=true
+      ProtectKernelModules=true
+      ProtectControlGroups=true
+      RestrictSUIDSGID=true
+      RestrictRealtime=true
+      LockPersonality=true
+      NoNewPrivileges=false
     ''} $out/etc/systemd/system/agent-box-settings@.service
     install -m444 ${pkgs.writeText "agent-box-settings@.socket" ''
-      @@include:src/units/agent-box-settings@.socket@@
+      [Unit]
+      Description=Settings page socket for %i
+
+      [Socket]
+      ListenStream=/run/agent-box-settings/%i.sock
+      SocketUser=%i
+      SocketGroup=caddy
+      SocketMode=0660
     ''} $out/etc/systemd/system/agent-box-settings@.socket
     install -m444 ${pkgs.writeText "agent-box-webhook@.service" ''
-      @@include:src/units/agent-box-webhook@.service@@
+      [Unit]
+      Description=Webhook receiver daemon (local-webhook) for %i
+      After=network-online.target agent-box-webhook@%i.socket
+      Requires=agent-box-webhook@%i.socket
+      Wants=network-online.target
+
+      [Service]
+      User=%i
+      Restart=always
+      RestartSec=5s
+      Environment=LOCAL_WEBHOOK_RECEIVER_ONLY=1
+      Environment=LOCAL_WEBHOOK_STATE_DIR=/home/%i/.local/state/local-webhook
+      Environment=LOCAL_WEBHOOK_PORT=0
+      EnvironmentFile=-/etc/agent-box/units/agent-box-webhook-%i.env
+      EnvironmentFile=-/etc/agent-box/units/agent-box-webhook-%i.local.env
+      ExecStartPre=agent-box-webhook-policy-apply
+      ExecStart=agent-box-webhook-receiver
+      StandardInput=null
+      ProtectSystem=strict
+      ReadWritePaths=/home/%i
+      ProtectHome=false
+      PrivateDevices=true
+      ProtectKernelTunables=true
+      ProtectKernelModules=true
+      ProtectControlGroups=true
+      RestrictSUIDSGID=true
+      RestrictRealtime=true
+      LockPersonality=true
+      NoNewPrivileges=true
     ''} $out/etc/systemd/system/agent-box-webhook@.service
     install -m444 ${pkgs.writeText "agent-box-webhook@.socket" ''
-      @@include:src/units/agent-box-webhook@.socket@@
+      [Unit]
+      Description=Webhook ingress socket for %i
+
+      [Socket]
+      ListenStream=/run/agent-box-webhook/%i.sock
+      SocketUser=%i
+      SocketGroup=caddy
+      SocketMode=0660
     ''} $out/etc/systemd/system/agent-box-webhook@.socket
   '';
   tmuxSocketName = "agent-box";
