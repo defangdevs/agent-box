@@ -1204,6 +1204,142 @@
         timeout=60,
     )
 
+    # --- the hook-session ceiling is visible, not merely enforced (#170) -----
+    # A standing watch is the one delivery shape with no session behind it, so
+    # when the spawn wrapper refuses a batch webhook.py drops it and NOBODY got
+    # those events. That refusal used to reach the receiver daemon's journal
+    # and nowhere else, while `ls` and `status` kept reporting a healthy
+    # subscription: four hook sessions whose agents forgot `agent-box-session
+    # rm` made every watch on the box inert, and a wedged box read exactly like
+    # a quiet week. So a refusal is written down, and both listings say it.
+    refused = "/home/agent/.local/state/agent-box/webhook-spawn-refused.json"
+
+    def dispatch_status(cap="", expect=None):
+        # cap: AGENT_BOX_HOOK_SESSION_MAX as the receiver daemon would carry
+        # it. The CLI cannot read the daemon's environment, so raising the
+        # ceiling means raising it for both — which is what this passes.
+        out = machine.succeed(
+            f"{hookenv} {cap} agent-box-webhook status 2>/tmp/cap.err"
+        )
+        err = machine.succeed("cat /tmp/cap.err")
+        if expect is None:
+            assert "hook-* sessions already exist" not in err, err
+        else:
+            assert expect in err, err
+        return json.loads(out)["dispatch"]
+
+    # Nothing refused yet: the object is present (so it is a place to look, not
+    # a field that appears only in trouble) and says everything is fine.
+    machine.succeed(f"test ! -e {refused}")
+    d = dispatch_status()
+    assert d["topicCount"] > 0, d
+    assert d["spawnCommand"] is True, d
+    assert d["lastRefusal"] is None, d
+    assert d["hookSessions"]["max"] == 4, d
+    assert d["hookSessions"]["atCapacity"] is False, d
+    assert "warning" not in d, d
+
+    # The issue's own smallest reproduction: lower the ceiling under the hook
+    # sessions this test already accumulated, then drive the wrapper.
+    live = int(machine.succeed(
+        "jq '[.sessions | keys[] | select(startswith(\"hook-\"))] | length'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip())
+    assert live >= 1, live
+    drop_env = (
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " AGENT_BOX_HOOK_SESSION_MAX=1"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/dropped"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
+    )
+    rc, refusal_log = machine.execute(drop_env)
+    assert rc == 1, (rc, refusal_log)
+    assert "dropping this batch" in refusal_log, refusal_log
+    # The batch is gone, not queued — no session, and the record is the only
+    # thing left of it.
+    machine.fail(
+        "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-dropped\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    rec = json.loads(machine.succeed(f"cat {refused}"))
+    assert rec["count"] == 1, rec
+    assert rec["live"] == live, (rec, live)
+    assert rec["max"] == 1, rec
+    assert rec["topic"] == "github:defangdevs/*", rec
+    assert rec["key"] == "defangdevs/dropped", rec
+    assert rec["at"] == rec["firstAt"], rec
+
+    # status, at the ceiling: the count against the cap, the batch that was
+    # dropped, and ONE warning field — the same dispatch.warning webhook.py
+    # already sets for a receiver with no spawn command, so there is a single
+    # place to look rather than two.
+    d = dispatch_status(cap="AGENT_BOX_HOOK_SESSION_MAX=1",
+                        expect="hook-* sessions already exist")
+    assert d["hookSessions"] == {"live": live, "max": 1, "atCapacity": True}, d
+    assert "DROPPED" in d["warning"], d
+    assert "agent-box-session rm NAME" in d["warning"], d
+    assert d["lastRefusal"]["count"] == 1, d
+
+    # ls says it too — a listing of standing watches is where someone goes to
+    # ask why nothing fires — but on stderr, so its stdout stays byte-for-byte
+    # webhook.py's for anything parsing it.
+    ls_out = machine.succeed(
+        f"{hookenv} AGENT_BOX_HOOK_SESSION_MAX=1 agent-box-webhook ls 2>/tmp/cap.err"
+    )
+    ls_err = machine.succeed("cat /tmp/cap.err")
+    assert "every standing watch is inert" in ls_err, ls_err
+    assert '"dispatch"' in ls_out, ls_out
+    assert "every standing watch is inert" not in ls_out, ls_out
+
+    # Cumulative and never cleared: the dropped batches do not come back, so
+    # "N dropped since T" is the standing fact, not something the next spawn
+    # gets to forget.
+    rc, _ = machine.execute(drop_env)
+    assert rc == 1, rc
+    rec2 = json.loads(machine.succeed(f"cat {refused}"))
+    assert rec2["count"] == 2, rec2
+    assert rec2["firstAt"] == rec["firstAt"], (rec, rec2)
+
+    # Back under the ceiling: no warning anywhere, the history still reported.
+    d = dispatch_status()
+    assert d["hookSessions"]["atCapacity"] is False, d
+    assert "warning" not in d, d
+    assert d["lastRefusal"]["count"] == 2, d
+
+    # ...and the record is history, not a brake — a match still spawns.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/again"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    again = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-again-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(f"sudo -u agent env HOME=/home/agent agent-box-session rm {again}")
+    machine.succeed(f"jq -e '.count == 2' {refused} >/dev/null")
+
+    # A knob that --help documents is a knob someone will typo, and an unusable
+    # value must not refuse every batch for a reason nobody can see: it says so
+    # and falls back to the built-in ceiling.
+    rc, typo_log = machine.execute(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " AGENT_BOX_HOOK_SESSION_MAX=lots"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/typo"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
+    )
+    assert rc == 0, (rc, typo_log)
+    assert "is not a number" in typo_log, typo_log
+    typo = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-typo-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(f"sudo -u agent env HOME=/home/agent agent-box-session rm {typo}")
+
     # The daemon is the ingress owner and survives every delivery — the box's
     # endpoint must not depend on which sessions happen to be alive.
     machine.succeed("systemctl is-active agent-box-webhook-agent.service")
