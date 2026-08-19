@@ -242,18 +242,89 @@ registry_unlock() {
 # (initialPrompt) must fire on the FIRST spawn only; every later respawn
 # (crash, clean exit, reboot, Spot stop→restart — all of which keep the
 # on-disk transcript because /home is the persistent root EBS volume)
-# must RESUME the prior transcript instead of redoing the task. We fold
-# that state into sessions.json rather than a side file: after the first
-# spawn mark_started sets hasRun, records the (possibly freshly minted)
-# boxSessionId, and clears initialPrompt. boxSessionId is the STABLE id
-# WE own across respawns — Claude consumes it directly as --session-id /
-# --resume; for Codex (which mints its own id) we stamp it into the
-# kickoff prompt so the transcript is findable by content (codex_rollout_uuid).
+# must RESUME the prior transcript instead of redoing the task.
+#
+# That bookkeeping is the SUPERVISOR's own observation, and observations now
+# live in a supervisor-owned side file rather than in sessions.json (issue
+# #282). The registry is INTENT — what the operator asked for: name, agent,
+# working directory, prompts, stopped — and five writers in three languages
+# edit it, so a lost update there (issue #254) used to revert a long-running
+# session to "never spawned": new id, kickoff prompt fired a second time,
+# previous transcript orphaned. Intent cannot revert an observation it no
+# longer carries.
+#
+# MIGRATION — this release writes BOTH. The side file is read first and the
+# registry copy is the fallback, so a session that last spawned before this
+# release keeps its id, as does the id `agent-box-session add` mints up
+# front. The next release stops writing hasRun / boxSessionId / the cleared
+# initialPrompt into the registry and drops the fallback read; that is what
+# makes the supervisor a read-only consumer of sessions.json.
+SESSION_STATE_DIR="$HOME/.local/state/agent-box/session"
+session_state_file() {
+  # session_state_file NAME — the one place this script spells the path
+  # (issue #284). The key is the session NAME for now, and a name is a
+  # label rather than an identity: it is minted from a file that can be
+  # stale, and it is meant to become editable. The key this should grow
+  # into is one a harness mints — tmux #{session_id} plus the
+  # AGENT_BOX_SESSION_ID this spawn puts in the pane environment for the
+  # claim, and claude's transcript uuid / codex's rollout id for the
+  # conversation — so every reader and writer goes through here and the
+  # re-key is this function. `agent-box-session rm` carries the same
+  # accessor under the same name, and the settings daemon has
+  # session_state_path; the three must agree.
+  printf '%s/%s.json\n' "$SESSION_STATE_DIR" "$1"
+}
+
+session_launch_id() {
+  # session_launch_id SESSION — the id this session was last LAUNCHED with,
+  # or empty when the supervisor has never recorded one.
+  #
+  # EAFP: attempt the read and handle the miss. Testing for the file first
+  # would ask the kernel a question the read answers anyway, and the answer
+  # would already be stale by the time we acted on it.
+  _v="$($JQ -r '.launchSessionId // empty' "$(session_state_file "$1")" 2>/dev/null)" \
+    || _v=""
+  # Shape check on the way OUT, because this value reaches --resume, a
+  # find -name pattern and this file's own writer.
+  case "$_v" in
+    (*[!0-9a-fA-F-]*) _v="" ;;
+    (????????-????-????-????-????????????) ;;
+    (*) _v="" ;;
+  esac
+  printf '%s' "$_v"
+}
+
+record_launch() {
+  # record_launch SESSION BOXID — remember the id this spawn launched with,
+  # so the next one resumes the same conversation.
+  #
+  # mktemp + rename, not a create-if-absent: a rotation legitimately CHANGES
+  # the value, so the last writer must win. mktemp is the exclusive-creation
+  # primitive (O_EXCL on a name nobody can guess) and the rename is what
+  # keeps a reader from ever seeing half a document. Best effort throughout
+  # — a failed write costs a re-derived id on the next spawn, never a crash.
+  case "$2" in (*[!0-9a-fA-F-]*|"") return 0 ;; esac
+  mkdir -p "$SESSION_STATE_DIR" 2>/dev/null || return 0
+  _f="$(session_state_file "$1")"
+  _t="$(mktemp "$_f.XXXXXX" 2>/dev/null)" || return 0
+  if printf '{"launchSessionId":"%s"}\n' "$2" > "$_t" 2>/dev/null; then
+    mv -f "$_t" "$_f" 2>/dev/null || rm -f "$_t"
+  else
+    rm -f "$_t"
+  fi
+}
+
 mark_started() {
-  # mark_started SESSION BOXID — best-effort; a failed rewrite just means
-  # the prompt re-fires next spawn, never a crash. Read and rename happen
-  # under the registry lock (issue #254); the caller normally holds it
-  # already, and registry_lock nests.
+  # mark_started SESSION BOXID — the MIGRATION copy of what record_launch
+  # just wrote (issue #282): hasRun and boxSessionId in the registry, plus
+  # the consumed kickoff prompt. Kept for one release so a box that rolls
+  # back to the previous module still finds its ids where that module looks;
+  # the next release deletes this function and leaves sessions.json to
+  # intent alone.
+  #
+  # Best-effort; a failed rewrite just means the prompt re-fires next spawn,
+  # never a crash. Read and rename happen under the registry lock (issue
+  # #254); the caller normally holds it already, and registry_lock nests.
   #
   # `has` first, because this must only ever UPDATE: jq's `|=` on a missing
   # key CREATES it (verified), so a session deleted while this spawn was
@@ -319,33 +390,74 @@ start_session() {
   rcname="$($JQ -r '.remoteControlName // empty' <<<"$sjson")"
   ip="$($JQ -r '.initialPrompt // ""' <<<"$sjson")"
   rp="$($JQ -r '.resumePrompt // ""' <<<"$sjson")"
-  bid="$($JQ -r '.boxSessionId // ""' <<<"$sjson")"
-  hasrun="$($JQ -r 'if .hasRun == true then "true" else "false" end' <<<"$sjson")"
-  # Mint the stable box-session id on the first spawn if the file doesn't
-  # carry one (legacy/seed sessions, hand-edited files). /proc/.../uuid is
-  # the kernel's UUID source — a bash `read`, so nothing on PATH is needed
+  # The id this session was last LAUNCHED with (issue #282). Note what that
+  # is NOT: it is not an id that survives the conversation, because a
+  # segment rotation — clear, compact or resume — mints a new one and the
+  # block below adopts it. It names the SEGMENT this spawn hands the agent,
+  # which is why a consumer wanting "the conversation" has to follow the
+  # rotation record rather than trust this value (issues #274, #277).
+  #
+  # Supervisor side file first, registry copy as the migration fallback (see
+  # mark_started). `launched` — has this session ever been spawned at all —
+  # comes from whichever answered: the side file exists only because a spawn
+  # wrote it, and the registry's hasRun said the same thing before it moved.
+  launched=false
+  recorded="$(session_launch_id "$sname")"
+  bid="$recorded"
+  if [ -n "$bid" ]; then
+    launched=true
+  else
+    bid="$($JQ -r '.boxSessionId // ""' <<<"$sjson")"
+    if [ "$($JQ -r 'if .hasRun == true then "true" else "false" end' <<<"$sjson")" = true ]; then
+      launched=true
+    fi
+  fi
+  # Mint the launch id on the first spawn if nothing carries one yet
+  # (legacy/seed sessions, hand-edited files). /proc/.../uuid is the
+  # kernel's UUID source — a bash `read`, so nothing on PATH is needed
   # and the value is a valid UUID for Claude's --session-id.
   if [ -z "$bid" ] && [ -r /proc/sys/kernel/random/uuid ]; then
     read -r bid < /proc/sys/kernel/random/uuid || bid=
   fi
-  # /clear rotation (issue #223): claude's live session id can rotate away
-  # from the id this session was last launched with — /clear keeps the
-  # process (and its Remote Control registration) but starts a NEW
-  # transcript under a new uuid. The SessionStart hook (injected via
-  # AGENT_BOX_CLAUDE_SETTINGS below) records that live id, keyed by the
-  # launch id it finds in the pane environment. Follow the record here:
-  # without it, `--resume "$bid"` resurrects the pre-/clear transcript the
-  # user explicitly cleared away and orphans the conversation that replaced
-  # it — and the Claude apps, which thread Remote Control by NAME, then
-  # interleave both conversations in one app thread. The charset check
-  # doubles as glob-safety for claude_has_transcript's -name lookup; the
-  # adopted id is persisted below via mark_started, so sessions.json tracks
-  # the rotation and each record chains one hop at most.
+  # hasRun is DERIVED, never stored (issue #282). "Is there a conversation to
+  # resume" is a question the disk already answers for claude, and
+  # claude_has_transcript is the same check the resume arm below has always
+  # made — a stored copy could only ever disagree with it, and did: a
+  # reverted registry promised a resume of a transcript that was there, and a
+  # deleted transcript promised one that was not. The other harnesses have
+  # nothing equivalent to read (a codex rollout is found by a marker that
+  # only a kickoff prompt carries; a shell session has no transcript at all),
+  # so they keep answering from the launch record itself.
+  if [ "$agent" = claude ]; then
+    hasrun=false
+    claude_has_transcript "$bid" && hasrun=true
+  else
+    hasrun=$launched
+  fi
+  # Segment rotation (issue #223): claude's live session id can rotate away
+  # from the id this session was last launched with. Three triggers are
+  # observed on the live box — clear, compact and resume — and all three do
+  # the same thing: the process keeps running (and keeps its Remote Control
+  # registration) while a NEW transcript opens under a new uuid. The
+  # SessionStart hook (injected via AGENT_BOX_CLAUDE_SETTINGS below) fires on
+  # each of them and records the live id, keyed by the launch id it finds in
+  # the pane environment. Follow the record here: without it, `--resume
+  # "$bid"` resurrects the segment the user rotated away from and orphans the
+  # one that replaced it — and the Claude apps, which thread Remote Control
+  # by NAME, then interleave both conversations in one app thread. The charset
+  # check doubles as glob-safety for claude_has_transcript's -name lookup; the
+  # adopted id is recorded below, so each record chains one hop at most.
+  #
+  # Gated on `launched`, not on a transcript: what makes a live-id record
+  # meaningful is that this session has spawned before (nothing else writes
+  # under our launch id), and an adoption is its own proof of a resumable
+  # transcript. EAFP on the record — read it and handle the miss; a
+  # readability test first would only add a syscall and a race.
   rotated=false
-  if [ "$agent" = claude ] && [ "$hasrun" = true ] && [ -n "$bid" ] \
-     && [ -r "$HOME/.local/state/agent-box/live-session-id/$bid" ]; then
+  if [ "$agent" = claude ] && [ "$launched" = true ] && [ -n "$bid" ]; then
     live=""
-    read -r live < "$HOME/.local/state/agent-box/live-session-id/$bid" || live=""
+    read -r live < "$HOME/.local/state/agent-box/live-session-id/$bid" 2>/dev/null \
+      || live=""
     case "$live" in
       (*[!0-9a-fA-F-]*) live="" ;;
       (????????-????-????-????-????????????) ;;
@@ -354,6 +466,7 @@ start_session() {
     if [ -n "$live" ] && [ "$live" != "$bid" ] && claude_has_transcript "$live"; then
       bid="$live"
       rotated=true
+      hasrun=true
     fi
   fi
   # Resume on every respawn (hasRun already set); the kickoff prompt fires
@@ -421,7 +534,7 @@ start_session() {
         cmd="$cmd --remote-control $(printf '%q' "$rcname")"
       fi
       # The SessionStart hook that records the live session id (see the
-      # /clear-rotation block above). ADDITIONAL settings only: claude
+      # segment-rotation block above). ADDITIONAL settings only: claude
       # merges the file on top of the user/project settings.json, which
       # stay untouched, so only supervisor-spawned sessions carry the hook.
       [ -n "${AGENT_BOX_CLAUDE_SETTINGS:-}" ] \
@@ -636,7 +749,7 @@ start_session() {
   fi
   # AGENT_BOX_SESSION_ID rides the same session environment: it is the
   # launch id the SessionStart hook keys its live-id record by (the
-  # /clear-rotation block above). Quoted on its own — unlike $whargs it
+  # segment-rotation block above). Quoted on its own — unlike $whargs it
   # is runtime data from sessions.json, not supervisor-built tokens.
   # 9>&- closes the registry lock fd for this child: `new-session` STARTS the
   # tmux server when none is running, and that server daemonizes and outlives
@@ -650,12 +763,24 @@ start_session() {
       $TMUX kill-session -t "=$sname" 2>/dev/null || true
       return 0
     fi
-    # First spawn: persist the id + hasRun and consume the kickoff prompt,
-    # so the next respawn resumes instead of redoing the task. Rotated
-    # respawn (issue #223): persist the adopted live id the same way.
-    # (Ordered after the delist post-check: mark_started's jq assignment
-    # would otherwise re-create a just-deleted session as a stub entry.)
-    if [ "$resuming" != true ] || [ "$rotated" = true ]; then
+    # Record the id this spawn launched with, whenever that is not already
+    # what the record says: a first spawn, an adopted rotation, and the one
+    # respawn that migrates a session predating the side file (issue #282).
+    # Writing only on a CHANGE matters because a session that cannot start —
+    # a claude with no credentials, say — is respawned every couple of
+    # seconds, and neither file should be rewritten on that loop.
+    #
+    # The registry mirror is narrower still: it is a read-modify-write of the
+    # file everything else edits, held under the registry lock, so it runs
+    # only on a first-ever spawn or an adopted rotation — exactly when it has
+    # something new to say. (Both ordered after the delist post-check:
+    # mark_started's jq assignment would otherwise re-create a just-deleted
+    # session as a stub entry, and the side file of a session deleted in this
+    # window is left to the sweep.)
+    if [ "$bid" != "$recorded" ] || [ "$rotated" = true ]; then
+      record_launch "$sname" "$bid"
+    fi
+    if [ "$launched" != true ] || [ "$rotated" = true ]; then
       mark_started "$sname" "$bid"
     fi
   fi
@@ -693,11 +818,47 @@ sweep_orphan_filters() {
 }
 sweep_orphan_filters
 
+# Reclaim the supervisor's own per-session state for names the registry no
+# longer lists (issue #282).
+#
+# Keyed on the registry, and run from the reconcile loop rather than hung off
+# a delete path, because deletion is never guaranteed: nothing makes a hook
+# agent call `agent-box-session rm`, a session can be delisted while this
+# unit is down, and a box that upgrades into this file has no delete path to
+# have taken. Both delete paths do prune their own as an OPTIMISATION — it
+# closes the window in which a re-used name inherits the previous holder's
+# launch id — but neither is what makes the state reclaimable.
+#
+# Stale state here is not merely litter: a session name is re-usable, so a
+# file left by a deleted session would hand its launch id, and with it its
+# transcript, to the next session that takes the name.
+#
+# One jq for the whole sweep, not one per file: this runs on every tick. A
+# registry jq cannot answer for leaves everything alone — a transient read
+# error, or a file being replaced by rename right now, must never be read as
+# "no session exists". An EMPTY registry is a different answer from an
+# unreadable one, and this sweeps on it: the last session deleted is exactly
+# when the last file has to go.
+NL="
+"
+sweep_session_state() {
+  _listed="$($JQ -r '.sessions | keys[]' "$SESSIONS_FILE" 2>/dev/null)" || return 0
+  for _f in "$SESSION_STATE_DIR"/*.json; do
+    _n=${_f##*/}; _n=${_n%.json}
+    # Also how an unmatched glob leaves this loop: the literal pattern is not
+    # a legal session name, so nothing has to be stat'ed to skip it.
+    case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
+    case "$NL$_listed$NL" in (*"$NL$_n$NL"*) continue ;; esac
+    rm -f "$_f"
+  done
+}
+
 # Reconcile forever; systemd stop tears the whole tree down (ExecStop
 # kill-server + cgroup kill), Restart=always revives a crashed loop.
 # Sessions flagged stopped (a clean agent exit, or agent-box-session
 # stop) stay listed but are left down until a restart clears the flag.
 while true; do
+  sweep_session_state
   while IFS= read -r sname; do
     case "$sname" in
       (*[!A-Za-z0-9_-]*|"") continue ;;

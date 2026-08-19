@@ -98,6 +98,24 @@ prune_filter() {
   _sd="${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
   rm -f "$_sd/filter.$(id -un)-$1.json"
 }
+session_state_file() {
+  # session_state_file NAME — the supervisor's per-session observations
+  # (issue #282), spelled in one place per program: this accessor, the
+  # supervisor's function of the same name, and the settings daemon's
+  # session_state_path. Keying on the session NAME is a placeholder for a
+  # harness-minted id (issue #284), and going through an accessor is what
+  # makes that re-key a change to three functions rather than a migration.
+  printf '%s/%s.json\n' "$HOME/.local/state/agent-box/session" "$1"
+}
+prune_session_state() {
+  # Only ever called for a name that has just been DELISTED, and only as an
+  # OPTIMISATION: the supervisor sweeps this directory against the registry
+  # on every reconcile tick, because nothing guarantees anybody runs `rm` at
+  # all. What the prune buys is the window in between — `rm foo` followed
+  # straight by `add foo` would otherwise hand the new session the dead
+  # one's launch id, and with it the dead one's transcript.
+  rm -f "$(session_state_file "$1")"
+}
 # Serialize the read-modify-write of the session registry (issue #254). Every
 # writer of this file — this CLI, the supervisor, the mark-stopped epilogue,
 # the settings daemon, the webhook spawn wrapper — replaces it by rename, so a
@@ -249,9 +267,13 @@ case "$cmd" in
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
     fi
-    # The stable box-session id we own across respawns (Claude --session-id /
-    # --resume; Codex transcript marker). Minted here so it's set before the
-    # first spawn; the supervisor mints one too for legacy sessions.
+    # The id this session's FIRST spawn is launched with (Claude
+    # --session-id / --resume; Codex transcript marker). Not a stable handle
+    # on the conversation: a clear, a compact or a resume rotates the agent
+    # onto a NEW segment, and the supervisor adopts that id in its own side
+    # file (issue #282) — so this is where the session starts, not what it
+    # is. Minted here so it is set before the first spawn; the supervisor
+    # mints one too for legacy sessions.
     bid=""
     [ -r /proc/sys/kernel/random/uuid ] && read -r bid < /proc/sys/kernel/random/uuid || true
     # `--` after --args: jq otherwise still option-parses positional
@@ -289,6 +311,7 @@ case "$cmd" in
     jq_edit --arg n "$name" 'del(.sessions[$n])'
     kill_session "$name" || exit 1
     prune_filter "$name"
+    prune_session_state "$name"
     echo "session '$name' removed"
     ;;
   stop)

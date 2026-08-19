@@ -575,6 +575,14 @@
 
     # --- kickoff prompt: fires once, then resumes -------------------------
     sfile = "/home/agent/.config/agent-box/sessions.json"
+
+    def state_file(name):
+        """The supervisor's own record for one session (issue #282):
+        sessions.json is intent, this is what the supervisor observed. Spelled
+        here the way modules/src/supervisor.sh's session_state_file spells
+        it — one accessor per program, so re-keying it later (issue #284)
+        stays a small change."""
+        return f"/home/agent/.local/state/agent-box/session/{name}.json"
     with subtest("kickoff prompt is delivered once and consumed"):
         machine.succeed(
             "su -s /bin/sh agent -c "
@@ -587,9 +595,20 @@
         machine.succeed(
             f"jq -e '.sessions.task1.hasRun == false and (.sessions.task1.boxSessionId | type == \"string\")' {sfile}"
         )
-        # Once the supervisor spawns it, the prompt is consumed and hasRun set,
-        # so a later respawn resumes instead of re-running the task.
+        # Once the supervisor spawns it, the prompt is consumed and the launch
+        # id is recorded, so a later respawn resumes instead of re-running the
+        # task. The record lives in the supervisor's own file; the registry
+        # copy is the migration mirror this release still writes.
         machine.wait_until_succeeds(tmux("has-session -t =task1"), timeout=60)
+        machine.wait_until_succeeds(
+            f"jq -e '.launchSessionId | test(\"^[0-9a-f-]{{36}}$\")' {state_file('task1')}",
+            timeout=60,
+        )
+        machine.wait_until_succeeds(
+            f"jq -e --arg id \"$(jq -r .launchSessionId {state_file('task1')})\" "
+            f"'.sessions.task1.boxSessionId == $id' {sfile}",
+            timeout=60,
+        )
         machine.wait_until_succeeds(
             f"jq -e '.sessions.task1.hasRun == true and .sessions.task1.initialPrompt == null' {sfile}",
             timeout=60,
@@ -600,7 +619,39 @@
         machine.succeed(
             f"jq -e '.sessions.task1.initialPrompt == null and .sessions.task1.hasRun == true' {sfile}"
         )
+        # Delisting reclaims the supervisor's state for the name. `rm` prunes
+        # its own as an optimisation; the sweep below is what makes it
+        # reclaimable when nobody runs `rm` at all.
         machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm task1'")
+        machine.fail(f"test -e {state_file('task1')}")
+
+    with subtest("session state is swept against the registry, not on delist"):
+        # Nothing guarantees a delete path ever runs — a hook agent may never
+        # call `agent-box-session rm`, and a session can be delisted while the
+        # unit is down — so the supervisor sweeps this directory against
+        # sessions.json on every reconcile tick (issue #282). Stale state here
+        # is not litter: a session name is re-usable, and the file would hand
+        # the next holder of the name the dead session's launch id.
+        # Written as the agent, into the directory the supervisor already
+        # owns: a root-created parent would lock its own writer out of it.
+        machine.succeed(
+            as_agent(
+                "printf '%s' "
+                + shlex.quote('{"launchSessionId":"deadbeef-0000-4000-8000-000000000001"}')
+                + " > " + state_file("ghost")
+            )
+        )
+        machine.wait_until_fails(f"test -e {state_file('ghost')}", timeout=60)
+        # A LISTED session's state is never swept — it is that session's
+        # conversation, and being merely down (stopped, or between respawns)
+        # is not being gone.
+        machine.succeed(as_agent("agent-box-session add kept --agent shell"))
+        machine.wait_until_succeeds(tmux("has-session -t =kept"), timeout=60)
+        machine.wait_until_succeeds(f"test -e {state_file('kept')}", timeout=60)
+        machine.succeed(as_agent("agent-box-session stop kept"))
+        machine.succeed("sleep 6")
+        machine.succeed(f"test -e {state_file('kept')}")
+        machine.succeed(as_agent("agent-box-session rm kept"))
 
     # --- a variadic extraArg must not swallow the prompt ------------------
     with subtest("trailing variadic extraArg does not eat the kickoff prompt"):
@@ -697,26 +748,35 @@
         assert "--dangerously-bypass-approvals-and-sandbox" not in careful_cmd, careful_cmd
         machine.succeed(as_agent("agent-box-session rm careful"))
 
-    # --- /clear rotation: respawn follows the recorded live id ------------
-    with subtest("/clear rotation: respawn resumes the recorded live id"):
-        # /clear rotates claude's live session id mid-process (issue #223):
-        # the process keeps running (and keeps its Remote Control name) but
-        # writes a NEW transcript under a new uuid, while sessions.json
-        # still holds the launch id. The SessionStart hook records
-        # live-id-by-launch-id; a respawn must resume the RECORDED id — not
-        # resurrect the pre-/clear transcript — and persist the adopted id.
+    # --- segment rotation: respawn follows the recorded live id -----------
+    with subtest("segment rotation: respawn resumes the recorded live id"):
+        # A clear, a compact or a resume rotates claude's live session id
+        # mid-process (issue #223): the process keeps running (and keeps its
+        # Remote Control name) but opens a NEW transcript under a new uuid,
+        # while the supervisor still holds the id it launched with. The
+        # SessionStart hook records live-id-by-launch-id; a respawn must
+        # resume the RECORDED id — not the segment the session moved off —
+        # and record the adopted id for the next hop.
+        #
+        # Two hops, because one hop cannot tell a chain from a coincidence:
+        # the record the supervisor follows on the second hop is keyed by an
+        # id it ADOPTED rather than minted, so a supervisor that only ever
+        # looks under its original launch id passes the first hop and fails
+        # here (issue #282).
+        rot_state = state_file("rot")
         machine.succeed(
             as_agent(
                 "agent-box-session add rot --agent claude --prompt 'do the rotation thing'"
             )
         )
         machine.wait_until_succeeds(tmux("has-session -t =rot"), timeout=60)
+        # The launch id comes from the SUPERVISOR's state file, which is where
+        # it lives now — sessions.json carries the migration copy only.
         machine.wait_until_succeeds(
-            f"jq -e '.sessions.rot.hasRun == true' {sfile}", timeout=60
+            f"jq -e '.launchSessionId | test(\"^[0-9a-f-]{{36}}$\")' {rot_state}",
+            timeout=60,
         )
-        rot_bid = machine.succeed(
-            f"jq -r '.sessions.rot.boxSessionId' {sfile}"
-        ).strip()
+        rot_bid = machine.succeed(f"jq -r '.launchSessionId' {rot_state}").strip()
         # The spawn hands the launch id to the pane environment (the hook's
         # key) and the hook settings file to claude via --settings; recover
         # the hook script's store path from the live command line rather
@@ -735,42 +795,92 @@
         hook = machine.succeed(
             f"jq -r '.hooks.SessionStart[0].hooks[0].command' {settings_m.group(1)}"
         ).strip()
-        # Drive the REAL hook exactly as claude does on /clear: SessionStart
-        # payload on stdin, launch id in the environment.
-        rotated = "12345678-9abc-4def-8123-456789abcdef"
-        payload = json.dumps(
-            {"session_id": rotated, "hook_event_name": "SessionStart", "source": "clear"}
+
+        def rotate(launch_id, new_id):
+            """One hop: drive the REAL hook exactly as claude does on a
+            clear/compact/resume (SessionStart payload on stdin, launch id in
+            the environment), stand in the transcript the rotation leaves
+            behind, then bounce the session and return what the supervisor
+            BUILT. Reading the recorded pane start command rather than a live
+            process, as in the codex subtest: it must not depend on claude
+            surviving its (unauthenticated) resume attempt."""
+            payload = json.dumps(
+                {
+                    "session_id": new_id,
+                    "hook_event_name": "SessionStart",
+                    "source": "clear",
+                }
+            )
+            machine.succeed(
+                as_agent(
+                    f"printf %s {shlex.quote(payload)} | "
+                    f"AGENT_BOX_SESSION_ID={launch_id} {hook}"
+                )
+            )
+            machine.succeed(
+                f"grep -qx {new_id} "
+                f"/home/agent/.local/state/agent-box/live-session-id/{launch_id}"
+            )
+            # claude_has_transcript gates the switch, and a real rotation
+            # always leaves the new segment's file behind.
+            machine.succeed(
+                "install -D -o agent /dev/null "
+                f"/home/agent/.claude/projects/-home-agent/{new_id}.jsonl"
+            )
+            machine.succeed(tmux("kill-session -t =rot"))
+            return machine.wait_until_succeeds(
+                tmux('list-panes -t "=rot" -F "#{pane_start_command}"'), timeout=60
+            )
+
+        # Hop 1: from the id the supervisor minted.
+        first = "12345678-9abc-4def-8123-456789abcdef"
+        cmd1 = rotate(rot_bid, first)
+        assert f"--resume {first}" in cmd1.replace("\\", ""), cmd1
+        # The adopted id is recorded, so the NEXT respawn needs no record —
+        # and it is recorded in the supervisor's own file. sessions.json gets
+        # the migration copy for one more release.
+        machine.wait_until_succeeds(
+            f"jq -e '.launchSessionId == \"{first}\"' {rot_state}", timeout=60
         )
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions.rot.boxSessionId == \"{first}\"' {sfile}", timeout=60
+        )
+        machine.succeed(
+            tmux('show-environment -t "=rot" AGENT_BOX_SESSION_ID')
+            + f" | grep -qx AGENT_BOX_SESSION_ID={first}"
+        )
+
+        # Hop 2: from the id it ADOPTED. The newest segment wins.
+        second = "22345678-9abc-4def-8123-456789abcdef"
+        cmd2 = rotate(first, second)
+        assert f"--resume {second}" in cmd2.replace("\\", ""), cmd2
+        assert f"--resume {first}" not in cmd2.replace("\\", ""), cmd2
+        machine.wait_until_succeeds(
+            f"jq -e '.launchSessionId == \"{second}\"' {rot_state}", timeout=60
+        )
+
+        # And the SIDE FILE is what carries it, not the registry. Corrupt the
+        # registry copy exactly as a lost update did (issue #254) — a stale id
+        # and hasRun back to false, which used to mean "first spawn": new id,
+        # kickoff prompt fired again, conversation orphaned. The supervisor
+        # reads its own record, so the respawn still resumes the newest
+        # segment.
+        stale = "32345678-9abc-4def-8123-456789abcdef"
         machine.succeed(
             as_agent(
-                f"printf %s {shlex.quote(payload)} | "
-                f"AGENT_BOX_SESSION_ID={rot_bid} {hook}"
+                f"jq '.sessions.rot.boxSessionId = \"{stale}\" | "
+                f".sessions.rot.hasRun = false' {sfile} > {sfile}.t "
+                f"&& mv {sfile}.t {sfile}"
             )
         )
-        machine.succeed(
-            f"grep -qx {rotated} "
-            f"/home/agent/.local/state/agent-box/live-session-id/{rot_bid}"
-        )
-        # The rotated transcript must exist (claude_has_transcript gates the
-        # switch) — a real /clear always leaves one behind.
-        machine.succeed(
-            "install -D -o agent /dev/null "
-            f"/home/agent/.claude/projects/-home-agent/{rotated}.jsonl"
-        )
         machine.succeed(tmux("kill-session -t =rot"))
-        # As in the codex subtest, read what the supervisor BUILT from the
-        # recorded pane start command — it must not depend on claude
-        # surviving its (unauthenticated) resume attempt.
-        rot_start_cmd = machine.wait_until_succeeds(
+        cmd3 = machine.wait_until_succeeds(
             tmux('list-panes -t "=rot" -F "#{pane_start_command}"'), timeout=60
         )
-        assert f"--resume {rotated}" in rot_start_cmd.replace("\\", ""), rot_start_cmd
-        # The adopted id is persisted, so the NEXT respawn needs no record.
-        machine.wait_until_succeeds(
-            f"jq -e '.sessions.rot.boxSessionId == \"{rotated}\"' {sfile}",
-            timeout=60,
-        )
+        assert f"--resume {second}" in cmd3.replace("\\", ""), cmd3
+        assert stale not in cmd3, cmd3
         machine.succeed(as_agent("agent-box-session rm rot"))
+        machine.fail(f"test -e {rot_state}")
 
     # --- env CLI writes the same file the settings page + wrapper use -----
     with subtest("env set/ls/rm on ~/.config/agent-box/env"):
