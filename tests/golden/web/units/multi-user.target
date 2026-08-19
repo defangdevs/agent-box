@@ -1,0 +1,2 @@
+[Unit]
+Wants=machines.target agent-web-terminal@agent.service agent-web-terminal@robot.service agent-box-settings@agent.service agent-box-settings@robot.service agent-box-webhook@agent.service agent-box-webhook@robot.service agent-box@agent.service agent-box@robot.service

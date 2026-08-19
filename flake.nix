@@ -44,8 +44,18 @@
             # whole Caddy/ttyd/settings/webhook/self-update surface too.
             web = [ self.nixosModules.agent-box ./hosts/vm.nix ./tests/golden-web.nix ];
           };
+          # multi-user.target/sockets.target (issue #154 Phase 3): the module
+          # doesn't own these units, but it drops a `Wants=` override onto
+          # each one to enable a per-user %i template instance (see the
+          # agent-box@/agent-box-settings@/agent-box-webhook@/
+          # agent-web-terminal@ instances below) — a mechanism the earlier
+          # per-instance `wantedBy` attempt got wrong in a way no eval-level
+          # check caught (only a real VM boot did, unit stayed inactive).
+          # Capturing the override text here is what would have caught it.
           unitFilter = n:
-            builtins.match "(agent-box|agent-web|caddy|fail2ban|earlyoom).*" n != null;
+            builtins.match
+              "(agent-box|agent-web|caddy|fail2ban|earlyoom).*|multi-user\\.target|sockets\\.target"
+              n != null;
           # /etc content the module owns or materially shapes. The fail2ban
           # dir entries (filter.d/, action.d/) are upstream package trees and
           # deliberately excluded; the module's own filter and the jail
