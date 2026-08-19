@@ -42,7 +42,7 @@ import sys
 from pathlib import Path
 
 MARKER = re.compile(
-    r"^(?P<indent>[ ]*)@@include(?P<verbatim>-verbatim)?:(?P<path>[^@]+)@@[ ]*$"
+    r"^(?P<indent>[ ]*)@@include(?P<verbatim>-verbatim)?:(?P<path>.+)@@[ ]*$"
 )
 
 BANNER = """\

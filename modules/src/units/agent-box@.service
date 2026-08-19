@@ -1,0 +1,30 @@
+[Unit]
+Description=Coding agent sessions (tmux) for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=%i
+Restart=always
+RestartSec=2s
+ExecStart=agent-box-supervisor
+ExecStop=tmux -L agent-box kill-server
+RuntimeDirectory=agent-box-%i
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+Environment=HOME=/home/%i
+Environment=TMUX_TMPDIR=/run/agent-box-%i
+EnvironmentFile=-/etc/agent-box/units/%i.env
+EnvironmentFile=-/etc/agent-box/units/%i.local.env
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ReadWritePaths=/home/%i
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true

@@ -1,0 +1,14 @@
+[Unit]
+Description=Browser terminal (ttyd) attached to %i's tmux
+After=agent-box@%i.service network-online.target
+Wants=network-online.target
+
+[Service]
+User=%i
+Restart=always
+RestartSec=5s
+Environment=TMUX_TMPDIR=/run/agent-box-%i
+Environment=AGENT_BOX_SESSIONS_FILE=/home/%i/.config/agent-box/sessions.json
+EnvironmentFile=-/etc/agent-box/units/agent-web-terminal-%i.env
+EnvironmentFile=-/etc/agent-box/units/agent-web-terminal-%i.local.env
+ExecStart=ttyd --writable --url-arg -p ${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@${AGENT_BOX_WEB_DOMAIN} agent-box-attach

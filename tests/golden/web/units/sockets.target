@@ -1,0 +1,2 @@
+[Unit]
+Wants=agent-box-settings@agent.socket agent-box-settings@robot.socket agent-box-webhook@agent.socket agent-box-webhook@robot.socket
