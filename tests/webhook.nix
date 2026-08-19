@@ -151,9 +151,21 @@
     machine.succeed(
         "systemctl show -p Environment agent-box@agent.service | grep agent-box-webhook/bin >/dev/null"
     )
+    # AGENT_BOX_WEBHOOK_URL is per-user (the path segment has this user's
+    # name in it), so issue #154 Phase 3 puts it in the generated
+    # /etc/agent-box/units/agent.env — loaded via the unit's
+    # EnvironmentFile=, not a static Environment= directive, so it will
+    # never show up in `systemctl show -p Environment`. Check the actual
+    # running process's environment instead: the thing this assertion
+    # cares about is that the agent can discover the URL at runtime, and
+    # this proves EnvironmentFile= really got wired up, not just that the
+    # generated file has the right text.
+    main_pid = machine.succeed(
+        "systemctl show -p MainPID --value agent-box@agent.service"
+    ).strip()
     machine.succeed(
-        "systemctl show -p Environment agent-box@agent.service"
-        " | grep 'AGENT_BOX_WEBHOOK_URL=https://box.test/agent/webhook' >/dev/null"
+        f"tr '\\0' '\\n' < /proc/{main_pid}/environ"
+        " | grep -x 'AGENT_BOX_WEBHOOK_URL=https://box.test/agent/webhook' >/dev/null"
     )
     # The supervisor gives each tmux session its own subscription scope, so a
     # bare `agent-box-webhook subscribe` in that session cannot leak into a

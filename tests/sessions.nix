@@ -144,10 +144,15 @@
     # grep -o matches the store path twice. Without it, interpolating the
     # two-line value below makes the second line its own shell command — the
     # backdoor shell EXECUTES the supervisor script as root and never returns
-    # (the CI hang on this PR's first three runs).
+    # (the CI hang on this PR's first three runs). The pattern has to end in
+    # "/bin/agent-box-supervisor", not just "-agent-box-supervisor": the
+    # writeShellScriptBin derivation directory ITSELF ends in
+    # "-agent-box-supervisor" too, one path segment earlier — matching only
+    # the shorter suffix greps the directory, not the script, and `grep` on
+    # a directory fails with "Is a directory" (exit 2) below.
     start_script = machine.succeed(
         "systemctl show agent-box@agent --property=ExecStart --value "
-        "| grep -o '/nix/store/[^ ;]*-agent-box-supervisor' | head -n1"
+        "| grep -o '/nix/store/[^ ;]*/bin/agent-box-supervisor' | head -n1"
     ).strip()
     machine.succeed(
         "systemctl show agent-box@agent -p Environment --value "
