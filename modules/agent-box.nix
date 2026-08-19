@@ -3862,23 +3862,42 @@ in
       };
     };
     }
-    # Enablement + the one per-user drop-in the generated env file can't
-    # express: arbitrary u.environment/u.environmentFiles (issue #154
-    # Phase 3 design's stated exception — an env file can't add its own
+    # The one per-user drop-in the generated env file can't express:
+    # arbitrary u.environment/u.environmentFiles (issue #154 Phase 3
+    # design's stated exception — an env file can't add its own
     # EnvironmentFile= entries or override an already-set var per
     # instance). overrideStrategy = "asDropin" is required here (unlike
     # "agent-box@" above): nothing on disk is literally named
     # "agent-box@alice.service" for the default detection to find, since
-    # instances are virtual.
+    # instances are virtual — so "asDropinIfExists" would render this as a
+    # (broken, ExecStart-less) STANDALONE unit instead of extending the
+    # template. NOTE: enablement is NOT here — see systemd.targets.multi-user
+    # below for why a per-instance `wantedBy` on an asDropin unit doesn't
+    # actually start anything.
     // (lib.mapAttrs' (name: u: lib.nameValuePair "agent-box@${name}" (
-      { overrideStrategy = "asDropin";
-        wantedBy = [ "multi-user.target" ];
-      }
+      { overrideStrategy = "asDropin"; }
       // lib.optionalAttrs (u.environment != { }) { environment = u.environment; }
       // lib.optionalAttrs (u.environmentFiles != [ ]) {
         serviceConfig.EnvironmentFile = u.environmentFiles;
       }
     )) cfg.users);
+
+    # Enablement for every per-user template instance (issue #154 Phase 3).
+    # `wantedBy` on an "asDropin"-strategy systemd.services entry is a dead
+    # end: NixOS's .wants-symlink generation links "../<unit-name>" — i.e. it
+    # needs a real top-level file named e.g. "agent-box@alice.service" to
+    # point at, and an asDropin instance never has one (only a
+    # "agent-box@alice.service.d/overrides.conf"). The symlink ends up
+    # dangling, systemd never schedules a start job, and the unit sits
+    # "inactive" forever with no error anywhere (caught by every VM test
+    # that waits on it — see PR #295 CI). `systemd.targets.<x>.wants` is
+    # different: it renders as a literal `Wants=` line in the TARGET's own
+    # unit file (systemd-lib.nix's generic `wants` -> `Wants=` mapping), and
+    # systemd resolves a wanted instance name straight from the `%i`
+    # template at boot — no per-instance file needed at all. This is the
+    # same pattern nixpkgs itself uses to enable one instance of a template
+    # unit (e.g. containers.nix's `systemd-nspawn@<name>`).
+    systemd.targets.multi-user.wants = map (name: "agent-box@${name}.service") (lib.attrNames cfg.users);
 
     security.sudo.extraRules = lib.mkIf (effectiveSudoAllowlist != [ ]) [{
       users = lib.attrNames cfg.users;
@@ -8557,14 +8576,12 @@ in
           serviceConfig.ExecSearchPath = lib.makeBinPath [ settingsDaemon ];
         };
       }
-      // lib.listToAttrs (map (name: lib.nameValuePair "agent-web-terminal@${name}" {
-        overrideStrategy = "asDropin";
-        wantedBy = [ "multi-user.target" ];
-      }) terminalUsers)
-      // lib.listToAttrs (map (name: lib.nameValuePair "agent-box-settings@${name}" {
-        overrideStrategy = "asDropin";
-        wantedBy = [ "multi-user.target" ];
-      }) terminalUsers)
+      # No per-instance drop-in for agent-web-terminal@/agent-box-settings@:
+      # neither has any per-user content beyond the %i template itself, so
+      # there is nothing to override — enablement is
+      # systemd.targets.multi-user.wants below, not a `wantedBy` here (see
+      # the note by that option: a `wantedBy` on an "asDropin" instance
+      # produces a dangling .wants symlink and never actually starts).
       # Webhook receiver daemon (issue #101), one per terminal user, gated on
       # webhook.enable. Runs webhook.py (via the agent-box-webhook-receiver
       # wrapper, resolved through ExecSearchPath) in RECEIVER_ONLY mode as
@@ -8583,26 +8600,28 @@ in
           environment.LOCAL_WEBHOOK_SPAWN_CMD = "${webhookSpawn}/bin/agent-box-webhook-spawn";
           serviceConfig.ExecSearchPath = lib.makeBinPath [ webhookPolicyApply webhookReceiverBin ];
         };
-      } // lib.listToAttrs (map (name: lib.nameValuePair "agent-box-webhook@${name}" {
-        overrideStrategy = "asDropin";
-        wantedBy = [ "multi-user.target" ];
-      }) terminalUsers));
+      });
+      # No systemd.sockets overrides: the settings daemon's listening
+      # sockets (issue #49) and the webhook ingress sockets (issue #101)
+      # are fully %i-derived already (see src/units/*.socket, shipped via
+      # systemd.packages) — root binds each one 0660 <user>:caddy BEFORE
+      # the daemon starts, exactly as before. Only ENABLEMENT is
+      # per-instance, and that belongs in systemd.targets.sockets.wants
+      # below (same dangling-.wants-symlink reasoning as the .service
+      # instances — see the note by systemd.targets.multi-user.wants
+      # above).
 
-      # The settings daemon's listening sockets (issue #49) and the webhook
-      # ingress sockets (issue #101) are fully %i-derived already (see
-      # src/units/*.socket, shipped via systemd.packages) — root binds
-      # each one 0660 <user>:caddy BEFORE the daemon starts, exactly as
-      # before; only per-instance ENABLEMENT (sockets.target) is needed
-      # here, same asDropin reasoning as the .service instances above.
-      systemd.sockets =
-        lib.listToAttrs (map (name: lib.nameValuePair "agent-box-settings@${name}" {
-          overrideStrategy = "asDropin";
-          wantedBy = [ "sockets.target" ];
-        }) terminalUsers)
-        // lib.optionalAttrs webhookEnabled (lib.listToAttrs (map (name: lib.nameValuePair "agent-box-webhook@${name}" {
-          overrideStrategy = "asDropin";
-          wantedBy = [ "sockets.target" ];
-        }) terminalUsers));
+      # Enablement for every per-terminal-user template instance (issue
+      # #154 Phase 3) — see the note by the box-wide
+      # systemd.targets.multi-user.wants above for why this can't be a
+      # per-instance `wantedBy` on an asDropin unit.
+      systemd.targets.multi-user.wants =
+        (map (name: "agent-web-terminal@${name}.service") terminalUsers)
+        ++ (map (name: "agent-box-settings@${name}.service") terminalUsers)
+        ++ lib.optionals webhookEnabled (map (name: "agent-box-webhook@${name}.service") terminalUsers);
+      systemd.targets.sockets.wants =
+        (map (name: "agent-box-settings@${name}.socket") terminalUsers)
+        ++ lib.optionals webhookEnabled (map (name: "agent-box-webhook@${name}.socket") terminalUsers);
     }
   ))
 
