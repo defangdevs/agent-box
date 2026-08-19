@@ -125,9 +125,9 @@ taken. A dispatched session is subscribed to the event's own repo at spawn,
 so its red CI spawns no sibling; a new issue or someone else's PR always
 spawns. Its prompt tells it to `agent-box-session rm NAME` when done — clean
 stale `hook-*` sessions the same way. That cleanup is load-bearing: at most 4
-`hook-*` sessions may exist at once, and once that ceiling is reached EVERY
+`hook-*` sessions may RUN at once, and once that ceiling is reached EVERY
 watch on the box is inert — a matching batch is refused and dropped, never
-queued. So before you conclude a repo has been quiet, run `agent-box-webhook
+queued. A stopped session frees its slot even before it is delisted. So before you conclude a repo has been quiet, run `agent-box-webhook
 status`: its `dispatch` object has the live count against the ceiling and the
 last batch the ceiling dropped.
 

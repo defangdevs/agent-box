@@ -57,14 +57,15 @@ Two delivery shapes:
                          A spawned session is subscribed to the event's own
                          repo for it, so its own CI spawns no sibling.
                          THERE IS A CEILING: at most 4 hook-* sessions may
-                         exist at once (AGENT_BOX_HOOK_SESSION_MAX in the
+                         RUN at once (AGENT_BOX_HOOK_SESSION_MAX in the
                          receiver daemon's environment). Hook sessions are
-                         removed by the agent they start, so four that ended
-                         without running `agent-box-session rm NAME` wedge
-                         every watch on the box — a refused batch is DROPPED,
-                         never queued. `status` reports the live count, the
-                         ceiling and the last refusal, and `ls` says so too
-                         once the box is at the ceiling.
+                         removed by the agent they start, so four of them
+                         still running wedge every watch on the box — a
+                         refused batch is DROPPED, never queued. Stopping one
+                         frees its slot; `agent-box-session rm NAME` also
+                         delists it. `status` reports the count, the ceiling
+                         and the last refusal, and `ls` says so too once the
+                         box is at the ceiling.
 
 --ignore-sender LOGIN mutes echoes of that sender's own comments and pushes
 ("@self" is $LOCAL_WEBHOOK_SELF); CI-outcome events are delivered anyway.
@@ -88,7 +89,7 @@ NEWER than the pin is normal — claude tracks the marketplace's default
 branch — and is reported in the JSON (`plugin.skew`) without a warning.
 
 Its `dispatch` object is where to look when standing watches seem dead:
-`hookSessions` is the live hook-* count against the ceiling, `lastRefusal`
+`hookSessions` is the running hook-* count against the ceiling, `lastRefusal`
 is the batch the ceiling most recently dropped (with a running total), and
 `warning` — the same field `ls` sets when the receiver has no spawn command
 — is present exactly when a match right now would spawn nothing.
@@ -177,19 +178,29 @@ peer_kinds() {
 
 # ----------------------------------------------------- standing-watch cap ---
 # Standing watches are the one delivery shape with no session behind it, so
-# when the spawn wrapper refuses a batch (too many hook-* sessions already
-# exist) webhook.py drops it and NOBODY got those events. That refusal used to
+# when the spawn wrapper refuses a batch (too many hook-* sessions running)
+# webhook.py drops it and NOBODY got those events. That refusal used to
 # reach only the receiver daemon journal while every listing here still said
 # "subscribed" — four hook sessions whose agents forgot `agent-box-session rm`
 # made the whole box inert and it read like a quiet week (issue #170). These
 # three read the state the wrapper decides on, so `status` and `ls` can say it.
 
 hook_sessions() {
-  # Live hook-* sessions: the same file and the same query the wrapper counts
-  # (src/webhook-spawn.sh), so this is the number the ceiling is applied to.
+  # The capacity in use, counted the way the wrapper counts it
+  # (src/webhook-spawn.sh): a hook-* entry that is not `stopped` — running, or
+  # queued for the supervisor's reconcile loop to start within ~2s. A `stopped`
+  # entry is FREE capacity, so counting it here would report a healthy box as
+  # wedged (issue #280) — the same over-count that used to wedge it for real.
+  #
+  # The wrapper additionally counts live hook-* tmux panes that no entry
+  # claims, which needs the tmux binary its unit pins; this process has no such
+  # pin, and the divergence can only under-count. The wrapper stays the
+  # authority either way: when the two disagree, lastRefusal is the decision
+  # that was enforced.
   if [ -s "$SESSIONS" ]; then
-    "$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' \
-      "$SESSIONS" 2>/dev/null || printf '0'
+    "$JQ" -r '[.sessions | to_entries[]
+               | select((.key | startswith("hook-")) and .value.stopped != true)]
+              | length' "$SESSIONS" 2>/dev/null || printf '0'
   else
     printf '0'
   fi
@@ -225,10 +236,11 @@ hook_capacity_warning() {
   # not. One wording in one place: two copies would drift, and this is the
   # sentence the reader acts on.
   [ "$1" -ge "$2" ] || return 0
-  printf '%s' "$1 of at most $2 hook-* sessions already exist, so every \
+  printf '%s' "$1 of at most $2 hook-* sessions are running, so every \
 standing watch is inert: a matching event batch is refused and DROPPED, never \
-queued. Remove the finished ones (agent-box-session ls, then agent-box-session \
-rm NAME), or raise AGENT_BOX_HOOK_SESSION_MAX on the receiver daemon unit."
+queued. Free a slot (agent-box-session ls, then agent-box-session stop NAME, \
+or agent-box-session rm NAME to delist it for good), or raise \
+AGENT_BOX_HOOK_SESSION_MAX on the receiver daemon unit."
 }
 
 cmd="${1:-}"; shift || true
