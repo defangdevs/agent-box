@@ -14,6 +14,10 @@
 #     restart clears the flag and revives it,
 #   - both agent CLIs installed regardless of what sessions run
 #     (installAgents default),
+#   - the instruction files each harness reads (issue #305): the editable
+#     AGENTS.md plus, for a claude session only, the project-scope and
+#     user-scope CLAUDE.md pointers — seeded IFF absent, never clobbering,
+#     and skipped for codex (reads AGENTS.md natively) and shell sessions,
 #   - browser tmux clients advertise OSC 8 support, preserving a long hidden
 #     hyperlink target when its visible URL wraps across terminal rows (#18),
 #   - the root tabbed terminal workspace (the settings daemon in
@@ -222,6 +226,66 @@
     )
     assert link_url.encode() in hyperlink_targets, tmux_browser_output
     assert b"END_OF_FULL_URL" in tmux_browser_output, tmux_browser_output
+
+    # --- instruction files the harnesses actually read (issue #305) -------
+    with subtest("seeded AGENTS.md and the two claude CLAUDE.md pointers"):
+        # The boot "main" session is claude in $HOME, so all three files are
+        # seeded already: the editable notes file plus the two pointers claude
+        # needs (it discovers CLAUDE.md only and never reads AGENTS.md).
+        machine.succeed("test -f /home/agent/AGENTS.md")
+        machine.succeed(
+            "grep -F /etc/agent-box-guides/AGENTS.agent.md /home/agent/AGENTS.md"
+            " >/dev/null"
+        )
+        # Project scope imports the sibling notes file by RELATIVE path: a
+        # project-scope import cannot climb out of the project tree.
+        machine.succeed("grep -Fx '@AGENTS.md' /home/agent/CLAUDE.md >/dev/null")
+        # User scope carries the canonical guide, the one scope whose imports
+        # reach outside the project tree at all.
+        machine.succeed(
+            "grep -Fx '@/etc/agent-box-guides/AGENTS.agent.md' "
+            "/home/agent/.claude/CLAUDE.md >/dev/null"
+        )
+        # That target is readable by the agent and not writable by it.
+        machine.succeed(as_agent("test -r /etc/agent-box-guides/AGENTS.agent.md"))
+        machine.fail(as_agent("test -w /etc/agent-box-guides/AGENTS.agent.md"))
+        for seeded in ["/home/agent/AGENTS.md", "/home/agent/CLAUDE.md",
+                       "/home/agent/.claude/CLAUDE.md"]:
+            machine.succeed(f"stat -c '%U %a' {seeded} | grep -x 'agent 644'")
+
+        # Nothing is ever clobbered: a directory that already holds both files
+        # keeps its own content, so a repo checkout's CLAUDE.md and any hand
+        # edit survive every (re)spawn.
+        machine.succeed(as_agent("mkdir -p /home/agent/keep"))
+        machine.succeed(as_agent("echo MINE-AGENTS > /home/agent/keep/AGENTS.md"))
+        machine.succeed(as_agent("echo MINE-CLAUDE > /home/agent/keep/CLAUDE.md"))
+        machine.succeed(as_agent(
+            "agent-box-session add keeper --agent claude --cwd /home/agent/keep"
+        ))
+        machine.wait_until_succeeds(tmux("has-session -t =keeper"), timeout=60)
+        machine.succeed("grep -Fx MINE-AGENTS /home/agent/keep/AGENTS.md >/dev/null")
+        machine.succeed("grep -Fx MINE-CLAUDE /home/agent/keep/CLAUDE.md >/dev/null")
+        machine.succeed(as_agent("agent-box-session rm keeper"))
+
+        # A codex session gets AGENTS.md alone — codex reads that name
+        # natively, so a CLAUDE.md beside it would be dead weight.
+        machine.succeed(as_agent("mkdir -p /home/agent/cxdir"))
+        machine.succeed(as_agent(
+            "agent-box-session add cx --agent codex --cwd /home/agent/cxdir"
+        ))
+        machine.wait_until_succeeds("test -f /home/agent/cxdir/AGENTS.md", timeout=60)
+        machine.fail("test -e /home/agent/cxdir/CLAUDE.md")
+        machine.succeed(as_agent("agent-box-session rm cx"))
+
+        # A shell session gets neither: no agent there reads them.
+        machine.succeed(as_agent("mkdir -p /home/agent/shdir"))
+        machine.succeed(as_agent(
+            "agent-box-session add sh --agent shell --cwd /home/agent/shdir"
+        ))
+        machine.wait_until_succeeds(tmux("has-session -t =sh"), timeout=60)
+        machine.fail("test -e /home/agent/shdir/AGENTS.md")
+        machine.fail("test -e /home/agent/shdir/CLAUDE.md")
+        machine.succeed(as_agent("agent-box-session rm sh"))
 
     # --- runtime add: no sudo, no rebuild ---------------------------------
     machine.succeed(

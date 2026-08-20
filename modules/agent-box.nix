@@ -2645,8 +2645,13 @@ $PROMPT"
           there).
 
           AGENTS.md is the cross-vendor agent-instructions convention read
-          natively by codex and opencode, and by claude-code as a fallback
-          when CLAUDE.md is absent. The agent's systemd env exports
+          natively by codex and opencode. claude-code does NOT read it — it
+          discovers CLAUDE.md only (issue #305) — so a claude session also
+          gets two generated one-import pointer files, seeded IFF absent:
+          <workingDirectory>/CLAUDE.md imports the AGENTS.md beside it, and
+          ~/.claude/CLAUDE.md imports the canonical guide under /etc. Both
+          follow this option: agentsMd = null seeds neither.
+          The agent's systemd env exports
           AGENT_BOX_URL whenever this user has a browser terminal (see
           web.passwordHashFile), so an AGENTS.md that references that variable
           lets the agent answer "where am I reachable?" without hard-coding
@@ -2698,17 +2703,18 @@ $PROMPT"
       map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
       ++ [ "shell=${utils.toShellPath config.users.users.${name}.shell}" ]
     );
-  # AGENTS.md — cross-vendor agent-instructions file (codex, opencode
-  # native; claude-code as CLAUDE.md fallback). What we SEED into $HOME is
-  # deliberately minimal and EDITABLE: a short notes header plus a claude
-  # `@import` of the read-only canonical guide at canonicalAgentsPath, so
-  # the up-to-date guidance is pulled in at load time without ever
-  # overwriting the agent's own edits. The canonical file itself is
-  # published via environment.etc and refreshed on every box update.
+  # AGENTS.md — cross-vendor agent-instructions file (codex and opencode
+  # read it natively; claude does NOT — see claudeMdPointers below). What we
+  # SEED into $HOME is
+  # deliberately minimal and EDITABLE: a short notes header that NAMES the
+  # read-only canonical guide at canonicalAgentsPath, so the agent's own
+  # edits are never overwritten. The canonical file itself is published via
+  # environment.etc and refreshed on every box update.
   # null (agentsMd = null) opts out of seeding entirely.
-  # NOTE: claude-code expands `@path` imports; codex does not, so on a
-  # codex session the import line shows literally — the guide then has to
-  # be read explicitly from canonicalAgentsPath.
+  # NOTE: this file carries no `@import` of the guide, because no harness
+  # would act on one here — codex does not expand `@path` at all, and claude
+  # never reads AGENTS.md in the first place (issue #305). claude gets the
+  # guide from claudeGuidePointer below; every other harness reads the path.
   agentsMdPointer = name: u:
     if u.agentsMd == null then null
     else pkgs.writeText "agent-box-${name}-agents-pointer.md" ''
@@ -2717,8 +2723,55 @@ $PROMPT"
       This file is yours to edit; anything you add here persists across
       restarts. The canonical agent-box guide (environment, secrets,
       serving files, self-update) is read-only and auto-updated on every
-      box update — it is imported below and also readable directly at
+      box update. A claude session loads it automatically through
+      ~/.claude/CLAUDE.md; on any other harness, read it yourself at
       ${canonicalAgentsPath name}.
+    '';
+
+  # CLAUDE.md — claude-code's ONLY instruction-file name (issue #305).
+  # Measured on claude-code 2.1.233: AGENTS.md is never discovered (in that
+  # binary the name occurs only in its Codex importer and its /init prompt),
+  # so the AGENTS.md seeded above — and with it the canonical guide that file
+  # imports — reached no claude session at all. Two pointer files fix it, one
+  # per memory SCOPE, because claude confines an `@import` differently in
+  # each:
+  #   - PROJECT scope (<workingDirectory>/CLAUDE.md) resolves imports only
+  #     INSIDE the project tree and drops a target above it SILENTLY, so it
+  #     cannot reach /etc. It imports the AGENTS.md beside it — the agent's
+  #     own editable notes — by relative path.
+  #   - USER scope (~/.claude/CLAUDE.md) has no such limit, and loads
+  #     whatever directory the session starts in, so it imports the canonical
+  #     guide directly.
+  # Each file therefore supplies exactly what the other cannot, and the guide
+  # is never loaded twice. Both are seeded IFF absent (see supervisor.sh), so
+  # a repo checkout's own CLAUDE.md and any hand edits survive.
+  claudeNotesPointer = name: u:
+    if u.agentsMd == null then null
+    else pkgs.writeText "agent-box-${name}-claude-notes-pointer.md" ''
+      # agent-box — claude entry point
+
+      claude reads CLAUDE.md, never AGENTS.md, so this file imports the
+      cross-vendor notes file beside it. Put your own notes in that AGENTS.md
+      rather than here: codex and opencode read it natively, and this pointer
+      is seeded once and then left alone.
+
+      @AGENTS.md
+    '';
+  # The canonical guide, at USER scope so every session gets it whatever
+  # directory it starts in — and because a project-scope import cannot climb
+  # out to /etc (see above).
+  claudeGuidePointer = name: u:
+    if u.agentsMd == null then null
+    else pkgs.writeText "agent-box-${name}-claude-guide-pointer.md" ''
+      # agent-box — claude entry point
+
+      The canonical agent-box guide (environment, secrets, serving files,
+      self-update) is read-only and auto-updated on every box update. It is
+      imported below and also readable directly at
+      ${canonicalAgentsPath name}.
+
+      This file loads in every session of this user. Notes that belong to one
+      working directory go in that directory's AGENTS.md instead.
 
       @${canonicalAgentsPath name}
     '';
@@ -3415,6 +3468,27 @@ $PROMPT"
            && [ "$agent" != shell ] && [ ! -e "$wd/AGENTS.md" ]; then
         mkdir -p "$wd"
         install -m 0644 "$AGENT_BOX_AGENTS_POINTER" "$wd/AGENTS.md"
+      fi
+      # claude reads CLAUDE.md and NEVER AGENTS.md (issue #305), so the file
+      # seeded above reaches a claude session only through a pointer. Two are
+      # needed because a claude @import is confined per memory scope: the
+      # project-scope one imports the sibling AGENTS.md (a relative path — a
+      # project-scope import cannot climb out of the project tree), and the
+      # user-scope one carries the canonical /etc guide, which only that scope
+      # can reach. Both IFF absent, so a repo's own CLAUDE.md and any hand
+      # edits survive; the notes pointer only when there IS an AGENTS.md beside
+      # it to import (the line above just made sure of that, unless the user
+      # opted out or something else owns the file).
+      if [ "$agent" = claude ]; then
+        if [ -n "''${AGENT_BOX_CLAUDE_NOTES_POINTER:-}" ] \
+             && [ -e "$wd/AGENTS.md" ] && [ ! -e "$wd/CLAUDE.md" ]; then
+          install -m 0644 "$AGENT_BOX_CLAUDE_NOTES_POINTER" "$wd/CLAUDE.md"
+        fi
+        if [ -n "''${AGENT_BOX_CLAUDE_GUIDE_POINTER:-}" ] \
+             && [ ! -e "$HOME/.claude/CLAUDE.md" ]; then
+          mkdir -p "$HOME"/.claude
+          install -m 0644 "$AGENT_BOX_CLAUDE_GUIDE_POINTER" "$HOME"/.claude/CLAUDE.md
+        fi
       fi
       # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
       # time, not unit start — then execs the agent (issue 89), so
@@ -4446,6 +4520,10 @@ in
           // (lib.optionalAttrs (agentsMdPointer name u != null) {
             # Seeded-AGENTS.md pointer file; unset = agentsMd null opt-out.
             AGENT_BOX_AGENTS_POINTER = "${agentsMdPointer name u}";
+            # The two claude CLAUDE.md pointers (issue #305): AGENTS.md alone
+            # reaches no claude session. Same opt-out as above.
+            AGENT_BOX_CLAUDE_NOTES_POINTER = "${claudeNotesPointer name u}";
+            AGENT_BOX_CLAUDE_GUIDE_POINTER = "${claudeGuidePointer name u}";
           })
           // (lib.optionalAttrs webhookEnabled {
             # Doubles as the supervisor's "webhook receiver is live" flag

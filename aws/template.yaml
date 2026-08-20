@@ -212,8 +212,9 @@ Parameters:
       (persistence, sslip.io URL, IPv6/NAT64, growing the disk). Edit or clear
       it to taste; whatever you leave here lands below the built-in default.
       AGENTS.md is the cross-vendor agent-instructions convention read
-      natively by codex and opencode, and by claude-code as a CLAUDE.md
-      fallback. Content is embedded into user-data as a Nix indented string,
+      natively by codex and opencode; claude reads CLAUDE.md instead, and the
+      module seeds pointer files so a claude session picks this text up too.
+      Content is embedded into user-data as a Nix indented string,
       so avoid the sequences `${` and `''` in the body — Nix will otherwise
       try to antiquote / close the string mid-file. Plain $VAR (no braces) is
       fine.

@@ -681,6 +681,27 @@ start_session() {
     mkdir -p "$wd"
     install -m 0644 "$AGENT_BOX_AGENTS_POINTER" "$wd/AGENTS.md"
   fi
+  # claude reads CLAUDE.md and NEVER AGENTS.md (issue #305), so the file
+  # seeded above reaches a claude session only through a pointer. Two are
+  # needed because a claude @import is confined per memory scope: the
+  # project-scope one imports the sibling AGENTS.md (a relative path — a
+  # project-scope import cannot climb out of the project tree), and the
+  # user-scope one carries the canonical /etc guide, which only that scope
+  # can reach. Both IFF absent, so a repo's own CLAUDE.md and any hand
+  # edits survive; the notes pointer only when there IS an AGENTS.md beside
+  # it to import (the line above just made sure of that, unless the user
+  # opted out or something else owns the file).
+  if [ "$agent" = claude ]; then
+    if [ -n "${AGENT_BOX_CLAUDE_NOTES_POINTER:-}" ] \
+         && [ -e "$wd/AGENTS.md" ] && [ ! -e "$wd/CLAUDE.md" ]; then
+      install -m 0644 "$AGENT_BOX_CLAUDE_NOTES_POINTER" "$wd/CLAUDE.md"
+    fi
+    if [ -n "${AGENT_BOX_CLAUDE_GUIDE_POINTER:-}" ] \
+         && [ ! -e "$HOME/.claude/CLAUDE.md" ]; then
+      mkdir -p "$HOME"/.claude
+      install -m 0644 "$AGENT_BOX_CLAUDE_GUIDE_POINTER" "$HOME"/.claude/CLAUDE.md
+    fi
+  fi
   # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
   # time, not unit start — then execs the agent (issue 89), so
   # settings-page secrets land on the next session (re)start.
