@@ -1794,11 +1794,8 @@ rand=$(od -An -N2 -tx2 /dev/urandom | tr -d ' \n')
 name="hook-''${san:-event}-$rand"
 if [ "''${#name}" -gt "$NAME_MAX" ]; then
   name="hook-$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
-  # The key is printed unquoted on purpose: a single quote written directly
-  # before a shell parameter expansion is mis-escaped by assemble-module.py
-  # and reaches the generated module as broken Nix (agent-box#244).
-  echo "agent-box-webhook-spawn: this key does not fit a session name" \
-       "(max $NAME_MAX characters): ''${LOCAL_WEBHOOK_SPAWN_KEY:-event}" >&2
+  echo "agent-box-webhook-spawn: key ''\'''${LOCAL_WEBHOOK_SPAWN_KEY:-event}'" \
+       "does not fit a session name (max $NAME_MAX characters)" >&2
   echo "agent-box-webhook-spawn: naming this session $name instead," \
        "so its tab is anonymous but never ambiguous" >&2
 fi
