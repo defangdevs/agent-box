@@ -366,6 +366,32 @@
               python3 repo/bin/assemble-module.py --check --repo repo
               touch "$out"
             '';
+
+          # Unit test for the assembler's Nix escaping (issue #244).
+          # module-generated-up-to-date cannot catch an escaping bug — it
+          # regenerates the file with the same assembler, so the check and the
+          # bug agree on the wrong bytes. This one decodes the escaped text the
+          # way Nix's lexer does and round-trips a corpus through it.
+          assemble-module-escaping =
+            pkgs.runCommand "agent-box-assemble-module-escaping"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                assembler = ./bin/assemble-module.py;
+                tests = ./tests/test-assemble-module.py;
+              } ''
+              install -d repo/bin repo/tests
+              cp "$assembler" repo/bin/assemble-module.py
+              cp "$tests" repo/tests/test-assemble-module.py
+              # Not piped into tee: the log has to reach the build output
+              # whether the tests pass or fail, and the exit status has to be
+              # python's own.
+              python3 repo/tests/test-assemble-module.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
         }
         # Everything below boots a guest, so it only exists for `vmSystems`:
         # runNixOSTest wants a same-arch KVM guest (cross-arch falls back to

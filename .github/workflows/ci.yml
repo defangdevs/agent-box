@@ -12,6 +12,7 @@ on:
       - 'modules/agent-box.nix.in'
       - 'modules/src/**'
       - 'bin/assemble-module.py'
+      - 'tests/test-assemble-module.py'
       # The mascot mark (issue #185) is embedded into the settings daemon at
       # assemble time, so it is a module source as much as a website asset.
       - 'docs/potato.svg'
@@ -73,6 +74,13 @@ jobs:
       # `nix run .#assemble`, so the committed single file never drifts.
       - name: Check generated module is up to date
         run: nix build -L .#checks.x86_64-linux.module-generated-up-to-date && cat result
+
+      # Issue 244: the assembler's Nix escaping, decoded the way Nix's lexer
+      # does. The up-to-date check above cannot see an escaping bug — it
+      # regenerates the file with the same assembler, so both agree on the
+      # wrong bytes.
+      - name: Check assembler escaping
+        run: nix build -L .#checks.x86_64-linux.assemble-module-escaping && cat result
 
       # Eval/build check (issue 132): the module's generated Caddyfile carries
       # the authenticated /<user>/downloads/ file-server route.
