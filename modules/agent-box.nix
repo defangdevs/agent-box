@@ -14,7 +14,7 @@
 
 let
   cfg = config.services.agent-box;
-  supportedAgents = [ "claude" "codex" ];
+  supportedAgents = [ "claude" "codex" "opencode" ];
   # Everything a session's `agent` field may name: the agent CLIs plus the
   # pseudo-agent "shell" (issue #113) — a plain login shell in a supervised
   # tmux session, for manual investigation/clean-up. "shell" is always
@@ -709,7 +709,7 @@ done
     cfg.sudoAllowlist
     ++ lib.optional cfg.web.enable caddyReloadCmd
     ++ lib.optionals cfg.selfUpdate.enable [ updateStartCmd updateStartNoBlockCmd ];
-  # Agent CLIs (claude-code, codex) move much faster than any host channel.
+  # Agent CLIs (claude-code, codex, opencode) move much faster than any host channel.
   # When the host wires selfUpdate.agentNixpkgs (from the pin file the update
   # service maintains — see that option), resolve just the agent packages from
   # that pinned nixos-unstable snapshot; the rest of the system stays on the
@@ -725,7 +725,8 @@ done
         system = pkgs.stdenv.hostPlatform.system;
         # The host's allowUnfreePredicate does not reach a second nixpkgs
         # import; allow exactly the bundled agent packages (mirrors the
-        # host-side default set below).
+        # host-side default set below). opencode is MIT (free), so it needs
+        # no entry here — this list is only unfree packages.
         config.allowUnfreePredicate = pkg:
           builtins.elem (lib.getName pkg) [ "claude-code" "codex" ];
       }
@@ -733,7 +734,8 @@ done
   agentPackage = agent:
     if cfg.package != null then cfg.package
     else if agent == "claude" then agentPkgs.claude-code
-    else agentPkgs.codex;
+    else if agent == "codex" then agentPkgs.codex
+    else agentPkgs.opencode;
   installedAgentPackages = map agentPackage cfg.installAgents;
   installedCodexPackage = lib.optional (builtins.elem "codex" cfg.installAgents) (agentPackage "codex");
   # Box-wide codex autonomy is on only when codex is actually installed:
@@ -2465,7 +2467,8 @@ $PROMPT"
         default = null;
         description = ''
           Remote Control session name (claude sessions only — codex derives
-          its own name from the hostname). When null, defaults to
+          its own name from the hostname; opencode has no Remote Control
+          analogue and ignores this). When null, defaults to
           "<user>-<session>@<host>", where <host> is
           services.agent-box.remoteControlHost (fqdnOrHostName by default,
           the public sslip.io host on the AWS image), else the public
@@ -2512,7 +2515,7 @@ $PROMPT"
       sessions = lib.mkOption {
         type = lib.types.attrsOf (lib.types.submodule sessionOpts);
         default = { };
-        example = lib.literalExpression ''{ main = { }; review = { agent = "codex"; }; scratch = { agent = "shell"; }; }'';
+        example = lib.literalExpression ''{ main = { }; review = { agent = "codex"; }; oc = { agent = "opencode"; }; scratch = { agent = "shell"; }; }'';
         description = ''
           Seed sessions for this user — each is an agent CLI (or a plain
           login shell, agent = "shell") running in its own tmux session
@@ -2583,6 +2586,12 @@ $PROMPT"
             browser terminal. The codex daemon is a per-user singleton (one
             control socket per user), so enable it on at most ONE codex session
             per user; two would fight over the same daemon.
+          - opencode: has no Remote Control analogue yet (no vendor pairing
+            app) — this setting is IGNORED for opencode sessions, which
+            always run the normal TUI, reachable only via the browser
+            terminal or a local tmux attach. (`opencode serve`/`web` behind
+            this box's own Caddy front end could stand in for it later;
+            that is a separate product decision, not this one.)
         '';
       };
       remoteControlName = lib.mkOption {
@@ -3148,6 +3157,23 @@ $PROMPT"
       printf '%s' "''${b: -36}"
     }
 
+    opencode_session_id() {
+      # Echo the opencode session id whose first user message carries our
+      # "[agent-box session <boxid>]" marker (newest wins — same "resume the
+      # newest match, else start fresh" rule as codex_rollout_uuid). Unlike
+      # codex's one-rollout-per-session jsonl files, every opencode session
+      # (across every session name and working directory this user has ever
+      # run) lives in ONE shared SQLite database, so there is no directory to
+      # grep — `opencode db` (the CLI's own query tool; the box adds no sqlite
+      # dependency for this) stands in for it. Empty when none match, or when
+      # the binary has no `db` subcommand yet (an older opencode).
+      [ -n "$1" ] && [ -n "$2" ] || return 0
+      esc=''${1//\'/\'\'}
+      "$2" db \
+        "select session_id from part where data like '%agent-box session $esc%' order by time_created desc limit 1;" \
+        --format tsv 2>/dev/null | tail -n +2
+    }
+
     start_session() {
       sname=$1
       sjson="$($JQ -c --arg s "$sname" '.sessions[$s] // empty' "$SESSIONS_FILE")" || return 0
@@ -3423,6 +3449,29 @@ $PROMPT"
             # the prompt and codex would open with no task at all.
             if [ -n "$prompt" ]; then
               cmd="$cmd -- $(printf '%q' "[agent-box session $bid] $prompt")"
+            fi
+          fi
+          ;;
+        opencode)
+          # No Remote Control analogue yet (issue 80): $rc is deliberately never
+          # read here — the browser terminal (or a local tmux attach) is the
+          # only way to drive an opencode session from outside a shell.
+          #
+          # opencode has nothing like claude's --session-id (mint-your-own) or
+          # codex's rollout-per-session files, so "is there a conversation to
+          # resume" is answered the same way as codex's: look up our stamped
+          # marker (opencode_session_id, backed by `opencode db`) and either
+          # continue that session id or start fresh and stamp a new marker.
+          target=""
+          [ "$resuming" = true ] && target="$(opencode_session_id "$bid" "$bin")"
+          [ -n "$target" ] && cmd="$cmd --session $(printf '%q' "$target")"
+          [ "$skip" = true ] && cmd="$cmd --auto"
+          append_extra
+          if [ -n "$prompt" ]; then
+            if [ -n "$target" ]; then
+              cmd="$cmd --prompt $(printf '%q' "$prompt")"
+            else
+              cmd="$cmd --prompt $(printf '%q' "[agent-box session $bid] $prompt")"
             fi
           fi
           ;;
@@ -3732,13 +3781,13 @@ in
     agent = lib.mkOption {
       type = lib.types.enum supportedAgents;
       default = "claude";
-      description = "Default agent CLI to run. Supported values: claude, codex.";
+      description = "Default agent CLI to run. Supported values: claude, codex, opencode.";
     };
 
     package = lib.mkOption {
       type = lib.types.nullOr lib.types.package;
       default = null;
-      defaultText = lib.literalExpression ''null (pkgs.claude-code for agent = "claude"; pkgs.codex for agent = "codex")'';
+      defaultText = lib.literalExpression ''null (pkgs.claude-code for agent = "claude"; pkgs.codex for agent = "codex"; pkgs.opencode for agent = "opencode")'';
       description = "Package to run for every agent user. Leave null to use the selected agent's default package.";
     };
 
@@ -5589,6 +5638,15 @@ in
         # transcript cannot be located (a codex session started with no prompt, hence
         # no marker; a `shell` session; an agent the box knows no layout for) simply
         # have no download button — see transcript_of.
+        #
+        # opencode (issue #80) is deliberately in that last bucket, not a third
+        # per-agent branch: every opencode session for this user, across every
+        # session name and working directory, lives in ONE shared SQLite database
+        # (`opencode db path`) — there is no per-session file to `open()` the way
+        # claude's and codex's transcripts are. Locating the session (the same
+        # marker-match query, via the stdlib sqlite3 module) and turning it into a
+        # downloadable file (an on-demand `opencode export --sanitize`, cached like
+        # a transcript path) is issue #314.
         CLAUDE_PROJECTS_DIR = os.path.join(HOME_DIR, ".claude", "projects")
         CODEX_SESSIONS_DIR = os.path.join(HOME_DIR, ".codex", "sessions")
         LIVE_ID_DIR = os.path.join(
@@ -5796,9 +5854,9 @@ in
                 elif agent == "codex":
                     path = codex_index().get(box_id.lower())
                 else:
-                    # shell sessions have no conversation, and an agent whose
-                    # on-disk layout the box does not know is not worth a guess
-                    # (issue #80 adds one when opencode support lands).
+                    # shell sessions have no conversation, and opencode's session
+                    # store is not a per-session file to guess a path for at all
+                    # (see the module docstring above) — issue #314.
                     path = None
                 if len(_transcript_cache) > 256:
                     # Sessions come and go (dispatched hook-* sessions especially),

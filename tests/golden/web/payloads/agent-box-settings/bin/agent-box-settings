@@ -539,6 +539,15 @@ def kill_session(name):
 # transcript cannot be located (a codex session started with no prompt, hence
 # no marker; a `shell` session; an agent the box knows no layout for) simply
 # have no download button — see transcript_of.
+#
+# opencode (issue #80) is deliberately in that last bucket, not a third
+# per-agent branch: every opencode session for this user, across every
+# session name and working directory, lives in ONE shared SQLite database
+# (`opencode db path`) — there is no per-session file to `open()` the way
+# claude's and codex's transcripts are. Locating the session (the same
+# marker-match query, via the stdlib sqlite3 module) and turning it into a
+# downloadable file (an on-demand `opencode export --sanitize`, cached like
+# a transcript path) is issue #314.
 CLAUDE_PROJECTS_DIR = os.path.join(HOME_DIR, ".claude", "projects")
 CODEX_SESSIONS_DIR = os.path.join(HOME_DIR, ".codex", "sessions")
 LIVE_ID_DIR = os.path.join(
@@ -746,9 +755,9 @@ def transcript_of(name, entry):
         elif agent == "codex":
             path = codex_index().get(box_id.lower())
         else:
-            # shell sessions have no conversation, and an agent whose
-            # on-disk layout the box does not know is not worth a guess
-            # (issue #80 adds one when opencode support lands).
+            # shell sessions have no conversation, and opencode's session
+            # store is not a per-session file to guess a path for at all
+            # (see the module docstring above) — issue #314.
             path = None
         if len(_transcript_cache) > 256:
             # Sessions come and go (dispatched hook-* sessions especially),

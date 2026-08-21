@@ -59,9 +59,9 @@ Metadata:
         default: agent-box module sha256
 Description: >
   agent-box - 1-click NixOS host running a coding agent inside a persistent
-  tmux session. Choose Claude Code or Codex at deployment time. Reach it through
-  a browser terminal (Caddy + ttyd); sessions can also be driven
-  from the agent's desktop and mobile apps via Remote Control.
+  tmux session. Choose Claude Code, Codex or opencode at deployment time.
+  Reach it through a browser terminal (Caddy + ttyd); sessions can also be
+  driven from the agent's desktop and mobile apps via Remote Control.
   Source: https://github.com/defangdevs/agent-box
 
 Parameters:
@@ -71,12 +71,16 @@ Parameters:
     AllowedValues:
       - claude
       - codex
+      - opencode
     Description: >-
       Agent CLI to run in the persistent tmux session. Supported values:
-      claude (Claude Code) and codex (OpenAI Codex CLI). Both support Remote
-      Control; the <UserName>-main@<host> session name applies to claude only
-      (codex runs the `codex remote-control` daemon, which names itself from
-      the hostname).
+      claude (Claude Code), codex (OpenAI Codex CLI) and opencode (the
+      opencode CLI, https://opencode.ai). claude and codex support Remote
+      Control; the <UserName>-main@<host> session name applies to claude
+      only (codex runs the `codex remote-control` daemon, which names
+      itself from the hostname). opencode has no Remote Control analogue
+      yet, so a deployment with Agent=opencode is reachable only through
+      the browser terminal.
 
   UserName:
     Type: String
@@ -276,7 +280,7 @@ Parameters:
     Default: ''
     Description: >-
       Immutable nixos-unstable channel-release tarball to use for agent CLI
-      packages (claude-code, codex). The S3-published 1-click template gets a
+      packages (claude-code, codex, opencode). The S3-published 1-click template gets a
       fresh Default injected by publish-template.yml; empty (the source
       template's default, used by deploy-test) falls back to the AMI channel.
       When set, AgentNixpkgsUrl + AgentNixpkgsSha256 are a pinned pair, and
@@ -593,7 +597,7 @@ Resources:
                   then import /etc/nixos/agent-box-pin.nix
                   else { rev = "${AgentBoxRev}"; sha256 = "${AgentBoxSha256}"; };
                 # Agent-CLI pin: a nixos-unstable channel-release snapshot that
-                # only the agent packages (claude-code, codex) resolve from.
+                # only the agent packages (claude-code, codex, opencode) resolve from.
                 # First boot uses the launch-time parameters; after that,
                 # agent-box-update.service owns the pin file and advances it.
                 # Empty URL (source-template launches, e.g. deploy-test) means
@@ -811,7 +815,10 @@ Outputs:
       (sign in with the same Claude account). Only meaningful when Agent=claude;
       Codex is remote-controlled too, but its `codex remote-control` daemon
       names itself from the hostname; its session tab signs the box in and
-      prints the pairing code for the Codex apps.
+      prints the pairing code for the Codex apps. opencode has no Remote
+      Control analogue yet, so this output is not meaningful for
+      Agent=opencode either — reach that session through the browser
+      terminal.
     Value: !Sub
       - "${UserName}-main@${Host}.sslip.io"
       - Host: !If

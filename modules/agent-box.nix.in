@@ -10,7 +10,7 @@
 
 let
   cfg = config.services.agent-box;
-  supportedAgents = [ "claude" "codex" ];
+  supportedAgents = [ "claude" "codex" "opencode" ];
   # Everything a session's `agent` field may name: the agent CLIs plus the
   # pseudo-agent "shell" (issue #113) — a plain login shell in a supervised
   # tmux session, for manual investigation/clean-up. "shell" is always
@@ -176,7 +176,7 @@ let
     cfg.sudoAllowlist
     ++ lib.optional cfg.web.enable caddyReloadCmd
     ++ lib.optionals cfg.selfUpdate.enable [ updateStartCmd updateStartNoBlockCmd ];
-  # Agent CLIs (claude-code, codex) move much faster than any host channel.
+  # Agent CLIs (claude-code, codex, opencode) move much faster than any host channel.
   # When the host wires selfUpdate.agentNixpkgs (from the pin file the update
   # service maintains — see that option), resolve just the agent packages from
   # that pinned nixos-unstable snapshot; the rest of the system stays on the
@@ -192,7 +192,8 @@ let
         system = pkgs.stdenv.hostPlatform.system;
         # The host's allowUnfreePredicate does not reach a second nixpkgs
         # import; allow exactly the bundled agent packages (mirrors the
-        # host-side default set below).
+        # host-side default set below). opencode is MIT (free), so it needs
+        # no entry here — this list is only unfree packages.
         config.allowUnfreePredicate = pkg:
           builtins.elem (lib.getName pkg) [ "claude-code" "codex" ];
       }
@@ -200,7 +201,8 @@ let
   agentPackage = agent:
     if cfg.package != null then cfg.package
     else if agent == "claude" then agentPkgs.claude-code
-    else agentPkgs.codex;
+    else if agent == "codex" then agentPkgs.codex
+    else agentPkgs.opencode;
   installedAgentPackages = map agentPackage cfg.installAgents;
   installedCodexPackage = lib.optional (builtins.elem "codex" cfg.installAgents) (agentPackage "codex");
   # Box-wide codex autonomy is on only when codex is actually installed:
@@ -481,7 +483,8 @@ let
         default = null;
         description = ''
           Remote Control session name (claude sessions only — codex derives
-          its own name from the hostname). When null, defaults to
+          its own name from the hostname; opencode has no Remote Control
+          analogue and ignores this). When null, defaults to
           "<user>-<session>@<host>", where <host> is
           services.agent-box.remoteControlHost (fqdnOrHostName by default,
           the public sslip.io host on the AWS image), else the public
@@ -528,7 +531,7 @@ let
       sessions = lib.mkOption {
         type = lib.types.attrsOf (lib.types.submodule sessionOpts);
         default = { };
-        example = lib.literalExpression ''{ main = { }; review = { agent = "codex"; }; scratch = { agent = "shell"; }; }'';
+        example = lib.literalExpression ''{ main = { }; review = { agent = "codex"; }; oc = { agent = "opencode"; }; scratch = { agent = "shell"; }; }'';
         description = ''
           Seed sessions for this user — each is an agent CLI (or a plain
           login shell, agent = "shell") running in its own tmux session
@@ -599,6 +602,12 @@ let
             browser terminal. The codex daemon is a per-user singleton (one
             control socket per user), so enable it on at most ONE codex session
             per user; two would fight over the same daemon.
+          - opencode: has no Remote Control analogue yet (no vendor pairing
+            app) — this setting is IGNORED for opencode sessions, which
+            always run the normal TUI, reachable only via the browser
+            terminal or a local tmux attach. (`opencode serve`/`web` behind
+            this box's own Caddy front end could stand in for it later;
+            that is a separate product decision, not this one.)
         '';
       };
       remoteControlName = lib.mkOption {
@@ -818,13 +827,13 @@ in
     agent = lib.mkOption {
       type = lib.types.enum supportedAgents;
       default = "claude";
-      description = "Default agent CLI to run. Supported values: claude, codex.";
+      description = "Default agent CLI to run. Supported values: claude, codex, opencode.";
     };
 
     package = lib.mkOption {
       type = lib.types.nullOr lib.types.package;
       default = null;
-      defaultText = lib.literalExpression ''null (pkgs.claude-code for agent = "claude"; pkgs.codex for agent = "codex")'';
+      defaultText = lib.literalExpression ''null (pkgs.claude-code for agent = "claude"; pkgs.codex for agent = "codex"; pkgs.opencode for agent = "opencode")'';
       description = "Package to run for every agent user. Leave null to use the selected agent's default package.";
     };
 

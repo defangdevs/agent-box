@@ -15,6 +15,7 @@ Supported agents:
 | --- | --- | --- | --- |
 | Claude Code | `pkgs.claude-code` | `--dangerously-skip-permissions` | Supports Claude Remote Control. |
 | Codex | `pkgs.codex` | `--dangerously-bypass-approvals-and-sandbox` | Per session, *either* the TUI in the browser terminal *or* Remote Control via the `codex remote-control` daemon (`remoteControl = true`) - not both. |
+| opencode | `pkgs.opencode` | `--auto` | No Remote Control analogue yet - reachable only through the browser terminal (or a local `tmux` attach). Provider keys (e.g. for Kimi) are set the same way as any other secret: `agent-box-session env set`, or the settings page's env editor - opencode reads them straight from the environment, no sign-in flow needed. |
 
 ## 1-click AWS launch
 
@@ -35,7 +36,7 @@ launch to take ~10-20 minutes while the conversion and the first
 | eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml) |
 | eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml) |
 
-Choose `Agent` (`claude` or `codex`), set a `WebPassword` (any 16&ndash;64
+Choose `Agent` (`claude`, `codex` or `opencode`), set a `WebPassword` (any 16&ndash;64
 characters, including password-manager symbols), pick a bundle size,
 launch. The stack reports
 CREATE_COMPLETE only after the box phones home from its first successful
@@ -84,7 +85,7 @@ to its GitHub commit), or ask the agent in its terminal to run
 `sudo systemctl start agent-box-update.service` — a root oneshot (alongside
 the caddy reload, the only sudo the agent holds) that fast-forwards the box
 to this repo's latest master, advances the agent-CLI pin to the newest
-nixos-unstable channel release (so `claude` / `codex` stay current even
+nixos-unstable channel release (so `claude` / `codex` / `opencode` stay current even
 though the box itself tracks a stable NixOS release), and runs
 `nixos-rebuild switch`. Have the agent save its working context first: the
 rebuild restarts changed agent services, which kills their running sessions.
@@ -165,7 +166,7 @@ Add the flake as an input and import the module:
 
   services.agent-box = {
     enable = true;
-    agent = "claude"; # or "codex"
+    agent = "claude"; # or "codex", "opencode"
     users = {
       # One account, several agents: sessions seed on FIRST BOOT only —
       # afterwards add/remove them at runtime (see "Sessions" below).
@@ -173,6 +174,7 @@ Add the flake as an input and import the module:
         sessions = {
           main   = { };                    # box default agent
           review = { agent = "codex"; };
+          kimi   = { agent = "opencode"; };
         };
       };
       bob   = { remoteControlName = "bob-box"; };
@@ -200,6 +202,10 @@ tmux control socket lives under `/run/agent-box-<user>` rather than `/tmp`.
 
 Credentials live in that user's home directory (`~/.claude` for Claude Code,
 `~/.codex` for Codex) - per-user runtime state, never baked into the config.
+opencode needs no sign-in step at all: it reads provider keys straight from
+the environment, so a Kimi (or any other provider) key set with
+`agent-box-session env set` is the entire story - see "opencode: no sign-in
+needed" below.
 
 Sign-in is the *only* interactive step: the module pre-accepts Claude Code's
 other first-run dialogs (the folder-trust prompt for the agent's working
@@ -269,11 +275,26 @@ agent-box therefore runs the daemon in a private UTS namespace whose hostname
 is the box's public address, so it appears as e.g. `1-2-3-4.sslip.io` rather
 than an internal cloud hostname. `remoteControlName` remains Claude-only.
 
+**opencode: no sign-in needed.** opencode reads provider credentials straight
+from the environment (or `opencode auth login`, run once from the browser
+terminal, for a provider that needs it) - there is no OAuth/device-code dance
+to drive. To use Kimi (or any other provider), set its API key the same way
+as any other secret and (re)start the session:
+
+```bash
+agent-box-session env set KIMI_API_KEY sk-...   # or whatever the provider calls it
+agent-box-session restart <name>
+```
+
+opencode has no Remote Control analogue yet, so a session running it is
+reachable only through the browser terminal or a local `tmux` attach -
+`remoteControl` is accepted but ignored for `agent = "opencode"` sessions.
+
 ## Sessions (any user can run any agent — no rebuild)
 
 A linux user account and an agent CLI are decoupled: each user runs one or
-more **sessions**, and each session is one agent (Claude Code or Codex) in
-its own tmux session, all supervised by that user's single hardened
+more **sessions**, and each session is one agent (Claude Code, Codex or
+opencode) in its own tmux session, all supervised by that user's single hardened
 `agent-box-<name>.service`. All supported agent CLIs are installed
 regardless of what any session runs (`installAgents`). The pseudo-agent
 `shell` runs the user's login shell instead — a supervised plain terminal
@@ -290,6 +311,7 @@ agent-box-session ls                        # NAME AGENT STATE
 agent-box-session add --agent codex         # auto-named "codex" (or "codex-XXXX")
 agent-box-session add review --agent codex  # or name it yourself; starts within ~2s
 agent-box-session add scratch --cwd ~/proj -- --model opus
+agent-box-session add kimi --agent opencode -- --model kimi/kimi-k2
 agent-box-session add tidy --agent shell    # plain login shell, no agent
 agent-box-session restart review
 agent-box-session rm review                 # delist + kill
@@ -450,7 +472,7 @@ All under `services.agent-box`:
 | Option | Default | Description |
 | --- | --- | --- |
 | `enable` | `false` | Turn the module on. |
-| `agent` | `"claude"` | Default agent CLI: `"claude"` or `"codex"`. |
+| `agent` | `"claude"` | Default agent CLI: `"claude"`, `"codex"` or `"opencode"`. |
 | `package` | selected agent default | Override package to run for every agent user. |
 | `installAgents` | all supported | Agent CLIs installed on the box (independent of what sessions run). |
 | `codexFullAccess` | `true` | Run codex with no approval prompts and no sandbox, box-wide, via `/etc/codex/config.toml`. The box is the sandbox. That file is codex's *system* config layer, so a user's own `~/.codex/config.toml` still overrides it — and it is the only path that reaches the app-server daemon behind a remote-controlled codex session. |
@@ -458,8 +480,8 @@ All under `services.agent-box`:
 | `users.<name>.sessions.<s>.*` | `{}` | Seed sessions (first boot only): per session `agent`, `skipPermissions`, `remoteControl`, `remoteControlName`, `workingDirectory`, `extraArgs`. Empty = the legacy per-user options below seed a session named `main`. |
 | `users.<name>.agent` | `null` | Agent for the default `main` session; null uses `services.agent-box.agent`. |
 | `users.<name>.skipPermissions` | `true` | Pass the selected agent's autonomy flag. |
-| `users.<name>.remoteControl` | `true` | Make the session drivable from the agent's apps: claude gets `--remote-control`; codex runs the `codex remote-control` daemon instead of its TUI. |
-| `users.<name>.remoteControlName` | `<name>-main@<host>` | Claude Remote Control session name (null -> `<user>-<session>@<host>`, where `<host>` is `remoteControlHost`). Ignored for Codex (its daemon names itself from the hostname). |
+| `users.<name>.remoteControl` | `true` | Make the session drivable from the agent's apps: claude gets `--remote-control`; codex runs the `codex remote-control` daemon instead of its TUI; ignored for opencode (no analogue yet). |
+| `users.<name>.remoteControlName` | `<name>-main@<host>` | Claude Remote Control session name (null -> `<user>-<session>@<host>`, where `<host>` is `remoteControlHost`). Ignored for Codex (its daemon names itself from the hostname) and opencode (no analogue yet). |
 | `users.<name>.workingDirectory` | `/home/<name>` | Agent startup directory. |
 | `users.<name>.extraGroups` | `[]` | Extra groups for the user. |
 | `users.<name>.extraArgs` | `[]` | Extra args appended to the selected agent CLI. |
