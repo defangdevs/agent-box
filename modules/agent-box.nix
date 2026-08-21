@@ -6697,7 +6697,7 @@ in
           .tab-empty { color: #8b949e; font-size: 13px; padding: 6px 8px 8px; }
           .tabs .btn.add { margin: 0 4px 6px; padding: 2px 9px; }
           .tabs .spacer { flex: 1; }
-          .tabs a.gear { color: #8b949e; text-decoration: none; font-size: 15px;
+          .tabs a.gear { color: #8b949e; text-decoration: none; font-size: 20px;
                          padding: 2px 8px 8px; }
           .tabs a.gear:hover { color: #e6edf3; }
           .ws .editor, .ws .msg { margin: 8px; flex: none; }
@@ -7667,7 +7667,13 @@ in
           });
           document.addEventListener("focusin", function (e) {
             var input = e.target;
-            if (input && input.hasAttribute && input.hasAttribute("data-dir-input")) { acFetch(input); }
+            if (input && input.hasAttribute && input.hasAttribute("data-dir-input")) {
+              // The field starts on the untouched default "~": select it so the
+              // first keystroke replaces it instead of appending, which is what
+              // produced an invalid "~docu" (issue #308).
+              if (input.value === "~") { input.select(); }
+              acFetch(input);
+            }
           });
           document.addEventListener("focusout", function (e) {
             var input = e.target;
@@ -8881,6 +8887,7 @@ in
             echo "session '$want' is stopped: it is still listed, but nothing will"
             echo "bring it back on its own. Press Start on the settings page, or run:"
             echo "  agent-box-session restart $want"
+            echo "then reload this page — Start does not reconnect this pane on its own."
           else
             echo "session '$want' is starting — the supervisor spawns it within a few"
             echo "seconds. Reload this page."

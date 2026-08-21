@@ -219,7 +219,7 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
 .tab-empty { color: #8b949e; font-size: 13px; padding: 6px 8px 8px; }
 .tabs .btn.add { margin: 0 4px 6px; padding: 2px 9px; }
 .tabs .spacer { flex: 1; }
-.tabs a.gear { color: #8b949e; text-decoration: none; font-size: 15px;
+.tabs a.gear { color: #8b949e; text-decoration: none; font-size: 20px;
                padding: 2px 8px 8px; }
 .tabs a.gear:hover { color: #e6edf3; }
 .ws .editor, .ws .msg { margin: 8px; flex: none; }
