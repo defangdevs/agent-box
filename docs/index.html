@@ -192,7 +192,7 @@
       <strong>Set a password you'll remember.</strong> On the AWS form, type any 16&ndash;64 character password into <code>WebPassword</code> &mdash; that's what you'll use to log into the browser terminal. AWS masks it with dots after you type it and never shows it again, so save it somewhere before you launch. Choose Claude Code or Codex, pick a size, and launch. The box takes about 2&ndash;3 minutes to start; your browser link then appears under <strong>Outputs</strong> in the AWS console &mdash; open it, enter the password, finish the selected agent's one-time sign-in, and you're in. (Claude Code stacks can drive the box from the Claude desktop / mobile app via <strong>Remote Control</strong> after the first browser login &mdash; the session name is <code>&lt;UserName&gt;-main@&lt;host&gt;.sslip.io</code>, the box's own public address &mdash; so the entry in the Claude apps doubles as the address you reach it at.)
     </div>
     <div class="note">
-      <strong>The ~$3.60/month IPv4 charge, explained.</strong> The Launch buttons above default to <code>PublicIpv4</code> checked on the AWS form &mdash; a stable IPv4 address, ~$3.60/month by AWS's 2024 pricing &mdash; so the box is reachable no matter what network you connect from, including offices and public Wi-Fi that lack real IPv6. If you know the networks you'll connect from have working IPv6 (most home connections do), uncheck <code>PublicIpv4</code> to drop that charge and run IPv6-only instead. Either way the box itself reaches IPv4-only sites &mdash; notably <code>github.com</code> &mdash; through a free public NAT64 relay (<a href="https://nat64.net">nat64.net</a>) when running IPv6-only. TLS and SSH stay end-to-end encrypted, but if you'd rather not route through a third party, launch with <code>Nat64</code> unchecked too.
+      <strong>The ~$3.60/month IPv4 charge, explained.</strong> The Launch buttons above default to <code>PublicIpv4</code> checked on the AWS form &mdash; a stable IPv4 address, ~$3.60/month by AWS's 2024 pricing &mdash; so the box is reachable no matter what network you connect from, including offices and public Wi-Fi that lack real IPv6. If you know the networks you'll connect from have working IPv6 (most home connections do), uncheck <code>PublicIpv4</code> to drop that charge and run IPv6-only instead. <span id="has-ipv6-note" hidden><strong>Your current network has working IPv6</strong> &mdash; if you'll always connect from a network like this one, you can uncheck <code>PublicIpv4</code> on the form to save the ~$3.60/month.</span> Either way the box itself reaches IPv4-only sites &mdash; notably <code>github.com</code> &mdash; through a free public NAT64 relay (<a href="https://nat64.net">nat64.net</a>) when running IPv6-only. TLS and SSH stay end-to-end encrypted, but if you'd rather not route through a third party, launch with <code>Nat64</code> unchecked too.
     </div>
   </div>
 </section>
@@ -213,6 +213,35 @@
     <br>Dogfood note: this page &mdash; and most of this project &mdash; was written, tested, and shipped by a coding agent running on agent-box.
   </div>
 </footer>
+
+<script>
+  // Detect whether this browser has real IPv6 connectivity. Purely
+  // informational: the Launch buttons already default to PublicIpv4=true
+  // (reachable from anywhere), so a working v6 route doesn't change the
+  // link — it just means the visitor could safely uncheck PublicIpv4 on the
+  // AWS form to save ~$3.60/month, so reveal a note saying that. Fetches
+  // Cloudflare's resolver by IPv6 literal (their 1.1.1.1 cert carries IP
+  // SANs, incl. this address), so no DNS is involved: a completed fetch
+  // proves a working v6 route; abort/network error means no v6.
+  (async function () {
+    const controller = new AbortController();
+    const t = setTimeout(function () { controller.abort(); }, 2500);
+    let hasV6 = false;
+    try {
+      await fetch('https://[2606:4700:4700::1111]/', {
+        method: 'GET',
+        mode: 'no-cors',
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      hasV6 = true;
+    } catch (_) { /* no v6 route, DNS failure, or timeout */ }
+    clearTimeout(t);
+    if (!hasV6) return;
+    const note = document.getElementById('has-ipv6-note');
+    if (note) note.hidden = false;
+  })();
+</script>
 
 </body>
 </html>
