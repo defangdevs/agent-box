@@ -1185,6 +1185,19 @@ CONNECT_SECRET_RE = re.compile(
     r"(sk-ant-[A-Za-z0-9._-]+|gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)"
 )
 CONNECT_ERROR_MAX = 240
+# Pane lines that are never the diagnosis: the instructions, and the echo
+# of the prompt the code was typed into (which carries the code itself —
+# the user's own value, but not something to render back at them).
+CONNECT_NOISE_RE = re.compile(
+    r"(paste code|browser did|opening browser|press enter|first copy|"
+    r"visit:|sign in)", re.IGNORECASE
+)
+# What a CLI's own complaint looks like, so the tail names the cause
+# instead of whatever happened to be printed last.
+CONNECT_BLAME_RE = re.compile(
+    r"(error|failed|failure|denied|invalid|expired|refus|unable|cannot)",
+    re.IGNORECASE
+)
 
 # Which CLI each card drives, as "<id>=<absolute binary>" pairs
 # (AGENT_BOX_CONNECT_BINS, same convention as AGENT_BOX_AGENT_BINS).
@@ -1428,6 +1441,13 @@ def connect_expire(flow_id):
             _connect_status_cache[flow_id] = (0.0, hit[1])
 
 
+def connect_fresh(flow_id):
+    """True when this flow's cached status is younger than the TTL."""
+    with _connect_lock:
+        hit = _connect_status_cache.get(flow_id)
+    return bool(hit) and time.monotonic() - hit[0] < CONNECT_STATUS_TTL
+
+
 def connect_status(flow):
     """Cached (connected, detail), or None while nothing is known yet.
 
@@ -1540,10 +1560,13 @@ def connect_error(text):
         line = "".join(ch for ch in line if ch == " " or ch.isprintable())
         if line:
             lines.append(line)
-    if not lines:
+    lines = [x for x in lines
+             if not CONNECT_NOISE_RE.search(x) and not CONNECT_URL_RE.search(x)]
+    blamed = [x for x in lines if CONNECT_BLAME_RE.search(x)]
+    picked = (blamed or lines)[-2:]
+    if not picked:
         return ""
-    tail = " ".join(lines[-3:])
-    tail = CONNECT_SECRET_RE.sub("[redacted]", tail)
+    tail = CONNECT_SECRET_RE.sub("[redacted]", " ".join(picked))
     return tail[:CONNECT_ERROR_MAX]
 
 
@@ -1555,28 +1578,32 @@ def connect_state(flow, keys=None, tmux_state=None):
     running = connect_pane(flow_id) in live
     status = connect_status(flow)
     connected, detail = status if status is not None else (False, "")
-    # "checking" is not "signed out": saying the latter before the CLI has
-    # answered would invite a sign-in the box does not need.
-    state = "connected" if connected else ("idle" if status is not None else "checking")
     url = code = error = None
     if running:
+        # A LIVE pane owns the card; the status answer does not get to
+        # overrule it. Reaping a pane because the cached status still says
+        # "connected" killed every "Sign in again" — the card says signed
+        # in, which is exactly why the user pressed the button, so the
+        # pane died within milliseconds of starting (caught by
+        # connect.nix's cancel subtest: "claude stuck in idle").
         text = connect_capture(flow_id) or ""
-        if connected:
-            # Signed in: the pane has nothing left to say.
-            connect_cancel(flow_id)
-            running = False
-        elif CONNECT_EXIT_RE.search(text):
-            # The CLI is done. Trust ITS exit code over our cached status,
-            # which predates the exchange: a 0 means it believes the
-            # sign-in worked, and flashing "Not signed in" for the two
-            # seconds until the next probe lands would be a lie at exactly
-            # the wrong moment.
-            if CONNECT_EXIT_RE.search(text).group(1) == "0":
-                connect_expire(flow_id)
-                state = "exchanging"
-            else:
+        exited = CONNECT_EXIT_RE.search(text)
+        if exited:
+            # The CLI is done, and its exit code beats a cached status that
+            # predates the exchange: a 0 means it believes the sign-in
+            # worked, so hold the card there until a FRESH probe agrees
+            # rather than flashing "Not signed in" at the moment of
+            # success.
+            if exited.group(1) != "0":
                 state = "failed"
                 error = connect_error(text)
+            elif connected and connect_fresh(flow_id):
+                connect_cancel(flow_id)
+                running = False
+                state = "connected"
+            else:
+                connect_expire(flow_id)
+                state = "exchanging"
         elif (connect_age(flow_id) or 0) > CONNECT_TTL:
             connect_cancel(flow_id)
             state = "expired"
@@ -1584,6 +1611,11 @@ def connect_state(flow, keys=None, tmux_state=None):
             url = connect_trusted_url(text, flow["hosts"])
             code = connect_user_code(text) if flow["show_code"] else None
             state = "waiting" if url else "starting"
+    else:
+        # "checking" is not "signed out": saying the latter before the CLI
+        # has answered would invite a sign-in the box does not need.
+        state = ("connected" if connected
+                 else ("idle" if status is not None else "checking"))
     keys = read_keys() if keys is None else keys
     shadow = [k for k in flow["shadow"] if k in keys]
     return {
