@@ -31,6 +31,7 @@ in
         set -u
         case "$1 $2" in
           "auth login")
+            mkdir -p ${stateDir}
             echo "Opening browser to sign in..."
             echo "Decoy: https://evil.example.com/claude.com/oauth/authorize"
             echo "If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=stub&state=abc"
@@ -64,6 +65,7 @@ in
         set -u
         case "$1 $2" in
           "auth login")
+            mkdir -p ${stateDir}
             echo "! First copy your one-time code: EE45-B423"
             printf "Press Enter to open https://github.com/login/device in your browser... "
             read -r _ignored || exit 1
@@ -109,10 +111,6 @@ in
       # relying on PATH.
       systemd.services.agent-box-settings-agent.environment.AGENT_BOX_CONNECT_BINS =
         lib.mkForce "claude=${stubClaude}/bin/claude github=${stubGh}/bin/gh";
-
-      system.activationScripts.connect-stub-state.text = ''
-        install -d -o agent -g users -m 0755 ${stateDir}
-      '';
 
       system.activationScripts.agent-web-password-hash.text = ''
         install -d -m 0700 /var/lib/agent-box-web
