@@ -2100,8 +2100,10 @@ CONNECT_SECTION_TPL = """<section>
 # server-side can bridge tmux's paste buffer to the browser clipboard
 # either). xterm.js's own fallback is holding Shift (Option on a Mac)
 # while dragging, which forces its native DOM selection — and that in
-# turn is what ttyd auto-copies on selection change. Surfacing that here
-# is the fix; it is not something a tmux or ttyd config flag can restore.
+# turn is what ttyd auto-copies on selection change. On Mac that fallback
+# also needed a ttyd flag (macOptionClickForcesSelection=true, next to
+# the ttyd ExecStart below) since xterm.js ships it off by default; this
+# hint is the other half — telling people the gesture exists at all.
 HOME_BODY = """<body class="ws">
 <div id="msg-slot">{message}</div>
 <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}">

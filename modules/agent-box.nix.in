@@ -2188,6 +2188,19 @@ in
             "-b" "/${name}"
             "-t" "disableLeaveAlert=true"
             "-t" "titleFixed=${name}@${cfg.web.domain}"
+            # Issue #327: xterm.js's Shift-drag bypass of tmux mouse
+            # tracking (see the HOME_BODY hint above) is gated off on Mac
+            # entirely — xterm.js's SelectionService.shouldForceSelection
+            # checks Option (Alt), not Shift, when Browser.isMac, and
+            # that check is itself gated by macOptionClickForcesSelection,
+            # which defaults to false and which ttyd never sets. Without
+            # this flag there is NO modifier-click escape hatch on Mac at
+            # all, confirmed live on Safari and Chrome on a Mac (reported
+            # against #327). This is one of ttyd's passthrough `-t`
+            # client options (same mechanism as disableLeaveAlert/
+            # titleFixed above): it lands on the xterm.js Terminal
+            # instance verbatim, so it only needs setting once, here.
+            "-t" "macOptionClickForcesSelection=true"
             (toString attachScript)
           ];
         };

@@ -599,9 +599,12 @@ arbitrary command execution as the agent user.
 - tmux mouse mode (`set -g mouse on`, enabled so the wheel scrolls pane
   history) takes over plain click-drag for its own copy-mode selection,
   which the browser terminal (ttyd/xterm.js) can't turn into a real
-  clipboard copy. Hold **Shift** while dragging to bypass tmux and mouse
-  tracking entirely and get the browser's native text selection instead,
-  which copies normally (Ctrl+C / Cmd+C).
+  clipboard copy. Hold **Shift** (or **Option** on a Mac) while dragging
+  to bypass tmux and mouse tracking entirely and get the browser's
+  native text selection instead, which copies normally (Ctrl+C /
+  Cmd+C). Mac's browsers ignore Shift for this — xterm.js only offers
+  Option there, and only because ttyd now turns on its
+  `macOptionClickForcesSelection` client option (off by default).
 
 ## Docs
 
