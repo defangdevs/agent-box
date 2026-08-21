@@ -382,14 +382,26 @@ bundle's initial closure build is slow) and then emits `WebURL`,
 
 ### Validation status
 
-`cfn-lint` passes and the generated `configuration.nix` parses as valid Nix
-(both checked in PR CI via `aws-ci.yml`). The end-to-end `nixos-infect`
-bootstrap has **not** yet been exercised by an automated live deploy — treat a
-first real launch as the acceptance test. Remaining follow-up:
+`cfn-lint` passes, the generated `configuration.nix` parses as valid Nix, and
+`scripts/check_lightsail_userdata.py` proves the launch script reaches its bash
+re-exec guard under dash (all three run in PR CI via `aws-ci.yml`).
+
+The first real launch, on 2026-08-21, was the acceptance test — and it failed
+immediately: Lightsail prepends its own `#!/bin/sh` preamble to the launch
+script, so the template's shebang was only a comment, the script ran under
+dash, and `set -euxo pipefail` aborted it 19 seconds into first boot. No nix,
+no infection, no signal — every launch since 2026-08-11 sat until the
+`FirstBootDone` WaitCondition timed out and rolled the stack back. The re-exec
+guard fixes it and the CI check above keeps it fixed.
+
+The **rest** of the bootstrap (infect, reboot into NixOS, signal) has still
+never been exercised by an automated live deploy. Remaining follow-up:
 
 - A Lightsail leg in `deploy-test.yml` (create stack, assert `WebURL` reachable
   over IPv4, tear down). GitHub runners are IPv4-only and Lightsail is
   IPv4-native, so unlike the EC2 IPv6-only leg this can smoke-test the live URL.
+  It needs `lightsail:*` on the test account's OIDC role, which this repo does
+  not manage.
 
 ## Refreshing the AMI map
 

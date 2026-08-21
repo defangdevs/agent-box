@@ -52,6 +52,7 @@ jobs:
         run: |
           pip install --quiet cfn-lint
           cfn-lint aws/template.yaml aws/lightsail-template.yaml
+          python3 scripts/check_lightsail_userdata.py
 
       - name: Inject pinned defaults for the 1-click copies
         # The source templates deliberately ship without Default: values for

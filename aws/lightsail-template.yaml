@@ -288,6 +288,18 @@ Resources:
             # agent-box with nixos-infect. Runs once, as root, via Lightsail's
             # launch-script mechanism. All output is teed to a log so a failed
             # conversion is debuggable over SSH (DebugSsh=true).
+            #
+            # Lightsail PREPENDS its own "#!/bin/sh" preamble (the instance SSH
+            # CA block) to this launch script, so the shebang above is just a
+            # comment in the middle of the file cloud-init actually runs, and
+            # the whole thing executes under dash: "set -o pipefail" is an
+            # illegal option there and the script died on that line, 19s into
+            # first boot, before nix was ever installed. Re-exec under bash so
+            # the dialect no longer depends on what AWS puts in front of us.
+            # Re-running AWS's preamble is harmless (it re-registers the same
+            # CA key). EC2 user data needs no such guard - cloud-init honours
+            # the shebang there because nothing is prepended.
+            if [ -z "${!BASH_VERSION:-}" ]; then exec /bin/bash "$0" "$@"; fi
             set -euxo pipefail
             exec > >(tee /var/log/agent-box-infect.log) 2>&1
 
