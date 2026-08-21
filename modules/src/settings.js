@@ -233,6 +233,30 @@
   }
   // The burst poll is the no-feed fallback for "starting" → "live"; with
   // the live feed attached the daemon reports that transition itself.
+  // Guided sign-in (issues #207, #208, #313). While a card is
+  // mid-flight its state moves without this page posting anything: the
+  // CLI prints its URL a beat after start, and the sign-in itself
+  // completes in another tab entirely. So re-fetch and swap the section
+  // while it reports itself busy, and stop as soon as it does not —
+  // there is nothing to watch on a page whose cards are all settled.
+  var connectTimer = null;
+  function connectBusy() {
+    var el = document.getElementById("connect-list");
+    return !!el && el.getAttribute("data-busy") === "1";
+  }
+  function connectPoll() {
+    if (connectTimer || !connectBusy()) { return; }
+    connectTimer = window.setTimeout(function () {
+      connectTimer = null;
+      if (document.hidden) { connectPoll(); return; }
+      fetch(window.location.pathname + window.location.search)
+        .then(function (r) { return r.text(); })
+        .then(function (t) { applyDoc(parseHTML(t), ["connect-list"]); })
+        .catch(function () {})
+        .then(function () { connectPoll(); });
+    }, 2500);
+  }
+
   function startPolling(n) {
     if (liveFeed) { return; }
     pollLeft = n;
@@ -575,10 +599,12 @@
 
     function afterPost(t) {
       applyDoc(parseHTML(t),
-        ["msg-slot", "secrets-list", "sessions-list", "webhooks-list", "tab-bar"]);
+        ["msg-slot", "secrets-list", "sessions-list", "webhooks-list",
+         "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");
       if (ed) { f.reset(); ed.hidden = true; }
       var added = wsActive();   // the tab the fetched page marks current
+      connectPoll();
       if (tabsBefore && added && tabsBefore.indexOf(added) < 0) { wsSelect(added, true); }
       else if (wasActive && tabEl(wasActive)) { wsSelect(wasActive, false); }
       wsSync();
@@ -753,6 +779,7 @@
 
   checkForUpdate();
   liveUpdates();
+  connectPoll();
   // Land in the terminal: focus the server-selected tab's pane.
   if (wsActive()) { wsSelect(wsActive(), true); }
   // Still armed for the moment before the feed reports itself open; it

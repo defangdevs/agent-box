@@ -2713,6 +2713,19 @@ $PROMPT"
       map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
       ++ [ "shell=${utils.toShellPath config.users.users.${name}.shell}" ]
     );
+  # Guided sign-in cards (issues #207, #208, #313): "<id>=<binary>" pairs
+  # naming the CLI each card drives. The settings daemon runs the tool's
+  # OWN sign-in command (`claude auth login`, `codex login --device-auth`,
+  # `gh auth login --web`) in its own tmux session and never handles a
+  # token, so a card exists only where its binary does — an agent left out
+  # of installAgents simply has no card. Absolute paths because that
+  # daemon's unit deliberately carries no agent PATH; a VM test overrides
+  # this variable to point an id at a stub.
+  connectBins = lib.concatStringsSep " " (
+    map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
+    ++ [ "github=${pkgs.gh}/bin/gh" ]
+  );
+
   # AGENTS.md — cross-vendor agent-instructions file (codex and opencode
   # read it natively; claude does NOT — it reaches this file only through
   # the CLAUDE.md symlink seeded in supervisor.sh). What we SEED into $HOME
@@ -5111,6 +5124,8 @@ in
         #                                 no webhook receiver, so no panel)
         #   AGENT_BOX_WEBHOOK_STATE_DIR  where its filter.*.json files live
         #   AGENT_BOX_WEBHOOK_PYTHON     interpreter for that script
+        #   AGENT_BOX_CONNECT_BINS       "<id>=<binary>" pairs for the guided
+        #                                 sign-in cards (claude, codex, github)
 
         import contextlib
         import fcntl
@@ -5124,6 +5139,7 @@ in
         import re
         import secrets
         import select
+        import shlex
         import signal
         import socket
         import subprocess
@@ -6162,6 +6178,584 @@ in
             return sessions, watches
 
 
+        # --- Guided sign-in (issues #207, #208, #313) ------------------------
+        # Onboarding used to mean finding the right terminal tab, reading a
+        # wrapped OSC-8 link out of a TUI, and pasting a code into a prompt that
+        # echoes nothing — and, for GitHub, leaving the box entirely to mint a
+        # token by hand. These cards remove that walk WITHOUT reimplementing any
+        # of it: every flow here is the vendor's own sign-in command
+        # (`claude auth login`, `codex login --device-auth`, `gh auth login
+        # --web`), run in a tmux session the user never has to find.
+        #
+        # The daemon reads the URL off that pane, renders it as a real link,
+        # types the code back in, and then asks the CLI ITSELF whether it is
+        # signed in (`claude auth status` answers JSON; the others answer a
+        # line). So no OAuth endpoint, client id, PKCE verifier or token ever
+        # lives here: the credential is written by the CLI to ~/.claude,
+        # ~/.codex or ~/.config/gh, exactly as it would have been from the
+        # terminal. Setting GH_TOKEN or ANTHROPIC_API_KEY by hand under
+        # Environment secrets keeps working, and keeps winning — every one of
+        # these CLIs prefers its environment variable over its stored
+        # credential, so the manual path stays the override it always was.
+        #
+        # Nothing in here is persisted by the daemon: the tmux session IS the
+        # state. That is why a card can be reconstructed after a reload, a
+        # daemon restart or from a second browser tab.
+        CONNECT_PREFIX = "_connect-"
+        # A pane this wide keeps a sign-in URL on ONE unwrapped line, so
+        # capture-pane reads it whole (the wrapped-URL problem the README
+        # documents for the terminal flow simply cannot happen here).
+        CONNECT_COLS = 512
+        CONNECT_ROWS = 40
+        # Device/user codes live 15 minutes; an abandoned pane is reaped at the
+        # same age rather than lingering with a code that can no longer work.
+        CONNECT_TTL = 900
+        # How long the pane stays after the CLI exits: its last screen is the
+        # only diagnostic a failed flow has.
+        CONNECT_LINGER = 60
+        # Claude Code's prompt treats one large stdin chunk as a PASTE and
+        # absorbs a trailing carriage return, so a real ~100-character code
+        # never submits when Enter rides along in the same write. Send Enter as
+        # a separate keypress after a settle delay (this exact failure is
+        # documented in raphaeltm/simple-agent-manager's setup-token driver).
+        CONNECT_ENTER_DELAY = 1.0
+        # gh's web flow prints the code, then waits on a keypress before it
+        # starts polling. Answer that prompt for the user.
+        CONNECT_PROMPT_WAIT = 6.0
+        CONNECT_PROMPT_STEP = 0.25
+        CONNECT_STATUS_TTL = 5.0
+        CONNECT_EXIT_RE = re.compile(r"\[agent-box\] exit=(\d+)")
+        CONNECT_URL_RE = re.compile(r"https://[^\s<>'\"`]+")
+        # The one-time code a device flow displays IN the pane (gh, codex).
+        # Claude's flow shows no code here — the user copies it from the browser.
+        CONNECT_CODE_RE = re.compile(
+            r"code[^A-Za-z0-9]{0,12}([A-Z0-9][A-Z0-9-]{3,31})", re.IGNORECASE
+        )
+        # Words the code pattern above happily matches out of the surrounding
+        # prose ("Paste code here", "code: none"). A real one-time code is never
+        # one of them, and rendering one as if it were would send the user to the
+        # device page with a word to type.
+        CONNECT_PROSE = frozenset(("HERE", "NONE", "NULL", "TRUE", "FALSE",
+                                   "PROMPTED", "ABOVE", "BELOW"))
+        # What the user may paste back. Printable, no whitespace, bounded: the
+        # value is typed into a tmux pane as literal keys, never into a shell.
+        CONNECT_CODE_MAX = 512
+        CONNECT_CODE_OK = re.compile(r"^[\x21-\x7e]{4,%d}$" % CONNECT_CODE_MAX)
+        # Redaction for the one place pane text reaches the browser (the error
+        # line of a failed flow). These CLIs do not print credentials on the
+        # paths we drive, so this is a belt-and-braces guard, not the plan.
+        CONNECT_SECRET_RE = re.compile(
+            r"(sk-ant-[A-Za-z0-9._-]+|gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)"
+        )
+        CONNECT_ERROR_MAX = 240
+        # Pane lines that are never the diagnosis: the instructions, and the echo
+        # of the prompt the code was typed into (which carries the code itself —
+        # the user's own value, but not something to render back at them).
+        CONNECT_NOISE_RE = re.compile(
+            r"(paste code|browser did|opening browser|press enter|first copy|"
+            r"visit:|sign in)", re.IGNORECASE
+        )
+        # What a CLI's own complaint looks like, so the tail names the cause
+        # instead of whatever happened to be printed last.
+        CONNECT_BLAME_RE = re.compile(
+            r"(error|failed|failure|denied|invalid|expired|refus|unable|cannot)",
+            re.IGNORECASE
+        )
+
+        # Which CLI each card drives, as "<id>=<absolute binary>" pairs
+        # (AGENT_BOX_CONNECT_BINS, same convention as AGENT_BOX_AGENT_BINS).
+        # Absolute paths, not $PATH: this daemon's unit deliberately carries no
+        # agent PATH, and naming the binary also lets a VM test point an id at a
+        # stub. A flow whose id is absent here has no card.
+        CONNECT_BINS = {}
+        for _pair in os.environ.get("AGENT_BOX_CONNECT_BINS", "").split():
+            if "=" in _pair:
+                _flow_id, _flow_bin = _pair.split("=", 1)
+                if _flow_id and _flow_bin:
+                    CONNECT_BINS[_flow_id] = _flow_bin
+
+
+        def parse_claude_status(proc):
+            """`claude auth status` answers JSON — the one structured signal in
+            the set, so success is never a guess about rendered prose."""
+            try:
+                data = json.loads(proc.stdout or "{}")
+            except ValueError:
+                return (False, "")
+            if not isinstance(data, dict) or not data.get("loggedIn"):
+                return (False, "")
+            who = str(data.get("email")
+                      or data.get("orgName")
+                      or data.get("authMethod")
+                      or "signed in")
+            plan = str(data.get("subscriptionType") or "")
+            return (True, "%s (%s)" % (who, plan) if plan else who)
+
+
+        def connect_detail(line):
+            """The CLI's own status line, minus the "logged in" it opens with:
+            the pill already says "Signed in", so repeating it there reads as
+            "Signed in — Logged in to github.com …"."""
+            text = line.strip()
+            for prefix in ("logged in to ", "logged in as ", "logged in "):
+                if text.lower().startswith(prefix):
+                    return text[len(prefix):].strip()
+            return text
+
+
+        def parse_codex_status(proc):
+            """`codex login status` prints e.g. "Logged in using ChatGPT".
+
+            Deliberately reported as "signed in locally": it is a LOCAL check, so
+            it keeps saying that for credentials the backend has already
+            invalidated (README, Codex sign-in). Pairing is what discovers those.
+            """
+            lines = [x.strip() for x in ((proc.stdout or "") + (proc.stderr or "")).splitlines()]
+            first = next((x for x in lines if x), "")
+            low = first.lower()
+            if proc.returncode == 0 and "logged in" in low and "not logged in" not in low:
+                return (True, connect_detail(first))
+            return (False, "")
+
+
+        def parse_gh_status(proc):
+            """`gh auth status` prints "Logged in to github.com account <login>
+            (<source>)", where <source> names GH_TOKEN when the env store's key
+            is what gh is using — which is exactly what the card must say."""
+            text = (proc.stdout or "") + (proc.stderr or "")
+            for raw in text.splitlines():
+                line = raw.strip().lstrip("✓").strip()
+                if line.lower().startswith("logged in to"):
+                    return (True, connect_detail(line))
+            return (False, "")
+
+
+        CONNECT_PARSERS = {
+            "claude": parse_claude_status,
+            "codex": parse_codex_status,
+            "gh": parse_gh_status,
+        }
+
+        # One row per flow, in render order. `start` and `status` are argv tails
+        # appended to the flow's binary; nothing is passed through a shell except
+        # the pane wrapper built in connect_start (via shlex.quote).
+        CONNECT_DEFS = [
+            {
+                "id": "claude",
+                "label": "Claude Code",
+                "note": "Runs <code>claude auth login</code> &mdash; your Claude "
+                        "subscription or Console account. The CLI stores the "
+                        "credential in <code>~/.claude</code>.",
+                "start": ["auth", "login"],
+                "status": ["auth", "status"],
+                "parse": "claude",
+                "hosts": ("claude.com", "claude.ai", "anthropic.com"),
+                "needs_code": True,
+                "show_code": False,
+                "unset": (),
+                "shadow": ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"),
+                "prompt_re": None,
+                "destructive": False,
+            },
+            {
+                "id": "codex",
+                "label": "Codex",
+                "note": "Runs <code>codex login --device-auth</code> &mdash; enter "
+                        "the code on the page it prints. The CLI stores the "
+                        "credential in <code>~/.codex</code>.",
+                "start": ["login", "--device-auth"],
+                "status": ["login", "status"],
+                "parse": "codex",
+                "hosts": ("openai.com", "chatgpt.com"),
+                "needs_code": False,
+                "show_code": True,
+                "unset": (),
+                "shadow": ("OPENAI_API_KEY",),
+                "prompt_re": None,
+                # --device-auth DELETES stored credentials as it starts and does
+                # not restore them if the flow is abandoned (README), so signing
+                # in again is a destructive act and asks first.
+                "destructive": True,
+            },
+            {
+                "id": "github",
+                "label": "GitHub",
+                "note": "Runs <code>gh auth login --web</code> &mdash; GitHub's own "
+                        "device flow. No app to register, no token to copy, and "
+                        "<code>git</code> reads it through gh's credential "
+                        "helper.",
+                "start": ["auth", "login", "--hostname", "github.com",
+                          "--git-protocol", "https", "--web",
+                          "--scopes", "repo,read:org,workflow"],
+                "status": ["auth", "status", "--hostname", "github.com"],
+                "parse": "gh",
+                "hosts": ("github.com",),
+                "needs_code": False,
+                "show_code": True,
+                # gh REFUSES to store a credential while GH_TOKEN is set in its
+                # environment, so the SIGN-IN pane clears it (a login-time rule
+                # only — the status probe above deliberately keeps it, because
+                # that is what the sessions actually use).
+                "unset": ("GH_TOKEN", "GITHUB_TOKEN"),
+                "shadow": ("GH_TOKEN", "GITHUB_TOKEN"),
+                "prompt_re": re.compile(r"Press Enter", re.IGNORECASE),
+                "destructive": False,
+            },
+        ]
+
+        _connect_status_cache = {}
+        _connect_probing = set()
+        _connect_lock = threading.Lock()
+
+
+        def connect_flows():
+            """The cards this box can actually show: a flow per installed CLI."""
+            flows = []
+            for spec in CONNECT_DEFS:
+                binary = CONNECT_BINS.get(spec["id"])
+                if binary:
+                    flow = dict(spec)
+                    flow["bin"] = binary
+                    flows.append(flow)
+            return flows
+
+
+        def connect_flow(flow_id):
+            for flow in connect_flows():
+                if flow["id"] == flow_id:
+                    return flow
+            return None
+
+
+        def connect_pane(flow_id):
+            return CONNECT_PREFIX + flow_id
+
+
+        def connect_target(flow_id):
+            """The flow's pane, as a tmux TARGET-PANE.
+
+            The trailing colon is load-bearing: `=name` is an exact SESSION
+            target, and capture-pane/send-keys resolve a pane, so they answer
+            "can't find pane" for it. `=name:` is that session's active pane,
+            which is the only pane these sessions ever have.
+            """
+            return "=" + connect_pane(flow_id) + ":"
+
+
+        def connect_status_env(flow):
+            """The environment a SESSION would give this CLI.
+
+            The card answers "are my sessions signed in?", and for these CLIs an
+            environment variable answers that before any stored credential does.
+            This daemon's unit does not load the env store (the supervisor's spawn
+            wrapper does, per session), so a probe run with our own environment
+            would report "not signed in" on a box whose sessions are perfectly
+            authenticated through a hand-set GH_TOKEN. Lift exactly the keys this
+            flow cares about out of the store, so the pill matches what the
+            terminal would say. No value is ever rendered.
+            """
+            env = dict(os.environ)
+            stored = dict(load_pairs())
+            for key in flow["shadow"]:
+                if key in stored:
+                    env[key] = stored[key]
+            return env
+
+
+        def connect_run(flow, args, timeout=15):
+            """Run one of the flow's own subcommands. None on any failure —
+            a missing binary or a hung status call must not 500 the page."""
+            try:
+                return subprocess.run(
+                    [flow["bin"]] + list(args),
+                    env=connect_status_env(flow),
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+
+
+        def connect_probe(flow):
+            """Ask one CLI whether it is signed in, off the request path."""
+            try:
+                proc = connect_run(flow, flow["status"])
+                value = (False, "") if proc is None else CONNECT_PARSERS[flow["parse"]](proc)
+                with _connect_lock:
+                    _connect_status_cache[flow["id"]] = (time.monotonic(), value)
+            finally:
+                with _connect_lock:
+                    _connect_probing.discard(flow["id"])
+
+
+        def connect_expire(flow_id):
+            """Mark this flow's cached status stale, keeping the value.
+
+            Used the moment the CLI exits: the cached answer predates the sign-in
+            it just finished, so the next read must re-probe. The value is kept so
+            the card still has something to render, and the stamp — not the entry —
+            is what is dropped, so a probe landing concurrently is never lost.
+            """
+            with _connect_lock:
+                hit = _connect_status_cache.get(flow_id)
+                if hit:
+                    _connect_status_cache[flow_id] = (0.0, hit[1])
+
+
+        def connect_fresh(flow_id):
+            """True when this flow's cached status is younger than the TTL."""
+            with _connect_lock:
+                hit = _connect_status_cache.get(flow_id)
+            return bool(hit) and time.monotonic() - hit[0] < CONNECT_STATUS_TTL
+
+
+        def connect_status(flow):
+            """Cached (connected, detail), or None while nothing is known yet.
+
+            This NEVER blocks the request. A render asks every card, each answer
+            forks a real CLI, and `gh auth status` talks to GitHub — so a slow or
+            unreachable network held the whole settings page, past the 10s client
+            timeout, for a page that has nothing to do with these cards (caught by
+            settings-page.nix, not by connect.nix, which stubs the CLIs). A stale
+            answer plus a background refresh is the right trade for a status pill:
+            the page polls, and the truth lands a beat later.
+            """
+            now = time.monotonic()
+            with _connect_lock:
+                hit = _connect_status_cache.get(flow["id"])
+                stale = not hit or now - hit[0] >= CONNECT_STATUS_TTL
+                if stale and flow["id"] not in _connect_probing:
+                    _connect_probing.add(flow["id"])
+                    threading.Thread(
+                        target=connect_probe, args=(flow,), daemon=True
+                    ).start()
+            return hit[1] if hit else None
+
+
+        def tmux_sessions():
+            """(server_up, {session names}) from ONE `tmux list-sessions`.
+
+            Both facts are needed for every card, and each call is a process:
+            "is the server up" is not the same question as "is this pane live",
+            but it is the same fork.
+            """
+            proc = tmux("list-sessions", "-F", "#S")
+            if proc is None or proc.returncode != 0:
+                return (False, set())
+            return (True, {line for line in proc.stdout.splitlines() if line})
+
+
+        def tmux_server_up():
+            """True when the user's tmux server is already running.
+
+            connect_start REFUSES to start one. `tmux new-session` starts a
+            server when none is running, and that server outlives the request —
+            so a pane created with no server would make THIS daemon the parent of
+            every session the supervisor later spawns, moving the agents out of
+            the hardened agent unit's namespace and cgroup and into the settings
+            daemon's (which, unlike theirs, keeps NoNewPrivileges off for its
+            sudo'd password helper). The sign-in pane must be a child of the
+            agent unit's server or it must not exist.
+            """
+            return tmux_sessions()[0]
+
+
+        def connect_capture(flow_id):
+            """The pane's text, wrapped lines rejoined, scrollback included."""
+            proc = tmux("capture-pane", "-p", "-J", "-S", "-200",
+                        "-t", connect_target(flow_id))
+            if proc is None or proc.returncode != 0:
+                return None
+            return proc.stdout
+
+
+        def connect_age(flow_id):
+            proc = tmux("display-message", "-p", "-t", connect_target(flow_id),
+                        "#{session_created}")
+            if proc is None or proc.returncode != 0:
+                return None
+            try:
+                return max(0.0, time.time() - int(proc.stdout.strip()))
+            except ValueError:
+                return None
+
+
+        def connect_trusted_url(text, hosts):
+            """The first https URL on a host this flow is allowed to send the
+            user to. Host-anchored on purpose: the page turns this into a link
+            the user is asked to trust, so a future CLI change (or anything else
+            that reaches the pane) must not be able to pick the destination."""
+            for match in CONNECT_URL_RE.finditer(text or ""):
+                candidate = match.group(0)
+                while candidate and candidate[-1] in ").,;:'\"":
+                    candidate = candidate[:-1]
+                try:
+                    parsed = urllib.parse.urlsplit(candidate)
+                except ValueError:
+                    continue
+                host = (parsed.hostname or "").lower()
+                if parsed.scheme != "https":
+                    continue
+                if any(host == h or host.endswith("." + h) for h in hosts):
+                    return candidate
+            return None
+
+
+        def connect_user_code(text):
+            """The one-time code a device flow prints in the pane. Searched with
+            URLs removed, so a `code=` query parameter cannot pose as one."""
+            stripped = CONNECT_URL_RE.sub(" ", text or "")
+            for match in CONNECT_CODE_RE.finditer(stripped):
+                code = match.group(1).upper()
+                if code not in CONNECT_PROSE:
+                    return code
+            return None
+
+
+        def connect_error(text):
+            """A short, redacted tail of the pane for a flow that ended without
+            signing in — the CLI's own words are the only diagnostic there is."""
+            lines = []
+            for raw in (text or "").splitlines():
+                line = CONNECT_EXIT_RE.sub("", raw).strip()
+                line = "".join(ch for ch in line if ch == " " or ch.isprintable())
+                if line:
+                    lines.append(line)
+            lines = [x for x in lines
+                     if not CONNECT_NOISE_RE.search(x) and not CONNECT_URL_RE.search(x)]
+            blamed = [x for x in lines if CONNECT_BLAME_RE.search(x)]
+            picked = (blamed or lines)[-2:]
+            if not picked:
+                return ""
+            tail = CONNECT_SECRET_RE.sub("[redacted]", " ".join(picked))
+            return tail[:CONNECT_ERROR_MAX]
+
+
+        def connect_state(flow, keys=None, tmux_state=None):
+            """What the card shows, derived from the CLI and the pane — never
+            from anything the daemon stored."""
+            flow_id = flow["id"]
+            server_up, live = tmux_sessions() if tmux_state is None else tmux_state
+            running = connect_pane(flow_id) in live
+            status = connect_status(flow)
+            connected, detail = status if status is not None else (False, "")
+            url = code = error = None
+            if running:
+                # A LIVE pane owns the card; the status answer does not get to
+                # overrule it. Reaping a pane because the cached status still says
+                # "connected" killed every "Sign in again" — the card says signed
+                # in, which is exactly why the user pressed the button, so the
+                # pane died within milliseconds of starting (caught by
+                # connect.nix's cancel subtest: "claude stuck in idle").
+                text = connect_capture(flow_id) or ""
+                exited = CONNECT_EXIT_RE.search(text)
+                if exited:
+                    # The CLI is done, and its exit code beats a cached status that
+                    # predates the exchange: a 0 means it believes the sign-in
+                    # worked, so hold the card there until a FRESH probe agrees
+                    # rather than flashing "Not signed in" at the moment of
+                    # success.
+                    if exited.group(1) != "0":
+                        state = "failed"
+                        error = connect_error(text)
+                    elif connected and connect_fresh(flow_id):
+                        connect_cancel(flow_id)
+                        running = False
+                        state = "connected"
+                    else:
+                        connect_expire(flow_id)
+                        state = "exchanging"
+                elif (connect_age(flow_id) or 0) > CONNECT_TTL:
+                    connect_cancel(flow_id)
+                    state = "expired"
+                else:
+                    url = connect_trusted_url(text, flow["hosts"])
+                    code = connect_user_code(text) if flow["show_code"] else None
+                    state = "waiting" if url else "starting"
+            else:
+                # "checking" is not "signed out": saying the latter before the CLI
+                # has answered would invite a sign-in the box does not need.
+                state = ("connected" if connected
+                         else ("idle" if status is not None else "checking"))
+            keys = read_keys() if keys is None else keys
+            shadow = [k for k in flow["shadow"] if k in keys]
+            return {
+                "id": flow_id,
+                "label": flow["label"],
+                "note": flow["note"],
+                "state": state,
+                "detail": detail,
+                "url": url,
+                "code": code,
+                "error": error,
+                "needs_code": flow["needs_code"],
+                # No tmux server means no session to sign in from, and starting
+                # one HERE is exactly what tmux_server_up() explains we must not
+                # do — so the card says so instead of offering a dead button.
+                "blocked": not server_up,
+                "destructive": flow["destructive"],
+                "shadow": shadow,
+            }
+
+
+        def connect_start(flow):
+            """Start the flow's own sign-in command in its own tmux session."""
+            flow_id = flow["id"]
+            if connect_pane(flow_id) in live_sessions():
+                return connect_state(flow)          # already in flight: idempotent
+            if not tmux_server_up():
+                state = connect_state(flow)
+                state["state"] = "failed"
+                state["error"] = ("No terminal session is running, so there is "
+                                  "nowhere to sign in from. Start a session first.")
+                return state
+            inner = " ".join(shlex.quote(a) for a in [flow["bin"]] + flow["start"])
+            if flow["unset"]:
+                inner = ("env " + " ".join("-u " + k for k in flow["unset"]) + " " + inner)
+            # The exit marker turns "the CLI is done" into something the state
+            # machine can see, and the sleep keeps the final screen readable
+            # until then. Both are shell-level, so no CLI has to cooperate.
+            script = "%s; printf '\\n[agent-box] exit=%%s\\n' \"$?\"; sleep %d" % (
+                inner, CONNECT_LINGER)
+            tmux("new-session", "-d", "-s", connect_pane(flow_id),
+                 "-x", str(CONNECT_COLS), "-y", str(CONNECT_ROWS), script)
+            if flow["prompt_re"] is not None:
+                connect_answer_prompt(flow)
+            return connect_state(flow)
+
+
+        def connect_answer_prompt(flow):
+            """Press Enter once the CLI asks for it (gh's web flow waits for a
+            keypress before it starts polling). Bounded: a CLI that never asks
+            simply gets no keypress."""
+            deadline = time.monotonic() + CONNECT_PROMPT_WAIT
+            while time.monotonic() < deadline:
+                text = connect_capture(flow["id"])
+                if text and flow["prompt_re"].search(text):
+                    tmux("send-keys", "-t", connect_target(flow["id"]), "C-m")
+                    return True
+                time.sleep(CONNECT_PROMPT_STEP)
+            return False
+
+
+        def connect_send_code(flow, code):
+            """Type the code the user pasted into the pane, then submit it."""
+            flow_id = flow["id"]
+            if connect_pane(flow_id) not in live_sessions():
+                return connect_state(flow)
+            target = connect_target(flow_id)
+            tmux("send-keys", "-t", target, "-l", code)
+            time.sleep(CONNECT_ENTER_DELAY)
+            tmux("send-keys", "-t", target, "C-m")
+            return connect_state(flow)
+
+
+        def connect_cancel(flow_id):
+            tmux("kill-session", "-t", "=" + connect_pane(flow_id))
+
+
         def find_supervisor_pids():
             """PIDs of this user's session supervisor — the agent unit's main
             process (the shared src/supervisor.sh store script; issue #154 Phase 2
@@ -6580,6 +7174,22 @@ in
           .state[data-state=starting] { color: #d29922; }
           /* stopped = parked on purpose (clean agent exit / stop), not pending */
           .state[data-state=stopped] { color: #8b949e; }
+          .state[data-state=failed] { color: #f85149; }
+          /* Guided sign-in cards (issues #207, #208, #313): a wizard step is a
+             full-width row under the flow it belongs to, so the steps read in
+             order instead of competing with the pill for the same line. */
+          .tbl li.conn-step { display: block; padding: 10px 16px 12px;
+                              background: #161b22; }
+          .conn-step .note:first-child { margin-top: 0; }
+          .conn-step form { margin-top: 8px; }
+          .tbl li.conn-row { display: block; padding: 12px 16px; }
+          .conn-head { display: flex; align-items: center; justify-content: space-between;
+                       gap: 12px; }
+          .conn-row .note { margin: 4px 0 0; }
+          .conn-warn { color: #d29922; }
+          .conn-code { font-size: 15px; letter-spacing: 1px; color: #e6edf3; }
+          .conn-error { color: #f85149; }
+          .conn-field { gap: 6px; }
           .btn { font: inherit; font-size: 13px; font-weight: 500; padding: 5px 14px;
                  border-radius: 6px; border: 1px solid #30363d; background: #21262d;
                  color: #e6edf3; cursor: pointer; white-space: nowrap; }
@@ -6783,6 +7393,21 @@ in
             <div id="webhooks-list">{webhooks}</div>
           </section>"""
 
+        # Guided sign-in (issues #207, #208, #313). Hidden entirely when the box
+        # passed no AGENT_BOX_CONNECT_BINS. data-busy tells the page whether a
+        # flow is mid-flight, which is the only thing its poll loop needs to know.
+        CONNECT_SECTION_TPL = """<section>
+            <div class="sec-head">
+              <h2>Connections</h2>
+            </div>
+            <p class="note">Sign in without leaving this page. Each card runs
+            that tool's OWN sign-in command in a terminal you never have to
+            find, and the tool stores its own credential &mdash; this page never
+            sees a token. Setting a key by hand under Environment secrets still
+            works, and still wins.</p>
+            <div id="connect-list" data-busy="{busy}">{cards}</div>
+          </section>"""
+
         # Root page (HOME mode): a tabbed terminal workspace (issue #119) —
         # one tab per session, the active one shown in an iframe onto the
         # existing per-session ttyd URL (/<user>/?arg=<session>; same origin,
@@ -6834,6 +7459,7 @@ in
           <div id="msg-slot">{message}</div>
           {sessions_section}
           {webhooks_section}
+          {connect_section}
           <section>
             <div class="sec-head">
               <h2>Environment secrets</h2>
@@ -7198,6 +7824,30 @@ in
           }
           // The burst poll is the no-feed fallback for "starting" → "live"; with
           // the live feed attached the daemon reports that transition itself.
+          // Guided sign-in (issues #207, #208, #313). While a card is
+          // mid-flight its state moves without this page posting anything: the
+          // CLI prints its URL a beat after start, and the sign-in itself
+          // completes in another tab entirely. So re-fetch and swap the section
+          // while it reports itself busy, and stop as soon as it does not —
+          // there is nothing to watch on a page whose cards are all settled.
+          var connectTimer = null;
+          function connectBusy() {
+            var el = document.getElementById("connect-list");
+            return !!el && el.getAttribute("data-busy") === "1";
+          }
+          function connectPoll() {
+            if (connectTimer || !connectBusy()) { return; }
+            connectTimer = window.setTimeout(function () {
+              connectTimer = null;
+              if (document.hidden) { connectPoll(); return; }
+              fetch(window.location.pathname + window.location.search)
+                .then(function (r) { return r.text(); })
+                .then(function (t) { applyDoc(parseHTML(t), ["connect-list"]); })
+                .catch(function () {})
+                .then(function () { connectPoll(); });
+            }, 2500);
+          }
+
           function startPolling(n) {
             if (liveFeed) { return; }
             pollLeft = n;
@@ -7540,10 +8190,12 @@ in
 
             function afterPost(t) {
               applyDoc(parseHTML(t),
-                ["msg-slot", "secrets-list", "sessions-list", "webhooks-list", "tab-bar"]);
+                ["msg-slot", "secrets-list", "sessions-list", "webhooks-list",
+                 "connect-list", "tab-bar"]);
               var ed = f.closest(".editor");
               if (ed) { f.reset(); ed.hidden = true; }
               var added = wsActive();   // the tab the fetched page marks current
+              connectPoll();
               if (tabsBefore && added && tabsBefore.indexOf(added) < 0) { wsSelect(added, true); }
               else if (wasActive && tabEl(wasActive)) { wsSelect(wasActive, false); }
               wsSync();
@@ -7718,6 +8370,7 @@ in
 
           checkForUpdate();
           liveUpdates();
+          connectPoll();
           // Land in the terminal: focus the server-selected tab's pane.
           if (wsActive()) { wsSelect(wsActive(), true); }
           // Still armed for the moment before the feed reports itself open; it
@@ -8086,6 +8739,129 @@ in
             )
 
 
+        def render_connect_card(state):
+            """One flow's row, plus the wizard step under it while a sign-in is
+            in flight. Rendered server-side on purpose: the tmux session is the
+            only state, so a reload, a second tab or a daemon restart all show
+            the same step — and the page keeps working without JavaScript."""
+            base = html.escape(BASE)
+            flow_id = html.escape(state["id"])
+            pill = {
+                "connected": ("live", "Signed in" + (" — " + html.escape(state["detail"])
+                                                     if state["detail"] else "")),
+                "waiting": ("starting", "Waiting for you"),
+                "starting": ("starting", "Starting…"),
+                "failed": ("failed", "Not signed in"),
+                "expired": ("failed", "Sign-in expired"),
+                "exchanging": ("starting", "Finishing sign-in&hellip;"),
+                "idle": ("stopped", "Not signed in"),
+                "checking": ("stopped", "Checking&hellip;"),
+            }[state["state"]]
+            if state["state"] in ("waiting", "starting", "checking", "exchanging"):
+                label, confirm = None, False
+            elif state["blocked"]:
+                label, confirm = None, False
+            elif state["state"] == "connected":
+                label, confirm = "Sign in again", state["destructive"]
+            else:
+                label, confirm = "Sign in", False
+            action = ""
+            if label:
+                guard = ""
+                if confirm:
+                    guard = (' onsubmit="return confirm(\'Sign in again? The current '
+                             'credential is dropped as the new sign-in starts.\');"')
+                action = (
+                    f'<form class="inline" method="post" action="{base}/connect/start"{guard}>'
+                    f'<input type="hidden" name="flow" value="{flow_id}">'
+                    f'<button type="submit" class="btn small">{label}</button></form>'
+                )
+            row = (
+                f'<li class="conn-row"><div class="conn-head">'
+                f'<strong>{html.escape(state["label"])}</strong>'
+                f'<span class="acts"><span class="state" data-state="{pill[0]}">{pill[1]}</span>'
+                f'{action}</span></div>'
+                f'<p class="note">{state["note"]}</p></li>'
+            )
+            step = render_connect_step(state)
+            if state["blocked"]:
+                step = ('<li class="conn-step"><p class="note">No terminal session '
+                        'is running, so there is nowhere to sign in from. Add a '
+                        'session above first.</p></li>')
+            warn = ""
+            if state["shadow"]:
+                keys = ", ".join("<code>%s</code>" % html.escape(k) for k in state["shadow"])
+                warn = (
+                    f'<li class="conn-step"><p class="note conn-warn">{keys} is set '
+                    f'under Environment secrets. These CLIs prefer their environment '
+                    f'variable over a stored credential, so the value you set by hand '
+                    f'is what your sessions use &mdash; signed in here or not.</p></li>'
+                )
+            return row + step + warn
+
+
+        def render_connect_step(state):
+            """The wizard body: what the user has to do right now."""
+            base = html.escape(BASE)
+            flow_id = html.escape(state["id"])
+            cancel = (
+                f'<form class="inline" method="post" action="{base}/connect/cancel">'
+                f'<input type="hidden" name="flow" value="{flow_id}">'
+                f'<button type="submit" class="btn small">Cancel</button></form>'
+            )
+            if state["state"] == "starting":
+                return (f'<li class="conn-step"><p class="note">Starting the '
+                        f'sign-in&hellip;</p>{cancel}</li>')
+            if state["state"] == "exchanging":
+                return ('<li class="conn-step"><p class="note">The CLI finished '
+                        'signing in &mdash; confirming with it now&hellip;</p></li>')
+            if state["state"] in ("failed", "expired") and state["error"]:
+                return (f'<li class="conn-step"><p class="note conn-error">'
+                        f'{html.escape(state["error"])}</p></li>')
+            if state["state"] != "waiting":
+                return ""
+            url = html.escape(state["url"], quote=True)
+            parts = [
+                f'<p class="note"><strong>1.</strong> '
+                f'<a href="{url}" target="_blank" rel="noopener noreferrer">'
+                f'Open the sign-in page</a> and approve the request.</p>'
+            ]
+            if state["code"]:
+                parts.append(
+                    f'<p class="note"><strong>2.</strong> Enter this code on that '
+                    f'page: <code class="conn-code">{html.escape(state["code"])}</code></p>'
+                )
+            if state["needs_code"]:
+                step = "3" if state["code"] else "2"
+                parts.append(
+                    f'<form method="post" action="{base}/connect/code" class="row conn-form">'
+                    f'<input type="hidden" name="flow" value="{flow_id}">'
+                    f'<label class="field conn-field"><span class="note">'
+                    f'<strong>{step}.</strong> Paste the code the page gives you back'
+                    f'</span>'
+                    f'<input type="password" name="code" autocomplete="off" required '
+                    f'placeholder="code from the sign-in page"></label>'
+                    f'<button type="submit" class="btn">Submit code</button></form>'
+                )
+            parts.append(cancel)
+            return '<li class="conn-step">' + "".join(parts) + "</li>"
+
+
+        def render_connect():
+            """Every card, plus the busy flag the page polls on."""
+            keys = read_keys()
+            tmux_state = tmux_sessions()
+            states = [connect_state(flow, keys=keys, tmux_state=tmux_state)
+                      for flow in connect_flows()]
+            busy = "1" if any(
+                s["state"] in ("starting", "waiting", "checking", "exchanging")
+                for s in states
+            ) else "0"
+            cards = "".join(render_connect_card(s) for s in states)
+            return CONNECT_SECTION_TPL.format(
+                cards='<ul class="tbl">' + cards + "</ul>", busy=busy)
+
+
         def render_sessions_section(subs=None):
             return SESSIONS_SECTION_TPL.format(
                 action_base=html.escape(SESS_BASE),
@@ -8237,6 +9013,7 @@ in
                         WEBHOOKS_SECTION_TPL.format(webhooks=render_webhooks(watches))
                         if WEBHOOKS else ""
                     ),
+                    connect_section=render_connect() if connect_flows() else "",
                     message=msg_html,
                     password_section=(
                         PASSWORD_SECTION.format(base=html.escape(BASE))
@@ -8481,6 +9258,9 @@ in
                 "webhook_forgotten": "Subscriptions cleared — that session now receives nothing.",
                 "webhook_kept": "Could not delete that subscription. It may already be gone.",
                 "password_changed": "Password changed. Sign in with your new password.",
+                "connect_started": "Sign-in started \u2014 follow the steps under Connections.",
+                "connect_cancelled": "Sign-in cancelled.",
+                "connect_code": "Code sent \u2014 waiting for the sign-in to finish.",
             }
 
             def do_GET(self):
@@ -8535,6 +9315,17 @@ in
                 # (read-only, same auth block as the page it lives under).
                 if parsed.path.rstrip("/") == BASE + "/status":
                     self._send_json(status_payload())
+                    return
+                # Guided sign-in state as JSON, for a client that would rather
+                # poll one card than re-fetch the page (read-only: it reports
+                # what the CLI and the pane say, and carries no secret — the
+                # only pane text it can return is a redacted error line).
+                if parsed.path.rstrip("/") == BASE + "/connect":
+                    flow = connect_flow((params.get("flow", [""])[0]).strip())
+                    if flow is None:
+                        self._send_json({"ok": False}, status=404)
+                    else:
+                        self._send_json({"ok": True, "flow": connect_state(flow)})
                     return
                 self._send_html(render_page(message))
 
@@ -8644,6 +9435,42 @@ in
                         return
                     set_key(key, value)
                     self._redirect("ok=saved")
+                elif path.startswith(BASE + "/connect/"):
+                    # Guided sign-in (issues #207, #208, #313). All three verbs
+                    # act on ONE tmux session per flow and store nothing here, so
+                    # a repeat POST (double click, stale tab) is harmless: start
+                    # returns the flow already in flight, cancel kills a session
+                    # that may already be gone.
+                    action = path[len(BASE + "/connect/"):]
+                    flow = connect_flow((form.get("flow", [""])[0]).strip())
+                    if flow is None or action not in ("start", "code", "cancel"):
+                        self._send_html("<h1>404</h1>", status=404)
+                        return
+                    if action == "start":
+                        result = connect_start(flow)
+                        # A start that could not begin has something to say, and
+                        # the card is rebuilt from the pane on the next GET — so
+                        # say it here rather than redirecting into a page that no
+                        # longer remembers the attempt.
+                        if result["state"] == "failed" and result["error"]:
+                            self._send_html(render_page(result["error"]), status=409)
+                            return
+                        self._redirect("ok=connect_started")
+                    elif action == "cancel":
+                        connect_cancel(flow["id"])
+                        self._redirect("ok=connect_cancelled")
+                    else:
+                        code = form.get("code", [""])[0].strip()
+                        if not CONNECT_CODE_OK.match(code):
+                            self._send_html(
+                                render_page("That does not look like a sign-in code. "
+                                            "Copy the whole value the sign-in page "
+                                            "shows, with no spaces."),
+                                status=400,
+                            )
+                            return
+                        connect_send_code(flow, code)
+                        self._redirect("ok=connect_code")
                 elif path == BASE + "/delete":
                     key = (form.get("key", [""])[0]).strip()
                     if KEY_RE.match(key):
@@ -9367,6 +10194,11 @@ in
           AGENT_BOX_SESSIONS_FILE = userSessionsFile name;
           AGENT_BOX_AGENTS = lib.concatStringsSep "," (sessionKinds cfg.installAgents);
           AGENT_BOX_DEFAULT_AGENT = cfg.agent;
+          # Guided sign-in (issues #207, #208, #313). The daemon starts
+          # these in a tmux session on the AGENT unit's server, so the
+          # credential is written in the same namespace a terminal sign-in
+          # would have written it in.
+          AGENT_BOX_CONNECT_BINS = connectBins;
           AGENT_BOX_PASSWORD_CMD =
             "/run/wrappers/bin/sudo -n ${passwordHelperCmdOf name}";
         } // lib.optionalAttrs (name == rootUser) {

@@ -142,6 +142,11 @@ jobs:
       #                     session, agent-box-session add/rm with no sudo and
       #                     no rebuild, cgroup containment, root session
       #                     manager page behind auth
+      #   connect           (issues 207/208/313) the guided sign-in cards —
+      #                     one tmux session per flow driving the tool's own
+      #                     login command (stubbed CLIs), host-anchored URL,
+      #                     code forwarding, success read from the CLI, and
+      #                     the refusal to start a tmux server of its own
       #   webhook           (issue 101) the default-on webhook receiver —
       #                     socket-activated 0660 <user>:caddy ingress, the
       #                     unauthenticated public path beside a still-401ing
@@ -155,4 +160,5 @@ jobs:
             .#checks.x86_64-linux.settings-page \
             .#checks.x86_64-linux.memory-protection \
             .#checks.x86_64-linux.sessions \
+            .#checks.x86_64-linux.connect \
             .#checks.x86_64-linux.webhook

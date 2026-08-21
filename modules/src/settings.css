@@ -92,6 +92,22 @@ ul.tbl.subs li { padding-left: 40px; }
 .state[data-state=starting] { color: #d29922; }
 /* stopped = parked on purpose (clean agent exit / stop), not pending */
 .state[data-state=stopped] { color: #8b949e; }
+.state[data-state=failed] { color: #f85149; }
+/* Guided sign-in cards (issues #207, #208, #313): a wizard step is a
+   full-width row under the flow it belongs to, so the steps read in
+   order instead of competing with the pill for the same line. */
+.tbl li.conn-step { display: block; padding: 10px 16px 12px;
+                    background: #161b22; }
+.conn-step .note:first-child { margin-top: 0; }
+.conn-step form { margin-top: 8px; }
+.tbl li.conn-row { display: block; padding: 12px 16px; }
+.conn-head { display: flex; align-items: center; justify-content: space-between;
+             gap: 12px; }
+.conn-row .note { margin: 4px 0 0; }
+.conn-warn { color: #d29922; }
+.conn-code { font-size: 15px; letter-spacing: 1px; color: #e6edf3; }
+.conn-error { color: #f85149; }
+.conn-field { gap: 6px; }
 .btn { font: inherit; font-size: 13px; font-weight: 500; padding: 5px 14px;
        border-radius: 6px; border: 1px solid #30363d; background: #21262d;
        color: #e6edf3; cursor: pointer; white-space: nowrap; }
