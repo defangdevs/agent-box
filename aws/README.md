@@ -8,9 +8,10 @@ Claude Code or Codex.
   buttons point here): agent-box on **AWS Lightsail** for one flat monthly
   bundle price. See
   ["Lightsail variant"](#lightsail-variant-lightsail-templateyaml) below.
-- `template.yaml` - the EC2 alternative (Spot pricing, IPv4 by default with
-  an IPv6-only opt-out, SSM root access, resizable EBS). Most of this
-  document describes it; the Lightsail section covers what differs.
+- `template.yaml` - the EC2 alternative (on-demand with a Spot opt-in, IPv4
+  by default with an IPv6-only opt-out, SSM root access, resizable EBS).
+  Most of this document describes it; the Lightsail section covers what
+  differs.
 
 ## What the template does
 
@@ -245,20 +246,24 @@ nets and coffee-shop WiFi often lack real IPv6. Users who know their
 client has IPv6 connectivity can set `PublicIpv4: false` at launch to go
 IPv6-only and drop that charge.
 
-### Spot by default (persistent + stop)
+### On-demand by default, Spot opt-in to save cost
 
-`UseSpot` defaults to `true` because cost is the whole point. The spot
-options can't sit on `AWS::EC2::Instance` (it has no `InstanceMarketOptions`),
-so they ride on a conditional `AWS::EC2::LaunchTemplate` that the instance
-references only when `UseSpot=true`. We use a **persistent** request with
+`UseSpot` defaults to `false` (on-demand) so a freshly launched box never
+gets reclaimed mid-session - the same reachability-first reasoning as the
+`PublicIpv4` default above. Users who accept the interruption risk for the
+lower price set `UseSpot: true`. The spot options can't sit on
+`AWS::EC2::Instance` (it has no `InstanceMarketOptions`), so they ride on a
+conditional `AWS::EC2::LaunchTemplate` that the instance references only
+when `UseSpot=true`. We use a **persistent** request with
 `InstanceInterruptionBehavior: stop`: on interruption AWS stops (not
 terminates) the instance and restarts the *same* instance in the *same AZ*
 when capacity returns, so the root EBS, the ENI's IPv6, and the on-disk TLS
 cert all survive. What does not survive is the live tmux session (RAM is
 lost on any stop). Risk: if that one AZ+type pool stays capacity-starved,
 the box stays stopped until it frees up - pick a deep pool. No `MaxPrice` is
-set, so the cap is the on-demand rate. The E2E deploy-test forces
-`UseSpot=false` so CI doesn't depend on spot capacity.
+set, so the cap is the on-demand rate. The E2E deploy-test's `ipv4-full` leg
+runs on-demand by default too (`UseSpot=false`) so CI doesn't depend on spot
+capacity; a `use_spot` dispatch input can opt that leg into Spot instead.
 
 ### Race condition: EIP association vs boot
 
