@@ -39,7 +39,7 @@ on:
         type: string
         default: ''
       use_spot:
-        description: Deploy the ipv4-full leg as a Spot instance (matches the 1-click default)
+        description: Deploy the ipv4-full leg as a Spot instance (the 1-click default is on-demand; this opts the leg into Spot instead)
         type: boolean
         default: false
 

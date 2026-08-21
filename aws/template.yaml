@@ -46,7 +46,7 @@ Metadata:
       PublicIpv4:
         default: Allocate a public IPv4 (costs ~$3.60/mo)
       Nat64:
-        default: "IPv6-only mode: reach IPv4-only sites (github.com) via public NAT64"
+        default: "If IPv6-only (PublicIpv4=false): reach IPv4-only sites (github.com) via public NAT64"
       AllowCidr:
         default: IPv4 CIDR allowed to reach 443
       EnableSsm:
@@ -155,18 +155,19 @@ Parameters:
 
   UseSpot:
     Type: String
-    Default: 'true'
+    Default: 'false'
     AllowedValues: ['true', 'false']
     Description: >-
-      true (default): run as a persistent Spot instance (currently ~50-60%
-      cheaper for t4g in the four launch regions — the deep 70-90% Spot
-      discounts don't apply to these small Graviton types).
-      On a Spot interruption AWS stops the instance and restarts the SAME
-      instance in the SAME AZ when capacity returns, so the root volume,
-      IPv6 address, and TLS cert all survive. The live tmux session does
-      not (RAM is lost on any stop). Risk: if this AZ+type pool stays
-      capacity-starved, the box stays stopped until it frees up.
-      false: on-demand (always available, full price).
+      false (default): on-demand (always available, full price). true: run
+      as a persistent Spot instance (currently ~50-60% cheaper for t4g in
+      the four launch regions — the deep 70-90% Spot discounts don't apply
+      to these small Graviton types). On a Spot interruption AWS stops the
+      instance and restarts the SAME instance in the SAME AZ when capacity
+      returns, so the root volume, IPv6 address, and TLS cert all survive.
+      The live tmux session does not (RAM is lost on any stop). Risk: if
+      this AZ+type pool stays capacity-starved, the box stays stopped
+      until it frees up — set this only if you're comfortable with that
+      tradeoff for the lower price.
 
   WebPassword:
     Type: String
@@ -191,9 +192,10 @@ Parameters:
       ## This box (AWS / EC2)
 
       - This is an EC2 instance. The root disk persists but RAM does not: on a
-        reboot or Spot interruption (Spot is the default) the instance stops
-        and later restarts with the same disk, IP, and TLS cert, but the live
-        tmux session is gone. Save working context to disk under your home.
+        reboot (or a Spot interruption, if this stack was launched with
+        UseSpot=true) the instance stops and later restarts with the same
+        disk, IP, and TLS cert, but the live tmux session is gone. Save
+        working context to disk under your home.
       - Your URL is derived from the instance IP via sslip.io and changes if
         the public IP changes, so always read $AGENT_BOX_URL rather than
         hard-coding the hostname.
