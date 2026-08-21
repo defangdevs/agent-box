@@ -124,6 +124,24 @@
           # golden-snapshot check, materialized into tests/golden by
           # `nix run .#update-golden`.
           golden-snapshot = goldenSnapshotFor system;
+
+          # The runtime profile a non-NixOS host installs instead of a system
+          # closure (issue #154 Phase 4):
+          #   nix profile install github:defangdevs/agent-box/<rev>#runtime
+          # Built from modules/src/*, the same payloads the NixOS module
+          # embeds — see nix/runtime.nix.
+          runtime = import ./nix/runtime.nix {
+            pkgs = nixpkgs.legacyPackages.${system};
+            # The bundled agent CLIs are unfree, and a flake package has no
+            # host configuration.nix to carry an allowUnfreePredicate — so
+            # allow exactly those two here, the same set (and the same
+            # reasoning) as the module's agentPkgs import.
+            agentPkgs = import nixpkgs {
+              inherit system;
+              config.allowUnfreePredicate = pkg:
+                builtins.elem (nixpkgs.lib.getName pkg) [ "claude-code" "codex" ];
+            };
+          };
         }
         // nixpkgs.lib.optionalAttrs (system == imageSystem) (
           let
@@ -363,6 +381,90 @@
                 echo "tests/golden diff, and commit it with the change."
                 exit 1
               fi
+            '';
+
+          # Issue #154 Phase 4: the runtime profile is how a non-NixOS host
+          # gets its software, so the one thing that must never drift is the
+          # payload bytes — a native box running a different supervisor than
+          # the NixOS golden fixture locks would be a silent fork of the
+          # product. Assert every shipped payload is its modules/src file
+          # verbatim (the shebang writeShellScriptBin adds, then the body),
+          # that the shared assets are byte-identical too, and that each
+          # script parses.
+          runtime-profile =
+            pkgs.runCommand "agent-box-runtime-profile-ok"
+              {
+                nativeBuildInputs = [ pkgs.bash ];
+                profile = self.packages.${system}.runtime;
+                srcDir = ./modules/src;
+              } ''
+              fail=0
+              # bin/<name> must be src/<file>, modulo the added shebang.
+              check_payload() {
+                bin="$profile/bin/$1"
+                src="$srcDir/$2"
+                if [ ! -x "$bin" ]; then
+                  echo "MISSING: bin/$1"; fail=1; return
+                fi
+                # writeShellScriptBin prepends a shebang and ends the file
+                # with a newline; the body between must match byte for byte.
+                if ! diff -u <(tail -n +2 "$bin") <(cat "$src"; printf '\n') >/dev/null \
+                  && ! diff -u <(tail -n +2 "$bin") "$src" >/dev/null; then
+                  echo "DRIFT: bin/$1 is not modules/src/$2 verbatim"
+                  diff -u <(tail -n +2 "$bin") "$src" | head -20 || true
+                  fail=1
+                  return
+                fi
+                bash -n "$bin" || { echo "SYNTAX: bin/$1"; fail=1; }
+                echo "ok: bin/$1 == src/$2"
+              }
+              check_payload agent-box-supervisor supervisor.sh
+              check_payload agent-box-attach attach.sh
+              check_payload agent-box-mark-stopped mark-stopped.sh
+              check_payload agent-box-spot-monitor spot-monitor.sh
+              check_payload agent-box-update update.sh
+              check_payload agent-box-codex-remote-control codex-remote-control.sh
+              check_payload agent-box-claude-session-start-hook claude-session-start-hook.sh
+              check_payload agent-box-env-exec env-exec.sh
+              check_payload agent-box-session-bare session-cli.sh
+
+              # Shared assets: the units both backends install verbatim, the
+              # Caddyfile fragments and guides the native renderer binds, the
+              # settings page assets, and the password-helper template.
+              for u in "$srcDir"/units/*; do
+                got="$profile/share/agent-box/units/$(basename "$u")"
+                if ! diff -u "$u" "$got" >/dev/null 2>&1; then
+                  echo "DRIFT: share/agent-box/units/$(basename "$u")"; fail=1
+                else
+                  echo "ok: units/$(basename "$u")"
+                fi
+              done
+              for c in "$srcDir"/caddyfile-*.caddy; do
+                diff -u "$c" "$profile/share/agent-box/caddy/$(basename "$c")" >/dev/null \
+                  || { echo "DRIFT: caddy/$(basename "$c")"; fail=1; }
+              done
+              for a in default-agents.md default-agents-webhook.md; do
+                diff -u "$srcDir/$a" "$profile/share/agent-box/guides/$a" >/dev/null \
+                  || { echo "DRIFT: guides/$a"; fail=1; }
+              done
+              for a in settings.css settings.js; do
+                diff -u "$srcDir/$a" "$profile/share/agent-box/web/$a" >/dev/null \
+                  || { echo "DRIFT: web/$a"; fail=1; }
+              done
+              diff -u "$srcDir/password-helper.py" \
+                "$profile/libexec/agent-box/password-helper.py" >/dev/null \
+                || { echo "DRIFT: libexec/agent-box/password-helper.py"; fail=1; }
+
+              # The tools a session's PATH is expected to have, and the
+              # services the units drive. A missing one is a native box that
+              # boots and then cannot serve, so name them explicitly.
+              for b in agent-box-settings tmux ttyd caddy jq gh git python3 \
+                       bwrap flock claude codex; do
+                [ -x "$profile/bin/$b" ] || { echo "MISSING: bin/$b"; fail=1; }
+              done
+
+              [ "$fail" -eq 0 ] || exit 1
+              printf 'runtime profile payloads match modules/src\n' > "$out"
             '';
 
           module-generated-up-to-date =
