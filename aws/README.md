@@ -286,6 +286,49 @@ rejected by EC2's API but cfn-lint only checks the group description.
 The template avoids em-dashes anywhere that becomes a rule description
 to sidestep this.
 
+## Native Lightsail variant (`lightsail-native-template.yaml`)
+
+Issue #154 Phase 4: agent-box on Lightsail **without** `nixos-infect`. The
+instance boots the same `ubuntu_24_04` blueprint and stays Ubuntu — Nix is
+installed as a plain package manager (Determinate installer), the pinned
+runtime profile (`nix profile install <ref>#runtime`) brings the payloads,
+tools and agent CLIs, and `agentbox apply --first-boot` renders the users,
+units, sudoers, tmpfiles, Caddyfile and first-boot secrets.
+
+What that buys over the infect template:
+
+| | infect | native |
+|---|---|---|
+| First boot | closure build + relabel + reboot | install Nix, substitute a profile |
+| WaitCondition timeout | 2700 s | 1200 s |
+| Smallest usable bundle | `small_3_0` (2 GiB) | `nano_3_0` (1 GiB) |
+| Debug access after boot | root SSH only (lustrate wiped `ubuntu`) | ordinary Ubuntu, console browser-SSH works |
+| Base-OS patching | nixos-rebuild | apt / unattended-upgrades (`agentbox apply` never calls apt) |
+| Rollback | `nixos-rebuild --rollback` | `nix profile rollback --profile /nix/var/nix/profiles/agent-box` |
+
+**The launch script must stay bash-guarded.** Lightsail prepends its own
+`#!/bin/sh` preamble to an instance's launch script, so the template's shebang
+is only a comment in the middle of the file cloud-init runs and the payload
+executes under dash. That is exactly how the infect template failed — `set
+-euxo pipefail` aborted it 19 s into first boot, on every launch it ever had —
+so the native script re-execs itself under bash on its first line and
+`scripts/check_lightsail_userdata.py` fails CI if that guard goes missing (or
+if a bashism appears ahead of it). It is also why the payload is a shell
+script rather than the `#cloud-config` the Phase 4 design sketched: on
+Lightsail the launch script is concatenated *into* a shell script, so a YAML
+cloud-config document could never be parsed as one. A native **EC2** template
+can use `#cloud-config` — nothing is prepended there.
+
+### Validation status
+
+`cfn-lint`, the launch-script dialect check, and `tests/test_agentbox.py`
+(which renders `tests/native/config.{json,yaml}` and diffs it against
+`tests/native/expected`, then hands the rendered Caddyfile to `caddy
+validate`) all run in PR CI. The end-to-end launch has **not** yet been
+exercised on live hardware — treat the first real launch as the acceptance
+test, and read `/var/log/agent-box-bootstrap.log` over SSH if the stack times
+out.
+
 ## Lightsail variant (`lightsail-template.yaml`)
 
 A separate template (not a toggle on the EC2 one) that runs the same

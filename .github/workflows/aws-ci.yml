@@ -6,8 +6,13 @@ on:
     paths: &aws-ci-paths
       - 'aws/template.yaml'
       - 'aws/lightsail-template.yaml'
+      - 'aws/lightsail-native-template.yaml'
       - 'docs/index.html'
       - 'scripts/ws_smoke.py'
+      - 'scripts/check_lightsail_userdata.py'
+      - 'bin/agentbox'
+      - 'tests/test_agentbox.py'
+      - 'tests/native/**'
       - '.github/workflows/aws-ci.yml'
       - '.github/workflows/deploy-test.yml'
   pull_request:
@@ -32,7 +37,20 @@ jobs:
         run: python3 -m pip install --quiet cfn-lint
 
       - name: Validate CloudFormation templates
-        run: cfn-lint aws/template.yaml aws/lightsail-template.yaml
+        run: |
+          cfn-lint aws/template.yaml aws/lightsail-template.yaml \
+            aws/lightsail-native-template.yaml
+
+      # cfn-lint reads YAML, so it cannot see that Lightsail prepends its
+      # own #!/bin/sh preamble and runs the launch script under dash — the
+      # failure that kept the infect-based 1-click from ever booting.
+      - name: Check the Lightsail launch-script shell dialect
+        run: python3 scripts/check_lightsail_userdata.py
+
+      - name: Run the native renderer's tests
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 tests/test_agentbox.py
 
       - name: Compile WebSocket smoke helper
         run: python3 -m py_compile scripts/ws_smoke.py
