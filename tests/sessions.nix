@@ -288,6 +288,40 @@
         machine.fail("test -e /home/agent/shdir/CLAUDE.md")
         machine.succeed(as_agent("agent-box-session rm sh"))
 
+    # --- pre-accepted claude first-run dialogs ----------------------------
+    with subtest("claude's startup dialogs are seeded, not asked"):
+        # The boot "main" session is claude in $HOME, so the flags are already
+        # written. Sign-in is meant to be the ONLY interactive step: a session
+        # parked on a dialog is one Remote Control cannot answer.
+        machine.wait_until_succeeds(
+            "jq -e '.projects[\"/home/agent\"].hasTrustDialogAccepted == true'"
+            " /home/agent/.claude.json",
+            timeout=60,
+        )
+        # hasCompletedOnboarding skips the first-run wizard, whose opening
+        # screen is the theme picker. The wizard pushes that step
+        # unconditionally, so a seeded theme alone would not skip it.
+        machine.succeed(
+            "jq -e '.hasCompletedOnboarding == true' /home/agent/.claude.json"
+        )
+        machine.succeed(
+            "jq -e '.theme == \"dark\"' /home/agent/.claude/settings.json"
+        )
+
+        # The theme seed never clobbers a hand-picked one: /theme writes the
+        # same key, and the seeder re-runs on every session start.
+        machine.succeed(as_agent(
+            "jq '.theme = \"light\"' /home/agent/.claude/settings.json"
+            " > /home/agent/s.tmp && mv /home/agent/s.tmp"
+            " /home/agent/.claude/settings.json"
+        ))
+        machine.succeed(as_agent("agent-box-session add themed --agent claude"))
+        machine.wait_until_succeeds(tmux("has-session -t =themed"), timeout=60)
+        machine.succeed(
+            "jq -e '.theme == \"light\"' /home/agent/.claude/settings.json"
+        )
+        machine.succeed(as_agent("agent-box-session rm themed"))
+
     # --- runtime add: no sudo, no rebuild ---------------------------------
     machine.succeed(
         "su -s /bin/sh agent -c 'agent-box-session add helper --agent codex'"
