@@ -885,7 +885,12 @@
         )
         resumed = resumed_cmd.replace("\\", "")
         assert "--session ses_" in resumed, resumed
-        assert "agent-box session" not in resumed, resumed
+        # The bracketed "[agent-box session <bid>]" MARKER must not be
+        # restamped once a target session id is found — but the default
+        # resume steer prompt's own wording ("...restarted (agent-box
+        # session <bid>)...") legitimately contains the bare phrase without
+        # brackets, so check for the marker's brackets specifically.
+        assert "[agent-box session" not in resumed, resumed
         machine.succeed(as_agent("agent-box-session rm oc1"))
 
     # --- segment rotation: respawn follows the recorded live id -----------
