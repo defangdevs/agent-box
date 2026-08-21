@@ -74,7 +74,11 @@ in
             echo "! Failed opening a web browser at https://github.com/login/device"
             ;;
           "auth status")
-            if [ -e ${stateDir}/gh-in ]; then
+            # Same precedence the real gh reports: an environment token
+            # wins over the stored credential, and the source is named.
+            if [ -n "''${GH_TOKEN:-}" ]; then
+              echo "✓ Logged in to github.com account envuser (GH_TOKEN)"
+            elif [ -e ${stateDir}/gh-in ]; then
               echo "✓ Logged in to github.com account stubuser (keyring)"
             else
               echo "You are not logged into any GitHub hosts." >&2
@@ -175,6 +179,15 @@ in
         )
 
 
+    def wait_detail(flow, want, tries=20):
+        for _ in range(tries):
+            got = state(flow)
+            if want in got["detail"]:
+                return got
+            machine.sleep(1)
+        raise Exception(f"{flow} detail {state(flow)['detail']!r} never held {want!r}")
+
+
     def wait_state(flow, want, tries=40):
         for _ in range(tries):
             got = state(flow)
@@ -236,6 +249,13 @@ in
         body = get("/agent/settings/")
         assert "is set under Environment secrets" in body
         assert "ghp_manual" not in body
+        # The status probe must see the env STORE, not just the daemon's own
+        # environment: that unit never loads the store (the supervisor's
+        # spawn wrapper does, per session), so a probe with our bare
+        # environment would report "not signed in" for a box whose sessions
+        # authenticate perfectly through this key. The stub reports the
+        # source, so the card can be checked for it.
+        wait_detail("github", "envuser (GH_TOKEN)")
 
     with subtest("an unknown flow is a 404, not a started pane"):
         assert post("/agent/settings/connect/start", "flow=nope") == "404"

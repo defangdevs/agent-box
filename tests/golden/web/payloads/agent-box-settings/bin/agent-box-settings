@@ -1317,10 +1317,9 @@ CONNECT_DEFS = [
         "needs_code": False,
         "show_code": True,
         # gh REFUSES to store a credential while GH_TOKEN is set in its
-        # environment. The daemon's unit does not load the env store, so
-        # this is for the case where the operator's own environment has
-        # one — clearing it for the pane keeps the guided flow usable
-        # without touching the manual key.
+        # environment, so the SIGN-IN pane clears it (a login-time rule
+        # only — the status probe above deliberately keeps it, because
+        # that is what the sessions actually use).
         "unset": ("GH_TOKEN", "GITHUB_TOKEN"),
         "shadow": ("GH_TOKEN", "GITHUB_TOKEN"),
         "prompt_re": re.compile(r"Press Enter", re.IGNORECASE),
@@ -1365,10 +1364,23 @@ def connect_target(flow_id):
     return "=" + connect_pane(flow_id) + ":"
 
 
-def connect_env(flow):
+def connect_status_env(flow):
+    """The environment a SESSION would give this CLI.
+
+    The card answers "are my sessions signed in?", and for these CLIs an
+    environment variable answers that before any stored credential does.
+    This daemon's unit does not load the env store (the supervisor's spawn
+    wrapper does, per session), so a probe run with our own environment
+    would report "not signed in" on a box whose sessions are perfectly
+    authenticated through a hand-set GH_TOKEN. Lift exactly the keys this
+    flow cares about out of the store, so the pill matches what the
+    terminal would say. No value is ever rendered.
+    """
     env = dict(os.environ)
-    for key in flow["unset"]:
-        env.pop(key, None)
+    stored = dict(load_pairs())
+    for key in flow["shadow"]:
+        if key in stored:
+            env[key] = stored[key]
     return env
 
 
@@ -1378,7 +1390,7 @@ def connect_run(flow, args, timeout=15):
     try:
         return subprocess.run(
             [flow["bin"]] + list(args),
-            env=connect_env(flow),
+            env=connect_status_env(flow),
             check=False,
             capture_output=True,
             text=True,
