@@ -41,6 +41,7 @@ ProtectKernelTunables=true
 ProtectSystem=strict
 ReadWritePaths=/home/agent
 ReadWritePaths=/var/lib/agent-box-sites/agent
+ReadWritePaths=/var/lib/agent-box-downloads/agent
 Restart=always
 RestartSec=2s
 RestrictRealtime=true

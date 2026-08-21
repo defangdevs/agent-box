@@ -107,6 +107,16 @@
     client_ip = client.succeed("ip -4 -o addr show eth1 | head -1").split()[3].split("/")[0]
     curl = f"curl -sk --resolve box.test:443:{machine_ip}"
 
+    # Writes that the guide tells an agent to make (~/downloads, ~/sites) must be
+    # exercised INSIDE the agent unit's mount namespace. Writing as the agent uid
+    # from the driver's root shell skips ProtectSystem entirely, which is how a
+    # read-only ~/downloads shipped under a green test (issue #316).
+    agent_pid = machine.succeed(
+        "systemctl show -p MainPID --value agent-box-agent.service"
+    ).strip()
+    assert agent_pid not in ("", "0"), "agent unit has no main PID"
+    in_session = f"nsenter -t {agent_pid} -m -- runuser -u agent --"
+
     with subtest("~/downloads is a per-user file drop served behind the auth gate"):
         # The tmpfiles-created symlink from ~agent/downloads into the backing dir.
         machine.succeed("test -L /home/agent/downloads")
@@ -121,10 +131,19 @@
             "stat -c '%U:%G %a' /var/lib/agent-box-downloads/agent | grep -x 'agent:caddy 750'"
         )
 
-        # The agent drops a file through the ~/downloads symlink (never touches
-        # /var/lib directly), exactly as AGENTS.md instructs.
+        # ~/downloads resolves to /var/lib/agent-box-downloads/agent, outside
+        # /home — so ProtectSystem=strict denies it with EROFS unless the target
+        # is named in ReadWritePaths, exactly as for ~/sites below (issue #316).
         machine.succeed(
-            "sudo -u agent tee /home/agent/downloads/report.txt > /dev/null <<'EOF'\n"
+            "systemctl show agent-box-agent --property=ReadWritePaths --value "
+            "| grep /var/lib/agent-box-downloads/agent >/dev/null"
+        )
+
+        # The agent drops a file through the ~/downloads symlink (never touches
+        # /var/lib directly), exactly as AGENTS.md instructs — and from inside
+        # the unit's namespace, which is the only place that proves it.
+        machine.succeed(
+            f"{in_session} tee /home/agent/downloads/report.txt > /dev/null <<'EOF'\n"
             "hello from the box\n"
             "EOF"
         )
@@ -182,12 +201,8 @@
         # nsenter joins the running unit's mount namespace so the write is subject
         # to the same read-only remount a tool shell inside the session gets;
         # runuser then drops to the agent uid for the ownership check below.
-        agent_pid = machine.succeed(
-            "systemctl show -p MainPID --value agent-box-agent.service"
-        ).strip()
-        assert agent_pid not in ("", "0"), "agent unit has no main PID"
         machine.succeed(
-            f"nsenter -t {agent_pid} -m -- runuser -u agent -- "
+            f"{in_session} "
             "tee /home/agent/sites/mysite.caddy > /dev/null <<'CFG'\n"
             "mysite.test {\n"
             "  tls internal\n"
