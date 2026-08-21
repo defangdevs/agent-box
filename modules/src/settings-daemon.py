@@ -2090,6 +2090,18 @@ CONNECT_SECTION_TPL = """<section>
 # #188): it is page-level feedback, and sitting between the tabs and
 # the panes it both prised the tab bar away from the terminal it labels
 # and read as a message from the session in that pane.
+#
+# The (i) hint (issue #327): tmux's `mouse on` (issue #265) claims every
+# button and drag for itself, not just the wheel — there is no tmux/xterm
+# mouse-tracking mode that reports wheel events alone. So a plain
+# click-drag now paints tmux's own copy-mode highlight instead of a
+# browser selection, and it vanishes on mouse-up without reaching the
+# clipboard (ttyd's bundled xterm.js has no OSC 52 support, so nothing
+# server-side can bridge tmux's paste buffer to the browser clipboard
+# either). xterm.js's own fallback is holding Shift (Option on a Mac)
+# while dragging, which forces its native DOM selection — and that in
+# turn is what ttyd auto-copies on selection change. Surfacing that here
+# is the fix; it is not something a tmux or ttyd config flag can restore.
 HOME_BODY = """<body class="ws">
 <div id="msg-slot">{message}</div>
 <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}">
@@ -2097,6 +2109,8 @@ HOME_BODY = """<body class="ws">
   <button type="button" class="btn add" data-toggle="session-editor"
           title="New session" aria-label="New session">+</button>
   <span class="spacer"></span>
+  <span class="hint" tabindex="0" aria-label="Terminal mouse tip"
+        title="Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text.">&#9432;</span>
   <a class="gear" href="{base}/" title="Settings" aria-label="Settings">&#9881;</a>
 </nav>
 <div id="session-editor" class="editor">
