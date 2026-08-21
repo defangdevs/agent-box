@@ -101,6 +101,16 @@ context still knows what the event is about.
     agent-box-webhook ls                     # what this session listens to
     agent-box-webhook unsubscribe OWNER/REPO # when you wrap up
 
+When you pick up ONE issue or PR, say so with `--include`. That both narrows
+what reaches you and tells a standing watch the work is taken, so a review or
+a comment on it no longer starts a second session on top of you:
+
+    agent-box-webhook subscribe OWNER/REPO \
+      --note "PR 42: waiting on CI + review" \
+      --include '{"any":[{"path":"pull_request.number","in":[42]},
+                         {"path":"issue.number","in":[42]},
+                         {"path":"workflow_run.head_branch","in":["fix/42-thing"]}]}'
+
 Claude Code has the same as MCP tools (`webhook_subscribe`,
 `webhook_unsubscribe`, `webhook_subscriptions`); both share one list.
 Subscriptions are PER SESSION and expire after an hour (`--ttl HOURS` for a
@@ -117,13 +127,18 @@ session is active, indefinitely. Add a standing watch instead:
 
 Matching events spawn a FRESH `hook-*` session primed with the event text,
 and bursts coalesce into one. Watches are SHARED, never expire by default,
-and `agent-box-webhook ls` lists them under `dispatch`. A watch never
-doubles up on work you own: a CI event spawns only on FAILURE, and never
-while a live session is subscribed to that topic — the other reason to
-subscribe when you pick up a PR, since that is how a watch knows the work is
-taken. A dispatched session is subscribed to the event's own repo at spawn,
-so its red CI spawns no sibling; a new issue or someone else's PR always
-spawns. Its prompt tells it to `agent-box-session rm NAME` when done — clean
+and `agent-box-webhook ls` lists them under `dispatch`. A watch tries not to
+double up on work you own, and how well it manages depends on what you told
+it. A CI event spawns only on FAILURE, and never while a live session is
+subscribed to that topic. Every OTHER event — a review, a comment, a push —
+is only recognised as yours when your subscription carries an `--include`
+predicate that matches it: a bare repo-wide subscription is not a claim,
+because one session must not silence the watch for every unrelated issue in
+the repo. So scope the subscription when you pick up an object, or expect a
+review on your own PR to spawn a sibling that starts working it (that is
+exactly what happened twice in one hour before local-webhook 0.19.0). A
+dispatched session is subscribed to the event's own repo at spawn, so its red
+CI spawns no sibling; a new issue or someone else's PR always spawns. Its prompt tells it to `agent-box-session rm NAME` when done — clean
 stale `hook-*` sessions the same way. That cleanup is load-bearing: at most 4
 `hook-*` sessions may RUN at once, and once that ceiling is reached EVERY
 watch on the box is inert — a matching batch is refused and dropped, never
