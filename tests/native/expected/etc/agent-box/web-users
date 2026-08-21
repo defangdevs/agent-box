@@ -1,0 +1,2 @@
+agent	/etc/agent-box/agent.hash
+robot	/etc/agent-box/robot.hash

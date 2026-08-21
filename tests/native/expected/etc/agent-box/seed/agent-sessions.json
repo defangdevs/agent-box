@@ -1,0 +1,13 @@
+{
+  "sessions": [
+    {
+      "name": "main",
+      "agent": "claude"
+    },
+    {
+      "name": "review",
+      "agent": "codex",
+      "cwd": "/home/agent/agent-box"
+    }
+  ]
+}
