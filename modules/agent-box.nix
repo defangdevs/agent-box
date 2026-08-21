@@ -224,6 +224,16 @@ let
     Update the box's software with:
     `sudo systemctl start agent-box-update.service`
     (kills the running tmux session — save context first).
+
+    ## This platform has its own upstream repo
+
+    The box itself — the terminal, session manager, webhook wiring, this guide
+    — is github.com/defangdevs/agent-box, the repo the update service above
+    pulls from. A bug in that platform is not the same as a bug in the user's
+    project: if you hit one, first work around it so your own running session
+    is unblocked, then file an issue (or a PR, if you already have the fix)
+    upstream so every other deployment gets it too. Search for an existing
+    issue before opening one, and don't wait for permission to file it.
   '';
   # The canonical guide is published READ-ONLY under /etc (see
   # environment.etc below) rather than seeded into $HOME. environment.etc
