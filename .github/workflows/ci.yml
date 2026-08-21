@@ -119,20 +119,20 @@ jobs:
       # twice over: per-step, and via nix's default max-jobs=1). Ran
       # back-to-back they took ~8 min of the job's ~10; concurrently they
       # bound the job at roughly the slowest wave (~3-4 min).
-      #   --max-jobs 3: ubuntu-latest has 4 vCPUs / 16 GiB and web-fail2ban
+      #   --max-jobs 3: ubuntu-latest has 4 vCPUs / 16 GiB and web-surface
       #     boots TWO qemu nodes — 6 tests at once would thrash and trade
       #     the saved minutes back as flaky timeouts.
       #   --keep-going: one red test doesn't hide the others' results (the
       #     failing drv is still named in the log).
       # What each check covers:
-      #   web-fail2ban      brute-forcing the web terminal's basic auth gets
-      #                     the client banned
-      #   self-serve-domain an agent user adds a virtual host at runtime by
-      #                     writing a snippet to ~/sites/ and reloading caddy
-      #                     — no rebuild
-      #   download-files    (issue 132) per-user ~/downloads served at
-      #                     /<user>/downloads/ behind the terminal's auth —
-      #                     perms/symlink, auth gate, serving, browsable index
+      #   web-surface       (issues 40/132/312) the user-facing web surface in
+      #                     one guest — per-user ~/downloads served at
+      #                     /<user>/downloads/ behind the terminal's auth
+      #                     (perms/symlink, auth gate, serving, browsable
+      #                     index), an agent adding a virtual host at runtime
+      #                     by writing a snippet to ~/sites/ and reloading
+      #                     caddy with no rebuild, and brute-forcing the basic
+      #                     auth getting the client banned
       #   settings-page     the settings page stores a secret through the
       #                     browser and the agent unit picks it up
       #   memory-protection (issue 62) protectMemory — zram swap up,
@@ -151,9 +151,7 @@ jobs:
       - name: Run VM tests
         run: |
           nix build -L --keep-going --max-jobs 3 \
-            .#checks.x86_64-linux.web-fail2ban \
-            .#checks.x86_64-linux.self-serve-domain \
-            .#checks.x86_64-linux.download-files \
+            .#checks.x86_64-linux.web-surface \
             .#checks.x86_64-linux.settings-page \
             .#checks.x86_64-linux.memory-protection \
             .#checks.x86_64-linux.sessions \

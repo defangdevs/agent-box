@@ -1,0 +1,23 @@
+# Paths whose rendered bytes are identical to an earlier path in this snapshot
+# (issue #312). The owner holds the content; these are `<path> -> <owner>`, in
+# sorted order, so one edit to a shared payload is one hunk in the fixture diff
+# instead of one per config that renders it.
+#
+# The web config is the vm config plus the web overlay, and a user's units and
+# payloads are rendered per user, so most sharing is vm<->web or agent<->robot.
+# A line DISAPPEARING is a behavior change, not a cleanup: those two paths no
+# longer render the same bytes, and the copy that diverged shows up as its own
+# file in the same diff.
+web/etc/agent-box-guides/AGENTS.robot.md -> web/etc/agent-box-guides/AGENTS.agent.md
+web/etc/codex/config.toml -> vm/etc/codex/config.toml
+web/payloads/agent-box-agent-agents-pointer.md -> vm/payloads/agent-box-agent-agents-pointer.md
+web/payloads/agent-box-agent-mark-stopped -> vm/payloads/agent-box-agent-mark-stopped
+web/payloads/agent-box-agent-sessions.json -> vm/payloads/agent-box-agent-sessions.json
+web/payloads/agent-box-claude-hook-settings.json -> vm/payloads/agent-box-claude-hook-settings.json
+web/payloads/agent-box-claude-session-start-hook -> vm/payloads/agent-box-claude-session-start-hook
+web/payloads/agent-box-codex-remote-control -> vm/payloads/agent-box-codex-remote-control
+web/payloads/agent-box-env-exec -> vm/payloads/agent-box-env-exec
+web/payloads/agent-box-session/bin/agent-box-session -> vm/payloads/agent-box-session/bin/agent-box-session
+web/payloads/agent-box-spot-monitor -> vm/payloads/agent-box-spot-monitor
+web/payloads/agent-box-supervisor -> vm/payloads/agent-box-supervisor
+web/units/earlyoom.service -> vm/units/earlyoom.service
