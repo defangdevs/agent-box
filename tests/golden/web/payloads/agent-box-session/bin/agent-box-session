@@ -1,5 +1,5 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
-export AGENT_BOX_AGENTS='claude codex shell'
+export AGENT_BOX_AGENTS='claude codex opencode shell'
 export AGENT_BOX_DEFAULT_AGENT=claude
 # sessions.json lock (issue #254). Pinned in the WRAPPER, not in a unit
 # environment like the supervisor's other AGENT_BOX_*_BIN pins: this CLI

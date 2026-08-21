@@ -12,12 +12,15 @@
 #   - stop semantics (issue 167): a clean agent exit (or agent-box-session
 #     stop) parks the session — listed, flagged stopped, left down — and
 #     restart clears the flag and revives it,
-#   - both agent CLIs installed regardless of what sessions run
+#   - all three agent CLIs installed regardless of what sessions run
 #     (installAgents default),
 #   - the instruction files each harness reads (issue #305): the editable
 #     AGENTS.md plus, for a claude session only, the project-scope and
 #     user-scope CLAUDE.md pointers — seeded IFF absent, never clobbering,
-#     and skipped for codex (reads AGENTS.md natively) and shell sessions,
+#     and skipped for codex/opencode (read AGENTS.md natively) and shell
+#     sessions,
+#   - opencode (issue #80): the new agent's kickoff-prompt marker and
+#     resume-by-session-id path, exercised against the real binary,
 #   - browser tmux clients advertise OSC 8 support, preserving a long hidden
 #     hyperlink target when its visible URL wraps across terminal rows (#18),
 #   - the root tabbed terminal workspace (the settings daemon in
@@ -159,10 +162,11 @@
     )
     machine.succeed(f"grep -qF 'rcname=$USER-$sname' {start_script}")
 
-    # Both agent CLIs are installed even though no session uses codex yet
-    # (installAgents defaults to all supported agents).
+    # All three agent CLIs are installed even though no session uses codex or
+    # opencode yet (installAgents defaults to all supported agents).
     machine.succeed("test -x /run/current-system/sw/bin/claude")
     machine.succeed("test -x /run/current-system/sw/bin/codex")
+    machine.succeed("test -x /run/current-system/sw/bin/opencode")
     machine.succeed("su -s /bin/sh agent -c 'test -x /home/agent/.codex/packages/standalone/current/codex'")
     machine.succeed("test -x /run/current-system/sw/bin/bwrap")
     # Tools agents assume exist resolve by bare name in agent tool shells.
@@ -277,6 +281,15 @@
         machine.wait_until_succeeds("test -f /home/agent/cxdir/AGENTS.md", timeout=60)
         machine.fail("test -e /home/agent/cxdir/CLAUDE.md")
         machine.succeed(as_agent("agent-box-session rm cx"))
+
+        # opencode reads AGENTS.md natively too — same as codex, above.
+        machine.succeed(as_agent("mkdir -p /home/agent/ocdir"))
+        machine.succeed(as_agent(
+            "agent-box-session add ocdir --agent opencode --cwd /home/agent/ocdir"
+        ))
+        machine.wait_until_succeeds("test -f /home/agent/ocdir/AGENTS.md", timeout=60)
+        machine.fail("test -e /home/agent/ocdir/CLAUDE.md")
+        machine.succeed(as_agent("agent-box-session rm ocdir"))
 
         # A shell session gets neither: no agent there reads them.
         machine.succeed(as_agent("mkdir -p /home/agent/shdir"))
@@ -812,6 +825,68 @@
         assert "-c sandbox_mode=workspace-write" in careful_cmd, careful_cmd
         assert "--dangerously-bypass-approvals-and-sandbox" not in careful_cmd, careful_cmd
         machine.succeed(as_agent("agent-box-session rm careful"))
+
+    with subtest("opencode: agent-box-session add accepts the new agent name"):
+        machine.succeed(as_agent("agent-box-session add --agent opencode"))
+        machine.wait_until_succeeds(tmux("has-session -t =opencode"), timeout=60)
+        machine.succeed(f'jq -e \'.sessions.opencode.agent == "opencode"\' {sfile}')
+        machine.succeed(as_agent("agent-box-session rm opencode"))
+
+    with subtest("opencode: kickoff prompt is stamped with the marker, resume finds it"):
+        # opencode has nothing like claude's --session-id (mint-your-own) or
+        # codex's rollout-per-session files, so resume identity works the
+        # same way codex's does: stamp "[agent-box session <bid>]" into the
+        # kickoff prompt, then find it again via opencode_session_id. Unlike
+        # the codex tests above, this drives the REAL opencode binary (no
+        # stub) — no provider/API key is configured in this VM and it has no
+        # network, but that turns out not to matter: verified live against
+        # opencode 1.18.18 that the TUI writes the kickoff prompt into its
+        # session database as soon as it starts, well before it would ever
+        # reach a model. One write, as with vcodex/careful above, so the
+        # supervisor's first spawn already sees the final config.
+        machine.succeed(
+            as_agent(
+                'jq \'.sessions.oc1 = {agent: "opencode", skipPermissions: true, '
+                'remoteControl: false, remoteControlName: null, '
+                'workingDirectory: null, extraArgs: [], '
+                'initialPrompt: "do the opencode thing", resumePrompt: null, '
+                f"boxSessionId: null, hasRun: false}}' {sfile} > {sfile}.t "
+                f"&& mv {sfile}.t {sfile}"
+            )
+        )
+        machine.wait_until_succeeds(tmux("has-session -t =oc1"), timeout=60)
+        oc_start_cmd = machine.wait_until_succeeds(
+            tmux('list-panes -t "=oc1" -F "#{pane_start_command}"'), timeout=60
+        )
+        unescaped = oc_start_cmd.replace("\\", "")
+        assert "--auto" in unescaped, oc_start_cmd
+        assert "do the opencode thing" in unescaped, oc_start_cmd
+        bid_match = re.search(r"agent-box session ([0-9a-f-]{36})", unescaped)
+        assert bid_match, unescaped
+        bid = bid_match.group(1)
+
+        # Give the TUI a moment to actually render and submit that first
+        # message into its shared SQLite database before killing it.
+        machine.wait_until_succeeds(
+            as_agent(
+                "/run/current-system/sw/bin/opencode db "
+                f"\"select 1 from part where data like '%agent-box session {bid}%';\" "
+                "--format tsv | grep -qx 1"
+            ),
+            timeout=60,
+        )
+
+        # A respawn must resume that exact session by id, not stamp a fresh
+        # marker over a second, orphaned one.
+        machine.succeed(tmux("kill-session -t =oc1"))
+        machine.wait_until_succeeds(tmux("has-session -t =oc1"), timeout=60)
+        resumed_cmd = machine.wait_until_succeeds(
+            tmux('list-panes -t "=oc1" -F "#{pane_start_command}"'), timeout=60
+        )
+        resumed = resumed_cmd.replace("\\", "")
+        assert "--session ses_" in resumed, resumed
+        assert "agent-box session" not in resumed, resumed
+        machine.succeed(as_agent("agent-box-session rm oc1"))
 
     # --- segment rotation: respawn follows the recorded live id -----------
     with subtest("segment rotation: respawn resumes the recorded live id"):

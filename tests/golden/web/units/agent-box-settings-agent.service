@@ -5,7 +5,7 @@ Requires=agent-box-settings-agent.socket
 Wants=network-online.target
 
 [Service]
-Environment="AGENT_BOX_AGENTS=claude,codex,shell"
+Environment="AGENT_BOX_AGENTS=claude,codex,opencode,shell"
 Environment="AGENT_BOX_DEFAULT_AGENT=claude"
 Environment="AGENT_BOX_HOME=1"
 Environment="AGENT_BOX_HOOK_SPAWN_CMD=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook-spawn/bin/agent-box-webhook-spawn"
