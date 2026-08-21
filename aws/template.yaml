@@ -129,13 +129,15 @@ Parameters:
 
   PublicIpv4:
     Type: String
-    Default: 'false'
+    Default: 'true'
     AllowedValues: ['true', 'false']
     Description: >-
-      false (default): IPv6-only. No public IPv4 charge (~$0/mo for the
-      network address). Requires the client to have IPv6 connectivity.
-      true: allocate an Elastic IP for a stable IPv4. ~$3.60/mo per AWS's
-      2024 IPv4 pricing (charged for any public IPv4, EIP or not).
+      true (default): allocate an Elastic IP for a stable IPv4, so the box is
+      reachable regardless of the client's own connectivity. ~$3.60/mo per
+      AWS's 2024 IPv4 pricing (charged for any public IPv4, EIP or not).
+      false: IPv6-only, no public IPv4 charge (~$0/mo for the network
+      address) — set this only if you know the client reaching the box has
+      real IPv6 connectivity (corporate/coffee-shop networks often don't).
 
   Nat64:
     Type: String
@@ -195,9 +197,10 @@ Parameters:
       - Your URL is derived from the instance IP via sslip.io and changes if
         the public IP changes, so always read $AGENT_BOX_URL rather than
         hard-coding the hostname.
-      - The box is IPv6-only by default; IPv4-only sites such as github.com
-        are reached through a public NAT64 relay, so expect the occasional
-        IPv4 reachability quirk.
+      - The box has a public IPv4 by default. If this stack was launched with
+        PublicIpv4=false instead (IPv6-only), IPv4-only sites such as
+        github.com are reached through a public NAT64 relay, so expect the
+        occasional IPv4 reachability quirk.
       - Low on disk? Enlarge the EBS root volume in the EC2 console and reboot
         — NixOS grows the filesystem automatically; scheduled nix garbage
         collection also reclaims space.

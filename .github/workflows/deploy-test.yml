@@ -60,7 +60,8 @@ jobs:
     #    connectivity smoke tests. On-demand (UseSpot=false): a Spot reclaim
     #    mid-test reads as a black-holed EIP, indistinguishable from a real
     #    provisioning bug (two back-to-back runs on 2026-07-07).
-    #  - ipv6-outputs: exercises the DEFAULT IPv6-only path. The runner can't
+    #  - ipv6-outputs: forces PublicIpv4=false, exercising the IPv6-only opt-out
+    #    from the template's PublicIpv4=true default. The runner can't
     #    connect over IPv6, so this leg only asserts the stack reaches
     #    CREATE_COMPLETE and its outputs populate. That still catches template
     #    resolution bugs (e.g. the old EIPAssoc dependency) and empty-GetAtt bugs

@@ -96,7 +96,7 @@ Template source: [`aws/lightsail-template.yaml`](./aws/lightsail-template.yaml).
 See [`aws/README.md`](./aws/README.md) for design notes and the S3-hosting
 setup.
 
-### Alternative: EC2 template (Spot, IPv6-only)
+### Alternative: EC2 template (Spot, IPv6 opt-in)
 
 The original EC2 template is still published, for accounts that want EC2's
 flexibility: arbitrary instance types, Spot pricing, IaC-native VPC
@@ -111,16 +111,18 @@ can grow in place.
 | eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
 
 It boots a NixOS 26.05 AMI directly (no conversion step; first load ~2-3
-minutes) and defaults to a **persistent Spot** `t4g.medium` on an
-**IPv6-only** network — ~$16-20/mo all-in, dodging AWS's ~$3.60/mo
-public-IPv4 charge. Set `PublicIpv4: true` at launch if your client has no
-IPv6 connectivity (corporate/coffee-shop networks often don't; adds the
-$3.60/mo EIP), and `UseSpot: false` for on-demand (~$27/mo all-in, no
-interruption risk). IPv6-only boxes reach IPv4-only hosts through a free
-public DNS64/NAT64 service ([nat64.net](https://nat64.net)); set
-`Nat64: false` to opt out. The full cost breakdown, the Spot
-stop-not-terminate behavior, SSM root access, and the other design notes
-live in [aws/README.md](./aws/README.md); template source:
+minutes) and defaults to a **persistent Spot** `t4g.medium` with a public
+**IPv4** address — ~$20-24/mo all-in, including AWS's ~$3.60/mo
+public-IPv4 charge, so the box is reachable regardless of your own
+network's connectivity. Set `PublicIpv4: false` at launch to go IPv6-only
+instead and drop that charge, if you know the client reaching the box has
+real IPv6 connectivity (corporate/coffee-shop networks often don't). Set
+`UseSpot: false` for on-demand (~$31/mo all-in, no interruption risk).
+IPv6-only boxes reach IPv4-only hosts through a free public DNS64/NAT64
+service ([nat64.net](https://nat64.net)); set `Nat64: false` to opt out.
+The full cost breakdown, the Spot stop-not-terminate behavior, SSM root
+access, and the other design notes live in
+[aws/README.md](./aws/README.md); template source:
 [`aws/template.yaml`](./aws/template.yaml).
 
 ## Why
