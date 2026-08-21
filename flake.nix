@@ -402,17 +402,16 @@
           # proof (compiles the system agents would run in).
           vm-closure = self.nixosConfigurations.vm.config.system.build.vm;
 
-          # Interactive VM test: wrong-password basic-auth attempts on the web
-          # terminal get the client IP banned. Needs KVM (or slow TCG); CI
-          # enables /dev/kvm before building this.
-          web-fail2ban = pkgs.testers.runNixOSTest
-            (import ./tests/web-fail2ban.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test: an agent user drops a snippet into ~/sites/
-          # and reloads caddy via the sudoAllowlist rule; the new vhost
-          # serves without any nixos-rebuild.
-          self-serve-domain = pkgs.testers.runNixOSTest
-            (import ./tests/self-serve-domain.nix { agent-box = self.nixosModules.agent-box; });
+          # Interactive VM test for the whole user-facing web surface, in one
+          # guest (issue #312 — this was three tests with the same node
+          # definition): the per-user ~/downloads file drop served behind the
+          # auth gate (issue #132), an agent adding a vhost by writing ~/sites/
+          # and reloading caddy via the sudoAllowlist rule with no
+          # nixos-rebuild (issue #40), and wrong-password basic-auth attempts
+          # getting the client IP banned by the fail2ban jail. Needs KVM (or
+          # slow TCG); CI enables /dev/kvm before building this.
+          web-surface = pkgs.testers.runNixOSTest
+            (import ./tests/web-surface.nix { agent-box = self.nixosModules.agent-box; });
 
           # Interactive VM test: the per-user settings page (issue #36) adds a
           # secret through the browser (behind basic auth), writes the
@@ -437,14 +436,6 @@
           # CRUD routes, all behind the web auth gate.
           sessions = pkgs.testers.runNixOSTest
             (import ./tests/sessions.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test (issue #132): each web user's ~/downloads
-          # file-drop dir is served behind the terminal's basic auth at
-          # /<user>/downloads/, so an agent can hand a produced file to the
-          # user as a URL — perms/symlink, caddy reachability, and the auth
-          # gate.
-          download-files = pkgs.testers.runNixOSTest
-            (import ./tests/download-files.nix { agent-box = self.nixosModules.agent-box; });
 
           # Interactive VM test (issue #101): the per-user webhook receiver, ON
           # BY DEFAULT. Socket-activated 0660 <user>:caddy ingress, the
