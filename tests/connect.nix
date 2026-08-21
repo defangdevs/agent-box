@@ -173,9 +173,14 @@ in
 
 
     def tmux(cmd):
-        return (
-            "su -s /bin/sh agent -c 'env TMUX_TMPDIR=/run/agent-box-agent "
-            "tmux -L agent-box " + cmd + "'"
+        # Route through as_agent's shlex.quote rather than splicing cmd into
+        # a hand-written single-quoted string: cmd itself carries quotes
+        # (e.g. "list-sessions -F '#S'"), and naive splicing closes the
+        # outer quote early, leaving a bare # that swallows the rest as a
+        # shell comment (agent-box#317's CI failure).
+        return as_agent(
+            "env TMUX_TMPDIR=/run/agent-box-agent "
+            "tmux -L agent-box " + cmd
         )
 
 
