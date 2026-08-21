@@ -89,6 +89,20 @@
             ];
           };
         };
+        # A third governed watch, for the review-verdict clause (#255).
+        # Its own topic for the same reason as mention-demo: one spawn per
+        # key, and the cases below need three declines and one spawn.
+        "github:defangdevs/review-demo" = {
+          note = "managed: review watch (test)";
+          when = {
+            all = [
+              { path = "action"; "in" = [ "submitted" ]; }
+              { path = "review.state"; "in" = [ "approved" "changes_requested" "commented" ]; }
+              { path = "pull_request.user.login"; "in" = [ "box-bot" ]; }
+              { path = "sender.login"; notIn = [ "box-bot" ]; }
+            ];
+          };
+        };
       };
     };
     system.stateVersion = "25.05";
@@ -962,6 +976,13 @@
         " agent-box-webhook subscribe defangdevs/mention-demo --deliver-to subagent"
         " --note 'to be governed too'"
     )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/review-demo --deliver-to subagent"
+        " --note 'to be governed as well'"
+    )
     machine.succeed("systemctl restart agent-box-webhook-agent.service")
     machine.wait_for_unit("agent-box-webhook-agent.service")
     machine.wait_until_succeeds(
@@ -1109,6 +1130,92 @@
     ).strip()
     machine.succeed(
         "sudo -u agent env HOME=/home/agent agent-box-session rm " + mention_session
+    )
+
+    # --- a review verdict on the box's OWN PR spawns a session (#255) --------
+    # The hole this closes: the last event that could start a session for a PR
+    # the box wrote was a CI FAILURE. Success ended the box's involvement, so
+    # an approved, green, own PR waited for a human indefinitely — and a
+    # changes-requested review, which is a direct instruction, reached nobody
+    # unless a session happened to still hold the topic. The session that opens
+    # a PR is usually gone by then.
+    #
+    # Every leaf here is `in`/`notIn` on a path GitHub already sends, so unlike
+    # the mention clause above this needs no new operator.
+    machine.succeed(
+        "jq -e '.topics[] | select(.topic == \"github:defangdevs/review-demo\")"
+        " | .when.all[2].path == \"pull_request.user.login\"'"
+        " /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+
+    def post_review(name, state, author, sender, action="submitted"):
+        client.succeed(
+            "cat > /tmp/" + name + ".json <<'EOF'\n"
+            '{"action":"' + action + '",'
+            '"review":{"state":"' + state + '","body":"a verdict"},'
+            '"pull_request":{"number":7,"title":"a pr",'
+            '"user":{"login":"' + author + '"}},'
+            '"repository":{"full_name":"defangdevs/review-demo"},'
+            '"sender":{"login":"' + sender + '"}}\n'
+            "EOF"
+        )
+        sig = client.succeed(
+            "openssl dgst -sha256 -hmac " + secret + " -r /tmp/" + name
+            + ".json | cut -d' ' -f1"
+        ).strip()
+        client.succeed(
+            curl + " -o /dev/null -w '%{http_code}' -X POST"
+            " -H 'content-type: application/json'"
+            " -H 'x-github-event: pull_request_review'"
+            " -H 'x-github-delivery: test-" + name + "'"
+            " -H 'x-hub-signature-256: sha256=" + sig + "'"
+            " --data-binary @/tmp/" + name + ".json"
+            " https://box.test/agent/webhook/github | grep -x 200"
+        )
+
+    declined_review = (
+        "journalctl -u agent-box-webhook-agent --no-pager"
+        " | grep -c 'not spawning for pull_request_review on defangdevs/review-demo'"
+    )
+    review_session = (
+        "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-review\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+
+    # A review on somebody ELSE's PR is that person's business. This is the
+    # leaf that keeps the clause from spawning on every review in the org.
+    post_review("review-other", "changes_requested", "human", "human")
+    machine.wait_until_succeeds('test "$(' + declined_review + ')" -ge 1', timeout=30)
+    machine.fail(review_session)
+
+    # The box reviewing its own PR must not wake itself — same job the sender
+    # leaf does in the assignment and mention clauses.
+    post_review("review-self", "changes_requested", "box-bot", "box-bot")
+    machine.wait_until_succeeds('test "$(' + declined_review + ')" -ge 2', timeout=30)
+
+    # A dismissal is the REMOVAL of a verdict, and GitHub rewrites review.state
+    # to "dismissed" on that action, so it falls outside the state list by
+    # construction. Asserted, not assumed: this is the one exclusion a reader
+    # would otherwise expect to ride the clause.
+    post_review("review-dismissed", "dismissed", "box-bot", "human",
+                action="dismissed")
+    machine.wait_until_succeeds('test "$(' + declined_review + ')" -ge 3', timeout=30)
+    machine.fail(review_session)
+
+    # The verdict that must land. "changes requested" and not "approved" on
+    # purpose: an approval is the case #255 was filed about, and this is the
+    # case Lio asked for on top of it — a denial is an instruction too, and the
+    # payload spells it lowercase, so a rule copied from the REST API's
+    # uppercase spelling would match nothing here.
+    post_review("review-hit", "changes_requested", "box-bot", "human")
+    machine.wait_until_succeeds(review_session, timeout=60)
+
+    verdict_session = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-review\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent agent-box-session rm " + verdict_session
     )
 
     # --- the settings page shows and deletes subscriptions (#227) -----------

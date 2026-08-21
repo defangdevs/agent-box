@@ -4073,15 +4073,18 @@ in
         # the box's own repos, IF one exists. Current policy: spawn a triage
         # session for issues/PRs entering the queue (opened/reopened) unless
         # the box's own login created them, for terminal CI failures whoever
-        # triggered the run, and for an issue or PR somebody ASSIGNS to the box
-        # (a work request, #253); everything else — closes, merges, pushes,
-        # green or in-flight CI — is not worth a session. On a box whose
+        # triggered the run, for an issue or PR somebody ASSIGNS to the box or
+        # a comment that MENTIONS it by name (both direct work requests,
+        # #253/#296), and for any review verdict on a PR the box itself wrote
+        # (#255); everything else — closes, merges, pushes, green or in-flight
+        # CI, reviews of other people's PRs — is not worth a session. On a box whose
         # sessions never subscribed a defangdevs watch this default matches no
         # entry and does nothing; set it to { } to opt out entirely.
         default = {
           "github:defangdevs/*" = {
             note = "standing watch: unowned defangdevs activity (new issues, outside PRs, failing CI, "
-              + "issues/PRs assigned to this box, comments that mention it) — "
+              + "issues/PRs assigned to this box, comments that mention it, reviews "
+              + "on its own PRs) — "
               + "rules managed by services.agent-box.webhook.watchPolicy and re-applied when the "
               + "receiver daemon starts, so edit the NixOS config, not this entry";
             when =
@@ -4145,6 +4148,44 @@ in
                       { path = "action"; "in" = [ "created" "edited" ]; }
                       { path = "sender.login"; notIn = [ "defangdevs" ]; }
                       { path = "comment.body"; contains = [ "@defangdevs" ]; }
+                    ];
+                  }
+                  # A review verdict on a PR the box WROTE is the answer to
+                  # work it is already waiting on, so every verdict starts a
+                  # session — not the approval alone (#255). "Approved" means
+                  # merge it; "changes requested" means fix it; a review whose
+                  # state is only "commented" is a batch of review notes, which
+                  # is the same request in a softer voice. All three are news.
+                  # Nothing else on this event is: a green PR nobody reviewed
+                  # must not merge itself, and the CI clauses below stay
+                  # failure-only for the same reason.
+                  #
+                  # `pull_request.user.login` is what keeps the rule narrow —
+                  # a review on somebody ELSE's PR is that person's business,
+                  # even on the box's own repos. It is a plain `in` leaf on a
+                  # path GitHub already sends, so unlike the mention clause
+                  # this needs no new operator and no pin bump.
+                  #
+                  # Two payload spellings to keep straight. `review.state` is
+                  # LOWERCASE on the webhook ("changes_requested"); the REST
+                  # API spells the same value uppercase, so a rule copied from
+                  # API docs matches nothing. And there is no "denied" state at
+                  # all — "changes_requested" IS the denial.
+                  #
+                  # `action = "dismissed"` is deliberately absent. GitHub
+                  # rewrites review.state to "dismissed" on that action, so it
+                  # cannot ride this clause anyway, and a withdrawn verdict is
+                  # the removal of news rather than news.
+                  #
+                  # The sender leaf does the same job as in the two clauses
+                  # above: the session answers the review on the PR, and a
+                  # self-review must not wake another one.
+                  {
+                    all = [
+                      { path = "action"; "in" = [ "submitted" ]; }
+                      { path = "review.state"; "in" = [ "approved" "changes_requested" "commented" ]; }
+                      { path = "pull_request.user.login"; "in" = [ "defangdevs" ]; }
+                      { path = "sender.login"; notIn = [ "defangdevs" ]; }
                     ];
                   }
                   { path = "workflow_run.conclusion"; "in" = ciFailure; }
