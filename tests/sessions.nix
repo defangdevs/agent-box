@@ -237,21 +237,22 @@
             "grep -F /etc/agent-box-guides/AGENTS.agent.md /home/agent/AGENTS.md"
             " >/dev/null"
         )
-        # Project scope imports the sibling notes file by RELATIVE path: a
-        # project-scope import cannot climb out of the project tree.
-        machine.succeed("grep -Fx '@AGENTS.md' /home/agent/CLAUDE.md >/dev/null")
-        # User scope carries the canonical guide, the one scope whose imports
-        # reach outside the project tree at all.
+        # Project scope is a plain symlink to the sibling notes file.
+        machine.succeed("test -L /home/agent/CLAUDE.md")
+        machine.succeed("readlink /home/agent/CLAUDE.md | grep -Fx AGENTS.md")
+        # User scope is a plain symlink straight at the canonical guide, so
+        # it stays live across box updates without ever being reseeded.
+        machine.succeed("test -L /home/agent/.claude/CLAUDE.md")
         machine.succeed(
-            "grep -Fx '@/etc/agent-box-guides/AGENTS.agent.md' "
-            "/home/agent/.claude/CLAUDE.md >/dev/null"
+            "readlink /home/agent/.claude/CLAUDE.md"
+            " | grep -Fx /etc/agent-box-guides/AGENTS.agent.md"
         )
         # That target is readable by the agent and not writable by it.
         machine.succeed(as_agent("test -r /etc/agent-box-guides/AGENTS.agent.md"))
         machine.fail(as_agent("test -w /etc/agent-box-guides/AGENTS.agent.md"))
-        for seeded in ["/home/agent/AGENTS.md", "/home/agent/CLAUDE.md",
-                       "/home/agent/.claude/CLAUDE.md"]:
-            machine.succeed(f"stat -c '%U %a' {seeded} | grep -x 'agent 644'")
+        machine.succeed("stat -c '%U %a' /home/agent/AGENTS.md | grep -x 'agent 644'")
+        for seeded in ["/home/agent/CLAUDE.md", "/home/agent/.claude/CLAUDE.md"]:
+            machine.succeed(f"stat -c '%U' {seeded} | grep -x agent")
 
         # Nothing is ever clobbered: a directory that already holds both files
         # keeps its own content, so a repo checkout's CLAUDE.md and any hand
