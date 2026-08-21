@@ -1,0 +1,30 @@
+{
+  "domain": "golden.example.org",
+  "hostLabel": "golden.example.org",
+  "agents": ["claude", "codex"],
+  "defaultAgent": "claude",
+  "repo": "defangdevs/agent-box",
+  "rev": "0000000000000000000000000000000000000000",
+  "protectMemory": true,
+  "sudoAllowlist": ["/usr/bin/systemctl restart my-app.service"],
+  "web": { "enable": true },
+  "webhook": {
+    "repo": "defangdevs/local-channels",
+    "script": "/etc/agent-box/webhook.py"
+  },
+  "users": {
+    "agent": {
+      "root": true,
+      "sessions": {
+        "main": { "agent": "claude" },
+        "review": { "agent": "codex", "cwd": "/home/agent/agent-box" }
+      }
+    },
+    "robot": {
+      "agent": "codex",
+      "environment": { "AGENT_BOX_EXTRA": "1" },
+      "environmentFiles": ["/etc/agent-box/robot.extra.env"],
+      "sessions": { "main": { "agent": "codex" } }
+    }
+  }
+}

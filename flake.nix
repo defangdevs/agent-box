@@ -467,6 +467,49 @@
               printf 'runtime profile payloads match modules/src\n' > "$out"
             '';
 
+          # Issue #154 Phase 4: the native backend's render is reviewable the
+          # same way the NixOS one is. tests/test_agentbox.py renders
+          # tests/native/config.{json,yaml} into a tree and diffs it against
+          # the committed tests/native/expected fixture, so a change to what
+          # a native box gets shows up in the pull request. The render is
+          # then handed to `caddy validate`, which is the check the golden
+          # fixture cannot do: a Caddyfile that adapts and provisions, not
+          # just one whose bytes are expected.
+          agentbox-render =
+            pkgs.runCommand "agent-box-agentbox-render-ok"
+              {
+                nativeBuildInputs = [
+                  (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
+                  pkgs.caddy
+                ];
+                repo = builtins.path {
+                  path = ./.;
+                  name = "agent-box-src";
+                  filter = path: type:
+                    let base = builtins.baseNameOf path; in
+                    base != "result" && base != ".git";
+                };
+              } ''
+              cp -rT --no-preserve=mode,ownership "$repo" repo
+              cd repo
+              python3 tests/test_agentbox.py -v 2>&1 | tail -20
+
+              # The rendered Caddyfile must be a config caddy accepts. Env
+              # placeholders are resolved from a throwaway env file with a
+              # real argon2id hash — an invalid hash fails provisioning, so
+              # this also proves the auth block is wired the way caddy wants.
+              hash=$(printf 'test-password-1234\n' \
+                | caddy hash-password --algorithm argon2id)
+              for u in AGENT ROBOT; do
+                printf 'WEB_PASSWORD_HASH_%s=%s\n' "$u" "$hash"
+                printf 'WEB_PASSWORD_ALGORITHM_%s=argon2id\n' "$u"
+                printf 'WEB_COOKIE_SECRET_%s=%s\n' "$u" deadbeef
+              done > caddy.env
+              caddy validate --envfile caddy.env --adapter caddyfile \
+                --config tests/native/expected/etc/agent-box/Caddyfile
+              printf 'agentbox render matches tests/native/expected\n' > "$out"
+            '';
+
           module-generated-up-to-date =
             pkgs.runCommand "agent-box-module-generated-up-to-date"
               {
