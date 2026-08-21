@@ -1156,24 +1156,28 @@ CONNECT_LINGER = 60
 # a separate keypress after a settle delay (this exact failure is
 # documented in raphaeltm/simple-agent-manager's setup-token driver).
 CONNECT_ENTER_DELAY = 1.0
-# gh's web flow prints the code, then waits on a keypress before it
-# starts polling. Answer that prompt for the user.
-CONNECT_PROMPT_WAIT = 6.0
-CONNECT_PROMPT_STEP = 0.25
 CONNECT_STATUS_TTL = 5.0
 CONNECT_EXIT_RE = re.compile(r"\[agent-box\] exit=(\d+)")
 CONNECT_URL_RE = re.compile(r"https://[^\s<>'\"`]+")
 # The one-time code a device flow displays IN the pane (gh, codex).
 # Claude's flow shows no code here — the user copies it from the browser.
-CONNECT_CODE_RE = re.compile(
-    r"code[^A-Za-z0-9]{0,12}([A-Z0-9][A-Z0-9-]{3,31})", re.IGNORECASE
-)
-# Words the code pattern above happily matches out of the surrounding
-# prose ("Paste code here", "code: none"). A real one-time code is never
-# one of them, and rendering one as if it were would send the user to the
-# device page with a word to type.
+#
+# Matched by SHAPE, not by proximity to the word "code": hyphen-joined
+# groups of upper-case alphanumerics, which is what both real CLIs print
+# ("EC7A-D4B8" for gh, "56D0-6G7MP" for codex). Anchoring on the word
+# instead read the codex card's prose back at the user — its first line
+# is "…sign in with ChatGPT using device code authorization:", so
+# "code authorization" rendered as the code AUTHORIZATION, while the real
+# code, printed two lines further down under "Enter this one-time code",
+# was never matched at all. Case-sensitive, and a hyphen is required, so
+# ordinary words cannot pose as a code.
+CONNECT_CODE_RE = re.compile(r"\b([0-9A-Z]{3,8}(?:-[0-9A-Z]{3,8}){1,3})\b")
+# Upper-case hyphenated words these CLIs print that are NOT codes.
+# Rendering one as if it were would send the user to the device page with
+# a word to type.
 CONNECT_PROSE = frozenset(("HERE", "NONE", "NULL", "TRUE", "FALSE",
-                           "PROMPTED", "ABOVE", "BELOW"))
+                           "PROMPTED", "ABOVE", "BELOW", "ONE-TIME",
+                           "SIGN-IN", "DEVICE-AUTH", "READ-ONLY"))
 # What the user may paste back. Printable, no whitespace, bounded: the
 # value is typed into a tmux pane as literal keys, never into a shell.
 CONNECT_CODE_MAX = 512
@@ -1214,13 +1218,23 @@ for _pair in os.environ.get("AGENT_BOX_CONNECT_BINS", "").split():
 
 def parse_claude_status(proc):
     """`claude auth status` answers JSON — the one structured signal in
-    the set, so success is never a guess about rendered prose."""
+    the set, so success is never a guess about rendered prose.
+
+    It reports "loggedIn" for an environment key too, and for ANY value of
+    one: a stale ANTHROPIC_API_KEY answers `{"loggedIn": true,
+    "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"}` without
+    the key ever being tried. The card cannot validate it — nothing local
+    can — so it names the source instead of implying a checked account.
+    """
     try:
         data = json.loads(proc.stdout or "{}")
     except ValueError:
         return (False, "")
     if not isinstance(data, dict) or not data.get("loggedIn"):
         return (False, "")
+    source = str(data.get("apiKeySource") or "")
+    if source and source != "none":
+        return (True, "using " + source)
     who = str(data.get("email")
               or data.get("orgName")
               or data.get("authMethod")
@@ -1608,6 +1622,8 @@ def connect_state(flow, keys=None, tmux_state=None):
             connect_cancel(flow_id)
             state = "expired"
         else:
+            if flow["prompt_re"] is not None:
+                connect_answer_prompt(flow, text)
             url = connect_trusted_url(text, flow["hosts"])
             code = connect_user_code(text) if flow["show_code"] else None
             state = "waiting" if url else "starting"
@@ -1637,6 +1653,36 @@ def connect_state(flow, keys=None, tmux_state=None):
     }
 
 
+def connect_server_path():
+    """The PATH a SESSION's pane gets, read off the tmux server.
+
+    A pane this daemon creates inherits the tmux CLIENT's environment —
+    ours — and this unit deliberately carries no agent PATH (coreutils,
+    findutils, grep, sed, systemd; no git, no gh, no node). That is not a
+    cosmetic difference: `gh auth login` shells out to `git` to read the
+    credential helper /etc/gitconfig configures for github.com, and with
+    no git on PATH it cannot, so it opens with an interactive
+    "Authenticate Git with your GitHub credentials? (Y/n)" that nothing
+    answers — the card sat at "Starting the sign-in…" until the pane
+    expired, with no URL and no code, because gh never got as far as
+    asking GitHub for one.
+
+    The tmux server's global environment IS the agent unit's, so a pane
+    started with it looks like the terminal the user would have used. Only
+    PATH is lifted: the sign-in pane deliberately carries no session
+    secrets (see `unset`), and the env store is the supervisor's job.
+    """
+    proc = tmux("show-environment", "-g", "PATH")
+    if proc is None or proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        # "PATH=..." when set; "-PATH" when the server has it unset.
+        if line.startswith("PATH="):
+            value = line[len("PATH="):]
+            return value or None
+    return None
+
+
 def connect_start(flow):
     """Start the flow's own sign-in command in its own tmux session."""
     flow_id = flow["id"]
@@ -1656,25 +1702,38 @@ def connect_start(flow):
     # until then. Both are shell-level, so no CLI has to cooperate.
     script = "%s; printf '\\n[agent-box] exit=%%s\\n' \"$?\"; sleep %d" % (
         inner, CONNECT_LINGER)
+    # In the script, not `new-session -e PATH=...`: tmux honours -e for any
+    # other variable but the pane's PATH comes from the CLIENT regardless
+    # (measured on tmux 3.6a — an -e FOO reaches the pane while an -e PATH
+    # beside it is dropped), and this client is the settings daemon.
+    server_path = connect_server_path()
+    if server_path:
+        script = "export PATH=%s; %s" % (shlex.quote(server_path), script)
     tmux("new-session", "-d", "-s", connect_pane(flow_id),
          "-x", str(CONNECT_COLS), "-y", str(CONNECT_ROWS), script)
-    if flow["prompt_re"] is not None:
-        connect_answer_prompt(flow)
     return connect_state(flow)
 
 
-def connect_answer_prompt(flow):
-    """Press Enter once the CLI asks for it (gh's web flow waits for a
-    keypress before it starts polling). Bounded: a CLI that never asks
-    simply gets no keypress."""
-    deadline = time.monotonic() + CONNECT_PROMPT_WAIT
-    while time.monotonic() < deadline:
-        text = connect_capture(flow["id"])
-        if text and flow["prompt_re"].search(text):
-            tmux("send-keys", "-t", connect_target(flow["id"]), "C-m")
-            return True
-        time.sleep(CONNECT_PROMPT_STEP)
-    return False
+def connect_answer_prompt(flow, text):
+    """Press Enter for the user when the CLI is sitting on a keypress it
+    waits for (gh's web flow does this before it starts polling).
+
+    Answered from the pane's CURRENT tail on every render rather than in a
+    bounded loop at start-up: the loop blocked the POST for its whole
+    window and then gave up for good, so a CLI that took longer than that
+    to print its prompt — a slow device-code request is all it takes — was
+    left holding a keypress nobody would ever send, showing the user a URL
+    and a code for a flow that had not started polling and never would.
+
+    Only the last non-empty line is matched, so a prompt that has already
+    been answered (its line is no longer the tail) is not answered twice,
+    and one that is still waiting gets another keypress on the next poll.
+    """
+    line = next((x for x in reversed((text or "").splitlines()) if x.strip()), "")
+    if not flow["prompt_re"].search(line):
+        return False
+    tmux("send-keys", "-t", connect_target(flow["id"]), "C-m")
+    return True
 
 
 def connect_send_code(flow, code):

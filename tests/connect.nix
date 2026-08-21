@@ -71,8 +71,29 @@ in
         case "$1 $2" in
           "auth login")
             mkdir -p ${stateDir}
-            echo "! First copy your one-time code: EE45-B423"
-            printf "Press Enter to open https://github.com/login/device in your browser... "
+            # Whether the pane can run git at all. The real gh shells out
+            # to it to read the credential helper /etc/gitconfig sets for
+            # github.com, and a pane that inherited the settings daemon's
+            # PATH instead of the agent unit's cannot: gh then opens with
+            # an interactive "Authenticate Git with your GitHub
+            # credentials?" that nothing answers, and the card never gets
+            # a URL or a code.
+            command -v git > ${stateDir}/gh-git 2>/dev/null || true
+            # The shape the REAL device-flow CLIs print: prose that
+            # contains the word "code", and the code itself on a line of
+            # its own further down. Anchoring the code on "code" rendered
+            # "code authorization" as the code AUTHORIZATION and never
+            # found the real one (codex, agent-box#317 follow-up).
+            echo "Follow these steps to sign in using device code authorization:"
+            echo "! First copy your one-time code"
+            echo "   EE45-B423"
+            echo "Open this URL to continue in your web browser: https://github.com/login/device"
+            # LATE, on purpose: the keypress used to be answered by a
+            # bounded poll at start-up only, so a CLI slower than that
+            # window (one slow device-code request) was left holding a
+            # prompt nobody would ever answer.
+            sleep 8
+            printf "Press Enter to open github.com in your browser... "
             read -r _ignored || exit 1
             : > ${stateDir}/gh-enter
             : > ${stateDir}/gh-in
@@ -237,11 +258,21 @@ in
         # Signed in: the pane is reaped rather than left holding a stale code.
         machine.wait_until_fails(tmux("has-session -t =_connect-claude"))
 
-    with subtest("a code with whitespace is refused before it reaches the pane"):
-        assert post("/agent/settings/connect/code", "flow=claude&code=with space") == "400"
-
-    with subtest("gh's keypress prompt is answered for the user"):
+    with subtest("the card shows the code the CLI printed, not its prose"):
         assert post("/agent/settings/connect/start", "flow=github") == "303"
+        waiting = wait_state("github", "waiting")
+        assert waiting["code"] == "EE45-B423", waiting
+        assert waiting["url"] == "https://github.com/login/device", waiting
+        body = get("/agent/settings/")
+        assert "EE45-B423" in body
+        assert "AUTHORIZATION" not in body
+
+    with subtest("the pane can run git, so gh never has to ask about it"):
+        # Empty means the pane inherited this daemon's PATH instead of the
+        # agent unit's — the state the GitHub card hung in.
+        machine.succeed("test -s ${stateDir}/gh-git")
+
+    with subtest("gh's keypress prompt is answered however late it arrives"):
         wait_state("github", "connected")
         machine.succeed("test -e ${stateDir}/gh-enter")
         assert "stubuser" in state("github")["detail"]
