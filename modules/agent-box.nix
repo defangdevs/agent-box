@@ -8607,8 +8607,10 @@ CONNECT_SECTION_TPL = """<section>
 # server-side can bridge tmux's paste buffer to the browser clipboard
 # either). xterm.js's own fallback is holding Shift (Option on a Mac)
 # while dragging, which forces its native DOM selection — and that in
-# turn is what ttyd auto-copies on selection change. Surfacing that here
-# is the fix; it is not something a tmux or ttyd config flag can restore.
+# turn is what ttyd auto-copies on selection change. On Mac that fallback
+# also needed a ttyd flag (macOptionClickForcesSelection=true, next to
+# the ttyd ExecStart below) since xterm.js ships it off by default; this
+# hint is the other half — telling people the gesture exists at all.
 HOME_BODY = """<body class="ws">
 <div id="msg-slot">{message}</div>
 <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}">
@@ -11498,6 +11500,19 @@ if __name__ == "__main__":
             "-b" "/${name}"
             "-t" "disableLeaveAlert=true"
             "-t" "titleFixed=${name}@${cfg.web.domain}"
+            # Issue #327: xterm.js's Shift-drag bypass of tmux mouse
+            # tracking (see the HOME_BODY hint above) is gated off on Mac
+            # entirely — xterm.js's SelectionService.shouldForceSelection
+            # checks Option (Alt), not Shift, when Browser.isMac, and
+            # that check is itself gated by macOptionClickForcesSelection,
+            # which defaults to false and which ttyd never sets. Without
+            # this flag there is NO modifier-click escape hatch on Mac at
+            # all, confirmed live on Safari and Chrome on a Mac (reported
+            # against #327). This is one of ttyd's passthrough `-t`
+            # client options (same mechanism as disableLeaveAlert/
+            # titleFixed above): it lands on the xterm.js Terminal
+            # instance verbatim, so it only needs setting once, here.
+            "-t" "macOptionClickForcesSelection=true"
             (toString attachScript)
           ];
         };
