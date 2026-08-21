@@ -421,6 +421,9 @@
           settings-page = pkgs.testers.runNixOSTest
             (import ./tests/settings-page.nix { agent-box = self.nixosModules.agent-box; });
 
+          connect = pkgs.testers.runNixOSTest
+            (import ./tests/connect.nix { agent-box = self.nixosModules.agent-box; });
+
           # Interactive VM test (issue 62): protectMemory defaults — zram
           # swap active, agent unit's OOMScoreAdjust applied, and earlyoom
           # kills a runaway memory hog while the box stays responsive

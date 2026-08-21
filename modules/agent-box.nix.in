@@ -729,6 +729,19 @@ let
       map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
       ++ [ "shell=${utils.toShellPath config.users.users.${name}.shell}" ]
     );
+  # Guided sign-in cards (issues #207, #208, #313): "<id>=<binary>" pairs
+  # naming the CLI each card drives. The settings daemon runs the tool's
+  # OWN sign-in command (`claude auth login`, `codex login --device-auth`,
+  # `gh auth login --web`) in its own tmux session and never handles a
+  # token, so a card exists only where its binary does — an agent left out
+  # of installAgents simply has no card. Absolute paths because that
+  # daemon's unit deliberately carries no agent PATH; a VM test overrides
+  # this variable to point an id at a stub.
+  connectBins = lib.concatStringsSep " " (
+    map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
+    ++ [ "github=${pkgs.gh}/bin/gh" ]
+  );
+
   # AGENTS.md — cross-vendor agent-instructions file (codex and opencode
   # read it natively; claude does NOT — it reaches this file only through
   # the CLAUDE.md symlink seeded in supervisor.sh). What we SEED into $HOME
@@ -2199,6 +2212,11 @@ in
           AGENT_BOX_SESSIONS_FILE = userSessionsFile name;
           AGENT_BOX_AGENTS = lib.concatStringsSep "," (sessionKinds cfg.installAgents);
           AGENT_BOX_DEFAULT_AGENT = cfg.agent;
+          # Guided sign-in (issues #207, #208, #313). The daemon starts
+          # these in a tmux session on the AGENT unit's server, so the
+          # credential is written in the same namespace a terminal sign-in
+          # would have written it in.
+          AGENT_BOX_CONNECT_BINS = connectBins;
           AGENT_BOX_PASSWORD_CMD =
             "/run/wrappers/bin/sudo -n ${passwordHelperCmdOf name}";
         } // lib.optionalAttrs (name == rootUser) {
