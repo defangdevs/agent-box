@@ -1327,6 +1327,8 @@ CONNECT_DEFS = [
 ]
 
 _connect_status_cache = {}
+_connect_probing = set()
+_connect_lock = threading.Lock()
 
 
 def connect_flows():
@@ -1399,18 +1401,53 @@ def connect_run(flow, args, timeout=15):
         return None
 
 
-def connect_status(flow, refresh=False):
-    """(connected, detail) straight from the CLI, cached for a few
-    seconds: the page renders three of these and then polls, and each
-    call forks a real binary."""
+def connect_probe(flow):
+    """Ask one CLI whether it is signed in, off the request path."""
+    try:
+        proc = connect_run(flow, flow["status"])
+        value = (False, "") if proc is None else CONNECT_PARSERS[flow["parse"]](proc)
+        with _connect_lock:
+            _connect_status_cache[flow["id"]] = (time.monotonic(), value)
+    finally:
+        with _connect_lock:
+            _connect_probing.discard(flow["id"])
+
+
+def connect_expire(flow_id):
+    """Mark this flow's cached status stale, keeping the value.
+
+    Used the moment the CLI exits: the cached answer predates the sign-in
+    it just finished, so the next read must re-probe. The value is kept so
+    the card still has something to render, and the stamp — not the entry —
+    is what is dropped, so a probe landing concurrently is never lost.
+    """
+    with _connect_lock:
+        hit = _connect_status_cache.get(flow_id)
+        if hit:
+            _connect_status_cache[flow_id] = (0.0, hit[1])
+
+
+def connect_status(flow):
+    """Cached (connected, detail), or None while nothing is known yet.
+
+    This NEVER blocks the request. A render asks every card, each answer
+    forks a real CLI, and `gh auth status` talks to GitHub — so a slow or
+    unreachable network held the whole settings page, past the 10s client
+    timeout, for a page that has nothing to do with these cards (caught by
+    settings-page.nix, not by connect.nix, which stubs the CLIs). A stale
+    answer plus a background refresh is the right trade for a status pill:
+    the page polls, and the truth lands a beat later.
+    """
     now = time.monotonic()
-    hit = _connect_status_cache.get(flow["id"])
-    if hit and not refresh and now - hit[0] < CONNECT_STATUS_TTL:
-        return hit[1]
-    proc = connect_run(flow, flow["status"])
-    value = (False, "") if proc is None else CONNECT_PARSERS[flow["parse"]](proc)
-    _connect_status_cache[flow["id"]] = (now, value)
-    return value
+    with _connect_lock:
+        hit = _connect_status_cache.get(flow["id"])
+        stale = not hit or now - hit[0] >= CONNECT_STATUS_TTL
+        if stale and flow["id"] not in _connect_probing:
+            _connect_probing.add(flow["id"])
+            threading.Thread(
+                target=connect_probe, args=(flow,), daemon=True
+            ).start()
+    return hit[1] if hit else None
 
 
 def tmux_sessions():
@@ -1509,14 +1546,17 @@ def connect_error(text):
     return tail[:CONNECT_ERROR_MAX]
 
 
-def connect_state(flow, refresh=False, keys=None, tmux_state=None):
+def connect_state(flow, keys=None, tmux_state=None):
     """What the card shows, derived from the CLI and the pane — never
     from anything the daemon stored."""
     flow_id = flow["id"]
     server_up, live = tmux_sessions() if tmux_state is None else tmux_state
     running = connect_pane(flow_id) in live
-    connected, detail = connect_status(flow, refresh=refresh)
-    state = "connected" if connected else "idle"
+    status = connect_status(flow)
+    connected, detail = status if status is not None else (False, "")
+    # "checking" is not "signed out": saying the latter before the CLI has
+    # answered would invite a sign-in the box does not need.
+    state = "connected" if connected else ("idle" if status is not None else "checking")
     url = code = error = None
     if running:
         text = connect_capture(flow_id) or ""
@@ -1525,8 +1565,17 @@ def connect_state(flow, refresh=False, keys=None, tmux_state=None):
             connect_cancel(flow_id)
             running = False
         elif CONNECT_EXIT_RE.search(text):
-            state = "failed"
-            error = connect_error(text)
+            # The CLI is done. Trust ITS exit code over our cached status,
+            # which predates the exchange: a 0 means it believes the
+            # sign-in worked, and flashing "Not signed in" for the two
+            # seconds until the next probe lands would be a lie at exactly
+            # the wrong moment.
+            if CONNECT_EXIT_RE.search(text).group(1) == "0":
+                connect_expire(flow_id)
+                state = "exchanging"
+            else:
+                state = "failed"
+                error = connect_error(text)
         elif (connect_age(flow_id) or 0) > CONNECT_TTL:
             connect_cancel(flow_id)
             state = "expired"
@@ -1578,7 +1627,7 @@ def connect_start(flow):
          "-x", str(CONNECT_COLS), "-y", str(CONNECT_ROWS), script)
     if flow["prompt_re"] is not None:
         connect_answer_prompt(flow)
-    return connect_state(flow, refresh=True)
+    return connect_state(flow)
 
 
 def connect_answer_prompt(flow):
@@ -1604,7 +1653,7 @@ def connect_send_code(flow, code):
     tmux("send-keys", "-t", target, "-l", code)
     time.sleep(CONNECT_ENTER_DELAY)
     tmux("send-keys", "-t", target, "C-m")
-    return connect_state(flow, refresh=True)
+    return connect_state(flow)
 
 
 def connect_cancel(flow_id):
@@ -2554,9 +2603,11 @@ def render_connect_card(state):
         "starting": ("starting", "Starting…"),
         "failed": ("failed", "Not signed in"),
         "expired": ("failed", "Sign-in expired"),
+        "exchanging": ("starting", "Finishing sign-in&hellip;"),
         "idle": ("stopped", "Not signed in"),
+        "checking": ("stopped", "Checking&hellip;"),
     }[state["state"]]
-    if state["state"] in ("waiting", "starting"):
+    if state["state"] in ("waiting", "starting", "checking", "exchanging"):
         label, confirm = None, False
     elif state["blocked"]:
         label, confirm = None, False
@@ -2611,6 +2662,9 @@ def render_connect_step(state):
     if state["state"] == "starting":
         return (f'<li class="conn-step"><p class="note">Starting the '
                 f'sign-in&hellip;</p>{cancel}</li>')
+    if state["state"] == "exchanging":
+        return ('<li class="conn-step"><p class="note">The CLI finished '
+                'signing in &mdash; confirming with it now&hellip;</p></li>')
     if state["state"] in ("failed", "expired") and state["error"]:
         return (f'<li class="conn-step"><p class="note conn-error">'
                 f'{html.escape(state["error"])}</p></li>')
@@ -2649,7 +2703,10 @@ def render_connect():
     tmux_state = tmux_sessions()
     states = [connect_state(flow, keys=keys, tmux_state=tmux_state)
               for flow in connect_flows()]
-    busy = "1" if any(s["state"] in ("starting", "waiting") for s in states) else "0"
+    busy = "1" if any(
+        s["state"] in ("starting", "waiting", "checking", "exchanging")
+        for s in states
+    ) else "0"
     cards = "".join(render_connect_card(s) for s in states)
     return CONNECT_SECTION_TPL.format(
         cards='<ul class="tbl">' + cards + "</ul>", busy=busy)

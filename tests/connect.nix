@@ -209,8 +209,8 @@ in
         assert "GitHub" in body
         # codex is not in installAgents, so it has no card.
         assert ">Codex<" not in body
-        assert state("claude")["state"] == "idle"
-        assert state("github")["state"] == "idle"
+        wait_state("claude", "idle")
+        wait_state("github", "idle")
 
     with subtest("start opens one pane and the card links the trusted URL"):
         assert post("/agent/settings/connect/start", "flow=claude") == "303"
@@ -247,7 +247,7 @@ in
         wait_state("claude", "waiting")
         assert post("/agent/settings/connect/cancel", "flow=claude") == "303"
         machine.wait_until_fails(tmux("has-session -t =_connect-claude"))
-        assert state("claude")["state"] == "idle"
+        wait_state("claude", "idle")
 
     with subtest("a hand-set env key still wins, and the card says so"):
         assert post("/agent/settings/set", "key=GH_TOKEN&value=ghp_manual") == "303"
@@ -261,6 +261,14 @@ in
         # authenticate perfectly through this key. The stub reports the
         # source, so the card can be checked for it.
         wait_detail("github", "envuser (GH_TOKEN)")
+
+    with subtest("rendering the page never waits on a CLI"):
+        # The probes run in a background thread; a render that forked three
+        # real CLIs held the settings page past its client timeout.
+        machine.succeed(
+            as_agent(f"{sock} --max-time 5 -o /dev/null -w '%{{http_code}}' {page}")
+            + " | grep -x 200 >/dev/null"
+        )
 
     with subtest("an unknown flow is a 404, not a started pane"):
         assert post("/agent/settings/connect/start", "flow=nope") == "404"
