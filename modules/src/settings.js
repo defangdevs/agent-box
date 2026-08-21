@@ -712,7 +712,13 @@
   });
   document.addEventListener("focusin", function (e) {
     var input = e.target;
-    if (input && input.hasAttribute && input.hasAttribute("data-dir-input")) { acFetch(input); }
+    if (input && input.hasAttribute && input.hasAttribute("data-dir-input")) {
+      // The field starts on the untouched default "~": select it so the
+      // first keystroke replaces it instead of appending, which is what
+      // produced an invalid "~docu" (issue #308).
+      if (input.value === "~") { input.select(); }
+      acFetch(input);
+    }
   });
   document.addEventListener("focusout", function (e) {
     var input = e.target;
