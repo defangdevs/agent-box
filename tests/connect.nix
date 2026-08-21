@@ -42,10 +42,15 @@ in
             read -r code || exit 1
             [ -n "$code" ] || exit 1
             printf '%s' "$code" > ${stateDir}/claude-code
-            if [ "$code" = "bad" ]; then
-              echo "OAuth error: Request failed with status code 400"
-              exit 1
-            fi
+            # Prefix, not equality: the daemon refuses a code under four
+            # characters before it reaches this pane, so the test cannot
+            # send a bare "bad".
+            case "$code" in
+              bad*)
+                echo "OAuth error: Request failed with status code 400"
+                exit 1
+                ;;
+            esac
             : > ${stateDir}/claude-in
             echo "Login successful."
             ;;
@@ -235,20 +240,6 @@ in
     with subtest("a code with whitespace is refused before it reaches the pane"):
         assert post("/agent/settings/connect/code", "flow=claude&code=with space") == "400"
 
-    with subtest("a rejected code reports the CLI's complaint, not the transcript"):
-        machine.succeed("rm -f ${stateDir}/claude-in")
-        assert post("/agent/settings/connect/start", "flow=claude") == "303"
-        wait_state("claude", "waiting")
-        assert post("/agent/settings/connect/code", "flow=claude&code=badcode1") == "303"
-        failed = wait_state("claude", "failed")
-        # The CLI's own line, and ONLY that: not the instructions, not the
-        # URL, and not the echo of the prompt the code was typed into (which
-        # carries the code itself).
-        assert "status code 400" in failed["error"], failed
-        assert "badcode1" not in failed["error"], failed
-        assert "claude.com" not in failed["error"], failed
-        assert post("/agent/settings/connect/cancel", "flow=claude") == "303"
-
     with subtest("gh's keypress prompt is answered for the user"):
         assert post("/agent/settings/connect/start", "flow=github") == "303"
         wait_state("github", "connected")
@@ -265,6 +256,20 @@ in
         assert post("/agent/settings/connect/cancel", "flow=claude") == "303"
         machine.wait_until_fails(tmux("has-session -t =_connect-claude"))
         wait_state("claude", "connected")
+
+    with subtest("a rejected code reports the CLI's complaint, not the transcript"):
+        machine.succeed("rm -f ${stateDir}/claude-in")
+        assert post("/agent/settings/connect/start", "flow=claude") == "303"
+        wait_state("claude", "waiting")
+        assert post("/agent/settings/connect/code", "flow=claude&code=badcode1") == "303"
+        failed = wait_state("claude", "failed")
+        # The CLI's own line, and ONLY that: not the instructions, not the
+        # URL, and not the echo of the prompt the code was typed into (which
+        # carries the code itself).
+        assert "status code 400" in failed["error"], failed
+        assert "badcode1" not in failed["error"], failed
+        assert "claude.com" not in failed["error"], failed
+        assert post("/agent/settings/connect/cancel", "flow=claude") == "303"
 
     with subtest("cancel kills the pane"):
         machine.succeed("rm -f ${stateDir}/claude-in")
