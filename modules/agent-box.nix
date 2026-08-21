@@ -4628,20 +4628,26 @@ in
           PrivateTmp = true;
           PrivateDevices = true;              # keeps pty subsystem; blocks /dev/mem etc.
           ProtectSystem = "strict";           # entire fs read-only except explicit RW paths
-          # ~/sites is a SYMLINK to /var/lib/agent-box-sites/<name>, so a write
-          # through it resolves outside /home and ProtectSystem=strict denied it
-          # with EROFS — the self-serve vhost flow the guide documents was
-          # impossible from inside the agent's own namespace. ReadWritePaths
-          # matches on the resolved path, so the target has to be listed too.
-          # The dir is tmpfiles-created (sysinit, well before this unit), so it
-          # always exists by unit start and needs no `-` prefix — but ONLY when
-          # web.enable is on, since that is what gates the tmpfiles rule. Listing
-          # it unconditionally fails the whole namespace setup with 226/NAMESPACE
-          # on a default (web-less) box, so the unit never starts at all: no `-`
-          # here, an explicit guard instead, so a dir that is genuinely missing
-          # while web is on stays loud rather than silently reverting to EROFS.
+          # ~/sites and ~/downloads are SYMLINKS to /var/lib/agent-box-{sites,
+          # downloads}/<name>, so a write through either resolves outside /home
+          # and ProtectSystem=strict denied it with EROFS — both flows the guide
+          # documents (serve a vhost by writing a snippet; hand the user a file
+          # by moving it into ~/downloads) were impossible from inside the
+          # agent's own namespace. ReadWritePaths matches on the resolved path,
+          # so the targets have to be listed too.
+          # Both dirs are tmpfiles-created (sysinit, well before this unit), so
+          # they always exist by unit start and need no `-` prefix — but ONLY
+          # when web.enable is on, since that is what gates the tmpfiles rules.
+          # Listing them unconditionally fails the whole namespace setup with
+          # 226/NAMESPACE on a default (web-less) box, so the unit never starts
+          # at all: no `-` here, an explicit guard instead, so a dir that is
+          # genuinely missing while web is on stays loud rather than silently
+          # reverting to EROFS.
           ReadWritePaths = [ "/home/${name}" ]
-            ++ lib.optional cfg.web.enable "/var/lib/agent-box-sites/${name}";
+            ++ lib.optionals cfg.web.enable [
+                 "/var/lib/agent-box-sites/${name}"
+                 (downloadsDirOf name)
+               ];
           ProtectKernelTunables = true;
           ProtectKernelModules = true;
           ProtectControlGroups = true;
