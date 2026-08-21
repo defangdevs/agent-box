@@ -46,7 +46,7 @@ Metadata:
       PublicIpv4:
         default: Allocate a public IPv4 (costs ~$3.60/mo)
       Nat64:
-        default: "IPv6-only mode: reach IPv4-only sites (github.com) via public NAT64"
+        default: "If IPv6-only (PublicIpv4=false): reach IPv4-only sites (github.com) via public NAT64"
       AllowCidr:
         default: IPv4 CIDR allowed to reach 443
       EnableSsm:
