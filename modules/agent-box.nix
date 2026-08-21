@@ -2645,8 +2645,13 @@ $PROMPT"
           there).
 
           AGENTS.md is the cross-vendor agent-instructions convention read
-          natively by codex and opencode, and by claude-code as a fallback
-          when CLAUDE.md is absent. The agent's systemd env exports
+          natively by codex and opencode. claude-code does NOT read it — it
+          discovers CLAUDE.md only (issue #305) — so a claude session also
+          gets two symlinks, seeded IFF absent:
+          <workingDirectory>/CLAUDE.md points at the AGENTS.md beside it, and
+          ~/.claude/CLAUDE.md points at the canonical guide under /etc. Both
+          follow this option: agentsMd = null seeds neither.
+          The agent's systemd env exports
           AGENT_BOX_URL whenever this user has a browser terminal (see
           web.passwordHashFile), so an AGENTS.md that references that variable
           lets the agent answer "where am I reachable?" without hard-coding
@@ -2698,17 +2703,19 @@ $PROMPT"
       map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
       ++ [ "shell=${utils.toShellPath config.users.users.${name}.shell}" ]
     );
-  # AGENTS.md — cross-vendor agent-instructions file (codex, opencode
-  # native; claude-code as CLAUDE.md fallback). What we SEED into $HOME is
-  # deliberately minimal and EDITABLE: a short notes header plus a claude
-  # `@import` of the read-only canonical guide at canonicalAgentsPath, so
-  # the up-to-date guidance is pulled in at load time without ever
-  # overwriting the agent's own edits. The canonical file itself is
-  # published via environment.etc and refreshed on every box update.
+  # AGENTS.md — cross-vendor agent-instructions file (codex and opencode
+  # read it natively; claude does NOT — it reaches this file only through
+  # the CLAUDE.md symlink seeded in supervisor.sh). What we SEED into $HOME
+  # is deliberately minimal and EDITABLE: a short notes header that NAMES the
+  # read-only canonical guide at canonicalAgentsPath, so the agent's own
+  # edits are never overwritten. The canonical file itself is published via
+  # environment.etc and refreshed on every box update.
   # null (agentsMd = null) opts out of seeding entirely.
-  # NOTE: claude-code expands `@path` imports; codex does not, so on a
-  # codex session the import line shows literally — the guide then has to
-  # be read explicitly from canonicalAgentsPath.
+  # NOTE: this file carries no `@import` of the guide, because no harness
+  # would act on one here — codex does not expand `@path` at all, and claude
+  # never reads AGENTS.md in the first place (issue #305); claude gets the
+  # guide through the ~/.claude/CLAUDE.md symlink in supervisor.sh instead.
+  # Every other harness reads the path named below.
   agentsMdPointer = name: u:
     if u.agentsMd == null then null
     else pkgs.writeText "agent-box-${name}-agents-pointer.md" ''
@@ -2717,11 +2724,33 @@ $PROMPT"
       This file is yours to edit; anything you add here persists across
       restarts. The canonical agent-box guide (environment, secrets,
       serving files, self-update) is read-only and auto-updated on every
-      box update — it is imported below and also readable directly at
+      box update. A claude session loads it automatically through
+      ~/.claude/CLAUDE.md; on any other harness, read it yourself at
       ${canonicalAgentsPath name}.
-
-      @${canonicalAgentsPath name}
     '';
+
+  # CLAUDE.md — claude-code's ONLY instruction-file name (issue #305).
+  # Measured on claude-code 2.1.233: AGENTS.md is never discovered (in that
+  # binary the name occurs only in its Codex importer and its /init prompt),
+  # so the AGENTS.md seeded above reached no claude session at all. Fixed
+  # with two plain symlinks (seeded IFF absent in supervisor.sh, so a repo
+  # checkout's own CLAUDE.md or a hand edit survives), one per memory SCOPE:
+  #   - PROJECT scope (<workingDirectory>/CLAUDE.md) -> the sibling
+  #     AGENTS.md — the agent's own editable notes.
+  #   - USER scope (~/.claude/CLAUDE.md) -> the canonical guide at
+  #     canonicalAgentsPath.
+  # A symlink is resolved by the filesystem before claude ever sees the
+  # path, so — unlike a claude `@import`, which resolves a PROJECT-scope
+  # target only inside the project tree and drops one above it silently —
+  # there is no scope restriction to route around here; each symlink just
+  # names its target directly. Each file supplies exactly what the other
+  # cannot, and the guide stays live across box updates (canonicalAgentsPath
+  # is a stable environment.etc path that NixOS repoints on every rebuild)
+  # without this symlink ever needing to be reseeded.
+  # Neither symlink needs a generated derivation: the project-scope target
+  # is the constant "AGENTS.md", hardcoded in supervisor.sh; the user-scope
+  # target is exported below as a plain string (canonicalAgentsPath), for
+  # supervisor.sh to `ln -s`.
 
   # The per-user SUPERVISOR (issue #59). One hardened unit per user; the tmux
   # server and every session — including ones added at runtime — are children
@@ -3406,15 +3435,38 @@ $PROMPT"
         rm -f "$HOME"/.claude/remote-settings.json
         seed_claude_state "$wd" "$skip"
       fi
-      # Seed the minimal editable AGENTS.md (which @imports the read-only
-      # canonical guide) IFF absent, so the agent's own edits or a repo
-      # checkout there never get clobbered. Not for shell sessions: no agent
-      # reads it there, and scratch dirs shouldn't get littered. Unset (the
-      # user opted out with agentsMd = null) seeds nothing.
+      # Seed the minimal editable AGENTS.md (points at the read-only canonical
+      # guide) IFF absent, so the agent's own edits or a repo checkout there
+      # never get clobbered. Not for shell sessions: no agent reads it there,
+      # and scratch dirs shouldn't get littered. Unset (the user opted out with
+      # agentsMd = null) seeds nothing.
       if [ -n "''${AGENT_BOX_AGENTS_POINTER:-}" ] \
            && [ "$agent" != shell ] && [ ! -e "$wd/AGENTS.md" ]; then
         mkdir -p "$wd"
         install -m 0644 "$AGENT_BOX_AGENTS_POINTER" "$wd/AGENTS.md"
+      fi
+      # claude reads CLAUDE.md and NEVER AGENTS.md (issue #305), so the file
+      # seeded above reaches a claude session only through a symlink. Two are
+      # needed, one per memory scope: the project-scope one points at the
+      # sibling AGENTS.md (relative target — a symlink, unlike a claude
+      # `@import`, has no trouble reaching outside the project tree, but
+      # AGENTS.md happens to sit right beside it), and the user-scope one
+      # points straight at the canonical /etc guide, so it stays live across
+      # box updates without ever being reseeded. Both IFF absent, so a repo's
+      # own CLAUDE.md and any hand edits survive; the notes symlink only when
+      # there IS an AGENTS.md beside it to point at (the line above just made
+      # sure of that, unless the user opted out or something else owns the
+      # file).
+      if [ "$agent" = claude ]; then
+        if [ -n "''${AGENT_BOX_AGENTS_POINTER:-}" ] \
+             && [ -e "$wd/AGENTS.md" ] && [ ! -e "$wd/CLAUDE.md" ]; then
+          ln -s AGENTS.md "$wd/CLAUDE.md"
+        fi
+        if [ -n "''${AGENT_BOX_CLAUDE_GUIDE_TARGET:-}" ] \
+             && [ ! -e "$HOME/.claude/CLAUDE.md" ]; then
+          mkdir -p "$HOME"/.claude
+          ln -s "$AGENT_BOX_CLAUDE_GUIDE_TARGET" "$HOME"/.claude/CLAUDE.md
+        fi
       fi
       # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
       # time, not unit start — then execs the agent (issue 89), so
@@ -4487,6 +4539,11 @@ in
           // (lib.optionalAttrs (agentsMdPointer name u != null) {
             # Seeded-AGENTS.md pointer file; unset = agentsMd null opt-out.
             AGENT_BOX_AGENTS_POINTER = "${agentsMdPointer name u}";
+            # Symlink target for the claude user-scope CLAUDE.md (issue
+            # #305): AGENTS.md alone reaches no claude session. Same
+            # opt-out as above; the project-scope symlink's target is the
+            # constant "AGENTS.md", hardcoded in supervisor.sh.
+            AGENT_BOX_CLAUDE_GUIDE_TARGET = canonicalAgentsPath name;
           })
           // (lib.optionalAttrs webhookEnabled {
             # Doubles as the supervisor's "webhook receiver is live" flag
