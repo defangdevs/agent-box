@@ -47,13 +47,34 @@
       .then(function (r) { if (!r.ok) { throw new Error(); } return r.json(); })
       .catch(function () { return null; });
   }
+  // Re-fetch the page this script is running on.
+  //
+  // The daemon can decide the current URL is no longer the right page:
+  // /<user>/ redirects to the settings page once the last session is gone.
+  // Splicing fragments out of THAT answer patches nothing — applyDoc skips an
+  // id the other document does not have — so the tab bar would sit there
+  // showing a session that no longer exists until someone reloaded by hand.
+  // Follow the redirect for real instead.
+  function fetchPage() {
+    var here = window.location.pathname;
+    return fetch(here + window.location.search).then(function (r) {
+      if (r.redirected && new URL(r.url).pathname !== here) {
+        window.location.replace(r.url);
+        return null;
+      }
+      return r.text();
+    });
+  }
   // Re-fetch the current page and patch the live session list/tabs, so
   // the visible list tracks a restart even when nothing was "starting"
   // at submit time (which is what otherwise gates schedulePoll).
   function pollPageOnce() {
-    return fetch(window.location.pathname + window.location.search)
-      .then(function (r) { return r.text(); })
-      .then(function (t) { applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]); wsSync(); })
+    return fetchPage()
+      .then(function (t) {
+        if (t === null) { return; }
+        applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+        wsSync();
+      })
       .catch(function () {});
   }
   // Coalescing wrapper for the live feed, which can report a burst of
@@ -222,9 +243,9 @@
       pollTimer = null;
       // Keep the query string: on the workspace it carries ?tab=, so
       // the fetched tab bar marks the same tab current.
-      fetch(window.location.pathname + window.location.search)
-        .then(function (r) { return r.text(); })
+      fetchPage()
         .then(function (t) {
+          if (t === null) { return; }
           applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
           wsSync();
           schedulePoll();
@@ -249,9 +270,8 @@
     connectTimer = window.setTimeout(function () {
       connectTimer = null;
       if (document.hidden) { connectPoll(); return; }
-      fetch(window.location.pathname + window.location.search)
-        .then(function (r) { return r.text(); })
-        .then(function (t) { applyDoc(parseHTML(t), ["connect-list"]); })
+      fetchPage()
+        .then(function (t) { if (t !== null) { applyDoc(parseHTML(t), ["connect-list"]); } })
         .catch(function () {})
         .then(function () { connectPoll(); });
     }, 2500);
@@ -393,8 +413,10 @@
     var el;
     if (tabLive(name)) {
       el = document.createElement("iframe");
+      // data-term-base is this user's own path with its trailing slash;
+      // a session hangs off it as a path segment, not a query.
       el.src = tabBar().getAttribute("data-term-base") +
-               "?arg=" + encodeURIComponent(name);
+               encodeURIComponent(name) + "/";
       el.title = name + " terminal";
       el.setAttribute("allow", "clipboard-read; clipboard-write");
       el.className = "pane";
@@ -424,7 +446,8 @@
     document.querySelectorAll("#panes .pane").forEach(function (p) {
       p.classList.toggle("active", p === pane);
     });
-    history.replaceState(null, "", "/?tab=" + encodeURIComponent(name));
+    history.replaceState(null, "", bar.getAttribute("data-term-base") +
+                         "?tab=" + encodeURIComponent(name));
     if (focus && pane.tagName === "IFRAME") {
       try { pane.contentWindow.focus(); } catch (err) { /* cross-origin never happens; be safe */ }
     }
