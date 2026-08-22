@@ -393,8 +393,10 @@
     var el;
     if (tabLive(name)) {
       el = document.createElement("iframe");
+      // data-term-base is this user's own path with its trailing slash;
+      // a session hangs off it as a path segment, not a query.
       el.src = tabBar().getAttribute("data-term-base") +
-               "?arg=" + encodeURIComponent(name);
+               encodeURIComponent(name) + "/";
       el.title = name + " terminal";
       el.setAttribute("allow", "clipboard-read; clipboard-write");
       el.className = "pane";
@@ -424,7 +426,8 @@
     document.querySelectorAll("#panes .pane").forEach(function (p) {
       p.classList.toggle("active", p === pane);
     });
-    history.replaceState(null, "", "/?tab=" + encodeURIComponent(name));
+    history.replaceState(null, "", bar.getAttribute("data-term-base") +
+                         "?tab=" + encodeURIComponent(name));
     if (focus && pane.tagName === "IFRAME") {
       try { pane.contentWindow.focus(); } catch (err) { /* cross-origin never happens; be safe */ }
     }

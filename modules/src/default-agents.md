@@ -1,10 +1,11 @@
 # agent-box
 
 You run inside an agent-box deployment: a coding agent in a persistent tmux
-session on a locked-down NixOS host. Your browser terminal is at
-$AGENT_BOX_URL (`echo $AGENT_BOX_URL` prints it). Share that URL with anyone
-who needs to view or take over your session; the sign-in username is your
-own login name (`whoami`) and the password was set at deploy time.
+session on a locked-down NixOS host. Your workspace is at $AGENT_BOX_URL
+(`echo $AGENT_BOX_URL` prints it): one tab per session, and each session also
+has a terminal of its own at ${AGENT_BOX_URL}<session>/. Share those URLs
+with anyone who needs to view or take over your session; the sign-in username
+is your own login name (`whoami`) and the password was set at deploy time.
 
 The user connects to this box over the web, so point them at full absolute
 URLs built from $AGENT_BOX_URL — never a bare local path or a link relative

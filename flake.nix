@@ -218,6 +218,68 @@
               printf 'downloads route present in generated Caddyfile\n' > "$out"
             '';
 
+          # Guard: the module's REAL generated Caddyfile (every VM test swaps
+          # in a `tls internal` stand-in) must give each session a path of
+          # its own — /<user>/<session>/ rewritten onto ttyd's own path with
+          # the session in ?arg= — and must keep the bare /<user>/ landing
+          # page pointed at the settings daemon. It also has to PARSE: a
+          # typo in a matcher here takes the whole web UI down at once, and
+          # nothing else in CI adapts this file. Cheap: realises only the
+          # tiny rendered config, then adapts it with stand-in secrets.
+          session-route =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "sessions.test";
+                        user = "agent";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-session-route-ok"
+              { caddyfile = sys.config.services.caddy.configFile;
+                nativeBuildInputs = [ pkgs.caddy ]; } ''
+              # The landing page is the daemon's, and only without an arg=:
+              # the session routes rewrite onto this same path WITH one, and
+              # ttyd has to keep receiving those.
+              grep -qF 'path /agent/' "$caddyfile"
+              grep -qF 'not query arg=*' "$caddyfile"
+              # One path per session, plus the canonical trailing slash.
+              grep -qF 'path_regexp sess_agent ^/agent/([^/]+)/(.*)$' "$caddyfile"
+              grep -qF 'rewrite @sess_agent /agent/{re.sess_agent.2}?arg={re.sess_agent.1}&{query}' "$caddyfile"
+              grep -qF 'redir @sess_bare_agent /agent/{re.bare_agent.1}/' "$caddyfile"
+              # The names a session may not take are excluded from both, so
+              # the pages that own them keep answering.
+              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/webhook*' "$caddyfile"
+              # Ordering: the rewrite must be emitted before the catch-all it
+              # feeds, and the landing page before it too.
+              rw=$(grep -n 'rewrite @sess_agent' "$caddyfile" | cut -d: -f1)
+              home=$(grep -n 'handle @home_agent {' "$caddyfile" | cut -d: -f1)
+              catchall=$(grep -n 'handle /agent/\* {' "$caddyfile" | cut -d: -f1)
+              [ "$home" -lt "$catchall" ]
+              [ "$rw" -lt "$catchall" ]
+              # And it all parses. The secrets are Caddy env placeholders,
+              # absent in a build sandbox: stand-ins keep basic_auth happy.
+              WEB_PASSWORD_ALGORITHM_AGENT=bcrypt \
+              WEB_PASSWORD_HASH_AGENT='$2a$14$ptCNRCTOMkoUnEXBv0kPWuOJHhYtnpBWQZbLFXW/Ehg5AGKQMoS/W' \
+              WEB_COOKIE_SECRET_AGENT=0123456789abcdef \
+                caddy validate --config "$caddyfile" --adapter caddyfile
+              printf 'per-session routes present and the Caddyfile adapts\n' > "$out"
+            '';
+
           # Guard (issue #101): the module's REAL generated Caddyfile (the VM
           # test below swaps in a `tls internal` stand-in) must route the
           # webhook path to the user's ingress socket, BEFORE the /<user>/*

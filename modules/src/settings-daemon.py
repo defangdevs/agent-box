@@ -103,9 +103,20 @@ SESSIONS_FILE = os.environ.get("AGENT_BOX_SESSIONS_FILE", "")
 # The settings page keeps the session manager list plus secrets +
 # danger zone.
 HOME = os.environ.get("AGENT_BOX_HOME", "") == "1"
+# This user's own space on the vhost: the workspace page at TERM_HOME, the
+# settings page under it, and one path per session. The
+# vhost root is a user picker that lands here — so a bookmark of the
+# handed-out URL opens the box, not a single raw terminal.
+TERM_BASE = "/" + urllib.parse.quote(
+    os.environ.get("AGENT_BOX_SETTINGS_USER", "agent"), safe="")
+TERM_HOME = TERM_BASE + "/"
+# Every terminal user on this box, in the order the vhost lists them, so
+# the root picker can name them. One entry (the norm) means there is
+# nothing to pick and the root redirects straight into it.
+WEB_USERS = [x for x in os.environ.get("AGENT_BOX_WEB_USERS", "").split(",") if x]
 # Where session CRUD routes live, and the page they redirect back to.
 SESS_BASE = "" if HOME else BASE
-SESS_PAGE = "/" if HOME else BASE + "/"
+SESS_PAGE = TERM_HOME if HOME else BASE + "/"
 AGENTS = [a for a in os.environ.get("AGENT_BOX_AGENTS", "claude").split(",") if a]
 DEFAULT_AGENT = os.environ.get("AGENT_BOX_DEFAULT_AGENT", "claude")
 # Full sudo command line that triggers the box update (issue 54). Empty
@@ -166,6 +177,16 @@ KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # it stays far below what a filter.<user>-<session>.json filename allows.
 NAME_MAX = 150
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,%d}$" % NAME_MAX)
+# Names a session may never take: each already means something else under
+# TERM_BASE, and a session path is what the vhost sends everything ELSE
+# there to. A session called "settings" would shadow the settings page —
+# or, worse, be shadowed BY it and become unreachable with no hint why.
+# "token" and "ws" are ttyd's own endpoints, reached without a trailing
+# slash, which is the one shape a session path cannot be told apart from.
+# Mirrored by the CLI's own check and by the module's session-name
+# assertion, so a name is refused wherever it is typed.
+RESERVED_NAMES = frozenset(("settings", "downloads", "webhook", "sessions",
+                            "token", "ws"))
 # Subscription topics: "source:owner/repo", or the prefix "source:owner/*"
 # (local-webhook 0.13.0 dropped "*" and "source:*" as topics). The
 # panel only ever posts back a topic it just rendered, and the CLI is
@@ -184,6 +205,12 @@ TOPIC_RE = re.compile(r"^[A-Za-z0-9_.:/*-]{1,128}$")
 HOME_DIR = os.path.realpath(
     os.environ.get("HOME") or os.path.expanduser("~" + USER)
 )
+
+
+def session_url(name):
+    """Where one session's terminal lives. SESSION_RE names are URL-safe
+    as they stand; the trailing slash is what the vhost matches on."""
+    return TERM_HOME + name + "/"
 
 
 def resolve_browse_dir(raw):
@@ -429,23 +456,28 @@ def gen_session_name(agent, sessions, cwd=None):
     and names nothing) or an absolute path this daemon has resolved. Keeping
     the mirror in session-cli.sh's gen_name in step is deliberate: both
     creation paths must name a session the same way.
+
+    RESERVED_NAMES count as taken: the directory branch below would happily
+    name a session after ~/settings or ~/ws, and that is precisely the name
+    the vhost cannot route to a terminal.
     """
-    if agent not in sessions:
+    taken = set(sessions) | RESERVED_NAMES
+    if agent not in taken:
         return agent
     base = re.sub(r"[^A-Za-z0-9_-]", "-", os.path.basename((cwd or "").rstrip("/")))
     base = base.strip("-")
     if base and len(base) <= NAME_MAX - 2:
-        if base not in sessions:
+        if base not in taken:
             return base
         for suffix in range(2, 10):
             candidate = "%s-%d" % (base, suffix)
-            if candidate not in sessions:
+            if candidate not in taken:
                 return candidate
     # No usable directory name, or nine sessions already work in that one:
     # random cannot collide the way a tenth "-N" guess would.
     for _ in range(1000):
         candidate = "%s-%s" % (agent, secrets.token_hex(2))
-        if candidate not in sessions:
+        if candidate not in taken:
             return candidate
     # Astronomically unlikely fallback: a longer token can't be taken.
     return ("%s-%s" % (agent, secrets.token_hex(8)))[:NAME_MAX]
@@ -2077,12 +2109,12 @@ CONNECT_SECTION_TPL = """<section>
     <div id="connect-list" data-busy="{busy}">{cards}</div>
   </section>"""
 
-# Root page (HOME mode): a tabbed terminal workspace (issue #119) —
-# one tab per session, the active one shown in an iframe onto the
-# existing per-session ttyd URL (/<user>/?arg=<session>; same origin,
-# so the auth cookie and its WebSocket upgrade work unchanged). Tabs
-# are plain ?tab= links so the page works without JS (each click
-# re-renders with the other terminal); SCRIPT upgrades that to
+# The user's landing page (HOME mode): a tabbed terminal workspace
+# (issue #119) — one tab per session, the active one shown in an iframe
+# onto that session's own path (/<user>/<session>/; same origin, so the
+# auth cookie and its WebSocket upgrade work unchanged). Tabs are plain
+# ?tab= links so the page works without JS (each click re-renders with
+# the other terminal); SCRIPT upgrades that to
 # client-side switching with background tabs kept attached. Session
 # CRUD beyond "add" lives on the settings page.
 #
@@ -2123,7 +2155,7 @@ BODY = """<main>
     </svg>
     GitHub
   </a>
-  <a class="back" href="/">&larr; terminal</a>
+  <a class="back" href="{term_home}">&larr; terminal</a>
   <h1><span class="mark">{mark}</span>Settings for {user}</h1>
   <div id="msg-slot">{message}</div>
   {sessions_section}
@@ -2304,7 +2336,7 @@ def render_sessions(subs=None):
     rows tagged with a session name made the reader do that join by eye."""
     entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
     base = html.escape(SESS_BASE)
-    user = urllib.parse.quote(USER, safe="")
+    term = html.escape(TERM_HOME)
     if not entries:
         body = '<li class="empty">No sessions defined.</li>'
     else:
@@ -2370,11 +2402,10 @@ def render_sessions(subs=None):
             else:
                 subject = ""
             row = (
-                # The name deep-links into the terminal via ttyd's
-                # ?arg= session selector. No userinfo in the href
-                # (issue 56). SESSION_RE names are URL-safe as-is.
+                # The name deep-links into that session's own path. No
+                # userinfo in the href (issue 56).
                 f'<span class="nm">'
-                f'<a class="sess" href="/{user}/?arg={safe}"><code>{safe}</code></a>'
+                f'<a class="sess" href="{term}{safe}/"><code>{safe}</code></a>'
                 f'<span class="meta">{agent}</span>'
                 f'<span class="meta" title="Working directory"><code>{cwd}</code></span>'
                 f'{subject}'
@@ -2780,6 +2811,7 @@ def render_tabs(names, live, stopped, selected):
     other tabs out of the bar; title carries it in full."""
     items = []
     base = html.escape(SESS_BASE)
+    home = html.escape(TERM_HOME)
     for name in names:
         safe = html.escape(name)
         cur = ' aria-current="page"' if name == selected else ""
@@ -2791,7 +2823,7 @@ def render_tabs(names, live, stopped, selected):
             state = "starting"
         items.append(
             f'<span class="tab-wrap">'
-            f'<a class="tab" data-tab="{safe}" href="/?tab={safe}"{cur}'
+            f'<a class="tab" data-tab="{safe}" href="{home}?tab={safe}"{cur}'
             f' title="{safe}">'
             f'<span class="state" data-state="{state}"></span>'
             f'<span class="tab-name">{safe}</span></a>'
@@ -2854,10 +2886,8 @@ def render_pane(selected, live, stopped):
         return (f'<div class="pane placeholder active" data-pane="{safe}" '
                 f'data-ph="starting">{safe} is starting&hellip; '
                 f'reload in a few seconds.</div>')
-    user = urllib.parse.quote(USER, safe="")
-    # SESSION_RE names are URL-safe as-is.
     return (f'<iframe class="pane active" data-pane="{safe}" data-ph="live" '
-            f'src="/{user}/?arg={safe}" title="{safe} terminal" '
+            f'src="{html.escape(session_url(selected))}" title="{safe} terminal" '
             f'allow="clipboard-read; clipboard-write"></iframe>')
 
 
@@ -2886,6 +2916,7 @@ def render_page(message=""):
         + BODY.format(
             user=html.escape(USER),
             base=html.escape(BASE),
+            term_home=html.escape(TERM_HOME),
             mark=POTATO_SVG,
             keys=render_keys(read_keys()),
             # Every user, primary included: the HOME root page is the
@@ -2910,6 +2941,31 @@ def render_page(message=""):
     )
 
 
+def render_users():
+    """The vhost root on a box with more than one terminal user: which of
+    them to open. Every user has their own auth on their own path, so this
+    is a list of links and nothing more — it grants no access, and it says
+    which user this browser is already authenticated as."""
+    items = []
+    for name in WEB_USERS:
+        safe = html.escape(name)
+        href = "/" + urllib.parse.quote(name, safe="") + "/"
+        mine = " (you)" if name == USER else ""
+        items.append(
+            f'<li class="conn-row"><div class="conn-head">'
+            f'<strong><a href="{href}">{safe}</a></strong>{mine}</div></li>'
+        )
+    return (
+        render_head("Agent Box")
+        + STYLE
+        + '<main class="wrap"><section class="card"><div class="card-head">'
+        + "<h2>Choose a user</h2></div>"
+        + '<p class="note">Each user has their own terminal, sessions and '
+        + "settings, behind their own sign-in.</p>"
+        + '<ul class="tbl">' + "".join(items) + "</ul></section></main>"
+    )
+
+
 def render_home(message="", selected=None):
     entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
     names = list(entries)
@@ -2918,14 +2974,15 @@ def render_home(message="", selected=None):
     live = live_sessions()
     stopped = {n for n, v in entries.items() if v.get("stopped")}
     # Dismissing keeps the selected tab (SESSION_RE names are URL-safe).
-    msg_html = render_msg(message, "/?tab=" + selected if selected else "/")
+    msg_html = render_msg(
+        message, TERM_HOME + ("?tab=" + selected if selected else ""))
     return (
         render_head("Agent Box &mdash; " + html.escape(USER))
         + STYLE
         + HOME_BODY.format(
             base=html.escape(BASE),
             action_base=html.escape(SESS_BASE),
-            term_base="/%s/" % urllib.parse.quote(USER, safe=""),
+            term_base=html.escape(TERM_HOME),
             tabs=render_tabs(names, live, stopped, selected),
             pane=render_pane(selected, live, stopped),
             new_session_fields=render_new_session_fields(),
@@ -3184,6 +3241,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if "ok" in params:
             message = self.OK_MESSAGES.get(params["ok"][0], "")
         if HOME and parsed.path == "/":
+            # The vhost root picks a USER. With one terminal user — the norm
+            # — there is nothing to pick, so it lands in that user's space,
+            # carrying the query so an old /?tab=<session> bookmark still
+            # opens on its tab.
+            if len(WEB_USERS) > 1:
+                self._send_html(render_users())
+                return
+            self._redirect(query=parsed.query, page=TERM_HOME)
+            return
+        if HOME and parsed.path.rstrip("/") == TERM_BASE:
+            # This user's own landing page. A box with no session has
+            # nothing to show a tab bar for, and the thing its owner
+            # actually needs first is the settings page — sign in, add a
+            # session — so that is where it lands until one exists.
+            if not [n for n in read_sessions() if SESSION_RE.match(n)]:
+                self._redirect(page=BASE + "/")
+                return
             # ?tab=<session> selects the rendered tab (also the no-JS
             # switching mechanism); anything invalid falls back to the
             # default selection inside render_home.

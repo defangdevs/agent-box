@@ -1479,6 +1479,14 @@ in
           message = "services.agent-box.users.${name}: session name \"${sname}\" must match [A-Za-z0-9_-]{1,150}.";
         }
         {
+          # A session's terminal lives at /<user>/<session>/, so these names
+          # are already spoken for: the more specific route wins and the
+          # session would be unreachable with nothing to say why. Mirrored by
+          # the CLI's RESERVED_NAMES and the daemon's.
+          assertion = !(builtins.elem sname [ "settings" "downloads" "webhook" "sessions" "token" "ws" ]);
+          message = "services.agent-box.users.${name}: session name \"${sname}\" is reserved — /${name}/${sname}/ is already a page on the web UI.";
+        }
+        {
           assertion = builtins.elem (if s.agent != null then s.agent else cfg.agent) cfg.installAgents;
           message = "services.agent-box.users.${name}: session \"${sname}\" uses agent \"${if s.agent != null then s.agent else cfg.agent}\", which is not in services.agent-box.installAgents.";
         }
@@ -2190,7 +2198,8 @@ in
             "${pkgs.ttyd}/bin/ttyd"
             "--writable"
             # ?arg=<session> in the URL becomes $1 of the attach wrapper —
-            # session-level deep links from the root sessions page (issue #59).
+            # what the vhost rewrites /<user>/<session>/ onto, so every
+            # session has a URL of its own (issue #59).
             "--url-arg"
             "-p" (toString portOf.${name})
             "-i" "127.0.0.1"
@@ -2235,10 +2244,14 @@ in
           AGENT_BOX_PASSWORD_CMD =
             "/run/wrappers/bin/sudo -n ${passwordHelperCmdOf name}";
         } // lib.optionalAttrs (name == rootUser) {
-          # This daemon also serves the vhost root: GET / is the session
-          # manager (Caddy proxies it here behind the user's auth) and the
-          # session CRUD routes move to /sessions/*.
+          # This daemon also serves the vhost root: GET / picks a user (with
+          # one terminal user, the norm, it redirects straight into them),
+          # the workspace page moved to /<user>/, and the session CRUD
+          # routes live at /sessions/*.
           AGENT_BOX_HOME = "1";
+          # Who the root picker can offer. Only meaningful on the root
+          # daemon, and only when there is more than one name in it.
+          AGENT_BOX_WEB_USERS = lib.concatStringsSep "," terminalUsers;
         } // lib.optionalAttrs webhookEnabled {
           # Webhook subscriptions panel (issue #227). The daemon runs the
           # pinned webhook.py's own CLI once per session, with
