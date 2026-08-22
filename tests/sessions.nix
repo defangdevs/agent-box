@@ -1076,15 +1076,16 @@
     # workspace redirect lands on the new session's tab. The name is always
     # auto-derived from the agent (there is no name field in the form): with
     # no session literally named "claude" yet, the first claude add lands on
-    # the bare-agent-name tab. Assert the raw Location header (h2 lowercases
-    # it, CRLF line ends — no grep -x): what the daemon EMITS is the contract,
-    # curl's %{redirect_url} resolution is not. Any submitted "name" field is
+    # the bare-agent-name tab — on /<user>/, which is where the tab bar lives.
+    # Assert the raw Location header (h2 lowercases it, CRLF line ends — no
+    # grep -x): what the daemon EMITS is the contract, curl's
+    # %{redirect_url} resolution is not. Any submitted "name" field is
     # ignored, so passing a bogus one changes nothing.
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -D - "
         "-d 'name=ignored&agent=claude' "
         "https://box.test/sessions/add "
-        "| grep -i '^location: /?ok=session_added&tab=claude'"
+        "| grep -i '^location: /agent/?ok=session_added&tab=claude'"
     )
     machine.wait_until_succeeds(tmux("has-session -t =claude"), timeout=60)
     machine.succeed(
