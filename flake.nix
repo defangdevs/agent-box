@@ -238,6 +238,11 @@
                       enable = true;
                       agent = "claude";
                       users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      # A SECOND user, because the point of the scheme is
+                      # hosting several on one Caddy (issue #221): every user
+                      # must get their own landing page and session paths, not
+                      # just the one whose daemon serves the vhost root.
+                      users.bob.web.passwordHashFile = "/var/lib/agent-box-web/bob-hash";
                       web = {
                         enable = true;
                         domain = "sessions.test";
@@ -273,11 +278,24 @@
               [ "$rw" -lt "$catchall" ]
               # And it all parses. The secrets are Caddy env placeholders,
               # absent in a build sandbox: stand-ins keep basic_auth happy.
+              # One set PER USER — an unset algorithm placeholder collapses to
+              # nothing and Caddy then reads the login name as the algorithm,
+              # which is its own reason to adapt this file in CI.
               WEB_PASSWORD_ALGORITHM_AGENT=bcrypt \
               WEB_PASSWORD_HASH_AGENT='$2a$14$ptCNRCTOMkoUnEXBv0kPWuOJHhYtnpBWQZbLFXW/Ehg5AGKQMoS/W' \
               WEB_COOKIE_SECRET_AGENT=0123456789abcdef \
+              WEB_PASSWORD_ALGORITHM_BOB=bcrypt \
+              WEB_PASSWORD_HASH_BOB='$2a$14$ptCNRCTOMkoUnEXBv0kPWuOJHhYtnpBWQZbLFXW/Ehg5AGKQMoS/W' \
+              WEB_COOKIE_SECRET_BOB=fedcba9876543210 \
                 caddy validate --config "$caddyfile" --adapter caddyfile
-              printf 'per-session routes present and the Caddyfile adapts\n' > "$out"
+              # The second user gets the same shape, on their own path.
+              grep -qF 'handle @home_bob {' "$caddyfile"
+              grep -qF 'path_regexp sess_bob ^/bob/([^/]+)/(.*)$' "$caddyfile"
+              grep -qF 'rewrite @sess_bob /bob/{re.sess_bob.2}?arg={re.sess_bob.1}&{query}' "$caddyfile"
+              bobrw=$(grep -n 'rewrite @sess_bob' "$caddyfile" | cut -d: -f1)
+              bobcatch=$(grep -n 'handle /bob/\* {' "$caddyfile" | cut -d: -f1)
+              [ "$bobrw" -lt "$bobcatch" ]
+              printf 'per-session routes present for every user, and the Caddyfile adapts\n' > "$out"
             '';
 
           # Guard (issue #101): the module's REAL generated Caddyfile (the VM

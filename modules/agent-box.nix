@@ -9128,7 +9128,12 @@ in
             """The vhost root on a box with more than one terminal user: which of
             them to open. Every user has their own auth on their own path, so this
             is a list of links and nothing more — it grants no access, and it says
-            which user this browser is already authenticated as."""
+            which user this browser is already authenticated as.
+
+            Only the root daemon renders it, so reaching it means holding THAT
+            user's password; everyone else bookmarks their own /<user>/ (which is
+            the page this one links to) and never sees this list.
+            """
             items = []
             for name in WEB_USERS:
                 safe = html.escape(name)
@@ -9433,11 +9438,17 @@ in
                         return
                     self._redirect(query=parsed.query, page=TERM_HOME)
                     return
-                if HOME and parsed.path.rstrip("/") == TERM_BASE:
-                    # This user's own landing page. A box with no session has
-                    # nothing to show a tab bar for, and the thing its owner
-                    # actually needs first is the settings page — sign in, add a
-                    # session — so that is where it lands until one exists.
+                if parsed.path.rstrip("/") == TERM_BASE:
+                    # This user's own landing page — EVERY user's, not just the one
+                    # whose daemon also serves the vhost root: /<user>/ is theirs,
+                    # and the workspace's forms and feed already address SESS_BASE,
+                    # which for a non-primary user is their own settings base. Before
+                    # this, a second user's /<user>/ was their raw terminal.
+                    #
+                    # A box with no session has nothing to show a tab bar for, and
+                    # the thing its owner actually needs first is the settings page —
+                    # sign in, add a session — so that is where it lands until one
+                    # exists.
                     if not [n for n in read_sessions() if SESSION_RE.match(n)]:
                         self._redirect(page=BASE + "/")
                         return
