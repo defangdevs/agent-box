@@ -411,10 +411,23 @@ let
       exit 0
     fi
     # For every entry whose topic is declared: the declaration REPLACES the
-    # managed fields (when/drop/ignoreSenders/note) wholesale — partial merges
-    # would let config and state drift apart. Runtime fields (ttlHours,
-    # renewOnEvent, timestamps) stay the entry's own. Bare-string topics
-    # normalize to the object form webhook.py itself writes.
+    # managed fields (the payload predicates, ignoreSenders, note) wholesale —
+    # partial merges would let config and state drift apart. Runtime fields
+    # (ttlHours, renewOnEvent, timestamps) stay the entry's own. Bare-string
+    # topics normalize to the object form webhook.py itself writes.
+    #
+    # The predicates are written as include/exclude, which is what the pinned
+    # local-webhook PERSISTS: 0.19.0 renamed them, and when/drop live on only
+    # as input aliases it normalizes on read. The public option keeps the old
+    # names — an option must not be renamed out from under a host
+    # configuration — so this is where the two spellings meet.
+    #
+    # BOTH pairs are deleted before the declared rules go in. Clearing only
+    # when/drop left whatever the daemon had already rewritten to
+    # include/exclude in place, and since the loader PREFERS include, a
+    # governed watch then kept running the state's stale rules and ignored the
+    # declaration entirely — the exact drift this "replaces wholesale" is for
+    # (issue #331).
     tmp="$FILE.policy.$$"
     if "$JQ" --slurpfile pol "$POLICY" '
           $pol[0] as $p
@@ -423,9 +436,9 @@ let
               | (if type == "object" then (.topic // "") else "" end) as $t
               | if $t != "" and ($p | has($t)) then
                   $p[$t] as $r
-                  | del(.when, .drop, .ignoreSenders)
-                  | (if $r.when != null then .when = $r.when else . end)
-                  | (if $r.drop != null then .drop = $r.drop else . end)
+                  | del(.when, .drop, .include, .exclude, .ignoreSenders)
+                  | (if $r.when != null then .include = $r.when else . end)
+                  | (if $r.drop != null then .exclude = $r.drop else . end)
                   | (if (($r.ignoreSenders // []) | length) > 0 then .ignoreSenders = $r.ignoreSenders else . end)
                   | (if $r.note != null then .note = $r.note else . end)
                 else . end ]

@@ -993,9 +993,16 @@
     # Rules present, the ad-hoc sender mute cleared (sender policy lives inside
     # the rules — muting the human outright is the trade #197 exists to end),
     # note replaced; runtime fields (pinned ttl) kept.
+    # Read under the names the daemon PERSISTS: local-webhook 0.19.0 renamed
+    # the per-entry predicates when/drop to include/exclude, keeping the old
+    # names as input aliases it normalizes away on the next write. The module
+    # declares them as when/drop (a public option keeps its name) and the
+    # applier writes the new spelling — and clears BOTH, which is what stops a
+    # declaration from losing to whatever the daemon last rewrote (#331).
     machine.succeed(
         "jq -e '.topics[] | select(.topic == \"github:defangdevs/local-channels\")"
-        " | (.when.any | length == 2) and (has(\"ignoreSenders\") | not)"
+        " | (.include.any | length == 2) and (has(\"ignoreSenders\") | not)"
+        " and (has(\"when\") | not) and (has(\"drop\") | not)"
         " and .note == \"managed: rules watch (test)\" and .ttlHours == 0'"
         " /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
@@ -1066,9 +1073,14 @@
     # whole values can ever name it (local-channels#33). Until it existed the
     # watch declined every comment, and an "@box rebase" reached nobody unless
     # a live session happened to hold the topic.
+    # Selected by its own path rather than by index: a clause added to a
+    # governed watch must not be able to break this assertion (and an index is
+    # what made the 0.19.0 rename read as "the rule vanished" instead of "the
+    # field moved").
     machine.succeed(
         "jq -e '.topics[] | select(.topic == \"github:defangdevs/mention-demo\")"
-        " | .when.all[2].contains == [\"@box-bot\"]'"
+        " | [.include.all[] | select(.path == \"comment.body\")]"
+        " | length == 1 and (.[0].contains == [\"@box-bot\"])'"
         " /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
 
@@ -1144,7 +1156,8 @@
     # the mention clause above this needs no new operator.
     machine.succeed(
         "jq -e '.topics[] | select(.topic == \"github:defangdevs/review-demo\")"
-        " | .when.all[2].path == \"pull_request.user.login\"'"
+        " | [.include.all[] | select(.path == \"pull_request.user.login\")]"
+        " | length == 1 and (.[0][\"in\"] == [\"box-bot\"])'"
         " /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
 
