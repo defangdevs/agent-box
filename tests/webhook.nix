@@ -995,7 +995,8 @@
     # note replaced; runtime fields (pinned ttl) kept.
     machine.succeed(
         "jq -e '.topics[] | select(.topic == \"github:defangdevs/local-channels\")"
-        " | (.when.any | length == 2) and (has(\"ignoreSenders\") | not)"
+        " | (.include.any | length == 2) and (has(\"when\") | not)"
+        " and (has(\"ignoreSenders\") | not)"
         " and .note == \"managed: rules watch (test)\" and .ttlHours == 0'"
         " /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
@@ -1068,7 +1069,8 @@
     # a live session happened to hold the topic.
     machine.succeed(
         "jq -e '.topics[] | select(.topic == \"github:defangdevs/mention-demo\")"
-        " | .when.all[2].contains == [\"@box-bot\"]'"
+        " | .include.all[] | select(.path == \"comment.body\")"
+        " | .contains == [\"@box-bot\"]'"
         " /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
 
@@ -1144,7 +1146,8 @@
     # the mention clause above this needs no new operator.
     machine.succeed(
         "jq -e '.topics[] | select(.topic == \"github:defangdevs/review-demo\")"
-        " | .when.all[2].path == \"pull_request.user.login\"'"
+        " | [.include.all[] | select(.path == \"pull_request.user.login\")]"
+        " | length == 1'"
         " /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
 

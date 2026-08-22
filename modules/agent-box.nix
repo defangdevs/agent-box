@@ -2410,10 +2410,19 @@ $PROMPT"
       exit 0
     fi
     # For every entry whose topic is declared: the declaration REPLACES the
-    # managed fields (when/drop/ignoreSenders/note) wholesale — partial merges
-    # would let config and state drift apart. Runtime fields (ttlHours,
-    # renewOnEvent, timestamps) stay the entry's own. Bare-string topics
-    # normalize to the object form webhook.py itself writes.
+    # managed fields (the payload predicates, ignoreSenders, note) wholesale —
+    # partial merges would let config and state drift apart. Runtime fields
+    # (ttlHours, renewOnEvent, timestamps) stay the entry's own. Bare-string
+    # topics normalize to the object form webhook.py itself writes.
+    #
+    # local-webhook 0.19.0 renamed the two predicates when -> include and
+    # drop -> exclude (local-channels#294). It still ACCEPTS the old names on
+    # input, but it persists the new ones, so an applier that wrote `when`
+    # left the entry carrying both: its own `when` plus the daemon's `include`
+    # rewrite of it. Write the new names and delete BOTH pairs, so a declared
+    # entry never keeps a stale second predicate — whichever version last
+    # touched the file. The watchPolicy OPTION keeps its when/drop keys; the
+    # rename is upstream's state format, not this module's interface.
     tmp="$FILE.policy.$$"
     if "$JQ" --slurpfile pol "$POLICY" '
           $pol[0] as $p
@@ -2422,9 +2431,9 @@ $PROMPT"
               | (if type == "object" then (.topic // "") else "" end) as $t
               | if $t != "" and ($p | has($t)) then
                   $p[$t] as $r
-                  | del(.when, .drop, .ignoreSenders)
-                  | (if $r.when != null then .when = $r.when else . end)
-                  | (if $r.drop != null then .drop = $r.drop else . end)
+                  | del(.when, .drop, .include, .exclude, .ignoreSenders)
+                  | (if $r.when != null then .include = $r.when else . end)
+                  | (if $r.drop != null then .exclude = $r.drop else . end)
                   | (if (($r.ignoreSenders // []) | length) > 0 then .ignoreSenders = $r.ignoreSenders else . end)
                   | (if $r.note != null then .note = $r.note else . end)
                 else . end ]
