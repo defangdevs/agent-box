@@ -229,10 +229,15 @@ Credentials live in that user's home directory (`~/.claude` for Claude Code,
 
 Sign-in is the *only* interactive step: the module pre-accepts Claude Code's
 other first-run dialogs (the folder-trust prompt for the agent's working
-directory, and the Bypass Permissions warning when `skipPermissions` is on)
-by seeding the acceptance flags into `~/.claude.json` and
+directory, the Bypass Permissions warning when `skipPermissions` is on, and
+the whole first-run onboarding wizard — theme picker, security notes,
+terminal setup) by seeding the acceptance flags into `~/.claude.json` and
 `~/.claude/settings.json` before each start. Without that, a fresh box parks
-the session on a dialog that Remote Control can't answer.
+the session on a dialog that Remote Control can't answer. Skipping the wizard
+also skips the login picker it embeds, which this box does not need: sign-in
+runs `claude auth login` from the settings page instead. Until it does, the
+session opens straight on the REPL and says so in its status line
+(`Not logged in · Run /login`).
 
 **Claude Code first login in the browser terminal:** Claude emits its OAuth URL
 as an OSC 8 hyperlink with the complete URL in a hidden target. The terminal's

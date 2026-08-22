@@ -53,6 +53,19 @@ seed_json() {
 # values seeded before first launch survive login/onboarding:
 #   ~/.claude.json          projects.<workdir>.hasTrustDialogAccepted
 #   ~/.claude/settings.json skipDangerousModePermissionPrompt
+#
+# hasCompletedOnboarding skips the whole first-run onboarding wizard,
+# whose first screen is the theme picker ("Choose the text style that
+# looks best with your terminal"). Verified against claude 2.1.233: the
+# wizard's step list pushes the theme step UNCONDITIONALLY, so a seeded
+# ~/.claude/settings.json theme does NOT skip it — the only lever is the
+# hasCompletedOnboarding gate on the wizard as a whole. Skipping it also
+# drops the wizard's security-notes and terminal-setup screens, and its
+# embedded login picker: an unauthenticated session lands on the REPL
+# with "Not logged in · Run /login" in the status line, which is the
+# same sign-in the README already documents as `claude auth login`.
+# Theme is seeded too, but only when unset (`//=`), so /theme sticks.
+#
 # Runs before every claude session start (idempotent), which also
 # covers upstream's occasional failure to persist an interactive
 # acceptance (anthropics/claude-code issue 36403). Codex has no such
@@ -60,7 +73,9 @@ seed_json() {
 seed_claude_state() {
   mkdir -p "$HOME"/.claude
   seed_json "$HOME"/.claude.json --arg wd "$1" \
-    '.projects[$wd] = ((.projects[$wd] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})'
+    '.projects[$wd] = ((.projects[$wd] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})
+     | .hasCompletedOnboarding = true'
+  seed_json "$HOME"/.claude/settings.json '.theme //= "dark"'
   if [ "$2" = true ]; then
     seed_json "$HOME"/.claude/settings.json \
       '.skipDangerousModePermissionPrompt = true'
