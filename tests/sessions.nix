@@ -820,7 +820,7 @@ in
         # than hardcoding it.
         machine.succeed(
             tmux('show-environment -t "=rot" AGENT_BOX_SESSION_ID')
-            + f" | grep -qx AGENT_BOX_SESSION_ID={rot_bid}"
+            + f" | grep -x AGENT_BOX_SESSION_ID={rot_bid} >/dev/null"
         )
         rot_cmdline = machine.wait_until_succeeds(
             "pgrep -u agent -af agent-box-claude-hook-settings", timeout=60
@@ -884,7 +884,7 @@ in
         )
         machine.succeed(
             tmux('show-environment -t "=rot" AGENT_BOX_SESSION_ID')
-            + f" | grep -qx AGENT_BOX_SESSION_ID={first}"
+            + f" | grep -x AGENT_BOX_SESSION_ID={first} >/dev/null"
         )
 
         # Hop 2: from the id it ADOPTED. The newest segment wins.
