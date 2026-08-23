@@ -995,6 +995,57 @@
         machine.succeed("su -s /bin/sh agent -c 'agent-box-session env rm MY_TOKEN'")
         machine.fail("grep -q MY_TOKEN /home/agent/.config/agent-box/env")
 
+    # --- a value may span lines (issue #212) ------------------------------
+    with subtest("a multi-line secret survives the store, the CLI and a spawn"):
+        # The value people actually need to paste here is a PEM, and it is
+        # also the value every pre-#212 reader mangled: a line-per-pair loop
+        # exported the first line and then read the body as more assignments.
+        # The base64 line ends in `=` on purpose — that is what made a body
+        # line look like one.
+        pem = (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "MIIBVgIBADANBgkqhkiG9w0BAQEFAASCAUAwggE8AgEAAkEA1x==\n"
+            "-----END PRIVATE KEY-----"
+        )
+        machine.succeed(
+            "printf '%s\\n' " + shlex.quote(pem) + " > /tmp/pem && chmod a+r /tmp/pem"
+        )
+        # --stdin is how it gets in: the value reaches no command line, so it
+        # is in no shell history and in nobody's `ps` output.
+        machine.succeed(as_agent("agent-box-session env set MY_PEM --stdin < /tmp/pem"))
+        # Stored as ONE quoted entry, and still 0600.
+        machine.succeed(
+            "grep -qx 'MY_PEM=\"-----BEGIN PRIVATE KEY-----' "
+            "/home/agent/.config/agent-box/env"
+        )
+        machine.succeed("stat -c '%a' /home/agent/.config/agent-box/env | grep -x 600")
+        # ls sees one key, not four: the reader knows where the entry ends.
+        env_ls = machine.succeed(as_agent("agent-box-session env ls"))
+        assert env_ls.split() == ["MY_PEM"], env_ls
+        # Writing a second key must not disturb the first: writer and reader
+        # agree about continuation lines, or a set corrupts what it did not
+        # touch.
+        machine.succeed(as_agent("agent-box-session env set PLAIN tok"))
+        machine.succeed("grep -qx 'PLAIN=tok' /home/agent/.config/agent-box/env")
+        assert machine.succeed(as_agent("agent-box-session env ls")).split() == [
+            "MY_PEM",
+            "PLAIN",
+        ]
+        # And the whole value reaches a session's environment at spawn, which
+        # is the end of the path the settings page starts (issue 89): the
+        # env-exec wrapper reads this file with the same parser that wrote it.
+        machine.succeed(as_agent("agent-box-session add pemsess --agent shell"))
+        machine.wait_until_succeeds(tmux("has-session -t =pemsess"), timeout=60)
+        ppid = machine.wait_until_succeeds(
+            tmux('display -p -t "=pemsess:" "#{pane_pid}"') + " | grep .", timeout=60
+        ).strip()
+        environ = machine.succeed(f"tr '\\0' '\\n' < /proc/{ppid}/environ")
+        assert "MY_PEM=" + pem in environ, environ
+        machine.succeed(as_agent("agent-box-session rm pemsess"))
+        machine.succeed(as_agent("agent-box-session env rm MY_PEM"))
+        machine.succeed(as_agent("agent-box-session env rm PLAIN"))
+        assert machine.succeed(as_agent("agent-box-session env ls")).split() == []
+
     # --- agent profiles (issue #321) --------------------------------------
     with subtest("a profile resolves a worker: harness, args and session env"):
         # A profile is the WORKER (harness + model + effort + appended system

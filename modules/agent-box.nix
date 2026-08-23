@@ -161,7 +161,12 @@ let
       and `#` comment lines are ignored, so annotate freely). Set them with
       `agent-box-session env set KEY VALUE` (or `env ls` / `env rm KEY`, or the
       settings page); they load on the next session (re)start — e.g. GH_TOKEN is
-      read automatically, so `git clone https://github.com/...` just works.
+      read automatically, so `git clone https://github.com/...` just works. A
+      value may span lines, so a PEM or an SSH key goes in whole:
+      `agent-box-session env set MY_KEY --stdin < key.pem` (--stdin also keeps
+      the value out of the command line, the shell history and `ps`). Such a
+      value is stored double-quoted, which is the one thing to preserve if you
+      ever hand-edit the file.
     - Manage your own sessions without a rebuild:
       `agent-box-session ls|add|rm|stop|restart`. `add` takes an optional name
       plus `--agent claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` —
@@ -348,84 +353,553 @@ let
   # single live source for those keys (it is deliberately NOT in the
   # unit's EnvironmentFile, so a DELETED key disappears on restart too).
   # Values are exported literally — never eval'd — so a secret full of
-  # shell metacharacters can't break or inject anything; one pair of
-  # surrounding quotes is stripped to match how systemd read the same
-  # file before. Key charset mirrors the settings daemon's KEY_RE.
-  envExecWrapper = pkgs.writeShellScript "agent-box-env-exec" ''
+  # shell metacharacters can't break or inject anything.
+  #
+  # Python since issue #212, because the format now has continuation lines:
+  # see envStoreLib below for why one parser owns them.
+  envExecWrapper = pkgs.writers.writePython3 "agent-box-env-exec" {
+    # E402: the library is spliced in ABOVE this program, so its own imports
+    # follow module-level code. E501: the prose comments run long.
+    flakeIgnore = [ "E402" "E501" ];
+  } (envStoreLib + ''
+
+
+"""Session-spawn env loader (issue 89), then exec the agent.
+
+Sessions are (re)created by the long-lived supervisor inside the agent unit,
+so a unit-level EnvironmentFile= snapshot of the user's env file goes stale
+the moment the settings page (or a hand edit) changes it — "restart the
+sessions to apply" silently applied nothing. This wrapper re-reads the file at
+EVERY session spawn and then execs the agent, making the file the single live
+source for those keys (it is deliberately NOT in the unit's EnvironmentFile,
+so a DELETED key disappears on restart too).
+
+Python since issue #212: a value may now span lines, and the parser that
+understands that lives in src/lib/envstore.py, spliced in above this file.
+Values still reach the child as literal strings — nothing here is eval'd or
+expanded, so a secret full of shell metacharacters cannot break or inject
+anything.
+
+Best effort by construction: a missing, unreadable or half-corrupt store
+costs the keys it holds, never the session. The exec at the bottom is the only
+step allowed to fail.
+"""
+# The library above already imported os; only what it does not is imported
+# here.
+import shutil
+import subprocess
+import sys
+
+
+def load_into(environ, path, skip=()):
+    for key, value in load(path):
+        if key in skip:
+            continue
+        environ[key] = value
+
+
+def main(argv):
+    if not argv:
+        sys.stderr.write("agent-box-env-exec: nothing to exec\n")
+        return 2
+    home = os.path.expanduser("~")
+    config = os.path.join(home, ".config", "agent-box")
+
     # The per-user secrets file the settings page and `agent-box-session env`
-    # manage. Runs inside the user's session, so $HOME names it directly.
-    FILE="$HOME/.config/agent-box/env"
-    if [ -r "$FILE" ]; then
-      while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-        key=''${line%%=*}
-        case "$key" in (*[!A-Za-z0-9_]*|""|[0-9]*) continue ;; esac
-        val=''${line#*=}
-        case "$val" in
-          \"*\") val=''${val#\"}; val=''${val%\"} ;;
-          \'*\') val=''${val#\'}; val=''${val%\'} ;;
-        esac
-        export "$key=$val"
-      done < "$FILE"
-    fi
+    # manage.
+    load_into(os.environ, os.path.join(config, "env"))
 
-    # The agent profile's own environment (issue #321), on top of the file above:
-    # every key in ~/.config/agent-box/profiles/<name>.env that is not one of the
-    # reserved LAUNCH keys agent-box-profile turns into harness arguments. The
+    # The agent profile's own environment (issue #321), on top of the file
+    # above: every key in profiles/<name>.env that is not one of the reserved
+    # LAUNCH keys agent-box-profile turns into harness arguments. The
     # supervisor passes the name through the tmux session environment, so this
-    # applies at every spawn — an edited profile reaches the session on its next
-    # restart, exactly like the file above.
+    # applies at every spawn — an edited profile reaches the session on its
+    # next restart, exactly like the file above.
     #
-    # Convenience, NOT isolation: this process's environment is readable through
-    # /proc/<pid>/environ by every other session of this user (issue #135, wiki
-    # Users-vs-Sessions), so a secret in a profile is a secret all of them have.
-    # What a profile buys is that sessions started with OTHER profiles do not get
-    # it handed to them, not that they cannot reach it.
-    if [ -n "''${AGENT_BOX_PROFILE:-}" ]; then
-      case "$AGENT_BOX_PROFILE" in
-        (*[!A-Za-z0-9_-]*|"") ;;
-        (*)
-          PFILE="$HOME/.config/agent-box/profiles/$AGENT_BOX_PROFILE.env"
-          if [ -r "$PFILE" ]; then
-            while IFS= read -r line || [ -n "$line" ]; do
-              case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-              key=''${line%%=*}
-              case "$key" in (*[!A-Za-z0-9_]*|""|[0-9]*) continue ;; esac
-              # The reserved keys are launch config, not environment: HARNESS,
-              # MODEL, EFFORT and SYSTEM_PROMPT are already in the session's
-              # agent/extraArgs, and exporting them would put a system prompt in
-              # the environment of everything the agent runs.
-              case "$key" in (HARNESS|MODEL|EFFORT|SYSTEM_PROMPT) continue ;; esac
-              val=''${line#*=}
-              case "$val" in
-                \"*\") val=''${val#\"}; val=''${val%\"} ;;
-                \'*\') val=''${val#\'}; val=''${val%\'} ;;
-              esac
-              export "$key=$val"
-            done < "$PFILE"
-          fi
-          ;;
-      esac
-    fi
+    # Convenience, NOT isolation: this process's environment is readable
+    # through /proc/<pid>/environ by every other session of this user (issue
+    # #135, wiki Users-vs-Sessions), so a secret in a profile is a secret all
+    # of them have. What a profile buys is that sessions started with OTHER
+    # profiles do not get it handed to them, not that they cannot reach it.
+    profile = os.environ.get("AGENT_BOX_PROFILE", "")
+    if profile and all(
+        char.isascii() and (char.isalnum() or char in "_-") for char in profile
+    ):
+        load_into(
+            os.environ,
+            os.path.join(config, "profiles", f"{profile}.env"),
+            skip=PROFILE_RESERVED,
+        )
 
-    # The GitHub login this box acts as, for local-webhook's "@self" sender mute
-    # (issue #261). Resolved HERE because this is the one process that holds the
-    # token: the loop above just exported it, and the identity is a property of
-    # that token, not of the deployment. A value the env store set wins (the
-    # resolver echoes it straight back); otherwise the resolver answers from its
-    # cache, and only calls GitHub when the token changed. --throttled because
-    # this runs at EVERY session start: one failed lookup per token per hour is
-    # enough, and a session must not wait on a network timeout to begin. Best
-    # effort — no token, no network or no resolver leaves it unset, which is what
-    # a box that writes nothing to GitHub wants anyway.
-    if command -v agent-box-webhook-self >/dev/null 2>&1; then
-      _self=$(agent-box-webhook-self --throttled 2>/dev/null) || _self=""
-      [ -n "$_self" ] && export LOCAL_WEBHOOK_SELF="$_self"
-      unset _self
-    fi
+    # The GitHub login this box acts as, for local-webhook's "@self" sender
+    # mute (issue #261). Resolved HERE because this is the one process that
+    # holds the token: the loop above just set it, and the identity is a
+    # property of that token, not of the deployment. A value the env store set
+    # wins (the resolver echoes it straight back); otherwise the resolver
+    # answers from its cache, and only calls GitHub when the token changed.
+    # --throttled because this runs at EVERY session start: one failed lookup
+    # per token per hour is enough, and a session must not wait on a network
+    # timeout to begin. Best effort — no token, no network or no resolver
+    # leaves it unset, which is what a box that writes nothing to GitHub wants
+    # anyway.
+    resolver = shutil.which("agent-box-webhook-self")
+    if resolver:
+        try:
+            result = subprocess.run(
+                [resolver, "--throttled"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            login = result.stdout.strip() if result.returncode == 0 else ""
+        except OSError:
+            login = ""
+        if login:
+            os.environ["LOCAL_WEBHOOK_SELF"] = login
 
-    exec "$@"
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as error:
+        sys.stderr.write(f"agent-box-env-exec: cannot exec {argv[0]}: {error}\n")
+        return 127
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+  '');
+
+  # The env store's format — ~/.config/agent-box/env and
+  # profiles/<name>.env — has ONE owner (issue #212). Six places used to
+  # parse it independently, so a format CHANGE had to land in six dialects at
+  # once or the file meant different things to different readers; multi-line
+  # values are exactly such a change. Every python program that touches the
+  # file gets this library spliced in ahead of its own code, and the shell
+  # callers go through envStoreCli below.
+  #
+  # Spliced rather than packaged as a python module: the module has to stay a
+  # SINGLE file (the contract at the top of this one), so a real site-packages
+  # library would mean building a derivation to hold one 200-line file. When a
+  # third library appears, that trade flips.
+  envStoreLib = ''
+# The env store: ONE implementation of the KEY=value file format that
+# ~/.config/agent-box/env and ~/.config/agent-box/profiles/<name>.env are
+# written in (issue #212).
+#
+# Why this is a library and not another copy of the loop
+# -----------------------------------------------------
+# Six places used to parse this format independently — the env-exec wrapper,
+# `agent-box-session env`, `agent-box-profile`, the settings daemon, the
+# webhook spawner, and the profile reader inside the wrapper. Every one of
+# them re-derived the same three rules (skip a comment, validate the key,
+# strip one pair of quotes), and a format CHANGE therefore had to land in six
+# dialects at once or the file would mean different things to different
+# readers. Multi-line values are exactly such a change: a PEM written by the
+# settings page and read by a line-per-pair shell loop does not come back as a
+# PEM, it comes back as its first line plus a handful of junk exports.
+#
+# So the format has one owner. Python, because the readers that cannot be
+# Python (a systemd ExecStart, a hook) go through the agent-box-envstore CLI
+# instead, and because a quote-and-continuation scanner in POSIX sh is how the
+# next bug gets written.
+#
+# The file format
+# ---------------
+#   * A line whose first non-blank character is `#`, or that is blank, is a
+#     comment. A line with no `=` is skipped, as is one whose key is not
+#     [A-Za-z_][A-Za-z0-9_]* — a hand-edited file must never be able to make a
+#     reader do something other than set a variable.
+#   * An UNQUOTED value ends at the end of its line, with trailing whitespace
+#     removed. Use quotes to keep whitespace. `KEY = value` is not an
+#     assignment: the key is `KEY ` and the line is skipped.
+#   * A DOUBLE-QUOTED value may span lines: it ends at the next unescaped `"`,
+#     however many newlines away that is. `\"` is a literal quote and `\\` a
+#     literal backslash; every other backslash is itself, and a newline is a
+#     newline. `\n` is NOT an escape — this is systemd's env-file rule
+#     (env-file.c), which is what an operator moving a PEM off a systemd box
+#     expects, and it means a value can never smuggle in a character the file
+#     does not literally contain.
+#   * A SINGLE-QUOTED value is legacy: one pair of quotes is stripped when
+#     both sit on the same line. It does not continue across lines. Kept
+#     because the pre-#212 readers stripped it and files in the wild have it.
+#   * An unterminated `"` does not swallow the rest of the file. The line is
+#     taken as a legacy raw value and parsing resumes with the next one, so
+#     one corrupt entry costs one entry.
+#
+# Writing is the exact inverse: a value is quoted only when it has to be, so a
+# file of ordinary tokens stays the plain KEY=value text that `grep` and a
+# human both expect.
+import json
+import os
+import re
+import tempfile
+
+# The key charset every reader already agreed on (the settings daemon's
+# KEY_RE, the shell CLIs' valid_key).
+KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+ENV_HEADER = (
+    "# Managed by agent-box settings page. KEY=value, one per line.\n"
+    "# Do not add secrets by hand here unless you know what you are doing.\n"
+    "# A value may span lines when it is double-quoted (issue #212).\n"
+)
+
+# Launch config, not environment: agent-box-profile turns these into harness
+# arguments and env-exec must not export them (a SYSTEM_PROMPT in the
+# environment of everything the agent runs is a footgun, not a feature).
+PROFILE_RESERVED = ("HARNESS", "MODEL", "EFFORT", "SYSTEM_PROMPT")
+
+
+def profile_header(name):
+    return (
+        f'# agent-box agent profile "{name}" — managed by agent-box-profile.\n'
+        "# KEY=value, one per line. HARNESS/MODEL/EFFORT/SYSTEM_PROMPT become\n"
+        "# harness arguments; any other key becomes session environment, which\n"
+        "# every session of this user can read (issue #135).\n"
+        "# A value may span lines when it is double-quoted (issue #212).\n"
+    )
+
+
+def valid_key(key):
+    return bool(KEY_RE.match(key))
+
+
+def _unescape(text):
+    """Resolve `\\"` and `\\\\`; leave every other backslash literal."""
+    out = []
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == "\\" and text[i + 1:i + 2] in ('"', "\\"):
+            out.append(text[i + 1])
+            i += 2
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
+def _scan_quoted(rest, lines, index):
+    """Read a double-quoted value whose opening quote is already consumed.
+
+    `rest` is what followed that quote on its own line, `lines[index:]` the
+    lines after it. Returns (value, next_index), or None when the quote is
+    never closed — the caller then falls back to the legacy single-line
+    reading rather than losing every entry below it.
+    """
+    chunks = []
+    buf = rest
+    while True:
+        piece = []
+        pos = 0
+        while pos < len(buf):
+            char = buf[pos]
+            # Keep the escape pair intact here and resolve it once, after the
+            # lines are joined; that way a `\"` cannot be mistaken for the
+            # terminator and a `\\` cannot hide one.
+            if char == "\\" and buf[pos + 1:pos + 2] in ('"', "\\"):
+                piece.append(buf[pos:pos + 2])
+                pos += 2
+                continue
+            if char == '"':
+                chunks.append("".join(piece))
+                return _unescape("\n".join(chunks)), index
+            piece.append(char)
+            pos += 1
+        chunks.append("".join(piece))
+        if index >= len(lines):
+            return None
+        buf = lines[index]
+        index += 1
+
+
+def parse(text):
+    """Return the file's [(key, value)] in file order, junk lines skipped.
+
+    Later duplicates are kept as duplicates; callers that want one value per
+    key take the last (see `as_dict`), which is what every reader of this
+    format has always done.
+    """
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    pairs = []
+    index = 0
+    while index < len(lines):
+        # Left-stripped, never fully stripped: a quoted value owns every byte
+        # after its opening quote, trailing blanks on a continued line
+        # included.
+        line = lines[index].lstrip()
+        index += 1
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        # No strip on the key: `KEY = value` is not this format, and a reader
+        # that quietly accepted it disagreed with the four that did not. The
+        # line's own leading indentation is already gone (lstrip above).
+        if not valid_key(key):
+            continue
+        if value.startswith('"'):
+            scanned = _scan_quoted(value[1:], lines, index)
+            if scanned is not None:
+                value, index = scanned
+                pairs.append((key, value))
+                continue
+            # Unterminated quote: fall through and read THIS line the legacy
+            # way, leaving the lines below it to be parsed on their own.
+        value = value.rstrip()
+        if len(value) >= 2 and value.startswith("'") and value.endswith("'"):
+            value = value[1:-1]
+        pairs.append((key, value))
+    return pairs
+
+
+def as_dict(pairs):
+    """Collapse [(key, value)] to {key: value}, last occurrence winning."""
+    return dict(pairs)
+
+
+def load(path):
+    """`parse` the file at `path`; a missing or unreadable file is empty.
+
+    Unreadable is deliberately not an error: this runs on the session-spawn
+    path, where a permission problem on the secrets file must cost the
+    secrets, not the session.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return parse(handle.read())
+    except OSError:
+        return []
+
+
+def needs_quoting(value):
+    if value != value.strip():
+        return True
+    if any(char in value for char in '\n\r"\\'):
+        return True
+    return value[:1] in ("'", '"')
+
+
+def quote(value):
+    """Render one value, quoting it only when the format requires it."""
+    if not needs_quoting(value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def render(pairs, header=""):
+    return header + "".join(f"{key}={quote(value)}\n" for key, value in pairs)
+
+
+def save(path, pairs, header="", mode=0o600, dir_mode=0o700):
+    """Atomically publish `pairs` to `path`.
+
+    Same rename-over-a-temp-file-in-the-same-directory shape the settings
+    daemon and both shell CLIs already used, so a reader either sees the old
+    file or the new one. 0600 because the value beside the key is a secret.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=dir_mode, exist_ok=True)
+    # makedirs applies `mode` only when it CREATES the directory, and a
+    # directory made by an older `mkdir -p` under umask 022 is 0755. The old
+    # shell writer chmod'ed it on every write for that reason; keep doing so,
+    # because the file inside is a secret.
+    try:
+        os.chmod(directory, dir_mode)
+    except OSError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".envstore.")
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(render(pairs, header))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def update(path, assignments, header="", drop=()):
+    """Rewrite `path` with `drop` and the assigned keys removed, then append.
+
+    One read-modify-write, so `set` keeps the file's order for untouched keys
+    and moves a re-set key to the end — the behavior the shell `env_rewrite`
+    and the daemon's `set_key` both had.
+    """
+    doomed = set(drop) | {key for key, _ in assignments}
+    kept = [(k, v) for (k, v) in load(path) if k not in doomed]
+    save(path, kept + list(assignments), header)
+
+
+def keys(path):
+    """Sorted, de-duplicated key NAMES — never the values.
+
+    The settings page and both CLIs list keys and refuse to show values; that
+    rule belongs to the format's owner, not to each caller.
+    """
+    return sorted({key for key, _ in load(path)})
+
+
+def dumps(path):
+    """The store as a JSON object, for the shell callers that hold jq."""
+    return json.dumps(as_dict(load(path)), ensure_ascii=False)
   '';
+
+  # The same library, as a program, for the callers that are not python: the
+  # session CLI's `env` verb, agent-box-profile, and the webhook spawner. NOT
+  # on any PATH — every caller pins its store path (AGENT_BOX_ENVSTORE_BIN),
+  # the convention sessionCli already uses for flock and agent-box-profile, so
+  # a caller cannot silently fall back to a different copy or to none.
+  envStoreCli = pkgs.writers.writePython3Bin "agent-box-envstore" {
+    flakeIgnore = [ "E402" "E501" ];
+  } (envStoreLib + ''
+
+
+"""agent-box-envstore — read and write the box's KEY=value stores.
+
+The format's one owner is src/lib/envstore.py; this is the door the callers
+that are not Python use (issue #212). It is deliberately NOT on any PATH: the
+wrappers that need it pin its store path as AGENT_BOX_ENVSTORE_BIN, the same
+convention sessionCli already uses for flock and agent-box-profile, so a
+caller cannot silently fall back to an older copy or to no copy at all.
+
+Verbs, all of which take --file PATH or --profile NAME and otherwise act on
+~/.config/agent-box/env:
+
+  keys                 the key NAMES, sorted, one per line — never a value
+  get KEY              one value, verbatim, no trailing newline added
+  json                 the whole store as a JSON object, for jq callers
+  set KEY=VALUE ...    add or replace; --stdin reads ONE value from stdin
+  unset KEY ...        remove
+
+`get` on a missing key exits 1 with nothing on stdout, so a shell caller can
+write `v=$(... get K) || v=default`. Bad usage exits 2, matching the shell
+CLIs.
+"""
+# The env-store library is spliced in ABOVE this file by the generated module
+# (see envStoreCli in modules/agent-box.nix.in), so `os` and the envstore
+# names are already bound here; only what the library does not import is
+# imported again.
+import argparse
+import sys
+
+PROFILE_NAME_MAX = 64
+
+
+def die(message):
+    sys.stderr.write(f"agent-box-envstore: {message}\n")
+    raise SystemExit(2)
+
+
+def valid_profile_name(name):
+    if name == "" or len(name) > PROFILE_NAME_MAX:
+        return False
+    return all(char.isascii() and (char.isalnum() or char in "_-") for char in name)
+
+
+def config_dir():
+    # AGENT_BOX_CONFIG_DIR exists for the tests and for a caller that already
+    # resolved the directory (the settings daemon is told its env file
+    # outright); everything else follows $HOME, because this always runs as
+    # the user whose store it is.
+    override = os.environ.get("AGENT_BOX_CONFIG_DIR")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".config", "agent-box")
+
+
+def target(args):
+    """Return (path, header) for the store this invocation acts on."""
+    if args.file:
+        if args.profile:
+            die("--file and --profile are mutually exclusive")
+        # A bare --file gets the env-store header: the only other shape is a
+        # profile, and that one names itself.
+        return args.file, ENV_HEADER
+    if args.profile:
+        if not valid_profile_name(args.profile):
+            die(
+                f"invalid profile name '{args.profile}' (letters, digits, '_' "
+                f"and '-', at most {PROFILE_NAME_MAX} characters)"
+            )
+        path = os.path.join(config_dir(), "profiles", f"{args.profile}.env")
+        return path, profile_header(args.profile)
+    return os.path.join(config_dir(), "env"), ENV_HEADER
+
+
+def parse_assignments(items, from_stdin):
+    if from_stdin:
+        if len(items) != 1:
+            die("--stdin takes exactly one KEY")
+        key = items[0]
+        if not valid_key(key):
+            die(f"invalid key '{key}'")
+        # The newline a shell here-doc or a `<file` redirect leaves at the end
+        # is the terminator, not part of the secret — one is dropped, the rest
+        # are kept. A PEM read with `--stdin < key.pem` therefore round-trips
+        # byte-for-byte.
+        value = sys.stdin.read()
+        if value.endswith("\n"):
+            value = value[:-1]
+        return [(key, value)]
+    assignments = []
+    for item in items:
+        if "=" not in item:
+            die(f"not a KEY=VALUE assignment: '{item}'")
+        key, value = item.split("=", 1)
+        if not valid_key(key):
+            die(
+                f"invalid key '{key}' (use letters, digits, underscore; not "
+                "starting with a digit)"
+            )
+        assignments.append((key, value))
+    return assignments
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="agent-box-envstore", add_help=True)
+    parser.add_argument("--file", help="act on this file instead of the env store")
+    parser.add_argument("--profile", help="act on ~/.config/agent-box/profiles/NAME.env")
+    parser.add_argument("--stdin", action="store_true", help="`set`: read the value from stdin")
+    parser.add_argument("verb", choices=("keys", "get", "json", "set", "unset"))
+    parser.add_argument("args", nargs="*")
+    args = parser.parse_args(argv)
+    path, header = target(args)
+
+    if args.verb == "keys":
+        for key in keys(path):
+            print(key)
+        return 0
+    if args.verb == "json":
+        print(dumps(path))
+        return 0
+    if args.verb == "get":
+        if len(args.args) != 1:
+            die("get takes exactly one KEY")
+        value = as_dict(load(path)).get(args.args[0])
+        if value is None:
+            return 1
+        sys.stdout.write(value)
+        return 0
+    if args.verb == "set":
+        if not args.args:
+            die("set takes at least one KEY=VALUE")
+        update(path, parse_assignments(args.args, args.stdin), header)
+        return 0
+    # unset
+    if not args.args:
+        die("unset takes at least one KEY")
+    for key in args.args:
+        if not valid_key(key):
+            die(f"invalid key '{key}'")
+    update(path, [], header, drop=args.args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+  '');
 
   # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
   # quit, so the pane records stopped=true and the supervisor leaves the
@@ -926,6 +1400,11 @@ done
     # from PATHs that do not carry it — the webhook receiver unit's PATH is
     # jq + coreutils + this CLI. Same pin convention as the flock above.
     export AGENT_BOX_PROFILE_BIN=${profileCli}/bin/agent-box-profile
+    # The env store's one reader/writer (issue #212): `env ls/set/rm` here and
+    # the settings page must agree byte-for-byte about a multi-line value, so
+    # neither owns a parser. Pinned in the wrapper for the same reason as the
+    # flock above — this CLI runs from PATHs that carry almost nothing.
+    export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
   '' + ''
 set -eu
 # jq/tmux resolve from PATH (system packages + every agent unit's PATH);
@@ -967,7 +1446,9 @@ usage() {
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
-  echo "       agent-box-session env ls | set KEY VALUE | rm KEY"
+  echo "       agent-box-session env ls | set KEY VALUE | set KEY --stdin | rm KEY"
+  echo "         (--stdin reads the value from stdin: for a multi-line secret"
+  echo "          such as a PEM, and to keep any secret out of the command line)"
   echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters, and"
   echo "not one of: $RESERVED_NAMES (each is already a path under /<user>/). (a"
   echo "longer name would be invisible in the web UI)."
@@ -1374,54 +1855,38 @@ case "$cmd" in
     # the env-exec wrapper reads at every session spawn. Applies on the next
     # (re)start — see 'restart'. ls shows KEYS only, never values (matching
     # the settings page, which never surfaces a stored secret).
+    #
+    # The format has ONE owner (issue #212) and this verb delegates to it
+    # rather than carrying a second KEY=value parser: a value that spans lines
+    # — a PEM, an SSH key — has to mean the same thing here, on the settings
+    # page and at session spawn, or setting it in one place corrupts it in
+    # another.
+    ENVSTORE="''${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
     ENV_FILE="$HOME/.config/agent-box/env"
-    env_header() {
-      printf '# Managed by agent-box settings page. KEY=value, one per line.\n'
-      printf '# Do not add secrets by hand here unless you know what you are doing.\n'
-    }
-    env_rewrite() {
-      # env_rewrite DROP_KEY [APPEND_KEY APPEND_VALUE] — atomically rewrite
-      # ENV_FILE dropping DROP_KEY, keeping every other valid KEY=value, then
-      # optionally appending a fresh pair.
-      mkdir -p "$(dirname "$ENV_FILE")"
-      tmp="$(mktemp "$ENV_FILE.XXXXXX")"
-      { env_header
-        if [ -f "$ENV_FILE" ]; then
-          while IFS= read -r line; do
-            case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-            ek="''${line%%=*}"
-            valid_key "$ek" || continue
-            [ "$ek" = "$1" ] && continue
-            printf '%s\n' "$line"
-          done < "$ENV_FILE"
-        fi
-        if [ $# -ge 3 ]; then printf '%s=%s\n' "$2" "$3"; fi
-      } > "$tmp"
-      chmod 600 "$tmp"; mv "$tmp" "$ENV_FILE"
-    }
     sub="''${1:-}"; shift || true
     case "$sub" in
       ls)
-        [ -f "$ENV_FILE" ] || exit 0
-        while IFS= read -r line; do
-          case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-          k="''${line%%=*}"
-          valid_key "$k" && printf '%s\n' "$k"
-        done < "$ENV_FILE" | sort -u
+        "$ENVSTORE" keys
         ;;
       set)
-        k="''${1:-}"; v="''${2-}"
+        k="''${1:-}"
         valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
-        case "$v" in (*"
-"*) echo "value may not contain a newline" >&2; exit 2 ;; esac
-        env_rewrite "$k" "$k" "$v"
+        if [ "''${2-}" = "--stdin" ]; then
+          # The way to set a multi-line secret, and the safer way to set any
+          # secret: the value never reaches a command line, so it is not in
+          # the shell history and not in anyone's `ps` output.
+          "$ENVSTORE" set --stdin "$k"
+        else
+          "$ENVSTORE" set "$k=''${2-}"
+        fi
         echo "env '$k' set — applies on the next session (re)start ('agent-box-session restart --all')"
         ;;
       rm)
         k="''${1:-}"
         valid_key "$k" || { usage >&2; exit 2; }
+        # No file, nothing to remove — and no file created just to say so.
         [ -f "$ENV_FILE" ] || exit 0
-        env_rewrite "$k"
+        "$ENVSTORE" unset "$k"
         echo "env '$k' removed — applies on the next session (re)start ('agent-box-session restart --all')"
         ;;
       *) usage >&2; exit 2 ;;
@@ -1447,6 +1912,9 @@ esac
   profileCli = pkgs.writeShellScriptBin "agent-box-profile" (''
     export AGENT_BOX_AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " (sessionKinds cfg.installAgents))}
     export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+    # A profile file is the env store in another directory, so it has the same
+    # one parser (issue #212).
+    export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
   '' + ''
 set -eu
 # jq resolves from PATH (system packages + every agent unit's PATH); the
@@ -1465,6 +1933,11 @@ JQ=jq
 # format the settings page and `agent-box-session env` already write.
 DIR="$HOME/.config/agent-box/profiles"
 HARNESSES="''${AGENT_BOX_AGENTS:?}"
+# A profile file is the env store in another directory, so it is read and
+# written by the store's one parser (issue #212) — not by a copy of the
+# KEY=value loop that lives here. That is what lets a SYSTEM_PROMPT span
+# lines.
+ENVSTORE="''${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
 
 # Reserved keys are the LAUNCH config: this script turns them into harness
 # arguments. Every other key in the file is environment for a session started
@@ -1505,36 +1978,37 @@ valid_key() {
   # digits, underscore, not starting with a digit.
   case "$1" in (*[!A-Za-z0-9_]*|""|[0-9]*) return 1 ;; esac
 }
-reserved_key() {
-  case " $RESERVED " in (*" $1 "*) return 0 ;; esac
-  return 1
-}
 file_for() { printf '%s/%s.env\n' "$DIR" "$1"; }
 
 # read_profile NAME — set the res_<KEY> variables for the reserved keys and
-# collect the remaining key NAMES in env_keys. Same defensive parse as the
-# env-exec wrapper (issue #212): a line that is not KEY=value is skipped
-# rather than interpreted, so a hand-edited file cannot run anything.
+# collect the remaining key NAMES in env_keys. The file is read by the env
+# store's own parser (issue #212), so a value that spans lines arrives whole
+# here, in the settings page and at session spawn alike.
 read_profile() {
   res_HARNESS=""; res_MODEL=""; res_EFFORT=""; res_SYSTEM_PROMPT=""
   env_keys=""
   pf="$(file_for "$1")"
   [ -r "$pf" ] || return 1
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-    k=''${line%%=*}
-    valid_key "$k" || continue
-    v=''${line#*=}
-    case "$v" in
-      \"*\") v=''${v#\"}; v=''${v%\"} ;;
-      \'*\') v=''${v#\'}; v=''${v%\'} ;;
+  pj="$("$ENVSTORE" --file "$pf" json)" || return 1
+  for k in $RESERVED; do
+    # Trailing newlines in a value do not survive command substitution. That
+    # is the shell's rule, not the store's: the file keeps the value whole and
+    # so does the session that gets it.
+    v="$(printf '%s' "$pj" | "$JQ" -r --arg k "$k" '.[$k] // ""')"
+    case "$k" in
+      (HARNESS) res_HARNESS="$v" ;;
+      (MODEL) res_MODEL="$v" ;;
+      (EFFORT) res_EFFORT="$v" ;;
+      (SYSTEM_PROMPT) res_SYSTEM_PROMPT="$v" ;;
     esac
-    if reserved_key "$k"; then
-      eval "res_$k=\$v"
-    else
-      env_keys="$env_keys $k"
-    fi
-  done < "$pf"
+  done
+  # Every other key is environment; only the NAMES are needed here, and only
+  # the names are ever printed.
+  env_keys="$(printf '%s' "$pj" | "$JQ" -r --arg r " $RESERVED " \
+    'keys[] | . as $k | select(($r | contains(" " + $k + " ")) | not)' \
+    | tr '\n' ' ')"
+  env_keys="''${env_keys% }"
+  [ -z "$env_keys" ] || env_keys=" $env_keys"
 }
 
 # launch_json NAME — {harness, args, envKeys, warnings} for the resolved
@@ -1593,40 +2067,6 @@ launch_json() {
     --args -- "$@"
 }
 
-# rewrite NAME [KEY VALUE]... — atomically rewrite the profile file, dropping
-# every key named in the (whitespace-separated) DROP list and appending the
-# pairs given. Same shape as session-cli's env_rewrite, and 600 for the same
-# reason: a profile may carry environment.
-DROP=""
-rewrite() {
-  pname="$1"; shift
-  f="$(file_for "$pname")"
-  mkdir -p "$DIR"
-  chmod 700 "$DIR" 2>/dev/null || true
-  tmp="$(mktemp "$f.XXXXXX")"
-  { printf '# agent-box agent profile "%s" — managed by agent-box-profile.\n' "$pname"
-    printf '# KEY=value, one per line. HARNESS/MODEL/EFFORT/SYSTEM_PROMPT become\n'
-    printf '# harness arguments; any other key becomes session environment, which\n'
-    printf '# every session of this user can read (issue #135).\n'
-    if [ -f "$f" ]; then
-      while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-        ek="''${line%%=*}"
-        valid_key "$ek" || continue
-        skip=0
-        for d in $DROP; do [ "$ek" = "$d" ] && skip=1; done
-        [ "$skip" = 1 ] && continue
-        printf '%s\n' "$line"
-      done < "$f"
-    fi
-    while [ $# -ge 2 ]; do
-      printf '%s=%s\n' "$1" "$2"
-      shift 2
-    done
-  } > "$tmp"
-  chmod 600 "$tmp"; mv "$tmp" "$f"
-}
-
 cmd="''${1:-}"; shift || true
 case "$cmd" in
   ls)
@@ -1671,24 +2111,22 @@ case "$cmd" in
     # Validate every assignment BEFORE writing any of them: a `set` that
     # stored the first two of three pairs and then failed would leave a
     # profile nobody asked for.
-    pairs=()
-    DROP=""
+    assign=()
     for a in "$@"; do
       case "$a" in (*=*) ;; (*) echo "not a KEY=VALUE assignment: '$a'" >&2; exit 2 ;; esac
       k="''${a%%=*}"; v="''${a#*=}"
       valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
-      case "$v" in (*"
-"*) echo "value for '$k' may not contain a newline" >&2; exit 2 ;; esac
       if [ "$k" = HARNESS ]; then
         case " $HARNESSES " in
           (*" $v "*) ;;
           (*) echo "harness '$v' is not available (available: $HARNESSES)" >&2; exit 2 ;;
         esac
       fi
-      DROP="$DROP $k"
-      pairs+=("$k" "$v")
+      assign+=("$a")
     done
-    rewrite "$name" "''${pairs[@]}"
+    # A newline in a value is no longer refused (issue #212): a SYSTEM_PROMPT
+    # is prose, and prose has paragraphs. The store quotes it on the way in.
+    "$ENVSTORE" --profile "$name" set "''${assign[@]}"
     echo "profile '$name' updated — 'agent-box-session add --profile $name' starts a session with it"
     # Report what the profile now launches, so a key the harness cannot use
     # shows up here rather than silently at the next spawn.
@@ -1704,13 +2142,11 @@ case "$cmd" in
       rm -f "$f"
       echo "profile '$name' removed — sessions already running with it are unaffected"
     else
-      DROP=""
       for k in "$@"; do
         valid_key "$k" || { usage >&2; exit 2; }
-        DROP="$DROP $k"
       done
-      rewrite "$name"
-      echo "profile '$name': removed$DROP"
+      "$ENVSTORE" --profile "$name" unset "$@"
+      echo "profile '$name': removed $*"
     fi
     ;;
   launch)
@@ -2384,6 +2820,10 @@ exit 1
     # NAME it, because that is the half of "what does this watch launch" the
     # page could not show before (issue #292). Same value sessionCli exports.
     export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+    # This wrapper reads two keys out of the env store, so it reads them with
+    # the store's own parser (issue #212) rather than a fifth copy of the
+    # KEY=value loop.
+    export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
   '' + lib.optionalString (cfg.webhook.hookSessionArgs != [ ]) ''
     # The fleet-wide default for hook-session args (webhook.hookSessionArgs),
     # JSON so multi-word args survive the round trip; the script decodes it
@@ -2444,9 +2884,8 @@ agent-box-webhook ls).}"
 # the same key in ~/.config/agent-box/env — the file `agent-box-session env
 # set`/the settings page already manage — overrides it with no rebuild: any
 # user can set that key to a JSON array of arguments and pick their own
-# hook-session model from chat (issue #290). Same safe KEY=VALUE parse as the
-# env-exec wrapper (#212); only this one key is read, so nothing else in the
-# file reaches this process's environment.
+# hook-session model from chat (issue #290). Read through the env store's one
+# parser, exactly as the env-exec wrapper reads it (#212).
 #
 # Resolved HERE, above the --preamble exit, because BOTH readers need it: a
 # real spawn decodes it into the add call's `--` tail (which the supervisor
@@ -2458,6 +2897,7 @@ agent-box-webhook ls).}"
 #   extra[]           the resolved args
 #   hook_args_source  where they came from, for the --preamble report
 hook_args_file="$HOME/.config/agent-box/env"
+ENVSTORE="''${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
 hook_args_source=""
 if [ -n "''${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   hook_args_source="services.agent-box.webhook.hookSessionArgs (NixOS config)"
@@ -2477,27 +2917,19 @@ fi
 # delivery must never be dropped because a profile was renamed.
 hook_profile="''${AGENT_BOX_HOOK_PROFILE:-}"
 hook_profile_source=""
+# Read with the env store's own parser (issue #212), never a fifth copy of the
+# KEY=value loop: the file may hold a multi-line value now, and only the one
+# parser knows where such an entry ends. Only these two keys are read, so
+# nothing else in the file reaches this process.
 if [ -r "$hook_args_file" ]; then
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-    key=''${line%%=*}
-    case "$key" in
-      (AGENT_BOX_HOOK_SESSION_ARGS|AGENT_BOX_HOOK_PROFILE) ;;
-      (*) continue ;;
-    esac
-    val=''${line#*=}
-    case "$val" in
-      \"*\") val=''${val#\"}; val=''${val%\"} ;;
-      \'*\') val=''${val#\'}; val=''${val%\'} ;;
-    esac
-    if [ "$key" = AGENT_BOX_HOOK_PROFILE ]; then
-      hook_profile=$val
-      hook_profile_source="AGENT_BOX_HOOK_PROFILE in $hook_args_file"
-    else
-      AGENT_BOX_HOOK_SESSION_ARGS=$val
-      hook_args_source="AGENT_BOX_HOOK_SESSION_ARGS in $hook_args_file"
-    fi
-  done < "$hook_args_file"
+  if val=$("$ENVSTORE" --file "$hook_args_file" get AGENT_BOX_HOOK_PROFILE); then
+    hook_profile=$val
+    hook_profile_source="AGENT_BOX_HOOK_PROFILE in $hook_args_file"
+  fi
+  if val=$("$ENVSTORE" --file "$hook_args_file" get AGENT_BOX_HOOK_SESSION_ARGS); then
+    AGENT_BOX_HOOK_SESSION_ARGS=$val
+    hook_args_source="AGENT_BOX_HOOK_SESSION_ARGS in $hook_args_file"
+  fi
 fi
 # A value that did not come from the env file was exported into this process
 # (a hand-run script, or a unit environment): say so rather than reporting a
@@ -5618,7 +6050,13 @@ in
         # No external libraries; skip flake8 style gate (the script is
         # formatted for readability, not lint-perfection) but keep syntax
         # checking that writePython3Bin does by compiling.
-        flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" ];
+        #
+        # F811 as well, and only here: the env-store library is spliced in
+        # after this file's own imports (issue #212), so its `import json`,
+        # `os`, `re` and `tempfile` re-bind four names this file already
+        # imported. Nothing else in the two files shares a name — the library
+        # was written to stay clear of the daemon's globals.
+        flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" "F811" ];
       } ''
         # Per-user settings daemon for agent-box (issue #36).
         # (Run via pkgs.writers.writePython3Bin, which supplies the interpreter
@@ -5707,6 +6145,275 @@ in
         import time
         import urllib.parse
 
+        # The env store's format lives in ONE place (issue #212) and the generated
+        # module splices it in here, straight after the imports above: this daemon is
+        # the file's main writer, and a secret must not travel through the argv of a
+        # helper process to get written. The names it defines — KEY_RE, ENV_HEADER,
+        # load/keys/update — are used below.
+        # The env store: ONE implementation of the KEY=value file format that
+        # ~/.config/agent-box/env and ~/.config/agent-box/profiles/<name>.env are
+        # written in (issue #212).
+        #
+        # Why this is a library and not another copy of the loop
+        # -----------------------------------------------------
+        # Six places used to parse this format independently — the env-exec wrapper,
+        # `agent-box-session env`, `agent-box-profile`, the settings daemon, the
+        # webhook spawner, and the profile reader inside the wrapper. Every one of
+        # them re-derived the same three rules (skip a comment, validate the key,
+        # strip one pair of quotes), and a format CHANGE therefore had to land in six
+        # dialects at once or the file would mean different things to different
+        # readers. Multi-line values are exactly such a change: a PEM written by the
+        # settings page and read by a line-per-pair shell loop does not come back as a
+        # PEM, it comes back as its first line plus a handful of junk exports.
+        #
+        # So the format has one owner. Python, because the readers that cannot be
+        # Python (a systemd ExecStart, a hook) go through the agent-box-envstore CLI
+        # instead, and because a quote-and-continuation scanner in POSIX sh is how the
+        # next bug gets written.
+        #
+        # The file format
+        # ---------------
+        #   * A line whose first non-blank character is `#`, or that is blank, is a
+        #     comment. A line with no `=` is skipped, as is one whose key is not
+        #     [A-Za-z_][A-Za-z0-9_]* — a hand-edited file must never be able to make a
+        #     reader do something other than set a variable.
+        #   * An UNQUOTED value ends at the end of its line, with trailing whitespace
+        #     removed. Use quotes to keep whitespace. `KEY = value` is not an
+        #     assignment: the key is `KEY ` and the line is skipped.
+        #   * A DOUBLE-QUOTED value may span lines: it ends at the next unescaped `"`,
+        #     however many newlines away that is. `\"` is a literal quote and `\\` a
+        #     literal backslash; every other backslash is itself, and a newline is a
+        #     newline. `\n` is NOT an escape — this is systemd's env-file rule
+        #     (env-file.c), which is what an operator moving a PEM off a systemd box
+        #     expects, and it means a value can never smuggle in a character the file
+        #     does not literally contain.
+        #   * A SINGLE-QUOTED value is legacy: one pair of quotes is stripped when
+        #     both sit on the same line. It does not continue across lines. Kept
+        #     because the pre-#212 readers stripped it and files in the wild have it.
+        #   * An unterminated `"` does not swallow the rest of the file. The line is
+        #     taken as a legacy raw value and parsing resumes with the next one, so
+        #     one corrupt entry costs one entry.
+        #
+        # Writing is the exact inverse: a value is quoted only when it has to be, so a
+        # file of ordinary tokens stays the plain KEY=value text that `grep` and a
+        # human both expect.
+        import json
+        import os
+        import re
+        import tempfile
+
+        # The key charset every reader already agreed on (the settings daemon's
+        # KEY_RE, the shell CLIs' valid_key).
+        KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+        ENV_HEADER = (
+            "# Managed by agent-box settings page. KEY=value, one per line.\n"
+            "# Do not add secrets by hand here unless you know what you are doing.\n"
+            "# A value may span lines when it is double-quoted (issue #212).\n"
+        )
+
+        # Launch config, not environment: agent-box-profile turns these into harness
+        # arguments and env-exec must not export them (a SYSTEM_PROMPT in the
+        # environment of everything the agent runs is a footgun, not a feature).
+        PROFILE_RESERVED = ("HARNESS", "MODEL", "EFFORT", "SYSTEM_PROMPT")
+
+
+        def profile_header(name):
+            return (
+                f'# agent-box agent profile "{name}" — managed by agent-box-profile.\n'
+                "# KEY=value, one per line. HARNESS/MODEL/EFFORT/SYSTEM_PROMPT become\n"
+                "# harness arguments; any other key becomes session environment, which\n"
+                "# every session of this user can read (issue #135).\n"
+                "# A value may span lines when it is double-quoted (issue #212).\n"
+            )
+
+
+        def valid_key(key):
+            return bool(KEY_RE.match(key))
+
+
+        def _unescape(text):
+            """Resolve `\\"` and `\\\\`; leave every other backslash literal."""
+            out = []
+            i = 0
+            while i < len(text):
+                char = text[i]
+                if char == "\\" and text[i + 1:i + 2] in ('"', "\\"):
+                    out.append(text[i + 1])
+                    i += 2
+                else:
+                    out.append(char)
+                    i += 1
+            return "".join(out)
+
+
+        def _scan_quoted(rest, lines, index):
+            """Read a double-quoted value whose opening quote is already consumed.
+
+            `rest` is what followed that quote on its own line, `lines[index:]` the
+            lines after it. Returns (value, next_index), or None when the quote is
+            never closed — the caller then falls back to the legacy single-line
+            reading rather than losing every entry below it.
+            """
+            chunks = []
+            buf = rest
+            while True:
+                piece = []
+                pos = 0
+                while pos < len(buf):
+                    char = buf[pos]
+                    # Keep the escape pair intact here and resolve it once, after the
+                    # lines are joined; that way a `\"` cannot be mistaken for the
+                    # terminator and a `\\` cannot hide one.
+                    if char == "\\" and buf[pos + 1:pos + 2] in ('"', "\\"):
+                        piece.append(buf[pos:pos + 2])
+                        pos += 2
+                        continue
+                    if char == '"':
+                        chunks.append("".join(piece))
+                        return _unescape("\n".join(chunks)), index
+                    piece.append(char)
+                    pos += 1
+                chunks.append("".join(piece))
+                if index >= len(lines):
+                    return None
+                buf = lines[index]
+                index += 1
+
+
+        def parse(text):
+            """Return the file's [(key, value)] in file order, junk lines skipped.
+
+            Later duplicates are kept as duplicates; callers that want one value per
+            key take the last (see `as_dict`), which is what every reader of this
+            format has always done.
+            """
+            lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            pairs = []
+            index = 0
+            while index < len(lines):
+                # Left-stripped, never fully stripped: a quoted value owns every byte
+                # after its opening quote, trailing blanks on a continued line
+                # included.
+                line = lines[index].lstrip()
+                index += 1
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                # No strip on the key: `KEY = value` is not this format, and a reader
+                # that quietly accepted it disagreed with the four that did not. The
+                # line's own leading indentation is already gone (lstrip above).
+                if not valid_key(key):
+                    continue
+                if value.startswith('"'):
+                    scanned = _scan_quoted(value[1:], lines, index)
+                    if scanned is not None:
+                        value, index = scanned
+                        pairs.append((key, value))
+                        continue
+                    # Unterminated quote: fall through and read THIS line the legacy
+                    # way, leaving the lines below it to be parsed on their own.
+                value = value.rstrip()
+                if len(value) >= 2 and value.startswith("'") and value.endswith("'"):
+                    value = value[1:-1]
+                pairs.append((key, value))
+            return pairs
+
+
+        def as_dict(pairs):
+            """Collapse [(key, value)] to {key: value}, last occurrence winning."""
+            return dict(pairs)
+
+
+        def load(path):
+            """`parse` the file at `path`; a missing or unreadable file is empty.
+
+            Unreadable is deliberately not an error: this runs on the session-spawn
+            path, where a permission problem on the secrets file must cost the
+            secrets, not the session.
+            """
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    return parse(handle.read())
+            except OSError:
+                return []
+
+
+        def needs_quoting(value):
+            if value != value.strip():
+                return True
+            if any(char in value for char in '\n\r"\\'):
+                return True
+            return value[:1] in ("'", '"')
+
+
+        def quote(value):
+            """Render one value, quoting it only when the format requires it."""
+            if not needs_quoting(value):
+                return value
+            return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+        def render(pairs, header=""):
+            return header + "".join(f"{key}={quote(value)}\n" for key, value in pairs)
+
+
+        def save(path, pairs, header="", mode=0o600, dir_mode=0o700):
+            """Atomically publish `pairs` to `path`.
+
+            Same rename-over-a-temp-file-in-the-same-directory shape the settings
+            daemon and both shell CLIs already used, so a reader either sees the old
+            file or the new one. 0600 because the value beside the key is a secret.
+            """
+            directory = os.path.dirname(path) or "."
+            os.makedirs(directory, mode=dir_mode, exist_ok=True)
+            # makedirs applies `mode` only when it CREATES the directory, and a
+            # directory made by an older `mkdir -p` under umask 022 is 0755. The old
+            # shell writer chmod'ed it on every write for that reason; keep doing so,
+            # because the file inside is a secret.
+            try:
+                os.chmod(directory, dir_mode)
+            except OSError:
+                pass
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix=".envstore.")
+            try:
+                os.fchmod(fd, mode)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(render(pairs, header))
+                os.replace(tmp, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+
+
+        def update(path, assignments, header="", drop=()):
+            """Rewrite `path` with `drop` and the assigned keys removed, then append.
+
+            One read-modify-write, so `set` keeps the file's order for untouched keys
+            and moves a re-set key to the end — the behavior the shell `env_rewrite`
+            and the daemon's `set_key` both had.
+            """
+            doomed = set(drop) | {key for key, _ in assignments}
+            kept = [(k, v) for (k, v) in load(path) if k not in doomed]
+            save(path, kept + list(assignments), header)
+
+
+        def keys(path):
+            """Sorted, de-duplicated key NAMES — never the values.
+
+            The settings page and both CLIs list keys and refuse to show values; that
+            rule belongs to the format's owner, not to each caller.
+            """
+            return sorted({key for key, _ in load(path)})
+
+
+        def dumps(path):
+            """The store as a JSON object, for the shell callers that hold jq."""
+            return json.dumps(as_dict(load(path)), ensure_ascii=False)
+
         USER = os.environ.get("AGENT_BOX_SETTINGS_USER", "agent")
         ENV_FILE = os.environ["AGENT_BOX_SETTINGS_ENV_FILE"]
         # Agent profiles (issue #321) live beside the env store, one file per profile.
@@ -5785,10 +6492,9 @@ in
         # a watch DOES instead of restating why it exists (#259).
         HOOK_SPAWN_CMD = os.environ.get("AGENT_BOX_HOOK_SPAWN_CMD", "")
 
-        # Env var names: POSIX-ish. Must start with a letter or underscore and
-        # contain only letters, digits, underscores. This is what a shell / systemd
-        # EnvironmentFile will accept as a variable name.
-        KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        # Env var names (KEY_RE) come from the spliced env-store library above: the
+        # charset a shell / systemd EnvironmentFile accepts as a variable name, and
+        # the same one the CLIs enforce.
         # Session names: same charset the supervisor and CLI enforce (they
         # land in tmux -t targets and URLs). Every render and publish path filters
         # through this, so a name it rejects is not merely unlisted — that session
@@ -5905,84 +6611,21 @@ in
 
 
         def read_keys():
-            """Return the sorted list of KEY names currently in the env file.
+            """The sorted KEY names in the env file — never their values.
 
-            Values are intentionally never returned — the UI must not be able to
-            surface a stored secret.
+            The UI must not be able to surface a stored secret, so the page asks for
+            names only. Reading and writing the file itself is the env-store
+            library's job (issue #212), including the multi-line values a PEM needs.
             """
-            keys = []
-            try:
-                with open(ENV_FILE, "r", encoding="utf-8") as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        key = line.split("=", 1)[0].strip()
-                        if KEY_RE.match(key):
-                            keys.append(key)
-            except FileNotFoundError:
-                pass
-            # De-dup preserving the last occurrence's position is unnecessary; names
-            # are what matter, so sort for a stable UI.
-            return sorted(set(keys))
-
-
-        def load_pairs():
-            """Return an ordered dict-ish list of (key, rawvalue) for rewriting.
-
-            Used only internally when mutating the file; values never leave the
-            process.
-            """
-            pairs = []
-            try:
-                with open(ENV_FILE, "r", encoding="utf-8") as fh:
-                    for line in fh:
-                        stripped = line.strip()
-                        if not stripped or stripped.startswith("#") or "=" not in stripped:
-                            continue
-                        key, val = stripped.split("=", 1)
-                        key = key.strip()
-                        if KEY_RE.match(key):
-                            pairs.append((key, val))
-            except FileNotFoundError:
-                pass
-            return pairs
-
-
-        def write_pairs(pairs):
-            """Atomically write pairs to ENV_FILE at mode 0600.
-
-            Writes to a temp file in the same directory (so os.replace is atomic on
-            the same filesystem) then renames over the target.
-            """
-            directory = os.path.dirname(ENV_FILE) or "."
-            os.makedirs(directory, mode=0o700, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=directory, prefix=".env.")
-            try:
-                os.fchmod(fd, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write("# Managed by agent-box settings page. KEY=value, one per line.\n")
-                    fh.write("# Do not add secrets by hand here unless you know what you are doing.\n")
-                    for key, val in pairs:
-                        fh.write(f"{key}={val}\n")
-                os.replace(tmp, ENV_FILE)
-            except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
+            return keys(ENV_FILE)
 
 
         def set_key(key, value):
-            pairs = [(k, v) for (k, v) in load_pairs() if k != key]
-            pairs.append((key, value))
-            write_pairs(pairs)
+            update(ENV_FILE, [(key, value)], ENV_HEADER)
 
 
         def delete_key(key):
-            pairs = [(k, v) for (k, v) in load_pairs() if k != key]
-            write_pairs(pairs)
+            update(ENV_FILE, [], ENV_HEADER, drop=[key])
 
 
         @contextlib.contextmanager
@@ -6114,7 +6757,7 @@ in
         def write_sessions(sessions):
             """Atomically rewrite SESSIONS_FILE (0600) with the given dict.
 
-            Same tempfile-in-directory + os.replace dance as write_pairs. The
+            Same tempfile-in-directory + os.replace dance as envstore.save. The
             supervisor in the agent unit picks the change up within ~2s.
             """
             directory = os.path.dirname(SESSIONS_FILE) or "."
@@ -7075,7 +7718,7 @@ in
             terminal would say. No value is ever rendered.
             """
             env = dict(os.environ)
-            stored = dict(load_pairs())
+            stored = as_dict(load(ENV_FILE))
             for key in flow["shadow"]:
                 if key in stored:
                     env[key] = stored[key]
@@ -7885,6 +8528,13 @@ in
                                     color: #e6edf3; }
           input[type=text] { width: 200px; max-width: 100%; }
           input[type=password] { width: 280px; max-width: 100%; }
+          /* The secret VALUE field is a textarea (issue #212): a PEM does not fit on
+             one line. Sized like the password input it replaced so the add-secret row
+             still reads as one row, and it grows only if the user drags it. */
+          textarea.secret-value { width: 280px; max-width: 100%; flex: 0 1 280px;
+                                  height: 3.2em; resize: vertical; white-space: pre;
+                                  font-family: ui-monospace, SFMono-Regular, Menlo,
+                                               monospace; }
           textarea { width: 100%; resize: vertical; }
           .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
           .new-session-row { align-items: flex-end; }
@@ -8141,11 +8791,15 @@ in
                   <input type="text" name="key" placeholder="KEY_NAME"
                          pattern="[A-Za-z_][A-Za-z0-9_]*" required
                          title="Letters, digits and underscores; must not start with a digit">
-                  <input type="password" name="value" placeholder="value" autocomplete="off" required>
+                  <textarea name="value" class="secret-value" rows="2" spellcheck="false"
+                            placeholder="value (may span lines &mdash; paste a PEM whole)"
+                            autocomplete="off" required></textarea>
                   <button type="submit" class="btn">Save</button>
                 </div>
                 <p class="note">The value is write-only &mdash; saving replaces any
-                existing value for that key. This page never displays stored values.</p>
+                existing value for that key. This page never displays stored values.
+                A value may span lines, so an x509 key or a PEM can be pasted whole
+                (from a session: <code>agent-box-session env set KEY --stdin</code>).</p>
               </form>
             </div>
             <div id="secrets-list">{keys}</div>
@@ -8838,7 +9492,7 @@ in
               var key = form.querySelector("input[name=key]");
               key.value = t.getAttribute("data-edit");
               key.readOnly = true;
-              form.querySelector("input[name=value]").focus();
+              form.querySelector("[name=value]").focus();
               return;
             }
             var el = document.getElementById(t.getAttribute("data-toggle"));
@@ -10166,7 +10820,10 @@ in
                     self._redirect("ok=password_changed")
                 elif path == BASE + "/set":
                     key = (form.get("key", [""])[0]).strip()
-                    value = form.get("value", [""])[0]
+                    # A textarea posts its newlines as CRLF (HTML forms, RFC 1866).
+                    # Normalize here, so what a session reads back is what was
+                    # pasted rather than the same text with stray carriage returns.
+                    value = form.get("value", [""])[0].replace("\r\n", "\n").replace("\r", "\n")
                     if not KEY_RE.match(key):
                         self._send_html(
                             render_page("Invalid key name. Use letters, digits and "

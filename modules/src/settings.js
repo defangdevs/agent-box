@@ -582,7 +582,7 @@
       var key = form.querySelector("input[name=key]");
       key.value = t.getAttribute("data-edit");
       key.readOnly = true;
-      form.querySelector("input[name=value]").focus();
+      form.querySelector("[name=value]").focus();
       return;
     }
     var el = document.getElementById(t.getAttribute("data-toggle"));

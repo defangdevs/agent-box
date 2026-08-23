@@ -124,12 +124,48 @@ let
   # single live source for those keys (it is deliberately NOT in the
   # unit's EnvironmentFile, so a DELETED key disappears on restart too).
   # Values are exported literally — never eval'd — so a secret full of
-  # shell metacharacters can't break or inject anything; one pair of
-  # surrounding quotes is stripped to match how systemd read the same
-  # file before. Key charset mirrors the settings daemon's KEY_RE.
-  envExecWrapper = pkgs.writeShellScript "agent-box-env-exec" ''
-    @@include:src/env-exec.sh@@
+  # shell metacharacters can't break or inject anything.
+  #
+  # Python since issue #212, because the format now has continuation lines:
+  # see envStoreLib below for why one parser owns them.
+  envExecWrapper = pkgs.writers.writePython3 "agent-box-env-exec" {
+    # E402: the library is spliced in ABOVE this program, so its own imports
+    # follow module-level code. E501: the prose comments run long.
+    flakeIgnore = [ "E402" "E501" ];
+  } (envStoreLib + ''
+
+
+@@include:src/env-exec.py@@
+  '');
+
+  # The env store's format — ~/.config/agent-box/env and
+  # profiles/<name>.env — has ONE owner (issue #212). Six places used to
+  # parse it independently, so a format CHANGE had to land in six dialects at
+  # once or the file meant different things to different readers; multi-line
+  # values are exactly such a change. Every python program that touches the
+  # file gets this library spliced in ahead of its own code, and the shell
+  # callers go through envStoreCli below.
+  #
+  # Spliced rather than packaged as a python module: the module has to stay a
+  # SINGLE file (the contract at the top of this one), so a real site-packages
+  # library would mean building a derivation to hold one 200-line file. When a
+  # third library appears, that trade flips.
+  envStoreLib = ''
+@@include:src/lib/envstore.py@@
   '';
+
+  # The same library, as a program, for the callers that are not python: the
+  # session CLI's `env` verb, agent-box-profile, and the webhook spawner. NOT
+  # on any PATH — every caller pins its store path (AGENT_BOX_ENVSTORE_BIN),
+  # the convention sessionCli already uses for flock and agent-box-profile, so
+  # a caller cannot silently fall back to a different copy or to none.
+  envStoreCli = pkgs.writers.writePython3Bin "agent-box-envstore" {
+    flakeIgnore = [ "E402" "E501" ];
+  } (envStoreLib + ''
+
+
+@@include:src/envstore-cli.py@@
+  '');
 
   # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
   # quit, so the pane records stopped=true and the supervisor leaves the
@@ -328,6 +364,11 @@ let
     # from PATHs that do not carry it — the webhook receiver unit's PATH is
     # jq + coreutils + this CLI. Same pin convention as the flock above.
     export AGENT_BOX_PROFILE_BIN=${profileCli}/bin/agent-box-profile
+    # The env store's one reader/writer (issue #212): `env ls/set/rm` here and
+    # the settings page must agree byte-for-byte about a multi-line value, so
+    # neither owns a parser. Pinned in the wrapper for the same reason as the
+    # flock above — this CLI runs from PATHs that carry almost nothing.
+    export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
   '' + ''
 @@include:src/session-cli.sh@@
   '');
@@ -345,6 +386,9 @@ let
   profileCli = pkgs.writeShellScriptBin "agent-box-profile" (''
     export AGENT_BOX_AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " (sessionKinds cfg.installAgents))}
     export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+    # A profile file is the env store in another directory, so it has the same
+    # one parser (issue #212).
+    export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
   '' + ''
 @@include:src/profile-cli.sh@@
   '');
@@ -396,6 +440,10 @@ let
     # NAME it, because that is the half of "what does this watch launch" the
     # page could not show before (issue #292). Same value sessionCli exports.
     export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+    # This wrapper reads two keys out of the env store, so it reads them with
+    # the store's own parser (issue #212) rather than a fifth copy of the
+    # KEY=value loop.
+    export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
   '' + lib.optionalString (cfg.webhook.hookSessionArgs != [ ]) ''
     # The fleet-wide default for hook-session args (webhook.hookSessionArgs),
     # JSON so multi-word args survive the round trip; the script decodes it
@@ -1934,7 +1982,13 @@ in
         # No external libraries; skip flake8 style gate (the script is
         # formatted for readability, not lint-perfection) but keep syntax
         # checking that writePython3Bin does by compiling.
-        flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" ];
+        #
+        # F811 as well, and only here: the env-store library is spliced in
+        # after this file's own imports (issue #212), so its `import json`,
+        # `os`, `re` and `tempfile` re-bind four names this file already
+        # imported. Nothing else in the two files shares a name — the library
+        # was written to stay clear of the daemon's globals.
+        flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" "F811" ];
       } ''
         @@include:src/settings-daemon.py@@
       '';

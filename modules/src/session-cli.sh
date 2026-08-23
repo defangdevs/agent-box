@@ -38,7 +38,9 @@ usage() {
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
-  echo "       agent-box-session env ls | set KEY VALUE | rm KEY"
+  echo "       agent-box-session env ls | set KEY VALUE | set KEY --stdin | rm KEY"
+  echo "         (--stdin reads the value from stdin: for a multi-line secret"
+  echo "          such as a PEM, and to keep any secret out of the command line)"
   echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters, and"
   echo "not one of: $RESERVED_NAMES (each is already a path under /<user>/). (a"
   echo "longer name would be invisible in the web UI)."
@@ -445,54 +447,38 @@ case "$cmd" in
     # the env-exec wrapper reads at every session spawn. Applies on the next
     # (re)start — see 'restart'. ls shows KEYS only, never values (matching
     # the settings page, which never surfaces a stored secret).
+    #
+    # The format has ONE owner (issue #212) and this verb delegates to it
+    # rather than carrying a second KEY=value parser: a value that spans lines
+    # — a PEM, an SSH key — has to mean the same thing here, on the settings
+    # page and at session spawn, or setting it in one place corrupts it in
+    # another.
+    ENVSTORE="${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
     ENV_FILE="$HOME/.config/agent-box/env"
-    env_header() {
-      printf '# Managed by agent-box settings page. KEY=value, one per line.\n'
-      printf '# Do not add secrets by hand here unless you know what you are doing.\n'
-    }
-    env_rewrite() {
-      # env_rewrite DROP_KEY [APPEND_KEY APPEND_VALUE] — atomically rewrite
-      # ENV_FILE dropping DROP_KEY, keeping every other valid KEY=value, then
-      # optionally appending a fresh pair.
-      mkdir -p "$(dirname "$ENV_FILE")"
-      tmp="$(mktemp "$ENV_FILE.XXXXXX")"
-      { env_header
-        if [ -f "$ENV_FILE" ]; then
-          while IFS= read -r line; do
-            case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-            ek="${line%%=*}"
-            valid_key "$ek" || continue
-            [ "$ek" = "$1" ] && continue
-            printf '%s\n' "$line"
-          done < "$ENV_FILE"
-        fi
-        if [ $# -ge 3 ]; then printf '%s=%s\n' "$2" "$3"; fi
-      } > "$tmp"
-      chmod 600 "$tmp"; mv "$tmp" "$ENV_FILE"
-    }
     sub="${1:-}"; shift || true
     case "$sub" in
       ls)
-        [ -f "$ENV_FILE" ] || exit 0
-        while IFS= read -r line; do
-          case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-          k="${line%%=*}"
-          valid_key "$k" && printf '%s\n' "$k"
-        done < "$ENV_FILE" | sort -u
+        "$ENVSTORE" keys
         ;;
       set)
-        k="${1:-}"; v="${2-}"
+        k="${1:-}"
         valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
-        case "$v" in (*"
-"*) echo "value may not contain a newline" >&2; exit 2 ;; esac
-        env_rewrite "$k" "$k" "$v"
+        if [ "${2-}" = "--stdin" ]; then
+          # The way to set a multi-line secret, and the safer way to set any
+          # secret: the value never reaches a command line, so it is not in
+          # the shell history and not in anyone's `ps` output.
+          "$ENVSTORE" set --stdin "$k"
+        else
+          "$ENVSTORE" set "$k=${2-}"
+        fi
         echo "env '$k' set — applies on the next session (re)start ('agent-box-session restart --all')"
         ;;
       rm)
         k="${1:-}"
         valid_key "$k" || { usage >&2; exit 2; }
+        # No file, nothing to remove — and no file created just to say so.
         [ -f "$ENV_FILE" ] || exit 0
-        env_rewrite "$k"
+        "$ENVSTORE" unset "$k"
         echo "env '$k' removed — applies on the next session (re)start ('agent-box-session restart --all')"
         ;;
       *) usage >&2; exit 2 ;;

@@ -472,6 +472,36 @@
               cat log
               cp log "$out"
             '';
+
+          # Unit test for the env store's format (issue #212). The VM tests
+          # prove one PEM survives one caller at 300+ seconds a run; this
+          # pins the format itself — round trip, no key injection, and the
+          # legacy readings a deployed box's file relies on — in a second,
+          # natively, on every architecture. It also composes and runs the
+          # CLI the way the generated module does, so the library and its
+          # front end cannot drift apart unnoticed.
+          envstore-format =
+            pkgs.runCommand "agent-box-envstore-format"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                envstoreLib = ./modules/src/lib/envstore.py;
+                envstoreCli = ./modules/src/envstore-cli.py;
+                tests = ./tests/test-envstore.py;
+              } ''
+              install -d repo/modules/src/lib repo/tests
+              cp "$envstoreLib" repo/modules/src/lib/envstore.py
+              cp "$envstoreCli" repo/modules/src/envstore-cli.py
+              cp "$tests" repo/tests/test-envstore.py
+              # Not piped into tee: the log has to reach the build output
+              # whether the tests pass or fail, and the exit status has to be
+              # python's own.
+              python3 repo/tests/test-envstore.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
         }
         # Everything below boots a guest, so it only exists for `vmSystems`:
         # runNixOSTest wants a same-arch KVM guest (cross-arch falls back to
