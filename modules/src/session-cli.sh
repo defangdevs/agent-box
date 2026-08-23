@@ -39,7 +39,8 @@ usage() {
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
   echo "       agent-box-session env ls | set KEY VALUE | rm KEY"
-  echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters (a"
+  echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters, and"
+  echo "not one of: $RESERVED_NAMES (each is already a path under /<user>/). (a"
   echo "longer name would be invisible in the web UI)."
   echo "agents: $AGENTS (default: $DEFAULT_AGENT) — the HARNESS to run."
   echo "--profile names an agent profile (agent-box-profile ls): a harness plus"
@@ -64,14 +65,27 @@ NAME_MAX=150
 valid_name() {
   case "$1" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
 }
+# Names the vhost already spends on something else. A session's terminal
+# lives at /<user>/<session>/, so a session called "settings" would collide
+# with the settings page — the more specific route wins and the session
+# becomes unreachable, with nothing on the page to say why. Mirrored by the
+# daemon's RESERVED_NAMES and the module's session-name assertion.
+RESERVED_NAMES="settings downloads webhook sessions token ws"
+reserved_name() {
+  for r in $RESERVED_NAMES; do
+    [ "$1" = "$r" ] && return 0
+  done
+  return 1
+}
 valid_new_name() {
-  # The length rule belongs on CREATION only — this is the one gate every
-  # creation path passes through (add, and the webhook spawn wrapper through
-  # it), so refusing here is what keeps such a name from existing. rm, stop
-  # and restart deliberately keep to the charset: a name minted before this
-  # bound existed, or written into sessions.json by hand, is invisible in the
-  # UI and the CLI is the only way left to get rid of it.
-  valid_name "$1" && [ "${#1}" -le "$NAME_MAX" ]
+  # The length and reserved-name rules belong on CREATION only — this is the
+  # one gate every creation path passes through (add, and the webhook spawn
+  # wrapper through it), so refusing here is what keeps such a name from
+  # existing. rm, stop and restart deliberately keep to the charset: a name
+  # minted before these bounds existed, or written into sessions.json by
+  # hand, is invisible in the UI and the CLI is the only way left to get rid
+  # of it.
+  valid_name "$1" && [ "${#1}" -le "$NAME_MAX" ] && ! reserved_name "$1"
 }
 valid_key() {
   # env var name charset — mirrors the settings daemon's KEY_RE and the
@@ -176,6 +190,15 @@ jq_edit() {
   registry_unlock
 }
 taken() { "$JQ" -e --arg n "$1" '.sessions | has($n)' "$FILE" >/dev/null; }
+# Free to MINT, which is not the same question as `taken`: stop and start ask
+# whether a session exists, and answering "yes" for a reserved name would have
+# them write a stub entry under it. Only auto-naming asks this one — and it
+# must, because the name can come from a WORKING DIRECTORY's own basename, so
+# a session in ~/ws or ~/settings would otherwise be minted with exactly the
+# name the vhost cannot route to a terminal.
+mintable() {
+  ! reserved_name "$1" && ! taken "$1"
+}
 gen_name() {
   # gen_name AGENT [CWD] — echo a unique session name derived from AGENT: the
   # bare name when free ("claude"), else the working directory's own name
@@ -189,7 +212,7 @@ gen_name() {
   # wrong transcript got downloaded (issue #277). The directory name is the
   # one fact that says WHERE this session works.
   a="$1"
-  taken "$a" || { printf '%s' "$a"; return; }
+  mintable "$a" && { printf '%s' "$a"; return; }
   # HOME is deliberately not used: its basename is the user's own name, which
   # says nothing (every default session sits there), so those keep the hex.
   base="${2:-}"
@@ -200,11 +223,11 @@ gen_name() {
   base="${base#-}"
   base="${base%-}"
   if [ -n "$base" ] && [ "${#base}" -le "$((NAME_MAX - 2))" ]; then
-    taken "$base" || { printf '%s' "$base"; return; }
+    mintable "$base" && { printf '%s' "$base"; return; }
     n=2
     while [ "$n" -le 9 ]; do
       cand="$base-$n"
-      taken "$cand" || { printf '%s' "$cand"; return; }
+      mintable "$cand" && { printf '%s' "$cand"; return; }
       n=$((n + 1))
     done
   fi
@@ -212,7 +235,7 @@ gen_name() {
   # that directory. Random cannot collide the way a tenth "-N" guess would.
   while :; do
     cand="$a-$(printf '%04x' $((RANDOM % 65536)))"
-    taken "$cand" || { printf '%s' "$cand"; return; }
+    mintable "$cand" && { printf '%s' "$cand"; return; }
   done
 }
 

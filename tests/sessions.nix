@@ -20,16 +20,19 @@
 #     and skipped for codex (reads AGENTS.md natively) and shell sessions,
 #   - browser tmux clients advertise OSC 8 support, preserving a long hidden
 #     hyperlink target when its visible URL wraps across terminal rows (#18),
-#   - the root tabbed terminal workspace (the settings daemon in
+#   - the tabbed terminal workspace at /<user>/ (the settings daemon in
 #     AGENT_BOX_HOME mode for the primary web user; issue 119) — one tab per
-#     session, panes iframing the per-session ttyd URLs, server-side ?tab=
-#     selection — and its /sessions/* CRUD routes, all behind auth — nothing
-#     on the vhost is served unauthenticated anymore (the old picker and its
-#     public sessions.json are gone),
+#     session, panes iframing each session's own path, server-side ?tab=
+#     selection — the vhost root redirecting into it, and its /sessions/*
+#     CRUD routes, all behind auth — nothing on the vhost is served
+#     unauthenticated anymore (the old picker and its public sessions.json
+#     are gone),
 #   - session CRUD on the settings page (back=settings redirects there),
 #   - the live session feed both pages follow (Server-Sent Events through
 #     Caddy, plus the one-shot fingerprint its no-stream fallback polls),
-#   - ttyd running with --url-arg so /<user>/?arg=<session> deep links work.
+#   - ttyd running with --url-arg, which is what /<user>/<session>/ is
+#     rewritten onto (this test swaps the Caddyfile, so the rewrite itself is
+#     the session-route eval check's job; here it is the LINKS that matter).
 #
 # Like the other tests, lib.mkForce-swaps the module Caddyfile for a minimal
 # `tls internal` one (no ACME in the sandbox) that keeps the same routing
@@ -1140,13 +1143,31 @@
         "https://box.test/agent/sessions.json | grep -x 401"
     )
 
+    # The vhost root picks a user and lands in their space: with one
+    # terminal user there is nothing to pick, so it redirects — carrying the
+    # query, so a /?tab=<session> bookmark from before this scheme still
+    # opens on its tab.
+    redirect = client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}} %{{redirect_url}}'"
+        " https://box.test/"
+    ).split()
+    assert redirect[0] == "303", redirect
+    assert redirect[1] == "https://box.test/agent/", redirect
+    tab_redirect = client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{redirect_url}}'"
+        " 'https://box.test/?tab=main'"
+    ).strip()
+    assert tab_redirect == "https://box.test/agent/?tab=main", tab_redirect
+
     # The root page (behind auth) is the tabbed terminal workspace (issue
     # 119): a tab per session, the selected (live) session's pane iframing
     # its ttyd deep link. Never a session's argv/cwd/env (may hold secrets).
-    root_page = client.succeed(f"{curl} -u agent:testpassword https://box.test/")
+    root_page = client.succeed(
+        f"{curl} -u agent:testpassword https://box.test/agent/"
+    )
     assert 'id="tab-bar"' in root_page, root_page
-    assert 'data-tab="main" href="/?tab=main" aria-current="page"' in root_page, root_page
-    assert 'src="/agent/?arg=main"' in root_page, root_page
+    assert 'data-tab="main" href="/agent/?tab=main" aria-current="page"' in root_page, root_page
+    assert 'src="/agent/main/"' in root_page, root_page
     assert "workingDirectory" not in root_page, root_page
 
     # The add/delete banner is page-level feedback, so it renders ABOVE the
@@ -1155,7 +1176,7 @@
     # message, so the tabs stay flush with the top of the viewport.
     assert '<div id="msg-slot"></div>' in root_page, root_page
     ok_page = client.succeed(
-        f"{curl} -u agent:testpassword 'https://box.test/?ok=session_added'"
+        f"{curl} -u agent:testpassword 'https://box.test/agent/?ok=session_added'"
     )
     assert "Session added" in ok_page, ok_page
     assert ok_page.index('class="msg"') < ok_page.index('id="tab-bar"'), ok_page
@@ -1166,7 +1187,7 @@
     # the workspace and tear down every attached terminal). Dismissing on
     # the workspace keeps the selected tab; on the settings page it goes
     # back to that page's own address.
-    assert '<a class="msg-x" href="/?tab=main" aria-label="Dismiss"' in ok_page, ok_page
+    assert '<a class="msg-x" href="/agent/?tab=main" aria-label="Dismiss"' in ok_page, ok_page
     ok_settings = client.succeed(
         f"{curl} -u agent:testpassword 'https://box.test/agent/settings/?ok=saved'"
     )
@@ -1183,15 +1204,16 @@
     # workspace redirect lands on the new session's tab. The name is always
     # auto-derived from the agent (there is no name field in the form): with
     # no session literally named "claude" yet, the first claude add lands on
-    # the bare-agent-name tab. Assert the raw Location header (h2 lowercases
-    # it, CRLF line ends — no grep -x): what the daemon EMITS is the contract,
-    # curl's %{redirect_url} resolution is not. Any submitted "name" field is
+    # the bare-agent-name tab — on /<user>/, which is where the tab bar lives.
+    # Assert the raw Location header (h2 lowercases it, CRLF line ends — no
+    # grep -x): what the daemon EMITS is the contract, curl's
+    # %{redirect_url} resolution is not. Any submitted "name" field is
     # ignored, so passing a bogus one changes nothing.
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -D - "
         "-d 'name=ignored&agent=claude' "
         "https://box.test/sessions/add "
-        "| grep -i '^location: /?ok=session_added&tab=claude'"
+        "| grep -i '^location: /agent/?ok=session_added&tab=claude'"
     )
     machine.wait_until_succeeds(tmux("has-session -t =claude"), timeout=60)
     machine.succeed(
@@ -1201,11 +1223,45 @@
 
     # ?tab= selects a tab server-side (the no-JS switching path): the new
     # tab is current and its live pane iframes its ttyd URL.
-    tab_page = client.succeed(f"{curl} -u agent:testpassword 'https://box.test/?tab=claude'")
-    assert 'data-tab="claude" href="/?tab=claude" aria-current="page"' in tab_page, tab_page
-    assert 'src="/agent/?arg=claude"' in tab_page, tab_page
+    tab_page = client.succeed(
+        f"{curl} -u agent:testpassword 'https://box.test/agent/?tab=claude'"
+    )
+    assert 'data-tab="claude" href="/agent/?tab=claude" aria-current="page"' in tab_page, tab_page
+    assert 'src="/agent/claude/"' in tab_page, tab_page
     # main is still a tab, just not the current one.
-    assert 'data-tab="main" href="/?tab=main" title="main">' in tab_page, tab_page
+    assert 'data-tab="main" href="/agent/?tab=main" title="main">' in tab_page, tab_page
+
+    with subtest("a name the vhost already owns is refused"):
+        # /agent/settings/ is a page, so a session called "settings" could
+        # never be routed to a terminal — the CLI refuses the name outright.
+        for name in ["settings", "downloads", "webhook", "sessions", "token", "ws"]:
+            machine.fail(as_agent(f"agent-box-session add {name} --agent shell"))
+        machine.succeed(
+            "jq -e '.sessions | has(\"settings\") | not'"
+            " /home/agent/.config/agent-box/sessions.json"
+        )
+        # And auto-naming cannot mint one either. The name it derives is the
+        # working directory's own basename, and that branch is only reached
+        # once the agent's own bare name is taken — so the FIRST session in
+        # ~/ws is "shell" and the second is the one that would have been
+        # called "ws".
+        machine.succeed(as_agent("mkdir -p /home/agent/ws"))
+        for _ in range(2):
+            machine.succeed(
+                as_agent("agent-box-session add --cwd /home/agent/ws --agent shell")
+            )
+        machine.succeed(
+            "jq -e '.sessions | has(\"ws\") | not'"
+            " /home/agent/.config/agent-box/sessions.json"
+        )
+        minted = machine.succeed(
+            "jq -r '.sessions | to_entries[]"
+            " | select(.value.workingDirectory == \"/home/agent/ws\") | .key'"
+            " /home/agent/.config/agent-box/sessions.json"
+        ).split()
+        assert len(minted) == 2 and "ws" not in minted, minted
+        for name in minted:
+            machine.succeed(as_agent(f"agent-box-session rm {name}"))
 
     # A dispatch-shaped long name renders as a tab (issue #236). The daemon
     # used to bound a name at 32 and DROP the rest, so hook-<owner/repo>-<hex>
@@ -1218,8 +1274,10 @@
     machine.succeed(
         f"su -s /bin/sh agent -c 'agent-box-session add {long_name} --agent shell'"
     )
-    long_page = client.succeed(f"{curl} -u agent:testpassword https://box.test/")
-    assert f'data-tab="{long_name}" href="/?tab={long_name}"' in long_page, long_page
+    long_page = client.succeed(
+        f"{curl} -u agent:testpassword https://box.test/agent/"
+    )
+    assert f'data-tab="{long_name}" href="/agent/?tab={long_name}"' in long_page, long_page
     assert f'title="{long_name}"' in long_page, long_page
     assert f'<span class="tab-name">{long_name}</span>' in long_page, long_page
     assert f'class="tab-x" data-close="{long_name}"' in long_page, long_page
@@ -1318,7 +1376,7 @@
         )
         # Just this row's own markup: from its terminal link to the delete
         # form that closes it (the fold below a row carries forms of its own).
-        row = stopped_page[stopped_page.index('href="/agent/?arg=main"'):]
+        row = stopped_page[stopped_page.index('href="/agent/main/"'):]
         row = row[:row.index("/sessions/delete")]
         assert 'data-state="stopped"' in row, row
         assert ">Start</button>" in row, row
@@ -1326,10 +1384,12 @@
 
         # The workspace pane says the same thing, and stamps the state it
         # was built for so the page can tell a pane that has gone stale.
-        ws = client.succeed(f"{curl} -u agent:testpassword 'https://box.test/?tab=main'")
+        ws = client.succeed(
+            f"{curl} -u agent:testpassword 'https://box.test/agent/?tab=main'"
+        )
         assert 'data-ph="stopped"' in ws, ws
         assert "main is stopped" in ws, ws
-        assert 'src="/agent/?arg=main"' not in ws, ws
+        assert 'src="/agent/main/"' not in ws, ws
 
         # The terminal dead end names the verb that actually revives it.
         # Print the wrapper's path (see the grep -o note below) — running
@@ -1364,7 +1424,7 @@
         )
         machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=60)
         live_ws = client.succeed(
-            f"{curl} -u agent:testpassword 'https://box.test/?tab=main'"
+            f"{curl} -u agent:testpassword 'https://box.test/agent/?tab=main'"
         )
         assert 'data-ph="live"' in live_ws, live_ws
 
@@ -1503,7 +1563,7 @@
         # Both pages carry the feed's handle: where to stream from, plus the
         # fingerprint of the state they were rendered with (so a change
         # landing before the stream connects is not missed).
-        for page_url in ["https://box.test/", "https://box.test/agent/settings/"]:
+        for page_url in ["https://box.test/agent/", "https://box.test/agent/settings/"]:
             feed_page = client.succeed(f"{curl} -u agent:testpassword {page_url}")
             assert 'name="agent-box-events" content="/sessions/events"' in feed_page, feed_page
             assert re.search(r'data-fp="[0-9a-f]{16}"', feed_page), feed_page

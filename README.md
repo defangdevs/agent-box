@@ -326,9 +326,13 @@ agent-box-session restart review
 agent-box-session rm review                 # delist + kill
 ```
 
-The site root (web setups) is the terminal itself — `https://<domain>/` is
-a tabbed workspace, one tab per session, behind the same login as the
-terminal (add and close sessions from the tab bar — the tab's `×` arms on
+The site root (web setups) picks a user and lands in their space:
+`https://<domain>/` sends you to `https://<domain>/<user>/`, which is a
+tabbed workspace, one tab per session, behind the same login as the
+terminal — or, on a box with no session yet, straight to that user's
+settings page, where a sign-in and a first session are what is actually
+needed. On a box with several terminal users the root lists them instead,
+each behind their own login (add and close sessions from the tab bar — the tab's `×` arms on
 the first click and only closes on the second; restart/delete also on the
 settings page) — and agents can spawn sibling sessions themselves (it's just
 a file edit on their own account — handy for "have Codex cross-check this").
@@ -353,7 +357,12 @@ closes on the second](docs/workspace-tab-close.png)
 Attach locally with `tmux -L agent-box attach -t <session>` (see
 `TMUX_TMPDIR` note above). In the browser, every tab is also a
 deep-linkable standalone terminal at
-`https://<domain>/<user>/?arg=<session>`. Killed-on-error sessions keep a
+`https://<domain>/<user>/<session>/` — one path per session, so a session
+can be bookmarked, shared with whoever holds the login, or opened in its
+own window. `settings`, `downloads`, `webhook`, `sessions`, `token` and
+`ws` are already paths under `/<user>/`, so no session may take one of
+those names (the CLI, the settings page and a module assertion all refuse
+them). Killed-on-error sessions keep a
 post-mortem shell open instead of being respawned over; delisted sessions
 stay gone.
 

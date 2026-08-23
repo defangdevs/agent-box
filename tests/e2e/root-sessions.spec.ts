@@ -5,8 +5,9 @@
 // a tab per session, each pane an iframe onto the per-session ttyd URL.
 // Complements tests/sessions.nix (which curls the HTTP surface inside a VM)
 // by covering the browser-only legs:
-//   - the auth gate on / (401 unauthenticated; basic auth renders the page),
-//   - the active tab's pane iframing /<user>/?arg=<session> with no URL
+//   - the auth gate on / (401 unauthenticated; basic auth renders the page,
+//     which the root redirects to /<user>/ — every goto('/') below follows it),
+//   - the active tab's pane iframing /<user>/<session>/ with no URL
 //     userinfo (issue 56: Chrome answers the basic-auth challenge with
 //     userinfo plus an EMPTY password, and typed credentials can't override),
 //   - client-side tab switching that keeps background panes mounted,
@@ -68,7 +69,7 @@ test('authenticated root shows the tab bar with main active and its terminal ifr
   await expect(mainTab).toHaveAttribute('aria-current', 'page');
   // The pane may briefly be a "starting" placeholder; the poller swaps in
   // the iframe once the session is live.
-  const frame = page.locator(`#panes iframe[src="/${USER}/?arg=main"]`);
+  const frame = page.locator(`#panes iframe[src="/${USER}/main/"]`);
   await expect(frame).toBeVisible({ timeout: 30_000 });
   // Every pane records the session state it was built for, the iframe
   // included. That stamp is what lets the page retire a terminal whose
@@ -107,7 +108,7 @@ test('add a session from the tab bar, switch tabs, delete it on the settings pag
   const name = (await tabNames(page)).find((n) => !before.includes(n)) as string;
   const newTab = page.locator(`#tab-bar .tab[data-tab="${name}"]`);
   await expect(newTab).toHaveAttribute('aria-current', 'page');
-  await expect(page.locator(`#panes iframe[src="/${USER}/?arg=${name}"]`))
+  await expect(page.locator(`#panes iframe[src="/${USER}/${name}/"]`))
     .toBeVisible({ timeout: 30_000 });
 
   // Switch back to main: its pane shows, the new pane stays mounted but
@@ -117,7 +118,7 @@ test('add a session from the tab bar, switch tabs, delete it on the settings pag
   await expect(newTab).not.toHaveAttribute('aria-current', 'page');
   await expect(page.locator(`#panes .pane[data-pane="${name}"]`)).toHaveCount(1);
   await expect(page.locator(`#panes .pane[data-pane="${name}"]`)).not.toBeVisible();
-  await expect(page.locator(`#panes iframe[src="/${USER}/?arg=main"]`))
+  await expect(page.locator(`#panes iframe[src="/${USER}/main/"]`))
     .toBeVisible({ timeout: 30_000 });
 
   // Delete lives on the settings page now. Dismissed confirm is a no-op;
@@ -146,7 +147,7 @@ test('add a session from the tab bar, switch tabs, delete it on the settings pag
 test('the feedback banner can be dismissed without reloading the workspace', async ({ browser }) => {
   const page = await authedPage(browser);
   await page.goto('/');
-  await expect(page.locator(`#panes iframe[src="/${USER}/?arg=main"]`))
+  await expect(page.locator(`#panes iframe[src="/${USER}/main/"]`))
     .toBeVisible({ timeout: 30_000 });
 
   const before = await tabNames(page);
