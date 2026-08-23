@@ -171,6 +171,16 @@ let
       not respawned — until `restart NAME` revives it; `rm` delists it for
       good. `restart --all` bounces every session. Listed sessions start
       within ~2s.
+    - `--agent` picks the HARNESS (the CLI program). An agent PROFILE is the
+      worker: a harness plus a model, an effort level, an appended system prompt
+      and environment. Make one with `agent-box-profile set NAME
+      HARNESS=claude MODEL=sonnet EFFORT=low KEY=value`, read it back with
+      `agent-box-profile show NAME`, and start it with `agent-box-session add
+      [NAME] --profile PROFILE`. A `-- EXTRA_ARGS` tail still wins over the
+      profile. Profile env is convenience, not isolation: every session of this
+      user can read it out of /proc. A standing webhook watch hands its work to
+      a profile through `agent-box-session env set AGENT_BOX_HOOK_PROFILE NAME`,
+      which is the only way to pick the harness a dispatched hook-* session runs.
 
     ## Slash commands: type them into your own pane
 
@@ -356,6 +366,45 @@ let
         esac
         export "$key=$val"
       done < "$FILE"
+    fi
+
+    # The agent profile's own environment (issue #321), on top of the file above:
+    # every key in ~/.config/agent-box/profiles/<name>.env that is not one of the
+    # reserved LAUNCH keys agent-box-profile turns into harness arguments. The
+    # supervisor passes the name through the tmux session environment, so this
+    # applies at every spawn — an edited profile reaches the session on its next
+    # restart, exactly like the file above.
+    #
+    # Convenience, NOT isolation: this process's environment is readable through
+    # /proc/<pid>/environ by every other session of this user (issue #135, wiki
+    # Users-vs-Sessions), so a secret in a profile is a secret all of them have.
+    # What a profile buys is that sessions started with OTHER profiles do not get
+    # it handed to them, not that they cannot reach it.
+    if [ -n "''${AGENT_BOX_PROFILE:-}" ]; then
+      case "$AGENT_BOX_PROFILE" in
+        (*[!A-Za-z0-9_-]*|"") ;;
+        (*)
+          PFILE="$HOME/.config/agent-box/profiles/$AGENT_BOX_PROFILE.env"
+          if [ -r "$PFILE" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
+              key=''${line%%=*}
+              case "$key" in (*[!A-Za-z0-9_]*|""|[0-9]*) continue ;; esac
+              # The reserved keys are launch config, not environment: HARNESS,
+              # MODEL, EFFORT and SYSTEM_PROMPT are already in the session's
+              # agent/extraArgs, and exporting them would put a system prompt in
+              # the environment of everything the agent runs.
+              case "$key" in (HARNESS|MODEL|EFFORT|SYSTEM_PROMPT) continue ;; esac
+              val=''${line#*=}
+              case "$val" in
+                \"*\") val=''${val#\"}; val=''${val%\"} ;;
+                \'*\') val=''${val#\'}; val=''${val%\'} ;;
+              esac
+              export "$key=$val"
+            done < "$PFILE"
+          fi
+          ;;
+      esac
     fi
 
     # The GitHub login this box acts as, for local-webhook's "@self" sender mute
@@ -803,7 +852,7 @@ done
 
   agentRuntimePackages = lib.unique (
     installedAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli ]
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli ]
@@ -871,6 +920,11 @@ done
     # this CLI, no util-linux) — and a lock that only some writers take is not
     # a lock. util-linux is the only package that ships flock.
     export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
+    # Agent profiles (issue #321): `add --profile` resolves the harness and
+    # its arguments by shelling out to agent-box-profile, and this CLI runs
+    # from PATHs that do not carry it — the webhook receiver unit's PATH is
+    # jq + coreutils + this CLI. Same pin convention as the flock above.
+    export AGENT_BOX_PROFILE_BIN=${profileCli}/bin/agent-box-profile
   '' + ''
 set -eu
 # jq/tmux resolve from PATH (system packages + every agent unit's PATH);
@@ -907,7 +961,7 @@ kill_session() {
 
 usage() {
   echo "usage: agent-box-session ls"
-  echo "       agent-box-session add [NAME] [--agent AGENT] [--cwd DIR]"
+  echo "       agent-box-session add [NAME] [--agent AGENT] [--profile PROFILE] [--cwd DIR]"
   echo "                             [--prompt TEXT] [--resume-prompt TEXT] [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
@@ -915,7 +969,10 @@ usage() {
   echo "       agent-box-session env ls | set KEY VALUE | rm KEY"
   echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters (a"
   echo "longer name would be invisible in the web UI)."
-  echo "agents: $AGENTS (default: $DEFAULT_AGENT)"
+  echo "agents: $AGENTS (default: $DEFAULT_AGENT) — the HARNESS to run."
+  echo "--profile names an agent profile (agent-box-profile ls): a harness plus"
+  echo "a model, an effort level, an appended system prompt and session env."
+  echo "--agent and a '-- EXTRA_ARGS' tail override what the profile resolved."
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
   echo "Listed sessions are (re)started by the per-user supervisor within ~2s."
@@ -1116,9 +1173,11 @@ case "$cmd" in
       *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
     agent="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
+    profile=""; has_agent=0
     while [ $# -gt 0 ]; do
       case "$1" in
-        --agent) agent="''${2:?--agent needs a value}"; shift 2 ;;
+        --agent) agent="''${2:?--agent needs a value}"; has_agent=1; shift 2 ;;
+        --profile) profile="''${2:?--profile needs a value}"; shift 2 ;;
         --cwd) cwd="''${2:?--cwd needs a value}"; shift 2 ;;
         --prompt) prompt="''${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
         --resume-prompt) rprompt="''${2?--resume-prompt needs a value}"; has_rprompt=1; shift 2 ;;
@@ -1126,6 +1185,36 @@ case "$cmd" in
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
     done
+    # An agent PROFILE (issue #321) resolves to a harness plus the arguments
+    # that make this session a particular worker — model, effort, appended
+    # system prompt. Resolved by agent-box-profile, the one place that mapping
+    # lives, and resolved NOW rather than at every spawn: what a session was
+    # started with must not change under it when the profile is later edited
+    # (the same rule webhook.hookSessionArgs states). The profile's remaining
+    # keys are session ENVIRONMENT, which the env-exec wrapper applies at each
+    # spawn from the profile name recorded below — so a rotated token in a
+    # profile reaches the session on its next restart.
+    #
+    # The binary is pinned by the generated wrapper (AGENT_BOX_PROFILE_BIN):
+    # this CLI also runs from the webhook receiver unit's PATH, which carries
+    # jq, coreutils and this script and nothing else.
+    profile_args=""
+    if [ -n "$profile" ]; then
+      # --agent on the command line wins over the profile's harness, the same
+      # override order the env file has over the NixOS option elsewhere here —
+      # and it is passed INTO the resolver, because the arguments a profile
+      # resolves to are harness-specific (`--model` for claude, `-m` for
+      # codex, none at all for a shell session).
+      povr=""
+      [ "$has_agent" = 1 ] && povr="$agent"
+      pjson="$("''${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" launch "$profile" "$povr")" || exit 2
+      agent="$("$JQ" -r '.harness' <<<"$pjson")"
+      "$JQ" -r --arg p "$profile" \
+        '.warnings[] | "agent-box-session: profile \($p): " + .' <<<"$pjson" >&2
+      # Profile args go FIRST so an explicit `-- EXTRA_ARGS` tail still has the
+      # last word (both harness CLIs take the last occurrence of a flag).
+      profile_args="$("$JQ" -r '.args[]' <<<"$pjson")"
+    fi
     case " $AGENTS " in
       (*" $agent "*) ;;
       (*) echo "agent '$agent' is not available (available: $AGENTS)" >&2; exit 2 ;;
@@ -1152,18 +1241,29 @@ case "$cmd" in
     [ -r /proc/sys/kernel/random/uuid ] && read -r bid < /proc/sys/kernel/random/uuid || true
     # `--` after --args: jq otherwise still option-parses positional
     # args, so a dashed extra arg like --model would error out.
+    # One argument vector: the profile's args first, the caller's own `--`
+    # tail after them, so an explicit flag still has the last word.
+    sargs=()
+    if [ -n "$profile_args" ]; then
+      while IFS= read -r parg; do
+        sargs+=("$parg")
+      done <<<"$profile_args"
+    fi
+    sargs+=("$@")
     jq_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
+      --arg prof "$profile" \
       '.sessions[$n] = {agent: $a, skipPermissions: true, remoteControl: true,
                         remoteControlName: null,
                         workingDirectory: (if $c == "" then null else $c end),
                         extraArgs: $ARGS.positional,
+                        profile: (if $prof == "" then null else $prof end),
                         initialPrompt: (if $pp == "1" then $p else null end),
                         resumePrompt: (if $rpp == "1" then $rp else null end),
                         boxSessionId: (if $bid == "" then null else $bid end),
                         hasRun: false}' \
-      --args -- "$@"
+      --args -- "''${sargs[@]}"
     registry_unlock
     # The mascot (issue #185) marks the closest thing this CLI has to
     # "an agent just started". Small on purpose: this runs in webhook
@@ -1172,10 +1272,12 @@ case "$cmd" in
         "   .-~~-." \
         "  ( (o) )" \
         "   \`-~~-'"
+    what="$agent"
+    [ -n "$profile" ] && what="$agent, profile $profile"
     if [ "$has_prompt" = 1 ]; then
-      echo "session '$name' ($agent) added with a kickoff prompt — the supervisor starts it within ~2s"
+      echo "session '$name' ($what) added with a kickoff prompt — the supervisor starts it within ~2s"
     else
-      echo "session '$name' ($agent) added — the supervisor starts it within ~2s"
+      echo "session '$name' ($what) added — the supervisor starts it within ~2s"
     fi
     ;;
   rm)
@@ -1300,6 +1402,302 @@ case "$cmd" in
         ;;
       *) usage >&2; exit 2 ;;
     esac
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+  '');
+
+  # Agent profiles (issue #321): the WORKER, as opposed to the harness that
+  # `--agent` selects — a harness plus the model, effort, appended system
+  # prompt and environment that tell two sessions on one harness apart.
+  #
+  # Deliberately NOT a services.agent-box.* option: a profile is per-user
+  # preference data a user must be able to change from chat with no root and
+  # no rebuild (the precedent set by issue #290/#291), so it lives beside the
+  # env store in ~/.config/agent-box/profiles/ and this CLI is the only writer.
+  # The wrapper injects the same harness list and default the session CLI gets,
+  # so a profile cannot name a harness this box does not install.
+  profileCli = pkgs.writeShellScriptBin "agent-box-profile" (''
+    export AGENT_BOX_AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " (sessionKinds cfg.installAgents))}
+    export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+  '' + ''
+set -eu
+# jq resolves from PATH (system packages + every agent unit's PATH); the
+# installed-harness list comes from the AGENT_BOX_* env the generated wrapper
+# exports, exactly as src/session-cli.sh does (issue #154, Phase 2).
+JQ=jq
+# An agent PROFILE (issue #321): the concrete worker, as opposed to the
+# HARNESS (claude/codex/shell) that `agent-box-session --agent` selects. A
+# profile names a harness plus the knobs that make two sessions on the same
+# harness different workers — model, effort, an appended system prompt, and
+# environment for the session.
+#
+# Runtime data, not a NixOS option: this is per-user preference a user must be
+# able to change from chat with no root and no rebuild (issue #290/#291's
+# precedent), so it lives beside ~/.config/agent-box/env in the same KEY=VALUE
+# format the settings page and `agent-box-session env` already write.
+DIR="$HOME/.config/agent-box/profiles"
+HARNESSES="''${AGENT_BOX_AGENTS:?}"
+
+# Reserved keys are the LAUNCH config: this script turns them into harness
+# arguments. Every other key in the file is environment for a session started
+# with the profile (see the warning in usage() — env is not a boundary).
+RESERVED="HARNESS MODEL EFFORT SYSTEM_PROMPT"
+
+usage() {
+  echo "usage: agent-box-profile ls"
+  echo "       agent-box-profile show NAME"
+  echo "       agent-box-profile set NAME KEY=VALUE..."
+  echo "       agent-box-profile rm NAME [KEY...]"
+  echo "       agent-box-profile launch NAME [HARNESS]   (JSON, for agent-box-session)"
+  echo "A profile is a worker: a harness plus the knobs that tell two sessions"
+  echo "on that harness apart. Start one with:"
+  echo "       agent-box-session add [NAME] --profile PROFILE"
+  echo "Reserved keys (turned into harness arguments):"
+  echo "  HARNESS        $HARNESSES"
+  echo "  MODEL          claude: --model VALUE; codex: -m VALUE"
+  echo "  EFFORT         claude: --effort VALUE; codex: -c model_reasoning_effort=VALUE"
+  echo "  SYSTEM_PROMPT  claude: --append-system-prompt VALUE"
+  echo "Any OTHER key is environment for sessions started with this profile,"
+  echo "applied at spawn on top of 'agent-box-session env'. It is convenience,"
+  echo "NOT isolation: a sibling session on this account reads it out of"
+  echo "/proc/<pid>/environ (issue #135, wiki: Users-vs-Sessions), so a secret"
+  echo "in a profile is a secret every session of this user has."
+  echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters."
+  echo "Changes apply to sessions started AFTERWARDS: a running session keeps"
+  echo "the arguments and environment it started with."
+}
+
+NAME_MAX=64
+valid_name() {
+  case "$1" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
+  [ "''${#1}" -le "$NAME_MAX" ]
+}
+valid_key() {
+  # Same charset as the env store and the settings daemon's KEY_RE: letters,
+  # digits, underscore, not starting with a digit.
+  case "$1" in (*[!A-Za-z0-9_]*|""|[0-9]*) return 1 ;; esac
+}
+reserved_key() {
+  case " $RESERVED " in (*" $1 "*) return 0 ;; esac
+  return 1
+}
+file_for() { printf '%s/%s.env\n' "$DIR" "$1"; }
+
+# read_profile NAME — set the res_<KEY> variables for the reserved keys and
+# collect the remaining key NAMES in env_keys. Same defensive parse as the
+# env-exec wrapper (issue #212): a line that is not KEY=value is skipped
+# rather than interpreted, so a hand-edited file cannot run anything.
+read_profile() {
+  res_HARNESS=""; res_MODEL=""; res_EFFORT=""; res_SYSTEM_PROMPT=""
+  env_keys=""
+  pf="$(file_for "$1")"
+  [ -r "$pf" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
+    k=''${line%%=*}
+    valid_key "$k" || continue
+    v=''${line#*=}
+    case "$v" in
+      \"*\") v=''${v#\"}; v=''${v%\"} ;;
+      \'*\') v=''${v#\'}; v=''${v%\'} ;;
+    esac
+    if reserved_key "$k"; then
+      eval "res_$k=\$v"
+    else
+      env_keys="$env_keys $k"
+    fi
+  done < "$pf"
+}
+
+# launch_json NAME — {harness, args, envKeys, warnings} for the resolved
+# profile. ONE resolver, because two would drift: `agent-box-session add
+# --profile` reads it to pick the harness and the arguments it stores, and
+# `show` prints the same answer so what an operator reads is what a session
+# gets. The harness-specific mapping lives here rather than in the supervisor
+# on purpose — the arguments are resolved once, when the session is created,
+# and a later profile edit does not silently re-arm a running session (the
+# same rule webhook.hookSessionArgs already states).
+launch_json() {
+  read_profile "$1" || { echo "no such profile: '$1' (see agent-box-profile ls)" >&2; return 2; }
+  # $2 = a harness that overrides the profile's own (agent-box-session add
+  # --profile P --agent H). It has to be resolved HERE and not corrected
+  # afterwards: the arguments are harness-specific, so a profile resolved for
+  # codex and then started on another harness would hand it codex's flags.
+  h="''${2:-}"
+  [ -n "$h" ] || h="$res_HARNESS"
+  [ -n "$h" ] || h="''${AGENT_BOX_DEFAULT_AGENT:-}"
+  warn=""
+  case " $HARNESSES " in
+    (*" $h "*) ;;
+    (*) echo "profile '$1': harness '$h' is not available (available: $HARNESSES)" >&2; return 2 ;;
+  esac
+  set --
+  case "$h" in
+    claude)
+      [ -n "$res_MODEL" ] && set -- "$@" --model "$res_MODEL"
+      [ -n "$res_EFFORT" ] && set -- "$@" --effort "$res_EFFORT"
+      [ -n "$res_SYSTEM_PROMPT" ] && set -- "$@" --append-system-prompt "$res_SYSTEM_PROMPT"
+      ;;
+    codex)
+      [ -n "$res_MODEL" ] && set -- "$@" -m "$res_MODEL"
+      # codex takes reasoning effort as a config override, not a flag.
+      [ -n "$res_EFFORT" ] && set -- "$@" -c "model_reasoning_effort=$res_EFFORT"
+      # codex has no --append-system-prompt equivalent; its instructions come
+      # from AGENTS.md in the working directory. Say so instead of dropping
+      # the key silently — a profile whose prompt never arrives is worse than
+      # one that refuses to pretend.
+      [ -n "$res_SYSTEM_PROMPT" ] && warn="$warn|SYSTEM_PROMPT is ignored for the codex harness (no --append-system-prompt equivalent); put the instructions in the working directory's AGENTS.md"
+      ;;
+    *)
+      # shell, and any harness added later: no argument mapping exists, so
+      # nothing is invented for it.
+      for k in MODEL EFFORT SYSTEM_PROMPT; do
+        eval "kv=\$res_$k"
+        [ -n "$kv" ] && warn="$warn|$k is ignored for the '$h' harness"
+      done
+      ;;
+  esac
+  "$JQ" -n --arg h "$h" --arg ek "$env_keys" --arg w "$warn" \
+    '{harness: $h,
+      args: $ARGS.positional,
+      envKeys: ($ek | split(" ") | map(select(length > 0))),
+      warnings: ($w | split("|") | map(select(length > 0)))}' \
+    --args -- "$@"
+}
+
+# rewrite NAME [KEY VALUE]... — atomically rewrite the profile file, dropping
+# every key named in the (whitespace-separated) DROP list and appending the
+# pairs given. Same shape as session-cli's env_rewrite, and 600 for the same
+# reason: a profile may carry environment.
+DROP=""
+rewrite() {
+  pname="$1"; shift
+  f="$(file_for "$pname")"
+  mkdir -p "$DIR"
+  chmod 700 "$DIR" 2>/dev/null || true
+  tmp="$(mktemp "$f.XXXXXX")"
+  { printf '# agent-box agent profile "%s" — managed by agent-box-profile.\n' "$pname"
+    printf '# KEY=value, one per line. HARNESS/MODEL/EFFORT/SYSTEM_PROMPT become\n'
+    printf '# harness arguments; any other key becomes session environment, which\n'
+    printf '# every session of this user can read (issue #135).\n'
+    if [ -f "$f" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
+        ek="''${line%%=*}"
+        valid_key "$ek" || continue
+        skip=0
+        for d in $DROP; do [ "$ek" = "$d" ] && skip=1; done
+        [ "$skip" = 1 ] && continue
+        printf '%s\n' "$line"
+      done < "$f"
+    fi
+    while [ $# -ge 2 ]; do
+      printf '%s=%s\n' "$1" "$2"
+      shift 2
+    done
+  } > "$tmp"
+  chmod 600 "$tmp"; mv "$tmp" "$f"
+}
+
+cmd="''${1:-}"; shift || true
+case "$cmd" in
+  ls)
+    [ -d "$DIR" ] || exit 0
+    printf '%-20s %-8s %-18s %s\n' NAME HARNESS MODEL EFFORT
+    for f in "$DIR"/*.env; do
+      [ -f "$f" ] || continue
+      n="''${f##*/}"; n="''${n%.env}"
+      valid_name "$n" || continue
+      read_profile "$n" || continue
+      printf '%-20s %-8s %-18s %s\n' "$n" "''${res_HARNESS:-''${AGENT_BOX_DEFAULT_AGENT:-?}}" \
+        "''${res_MODEL:--}" "''${res_EFFORT:--}"
+    done
+    ;;
+  show)
+    name="''${1:-}"
+    valid_name "$name" || { usage >&2; exit 2; }
+    read_profile "$name" || { echo "no such profile: '$name' (see agent-box-profile ls)" >&2; exit 2; }
+    j="$(launch_json "$name")" || exit 2
+    printf 'profile %s (%s)\n' "$name" "$(file_for "$name")"
+    printf '  HARNESS        %s\n' "$("$JQ" -r '.harness' <<<"$j")"
+    printf '  MODEL          %s\n' "''${res_MODEL:--}"
+    printf '  EFFORT         %s\n' "''${res_EFFORT:--}"
+    printf '  SYSTEM_PROMPT  %s\n' "''${res_SYSTEM_PROMPT:--}"
+    # Environment KEYS only, never their values — the settings page and
+    # `agent-box-session env ls` hold the same line, and a profile is where a
+    # token is most likely to sit.
+    if [ -n "$env_keys" ]; then
+      printf '  env            %s\n' "$(printf '%s' "''${env_keys# }")"
+    else
+      printf '  env            (none)\n'
+    fi
+    printf 'Launch: %s %s\n' "$("$JQ" -r '.harness' <<<"$j")" \
+      "$("$JQ" -r '.args | map(@sh) | join(" ")' <<<"$j")"
+    "$JQ" -r '.warnings[] | "warning: " + .' <<<"$j"
+    printf 'Start it: agent-box-session add --profile %s\n' "$name"
+    ;;
+  set)
+    name="''${1:-}"; shift || true
+    valid_name "$name" || { echo "invalid profile name '$name' (letters, digits, '_' and '-', at most $NAME_MAX characters)" >&2; exit 2; }
+    [ $# -gt 0 ] || { usage >&2; exit 2; }
+    # Validate every assignment BEFORE writing any of them: a `set` that
+    # stored the first two of three pairs and then failed would leave a
+    # profile nobody asked for.
+    pairs=()
+    DROP=""
+    for a in "$@"; do
+      case "$a" in (*=*) ;; (*) echo "not a KEY=VALUE assignment: '$a'" >&2; exit 2 ;; esac
+      k="''${a%%=*}"; v="''${a#*=}"
+      valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
+      case "$v" in (*"
+"*) echo "value for '$k' may not contain a newline" >&2; exit 2 ;; esac
+      if [ "$k" = HARNESS ]; then
+        case " $HARNESSES " in
+          (*" $v "*) ;;
+          (*) echo "harness '$v' is not available (available: $HARNESSES)" >&2; exit 2 ;;
+        esac
+      fi
+      DROP="$DROP $k"
+      pairs+=("$k" "$v")
+    done
+    rewrite "$name" "''${pairs[@]}"
+    echo "profile '$name' updated — 'agent-box-session add --profile $name' starts a session with it"
+    # Report what the profile now launches, so a key the harness cannot use
+    # shows up here rather than silently at the next spawn.
+    j="$(launch_json "$name")" || exit 0
+    "$JQ" -r '.warnings[] | "warning: " + .' <<<"$j"
+    ;;
+  rm)
+    name="''${1:-}"; shift || true
+    valid_name "$name" || { usage >&2; exit 2; }
+    f="$(file_for "$name")"
+    [ -f "$f" ] || { echo "no such profile: '$name' (see agent-box-profile ls)" >&2; exit 2; }
+    if [ $# -eq 0 ]; then
+      rm -f "$f"
+      echo "profile '$name' removed — sessions already running with it are unaffected"
+    else
+      DROP=""
+      for k in "$@"; do
+        valid_key "$k" || { usage >&2; exit 2; }
+        DROP="$DROP $k"
+      done
+      rewrite "$name"
+      echo "profile '$name': removed$DROP"
+    fi
+    ;;
+  launch)
+    # The machine-readable half of `show`, for `agent-box-session add
+    # --profile`. Warnings go to stderr there too, so the operator sees them
+    # once, on the CLI they ran. The optional second argument is the harness
+    # the caller settled on (`add --profile P --agent H`), which decides the
+    # argument mapping.
+    name="''${1:-}"; shift || true
+    valid_name "$name" || { usage >&2; exit 2; }
+    launch_json "$name" "''${1:-}" || exit 2
     ;;
   *)
     usage >&2
@@ -2040,19 +2438,68 @@ hook_args_source=""
 if [ -n "''${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   hook_args_source="services.agent-box.webhook.hookSessionArgs (NixOS config)"
 fi
+# The same file also names the agent PROFILE a standing watch hands work to
+# (issue #321): AGENT_BOX_HOOK_PROFILE. That is the whole point of a profile
+# here — the harness a match starts was previously never chosen at all (the
+# comment on render_launch below), and hookSessionArgs could only append flags
+# to the box default, never pick a harness. A profile picks the harness, the
+# model, the effort, an appended system prompt and the session's environment,
+# in one name an operator can read back with `agent-box-profile show`.
+#
+# Runtime only, with no NixOS option beside it: the profile it names is
+# runtime data a user creates with agent-box-profile, so a declared value
+# could name a profile that does not exist on the box. An unusable value is
+# reported and IGNORED below rather than failing the spawn — a webhook
+# delivery must never be dropped because a profile was renamed.
+hook_profile="''${AGENT_BOX_HOOK_PROFILE:-}"
+hook_profile_source=""
 if [ -r "$hook_args_file" ]; then
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
     key=''${line%%=*}
-    [ "$key" = "AGENT_BOX_HOOK_SESSION_ARGS" ] || continue
+    case "$key" in
+      (AGENT_BOX_HOOK_SESSION_ARGS|AGENT_BOX_HOOK_PROFILE) ;;
+      (*) continue ;;
+    esac
     val=''${line#*=}
     case "$val" in
       \"*\") val=''${val#\"}; val=''${val%\"} ;;
       \'*\') val=''${val#\'}; val=''${val%\'} ;;
     esac
-    AGENT_BOX_HOOK_SESSION_ARGS=$val
-    hook_args_source="AGENT_BOX_HOOK_SESSION_ARGS in $hook_args_file"
+    if [ "$key" = AGENT_BOX_HOOK_PROFILE ]; then
+      hook_profile=$val
+      hook_profile_source="AGENT_BOX_HOOK_PROFILE in $hook_args_file"
+    else
+      AGENT_BOX_HOOK_SESSION_ARGS=$val
+      hook_args_source="AGENT_BOX_HOOK_SESSION_ARGS in $hook_args_file"
+    fi
   done < "$hook_args_file"
+fi
+# A value that did not come from the env file was exported into this process
+# (a hand-run script, or a unit environment): say so rather than reporting a
+# source of "".
+[ -z "$hook_profile" ] || [ -n "$hook_profile_source" ] \
+  || hook_profile_source="the AGENT_BOX_HOOK_PROFILE environment variable"
+if [ -n "$hook_profile" ]; then
+  # Checked HERE, not left to `agent-box-session add --profile`, which exits 2
+  # on an unknown profile: that exit would drop the batch, and the events do
+  # not come back. Name charset first (it reaches a file path), then the file.
+  case "$hook_profile" in
+    (*[!A-Za-z0-9_-]*)
+      echo "agent-box-webhook-spawn: AGENT_BOX_HOOK_PROFILE '$hook_profile' is not a" \
+           "valid profile name; starting this session on the box default" >&2
+      hook_profile_source="$hook_profile_source — IGNORED, not a valid profile name"
+      hook_profile=""
+      ;;
+    (*)
+      if [ ! -r "$HOME/.config/agent-box/profiles/$hook_profile.env" ]; then
+        echo "agent-box-webhook-spawn: no such profile '$hook_profile'" \
+             "(agent-box-profile ls); starting this session on the box default" >&2
+        hook_profile_source="$hook_profile_source — IGNORED, no such profile"
+        hook_profile=""
+      fi
+      ;;
+  esac
 fi
 
 extra=()
@@ -2089,9 +2536,25 @@ render_launch() {
   # survive their shell.
   hook_args_example="'[\"--model\",\"sonnet\"]'"
   printf 'Launch command — what a match starts, with the prompt below:\n'
-  printf '  %s' "''${AGENT_BOX_DEFAULT_AGENT:-<the box default agent>}"
+  if [ -n "$hook_profile" ]; then
+    printf '  agent profile %s' "$hook_profile"
+  else
+    printf '  %s' "''${AGENT_BOX_DEFAULT_AGENT:-<the box default agent>}"
+  fi
   if [ "''${#extra[@]}" -gt 0 ]; then printf ' %s' "''${extra[@]}"; fi
   printf '\n'
+  if [ -n "$hook_profile" ]; then
+    printf '%s\n' "The harness, model, effort, appended system prompt and \
+environment come from that profile ($hook_profile_source) — read it back with \
+'agent-box-profile show $hook_profile'."
+  elif [ -n "$hook_profile_source" ]; then
+    printf '%s\n' "A profile was named but not used: $hook_profile_source."
+  else
+    printf '%s\n' "No agent profile is set, so a match starts the box default \
+harness. Pick a worker for every LATER hook session with: agent-box-profile \
+set triage HARNESS=claude MODEL=sonnet EFFORT=low && agent-box-session env set \
+AGENT_BOX_HOOK_PROFILE triage"
+  fi
   if [ -n "$hook_args_source" ]; then
     printf 'The arguments after the agent come from %s.\n' "$hook_args_source"
   else
@@ -2381,12 +2844,17 @@ topic="''${LOCAL_WEBHOOK_SPAWN_TOPIC:-?}"
 note="''${LOCAL_WEBHOOK_SPAWN_NOTE:+ (\"$LOCAL_WEBHOOK_SPAWN_NOTE\")}"
 preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded")"
 
+# --profile resolves the harness and its arguments (issue #321); the extra
+# args stay a `--` tail after it, so hookSessionArgs still has the last word
+# over a profile's own model.
+pflag=()
+[ -n "$hook_profile" ] && pflag=(--profile "$hook_profile")
 if [ "''${#extra[@]}" -gt 0 ]; then
-  exec agent-box-session add "$name" --prompt "$preamble
+  exec agent-box-session add "$name" "''${pflag[@]+"''${pflag[@]}"}" --prompt "$preamble
 
 $PROMPT" -- "''${extra[@]}"
 fi
-exec agent-box-session add "$name" --prompt "$preamble
+exec agent-box-session add "$name" "''${pflag[@]+"''${pflag[@]}"}" --prompt "$preamble
 
 $PROMPT"
   '');
@@ -3214,6 +3682,14 @@ $PROMPT"
       skip="$($JQ -r 'if .skipPermissions == false then "false" else "true" end' <<<"$sjson")"
       rc="$($JQ -r 'if .remoteControl == false then "false" else "true" end' <<<"$sjson")"
       rcname="$($JQ -r '.remoteControlName // empty' <<<"$sjson")"
+      # The agent profile this session was created with (issue #321), or empty.
+      # Its harness and arguments were already resolved into `agent`/`extraArgs`
+      # by agent-box-session, so nothing here re-reads them: what the name is for
+      # is the profile's ENVIRONMENT, which the env-exec wrapper applies at every
+      # spawn — a rotated token in a profile therefore reaches the session on its
+      # next restart, while the arguments it started with stay put.
+      sprofile="$($JQ -r '.profile // ""' <<<"$sjson")"
+      case "$sprofile" in (*[!A-Za-z0-9_-]*) sprofile="" ;; esac
       ip="$($JQ -r '.initialPrompt // ""' <<<"$sjson")"
       rp="$($JQ -r '.resumePrompt // ""' <<<"$sjson")"
       # The id this session was last LAUNCHED with (issue #282). Note what that
@@ -3604,7 +4080,12 @@ $PROMPT"
       # tmux server when none is running, and that server daemonizes and outlives
       # us — inheriting the fd would hand it the lock forever and wedge every
       # other writer (the lock lives on the open file description, not the pid).
-      if $TMUX new-session -d -s "$sname" -c "$wd" $whargs \
+      # AGENT_BOX_PROFILE rides the same session environment, for the env-exec
+      # wrapper's profile overlay (and so anything running in the pane can say
+      # which profile it is). Charset-checked above, like $sname.
+      pargs=""
+      [ -n "$sprofile" ] && pargs="-e AGENT_BOX_PROFILE=$sprofile"
+      if $TMUX new-session -d -s "$sname" -c "$wd" $whargs $pargs \
            -e AGENT_BOX_SESSION_ID="$bid" \
            "''${AGENT_BOX_ENV_EXEC:?} $cmd$epilogue" 9>&-; then
         if ! listed; then
@@ -5196,6 +5677,12 @@ in
 
         USER = os.environ.get("AGENT_BOX_SETTINGS_USER", "agent")
         ENV_FILE = os.environ["AGENT_BOX_SETTINGS_ENV_FILE"]
+        # Agent profiles (issue #321) live beside the env store, one file per profile.
+        # Only the preamble cache key reads this: a watch's launch report names the
+        # profile AGENT_BOX_HOOK_PROFILE picks and whether it still exists, so
+        # creating or deleting a profile changes that report without touching the env
+        # file. The page has no profile editor yet (that is step 5 of #321).
+        PROFILES_DIR = os.path.join(os.path.dirname(ENV_FILE), "profiles")
         BASE = os.environ.get("AGENT_BOX_SETTINGS_BASE", "/settings").rstrip("/")
         PORT = int(os.environ.get("AGENT_BOX_SETTINGS_PORT", "8080"))
         TMUX_SOCKET = os.environ.get("AGENT_BOX_TMUX_SOCKET", "agent-box")
@@ -6104,7 +6591,7 @@ in
 
 
         def hook_args_stamp():
-            """(mtime_ns, size) of the env file, or None when there is none.
+            """(mtime_ns, size) of the env file and of the profiles directory.
 
             Part of hook_preamble's cache key. The dispatch script reports the
             hook-session arguments that file can override (#292), so its output is
@@ -6112,12 +6599,22 @@ in
             set` between two renders changes which model the page should show, and
             a cached answer would keep naming the old one for the life of the
             daemon. One stat per render is cheap; the fork it guards is not.
+
+            The profiles directory is stamped for the same reason (#321): the report
+            names the agent profile AGENT_BOX_HOOK_PROFILE picks, and whether that
+            profile still exists decides whether the watch uses it at all. Creating
+            or removing one does not touch the env file, and every write goes through
+            a rename inside this directory, so its mtime moves on both.
             """
-            try:
-                info = os.stat(ENV_FILE)
-            except OSError:
-                return None
-            return (info.st_mtime_ns, info.st_size)
+            stamps = []
+            for path in (ENV_FILE, PROFILES_DIR):
+                try:
+                    info = os.stat(path)
+                except OSError:
+                    stamps.append(None)
+                else:
+                    stamps.append((info.st_mtime_ns, info.st_size))
+            return tuple(stamps)
 
 
         @functools.lru_cache(maxsize=64)

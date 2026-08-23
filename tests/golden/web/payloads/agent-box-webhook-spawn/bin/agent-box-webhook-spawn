@@ -72,19 +72,68 @@ hook_args_source=""
 if [ -n "${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   hook_args_source="services.agent-box.webhook.hookSessionArgs (NixOS config)"
 fi
+# The same file also names the agent PROFILE a standing watch hands work to
+# (issue #321): AGENT_BOX_HOOK_PROFILE. That is the whole point of a profile
+# here — the harness a match starts was previously never chosen at all (the
+# comment on render_launch below), and hookSessionArgs could only append flags
+# to the box default, never pick a harness. A profile picks the harness, the
+# model, the effort, an appended system prompt and the session's environment,
+# in one name an operator can read back with `agent-box-profile show`.
+#
+# Runtime only, with no NixOS option beside it: the profile it names is
+# runtime data a user creates with agent-box-profile, so a declared value
+# could name a profile that does not exist on the box. An unusable value is
+# reported and IGNORED below rather than failing the spawn — a webhook
+# delivery must never be dropped because a profile was renamed.
+hook_profile="${AGENT_BOX_HOOK_PROFILE:-}"
+hook_profile_source=""
 if [ -r "$hook_args_file" ]; then
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
     key=${line%%=*}
-    [ "$key" = "AGENT_BOX_HOOK_SESSION_ARGS" ] || continue
+    case "$key" in
+      (AGENT_BOX_HOOK_SESSION_ARGS|AGENT_BOX_HOOK_PROFILE) ;;
+      (*) continue ;;
+    esac
     val=${line#*=}
     case "$val" in
       \"*\") val=${val#\"}; val=${val%\"} ;;
       \'*\') val=${val#\'}; val=${val%\'} ;;
     esac
-    AGENT_BOX_HOOK_SESSION_ARGS=$val
-    hook_args_source="AGENT_BOX_HOOK_SESSION_ARGS in $hook_args_file"
+    if [ "$key" = AGENT_BOX_HOOK_PROFILE ]; then
+      hook_profile=$val
+      hook_profile_source="AGENT_BOX_HOOK_PROFILE in $hook_args_file"
+    else
+      AGENT_BOX_HOOK_SESSION_ARGS=$val
+      hook_args_source="AGENT_BOX_HOOK_SESSION_ARGS in $hook_args_file"
+    fi
   done < "$hook_args_file"
+fi
+# A value that did not come from the env file was exported into this process
+# (a hand-run script, or a unit environment): say so rather than reporting a
+# source of "".
+[ -z "$hook_profile" ] || [ -n "$hook_profile_source" ] \
+  || hook_profile_source="the AGENT_BOX_HOOK_PROFILE environment variable"
+if [ -n "$hook_profile" ]; then
+  # Checked HERE, not left to `agent-box-session add --profile`, which exits 2
+  # on an unknown profile: that exit would drop the batch, and the events do
+  # not come back. Name charset first (it reaches a file path), then the file.
+  case "$hook_profile" in
+    (*[!A-Za-z0-9_-]*)
+      echo "agent-box-webhook-spawn: AGENT_BOX_HOOK_PROFILE '$hook_profile' is not a" \
+           "valid profile name; starting this session on the box default" >&2
+      hook_profile_source="$hook_profile_source — IGNORED, not a valid profile name"
+      hook_profile=""
+      ;;
+    (*)
+      if [ ! -r "$HOME/.config/agent-box/profiles/$hook_profile.env" ]; then
+        echo "agent-box-webhook-spawn: no such profile '$hook_profile'" \
+             "(agent-box-profile ls); starting this session on the box default" >&2
+        hook_profile_source="$hook_profile_source — IGNORED, no such profile"
+        hook_profile=""
+      fi
+      ;;
+  esac
 fi
 
 extra=()
@@ -121,9 +170,25 @@ render_launch() {
   # survive their shell.
   hook_args_example="'[\"--model\",\"sonnet\"]'"
   printf 'Launch command — what a match starts, with the prompt below:\n'
-  printf '  %s' "${AGENT_BOX_DEFAULT_AGENT:-<the box default agent>}"
+  if [ -n "$hook_profile" ]; then
+    printf '  agent profile %s' "$hook_profile"
+  else
+    printf '  %s' "${AGENT_BOX_DEFAULT_AGENT:-<the box default agent>}"
+  fi
   if [ "${#extra[@]}" -gt 0 ]; then printf ' %s' "${extra[@]}"; fi
   printf '\n'
+  if [ -n "$hook_profile" ]; then
+    printf '%s\n' "The harness, model, effort, appended system prompt and \
+environment come from that profile ($hook_profile_source) — read it back with \
+'agent-box-profile show $hook_profile'."
+  elif [ -n "$hook_profile_source" ]; then
+    printf '%s\n' "A profile was named but not used: $hook_profile_source."
+  else
+    printf '%s\n' "No agent profile is set, so a match starts the box default \
+harness. Pick a worker for every LATER hook session with: agent-box-profile \
+set triage HARNESS=claude MODEL=sonnet EFFORT=low && agent-box-session env set \
+AGENT_BOX_HOOK_PROFILE triage"
+  fi
   if [ -n "$hook_args_source" ]; then
     printf 'The arguments after the agent come from %s.\n' "$hook_args_source"
   else
@@ -413,12 +478,17 @@ topic="${LOCAL_WEBHOOK_SPAWN_TOPIC:-?}"
 note="${LOCAL_WEBHOOK_SPAWN_NOTE:+ (\"$LOCAL_WEBHOOK_SPAWN_NOTE\")}"
 preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded")"
 
+# --profile resolves the harness and its arguments (issue #321); the extra
+# args stay a `--` tail after it, so hookSessionArgs still has the last word
+# over a profile's own model.
+pflag=()
+[ -n "$hook_profile" ] && pflag=(--profile "$hook_profile")
 if [ "${#extra[@]}" -gt 0 ]; then
-  exec agent-box-session add "$name" --prompt "$preamble
+  exec agent-box-session add "$name" "${pflag[@]+"${pflag[@]}"}" --prompt "$preamble
 
 $PROMPT" -- "${extra[@]}"
 fi
-exec agent-box-session add "$name" --prompt "$preamble
+exec agent-box-session add "$name" "${pflag[@]+"${pflag[@]}"}" --prompt "$preamble
 
 $PROMPT"
 

@@ -403,6 +403,14 @@ start_session() {
   skip="$($JQ -r 'if .skipPermissions == false then "false" else "true" end' <<<"$sjson")"
   rc="$($JQ -r 'if .remoteControl == false then "false" else "true" end' <<<"$sjson")"
   rcname="$($JQ -r '.remoteControlName // empty' <<<"$sjson")"
+  # The agent profile this session was created with (issue #321), or empty.
+  # Its harness and arguments were already resolved into `agent`/`extraArgs`
+  # by agent-box-session, so nothing here re-reads them: what the name is for
+  # is the profile's ENVIRONMENT, which the env-exec wrapper applies at every
+  # spawn — a rotated token in a profile therefore reaches the session on its
+  # next restart, while the arguments it started with stay put.
+  sprofile="$($JQ -r '.profile // ""' <<<"$sjson")"
+  case "$sprofile" in (*[!A-Za-z0-9_-]*) sprofile="" ;; esac
   ip="$($JQ -r '.initialPrompt // ""' <<<"$sjson")"
   rp="$($JQ -r '.resumePrompt // ""' <<<"$sjson")"
   # The id this session was last LAUNCHED with (issue #282). Note what that
@@ -793,7 +801,12 @@ start_session() {
   # tmux server when none is running, and that server daemonizes and outlives
   # us — inheriting the fd would hand it the lock forever and wedge every
   # other writer (the lock lives on the open file description, not the pid).
-  if $TMUX new-session -d -s "$sname" -c "$wd" $whargs \
+  # AGENT_BOX_PROFILE rides the same session environment, for the env-exec
+  # wrapper's profile overlay (and so anything running in the pane can say
+  # which profile it is). Charset-checked above, like $sname.
+  pargs=""
+  [ -n "$sprofile" ] && pargs="-e AGENT_BOX_PROFILE=$sprofile"
+  if $TMUX new-session -d -s "$sname" -c "$wd" $whargs $pargs \
        -e AGENT_BOX_SESSION_ID="$bid" \
        "${AGENT_BOX_ENV_EXEC:?} $cmd$epilogue" 9>&-; then
     if ! listed; then

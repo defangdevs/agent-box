@@ -357,6 +357,46 @@ deep-linkable standalone terminal at
 post-mortem shell open instead of being respawned over; delisted sessions
 stay gone.
 
+**Harness or agent profile?** `--agent` selects the **harness** — the CLI
+program (`claude`, `codex`, or the `shell` pseudo-agent). An **agent
+profile** is the *worker*: a harness plus the model, the effort level, an
+appended system prompt and the environment that tell two sessions on the
+same harness apart. Profiles are per-user runtime data too, in
+`~/.config/agent-box/profiles/<name>.env`:
+
+```bash
+agent-box-profile set triage HARNESS=claude MODEL=sonnet EFFORT=low \
+    SYSTEM_PROMPT='Triage only. Report, do not fix.'
+agent-box-profile ls                        # NAME HARNESS MODEL EFFORT
+agent-box-profile show triage               # launch config + env KEY names
+agent-box-session add issues --profile triage
+agent-box-session add issues2 --profile triage -- --model opus   # tail wins
+agent-box-profile rm triage                 # running sessions keep what they got
+```
+
+`HARNESS`, `MODEL`, `EFFORT` and `SYSTEM_PROMPT` become harness arguments
+(`--model`/`-m`, `--effort`/`-c model_reasoning_effort=`,
+`--append-system-prompt`); every other key becomes **environment** for
+sessions started with that profile, applied at each spawn on top of
+`agent-box-session env`. That env is convenience, not a boundary: sessions of
+one user are not isolated, so a sibling session reads it out of
+`/proc/<pid>/environ` — a token in a profile is a token every session of that
+user has. Arguments are resolved when the session is created, so an edited
+profile changes what starts *next*, never a running session.
+
+A standing webhook watch can hand its work to a profile instead of the box
+default harness, which is the one place nothing could pick a harness before:
+
+```bash
+agent-box-session env set AGENT_BOX_HOOK_PROFILE triage
+```
+
+Every later dispatched `hook-*` session then starts as that worker, and the
+webhook panel on the settings page names it under the watch (that panel prints
+the spawn wrapper's own `--preamble`, so there is one copy of the answer). A
+renamed or deleted profile is reported and ignored — a delivery is never
+dropped over it.
+
 **New user or new session?** A user is the trust boundary; a session is a
 unit of work, and sessions of one user are *not* isolated from each other.
 The decision rule, the measurements behind it, and what "1 user = 1
