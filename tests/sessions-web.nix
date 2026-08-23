@@ -55,11 +55,11 @@ in
     # challenges for auth, and the old public sessions.json is gone (its
     # path now falls into the auth-gated catch-all).
     client.succeed(
-        f"{curl} -o /dev/null -w '%{{http_code}}' https://box.test/ | grep -x 401"
+        f"{curl} -o /dev/null -w '%{{http_code}}' https://box.test/ | grep -x 401 >/dev/null"
     )
     client.succeed(
         f"{curl} -o /dev/null -w '%{{http_code}}' "
-        "https://box.test/agent/sessions.json | grep -x 401"
+        "https://box.test/agent/sessions.json | grep -x 401 >/dev/null"
     )
 
     # The vhost root picks a user and lands in their space: with one
@@ -206,7 +206,7 @@ in
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
         "-d 'name=claude' "
-        "https://box.test/sessions/delete | grep -x 303"
+        "https://box.test/sessions/delete | grep -x 303 >/dev/null"
     )
     settle()
     machine.fail(tmux("has-session -t =claude"))
@@ -224,7 +224,7 @@ in
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
         "-d 'agent=claude' --data-urlencode 'prompt=hello there' "
-        "https://box.test/sessions/add | grep -x 303"
+        "https://box.test/sessions/add | grep -x 303 >/dev/null"
     )
     machine.wait_until_succeeds(tmux("has-session -t =claude"), timeout=60)
     prompt_start_cmd = machine.wait_until_succeeds(
@@ -241,7 +241,7 @@ in
     )
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
-        "-d 'name=claude' https://box.test/sessions/delete | grep -x 303"
+        "-d 'name=claude' https://box.test/sessions/delete | grep -x 303 >/dev/null"
     )
     settle()
     machine.fail(tmux("has-session -t =claude"))
@@ -250,7 +250,7 @@ in
     client.succeed(
         f"{curl} -o /dev/null -w '%{{http_code}}' "
         "-d 'agent=claude' "
-        "https://box.test/sessions/add | grep -x 401"
+        "https://box.test/sessions/add | grep -x 401 >/dev/null"
     )
 
     # The session CRUD routes stay at the root for the primary user (the
@@ -258,7 +258,7 @@ in
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
         "-d 'agent=claude' "
-        "https://box.test/agent/settings/sessions/add | grep -x 404"
+        "https://box.test/agent/settings/sessions/add | grep -x 404 >/dev/null"
     )
     # ...but the settings page renders the session manager again (the root
     # page is the workspace now, issue 119), with back=settings so its forms
@@ -393,7 +393,7 @@ in
             client.succeed(
                 f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
                 f"-d 'agent=claude&cwd={bad}' "
-                "https://box.test/sessions/add | grep -x 400"
+                "https://box.test/sessions/add | grep -x 400 >/dev/null"
             )
         machine.succeed(
             "jq -e '(.sessions.claude // null) == null' "
@@ -406,7 +406,7 @@ in
         client.succeed(
             f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
             "-d 'agent=claude&cwd=~/work/repo' "
-            "https://box.test/sessions/add | grep -x 303"
+            "https://box.test/sessions/add | grep -x 303 >/dev/null"
         )
         machine.succeed(
             "jq -e '.sessions.claude.workingDirectory == \"/home/agent/work/repo\"' "
@@ -415,7 +415,7 @@ in
         machine.wait_until_succeeds(tmux("has-session -t =claude"), timeout=60)
         machine.wait_until_succeeds(
             tmux('display -p -t "=claude:" "#{pane_current_path}"')
-            + " | grep -x /home/agent/work/repo",
+            + " | grep -x /home/agent/work/repo >/dev/null",
             timeout=60,
         )
 
@@ -427,7 +427,7 @@ in
         client.succeed(
             f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
             "-d 'agent=claude&cwd=~/work/repo' "
-            "https://box.test/sessions/add | grep -x 303"
+            "https://box.test/sessions/add | grep -x 303 >/dev/null"
         )
         machine.succeed(
             "jq -e '.sessions.repo.workingDirectory == \"/home/agent/work/repo\"' "
@@ -477,7 +477,7 @@ in
         # Auth-gated like every other route on the vhost.
         client.succeed(
             f"{curl} -o /dev/null -w '%{{http_code}}' "
-            "https://box.test/sessions/events | grep -x 401"
+            "https://box.test/sessions/events | grep -x 401 >/dev/null"
         )
         # Both pages carry the feed's handle: where to stream from, plus the
         # fingerprint of the state they were rendered with (so a change
@@ -630,11 +630,11 @@ in
         for bad in ["shelltest", "ghost", "..%2F..%2Fetc%2Fpasswd", ""]:
             client.succeed(
                 f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
-                f"'https://box.test/sessions/transcript?name={bad}' | grep -x 404"
+                f"'https://box.test/sessions/transcript?name={bad}' | grep -x 404 >/dev/null"
             )
         client.succeed(
             f"{curl} -o /dev/null -w '%{{http_code}}' "
-            "'https://box.test/sessions/transcript?name=main' | grep -x 401"
+            "'https://box.test/sessions/transcript?name=main' | grep -x 401 >/dev/null"
         )
 
         machine.succeed(as_agent("agent-box-session rm shelltest"))
