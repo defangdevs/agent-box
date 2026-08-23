@@ -382,7 +382,9 @@ jobs:
             echo "::error::Expected 401 at $root_url without credentials, got $code."
             exit 1
           fi
-          body=$(curl -sS --max-time 10 -u "agent:${WEB_PASSWORD}" "$root_url" || true)
+          # -L: a single-user box's root now redirects into that user's own
+          # space (#334) rather than serving the workspace at "/" directly.
+          body=$(curl -sSL --max-time 10 -u "agent:${WEB_PASSWORD}" "$root_url" || true)
           if echo "$body" | grep -q 'href="https://[^/"]*@'; then
             echo "::error::Workspace at $root_url embeds URL userinfo (user@) in an href — Chrome auto-sends an empty password and typed credentials can't override it (issue 56):"
             echo "$body" | head -20
