@@ -93,9 +93,12 @@ jobs:
       - name: Check webhook route in generated Caddyfile
         run: nix build -L .#checks.x86_64-linux.webhook-route && cat result
 
-      # Full closure build — the real "module is usable" proof.
+      # Full closure build — the real "module is usable" proof. --max-jobs
+      # auto because nix defaults to ONE: a system closure is hundreds of
+      # small independent derivations and this step served them one at a
+      # time (issue #312).
       - name: Build VM system closure
-        run: nix build -L .#checks.x86_64-linux.vm-closure
+        run: nix build -L --max-jobs auto .#checks.x86_64-linux.vm-closure
 
       # Behavior lock for the portability refactor (issue #154, Phase 0):
       # rendered units/etc/tmpfiles/payload scripts must byte-match the
@@ -120,8 +123,10 @@ jobs:
       # back-to-back they took ~8 min of the job's ~10; concurrently they
       # bound the job at roughly the slowest wave (~3-4 min).
       #   --max-jobs 3: ubuntu-latest has 4 vCPUs / 16 GiB and web-surface
-      #     boots TWO qemu nodes — 6 tests at once would thrash and trade
-      #     the saved minutes back as flaky timeouts.
+      #     boots TWO qemu nodes — all 7 at once would thrash and trade the
+      #     saved minutes back as flaky timeouts. With `sessions` split
+      #     (issue #312) no single check holds the wave open any more, so the
+      #     bound here is the total work over three slots.
       #   --keep-going: one red test doesn't hide the others' results (the
       #     failing drv is still named in the log).
       # What each check covers:
@@ -140,8 +145,11 @@ jobs:
       #                     a memory hog while the box stays responsive
       #   sessions          (issue 59) runtime session CRUD — seeded main
       #                     session, agent-box-session add/rm with no sudo and
-      #                     no rebuild, cgroup containment, root session
-      #                     manager page behind auth
+      #                     no rebuild, cgroup containment, and two writers
+      #                     racing the registry
+      #   sessions-web      (issue 119) the browser half of the same box —
+      #                     tabbed workspace, settings-page session manager,
+      #                     /sessions/* CRUD, live feed, transcript download
       #   connect           (issues 207/208/313) the guided sign-in cards —
       #                     one tmux session per flow driving the tool's own
       #                     login command (stubbed CLIs), host-anchored URL,
@@ -160,5 +168,6 @@ jobs:
             .#checks.x86_64-linux.settings-page \
             .#checks.x86_64-linux.memory-protection \
             .#checks.x86_64-linux.sessions \
+            .#checks.x86_64-linux.sessions-web \
             .#checks.x86_64-linux.connect \
             .#checks.x86_64-linux.webhook
