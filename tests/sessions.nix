@@ -1036,20 +1036,37 @@
         # env-exec wrapper reads this file with the same parser that wrote it.
         machine.succeed(as_agent("agent-box-session add pemsess --agent shell"))
         machine.wait_until_succeeds(tmux("has-session -t =pemsess"), timeout=60)
-        ppid = machine.wait_until_succeeds(
-            tmux('display -p -t "=pemsess:" "#{pane_pid}"') + " | grep .", timeout=60
-        ).strip()
-        # Compare the NUL-delimited ENTRY, not a substring of a joined dump:
-        # a substring match cannot tell "the value ends here" from "the value
+        # /proc/<pid>/environ is an EXEC-TIME snapshot, and the pane command is
+        # `<env-exec wrapper> <shell>` run by tmux through sh: whether the
+        # loaded environment lands on the pane pid itself or on its child
+        # depends on whether that sh exec'd or forked. So look at both pids,
+        # and WAIT — a session that answers has-session does not yet have a
+        # shell that finished exec'ing (CI 32649971831 read 49 entries with no
+        # MY_PEM at all, where the run before it passed).
+        pids = (
+            tmux('display -p -t "=pemsess:" "#{pane_pid}"')
+            + " | xargs -I{} sh -c 'echo {}; pgrep -P {} || true'"
+        )
+        machine.wait_until_succeeds(
+            pids
+            + " | xargs -I{} sh -c \"tr '\\0' '\\n' < /proc/{}/environ\""
+            + " | grep -x 'MY_PEM=-----BEGIN PRIVATE KEY-----' >/dev/null",
+            timeout=60,
+        )
+        # Then the exact entry, from whichever of those pids carries it.
+        # Compare the NUL-delimited ENTRY, not a substring of a joined dump: a
+        # substring match cannot tell "the value ends here" from "the value
         # continues", which is the very thing a continuation-line parser has
-        # to get right. base64 keeps the NULs intact through the shell.
-        raw = machine.succeed(f"base64 -w0 < /proc/{ppid}/environ")
-        # chr(0), not "\0": this file is a Nix indented string, which passes
-        # backslashes through untouched, so the escape would have to survive
-        # only Python — and one level too many silently splits on nothing.
-        entries = base64.b64decode(raw).decode().split(chr(0))
+        # to get right. base64 keeps the NULs intact through the shell, and
+        # chr(0) splits on them — "\0" here would be a literal backslash-zero,
+        # because a Nix indented string passes backslashes through untouched.
+        examined = machine.succeed(pids).split()
+        entries = []
+        for pid in examined:
+            raw = machine.succeed(f"base64 -w0 < /proc/{pid}/environ || true")
+            entries += base64.b64decode(raw).decode().split(chr(0))
         assert "MY_PEM=" + pem in entries, (
-            f"{len(entries)} entries",
+            f"pids {examined}, {len(entries)} entries",
             [e for e in entries if e.startswith("MY_PEM")],
         )
         machine.succeed(as_agent("agent-box-session rm pemsess"))
