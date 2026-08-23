@@ -1044,10 +1044,14 @@
         # continues", which is the very thing a continuation-line parser has
         # to get right. base64 keeps the NULs intact through the shell.
         raw = machine.succeed(f"base64 -w0 < /proc/{ppid}/environ")
-        entries = base64.b64decode(raw).decode().split("\\0")
-        assert "MY_PEM=" + pem in entries, [
-            e for e in entries if e.startswith("MY_PEM")
-        ]
+        # chr(0), not "\0": this file is a Nix indented string, which passes
+        # backslashes through untouched, so the escape would have to survive
+        # only Python — and one level too many silently splits on nothing.
+        entries = base64.b64decode(raw).decode().split(chr(0))
+        assert "MY_PEM=" + pem in entries, (
+            f"{len(entries)} entries",
+            [e for e in entries if e.startswith("MY_PEM")],
+        )
         machine.succeed(as_agent("agent-box-session rm pemsess"))
         machine.succeed(as_agent("agent-box-session env rm MY_PEM"))
         machine.succeed(as_agent("agent-box-session env rm PLAIN"))
@@ -1122,11 +1126,11 @@
         machine.succeed(
             as_agent(
                 "agent-box-profile set reviewer "
-                + shlex.quote("SYSTEM_PROMPT=Review PRs.\n\nBe terse.\n")
+                + shlex.quote("SYSTEM_PROMPT=Review PRs.\n\nBe terse.\n\n")
             )
         )
         relaunch = json.loads(machine.succeed(as_agent("agent-box-profile launch reviewer")))
-        assert relaunch["args"][-1] == "Review PRs.\n\nBe terse.\n", relaunch
+        assert relaunch["args"][-1] == "Review PRs.\n\nBe terse.\n\n", relaunch
         assert launch["args"] == [
             "--model", "sonnet", "--effort", "low",
             "--append-system-prompt", "You review PRs.",
