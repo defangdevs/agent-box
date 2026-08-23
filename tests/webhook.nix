@@ -289,7 +289,7 @@
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
-        " agent-box-webhook subscribe defangdevs/agent-box --note 'testing #101' --ttl 0"
+        " agent-box-webhook subscribe defangdevs/agent-box --note 'testing #101' --ttl 8"
     )
     machine.succeed(
         "jq -e '.topics[0].topic == \"github:defangdevs/agent-box\""
@@ -1334,7 +1334,7 @@
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
-        " agent-box-webhook subscribe defangdevs/panel --note 'shown in the UI' --ttl 0"
+        " agent-box-webhook subscribe defangdevs/panel --note 'shown in the UI' --ttl 8"
     )
     page = machine.succeed(f"{settings_curl} {settings_page}")
     for want in [
@@ -1410,7 +1410,7 @@
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
-        " agent-box-webhook subscribe defangdevs/panel --note 'back again' --ttl 0"
+        " agent-box-webhook subscribe defangdevs/panel --note 'back again' --ttl 8"
     )
     machine.succeed(f"test -e {main_filter}")
 
@@ -1426,7 +1426,7 @@
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
-        " agent-box-webhook subscribe defangdevs/panel --note 'back again' --ttl 0"
+        " agent-box-webhook subscribe defangdevs/panel --note 'back again' --ttl 8"
     )
 
     # The same for a standing watch — the entry a flood most likely comes
@@ -1950,7 +1950,7 @@
         f" LOCAL_WEBHOOK_STATE_DIR={state}"
         " LOCAL_WEBHOOK_SESSION=agent-echo"
         " agent-box-webhook subscribe defangdevs/echo --note 'echo mute (#261)'"
-        " --ignore-sender @self --ttl 0"
+        " --ignore-sender @self --ttl 8"
     )
     machine.succeed(
         "systemd-run --unit=webhook-echo-peer --uid=agent --setenv=HOME=/home/agent"
