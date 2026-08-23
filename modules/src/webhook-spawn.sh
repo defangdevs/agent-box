@@ -122,12 +122,20 @@ if [ -n "${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   # A hand-edited value that is not a JSON array of strings must not take the
   # delivery down with it: say so where the operator will look (--preamble,
   # and the journal) and start the session on the agent CLI's own defaults.
-  if hook_args_decoded=$("$JQ" -r '.[]' <<<"$AGENT_BOX_HOOK_SESSION_ARGS" 2>/dev/null); then
-    if [ -n "$hook_args_decoded" ]; then
-      while IFS= read -r arg; do
-        extra+=("$arg")
-      done <<<"$hook_args_decoded"
-    fi
+  # Two steps, because the decode below cannot report a bad value: a shell
+  # variable cannot carry NUL, so the args arrive through a process
+  # substitution whose exit status is not this shell's. Checking the SHAPE
+  # first is also stricter than the `jq -r '.[]'` this replaces, which
+  # stringified a value like [1,2] instead of rejecting it.
+  #
+  # NUL-delimited for the same reason as the profile args in session-cli.sh
+  # (issue #212): one of these arguments may be a multi-line system prompt,
+  # and one-per-line cannot tell that from several arguments.
+  if "$JQ" -e 'type == "array" and all(.[]; type == "string")' \
+       >/dev/null 2>&1 <<<"$AGENT_BOX_HOOK_SESSION_ARGS"; then
+    while IFS= read -r -d '' arg; do
+      extra+=("$arg")
+    done < <("$JQ" -j '.[] + "\u0000"' <<<"$AGENT_BOX_HOOK_SESSION_ARGS")
   else
     hook_args_source="$hook_args_source — IGNORED, not a JSON array of strings"
     echo "agent-box-webhook-spawn: AGENT_BOX_HOOK_SESSION_ARGS is not a JSON" \

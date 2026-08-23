@@ -1121,16 +1121,27 @@
         assert launch["harness"] == "claude", launch
         # A SYSTEM_PROMPT is prose: it may span lines and it may end on a
         # blank one, and the harness must be handed exactly what the store
-        # holds (issue #212). The token-shaped keys still get stripped —
-        # a newline in HARNESS would match no harness at all.
+        # holds (issue #212). Its own profile, because `reviewer` is asserted
+        # on below and must keep the prompt it was created with.
         machine.succeed(
             as_agent(
-                "agent-box-profile set reviewer "
+                "agent-box-profile set prosaic HARNESS=claude "
                 + shlex.quote("SYSTEM_PROMPT=Review PRs.\n\nBe terse.\n\n")
             )
         )
-        relaunch = json.loads(machine.succeed(as_agent("agent-box-profile launch reviewer")))
-        assert relaunch["args"][-1] == "Review PRs.\n\nBe terse.\n\n", relaunch
+        prose = json.loads(machine.succeed(as_agent("agent-box-profile launch prosaic")))
+        assert prose["args"][-1] == "Review PRs.\n\nBe terse.\n\n", prose
+        # And it survives `add --profile`, which stores the resolved argument
+        # vector: a newline-separated decode turned one two-paragraph prompt
+        # into three separate flags to the agent CLI.
+        machine.succeed(as_agent("agent-box-session add proser --profile prosaic"))
+        stored = json.loads(machine.succeed(f"cat {sfile}"))["sessions"]["proser"]
+        assert stored["extraArgs"] == [
+            "--append-system-prompt",
+            "Review PRs.\n\nBe terse.\n\n",
+        ], stored
+        machine.succeed(as_agent("agent-box-session rm proser"))
+        machine.succeed(as_agent("agent-box-profile rm prosaic"))
         assert launch["args"] == [
             "--model", "sonnet", "--effort", "low",
             "--append-system-prompt", "You review PRs.",

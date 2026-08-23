@@ -1706,7 +1706,7 @@ case "$cmd" in
     # The binary is pinned by the generated wrapper (AGENT_BOX_PROFILE_BIN):
     # this CLI also runs from the webhook receiver unit's PATH, which carries
     # jq, coreutils and this script and nothing else.
-    profile_args=""
+    pargs=()
     if [ -n "$profile" ]; then
       # --agent on the command line wins over the profile's harness, the same
       # override order the env file has over the NixOS option elsewhere here —
@@ -1721,7 +1721,15 @@ case "$cmd" in
         '.warnings[] | "agent-box-session: profile \($p): " + .' <<<"$pjson" >&2
       # Profile args go FIRST so an explicit `-- EXTRA_ARGS` tail still has the
       # last word (both harness CLIs take the last occurrence of a flag).
-      profile_args="$("$JQ" -r '.args[]' <<<"$pjson")"
+      #
+      # NUL-delimited, not one-per-line: an argument may CONTAIN newlines now
+      # that a SYSTEM_PROMPT can (issue #212), and a newline-separated list
+      # cannot tell ONE multi-line argument from SEVERAL arguments — a
+      # two-paragraph prompt silently reached the agent CLI as three separate
+      # flags. NUL is the one byte a value can never hold.
+      while IFS= read -r -d ''' parg; do
+        pargs+=("$parg")
+      done < <("$JQ" -j '.args[] + "\u0000"' <<<"$pjson")
     fi
     case " $AGENTS " in
       (*" $agent "*) ;;
@@ -1751,13 +1759,7 @@ case "$cmd" in
     # args, so a dashed extra arg like --model would error out.
     # One argument vector: the profile's args first, the caller's own `--`
     # tail after them, so an explicit flag still has the last word.
-    sargs=()
-    if [ -n "$profile_args" ]; then
-      while IFS= read -r parg; do
-        sargs+=("$parg")
-      done <<<"$profile_args"
-    fi
-    sargs+=("$@")
+    sargs=("''${pargs[@]}" "$@")
     jq_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
@@ -2975,12 +2977,20 @@ if [ -n "''${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   # A hand-edited value that is not a JSON array of strings must not take the
   # delivery down with it: say so where the operator will look (--preamble,
   # and the journal) and start the session on the agent CLI's own defaults.
-  if hook_args_decoded=$("$JQ" -r '.[]' <<<"$AGENT_BOX_HOOK_SESSION_ARGS" 2>/dev/null); then
-    if [ -n "$hook_args_decoded" ]; then
-      while IFS= read -r arg; do
-        extra+=("$arg")
-      done <<<"$hook_args_decoded"
-    fi
+  # Two steps, because the decode below cannot report a bad value: a shell
+  # variable cannot carry NUL, so the args arrive through a process
+  # substitution whose exit status is not this shell's. Checking the SHAPE
+  # first is also stricter than the `jq -r '.[]'` this replaces, which
+  # stringified a value like [1,2] instead of rejecting it.
+  #
+  # NUL-delimited for the same reason as the profile args in session-cli.sh
+  # (issue #212): one of these arguments may be a multi-line system prompt,
+  # and one-per-line cannot tell that from several arguments.
+  if "$JQ" -e 'type == "array" and all(.[]; type == "string")' \
+       >/dev/null 2>&1 <<<"$AGENT_BOX_HOOK_SESSION_ARGS"; then
+    while IFS= read -r -d ''' arg; do
+      extra+=("$arg")
+    done < <("$JQ" -j '.[] + "\u0000"' <<<"$AGENT_BOX_HOOK_SESSION_ARGS")
   else
     hook_args_source="$hook_args_source — IGNORED, not a JSON array of strings"
     echo "agent-box-webhook-spawn: AGENT_BOX_HOOK_SESSION_ARGS is not a JSON" \
