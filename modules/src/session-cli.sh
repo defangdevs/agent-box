@@ -458,7 +458,6 @@ case "$cmd" in
     # page and at session spawn, or setting it in one place corrupts it in
     # another.
     ENVSTORE="${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
-    ENV_FILE="$HOME/.config/agent-box/env"
     sub="${1:-}"; shift || true
     case "$sub" in
       ls)
@@ -480,8 +479,9 @@ case "$cmd" in
       rm)
         k="${1:-}"
         valid_key "$k" || { usage >&2; exit 2; }
-        # No file, nothing to remove — and no file created just to say so.
-        [ -f "$ENV_FILE" ] || exit 0
+        # "no store, nothing to remove" is the store's own answer: this CLI
+        # does not know where the file is, which is what keeps it right when
+        # AGENT_BOX_CONFIG_DIR moves it.
         "$ENVSTORE" unset "$k"
         echo "env '$k' removed — applies on the next session (re)start ('agent-box-session restart --all')"
         ;;

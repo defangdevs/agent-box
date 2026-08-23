@@ -132,6 +132,12 @@ def main(argv):
     # unset
     if not args.args:
         die("unset takes at least one KEY")
+    # No store, nothing to remove — and no store created to say so. The check
+    # lives here, where the path is resolved, and not in a caller: a caller
+    # that guessed the path would guess wrong whenever AGENT_BOX_CONFIG_DIR
+    # moves it.
+    if not os.path.exists(path):
+        return 0
     for key in args.args:
         if not valid_key(key):
             die(f"invalid key '{key}'")

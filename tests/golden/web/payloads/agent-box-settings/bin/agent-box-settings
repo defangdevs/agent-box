@@ -51,6 +51,17 @@
 # Writing is the exact inverse: a value is quoted only when it has to be, so a
 # file of ordinary tokens stays the plain KEY=value text that `grep` and a
 # human both expect.
+#
+# A write is a read-modify-write, so it takes a lock. os.replace makes a
+# READER see a whole document and nothing more, but it does not stop two
+# writers that both started from the same base: the second one publishes a
+# file that never contained the first one's key, and a secret disappears with
+# no error anywhere. That is agent-box#254 in another file. One lock covers
+# every writer here because every writer now goes through this function —
+# in-process for the settings daemon, through agent-box-envstore for the
+# shell CLIs — which is the point of the format having one owner.
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -258,16 +269,41 @@ def save(path, pairs, header="", mode=0o600, dir_mode=0o700):
         raise
 
 
+@contextlib.contextmanager
+def locked(path):
+    """Hold an exclusive advisory lock on `path` for one read-modify-write.
+
+    The lock file sits beside the store, the convention sessions.json already
+    uses. fcntl rather than util-linux's flock(1) because every writer of this
+    format is python now; the shell CLIs reach it through agent-box-envstore
+    and inherit the lock without knowing it exists.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    handle = open(path + ".lock", "a", encoding="utf-8")
+    try:
+        try:
+            os.fchmod(handle.fileno(), 0o600)
+        except OSError:
+            pass
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        handle.close()
+
+
 def update(path, assignments, header="", drop=()):
     """Rewrite `path` with `drop` and the assigned keys removed, then append.
 
-    One read-modify-write, so `set` keeps the file's order for untouched keys
-    and moves a re-set key to the end — the behavior the shell `env_rewrite`
-    and the daemon's `set_key` both had.
+    One read-modify-write under the lock, so `set` keeps the file's order for
+    untouched keys and moves a re-set key to the end — the behavior the shell
+    `env_rewrite` and the daemon's `set_key` both had — and a concurrent
+    writer cannot drop the key this one did not touch.
     """
-    doomed = set(drop) | {key for key, _ in assignments}
-    kept = [(k, v) for (k, v) in load(path) if k not in doomed]
-    save(path, kept + list(assignments), header)
+    with locked(path):
+        doomed = set(drop) | {key for key, _ in assignments}
+        kept = [(k, v) for (k, v) in load(path) if k not in doomed]
+        save(path, kept + list(assignments), header)
 
 
 def keys(path):

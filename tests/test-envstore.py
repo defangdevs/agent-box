@@ -23,6 +23,7 @@ The CLI is exercised too, by composing it the way the generated module does
 (library text, then CLI text) and running it — which also proves the two
 halves still fit together.
 """
+import fcntl
 import importlib.util
 import itertools
 import os
@@ -247,6 +248,42 @@ class FileOperations(unittest.TestCase):
         )
         es.update(self.path, [], es.ENV_HEADER, drop=["A", "missing"])
         self.assertEqual(es.load(self.path), [("C", "3"), ("B", "9")])
+
+    def update_in_subprocess(self, key):
+        return subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]);"
+             "import envstore;"
+             "envstore.update(sys.argv[2], [(sys.argv[3], sys.argv[3])],"
+             " envstore.ENV_HEADER)",
+             str(LIB.parent), self.path, key],
+        )
+
+    def test_update_waits_for_the_store_lock(self):
+        # The deterministic half of the guarantee: whatever the scheduler
+        # does, an update must not proceed while another writer holds the
+        # store. (The racing test below is the end-to-end net; on its own it
+        # can only catch a missing lock MOST of the time.)
+        with es.locked(self.path):
+            proc = self.update_in_subprocess("BLOCKED")
+            with self.assertRaises(subprocess.TimeoutExpired):
+                proc.wait(timeout=2)
+        self.assertEqual(proc.wait(timeout=60), 0)
+        self.assertEqual(es.keys(self.path), ["BLOCKED"])
+
+    def test_concurrent_writers_do_not_lose_a_key(self):
+        # Two writers that both start from the same base each publish a file
+        # that never contained the other's key, and a secret disappears with
+        # no error anywhere (agent-box#254, in another file). Every writer of
+        # this format goes through `update`, so the lock there covers the
+        # settings daemon and both shell CLIs at once.
+        writers = 24
+        procs = [self.update_in_subprocess(f"K{i:02d}") for i in range(writers)]
+        for proc in procs:
+            self.assertEqual(proc.wait(timeout=60), 0)
+        self.assertEqual(
+            es.keys(self.path), [f"K{i:02d}" for i in range(writers)]
+        )
 
     def test_keys_are_sorted_and_deduplicated(self):
         es.save(self.path, [("B", "1"), ("A", "2"), ("B", "3")], es.ENV_HEADER)
