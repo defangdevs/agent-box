@@ -4796,7 +4796,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     status=400,
                 )
                 return
-            set_key(key, value)
+            # The store refuses a value that holds a NUL (lib/envstore.py: no
+            # environment variable can carry one, and NUL frames the argument
+            # vectors this file feeds). A form cannot TYPE one, but a POST can
+            # carry one, and a 400 saying so beats a traceback in the journal
+            # and a 500 on the page.
+            try:
+                set_key(key, value)
+            except EnvStoreError as exc:
+                self._send_html(
+                    render_page("Could not save that secret — %s." % exc),
+                    status=400,
+                )
+                return
             self._redirect("ok=saved")
         elif path.startswith(BASE + "/connect/"):
             # Guided sign-in (issues #207, #208, #313). All three verbs

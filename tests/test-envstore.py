@@ -121,6 +121,50 @@ class NoInjection(unittest.TestCase):
         self.assertEqual(es.parse(text), [("GOOD", "y")])
 
 
+class NulAtTheBoundary(unittest.TestCase):
+    """What a refusal must NOT cost, beyond refusing.
+
+    `NoInjection` pins that a NUL is refused on write and skipped on read.
+    These pin the two things a refusal could still get wrong: losing the
+    secrets that were already stored, and leaking them into a leftover temp
+    file.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "env")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_a_refused_write_leaves_the_store_untouched(self):
+        es.save(self.path, [("KEEP", "1")], es.ENV_HEADER)
+        with self.assertRaises(es.EnvStoreError):
+            es.update(self.path, [("J", "a\0b")], es.ENV_HEADER)
+        self.assertEqual(es.load(self.path), [("KEEP", "1")])
+        # And nothing half-written left behind holding the value: the check
+        # has to happen BEFORE the temp file exists, not while writing it.
+        self.assertEqual(
+            [n for n in os.listdir(self.dir.name) if n.startswith(".envstore.")],
+            [],
+        )
+
+    def test_no_parsed_value_can_hold_a_nul(self):
+        # The invariant stated positively, over the spellings a hand-edited
+        # file can use — a caller may assume this, because two argument
+        # decoders do.
+        for text in (
+            "K=a\0b\n",
+            'K="a\0b"\n',
+            "K=\0\n",
+            'K="line\nwith\0nul"\n',
+            "K='a\0b'\n",
+            'K="unterminated\0\n',
+        ):
+            for key, value in es.parse(text):
+                self.assertNotIn("\0", value, text)
+
+
 class LegacyReadings(unittest.TestCase):
     """What the six pre-#212 parsers did, still done."""
 
@@ -255,6 +299,16 @@ class Cli(unittest.TestCase):
         # And the file the session-spawn loader reads holds it as one key.
         env_file = os.path.join(self.dir.name, "env")
         self.assertEqual([k for k, _ in es.load(env_file)], ["PEM"])
+
+    def test_stdin_nul_is_refused_not_stored(self):
+        # The CLI is what a shell caller and the session env command reach, so
+        # the refusal has to arrive as an exit status and a message rather than
+        # a traceback.
+        self.run_cli("set", "KEEP=1")
+        done = self.run_cli("set", "--stdin", "PEM", stdin="a\0b")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("NUL", done.stderr)
+        self.assertEqual(self.run_cli("keys").stdout, "KEEP\n")
 
     def test_json_is_jq_readable(self):
         self.run_cli("set", "A=1", "B=two lines\nhere")

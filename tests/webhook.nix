@@ -808,6 +808,57 @@
         f"sudo -u agent env HOME=/home/agent agent-box-session rm {overridden}"
     )
 
+    # A `\u0000` ESCAPE in that same override must not split one argument in
+    # two. The value is JSON TEXT: the store it comes from sees six ordinary
+    # characters, and only jq's decode turns them into a real NUL — the very
+    # byte the argument framing below uses as its delimiter. So a user who may
+    # already pick their own hook-session model could otherwise append a flag
+    # nobody wrote, `--dangerously-skip-permissions` being the one that
+    # matters. The store refuses a NUL BYTE; this is the escape, refused after
+    # the decode that creates it, and this asserts the whole path rather than
+    # either half of it.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-session env set AGENT_BOX_HOOK_SESSION_ARGS"
+        " '[\"--model\\u0000--dangerously-skip-permissions\",\"haiku\"]'"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github"
+        " LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/nul-probe"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    nul_probe = machine.succeed(
+        "jq -r '.sessions | keys[]"
+        " | select(startswith(\"hook-defangdevs-nul-probe-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    # No extra args at all: not the two the split would have produced, and not
+    # the `--model haiku` beside them either. A malformed value is refused
+    # whole, which is what the shape check already promised for [1,2].
+    machine.succeed(
+        f"jq -e '.sessions[\"{nul_probe}\"].extraArgs == []'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    # And the operator is told, in the one report that says what a match
+    # launches — a silently dropped override is how this goes unnoticed.
+    refused = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        f" {spawn_cmd} --preamble 'github:defangdevs/*'"
+    )
+    assert "IGNORED, not a JSON array of strings" in refused, refused
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {nul_probe}"
+    )
+    # Back to the plain override, which the next block reports on.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-session env set AGENT_BOX_HOOK_SESSION_ARGS"
+        " '[\"--model\",\"haiku\"]'"
+    )
+
     # --- issue #292: --preamble says what a match LAUNCHES ------------------
     # The override above is invisible unless something reports it: the prompt
     # is only half of what a delivery starts, and the other half is what picks
