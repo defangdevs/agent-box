@@ -527,6 +527,11 @@ if __name__ == "__main__":
 #   * An unterminated `"` does not swallow the rest of the file. The line is
 #     taken as a legacy raw value and parsing resumes with the next one, so
 #     one corrupt entry costs one entry.
+#   * A value may not contain NUL, and an entry that does is skipped on read
+#     and refused on write. execve cannot carry one anyway — the variable
+#     would silently truncate at it — and NUL is what frames the argument
+#     vectors this store feeds (see session-cli.sh's profile decode), so a
+#     value holding one could turn itself into two arguments.
 #
 # Writing is the exact inverse: a value is quoted only when it has to be, so a
 # file of ordinary tokens stays the plain KEY=value text that `grep` and a
@@ -564,6 +569,11 @@ def profile_header(name):
 
 def valid_key(key):
     return bool(KEY_RE.match(key))
+
+
+def valid_value(value):
+    """NUL disqualifies a value. See the format notes at the top."""
+    return "\0" not in value
 
 
 def _unescape(text):
@@ -643,13 +653,16 @@ def parse(text):
             scanned = _scan_quoted(value[1:], lines, index)
             if scanned is not None:
                 value, index = scanned
-                pairs.append((key, value))
+                if valid_value(value):
+                    pairs.append((key, value))
                 continue
             # Unterminated quote: fall through and read THIS line the legacy
             # way, leaving the lines below it to be parsed on their own.
         value = value.rstrip()
         if len(value) >= 2 and value.startswith("'") and value.endswith("'"):
             value = value[1:-1]
+        if not valid_value(value):
+            continue
         pairs.append((key, value))
     return pairs
 
@@ -692,6 +705,10 @@ def render(pairs, header=""):
     return header + "".join(f"{key}={quote(value)}\n" for key, value in pairs)
 
 
+class EnvStoreError(ValueError):
+    """A value the format cannot carry."""
+
+
 def save(path, pairs, header="", mode=0o600, dir_mode=0o700):
     """Atomically publish `pairs` to `path`.
 
@@ -699,6 +716,9 @@ def save(path, pairs, header="", mode=0o600, dir_mode=0o700):
     daemon and both shell CLIs already used, so a reader either sees the old
     file or the new one. 0600 because the value beside the key is a secret.
     """
+    for key, value in pairs:
+        if not valid_value(value):
+            raise EnvStoreError(f"{key}: a value may not contain NUL")
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, mode=dir_mode, exist_ok=True)
     # makedirs applies `mode` only when it CREATES the directory, and a
@@ -901,7 +921,10 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except EnvStoreError as error:
+        die(str(error))
   '');
 
   # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
@@ -1726,7 +1749,9 @@ case "$cmd" in
       # that a SYSTEM_PROMPT can (issue #212), and a newline-separated list
       # cannot tell ONE multi-line argument from SEVERAL arguments — a
       # two-paragraph prompt silently reached the agent CLI as three separate
-      # flags. NUL is the one byte a value can never hold.
+      # flags. NUL is the one byte a value cannot hold: the env store refuses
+      # to write one and skips an entry that holds one (src/lib/envstore.py),
+      # so a profile file cannot put the frame byte inside a frame.
       while IFS= read -r -d ''' parg; do
         pargs+=("$parg")
       done < <("$JQ" -j '.args[] + "\u0000"' <<<"$pjson")
@@ -2981,12 +3006,15 @@ if [ -n "''${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   # variable cannot carry NUL, so the args arrive through a process
   # substitution whose exit status is not this shell's. Checking the SHAPE
   # first is also stricter than the `jq -r '.[]'` this replaces, which
-  # stringified a value like [1,2] instead of rejecting it.
+  # stringified a value like [1,2] instead of rejecting it — and it is where
+  # a U+0000 is refused: argv cannot carry a NUL, but JSON can SPELL one
+  # (\u0000), so without this an argument could frame itself as two.
   #
   # NUL-delimited for the same reason as the profile args in session-cli.sh
   # (issue #212): one of these arguments may be a multi-line system prompt,
   # and one-per-line cannot tell that from several arguments.
-  if "$JQ" -e 'type == "array" and all(.[]; type == "string")' \
+  if "$JQ" -e 'type == "array"
+               and all(.[]; type == "string" and index("\u0000") == null)' \
        >/dev/null 2>&1 <<<"$AGENT_BOX_HOOK_SESSION_ARGS"; then
     while IFS= read -r -d ''' arg; do
       extra+=("$arg")

@@ -82,7 +82,13 @@ class RoundTrip(unittest.TestCase):
 
 
 class NoInjection(unittest.TestCase):
-    """A value must never be able to introduce a second key."""
+    """A value must never introduce a second key — or a second argument."""
+
+    def setUp(self):
+        self.nul_dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.nul_dir.cleanup()
 
     def test_value_holding_an_assignment(self):
         for value in (
@@ -97,6 +103,18 @@ class NoInjection(unittest.TestCase):
             pairs = es.parse(text)
             self.assertEqual([k for k, _ in pairs], ["K"], f"for {value!r}: {text!r}")
             self.assertEqual(pairs[0][1], value)
+
+    def test_nul_is_refused_on_write_and_skipped_on_read(self):
+        # NUL frames the argument vectors this store feeds (session-cli's
+        # profile decode, webhook-spawn's hook args), and execve cannot carry
+        # one anyway — a variable would truncate at it. So a value holding one
+        # must never reach the file, and one that somehow did must not be
+        # handed on as if it were ordinary text.
+        self.assertFalse(es.valid_value("a\0b"))
+        with self.assertRaises(es.EnvStoreError):
+            es.save(os.path.join(self.nul_dir.name, "env"), [("K", "a\0b")])
+        self.assertEqual(es.parse("K=a\0b\nJ=fine\n"), [("J", "fine")])
+        self.assertEqual(es.parse('K="a\0b"\nJ=fine\n'), [("J", "fine")])
 
     def test_key_charset_is_enforced_on_read(self):
         text = "1BAD=x\nBAD-KEY=x\n=x\n BAD KEY=x\nGOOD=y\n"

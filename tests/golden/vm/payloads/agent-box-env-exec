@@ -42,6 +42,11 @@
 #   * An unterminated `"` does not swallow the rest of the file. The line is
 #     taken as a legacy raw value and parsing resumes with the next one, so
 #     one corrupt entry costs one entry.
+#   * A value may not contain NUL, and an entry that does is skipped on read
+#     and refused on write. execve cannot carry one anyway — the variable
+#     would silently truncate at it — and NUL is what frames the argument
+#     vectors this store feeds (see session-cli.sh's profile decode), so a
+#     value holding one could turn itself into two arguments.
 #
 # Writing is the exact inverse: a value is quoted only when it has to be, so a
 # file of ordinary tokens stays the plain KEY=value text that `grep` and a
@@ -79,6 +84,11 @@ def profile_header(name):
 
 def valid_key(key):
     return bool(KEY_RE.match(key))
+
+
+def valid_value(value):
+    """NUL disqualifies a value. See the format notes at the top."""
+    return "\0" not in value
 
 
 def _unescape(text):
@@ -158,13 +168,16 @@ def parse(text):
             scanned = _scan_quoted(value[1:], lines, index)
             if scanned is not None:
                 value, index = scanned
-                pairs.append((key, value))
+                if valid_value(value):
+                    pairs.append((key, value))
                 continue
             # Unterminated quote: fall through and read THIS line the legacy
             # way, leaving the lines below it to be parsed on their own.
         value = value.rstrip()
         if len(value) >= 2 and value.startswith("'") and value.endswith("'"):
             value = value[1:-1]
+        if not valid_value(value):
+            continue
         pairs.append((key, value))
     return pairs
 
@@ -207,6 +220,10 @@ def render(pairs, header=""):
     return header + "".join(f"{key}={quote(value)}\n" for key, value in pairs)
 
 
+class EnvStoreError(ValueError):
+    """A value the format cannot carry."""
+
+
 def save(path, pairs, header="", mode=0o600, dir_mode=0o700):
     """Atomically publish `pairs` to `path`.
 
@@ -214,6 +231,9 @@ def save(path, pairs, header="", mode=0o600, dir_mode=0o700):
     daemon and both shell CLIs already used, so a reader either sees the old
     file or the new one. 0600 because the value beside the key is a secret.
     """
+    for key, value in pairs:
+        if not valid_value(value):
+            raise EnvStoreError(f"{key}: a value may not contain NUL")
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, mode=dir_mode, exist_ok=True)
     # makedirs applies `mode` only when it CREATES the directory, and a

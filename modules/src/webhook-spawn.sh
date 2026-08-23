@@ -126,12 +126,15 @@ if [ -n "${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   # variable cannot carry NUL, so the args arrive through a process
   # substitution whose exit status is not this shell's. Checking the SHAPE
   # first is also stricter than the `jq -r '.[]'` this replaces, which
-  # stringified a value like [1,2] instead of rejecting it.
+  # stringified a value like [1,2] instead of rejecting it — and it is where
+  # a U+0000 is refused: argv cannot carry a NUL, but JSON can SPELL one
+  # (\u0000), so without this an argument could frame itself as two.
   #
   # NUL-delimited for the same reason as the profile args in session-cli.sh
   # (issue #212): one of these arguments may be a multi-line system prompt,
   # and one-per-line cannot tell that from several arguments.
-  if "$JQ" -e 'type == "array" and all(.[]; type == "string")' \
+  if "$JQ" -e 'type == "array"
+               and all(.[]; type == "string" and index("\u0000") == null)' \
        >/dev/null 2>&1 <<<"$AGENT_BOX_HOOK_SESSION_ARGS"; then
     while IFS= read -r -d '' arg; do
       extra+=("$arg")
