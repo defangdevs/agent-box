@@ -88,6 +88,12 @@ import urllib.parse
 
 USER = os.environ.get("AGENT_BOX_SETTINGS_USER", "agent")
 ENV_FILE = os.environ["AGENT_BOX_SETTINGS_ENV_FILE"]
+# Agent profiles (issue #321) live beside the env store, one file per profile.
+# Only the preamble cache key reads this: a watch's launch report names the
+# profile AGENT_BOX_HOOK_PROFILE picks and whether it still exists, so
+# creating or deleting a profile changes that report without touching the env
+# file. The page has no profile editor yet (that is step 5 of #321).
+PROFILES_DIR = os.path.join(os.path.dirname(ENV_FILE), "profiles")
 BASE = os.environ.get("AGENT_BOX_SETTINGS_BASE", "/settings").rstrip("/")
 PORT = int(os.environ.get("AGENT_BOX_SETTINGS_PORT", "8080"))
 TMUX_SOCKET = os.environ.get("AGENT_BOX_TMUX_SOCKET", "agent-box")
@@ -996,7 +1002,7 @@ def webhook_unsubscribe(key, topic, dispatch):
 
 
 def hook_args_stamp():
-    """(mtime_ns, size) of the env file, or None when there is none.
+    """(mtime_ns, size) of the env file and of the profiles directory.
 
     Part of hook_preamble's cache key. The dispatch script reports the
     hook-session arguments that file can override (#292), so its output is
@@ -1004,12 +1010,22 @@ def hook_args_stamp():
     set` between two renders changes which model the page should show, and
     a cached answer would keep naming the old one for the life of the
     daemon. One stat per render is cheap; the fork it guards is not.
+
+    The profiles directory is stamped for the same reason (#321): the report
+    names the agent profile AGENT_BOX_HOOK_PROFILE picks, and whether that
+    profile still exists decides whether the watch uses it at all. Creating
+    or removing one does not touch the env file, and every write goes through
+    a rename inside this directory, so its mtime moves on both.
     """
-    try:
-        info = os.stat(ENV_FILE)
-    except OSError:
-        return None
-    return (info.st_mtime_ns, info.st_size)
+    stamps = []
+    for path in (ENV_FILE, PROFILES_DIR):
+        try:
+            info = os.stat(path)
+        except OSError:
+            stamps.append(None)
+        else:
+            stamps.append((info.st_mtime_ns, info.st_size))
+    return tuple(stamps)
 
 
 @functools.lru_cache(maxsize=64)

@@ -845,6 +845,98 @@
     # way: the report has to distinguish the two levers, not just mention them.
     assert "come from services.agent-box.webhook.hookSessionArgs" in launch, launch
 
+    # --- issue #321: a standing watch hands work to an agent PROFILE --------
+    # The gap a profile closes here: the spawn passes no --agent, so a match
+    # always started the box default harness, and hookSessionArgs could only
+    # append flags to it. A profile picks the harness, the model, the effort,
+    # an appended system prompt and the session's environment, under one name.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-profile set triage HARNESS=codex MODEL=gpt-5.6 EFFORT=low"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-session env set AGENT_BOX_HOOK_PROFILE triage"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github"
+        " LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/profile-probe"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    profiled = machine.succeed(
+        "jq -r '.sessions | keys[]"
+        " | select(startswith(\"hook-defangdevs-profile-probe-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    # The HARNESS came from the profile — not the box default (claude) — and
+    # the profile's args are mapped for codex, with hookSessionArgs still
+    # appended after them, so the `--` tail keeps the last word.
+    machine.succeed(
+        f"jq -e '.sessions[\"{profiled}\"].agent == \"codex\"'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    machine.succeed(
+        f"jq -e '.sessions[\"{profiled}\"].profile == \"triage\"'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    machine.succeed(
+        f"jq -e '.sessions[\"{profiled}\"].extraArgs"
+        " == [\"-m\", \"gpt-5.6\", \"-c\", \"model_reasoning_effort=low\","
+        " \"--model\", \"sonnet\"]'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    # ...and --preamble names the profile, so the settings page can answer
+    # "what does this watch start" without a second copy of the answer (#292).
+    launch = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        f" {spawn_cmd} --preamble 'github:defangdevs/*'"
+    )
+    assert "agent profile triage" in launch, launch
+    assert "agent-box-profile show triage" in launch, launch
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {profiled}"
+    )
+
+    # A profile that no longer exists must never cost a delivery: the events
+    # are dropped for good if the spawn fails, so the wrapper reports the
+    # unusable name and starts the session on the box default instead.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent agent-box-profile rm triage"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github"
+        " LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/ghost-profile-probe"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    ghosted = machine.succeed(
+        "jq -r '.sessions | keys[]"
+        " | select(startswith(\"hook-defangdevs-ghost-profile-probe-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        f"jq -e '.sessions[\"{ghosted}\"].agent == \"claude\""
+        f" and .sessions[\"{ghosted}\"].profile == null'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    launch = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        f" {spawn_cmd} --preamble 'github:defangdevs/*'"
+    )
+    assert "IGNORED, no such profile" in launch, launch
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {ghosted}"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-session env rm AGENT_BOX_HOOK_PROFILE"
+    )
+
     # An assignment is a work request, not a triage request (#253). The watch's
     # predicate decides WHICH assignments arrive (assignee = the box); this
     # wrapper decides what the session is TOLD, and a session told only to

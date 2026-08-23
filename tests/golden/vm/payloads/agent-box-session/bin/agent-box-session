@@ -8,6 +8,11 @@ export AGENT_BOX_DEFAULT_AGENT=claude
 # this CLI, no util-linux) — and a lock that only some writers take is not
 # a lock. util-linux is the only package that ships flock.
 export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock
+# Agent profiles (issue #321): `add --profile` resolves the harness and
+# its arguments by shelling out to agent-box-profile, and this CLI runs
+# from PATHs that do not carry it — the webhook receiver unit's PATH is
+# jq + coreutils + this CLI. Same pin convention as the flock above.
+export AGENT_BOX_PROFILE_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-profile/bin/agent-box-profile
 set -eu
 # jq/tmux resolve from PATH (system packages + every agent unit's PATH);
 # the installed-agent list and default come from the AGENT_BOX_* env the
@@ -43,7 +48,7 @@ kill_session() {
 
 usage() {
   echo "usage: agent-box-session ls"
-  echo "       agent-box-session add [NAME] [--agent AGENT] [--cwd DIR]"
+  echo "       agent-box-session add [NAME] [--agent AGENT] [--profile PROFILE] [--cwd DIR]"
   echo "                             [--prompt TEXT] [--resume-prompt TEXT] [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
@@ -51,7 +56,10 @@ usage() {
   echo "       agent-box-session env ls | set KEY VALUE | rm KEY"
   echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters (a"
   echo "longer name would be invisible in the web UI)."
-  echo "agents: $AGENTS (default: $DEFAULT_AGENT)"
+  echo "agents: $AGENTS (default: $DEFAULT_AGENT) — the HARNESS to run."
+  echo "--profile names an agent profile (agent-box-profile ls): a harness plus"
+  echo "a model, an effort level, an appended system prompt and session env."
+  echo "--agent and a '-- EXTRA_ARGS' tail override what the profile resolved."
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
   echo "Listed sessions are (re)started by the per-user supervisor within ~2s."
@@ -252,9 +260,11 @@ case "$cmd" in
       *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
     agent="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
+    profile=""; has_agent=0
     while [ $# -gt 0 ]; do
       case "$1" in
-        --agent) agent="${2:?--agent needs a value}"; shift 2 ;;
+        --agent) agent="${2:?--agent needs a value}"; has_agent=1; shift 2 ;;
+        --profile) profile="${2:?--profile needs a value}"; shift 2 ;;
         --cwd) cwd="${2:?--cwd needs a value}"; shift 2 ;;
         --prompt) prompt="${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
         --resume-prompt) rprompt="${2?--resume-prompt needs a value}"; has_rprompt=1; shift 2 ;;
@@ -262,6 +272,36 @@ case "$cmd" in
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
     done
+    # An agent PROFILE (issue #321) resolves to a harness plus the arguments
+    # that make this session a particular worker — model, effort, appended
+    # system prompt. Resolved by agent-box-profile, the one place that mapping
+    # lives, and resolved NOW rather than at every spawn: what a session was
+    # started with must not change under it when the profile is later edited
+    # (the same rule webhook.hookSessionArgs states). The profile's remaining
+    # keys are session ENVIRONMENT, which the env-exec wrapper applies at each
+    # spawn from the profile name recorded below — so a rotated token in a
+    # profile reaches the session on its next restart.
+    #
+    # The binary is pinned by the generated wrapper (AGENT_BOX_PROFILE_BIN):
+    # this CLI also runs from the webhook receiver unit's PATH, which carries
+    # jq, coreutils and this script and nothing else.
+    profile_args=""
+    if [ -n "$profile" ]; then
+      # --agent on the command line wins over the profile's harness, the same
+      # override order the env file has over the NixOS option elsewhere here —
+      # and it is passed INTO the resolver, because the arguments a profile
+      # resolves to are harness-specific (`--model` for claude, `-m` for
+      # codex, none at all for a shell session).
+      povr=""
+      [ "$has_agent" = 1 ] && povr="$agent"
+      pjson="$("${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" launch "$profile" "$povr")" || exit 2
+      agent="$("$JQ" -r '.harness' <<<"$pjson")"
+      "$JQ" -r --arg p "$profile" \
+        '.warnings[] | "agent-box-session: profile \($p): " + .' <<<"$pjson" >&2
+      # Profile args go FIRST so an explicit `-- EXTRA_ARGS` tail still has the
+      # last word (both harness CLIs take the last occurrence of a flag).
+      profile_args="$("$JQ" -r '.args[]' <<<"$pjson")"
+    fi
     case " $AGENTS " in
       (*" $agent "*) ;;
       (*) echo "agent '$agent' is not available (available: $AGENTS)" >&2; exit 2 ;;
@@ -288,18 +328,29 @@ case "$cmd" in
     [ -r /proc/sys/kernel/random/uuid ] && read -r bid < /proc/sys/kernel/random/uuid || true
     # `--` after --args: jq otherwise still option-parses positional
     # args, so a dashed extra arg like --model would error out.
+    # One argument vector: the profile's args first, the caller's own `--`
+    # tail after them, so an explicit flag still has the last word.
+    sargs=()
+    if [ -n "$profile_args" ]; then
+      while IFS= read -r parg; do
+        sargs+=("$parg")
+      done <<<"$profile_args"
+    fi
+    sargs+=("$@")
     jq_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
+      --arg prof "$profile" \
       '.sessions[$n] = {agent: $a, skipPermissions: true, remoteControl: true,
                         remoteControlName: null,
                         workingDirectory: (if $c == "" then null else $c end),
                         extraArgs: $ARGS.positional,
+                        profile: (if $prof == "" then null else $prof end),
                         initialPrompt: (if $pp == "1" then $p else null end),
                         resumePrompt: (if $rpp == "1" then $rp else null end),
                         boxSessionId: (if $bid == "" then null else $bid end),
                         hasRun: false}' \
-      --args -- "$@"
+      --args -- "${sargs[@]}"
     registry_unlock
     # The mascot (issue #185) marks the closest thing this CLI has to
     # "an agent just started". Small on purpose: this runs in webhook
@@ -308,10 +359,12 @@ case "$cmd" in
         "   .-~~-." \
         "  ( (o) )" \
         "   \`-~~-'"
+    what="$agent"
+    [ -n "$profile" ] && what="$agent, profile $profile"
     if [ "$has_prompt" = 1 ]; then
-      echo "session '$name' ($agent) added with a kickoff prompt — the supervisor starts it within ~2s"
+      echo "session '$name' ($what) added with a kickoff prompt — the supervisor starts it within ~2s"
     else
-      echo "session '$name' ($agent) added — the supervisor starts it within ~2s"
+      echo "session '$name' ($what) added — the supervisor starts it within ~2s"
     fi
     ;;
   rm)

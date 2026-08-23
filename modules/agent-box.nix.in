@@ -255,7 +255,7 @@ let
 
   agentRuntimePackages = lib.unique (
     installedAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli ]
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli ]
@@ -323,8 +323,30 @@ let
     # this CLI, no util-linux) — and a lock that only some writers take is not
     # a lock. util-linux is the only package that ships flock.
     export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
+    # Agent profiles (issue #321): `add --profile` resolves the harness and
+    # its arguments by shelling out to agent-box-profile, and this CLI runs
+    # from PATHs that do not carry it — the webhook receiver unit's PATH is
+    # jq + coreutils + this CLI. Same pin convention as the flock above.
+    export AGENT_BOX_PROFILE_BIN=${profileCli}/bin/agent-box-profile
   '' + ''
 @@include:src/session-cli.sh@@
+  '');
+
+  # Agent profiles (issue #321): the WORKER, as opposed to the harness that
+  # `--agent` selects — a harness plus the model, effort, appended system
+  # prompt and environment that tell two sessions on one harness apart.
+  #
+  # Deliberately NOT a services.agent-box.* option: a profile is per-user
+  # preference data a user must be able to change from chat with no root and
+  # no rebuild (the precedent set by issue #290/#291), so it lives beside the
+  # env store in ~/.config/agent-box/profiles/ and this CLI is the only writer.
+  # The wrapper injects the same harness list and default the session CLI gets,
+  # so a profile cannot name a harness this box does not install.
+  profileCli = pkgs.writeShellScriptBin "agent-box-profile" (''
+    export AGENT_BOX_AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " (sessionKinds cfg.installAgents))}
+    export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+  '' + ''
+@@include:src/profile-cli.sh@@
   '');
 
   # Webhook self-service, shipped on every PATH when webhookEnabled (issue #101).

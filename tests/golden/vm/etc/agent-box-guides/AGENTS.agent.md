@@ -52,6 +52,16 @@ to the terminal, which a remote user can't act on.
   not respawned — until `restart NAME` revives it; `rm` delists it for
   good. `restart --all` bounces every session. Listed sessions start
   within ~2s.
+- `--agent` picks the HARNESS (the CLI program). An agent PROFILE is the
+  worker: a harness plus a model, an effort level, an appended system prompt
+  and environment. Make one with `agent-box-profile set NAME
+  HARNESS=claude MODEL=sonnet EFFORT=low KEY=value`, read it back with
+  `agent-box-profile show NAME`, and start it with `agent-box-session add
+  [NAME] --profile PROFILE`. A `-- EXTRA_ARGS` tail still wins over the
+  profile. Profile env is convenience, not isolation: every session of this
+  user can read it out of /proc. A standing webhook watch hands its work to
+  a profile through `agent-box-session env set AGENT_BOX_HOOK_PROFILE NAME`,
+  which is the only way to pick the harness a dispatched hook-* session runs.
 
 ## Slash commands: type them into your own pane
 

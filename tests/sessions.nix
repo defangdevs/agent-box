@@ -992,6 +992,100 @@
         machine.succeed("su -s /bin/sh agent -c 'agent-box-session env rm MY_TOKEN'")
         machine.fail("grep -q MY_TOKEN /home/agent/.config/agent-box/env")
 
+    # --- agent profiles (issue #321) --------------------------------------
+    with subtest("a profile resolves a worker: harness, args and session env"):
+        # A profile is the WORKER (harness + model + effort + appended system
+        # prompt + env), as opposed to the harness `--agent` picks. Runtime
+        # data like the env store: written by the CLI, no rebuild, no root.
+        machine.succeed(
+            as_agent(
+                "agent-box-profile set triage HARNESS=shell MODEL=sonnet "
+                "EFFORT=low PROFILE_TOKEN=sekret"
+            )
+        )
+        pfile = "/home/agent/.config/agent-box/profiles/triage.env"
+        machine.succeed(f"stat -c '%a' {pfile} | grep -x 600")
+        prof_ls = machine.succeed(as_agent("agent-box-profile ls"))
+        assert re.search(r"^triage\s+shell\s+sonnet\s+low", prof_ls, re.M), prof_ls
+        # show prints the launch config, and the env KEY without its value —
+        # the same rule `agent-box-session env ls` holds (a profile is exactly
+        # where a token ends up).
+        prof_show = machine.succeed(as_agent("agent-box-profile show triage"))
+        assert "PROFILE_TOKEN" in prof_show, prof_show
+        assert "sekret" not in prof_show, prof_show
+        # A harness this box does not install is refused at write time, so a
+        # profile can never resolve to a session that cannot start.
+        machine.fail(as_agent("agent-box-profile set triage HARNESS=nosuch"))
+        # MODEL/EFFORT map to nothing on a shell session, and the CLI says so
+        # rather than inventing flags for it.
+        assert "ignored for the 'shell' harness" in prof_show, prof_show
+
+        # add --profile: the harness comes from the profile, and the caller's
+        # own `--` tail is appended AFTER the profile's args, so an explicit
+        # flag still has the last word.
+        machine.succeed(as_agent("agent-box-session add worker --profile triage"))
+        machine.succeed(f"jq -e '.sessions.worker.agent == \"shell\"' {sfile}")
+        machine.succeed(f"jq -e '.sessions.worker.profile == \"triage\"' {sfile}")
+        # The profile's env reaches the session's process environment at spawn
+        # — through the env-exec wrapper, keyed on the recorded profile name,
+        # so a later edit applies on the next restart. It is convenience and
+        # not isolation (issue #135): a sibling session reads it out of
+        # /proc/<pid>/environ, which is exactly how this assertion reads it.
+        machine.wait_until_succeeds(tmux("has-session -t =worker"), timeout=60)
+        wpid = machine.wait_until_succeeds(
+            tmux('display -p -t "=worker:" "#{pane_pid}"') + " | grep .", timeout=60
+        ).strip()
+        environ = machine.succeed(f"tr '\\0' '\\n' < /proc/{wpid}/environ")
+        assert "PROFILE_TOKEN=sekret" in environ, environ
+        assert "AGENT_BOX_PROFILE=triage" in environ, environ
+        # The reserved LAUNCH keys are NOT environment: a system prompt in the
+        # environment of everything the agent shells out to is not what a
+        # profile promised.
+        assert "MODEL=sonnet" not in environ, environ
+
+        # A claude profile maps the same keys onto claude's own flags, and the
+        # override order holds: --agent wins over the profile's harness, and
+        # the args follow the harness that actually runs.
+        machine.succeed(
+            as_agent(
+                "agent-box-profile set reviewer HARNESS=claude MODEL=sonnet "
+                "EFFORT=low SYSTEM_PROMPT='You review PRs.'"
+            )
+        )
+        launch = json.loads(machine.succeed(as_agent("agent-box-profile launch reviewer")))
+        assert launch["harness"] == "claude", launch
+        assert launch["args"] == [
+            "--model", "sonnet", "--effort", "low",
+            "--append-system-prompt", "You review PRs.",
+        ], launch
+        codex_launch = json.loads(
+            machine.succeed(as_agent("agent-box-profile launch reviewer codex"))
+        )
+        assert codex_launch["args"][:2] == ["-m", "sonnet"], codex_launch
+        assert "-c" in codex_launch["args"], codex_launch
+        assert codex_launch["warnings"], codex_launch
+        # And what the session actually stores: profile args first, the
+        # caller's `-- EXTRA_ARGS` tail after them (both harness CLIs take the
+        # last occurrence of a flag, so the tail is what wins).
+        machine.succeed(
+            as_agent("agent-box-session add tailtest --profile reviewer -- --model opus")
+        )
+        stored = json.loads(machine.succeed(f"jq -c '.sessions.tailtest' {sfile}"))
+        assert stored["agent"] == "claude", stored
+        assert stored["extraArgs"] == launch["args"] + ["--model", "opus"], stored
+        machine.succeed(as_agent("agent-box-session rm tailtest"))
+
+        # rm KEY drops one key; rm with no key drops the profile, and a
+        # session already running with it is unaffected.
+        machine.succeed(as_agent("agent-box-profile rm triage PROFILE_TOKEN"))
+        machine.fail(f"grep -q PROFILE_TOKEN {pfile}")
+        machine.succeed(as_agent("agent-box-profile rm triage"))
+        machine.fail(f"test -e {pfile}")
+        machine.succeed(tmux("has-session -t =worker"))
+        machine.fail(as_agent("agent-box-session add orphan --profile triage"))
+        machine.succeed(as_agent("agent-box-session rm worker"))
+        machine.succeed(as_agent("agent-box-profile rm reviewer"))
+
     # --- restart --all bounces every listed session -----------------------
     with subtest("restart --all"):
         old_all = machine.succeed(tmux('display -p -t "=main:" "#{pane_pid}"')).strip()
