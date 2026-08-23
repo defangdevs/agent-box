@@ -438,10 +438,12 @@ def main(argv):
     # wins (the resolver echoes it straight back); otherwise the resolver
     # answers from its cache, and only calls GitHub when the token changed.
     # --throttled because this runs at EVERY session start: one failed lookup
-    # per token per hour is enough, and a session must not wait on a network
-    # timeout to begin. Best effort — no token, no network or no resolver
-    # leaves it unset, which is what a box that writes nothing to GitHub wants
-    # anyway.
+    # per token per hour is enough. It bounds how OFTEN the resolver calls
+    # GitHub, though, not how long one call may take, so the timeout below is
+    # what actually keeps a session from waiting on the network: a box whose
+    # DNS or egress is broken must still start its sessions. Best effort — no
+    # token, no network, no resolver or a slow one leaves the key unset, which
+    # is what a box that writes nothing to GitHub wants anyway.
     resolver = shutil.which("agent-box-webhook-self")
     if resolver:
         try:
@@ -450,9 +452,10 @@ def main(argv):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
+                timeout=10,
             )
             login = result.stdout.strip() if result.returncode == 0 else ""
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             login = ""
         if login:
             os.environ["LOCAL_WEBHOOK_SELF"] = login
@@ -1991,10 +1994,19 @@ read_profile() {
   [ -r "$pf" ] || return 1
   pj="$("$ENVSTORE" --file "$pf" json)" || return 1
   for k in $RESERVED; do
-    # Trailing newlines in a value do not survive command substitution. That
-    # is the shell's rule, not the store's: the file keeps the value whole and
-    # so does the session that gets it.
-    v="$(printf '%s' "$pj" | "$JQ" -r --arg k "$k" '.[$k] // ""')"
+    # Command substitution strips EVERY trailing newline, and `jq -r` adds one
+    # of its own. For the token-shaped keys that is what we want. For
+    # SYSTEM_PROMPT it is not — a prompt's last blank line is content — so
+    # there the value is fenced with a sentinel and only jq's own newline is
+    # removed. A trailing newline in HARNESS would break the harness match
+    # below, so it keeps the stripping.
+    if [ "$k" = SYSTEM_PROMPT ]; then
+      v="$(printf '%s' "$pj" | "$JQ" -r --arg k "$k" '.[$k] // ""'; printf X)"
+      v="''${v%X}"
+      v="''${v%$'\n'}"
+    else
+      v="$(printf '%s' "$pj" | "$JQ" -r --arg k "$k" '.[$k] // ""')"
+    fi
     case "$k" in
       (HARNESS) res_HARNESS="$v" ;;
       (MODEL) res_MODEL="$v" ;;

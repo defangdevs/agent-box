@@ -1039,8 +1039,15 @@
         ppid = machine.wait_until_succeeds(
             tmux('display -p -t "=pemsess:" "#{pane_pid}"') + " | grep .", timeout=60
         ).strip()
-        environ = machine.succeed(f"tr '\\0' '\\n' < /proc/{ppid}/environ")
-        assert "MY_PEM=" + pem in environ, environ
+        # Compare the NUL-delimited ENTRY, not a substring of a joined dump:
+        # a substring match cannot tell "the value ends here" from "the value
+        # continues", which is the very thing a continuation-line parser has
+        # to get right. base64 keeps the NULs intact through the shell.
+        raw = machine.succeed(f"base64 -w0 < /proc/{ppid}/environ")
+        entries = base64.b64decode(raw).decode().split("\\0")
+        assert "MY_PEM=" + pem in entries, [
+            e for e in entries if e.startswith("MY_PEM")
+        ]
         machine.succeed(as_agent("agent-box-session rm pemsess"))
         machine.succeed(as_agent("agent-box-session env rm MY_PEM"))
         machine.succeed(as_agent("agent-box-session env rm PLAIN"))
@@ -1108,6 +1115,18 @@
         )
         launch = json.loads(machine.succeed(as_agent("agent-box-profile launch reviewer")))
         assert launch["harness"] == "claude", launch
+        # A SYSTEM_PROMPT is prose: it may span lines and it may end on a
+        # blank one, and the harness must be handed exactly what the store
+        # holds (issue #212). The token-shaped keys still get stripped —
+        # a newline in HARNESS would match no harness at all.
+        machine.succeed(
+            as_agent(
+                "agent-box-profile set reviewer "
+                + shlex.quote("SYSTEM_PROMPT=Review PRs.\n\nBe terse.\n")
+            )
+        )
+        relaunch = json.loads(machine.succeed(as_agent("agent-box-profile launch reviewer")))
+        assert relaunch["args"][-1] == "Review PRs.\n\nBe terse.\n", relaunch
         assert launch["args"] == [
             "--model", "sonnet", "--effort", "low",
             "--append-system-prompt", "You review PRs.",

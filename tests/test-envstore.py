@@ -162,6 +162,17 @@ class FileOperations(unittest.TestCase):
         es.save(self.path, [("K", "v")], es.ENV_HEADER)
         self.assertEqual(os.listdir(os.path.dirname(self.path)), ["env"])
 
+    def test_save_tightens_a_pre_existing_loose_directory(self):
+        # makedirs applies its mode only when it creates the directory, so a
+        # directory an older `mkdir -p` left at 0755 under umask 022 would
+        # otherwise keep the secrets file listable by every user on the box.
+        os.makedirs(os.path.dirname(self.path), mode=0o755)
+        os.chmod(os.path.dirname(self.path), 0o755)
+        es.save(self.path, [("K", "v")], es.ENV_HEADER)
+        self.assertEqual(
+            stat.S_IMODE(os.stat(os.path.dirname(self.path)).st_mode), 0o700
+        )
+
     def test_missing_file_is_empty_not_an_error(self):
         self.assertEqual(es.load(self.path), [])
         self.assertEqual(es.keys(self.path), [])

@@ -73,10 +73,19 @@ read_profile() {
   [ -r "$pf" ] || return 1
   pj="$("$ENVSTORE" --file "$pf" json)" || return 1
   for k in $RESERVED; do
-    # Trailing newlines in a value do not survive command substitution. That
-    # is the shell's rule, not the store's: the file keeps the value whole and
-    # so does the session that gets it.
-    v="$(printf '%s' "$pj" | "$JQ" -r --arg k "$k" '.[$k] // ""')"
+    # Command substitution strips EVERY trailing newline, and `jq -r` adds one
+    # of its own. For the token-shaped keys that is what we want. For
+    # SYSTEM_PROMPT it is not — a prompt's last blank line is content — so
+    # there the value is fenced with a sentinel and only jq's own newline is
+    # removed. A trailing newline in HARNESS would break the harness match
+    # below, so it keeps the stripping.
+    if [ "$k" = SYSTEM_PROMPT ]; then
+      v="$(printf '%s' "$pj" | "$JQ" -r --arg k "$k" '.[$k] // ""'; printf X)"
+      v="${v%X}"
+      v="${v%$'\n'}"
+    else
+      v="$(printf '%s' "$pj" | "$JQ" -r --arg k "$k" '.[$k] // ""')"
+    fi
     case "$k" in
       (HARNESS) res_HARNESS="$v" ;;
       (MODEL) res_MODEL="$v" ;;
