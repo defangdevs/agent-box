@@ -399,10 +399,13 @@ jobs:
             echo "$body" | head -20
             exit 1
           fi
-          if echo "$body" | grep -qF 'href="/?tab='; then
+          # Tab links point at TERM_HOME (this user's own path), not root
+          # (#334's render_tabs: href="{home}?tab={name}") — so /agent/?tab=,
+          # not /?tab=.
+          if echo "$body" | grep -qF 'href="/agent/?tab='; then
             echo "::notice::Workspace tab bar lists the sessions (no credentials in the URL)."
           else
-            echo "::error::Workspace at $root_url has no session tabs (href=\"/?tab=\"):"
+            echo "::error::Workspace at $root_url has no session tabs (href=\"/agent/?tab=\"):"
             echo "$body" | head -20
             exit 1
           fi
