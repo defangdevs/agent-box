@@ -13,6 +13,7 @@ on:
       - 'modules/src/**'
       - 'bin/assemble-module.py'
       - 'tests/test-assemble-module.py'
+      - 'tests/test-envstore.py'
       # The mascot mark (issue #185) is embedded into the settings daemon at
       # assemble time, so it is a module source as much as a website asset.
       - 'docs/potato.svg'
