@@ -85,12 +85,13 @@ import threading
 import time
 import urllib.parse
 
-# The env store's format lives in ONE place (issue #212) and the generated
-# module splices it in here, straight after the imports above: this daemon is
-# the file's main writer, and a secret must not travel through the argv of a
-# helper process to get written. The names it defines — KEY_RE, ENV_HEADER,
-# load/keys/update — are used below.
-@@include:lib/envstore.py@@
+# The env store's format lives in ONE place (issue #212): src/lib/envstore.py,
+# which the generated module prepends to this file (see settingsDaemon in
+# modules/agent-box.nix.in, the same seam envExecWrapper and envStoreCli use).
+# This daemon is the file's main writer and does NOT shell out to the CLI: a
+# secret must not travel through the argv of a helper process to get written.
+# The names that library defines — KEY_RE, ENV_HEADER, as_dict/load/keys/update
+# — are therefore already bound here and are used below.
 
 USER = os.environ.get("AGENT_BOX_SETTINGS_USER", "agent")
 ENV_FILE = os.environ["AGENT_BOX_SETTINGS_ENV_FILE"]

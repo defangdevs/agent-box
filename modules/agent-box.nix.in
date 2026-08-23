@@ -1983,15 +1983,18 @@ in
         # formatted for readability, not lint-perfection) but keep syntax
         # checking that writePython3Bin does by compiling.
         #
-        # F811 as well, and only here: the env-store library is spliced in
-        # after this file's own imports (issue #212), so its `import json`,
-        # `os`, `re` and `tempfile` re-bind four names this file already
-        # imported. Nothing else in the two files shares a name — the library
-        # was written to stay clear of the daemon's globals.
-        flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" "F811" ];
-      } ''
-        @@include:src/settings-daemon.py@@
-      '';
+        # E402 and F811 as well, and only here, because of the env-store
+        # library prepended below (issue #212): this daemon's own ~25 imports
+        # follow that library's code, and its `import json`, `os`, `re` and
+        # `tempfile` re-bind four names the library already imported. Nothing
+        # else in the two files shares a name — the library was written to
+        # stay clear of the daemon's globals.
+        flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" "E402" "F811" ];
+      } (envStoreLib + ''
+
+
+@@include:src/settings-daemon.py@@
+      '');
       # Per-connection tmux attach for ttyd (issue #59). ttyd runs with
       # --url-arg, so /<user>/?arg=<session> passes <session> as $1 — ONE
       # ttyd per user serves every session, including runtime-created ones.
