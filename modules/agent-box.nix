@@ -130,6 +130,15 @@ let
     URLs built from $AGENT_BOX_URL — never a bare local path or a link relative
     to the terminal, which a remote user can't act on.
 
+    Assume they have no shell here. They may be reading you from a phone, a chat
+    client or the web terminal, and cannot run a command you suggest, paste its
+    output back, or open a file to see what is in it — you are their hands on
+    this machine. So run the command yourself instead of handing over a list to
+    try, read the file instead of asking what it contains, and quote the output
+    that matters instead of naming the path it lives in. What can only be
+    settled on the host, settle on the host; what genuinely cannot, say so
+    plainly rather than handing it back.
+
     ## Your environment
 
     - Only your home directory is writable; the rest of the filesystem is
@@ -149,6 +158,11 @@ let
       Claude Code under ~/.claude/projects/ (plus ~/.claude/history.jsonl),
       Codex under ~/.codex/sessions/. After a respawn, or when you take over
       another agent's session, skim the most recent one before writing code.
+    - Your harness's own configuration lives under $HOME and so survives a
+      respawn: ~/.claude/ for Claude Code (settings.json, skills/, commands/,
+      and the transcripts under projects/), ~/.codex/ for Codex. A skill, a
+      slash command or a hook you want the NEXT session to have goes there —
+      and notes for your future self go in ~/AGENTS.md, which is yours to edit.
     - sudo is a tight allowlist (essentially caddy reload + self-update), not
       general root — don't plan around arbitrary sudo.
 
@@ -280,9 +294,21 @@ let
       (defaultAgentsMd
         + lib.optionalString (builtins.match "[[:space:]]*" u.agentsMd == null)
           "\n${u.agentsMd}");
-  # Stable read-only path the seeded ~/AGENTS.md @imports. Refreshed on every
+  # Stable read-only path the seeded ~/AGENTS.md names (and, for claude and
+  # codex, the user-scope pointers symlink at). Refreshed on every
   # `nixos-rebuild switch` (i.e. every box update); readable but not writable
   # under ProtectSystem=strict.
+  # Its own directory rather than /etc/agent-box, for a reason that is now
+  # purely historical: /etc/agent-box WAS tokenDir, which tmpfiles kept
+  # 0700 root:root — the agent user could not traverse into it — and which
+  # the claude-box rename migration would only move while empty. Publishing
+  # guides inside it broke that guard permanently and silently stranded
+  # tokens at the old path (65099d7). tokenDir was then removed outright
+  # (c25f8e5, superseded by the user-owned ~/.config/agent-box/env), so
+  # /etc/agent-box is free again and nothing in this module claims it. The
+  # guides simply never moved back, and renaming them now buys tidiness at
+  # the price of dangling every pointer symlink and every ~/AGENTS.md
+  # already seeded on a deployed box. Don't, unless you also migrate those.
   canonicalAgentsPath = name: "/etc/agent-box-guides/AGENTS.${name}.md";
   tmuxSocketName = "agent-box";
   runtimeDirectory = name: "agent-box-${name}";
@@ -5279,10 +5305,27 @@ $PROMPT"
              && [ -e "$wd/AGENTS.md" ] && [ ! -e "$wd/CLAUDE.md" ]; then
           ln -s AGENTS.md "$wd/CLAUDE.md"
         fi
-        if [ -n "''${AGENT_BOX_CLAUDE_GUIDE_TARGET:-}" ] \
+        if [ -n "''${AGENT_BOX_GUIDE_TARGET:-}" ] \
              && [ ! -e "$HOME/.claude/CLAUDE.md" ]; then
           mkdir -p "$HOME"/.claude
-          ln -s "$AGENT_BOX_CLAUDE_GUIDE_TARGET" "$HOME"/.claude/CLAUDE.md
+          ln -s "$AGENT_BOX_GUIDE_TARGET" "$HOME"/.claude/CLAUDE.md
+        fi
+      fi
+      # codex reads AGENTS.md natively, so it needs no rename — but only from
+      # the project root DOWN to the cwd, plus one global file at
+      # $CODEX_HOME/AGENTS.md. The seeded $wd/AGENTS.md therefore stops
+      # reaching it the moment a session works inside a checkout below $wd,
+      # which is what a session doing real work does. The global file is the
+      # scope that survives that, so point it at the canonical guide — the
+      # exact counterpart of claude's ~/.claude/CLAUDE.md above. IFF absent, so
+      # an agent's own global instructions win. CODEX_HOME is codex's own
+      # override for that directory and nothing here sets it, but honour it the
+      # way codex-remote-control.sh does rather than hardcoding the default.
+      if [ "$agent" = codex ] && [ -n "''${AGENT_BOX_GUIDE_TARGET:-}" ]; then
+        cxhome="''${CODEX_HOME:-$HOME/.codex}"
+        if [ ! -e "$cxhome/AGENTS.md" ]; then
+          mkdir -p "$cxhome"
+          ln -s "$AGENT_BOX_GUIDE_TARGET" "$cxhome/AGENTS.md"
         fi
       fi
       # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
@@ -6257,7 +6300,8 @@ in
     environment.systemPackages = agentRuntimePackages;
 
     # Canonical, read-only agent guide per user at /etc/agent-box-guides/
-    # AGENTS.<user>.md (see canonicalAgentsPath for why not /etc/agent-box).
+    # AGENTS.<user>.md (canonicalAgentsPath carries the story of that
+    # directory name, and why moving it is not free).
     # environment.etc symlinks are relinked by `nixos-rebuild switch` (which the
     # self-update service runs), so this always tracks the current module while
     # the seeded ~/AGENTS.md — which @imports this path — stays editable. Skipped
@@ -6369,11 +6413,17 @@ in
           // (lib.optionalAttrs (agentsMdPointer name u != null) {
             # Seeded-AGENTS.md pointer file; unset = agentsMd null opt-out.
             AGENT_BOX_AGENTS_POINTER = "${agentsMdPointer name u}";
-            # Symlink target for the claude user-scope CLAUDE.md (issue
-            # #305): AGENTS.md alone reaches no claude session. Same
-            # opt-out as above; the project-scope symlink's target is the
-            # constant "AGENTS.md", hardcoded in supervisor.sh.
-            AGENT_BOX_CLAUDE_GUIDE_TARGET = canonicalAgentsPath name;
+            # Symlink target for the USER-SCOPE guide pointer each harness
+            # reads whatever the session's working directory is: claude's
+            # ~/.claude/CLAUDE.md (issue #305 — AGENTS.md alone reaches no
+            # claude session) and codex's ~/.codex/AGENTS.md. Both matter
+            # for a session working in a SUBDIRECTORY, e.g. a repo checkout:
+            # the seeded ~/AGENTS.md is then out of scope for codex, which
+            # reads project docs from the project root down, so without this
+            # the box guide would reach no codex session doing real work.
+            # Same opt-out as above; the project-scope symlink's target is
+            # the constant "AGENTS.md", hardcoded in supervisor.sh.
+            AGENT_BOX_GUIDE_TARGET = canonicalAgentsPath name;
           })
           // (lib.optionalAttrs webhookEnabled {
             # Doubles as the supervisor's "webhook receiver is live" flag

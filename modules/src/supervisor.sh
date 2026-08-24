@@ -701,10 +701,27 @@ start_session() {
          && [ -e "$wd/AGENTS.md" ] && [ ! -e "$wd/CLAUDE.md" ]; then
       ln -s AGENTS.md "$wd/CLAUDE.md"
     fi
-    if [ -n "${AGENT_BOX_CLAUDE_GUIDE_TARGET:-}" ] \
+    if [ -n "${AGENT_BOX_GUIDE_TARGET:-}" ] \
          && [ ! -e "$HOME/.claude/CLAUDE.md" ]; then
       mkdir -p "$HOME"/.claude
-      ln -s "$AGENT_BOX_CLAUDE_GUIDE_TARGET" "$HOME"/.claude/CLAUDE.md
+      ln -s "$AGENT_BOX_GUIDE_TARGET" "$HOME"/.claude/CLAUDE.md
+    fi
+  fi
+  # codex reads AGENTS.md natively, so it needs no rename — but only from
+  # the project root DOWN to the cwd, plus one global file at
+  # $CODEX_HOME/AGENTS.md. The seeded $wd/AGENTS.md therefore stops
+  # reaching it the moment a session works inside a checkout below $wd,
+  # which is what a session doing real work does. The global file is the
+  # scope that survives that, so point it at the canonical guide — the
+  # exact counterpart of claude's ~/.claude/CLAUDE.md above. IFF absent, so
+  # an agent's own global instructions win. CODEX_HOME is codex's own
+  # override for that directory and nothing here sets it, but honour it the
+  # way codex-remote-control.sh does rather than hardcoding the default.
+  if [ "$agent" = codex ] && [ -n "${AGENT_BOX_GUIDE_TARGET:-}" ]; then
+    cxhome="${CODEX_HOME:-$HOME/.codex}"
+    if [ ! -e "$cxhome/AGENTS.md" ]; then
+      mkdir -p "$cxhome"
+      ln -s "$AGENT_BOX_GUIDE_TARGET" "$cxhome/AGENTS.md"
     fi
   fi
   # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn

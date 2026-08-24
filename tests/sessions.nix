@@ -21,9 +21,11 @@
 #   - both agent CLIs installed regardless of what sessions run
 #     (installAgents default),
 #   - the instruction files each harness reads (issue #305): the editable
-#     AGENTS.md plus, for a claude session only, the project-scope and
-#     user-scope CLAUDE.md pointers — seeded IFF absent, never clobbering,
-#     and skipped for codex (reads AGENTS.md natively) and shell sessions,
+#     AGENTS.md plus a user-scope pointer at the canonical guide under the
+#     name that harness discovers — ~/.claude/CLAUDE.md for claude (which
+#     also gets a project-scope CLAUDE.md beside the notes) and
+#     ~/.codex/AGENTS.md for codex — seeded IFF absent, never clobbering,
+#     and skipped entirely for shell sessions,
 #   - browser tmux clients advertise OSC 8 support, preserving a long hidden
 #     hyperlink target when its visible URL wraps across terminal rows (#18),
 #   - the codex arms: the app-server daemon, box-wide autonomy through
@@ -163,7 +165,7 @@ in
     assert b"END_OF_FULL_URL" in tmux_browser_output, tmux_browser_output
 
     # --- instruction files the harnesses actually read (issue #305) -------
-    with subtest("seeded AGENTS.md and the two claude CLAUDE.md pointers"):
+    with subtest("seeded AGENTS.md and each harness's guide pointers"):
         # The boot "main" session is claude in $HOME, so all three files are
         # seeded already: the editable notes file plus the two pointers claude
         # needs (it discovers CLAUDE.md only and never reads AGENTS.md).
@@ -203,14 +205,28 @@ in
         machine.succeed("grep -Fx MINE-CLAUDE /home/agent/keep/CLAUDE.md >/dev/null")
         machine.succeed(as_agent("agent-box-session rm keeper"))
 
-        # A codex session gets AGENTS.md alone — codex reads that name
-        # natively, so a CLAUDE.md beside it would be dead weight.
+        # A codex session gets AGENTS.md alone in its working directory —
+        # codex reads that name natively, so a CLAUDE.md beside it would be
+        # dead weight. Nothing has claimed codex's global instructions yet.
+        machine.fail("test -e /home/agent/.codex/AGENTS.md")
         machine.succeed(as_agent("mkdir -p /home/agent/cxdir"))
         machine.succeed(as_agent(
             "agent-box-session add cx --agent codex --cwd /home/agent/cxdir"
         ))
         machine.wait_until_succeeds("test -f /home/agent/cxdir/AGENTS.md", timeout=60)
         machine.fail("test -e /home/agent/cxdir/CLAUDE.md")
+        # ...and the counterpart of claude's user-scope pointer: codex reads
+        # project docs from the project root DOWN, so a session working in a
+        # checkout below its working directory loses the seeded notes file
+        # and with it every mention of the guide. $CODEX_HOME/AGENTS.md is
+        # the scope that survives that, pointed straight at the canonical
+        # guide so box updates keep it current.
+        machine.wait_until_succeeds("test -L /home/agent/.codex/AGENTS.md", timeout=60)
+        machine.succeed(
+            "readlink /home/agent/.codex/AGENTS.md"
+            " | grep -Fx /etc/agent-box-guides/AGENTS.agent.md"
+        )
+        machine.succeed("stat -c '%U' /home/agent/.codex/AGENTS.md | grep -x agent")
         machine.succeed(as_agent("agent-box-session rm cx"))
 
         # A shell session gets neither: no agent there reads them.
