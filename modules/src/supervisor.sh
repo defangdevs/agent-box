@@ -369,6 +369,24 @@ claude_has_transcript() {
     | $GREP -q .
 }
 
+claude_transcript_has_work() {
+  # True when $1's transcript contains at least one REAL assistant turn.
+  # model:"<synthetic>" is claude's own marker for a turn it manufactured
+  # without calling the model at all — a bare "No response requested." to
+  # a local-command-caveat batch, a login/limit notice — never anything a
+  # model actually said. A transcript can exist with none: /clear rotates
+  # to a brand-new session id (see the segment-rotation block below) whose
+  # only content, until a real prompt lands, is the /clear command's own
+  # echo and that synthetic non-reply. Resuming such a transcript is
+  # harmless; telling the model it "was interrupted" and to "review what
+  # you had already done" is not — there is nothing to review, and it
+  # derails a session that should just run its normal kickoff.
+  [ -n "$1" ] || return 1
+  f=$($FIND "$HOME"/.claude/projects -maxdepth 3 -name "$1.jsonl" 2>/dev/null | head -n1)
+  [ -n "$f" ] || return 1
+  $GREP '"type":"assistant"' "$f" 2>/dev/null | $GREP -qv '"model":"<synthetic>"'
+}
+
 codex_rollout_uuid() {
   # Echo the Codex session UUID whose rollout transcript carries our
   # "[agent-box session <boxid>]" marker (newest wins if a prior resume
@@ -500,6 +518,12 @@ start_session() {
     resuming=true
     if [ -n "$rp" ]; then
       prompt="$rp"
+    elif [ "$agent" = claude ] && ! claude_transcript_has_work "$bid"; then
+      # /clear (or any respawn before a first real prompt lands) leaves a
+      # transcript that exists but holds no actual work — see
+      # claude_transcript_has_work. Run the normal kickoff instead of
+      # claiming an interruption nothing backs up.
+      prompt="$ip"
     else
       prompt="You were interrupted and automatically restarted (agent-box session $bid). Your previous transcript for this session has been resumed — review what you had already done, verify the current state, and continue from where you left off. If that work was already complete, say so briefly and stop rather than redoing it."
     fi
