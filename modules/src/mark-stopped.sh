@@ -27,10 +27,11 @@ for _ in 1 2 3; do
   # takes the same lock, and parking it for a second would delay every session
   # on the box. registry_edit nests inside this, and nothing this script starts
   # outlives it, so no child can carry the fd (and the lock) away.
-  registry_lock
-  # jq's stderr is dropped: this prints into the pane the user just quit, and
-  # an unparseable registry is the supervisor's news to report, not this
-  # script's.
+  # Both calls are silenced, because this prints into the pane the user just
+  # quit: a lock timeout would otherwise put a warning there once per retry
+  # pass (`flock -w` itself printed nothing before this), and an unparseable
+  # registry is the supervisor's news to report, not this script's.
+  registry_lock 2>/dev/null
   registry_edit --arg s "$1" \
     'if .sessions | has($s) then .sessions[$s].stopped = true else . end' \
     2>/dev/null

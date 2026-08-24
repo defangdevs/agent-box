@@ -128,8 +128,13 @@ registry_edit() {
   # keeps holding it here and does not deadlock against itself.
   registry_lock
   _registry_tmp="$(mktemp "$REGISTRY_FILE.XXXXXX")" || { registry_unlock; return 1; }
-  if "$REGISTRY_JQ" "$@" < "$REGISTRY_FILE" > "$_registry_tmp"; then
-    mv "$_registry_tmp" "$REGISTRY_FILE"
+  # The RENAME is checked too, not just jq: a read-only $HOME or a full disk
+  # must not be reported as a write to the two writers that do not run under
+  # `set -e` (the supervisor and the pane epilogue would carry on as if the
+  # flag had stuck), and must not leave a sessions.json.XXXXXX behind for the
+  # two that do.
+  if "$REGISTRY_JQ" "$@" < "$REGISTRY_FILE" > "$_registry_tmp" \
+     && mv "$_registry_tmp" "$REGISTRY_FILE"; then
     registry_unlock
     return 0
   fi
@@ -153,6 +158,17 @@ registry_ensure() {
   # An existing file is never touched, seed or no seed: sessions are RUNTIME
   # data (issue #59), so a rebuild must not clobber what the operator changed
   # while the box was live.
+  #
+  # Which means the lock makes the first-boot race DETERMINISTIC rather than
+  # merging its two outcomes, and the losing outcome is worth stating: if an
+  # `add` gets there first — a webhook spawn on a box that has just come up —
+  # it publishes an empty registry, this seed then finds a non-empty file, and
+  # the sessions declared in the NixOS config are not seeded on that boot or
+  # any later one. That is the same rule as above (a registry that exists is
+  # the operator's, not the config's) and it is preferable to the reverse,
+  # where the seed silently deletes a session that was already added and the
+  # webhook batch behind it is never redelivered. An operator who wants the
+  # declared set back deletes sessions.json and restarts the unit.
   mkdir -p "${REGISTRY_FILE%/*}"
   registry_lock
   if [ ! -s "$REGISTRY_FILE" ]; then

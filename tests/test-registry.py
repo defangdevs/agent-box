@@ -128,7 +128,8 @@ class RegistryCase(unittest.TestCase):
             proc.kill()
         proc.wait()
         for pipe in (proc.stdout, proc.stderr):
-            pipe.close()
+            if pipe is not None and not pipe.closed:
+                pipe.close()
 
     # --- the other language ------------------------------------------------
     def hold_lock_as_the_daemon_does(self):
@@ -173,17 +174,31 @@ class LostUpdate(RegistryCase):
         # read-modify-write each of them then does: without it they queue up
         # behind their own startup and never overlap, which would make an
         # unlocked run look safe.
+        #
+        # Each writer reports READY before it starts spinning, and the gate
+        # opens only once all of them have. Waiting for "no child has exited
+        # yet" would prove nothing — Popen has just returned — and on a loaded
+        # runner the gate would open while some writers were still in bash
+        # startup, degrading the run toward serial.
         self.seed()
+        ready = self.home / "ready"
+        ready.mkdir()
         gate = self.home / "go"
-        body = 'while [ ! -e %s ]; do :; done\n%s' % (gate, self.ADD_ONE)
+        body = 'touch %s/"$1"\nwhile [ ! -e %s ]; do :; done\n%s' % (ready, gate, self.ADD_ONE)
         procs = [
             self.start_writer(body, args=["s%02d" % i], flock=flock)
             for i in range(self.WRITERS)
         ]
-        self.assertTrue(wait_until(lambda: all(p.poll() is None for p in procs), 2))
+        self.assertTrue(wait_until(lambda: len(list(ready.iterdir())) == self.WRITERS),
+                        "only %d of %d writers reached the gate"
+                        % (len(list(ready.iterdir())), self.WRITERS))
         gate.touch()
         for proc in procs:
-            self.assertEqual(proc.wait(timeout=TIMEOUT), 0, proc.stderr.read())
+            # communicate() drains the pipes while it waits: a writer that
+            # filled its stderr buffer would otherwise block on write and turn
+            # a failure into a 20s hang.
+            _, err = proc.communicate(timeout=TIMEOUT)
+            self.assertEqual(proc.returncode, 0, err)
         return self.sessions()
 
     def test_every_concurrent_write_survives(self):
@@ -215,7 +230,8 @@ class HeldLock(RegistryCase):
         self.assertNotIn("waited", self.sessions(), "wrote while the daemon held the lock")
         self.assertIsNone(proc.poll(), "the writer did not wait")
         fcntl.flock(holder, fcntl.LOCK_UN)
-        self.assertEqual(proc.wait(timeout=TIMEOUT), 0, proc.stderr.read())
+        _, err = proc.communicate(timeout=TIMEOUT)
+        self.assertEqual(proc.returncode, 0, err)
         self.assertIn("waited", self.sessions())
 
     def test_shell_holder_blocks_the_daemon(self):
@@ -336,6 +352,21 @@ class Degrading(RegistryCase):
         self.assertIn("#254", done.stderr)
         self.assertIn("test-writer", done.stderr)
 
+    def test_a_write_that_cannot_land_is_reported_as_a_failure(self):
+        # The two writers that do not run under `set -e` — the supervisor and
+        # the pane epilogue — act on registry_edit's status, so a publish that
+        # never happened must not come back as success. A read-only directory
+        # is the shape a full disk or a remounted $HOME takes here.
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the directory mode this test relies on")
+        self.seed({"keep": {"agent": "claude"}})
+        before = self.file.read_text()
+        os.chmod(self.file.parent, 0o500)
+        self.addCleanup(os.chmod, self.file.parent, 0o700)
+        done = self.run_writer(self.ADD_ONE, args=["doomed"], check=False)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(self.file.read_text(), before)
+
     def test_a_failing_filter_leaves_the_registry_alone(self):
         # registry_edit publishes jq's output or nothing at all: a filter that
         # fails must not truncate the file every writer reads.
@@ -367,7 +398,8 @@ class Creation(RegistryCase):
         time.sleep(BLOCKED_FOR)
         self.assertFalse(self.file.exists(), "seeded while another writer held the lock")
         fcntl.flock(holder, fcntl.LOCK_UN)
-        self.assertEqual(proc.wait(timeout=TIMEOUT), 0, proc.stderr.read())
+        _, err = proc.communicate(timeout=TIMEOUT)
+        self.assertEqual(proc.returncode, 0, err)
         self.assertEqual(self.sessions(), {"main": {}})
 
     def test_an_existing_registry_is_never_clobbered(self):
