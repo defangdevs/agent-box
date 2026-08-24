@@ -1735,11 +1735,17 @@ in
           // (lib.optionalAttrs (agentsMdPointer name u != null) {
             # Seeded-AGENTS.md pointer file; unset = agentsMd null opt-out.
             AGENT_BOX_AGENTS_POINTER = "${agentsMdPointer name u}";
-            # Symlink target for the claude user-scope CLAUDE.md (issue
-            # #305): AGENTS.md alone reaches no claude session. Same
-            # opt-out as above; the project-scope symlink's target is the
-            # constant "AGENTS.md", hardcoded in supervisor.sh.
-            AGENT_BOX_CLAUDE_GUIDE_TARGET = canonicalAgentsPath name;
+            # Symlink target for the USER-SCOPE guide pointer each harness
+            # reads whatever the session's working directory is: claude's
+            # ~/.claude/CLAUDE.md (issue #305 — AGENTS.md alone reaches no
+            # claude session) and codex's ~/.codex/AGENTS.md. Both matter
+            # for a session working in a SUBDIRECTORY, e.g. a repo checkout:
+            # the seeded ~/AGENTS.md is then out of scope for codex, which
+            # reads project docs from the project root down, so without this
+            # the box guide would reach no codex session doing real work.
+            # Same opt-out as above; the project-scope symlink's target is
+            # the constant "AGENTS.md", hardcoded in supervisor.sh.
+            AGENT_BOX_GUIDE_TARGET = canonicalAgentsPath name;
           })
           // (lib.optionalAttrs webhookEnabled {
             # Doubles as the supervisor's "webhook receiver is live" flag

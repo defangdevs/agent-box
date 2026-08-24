@@ -4586,10 +4586,27 @@ $PROMPT"
              && [ -e "$wd/AGENTS.md" ] && [ ! -e "$wd/CLAUDE.md" ]; then
           ln -s AGENTS.md "$wd/CLAUDE.md"
         fi
-        if [ -n "''${AGENT_BOX_CLAUDE_GUIDE_TARGET:-}" ] \
+        if [ -n "''${AGENT_BOX_GUIDE_TARGET:-}" ] \
              && [ ! -e "$HOME/.claude/CLAUDE.md" ]; then
           mkdir -p "$HOME"/.claude
-          ln -s "$AGENT_BOX_CLAUDE_GUIDE_TARGET" "$HOME"/.claude/CLAUDE.md
+          ln -s "$AGENT_BOX_GUIDE_TARGET" "$HOME"/.claude/CLAUDE.md
+        fi
+      fi
+      # codex reads AGENTS.md natively, so it needs no rename — but only from
+      # the project root DOWN to the cwd, plus one global file at
+      # $CODEX_HOME/AGENTS.md. The seeded $wd/AGENTS.md therefore stops
+      # reaching it the moment a session works inside a checkout below $wd,
+      # which is what a session doing real work does. The global file is the
+      # scope that survives that, so point it at the canonical guide — the
+      # exact counterpart of claude's ~/.claude/CLAUDE.md above. IFF absent, so
+      # an agent's own global instructions win. CODEX_HOME is codex's own
+      # override for that directory and nothing here sets it, but honour it the
+      # way codex-remote-control.sh does rather than hardcoding the default.
+      if [ "$agent" = codex ] && [ -n "''${AGENT_BOX_GUIDE_TARGET:-}" ]; then
+        cxhome="''${CODEX_HOME:-$HOME/.codex}"
+        if [ ! -e "$cxhome/AGENTS.md" ]; then
+          mkdir -p "$cxhome"
+          ln -s "$AGENT_BOX_GUIDE_TARGET" "$cxhome/AGENTS.md"
         fi
       fi
       # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
@@ -5676,11 +5693,17 @@ in
           // (lib.optionalAttrs (agentsMdPointer name u != null) {
             # Seeded-AGENTS.md pointer file; unset = agentsMd null opt-out.
             AGENT_BOX_AGENTS_POINTER = "${agentsMdPointer name u}";
-            # Symlink target for the claude user-scope CLAUDE.md (issue
-            # #305): AGENTS.md alone reaches no claude session. Same
-            # opt-out as above; the project-scope symlink's target is the
-            # constant "AGENTS.md", hardcoded in supervisor.sh.
-            AGENT_BOX_CLAUDE_GUIDE_TARGET = canonicalAgentsPath name;
+            # Symlink target for the USER-SCOPE guide pointer each harness
+            # reads whatever the session's working directory is: claude's
+            # ~/.claude/CLAUDE.md (issue #305 — AGENTS.md alone reaches no
+            # claude session) and codex's ~/.codex/AGENTS.md. Both matter
+            # for a session working in a SUBDIRECTORY, e.g. a repo checkout:
+            # the seeded ~/AGENTS.md is then out of scope for codex, which
+            # reads project docs from the project root down, so without this
+            # the box guide would reach no codex session doing real work.
+            # Same opt-out as above; the project-scope symlink's target is
+            # the constant "AGENTS.md", hardcoded in supervisor.sh.
+            AGENT_BOX_GUIDE_TARGET = canonicalAgentsPath name;
           })
           // (lib.optionalAttrs webhookEnabled {
             # Doubles as the supervisor's "webhook receiver is live" flag
