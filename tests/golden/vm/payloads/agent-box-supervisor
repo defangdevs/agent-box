@@ -385,7 +385,7 @@ claude_transcript_has_work() {
   [ -n "$1" ] || return 1
   f=$($FIND "$HOME"/.claude/projects -maxdepth 3 -name "$1.jsonl" 2>/dev/null | head -n1)
   [ -n "$f" ] || return 1
-  $GREP '"type":"assistant"' "$f" 2>/dev/null | $GREP -qv '"model":"<synthetic>"'
+  $GREP '"type":"assistant"' "$f" 2>/dev/null | $GREP -v '"model":"<synthetic>"' >/dev/null
 }
 
 codex_rollout_uuid() {
