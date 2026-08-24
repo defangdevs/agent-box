@@ -873,6 +873,11 @@ in
         first = "12345678-9abc-4def-8123-456789abcdef"
         cmd1 = rotate(rot_bid, first)
         assert f"--resume {first}" in cmd1.replace("\\", ""), cmd1
+        # The rotated segment's transcript is the empty stand-in `rotate`
+        # installed — no real assistant turn yet, exactly what a /clear
+        # leaves behind before the next prompt lands. The respawn must not
+        # claim an interruption there is nothing in that segment to back up.
+        assert "You were interrupted" not in cmd1.replace("\\", ""), cmd1
         # The adopted id is recorded, so the NEXT respawn needs no record —
         # and it is recorded in the supervisor's own file. sessions.json gets
         # the migration copy for one more release.
