@@ -654,6 +654,18 @@
         " and (.topics[0].note | contains(\"seeded at spawn\"))'"
         f" {hook_filter}"
     )
+    # The topic says what it LISTENS to; the include says what it CLAIMS, and a
+    # claim is what silences the standing watch (issue #251). This session was
+    # spawned for a CI outcome, so it claims CI outcomes — enough to swallow
+    # the second event of the same failing run, and no more. A rule-less entry
+    # here claimed every event on the repo: on 2026-08-24 a session spawned for
+    # one issue silenced the master Deploy test failure four seconds later.
+    machine.succeed(
+        "jq -e '(.topics[0].include.any | map(.path))"
+        " == [\"workflow_run\", \"check_run\", \"check_suite\", \"workflow_job\"]"
+        " and (.topics[0].include.any | all(.notIn == [null]))'"
+        f" {hook_filter}"
+    )
     # ...and the session is told, so it neither re-subscribes nor assumes that
     # being spawned means nobody else is on this.
     assert "already subscribed to github:defangdevs/agent-box" in hook_prompt, hook_prompt
@@ -738,6 +750,76 @@
     machine.succeed(
         "jq -e '.topics[0].topic == \"github:defangdevs/elsewhere\"'"
         f" /home/agent/.local/state/local-webhook/filter.agent-{other}.json"
+    )
+
+    # A spawn for a numbered object claims exactly that object (issue #251).
+    # The number comes from LOCAL_WEBHOOK_SPAWN_META, the dispatcher's own
+    # summary of the batch, so this drives the wrapper with the meta the
+    # daemon would export for `issues.assigned` on #4242.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/numbered"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        " LOCAL_WEBHOOK_SPAWN_EVENT=issues"
+        """ LOCAL_WEBHOOK_SPAWN_META='{"event":"issues","action":"assigned","number":"4242"}'"""
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    numbered = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-numbered-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    numbered_filter = (
+        f"/home/agent/.local/state/local-webhook/filter.agent-{numbered}.json"
+    )
+    # Both paths a number can arrive on, and NOT the CI paths: a session
+    # working one issue must not own the repo's CI. Not
+    # workflow_run.pull_requests.0.number either, which reads well and never
+    # matches — the predicate walker steps through dicts only, so a list index
+    # ends the walk (local-channels#46).
+    machine.succeed(
+        "jq -e '(.topics[0].include.any | map(.path)) =="
+        " [\"issue.number\", \"pull_request.number\"]"
+        " and (.topics[0].include.any | all(.in == [4242]))'"
+        f" {numbered_filter}"
+    )
+    # The note names the object, because it is echoed under every delivery and
+    # a fresh-context session reads it to learn why the event matters. It used
+    # to be one fixed sentence, byte-identical across every hook session.
+    machine.succeed(
+        "jq -e '.topics[0].note | contains(\"defangdevs/numbered#4242\")"
+        " and contains(\"issues.assigned\")'"
+        f" {numbered_filter}"
+    )
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {numbered}"
+    )
+
+    # A `number` that is not a number falls back to the CI claim, and the NOTE
+    # falls back with it. The two used to test the value differently, so a meta
+    # like {"number":"n/a"} produced a note saying the session owned KEY#n/a
+    # while the claim covered CI outcomes — a note that describes a claim
+    # nobody holds is worse than no note.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/unnumbered"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        " LOCAL_WEBHOOK_SPAWN_EVENT=issues"
+        """ LOCAL_WEBHOOK_SPAWN_META='{"event":"issues","action":"opened","number":"n/a"}'"""
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    unnumbered = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-unnumbered-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        "jq -e '(.topics[0].include.any | map(.path) | index(\"workflow_run\")) != null"
+        " and (.topics[0].note | contains(\"#\") | not)'"
+        f" /home/agent/.local/state/local-webhook/filter.agent-{unnumbered}.json"
+    )
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {unnumbered}"
     )
 
     # A long key keeps its WHOLE name (issue #236). The key used to be cut at
