@@ -51,9 +51,21 @@ let
       (defaultAgentsMd
         + lib.optionalString (builtins.match "[[:space:]]*" u.agentsMd == null)
           "\n${u.agentsMd}");
-  # Stable read-only path the seeded ~/AGENTS.md @imports. Refreshed on every
+  # Stable read-only path the seeded ~/AGENTS.md names (and, for claude and
+  # codex, the user-scope pointers symlink at). Refreshed on every
   # `nixos-rebuild switch` (i.e. every box update); readable but not writable
   # under ProtectSystem=strict.
+  # Its own directory rather than /etc/agent-box, for a reason that is now
+  # purely historical: /etc/agent-box WAS tokenDir, which tmpfiles kept
+  # 0700 root:root — the agent user could not traverse into it — and which
+  # the claude-box rename migration would only move while empty. Publishing
+  # guides inside it broke that guard permanently and silently stranded
+  # tokens at the old path (65099d7). tokenDir was then removed outright
+  # (c25f8e5, superseded by the user-owned ~/.config/agent-box/env), so
+  # /etc/agent-box is free again and nothing in this module claims it. The
+  # guides simply never moved back, and renaming them now buys tidiness at
+  # the price of dangling every pointer symlink and every ~/AGENTS.md
+  # already seeded on a deployed box. Don't, unless you also migrate those.
   canonicalAgentsPath = name: "/etc/agent-box-guides/AGENTS.${name}.md";
   tmuxSocketName = "agent-box";
   runtimeDirectory = name: "agent-box-${name}";
@@ -1623,7 +1635,8 @@ in
     environment.systemPackages = agentRuntimePackages;
 
     # Canonical, read-only agent guide per user at /etc/agent-box-guides/
-    # AGENTS.<user>.md (see canonicalAgentsPath for why not /etc/agent-box).
+    # AGENTS.<user>.md (canonicalAgentsPath carries the story of that
+    # directory name, and why moving it is not free).
     # environment.etc symlinks are relinked by `nixos-rebuild switch` (which the
     # self-update service runs), so this always tracks the current module while
     # the seeded ~/AGENTS.md — which @imports this path — stays editable. Skipped
