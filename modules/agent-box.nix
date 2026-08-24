@@ -1064,6 +1064,18 @@ if __name__ == "__main__":
     REGISTRY_HELD=0
     _registry_depth=0
 
+    registry_close_fd() {
+      # Close fd 9 and NOTHING ELSE. The braces are the whole point: `exec` with no
+      # command applies its redirections to the CURRENT SHELL and keeps them, so
+      # the obvious `exec 9>&- 2>/dev/null` closes the lock fd and then sends this
+      # program's stderr to /dev/null for the rest of its life. That is how the
+      # supervisor lost every diagnostic it prints after its first unlock —
+      # including the line a VM test waits for — and it is why the same shape in
+      # registry_lock wraps the OPEN in braces too: a redirection on a group is
+      # scoped to the group, while `exec`'s own fd change survives it.
+      { exec 9>&-; } 2>/dev/null || true
+    }
+
     registry_lock() {
       # Nesting-safe on purpose: flock(2) conflicts between two open file
       # DESCRIPTIONS, including two of the same process, so a second fd on the
@@ -1098,7 +1110,7 @@ if __name__ == "__main__":
         REGISTRY_HELD=1
       else
         echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-        exec 9>&- 2>/dev/null || true
+        registry_close_fd
       fi
       return 0
     }
@@ -1111,7 +1123,7 @@ if __name__ == "__main__":
       # would drop a lock this program never took.
       [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
       REGISTRY_HELD=0
-      exec 9>&- 2>/dev/null || true
+      registry_close_fd
     }
 
     registry_edit() {
@@ -1749,6 +1761,18 @@ REGISTRY_PROG=agent-box-session
 REGISTRY_HELD=0
 _registry_depth=0
 
+registry_close_fd() {
+  # Close fd 9 and NOTHING ELSE. The braces are the whole point: `exec` with no
+  # command applies its redirections to the CURRENT SHELL and keeps them, so
+  # the obvious `exec 9>&- 2>/dev/null` closes the lock fd and then sends this
+  # program's stderr to /dev/null for the rest of its life. That is how the
+  # supervisor lost every diagnostic it prints after its first unlock —
+  # including the line a VM test waits for — and it is why the same shape in
+  # registry_lock wraps the OPEN in braces too: a redirection on a group is
+  # scoped to the group, while `exec`'s own fd change survives it.
+  { exec 9>&-; } 2>/dev/null || true
+}
+
 registry_lock() {
   # Nesting-safe on purpose: flock(2) conflicts between two open file
   # DESCRIPTIONS, including two of the same process, so a second fd on the
@@ -1783,7 +1807,7 @@ registry_lock() {
     REGISTRY_HELD=1
   else
     echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-    exec 9>&- 2>/dev/null || true
+    registry_close_fd
   fi
   return 0
 }
@@ -1796,7 +1820,7 @@ registry_unlock() {
   # would drop a lock this program never took.
   [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
   REGISTRY_HELD=0
-  exec 9>&- 2>/dev/null || true
+  registry_close_fd
 }
 
 registry_edit() {
@@ -3326,6 +3350,18 @@ REGISTRY_PROG=agent-box-webhook-spawn
 REGISTRY_HELD=0
 _registry_depth=0
 
+registry_close_fd() {
+  # Close fd 9 and NOTHING ELSE. The braces are the whole point: `exec` with no
+  # command applies its redirections to the CURRENT SHELL and keeps them, so
+  # the obvious `exec 9>&- 2>/dev/null` closes the lock fd and then sends this
+  # program's stderr to /dev/null for the rest of its life. That is how the
+  # supervisor lost every diagnostic it prints after its first unlock —
+  # including the line a VM test waits for — and it is why the same shape in
+  # registry_lock wraps the OPEN in braces too: a redirection on a group is
+  # scoped to the group, while `exec`'s own fd change survives it.
+  { exec 9>&-; } 2>/dev/null || true
+}
+
 registry_lock() {
   # Nesting-safe on purpose: flock(2) conflicts between two open file
   # DESCRIPTIONS, including two of the same process, so a second fd on the
@@ -3360,7 +3396,7 @@ registry_lock() {
     REGISTRY_HELD=1
   else
     echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-    exec 9>&- 2>/dev/null || true
+    registry_close_fd
   fi
   return 0
 }
@@ -3373,7 +3409,7 @@ registry_unlock() {
   # would drop a lock this program never took.
   [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
   REGISTRY_HELD=0
-  exec 9>&- 2>/dev/null || true
+  registry_close_fd
 }
 
 registry_edit() {
@@ -4422,6 +4458,18 @@ $PROMPT"
     REGISTRY_HELD=0
     _registry_depth=0
 
+    registry_close_fd() {
+      # Close fd 9 and NOTHING ELSE. The braces are the whole point: `exec` with no
+      # command applies its redirections to the CURRENT SHELL and keeps them, so
+      # the obvious `exec 9>&- 2>/dev/null` closes the lock fd and then sends this
+      # program's stderr to /dev/null for the rest of its life. That is how the
+      # supervisor lost every diagnostic it prints after its first unlock —
+      # including the line a VM test waits for — and it is why the same shape in
+      # registry_lock wraps the OPEN in braces too: a redirection on a group is
+      # scoped to the group, while `exec`'s own fd change survives it.
+      { exec 9>&-; } 2>/dev/null || true
+    }
+
     registry_lock() {
       # Nesting-safe on purpose: flock(2) conflicts between two open file
       # DESCRIPTIONS, including two of the same process, so a second fd on the
@@ -4456,7 +4504,7 @@ $PROMPT"
         REGISTRY_HELD=1
       else
         echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-        exec 9>&- 2>/dev/null || true
+        registry_close_fd
       fi
       return 0
     }
@@ -4469,7 +4517,7 @@ $PROMPT"
       # would drop a lock this program never took.
       [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
       REGISTRY_HELD=0
-      exec 9>&- 2>/dev/null || true
+      registry_close_fd
     }
 
     registry_edit() {

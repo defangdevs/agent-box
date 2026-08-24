@@ -263,6 +263,43 @@ class HeldLock(RegistryCase):
         self.assertTrue((self.home / ".config/agent-box/sessions.json.lock").exists())
 
 
+class StderrSurvives(RegistryCase):
+    """Unlocking must close fd 9 and nothing else."""
+
+    MARKER = "still-talking"
+
+    def test_the_program_can_still_talk_after_unlocking(self):
+        # `exec` with no command applies its redirections to the CURRENT SHELL
+        # and keeps them, so the obvious `exec 9>&- 2>/dev/null` closes the lock
+        # fd and then throws this program's stderr away for good. The supervisor
+        # logs to stderr — that IS the journal — so it lost every diagnostic
+        # after its first unlock, including the plugin-refresh line a VM test
+        # waits 60s for. Cheap to break, invisible without this test.
+        self.seed()
+        done = self.run_writer(
+            "registry_lock\nregistry_unlock\necho %s >&2\n" % self.MARKER)
+        self.assertIn(self.MARKER, done.stderr)
+
+    def test_the_program_can_still_talk_after_a_timeout(self):
+        # Same trap on the degraded path, where the fd is closed straight after
+        # the warning — and where losing stderr would also lose the reason.
+        self.seed()
+        self.hold_lock_as_the_daemon_does()
+        done = self.run_writer(
+            "registry_lock\necho %s >&2\n" % self.MARKER, wait=1)
+        self.assertIn("lock timed out", done.stderr)
+        self.assertIn(self.MARKER, done.stderr)
+
+    def test_an_edit_leaves_stderr_alone(self):
+        # registry_edit unlocks on both its paths; neither may cost the caller
+        # its stderr.
+        self.seed()
+        done = self.run_writer(
+            self.ADD_ONE + "\nregistry_edit '.sessions | error(\"no\")' 2>/dev/null\n"
+            "echo %s >&2\n" % self.MARKER, args=["one"], check=False)
+        self.assertIn(self.MARKER, done.stderr)
+
+
 class Nesting(RegistryCase):
     """flock(2) conflicts between two descriptions of the same process."""
 
