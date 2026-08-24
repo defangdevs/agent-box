@@ -102,9 +102,12 @@ jobs:
       - name: Check webhook route in generated Caddyfile
         run: nix build -L .#checks.x86_64-linux.webhook-route && cat result
 
-      # Full closure build — the real "module is usable" proof.
+      # Full closure build — the real "module is usable" proof. --max-jobs
+      # auto because nix defaults to ONE: a system closure is hundreds of
+      # small independent derivations and this step served them one at a
+      # time (issue #312).
       - name: Build VM system closure
-        run: nix build -L .#checks.x86_64-linux.vm-closure
+        run: nix build -L --max-jobs auto .#checks.x86_64-linux.vm-closure
 
       # Behavior lock for the portability refactor (issue #154, Phase 0):
       # rendered units/etc/tmpfiles/payload scripts must byte-match the
@@ -129,8 +132,11 @@ jobs:
       # back-to-back they took ~8 min of the job's ~10; concurrently they
       # bound the job at roughly the slowest wave (~3-4 min).
       #   --max-jobs 3: ubuntu-latest has 4 vCPUs / 16 GiB and web-surface
-      #     boots TWO qemu nodes — 6 tests at once would thrash and trade
-      #     the saved minutes back as flaky timeouts.
+      #     boots TWO qemu nodes — all 7 at once would thrash and trade the
+      #     saved minutes back as flaky timeouts. Splitting `sessions` (issue
+      #     #312) does not by itself stop it holding the wave open, which is
+      #     why the long check is started first below; the bound is then the
+      #     greater of its length and the rest of the work over two slots.
       #   --keep-going: one red test doesn't hide the others' results (the
       #     failing drv is still named in the log).
       # What each check covers:
@@ -149,8 +155,11 @@ jobs:
       #                     a memory hog while the box stays responsive
       #   sessions          (issue 59) runtime session CRUD — seeded main
       #                     session, agent-box-session add/rm with no sudo and
-      #                     no rebuild, cgroup containment, root session
-      #                     manager page behind auth
+      #                     no rebuild, cgroup containment, and two writers
+      #                     racing the registry
+      #   sessions-web      (issue 119) the browser half of the same box —
+      #                     tabbed workspace, settings-page session manager,
+      #                     /sessions/* CRUD, live feed, transcript download
       #   connect           (issues 207/208/313) the guided sign-in cards —
       #                     one tmux session per flow driving the tool's own
       #                     login command (stubbed CLIs), host-anchored URL,
@@ -164,10 +173,31 @@ jobs:
       #                     its own filter, and the discovery surface
       - name: Run VM tests
         run: |
-          nix build -L --keep-going --max-jobs 3 \
+          # `sessions` is the longest check, so it has to START FIRST. With
+          # three slots the window is its own length only while it begins at
+          # t=0, and nix picks the order itself: measured on run 32649965071,
+          # it landed in the SECOND wave, began 86s in, finished last, and the
+          # window was 86+270=357s while the check itself was only 270s. The
+          # five short checks had already filled the slots.
+          #
+          # Two invocations pin the packing instead of hoping for it: the long
+          # check alone, the other six sharing the remaining two slots. Still
+          # three VM guests at once, so the memory budget below is unchanged
+          # (the long invocation holds ONE test, so its second slot only ever
+          # builds a dependency).
+          nix build -L --max-jobs 2 .#checks.x86_64-linux.sessions &
+          long=$!
+          nix build -L --keep-going --max-jobs 2 \
             .#checks.x86_64-linux.web-surface \
             .#checks.x86_64-linux.settings-page \
             .#checks.x86_64-linux.memory-protection \
-            .#checks.x86_64-linux.sessions \
+            .#checks.x86_64-linux.sessions-web \
             .#checks.x86_64-linux.connect \
-            .#checks.x86_64-linux.webhook
+            .#checks.x86_64-linux.webhook &
+          rest=$!
+          # Both are waited on before the step decides, so --keep-going's
+          # promise still holds across the pair: every result reaches the log,
+          # and one red check cannot hide another's.
+          long_status=0; wait "$long" || long_status=$?
+          rest_status=0; wait "$rest" || rest_status=$?
+          [ "$long_status" -eq 0 ] && [ "$rest_status" -eq 0 ]

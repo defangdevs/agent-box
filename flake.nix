@@ -545,10 +545,20 @@
           # seeded "main" session starts, `agent-box-session add/rm` brings a
           # second agent up and down as the user (no sudo, no rebuild), the
           # runtime session lives inside the hardened unit's cgroup, and the
-          # settings daemon serves the root session manager page plus its
-          # CRUD routes, all behind the web auth gate.
+          # supervisor's own bookkeeping survives two writers racing it.
           sessions = pkgs.testers.runNixOSTest
             (import ./tests/sessions.nix { agent-box = self.nixosModules.agent-box; });
+
+          # The browser half of the same box (issue #312 — this and `sessions`
+          # were one test that ran for 325s, more than the other five checks
+          # put together, so no amount of --max-jobs could shorten the wave):
+          # the tabbed workspace at /<user>/, the settings page's session
+          # manager, the /sessions/* CRUD routes, the live feed and the
+          # transcript download, all behind the web auth gate. Shares
+          # tests/sessions-common.nix with `sessions`, so both halves drive
+          # the same box.
+          sessions-web = pkgs.testers.runNixOSTest
+            (import ./tests/sessions-web.nix { agent-box = self.nixosModules.agent-box; });
 
           # Interactive VM test (issue #101): the per-user webhook receiver, ON
           # BY DEFAULT. Socket-activated 0660 <user>:caddy ingress, the
