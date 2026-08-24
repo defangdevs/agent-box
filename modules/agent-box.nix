@@ -130,6 +130,15 @@ let
     URLs built from $AGENT_BOX_URL — never a bare local path or a link relative
     to the terminal, which a remote user can't act on.
 
+    Assume they have no shell here. They may be reading you from a phone, a chat
+    client or the web terminal, and cannot run a command you suggest, paste its
+    output back, or open a file to see what is in it — you are their hands on
+    this machine. So run the command yourself instead of handing over a list to
+    try, read the file instead of asking what it contains, and quote the output
+    that matters instead of naming the path it lives in. What can only be
+    settled on the host, settle on the host; what genuinely cannot, say so
+    plainly rather than handing it back.
+
     ## Your environment
 
     - Only your home directory is writable; the rest of the filesystem is
@@ -149,6 +158,11 @@ let
       Claude Code under ~/.claude/projects/ (plus ~/.claude/history.jsonl),
       Codex under ~/.codex/sessions/. After a respawn, or when you take over
       another agent's session, skim the most recent one before writing code.
+    - Your harness's own configuration lives under $HOME and so survives a
+      respawn: ~/.claude/ for Claude Code (settings.json, skills/, commands/,
+      and the transcripts under projects/), ~/.codex/ for Codex. A skill, a
+      slash command or a hook you want the NEXT session to have goes there —
+      and notes for your future self go in ~/AGENTS.md, which is yours to edit.
     - sudo is a tight allowlist (essentially caddy reload + self-update), not
       general root — don't plan around arbitrary sudo.
 
