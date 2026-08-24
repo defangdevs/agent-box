@@ -8490,6 +8490,9 @@ STYLE = """<style>
   .tab-empty { color: #8b949e; font-size: 13px; padding: 6px 8px 8px; }
   .tabs .btn.add { margin: 0 4px 6px; padding: 2px 9px; }
   .tabs .spacer { flex: 1; }
+  .tabs .hint { color: #8b949e; font-size: 16px; padding: 2px 6px 8px;
+                cursor: help; }
+  .tabs .hint:hover, .tabs .hint:focus-visible { color: #e6edf3; }
   .tabs a.gear { color: #8b949e; text-decoration: none; font-size: 20px;
                  padding: 2px 8px 8px; }
   .tabs a.gear:hover { color: #e6edf3; }
@@ -8594,6 +8597,26 @@ CONNECT_SECTION_TPL = """<section>
 # #188): it is page-level feedback, and sitting between the tabs and
 # the panes it both prised the tab bar away from the terminal it labels
 # and read as a message from the session in that pane.
+#
+# The (i) hint (issue #327): tmux's `mouse on` (issue #265) claims every
+# button and drag for itself, not just the wheel — there is no tmux/xterm
+# mouse-tracking mode that reports wheel events alone. So a plain
+# click-drag now paints tmux's own copy-mode highlight instead of a
+# browser selection, and it vanishes on mouse-up without reaching the
+# clipboard (ttyd's bundled xterm.js has no OSC 52 support, so nothing
+# server-side can bridge tmux's paste buffer to the browser clipboard
+# either). xterm.js's own fallback is holding Shift (Option on a Mac)
+# while dragging, which forces its native DOM selection — and that in
+# turn is what ttyd auto-copies on selection change. On Mac that fallback
+# also needed a ttyd flag (macOptionClickForcesSelection=true, next to
+# the ttyd ExecStart below) since xterm.js ships it off by default; this
+# hint is the other half — telling people the gesture exists at all.
+# The gesture is spelled out TWICE in the span below, in `title` and in
+# `aria-label`, and that is not a copy-paste slip: `title` is the pointer
+# tooltip, while an `aria-label` REPLACES it as the accessible name and
+# `title` is not read as a description once a name exists. A short name of
+# its own ("Terminal mouse tip") would therefore be the whole of what a
+# screen reader ever announced, so both attributes carry the instructions.
 HOME_BODY = """<body class="ws">
 <div id="msg-slot">{message}</div>
 <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}">
@@ -8601,6 +8624,9 @@ HOME_BODY = """<body class="ws">
   <button type="button" class="btn add" data-toggle="session-editor"
           title="New session" aria-label="New session">+</button>
   <span class="spacer"></span>
+  <span class="hint" tabindex="0"
+        aria-label="Terminal mouse tip. Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text."
+        title="Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text.">&#9432;</span>
   <a class="gear" href="{base}/" title="Settings" aria-label="Settings">&#9881;</a>
 </nav>
 <div id="session-editor" class="editor">
@@ -11481,6 +11507,19 @@ if __name__ == "__main__":
             "-b" "/${name}"
             "-t" "disableLeaveAlert=true"
             "-t" "titleFixed=${name}@${cfg.web.domain}"
+            # Issue #327: xterm.js's Shift-drag bypass of tmux mouse
+            # tracking (see the HOME_BODY hint above) is gated off on Mac
+            # entirely — xterm.js's SelectionService.shouldForceSelection
+            # checks Option (Alt), not Shift, when Browser.isMac, and
+            # that check is itself gated by macOptionClickForcesSelection,
+            # which defaults to false and which ttyd never sets. Without
+            # this flag there is NO modifier-click escape hatch on Mac at
+            # all, confirmed live on Safari and Chrome on a Mac (reported
+            # against #327). This is one of ttyd's passthrough `-t`
+            # client options (same mechanism as disableLeaveAlert/
+            # titleFixed above): it lands on the xterm.js Terminal
+            # instance verbatim, so it only needs setting once, here.
+            "-t" "macOptionClickForcesSelection=true"
             (toString attachScript)
           ];
         };
