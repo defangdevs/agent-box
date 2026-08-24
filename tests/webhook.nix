@@ -662,8 +662,8 @@
     # one issue silenced the master Deploy test failure four seconds later.
     machine.succeed(
         "jq -e '(.topics[0].include.any | map(.path))"
-        " == [\"workflow_run.id\", \"check_run.id\", \"check_suite.id\","
-        " \"workflow_job.id\"]'"
+        " == [\"workflow_run\", \"check_run\", \"check_suite\", \"workflow_job\"]"
+        " and (.topics[0].include.any | all(.notIn == [null]))'"
         f" {hook_filter}"
     )
     # ...and the session is told, so it neither re-subscribes nor assumes that
@@ -776,7 +776,7 @@
     # working one issue must not own the repo's CI. Not
     # workflow_run.pull_requests.0.number either, which reads well and never
     # matches — the predicate walker steps through dicts only, so a list index
-    # ends the walk (local-channels#42).
+    # ends the walk (local-channels#46).
     machine.succeed(
         "jq -e '(.topics[0].include.any | map(.path)) =="
         " [\"issue.number\", \"pull_request.number\"]"
@@ -814,7 +814,7 @@
         " /home/agent/.config/agent-box/sessions.json"
     ).strip()
     machine.succeed(
-        "jq -e '(.topics[0].include.any | map(.path) | index(\"workflow_run.id\")) != null"
+        "jq -e '(.topics[0].include.any | map(.path) | index(\"workflow_run\")) != null"
         " and (.topics[0].note | contains(\"#\") | not)'"
         f" /home/agent/.local/state/local-webhook/filter.agent-{unnumbered}.json"
     )

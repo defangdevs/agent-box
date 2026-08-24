@@ -3931,12 +3931,20 @@ fi
 #   * a numbered object — claim exactly it, by the two paths that carry a
 #     number. NOT `workflow_run.pull_requests.0.number`, which reads well and
 #     never matches: the predicate walker splits on "." and steps through
-#     dicts only, so a list index silently ends the walk (local-channels#42).
+#     dicts only, so a list index silently ends the walk (local-channels#46).
 #   * anything else, which in practice is a CI outcome — claim CI outcomes on
-#     this repo, so the check_run and workflow_run of the SAME failing run do
+#     this repo, by the PRESENCE of the event's own object rather than a field
+#     inside it. `{path: "workflow_run", notIn: [null]}` reads oddly and is
+#     exactly right: an absent path is null and matches, a present one is a
+#     dict and does not, so notIn inverts to "this key exists". Naming a field
+#     instead (.id, .conclusion) would assume a payload shape — the first
+#     version asked for .id, which every real delivery carries and the VM
+#     test fixture does not, so the claim silently never matched.
+#     So: claim CI outcomes on this repo, so the check_run and workflow_run of
+#     the SAME failing run do
 #     not spawn twins. That is still wider than one run: the branch and the run
 #     id are in the payload but not in the meta this script is given, so it
-#     cannot narrow further today (local-channels#42 asks for them).
+#     cannot narrow further today (local-channels#46 asks for them).
 #
 # A numbered claim deliberately does NOT cover that object's CI. A session that
 # opens a PR learns its own branch, and the preamble tells it to re-subscribe
@@ -3954,10 +3962,10 @@ claim_include() {
         {any: [{path: "issue.number", in: [$n]},
                {path: "pull_request.number", in: [$n]}]}
       else
-        {any: [{path: "workflow_run.id", notIn: [null]},
-               {path: "check_run.id", notIn: [null]},
-               {path: "check_suite.id", notIn: [null]},
-               {path: "workflow_job.id", notIn: [null]}]}
+        {any: [{path: "workflow_run", notIn: [null]},
+               {path: "check_run", notIn: [null]},
+               {path: "check_suite", notIn: [null]},
+               {path: "workflow_job", notIn: [null]}]}
       end' 2>/dev/null
 }
 claim_note() {
