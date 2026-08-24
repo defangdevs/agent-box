@@ -272,9 +272,13 @@ jobs:
         #     healthy. Treating this form as fatal is a false negative that
         #     recurs periodically on perfectly good boxes - do not "simplify"
         #     the two spellings back into one alternation.
-        # A masked-mid-switch line that is never followed by ok_re still fails
-        # via the timeout below, so a genuinely wedged box after masking isn't
-        # mistaken for success.
+        # A masked-mid-switch boot also never prints "Finished|Started
+        # amazon-init" (the unit was masked before it got there), so ok_re
+        # needs its own switch-completion marker or a healthy masked-mid-switch
+        # box would just fail slower, via the timeout below, instead of fast.
+        # "Reached target Reactivate sysinit units" is systemd's own line for
+        # switch-to-configuration completing the reactivation that masking
+        # amazon-init is part of - present on every masked-mid-switch boot.
         run: |
           iid='${{ steps.outputs.outputs.instance_id }}'
           if [ -z "$iid" ] || [ "$iid" = "None" ]; then
@@ -282,7 +286,7 @@ jobs:
           fi
           unit='(Reconfigure the system from EC2 userdata|amazon-init\.service)'
           fail_re="(Failed to start.*Reconfigure the system from EC2 userdata|amazon-init\.service: (Failed|Main process exited))"
-          ok_re="(Finished|Started).*$unit"
+          ok_re="((Finished|Started).*$unit|Reached target .*Reactivate sysinit units)"
           # The stock NixOS AMI's fetch-ec2-metadata.service fails OPEN: an
           # IMDS hiccup logs a complaint, writes no user-data file, and exits
           # 0 — then amazon-init "finishes" having provisioned nothing, so
