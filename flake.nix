@@ -502,6 +502,36 @@
               cat log
               cp log "$out"
             '';
+
+          # The session registry's write protocol (issues #254, #289). The VM
+          # tests deliberately avoid concurrency — they stop the supervisor, or
+          # write once so the first spawn sees the final config — so a lock
+          # that stopped working would cost 300s a run and still go unnoticed
+          # (issue #285). This runs the real library, composed the way the
+          # generated module composes it, against real concurrent writers, in
+          # about ten seconds on every architecture. It also holds the settings
+          # daemon's fcntl side and the shell side to the same sidecar file,
+          # which is the one agreement nothing else checks.
+          registry-protocol =
+            pkgs.runCommand "agent-box-registry-protocol"
+              {
+                nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.jq pkgs.util-linux pkgs.coreutils ];
+                registryLib = ./modules/src/lib/registry.sh;
+                tests = ./tests/test-registry.py;
+              } ''
+              install -d repo/modules/src/lib repo/tests
+              cp "$registryLib" repo/modules/src/lib/registry.sh
+              cp "$tests" repo/tests/test-registry.py
+              # Not piped into tee: the log has to reach the build output
+              # whether the tests pass or fail, and the exit status has to be
+              # python's own.
+              python3 repo/tests/test-registry.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
         }
         # Everything below boots a guest, so it only exists for `vmSystems`:
         # runNixOSTest wants a same-arch KVM guest (cross-arch falls back to

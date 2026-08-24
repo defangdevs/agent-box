@@ -6,10 +6,14 @@ set -u
 # agentBaseTools), so the unit pins those two via AGENT_BOX_*_BIN.
 JQ=jq
 TMUX="tmux -L agent-box"
-SESSIONS_FILE="$HOME/.config/agent-box/sessions.json"
 GREP="${AGENT_BOX_GREP_BIN:-grep}"
 FIND="${AGENT_BOX_FIND_BIN:-find}"
-FLOCK="${AGENT_BOX_FLOCK_BIN:-}"
+# The session registry — where it lives, how it is locked and how it is
+# rewritten — is one file every shell writer splices in (issue #254). It is
+# spliced HERE, above the seed below, because creating the registry is part of
+# the same protocol as writing it (issue #289).
+REGISTRY_PROG=supervisor
+@@include:lib/registry.sh@@
 # The webhook channel plugin, spelled once (issue #257): three places have to
 # agree on it — the settings seed (an enabledPlugins key), the plugin-cache
 # sync, and claude's --channels tag. The marketplace NAME comes from the
@@ -21,11 +25,11 @@ WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
 
 # First boot only: seed the Nix-declared sessions. The file is RUNTIME
 # data afterwards — a rebuild must never clobber sessions the user
-# added or removed while the box was live.
-mkdir -p "$HOME"/.config/agent-box
-if [ ! -s "$SESSIONS_FILE" ]; then
-  install -m 0600 "${AGENT_BOX_SESSIONS_SEED:?}" "$SESSIONS_FILE"
-fi
+# added or removed while the box was live. Under the registry lock, because
+# this unit and a session being added start in parallel on a first boot, and
+# "the file was empty when I looked" must not survive another writer's
+# decision (issue #289).
+registry_ensure "${AGENT_BOX_SESSIONS_SEED:?}"
 
 seed_json() {
   # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
@@ -208,50 +212,6 @@ if cbin="$(agent_bin codex)"; then
   ln -sfn agent-box-current "$HOME"/.codex/packages/standalone/current
 fi
 
-# Serialize every read-modify-write of the session registry (issue #254).
-# tmp+rename buys ONE guarantee — a reader never sees half a document — and
-# says nothing about the interval between a writer's read and its rename: two
-# writers that start from the same base each publish a document that never
-# contained the other's edit, so a one-field update silently reverts every
-# field the other writer changed. Measured on the live box: two writers of the
-# shape used here lost 96 of 300 updates (32%). The registry has five writers
-# in three languages (this loop, the session CLI, the mark-stopped epilogue,
-# the settings daemon's three routes, the webhook spawn wrapper), so the lock
-# is the only thing that makes the file's state a function of its edits.
-#
-# The lock is a SIDECAR file, never sessions.json itself: every writer here
-# REPLACES that inode by rename, so a lock taken on the inode a writer read is
-# not the lock the next writer takes.
-#
-# AGENT_BOX_FLOCK_BIN is pinned by the unit because flock ships in util-linux
-# only (the AGENT_BOX_*_BIN convention, as for grep/find). Unset means "no
-# lock, carry on": a box whose module predates this must still start sessions,
-# and a missing lock must never be the reason a session does not spawn.
-REGISTRY_LOCK="$SESSIONS_FILE.lock"
-_lock_depth=0
-registry_lock() {
-  # Nesting-safe on purpose: flock(2) conflicts between two open file
-  # DESCRIPTIONS, including two of the same process, so start_session — which
-  # holds the lock across the mark_started it calls — would otherwise block
-  # the supervisor against itself forever (verified: a second fd on the same
-  # file blocks).
-  _lock_depth=$((_lock_depth + 1))
-  [ "$_lock_depth" = 1 ] || return 0
-  [ -n "$FLOCK" ] || return 0
-  { exec 9>>"$REGISTRY_LOCK"; } 2>/dev/null || return 0
-  # -w: nothing may park the reconcile loop. If some writer holds the lock
-  # past the timeout (a stopped process, a full disk) this spawn proceeds
-  # unlocked — the pre-#254 behavior, not a new failure mode.
-  "$FLOCK" -w 10 9 \
-    || echo "supervisor: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-}
-registry_unlock() {
-  [ "$_lock_depth" -gt 0 ] || return 0
-  _lock_depth=$((_lock_depth - 1))
-  [ "$_lock_depth" = 0 ] || return 0
-  exec 9>&- 2>/dev/null || true
-}
-
 # Deliver-once + resume bookkeeping. A session's kickoff prompt
 # (initialPrompt) must fire on the FIRST spawn only; every later respawn
 # (crash, clean exit, reboot, Spot stop→restart — all of which keep the
@@ -346,18 +306,15 @@ mark_started() {
   # the reconcile loop then started forever — a session nothing kills,
   # because no delete path knows it exists. That is the resurrect half of
   # #254; the lock is the lost-update half.
-  registry_lock
-  _tmp="$(mktemp "$SESSIONS_FILE.XXXXXX")" || { registry_unlock; return 0; }
-  if $JQ --arg s "$1" --arg b "$2" \
-       'if .sessions | has($s)
-        then (.sessions[$s]) |= (.hasRun = true | .boxSessionId = $b | .initialPrompt = null)
-        else . end' \
-       "$SESSIONS_FILE" > "$_tmp" 2>/dev/null; then
-    mv "$_tmp" "$SESSIONS_FILE"
-  else
-    rm -f "$_tmp"
-  fi
-  registry_unlock
+  #
+  # jq's stderr is dropped rather than journalled: this runs on every spawn of
+  # every session, so a registry the box cannot parse would repeat the same
+  # line every two seconds, and the reconcile loop already carries on without
+  # it.
+  registry_edit --arg s "$1" --arg b "$2" \
+    'if .sessions | has($s)
+     then (.sessions[$s]) |= (.hasRun = true | .boxSessionId = $b | .initialPrompt = null)
+     else . end' 2>/dev/null || true
 }
 
 claude_has_transcript() {
@@ -408,7 +365,7 @@ codex_rollout_uuid() {
 
 start_session() {
   sname=$1
-  sjson="$($JQ -c --arg s "$sname" '.sessions[$s] // empty' "$SESSIONS_FILE")" || return 0
+  sjson="$($JQ -c --arg s "$sname" '.sessions[$s] // empty' "$REGISTRY_FILE")" || return 0
   [ -n "$sjson" ] || return 0
   agent="$($JQ -r '.agent // empty' <<<"$sjson")"
   if ! bin="$(agent_bin "$agent")"; then
@@ -790,7 +747,7 @@ start_session() {
   listed() {
     $JQ -e --arg s "$sname" \
       '.sessions | has($s) and (.[$s].stopped != true)' \
-      "$SESSIONS_FILE" >/dev/null 2>&1
+      "$REGISTRY_FILE" >/dev/null 2>&1
   }
   # Pre-check, spawn, post-check and mark_started are ONE critical section
   # (issue #254), so the post-check is exact: without the lock a delete could
@@ -883,9 +840,9 @@ sweep_orphan_filters() {
     case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
     # A file jq cannot answer for is left alone: a transient read error must
     # not be read as "this session is gone" and unsubscribe a live session.
-    if $JQ -e --arg s "$_n" '.sessions | has($s)' "$SESSIONS_FILE" >/dev/null 2>&1; then
+    if $JQ -e --arg s "$_n" '.sessions | has($s)' "$REGISTRY_FILE" >/dev/null 2>&1; then
       continue
-    elif $JQ -e . "$SESSIONS_FILE" >/dev/null 2>&1; then
+    elif $JQ -e . "$REGISTRY_FILE" >/dev/null 2>&1; then
       rm -f "$_f"
     fi
   done
@@ -916,7 +873,7 @@ sweep_orphan_filters
 NL="
 "
 sweep_session_state() {
-  _listed="$($JQ -r '.sessions | keys[]' "$SESSIONS_FILE" 2>/dev/null)" || return 0
+  _listed="$($JQ -r '.sessions | keys[]' "$REGISTRY_FILE" 2>/dev/null)" || return 0
   for _f in "$SESSION_STATE_DIR"/*.json; do
     _n=${_f##*/}; _n=${_n%.json}
     # Also how an unmatched glob leaves this loop: the literal pattern is not
@@ -938,6 +895,6 @@ while true; do
       (*[!A-Za-z0-9_-]*|"") continue ;;
     esac
     $TMUX has-session -t "=$sname" 2>/dev/null || start_session "$sname"
-  done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$SESSIONS_FILE" 2>/dev/null)
+  done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$REGISTRY_FILE" 2>/dev/null)
   sleep 2
 done
