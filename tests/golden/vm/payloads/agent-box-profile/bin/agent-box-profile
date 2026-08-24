@@ -1,6 +1,9 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
 export AGENT_BOX_AGENTS='claude codex shell'
 export AGENT_BOX_DEFAULT_AGENT=claude
+# A profile file is the env store in another directory, so it has the same
+# one parser (issue #212).
+export AGENT_BOX_ENVSTORE_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-envstore/bin/agent-box-envstore
 set -eu
 # jq resolves from PATH (system packages + every agent unit's PATH); the
 # installed-harness list comes from the AGENT_BOX_* env the generated wrapper
@@ -18,6 +21,11 @@ JQ=jq
 # format the settings page and `agent-box-session env` already write.
 DIR="$HOME/.config/agent-box/profiles"
 HARNESSES="${AGENT_BOX_AGENTS:?}"
+# A profile file is the env store in another directory, so it is read and
+# written by the store's one parser (issue #212) — not by a copy of the
+# KEY=value loop that lives here. That is what lets a SYSTEM_PROMPT span
+# lines.
+ENVSTORE="${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
 
 # Reserved keys are the LAUNCH config: this script turns them into harness
 # arguments. Every other key in the file is environment for a session started
@@ -58,36 +66,46 @@ valid_key() {
   # digits, underscore, not starting with a digit.
   case "$1" in (*[!A-Za-z0-9_]*|""|[0-9]*) return 1 ;; esac
 }
-reserved_key() {
-  case " $RESERVED " in (*" $1 "*) return 0 ;; esac
-  return 1
-}
 file_for() { printf '%s/%s.env\n' "$DIR" "$1"; }
 
 # read_profile NAME — set the res_<KEY> variables for the reserved keys and
-# collect the remaining key NAMES in env_keys. Same defensive parse as the
-# env-exec wrapper (issue #212): a line that is not KEY=value is skipped
-# rather than interpreted, so a hand-edited file cannot run anything.
+# collect the remaining key NAMES in env_keys. The file is read by the env
+# store's own parser (issue #212), so a value that spans lines arrives whole
+# here, in the settings page and at session spawn alike.
 read_profile() {
   res_HARNESS=""; res_MODEL=""; res_EFFORT=""; res_SYSTEM_PROMPT=""
   env_keys=""
   pf="$(file_for "$1")"
   [ -r "$pf" ] || return 1
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-    k=${line%%=*}
-    valid_key "$k" || continue
-    v=${line#*=}
-    case "$v" in
-      \"*\") v=${v#\"}; v=${v%\"} ;;
-      \'*\') v=${v#\'}; v=${v%\'} ;;
-    esac
-    if reserved_key "$k"; then
-      eval "res_$k=\$v"
+  pj="$("$ENVSTORE" --file "$pf" json)" || return 1
+  for k in $RESERVED; do
+    # Command substitution strips EVERY trailing newline, and `jq -r` adds one
+    # of its own. For the token-shaped keys that is what we want. For
+    # SYSTEM_PROMPT it is not — a prompt's last blank line is content — so
+    # there the value is fenced with a sentinel and only jq's own newline is
+    # removed. A trailing newline in HARNESS would break the harness match
+    # below, so it keeps the stripping.
+    if [ "$k" = SYSTEM_PROMPT ]; then
+      v="$(printf '%s' "$pj" | "$JQ" -r --arg k "$k" '.[$k] // ""'; printf X)"
+      v="${v%X}"
+      v="${v%$'\n'}"
     else
-      env_keys="$env_keys $k"
+      v="$(printf '%s' "$pj" | "$JQ" -r --arg k "$k" '.[$k] // ""')"
     fi
-  done < "$pf"
+    case "$k" in
+      (HARNESS) res_HARNESS="$v" ;;
+      (MODEL) res_MODEL="$v" ;;
+      (EFFORT) res_EFFORT="$v" ;;
+      (SYSTEM_PROMPT) res_SYSTEM_PROMPT="$v" ;;
+    esac
+  done
+  # Every other key is environment; only the NAMES are needed here, and only
+  # the names are ever printed.
+  env_keys="$(printf '%s' "$pj" | "$JQ" -r --arg r " $RESERVED " \
+    'keys[] | . as $k | select(($r | contains(" " + $k + " ")) | not)' \
+    | tr '\n' ' ')"
+  env_keys="${env_keys% }"
+  [ -z "$env_keys" ] || env_keys=" $env_keys"
 }
 
 # launch_json NAME — {harness, args, envKeys, warnings} for the resolved
@@ -146,40 +164,6 @@ launch_json() {
     --args -- "$@"
 }
 
-# rewrite NAME [KEY VALUE]... — atomically rewrite the profile file, dropping
-# every key named in the (whitespace-separated) DROP list and appending the
-# pairs given. Same shape as session-cli's env_rewrite, and 600 for the same
-# reason: a profile may carry environment.
-DROP=""
-rewrite() {
-  pname="$1"; shift
-  f="$(file_for "$pname")"
-  mkdir -p "$DIR"
-  chmod 700 "$DIR" 2>/dev/null || true
-  tmp="$(mktemp "$f.XXXXXX")"
-  { printf '# agent-box agent profile "%s" — managed by agent-box-profile.\n' "$pname"
-    printf '# KEY=value, one per line. HARNESS/MODEL/EFFORT/SYSTEM_PROMPT become\n'
-    printf '# harness arguments; any other key becomes session environment, which\n'
-    printf '# every session of this user can read (issue #135).\n'
-    if [ -f "$f" ]; then
-      while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-        ek="${line%%=*}"
-        valid_key "$ek" || continue
-        skip=0
-        for d in $DROP; do [ "$ek" = "$d" ] && skip=1; done
-        [ "$skip" = 1 ] && continue
-        printf '%s\n' "$line"
-      done < "$f"
-    fi
-    while [ $# -ge 2 ]; do
-      printf '%s=%s\n' "$1" "$2"
-      shift 2
-    done
-  } > "$tmp"
-  chmod 600 "$tmp"; mv "$tmp" "$f"
-}
-
 cmd="${1:-}"; shift || true
 case "$cmd" in
   ls)
@@ -224,24 +208,22 @@ case "$cmd" in
     # Validate every assignment BEFORE writing any of them: a `set` that
     # stored the first two of three pairs and then failed would leave a
     # profile nobody asked for.
-    pairs=()
-    DROP=""
+    assign=()
     for a in "$@"; do
       case "$a" in (*=*) ;; (*) echo "not a KEY=VALUE assignment: '$a'" >&2; exit 2 ;; esac
       k="${a%%=*}"; v="${a#*=}"
       valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
-      case "$v" in (*"
-"*) echo "value for '$k' may not contain a newline" >&2; exit 2 ;; esac
       if [ "$k" = HARNESS ]; then
         case " $HARNESSES " in
           (*" $v "*) ;;
           (*) echo "harness '$v' is not available (available: $HARNESSES)" >&2; exit 2 ;;
         esac
       fi
-      DROP="$DROP $k"
-      pairs+=("$k" "$v")
+      assign+=("$a")
     done
-    rewrite "$name" "${pairs[@]}"
+    # A newline in a value is no longer refused (issue #212): a SYSTEM_PROMPT
+    # is prose, and prose has paragraphs. The store quotes it on the way in.
+    "$ENVSTORE" --profile "$name" set "${assign[@]}"
     echo "profile '$name' updated — 'agent-box-session add --profile $name' starts a session with it"
     # Report what the profile now launches, so a key the harness cannot use
     # shows up here rather than silently at the next spawn.
@@ -257,13 +239,11 @@ case "$cmd" in
       rm -f "$f"
       echo "profile '$name' removed — sessions already running with it are unaffected"
     else
-      DROP=""
       for k in "$@"; do
         valid_key "$k" || { usage >&2; exit 2; }
-        DROP="$DROP $k"
       done
-      rewrite "$name"
-      echo "profile '$name': removed$DROP"
+      "$ENVSTORE" --profile "$name" unset "$@"
+      echo "profile '$name': removed $*"
     fi
     ;;
   launch)

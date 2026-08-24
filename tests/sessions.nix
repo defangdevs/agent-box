@@ -930,6 +930,85 @@ in
         machine.succeed("su -s /bin/sh agent -c 'agent-box-session env rm MY_TOKEN'")
         machine.fail("grep -q MY_TOKEN /home/agent/.config/agent-box/env")
 
+    # --- a value may span lines (issue #212) ------------------------------
+    with subtest("a multi-line secret survives the store, the CLI and a spawn"):
+        # The value people actually need to paste here is a PEM, and it is
+        # also the value every pre-#212 reader mangled: a line-per-pair loop
+        # exported the first line and then read the body as more assignments.
+        # The base64 line ends in `=` on purpose — that is what made a body
+        # line look like one.
+        pem = (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "MIIBVgIBADANBgkqhkiG9w0BAQEFAASCAUAwggE8AgEAAkEA1x==\n"
+            "-----END PRIVATE KEY-----"
+        )
+        machine.succeed(
+            "printf '%s\\n' " + shlex.quote(pem) + " > /tmp/pem && chmod a+r /tmp/pem"
+        )
+        # --stdin is how it gets in: the value reaches no command line, so it
+        # is in no shell history and in nobody's `ps` output.
+        machine.succeed(as_agent("agent-box-session env set MY_PEM --stdin < /tmp/pem"))
+        # Stored as ONE quoted entry, and still 0600.
+        machine.succeed(
+            "grep -qx 'MY_PEM=\"-----BEGIN PRIVATE KEY-----' "
+            "/home/agent/.config/agent-box/env"
+        )
+        machine.succeed("stat -c '%a' /home/agent/.config/agent-box/env | grep -x 600")
+        # ls sees one key, not four: the reader knows where the entry ends.
+        env_ls = machine.succeed(as_agent("agent-box-session env ls"))
+        assert env_ls.split() == ["MY_PEM"], env_ls
+        # Writing a second key must not disturb the first: writer and reader
+        # agree about continuation lines, or a set corrupts what it did not
+        # touch.
+        machine.succeed(as_agent("agent-box-session env set PLAIN tok"))
+        machine.succeed("grep -qx 'PLAIN=tok' /home/agent/.config/agent-box/env")
+        assert machine.succeed(as_agent("agent-box-session env ls")).split() == [
+            "MY_PEM",
+            "PLAIN",
+        ]
+        # And the whole value reaches a session's environment at spawn, which
+        # is the end of the path the settings page starts (issue 89): the
+        # env-exec wrapper reads this file with the same parser that wrote it.
+        machine.succeed(as_agent("agent-box-session add pemsess --agent shell"))
+        machine.wait_until_succeeds(tmux("has-session -t =pemsess"), timeout=60)
+        # /proc/<pid>/environ is an EXEC-TIME snapshot, and the pane command is
+        # `<env-exec wrapper> <shell>` run by tmux through sh: whether the
+        # loaded environment lands on the pane pid itself or on its child
+        # depends on whether that sh exec'd or forked. So look at both pids,
+        # and WAIT — a session that answers has-session does not yet have a
+        # shell that finished exec'ing (CI 32649971831 read 49 entries with no
+        # MY_PEM at all, where the run before it passed).
+        pids = (
+            tmux('display -p -t "=pemsess:" "#{pane_pid}"')
+            + " | xargs -I{} sh -c 'echo {}; pgrep -P {} || true'"
+        )
+        machine.wait_until_succeeds(
+            pids
+            + " | xargs -I{} sh -c \"tr '\\0' '\\n' < /proc/{}/environ\""
+            + " | grep -x 'MY_PEM=-----BEGIN PRIVATE KEY-----' >/dev/null",
+            timeout=60,
+        )
+        # Then the exact entry, from whichever of those pids carries it.
+        # Compare the NUL-delimited ENTRY, not a substring of a joined dump: a
+        # substring match cannot tell "the value ends here" from "the value
+        # continues", which is the very thing a continuation-line parser has
+        # to get right. base64 keeps the NULs intact through the shell, and
+        # chr(0) splits on them — "\0" here would be a literal backslash-zero,
+        # because a Nix indented string passes backslashes through untouched.
+        examined = machine.succeed(pids).split()
+        entries = []
+        for pid in examined:
+            raw = machine.succeed(f"base64 -w0 < /proc/{pid}/environ || true")
+            entries += base64.b64decode(raw).decode().split(chr(0))
+        assert "MY_PEM=" + pem in entries, (
+            f"pids {examined}, {len(entries)} entries",
+            [e for e in entries if e.startswith("MY_PEM")],
+        )
+        machine.succeed(as_agent("agent-box-session rm pemsess"))
+        machine.succeed(as_agent("agent-box-session env rm MY_PEM"))
+        machine.succeed(as_agent("agent-box-session env rm PLAIN"))
+        assert machine.succeed(as_agent("agent-box-session env ls")).split() == []
+
     # --- agent profiles (issue #321) --------------------------------------
     with subtest("a profile resolves a worker: harness, args and session env"):
         # A profile is the WORKER (harness + model + effort + appended system
@@ -992,6 +1071,29 @@ in
         )
         launch = json.loads(machine.succeed(as_agent("agent-box-profile launch reviewer")))
         assert launch["harness"] == "claude", launch
+        # A SYSTEM_PROMPT is prose: it may span lines and it may end on a
+        # blank one, and the harness must be handed exactly what the store
+        # holds (issue #212). Its own profile, because `reviewer` is asserted
+        # on below and must keep the prompt it was created with.
+        machine.succeed(
+            as_agent(
+                "agent-box-profile set prosaic HARNESS=claude "
+                + shlex.quote("SYSTEM_PROMPT=Review PRs.\n\nBe terse.\n\n")
+            )
+        )
+        prose = json.loads(machine.succeed(as_agent("agent-box-profile launch prosaic")))
+        assert prose["args"][-1] == "Review PRs.\n\nBe terse.\n\n", prose
+        # And it survives `add --profile`, which stores the resolved argument
+        # vector: a newline-separated decode turned one two-paragraph prompt
+        # into three separate flags to the agent CLI.
+        machine.succeed(as_agent("agent-box-session add proser --profile prosaic"))
+        stored = json.loads(machine.succeed(f"cat {sfile}"))["sessions"]["proser"]
+        assert stored["extraArgs"] == [
+            "--append-system-prompt",
+            "Review PRs.\n\nBe terse.\n\n",
+        ], stored
+        machine.succeed(as_agent("agent-box-session rm proser"))
+        machine.succeed(as_agent("agent-box-profile rm prosaic"))
         assert launch["args"] == [
             "--model", "sonnet", "--effort", "low",
             "--append-system-prompt", "You review PRs.",

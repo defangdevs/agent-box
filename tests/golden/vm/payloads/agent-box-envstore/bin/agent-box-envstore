@@ -320,108 +320,155 @@ def dumps(path):
     return json.dumps(as_dict(load(path)), ensure_ascii=False)
 
 
-"""Session-spawn env loader (issue 89), then exec the agent.
+"""agent-box-envstore — read and write the box's KEY=value stores.
 
-Sessions are (re)created by the long-lived supervisor inside the agent unit,
-so a unit-level EnvironmentFile= snapshot of the user's env file goes stale
-the moment the settings page (or a hand edit) changes it — "restart the
-sessions to apply" silently applied nothing. This wrapper re-reads the file at
-EVERY session spawn and then execs the agent, making the file the single live
-source for those keys (it is deliberately NOT in the unit's EnvironmentFile,
-so a DELETED key disappears on restart too).
+The format's one owner is src/lib/envstore.py; this is the door the callers
+that are not Python use (issue #212). It is deliberately NOT on any PATH: the
+wrappers that need it pin its store path as AGENT_BOX_ENVSTORE_BIN, the same
+convention sessionCli already uses for flock and agent-box-profile, so a
+caller cannot silently fall back to an older copy or to no copy at all.
 
-Python since issue #212: a value may now span lines, and the parser that
-understands that lives in src/lib/envstore.py, spliced in above this file.
-Values still reach the child as literal strings — nothing here is eval'd or
-expanded, so a secret full of shell metacharacters cannot break or inject
-anything.
+Verbs, all of which take --file PATH or --profile NAME and otherwise act on
+~/.config/agent-box/env:
 
-Best effort by construction: a missing, unreadable or half-corrupt store
-costs the keys it holds, never the session. The exec at the bottom is the only
-step allowed to fail.
+  keys                 the key NAMES, sorted, one per line — never a value
+  get KEY              one value, verbatim, no trailing newline added
+  json                 the whole store as a JSON object, for jq callers
+  set KEY=VALUE ...    add or replace; --stdin reads ONE value from stdin
+  unset KEY ...        remove
+
+`get` on a missing key exits 1 with nothing on stdout, so a shell caller can
+write `v=$(... get K) || v=default`. Bad usage exits 2, matching the shell
+CLIs.
 """
-# The library above already imported os; only what it does not is imported
-# here.
-import shutil
-import subprocess
+# The env-store library is spliced in ABOVE this file by the generated module
+# (see envStoreCli in modules/agent-box.nix.in), so `os` and the envstore
+# names are already bound here; only what the library does not import is
+# imported again.
+import argparse
 import sys
 
+PROFILE_NAME_MAX = 64
 
-def load_into(environ, path, skip=()):
-    for key, value in load(path):
-        if key in skip:
-            continue
-        environ[key] = value
+
+def die(message):
+    sys.stderr.write(f"agent-box-envstore: {message}\n")
+    raise SystemExit(2)
+
+
+def valid_profile_name(name):
+    if name == "" or len(name) > PROFILE_NAME_MAX:
+        return False
+    return all(char.isascii() and (char.isalnum() or char in "_-") for char in name)
+
+
+def config_dir():
+    # AGENT_BOX_CONFIG_DIR exists for the tests and for a caller that already
+    # resolved the directory (the settings daemon is told its env file
+    # outright); everything else follows $HOME, because this always runs as
+    # the user whose store it is.
+    override = os.environ.get("AGENT_BOX_CONFIG_DIR")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".config", "agent-box")
+
+
+def target(args):
+    """Return (path, header) for the store this invocation acts on."""
+    if args.file:
+        if args.profile:
+            die("--file and --profile are mutually exclusive")
+        # A bare --file gets the env-store header: the only other shape is a
+        # profile, and that one names itself.
+        return args.file, ENV_HEADER
+    if args.profile:
+        if not valid_profile_name(args.profile):
+            die(
+                f"invalid profile name '{args.profile}' (letters, digits, '_' "
+                f"and '-', at most {PROFILE_NAME_MAX} characters)"
+            )
+        path = os.path.join(config_dir(), "profiles", f"{args.profile}.env")
+        return path, profile_header(args.profile)
+    return os.path.join(config_dir(), "env"), ENV_HEADER
+
+
+def parse_assignments(items, from_stdin):
+    if from_stdin:
+        if len(items) != 1:
+            die("--stdin takes exactly one KEY")
+        key = items[0]
+        if not valid_key(key):
+            die(f"invalid key '{key}'")
+        # The newline a shell here-doc or a `<file` redirect leaves at the end
+        # is the terminator, not part of the secret — one is dropped, the rest
+        # are kept. A PEM read with `--stdin < key.pem` therefore round-trips
+        # byte-for-byte.
+        value = sys.stdin.read()
+        if value.endswith("\n"):
+            value = value[:-1]
+        return [(key, value)]
+    assignments = []
+    for item in items:
+        if "=" not in item:
+            die(f"not a KEY=VALUE assignment: '{item}'")
+        key, value = item.split("=", 1)
+        if not valid_key(key):
+            die(
+                f"invalid key '{key}' (use letters, digits, underscore; not "
+                "starting with a digit)"
+            )
+        assignments.append((key, value))
+    return assignments
 
 
 def main(argv):
-    if not argv:
-        sys.stderr.write("agent-box-env-exec: nothing to exec\n")
-        return 2
-    home = os.path.expanduser("~")
-    config = os.path.join(home, ".config", "agent-box")
+    parser = argparse.ArgumentParser(prog="agent-box-envstore", add_help=True)
+    parser.add_argument("--file", help="act on this file instead of the env store")
+    parser.add_argument("--profile", help="act on ~/.config/agent-box/profiles/NAME.env")
+    parser.add_argument("--stdin", action="store_true", help="`set`: read the value from stdin")
+    parser.add_argument("verb", choices=("keys", "get", "json", "set", "unset"))
+    parser.add_argument("args", nargs="*")
+    args = parser.parse_args(argv)
+    path, header = target(args)
 
-    # The per-user secrets file the settings page and `agent-box-session env`
-    # manage.
-    load_into(os.environ, os.path.join(config, "env"))
-
-    # The agent profile's own environment (issue #321), on top of the file
-    # above: every key in profiles/<name>.env that is not one of the reserved
-    # LAUNCH keys agent-box-profile turns into harness arguments. The
-    # supervisor passes the name through the tmux session environment, so this
-    # applies at every spawn — an edited profile reaches the session on its
-    # next restart, exactly like the file above.
-    #
-    # Convenience, NOT isolation: this process's environment is readable
-    # through /proc/<pid>/environ by every other session of this user (issue
-    # #135, wiki Users-vs-Sessions), so a secret in a profile is a secret all
-    # of them have. What a profile buys is that sessions started with OTHER
-    # profiles do not get it handed to them, not that they cannot reach it.
-    profile = os.environ.get("AGENT_BOX_PROFILE", "")
-    if profile and all(
-        char.isascii() and (char.isalnum() or char in "_-") for char in profile
-    ):
-        load_into(
-            os.environ,
-            os.path.join(config, "profiles", f"{profile}.env"),
-            skip=PROFILE_RESERVED,
-        )
-
-    # The GitHub login this box acts as, for local-webhook's "@self" sender
-    # mute (issue #261). Resolved HERE because this is the one process that
-    # holds the token: the loop above just set it, and the identity is a
-    # property of that token, not of the deployment. A value the env store set
-    # wins (the resolver echoes it straight back); otherwise the resolver
-    # answers from its cache, and only calls GitHub when the token changed.
-    # --throttled because this runs at EVERY session start: one failed lookup
-    # per token per hour is enough. It bounds how OFTEN the resolver calls
-    # GitHub, though, not how long one call may take, so the timeout below is
-    # what actually keeps a session from waiting on the network: a box whose
-    # DNS or egress is broken must still start its sessions. Best effort — no
-    # token, no network, no resolver or a slow one leaves the key unset, which
-    # is what a box that writes nothing to GitHub wants anyway.
-    resolver = shutil.which("agent-box-webhook-self")
-    if resolver:
-        try:
-            result = subprocess.run(
-                [resolver, "--throttled"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=10,
-            )
-            login = result.stdout.strip() if result.returncode == 0 else ""
-        except (OSError, subprocess.TimeoutExpired):
-            login = ""
-        if login:
-            os.environ["LOCAL_WEBHOOK_SELF"] = login
-
-    try:
-        os.execvp(argv[0], argv)
-    except OSError as error:
-        sys.stderr.write(f"agent-box-env-exec: cannot exec {argv[0]}: {error}\n")
-        return 127
+    if args.verb == "keys":
+        for key in keys(path):
+            print(key)
+        return 0
+    if args.verb == "json":
+        print(dumps(path))
+        return 0
+    if args.verb == "get":
+        if len(args.args) != 1:
+            die("get takes exactly one KEY")
+        value = as_dict(load(path)).get(args.args[0])
+        if value is None:
+            return 1
+        sys.stdout.write(value)
+        return 0
+    if args.verb == "set":
+        if not args.args:
+            die("set takes at least one KEY=VALUE")
+        update(path, parse_assignments(args.args, args.stdin), header)
+        return 0
+    # unset
+    if not args.args:
+        die("unset takes at least one KEY")
+    # No store, nothing to remove — and no store created to say so. The check
+    # lives here, where the path is resolved, and not in a caller: a caller
+    # that guessed the path would guess wrong whenever AGENT_BOX_CONFIG_DIR
+    # moves it.
+    if not os.path.exists(path):
+        return 0
+    for key in args.args:
+        if not valid_key(key):
+            die(f"invalid key '{key}'")
+    update(path, [], header, drop=args.args)
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except EnvStoreError as error:
+        die(str(error))

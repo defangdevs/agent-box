@@ -17,6 +17,7 @@ web/payloads/agent-box-claude-hook-settings.json -> vm/payloads/agent-box-claude
 web/payloads/agent-box-claude-session-start-hook -> vm/payloads/agent-box-claude-session-start-hook
 web/payloads/agent-box-codex-remote-control -> vm/payloads/agent-box-codex-remote-control
 web/payloads/agent-box-env-exec -> vm/payloads/agent-box-env-exec
+web/payloads/agent-box-envstore/bin/agent-box-envstore -> vm/payloads/agent-box-envstore/bin/agent-box-envstore
 web/payloads/agent-box-profile/bin/agent-box-profile -> vm/payloads/agent-box-profile/bin/agent-box-profile
 web/payloads/agent-box-session/bin/agent-box-session -> vm/payloads/agent-box-session/bin/agent-box-session
 web/payloads/agent-box-spot-monitor -> vm/payloads/agent-box-spot-monitor

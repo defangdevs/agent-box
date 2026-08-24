@@ -43,9 +43,8 @@ agent-box-webhook ls).}"
 # the same key in ~/.config/agent-box/env — the file `agent-box-session env
 # set`/the settings page already manage — overrides it with no rebuild: any
 # user can set that key to a JSON array of arguments and pick their own
-# hook-session model from chat (issue #290). Same safe KEY=VALUE parse as the
-# env-exec wrapper (#212); only this one key is read, so nothing else in the
-# file reaches this process's environment.
+# hook-session model from chat (issue #290). Read through the env store's one
+# parser, exactly as the env-exec wrapper reads it (#212).
 #
 # Resolved HERE, above the --preamble exit, because BOTH readers need it: a
 # real spawn decodes it into the add call's `--` tail (which the supervisor
@@ -57,6 +56,7 @@ agent-box-webhook ls).}"
 #   extra[]           the resolved args
 #   hook_args_source  where they came from, for the --preamble report
 hook_args_file="$HOME/.config/agent-box/env"
+ENVSTORE="${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
 hook_args_source=""
 if [ -n "${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   hook_args_source="services.agent-box.webhook.hookSessionArgs (NixOS config)"
@@ -76,27 +76,19 @@ fi
 # delivery must never be dropped because a profile was renamed.
 hook_profile="${AGENT_BOX_HOOK_PROFILE:-}"
 hook_profile_source=""
+# Read with the env store's own parser (issue #212), never a fifth copy of the
+# KEY=value loop: the file may hold a multi-line value now, and only the one
+# parser knows where such an entry ends. Only these two keys are read, so
+# nothing else in the file reaches this process.
 if [ -r "$hook_args_file" ]; then
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-    key=${line%%=*}
-    case "$key" in
-      (AGENT_BOX_HOOK_SESSION_ARGS|AGENT_BOX_HOOK_PROFILE) ;;
-      (*) continue ;;
-    esac
-    val=${line#*=}
-    case "$val" in
-      \"*\") val=${val#\"}; val=${val%\"} ;;
-      \'*\') val=${val#\'}; val=${val%\'} ;;
-    esac
-    if [ "$key" = AGENT_BOX_HOOK_PROFILE ]; then
-      hook_profile=$val
-      hook_profile_source="AGENT_BOX_HOOK_PROFILE in $hook_args_file"
-    else
-      AGENT_BOX_HOOK_SESSION_ARGS=$val
-      hook_args_source="AGENT_BOX_HOOK_SESSION_ARGS in $hook_args_file"
-    fi
-  done < "$hook_args_file"
+  if val=$("$ENVSTORE" --file "$hook_args_file" get AGENT_BOX_HOOK_PROFILE); then
+    hook_profile=$val
+    hook_profile_source="AGENT_BOX_HOOK_PROFILE in $hook_args_file"
+  fi
+  if val=$("$ENVSTORE" --file "$hook_args_file" get AGENT_BOX_HOOK_SESSION_ARGS); then
+    AGENT_BOX_HOOK_SESSION_ARGS=$val
+    hook_args_source="AGENT_BOX_HOOK_SESSION_ARGS in $hook_args_file"
+  fi
 fi
 # A value that did not come from the env file was exported into this process
 # (a hand-run script, or a unit environment): say so rather than reporting a
@@ -130,12 +122,23 @@ if [ -n "${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   # A hand-edited value that is not a JSON array of strings must not take the
   # delivery down with it: say so where the operator will look (--preamble,
   # and the journal) and start the session on the agent CLI's own defaults.
-  if hook_args_decoded=$("$JQ" -r '.[]' <<<"$AGENT_BOX_HOOK_SESSION_ARGS" 2>/dev/null); then
-    if [ -n "$hook_args_decoded" ]; then
-      while IFS= read -r arg; do
-        extra+=("$arg")
-      done <<<"$hook_args_decoded"
-    fi
+  # Two steps, because the decode below cannot report a bad value: a shell
+  # variable cannot carry NUL, so the args arrive through a process
+  # substitution whose exit status is not this shell's. Checking the SHAPE
+  # first is also stricter than the `jq -r '.[]'` this replaces, which
+  # stringified a value like [1,2] instead of rejecting it — and it is where
+  # a U+0000 is refused: argv cannot carry a NUL, but JSON can SPELL one
+  # (\u0000), so without this an argument could frame itself as two.
+  #
+  # NUL-delimited for the same reason as the profile args in session-cli.sh
+  # (issue #212): one of these arguments may be a multi-line system prompt,
+  # and one-per-line cannot tell that from several arguments.
+  if "$JQ" -e 'type == "array"
+               and all(.[]; type == "string" and index("\u0000") == null)' \
+       >/dev/null 2>&1 <<<"$AGENT_BOX_HOOK_SESSION_ARGS"; then
+    while IFS= read -r -d '' arg; do
+      extra+=("$arg")
+    done < <("$JQ" -j '.[] + "\u0000"' <<<"$AGENT_BOX_HOOK_SESSION_ARGS")
   else
     hook_args_source="$hook_args_source — IGNORED, not a JSON array of strings"
     echo "agent-box-webhook-spawn: AGENT_BOX_HOOK_SESSION_ARGS is not a JSON" \

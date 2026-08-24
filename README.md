@@ -516,7 +516,15 @@ through the settings page's Secrets card or from a shell:
 
 ```bash
 sudo -u alice agent-box-session env set GH_TOKEN ghp_xxx
+sudo -u alice agent-box-session env set DEPLOY_KEY --stdin < deploy.pem
 ```
+
+A value may span lines (issue #212): the second form reads it from stdin, so
+a PEM or an SSH key goes in whole and never appears in the command line, the
+shell history or anyone's `ps`. The settings page's value field is a textarea
+for the same reason. Multi-line values are stored double-quoted, the form
+systemd's `EnvironmentFile` reads, and one parser
+(`modules/src/lib/envstore.py`) reads the file everywhere it is read.
 
 The supervisor's spawn wrapper re-reads the file at every session (re)start,
 so a new token applies on the next respawn — no unit restart, no rebuild, and

@@ -138,6 +138,13 @@ input, select, textarea { box-sizing: border-box; font: inherit; font-size: 13px
                           color: #e6edf3; }
 input[type=text] { width: 200px; max-width: 100%; }
 input[type=password] { width: 280px; max-width: 100%; }
+/* The secret VALUE field is a textarea (issue #212): a PEM does not fit on
+   one line. Sized like the password input it replaced so the add-secret row
+   still reads as one row, and it grows only if the user drags it. */
+textarea.secret-value { width: 280px; max-width: 100%; flex: 0 1 280px;
+                        height: 3.2em; resize: vertical; white-space: pre;
+                        font-family: ui-monospace, SFMono-Regular, Menlo,
+                                     monospace; }
 textarea { width: 100%; resize: vertical; }
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .new-session-row { align-items: flex-end; }

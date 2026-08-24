@@ -85,6 +85,14 @@ import threading
 import time
 import urllib.parse
 
+# The env store's format lives in ONE place (issue #212): src/lib/envstore.py,
+# which the generated module prepends to this file (see settingsDaemon in
+# modules/agent-box.nix.in, the same seam envExecWrapper and envStoreCli use).
+# This daemon is the file's main writer and does NOT shell out to the CLI: a
+# secret must not travel through the argv of a helper process to get written.
+# The names that library defines — KEY_RE, ENV_HEADER, as_dict/load/keys/update
+# — are therefore already bound here and are used below.
+
 USER = os.environ.get("AGENT_BOX_SETTINGS_USER", "agent")
 ENV_FILE = os.environ["AGENT_BOX_SETTINGS_ENV_FILE"]
 # Agent profiles (issue #321) live beside the env store, one file per profile.
@@ -163,10 +171,9 @@ WEBHOOKS = bool(WEBHOOK_SCRIPT and WEBHOOK_STATE_DIR)
 # a watch DOES instead of restating why it exists (#259).
 HOOK_SPAWN_CMD = os.environ.get("AGENT_BOX_HOOK_SPAWN_CMD", "")
 
-# Env var names: POSIX-ish. Must start with a letter or underscore and
-# contain only letters, digits, underscores. This is what a shell / systemd
-# EnvironmentFile will accept as a variable name.
-KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Env var names (KEY_RE) come from the spliced env-store library above: the
+# charset a shell / systemd EnvironmentFile accepts as a variable name, and
+# the same one the CLIs enforce.
 # Session names: same charset the supervisor and CLI enforce (they
 # land in tmux -t targets and URLs). Every render and publish path filters
 # through this, so a name it rejects is not merely unlisted — that session
@@ -283,84 +290,21 @@ def valid_password(password):
 
 
 def read_keys():
-    """Return the sorted list of KEY names currently in the env file.
+    """The sorted KEY names in the env file — never their values.
 
-    Values are intentionally never returned — the UI must not be able to
-    surface a stored secret.
+    The UI must not be able to surface a stored secret, so the page asks for
+    names only. Reading and writing the file itself is the env-store
+    library's job (issue #212), including the multi-line values a PEM needs.
     """
-    keys = []
-    try:
-        with open(ENV_FILE, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key = line.split("=", 1)[0].strip()
-                if KEY_RE.match(key):
-                    keys.append(key)
-    except FileNotFoundError:
-        pass
-    # De-dup preserving the last occurrence's position is unnecessary; names
-    # are what matter, so sort for a stable UI.
-    return sorted(set(keys))
-
-
-def load_pairs():
-    """Return an ordered dict-ish list of (key, rawvalue) for rewriting.
-
-    Used only internally when mutating the file; values never leave the
-    process.
-    """
-    pairs = []
-    try:
-        with open(ENV_FILE, "r", encoding="utf-8") as fh:
-            for line in fh:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#") or "=" not in stripped:
-                    continue
-                key, val = stripped.split("=", 1)
-                key = key.strip()
-                if KEY_RE.match(key):
-                    pairs.append((key, val))
-    except FileNotFoundError:
-        pass
-    return pairs
-
-
-def write_pairs(pairs):
-    """Atomically write pairs to ENV_FILE at mode 0600.
-
-    Writes to a temp file in the same directory (so os.replace is atomic on
-    the same filesystem) then renames over the target.
-    """
-    directory = os.path.dirname(ENV_FILE) or "."
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".env.")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write("# Managed by agent-box settings page. KEY=value, one per line.\n")
-            fh.write("# Do not add secrets by hand here unless you know what you are doing.\n")
-            for key, val in pairs:
-                fh.write(f"{key}={val}\n")
-        os.replace(tmp, ENV_FILE)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    return keys(ENV_FILE)
 
 
 def set_key(key, value):
-    pairs = [(k, v) for (k, v) in load_pairs() if k != key]
-    pairs.append((key, value))
-    write_pairs(pairs)
+    update(ENV_FILE, [(key, value)], ENV_HEADER)
 
 
 def delete_key(key):
-    pairs = [(k, v) for (k, v) in load_pairs() if k != key]
-    write_pairs(pairs)
+    update(ENV_FILE, [], ENV_HEADER, drop=[key])
 
 
 @contextlib.contextmanager
@@ -492,7 +436,7 @@ def gen_session_name(agent, sessions, cwd=None):
 def write_sessions(sessions):
     """Atomically rewrite SESSIONS_FILE (0600) with the given dict.
 
-    Same tempfile-in-directory + os.replace dance as write_pairs. The
+    Same tempfile-in-directory + os.replace dance as envstore.save. The
     supervisor in the agent unit picks the change up within ~2s.
     """
     directory = os.path.dirname(SESSIONS_FILE) or "."
@@ -1453,7 +1397,7 @@ def connect_status_env(flow):
     terminal would say. No value is ever rendered.
     """
     env = dict(os.environ)
-    stored = dict(load_pairs())
+    stored = as_dict(load(ENV_FILE))
     for key in flow["shadow"]:
         if key in stored:
             env[key] = stored[key]
@@ -2252,11 +2196,15 @@ BODY = """<main>
           <input type="text" name="key" placeholder="KEY_NAME"
                  pattern="[A-Za-z_][A-Za-z0-9_]*" required
                  title="Letters, digits and underscores; must not start with a digit">
-          <input type="password" name="value" placeholder="value" autocomplete="off" required>
+          <textarea name="value" class="secret-value" rows="2" spellcheck="false"
+                    placeholder="value (may span lines &mdash; paste a PEM whole)"
+                    autocomplete="off" required></textarea>
           <button type="submit" class="btn">Save</button>
         </div>
         <p class="note">The value is write-only &mdash; saving replaces any
-        existing value for that key. This page never displays stored values.</p>
+        existing value for that key. This page never displays stored values.
+        A value may span lines, so an x509 key or a PEM can be pasted whole
+        (from a session: <code>agent-box-session env set KEY --stdin</code>).</p>
       </form>
     </div>
     <div id="secrets-list">{keys}</div>
@@ -3467,7 +3415,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._redirect("ok=password_changed")
         elif path == BASE + "/set":
             key = (form.get("key", [""])[0]).strip()
-            value = form.get("value", [""])[0]
+            # A textarea posts its newlines as CRLF (HTML forms, RFC 1866).
+            # Normalize here, so what a session reads back is what was
+            # pasted rather than the same text with stray carriage returns.
+            value = form.get("value", [""])[0].replace("\r\n", "\n").replace("\r", "\n")
             if not KEY_RE.match(key):
                 self._send_html(
                     render_page("Invalid key name. Use letters, digits and "
@@ -3475,7 +3426,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     status=400,
                 )
                 return
-            set_key(key, value)
+            # The store refuses a value that holds a NUL (lib/envstore.py: no
+            # environment variable can carry one, and NUL frames the argument
+            # vectors this file feeds). A form cannot TYPE one, but a POST can
+            # carry one, and a 400 saying so beats a traceback in the journal
+            # and a 500 on the page.
+            try:
+                set_key(key, value)
+            except EnvStoreError as exc:
+                self._send_html(
+                    render_page("Could not save that secret — %s." % exc),
+                    status=400,
+                )
+                return
             self._redirect("ok=saved")
         elif path.startswith(BASE + "/connect/"):
             # Guided sign-in (issues #207, #208, #313). All three verbs

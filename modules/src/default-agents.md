@@ -42,7 +42,12 @@ to the terminal, which a remote user can't act on.
   and `#` comment lines are ignored, so annotate freely). Set them with
   `agent-box-session env set KEY VALUE` (or `env ls` / `env rm KEY`, or the
   settings page); they load on the next session (re)start — e.g. GH_TOKEN is
-  read automatically, so `git clone https://github.com/...` just works.
+  read automatically, so `git clone https://github.com/...` just works. A
+  value may span lines, so a PEM or an SSH key goes in whole:
+  `agent-box-session env set MY_KEY --stdin < key.pem` (--stdin also keeps
+  the value out of the command line, the shell history and `ps`). Such a
+  value is stored double-quoted, which is the one thing to preserve if you
+  ever hand-edit the file.
 - Manage your own sessions without a rebuild:
   `agent-box-session ls|add|rm|stop|restart`. `add` takes an optional name
   plus `--agent claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` —

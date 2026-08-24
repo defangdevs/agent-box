@@ -13,6 +13,7 @@ on:
       - 'modules/src/**'
       - 'bin/assemble-module.py'
       - 'tests/test-assemble-module.py'
+      - 'tests/test-envstore.py'
       # The mascot mark (issue #185) is embedded into the settings daemon at
       # assemble time, so it is a module source as much as a website asset.
       - 'docs/potato.svg'
@@ -81,6 +82,14 @@ jobs:
       # wrong bytes.
       - name: Check assembler escaping
         run: nix build -L .#checks.x86_64-linux.assemble-module-escaping && cat result
+
+      # The env store's format (issue #212): round trip, no key injection, and
+      # the legacy readings a deployed box's file relies on. A unit test, not
+      # a VM test, because the format is read on the session-spawn path and
+      # every caller has to agree about it — the VM tests below prove one
+      # value survives one caller, which is the end-to-end half.
+      - name: Check env store format
+        run: nix build -L .#checks.x86_64-linux.envstore-format && cat result
 
       # Eval/build check (issue 132): the module's generated Caddyfile carries
       # the authenticated /<user>/downloads/ file-server route.

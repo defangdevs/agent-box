@@ -13,6 +13,11 @@ export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linu
 # from PATHs that do not carry it — the webhook receiver unit's PATH is
 # jq + coreutils + this CLI. Same pin convention as the flock above.
 export AGENT_BOX_PROFILE_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-profile/bin/agent-box-profile
+# The env store's one reader/writer (issue #212): `env ls/set/rm` here and
+# the settings page must agree byte-for-byte about a multi-line value, so
+# neither owns a parser. Pinned in the wrapper for the same reason as the
+# flock above — this CLI runs from PATHs that carry almost nothing.
+export AGENT_BOX_ENVSTORE_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-envstore/bin/agent-box-envstore
 set -eu
 # jq/tmux resolve from PATH (system packages + every agent unit's PATH);
 # the installed-agent list and default come from the AGENT_BOX_* env the
@@ -53,7 +58,9 @@ usage() {
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
-  echo "       agent-box-session env ls | set KEY VALUE | rm KEY"
+  echo "       agent-box-session env ls | set KEY VALUE | set KEY --stdin | rm KEY"
+  echo "         (--stdin reads the value from stdin: for a multi-line secret"
+  echo "          such as a PEM, and to keep any secret out of the command line)"
   echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters, and"
   echo "not one of: $RESERVED_NAMES (each is already a path under /<user>/). (a"
   echo "longer name would be invisible in the web UI)."
@@ -308,7 +315,7 @@ case "$cmd" in
     # The binary is pinned by the generated wrapper (AGENT_BOX_PROFILE_BIN):
     # this CLI also runs from the webhook receiver unit's PATH, which carries
     # jq, coreutils and this script and nothing else.
-    profile_args=""
+    pargs=()
     if [ -n "$profile" ]; then
       # --agent on the command line wins over the profile's harness, the same
       # override order the env file has over the NixOS option elsewhere here —
@@ -323,7 +330,17 @@ case "$cmd" in
         '.warnings[] | "agent-box-session: profile \($p): " + .' <<<"$pjson" >&2
       # Profile args go FIRST so an explicit `-- EXTRA_ARGS` tail still has the
       # last word (both harness CLIs take the last occurrence of a flag).
-      profile_args="$("$JQ" -r '.args[]' <<<"$pjson")"
+      #
+      # NUL-delimited, not one-per-line: an argument may CONTAIN newlines now
+      # that a SYSTEM_PROMPT can (issue #212), and a newline-separated list
+      # cannot tell ONE multi-line argument from SEVERAL arguments — a
+      # two-paragraph prompt silently reached the agent CLI as three separate
+      # flags. NUL is the one byte a value cannot hold: the env store refuses
+      # to write one and skips an entry that holds one (src/lib/envstore.py),
+      # so a profile file cannot put the frame byte inside a frame.
+      while IFS= read -r -d '' parg; do
+        pargs+=("$parg")
+      done < <("$JQ" -j '.args[] + "\u0000"' <<<"$pjson")
     fi
     case " $AGENTS " in
       (*" $agent "*) ;;
@@ -353,13 +370,7 @@ case "$cmd" in
     # args, so a dashed extra arg like --model would error out.
     # One argument vector: the profile's args first, the caller's own `--`
     # tail after them, so an explicit flag still has the last word.
-    sargs=()
-    if [ -n "$profile_args" ]; then
-      while IFS= read -r parg; do
-        sargs+=("$parg")
-      done <<<"$profile_args"
-    fi
-    sargs+=("$@")
+    sargs=("${pargs[@]}" "$@")
     jq_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
@@ -460,54 +471,38 @@ case "$cmd" in
     # the env-exec wrapper reads at every session spawn. Applies on the next
     # (re)start — see 'restart'. ls shows KEYS only, never values (matching
     # the settings page, which never surfaces a stored secret).
-    ENV_FILE="$HOME/.config/agent-box/env"
-    env_header() {
-      printf '# Managed by agent-box settings page. KEY=value, one per line.\n'
-      printf '# Do not add secrets by hand here unless you know what you are doing.\n'
-    }
-    env_rewrite() {
-      # env_rewrite DROP_KEY [APPEND_KEY APPEND_VALUE] — atomically rewrite
-      # ENV_FILE dropping DROP_KEY, keeping every other valid KEY=value, then
-      # optionally appending a fresh pair.
-      mkdir -p "$(dirname "$ENV_FILE")"
-      tmp="$(mktemp "$ENV_FILE.XXXXXX")"
-      { env_header
-        if [ -f "$ENV_FILE" ]; then
-          while IFS= read -r line; do
-            case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-            ek="${line%%=*}"
-            valid_key "$ek" || continue
-            [ "$ek" = "$1" ] && continue
-            printf '%s\n' "$line"
-          done < "$ENV_FILE"
-        fi
-        if [ $# -ge 3 ]; then printf '%s=%s\n' "$2" "$3"; fi
-      } > "$tmp"
-      chmod 600 "$tmp"; mv "$tmp" "$ENV_FILE"
-    }
+    #
+    # The format has ONE owner (issue #212) and this verb delegates to it
+    # rather than carrying a second KEY=value parser: a value that spans lines
+    # — a PEM, an SSH key — has to mean the same thing here, on the settings
+    # page and at session spawn, or setting it in one place corrupts it in
+    # another.
+    ENVSTORE="${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
     sub="${1:-}"; shift || true
     case "$sub" in
       ls)
-        [ -f "$ENV_FILE" ] || exit 0
-        while IFS= read -r line; do
-          case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
-          k="${line%%=*}"
-          valid_key "$k" && printf '%s\n' "$k"
-        done < "$ENV_FILE" | sort -u
+        "$ENVSTORE" keys
         ;;
       set)
-        k="${1:-}"; v="${2-}"
+        k="${1:-}"
         valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
-        case "$v" in (*"
-"*) echo "value may not contain a newline" >&2; exit 2 ;; esac
-        env_rewrite "$k" "$k" "$v"
+        if [ "${2-}" = "--stdin" ]; then
+          # The way to set a multi-line secret, and the safer way to set any
+          # secret: the value never reaches a command line, so it is not in
+          # the shell history and not in anyone's `ps` output.
+          "$ENVSTORE" set --stdin "$k"
+        else
+          "$ENVSTORE" set "$k=${2-}"
+        fi
         echo "env '$k' set — applies on the next session (re)start ('agent-box-session restart --all')"
         ;;
       rm)
         k="${1:-}"
         valid_key "$k" || { usage >&2; exit 2; }
-        [ -f "$ENV_FILE" ] || exit 0
-        env_rewrite "$k"
+        # "no store, nothing to remove" is the store's own answer: this CLI
+        # does not know where the file is, which is what keeps it right when
+        # AGENT_BOX_CONFIG_DIR moves it.
+        "$ENVSTORE" unset "$k"
         echo "env '$k' removed — applies on the next session (re)start ('agent-box-session restart --all')"
         ;;
       *) usage >&2; exit 2 ;;
