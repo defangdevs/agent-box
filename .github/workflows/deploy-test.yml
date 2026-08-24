@@ -258,17 +258,30 @@ jobs:
         # reading the serial console. systemd logs the amazon-init unit either by
         # its Description ("Finished ... Reconfigure the system from EC2 userdata
         # on startup") or by its unit id ("Started amazon-init.service") depending
-        # on the boot - match both. Failure shows "Failed to start ..." or the
-        # unit reporting a non-zero exit. THIS is the check that catches the
-        # IPv6-only module-fetch failure the ipv4-full leg structurally cannot
-        # (that leg has a public IPv4 and reaches IPv4-only hosts directly).
+        # on the boot - match both for success.
+        #
+        # "Failed to start ..." is NOT symmetric with that, though (issue #186):
+        # systemd names a unit by its Description while it is still loaded, and
+        # falls back to the bare unit id once switch-to-configuration has masked
+        # it mid-switch. So the *same* line means two different things:
+        #   - Description form ("...Reconfigure the system from EC2 userdata on
+        #     startup") - the unit was still loaded, so it failed BEFORE ever
+        #     reaching the switch. Genuine failure.
+        #   - unit-id form ("...amazon-init.service") - the unit was masked
+        #     because the switch was already underway. Benign: the box is
+        #     healthy. Treating this form as fatal is a false negative that
+        #     recurs periodically on perfectly good boxes - do not "simplify"
+        #     the two spellings back into one alternation.
+        # A masked-mid-switch line that is never followed by ok_re still fails
+        # via the timeout below, so a genuinely wedged box after masking isn't
+        # mistaken for success.
         run: |
           iid='${{ steps.outputs.outputs.instance_id }}'
           if [ -z "$iid" ] || [ "$iid" = "None" ]; then
             echo "::error::No InstanceId output to inspect."; exit 1
           fi
           unit='(Reconfigure the system from EC2 userdata|amazon-init\.service)'
-          fail_re="(Failed to start.*$unit|amazon-init\.service: (Failed|Main process exited))"
+          fail_re="(Failed to start.*Reconfigure the system from EC2 userdata|amazon-init\.service: (Failed|Main process exited))"
           ok_re="(Finished|Started).*$unit"
           # The stock NixOS AMI's fetch-ec2-metadata.service fails OPEN: an
           # IMDS hiccup logs a complaint, writes no user-data file, and exits
