@@ -576,10 +576,8 @@ jobs:
           # deleted stack is no longer describable BY NAME, and anything else
           # is a stack somebody has to delete by hand.
           if ! aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"; then
-            desc_err=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-              --query 'Stacks[0].StackStatus' --output text 2>&1)
-            desc_rc=$?
-            if [ $desc_rc -eq 0 ]; then
+            if desc_err=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query 'Stacks[0].StackStatus' --output text 2>&1); then
               echo "::error::$STACK_NAME did not delete (status $desc_err) - it is STILL BILLING. Delete it by hand: aws cloudformation delete-stack --stack-name $STACK_NAME --region $AWS_REGION"
               exit 1
             elif printf '%s' "$desc_err" | grep -qE 'does not exist'; then
