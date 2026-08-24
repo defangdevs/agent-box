@@ -8611,6 +8611,12 @@ CONNECT_SECTION_TPL = """<section>
 # also needed a ttyd flag (macOptionClickForcesSelection=true, next to
 # the ttyd ExecStart below) since xterm.js ships it off by default; this
 # hint is the other half — telling people the gesture exists at all.
+# The gesture is spelled out TWICE in the span below, in `title` and in
+# `aria-label`, and that is not a copy-paste slip: `title` is the pointer
+# tooltip, while an `aria-label` REPLACES it as the accessible name and
+# `title` is not read as a description once a name exists. A short name of
+# its own ("Terminal mouse tip") would therefore be the whole of what a
+# screen reader ever announced, so both attributes carry the instructions.
 HOME_BODY = """<body class="ws">
 <div id="msg-slot">{message}</div>
 <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}">
@@ -8618,7 +8624,8 @@ HOME_BODY = """<body class="ws">
   <button type="button" class="btn add" data-toggle="session-editor"
           title="New session" aria-label="New session">+</button>
   <span class="spacer"></span>
-  <span class="hint" tabindex="0" aria-label="Terminal mouse tip"
+  <span class="hint" tabindex="0"
+        aria-label="Terminal mouse tip. Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text."
         title="Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text.">&#9432;</span>
   <a class="gear" href="{base}/" title="Settings" aria-label="Settings">&#9881;</a>
 </nav>
