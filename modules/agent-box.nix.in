@@ -170,9 +170,21 @@ let
   # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
   # quit, so the pane records stopped=true and the supervisor leaves the
   # session down. See src/mark-stopped.sh for the exact semantics.
-  markStopped = name: pkgs.writeShellScript "agent-box-${name}-mark-stopped" ''
-@@include-verbatim:src/mark-stopped.sh@@
-  '';
+  markStopped = name: pkgs.writeShellScript "agent-box-${name}-mark-stopped" (''
+    # This runs as the last command in an agent's pane, so it inherits that
+    # agent's PATH — which may be anything at all. Everything it needs is
+    # pinned here instead: coreutils on a PATH of its own, jq and the registry
+    # lock's flock by store path (flock ships in util-linux only, issue #254),
+    # and the registry of the user this copy was generated for rather than
+    # whatever $HOME the pane carries.
+    export PATH=${pkgs.coreutils}/bin
+    REGISTRY_FILE=${lib.escapeShellArg (userSessionsFile name)}
+    REGISTRY_JQ=${pkgs.jq}/bin/jq
+    REGISTRY_FLOCK=${pkgs.util-linux}/bin/flock
+    REGISTRY_PROG=agent-box-mark-stopped
+  '' + ''
+    @@include:src/mark-stopped.sh@@
+  '');
 
   # Codex Remote Control supervisor (issue 103). Unlike claude's
   # `--remote-control` TUI flag, codex uses a dedicated app-server daemon.

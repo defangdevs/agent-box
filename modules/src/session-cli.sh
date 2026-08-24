@@ -3,7 +3,13 @@ set -eu
 # the installed-agent list and default come from the AGENT_BOX_* env the
 # generated wrapper exports (issue #154, Phase 2).
 JQ=jq
-FILE="$HOME/.config/agent-box/sessions.json"
+# The session registry — where it lives, how it is locked and how it is
+# rewritten — is one file every shell writer splices in (issue #254). This CLI
+# is one of five writers, and the lock it takes has to be the same lock the
+# supervisor, the pane epilogue, the webhook spawner and the settings daemon
+# take, or it is not a lock.
+REGISTRY_PROG=agent-box-session
+@@include:lib/registry.sh@@
 AGENTS="${AGENT_BOX_AGENTS:?}"
 DEFAULT_AGENT="${AGENT_BOX_DEFAULT_AGENT:?}"
 # NOT ${TMUX_TMPDIR:-...}: the socket dir is the agent unit's
@@ -94,10 +100,6 @@ valid_key() {
   # env-exec wrapper: letters/digits/underscore, not starting with a digit.
   case "$1" in (*[!A-Za-z0-9_]*|""|[0-9]*) return 1 ;; esac
 }
-ensure_file() {
-  mkdir -p "$(dirname "$FILE")"
-  [ -s "$FILE" ] || printf '{"version":1,"sessions":{}}\n' > "$FILE"
-}
 prune_filter() {
   # Drop the delisted session's webhook filter file. webhook.py names it
   # filter.<LOCAL_WEBHOOK_SESSION>.json and the supervisor sets that to
@@ -135,63 +137,7 @@ prune_session_state() {
   # one's launch id, and with it the dead one's transcript.
   rm -f "$(session_state_file "$1")"
 }
-# Serialize the read-modify-write of the session registry (issue #254). Every
-# writer of this file — this CLI, the supervisor, the mark-stopped epilogue,
-# the settings daemon, the webhook spawn wrapper — replaces it by rename, so a
-# reader always gets a whole document but two writers that read the same base
-# each publish one that never contained the other's edit. Two writers of the
-# jq_edit shape below lost 96 of 300 updates when measured on the live box.
-# Hence a SIDECAR lock file: locking sessions.json itself would lock the inode
-# the next writer is about to replace, which is not the lock it takes.
-#
-# flock ships in util-linux ONLY, which is not on every PATH this CLI runs
-# from (a plain `su -c 'agent-box-session ...'` gets the system PATH, the
-# webhook receiver unit's PATH has jq + coreutils + this CLI and nothing
-# else), so the generated wrapper pins the binary — the AGENT_BOX_*_BIN
-# convention. Unset means no lock and no error: a session must still be
-# addable on a box whose module predates this.
-LOCK_FILE="$FILE.lock"
-FLOCK="${AGENT_BOX_FLOCK_BIN:-}"
-_lock_depth=0
-registry_lock() {
-  # Two cases skip the open. Nesting: flock(2) conflicts between two open file
-  # descriptions of the SAME process, so re-locking inside a held section
-  # would deadlock (a caller wraps check-then-write around jq_edit, which
-  # locks too). Inherited: agent-box-webhook-spawn holds this lock across the
-  # `exec` into `add` so its hook-session cap check and the add are one step —
-  # it hands the fd over and says so through the environment, and re-opening
-  # would first CLOSE that fd and drop the lock it took.
-  _lock_depth=$((_lock_depth + 1))
-  [ "$_lock_depth" = 1 ] || return 0
-  [ "${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
-  [ -n "$FLOCK" ] || return 0
-  { exec 9>>"$LOCK_FILE"; } 2>/dev/null || return 0
-  # -w so a wedged holder degrades to the old lost-update behaviour instead of
-  # hanging a CLI the user is waiting on.
-  "$FLOCK" -w 10 9 \
-    || echo "agent-box-session: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-}
-registry_unlock() {
-  [ "$_lock_depth" -gt 0 ] || return 0
-  _lock_depth=$((_lock_depth - 1))
-  [ "$_lock_depth" = 0 ] || return 0
-  [ "${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
-  exec 9>&- 2>/dev/null || true
-}
-jq_edit() {
-  # jq_edit JQ_ARGS... — atomically rewrite FILE through jq, under the
-  # registry lock so the read and the rename are one step.
-  registry_lock
-  tmp="$(mktemp "$FILE.XXXXXX")"
-  if "$JQ" "$@" < "$FILE" > "$tmp"; then
-    mv "$tmp" "$FILE"
-  else
-    rm -f "$tmp"
-    exit 1
-  fi
-  registry_unlock
-}
-taken() { "$JQ" -e --arg n "$1" '.sessions | has($n)' "$FILE" >/dev/null; }
+taken() { "$JQ" -e --arg n "$1" '.sessions | has($n)' "$REGISTRY_FILE" >/dev/null; }
 # Free to MINT, which is not the same question as `taken`: stop and start ask
 # whether a session exists, and answering "yes" for a reserved name would have
 # them write a stub entry under it. Only auto-naming asks this one — and it
@@ -246,8 +192,8 @@ case "$cmd" in
   ls)
     live="$(t list-sessions -F '#S' 2>/dev/null || true)"
     printf '%-24s %-8s %s\n' NAME AGENT STATE
-    if [ -s "$FILE" ]; then
-      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$FILE" \
+    if [ -s "$REGISTRY_FILE" ]; then
+      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$REGISTRY_FILE" \
       | while IFS="$(printf '\t')" read -r n a state; do
         printf '%s\n' "$live" | grep -qxF "$n" && state=live
         printf '%-24s %-8s %s\n' "$n" "$a" "$state"
@@ -256,7 +202,7 @@ case "$cmd" in
     # Live tmux sessions nobody listed (started by hand): show, don't hide.
     printf '%s\n' "$live" | while IFS= read -r n; do
       [ -n "$n" ] || continue
-      if [ ! -s "$FILE" ] || ! "$JQ" -e --arg n "$n" '.sessions | has($n)' "$FILE" >/dev/null; then
+      if [ ! -s "$REGISTRY_FILE" ] || ! "$JQ" -e --arg n "$n" '.sessions | has($n)' "$REGISTRY_FILE" >/dev/null; then
         printf '%-24s %-8s %s\n' "$n" '-' 'unmanaged'
       fi
     done
@@ -326,7 +272,7 @@ case "$cmd" in
       (*" $agent "*) ;;
       (*) echo "agent '$agent' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
-    ensure_file
+    registry_ensure
     # Name choice and write are one critical section (issue #254): gen_name
     # and taken() both decide from a READ of the file, so two concurrent adds
     # could pick the same free name and the second rename would drop the first
@@ -351,7 +297,7 @@ case "$cmd" in
     # One argument vector: the profile's args first, the caller's own `--`
     # tail after them, so an explicit flag still has the last word.
     sargs=("${pargs[@]}" "$@")
-    jq_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
+    registry_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
       --arg prof "$profile" \
@@ -384,8 +330,8 @@ case "$cmd" in
   rm)
     name="${1:-}"
     valid_name "$name" || { usage >&2; exit 2; }
-    ensure_file
-    jq_edit --arg n "$name" 'del(.sessions[$n])'
+    registry_ensure
+    registry_edit --arg n "$name" 'del(.sessions[$n])'
     kill_session "$name" || exit 1
     prune_filter "$name"
     prune_session_state "$name"
@@ -398,7 +344,7 @@ case "$cmd" in
     # id) stays listed for a later 'restart' to revive.
     name="${1:-}"
     valid_name "$name" || { usage >&2; exit 2; }
-    ensure_file
+    registry_ensure
     # Existence check and flag write together (issue #254): jq's assignment
     # CREATES a missing key, so a session deleted between the two came back as
     # a stub {stopped: true} — listed forever, startable by nobody, and the
@@ -408,7 +354,7 @@ case "$cmd" in
       echo "no such session: '$name' (see agent-box-session ls)" >&2
       exit 2
     fi
-    jq_edit --arg n "$name" '.sessions[$n].stopped = true'
+    registry_edit --arg n "$name" '.sessions[$n].stopped = true'
     registry_unlock
     kill_session "$name" || exit 1
     echo "session '$name' stopped — still listed, not respawned; 'agent-box-session restart $name' revives it"
@@ -417,21 +363,21 @@ case "$cmd" in
     # Clearing the stopped flag makes restart double as the revive verb
     # for parked sessions; kill-session tolerates one with nothing live.
     if [ "${1:-}" = "--all" ]; then
-      ensure_file
-      jq_edit 'del(.sessions[].stopped)'
-      "$JQ" -r '.sessions | keys[]' "$FILE" | while IFS= read -r n; do
+      registry_ensure
+      registry_edit 'del(.sessions[].stopped)'
+      "$JQ" -r '.sessions | keys[]' "$REGISTRY_FILE" | while IFS= read -r n; do
         [ -n "$n" ] && kill_session "$n" || true
       done
       echo "all sessions killed — the supervisor restarts each within ~2s (re-reading env)"
     else
       name="${1:-}"
       valid_name "$name" || { usage >&2; exit 2; }
-      ensure_file
+      registry_ensure
       # Listed-or-not decides which branch runs, so read it under the lock
       # (issue #254) — the flag write must apply to the file the check saw.
       registry_lock
       if taken "$name"; then
-        jq_edit --arg n "$name" 'del(.sessions[$n].stopped)'
+        registry_edit --arg n "$name" 'del(.sessions[$n].stopped)'
         registry_unlock
         # A stopped session has no live tmux session to kill; kill_session
         # treats that "can't find session" as success.

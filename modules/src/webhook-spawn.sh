@@ -3,7 +3,12 @@ set -eu
 # PATH (issue #154, Phase 2) — this script only ever runs as that unit's
 # LOCAL_WEBHOOK_SPAWN_CMD child.
 JQ=jq
-FILE="$HOME/.config/agent-box/sessions.json"
+# The session registry — where it lives, how it is locked and how it is
+# rewritten — is one file every shell writer splices in (issue #254). This one
+# only LOCKS: the write is done by the `agent-box-session add` it execs into,
+# which inherits the lock (see below).
+REGISTRY_PROG=agent-box-webhook-spawn
+@@include:lib/registry.sh@@
 
 # The assignment sentence (#253) and the preamble below are written once and
 # read twice: the receiver builds a prompt with them, and the settings page
@@ -223,19 +228,13 @@ PROMPT="$(cat)"
 # does not re-open fd 9 — which would first CLOSE this description and drop
 # the lock mid-decision.
 #
-# flock lives in util-linux only, which is NOT on the webhook receiver unit's
-# PATH (jq + coreutils + the session CLI), so the generated wrapper pins the
-# binary. Unset = no lock, and the spawn goes ahead regardless: a webhook
-# delivery must never be dropped for want of a lock.
-FLOCK="${AGENT_BOX_FLOCK_BIN:-}"
-if [ -n "$FLOCK" ] && { exec 9>>"$FILE.lock"; } 2>/dev/null; then
-  if "$FLOCK" -w 10 9; then
-    export AGENT_BOX_REGISTRY_LOCK_FD=9
-  else
-    echo "agent-box-webhook-spawn: sessions.json lock timed out;" \
-         "spawning unlocked (issue #254)" >&2
-    exec 9>&- 2>/dev/null || true
-  fi
+# A lock this program could not take is not announced: the fd is exported only
+# when it really holds one, so the CLI opens its own rather than trusting an
+# empty promise. Either way the spawn goes ahead — a webhook delivery must
+# never be dropped for want of a lock.
+registry_lock
+if [ "$REGISTRY_HELD" = 1 ]; then
+  export AGENT_BOX_REGISTRY_LOCK_FD=9
 fi
 
 # The ceiling on CONCURRENT hook-* sessions, and the record it leaves.
@@ -326,7 +325,7 @@ live_hook_sessions() {
   "$TMUX_BIN" -L agent-box list-sessions -F '#S' 2>/dev/null || true
 }
 
-if [ -s "$FILE" ]; then
+if [ -s "$REGISTRY_FILE" ]; then
   # Registry keys: every hook-* entry, finished or not. This was the whole cap
   # and is now only its fallback — nothing ever expires an entry (`stopped` is
   # set by the pane epilogue, and only `agent-box-session rm` clears the key),
@@ -334,7 +333,7 @@ if [ -s "$FILE" ]; then
   # of them made every standing watch inert with nothing running (issue #280).
   # The probe costs two tmux round trips, so it only runs once the keys claim
   # we are full.
-  keys=$("$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' "$FILE")
+  keys=$("$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' "$REGISTRY_FILE")
   used="$keys"
   if [ "$keys" -ge "$MAX" ]; then
     if panes=$(live_hook_sessions); then
@@ -348,7 +347,7 @@ if [ -s "$FILE" ]; then
       # probe reaches a live tmux but the wrong (or an empty) socket dir; the
       # pane half counts agents no entry claims — hand-started ones, and any
       # delisted while still running.
-      used=$(printf '%s\n' "$panes" | "$JQ" -R -s --slurpfile reg "$FILE" '
+      used=$(printf '%s\n' "$panes" | "$JQ" -R -s --slurpfile reg "$REGISTRY_FILE" '
         (split("\n") | map(select(startswith("hook-")))) as $panes
         | ($reg[0].sessions // {} | to_entries
            | map(select((.key | startswith("hook-")) and .value.stopped != true))

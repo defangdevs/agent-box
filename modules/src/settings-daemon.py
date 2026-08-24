@@ -311,26 +311,28 @@ def delete_key(key):
 def sessions_lock():
     """Serialize one read_sessions -> write_sessions pair (issue #254).
 
-    os.replace makes a READER see a whole document and nothing more: two
-    writers that start from the same base each publish a document that never
-    contained the other's edit, so a one-field update reverts every field the
-    other writer changed. That is not a theoretical race here — this daemon is
-    a ThreadingHTTPServer, so it races ITSELF as well as the supervisor, the
-    session CLI and the mark-stopped epilogue, and the loss it caused was
-    worse than a lost row: reverting hasRun / boxSessionId / the cleared
-    initialPrompt left a RUNNING session the supervisor treated as a first
-    spawn next time it died, re-firing the kickoff prompt against a new id
-    and orphaning the transcript. That particular cost is being taken off
-    the table separately (issue #282): the supervisor keeps its own
-    observations in ~/.local/state/agent-box/session/ and reads the registry
-    copy only as a migration fallback, so what a lost update here can revert
-    is intent — which the operator can see and re-state — and not the record
-    of a conversation. The lock stays either way: intent is worth as much.
+    The protocol itself — the sidecar path, the primitive, the bound, and why
+    a rename is not enough — is written down once, in
+    modules/src/lib/registry.sh, which the four SHELL writers splice in. This
+    is the fifth writer and the only one that is python, so it takes the same
+    flock(2) on the same sidecar file through fcntl instead. What has to agree
+    across the two languages is exactly that file's contract, and
+    tests/test-registry.py checks it from both sides.
 
-    The lock is a SIDECAR file, never SESSIONS_FILE: every writer replaces
-    that inode by rename, so the inode a writer locked is not the one the next
-    writer takes. Same flock(2) primitive the shell writers use through
-    util-linux's flock(1), so all five writers serialize against each other.
+    Two things are true here and nowhere else. This daemon is a
+    ThreadingHTTPServer, so it races ITSELF as well as the four shell writers
+    (each fcntl.flock call opens its own description, so its own threads
+    serialize too). And the loss it caused was worse than a lost row:
+    reverting hasRun / boxSessionId / the cleared initialPrompt left a RUNNING
+    session the supervisor treated as a first spawn next time it died,
+    re-firing the kickoff prompt against a new id and orphaning the
+    transcript. That particular cost is being taken off the table separately
+    (issue #282): the supervisor keeps its own observations in
+    ~/.local/state/agent-box/session/ and reads the registry copy only as a
+    migration fallback, so what a lost update here can revert is intent —
+    which the operator can see and re-state — and not the record of a
+    conversation. The lock stays either way: intent is worth as much.
+
     fcntl precedent in this repo: password-helper.py's AUTH_ENV_LOCK.
 
     Best effort by design: if the lock cannot be created or taken, the body

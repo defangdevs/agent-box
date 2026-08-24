@@ -91,6 +91,12 @@ jobs:
       - name: Check env store format
         run: nix build -L .#checks.x86_64-linux.envstore-format && cat result
 
+      # Issues 254/285/289: the session registry's write protocol — the lock
+      # five writers share, in two languages. The VM tests avoid concurrency
+      # on purpose, so this is what fails when the lock stops locking.
+      - name: Check session registry protocol
+        run: nix build -L .#checks.x86_64-linux.registry-protocol && cat result
+
       # Eval/build check (issue 132): the module's generated Caddyfile carries
       # the authenticated /<user>/downloads/ file-server route.
       - name: Check downloads route in generated Caddyfile

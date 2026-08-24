@@ -972,7 +972,19 @@ if __name__ == "__main__":
   # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
   # quit, so the pane records stopped=true and the supervisor leaves the
   # session down. See src/mark-stopped.sh for the exact semantics.
-  markStopped = name: pkgs.writeShellScript "agent-box-${name}-mark-stopped" ''
+  markStopped = name: pkgs.writeShellScript "agent-box-${name}-mark-stopped" (''
+    # This runs as the last command in an agent's pane, so it inherits that
+    # agent's PATH — which may be anything at all. Everything it needs is
+    # pinned here instead: coreutils on a PATH of its own, jq and the registry
+    # lock's flock by store path (flock ships in util-linux only, issue #254),
+    # and the registry of the user this copy was generated for rather than
+    # whatever $HOME the pane carries.
+    export PATH=${pkgs.coreutils}/bin
+    REGISTRY_FILE=${lib.escapeShellArg (userSessionsFile name)}
+    REGISTRY_JQ=${pkgs.jq}/bin/jq
+    REGISTRY_FLOCK=${pkgs.util-linux}/bin/flock
+    REGISTRY_PROG=agent-box-mark-stopped
+  '' + ''
     # Pane epilogue for a CLEAN agent exit (status 0 — /quit, Ctrl+D: an
     # exit somebody asked for). Records stopped=true on this session's
     # sessions.json entry so the supervisor's reconcile loop leaves the
@@ -980,14 +992,185 @@ if __name__ == "__main__":
     # Crashes never reach this (non-zero exit takes the post-mortem bash
     # branch), and kill-session / reboot / Spot stop end the pane without
     # running any epilogue — those still respawn. $1 = session name.
-    FILE=${lib.escapeShellArg (userSessionsFile name)}
-    JQ=${pkgs.jq}/bin/jq
-    CU=${pkgs.coreutils}/bin
-    # This script is generated with absolute store paths and runs with no PATH
-    # of its own, so the registry lock's flock is a store path too (issue
-    # #254; flock ships in util-linux only).
-    FLOCK=${pkgs.util-linux}/bin/flock
-    [ -n "''${1:-}" ] && [ -s "$FILE" ] || exit 0
+    #
+    # The session registry — where it lives, how it is locked and how it is
+    # rewritten — is one file every shell writer splices in (issue #254). This is
+    # the writer with no environment worth trusting: it runs as the last command in
+    # an agent's pane and inherits that agent's PATH, so the generated wrapper
+    # hands it a PATH, the two binaries the protocol needs, and the registry of the
+    # user it was generated for.
+    # The session registry's write protocol, spelled once (issue #254).
+    #
+    # ~/.config/agent-box/sessions.json is INTENT: what the operator asked this box
+    # to run — name, agent, working directory, prompts, stopped. FIVE programs
+    # write it (the session CLI, the supervisor's reconcile loop, the mark-stopped
+    # pane epilogue, the webhook spawn wrapper, the settings daemon's three
+    # routes), and every one of them replaces the file by rename. That buys exactly
+    # ONE guarantee: a reader never sees half a document. It says nothing about the
+    # interval between a writer's read and its rename, so two writers that start
+    # from the same base each publish a document that never contained the other's
+    # edit, and a one-field update silently reverts every field the other writer
+    # changed. Measured on the live box: two writers of the registry_edit shape
+    # below lost 96 of 300 updates (32%).
+    #
+    # So the four SHELL writers splice this file in (the assembler resolves nested
+    # includes) rather than carrying a copy each. What they have to agree on is
+    # small — the sidecar path, the primitive, the bound, who may skip the lock —
+    # and a copy per program is how those four facts drift apart. A lock only some
+    # writers take is not a lock.
+    #
+    # The fifth writer is python: the settings daemon takes the same flock(2) on
+    # the same sidecar through fcntl, and its sessions_lock() cites this file for
+    # the protocol rather than restating it. tests/test-registry.py holds the two
+    # implementations to it from both sides, because that agreement is the whole
+    # guarantee and nothing else checks it.
+    #
+    # The lock is a SIDECAR file, never the registry itself: every writer REPLACES
+    # that inode, so a lock taken on the inode a writer read is not the lock the
+    # next writer takes.
+    #
+    # READERS take no lock and need none — agent-box-webhook, the spot notifier and
+    # the reads in this file's own callers all get a whole document from the
+    # rename. The lock exists for the interval a read-modify-write spans.
+    #
+    # What a caller may set before the include, all optional:
+    #   REGISTRY_FILE       the registry path, when the caller already knows it
+    #   REGISTRY_PROG       the name the one warning below prints
+    #   REGISTRY_JQ         jq, when it is not on this program's PATH
+    #   REGISTRY_FLOCK      flock, likewise; EMPTY means "no lock, carry on"
+    #   REGISTRY_LOCK_WAIT  seconds to wait for a holder (the test shortens it)
+    #
+    # AGENT_BOX_SESSIONS_FILE is what the settings daemon is told; the mark-stopped
+    # epilogue is generated per user and bakes the path rather than trusting an
+    # inherited $HOME, and every other writer runs as the user whose registry it
+    # is.
+    : "''${REGISTRY_FILE:=''${AGENT_BOX_SESSIONS_FILE:-$HOME/.config/agent-box/sessions.json}}"
+    : "''${REGISTRY_PROG:=agent-box}"
+    : "''${REGISTRY_JQ:=jq}"
+    # flock ships in util-linux ONLY, which is not on every PATH a writer here runs
+    # from: a plain `su -c 'agent-box-session ...'` gets the system PATH, the
+    # webhook receiver unit's PATH is jq + coreutils + the session CLI, and the
+    # pane epilogue has none worth the name. So each generated wrapper pins the
+    # binary — the AGENT_BOX_*_BIN convention. Unset means no lock and no error: a
+    # session must still be addable, startable and stoppable on a box whose module
+    # predates this.
+    # Assigned only when UNSET, never when empty: "" is a caller saying it has no
+    # flock, and must not be answered with one from the environment.
+    : "''${REGISTRY_FLOCK=''${AGENT_BOX_FLOCK_BIN:-}}"
+    : "''${REGISTRY_LOCK_WAIT:=10}"
+    # 1 while the lock is genuinely held — taken here, inherited, or nested inside
+    # a section that holds it. Only the webhook spawn wrapper reads it, because it
+    # may advertise an inherited fd only if it really got the lock.
+    REGISTRY_HELD=0
+    _registry_depth=0
+
+    registry_lock() {
+      # Nesting-safe on purpose: flock(2) conflicts between two open file
+      # DESCRIPTIONS, including two of the same process, so a second fd on the
+      # sidecar blocks a writer against ITSELF (verified). Both the supervisor
+      # (start_session holds the lock across the mark_started it calls) and the
+      # session CLI (a check-then-write around registry_edit) do exactly that.
+      _registry_depth=$((_registry_depth + 1))
+      [ "$_registry_depth" = 1 ] || return 0
+      # An INHERITED lock: agent-box-webhook-spawn holds this lock across its exec
+      # into `agent-box-session add`, so its hook-session cap check and the add are
+      # one step. It hands the fd over and says so through the environment;
+      # re-opening fd 9 here would first CLOSE that description and drop the lock
+      # it took.
+      if [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" = 9 ]; then
+        REGISTRY_HELD=1
+        return 0
+      fi
+      [ -n "$REGISTRY_FLOCK" ] || return 0
+      # A missing directory is a first boot, which is the one moment when even
+      # CREATION races (issue #289) — so make it and take the lock, rather than
+      # writing the file that decides which sessions exist with no lock at all.
+      { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null \
+        || { mkdir -p "''${REGISTRY_FILE%/*}" 2>/dev/null
+             { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
+        || return 0
+      # Bounded, never an unbounded wait: nothing may park the supervisor's
+      # reconcile loop (every session on the box waits behind it) or a CLI a user
+      # is waiting on. A holder that times us out degrades THIS write to the
+      # pre-#254 lost-update behaviour, which is a bad write rather than a hung
+      # box, and says so on stderr.
+      if "$REGISTRY_FLOCK" -w "$REGISTRY_LOCK_WAIT" 9; then
+        REGISTRY_HELD=1
+      else
+        echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
+        exec 9>&- 2>/dev/null || true
+      fi
+      return 0
+    }
+
+    registry_unlock() {
+      [ "$_registry_depth" -gt 0 ] || return 0
+      _registry_depth=$((_registry_depth - 1))
+      [ "$_registry_depth" = 0 ] || return 0
+      # An inherited fd belongs to the process that opened it: closing it here
+      # would drop a lock this program never took.
+      [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
+      REGISTRY_HELD=0
+      exec 9>&- 2>/dev/null || true
+    }
+
+    registry_edit() {
+      # registry_edit JQ_ARGS... — rewrite the registry through jq as ONE
+      # read-modify-write under the lock. The document arrives on jq's stdin, not
+      # as an argument, so a filter may end in `--args -- "$@"` without the path
+      # being read as one of those arguments.
+      #
+      # Returns 1 with the registry untouched when jq fails. jq's own stderr is
+      # left alone: a caller that must stay quiet — the pane epilogue prints into
+      # the user's terminal — redirects it at the call site, which keeps that
+      # policy where the reason for it is.
+      #
+      # The lock nests, so a caller already holding it across a check-then-write
+      # keeps holding it here and does not deadlock against itself.
+      registry_lock
+      _registry_tmp="$(mktemp "$REGISTRY_FILE.XXXXXX")" || { registry_unlock; return 1; }
+      if "$REGISTRY_JQ" "$@" < "$REGISTRY_FILE" > "$_registry_tmp"; then
+        mv "$_registry_tmp" "$REGISTRY_FILE"
+        registry_unlock
+        return 0
+      fi
+      rm -f "$_registry_tmp"
+      registry_unlock
+      return 1
+    }
+
+    registry_ensure() {
+      # registry_ensure [SEED] — make sure the registry EXISTS, inside the same
+      # critical section as everything that writes it (issue #289).
+      #
+      # Creation was the one step outside the protocol, and two paths create the
+      # file: `agent-box-session add` (an empty registry) and the supervisor's
+      # first-boot seed (the Nix-declared one). Both asked "is it empty?" with no
+      # lock held, and the units that run them start in parallel, so on a first
+      # boot a `hook-*` session added by the webhook spawner could be replaced
+      # wholesale by the seed landing on top of it — and the batch that spawned
+      # that session is never redelivered.
+      #
+      # An existing file is never touched, seed or no seed: sessions are RUNTIME
+      # data (issue #59), so a rebuild must not clobber what the operator changed
+      # while the box was live.
+      mkdir -p "''${REGISTRY_FILE%/*}"
+      registry_lock
+      if [ ! -s "$REGISTRY_FILE" ]; then
+        if [ -n "''${1:-}" ]; then
+          install -m 0600 "$1" "$REGISTRY_FILE"
+        else
+          # 0600 like every other writer's output (the daemon's write_sessions, the
+          # seed above, and mktemp's own mode in registry_edit): the registry
+          # carries kickoff prompts and working directories, and only this user and
+          # root have any business reading them.
+          printf '{"version":1,"sessions":{}}\n' > "$REGISTRY_FILE"
+          chmod 600 "$REGISTRY_FILE"
+        fi
+      fi
+      registry_unlock
+    }
+    [ -n "''${1:-}" ] && [ -s "$REGISTRY_FILE" ] || exit 0
     # Verified write, retried: on an agent that exits within its first
     # seconds, the supervisor's mark_started rewrite can race this one
     # (both are tmp+mv, last writer wins). The sidecar lock below makes each
@@ -996,27 +1179,26 @@ if __name__ == "__main__":
     # us out. Re-read until the flag stuck.
     # A session delisted meanwhile is left alone rather than re-created.
     for _ in 1 2 3; do
-      # Taken per pass, never across the sleep: the supervisor's reconcile
-      # loop takes the same lock, and parking it for a second would delay
-      # every session on the box. Nothing this script starts outlives it, so
-      # no child can carry the fd (and the lock) away.
-      { exec 9>>"$FILE.lock"; } 2>/dev/null && "$FLOCK" -w 10 9
-      tmp="$("$CU"/mktemp "$FILE.XXXXXX")" || exit 0
-      if "$JQ" --arg s "$1" \
-           'if .sessions | has($s) then .sessions[$s].stopped = true else . end' \
-           "$FILE" > "$tmp" 2>/dev/null; then
-        "$CU"/mv "$tmp" "$FILE"
-      else
-        "$CU"/rm -f "$tmp"
-      fi
-      "$JQ" -e --arg s "$1" \
+      # Held across the edit and the re-read, so the pass verifies the document it
+      # published, but never across the sleep: the supervisor's reconcile loop
+      # takes the same lock, and parking it for a second would delay every session
+      # on the box. registry_edit nests inside this, and nothing this script starts
+      # outlives it, so no child can carry the fd (and the lock) away.
+      registry_lock
+      # jq's stderr is dropped: this prints into the pane the user just quit, and
+      # an unparseable registry is the supervisor's news to report, not this
+      # script's.
+      registry_edit --arg s "$1" \
+        'if .sessions | has($s) then .sessions[$s].stopped = true else . end' \
+        2>/dev/null
+      "$REGISTRY_JQ" -e --arg s "$1" \
         '(.sessions | has($s) | not) or (.sessions[$s].stopped == true)' \
-        "$FILE" >/dev/null 2>&1 && exit 0
-      exec 9>&- 2>/dev/null || true
-      "$CU"/sleep 1
+        "$REGISTRY_FILE" >/dev/null 2>&1 && exit 0
+      registry_unlock
+      sleep 1
     done
     exit 0
-  '';
+  '');
 
   # Codex Remote Control supervisor (issue 103). Unlike claude's
   # `--remote-control` TUI flag, codex uses a dedicated app-server daemon.
@@ -1479,7 +1661,183 @@ set -eu
 # the installed-agent list and default come from the AGENT_BOX_* env the
 # generated wrapper exports (issue #154, Phase 2).
 JQ=jq
-FILE="$HOME/.config/agent-box/sessions.json"
+# The session registry — where it lives, how it is locked and how it is
+# rewritten — is one file every shell writer splices in (issue #254). This CLI
+# is one of five writers, and the lock it takes has to be the same lock the
+# supervisor, the pane epilogue, the webhook spawner and the settings daemon
+# take, or it is not a lock.
+REGISTRY_PROG=agent-box-session
+# The session registry's write protocol, spelled once (issue #254).
+#
+# ~/.config/agent-box/sessions.json is INTENT: what the operator asked this box
+# to run — name, agent, working directory, prompts, stopped. FIVE programs
+# write it (the session CLI, the supervisor's reconcile loop, the mark-stopped
+# pane epilogue, the webhook spawn wrapper, the settings daemon's three
+# routes), and every one of them replaces the file by rename. That buys exactly
+# ONE guarantee: a reader never sees half a document. It says nothing about the
+# interval between a writer's read and its rename, so two writers that start
+# from the same base each publish a document that never contained the other's
+# edit, and a one-field update silently reverts every field the other writer
+# changed. Measured on the live box: two writers of the registry_edit shape
+# below lost 96 of 300 updates (32%).
+#
+# So the four SHELL writers splice this file in (the assembler resolves nested
+# includes) rather than carrying a copy each. What they have to agree on is
+# small — the sidecar path, the primitive, the bound, who may skip the lock —
+# and a copy per program is how those four facts drift apart. A lock only some
+# writers take is not a lock.
+#
+# The fifth writer is python: the settings daemon takes the same flock(2) on
+# the same sidecar through fcntl, and its sessions_lock() cites this file for
+# the protocol rather than restating it. tests/test-registry.py holds the two
+# implementations to it from both sides, because that agreement is the whole
+# guarantee and nothing else checks it.
+#
+# The lock is a SIDECAR file, never the registry itself: every writer REPLACES
+# that inode, so a lock taken on the inode a writer read is not the lock the
+# next writer takes.
+#
+# READERS take no lock and need none — agent-box-webhook, the spot notifier and
+# the reads in this file's own callers all get a whole document from the
+# rename. The lock exists for the interval a read-modify-write spans.
+#
+# What a caller may set before the include, all optional:
+#   REGISTRY_FILE       the registry path, when the caller already knows it
+#   REGISTRY_PROG       the name the one warning below prints
+#   REGISTRY_JQ         jq, when it is not on this program's PATH
+#   REGISTRY_FLOCK      flock, likewise; EMPTY means "no lock, carry on"
+#   REGISTRY_LOCK_WAIT  seconds to wait for a holder (the test shortens it)
+#
+# AGENT_BOX_SESSIONS_FILE is what the settings daemon is told; the mark-stopped
+# epilogue is generated per user and bakes the path rather than trusting an
+# inherited $HOME, and every other writer runs as the user whose registry it
+# is.
+: "''${REGISTRY_FILE:=''${AGENT_BOX_SESSIONS_FILE:-$HOME/.config/agent-box/sessions.json}}"
+: "''${REGISTRY_PROG:=agent-box}"
+: "''${REGISTRY_JQ:=jq}"
+# flock ships in util-linux ONLY, which is not on every PATH a writer here runs
+# from: a plain `su -c 'agent-box-session ...'` gets the system PATH, the
+# webhook receiver unit's PATH is jq + coreutils + the session CLI, and the
+# pane epilogue has none worth the name. So each generated wrapper pins the
+# binary — the AGENT_BOX_*_BIN convention. Unset means no lock and no error: a
+# session must still be addable, startable and stoppable on a box whose module
+# predates this.
+# Assigned only when UNSET, never when empty: "" is a caller saying it has no
+# flock, and must not be answered with one from the environment.
+: "''${REGISTRY_FLOCK=''${AGENT_BOX_FLOCK_BIN:-}}"
+: "''${REGISTRY_LOCK_WAIT:=10}"
+# 1 while the lock is genuinely held — taken here, inherited, or nested inside
+# a section that holds it. Only the webhook spawn wrapper reads it, because it
+# may advertise an inherited fd only if it really got the lock.
+REGISTRY_HELD=0
+_registry_depth=0
+
+registry_lock() {
+  # Nesting-safe on purpose: flock(2) conflicts between two open file
+  # DESCRIPTIONS, including two of the same process, so a second fd on the
+  # sidecar blocks a writer against ITSELF (verified). Both the supervisor
+  # (start_session holds the lock across the mark_started it calls) and the
+  # session CLI (a check-then-write around registry_edit) do exactly that.
+  _registry_depth=$((_registry_depth + 1))
+  [ "$_registry_depth" = 1 ] || return 0
+  # An INHERITED lock: agent-box-webhook-spawn holds this lock across its exec
+  # into `agent-box-session add`, so its hook-session cap check and the add are
+  # one step. It hands the fd over and says so through the environment;
+  # re-opening fd 9 here would first CLOSE that description and drop the lock
+  # it took.
+  if [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" = 9 ]; then
+    REGISTRY_HELD=1
+    return 0
+  fi
+  [ -n "$REGISTRY_FLOCK" ] || return 0
+  # A missing directory is a first boot, which is the one moment when even
+  # CREATION races (issue #289) — so make it and take the lock, rather than
+  # writing the file that decides which sessions exist with no lock at all.
+  { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null \
+    || { mkdir -p "''${REGISTRY_FILE%/*}" 2>/dev/null
+         { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
+    || return 0
+  # Bounded, never an unbounded wait: nothing may park the supervisor's
+  # reconcile loop (every session on the box waits behind it) or a CLI a user
+  # is waiting on. A holder that times us out degrades THIS write to the
+  # pre-#254 lost-update behaviour, which is a bad write rather than a hung
+  # box, and says so on stderr.
+  if "$REGISTRY_FLOCK" -w "$REGISTRY_LOCK_WAIT" 9; then
+    REGISTRY_HELD=1
+  else
+    echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
+    exec 9>&- 2>/dev/null || true
+  fi
+  return 0
+}
+
+registry_unlock() {
+  [ "$_registry_depth" -gt 0 ] || return 0
+  _registry_depth=$((_registry_depth - 1))
+  [ "$_registry_depth" = 0 ] || return 0
+  # An inherited fd belongs to the process that opened it: closing it here
+  # would drop a lock this program never took.
+  [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
+  REGISTRY_HELD=0
+  exec 9>&- 2>/dev/null || true
+}
+
+registry_edit() {
+  # registry_edit JQ_ARGS... — rewrite the registry through jq as ONE
+  # read-modify-write under the lock. The document arrives on jq's stdin, not
+  # as an argument, so a filter may end in `--args -- "$@"` without the path
+  # being read as one of those arguments.
+  #
+  # Returns 1 with the registry untouched when jq fails. jq's own stderr is
+  # left alone: a caller that must stay quiet — the pane epilogue prints into
+  # the user's terminal — redirects it at the call site, which keeps that
+  # policy where the reason for it is.
+  #
+  # The lock nests, so a caller already holding it across a check-then-write
+  # keeps holding it here and does not deadlock against itself.
+  registry_lock
+  _registry_tmp="$(mktemp "$REGISTRY_FILE.XXXXXX")" || { registry_unlock; return 1; }
+  if "$REGISTRY_JQ" "$@" < "$REGISTRY_FILE" > "$_registry_tmp"; then
+    mv "$_registry_tmp" "$REGISTRY_FILE"
+    registry_unlock
+    return 0
+  fi
+  rm -f "$_registry_tmp"
+  registry_unlock
+  return 1
+}
+
+registry_ensure() {
+  # registry_ensure [SEED] — make sure the registry EXISTS, inside the same
+  # critical section as everything that writes it (issue #289).
+  #
+  # Creation was the one step outside the protocol, and two paths create the
+  # file: `agent-box-session add` (an empty registry) and the supervisor's
+  # first-boot seed (the Nix-declared one). Both asked "is it empty?" with no
+  # lock held, and the units that run them start in parallel, so on a first
+  # boot a `hook-*` session added by the webhook spawner could be replaced
+  # wholesale by the seed landing on top of it — and the batch that spawned
+  # that session is never redelivered.
+  #
+  # An existing file is never touched, seed or no seed: sessions are RUNTIME
+  # data (issue #59), so a rebuild must not clobber what the operator changed
+  # while the box was live.
+  mkdir -p "''${REGISTRY_FILE%/*}"
+  registry_lock
+  if [ ! -s "$REGISTRY_FILE" ]; then
+    if [ -n "''${1:-}" ]; then
+      install -m 0600 "$1" "$REGISTRY_FILE"
+    else
+      # 0600 like every other writer's output (the daemon's write_sessions, the
+      # seed above, and mktemp's own mode in registry_edit): the registry
+      # carries kickoff prompts and working directories, and only this user and
+      # root have any business reading them.
+      printf '{"version":1,"sessions":{}}\n' > "$REGISTRY_FILE"
+      chmod 600 "$REGISTRY_FILE"
+    fi
+  fi
+  registry_unlock
+}
 AGENTS="''${AGENT_BOX_AGENTS:?}"
 DEFAULT_AGENT="''${AGENT_BOX_DEFAULT_AGENT:?}"
 # NOT ''${TMUX_TMPDIR:-...}: the socket dir is the agent unit's
@@ -1570,10 +1928,6 @@ valid_key() {
   # env-exec wrapper: letters/digits/underscore, not starting with a digit.
   case "$1" in (*[!A-Za-z0-9_]*|""|[0-9]*) return 1 ;; esac
 }
-ensure_file() {
-  mkdir -p "$(dirname "$FILE")"
-  [ -s "$FILE" ] || printf '{"version":1,"sessions":{}}\n' > "$FILE"
-}
 prune_filter() {
   # Drop the delisted session's webhook filter file. webhook.py names it
   # filter.<LOCAL_WEBHOOK_SESSION>.json and the supervisor sets that to
@@ -1611,63 +1965,7 @@ prune_session_state() {
   # one's launch id, and with it the dead one's transcript.
   rm -f "$(session_state_file "$1")"
 }
-# Serialize the read-modify-write of the session registry (issue #254). Every
-# writer of this file — this CLI, the supervisor, the mark-stopped epilogue,
-# the settings daemon, the webhook spawn wrapper — replaces it by rename, so a
-# reader always gets a whole document but two writers that read the same base
-# each publish one that never contained the other's edit. Two writers of the
-# jq_edit shape below lost 96 of 300 updates when measured on the live box.
-# Hence a SIDECAR lock file: locking sessions.json itself would lock the inode
-# the next writer is about to replace, which is not the lock it takes.
-#
-# flock ships in util-linux ONLY, which is not on every PATH this CLI runs
-# from (a plain `su -c 'agent-box-session ...'` gets the system PATH, the
-# webhook receiver unit's PATH has jq + coreutils + this CLI and nothing
-# else), so the generated wrapper pins the binary — the AGENT_BOX_*_BIN
-# convention. Unset means no lock and no error: a session must still be
-# addable on a box whose module predates this.
-LOCK_FILE="$FILE.lock"
-FLOCK="''${AGENT_BOX_FLOCK_BIN:-}"
-_lock_depth=0
-registry_lock() {
-  # Two cases skip the open. Nesting: flock(2) conflicts between two open file
-  # descriptions of the SAME process, so re-locking inside a held section
-  # would deadlock (a caller wraps check-then-write around jq_edit, which
-  # locks too). Inherited: agent-box-webhook-spawn holds this lock across the
-  # `exec` into `add` so its hook-session cap check and the add are one step —
-  # it hands the fd over and says so through the environment, and re-opening
-  # would first CLOSE that fd and drop the lock it took.
-  _lock_depth=$((_lock_depth + 1))
-  [ "$_lock_depth" = 1 ] || return 0
-  [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
-  [ -n "$FLOCK" ] || return 0
-  { exec 9>>"$LOCK_FILE"; } 2>/dev/null || return 0
-  # -w so a wedged holder degrades to the old lost-update behaviour instead of
-  # hanging a CLI the user is waiting on.
-  "$FLOCK" -w 10 9 \
-    || echo "agent-box-session: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-}
-registry_unlock() {
-  [ "$_lock_depth" -gt 0 ] || return 0
-  _lock_depth=$((_lock_depth - 1))
-  [ "$_lock_depth" = 0 ] || return 0
-  [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
-  exec 9>&- 2>/dev/null || true
-}
-jq_edit() {
-  # jq_edit JQ_ARGS... — atomically rewrite FILE through jq, under the
-  # registry lock so the read and the rename are one step.
-  registry_lock
-  tmp="$(mktemp "$FILE.XXXXXX")"
-  if "$JQ" "$@" < "$FILE" > "$tmp"; then
-    mv "$tmp" "$FILE"
-  else
-    rm -f "$tmp"
-    exit 1
-  fi
-  registry_unlock
-}
-taken() { "$JQ" -e --arg n "$1" '.sessions | has($n)' "$FILE" >/dev/null; }
+taken() { "$JQ" -e --arg n "$1" '.sessions | has($n)' "$REGISTRY_FILE" >/dev/null; }
 # Free to MINT, which is not the same question as `taken`: stop and start ask
 # whether a session exists, and answering "yes" for a reserved name would have
 # them write a stub entry under it. Only auto-naming asks this one — and it
@@ -1722,8 +2020,8 @@ case "$cmd" in
   ls)
     live="$(t list-sessions -F '#S' 2>/dev/null || true)"
     printf '%-24s %-8s %s\n' NAME AGENT STATE
-    if [ -s "$FILE" ]; then
-      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$FILE" \
+    if [ -s "$REGISTRY_FILE" ]; then
+      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$REGISTRY_FILE" \
       | while IFS="$(printf '\t')" read -r n a state; do
         printf '%s\n' "$live" | grep -qxF "$n" && state=live
         printf '%-24s %-8s %s\n' "$n" "$a" "$state"
@@ -1732,7 +2030,7 @@ case "$cmd" in
     # Live tmux sessions nobody listed (started by hand): show, don't hide.
     printf '%s\n' "$live" | while IFS= read -r n; do
       [ -n "$n" ] || continue
-      if [ ! -s "$FILE" ] || ! "$JQ" -e --arg n "$n" '.sessions | has($n)' "$FILE" >/dev/null; then
+      if [ ! -s "$REGISTRY_FILE" ] || ! "$JQ" -e --arg n "$n" '.sessions | has($n)' "$REGISTRY_FILE" >/dev/null; then
         printf '%-24s %-8s %s\n' "$n" '-' 'unmanaged'
       fi
     done
@@ -1802,7 +2100,7 @@ case "$cmd" in
       (*" $agent "*) ;;
       (*) echo "agent '$agent' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
-    ensure_file
+    registry_ensure
     # Name choice and write are one critical section (issue #254): gen_name
     # and taken() both decide from a READ of the file, so two concurrent adds
     # could pick the same free name and the second rename would drop the first
@@ -1827,7 +2125,7 @@ case "$cmd" in
     # One argument vector: the profile's args first, the caller's own `--`
     # tail after them, so an explicit flag still has the last word.
     sargs=("''${pargs[@]}" "$@")
-    jq_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
+    registry_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
       --arg prof "$profile" \
@@ -1860,8 +2158,8 @@ case "$cmd" in
   rm)
     name="''${1:-}"
     valid_name "$name" || { usage >&2; exit 2; }
-    ensure_file
-    jq_edit --arg n "$name" 'del(.sessions[$n])'
+    registry_ensure
+    registry_edit --arg n "$name" 'del(.sessions[$n])'
     kill_session "$name" || exit 1
     prune_filter "$name"
     prune_session_state "$name"
@@ -1874,7 +2172,7 @@ case "$cmd" in
     # id) stays listed for a later 'restart' to revive.
     name="''${1:-}"
     valid_name "$name" || { usage >&2; exit 2; }
-    ensure_file
+    registry_ensure
     # Existence check and flag write together (issue #254): jq's assignment
     # CREATES a missing key, so a session deleted between the two came back as
     # a stub {stopped: true} — listed forever, startable by nobody, and the
@@ -1884,7 +2182,7 @@ case "$cmd" in
       echo "no such session: '$name' (see agent-box-session ls)" >&2
       exit 2
     fi
-    jq_edit --arg n "$name" '.sessions[$n].stopped = true'
+    registry_edit --arg n "$name" '.sessions[$n].stopped = true'
     registry_unlock
     kill_session "$name" || exit 1
     echo "session '$name' stopped — still listed, not respawned; 'agent-box-session restart $name' revives it"
@@ -1893,21 +2191,21 @@ case "$cmd" in
     # Clearing the stopped flag makes restart double as the revive verb
     # for parked sessions; kill-session tolerates one with nothing live.
     if [ "''${1:-}" = "--all" ]; then
-      ensure_file
-      jq_edit 'del(.sessions[].stopped)'
-      "$JQ" -r '.sessions | keys[]' "$FILE" | while IFS= read -r n; do
+      registry_ensure
+      registry_edit 'del(.sessions[].stopped)'
+      "$JQ" -r '.sessions | keys[]' "$REGISTRY_FILE" | while IFS= read -r n; do
         [ -n "$n" ] && kill_session "$n" || true
       done
       echo "all sessions killed — the supervisor restarts each within ~2s (re-reading env)"
     else
       name="''${1:-}"
       valid_name "$name" || { usage >&2; exit 2; }
-      ensure_file
+      registry_ensure
       # Listed-or-not decides which branch runs, so read it under the lock
       # (issue #254) — the flag write must apply to the file the check saw.
       registry_lock
       if taken "$name"; then
-        jq_edit --arg n "$name" 'del(.sessions[$n].stopped)'
+        registry_edit --arg n "$name" 'del(.sessions[$n].stopped)'
         registry_unlock
         # A stopped session has no live tmux session to kill; kill_session
         # treats that "can't find session" as success.
@@ -2925,7 +3223,182 @@ set -eu
 # PATH (issue #154, Phase 2) — this script only ever runs as that unit's
 # LOCAL_WEBHOOK_SPAWN_CMD child.
 JQ=jq
-FILE="$HOME/.config/agent-box/sessions.json"
+# The session registry — where it lives, how it is locked and how it is
+# rewritten — is one file every shell writer splices in (issue #254). This one
+# only LOCKS: the write is done by the `agent-box-session add` it execs into,
+# which inherits the lock (see below).
+REGISTRY_PROG=agent-box-webhook-spawn
+# The session registry's write protocol, spelled once (issue #254).
+#
+# ~/.config/agent-box/sessions.json is INTENT: what the operator asked this box
+# to run — name, agent, working directory, prompts, stopped. FIVE programs
+# write it (the session CLI, the supervisor's reconcile loop, the mark-stopped
+# pane epilogue, the webhook spawn wrapper, the settings daemon's three
+# routes), and every one of them replaces the file by rename. That buys exactly
+# ONE guarantee: a reader never sees half a document. It says nothing about the
+# interval between a writer's read and its rename, so two writers that start
+# from the same base each publish a document that never contained the other's
+# edit, and a one-field update silently reverts every field the other writer
+# changed. Measured on the live box: two writers of the registry_edit shape
+# below lost 96 of 300 updates (32%).
+#
+# So the four SHELL writers splice this file in (the assembler resolves nested
+# includes) rather than carrying a copy each. What they have to agree on is
+# small — the sidecar path, the primitive, the bound, who may skip the lock —
+# and a copy per program is how those four facts drift apart. A lock only some
+# writers take is not a lock.
+#
+# The fifth writer is python: the settings daemon takes the same flock(2) on
+# the same sidecar through fcntl, and its sessions_lock() cites this file for
+# the protocol rather than restating it. tests/test-registry.py holds the two
+# implementations to it from both sides, because that agreement is the whole
+# guarantee and nothing else checks it.
+#
+# The lock is a SIDECAR file, never the registry itself: every writer REPLACES
+# that inode, so a lock taken on the inode a writer read is not the lock the
+# next writer takes.
+#
+# READERS take no lock and need none — agent-box-webhook, the spot notifier and
+# the reads in this file's own callers all get a whole document from the
+# rename. The lock exists for the interval a read-modify-write spans.
+#
+# What a caller may set before the include, all optional:
+#   REGISTRY_FILE       the registry path, when the caller already knows it
+#   REGISTRY_PROG       the name the one warning below prints
+#   REGISTRY_JQ         jq, when it is not on this program's PATH
+#   REGISTRY_FLOCK      flock, likewise; EMPTY means "no lock, carry on"
+#   REGISTRY_LOCK_WAIT  seconds to wait for a holder (the test shortens it)
+#
+# AGENT_BOX_SESSIONS_FILE is what the settings daemon is told; the mark-stopped
+# epilogue is generated per user and bakes the path rather than trusting an
+# inherited $HOME, and every other writer runs as the user whose registry it
+# is.
+: "''${REGISTRY_FILE:=''${AGENT_BOX_SESSIONS_FILE:-$HOME/.config/agent-box/sessions.json}}"
+: "''${REGISTRY_PROG:=agent-box}"
+: "''${REGISTRY_JQ:=jq}"
+# flock ships in util-linux ONLY, which is not on every PATH a writer here runs
+# from: a plain `su -c 'agent-box-session ...'` gets the system PATH, the
+# webhook receiver unit's PATH is jq + coreutils + the session CLI, and the
+# pane epilogue has none worth the name. So each generated wrapper pins the
+# binary — the AGENT_BOX_*_BIN convention. Unset means no lock and no error: a
+# session must still be addable, startable and stoppable on a box whose module
+# predates this.
+# Assigned only when UNSET, never when empty: "" is a caller saying it has no
+# flock, and must not be answered with one from the environment.
+: "''${REGISTRY_FLOCK=''${AGENT_BOX_FLOCK_BIN:-}}"
+: "''${REGISTRY_LOCK_WAIT:=10}"
+# 1 while the lock is genuinely held — taken here, inherited, or nested inside
+# a section that holds it. Only the webhook spawn wrapper reads it, because it
+# may advertise an inherited fd only if it really got the lock.
+REGISTRY_HELD=0
+_registry_depth=0
+
+registry_lock() {
+  # Nesting-safe on purpose: flock(2) conflicts between two open file
+  # DESCRIPTIONS, including two of the same process, so a second fd on the
+  # sidecar blocks a writer against ITSELF (verified). Both the supervisor
+  # (start_session holds the lock across the mark_started it calls) and the
+  # session CLI (a check-then-write around registry_edit) do exactly that.
+  _registry_depth=$((_registry_depth + 1))
+  [ "$_registry_depth" = 1 ] || return 0
+  # An INHERITED lock: agent-box-webhook-spawn holds this lock across its exec
+  # into `agent-box-session add`, so its hook-session cap check and the add are
+  # one step. It hands the fd over and says so through the environment;
+  # re-opening fd 9 here would first CLOSE that description and drop the lock
+  # it took.
+  if [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" = 9 ]; then
+    REGISTRY_HELD=1
+    return 0
+  fi
+  [ -n "$REGISTRY_FLOCK" ] || return 0
+  # A missing directory is a first boot, which is the one moment when even
+  # CREATION races (issue #289) — so make it and take the lock, rather than
+  # writing the file that decides which sessions exist with no lock at all.
+  { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null \
+    || { mkdir -p "''${REGISTRY_FILE%/*}" 2>/dev/null
+         { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
+    || return 0
+  # Bounded, never an unbounded wait: nothing may park the supervisor's
+  # reconcile loop (every session on the box waits behind it) or a CLI a user
+  # is waiting on. A holder that times us out degrades THIS write to the
+  # pre-#254 lost-update behaviour, which is a bad write rather than a hung
+  # box, and says so on stderr.
+  if "$REGISTRY_FLOCK" -w "$REGISTRY_LOCK_WAIT" 9; then
+    REGISTRY_HELD=1
+  else
+    echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
+    exec 9>&- 2>/dev/null || true
+  fi
+  return 0
+}
+
+registry_unlock() {
+  [ "$_registry_depth" -gt 0 ] || return 0
+  _registry_depth=$((_registry_depth - 1))
+  [ "$_registry_depth" = 0 ] || return 0
+  # An inherited fd belongs to the process that opened it: closing it here
+  # would drop a lock this program never took.
+  [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
+  REGISTRY_HELD=0
+  exec 9>&- 2>/dev/null || true
+}
+
+registry_edit() {
+  # registry_edit JQ_ARGS... — rewrite the registry through jq as ONE
+  # read-modify-write under the lock. The document arrives on jq's stdin, not
+  # as an argument, so a filter may end in `--args -- "$@"` without the path
+  # being read as one of those arguments.
+  #
+  # Returns 1 with the registry untouched when jq fails. jq's own stderr is
+  # left alone: a caller that must stay quiet — the pane epilogue prints into
+  # the user's terminal — redirects it at the call site, which keeps that
+  # policy where the reason for it is.
+  #
+  # The lock nests, so a caller already holding it across a check-then-write
+  # keeps holding it here and does not deadlock against itself.
+  registry_lock
+  _registry_tmp="$(mktemp "$REGISTRY_FILE.XXXXXX")" || { registry_unlock; return 1; }
+  if "$REGISTRY_JQ" "$@" < "$REGISTRY_FILE" > "$_registry_tmp"; then
+    mv "$_registry_tmp" "$REGISTRY_FILE"
+    registry_unlock
+    return 0
+  fi
+  rm -f "$_registry_tmp"
+  registry_unlock
+  return 1
+}
+
+registry_ensure() {
+  # registry_ensure [SEED] — make sure the registry EXISTS, inside the same
+  # critical section as everything that writes it (issue #289).
+  #
+  # Creation was the one step outside the protocol, and two paths create the
+  # file: `agent-box-session add` (an empty registry) and the supervisor's
+  # first-boot seed (the Nix-declared one). Both asked "is it empty?" with no
+  # lock held, and the units that run them start in parallel, so on a first
+  # boot a `hook-*` session added by the webhook spawner could be replaced
+  # wholesale by the seed landing on top of it — and the batch that spawned
+  # that session is never redelivered.
+  #
+  # An existing file is never touched, seed or no seed: sessions are RUNTIME
+  # data (issue #59), so a rebuild must not clobber what the operator changed
+  # while the box was live.
+  mkdir -p "''${REGISTRY_FILE%/*}"
+  registry_lock
+  if [ ! -s "$REGISTRY_FILE" ]; then
+    if [ -n "''${1:-}" ]; then
+      install -m 0600 "$1" "$REGISTRY_FILE"
+    else
+      # 0600 like every other writer's output (the daemon's write_sessions, the
+      # seed above, and mktemp's own mode in registry_edit): the registry
+      # carries kickoff prompts and working directories, and only this user and
+      # root have any business reading them.
+      printf '{"version":1,"sessions":{}}\n' > "$REGISTRY_FILE"
+      chmod 600 "$REGISTRY_FILE"
+    fi
+  fi
+  registry_unlock
+}
 
 # The assignment sentence (#253) and the preamble below are written once and
 # read twice: the receiver builds a prompt with them, and the settings page
@@ -3145,19 +3618,13 @@ PROMPT="$(cat)"
 # does not re-open fd 9 — which would first CLOSE this description and drop
 # the lock mid-decision.
 #
-# flock lives in util-linux only, which is NOT on the webhook receiver unit's
-# PATH (jq + coreutils + the session CLI), so the generated wrapper pins the
-# binary. Unset = no lock, and the spawn goes ahead regardless: a webhook
-# delivery must never be dropped for want of a lock.
-FLOCK="''${AGENT_BOX_FLOCK_BIN:-}"
-if [ -n "$FLOCK" ] && { exec 9>>"$FILE.lock"; } 2>/dev/null; then
-  if "$FLOCK" -w 10 9; then
-    export AGENT_BOX_REGISTRY_LOCK_FD=9
-  else
-    echo "agent-box-webhook-spawn: sessions.json lock timed out;" \
-         "spawning unlocked (issue #254)" >&2
-    exec 9>&- 2>/dev/null || true
-  fi
+# A lock this program could not take is not announced: the fd is exported only
+# when it really holds one, so the CLI opens its own rather than trusting an
+# empty promise. Either way the spawn goes ahead — a webhook delivery must
+# never be dropped for want of a lock.
+registry_lock
+if [ "$REGISTRY_HELD" = 1 ]; then
+  export AGENT_BOX_REGISTRY_LOCK_FD=9
 fi
 
 # The ceiling on CONCURRENT hook-* sessions, and the record it leaves.
@@ -3248,7 +3715,7 @@ live_hook_sessions() {
   "$TMUX_BIN" -L agent-box list-sessions -F '#S' 2>/dev/null || true
 }
 
-if [ -s "$FILE" ]; then
+if [ -s "$REGISTRY_FILE" ]; then
   # Registry keys: every hook-* entry, finished or not. This was the whole cap
   # and is now only its fallback — nothing ever expires an entry (`stopped` is
   # set by the pane epilogue, and only `agent-box-session rm` clears the key),
@@ -3256,7 +3723,7 @@ if [ -s "$FILE" ]; then
   # of them made every standing watch inert with nothing running (issue #280).
   # The probe costs two tmux round trips, so it only runs once the keys claim
   # we are full.
-  keys=$("$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' "$FILE")
+  keys=$("$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' "$REGISTRY_FILE")
   used="$keys"
   if [ "$keys" -ge "$MAX" ]; then
     if panes=$(live_hook_sessions); then
@@ -3270,7 +3737,7 @@ if [ -s "$FILE" ]; then
       # probe reaches a live tmux but the wrong (or an empty) socket dir; the
       # pane half counts agents no entry claims — hand-started ones, and any
       # delisted while still running.
-      used=$(printf '%s\n' "$panes" | "$JQ" -R -s --slurpfile reg "$FILE" '
+      used=$(printf '%s\n' "$panes" | "$JQ" -R -s --slurpfile reg "$REGISTRY_FILE" '
         (split("\n") | map(select(startswith("hook-")))) as $panes
         | ($reg[0].sessions // {} | to_entries
            | map(select((.key | startswith("hook-")) and .value.stopped != true))
@@ -3834,10 +4301,184 @@ $PROMPT"
     # agentBaseTools), so the unit pins those two via AGENT_BOX_*_BIN.
     JQ=jq
     TMUX="tmux -L agent-box"
-    SESSIONS_FILE="$HOME/.config/agent-box/sessions.json"
     GREP="''${AGENT_BOX_GREP_BIN:-grep}"
     FIND="''${AGENT_BOX_FIND_BIN:-find}"
-    FLOCK="''${AGENT_BOX_FLOCK_BIN:-}"
+    # The session registry — where it lives, how it is locked and how it is
+    # rewritten — is one file every shell writer splices in (issue #254). It is
+    # spliced HERE, above the seed below, because creating the registry is part of
+    # the same protocol as writing it (issue #289).
+    REGISTRY_PROG=supervisor
+    # The session registry's write protocol, spelled once (issue #254).
+    #
+    # ~/.config/agent-box/sessions.json is INTENT: what the operator asked this box
+    # to run — name, agent, working directory, prompts, stopped. FIVE programs
+    # write it (the session CLI, the supervisor's reconcile loop, the mark-stopped
+    # pane epilogue, the webhook spawn wrapper, the settings daemon's three
+    # routes), and every one of them replaces the file by rename. That buys exactly
+    # ONE guarantee: a reader never sees half a document. It says nothing about the
+    # interval between a writer's read and its rename, so two writers that start
+    # from the same base each publish a document that never contained the other's
+    # edit, and a one-field update silently reverts every field the other writer
+    # changed. Measured on the live box: two writers of the registry_edit shape
+    # below lost 96 of 300 updates (32%).
+    #
+    # So the four SHELL writers splice this file in (the assembler resolves nested
+    # includes) rather than carrying a copy each. What they have to agree on is
+    # small — the sidecar path, the primitive, the bound, who may skip the lock —
+    # and a copy per program is how those four facts drift apart. A lock only some
+    # writers take is not a lock.
+    #
+    # The fifth writer is python: the settings daemon takes the same flock(2) on
+    # the same sidecar through fcntl, and its sessions_lock() cites this file for
+    # the protocol rather than restating it. tests/test-registry.py holds the two
+    # implementations to it from both sides, because that agreement is the whole
+    # guarantee and nothing else checks it.
+    #
+    # The lock is a SIDECAR file, never the registry itself: every writer REPLACES
+    # that inode, so a lock taken on the inode a writer read is not the lock the
+    # next writer takes.
+    #
+    # READERS take no lock and need none — agent-box-webhook, the spot notifier and
+    # the reads in this file's own callers all get a whole document from the
+    # rename. The lock exists for the interval a read-modify-write spans.
+    #
+    # What a caller may set before the include, all optional:
+    #   REGISTRY_FILE       the registry path, when the caller already knows it
+    #   REGISTRY_PROG       the name the one warning below prints
+    #   REGISTRY_JQ         jq, when it is not on this program's PATH
+    #   REGISTRY_FLOCK      flock, likewise; EMPTY means "no lock, carry on"
+    #   REGISTRY_LOCK_WAIT  seconds to wait for a holder (the test shortens it)
+    #
+    # AGENT_BOX_SESSIONS_FILE is what the settings daemon is told; the mark-stopped
+    # epilogue is generated per user and bakes the path rather than trusting an
+    # inherited $HOME, and every other writer runs as the user whose registry it
+    # is.
+    : "''${REGISTRY_FILE:=''${AGENT_BOX_SESSIONS_FILE:-$HOME/.config/agent-box/sessions.json}}"
+    : "''${REGISTRY_PROG:=agent-box}"
+    : "''${REGISTRY_JQ:=jq}"
+    # flock ships in util-linux ONLY, which is not on every PATH a writer here runs
+    # from: a plain `su -c 'agent-box-session ...'` gets the system PATH, the
+    # webhook receiver unit's PATH is jq + coreutils + the session CLI, and the
+    # pane epilogue has none worth the name. So each generated wrapper pins the
+    # binary — the AGENT_BOX_*_BIN convention. Unset means no lock and no error: a
+    # session must still be addable, startable and stoppable on a box whose module
+    # predates this.
+    # Assigned only when UNSET, never when empty: "" is a caller saying it has no
+    # flock, and must not be answered with one from the environment.
+    : "''${REGISTRY_FLOCK=''${AGENT_BOX_FLOCK_BIN:-}}"
+    : "''${REGISTRY_LOCK_WAIT:=10}"
+    # 1 while the lock is genuinely held — taken here, inherited, or nested inside
+    # a section that holds it. Only the webhook spawn wrapper reads it, because it
+    # may advertise an inherited fd only if it really got the lock.
+    REGISTRY_HELD=0
+    _registry_depth=0
+
+    registry_lock() {
+      # Nesting-safe on purpose: flock(2) conflicts between two open file
+      # DESCRIPTIONS, including two of the same process, so a second fd on the
+      # sidecar blocks a writer against ITSELF (verified). Both the supervisor
+      # (start_session holds the lock across the mark_started it calls) and the
+      # session CLI (a check-then-write around registry_edit) do exactly that.
+      _registry_depth=$((_registry_depth + 1))
+      [ "$_registry_depth" = 1 ] || return 0
+      # An INHERITED lock: agent-box-webhook-spawn holds this lock across its exec
+      # into `agent-box-session add`, so its hook-session cap check and the add are
+      # one step. It hands the fd over and says so through the environment;
+      # re-opening fd 9 here would first CLOSE that description and drop the lock
+      # it took.
+      if [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" = 9 ]; then
+        REGISTRY_HELD=1
+        return 0
+      fi
+      [ -n "$REGISTRY_FLOCK" ] || return 0
+      # A missing directory is a first boot, which is the one moment when even
+      # CREATION races (issue #289) — so make it and take the lock, rather than
+      # writing the file that decides which sessions exist with no lock at all.
+      { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null \
+        || { mkdir -p "''${REGISTRY_FILE%/*}" 2>/dev/null
+             { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
+        || return 0
+      # Bounded, never an unbounded wait: nothing may park the supervisor's
+      # reconcile loop (every session on the box waits behind it) or a CLI a user
+      # is waiting on. A holder that times us out degrades THIS write to the
+      # pre-#254 lost-update behaviour, which is a bad write rather than a hung
+      # box, and says so on stderr.
+      if "$REGISTRY_FLOCK" -w "$REGISTRY_LOCK_WAIT" 9; then
+        REGISTRY_HELD=1
+      else
+        echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
+        exec 9>&- 2>/dev/null || true
+      fi
+      return 0
+    }
+
+    registry_unlock() {
+      [ "$_registry_depth" -gt 0 ] || return 0
+      _registry_depth=$((_registry_depth - 1))
+      [ "$_registry_depth" = 0 ] || return 0
+      # An inherited fd belongs to the process that opened it: closing it here
+      # would drop a lock this program never took.
+      [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
+      REGISTRY_HELD=0
+      exec 9>&- 2>/dev/null || true
+    }
+
+    registry_edit() {
+      # registry_edit JQ_ARGS... — rewrite the registry through jq as ONE
+      # read-modify-write under the lock. The document arrives on jq's stdin, not
+      # as an argument, so a filter may end in `--args -- "$@"` without the path
+      # being read as one of those arguments.
+      #
+      # Returns 1 with the registry untouched when jq fails. jq's own stderr is
+      # left alone: a caller that must stay quiet — the pane epilogue prints into
+      # the user's terminal — redirects it at the call site, which keeps that
+      # policy where the reason for it is.
+      #
+      # The lock nests, so a caller already holding it across a check-then-write
+      # keeps holding it here and does not deadlock against itself.
+      registry_lock
+      _registry_tmp="$(mktemp "$REGISTRY_FILE.XXXXXX")" || { registry_unlock; return 1; }
+      if "$REGISTRY_JQ" "$@" < "$REGISTRY_FILE" > "$_registry_tmp"; then
+        mv "$_registry_tmp" "$REGISTRY_FILE"
+        registry_unlock
+        return 0
+      fi
+      rm -f "$_registry_tmp"
+      registry_unlock
+      return 1
+    }
+
+    registry_ensure() {
+      # registry_ensure [SEED] — make sure the registry EXISTS, inside the same
+      # critical section as everything that writes it (issue #289).
+      #
+      # Creation was the one step outside the protocol, and two paths create the
+      # file: `agent-box-session add` (an empty registry) and the supervisor's
+      # first-boot seed (the Nix-declared one). Both asked "is it empty?" with no
+      # lock held, and the units that run them start in parallel, so on a first
+      # boot a `hook-*` session added by the webhook spawner could be replaced
+      # wholesale by the seed landing on top of it — and the batch that spawned
+      # that session is never redelivered.
+      #
+      # An existing file is never touched, seed or no seed: sessions are RUNTIME
+      # data (issue #59), so a rebuild must not clobber what the operator changed
+      # while the box was live.
+      mkdir -p "''${REGISTRY_FILE%/*}"
+      registry_lock
+      if [ ! -s "$REGISTRY_FILE" ]; then
+        if [ -n "''${1:-}" ]; then
+          install -m 0600 "$1" "$REGISTRY_FILE"
+        else
+          # 0600 like every other writer's output (the daemon's write_sessions, the
+          # seed above, and mktemp's own mode in registry_edit): the registry
+          # carries kickoff prompts and working directories, and only this user and
+          # root have any business reading them.
+          printf '{"version":1,"sessions":{}}\n' > "$REGISTRY_FILE"
+          chmod 600 "$REGISTRY_FILE"
+        fi
+      fi
+      registry_unlock
+    }
     # The webhook channel plugin, spelled once (issue #257): three places have to
     # agree on it — the settings seed (an enabledPlugins key), the plugin-cache
     # sync, and claude's --channels tag. The marketplace NAME comes from the
@@ -3849,11 +4490,11 @@ $PROMPT"
 
     # First boot only: seed the Nix-declared sessions. The file is RUNTIME
     # data afterwards — a rebuild must never clobber sessions the user
-    # added or removed while the box was live.
-    mkdir -p "$HOME"/.config/agent-box
-    if [ ! -s "$SESSIONS_FILE" ]; then
-      install -m 0600 "''${AGENT_BOX_SESSIONS_SEED:?}" "$SESSIONS_FILE"
-    fi
+    # added or removed while the box was live. Under the registry lock, because
+    # this unit and a session being added start in parallel on a first boot, and
+    # "the file was empty when I looked" must not survive another writer's
+    # decision (issue #289).
+    registry_ensure "''${AGENT_BOX_SESSIONS_SEED:?}"
 
     seed_json() {
       # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
@@ -4036,50 +4677,6 @@ $PROMPT"
       ln -sfn agent-box-current "$HOME"/.codex/packages/standalone/current
     fi
 
-    # Serialize every read-modify-write of the session registry (issue #254).
-    # tmp+rename buys ONE guarantee — a reader never sees half a document — and
-    # says nothing about the interval between a writer's read and its rename: two
-    # writers that start from the same base each publish a document that never
-    # contained the other's edit, so a one-field update silently reverts every
-    # field the other writer changed. Measured on the live box: two writers of the
-    # shape used here lost 96 of 300 updates (32%). The registry has five writers
-    # in three languages (this loop, the session CLI, the mark-stopped epilogue,
-    # the settings daemon's three routes, the webhook spawn wrapper), so the lock
-    # is the only thing that makes the file's state a function of its edits.
-    #
-    # The lock is a SIDECAR file, never sessions.json itself: every writer here
-    # REPLACES that inode by rename, so a lock taken on the inode a writer read is
-    # not the lock the next writer takes.
-    #
-    # AGENT_BOX_FLOCK_BIN is pinned by the unit because flock ships in util-linux
-    # only (the AGENT_BOX_*_BIN convention, as for grep/find). Unset means "no
-    # lock, carry on": a box whose module predates this must still start sessions,
-    # and a missing lock must never be the reason a session does not spawn.
-    REGISTRY_LOCK="$SESSIONS_FILE.lock"
-    _lock_depth=0
-    registry_lock() {
-      # Nesting-safe on purpose: flock(2) conflicts between two open file
-      # DESCRIPTIONS, including two of the same process, so start_session — which
-      # holds the lock across the mark_started it calls — would otherwise block
-      # the supervisor against itself forever (verified: a second fd on the same
-      # file blocks).
-      _lock_depth=$((_lock_depth + 1))
-      [ "$_lock_depth" = 1 ] || return 0
-      [ -n "$FLOCK" ] || return 0
-      { exec 9>>"$REGISTRY_LOCK"; } 2>/dev/null || return 0
-      # -w: nothing may park the reconcile loop. If some writer holds the lock
-      # past the timeout (a stopped process, a full disk) this spawn proceeds
-      # unlocked — the pre-#254 behavior, not a new failure mode.
-      "$FLOCK" -w 10 9 \
-        || echo "supervisor: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-    }
-    registry_unlock() {
-      [ "$_lock_depth" -gt 0 ] || return 0
-      _lock_depth=$((_lock_depth - 1))
-      [ "$_lock_depth" = 0 ] || return 0
-      exec 9>&- 2>/dev/null || true
-    }
-
     # Deliver-once + resume bookkeeping. A session's kickoff prompt
     # (initialPrompt) must fire on the FIRST spawn only; every later respawn
     # (crash, clean exit, reboot, Spot stop→restart — all of which keep the
@@ -4174,18 +4771,15 @@ $PROMPT"
       # the reconcile loop then started forever — a session nothing kills,
       # because no delete path knows it exists. That is the resurrect half of
       # #254; the lock is the lost-update half.
-      registry_lock
-      _tmp="$(mktemp "$SESSIONS_FILE.XXXXXX")" || { registry_unlock; return 0; }
-      if $JQ --arg s "$1" --arg b "$2" \
-           'if .sessions | has($s)
-            then (.sessions[$s]) |= (.hasRun = true | .boxSessionId = $b | .initialPrompt = null)
-            else . end' \
-           "$SESSIONS_FILE" > "$_tmp" 2>/dev/null; then
-        mv "$_tmp" "$SESSIONS_FILE"
-      else
-        rm -f "$_tmp"
-      fi
-      registry_unlock
+      #
+      # jq's stderr is dropped rather than journalled: this runs on every spawn of
+      # every session, so a registry the box cannot parse would repeat the same
+      # line every two seconds, and the reconcile loop already carries on without
+      # it.
+      registry_edit --arg s "$1" --arg b "$2" \
+        'if .sessions | has($s)
+         then (.sessions[$s]) |= (.hasRun = true | .boxSessionId = $b | .initialPrompt = null)
+         else . end' 2>/dev/null || true
     }
 
     claude_has_transcript() {
@@ -4218,7 +4812,7 @@ $PROMPT"
 
     start_session() {
       sname=$1
-      sjson="$($JQ -c --arg s "$sname" '.sessions[$s] // empty' "$SESSIONS_FILE")" || return 0
+      sjson="$($JQ -c --arg s "$sname" '.sessions[$s] // empty' "$REGISTRY_FILE")" || return 0
       [ -n "$sjson" ] || return 0
       agent="$($JQ -r '.agent // empty' <<<"$sjson")"
       if ! bin="$(agent_bin "$agent")"; then
@@ -4594,7 +5188,7 @@ $PROMPT"
       listed() {
         $JQ -e --arg s "$sname" \
           '.sessions | has($s) and (.[$s].stopped != true)' \
-          "$SESSIONS_FILE" >/dev/null 2>&1
+          "$REGISTRY_FILE" >/dev/null 2>&1
       }
       # Pre-check, spawn, post-check and mark_started are ONE critical section
       # (issue #254), so the post-check is exact: without the lock a delete could
@@ -4687,9 +5281,9 @@ $PROMPT"
         case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
         # A file jq cannot answer for is left alone: a transient read error must
         # not be read as "this session is gone" and unsubscribe a live session.
-        if $JQ -e --arg s "$_n" '.sessions | has($s)' "$SESSIONS_FILE" >/dev/null 2>&1; then
+        if $JQ -e --arg s "$_n" '.sessions | has($s)' "$REGISTRY_FILE" >/dev/null 2>&1; then
           continue
-        elif $JQ -e . "$SESSIONS_FILE" >/dev/null 2>&1; then
+        elif $JQ -e . "$REGISTRY_FILE" >/dev/null 2>&1; then
           rm -f "$_f"
         fi
       done
@@ -4720,7 +5314,7 @@ $PROMPT"
     NL="
     "
     sweep_session_state() {
-      _listed="$($JQ -r '.sessions | keys[]' "$SESSIONS_FILE" 2>/dev/null)" || return 0
+      _listed="$($JQ -r '.sessions | keys[]' "$REGISTRY_FILE" 2>/dev/null)" || return 0
       for _f in "$SESSION_STATE_DIR"/*.json; do
         _n=''${_f##*/}; _n=''${_n%.json}
         # Also how an unmatched glob leaves this loop: the literal pattern is not
@@ -4742,7 +5336,7 @@ $PROMPT"
           (*[!A-Za-z0-9_-]*|"") continue ;;
         esac
         $TMUX has-session -t "=$sname" 2>/dev/null || start_session "$sname"
-      done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$SESSIONS_FILE" 2>/dev/null)
+      done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$REGISTRY_FILE" 2>/dev/null)
       sleep 2
     done
   '';
@@ -6466,26 +7060,28 @@ def delete_key(key):
 def sessions_lock():
     """Serialize one read_sessions -> write_sessions pair (issue #254).
 
-    os.replace makes a READER see a whole document and nothing more: two
-    writers that start from the same base each publish a document that never
-    contained the other's edit, so a one-field update reverts every field the
-    other writer changed. That is not a theoretical race here — this daemon is
-    a ThreadingHTTPServer, so it races ITSELF as well as the supervisor, the
-    session CLI and the mark-stopped epilogue, and the loss it caused was
-    worse than a lost row: reverting hasRun / boxSessionId / the cleared
-    initialPrompt left a RUNNING session the supervisor treated as a first
-    spawn next time it died, re-firing the kickoff prompt against a new id
-    and orphaning the transcript. That particular cost is being taken off
-    the table separately (issue #282): the supervisor keeps its own
-    observations in ~/.local/state/agent-box/session/ and reads the registry
-    copy only as a migration fallback, so what a lost update here can revert
-    is intent — which the operator can see and re-state — and not the record
-    of a conversation. The lock stays either way: intent is worth as much.
+    The protocol itself — the sidecar path, the primitive, the bound, and why
+    a rename is not enough — is written down once, in
+    modules/src/lib/registry.sh, which the four SHELL writers splice in. This
+    is the fifth writer and the only one that is python, so it takes the same
+    flock(2) on the same sidecar file through fcntl instead. What has to agree
+    across the two languages is exactly that file's contract, and
+    tests/test-registry.py checks it from both sides.
 
-    The lock is a SIDECAR file, never SESSIONS_FILE: every writer replaces
-    that inode by rename, so the inode a writer locked is not the one the next
-    writer takes. Same flock(2) primitive the shell writers use through
-    util-linux's flock(1), so all five writers serialize against each other.
+    Two things are true here and nowhere else. This daemon is a
+    ThreadingHTTPServer, so it races ITSELF as well as the four shell writers
+    (each fcntl.flock call opens its own description, so its own threads
+    serialize too). And the loss it caused was worse than a lost row:
+    reverting hasRun / boxSessionId / the cleared initialPrompt left a RUNNING
+    session the supervisor treated as a first spawn next time it died,
+    re-firing the kickoff prompt against a new id and orphaning the
+    transcript. That particular cost is being taken off the table separately
+    (issue #282): the supervisor keeps its own observations in
+    ~/.local/state/agent-box/session/ and reads the registry copy only as a
+    migration fallback, so what a lost update here can revert is intent —
+    which the operator can see and re-state — and not the record of a
+    conversation. The lock stays either way: intent is worth as much.
+
     fcntl precedent in this repo: password-helper.py's AUTH_ENV_LOCK.
 
     Best effort by design: if the lock cannot be created or taken, the body
