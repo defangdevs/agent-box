@@ -491,14 +491,18 @@ claim_note() {
   # event matters. It used to be one fixed sentence, byte-identical across
   # every hook session on the box (issue #251).
   "$JQ" -rn --argjson meta "${LOCAL_WEBHOOK_SPAWN_META:-{\}}" --arg key "$1" '
-    ($meta.number // "" | tostring) as $n
+    # The SAME test claim_include uses, so the note cannot name an object the
+    # claim does not cover: a meta carrying a non-numeric `number` would
+    # otherwise be described as "#n/a" while the include claimed CI outcomes.
+    (($meta.number // "" | tostring)
+     | if test("^[0-9]+$") then . else "" end) as $n
     | ($meta.event // "") as $e
     | ($meta.action // "") as $a
     | (if $e == "" then "" else " (" + $e + (if $a == "" then "" else "." + $a end) + ")" end) as $what
     | if $n != "" then
         "seeded at spawn: this session was started for \($key)#\($n)\($what) and claims that object'"'"'s events while it lives"
       else
-        "seeded at spawn: this session was started for a CI outcome on \($key)\($what) and claims this repo'"'"'s CI outcomes while it lives"
+        "seeded at spawn: this session was started for \($key)\($what) and claims this repo'"'"'s CI outcomes while it lives"
       end' 2>/dev/null
 }
 

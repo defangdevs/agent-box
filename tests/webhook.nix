@@ -795,6 +795,33 @@
         f"sudo -u agent env HOME=/home/agent agent-box-session rm {numbered}"
     )
 
+    # A `number` that is not a number falls back to the CI claim, and the NOTE
+    # falls back with it. The two used to test the value differently, so a meta
+    # like {"number":"n/a"} produced a note saying the session owned KEY#n/a
+    # while the claim covered CI outcomes — a note that describes a claim
+    # nobody holds is worse than no note.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/unnumbered"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        " LOCAL_WEBHOOK_SPAWN_EVENT=issues"
+        """ LOCAL_WEBHOOK_SPAWN_META='{"event":"issues","action":"opened","number":"n/a"}'"""
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    unnumbered = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-unnumbered-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        "jq -e '(.topics[0].include.any | map(.path) | index(\"workflow_run.id\")) != null"
+        " and (.topics[0].note | contains(\"#\") | not)'"
+        f" /home/agent/.local/state/local-webhook/filter.agent-{unnumbered}.json"
+    )
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {unnumbered}"
+    )
+
     # A long key keeps its WHOLE name (issue #236). The key used to be cut at
     # 24 sanitized characters, which overran the 32 the daemon renders —
     # hook-defangdevs-local-channel-de2d is 34, so that session ran, owned its
