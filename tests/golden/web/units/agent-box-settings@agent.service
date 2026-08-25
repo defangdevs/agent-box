@@ -2,7 +2,7 @@
 
 [Service]
 Environment="AGENT_BOX_AGENTS=claude,codex,shell"
-Environment="AGENT_BOX_CONNECT_BINS=claude=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-claude-code-2.1.206/bin/claude codex=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-codex-0.144.1/bin/codex github=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gh-2.96.0/bin/gh"
+Environment="AGENT_BOX_CONNECT_BINS=claude=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-claude-code-2.1.206/bin/claude codex=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-codex-0.144.1/bin/codex github=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gh-2.96.0/bin/gh defang=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-defang-cli-git/bin/defang"
 Environment="AGENT_BOX_DEFAULT_AGENT=claude"
 Environment="AGENT_BOX_HOOK_SPAWN_CMD=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook-spawn/bin/agent-box-webhook-spawn"
 Environment="AGENT_BOX_REPO=defangdevs/agent-box"

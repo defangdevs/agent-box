@@ -324,6 +324,22 @@ let
   # (see the codexFullAccess option, issue 234).
   codexFullAccess = cfg.codexFullAccess && builtins.elem "codex" cfg.installAgents;
 
+  # Defang CLI (issue #363): not in nixpkgs, but DefangLabs/defang ships its
+  # own canonical packaging at pkgs/defang/cli.nix — `buildGo125Module`
+  # against the repo's own `src/`, with a `vendorHash` that is only ever
+  # valid for the go.sum sitting right next to it. Fetching the whole
+  # source tree at one pinned tag and calling THEIR file, rather than
+  # re-deriving a build ourselves, means that hash never needs maintaining
+  # here: it travels with the tag. (The alternative living beside it,
+  # pkgs/defang/default.nix — a fetchurl of the prebuilt release binary —
+  # is explicitly `lib.warn`-marked deprecated upstream and stuck on an old
+  # version; don't reach for that one.)
+  defangSrc = builtins.fetchTarball {
+    url = "https://github.com/DefangLabs/defang/archive/refs/tags/v3.14.1.tar.gz";
+    sha256 = "sha256:0advqwcrjmdfkraw6g5i5czd6hcglfk7yvhcxzy06clkx2j9bh0v";
+  };
+  defangCli = pkgs.callPackage "${defangSrc}/pkgs/defang/cli.nix" { };
+
   # Tools agents assume exist. Nearly all of these are already installed on
   # any NixOS host (system-path.nix's requiredPackages) — but the agent unit
   # runs with the curated PATH below, which does not include
@@ -367,6 +383,7 @@ let
     # if closure size matters more than matching a distro.
     pkgs.python3
     pkgs.nano
+    defangCli                 # deploy Compose apps to the cloud (issue #363)
   ];
 
   agentRuntimePackages = lib.unique (
@@ -900,7 +917,10 @@ let
   # this variable to point an id at a stub.
   connectBins = lib.concatStringsSep " " (
     map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
-    ++ [ "github=${pkgs.gh}/bin/gh" ]
+    ++ [
+      "github=${pkgs.gh}/bin/gh"
+      "defang=${defangCli}/bin/defang"
+    ]
   );
 
   # AGENTS.md — cross-vendor agent-instructions file (codex and opencode
