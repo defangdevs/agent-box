@@ -474,7 +474,7 @@
           runtime-profile =
             pkgs.runCommand "agent-box-runtime-profile-ok"
               {
-                nativeBuildInputs = [ pkgs.bash ];
+                nativeBuildInputs = [ pkgs.bash pkgs.python3 ];
                 profile = self.packages.${system}.runtime;
                 srcDir = ./modules/src;
               } ''
@@ -496,6 +496,13 @@
                   return
                 fi
                 bash -n "$bin" || { echo "SYNTAX: bin/$1"; fail=1; }
+                # A payload that grows an @@include@@ marker must not be
+                # shipped raw: only bin/assemble-module.py expands those, and
+                # a marker that reaches a box is served as literal text (see
+                # the settings-daemon check below for what that cost).
+                if grep -q '@@include' "$bin"; then
+                  echo "MARKER: bin/$1 still has an @@include@@ marker"; fail=1
+                fi
                 echo "ok: bin/$1 == src/$2"
               }
               check_payload agent-box-supervisor supervisor.sh
@@ -507,6 +514,30 @@
               check_payload agent-box-claude-session-start-hook claude-session-start-hook.sh
               check_payload agent-box-env-exec env-exec.sh
               check_payload agent-box-session-bare session-cli.sh
+
+              # The settings daemon is the one asset in modules/src that is
+              # NOT a finished file: it carries @@include@@ markers for
+              # settings.css, settings.js and docs/potato.svg. Shipping it
+              # verbatim put those markers in the served page — no stylesheet
+              # and "Uncaught SyntaxError: Invalid or unexpected token" — so
+              # what it must equal is the ASSEMBLER's output, not the source.
+              mkdir -p tree/modules tree/docs
+              cp -r "$srcDir" tree/modules/src
+              cp ${./docs/potato.svg} tree/docs/potato.svg
+              python3 ${./bin/assemble-module.py} \
+                --resolve tree/modules/src/settings-daemon.py > want.py
+              if grep -q '@@include' want.py; then
+                echo "MARKER: resolve() left a marker in settings-daemon.py"
+                fail=1
+              fi
+              if ! diff -u want.py <(tail -n +2 "$profile/bin/agent-box-settings") \
+                   >/dev/null; then
+                echo "DRIFT: bin/agent-box-settings is not resolve(src/settings-daemon.py)"
+                diff -u want.py <(tail -n +2 "$profile/bin/agent-box-settings") | head -20 || true
+                fail=1
+              else
+                echo "ok: bin/agent-box-settings == resolve(src/settings-daemon.py)"
+              fi
 
               # Shared assets: the units both backends install verbatim, the
               # Caddyfile fragments and guides the native renderer binds, the

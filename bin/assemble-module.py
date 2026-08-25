@@ -155,7 +155,23 @@ def main() -> int:
         default=Path(__file__).resolve().parent.parent,
         help="repo root (default: parent of bin/)",
     )
+    ap.add_argument(
+        "--resolve",
+        type=Path,
+        metavar="FILE",
+        help="expand FILE's @@include@@ markers and print the result, "
+             "instead of assembling the module. For a consumer that needs "
+             "a modules/src asset as a finished file rather than embedded "
+             "in the Nix module — the native runtime profile builds the "
+             "settings daemon this way (issue #154 Phase 4).",
+    )
     args = ap.parse_args()
+    if args.resolve:
+        # Same resolve() the module assembly uses, so the two backends
+        # cannot disagree about what a marker means. Non-.nix hosts get the
+        # identity escaper, so a .py asset comes out as plain Python.
+        sys.stdout.write(resolve(args.resolve.resolve()))
+        return 0
     out_path = args.repo / "modules" / "agent-box.nix"
     generated = assemble(args.repo)
     if args.check:
