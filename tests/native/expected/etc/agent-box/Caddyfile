@@ -1,0 +1,304 @@
+# This file is module-managed by services.agent-box — edits here get
+# OVERWRITTEN on the next nixos-rebuild. To add your own virtual host,
+# drop a *.caddy snippet into ~/sites/ (which is a symlink into
+# /var/lib/agent-box-sites/<you>/, a caddy-readable location) and
+# reload with: sudo systemctl reload caddy.service
+#
+# Recommended snippet shape — reverse-proxy to a localhost port your
+# agent runs, NOT `file_server /home/<you>/...`. caddy.service has
+# ProtectHome=true, so it cannot read files under /home; use file_server
+# only against a path outside /home (e.g. /var/lib/agent-box-sites/<you>/public):
+#
+#     foo.example.com {
+#       import acme_alpn_only    # Let's Encrypt via TLS-ALPN-01
+#       reverse_proxy 127.0.0.1:3000
+#     }
+#
+# New hosts get a Let's Encrypt cert on first request as long as DNS
+# for that hostname points at this box.
+
+(acme_alpn_only) {
+  tls {
+    issuer acme {
+      disable_http_challenge
+    }
+  }
+}
+
+golden.example.org {
+  # Access log to the journal — the fail2ban jail counts 401s here.
+  log
+  import acme_alpn_only
+  header {
+    Cache-Control "no-store"
+    X-Content-Type-Options "nosniff"
+  }
+  # This fragment ends INSIDE the block on purpose: the module appends one
+  # webhook + terminal block per user (and the root block), then the closing
+  # brace. Nothing is missing here.
+
+
+handle /agent/webhook* {
+  uri strip_prefix /agent/webhook
+  reverse_proxy unix//run/agent-box-webhook/agent.sock
+}
+
+# agent's terminal. Cookie first — browsers refuse to attach basic
+# auth credentials to WebSocket upgrades — then basic auth with the
+# linux user name as the login name.
+redir /agent /agent/
+# agent's settings page (issue #36). Same auth surface as the
+# terminal (cookie-or-basic-auth, same user name), just a different
+# upstream — the settings daemon over its user+caddy-only unix socket
+# (issue #49). More specific than /agent/* below, so Caddy routes
+# it here first.
+handle /agent/settings* {
+  @cookie_settings_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
+  handle @cookie_settings_agent {
+    reverse_proxy unix//run/agent-box-settings/agent.sock
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+        agent {$WEB_PASSWORD_HASH_AGENT}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      reverse_proxy unix//run/agent-box-settings/agent.sock
+    }
+  }
+}
+# agent's file drop (issue #132): a browsable static index of
+# ~/downloads, served from the caddy-readable /var/lib backing dir
+# (caddy.service can't read /home). Same cookie-or-basic auth as the
+# terminal, and MORE specific than /agent/* below so Caddy routes it
+# here first. The agent hands the user a agent/downloads/<file> URL.
+redir /agent/downloads /agent/downloads/
+handle /agent/downloads/* {
+  @cookie_dl_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
+  handle @cookie_dl_agent {
+    uri strip_prefix /agent/downloads
+    root * /var/lib/agent-box-downloads/agent
+    file_server browse
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+        agent {$WEB_PASSWORD_HASH_AGENT}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      uri strip_prefix /agent/downloads
+      root * /var/lib/agent-box-downloads/agent
+      file_server browse
+    }
+  }
+}
+# agent's landing page: the tabbed workspace (and, on a box with no
+# session yet, a redirect to the settings page — a tab bar with nothing
+# in it is not what its owner needs first). Served by the settings daemon,
+# and matched ONLY without an arg= query, which is what separates it from
+# the terminal below: the session routes rewrite to this same path with
+# arg=<session> attached, and ttyd has to keep receiving those.
+@home_agent {
+  path /agent/
+  not query arg=*
+}
+handle @home_agent {
+  @cookie_home_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
+  handle @cookie_home_agent {
+    reverse_proxy unix//run/agent-box-settings/agent.sock
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+        agent {$WEB_PASSWORD_HASH_AGENT}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      reverse_proxy unix//run/agent-box-settings/agent.sock
+    }
+  }
+}
+# One path per session: /agent/<session>/ is that session's terminal, and
+# everything ttyd asks for from a page loaded there (its ws and token
+# endpoints, resolved relative to the URL in the address bar) hangs off the
+# same prefix. Both are rewritten onto ttyd's own path with the session
+# named in ?arg=, which is the selector --url-arg feeds to the attach
+# wrapper — so a session gets a real URL of its own, and nothing about
+# ttyd's own routing changes.
+#
+# The exclusions are the names this vhost has already spent: no lookahead
+# in RE2, so they are a `not path` beside the regexp rather than part of
+# it, and the session name rules (CLI, daemon, module assertion) refuse
+# exactly this set so no session can be shadowed by one of them.
+@sess_bare_agent {
+  path_regexp bare_agent ^/agent/([^/]+)$
+  not path /agent/settings /agent/downloads /agent/webhook /agent/token /agent/ws
+}
+redir @sess_bare_agent /agent/{re.bare_agent.1}/
+@sess_agent {
+  path_regexp sess_agent ^/agent/([^/]+)/(.*)$
+  not path /agent/settings* /agent/downloads/* /agent/webhook*
+}
+rewrite @sess_agent /agent/{re.sess_agent.2}?arg={re.sess_agent.1}&{query}
+handle /agent/* {
+  @cookie_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
+  handle @cookie_agent {
+    reverse_proxy 127.0.0.1:7681
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+        agent {$WEB_PASSWORD_HASH_AGENT}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      reverse_proxy 127.0.0.1:7681
+    }
+  }
+}
+
+handle /robot/webhook* {
+  uri strip_prefix /robot/webhook
+  reverse_proxy unix//run/agent-box-webhook/robot.sock
+}
+
+# robot's terminal. Cookie first — browsers refuse to attach basic
+# auth credentials to WebSocket upgrades — then basic auth with the
+# linux user name as the login name.
+redir /robot /robot/
+# robot's settings page (issue #36). Same auth surface as the
+# terminal (cookie-or-basic-auth, same user name), just a different
+# upstream — the settings daemon over its user+caddy-only unix socket
+# (issue #49). More specific than /robot/* below, so Caddy routes
+# it here first.
+handle /robot/settings* {
+  @cookie_settings_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
+  handle @cookie_settings_robot {
+    reverse_proxy unix//run/agent-box-settings/robot.sock
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_ROBOT} robot {
+        robot {$WEB_PASSWORD_HASH_ROBOT}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      reverse_proxy unix//run/agent-box-settings/robot.sock
+    }
+  }
+}
+# robot's file drop (issue #132): a browsable static index of
+# ~/downloads, served from the caddy-readable /var/lib backing dir
+# (caddy.service can't read /home). Same cookie-or-basic auth as the
+# terminal, and MORE specific than /robot/* below so Caddy routes it
+# here first. The agent hands the user a robot/downloads/<file> URL.
+redir /robot/downloads /robot/downloads/
+handle /robot/downloads/* {
+  @cookie_dl_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
+  handle @cookie_dl_robot {
+    uri strip_prefix /robot/downloads
+    root * /var/lib/agent-box-downloads/robot
+    file_server browse
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_ROBOT} robot {
+        robot {$WEB_PASSWORD_HASH_ROBOT}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      uri strip_prefix /robot/downloads
+      root * /var/lib/agent-box-downloads/robot
+      file_server browse
+    }
+  }
+}
+# robot's landing page: the tabbed workspace (and, on a box with no
+# session yet, a redirect to the settings page — a tab bar with nothing
+# in it is not what its owner needs first). Served by the settings daemon,
+# and matched ONLY without an arg= query, which is what separates it from
+# the terminal below: the session routes rewrite to this same path with
+# arg=<session> attached, and ttyd has to keep receiving those.
+@home_robot {
+  path /robot/
+  not query arg=*
+}
+handle @home_robot {
+  @cookie_home_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
+  handle @cookie_home_robot {
+    reverse_proxy unix//run/agent-box-settings/robot.sock
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_ROBOT} robot {
+        robot {$WEB_PASSWORD_HASH_ROBOT}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      reverse_proxy unix//run/agent-box-settings/robot.sock
+    }
+  }
+}
+# One path per session: /robot/<session>/ is that session's terminal, and
+# everything ttyd asks for from a page loaded there (its ws and token
+# endpoints, resolved relative to the URL in the address bar) hangs off the
+# same prefix. Both are rewritten onto ttyd's own path with the session
+# named in ?arg=, which is the selector --url-arg feeds to the attach
+# wrapper — so a session gets a real URL of its own, and nothing about
+# ttyd's own routing changes.
+#
+# The exclusions are the names this vhost has already spent: no lookahead
+# in RE2, so they are a `not path` beside the regexp rather than part of
+# it, and the session name rules (CLI, daemon, module assertion) refuse
+# exactly this set so no session can be shadowed by one of them.
+@sess_bare_robot {
+  path_regexp bare_robot ^/robot/([^/]+)$
+  not path /robot/settings /robot/downloads /robot/webhook /robot/token /robot/ws
+}
+redir @sess_bare_robot /robot/{re.bare_robot.1}/
+@sess_robot {
+  path_regexp sess_robot ^/robot/([^/]+)/(.*)$
+  not path /robot/settings* /robot/downloads/* /robot/webhook*
+}
+rewrite @sess_robot /robot/{re.sess_robot.2}?arg={re.sess_robot.1}&{query}
+handle /robot/* {
+  @cookie_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
+  handle @cookie_robot {
+    reverse_proxy 127.0.0.1:7682
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_ROBOT} robot {
+        robot {$WEB_PASSWORD_HASH_ROBOT}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      reverse_proxy 127.0.0.1:7682
+    }
+  }
+}
+
+# Anything else, including /: the settings daemon behind the SAME
+# cookie-or-basic auth as the terminal — session CRUD must never be
+# reachable unauthenticated. GET / picks a USER and lands in their space
+# (/agent/, where the tabbed workspace now lives); the /sessions/* CRUD
+# routes the workspace posts to stay here, at the vhost root, so they are
+# one set of paths no session name can ever shadow.
+# This replaces the old unauthenticated picker (single-user boxes are
+# the norm now); with it gone — and the public sessions.json it fed
+# removed — nothing on this vhost is served without auth. Other
+# users' terminals stay at /<user>/ as before. No userinfo in any
+# href (issue 56): Chrome answers the basic-auth challenge with URL
+# userinfo + an EMPTY password, and credentials typed into the
+# prompt cannot override the URL-embedded identity.
+handle {
+  @cookie_root header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
+  handle @cookie_root {
+    reverse_proxy unix//run/agent-box-settings/agent.sock
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+        agent {$WEB_PASSWORD_HASH_AGENT}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      reverse_proxy unix//run/agent-box-settings/agent.sock
+    }
+  }
+}
+
+}

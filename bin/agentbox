@@ -1,0 +1,1021 @@
+#!/usr/bin/env python3
+"""agentbox — the native (non-NixOS) configuration layer. Issue #154, Phase 4.
+
+On NixOS the module renders units, sudoers, tmpfiles and the Caddyfile from
+one option tree and nixos-rebuild switches to them atomically. On a stock
+Ubuntu/RHEL host there is no such tree, so this CLI owns that layer:
+
+    agentbox apply [--config /etc/agent-box/config.yaml]
+
+reads the config and renders the same host state, idempotently — nothing is
+rewritten when it already matches, so a re-apply is silent and safe. The
+software itself comes from the Nix profile built by nix/runtime.nix, which
+is also where the shared assets (the %i template units, the Caddyfile
+fragments, the guides) are read from. Two hard rules from the design in
+issue #154:
+
+  * `agentbox apply` NEVER calls apt or dnf. The distro package manager
+    stays responsible for base-OS security patching only.
+  * The shared assets are installed byte-for-byte. Anything host-specific
+    goes in a generated env file or a drop-in, never in the unit text.
+
+`agentbox apply --first-boot` additionally absorbs what the CloudFormation
+templates used to do inline: settle the public IP, derive the sslip.io
+hostname, hash the web password, and signal the stack's WaitCondition.
+
+Render to a tree instead of the live host with `--root DIR` (implies no
+useradd/systemctl); that is what tests/test_agentbox.py diffs against a
+committed expectation, and it is the native half of the Phase 5 spec
+comparison.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+# ttyd ports are assigned in sorted user order, exactly as the module does,
+# so a user added later cannot renumber an existing user's port.
+TTYD_PORT_BASE = 7681
+
+
+class ConfigError(Exception):
+    pass
+
+
+def load_config(path):
+    """Load config.yaml (or .json).
+
+    YAML needs PyYAML, which the runtime profile ships. JSON needs nothing,
+    so a box can be configured from cloud-init with no parser question at
+    all; both spell the same structure.
+    """
+    text = Path(path).read_text()
+    if path.endswith(".json"):
+        return json.loads(text)
+    try:
+        import yaml
+    except ImportError:
+        raise ConfigError(
+            f"{path} is YAML but PyYAML is not importable. Install the "
+            "runtime profile (which ships it), or use a .json config."
+        )
+    data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path}: top level must be a mapping")
+    return data
+
+
+class Spec:
+    """The validated, defaulted view of config.yaml the renderer reads."""
+
+    def __init__(self, data, profile):
+        self.profile = profile
+        self.domain = data.get("domain") or ""
+        self.host_label = data.get("hostLabel") or self.domain or "agent-box"
+        self.agents = list(data.get("agents") or ["claude"])
+        self.default_agent = data.get("defaultAgent") or self.agents[0]
+        self.repo = data.get("repo") or "defangdevs/agent-box"
+        self.rev = data.get("rev") or "0" * 40
+        self.webhook_repo = (data.get("webhook") or {}).get("repo") or ""
+        self.webhook_script = (data.get("webhook") or {}).get("script") or ""
+        web = data.get("web") or {}
+        self.web_enable = bool(web.get("enable", True))
+        self.protect_memory = bool(data.get("protectMemory", True))
+        self.sudo_allowlist = list(data.get("sudoAllowlist") or [])
+
+        if self.default_agent not in self.agents:
+            raise ConfigError(
+                f"defaultAgent {self.default_agent!r} is not in agents "
+                f"{self.agents!r}"
+            )
+
+        users = data.get("users") or {}
+        if not users:
+            raise ConfigError("config must define at least one user")
+        self.users = []
+        for name in sorted(users):
+            if not USER_RE.match(name):
+                raise ConfigError(f"invalid user name {name!r}")
+            self.users.append(User(name, users[name] or {}, self))
+        # The settings page / root vhost belongs to exactly one user: the one
+        # flagged root, else the first in sorted order (same rule as the
+        # module's rootUser).
+        flagged = [u for u in self.users if u.want_root]
+        if len(flagged) > 1:
+            raise ConfigError(
+                "at most one user may set root: true, got "
+                + ", ".join(u.name for u in flagged)
+            )
+        self.root_user = flagged[0] if flagged else self.users[0]
+        for i, u in enumerate(self.users):
+            if u.ttyd_port is None:
+                u.ttyd_port = TTYD_PORT_BASE + i
+
+    @property
+    def webhook_enable(self):
+        return bool(self.webhook_repo and self.webhook_script)
+
+
+class User:
+    def __init__(self, name, data, spec):
+        self.name = name
+        self.spec = spec
+        self.home = data.get("home") or f"/home/{name}"
+        self.agent = data.get("agent") or spec.default_agent
+        self.ttyd_port = data.get("ttydPort")
+        self.want_root = bool(data.get("root"))
+        self.environment = dict(data.get("environment") or {})
+        self.environment_files = list(data.get("environmentFiles") or [])
+        sessions = data.get("sessions")
+        if sessions is None:
+            sessions = {"main": {"agent": self.agent}}
+        self.sessions = sessions
+        for sname, s in sorted(self.sessions.items()):
+            agent = (s or {}).get("agent") or self.agent
+            if agent not in spec.agents:
+                raise ConfigError(
+                    f"user {name}: session {sname!r} uses agent {agent!r}, "
+                    f"which is not in agents {spec.agents!r}"
+                )
+
+    @property
+    def url(self):
+        return f"https://{self.spec.domain}/{self.name}/"
+
+    @property
+    def env_key(self):
+        """The suffix caddy env placeholders use: uppercase, _ for -."""
+        return self.name.upper().replace("-", "_")
+
+
+# --------------------------------------------------------------------------
+# Rendering
+# --------------------------------------------------------------------------
+
+class Tree:
+    """Files, directories and symlinks to put on the host.
+
+    Collected first and written second so a render can be inspected
+    (`--dry-run`), diffed in a test (`--root`), and applied atomically per
+    file, with "what actually changed" reported rather than guessed.
+    """
+
+    def __init__(self):
+        self.files = {}      # path -> (text, mode)
+        self.dirs = []       # (path, mode, owner, group)
+        self.links = []      # (link, target)
+        self.units = []      # unit names to enable
+        self.disable = []    # unit names to disable
+
+    def file(self, path, text, mode=0o644):
+        self.files[str(path)] = (text, mode)
+
+    def dir(self, path, mode=0o755, owner="root", group="root"):
+        self.dirs.append((str(path), mode, owner, group))
+
+    def link(self, link, target):
+        self.links.append((str(link), str(target)))
+
+
+def env_file(pairs):
+    """Render an EnvironmentFile. Keys sorted for a stable diff."""
+    return "".join(f"{k}={v}\n" for k, v in pairs if v not in (None, ""))
+
+
+def dropin(section_lines):
+    return "[Unit]\n\n[Service]\n" + "".join(f"{l}\n" for l in section_lines)
+
+
+class Renderer:
+    def __init__(self, spec, profile, root=Path("/")):
+        self.spec = spec
+        self.profile = Path(profile)
+        self.root = Path(root)
+        self.bin = self.profile / "bin"
+        self.share = self.profile / "share" / "agent-box"
+
+    def p(self, *parts):
+        """A path inside the render root (so --root DIR renders a tree)."""
+        return self.root / Path(*parts).relative_to("/")
+
+    def render(self):
+        t = Tree()
+        self.dirs(t)
+        self.shared_units(t)
+        self.per_user(t)
+        self.sudoers(t)
+        self.tmpfiles(t)
+        if self.spec.web_enable:
+            self.caddy(t)
+        return t
+
+    # -- host directories ---------------------------------------------------
+
+    def dirs(self, t):
+        t.dir(self.p("/etc/agent-box"), 0o755)
+        t.dir(self.p("/etc/agent-box/units"), 0o755)
+        t.dir(self.p("/etc/agent-box/seed"), 0o755)
+        t.dir(self.p("/etc/agent-box/guides"), 0o755)
+        t.dir(self.p("/etc/systemd/system"), 0o755)
+
+    # -- units --------------------------------------------------------------
+
+    def shared_units(self, t):
+        """Install the %i template units from the profile, byte-for-byte."""
+        src = self.share / "units"
+        if not src.is_dir():
+            raise ConfigError(
+                f"{src} is missing — is the runtime profile installed? "
+                "(nix profile install github:defangdevs/agent-box#runtime)"
+            )
+        for unit in sorted(src.iterdir()):
+            if unit.name.startswith("agent-box-webhook@") and \
+                    not self.spec.webhook_enable:
+                continue
+            if unit.name.startswith(("agent-web-terminal@",
+                                     "agent-box-settings@")) and \
+                    not self.spec.web_enable:
+                continue
+            t.file(self.p("/etc/systemd/system", unit.name),
+                   unit.read_text(), 0o444)
+        if self.spec.web_enable:
+            t.file(self.p("/etc/systemd/system/caddy.service"),
+                   self.caddy_unit(), 0o444)
+
+    def caddy_unit(self):
+        """The web front door.
+
+        Native-only: on NixOS this is services.caddy. It keeps the name
+        caddy.service because the shared password helper reloads that unit
+        by name (modules/src/password-helper.py) — and nothing can collide
+        with it, since `apply` never installs a distro caddy. It reads the
+        auth secrets from /run/agent-box-web/env, which `apply --first-boot`
+        writes and the helper rewrites on a password change (the job
+        agent-web-auth-secrets.service does on the NixOS side).
+        """
+        return (
+            "[Unit]\n"
+            "Description=Caddy (agent-box web front door)\n"
+            "After=network-online.target\n"
+            "Wants=network-online.target\n"
+            "\n"
+            "[Service]\n"
+            "Type=notify\n"
+            "User=caddy\n"
+            "Group=caddy\n"
+            # NOT --environ: it dumps the whole environment to the journal
+            # on every start, and EnvironmentFile above is where the auth
+            # secrets (WEB_PASSWORD_HASH_*, WEB_COOKIE_SECRET_*) come from.
+            f"ExecStart={self.bin}/caddy run "
+            "--config /etc/agent-box/Caddyfile --adapter caddyfile\n"
+            f"ExecReload={self.bin}/caddy reload "
+            "--config /etc/agent-box/Caddyfile --adapter caddyfile --force\n"
+            "EnvironmentFile=/run/agent-box-web/env\n"
+            # Caddy puts its ACME certificates under $XDG_DATA_HOME/caddy,
+            # defaulting to $HOME/.local/share — and systemd takes HOME from
+            # passwd, where a system caddy user has /home/caddy. With
+            # ProtectHome=true below that is unreadable, so the very first
+            # certificate failed to cache and the box served no TLS at all
+            # ("permission denied" on .../certificates/...key, and every
+            # client got tlsv1 alert internal error). NixOS avoids it by
+            # giving the caddy user dataDir as its home; here the unit says
+            # so itself, which also holds when the distro created the user.
+            "Environment=HOME=/var/lib/caddy\n"
+            "Environment=XDG_DATA_HOME=/var/lib\n"
+            "Environment=XDG_CONFIG_HOME=/var/lib\n"
+            "StateDirectory=caddy\n"
+            "Restart=on-failure\n"
+            "RestartSec=5s\n"
+            # Same shape as the NixOS caddy unit: it must not read /home,
+            # which is why ~/sites is a symlink into /var/lib/agent-box-sites.
+            "ProtectHome=true\n"
+            "ProtectSystem=strict\n"
+            "ReadWritePaths=/var/lib/caddy\n"
+            "AmbientCapabilities=CAP_NET_BIND_SERVICE\n"
+            "CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n"
+            "NoNewPrivileges=true\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        )
+
+    def host_path(self, user):
+        """PATH for a session.
+
+        The user's own profile first (`nix profile add` self-service must
+        win), then the box profile, then the distro's own bin dirs — the
+        native counterpart of the module's curated store-path PATH.
+        """
+        return ":".join([
+            f"{user.home}/.nix-profile/bin",
+            str(self.bin),
+            "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+        ])
+
+    def per_user(self, t):
+        for u in self.spec.users:
+            self.user_env(t, u)
+            self.user_dropins(t, u)
+            self.user_seed(t, u)
+            t.units.append(f"agent-box@{u.name}.service")
+            if self.spec.web_enable:
+                t.units.append(f"agent-web-terminal@{u.name}.service")
+                t.units.append(f"agent-box-settings@{u.name}.socket")
+            if self.spec.webhook_enable:
+                t.units.append(f"agent-box-webhook@{u.name}.socket")
+        if self.spec.web_enable:
+            t.units.append("caddy.service")
+            # The manifest that replaces the module's eval-time per-user loop
+            # (design item 5 in issue #154): who has a web login, and where
+            # their password hash lives.
+            t.file(self.p("/etc/agent-box/web-users"),
+                   "".join(f"{u.name}\t/etc/agent-box/{u.name}.hash\n"
+                           for u in self.spec.users),
+                   0o600)
+
+    def user_env(self, t, u):
+        agent_bins = " ".join(
+            [f"{a}={self.bin}/{'claude' if a == 'claude' else a}"
+             for a in self.spec.agents] + ["shell=/bin/bash"])
+        pairs = [
+            ("AGENT_BOX_SESSIONS_SEED",
+             f"/etc/agent-box/seed/{u.name}-sessions.json"),
+            ("AGENT_BOX_AGENT_BINS", agent_bins),
+            ("AGENT_BOX_MARK_STOPPED", f"{self.bin}/agent-box-mark-stopped"),
+            ("AGENT_BOX_AGENTS_POINTER",
+             f"/etc/agent-box/guides/{u.name}-agents-pointer.md"),
+        ]
+        if self.spec.web_enable:
+            pairs.append(("AGENT_BOX_URL", u.url))
+            if self.spec.webhook_enable:
+                pairs.append(("AGENT_BOX_WEBHOOK_URL",
+                              f"https://{self.spec.domain}/{u.name}/webhook"))
+        # Arbitrary per-user extras (the module's u.environment) join the
+        # generated file rather than needing a drop-in.
+        pairs += sorted(u.environment.items())
+        t.file(self.p("/etc/agent-box/units", f"{u.name}.env"),
+               env_file(pairs))
+
+        if self.spec.web_enable:
+            t.file(self.p("/etc/agent-box/units",
+                          f"agent-web-terminal-{u.name}.env"),
+                   env_file([("AGENT_BOX_TTYD_PORT", u.ttyd_port),
+                             ("AGENT_BOX_WEB_DOMAIN", self.spec.domain)]))
+            settings = [
+                ("AGENT_BOX_PASSWORD_CMD",
+                 f"/usr/bin/sudo -n /etc/agent-box/bin/agent-box-password-{u.name}"),
+            ]
+            if u is self.spec.root_user:
+                settings.append(("AGENT_BOX_HOME", "1"))
+            if self.spec.webhook_enable:
+                settings.append(("AGENT_BOX_WEBHOOK_STATE_DIR",
+                                 f"{u.home}/.local/state/local-webhook"))
+            t.file(self.p("/etc/agent-box/units",
+                          f"agent-box-settings-{u.name}.env"),
+                   env_file(settings))
+        if self.spec.webhook_enable:
+            t.file(self.p("/etc/agent-box/units",
+                          f"agent-box-webhook-{u.name}.env"),
+                   env_file([("LOCAL_WEBHOOK_STATE_DIR",
+                              f"{u.home}/.local/state/local-webhook")]))
+
+    def user_dropins(self, t, u):
+        """Host-level content, per instance.
+
+        #295 found that a template-level drop-in silently never merges into
+        an instance, and that a bare-name ExecStart is not reliably resolved
+        by ExecSearchPath in practice — so every ExecStart here is absolute
+        and every drop-in is per instance, matching the NixOS side.
+        """
+        path = self.host_path(u)
+        lines = [
+            f'Environment="PATH={path}"',
+            f'Environment="AGENT_BOX_HOST_LABEL={self.spec.host_label}"',
+            f'Environment="AGENT_BOX_ENV_EXEC={self.bin}/agent-box-env-exec"',
+            f'Environment="AGENT_BOX_GREP_BIN={self.bin}/grep"',
+            f'Environment="AGENT_BOX_FIND_BIN={self.bin}/find"',
+            f'Environment="AGENT_BOX_FLOCK_BIN={self.bin}/flock"',
+            f'Environment="AGENT_BOX_HOSTNAME_BIN={self.bin}/hostname"',
+            f'ExecSearchPath={path}',
+            "ExecStart=",
+            f"ExecStart={self.bin}/agent-box-supervisor",
+            "ExecStop=",
+            f"ExecStop={self.bin}/tmux -L agent-box kill-server",
+        ]
+        if "codex" in self.spec.agents:
+            lines.insert(2, 'Environment="AGENT_BOX_CODEX_RC='
+                            f'{self.bin}/agent-box-codex-remote-control"')
+        if self.spec.webhook_enable:
+            lines.insert(2, 'Environment="AGENT_BOX_WEBHOOK_REPO='
+                            f'{self.spec.webhook_repo}"')
+        if self.spec.protect_memory:
+            # Same knob as the module: the supervisor is the last thing that
+            # should be killed when the box runs out of memory.
+            lines.append("OOMScoreAdjust=500")
+        if self.spec.sudo_allowlist:
+            lines.append("NoNewPrivileges=false")
+        if self.spec.web_enable:
+            lines.append(f"ReadWritePaths=/var/lib/agent-box-sites/{u.name}")
+            lines.append(
+                f"ReadWritePaths=/var/lib/agent-box-downloads/{u.name}")
+        for f in u.environment_files:
+            lines.append(f"EnvironmentFile=-{f}")
+        t.file(self.p("/etc/systemd/system",
+                      f"agent-box@{u.name}.service.d", "10-host.conf"),
+               dropin(lines))
+
+        if self.spec.web_enable:
+            t.file(self.p("/etc/systemd/system",
+                          f"agent-web-terminal@{u.name}.service.d",
+                          "10-host.conf"),
+                   dropin([
+                       f'Environment="PATH={self.bin}"',
+                       "ExecStart=",
+                       f"ExecStart={self.bin}/ttyd --writable --url-arg "
+                       f"-p {u.ttyd_port} -i 127.0.0.1 -b /{u.name} "
+                       "-t disableLeaveAlert=true "
+                       f"-t titleFixed={u.name}@{self.spec.domain} "
+                       f"{self.bin}/agent-box-attach",
+                   ]))
+            t.file(self.p("/etc/systemd/system",
+                          f"agent-box-settings@{u.name}.service.d",
+                          "10-host.conf"),
+                   dropin([
+                       f'Environment="PATH={self.bin}"',
+                       f'Environment="AGENT_BOX_AGENTS='
+                       f'{",".join(self.spec.agents + ["shell"])}"',
+                       f'Environment="AGENT_BOX_DEFAULT_AGENT='
+                       f'{self.spec.default_agent}"',
+                       f'Environment="AGENT_BOX_REPO={self.spec.repo}"',
+                       f'Environment="AGENT_BOX_REV={self.spec.rev}"',
+                       'Environment="AGENT_BOX_SYSTEMCTL=/usr/bin/systemctl"',
+                       f'Environment="AGENT_BOX_TMUX_BIN={self.bin}/tmux"',
+                       'Environment="AGENT_BOX_UPDATE_CMD=/usr/bin/sudo -n '
+                       '/usr/bin/systemctl start --no-block '
+                       'agent-box-update.service"',
+                       'Environment="AGENT_BOX_UPDATE_UNIT='
+                       'agent-box-update.service"',
+                       "ExecStart=",
+                       f"ExecStart={self.bin}/agent-box-settings",
+                   ]))
+        if self.spec.webhook_enable:
+            t.file(self.p("/etc/systemd/system",
+                          f"agent-box-webhook@{u.name}.service.d",
+                          "10-host.conf"),
+                   dropin([
+                       f'Environment="PATH={self.bin}"',
+                       'Environment="LOCAL_WEBHOOK_SPAWN_CMD='
+                       f'{self.bin}/agent-box-webhook-spawn"',
+                       "ExecStart=",
+                       f"ExecStart={self.bin}/agent-box-webhook-receiver",
+                   ]))
+
+    def user_seed(self, t, u):
+        """The declared sessions, seeded on first boot only.
+
+        sessions.json is runtime data afterwards — the supervisor never lets
+        an apply clobber sessions the user added or removed while live.
+
+        The schema is NOT ours to choose: modules/src/supervisor.sh reads
+        this file with jq as {"version":1,"sessions":{"<name>":{...}}} and
+        expects every runtime field to be present. An earlier shape here —
+        a list of {"name","agent"} — parsed as JSON and then broke the
+        supervisor on a live box: `jq: Cannot index array with string ("0")`
+        in a restart loop, with the seeded session showing up as one named
+        "0" and never starting. Defaults mirror the module's per-session
+        options (modules/agent-box.nix.in: skipPermissions/remoteControl
+        default true, everything else null/[]).
+        """
+        sessions = {}
+        for sname in sorted(u.sessions):
+            s = u.sessions[sname] or {}
+            sessions[sname] = {
+                "agent": s.get("agent") or u.agent,
+                "skipPermissions": bool(s.get("skipPermissions", True)),
+                "remoteControl": bool(s.get("remoteControl", True)),
+                "extraArgs": list(s.get("extraArgs") or []),
+                # null → the supervisor derives "<user>-<session>@<host>"
+                # at start time.
+                "remoteControlName": s.get("remoteControlName"),
+                "workingDirectory": s.get("cwd") or s.get(
+                    "workingDirectory") or u.home,
+                # Runtime state the supervisor manages; seeded so a declared
+                # kickoff prompt fires once and hasRun exists from the start.
+                "initialPrompt": s.get("prompt") or s.get("initialPrompt"),
+                "resumePrompt": s.get("resumePrompt"),
+                "boxSessionId": None,
+                "hasRun": False,
+            }
+        t.file(self.p("/etc/agent-box/seed", f"{u.name}-sessions.json"),
+               json.dumps({"version": 1, "sessions": sessions},
+                          indent=2, sort_keys=True) + "\n", 0o644)
+
+        guide = self.share / "guides" / "default-agents.md"
+        pointer = (
+            f"# agent-box — {u.name}@{self.spec.host_label}\n\n"
+            "The canonical guide is read-only and updated with the box:\n"
+            "@/etc/agent-box-guides/AGENTS.agent.md\n"
+        )
+        t.file(self.p("/etc/agent-box/guides",
+                      f"{u.name}-agents-pointer.md"), pointer)
+        if guide.is_file():
+            t.file(self.p("/etc/agent-box-guides/AGENTS.agent.md"),
+                   guide.read_text(), 0o444)
+
+    # -- sudoers, tmpfiles, caddy -------------------------------------------
+
+    def sudoers(self, t):
+        """Least-privilege sudo, data-driven from the config.
+
+        Only the exact commands the box needs: reload the web front door,
+        start the self-update unit, and each user's own password helper.
+        """
+        lines = [
+            "# Generated by `agentbox apply` — do not edit.",
+        ]
+        for u in self.spec.users:
+            cmds = [f"/etc/agent-box/bin/agent-box-password-{u.name}"]
+            if self.spec.web_enable:
+                cmds.append("/usr/bin/systemctl reload caddy.service")
+            cmds.append(
+                "/usr/bin/systemctl start --no-block agent-box-update.service")
+            cmds += self.spec.sudo_allowlist
+            lines.append(f"{u.name} ALL=(root) NOPASSWD: " + ", ".join(cmds))
+        t.file(self.p("/etc/sudoers.d/agent-box"),
+               "\n".join(lines) + "\n", 0o440)
+
+    def tmpfiles(self, t):
+        """The same directory set the module declares in tmpfiles.d.
+
+        systemd-tmpfiles exists on Ubuntu and RHEL too, so this stays a
+        declaration rather than a pile of mkdir calls — and `apply` runs
+        systemd-tmpfiles --create to realize it.
+        """
+        lines = []
+        if self.spec.web_enable:
+            lines += [
+                "d /var/lib/agent-box-web 0700 root root - -",
+                "d /run/agent-box-web 0700 root root - -",
+                "d /var/lib/agent-box-sites 0755 root root - -",
+                "d /var/lib/agent-box-downloads 0755 root root - -",
+                "d /run/agent-box-settings 0755 root root - -",
+            ]
+        for u in self.spec.users:
+            if self.spec.web_enable:
+                lines += [
+                    f"d /var/lib/agent-box-sites/{u.name} 0750 {u.name} caddy - -",
+                    f"L+ {u.home}/sites - - - - /var/lib/agent-box-sites/{u.name}",
+                    f"d /var/lib/agent-box-downloads/{u.name} 0750 {u.name} caddy - -",
+                    f"L+ {u.home}/downloads - - - - /var/lib/agent-box-downloads/{u.name}",
+                ]
+            # The parent is declared too, and owned by the user. Without it
+            # systemd-tmpfiles creates ~/.config itself as root, then refuses
+            # to descend into it — "Detected unsafe path transition
+            # /home/agent (owned by agent) -> /home/agent/.config (owned by
+            # root)", exit 73 — and the supervisor's first act on a fresh box
+            # is `mkdir ~/.config/agent-box`, which then fails with
+            # "Permission denied" and the seeded session never starts. The
+            # NixOS module gets away with the single rule only because
+            # ~/.config already exists, user-owned, by the time its rules run.
+            lines += [
+                f"d {u.home}/.config 0755 {u.name} {u.name} - -",
+                f"d {u.home}/.config/agent-box 0700 {u.name} {u.name} - -",
+            ]
+        if self.spec.webhook_enable:
+            lines.append("d /run/agent-box-webhook 0755 root root - -")
+        t.file(self.p("/etc/tmpfiles.d/agent-box.conf"),
+               "\n".join(lines) + "\n")
+
+    def caddy(self, t):
+        """Bind the shared Caddyfile fragments.
+
+        The fragments are @TOKEN@ templates — the same token set both
+        backends bind (issue #154 Phase 2), so the rendered Caddyfile is the
+        same text NixOS produces.
+        """
+        frag = self.share / "caddy"
+        root_user = self.spec.root_user
+
+        def bind(name, user=None):
+            text = (frag / f"caddyfile-{name}.caddy").read_text()
+            text = text.replace("@DOMAIN@", self.spec.domain)
+            if user is not None:
+                # Bind every token the fragments carry. The values mirror the
+                # module's helpers one for one (settingsSocketOf,
+                # downloadsDirOf, webhookSocketOf, webhookPathOf, envName),
+                # because the rendered Caddyfile has to be the same text on
+                # both backends.
+                for token, value in [
+                    ("@USER_ENV@", user.env_key),
+                    ("@SETTINGS_SOCKET@",
+                     f"/run/agent-box-settings/{user.name}.sock"),
+                    ("@DOWNLOADS_DIR@",
+                     f"/var/lib/agent-box-downloads/{user.name}"),
+                    ("@TTYD_PORT@", str(user.ttyd_port)),
+                    ("@WEBHOOK_PATH@", f"/{user.name}/webhook"),
+                    ("@WEBHOOK_SOCKET@",
+                     f"/run/agent-box-webhook/{user.name}.sock"),
+                    # Last: @USER@ is a prefix of nothing else, but keeping
+                    # it last means a value containing "@USER@" could never
+                    # be re-substituted.
+                    ("@USER@", user.name),
+                ]:
+                    text = text.replace(token, value)
+            left = re.findall(r"@[A-Z_]+@", text)
+            if left:
+                raise ConfigError(
+                    f"caddyfile-{name}.caddy has unbound token(s) "
+                    f"{sorted(set(left))} — the fragment gained a token the "
+                    "native renderer does not know about")
+            return text
+
+        parts = [bind("header")]
+        for u in self.spec.users:
+            if self.spec.webhook_enable:
+                parts.append(bind("webhook", u))
+            parts.append(bind("terminal", u))
+        parts.append(bind("root", root_user))
+        parts.append("}\n")
+        t.file(self.p("/etc/agent-box/Caddyfile"), "\n".join(parts), 0o644)
+
+        # The per-user password helper. It crosses sudo, so its paths are
+        # compiled in here rather than read from env — an env-supplied path
+        # would be a root-write redirect primitive (issue #154 Phase 2).
+        helper_src = self.profile / "libexec" / "agent-box" / \
+            "password-helper.py"
+        if helper_src.is_file():
+            body = helper_src.read_text()
+            for u in self.spec.users:
+                # Constants are APPENDED, exactly as the module's generated
+                # tail appends them: the body assigns its own defaults at
+                # import time, so anything that has to differ natively
+                # (SYSTEMCTL) must come after it. They are compiled in
+                # rather than read from env because the helper runs via
+                # sudo — an env-supplied path would be a root-write
+                # redirect primitive (issue #154 Phase 2 exception).
+                tail = (
+                    "\n"
+                    "# Per-user constants, appended by `agentbox apply`.\n"
+                    f"HASH_FILE = '/etc/agent-box/{u.name}.hash'\n"
+                    "COOKIE_FILE = "
+                    f"'/var/lib/agent-box-web/cookie-secret-{u.name}'\n"
+                    f"ENV_SUFFIX = '{u.env_key}'\n"
+                    f"CADDY = '{self.bin}/caddy'\n"
+                    "# Native override: the body's default is the NixOS path.\n"
+                    "SYSTEMCTL = '/usr/bin/systemctl'\n"
+                    "\n"
+                    'if __name__ == "__main__":\n'
+                    "    main()\n"
+                )
+                t.file(self.p("/etc/agent-box/bin",
+                              f"agent-box-password-{u.name}"),
+                       f"#!{self.bin}/agent-box-python\n" + body + tail,
+                       0o755)
+
+        # Interactive CLIs. The profile ships them bare (-bare); the env
+        # prelude the module compiles into its wrapper is generated here,
+        # because these run from every PATH there is, not from a unit.
+        t.file(self.p("/usr/local/bin/agent-box-session"),
+               "#!/bin/sh\n"
+               "# Generated by `agentbox apply`.\n"
+               f"export AGENT_BOX_AGENTS='{' '.join(self.spec.agents + ['shell'])}'\n"
+               f"export AGENT_BOX_DEFAULT_AGENT='{self.spec.default_agent}'\n"
+               f"export AGENT_BOX_FLOCK_BIN='{self.bin}/flock'\n"
+               f'exec {self.bin}/agent-box-session-bare "$@"\n', 0o755)
+        if self.spec.webhook_enable:
+            t.file(self.p("/usr/local/bin/agent-box-webhook"),
+                   "#!/bin/sh\n"
+                   "# Generated by `agentbox apply`.\n"
+                   f"export AGENT_BOX_WEBHOOK_SCRIPT='{self.spec.webhook_script}'\n"
+                   f'exec {self.bin}/agent-box-webhook-bare "$@"\n', 0o755)
+
+
+# --------------------------------------------------------------------------
+# Applying
+# --------------------------------------------------------------------------
+
+def run(cmd, check=True, capture=False):
+    return subprocess.run(cmd, check=check, text=True,
+                          capture_output=capture)
+
+
+def write_if_changed(path, text, mode, dry_run=False):
+    """Write atomically, and only when the content or mode differs."""
+    path = Path(path)
+    try:
+        current = path.read_text()
+        same = current == text and (path.stat().st_mode & 0o7777) == mode
+    except FileNotFoundError:
+        same = False
+    if same:
+        return False
+    if dry_run:
+        print(f"would write {path}")
+        return True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".agentbox-new")
+    tmp.write_text(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    print(f"wrote {path}")
+    return True
+
+
+def ensure_user(name, home, dry_run=False):
+    """Create the login if it is missing. Never modifies an existing one."""
+    import pwd
+    try:
+        pwd.getpwnam(name)
+        return False
+    except KeyError:
+        pass
+    if dry_run:
+        print(f"would create user {name}")
+        return True
+    run(["useradd", "--create-home", "--home-dir", home,
+         "--shell", "/bin/bash", name])
+    print(f"created user {name}")
+    return True
+
+
+def systemd_units_live(prefix):
+    out = run(["systemctl", "list-unit-files", "--no-legend", f"{prefix}*"],
+              check=False, capture=True).stdout or ""
+    return [line.split()[0] for line in out.splitlines() if line.strip()]
+
+
+def cmd_apply(args):
+    profile = resolve_profile(args.profile)
+    spec = Spec(load_config(args.config), profile)
+    if args.first_boot:
+        first_boot(spec, args)
+    rend = Renderer(spec, profile, root=args.root or "/")
+    tree = rend.render()
+
+    live = args.root is None
+    changed = 0
+    for path, mode, owner, group in tree.dirs:
+        p = Path(path)
+        if not p.is_dir():
+            if args.dry_run:
+                print(f"would mkdir {p}")
+            else:
+                p.mkdir(parents=True, exist_ok=True)
+                os.chmod(p, mode)
+            changed += 1
+    for path, (text, mode) in sorted(tree.files.items()):
+        if write_if_changed(path, text, mode, args.dry_run):
+            changed += 1
+
+    if not live:
+        print(f"rendered {len(tree.files)} files under {args.root}")
+        return 0
+
+    if not args.dry_run:
+        for u in spec.users:
+            ensure_user(u.name, u.home)
+        if spec.web_enable:
+            ensure_group_user("caddy", home="/var/lib/caddy")
+        run(["systemd-tmpfiles", "--create", "/etc/tmpfiles.d/agent-box.conf"],
+            check=False)
+        run(["systemctl", "daemon-reload"])
+        # Enable what the config declares; disable instances for users that
+        # were removed from it, so a shrinking config is honored too.
+        for unit in tree.units:
+            run(["systemctl", "enable", "--now", unit], check=False)
+        wanted = set(tree.units)
+        for prefix in ("agent-box@", "agent-web-terminal@",
+                       "agent-box-settings@", "agent-box-webhook@"):
+            for unit in systemd_units_live(prefix):
+                if unit not in wanted and "@." not in unit:
+                    print(f"disabling {unit} (not in config)")
+                    run(["systemctl", "disable", "--now", unit], check=False)
+        if spec.web_enable:
+            run(["systemctl", "reload-or-restart", "caddy.service"],
+                check=False)
+    print(f"apply complete ({changed} change(s))")
+    return 0
+
+
+def ensure_group_user(name, home=None):
+    import pwd
+    try:
+        pwd.getpwnam(name)
+        return
+    except KeyError:
+        # --home-dir without --create-home: StateDirectory= makes the
+        # directory (owned by this user) when the unit starts, but passwd
+        # has to agree, or $HOME points into /home — which the unit's
+        # ProtectHome=true then hides from it.
+        run(["useradd", "--system", "--user-group", "--no-create-home",
+             *(["--home-dir", home] if home else []),
+             "--shell", "/usr/sbin/nologin", name], check=False)
+
+
+# What a runtime profile has and an individual package does not.
+PROFILE_MARKER = Path("share") / "agent-box"
+
+
+def resolve_profile(explicit):
+    """Where the runtime profile is.
+
+    Derived from this script's own location by default: agentbox ships in
+    the profile, so the profile is two directories up from bin/agentbox.
+
+    Deliberately NOT Path.resolve(): in a Nix profile bin/agentbox is a
+    symlink into agentbox's OWN store path, whose bin/ contains nothing but
+    agentbox. Following it lands two directories up from THERE — the
+    package, not the profile — and the first live launch died on exactly
+    that: "No such file or directory:
+    /nix/store/...-agentbox/bin/caddy". The render test never caught it
+    because it passes --profile explicitly, so this function was only ever
+    exercised on a real box. Keep the resolved path as a candidate anyway,
+    for an install that is a plain directory rather than a profile.
+    """
+    if explicit:
+        return Path(explicit)
+    env = os.environ.get("AGENT_BOX_PROFILE")
+    if env:
+        return Path(env)
+    argv0 = Path(sys.argv[0])
+    if not argv0.is_absolute():
+        argv0 = Path(shutil.which(argv0.name) or argv0).absolute()
+    candidates = [
+        argv0.parent.parent,            # a profile, symlink left intact
+        argv0.resolve().parent.parent,  # a plain (non-symlinked) install
+        Path("/nix/var/nix/profiles/agent-box"),
+    ]
+    for candidate in candidates:
+        if (candidate / PROFILE_MARKER).is_dir():
+            return candidate
+    return candidates[0]
+
+
+# --------------------------------------------------------------------------
+# First boot
+# --------------------------------------------------------------------------
+
+def settle_public_ip(attempts=60, quiet=3, sleep=10, initial=0):
+    """Wait until the public IPv4 stops changing, then return it.
+
+    A cloud provider may attach a static address a minute or two after the
+    instance starts, and the hostname is derived from that address — so
+    baking in the first answer would bake in the wrong one.
+    """
+    if initial:
+        time.sleep(initial)
+    prev, stable = None, 0
+    ip = None
+    for _ in range(attempts):
+        try:
+            with urllib.request.urlopen(
+                    "https://checkip.amazonaws.com", timeout=5) as r:
+                ip = r.read().decode().strip()
+        except Exception:
+            ip = None
+        stable = stable + 1 if ip and ip == prev else 0
+        prev = ip
+        if stable >= quiet:
+            return ip
+        time.sleep(sleep)
+    if not ip:
+        raise ConfigError("no public IPv4 to derive a hostname from")
+    return ip
+
+
+def first_boot(spec, args):
+    """What the CloudFormation UserData used to do inline.
+
+    Kept here rather than in a template so both the Lightsail and the EC2
+    native templates (and a hand-provisioned box) get the same behavior,
+    and so it is testable.
+    """
+    if spec.domain in ("", "auto", "sslip.io"):
+        ip = settle_public_ip(initial=args.settle_delay)
+        spec.domain = ip.replace(".", "-") + ".sslip.io"
+        print(f"derived domain {spec.domain} from {ip}")
+
+    password = os.environ.get("AGENT_BOX_WEB_PASSWORD", "")
+    pw_file = os.environ.get("AGENT_BOX_WEB_PASSWORD_FILE", "")
+    if not password and pw_file:
+        password = Path(pw_file).read_text().strip()
+    if spec.web_enable and password:
+        caddy = str(Path(spec.profile) / "bin" / "caddy")
+        Path("/run/agent-box-web").mkdir(parents=True, exist_ok=True)
+        os.chmod("/run/agent-box-web", 0o700)
+        env_lines = []
+        for u in spec.users:
+            # argon2id, and via stdin — the same algorithm and the same
+            # invocation the password helper uses for a later change, so a
+            # first-boot hash and a changed one are the same kind of hash.
+            hashed = subprocess.run(
+                [caddy, "hash-password", "--algorithm", "argon2id"],
+                input=password + "\n", text=True, check=True,
+                capture_output=True).stdout.strip()
+            Path(f"/etc/agent-box/{u.name}.hash").write_text(hashed + "\n")
+            os.chmod(f"/etc/agent-box/{u.name}.hash", 0o600)
+            cookie = os.urandom(32).hex()
+            Path("/var/lib/agent-box-web").mkdir(parents=True, exist_ok=True)
+            Path(f"/var/lib/agent-box-web/cookie-secret-{u.name}").write_text(
+                cookie + "\n")
+            env_lines += [
+                f"WEB_PASSWORD_HASH_{u.env_key}={hashed}",
+                f"WEB_PASSWORD_ALGORITHM_{u.env_key}=argon2id",
+                f"WEB_COOKIE_SECRET_{u.env_key}={cookie}",
+            ]
+        Path("/run/agent-box-web/env").write_text(
+            "\n".join(env_lines) + "\n")
+        os.chmod("/run/agent-box-web/env", 0o640)
+        print(f"hashed the web password for {len(spec.users)} user(s)")
+
+    # Write the resolved domain back, so a later plain `agentbox apply`
+    # (a config edit, an update) renders the same hostname.
+    if args.config.endswith(".json"):
+        data = json.loads(Path(args.config).read_text())
+        data["domain"] = spec.domain
+        Path(args.config).write_text(json.dumps(data, indent=2) + "\n")
+    else:
+        text = Path(args.config).read_text()
+        if re.search(r"^domain:", text, re.M):
+            text = re.sub(r"^domain:.*$", f"domain: {spec.domain}", text,
+                          count=1, flags=re.M)
+        else:
+            text = f"domain: {spec.domain}\n" + text
+        Path(args.config).write_text(text)
+
+
+def cmd_signal(args):
+    """PUT the CloudFormation success signal.
+
+    Separate from apply so the template can signal only after the box is
+    actually serving, and so a failed apply leaves the stack to time out
+    (and roll back) instead of reporting a box that does not work.
+    """
+    body = json.dumps({
+        "Status": args.status,
+        "Reason": args.reason,
+        "UniqueId": "agent-box-first-boot",
+        "Data": args.reason,
+    }).encode()
+    req = urllib.request.Request(
+        args.url, data=body, method="PUT",
+        headers={"Content-Type": ""})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        print(f"signalled {args.status}: HTTP {r.status}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="agentbox", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("apply", help="render and apply host configuration")
+    a.add_argument("--config", default="/etc/agent-box/config.yaml")
+    a.add_argument(
+        "--profile",
+        help="runtime profile path (default: derived from argv[0])")
+    a.add_argument(
+        "--root",
+        help="render into this directory instead of configuring the host")
+    a.add_argument("--dry-run", action="store_true",
+                   help="report what would change, write nothing")
+    a.add_argument("--first-boot", action="store_true",
+                   help="also settle the public IP, derive the sslip.io "
+                        "hostname and hash the web password")
+    a.add_argument(
+        "--settle-delay", type=int, default=0,
+        help="seconds to wait before the first IP probe")
+    a.set_defaults(func=cmd_apply)
+
+    s = sub.add_parser("signal", help="PUT a CloudFormation WaitCondition signal")
+    s.add_argument("url")
+    s.add_argument("--status", default="SUCCESS",
+                   choices=["SUCCESS", "FAILURE"])
+    s.add_argument("--reason", default="agent-box first boot complete")
+    s.set_defaults(func=cmd_signal)
+
+    args = ap.parse_args(argv)
+    try:
+        return args.func(args)
+    except ConfigError as e:
+        print(f"agentbox: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

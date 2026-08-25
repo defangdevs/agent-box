@@ -1,0 +1,31 @@
+[Unit]
+Description=Per-user secrets settings page for %i
+After=network-online.target agent-box-settings@%i.socket
+Requires=agent-box-settings@%i.socket
+Wants=network-online.target
+
+[Service]
+User=%i
+Restart=always
+RestartSec=5s
+Environment=TMUX_TMPDIR=/run/agent-box-%i
+Environment=AGENT_BOX_SETTINGS_USER=%i
+Environment=AGENT_BOX_SETTINGS_ENV_FILE=/home/%i/.config/agent-box/env
+Environment=AGENT_BOX_SETTINGS_BASE=/%i/settings
+Environment=AGENT_BOX_TMUX_SOCKET=agent-box
+Environment=AGENT_BOX_TMUX_TMPDIR=/run/agent-box-%i
+Environment=AGENT_BOX_SESSIONS_FILE=/home/%i/.config/agent-box/sessions.json
+EnvironmentFile=-/etc/agent-box/units/agent-box-settings-%i.env
+EnvironmentFile=-/etc/agent-box/units/agent-box-settings-%i.local.env
+ExecStart=agent-box-settings
+ProtectSystem=strict
+ReadWritePaths=/home/%i /run/agent-box-%i /var/lib/agent-box-web
+ProtectHome=false
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+NoNewPrivileges=false

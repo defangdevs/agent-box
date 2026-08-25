@@ -1,0 +1,27 @@
+[Unit]
+Description=Caddy (agent-box web front door)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+ExecStart=@PROFILE@/bin/caddy run --config /etc/agent-box/Caddyfile --adapter caddyfile
+ExecReload=@PROFILE@/bin/caddy reload --config /etc/agent-box/Caddyfile --adapter caddyfile --force
+EnvironmentFile=/run/agent-box-web/env
+Environment=HOME=/var/lib/caddy
+Environment=XDG_DATA_HOME=/var/lib
+Environment=XDG_CONFIG_HOME=/var/lib
+StateDirectory=caddy
+Restart=on-failure
+RestartSec=5s
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/caddy
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
