@@ -427,7 +427,9 @@ case "$cmd" in
     if [ -s "$REGISTRY_FILE" ]; then
       "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$REGISTRY_FILE" \
       | while IFS="$(printf '\t')" read -r n a state; do
-        printf '%s\n' "$live" | grep -qxF "$n" && state=live
+        case $'\n'"$live"$'\n' in
+          *$'\n'"$n"$'\n'*) state=live ;;
+        esac
         printf '%-24s %-8s %s\n' "$n" "$a" "$state"
       done
     fi

@@ -1832,6 +1832,9 @@ done
   agentBaseTools = [
     # text / data
     pkgs.gawk                 # the most common shell idiom after grep/sed
+    pkgs.gnugrep pkgs.gnused pkgs.findutils  # grep/sed/find/xargs (issue #372):
+      # every shell snippet on earth assumes these; ripgrep below is not a
+      # substitute, it just made the gap harder to notice
     pkgs.diffutils pkgs.gnupatch    # compare generated vs committed, apply patches
     pkgs.less                 # git's default pager; without it `git log` fails in a TTY
     pkgs.file                 # identify a blob before cat'ing a binary into context
@@ -2350,7 +2353,9 @@ case "$cmd" in
     if [ -s "$REGISTRY_FILE" ]; then
       "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$REGISTRY_FILE" \
       | while IFS="$(printf '\t')" read -r n a state; do
-        printf '%s\n' "$live" | grep -qxF "$n" && state=live
+        case $'\n'"$live"$'\n' in
+          *$'\n'"$n"$'\n'*) state=live ;;
+        esac
         printf '%-24s %-8s %s\n' "$n" "$a" "$state"
       done
     fi

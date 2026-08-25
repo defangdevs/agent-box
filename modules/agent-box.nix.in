@@ -370,6 +370,9 @@ let
   agentBaseTools = [
     # text / data
     pkgs.gawk                 # the most common shell idiom after grep/sed
+    pkgs.gnugrep pkgs.gnused pkgs.findutils  # grep/sed/find/xargs (issue #372):
+      # every shell snippet on earth assumes these; ripgrep below is not a
+      # substitute, it just made the gap harder to notice
     pkgs.diffutils pkgs.gnupatch    # compare generated vs committed, apply patches
     pkgs.less                 # git's default pager; without it `git log` fails in a TTY
     pkgs.file                 # identify a blob before cat'ing a binary into context
