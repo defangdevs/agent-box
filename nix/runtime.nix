@@ -51,6 +51,52 @@ let
        then lib.concatStringsSep "\n" (lib.tail lines)
        else text;
 
+  # settings-daemon.py is the ONE asset in modules/src that is not a finished
+  # file: it carries three `@@include:` markers (settings.css, settings.js and
+  # docs/potato.svg) that only bin/assemble-module.py expands. readFile'ing it
+  # like every other payload shipped those markers to the box verbatim, so the
+  # workspace page served `@@include:settings.css@@` inside its <style> and
+  # `@@include:settings.js@@` inside its <script> — no stylesheet, and
+  # "Uncaught SyntaxError: Invalid or unexpected token" killing every bit of
+  # the page's behavior. Seen on a live Lightsail box; the NixOS backend was
+  # never affected, because assembling the module IS the expansion.
+  #
+  # Resolved through the assembler's own resolve(), not a second
+  # implementation of the marker syntax: a `.py` host gets the identity
+  # escaper, so what comes out is the same plain Python the module embeds.
+  # Built as a derivation rather than fed through writers.writePython3Bin,
+  # because resolving the markers means RUNNING the assembler: handing
+  # `builtins.readFile <derivation>` to a writer would be
+  # import-from-derivation, and then `packages.x86_64-linux.runtime` could not
+  # even be EVALUATED from an aarch64 box — no more `nix build --dry-run`
+  # against the deploy target. The two things writePython3Bin adds are
+  # reproduced explicitly: the interpreter shebang and the flake8 gate, with
+  # the same ignore list the other python payloads here use.
+  settingsDaemon = pkgs.runCommand "agent-box-settings"
+    {
+      nativeBuildInputs = [ pkgs.python3 pkgs.python3Packages.flake8 ];
+    } ''
+      # The marker paths are relative to the including file, and one of them
+      # reaches out to docs/, so the layout has to be rebuilt around it.
+      mkdir -p tree/modules tree/docs
+      cp -r ${src} tree/modules/src
+      cp ${../docs/potato.svg} tree/docs/potato.svg
+      python3 ${../bin/assemble-module.py} \
+        --resolve tree/modules/src/settings-daemon.py > daemon.py
+      if grep -q '@@include' daemon.py; then
+        echo "an @@include@@ marker survived resolve() — the page would" >&2
+        echo "serve the marker text as CSS and as JS" >&2
+        exit 1
+      fi
+      flake8 --show-source --ignore E501,E302,E305,W503,E226 daemon.py
+      mkdir -p $out/bin
+      {
+        printf '#!%s\n' ${pkgs.python3}/bin/python3
+        cat daemon.py
+      } > $out/bin/agent-box-settings
+      chmod +x $out/bin/agent-box-settings
+    '';
+
   # writeShellScriptBin, not writeShellApplication: the module builds these
   # the same way, and writeShellApplication would prepend `set -o errexit`
   # (etc.) and silently change the semantics of every payload.
@@ -74,11 +120,7 @@ let
     (payload "agent-box-codex-remote-control" "codex-remote-control.sh")
     (payload "agent-box-claude-session-start-hook" "claude-session-start-hook.sh")
     (payload "agent-box-env-exec" "env-exec.sh")
-    (pkgs.writers.writePython3Bin "agent-box-settings" {
-      # Same gate as the module: compile-check the script, skip the style
-      # rules it is deliberately not written to.
-      flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" ];
-    } (readSrc "settings-daemon.py"))
+    settingsDaemon
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-spawn" "webhook-spawn.sh")
     (pkgs.writeShellScriptBin "agent-box-webhook-receiver" ''
