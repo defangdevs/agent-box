@@ -175,8 +175,8 @@ let
       and the transcripts under projects/), ~/.codex/ for Codex. A skill, a
       slash command or a hook you want the NEXT session to have goes there —
       and notes for your future self go in ~/AGENTS.md, which is yours to edit.
-    - sudo is a tight allowlist (essentially caddy reload + self-update), not
-      general root — don't plan around arbitrary sudo.
+    - sudo is a tight allowlist of a few narrowly-scoped commands, not general
+      root — don't plan around arbitrary sudo.
 
     ## Tools, secrets, and sibling sessions
 
