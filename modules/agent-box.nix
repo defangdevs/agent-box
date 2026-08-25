@@ -1770,56 +1770,21 @@ done
   # (see the codexFullAccess option, issue 234).
   codexFullAccess = cfg.codexFullAccess && builtins.elem "codex" cfg.installAgents;
 
-  # Defang CLI (issue #363): not in nixpkgs, so fetched straight from its own
-  # goreleaser assets rather than compiled — the release ships a statically
-  # linked binary per arch, which needs no autoPatchelf and no dynamic
-  # linker fixup on NixOS. Pin the version and both arch hashes together so a
-  # bump is a one-line diff; unlisted `pkgs.stdenv.hostPlatform.system`
-  # throws at eval time instead of silently fetching nothing.
-  defangVersion = "3.14.1";
-  defangAssets = {
-    x86_64-linux = {
-      arch = "amd64";
-      sha256 = "7b7f1834dc681a3a88f172577854c35f4adc85246f211ba29343eca23cec2be2";
-    };
-    aarch64-linux = {
-      arch = "arm64";
-      sha256 = "a2dda48431b128e088bf16073708a0c4c7e54373ebcf41c0d1f2726117b8fdab";
-    };
+  # Defang CLI (issue #363): not in nixpkgs, but DefangLabs/defang ships its
+  # own canonical packaging at pkgs/defang/cli.nix — `buildGo125Module`
+  # against the repo's own `src/`, with a `vendorHash` that is only ever
+  # valid for the go.sum sitting right next to it. Fetching the whole
+  # source tree at one pinned tag and calling THEIR file, rather than
+  # re-deriving a build ourselves, means that hash never needs maintaining
+  # here: it travels with the tag. (The alternative living beside it,
+  # pkgs/defang/default.nix — a fetchurl of the prebuilt release binary —
+  # is explicitly `lib.warn`-marked deprecated upstream and stuck on an old
+  # version; don't reach for that one.)
+  defangSrc = builtins.fetchTarball {
+    url = "https://github.com/DefangLabs/defang/archive/refs/tags/v3.14.1.tar.gz";
+    sha256 = "sha256:0advqwcrjmdfkraw6g5i5czd6hcglfk7yvhcxzy06clkx2j9bh0v";
   };
-  defangCli =
-    let
-      asset = defangAssets.${pkgs.stdenv.hostPlatform.system}
-        or (throw "defang: no release asset for ${pkgs.stdenv.hostPlatform.system}");
-    in
-    pkgs.stdenvNoCC.mkDerivation {
-      pname = "defang";
-      version = defangVersion;
-      src = pkgs.fetchurl {
-        url = "https://github.com/DefangLabs/defang/releases/download/v${defangVersion}/defang_${defangVersion}_linux_${asset.arch}.tar.gz";
-        sha256 = asset.sha256;
-      };
-      # The archive is two loose files with no wrapping directory, which
-      # stdenv's default unpackPhase rejects ("unpacker appears to have
-      # produced no directories") — extract the one file we want by hand
-      # instead of unpacking the whole tree.
-      dontUnpack = true;
-      dontConfigure = true;
-      dontBuild = true;
-      installPhase = ''
-        runHook preInstall
-        tar -xzf $src defang
-        install -Dm755 defang $out/bin/defang
-        runHook postInstall
-      '';
-      meta = with lib; {
-        description = "Take a Docker Compose app from your laptop to a cloud deployment";
-        homepage = "https://defang.io";
-        license = licenses.mit;
-        platforms = [ "x86_64-linux" "aarch64-linux" ];
-        mainProgram = "defang";
-      };
-    };
+  defangCli = pkgs.callPackage "${defangSrc}/pkgs/defang/cli.nix" { };
 
   # Tools agents assume exist. Nearly all of these are already installed on
   # any NixOS host (system-path.nix's requiredPackages) — but the agent unit
