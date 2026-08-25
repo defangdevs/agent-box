@@ -221,6 +221,107 @@
               printf 'generated services: %s\n' ${nixpkgs.lib.escapeShellArg (toString wanted)} > "$out"
             '';
 
+          # Guard (issue #362): a test or host example that overrides a unit
+          # by an old/misspelled name — e.g. the flat "agent-box-settings-agent"
+          # a rename left behind, instead of the real per-instance
+          # "agent-box-settings@agent" — does not fail at eval. NixOS happily
+          # defines a brand-new, never-started unit under that name, and the
+          # override silently never reaches the real daemon. A VM test then
+          # fails three steps removed from the cause (a timeout, not a missing
+          # override), and a host example just ships a no-op.
+          #
+          # `phantomBaseline` below is a fully-featured eval (web on, so the
+          # settings/webhook/terminal per-user units all render) — the ground
+          # truth for "which units does the module actually define". Scanning
+          # a fixed list of names (the grep stopgap from the issue) has the
+          # same blind spot as the sweep that missed this in the first place:
+          # it can only reject names it already knows about. Eval knows what
+          # actually got rendered, so it catches a name nobody anticipated.
+          phantom-unit-overrides =
+            let
+              phantomBaseline = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = { enable = true; domain = "phantom-unit.test"; user = "agent"; };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+              hasAt = n: nixpkgs.lib.hasInfix "@" n;
+              # "agent-box-settings@agent" -> "agent-box-settings@": the
+              # per-instance override target is expected to differ from the
+              # baseline's own username, so only the template half is checked.
+              templateOf = n: nixpkgs.lib.head (nixpkgs.lib.splitString "@" n) + "@";
+              # services and sockets are DIFFERENT unit types — a name that
+              # exists only as a socket must still fail a
+              # systemd.services.NAME override targeting it (and vice versa),
+              # so each class gets its own flat/template sets rather than one
+              # merged pool.
+              knownByClass = {
+                services = builtins.attrNames phantomBaseline.config.systemd.services;
+                sockets = builtins.attrNames phantomBaseline.config.systemd.sockets;
+              };
+              setsFor = class:
+                let known = knownByClass.${class}; in
+                {
+                  flatNames = builtins.filter (n: ! hasAt n) known;
+                  templatePrefixes =
+                    nixpkgs.lib.unique (map templateOf (builtins.filter hasAt known));
+                };
+              isKnownUnit = class: name:
+                let sets = setsFor class; in
+                if hasAt name
+                then builtins.elem (templateOf name) sets.templatePrefixes
+                else builtins.elem name sets.flatNames;
+
+              # `systemd.services.NAME` / `systemd.sockets.NAME` at attribute-path
+              # position, NAME bare ("caddy") or quoted with an "@" instance
+              # ("agent-box-settings@agent"). No "." in the class: it must stop
+              # before a chained ".environment" / ".serviceConfig" continuation
+              # rather than swallowing it into the captured name.
+              pattern = ''systemd\.(services|sockets)\."?([A-Za-z0-9_@-]+)"?'';
+              namesInFile = file:
+                let
+                  matches = builtins.filter builtins.isList
+                    (builtins.split pattern (builtins.readFile file));
+                in
+                map (g: { class = builtins.elemAt g 0; name = builtins.elemAt g 1; inherit file; })
+                  matches;
+
+              # Every test node config and published host example — the two
+              # places an override can name a unit that no longer exists.
+              nixFilesIn = dir:
+                map (n: dir + "/${n}")
+                  (builtins.filter (n: nixpkgs.lib.hasSuffix ".nix" n)
+                    (builtins.attrNames (builtins.readDir dir)));
+              scanFiles = nixFilesIn ./tests ++ nixFilesIn ./hosts;
+
+              overrides = builtins.concatMap namesInFile scanFiles;
+              phantoms = builtins.filter (o: ! isKnownUnit o.class o.name) overrides;
+            in
+            if phantoms != [ ]
+            then
+              throw (
+                "phantom systemd unit override(s) — name not found among the " +
+                "module's own rendered units of that class (renamed unit? " +
+                "wrong class? missing \"@\"?):\n" +
+                nixpkgs.lib.concatMapStringsSep "\n"
+                  (o: "  ${toString o.file}: systemd.${o.class}.${o.name}")
+                  phantoms
+              )
+            else
+              pkgs.runCommand "agent-box-phantom-unit-overrides-ok" { } ''
+                printf 'no phantom systemd unit overrides in tests/ or hosts/\n' > "$out"
+              '';
+
           # Guard (issue #132): the module's REAL generated Caddyfile (the VM
           # test below swaps in a `tls internal` stand-in) must carry the
           # authenticated downloads route for a web user — the handle, the
