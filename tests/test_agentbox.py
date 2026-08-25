@@ -252,6 +252,53 @@ class RenderTest(unittest.TestCase):
             with self.assertRaises(mod.ConfigError):
                 mod.write_auth_env(users)
 
+    def test_instances_come_back_after_a_reboot(self):
+        """The %i instances must be wanted by a target, not just started.
+
+        They carry no [Install] section, so `systemctl enable` does nothing
+        for them: on the live box every instance ran until the reboot and
+        then never came back — caddy alone, / answering 502, no terminal and
+        no agent session. Enablement therefore has to be a Wants= on the
+        target, the same mechanism the NixOS backend uses.
+        """
+        mu = (FIXTURE / "etc/systemd/system/multi-user.target.d"
+                        "/10-agent-box.conf").read_text()
+        sk = (FIXTURE / "etc/systemd/system/sockets.target.d"
+                        "/10-agent-box.conf").read_text()
+        for user in ("agent", "robot"):
+            self.assertIn(f"Wants=agent-box@{user}.service", mu)
+            self.assertIn(f"Wants=agent-web-terminal@{user}.service", mu)
+            self.assertIn(f"Wants=agent-box-settings@{user}.service", mu)
+            self.assertIn(f"Wants=agent-box-settings@{user}.socket", sk)
+        # Every template instance the renderer starts must also be named in
+        # one of the two drop-ins, or it is a unit that does not survive a
+        # reboot.
+        wanted = set()
+        for text in (mu, sk):
+            for line in text.splitlines():
+                if line.startswith("Wants="):
+                    wanted.add(line.split("=", 1)[1].strip())
+        for unit in self._rendered_units():
+            if "@" in unit:
+                self.assertIn(
+                    unit, wanted,
+                    f"{unit} is started by apply but nothing wants it at "
+                    "boot — it would vanish on the first reboot")
+
+    def _rendered_units(self):
+        """The unit list `apply` would act on, for this fixture's config."""
+        import importlib.util
+        spec = importlib.util.spec_from_loader(
+            "agentbox", importlib.machinery.SourceFileLoader(
+                "agentbox", str(AGENTBOX)))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=Path(tmp) / "o")
+            return list(rend.render().units)
+
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
         for unit in (SRC / "units").iterdir():
