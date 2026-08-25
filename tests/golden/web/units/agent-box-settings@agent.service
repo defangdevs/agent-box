@@ -14,7 +14,7 @@ Environment="AGENT_BOX_UPDATE_UNIT=agent-box-update.service"
 Environment="AGENT_BOX_WEBHOOK_PYTHON=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.6/bin/python3"
 Environment="AGENT_BOX_WEBHOOK_SCRIPT=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-webhook.py"
 Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-67/lib/locale/locale-archive"
-Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-settings/bin"
+Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-settings/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.10.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261/bin"
 Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026b/share/zoneinfo"
 ExecStart=
 ExecStart=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-settings/bin/agent-box-settings

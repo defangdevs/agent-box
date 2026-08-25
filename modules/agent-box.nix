@@ -12649,7 +12649,23 @@ if __name__ == "__main__":
             AGENT_BOX_UPDATE_UNIT = "agent-box-update.service";
             AGENT_BOX_SYSTEMCTL = "/run/current-system/sw/bin/systemctl";
           })
-          // { PATH = lib.mkForce (lib.makeBinPath [ settingsDaemon ]); };
+          // {
+            # mkForce for the reason spelled out on the "agent-box@" unit:
+            # NixOS sets a default Environment=PATH= for any declared
+            # systemd.services.<name> at plain priority. The base tools are
+            # KEPT, not replaced — they are what that default provided on
+            # master, and the daemon runs third-party CLIs with its own
+            # environment (guided sign-in, issues #207/#208/#313), so a
+            # PATH holding only agent-box's own bin breaks them.
+            PATH = lib.mkForce (lib.makeBinPath [
+              settingsDaemon
+              pkgs.coreutils
+              pkgs.findutils
+              pkgs.gnugrep
+              pkgs.gnused
+              pkgs.systemd
+            ]);
+          };
         serviceConfig.ExecStart = [ "" "${settingsDaemon}/bin/agent-box-settings" ];
       }) terminalUsers))
       # Webhook receiver daemon (issue #101), one per terminal user, gated on

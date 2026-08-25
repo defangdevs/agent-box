@@ -315,7 +315,7 @@ in
         # the substitution as the command would run the WRAPPER instead.
         attach = machine.succeed(
             "{ systemctl show agent-web-terminal@agent --property=ExecStart "
-            "--value | grep -o '/nix/store/[^ ]*-agent-box-attach' "
+            "--value | grep -o '/nix/store/[^ ]*agent-box-attach' "
             "|| echo /missing; } | head -n1"
         ).strip()
         assert attach != "/missing", attach
@@ -356,7 +356,7 @@ in
     machine.succeed(
         "grep -q -- '-T hyperlinks' "
         "$({ systemctl show agent-web-terminal@agent --property=ExecStart --value "
-        "| grep -o '/nix/store/[^ ]*-agent-box-attach' || echo /missing; } | head -n1)"
+        "| grep -o '/nix/store/[^ ]*agent-box-attach' || echo /missing; } | head -n1)"
     )
 
     # Working-directory picker (issue 131): the add-session form browses the
