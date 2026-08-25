@@ -210,9 +210,23 @@ registry_ensure() {
   mkdir -p "${REGISTRY_FILE%/*}"
   registry_lock
   if [ ! -s "$REGISTRY_FILE" ]; then
-    if [ -n "${1:-}" ]; then
+    # A seed is trusted only after it PASSES this shape check (issue #356):
+    # two independent producers (this module's Nix-declared seed and the
+    # native backend's) write the file this reads, and a shape they disagree
+    # on — .sessions as a list instead of an object, seen live on the native
+    # side — used to be installed as-is. The reconcile loop then read a
+    # session name as an array index and jq errored "Cannot index array with
+    # string" every couple of seconds forever, with nothing pointing at the
+    # seed as the cause. Reject it once, loudly, instead.
+    if [ -n "${1:-}" ] && "$REGISTRY_JQ" -e \
+         '(.version == 1) and (.sessions | type == "object")' \
+         "$1" >/dev/null 2>&1; then
       install -m 0600 "$1" "$REGISTRY_FILE"
     else
+      if [ -n "${1:-}" ]; then
+        echo "$REGISTRY_PROG: seed $1 is not a valid sessions.json" \
+             '(want {"version":1,"sessions":{...}}); starting empty instead' >&2
+      fi
       # 0600 like every other writer's output (the daemon's write_sessions, the
       # seed above, and mktemp's own mode in registry_edit): the registry
       # carries kickoff prompts and working directories, and only this user and
