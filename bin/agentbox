@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -274,11 +275,26 @@ class Renderer:
             "Type=notify\n"
             "User=caddy\n"
             "Group=caddy\n"
-            f"ExecStart={self.bin}/caddy run --environ "
+            # NOT --environ: it dumps the whole environment to the journal
+            # on every start, and EnvironmentFile above is where the auth
+            # secrets (WEB_PASSWORD_HASH_*, WEB_COOKIE_SECRET_*) come from.
+            f"ExecStart={self.bin}/caddy run "
             "--config /etc/agent-box/Caddyfile --adapter caddyfile\n"
             f"ExecReload={self.bin}/caddy reload "
             "--config /etc/agent-box/Caddyfile --adapter caddyfile --force\n"
             "EnvironmentFile=/run/agent-box-web/env\n"
+            # Caddy puts its ACME certificates under $XDG_DATA_HOME/caddy,
+            # defaulting to $HOME/.local/share — and systemd takes HOME from
+            # passwd, where a system caddy user has /home/caddy. With
+            # ProtectHome=true below that is unreadable, so the very first
+            # certificate failed to cache and the box served no TLS at all
+            # ("permission denied" on .../certificates/...key, and every
+            # client got tlsv1 alert internal error). NixOS avoids it by
+            # giving the caddy user dataDir as its home; here the unit says
+            # so itself, which also holds when the distro created the user.
+            "Environment=HOME=/var/lib/caddy\n"
+            "Environment=XDG_DATA_HOME=/var/lib\n"
+            "Environment=XDG_CONFIG_HOME=/var/lib\n"
             "StateDirectory=caddy\n"
             "Restart=on-failure\n"
             "RestartSec=5s\n"
@@ -471,18 +487,40 @@ class Renderer:
 
         sessions.json is runtime data afterwards — the supervisor never lets
         an apply clobber sessions the user added or removed while live.
+
+        The schema is NOT ours to choose: modules/src/supervisor.sh reads
+        this file with jq as {"version":1,"sessions":{"<name>":{...}}} and
+        expects every runtime field to be present. An earlier shape here —
+        a list of {"name","agent"} — parsed as JSON and then broke the
+        supervisor on a live box: `jq: Cannot index array with string ("0")`
+        in a restart loop, with the seeded session showing up as one named
+        "0" and never starting. Defaults mirror the module's per-session
+        options (modules/agent-box.nix.in: skipPermissions/remoteControl
+        default true, everything else null/[]).
         """
-        sessions = []
+        sessions = {}
         for sname in sorted(u.sessions):
             s = u.sessions[sname] or {}
-            entry = {"name": sname, "agent": s.get("agent") or u.agent}
-            if s.get("cwd"):
-                entry["cwd"] = s["cwd"]
-            if s.get("prompt"):
-                entry["prompt"] = s["prompt"]
-            sessions.append(entry)
+            sessions[sname] = {
+                "agent": s.get("agent") or u.agent,
+                "skipPermissions": bool(s.get("skipPermissions", True)),
+                "remoteControl": bool(s.get("remoteControl", True)),
+                "extraArgs": list(s.get("extraArgs") or []),
+                # null → the supervisor derives "<user>-<session>@<host>"
+                # at start time.
+                "remoteControlName": s.get("remoteControlName"),
+                "workingDirectory": s.get("cwd") or s.get(
+                    "workingDirectory") or u.home,
+                # Runtime state the supervisor manages; seeded so a declared
+                # kickoff prompt fires once and hasRun exists from the start.
+                "initialPrompt": s.get("prompt") or s.get("initialPrompt"),
+                "resumePrompt": s.get("resumePrompt"),
+                "boxSessionId": None,
+                "hasRun": False,
+            }
         t.file(self.p("/etc/agent-box/seed", f"{u.name}-sessions.json"),
-               json.dumps({"sessions": sessions}, indent=2) + "\n", 0o644)
+               json.dumps({"version": 1, "sessions": sessions},
+                          indent=2, sort_keys=True) + "\n", 0o644)
 
         guide = self.share / "guides" / "default-agents.md"
         pointer = (
@@ -542,8 +580,19 @@ class Renderer:
                     f"d /var/lib/agent-box-downloads/{u.name} 0750 {u.name} caddy - -",
                     f"L+ {u.home}/downloads - - - - /var/lib/agent-box-downloads/{u.name}",
                 ]
-            lines.append(
-                f"d {u.home}/.config/agent-box 0700 {u.name} {u.name} - -")
+            # The parent is declared too, and owned by the user. Without it
+            # systemd-tmpfiles creates ~/.config itself as root, then refuses
+            # to descend into it — "Detected unsafe path transition
+            # /home/agent (owned by agent) -> /home/agent/.config (owned by
+            # root)", exit 73 — and the supervisor's first act on a fresh box
+            # is `mkdir ~/.config/agent-box`, which then fails with
+            # "Permission denied" and the seeded session never starts. The
+            # NixOS module gets away with the single rule only because
+            # ~/.config already exists, user-owned, by the time its rules run.
+            lines += [
+                f"d {u.home}/.config 0755 {u.name} {u.name} - -",
+                f"d {u.home}/.config/agent-box 0700 {u.name} {u.name} - -",
+            ]
         if self.spec.webhook_enable:
             lines.append("d /run/agent-box-webhook 0755 root root - -")
         t.file(self.p("/etc/tmpfiles.d/agent-box.conf"),
@@ -738,7 +787,7 @@ def cmd_apply(args):
         for u in spec.users:
             ensure_user(u.name, u.home)
         if spec.web_enable:
-            ensure_group_user("caddy")
+            ensure_group_user("caddy", home="/var/lib/caddy")
         run(["systemd-tmpfiles", "--create", "/etc/tmpfiles.d/agent-box.conf"],
             check=False)
         run(["systemctl", "daemon-reload"])
@@ -760,14 +809,23 @@ def cmd_apply(args):
     return 0
 
 
-def ensure_group_user(name):
+def ensure_group_user(name, home=None):
     import pwd
     try:
         pwd.getpwnam(name)
         return
     except KeyError:
+        # --home-dir without --create-home: StateDirectory= makes the
+        # directory (owned by this user) when the unit starts, but passwd
+        # has to agree, or $HOME points into /home — which the unit's
+        # ProtectHome=true then hides from it.
         run(["useradd", "--system", "--user-group", "--no-create-home",
+             *(["--home-dir", home] if home else []),
              "--shell", "/usr/sbin/nologin", name], check=False)
+
+
+# What a runtime profile has and an individual package does not.
+PROFILE_MARKER = Path("share") / "agent-box"
 
 
 def resolve_profile(explicit):
@@ -775,14 +833,34 @@ def resolve_profile(explicit):
 
     Derived from this script's own location by default: agentbox ships in
     the profile, so the profile is two directories up from bin/agentbox.
+
+    Deliberately NOT Path.resolve(): in a Nix profile bin/agentbox is a
+    symlink into agentbox's OWN store path, whose bin/ contains nothing but
+    agentbox. Following it lands two directories up from THERE — the
+    package, not the profile — and the first live launch died on exactly
+    that: "No such file or directory:
+    /nix/store/...-agentbox/bin/caddy". The render test never caught it
+    because it passes --profile explicitly, so this function was only ever
+    exercised on a real box. Keep the resolved path as a candidate anyway,
+    for an install that is a plain directory rather than a profile.
     """
     if explicit:
         return Path(explicit)
     env = os.environ.get("AGENT_BOX_PROFILE")
     if env:
         return Path(env)
-    here = Path(sys.argv[0]).resolve()
-    return here.parent.parent
+    argv0 = Path(sys.argv[0])
+    if not argv0.is_absolute():
+        argv0 = Path(shutil.which(argv0.name) or argv0).absolute()
+    candidates = [
+        argv0.parent.parent,            # a profile, symlink left intact
+        argv0.resolve().parent.parent,  # a plain (non-symlinked) install
+        Path("/nix/var/nix/profiles/agent-box"),
+    ]
+    for candidate in candidates:
+        if (candidate / PROFILE_MARKER).is_dir():
+            return candidate
+    return candidates[0]
 
 
 # --------------------------------------------------------------------------
@@ -834,7 +912,7 @@ def first_boot(spec, args):
     if not password and pw_file:
         password = Path(pw_file).read_text().strip()
     if spec.web_enable and password:
-        caddy = str(resolve_profile(args.profile) / "bin" / "caddy")
+        caddy = str(Path(spec.profile) / "bin" / "caddy")
         Path("/run/agent-box-web").mkdir(parents=True, exist_ok=True)
         os.chmod("/run/agent-box-web", 0o700)
         env_lines = []

@@ -1,13 +1,29 @@
 {
-  "sessions": [
-    {
-      "name": "main",
-      "agent": "claude"
+  "sessions": {
+    "main": {
+      "agent": "claude",
+      "boxSessionId": null,
+      "extraArgs": [],
+      "hasRun": false,
+      "initialPrompt": null,
+      "remoteControl": true,
+      "remoteControlName": null,
+      "resumePrompt": null,
+      "skipPermissions": true,
+      "workingDirectory": "/home/agent"
     },
-    {
-      "name": "review",
+    "review": {
       "agent": "codex",
-      "cwd": "/home/agent/agent-box"
+      "boxSessionId": null,
+      "extraArgs": [],
+      "hasRun": false,
+      "initialPrompt": null,
+      "remoteControl": true,
+      "remoteControlName": null,
+      "resumePrompt": null,
+      "skipPermissions": true,
+      "workingDirectory": "/home/agent/agent-box"
     }
-  ]
+  },
+  "version": 1
 }
