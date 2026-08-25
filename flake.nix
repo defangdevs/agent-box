@@ -615,6 +615,7 @@
               check_payload agent-box-claude-session-start-hook claude-session-start-hook.sh
               check_payload agent-box-env-exec env-exec.sh
               check_payload agent-box-session-bare session-cli.sh
+              check_payload agent-box-upload upload-cli.sh
 
               # The settings daemon is the one asset in modules/src that is
               # NOT a finished file: it carries @@include@@ markers for
@@ -765,6 +766,31 @@
               # whether the tests pass or fail, and the exit status has to be
               # python's own.
               python3 repo/tests/test-assemble-module.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # Unit test for agent-box-upload (issue #368). The three things it
+          # gets right were shipped WRONG first, as a curl recipe in the guide
+          # (PR #367 review): the token in argv, where every other Linux user
+          # can read it out of ps, and a plain `curl -sS` that exits 0 on a
+          # 404 and hands back an error body where a URL was expected. Prose
+          # cannot be tested; this can, and it fails on both if either
+          # regresses. gh and curl are shimmed, so it needs no network and no
+          # token — the real endpoint has no sandbox, and a check that depends
+          # on GitHub being up is a check that goes red for someone else's
+          # outage.
+          upload-cli =
+            pkgs.runCommand "agent-box-upload-cli"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.jq ];
+                script = ./modules/src/upload-cli.sh;
+                tests = ./tests/test-upload-cli.sh;
+              } ''
+              bash "$tests" "$script" > log 2>&1 || {
                 cat log
                 exit 1
               }

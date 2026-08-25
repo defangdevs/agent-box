@@ -130,6 +130,15 @@ Always hand over the complete https:// URL. Only files under ~/downloads are
 exposed; nothing else in your home is reachable over the web. For
 unauthenticated sharing, run your own service and expose it via ~/sites.
 
+## Putting a screenshot in a GitHub issue or PR
+
+A screenshot settles a UI argument that paragraphs cannot, and you have no
+browser to paste one from. `agent-box-upload FILE --repo OWNER/REPO` puts the
+file in the same store a human's drag-and-drop uses and prints the markdown to
+paste into the body — no binary committed, no screenshot branch. Run
+`agent-box-upload --help` for the caveats that matter, the first being that
+the URL 404s until your comment references it.
+
 ## Serving a web app publicly
 
 Drop a snippet into ~/sites/NAME.caddy that reverse-proxies to a local port,
