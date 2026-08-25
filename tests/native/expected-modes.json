@@ -28,6 +28,7 @@
   "etc/systemd/system/agent-box@.service": "0o444",
   "etc/systemd/system/agent-box@agent.service.d/10-host.conf": "0o644",
   "etc/systemd/system/agent-box@robot.service.d/10-host.conf": "0o644",
+  "etc/systemd/system/agent-web-auth-secrets.service": "0o444",
   "etc/systemd/system/agent-web-terminal@.service": "0o444",
   "etc/systemd/system/agent-web-terminal@agent.service.d/10-host.conf": "0o644",
   "etc/systemd/system/agent-web-terminal@robot.service.d/10-host.conf": "0o644",
