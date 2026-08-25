@@ -1396,9 +1396,23 @@ if __name__ == "__main__":
       mkdir -p "''${REGISTRY_FILE%/*}"
       registry_lock
       if [ ! -s "$REGISTRY_FILE" ]; then
-        if [ -n "''${1:-}" ]; then
+        # A seed is trusted only after it PASSES this shape check (issue #356):
+        # two independent producers (this module's Nix-declared seed and the
+        # native backend's) write the file this reads, and a shape they disagree
+        # on — .sessions as a list instead of an object, seen live on the native
+        # side — used to be installed as-is. The reconcile loop then read a
+        # session name as an array index and jq errored "Cannot index array with
+        # string" every couple of seconds forever, with nothing pointing at the
+        # seed as the cause. Reject it once, loudly, instead.
+        if [ -n "''${1:-}" ] && "$REGISTRY_JQ" -e \
+             '(.version == 1) and (.sessions | type == "object")' \
+             "$1" >/dev/null 2>&1; then
           install -m 0600 "$1" "$REGISTRY_FILE"
         else
+          if [ -n "''${1:-}" ]; then
+            echo "$REGISTRY_PROG: seed $1 is not a valid sessions.json" \
+                 '(want {"version":1,"sessions":{...}}); starting empty instead' >&2
+          fi
           # 0600 like every other writer's output (the daemon's write_sessions, the
           # seed above, and mktemp's own mode in registry_edit): the registry
           # carries kickoff prompts and working directories, and only this user and
@@ -2110,9 +2124,23 @@ registry_ensure() {
   mkdir -p "''${REGISTRY_FILE%/*}"
   registry_lock
   if [ ! -s "$REGISTRY_FILE" ]; then
-    if [ -n "''${1:-}" ]; then
+    # A seed is trusted only after it PASSES this shape check (issue #356):
+    # two independent producers (this module's Nix-declared seed and the
+    # native backend's) write the file this reads, and a shape they disagree
+    # on — .sessions as a list instead of an object, seen live on the native
+    # side — used to be installed as-is. The reconcile loop then read a
+    # session name as an array index and jq errored "Cannot index array with
+    # string" every couple of seconds forever, with nothing pointing at the
+    # seed as the cause. Reject it once, loudly, instead.
+    if [ -n "''${1:-}" ] && "$REGISTRY_JQ" -e \
+         '(.version == 1) and (.sessions | type == "object")' \
+         "$1" >/dev/null 2>&1; then
       install -m 0600 "$1" "$REGISTRY_FILE"
     else
+      if [ -n "''${1:-}" ]; then
+        echo "$REGISTRY_PROG: seed $1 is not a valid sessions.json" \
+             '(want {"version":1,"sessions":{...}}); starting empty instead' >&2
+      fi
       # 0600 like every other writer's output (the daemon's write_sessions, the
       # seed above, and mktemp's own mode in registry_edit): the registry
       # carries kickoff prompts and working directories, and only this user and
@@ -3699,9 +3727,23 @@ registry_ensure() {
   mkdir -p "''${REGISTRY_FILE%/*}"
   registry_lock
   if [ ! -s "$REGISTRY_FILE" ]; then
-    if [ -n "''${1:-}" ]; then
+    # A seed is trusted only after it PASSES this shape check (issue #356):
+    # two independent producers (this module's Nix-declared seed and the
+    # native backend's) write the file this reads, and a shape they disagree
+    # on — .sessions as a list instead of an object, seen live on the native
+    # side — used to be installed as-is. The reconcile loop then read a
+    # session name as an array index and jq errored "Cannot index array with
+    # string" every couple of seconds forever, with nothing pointing at the
+    # seed as the cause. Reject it once, loudly, instead.
+    if [ -n "''${1:-}" ] && "$REGISTRY_JQ" -e \
+         '(.version == 1) and (.sessions | type == "object")' \
+         "$1" >/dev/null 2>&1; then
       install -m 0600 "$1" "$REGISTRY_FILE"
     else
+      if [ -n "''${1:-}" ]; then
+        echo "$REGISTRY_PROG: seed $1 is not a valid sessions.json" \
+             '(want {"version":1,"sessions":{...}}); starting empty instead' >&2
+      fi
       # 0600 like every other writer's output (the daemon's write_sessions, the
       # seed above, and mktemp's own mode in registry_edit): the registry
       # carries kickoff prompts and working directories, and only this user and
@@ -4911,9 +4953,23 @@ $PROMPT"
       mkdir -p "''${REGISTRY_FILE%/*}"
       registry_lock
       if [ ! -s "$REGISTRY_FILE" ]; then
-        if [ -n "''${1:-}" ]; then
+        # A seed is trusted only after it PASSES this shape check (issue #356):
+        # two independent producers (this module's Nix-declared seed and the
+        # native backend's) write the file this reads, and a shape they disagree
+        # on — .sessions as a list instead of an object, seen live on the native
+        # side — used to be installed as-is. The reconcile loop then read a
+        # session name as an array index and jq errored "Cannot index array with
+        # string" every couple of seconds forever, with nothing pointing at the
+        # seed as the cause. Reject it once, loudly, instead.
+        if [ -n "''${1:-}" ] && "$REGISTRY_JQ" -e \
+             '(.version == 1) and (.sessions | type == "object")' \
+             "$1" >/dev/null 2>&1; then
           install -m 0600 "$1" "$REGISTRY_FILE"
         else
+          if [ -n "''${1:-}" ]; then
+            echo "$REGISTRY_PROG: seed $1 is not a valid sessions.json" \
+                 '(want {"version":1,"sessions":{...}}); starting empty instead' >&2
+          fi
           # 0600 like every other writer's output (the daemon's write_sessions, the
           # seed above, and mktemp's own mode in registry_edit): the registry
           # carries kickoff prompts and working directories, and only this user and
@@ -12540,9 +12596,19 @@ if __name__ == "__main__":
       # as that user and writes env (0600) inside. Created here so the daemon
       # and the agent unit's optional EnvironmentFile both have a stable path
       # even before the user saves any key.
-      ++ lib.map (name:
+      #
+      # ~/.config itself is declared too (issue #356, the NixOS twin of
+      # #355's native fix): with no ~/.config yet, systemd-tmpfiles creates
+      # it itself, as root, then refuses to descend into it ("Detected
+      # unsafe path transition ... owned by root", exit 73) — so
+      # ~/.config/agent-box is never created and the supervisor's first act
+      # (mkdir ~/.config/agent-box) fails with Permission denied in a
+      # restart loop. Deployed boxes dodge this only because something else
+      # creates ~/.config user-owned first; a fresh home has nothing else to.
+      ++ lib.concatMap (name: [
+        "d /home/${name}/.config 0755 ${name} ${name} - -"
         "d /home/${name}/.config/agent-box 0700 ${name} ${name} - -"
-      ) terminalUsers
+      ]) terminalUsers
       # Webhook ingress socket dir (issue #101). World-traversable parent; the
       # per-user socket files themselves are 0660 <user>:caddy, systemd-created
       # (see systemd.sockets). Only present when webhook.enable is set.

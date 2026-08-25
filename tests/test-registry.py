@@ -461,6 +461,25 @@ class Creation(RegistryCase):
         self.run_writer('registry_ensure "$1"\n', args=[str(self.seed_file)])
         self.assertEqual(stat.S_IMODE(self.file.stat().st_mode), 0o600)
 
+    def test_a_malformed_seed_is_rejected_not_installed(self):
+        # issue #356: a producer that disagrees with the schema (.sessions as
+        # a list, not an object — seen live from the native backend) must not
+        # be installed verbatim. The reconcile loop reads a session name as
+        # an array index against a list and jq errors every tick forever,
+        # with nothing pointing at the seed as the cause. A rejected seed
+        # yields the same empty, valid registry a missing seed would.
+        bad = self.home / "bad-seed.json"
+        bad.write_text(json.dumps({"version": 1, "sessions": [{"name": "main"}]}))
+        done = self.run_writer('registry_ensure "$1"\n', args=[str(bad)])
+        self.assertEqual(json.loads(self.file.read_text()), {"version": 1, "sessions": {}})
+        self.assertIn(str(bad), done.stderr)
+
+    def test_a_non_object_top_level_seed_is_rejected(self):
+        bad = self.home / "bad-seed.json"
+        bad.write_text(json.dumps([{"name": "main", "agent": "claude"}]))
+        self.run_writer('registry_ensure "$1"\n', args=[str(bad)])
+        self.assertEqual(json.loads(self.file.read_text()), {"version": 1, "sessions": {}})
+
     def test_a_missing_directory_is_made_and_locked(self):
         # A first boot can find neither the file nor its directory, and that
         # is exactly when creation races.
