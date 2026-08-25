@@ -3539,6 +3539,7 @@ done
 
 command -v gh >/dev/null 2>&1 || die "gh is not on PATH"
 command -v curl >/dev/null 2>&1 || die "curl is not on PATH"
+command -v jq >/dev/null 2>&1 || die "jq is not on PATH"
 
 name=''${file##*/}
 [ -n "$alt" ] || alt=$name
@@ -3583,7 +3584,6 @@ token=$(gh auth token 2>/dev/null) || token=
 
 # urlencode the query values: a file named "my shot.png" must not split the URL.
 encode() {
-  command -v jq >/dev/null 2>&1 || { printf '%s' "$1"; return; }
   printf '%s' "$1" | jq -sRr @uri
 }
 
