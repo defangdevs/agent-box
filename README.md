@@ -193,22 +193,25 @@ Add the flake as an input and import the module:
 
 Then `sudo nixos-rebuild switch`. Each user gets an `agent-box-<name>.service`.
 
-**Sign in from the web UI (issues #207, #208, #313).** The settings page has
-a **Connections** card per tool — Claude Code, Codex and GitHub. Each one runs
-that tool's OWN sign-in command (`claude auth login`,
-`codex login --device-auth`, `gh auth login --web`) in its own tmux session,
-shows the URL as a link and the one-time code as text, takes the code back in
-a form field, and then asks the CLI itself whether it worked
-(`claude auth status` answers JSON). The credential is written by the CLI to
-`~/.claude`, `~/.codex` or `~/.config/gh` — the page never handles a token,
-and there is no OAuth client, app registration or personal access token
-anywhere in the flow. GitHub in particular needs no PAT and no GitHub App:
-`gh` ships GitHub's own device-flow client.
+**Sign in from the web UI (issues #207, #208, #313, #363).** The settings
+page has a **Connections** card per tool — Claude Code, Codex, GitHub and
+Defang. Each one runs that tool's OWN sign-in command (`claude auth login`,
+`codex login --device-auth`, `gh auth login --web`, `defang login`) in its
+own tmux session, shows the URL as a link, and then asks the CLI itself
+whether it worked (`claude auth status` answers JSON). Claude and GitHub also
+show a one-time code and take it back in a form field; Defang, like Claude's
+underlying OAuth exchange, needs nothing typed back — the CLI polls the auth
+server itself until the browser tab approves it. The credential is written by
+the CLI to `~/.claude`, `~/.codex`, `~/.config/gh` or Defang's own state dir —
+the page never handles a token, and there is no OAuth client, app
+registration or personal access token anywhere in the flow. GitHub in
+particular needs no PAT and no GitHub App: `gh` ships GitHub's own
+device-flow client.
 
-Setting `GH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` by hand
-under Environment secrets keeps working, and keeps winning: every one of these
-CLIs prefers its environment variable over its stored credential. The card
-says so when it finds one.
+Setting `GH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` or
+`DEFANG_ACCESS_TOKEN` by hand under Environment secrets keeps working, and
+keeps winning: every one of these CLIs prefers its environment variable over
+its stored credential. The card says so when it finds one.
 
 The rest of this section is the terminal path those cards wrap — still the
 fallback when a card cannot run (no session up yet), and still what the CLIs

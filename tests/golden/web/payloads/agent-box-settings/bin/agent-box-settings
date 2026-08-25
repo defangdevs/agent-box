@@ -1596,10 +1596,36 @@ def parse_gh_status(proc):
     return (False, "")
 
 
+def parse_defang_status(proc):
+    """`defang whoami --json` prints the account as JSON on stdout and
+    exits 0 when signed in; signed out is a non-zero exit with nothing on
+    stdout ("Error: missing bearer token" goes to stderr instead), so the
+    exit code is checked before anything is parsed as JSON.
+
+    email/name come from a userinfo fetch the CLI only makes when it thinks
+    it has a TTY (auth.go's `global.HasTty` gate), which a piped probe never
+    has — so both are commonly absent even while signed in, and the pill
+    falls back to the fields that are always there.
+    """
+    if proc.returncode != 0:
+        return (False, "")
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return (False, "")
+    if not isinstance(data, dict):
+        return (False, "")
+    who = str(data.get("email") or data.get("name")
+              or data.get("workspace") or "signed in")
+    tier = str(data.get("subscriberTier") or "")
+    return (True, "%s (%s)" % (who, tier) if tier else who)
+
+
 CONNECT_PARSERS = {
     "claude": parse_claude_status,
     "codex": parse_codex_status,
     "gh": parse_gh_status,
+    "defang": parse_defang_status,
 }
 
 # One row per flow, in render order. `start` and `status` are argv tails
@@ -1665,6 +1691,26 @@ CONNECT_DEFS = [
         "unset": ("GH_TOKEN", "GITHUB_TOKEN"),
         "shadow": ("GH_TOKEN", "GITHUB_TOKEN"),
         "prompt_re": re.compile(r"Press Enter", re.IGNORECASE),
+        "destructive": False,
+    },
+    {
+        "id": "defang",
+        "label": "Defang",
+        "note": "Runs <code>defang login</code> &mdash; opens Defang's own "
+                "sign-in page in a browser; the CLI polls for your "
+                "approval itself, so there is no code to copy back.",
+        "start": ["login", "--non-interactive=false"],
+        "status": ["whoami", "--json"],
+        "parse": "defang",
+        "hosts": ("defang.io",),
+        # The CLI polls the auth server on its own (auth.go's
+        # StartAuthCodeFlow) until the browser tab approves it — unlike
+        # claude, nothing is ever shown for the user to type back here.
+        "needs_code": False,
+        "show_code": False,
+        "unset": ("DEFANG_ACCESS_TOKEN",),
+        "shadow": ("DEFANG_ACCESS_TOKEN",),
+        "prompt_re": None,
         "destructive": False,
     },
 ]

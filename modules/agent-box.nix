@@ -1770,6 +1770,57 @@ done
   # (see the codexFullAccess option, issue 234).
   codexFullAccess = cfg.codexFullAccess && builtins.elem "codex" cfg.installAgents;
 
+  # Defang CLI (issue #363): not in nixpkgs, so fetched straight from its own
+  # goreleaser assets rather than compiled — the release ships a statically
+  # linked binary per arch, which needs no autoPatchelf and no dynamic
+  # linker fixup on NixOS. Pin the version and both arch hashes together so a
+  # bump is a one-line diff; unlisted `pkgs.stdenv.hostPlatform.system`
+  # throws at eval time instead of silently fetching nothing.
+  defangVersion = "3.14.1";
+  defangAssets = {
+    x86_64-linux = {
+      arch = "amd64";
+      sha256 = "7b7f1834dc681a3a88f172577854c35f4adc85246f211ba29343eca23cec2be2";
+    };
+    aarch64-linux = {
+      arch = "arm64";
+      sha256 = "a2dda48431b128e088bf16073708a0c4c7e54373ebcf41c0d1f2726117b8fdab";
+    };
+  };
+  defangCli =
+    let
+      asset = defangAssets.${pkgs.stdenv.hostPlatform.system}
+        or (throw "defang: no release asset for ${pkgs.stdenv.hostPlatform.system}");
+    in
+    pkgs.stdenvNoCC.mkDerivation {
+      pname = "defang";
+      version = defangVersion;
+      src = pkgs.fetchurl {
+        url = "https://github.com/DefangLabs/defang/releases/download/v${defangVersion}/defang_${defangVersion}_linux_${asset.arch}.tar.gz";
+        sha256 = asset.sha256;
+      };
+      # The archive is two loose files with no wrapping directory, which
+      # stdenv's default unpackPhase rejects ("unpacker appears to have
+      # produced no directories") — extract the one file we want by hand
+      # instead of unpacking the whole tree.
+      dontUnpack = true;
+      dontConfigure = true;
+      dontBuild = true;
+      installPhase = ''
+        runHook preInstall
+        tar -xzf $src defang
+        install -Dm755 defang $out/bin/defang
+        runHook postInstall
+      '';
+      meta = with lib; {
+        description = "Take a Docker Compose app from your laptop to a cloud deployment";
+        homepage = "https://defang.io";
+        license = licenses.mit;
+        platforms = [ "x86_64-linux" "aarch64-linux" ];
+        mainProgram = "defang";
+      };
+    };
+
   # Tools agents assume exist. Nearly all of these are already installed on
   # any NixOS host (system-path.nix's requiredPackages) — but the agent unit
   # runs with the curated PATH below, which does not include
@@ -1813,6 +1864,7 @@ done
     # if closure size matters more than matching a distro.
     pkgs.python3
     pkgs.nano
+    defangCli                 # deploy Compose apps to the cloud (issue #363)
   ];
 
   agentRuntimePackages = lib.unique (
@@ -4623,7 +4675,10 @@ $PROMPT"
   # this variable to point an id at a stub.
   connectBins = lib.concatStringsSep " " (
     map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
-    ++ [ "github=${pkgs.gh}/bin/gh" ]
+    ++ [
+      "github=${pkgs.gh}/bin/gh"
+      "defang=${defangCli}/bin/defang"
+    ]
   );
 
   # AGENTS.md — cross-vendor agent-instructions file (codex and opencode
@@ -8505,10 +8560,36 @@ def parse_gh_status(proc):
     return (False, "")
 
 
+def parse_defang_status(proc):
+    """`defang whoami --json` prints the account as JSON on stdout and
+    exits 0 when signed in; signed out is a non-zero exit with nothing on
+    stdout ("Error: missing bearer token" goes to stderr instead), so the
+    exit code is checked before anything is parsed as JSON.
+
+    email/name come from a userinfo fetch the CLI only makes when it thinks
+    it has a TTY (auth.go's `global.HasTty` gate), which a piped probe never
+    has — so both are commonly absent even while signed in, and the pill
+    falls back to the fields that are always there.
+    """
+    if proc.returncode != 0:
+        return (False, "")
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return (False, "")
+    if not isinstance(data, dict):
+        return (False, "")
+    who = str(data.get("email") or data.get("name")
+              or data.get("workspace") or "signed in")
+    tier = str(data.get("subscriberTier") or "")
+    return (True, "%s (%s)" % (who, tier) if tier else who)
+
+
 CONNECT_PARSERS = {
     "claude": parse_claude_status,
     "codex": parse_codex_status,
     "gh": parse_gh_status,
+    "defang": parse_defang_status,
 }
 
 # One row per flow, in render order. `start` and `status` are argv tails
@@ -8574,6 +8655,26 @@ CONNECT_DEFS = [
         "unset": ("GH_TOKEN", "GITHUB_TOKEN"),
         "shadow": ("GH_TOKEN", "GITHUB_TOKEN"),
         "prompt_re": re.compile(r"Press Enter", re.IGNORECASE),
+        "destructive": False,
+    },
+    {
+        "id": "defang",
+        "label": "Defang",
+        "note": "Runs <code>defang login</code> &mdash; opens Defang's own "
+                "sign-in page in a browser; the CLI polls for your "
+                "approval itself, so there is no code to copy back.",
+        "start": ["login", "--non-interactive=false"],
+        "status": ["whoami", "--json"],
+        "parse": "defang",
+        "hosts": ("defang.io",),
+        # The CLI polls the auth server on its own (auth.go's
+        # StartAuthCodeFlow) until the browser tab approves it — unlike
+        # claude, nothing is ever shown for the user to type back here.
+        "needs_code": False,
+        "show_code": False,
+        "unset": ("DEFANG_ACCESS_TOKEN",),
+        "shadow": ("DEFANG_ACCESS_TOKEN",),
+        "prompt_re": None,
         "destructive": False,
     },
 ]

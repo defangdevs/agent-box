@@ -114,6 +114,36 @@ in
           *) echo "unexpected: $*" >&2; exit 64 ;;
         esac
       '';
+      # `defang login --non-interactive=false`: prints only a URL — the real
+      # CLI polls the auth server itself (auth.go's StartAuthCodeFlow) and
+      # never shows a code to paste back — so the stub blocks on a marker
+      # file standing in for that poll succeeding, instead of a real OAuth
+      # round trip.
+      stubDefang = pkgs.writeShellScriptBin "defang" ''
+        set -u
+        case "$1 $2" in
+          "login --non-interactive=false")
+            mkdir -p ${stateDir}
+            echo "Please visit the following URL to log in: (Right click the URL or press ENTER to open browser)"
+            echo "  https://auth.defang.io/cli/stubstate/stubchallenge"
+            for _ in $(seq 1 30); do
+              [ -e ${stateDir}/defang-approved ] && break
+              sleep 1
+            done
+            [ -e ${stateDir}/defang-approved ] || { echo "Error: login timed out" >&2; exit 1; }
+            : > ${stateDir}/defang-in
+            ;;
+          "whoami --json")
+            if [ -e ${stateDir}/defang-in ]; then
+              echo '{"workspace":"stub-ws","subscriberTier":"pro","provider":"aws","region":"us-east-1"}'
+            else
+              echo "Error: missing bearer token" >&2
+              exit 16
+            fi
+            ;;
+          *) echo "unexpected: $*" >&2; exit 64 ;;
+        esac
+      '';
     in
     {
       imports = [ agent-box ];
@@ -140,7 +170,7 @@ in
       # difference — which is the point of naming binaries rather than
       # relying on PATH.
       systemd.services."agent-box-settings@agent".environment.AGENT_BOX_CONNECT_BINS =
-        lib.mkForce "claude=${stubClaude}/bin/claude github=${stubGh}/bin/gh";
+        lib.mkForce "claude=${stubClaude}/bin/claude github=${stubGh}/bin/gh defang=${stubDefang}/bin/defang";
 
       system.activationScripts.agent-web-password-hash.text = ''
         install -d -m 0700 /var/lib/agent-box-web
@@ -233,10 +263,12 @@ in
         assert "Connections" in body, body[:400]
         assert "Claude Code" in body
         assert "GitHub" in body
+        assert "Defang" in body
         # codex is not in installAgents, so it has no card.
         assert ">Codex<" not in body
         wait_state("claude", "idle")
         wait_state("github", "idle")
+        wait_state("defang", "idle")
 
     with subtest("start opens one pane and the card links the trusted URL"):
         assert post("/agent/settings/connect/start", "flow=claude") == "303"
@@ -276,6 +308,16 @@ in
         wait_state("github", "connected")
         machine.succeed("test -e ${stateDir}/gh-enter")
         assert "stubuser" in state("github")["detail"]
+
+    with subtest("a flow with no code at all just waits on the URL, then polls itself"):
+        assert post("/agent/settings/connect/start", "flow=defang") == "303"
+        waiting = wait_state("defang", "waiting")
+        assert waiting["url"] == "https://auth.defang.io/cli/stubstate/stubchallenge", waiting
+        assert waiting["code"] is None, waiting
+        assert waiting["needs_code"] is False, waiting
+        machine.succeed("touch ${stateDir}/defang-approved")
+        got = wait_state("defang", "connected")
+        assert got["detail"] == "stub-ws (pro)", got
 
     with subtest("sign-in again works on a card that reports signed in"):
         # The card says "Signed in", which is WHY the button is pressed. A
