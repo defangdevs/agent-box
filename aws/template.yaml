@@ -624,6 +624,9 @@ Resources:
       MetadataOptions:
         HttpTokens: required
         HttpPutResponseHopLimit: 2
+      # Without this, the root EBS volume in BlockDeviceMappings stays
+      # untagged — PropagateTagsToVolumeOnCreation defaults to false.
+      PropagateTagsToVolumeOnCreation: true
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
