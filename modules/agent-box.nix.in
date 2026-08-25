@@ -24,14 +24,26 @@ let
   # verbatim in sync with that template default — the two must only differ by
   # such appended specifics. $AGENT_BOX_URL (no braces) stays literal for the
   # agent to expand at read time; Nix only antiquotes ''${...}''.
-  # src/default-agents.md is plain markdown (issue #154, Phase 2); the one
-  # bound value is the optional webhook section. Its @WEBHOOK_SECTION@ token
-  # sits flush against the next heading, so the disabled case leaves no
-  # stray blank line and the enabled case supplies its own trailing one.
+  # src/default-agents.md is plain markdown (issue #154, Phase 2); the two
+  # bound values are the optional webhook section and the "Updating" body,
+  # which only exists when selfUpdate.enable actually wires up the unit and
+  # sudo rule below (issue #358 — the native backend has neither, so it
+  # substitutes its own text for the same token instead of this one). Both
+  # tokens sit flush against the next heading, so the disabled case leaves
+  # no stray blank line and the enabled case supplies its own trailing one.
   defaultAgentsMd = lib.replaceStrings
-    [ "@WEBHOOK_SECTION@" ]
+    [ "@WEBHOOK_SECTION@" "@UPDATE_SECTION@" ]
     [ (lib.optionalString webhookEnabled ''
       @@include:src/default-agents-webhook.md@@
+
+    '')
+      (lib.optionalString cfg.selfUpdate.enable ''
+      ## Updating
+
+      Update the box's software with:
+      `sudo /run/current-system/sw/bin/systemctl start agent-box-update.service`
+      (kills the running tmux session — save context first). As above, the full
+      path is required for the passwordless sudo rule to match.
 
     '') ]
     ''
