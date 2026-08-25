@@ -12,6 +12,14 @@ bug is a shell dialect, and cfn-lint only reads YAML.
 This check keeps that from coming back. Everything up to and including
 the bash re-exec guard must parse under `dash -n`, and no bashism may
 appear before it.
+
+The same class of bug bit the NATIVE template on its first live launch:
+cloud-init runs the launch script with no HOME, Nix's profile snippet
+dereferences `$HOME` unguarded, and under `set -u` the bootstrap aborted
+40 s in with "HOME: unbound variable" — again invisible to cfn-lint and
+to every render test, because it is a property of the environment
+cloud-init provides. So the script must export HOME before it sources
+anything from the Nix profile.
 """
 import re
 import subprocess
@@ -26,6 +34,9 @@ TEMPLATES = [
     REPO / "aws" / "lightsail-native-template.yaml",
 ]
 GUARD = re.compile(r'exec\s+/bin/bash\s+"\$0"')
+# Sourcing the Nix profile snippet, which reads $HOME with no default.
+NIX_PROFILE_SOURCE = re.compile(r'^\s*\.\s+\S*/profile\.d/\S+\.sh')
+HOME_SET = re.compile(r'^\s*(export\s+)?HOME=')
 # Constructs dash does not have. Each one killed or would have killed the
 # script before the re-exec guard could hand over to bash.
 BASHISMS = (
@@ -92,6 +103,26 @@ def check(template: Path) -> int:
                     file=sys.stderr,
                 )
                 return 1
+
+    # cloud-init hands the launch script an environment with no HOME, and
+    # the Nix profile snippet expands $HOME with no default — fatal under
+    # `set -u`, which is how the first native launch died.
+    source_at = next(
+        (n for n, l in enumerate(lines) if NIX_PROFILE_SOURCE.search(l)), None
+    )
+    if source_at is not None:
+        home_at = next((n for n, l in enumerate(lines) if HOME_SET.search(l)), None)
+        if home_at is None or home_at > source_at:
+            print(
+                f"FAIL: line {source_at + 1} sources a Nix profile snippet "
+                "before the script sets HOME.\n"
+                '       Add: export HOME="${!HOME:-/root}"\n'
+                "       cloud-init runs the launch script with no HOME, and the\n"
+                "       snippet reads $HOME with no default — under `set -u` that\n"
+                "       aborts the whole bootstrap.",
+                file=sys.stderr,
+            )
+            return 1
 
     # CFN escapes: ${!VAR} means a literal ${VAR}; ${Param} is substituted at
     # deploy time. Neither should stop dash from parsing the prefix.

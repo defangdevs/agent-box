@@ -63,15 +63,19 @@ Parameters:
 
   BundleId:
     Type: String
-    Default: nano_3_0 (2 vCPU / 1 GiB / 40 GiB SSD / $7 mo)
+    Default: micro_3_0 (2 vCPU / 1 GiB / 40 GiB SSD / $7 mo)
     AllowedValues:
-      - nano_3_0 (2 vCPU / 1 GiB / 40 GiB SSD / $7 mo)
+      - nano_3_0 (2 vCPU / 0.5 GiB / 20 GiB SSD / $5 mo)
+      - micro_3_0 (2 vCPU / 1 GiB / 40 GiB SSD / $7 mo)
       - small_3_0 (2 vCPU / 2 GiB / 60 GiB SSD / $12 mo)
       - medium_3_0 (2 vCPU / 4 GiB / 80 GiB SSD / $24 mo)
     Description: >-
       Lightsail bundle. The native path has no closure build and no
-      nixos-rebuild, so the 1 GiB nano bundle is a usable default here — it
-      was not on the nixos-infect template.
+      nixos-rebuild, so a 1 GiB bundle is a usable default here — it was not
+      on the nixos-infect template. nano_3_0 (0.5 GiB) does complete a live
+      launch on the 2 GiB swap file the bootstrap creates — measured, not
+      assumed — but substituting the profile took ~6 min there against ~2.5
+      min on micro, so it is offered rather than defaulted.
 
   AgentsMd:
     Type: String
@@ -168,6 +172,15 @@ Resources:
             set -euxo pipefail
             exec > >(tee /var/log/agent-box-bootstrap.log) 2>&1
 
+            # cloud-init runs the launch script with an almost empty
+            # environment — no HOME. Nix's own profile script dereferences
+            # $HOME unguarded (`NIX_LINK=$HOME/.nix-profile`), so sourcing it
+            # under `set -u` aborted the whole bootstrap with "HOME: unbound
+            # variable" 40 s into first boot, on real hardware. Everything
+            # after this line also wants a HOME: `nix profile add` writes
+            # ~/.cache/nix, and `gh`/the agent CLIs read ~/.config.
+            export HOME="${!HOME:-/root}"
+
             # Swap. There is no closure build on this path, but substituting
             # the profile still peaks well above a 1 GiB bundle's RAM.
             if ! swapon --show=NAME --noheadings | grep -qx /agent-box-swap; then
@@ -184,7 +197,12 @@ Resources:
             # patching it). `agentbox apply` never calls apt.
             curl -fsSL "${NixInstallerUrl}" \
               | sh -s -- install linux --no-confirm --determinate
+            # `set +u` around a script we do not own: the installer's profile
+            # snippet is free to reference whatever the next release wants,
+            # and it must not be able to abort the bootstrap again.
+            set +u
             . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+            set -u
 
             # The runtime profile: payloads, tools, agent CLIs, shared assets.
             # A system profile, so `nix profile rollback --profile ...` is the
@@ -228,8 +246,15 @@ Resources:
             # lightsail:GetInstance on this account can read — same exposure
             # as the infect template had, and the reason the settings page
             # can change the password afterwards.
+            # set +x for this one command: the trace this script runs under
+            # writes every expanded word to /var/log/agent-box-bootstrap.log,
+            # so leaving it on put the plaintext password in a world-readable
+            # log on the box — which is precisely what "never written to disk"
+            # was supposed to mean.
+            set +x
             AGENT_BOX_WEB_PASSWORD=${WebPasswordPlain} \
               "$AGENTBOX" apply --first-boot --settle-delay 60
+            set -x
 
             # Only now, with the box actually configured and the units up,
             # tell CloudFormation the stack succeeded. A failed apply exits

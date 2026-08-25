@@ -1,8 +1,17 @@
 {
-  "sessions": [
-    {
-      "name": "main",
-      "agent": "codex"
+  "sessions": {
+    "main": {
+      "agent": "codex",
+      "boxSessionId": null,
+      "extraArgs": [],
+      "hasRun": false,
+      "initialPrompt": null,
+      "remoteControl": true,
+      "remoteControlName": null,
+      "resumePrompt": null,
+      "skipPermissions": true,
+      "workingDirectory": "/home/robot"
     }
-  ]
+  },
+  "version": 1
 }

@@ -7,9 +7,12 @@ Wants=network-online.target
 Type=notify
 User=caddy
 Group=caddy
-ExecStart=@PROFILE@/bin/caddy run --environ --config /etc/agent-box/Caddyfile --adapter caddyfile
+ExecStart=@PROFILE@/bin/caddy run --config /etc/agent-box/Caddyfile --adapter caddyfile
 ExecReload=@PROFILE@/bin/caddy reload --config /etc/agent-box/Caddyfile --adapter caddyfile --force
 EnvironmentFile=/run/agent-box-web/env
+Environment=HOME=/var/lib/caddy
+Environment=XDG_DATA_HOME=/var/lib
+Environment=XDG_CONFIG_HOME=/var/lib
 StateDirectory=caddy
 Restart=on-failure
 RestartSec=5s
