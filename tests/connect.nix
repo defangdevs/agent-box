@@ -252,23 +252,6 @@ in
 
     with subtest("the pasted code reaches the CLI and success is the CLI's own answer"):
         assert post("/agent/settings/connect/code", "flow=claude&code=abc-1234567890") == "303"
-        # TEMP diagnostic (#295 merge): claude sticks in "waiting" here on
-        # the merged branch and passes on master. Show what the pane
-        # actually did, so the next CI round names the step that broke
-        # instead of the step that noticed.
-        machine.sleep(3)
-        print("--- pane -------------------------------------------------")
-        print(machine.succeed(tmux("capture-pane -p -t '=_connect-claude:'") + " || true"))
-        print("--- stub state dir ---------------------------------------")
-        print(machine.succeed("ls -la ${stateDir} 2>&1 || true"))
-        print("--- server PATH (what connect_start exports into the pane) -")
-        print(machine.succeed(tmux("show-environment -g PATH") + " 2>&1 || true"))
-        print("--- daemon PATH ------------------------------------------")
-        print(machine.succeed(
-            "systemctl show agent-box-settings@agent --property=Environment --value"))
-        print("--- card state -------------------------------------------")
-        print(get("/agent/settings/connect?flow=claude"))
-        print("----------------------------------------------------------")
         got = wait_state("claude", "connected")
         assert got["detail"] == "stub@example.com (max)", got
         assert machine.succeed("cat ${stateDir}/claude-code").strip() == "abc-1234567890"
