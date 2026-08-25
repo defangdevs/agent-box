@@ -238,8 +238,8 @@ path is required for the passwordless sudo rule to match.
 ## This platform has its own upstream repo
 
 The box itself — the terminal, session manager, webhook wiring, this guide
-— is github.com/defangdevs/agent-box, the repo the update service above
-pulls from. A bug in that platform is not the same as a bug in the user's
+— is github.com/defangdevs/agent-box, the repo this deployment is built
+from. A bug in that platform is not the same as a bug in the user's
 project: if you hit one, first work around it so your own running session
 is unblocked, then file an issue (or a PR, if you already have the fix)
 upstream so every other deployment gets it too. Search for an existing

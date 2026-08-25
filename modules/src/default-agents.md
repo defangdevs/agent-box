@@ -148,18 +148,11 @@ $HOME (caddy can't read /home). Use the full path shown, not bare
 `systemctl` resolves through PATH to a Nix store path that won't match,
 silently falling back to asking for a password.
 
-## Updating
-
-Update the box's software with:
-`sudo /run/current-system/sw/bin/systemctl start agent-box-update.service`
-(kills the running tmux session — save context first). As above, the full
-path is required for the passwordless sudo rule to match.
-
-## This platform has its own upstream repo
+@UPDATE_SECTION@## This platform has its own upstream repo
 
 The box itself — the terminal, session manager, webhook wiring, this guide
-— is github.com/defangdevs/agent-box, the repo the update service above
-pulls from. A bug in that platform is not the same as a bug in the user's
+— is github.com/defangdevs/agent-box, the repo this deployment is built
+from. A bug in that platform is not the same as a bug in the user's
 project: if you hit one, first work around it so your own running session
 is unblocked, then file an issue (or a PR, if you already have the fix)
 upstream so every other deployment gets it too. Search for an existing

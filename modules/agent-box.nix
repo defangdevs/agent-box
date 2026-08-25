@@ -28,12 +28,15 @@ let
   # verbatim in sync with that template default — the two must only differ by
   # such appended specifics. $AGENT_BOX_URL (no braces) stays literal for the
   # agent to expand at read time; Nix only antiquotes ''${...}''.
-  # src/default-agents.md is plain markdown (issue #154, Phase 2); the one
-  # bound value is the optional webhook section. Its @WEBHOOK_SECTION@ token
-  # sits flush against the next heading, so the disabled case leaves no
-  # stray blank line and the enabled case supplies its own trailing one.
+  # src/default-agents.md is plain markdown (issue #154, Phase 2); the two
+  # bound values are the optional webhook section and the "Updating" body,
+  # which only exists when selfUpdate.enable actually wires up the unit and
+  # sudo rule below (issue #358 — the native backend has neither, so it
+  # substitutes its own text for the same token instead of this one). Both
+  # tokens sit flush against the next heading, so the disabled case leaves
+  # no stray blank line and the enabled case supplies its own trailing one.
   defaultAgentsMd = lib.replaceStrings
-    [ "@WEBHOOK_SECTION@" ]
+    [ "@WEBHOOK_SECTION@" "@UPDATE_SECTION@" ]
     [ (lib.optionalString webhookEnabled ''
       ## Getting told, instead of polling (webhooks)
 
@@ -114,6 +117,15 @@ let
       ready-made `gh api` command too. Until a secret exists the endpoint rejects
       everything. Any sender that HMAC-SHA256-signs its body works, not just
       GitHub: `agent-box-webhook setup stripe` adds a second source.
+
+    '')
+      (lib.optionalString cfg.selfUpdate.enable ''
+      ## Updating
+
+      Update the box's software with:
+      `sudo /run/current-system/sw/bin/systemctl start agent-box-update.service`
+      (kills the running tmux session — save context first). As above, the full
+      path is required for the passwordless sudo rule to match.
 
     '') ]
     ''
@@ -267,18 +279,11 @@ let
     `systemctl` resolves through PATH to a Nix store path that won't match,
     silently falling back to asking for a password.
 
-    ## Updating
-
-    Update the box's software with:
-    `sudo /run/current-system/sw/bin/systemctl start agent-box-update.service`
-    (kills the running tmux session — save context first). As above, the full
-    path is required for the passwordless sudo rule to match.
-
-    ## This platform has its own upstream repo
+    @UPDATE_SECTION@## This platform has its own upstream repo
 
     The box itself — the terminal, session manager, webhook wiring, this guide
-    — is github.com/defangdevs/agent-box, the repo the update service above
-    pulls from. A bug in that platform is not the same as a bug in the user's
+    — is github.com/defangdevs/agent-box, the repo this deployment is built
+    from. A bug in that platform is not the same as a bug in the user's
     project: if you hit one, first work around it so your own running session
     is unblocked, then file an issue (or a PR, if you already have the fix)
     upstream so every other deployment gets it too. Search for an existing
