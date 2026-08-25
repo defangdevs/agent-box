@@ -280,6 +280,10 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
+        - Key: agent-box:rev
+          Value: !Ref AgentBoxRev
+        - Key: agent-box:agent
+          Value: !Ref Agent
       UserData:
         Fn::Sub:
           - |
