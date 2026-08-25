@@ -139,7 +139,7 @@ in
       # variable the module computes, so the daemon cannot tell the
       # difference — which is the point of naming binaries rather than
       # relying on PATH.
-      systemd.services.agent-box-settings-agent.environment.AGENT_BOX_CONNECT_BINS =
+      systemd.services."agent-box-settings@agent".environment.AGENT_BOX_CONNECT_BINS =
         lib.mkForce "claude=${stubClaude}/bin/claude github=${stubGh}/bin/gh";
 
       system.activationScripts.agent-web-password-hash.text = ''
@@ -169,8 +169,8 @@ in
     import shlex
 
     start_all()
-    machine.wait_for_unit("agent-box-agent.service")
-    machine.wait_for_unit("agent-box-settings-agent.service")
+    machine.wait_for_unit("agent-box@agent.service")
+    machine.wait_for_unit("agent-box-settings@agent.service")
 
     sock = "curl -s --max-time 20 --unix-socket /run/agent-box-settings/agent.sock"
     page = "http://localhost/agent/settings/"
@@ -339,7 +339,7 @@ in
         # A server started here would parent every session the supervisor
         # later spawns, moving the agents out of their hardened unit's
         # namespace and into the settings daemon's.
-        machine.succeed("systemctl stop agent-box-agent.service")
+        machine.succeed("systemctl stop agent-box@agent.service")
         machine.wait_until_fails(tmux("list-sessions"))
         assert post("/agent/settings/connect/start", "flow=claude") == "409"
         machine.fail(tmux("list-sessions"))

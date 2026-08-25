@@ -97,7 +97,7 @@ while true; do
     sleep "$GRACE"
     echo "spot-monitor: stopping agent units (no respawn)" >&2
     for u in $USERS; do
-      $SYSTEMCTL stop "agent-box-$u.service" || true
+      $SYSTEMCTL stop "agent-box@$u.service" || true
     done
     $SYNC
     echo "spot-monitor: prepared; leaving the stop to AWS (preserves persistent-Spot auto-restart)" >&2

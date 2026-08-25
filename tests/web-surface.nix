@@ -100,7 +100,7 @@
     start_all()
     machine.wait_for_unit("caddy.service")
     machine.wait_for_unit("fail2ban.service")
-    machine.wait_for_unit("agent-box-agent.service")
+    machine.wait_for_unit("agent-box@agent.service")
     client.wait_for_unit("multi-user.target")
 
     machine_ip = machine.succeed("ip -4 -o addr show eth1 | head -1").split()[3].split("/")[0]
@@ -112,7 +112,7 @@
     # from the driver's root shell skips ProtectSystem entirely, which is how a
     # read-only ~/downloads shipped under a green test (issue #316).
     agent_pid = machine.succeed(
-        "systemctl show -p MainPID --value agent-box-agent.service"
+        "systemctl show -p MainPID --value agent-box@agent.service"
     ).strip()
     assert agent_pid not in ("", "0"), "agent unit has no main PID"
     in_session = f"nsenter -t {agent_pid} -m -- runuser -u agent --"
@@ -135,7 +135,7 @@
         # /home — so ProtectSystem=strict denies it with EROFS unless the target
         # is named in ReadWritePaths, exactly as for ~/sites below (issue #316).
         machine.succeed(
-            "systemctl show agent-box-agent --property=ReadWritePaths --value "
+            "systemctl show agent-box@agent --property=ReadWritePaths --value "
             "| grep /var/lib/agent-box-downloads/agent >/dev/null"
         )
 
@@ -192,7 +192,7 @@
         # flow returned EROFS for every real agent while this test (which used to
         # write as plain `sudo -u agent` from the driver's root namespace) passed.
         machine.succeed(
-            "systemctl show agent-box-agent --property=ReadWritePaths --value "
+            "systemctl show agent-box@agent --property=ReadWritePaths --value "
             "| grep /var/lib/agent-box-sites/agent >/dev/null"
         )
 
@@ -220,7 +220,7 @@
         # sudo wrapper, without which shells started by the agent CLI can't
         # invoke sudo even though the sudoers rule permits the command.
         machine.succeed(
-            "systemctl show agent-box-agent --property=Environment "
+            "systemctl show agent-box@agent --property=Environment "
             "| grep '/run/wrappers/bin' >/dev/null"
         )
 

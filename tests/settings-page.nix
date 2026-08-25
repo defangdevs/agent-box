@@ -116,8 +116,8 @@
   testScript = ''
     start_all()
     machine.wait_for_unit("caddy.service")
-    machine.wait_for_unit("agent-box-agent.service")
-    machine.wait_for_unit("agent-box-settings-agent.service")
+    machine.wait_for_unit("agent-box@agent.service")
+    machine.wait_for_unit("agent-box-settings@agent.service")
     client.wait_for_unit("multi-user.target")
 
     def tmux(cmd):
@@ -133,7 +133,7 @@
 
     # Daemon runs AS the agent user (no root).
     machine.succeed(
-        "systemctl show agent-box-settings-agent --property=User | grep -x 'User=agent'"
+        "systemctl show agent-box-settings@agent --property=User | grep -x 'User=agent'"
     )
 
     # Issue #49: the daemon listens ONLY on the systemd-owned unix socket —
@@ -240,7 +240,7 @@
     # sessions (and deleted keys never left). The spawn wrapper below is
     # the live source instead.
     machine.fail(
-        "systemctl show agent-box-agent --property=EnvironmentFiles "
+        "systemctl show agent-box@agent --property=EnvironmentFiles "
         "| grep '/home/agent/.config/agent-box/env' >/dev/null"
     )
 
@@ -341,14 +341,14 @@
             "-d 'key=UI_SECRET' https://box.test/agent/settings/delete | grep -x 303"
         )
         old_main = machine.succeed(
-            "systemctl show agent-box-agent --property=MainPID --value"
+            "systemctl show agent-box@agent --property=MainPID --value"
         ).strip()
         wait_new_pane(
             f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
             "-X POST https://box.test/agent/settings/restart | grep -x 303"
         )
         machine.wait_until_succeeds(
-            "p=$(systemctl show agent-box-agent --property=MainPID --value); "
+            "p=$(systemctl show agent-box@agent --property=MainPID --value); "
             f"[ -n \"$p\" ] && [ \"$p\" != 0 ] && [ \"$p\" != {old_main} ]",
             timeout=60,
         )

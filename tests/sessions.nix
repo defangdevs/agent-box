@@ -60,8 +60,8 @@ in
     import base64
 
     machine.start()
-    machine.wait_for_unit("agent-box-agent.service")
-    machine.wait_for_unit("agent-box-settings-agent.service")
+    machine.wait_for_unit("agent-box@agent.service")
+    machine.wait_for_unit("agent-box-settings@agent.service")
 
     # --- first boot: legacy options seeded a "main" session --------------
     machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=120)
@@ -85,13 +85,18 @@ in
     # grep -o matches the store path twice. Without it, interpolating the
     # two-line value below makes the second line its own shell command — the
     # backdoor shell EXECUTES the supervisor script as root and never returns
-    # (the CI hang on this PR's first three runs).
+    # (the CI hang on this PR's first three runs). The pattern has to end in
+    # "/bin/agent-box-supervisor", not just "-agent-box-supervisor": the
+    # writeShellScriptBin derivation directory ITSELF ends in
+    # "-agent-box-supervisor" too, one path segment earlier — matching only
+    # the shorter suffix greps the directory, not the script, and `grep` on
+    # a directory fails with "Is a directory" (exit 2) below.
     start_script = machine.succeed(
-        "systemctl show agent-box-agent --property=ExecStart --value "
-        "| grep -o '/nix/store/[^ ;]*-agent-box-supervisor' | head -n1"
+        "systemctl show agent-box@agent --property=ExecStart --value "
+        "| grep -o '/nix/store/[^ ;]*/bin/agent-box-supervisor' | head -n1"
     ).strip()
     machine.succeed(
-        "systemctl show agent-box-agent -p Environment --value "
+        "systemctl show agent-box@agent -p Environment --value "
         "| grep -F 'AGENT_BOX_HOST_LABEL=box.test' >/dev/null"
     )
     machine.succeed(f"grep -qF 'rcname=$USER-$sname' {start_script}")
@@ -107,7 +112,7 @@ in
     # which gets the full system path and would pass even when the unit PATH
     # is missing them (the bug this guards against).
     unit_path = machine.succeed(
-        "systemctl show agent-box-agent -p Environment --value"
+        "systemctl show agent-box@agent -p Environment --value"
     ).split("PATH=")[1].split()[0]
     for tool in ["curl", "wget", "awk", "tar", "gzip", "bzip2", "xz", "zip",
                  "unzip", "diff", "patch", "less", "file", "ps", "killall",
@@ -123,7 +128,7 @@ in
         "su -s /bin/sh agent -c "
         "'git config --get credential.https://github.com.helper' | grep 'gh auth git-credential' >/dev/null"
     )
-    machine.succeed("systemctl cat agent-box-agent | grep -- '-gh-' >/dev/null")
+    machine.succeed("systemctl cat agent-box@agent | grep -- '-gh-' >/dev/null")
 
     # Claude emits its long OAuth URL inside one complete OSC 8 sequence.
     # tmux stores that metadata, but redraws plain text unless the attaching
@@ -489,7 +494,7 @@ in
     # PANE, and a bare "=name" only resolves when that session is tmux's
     # idea of the current one — otherwise it silently expands to "" (rc 0).
     server_pid = machine.succeed(tmux('display -p -t "=helper:" "#{pid}"')).strip()
-    machine.succeed(f"grep -q agent-box-agent.service /proc/{server_pid}/cgroup")
+    machine.succeed(f"grep -q agent-box@agent.service /proc/{server_pid}/cgroup")
 
     # ls shows both sessions with their agents.
     listing = machine.succeed("su -s /bin/sh agent -c 'agent-box-session ls'")
@@ -1185,6 +1190,7 @@ in
         machine.succeed(
             f"jq -e '.sessions.main | has(\"stopped\") | not' {sfile}"
         )
+
 
     # --- two writers of sessions.json (issue #254, tests from #285) --------
     # Every writer of the registry rewrites the WHOLE document through

@@ -21,5 +21,9 @@ web/payloads/agent-box-envstore/bin/agent-box-envstore -> vm/payloads/agent-box-
 web/payloads/agent-box-profile/bin/agent-box-profile -> vm/payloads/agent-box-profile/bin/agent-box-profile
 web/payloads/agent-box-session/bin/agent-box-session -> vm/payloads/agent-box-session/bin/agent-box-session
 web/payloads/agent-box-spot-monitor -> vm/payloads/agent-box-spot-monitor
-web/payloads/agent-box-supervisor -> vm/payloads/agent-box-supervisor
+web/payloads/agent-box-supervisor/bin/agent-box-supervisor -> vm/payloads/agent-box-supervisor/bin/agent-box-supervisor
+web/units/agent-box-settings@robot.service -> web/units/agent-box-settings@agent.service
+web/units/agent-box-webhook@robot.service -> web/units/agent-box-webhook@agent.service
+web/units/agent-box@robot.service -> web/units/agent-box@agent.service
+web/units/agent-web-terminal@robot.service -> web/units/agent-web-terminal@agent.service
 web/units/earlyoom.service -> vm/units/earlyoom.service
