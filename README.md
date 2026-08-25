@@ -96,7 +96,7 @@ Template source: [`aws/lightsail-template.yaml`](./aws/lightsail-template.yaml).
 See [`aws/README.md`](./aws/README.md) for design notes and the S3-hosting
 setup.
 
-### Alternative: EC2 template (Spot, IPv6-only)
+### Alternative: EC2 template (on-demand, IPv6 opt-in)
 
 The original EC2 template is still published, for accounts that want EC2's
 flexibility: arbitrary instance types, Spot pricing, IaC-native VPC
@@ -111,16 +111,21 @@ can grow in place.
 | eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
 
 It boots a NixOS 26.05 AMI directly (no conversion step; first load ~2-3
-minutes) and defaults to a **persistent Spot** `t4g.medium` on an
-**IPv6-only** network — ~$16-20/mo all-in, dodging AWS's ~$3.60/mo
-public-IPv4 charge. Set `PublicIpv4: true` at launch if your client has no
-IPv6 connectivity (corporate/coffee-shop networks often don't; adds the
-$3.60/mo EIP), and `UseSpot: false` for on-demand (~$27/mo all-in, no
-interruption risk). IPv6-only boxes reach IPv4-only hosts through a free
-public DNS64/NAT64 service ([nat64.net](https://nat64.net)); set
-`Nat64: false` to opt out. The full cost breakdown, the Spot
-stop-not-terminate behavior, SSM root access, and the other design notes
-live in [aws/README.md](./aws/README.md); template source:
+minutes) and defaults to an **on-demand** `t4g.medium` with a public
+**IPv4** address — ~$31/mo all-in, including AWS's ~$3.60/mo public-IPv4
+charge, so the box is reachable regardless of your own network's
+connectivity and never gets reclaimed mid-session. Set `PublicIpv4: false`
+at launch to go IPv6-only instead and drop that charge, if you know the
+client reaching the box has real IPv6 connectivity (corporate/coffee-shop
+networks often don't). Set `UseSpot: true` for a cheaper **persistent
+Spot** instance instead (~$20-24/mo all-in, ~50-60% off compute, at the
+risk of the box staying stopped if its AZ+type pool runs out of
+capacity). IPv6-only boxes reach IPv4-only hosts through a free public
+DNS64/NAT64 service ([nat64.net](https://nat64.net)); set `Nat64: false`
+to opt out.
+The full cost breakdown, the Spot stop-not-terminate behavior, SSM root
+access, and the other design notes live in
+[aws/README.md](./aws/README.md); template source:
 [`aws/template.yaml`](./aws/template.yaml).
 
 ## Why
@@ -188,6 +193,27 @@ Add the flake as an input and import the module:
 
 Then `sudo nixos-rebuild switch`. Each user gets an `agent-box-<name>.service`.
 
+**Sign in from the web UI (issues #207, #208, #313).** The settings page has
+a **Connections** card per tool — Claude Code, Codex and GitHub. Each one runs
+that tool's OWN sign-in command (`claude auth login`,
+`codex login --device-auth`, `gh auth login --web`) in its own tmux session,
+shows the URL as a link and the one-time code as text, takes the code back in
+a form field, and then asks the CLI itself whether it worked
+(`claude auth status` answers JSON). The credential is written by the CLI to
+`~/.claude`, `~/.codex` or `~/.config/gh` — the page never handles a token,
+and there is no OAuth client, app registration or personal access token
+anywhere in the flow. GitHub in particular needs no PAT and no GitHub App:
+`gh` ships GitHub's own device-flow client.
+
+Setting `GH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` by hand
+under Environment secrets keeps working, and keeps winning: every one of these
+CLIs prefers its environment variable over its stored credential. The card
+says so when it finds one.
+
+The rest of this section is the terminal path those cards wrap — still the
+fallback when a card cannot run (no session up yet), and still what the CLIs
+do underneath.
+
 **First login (per user):** attach to the session and complete the one-time
 agent sign-in:
 
@@ -203,10 +229,15 @@ Credentials live in that user's home directory (`~/.claude` for Claude Code,
 
 Sign-in is the *only* interactive step: the module pre-accepts Claude Code's
 other first-run dialogs (the folder-trust prompt for the agent's working
-directory, and the Bypass Permissions warning when `skipPermissions` is on)
-by seeding the acceptance flags into `~/.claude.json` and
+directory, the Bypass Permissions warning when `skipPermissions` is on, and
+the whole first-run onboarding wizard — theme picker, security notes,
+terminal setup) by seeding the acceptance flags into `~/.claude.json` and
 `~/.claude/settings.json` before each start. Without that, a fresh box parks
-the session on a dialog that Remote Control can't answer.
+the session on a dialog that Remote Control can't answer. Skipping the wizard
+also skips the login picker it embeds, which this box does not need: sign-in
+runs `claude auth login` from the settings page instead. Until it does, the
+session opens straight on the REPL and says so in its status line
+(`Not logged in · Run /login`).
 
 **Claude Code first login in the browser terminal:** Claude emits its OAuth URL
 as an OSC 8 hyperlink with the complete URL in a hidden target. The terminal's
@@ -295,9 +326,13 @@ agent-box-session restart review
 agent-box-session rm review                 # delist + kill
 ```
 
-The site root (web setups) is the terminal itself — `https://<domain>/` is
-a tabbed workspace, one tab per session, behind the same login as the
-terminal (add and close sessions from the tab bar — the tab's `×` arms on
+The site root (web setups) picks a user and lands in their space:
+`https://<domain>/` sends you to `https://<domain>/<user>/`, which is a
+tabbed workspace, one tab per session, behind the same login as the
+terminal — or, on a box with no session yet, straight to that user's
+settings page, where a sign-in and a first session are what is actually
+needed. On a box with several terminal users the root lists them instead,
+each behind their own login (add and close sessions from the tab bar — the tab's `×` arms on
 the first click and only closes on the second; restart/delete also on the
 settings page) — and agents can spawn sibling sessions themselves (it's just
 a file edit on their own account — handy for "have Codex cross-check this").
@@ -322,9 +357,54 @@ closes on the second](docs/workspace-tab-close.png)
 Attach locally with `tmux -L agent-box attach -t <session>` (see
 `TMUX_TMPDIR` note above). In the browser, every tab is also a
 deep-linkable standalone terminal at
-`https://<domain>/<user>/?arg=<session>`. Killed-on-error sessions keep a
+`https://<domain>/<user>/<session>/` — one path per session, so a session
+can be bookmarked, shared with whoever holds the login, or opened in its
+own window. `settings`, `downloads`, `webhook`, `sessions`, `token` and
+`ws` are already paths under `/<user>/`, so no session may take one of
+those names (the CLI, the settings page and a module assertion all refuse
+them). Killed-on-error sessions keep a
 post-mortem shell open instead of being respawned over; delisted sessions
 stay gone.
+
+**Harness or agent profile?** `--agent` selects the **harness** — the CLI
+program (`claude`, `codex`, or the `shell` pseudo-agent). An **agent
+profile** is the *worker*: a harness plus the model, the effort level, an
+appended system prompt and the environment that tell two sessions on the
+same harness apart. Profiles are per-user runtime data too, in
+`~/.config/agent-box/profiles/<name>.env`:
+
+```bash
+agent-box-profile set triage HARNESS=claude MODEL=sonnet EFFORT=low \
+    SYSTEM_PROMPT='Triage only. Report, do not fix.'
+agent-box-profile ls                        # NAME HARNESS MODEL EFFORT
+agent-box-profile show triage               # launch config + env KEY names
+agent-box-session add issues --profile triage
+agent-box-session add issues2 --profile triage -- --model opus   # tail wins
+agent-box-profile rm triage                 # running sessions keep what they got
+```
+
+`HARNESS`, `MODEL`, `EFFORT` and `SYSTEM_PROMPT` become harness arguments
+(`--model`/`-m`, `--effort`/`-c model_reasoning_effort=`,
+`--append-system-prompt`); every other key becomes **environment** for
+sessions started with that profile, applied at each spawn on top of
+`agent-box-session env`. That env is convenience, not a boundary: sessions of
+one user are not isolated, so a sibling session reads it out of
+`/proc/<pid>/environ` — a token in a profile is a token every session of that
+user has. Arguments are resolved when the session is created, so an edited
+profile changes what starts *next*, never a running session.
+
+A standing webhook watch can hand its work to a profile instead of the box
+default harness, which is the one place nothing could pick a harness before:
+
+```bash
+agent-box-session env set AGENT_BOX_HOOK_PROFILE triage
+```
+
+Every later dispatched `hook-*` session then starts as that worker, and the
+webhook panel on the settings page names it under the watch (that panel prints
+the spawn wrapper's own `--preamble`, so there is one copy of the answer). A
+renamed or deleted profile is reported and ignored — a delivery is never
+dropped over it.
 
 **New user or new session?** A user is the trust boundary; a session is a
 unit of work, and sessions of one user are *not* isolated from each other.
@@ -387,8 +467,10 @@ On by default (`webhook.enable`), needs `web.enable`. How it fits together:
   subscription makes the daemon spawn a **fresh `hook-*` session** primed with
   the event text instead of interrupting whichever session is active. Bursts
   coalesce into one session; concurrent spawns are capped, and the wrapper
-  refuses to accumulate more than a handful of live `hook-*` sessions. The
-  spawned session's prompt tells it to remove itself when done.
+  refuses to accumulate more than a handful of live `hook-*` sessions — counted
+  as sessions that are actually running, so a finished one frees its slot even
+  if nobody delisted it. The spawned session's prompt tells it to remove itself
+  when done.
 - The **settings page** shows every subscription on the box, with a delete for
   each — for when a watch turns into a flood. Until then that state was
   readable only from inside a session, and only for that session. A session's
@@ -434,7 +516,15 @@ through the settings page's Secrets card or from a shell:
 
 ```bash
 sudo -u alice agent-box-session env set GH_TOKEN ghp_xxx
+sudo -u alice agent-box-session env set DEPLOY_KEY --stdin < deploy.pem
 ```
+
+A value may span lines (issue #212): the second form reads it from stdin, so
+a PEM or an SSH key goes in whole and never appears in the command line, the
+shell history or anyone's `ps`. The settings page's value field is a textarea
+for the same reason. Multi-line values are stored double-quoted, the form
+systemd's `EnvironmentFile` reads, and one parser
+(`modules/src/lib/envstore.py`) reads the file everywhere it is read.
 
 The supervisor's spawn wrapper re-reads the file at every session (re)start,
 so a new token applies on the next respawn — no unit restart, no rebuild, and
@@ -568,6 +658,15 @@ arbitrary command execution as the agent user.
   small NixOS config change (`services.agent-box.agent = ...`) plus
   `nixos-rebuild switch` and a service restart, but the UX still needs a tidy
   operator command because credentials and live tmux state are agent-specific.
+- tmux mouse mode (`set -g mouse on`, enabled so the wheel scrolls pane
+  history) takes over plain click-drag for its own copy-mode selection,
+  which the browser terminal (ttyd/xterm.js) can't turn into a real
+  clipboard copy. Hold **Shift** (or **Option** on a Mac) while dragging
+  to bypass tmux and mouse tracking entirely and get the browser's
+  native text selection instead, which copies normally (Ctrl+C /
+  Cmd+C). Mac's browsers ignore Shift for this — xterm.js only offers
+  Option there, and only because ttyd now turns on its
+  `macOptionClickForcesSelection` client option (off by default).
 
 ## Docs
 

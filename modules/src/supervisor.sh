@@ -6,10 +6,14 @@ set -u
 # agentBaseTools), so the unit pins those two via AGENT_BOX_*_BIN.
 JQ=jq
 TMUX="tmux -L agent-box"
-SESSIONS_FILE="$HOME/.config/agent-box/sessions.json"
 GREP="${AGENT_BOX_GREP_BIN:-grep}"
 FIND="${AGENT_BOX_FIND_BIN:-find}"
-FLOCK="${AGENT_BOX_FLOCK_BIN:-}"
+# The session registry — where it lives, how it is locked and how it is
+# rewritten — is one file every shell writer splices in (issue #254). It is
+# spliced HERE, above the seed below, because creating the registry is part of
+# the same protocol as writing it (issue #289).
+REGISTRY_PROG=supervisor
+@@include:lib/registry.sh@@
 # The webhook channel plugin, spelled once (issue #257): three places have to
 # agree on it — the settings seed (an enabledPlugins key), the plugin-cache
 # sync, and claude's --channels tag. The marketplace NAME comes from the
@@ -21,11 +25,11 @@ WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
 
 # First boot only: seed the Nix-declared sessions. The file is RUNTIME
 # data afterwards — a rebuild must never clobber sessions the user
-# added or removed while the box was live.
-mkdir -p "$HOME"/.config/agent-box
-if [ ! -s "$SESSIONS_FILE" ]; then
-  install -m 0600 "${AGENT_BOX_SESSIONS_SEED:?}" "$SESSIONS_FILE"
-fi
+# added or removed while the box was live. Under the registry lock, because
+# this unit and a session being added start in parallel on a first boot, and
+# "the file was empty when I looked" must not survive another writer's
+# decision (issue #289).
+registry_ensure "${AGENT_BOX_SESSIONS_SEED:?}"
 
 seed_json() {
   # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
@@ -52,6 +56,19 @@ seed_json() {
 # values seeded before first launch survive login/onboarding:
 #   ~/.claude.json          projects.<workdir>.hasTrustDialogAccepted
 #   ~/.claude/settings.json skipDangerousModePermissionPrompt
+#
+# hasCompletedOnboarding skips the whole first-run onboarding wizard,
+# whose first screen is the theme picker ("Choose the text style that
+# looks best with your terminal"). Verified against claude 2.1.233: the
+# wizard's step list pushes the theme step UNCONDITIONALLY, so a seeded
+# ~/.claude/settings.json theme does NOT skip it — the only lever is the
+# hasCompletedOnboarding gate on the wizard as a whole. Skipping it also
+# drops the wizard's security-notes and terminal-setup screens, and its
+# embedded login picker: an unauthenticated session lands on the REPL
+# with "Not logged in · Run /login" in the status line, which is the
+# same sign-in the README already documents as `claude auth login`.
+# Theme is seeded too, but only when unset (`//=`), so /theme sticks.
+#
 # Runs before every claude session start (idempotent), which also
 # covers upstream's occasional failure to persist an interactive
 # acceptance (anthropics/claude-code issue 36403). Codex has no such
@@ -59,7 +76,9 @@ seed_json() {
 seed_claude_state() {
   mkdir -p "$HOME"/.claude
   seed_json "$HOME"/.claude.json --arg wd "$1" \
-    '.projects[$wd] = ((.projects[$wd] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})'
+    '.projects[$wd] = ((.projects[$wd] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})
+     | .hasCompletedOnboarding = true'
+  seed_json "$HOME"/.claude/settings.json '.theme //= "dark"'
   if [ "$2" = true ]; then
     seed_json "$HOME"/.claude/settings.json \
       '.skipDangerousModePermissionPrompt = true'
@@ -193,66 +212,93 @@ if cbin="$(agent_bin codex)"; then
   ln -sfn agent-box-current "$HOME"/.codex/packages/standalone/current
 fi
 
-# Serialize every read-modify-write of the session registry (issue #254).
-# tmp+rename buys ONE guarantee — a reader never sees half a document — and
-# says nothing about the interval between a writer's read and its rename: two
-# writers that start from the same base each publish a document that never
-# contained the other's edit, so a one-field update silently reverts every
-# field the other writer changed. Measured on the live box: two writers of the
-# shape used here lost 96 of 300 updates (32%). The registry has five writers
-# in three languages (this loop, the session CLI, the mark-stopped epilogue,
-# the settings daemon's three routes, the webhook spawn wrapper), so the lock
-# is the only thing that makes the file's state a function of its edits.
-#
-# The lock is a SIDECAR file, never sessions.json itself: every writer here
-# REPLACES that inode by rename, so a lock taken on the inode a writer read is
-# not the lock the next writer takes.
-#
-# AGENT_BOX_FLOCK_BIN is pinned by the unit because flock ships in util-linux
-# only (the AGENT_BOX_*_BIN convention, as for grep/find). Unset means "no
-# lock, carry on": a box whose module predates this must still start sessions,
-# and a missing lock must never be the reason a session does not spawn.
-REGISTRY_LOCK="$SESSIONS_FILE.lock"
-_lock_depth=0
-registry_lock() {
-  # Nesting-safe on purpose: flock(2) conflicts between two open file
-  # DESCRIPTIONS, including two of the same process, so start_session — which
-  # holds the lock across the mark_started it calls — would otherwise block
-  # the supervisor against itself forever (verified: a second fd on the same
-  # file blocks).
-  _lock_depth=$((_lock_depth + 1))
-  [ "$_lock_depth" = 1 ] || return 0
-  [ -n "$FLOCK" ] || return 0
-  { exec 9>>"$REGISTRY_LOCK"; } 2>/dev/null || return 0
-  # -w: nothing may park the reconcile loop. If some writer holds the lock
-  # past the timeout (a stopped process, a full disk) this spawn proceeds
-  # unlocked — the pre-#254 behavior, not a new failure mode.
-  "$FLOCK" -w 10 9 \
-    || echo "supervisor: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-}
-registry_unlock() {
-  [ "$_lock_depth" -gt 0 ] || return 0
-  _lock_depth=$((_lock_depth - 1))
-  [ "$_lock_depth" = 0 ] || return 0
-  exec 9>&- 2>/dev/null || true
-}
-
 # Deliver-once + resume bookkeeping. A session's kickoff prompt
 # (initialPrompt) must fire on the FIRST spawn only; every later respawn
 # (crash, clean exit, reboot, Spot stop→restart — all of which keep the
 # on-disk transcript because /home is the persistent root EBS volume)
-# must RESUME the prior transcript instead of redoing the task. We fold
-# that state into sessions.json rather than a side file: after the first
-# spawn mark_started sets hasRun, records the (possibly freshly minted)
-# boxSessionId, and clears initialPrompt. boxSessionId is the STABLE id
-# WE own across respawns — Claude consumes it directly as --session-id /
-# --resume; for Codex (which mints its own id) we stamp it into the
-# kickoff prompt so the transcript is findable by content (codex_rollout_uuid).
+# must RESUME the prior transcript instead of redoing the task.
+#
+# That bookkeeping is the SUPERVISOR's own observation, and observations now
+# live in a supervisor-owned side file rather than in sessions.json (issue
+# #282). The registry is INTENT — what the operator asked for: name, agent,
+# working directory, prompts, stopped — and five writers in three languages
+# edit it, so a lost update there (issue #254) used to revert a long-running
+# session to "never spawned": new id, kickoff prompt fired a second time,
+# previous transcript orphaned. Intent cannot revert an observation it no
+# longer carries.
+#
+# MIGRATION — this release writes BOTH. The side file is read first and the
+# registry copy is the fallback, so a session that last spawned before this
+# release keeps its id, as does the id `agent-box-session add` mints up
+# front. The next release stops writing hasRun / boxSessionId / the cleared
+# initialPrompt into the registry and drops the fallback read; that is what
+# makes the supervisor a read-only consumer of sessions.json.
+SESSION_STATE_DIR="$HOME/.local/state/agent-box/session"
+session_state_file() {
+  # session_state_file NAME — the one place this script spells the path
+  # (issue #284). The key is the session NAME for now, and a name is a
+  # label rather than an identity: it is minted from a file that can be
+  # stale, and it is meant to become editable. The key this should grow
+  # into is one a harness mints — tmux #{session_id} plus the
+  # AGENT_BOX_SESSION_ID this spawn puts in the pane environment for the
+  # claim, and claude's transcript uuid / codex's rollout id for the
+  # conversation — so every reader and writer goes through here and the
+  # re-key is this function. `agent-box-session rm` carries the same
+  # accessor under the same name, and the settings daemon has
+  # session_state_path; the three must agree.
+  printf '%s/%s.json\n' "$SESSION_STATE_DIR" "$1"
+}
+
+session_launch_id() {
+  # session_launch_id SESSION — the id this session was last LAUNCHED with,
+  # or empty when the supervisor has never recorded one.
+  #
+  # EAFP: attempt the read and handle the miss. Testing for the file first
+  # would ask the kernel a question the read answers anyway, and the answer
+  # would already be stale by the time we acted on it.
+  _v="$($JQ -r '.launchSessionId // empty' "$(session_state_file "$1")" 2>/dev/null)" \
+    || _v=""
+  # Shape check on the way OUT, because this value reaches --resume, a
+  # find -name pattern and this file's own writer.
+  case "$_v" in
+    (*[!0-9a-fA-F-]*) _v="" ;;
+    (????????-????-????-????-????????????) ;;
+    (*) _v="" ;;
+  esac
+  printf '%s' "$_v"
+}
+
+record_launch() {
+  # record_launch SESSION BOXID — remember the id this spawn launched with,
+  # so the next one resumes the same conversation.
+  #
+  # mktemp + rename, not a create-if-absent: a rotation legitimately CHANGES
+  # the value, so the last writer must win. mktemp is the exclusive-creation
+  # primitive (O_EXCL on a name nobody can guess) and the rename is what
+  # keeps a reader from ever seeing half a document. Best effort throughout
+  # — a failed write costs a re-derived id on the next spawn, never a crash.
+  case "$2" in (*[!0-9a-fA-F-]*|"") return 0 ;; esac
+  mkdir -p "$SESSION_STATE_DIR" 2>/dev/null || return 0
+  _f="$(session_state_file "$1")"
+  _t="$(mktemp "$_f.XXXXXX" 2>/dev/null)" || return 0
+  if printf '{"launchSessionId":"%s"}\n' "$2" > "$_t" 2>/dev/null; then
+    mv -f "$_t" "$_f" 2>/dev/null || rm -f "$_t"
+  else
+    rm -f "$_t"
+  fi
+}
+
 mark_started() {
-  # mark_started SESSION BOXID — best-effort; a failed rewrite just means
-  # the prompt re-fires next spawn, never a crash. Read and rename happen
-  # under the registry lock (issue #254); the caller normally holds it
-  # already, and registry_lock nests.
+  # mark_started SESSION BOXID — the MIGRATION copy of what record_launch
+  # just wrote (issue #282): hasRun and boxSessionId in the registry, plus
+  # the consumed kickoff prompt. Kept for one release so a box that rolls
+  # back to the previous module still finds its ids where that module looks;
+  # the next release deletes this function and leaves sessions.json to
+  # intent alone.
+  #
+  # Best-effort; a failed rewrite just means the prompt re-fires next spawn,
+  # never a crash. Read and rename happen under the registry lock (issue
+  # #254); the caller normally holds it already, and registry_lock nests.
   #
   # `has` first, because this must only ever UPDATE: jq's `|=` on a missing
   # key CREATES it (verified), so a session deleted while this spawn was
@@ -260,18 +306,15 @@ mark_started() {
   # the reconcile loop then started forever — a session nothing kills,
   # because no delete path knows it exists. That is the resurrect half of
   # #254; the lock is the lost-update half.
-  registry_lock
-  _tmp="$(mktemp "$SESSIONS_FILE.XXXXXX")" || { registry_unlock; return 0; }
-  if $JQ --arg s "$1" --arg b "$2" \
-       'if .sessions | has($s)
-        then (.sessions[$s]) |= (.hasRun = true | .boxSessionId = $b | .initialPrompt = null)
-        else . end' \
-       "$SESSIONS_FILE" > "$_tmp" 2>/dev/null; then
-    mv "$_tmp" "$SESSIONS_FILE"
-  else
-    rm -f "$_tmp"
-  fi
-  registry_unlock
+  #
+  # jq's stderr is dropped rather than journalled: this runs on every spawn of
+  # every session, so a registry the box cannot parse would repeat the same
+  # line every two seconds, and the reconcile loop already carries on without
+  # it.
+  registry_edit --arg s "$1" --arg b "$2" \
+    'if .sessions | has($s)
+     then (.sessions[$s]) |= (.hasRun = true | .boxSessionId = $b | .initialPrompt = null)
+     else . end' 2>/dev/null || true
 }
 
 claude_has_transcript() {
@@ -281,6 +324,24 @@ claude_has_transcript() {
   [ -n "$1" ] || return 1
   $FIND "$HOME"/.claude/projects -maxdepth 3 -name "$1.jsonl" 2>/dev/null \
     | $GREP -q .
+}
+
+claude_transcript_has_work() {
+  # True when $1's transcript contains at least one REAL assistant turn.
+  # model:"<synthetic>" is claude's own marker for a turn it manufactured
+  # without calling the model at all — a bare "No response requested." to
+  # a local-command-caveat batch, a login/limit notice — never anything a
+  # model actually said. A transcript can exist with none: /clear rotates
+  # to a brand-new session id (see the segment-rotation block below) whose
+  # only content, until a real prompt lands, is the /clear command's own
+  # echo and that synthetic non-reply. Resuming such a transcript is
+  # harmless; telling the model it "was interrupted" and to "review what
+  # you had already done" is not — there is nothing to review, and it
+  # derails a session that should just run its normal kickoff.
+  [ -n "$1" ] || return 1
+  f=$($FIND "$HOME"/.claude/projects -maxdepth 3 -name "$1.jsonl" 2>/dev/null | head -n1)
+  [ -n "$f" ] || return 1
+  $GREP '"type":"assistant"' "$f" 2>/dev/null | $GREP -qv '"model":"<synthetic>"'
 }
 
 codex_rollout_uuid() {
@@ -304,7 +365,7 @@ codex_rollout_uuid() {
 
 start_session() {
   sname=$1
-  sjson="$($JQ -c --arg s "$sname" '.sessions[$s] // empty' "$SESSIONS_FILE")" || return 0
+  sjson="$($JQ -c --arg s "$sname" '.sessions[$s] // empty' "$REGISTRY_FILE")" || return 0
   [ -n "$sjson" ] || return 0
   agent="$($JQ -r '.agent // empty' <<<"$sjson")"
   if ! bin="$(agent_bin "$agent")"; then
@@ -316,35 +377,84 @@ start_session() {
   skip="$($JQ -r 'if .skipPermissions == false then "false" else "true" end' <<<"$sjson")"
   rc="$($JQ -r 'if .remoteControl == false then "false" else "true" end' <<<"$sjson")"
   rcname="$($JQ -r '.remoteControlName // empty' <<<"$sjson")"
+  # The agent profile this session was created with (issue #321), or empty.
+  # Its harness and arguments were already resolved into `agent`/`extraArgs`
+  # by agent-box-session, so nothing here re-reads them: what the name is for
+  # is the profile's ENVIRONMENT, which the env-exec wrapper applies at every
+  # spawn — a rotated token in a profile therefore reaches the session on its
+  # next restart, while the arguments it started with stay put.
+  sprofile="$($JQ -r '.profile // ""' <<<"$sjson")"
+  case "$sprofile" in (*[!A-Za-z0-9_-]*) sprofile="" ;; esac
   ip="$($JQ -r '.initialPrompt // ""' <<<"$sjson")"
   rp="$($JQ -r '.resumePrompt // ""' <<<"$sjson")"
-  bid="$($JQ -r '.boxSessionId // ""' <<<"$sjson")"
-  hasrun="$($JQ -r 'if .hasRun == true then "true" else "false" end' <<<"$sjson")"
-  # Mint the stable box-session id on the first spawn if the file doesn't
-  # carry one (legacy/seed sessions, hand-edited files). /proc/.../uuid is
-  # the kernel's UUID source — a bash `read`, so nothing on PATH is needed
+  # The id this session was last LAUNCHED with (issue #282). Note what that
+  # is NOT: it is not an id that survives the conversation, because a
+  # segment rotation — clear, compact or resume — mints a new one and the
+  # block below adopts it. It names the SEGMENT this spawn hands the agent,
+  # which is why a consumer wanting "the conversation" has to follow the
+  # rotation record rather than trust this value (issues #274, #277).
+  #
+  # Supervisor side file first, registry copy as the migration fallback (see
+  # mark_started). `launched` — has this session ever been spawned at all —
+  # comes from whichever answered: the side file exists only because a spawn
+  # wrote it, and the registry's hasRun said the same thing before it moved.
+  launched=false
+  recorded="$(session_launch_id "$sname")"
+  bid="$recorded"
+  if [ -n "$bid" ]; then
+    launched=true
+  else
+    bid="$($JQ -r '.boxSessionId // ""' <<<"$sjson")"
+    if [ "$($JQ -r 'if .hasRun == true then "true" else "false" end' <<<"$sjson")" = true ]; then
+      launched=true
+    fi
+  fi
+  # Mint the launch id on the first spawn if nothing carries one yet
+  # (legacy/seed sessions, hand-edited files). /proc/.../uuid is the
+  # kernel's UUID source — a bash `read`, so nothing on PATH is needed
   # and the value is a valid UUID for Claude's --session-id.
   if [ -z "$bid" ] && [ -r /proc/sys/kernel/random/uuid ]; then
     read -r bid < /proc/sys/kernel/random/uuid || bid=
   fi
-  # /clear rotation (issue #223): claude's live session id can rotate away
-  # from the id this session was last launched with — /clear keeps the
-  # process (and its Remote Control registration) but starts a NEW
-  # transcript under a new uuid. The SessionStart hook (injected via
-  # AGENT_BOX_CLAUDE_SETTINGS below) records that live id, keyed by the
-  # launch id it finds in the pane environment. Follow the record here:
-  # without it, `--resume "$bid"` resurrects the pre-/clear transcript the
-  # user explicitly cleared away and orphans the conversation that replaced
-  # it — and the Claude apps, which thread Remote Control by NAME, then
-  # interleave both conversations in one app thread. The charset check
-  # doubles as glob-safety for claude_has_transcript's -name lookup; the
-  # adopted id is persisted below via mark_started, so sessions.json tracks
-  # the rotation and each record chains one hop at most.
+  # hasRun is DERIVED, never stored (issue #282). "Is there a conversation to
+  # resume" is a question the disk already answers for claude, and
+  # claude_has_transcript is the same check the resume arm below has always
+  # made — a stored copy could only ever disagree with it, and did: a
+  # reverted registry promised a resume of a transcript that was there, and a
+  # deleted transcript promised one that was not. The other harnesses have
+  # nothing equivalent to read (a codex rollout is found by a marker that
+  # only a kickoff prompt carries; a shell session has no transcript at all),
+  # so they keep answering from the launch record itself.
+  if [ "$agent" = claude ]; then
+    hasrun=false
+    claude_has_transcript "$bid" && hasrun=true
+  else
+    hasrun=$launched
+  fi
+  # Segment rotation (issue #223): claude's live session id can rotate away
+  # from the id this session was last launched with. Three triggers are
+  # observed on the live box — clear, compact and resume — and all three do
+  # the same thing: the process keeps running (and keeps its Remote Control
+  # registration) while a NEW transcript opens under a new uuid. The
+  # SessionStart hook (injected via AGENT_BOX_CLAUDE_SETTINGS below) fires on
+  # each of them and records the live id, keyed by the launch id it finds in
+  # the pane environment. Follow the record here: without it, `--resume
+  # "$bid"` resurrects the segment the user rotated away from and orphans the
+  # one that replaced it — and the Claude apps, which thread Remote Control
+  # by NAME, then interleave both conversations in one app thread. The charset
+  # check doubles as glob-safety for claude_has_transcript's -name lookup; the
+  # adopted id is recorded below, so each record chains one hop at most.
+  #
+  # Gated on `launched`, not on a transcript: what makes a live-id record
+  # meaningful is that this session has spawned before (nothing else writes
+  # under our launch id), and an adoption is its own proof of a resumable
+  # transcript. EAFP on the record — read it and handle the miss; a
+  # readability test first would only add a syscall and a race.
   rotated=false
-  if [ "$agent" = claude ] && [ "$hasrun" = true ] && [ -n "$bid" ] \
-     && [ -r "$HOME/.local/state/agent-box/live-session-id/$bid" ]; then
+  if [ "$agent" = claude ] && [ "$launched" = true ] && [ -n "$bid" ]; then
     live=""
-    read -r live < "$HOME/.local/state/agent-box/live-session-id/$bid" || live=""
+    read -r live < "$HOME/.local/state/agent-box/live-session-id/$bid" 2>/dev/null \
+      || live=""
     case "$live" in
       (*[!0-9a-fA-F-]*) live="" ;;
       (????????-????-????-????-????????????) ;;
@@ -353,6 +463,7 @@ start_session() {
     if [ -n "$live" ] && [ "$live" != "$bid" ] && claude_has_transcript "$live"; then
       bid="$live"
       rotated=true
+      hasrun=true
     fi
   fi
   # Resume on every respawn (hasRun already set); the kickoff prompt fires
@@ -364,6 +475,12 @@ start_session() {
     resuming=true
     if [ -n "$rp" ]; then
       prompt="$rp"
+    elif [ "$agent" = claude ] && ! claude_transcript_has_work "$bid"; then
+      # /clear (or any respawn before a first real prompt lands) leaves a
+      # transcript that exists but holds no actual work — see
+      # claude_transcript_has_work. Run the normal kickoff instead of
+      # claiming an interruption nothing backs up.
+      prompt="$ip"
     else
       prompt="You were interrupted and automatically restarted (agent-box session $bid). Your previous transcript for this session has been resumed — review what you had already done, verify the current state, and continue from where you left off. If that work was already complete, say so briefly and stop rather than redoing it."
     fi
@@ -420,7 +537,7 @@ start_session() {
         cmd="$cmd --remote-control $(printf '%q' "$rcname")"
       fi
       # The SessionStart hook that records the live session id (see the
-      # /clear-rotation block above). ADDITIONAL settings only: claude
+      # segment-rotation block above). ADDITIONAL settings only: claude
       # merges the file on top of the user/project settings.json, which
       # stay untouched, so only supervisor-spawned sessions carry the hook.
       [ -n "${AGENT_BOX_CLAUDE_SETTINGS:-}" ] \
@@ -557,15 +674,55 @@ start_session() {
     rm -f "$HOME"/.claude/remote-settings.json
     seed_claude_state "$wd" "$skip"
   fi
-  # Seed the minimal editable AGENTS.md (which @imports the read-only
-  # canonical guide) IFF absent, so the agent's own edits or a repo
-  # checkout there never get clobbered. Not for shell sessions: no agent
-  # reads it there, and scratch dirs shouldn't get littered. Unset (the
-  # user opted out with agentsMd = null) seeds nothing.
+  # Seed the minimal editable AGENTS.md (points at the read-only canonical
+  # guide) IFF absent, so the agent's own edits or a repo checkout there
+  # never get clobbered. Not for shell sessions: no agent reads it there,
+  # and scratch dirs shouldn't get littered. Unset (the user opted out with
+  # agentsMd = null) seeds nothing.
   if [ -n "${AGENT_BOX_AGENTS_POINTER:-}" ] \
        && [ "$agent" != shell ] && [ ! -e "$wd/AGENTS.md" ]; then
     mkdir -p "$wd"
     install -m 0644 "$AGENT_BOX_AGENTS_POINTER" "$wd/AGENTS.md"
+  fi
+  # claude reads CLAUDE.md and NEVER AGENTS.md (issue #305), so the file
+  # seeded above reaches a claude session only through a symlink. Two are
+  # needed, one per memory scope: the project-scope one points at the
+  # sibling AGENTS.md (relative target — a symlink, unlike a claude
+  # `@import`, has no trouble reaching outside the project tree, but
+  # AGENTS.md happens to sit right beside it), and the user-scope one
+  # points straight at the canonical /etc guide, so it stays live across
+  # box updates without ever being reseeded. Both IFF absent, so a repo's
+  # own CLAUDE.md and any hand edits survive; the notes symlink only when
+  # there IS an AGENTS.md beside it to point at (the line above just made
+  # sure of that, unless the user opted out or something else owns the
+  # file).
+  if [ "$agent" = claude ]; then
+    if [ -n "${AGENT_BOX_AGENTS_POINTER:-}" ] \
+         && [ -e "$wd/AGENTS.md" ] && [ ! -e "$wd/CLAUDE.md" ]; then
+      ln -s AGENTS.md "$wd/CLAUDE.md"
+    fi
+    if [ -n "${AGENT_BOX_GUIDE_TARGET:-}" ] \
+         && [ ! -e "$HOME/.claude/CLAUDE.md" ]; then
+      mkdir -p "$HOME"/.claude
+      ln -s "$AGENT_BOX_GUIDE_TARGET" "$HOME"/.claude/CLAUDE.md
+    fi
+  fi
+  # codex reads AGENTS.md natively, so it needs no rename — but only from
+  # the project root DOWN to the cwd, plus one global file at
+  # $CODEX_HOME/AGENTS.md. The seeded $wd/AGENTS.md therefore stops
+  # reaching it the moment a session works inside a checkout below $wd,
+  # which is what a session doing real work does. The global file is the
+  # scope that survives that, so point it at the canonical guide — the
+  # exact counterpart of claude's ~/.claude/CLAUDE.md above. IFF absent, so
+  # an agent's own global instructions win. CODEX_HOME is codex's own
+  # override for that directory and nothing here sets it, but honour it the
+  # way codex-remote-control.sh does rather than hardcoding the default.
+  if [ "$agent" = codex ] && [ -n "${AGENT_BOX_GUIDE_TARGET:-}" ]; then
+    cxhome="${CODEX_HOME:-$HOME/.codex}"
+    if [ ! -e "$cxhome/AGENTS.md" ]; then
+      mkdir -p "$cxhome"
+      ln -s "$AGENT_BOX_GUIDE_TARGET" "$cxhome/AGENTS.md"
+    fi
   fi
   # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
   # time, not unit start — then execs the agent (issue 89), so
@@ -607,7 +764,7 @@ start_session() {
   listed() {
     $JQ -e --arg s "$sname" \
       '.sessions | has($s) and (.[$s].stopped != true)' \
-      "$SESSIONS_FILE" >/dev/null 2>&1
+      "$REGISTRY_FILE" >/dev/null 2>&1
   }
   # Pre-check, spawn, post-check and mark_started are ONE critical section
   # (issue #254), so the post-check is exact: without the lock a delete could
@@ -635,13 +792,18 @@ start_session() {
   fi
   # AGENT_BOX_SESSION_ID rides the same session environment: it is the
   # launch id the SessionStart hook keys its live-id record by (the
-  # /clear-rotation block above). Quoted on its own — unlike $whargs it
+  # segment-rotation block above). Quoted on its own — unlike $whargs it
   # is runtime data from sessions.json, not supervisor-built tokens.
   # 9>&- closes the registry lock fd for this child: `new-session` STARTS the
   # tmux server when none is running, and that server daemonizes and outlives
   # us — inheriting the fd would hand it the lock forever and wedge every
   # other writer (the lock lives on the open file description, not the pid).
-  if $TMUX new-session -d -s "$sname" -c "$wd" $whargs \
+  # AGENT_BOX_PROFILE rides the same session environment, for the env-exec
+  # wrapper's profile overlay (and so anything running in the pane can say
+  # which profile it is). Charset-checked above, like $sname.
+  pargs=""
+  [ -n "$sprofile" ] && pargs="-e AGENT_BOX_PROFILE=$sprofile"
+  if $TMUX new-session -d -s "$sname" -c "$wd" $whargs $pargs \
        -e AGENT_BOX_SESSION_ID="$bid" \
        "${AGENT_BOX_ENV_EXEC:?} $cmd$epilogue" 9>&-; then
     if ! listed; then
@@ -649,12 +811,24 @@ start_session() {
       $TMUX kill-session -t "=$sname" 2>/dev/null || true
       return 0
     fi
-    # First spawn: persist the id + hasRun and consume the kickoff prompt,
-    # so the next respawn resumes instead of redoing the task. Rotated
-    # respawn (issue #223): persist the adopted live id the same way.
-    # (Ordered after the delist post-check: mark_started's jq assignment
-    # would otherwise re-create a just-deleted session as a stub entry.)
-    if [ "$resuming" != true ] || [ "$rotated" = true ]; then
+    # Record the id this spawn launched with, whenever that is not already
+    # what the record says: a first spawn, an adopted rotation, and the one
+    # respawn that migrates a session predating the side file (issue #282).
+    # Writing only on a CHANGE matters because a session that cannot start —
+    # a claude with no credentials, say — is respawned every couple of
+    # seconds, and neither file should be rewritten on that loop.
+    #
+    # The registry mirror is narrower still: it is a read-modify-write of the
+    # file everything else edits, held under the registry lock, so it runs
+    # only on a first-ever spawn or an adopted rotation — exactly when it has
+    # something new to say. (Both ordered after the delist post-check:
+    # mark_started's jq assignment would otherwise re-create a just-deleted
+    # session as a stub entry, and the side file of a session deleted in this
+    # window is left to the sweep.)
+    if [ "$bid" != "$recorded" ] || [ "$rotated" = true ]; then
+      record_launch "$sname" "$bid"
+    fi
+    if [ "$launched" != true ] || [ "$rotated" = true ]; then
       mark_started "$sname" "$bid"
     fi
   fi
@@ -683,25 +857,61 @@ sweep_orphan_filters() {
     case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
     # A file jq cannot answer for is left alone: a transient read error must
     # not be read as "this session is gone" and unsubscribe a live session.
-    if $JQ -e --arg s "$_n" '.sessions | has($s)' "$SESSIONS_FILE" >/dev/null 2>&1; then
+    if $JQ -e --arg s "$_n" '.sessions | has($s)' "$REGISTRY_FILE" >/dev/null 2>&1; then
       continue
-    elif $JQ -e . "$SESSIONS_FILE" >/dev/null 2>&1; then
+    elif $JQ -e . "$REGISTRY_FILE" >/dev/null 2>&1; then
       rm -f "$_f"
     fi
   done
 }
 sweep_orphan_filters
 
+# Reclaim the supervisor's own per-session state for names the registry no
+# longer lists (issue #282).
+#
+# Keyed on the registry, and run from the reconcile loop rather than hung off
+# a delete path, because deletion is never guaranteed: nothing makes a hook
+# agent call `agent-box-session rm`, a session can be delisted while this
+# unit is down, and a box that upgrades into this file has no delete path to
+# have taken. Both delete paths do prune their own as an OPTIMISATION — it
+# closes the window in which a re-used name inherits the previous holder's
+# launch id — but neither is what makes the state reclaimable.
+#
+# Stale state here is not merely litter: a session name is re-usable, so a
+# file left by a deleted session would hand its launch id, and with it its
+# transcript, to the next session that takes the name.
+#
+# One jq for the whole sweep, not one per file: this runs on every tick. A
+# registry jq cannot answer for leaves everything alone — a transient read
+# error, or a file being replaced by rename right now, must never be read as
+# "no session exists". An EMPTY registry is a different answer from an
+# unreadable one, and this sweeps on it: the last session deleted is exactly
+# when the last file has to go.
+NL="
+"
+sweep_session_state() {
+  _listed="$($JQ -r '.sessions | keys[]' "$REGISTRY_FILE" 2>/dev/null)" || return 0
+  for _f in "$SESSION_STATE_DIR"/*.json; do
+    _n=${_f##*/}; _n=${_n%.json}
+    # Also how an unmatched glob leaves this loop: the literal pattern is not
+    # a legal session name, so nothing has to be stat'ed to skip it.
+    case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
+    case "$NL$_listed$NL" in (*"$NL$_n$NL"*) continue ;; esac
+    rm -f "$_f"
+  done
+}
+
 # Reconcile forever; systemd stop tears the whole tree down (ExecStop
 # kill-server + cgroup kill), Restart=always revives a crashed loop.
 # Sessions flagged stopped (a clean agent exit, or agent-box-session
 # stop) stay listed but are left down until a restart clears the flag.
 while true; do
+  sweep_session_state
   while IFS= read -r sname; do
     case "$sname" in
       (*[!A-Za-z0-9_-]*|"") continue ;;
     esac
     $TMUX has-session -t "=$sname" 2>/dev/null || start_session "$sname"
-  done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$SESSIONS_FILE" 2>/dev/null)
+  done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$REGISTRY_FILE" 2>/dev/null)
   sleep 2
 done

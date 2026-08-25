@@ -60,6 +60,8 @@
 #                                 no webhook receiver, so no panel)
 #   AGENT_BOX_WEBHOOK_STATE_DIR  where its filter.*.json files live
 #   AGENT_BOX_WEBHOOK_PYTHON     interpreter for that script
+#   AGENT_BOX_CONNECT_BINS       "<id>=<binary>" pairs for the guided
+#                                 sign-in cards (claude, codex, github)
 
 import contextlib
 import fcntl
@@ -73,6 +75,7 @@ import os
 import re
 import secrets
 import select
+import shlex
 import signal
 import socket
 import subprocess
@@ -82,8 +85,22 @@ import threading
 import time
 import urllib.parse
 
+# The env store's format lives in ONE place (issue #212): src/lib/envstore.py,
+# which the generated module prepends to this file (see settingsDaemon in
+# modules/agent-box.nix.in, the same seam envExecWrapper and envStoreCli use).
+# This daemon is the file's main writer and does NOT shell out to the CLI: a
+# secret must not travel through the argv of a helper process to get written.
+# The names that library defines — KEY_RE, ENV_HEADER, as_dict/load/keys/update
+# — are therefore already bound here and are used below.
+
 USER = os.environ.get("AGENT_BOX_SETTINGS_USER", "agent")
 ENV_FILE = os.environ["AGENT_BOX_SETTINGS_ENV_FILE"]
+# Agent profiles (issue #321) live beside the env store, one file per profile.
+# Only the preamble cache key reads this: a watch's launch report names the
+# profile AGENT_BOX_HOOK_PROFILE picks and whether it still exists, so
+# creating or deleting a profile changes that report without touching the env
+# file. The page has no profile editor yet (that is step 5 of #321).
+PROFILES_DIR = os.path.join(os.path.dirname(ENV_FILE), "profiles")
 BASE = os.environ.get("AGENT_BOX_SETTINGS_BASE", "/settings").rstrip("/")
 PORT = int(os.environ.get("AGENT_BOX_SETTINGS_PORT", "8080"))
 TMUX_SOCKET = os.environ.get("AGENT_BOX_TMUX_SOCKET", "agent-box")
@@ -100,9 +117,20 @@ SESSIONS_FILE = os.environ.get("AGENT_BOX_SESSIONS_FILE", "")
 # The settings page keeps the session manager list plus secrets +
 # danger zone.
 HOME = os.environ.get("AGENT_BOX_HOME", "") == "1"
+# This user's own space on the vhost: the workspace page at TERM_HOME, the
+# settings page under it, and one path per session. The
+# vhost root is a user picker that lands here — so a bookmark of the
+# handed-out URL opens the box, not a single raw terminal.
+TERM_BASE = "/" + urllib.parse.quote(
+    os.environ.get("AGENT_BOX_SETTINGS_USER", "agent"), safe="")
+TERM_HOME = TERM_BASE + "/"
+# Every terminal user on this box, in the order the vhost lists them, so
+# the root picker can name them. One entry (the norm) means there is
+# nothing to pick and the root redirects straight into it.
+WEB_USERS = [x for x in os.environ.get("AGENT_BOX_WEB_USERS", "").split(",") if x]
 # Where session CRUD routes live, and the page they redirect back to.
 SESS_BASE = "" if HOME else BASE
-SESS_PAGE = "/" if HOME else BASE + "/"
+SESS_PAGE = TERM_HOME if HOME else BASE + "/"
 AGENTS = [a for a in os.environ.get("AGENT_BOX_AGENTS", "claude").split(",") if a]
 DEFAULT_AGENT = os.environ.get("AGENT_BOX_DEFAULT_AGENT", "claude")
 # Full sudo command line that triggers the box update (issue 54). Empty
@@ -143,10 +171,9 @@ WEBHOOKS = bool(WEBHOOK_SCRIPT and WEBHOOK_STATE_DIR)
 # a watch DOES instead of restating why it exists (#259).
 HOOK_SPAWN_CMD = os.environ.get("AGENT_BOX_HOOK_SPAWN_CMD", "")
 
-# Env var names: POSIX-ish. Must start with a letter or underscore and
-# contain only letters, digits, underscores. This is what a shell / systemd
-# EnvironmentFile will accept as a variable name.
-KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Env var names (KEY_RE) come from the spliced env-store library above: the
+# charset a shell / systemd EnvironmentFile accepts as a variable name, and
+# the same one the CLIs enforce.
 # Session names: same charset the supervisor and CLI enforce (they
 # land in tmux -t targets and URLs). Every render and publish path filters
 # through this, so a name it rejects is not merely unlisted — that session
@@ -163,6 +190,16 @@ KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # it stays far below what a filter.<user>-<session>.json filename allows.
 NAME_MAX = 150
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,%d}$" % NAME_MAX)
+# Names a session may never take: each already means something else under
+# TERM_BASE, and a session path is what the vhost sends everything ELSE
+# there to. A session called "settings" would shadow the settings page —
+# or, worse, be shadowed BY it and become unreachable with no hint why.
+# "token" and "ws" are ttyd's own endpoints, reached without a trailing
+# slash, which is the one shape a session path cannot be told apart from.
+# Mirrored by the CLI's own check and by the module's session-name
+# assertion, so a name is refused wherever it is typed.
+RESERVED_NAMES = frozenset(("settings", "downloads", "webhook", "sessions",
+                            "token", "ws"))
 # Subscription topics: "source:owner/repo", or the prefix "source:owner/*"
 # (local-webhook 0.13.0 dropped "*" and "source:*" as topics). The
 # panel only ever posts back a topic it just rendered, and the CLI is
@@ -181,6 +218,12 @@ TOPIC_RE = re.compile(r"^[A-Za-z0-9_.:/*-]{1,128}$")
 HOME_DIR = os.path.realpath(
     os.environ.get("HOME") or os.path.expanduser("~" + USER)
 )
+
+
+def session_url(name):
+    """Where one session's terminal lives. SESSION_RE names are URL-safe
+    as they stand; the trailing slash is what the vhost matches on."""
+    return TERM_HOME + name + "/"
 
 
 def resolve_browse_dir(raw):
@@ -247,105 +290,49 @@ def valid_password(password):
 
 
 def read_keys():
-    """Return the sorted list of KEY names currently in the env file.
+    """The sorted KEY names in the env file — never their values.
 
-    Values are intentionally never returned — the UI must not be able to
-    surface a stored secret.
+    The UI must not be able to surface a stored secret, so the page asks for
+    names only. Reading and writing the file itself is the env-store
+    library's job (issue #212), including the multi-line values a PEM needs.
     """
-    keys = []
-    try:
-        with open(ENV_FILE, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key = line.split("=", 1)[0].strip()
-                if KEY_RE.match(key):
-                    keys.append(key)
-    except FileNotFoundError:
-        pass
-    # De-dup preserving the last occurrence's position is unnecessary; names
-    # are what matter, so sort for a stable UI.
-    return sorted(set(keys))
-
-
-def load_pairs():
-    """Return an ordered dict-ish list of (key, rawvalue) for rewriting.
-
-    Used only internally when mutating the file; values never leave the
-    process.
-    """
-    pairs = []
-    try:
-        with open(ENV_FILE, "r", encoding="utf-8") as fh:
-            for line in fh:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#") or "=" not in stripped:
-                    continue
-                key, val = stripped.split("=", 1)
-                key = key.strip()
-                if KEY_RE.match(key):
-                    pairs.append((key, val))
-    except FileNotFoundError:
-        pass
-    return pairs
-
-
-def write_pairs(pairs):
-    """Atomically write pairs to ENV_FILE at mode 0600.
-
-    Writes to a temp file in the same directory (so os.replace is atomic on
-    the same filesystem) then renames over the target.
-    """
-    directory = os.path.dirname(ENV_FILE) or "."
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".env.")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write("# Managed by agent-box settings page. KEY=value, one per line.\n")
-            fh.write("# Do not add secrets by hand here unless you know what you are doing.\n")
-            for key, val in pairs:
-                fh.write(f"{key}={val}\n")
-        os.replace(tmp, ENV_FILE)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    return keys(ENV_FILE)
 
 
 def set_key(key, value):
-    pairs = [(k, v) for (k, v) in load_pairs() if k != key]
-    pairs.append((key, value))
-    write_pairs(pairs)
+    update(ENV_FILE, [(key, value)], ENV_HEADER)
 
 
 def delete_key(key):
-    pairs = [(k, v) for (k, v) in load_pairs() if k != key]
-    write_pairs(pairs)
+    update(ENV_FILE, [], ENV_HEADER, drop=[key])
 
 
 @contextlib.contextmanager
 def sessions_lock():
     """Serialize one read_sessions -> write_sessions pair (issue #254).
 
-    os.replace makes a READER see a whole document and nothing more: two
-    writers that start from the same base each publish a document that never
-    contained the other's edit, so a one-field update reverts every field the
-    other writer changed. That is not a theoretical race here — this daemon is
-    a ThreadingHTTPServer, so it races ITSELF as well as the supervisor, the
-    session CLI and the mark-stopped epilogue, and the loss it caused is
-    worse than a lost row: reverting hasRun / boxSessionId / the cleared
-    initialPrompt leaves a RUNNING session the supervisor treats as a first
-    spawn next time it dies, re-firing the kickoff prompt against a new id
-    and orphaning the transcript.
+    The protocol itself — the sidecar path, the primitive, the bound, and why
+    a rename is not enough — is written down once, in
+    modules/src/lib/registry.sh, which the four SHELL writers splice in. This
+    is the fifth writer and the only one that is python, so it takes the same
+    flock(2) on the same sidecar file through fcntl instead. What has to agree
+    across the two languages is exactly that file's contract, and
+    tests/test-registry.py checks it from both sides.
 
-    The lock is a SIDECAR file, never SESSIONS_FILE: every writer replaces
-    that inode by rename, so the inode a writer locked is not the one the next
-    writer takes. Same flock(2) primitive the shell writers use through
-    util-linux's flock(1), so all five writers serialize against each other.
+    Two things are true here and nowhere else. This daemon is a
+    ThreadingHTTPServer, so it races ITSELF as well as the four shell writers
+    (each fcntl.flock call opens its own description, so its own threads
+    serialize too). And the loss it caused was worse than a lost row:
+    reverting hasRun / boxSessionId / the cleared initialPrompt left a RUNNING
+    session the supervisor treated as a first spawn next time it died,
+    re-firing the kickoff prompt against a new id and orphaning the
+    transcript. That particular cost is being taken off the table separately
+    (issue #282): the supervisor keeps its own observations in
+    ~/.local/state/agent-box/session/ and reads the registry copy only as a
+    migration fallback, so what a lost update here can revert is intent —
+    which the operator can see and re-state — and not the record of a
+    conversation. The lock stays either way: intent is worth as much.
+
     fcntl precedent in this repo: password-helper.py's AUTH_ENV_LOCK.
 
     Best effort by design: if the lock cannot be created or taken, the body
@@ -421,23 +408,28 @@ def gen_session_name(agent, sessions, cwd=None):
     and names nothing) or an absolute path this daemon has resolved. Keeping
     the mirror in session-cli.sh's gen_name in step is deliberate: both
     creation paths must name a session the same way.
+
+    RESERVED_NAMES count as taken: the directory branch below would happily
+    name a session after ~/settings or ~/ws, and that is precisely the name
+    the vhost cannot route to a terminal.
     """
-    if agent not in sessions:
+    taken = set(sessions) | RESERVED_NAMES
+    if agent not in taken:
         return agent
     base = re.sub(r"[^A-Za-z0-9_-]", "-", os.path.basename((cwd or "").rstrip("/")))
     base = base.strip("-")
     if base and len(base) <= NAME_MAX - 2:
-        if base not in sessions:
+        if base not in taken:
             return base
         for suffix in range(2, 10):
             candidate = "%s-%d" % (base, suffix)
-            if candidate not in sessions:
+            if candidate not in taken:
                 return candidate
     # No usable directory name, or nine sessions already work in that one:
     # random cannot collide the way a tenth "-N" guess would.
     for _ in range(1000):
         candidate = "%s-%s" % (agent, secrets.token_hex(2))
-        if candidate not in sessions:
+        if candidate not in taken:
             return candidate
     # Astronomically unlikely fallback: a longer token can't be taken.
     return ("%s-%s" % (agent, secrets.token_hex(8)))[:NAME_MAX]
@@ -446,7 +438,7 @@ def gen_session_name(agent, sessions, cwd=None):
 def write_sessions(sessions):
     """Atomically rewrite SESSIONS_FILE (0600) with the given dict.
 
-    Same tempfile-in-directory + os.replace dance as write_pairs. The
+    Same tempfile-in-directory + os.replace dance as envstore.save. The
     supervisor in the agent unit picks the change up within ~2s.
     """
     directory = os.path.dirname(SESSIONS_FILE) or "."
@@ -517,13 +509,14 @@ def kill_session(name):
 # own hand-off drop, and a copy there would be a second, stale transcript
 # with a lifetime nobody owns.
 #
-# What the daemon canNOT do is guess the filename from sessions.json. Its
-# boxSessionId is the id the session was LAUNCHED with, and both agents move
-# off it:
-#   claude — /clear keeps the process but starts a NEW transcript under a new
-#     uuid; the SessionStart hook records that live id, keyed by the launch id
-#     (issue #223). Follow the record, exactly as the supervisor does when it
-#     picks a --resume target.
+# What the daemon canNOT do is guess the filename from a launch id alone.
+# That id — read from the supervisor's session state, with sessions.json's
+# boxSessionId as the migration fallback (issue #282) — names the SEGMENT the
+# session was last launched with, and both agents move off it:
+#   claude — a clear, a compact or a resume keeps the process but opens a NEW
+#     transcript under a new uuid; the SessionStart hook records that live id,
+#     keyed by the launch id (issue #223). Follow the record, exactly as the
+#     supervisor does when it picks a --resume target.
 #   codex — the rollout file is named after codex's own session uuid, which
 #     the box never chooses. The supervisor finds it by the "agent-box
 #     session <id>" marker it stamps into the kickoff prompt; same marker
@@ -536,6 +529,9 @@ CLAUDE_PROJECTS_DIR = os.path.join(HOME_DIR, ".claude", "projects")
 CODEX_SESSIONS_DIR = os.path.join(HOME_DIR, ".codex", "sessions")
 LIVE_ID_DIR = os.path.join(
     HOME_DIR, ".local", "state", "agent-box", "live-session-id"
+)
+SESSION_STATE_DIR = os.path.join(
+    HOME_DIR, ".local", "state", "agent-box", "session"
 )
 # Session ids, as claude's --session-id and the record filenames use them.
 # Validated before it reaches a glob pattern or a path join, so it doubles as
@@ -556,7 +552,7 @@ CODEX_MARKER_RE = re.compile(rb"agent-box session ([0-9a-fA-F-]{36})")
 # Transcript lookups are re-run on every render of the sessions panel, and
 # the live feed re-renders it on every session state change. Memoize per box
 # id for a few seconds: long enough to collapse a render burst, short enough
-# that a /clear rotation or a fresh codex rollout shows up while the operator
+# that a segment rotation or a fresh codex rollout shows up while the operator
 # is still looking at the page.
 TRANSCRIPT_TTL = 5.0
 _transcript_cache = {}
@@ -566,8 +562,9 @@ _codex_index = (-1e9, {})
 def claude_transcript(box_id):
     """Path of the transcript claude would resume for this launch id, or
     None. The live-id record is followed FIRST (one hop, like the
-    supervisor): after a /clear the launch id's transcript still exists but
-    is the conversation the user threw away."""
+    supervisor): after a rotation — a clear, a compact or a resume — the
+    launch id's transcript still exists, but it is the segment the session
+    moved off."""
     ids = []
     live = read_live_id(box_id)
     if live and live != box_id:
@@ -618,6 +615,46 @@ def codex_index():
     return index
 
 
+def session_state_path(name):
+    """Path of one session's supervisor-owned state file (issue #282), or
+    None for a name this daemon will not touch.
+
+    The one place this daemon spells that path — the supervisor's
+    session_state_file and `agent-box-session`'s accessor of the same name
+    are the other two. The key is the session NAME for now, which is a label
+    and not an identity (it is meant to become editable, and it is minted
+    from a file that can be stale); the key it should grow into is one a
+    harness mints (issue #284). Routing every reader and writer through here
+    is what keeps that re-key to one function per program.
+
+    SESSION_RE is the path-safety check as well as the naming rule: the name
+    reaches a path join, and callers take it from sessions.json."""
+    return (
+        os.path.join(SESSION_STATE_DIR, name + ".json")
+        if SESSION_RE.match(name or "")
+        else None
+    )
+
+
+def read_launch_id(name):
+    """The id this session was last LAUNCHED with, per the supervisor's own
+    record, or None when it has never recorded one.
+
+    Attempt the read and handle the miss: the file is absent for a session
+    that has not spawned yet, and for one that last spawned before #282
+    shipped — the caller falls back to the registry copy for both."""
+    path = session_state_path(name)
+    if path is None:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            value = json.load(fh).get("launchSessionId")
+    except (OSError, ValueError, AttributeError):
+        return None
+    value = value if isinstance(value, str) else ""
+    return value if UUID_RE.match(value) else None
+
+
 def read_live_id(box_id):
     """The live session id the SessionStart hook recorded for this launch
     id, or None. Both ids are UUID-checked: box_id names the record file,
@@ -665,12 +702,16 @@ def newest_first(root):
     return [path for _mtime, path in found]
 
 
-def transcript_of(entry):
+def transcript_of(name, entry):
     """(path, size) of one session's transcript, or None when there is
-    none to offer. `entry` is its sessions.json record — the caller has
-    already name-checked the session, and nothing here comes from the
-    request."""
-    box_id = str((entry or {}).get("boxSessionId") or "")
+    none to offer. `name` and `entry` are its key and record in
+    sessions.json — the caller has already name-checked the session, and
+    nothing here comes from the request.
+
+    The launch id comes from the supervisor's own state file, falling back
+    to the registry copy for a session that last spawned before #282 (and
+    for the id `agent-box-session add` mints up front)."""
+    box_id = read_launch_id(name) or str((entry or {}).get("boxSessionId") or "")
     if not UUID_RE.match(box_id):
         # Never spawned, or a hand-written record: no id, so no transcript
         # can be attributed to this session (and guessing would hand over
@@ -786,7 +827,7 @@ def transcript_topic(path, size):
         if not isinstance(body, str):
             continue
         text = " ".join(body.split())
-        # /clear opens the next segment with the slash command itself, wrapped
+        # A clear opens the next segment with the slash command itself, wrapped
         # in the local-command caveat; the operator's own prompt follows it.
         if not text or "<local-command" in text or "<command-" in text:
             continue
@@ -938,7 +979,7 @@ def webhook_unsubscribe(key, topic, dispatch):
 
 
 def hook_args_stamp():
-    """(mtime_ns, size) of the env file, or None when there is none.
+    """(mtime_ns, size) of the env file and of the profiles directory.
 
     Part of hook_preamble's cache key. The dispatch script reports the
     hook-session arguments that file can override (#292), so its output is
@@ -946,12 +987,22 @@ def hook_args_stamp():
     set` between two renders changes which model the page should show, and
     a cached answer would keep naming the old one for the life of the
     daemon. One stat per render is cheap; the fork it guards is not.
+
+    The profiles directory is stamped for the same reason (#321): the report
+    names the agent profile AGENT_BOX_HOOK_PROFILE picks, and whether that
+    profile still exists decides whether the watch uses it at all. Creating
+    or removing one does not touch the env file, and every write goes through
+    a rename inside this directory, so its mtime moves on both.
     """
-    try:
-        info = os.stat(ENV_FILE)
-    except OSError:
-        return None
-    return (info.st_mtime_ns, info.st_size)
+    stamps = []
+    for path in (ENV_FILE, PROFILES_DIR):
+        try:
+            info = os.stat(path)
+        except OSError:
+            stamps.append(None)
+        else:
+            stamps.append((info.st_mtime_ns, info.st_size))
+    return tuple(stamps)
 
 
 @functools.lru_cache(maxsize=64)
@@ -1055,6 +1106,643 @@ def webhook_view():
         # and outlive every session, so read them under the user key.
         watches = webhook_entries(webhook_subscriptions(webhook_key("")), dispatch=True)
     return sessions, watches
+
+
+# --- Guided sign-in (issues #207, #208, #313) ------------------------
+# Onboarding used to mean finding the right terminal tab, reading a
+# wrapped OSC-8 link out of a TUI, and pasting a code into a prompt that
+# echoes nothing — and, for GitHub, leaving the box entirely to mint a
+# token by hand. These cards remove that walk WITHOUT reimplementing any
+# of it: every flow here is the vendor's own sign-in command
+# (`claude auth login`, `codex login --device-auth`, `gh auth login
+# --web`), run in a tmux session the user never has to find.
+#
+# The daemon reads the URL off that pane, renders it as a real link,
+# types the code back in, and then asks the CLI ITSELF whether it is
+# signed in (`claude auth status` answers JSON; the others answer a
+# line). So no OAuth endpoint, client id, PKCE verifier or token ever
+# lives here: the credential is written by the CLI to ~/.claude,
+# ~/.codex or ~/.config/gh, exactly as it would have been from the
+# terminal. Setting GH_TOKEN or ANTHROPIC_API_KEY by hand under
+# Environment secrets keeps working, and keeps winning — every one of
+# these CLIs prefers its environment variable over its stored
+# credential, so the manual path stays the override it always was.
+#
+# Nothing in here is persisted by the daemon: the tmux session IS the
+# state. That is why a card can be reconstructed after a reload, a
+# daemon restart or from a second browser tab.
+CONNECT_PREFIX = "_connect-"
+# A pane this wide keeps a sign-in URL on ONE unwrapped line, so
+# capture-pane reads it whole (the wrapped-URL problem the README
+# documents for the terminal flow simply cannot happen here).
+CONNECT_COLS = 512
+CONNECT_ROWS = 40
+# Device/user codes live 15 minutes; an abandoned pane is reaped at the
+# same age rather than lingering with a code that can no longer work.
+CONNECT_TTL = 900
+# How long the pane stays after the CLI exits: its last screen is the
+# only diagnostic a failed flow has.
+CONNECT_LINGER = 60
+# Claude Code's prompt treats one large stdin chunk as a PASTE and
+# absorbs a trailing carriage return, so a real ~100-character code
+# never submits when Enter rides along in the same write. Send Enter as
+# a separate keypress after a settle delay (this exact failure is
+# documented in raphaeltm/simple-agent-manager's setup-token driver).
+CONNECT_ENTER_DELAY = 1.0
+CONNECT_STATUS_TTL = 5.0
+CONNECT_EXIT_RE = re.compile(r"\[agent-box\] exit=(\d+)")
+CONNECT_URL_RE = re.compile(r"https://[^\s<>'\"`]+")
+# The one-time code a device flow displays IN the pane (gh, codex).
+# Claude's flow shows no code here — the user copies it from the browser.
+#
+# Matched by SHAPE, not by proximity to the word "code": hyphen-joined
+# groups of upper-case alphanumerics, which is what both real CLIs print
+# ("EC7A-D4B8" for gh, "56D0-6G7MP" for codex). Anchoring on the word
+# instead read the codex card's prose back at the user — its first line
+# is "…sign in with ChatGPT using device code authorization:", so
+# "code authorization" rendered as the code AUTHORIZATION, while the real
+# code, printed two lines further down under "Enter this one-time code",
+# was never matched at all. Case-sensitive, and a hyphen is required, so
+# ordinary words cannot pose as a code.
+CONNECT_CODE_RE = re.compile(r"\b([0-9A-Z]{3,8}(?:-[0-9A-Z]{3,8}){1,3})\b")
+# Upper-case hyphenated words these CLIs print that are NOT codes.
+# Rendering one as if it were would send the user to the device page with
+# a word to type.
+CONNECT_PROSE = frozenset(("HERE", "NONE", "NULL", "TRUE", "FALSE",
+                           "PROMPTED", "ABOVE", "BELOW", "ONE-TIME",
+                           "SIGN-IN", "DEVICE-AUTH", "READ-ONLY"))
+# What the user may paste back. Printable, no whitespace, bounded: the
+# value is typed into a tmux pane as literal keys, never into a shell.
+CONNECT_CODE_MAX = 512
+CONNECT_CODE_OK = re.compile(r"^[\x21-\x7e]{4,%d}$" % CONNECT_CODE_MAX)
+# Redaction for the one place pane text reaches the browser (the error
+# line of a failed flow). These CLIs do not print credentials on the
+# paths we drive, so this is a belt-and-braces guard, not the plan.
+CONNECT_SECRET_RE = re.compile(
+    r"(sk-ant-[A-Za-z0-9._-]+|gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)"
+)
+CONNECT_ERROR_MAX = 240
+# Pane lines that are never the diagnosis: the instructions, and the echo
+# of the prompt the code was typed into (which carries the code itself —
+# the user's own value, but not something to render back at them).
+CONNECT_NOISE_RE = re.compile(
+    r"(paste code|browser did|opening browser|press enter|first copy|"
+    r"visit:|sign in)", re.IGNORECASE
+)
+# What a CLI's own complaint looks like, so the tail names the cause
+# instead of whatever happened to be printed last.
+CONNECT_BLAME_RE = re.compile(
+    r"(error|failed|failure|denied|invalid|expired|refus|unable|cannot)",
+    re.IGNORECASE
+)
+
+# Which CLI each card drives, as "<id>=<absolute binary>" pairs
+# (AGENT_BOX_CONNECT_BINS, same convention as AGENT_BOX_AGENT_BINS).
+# Absolute paths, not $PATH: this daemon's unit deliberately carries no
+# agent PATH, and naming the binary also lets a VM test point an id at a
+# stub. A flow whose id is absent here has no card.
+CONNECT_BINS = {}
+for _pair in os.environ.get("AGENT_BOX_CONNECT_BINS", "").split():
+    if "=" in _pair:
+        _flow_id, _flow_bin = _pair.split("=", 1)
+        if _flow_id and _flow_bin:
+            CONNECT_BINS[_flow_id] = _flow_bin
+
+
+def parse_claude_status(proc):
+    """`claude auth status` answers JSON — the one structured signal in
+    the set, so success is never a guess about rendered prose.
+
+    It reports "loggedIn" for an environment key too, and for ANY value of
+    one: a stale ANTHROPIC_API_KEY answers `{"loggedIn": true,
+    "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"}` without
+    the key ever being tried. The card cannot validate it — nothing local
+    can — so it names the source instead of implying a checked account.
+    """
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return (False, "")
+    if not isinstance(data, dict) or not data.get("loggedIn"):
+        return (False, "")
+    source = str(data.get("apiKeySource") or "")
+    if source and source != "none":
+        return (True, "using " + source)
+    who = str(data.get("email")
+              or data.get("orgName")
+              or data.get("authMethod")
+              or "signed in")
+    plan = str(data.get("subscriptionType") or "")
+    return (True, "%s (%s)" % (who, plan) if plan else who)
+
+
+def connect_detail(line):
+    """The CLI's own status line, minus the "logged in" it opens with:
+    the pill already says "Signed in", so repeating it there reads as
+    "Signed in — Logged in to github.com …"."""
+    text = line.strip()
+    for prefix in ("logged in to ", "logged in as ", "logged in "):
+        if text.lower().startswith(prefix):
+            return text[len(prefix):].strip()
+    return text
+
+
+def parse_codex_status(proc):
+    """`codex login status` prints e.g. "Logged in using ChatGPT".
+
+    Deliberately reported as "signed in locally": it is a LOCAL check, so
+    it keeps saying that for credentials the backend has already
+    invalidated (README, Codex sign-in). Pairing is what discovers those.
+    """
+    lines = [x.strip() for x in ((proc.stdout or "") + (proc.stderr or "")).splitlines()]
+    first = next((x for x in lines if x), "")
+    low = first.lower()
+    if proc.returncode == 0 and "logged in" in low and "not logged in" not in low:
+        return (True, connect_detail(first))
+    return (False, "")
+
+
+def parse_gh_status(proc):
+    """`gh auth status` prints "Logged in to github.com account <login>
+    (<source>)", where <source> names GH_TOKEN when the env store's key
+    is what gh is using — which is exactly what the card must say."""
+    text = (proc.stdout or "") + (proc.stderr or "")
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("✓").strip()
+        if line.lower().startswith("logged in to"):
+            return (True, connect_detail(line))
+    return (False, "")
+
+
+CONNECT_PARSERS = {
+    "claude": parse_claude_status,
+    "codex": parse_codex_status,
+    "gh": parse_gh_status,
+}
+
+# One row per flow, in render order. `start` and `status` are argv tails
+# appended to the flow's binary; nothing is passed through a shell except
+# the pane wrapper built in connect_start (via shlex.quote).
+CONNECT_DEFS = [
+    {
+        "id": "claude",
+        "label": "Claude Code",
+        "note": "Runs <code>claude auth login</code> &mdash; your Claude "
+                "subscription or Console account. The CLI stores the "
+                "credential in <code>~/.claude</code>.",
+        "start": ["auth", "login"],
+        "status": ["auth", "status"],
+        "parse": "claude",
+        "hosts": ("claude.com", "claude.ai", "anthropic.com"),
+        "needs_code": True,
+        "show_code": False,
+        "unset": (),
+        "shadow": ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"),
+        "prompt_re": None,
+        "destructive": False,
+    },
+    {
+        "id": "codex",
+        "label": "Codex",
+        "note": "Runs <code>codex login --device-auth</code> &mdash; enter "
+                "the code on the page it prints. The CLI stores the "
+                "credential in <code>~/.codex</code>.",
+        "start": ["login", "--device-auth"],
+        "status": ["login", "status"],
+        "parse": "codex",
+        "hosts": ("openai.com", "chatgpt.com"),
+        "needs_code": False,
+        "show_code": True,
+        "unset": (),
+        "shadow": ("OPENAI_API_KEY",),
+        "prompt_re": None,
+        # --device-auth DELETES stored credentials as it starts and does
+        # not restore them if the flow is abandoned (README), so signing
+        # in again is a destructive act and asks first.
+        "destructive": True,
+    },
+    {
+        "id": "github",
+        "label": "GitHub",
+        "note": "Runs <code>gh auth login --web</code> &mdash; GitHub's own "
+                "device flow. No app to register, no token to copy, and "
+                "<code>git</code> reads it through gh's credential "
+                "helper.",
+        "start": ["auth", "login", "--hostname", "github.com",
+                  "--git-protocol", "https", "--web",
+                  "--scopes", "repo,read:org,workflow"],
+        "status": ["auth", "status", "--hostname", "github.com"],
+        "parse": "gh",
+        "hosts": ("github.com",),
+        "needs_code": False,
+        "show_code": True,
+        # gh REFUSES to store a credential while GH_TOKEN is set in its
+        # environment, so the SIGN-IN pane clears it (a login-time rule
+        # only — the status probe above deliberately keeps it, because
+        # that is what the sessions actually use).
+        "unset": ("GH_TOKEN", "GITHUB_TOKEN"),
+        "shadow": ("GH_TOKEN", "GITHUB_TOKEN"),
+        "prompt_re": re.compile(r"Press Enter", re.IGNORECASE),
+        "destructive": False,
+    },
+]
+
+_connect_status_cache = {}
+_connect_probing = set()
+_connect_lock = threading.Lock()
+
+
+def connect_flows():
+    """The cards this box can actually show: a flow per installed CLI."""
+    flows = []
+    for spec in CONNECT_DEFS:
+        binary = CONNECT_BINS.get(spec["id"])
+        if binary:
+            flow = dict(spec)
+            flow["bin"] = binary
+            flows.append(flow)
+    return flows
+
+
+def connect_flow(flow_id):
+    for flow in connect_flows():
+        if flow["id"] == flow_id:
+            return flow
+    return None
+
+
+def connect_pane(flow_id):
+    return CONNECT_PREFIX + flow_id
+
+
+def connect_target(flow_id):
+    """The flow's pane, as a tmux TARGET-PANE.
+
+    The trailing colon is load-bearing: `=name` is an exact SESSION
+    target, and capture-pane/send-keys resolve a pane, so they answer
+    "can't find pane" for it. `=name:` is that session's active pane,
+    which is the only pane these sessions ever have.
+    """
+    return "=" + connect_pane(flow_id) + ":"
+
+
+def connect_status_env(flow):
+    """The environment a SESSION would give this CLI.
+
+    The card answers "are my sessions signed in?", and for these CLIs an
+    environment variable answers that before any stored credential does.
+    This daemon's unit does not load the env store (the supervisor's spawn
+    wrapper does, per session), so a probe run with our own environment
+    would report "not signed in" on a box whose sessions are perfectly
+    authenticated through a hand-set GH_TOKEN. Lift exactly the keys this
+    flow cares about out of the store, so the pill matches what the
+    terminal would say. No value is ever rendered.
+    """
+    env = dict(os.environ)
+    stored = as_dict(load(ENV_FILE))
+    for key in flow["shadow"]:
+        if key in stored:
+            env[key] = stored[key]
+    return env
+
+
+def connect_run(flow, args, timeout=15):
+    """Run one of the flow's own subcommands. None on any failure —
+    a missing binary or a hung status call must not 500 the page."""
+    try:
+        return subprocess.run(
+            [flow["bin"]] + list(args),
+            env=connect_status_env(flow),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def connect_probe(flow):
+    """Ask one CLI whether it is signed in, off the request path."""
+    try:
+        proc = connect_run(flow, flow["status"])
+        value = (False, "") if proc is None else CONNECT_PARSERS[flow["parse"]](proc)
+        with _connect_lock:
+            _connect_status_cache[flow["id"]] = (time.monotonic(), value)
+    finally:
+        with _connect_lock:
+            _connect_probing.discard(flow["id"])
+
+
+def connect_expire(flow_id):
+    """Mark this flow's cached status stale, keeping the value.
+
+    Used the moment the CLI exits: the cached answer predates the sign-in
+    it just finished, so the next read must re-probe. The value is kept so
+    the card still has something to render, and the stamp — not the entry —
+    is what is dropped, so a probe landing concurrently is never lost.
+    """
+    with _connect_lock:
+        hit = _connect_status_cache.get(flow_id)
+        if hit:
+            _connect_status_cache[flow_id] = (0.0, hit[1])
+
+
+def connect_fresh(flow_id):
+    """True when this flow's cached status is younger than the TTL."""
+    with _connect_lock:
+        hit = _connect_status_cache.get(flow_id)
+    return bool(hit) and time.monotonic() - hit[0] < CONNECT_STATUS_TTL
+
+
+def connect_status(flow):
+    """Cached (connected, detail), or None while nothing is known yet.
+
+    This NEVER blocks the request. A render asks every card, each answer
+    forks a real CLI, and `gh auth status` talks to GitHub — so a slow or
+    unreachable network held the whole settings page, past the 10s client
+    timeout, for a page that has nothing to do with these cards (caught by
+    settings-page.nix, not by connect.nix, which stubs the CLIs). A stale
+    answer plus a background refresh is the right trade for a status pill:
+    the page polls, and the truth lands a beat later.
+    """
+    now = time.monotonic()
+    with _connect_lock:
+        hit = _connect_status_cache.get(flow["id"])
+        stale = not hit or now - hit[0] >= CONNECT_STATUS_TTL
+        if stale and flow["id"] not in _connect_probing:
+            _connect_probing.add(flow["id"])
+            threading.Thread(
+                target=connect_probe, args=(flow,), daemon=True
+            ).start()
+    return hit[1] if hit else None
+
+
+def tmux_sessions():
+    """(server_up, {session names}) from ONE `tmux list-sessions`.
+
+    Both facts are needed for every card, and each call is a process:
+    "is the server up" is not the same question as "is this pane live",
+    but it is the same fork.
+    """
+    proc = tmux("list-sessions", "-F", "#S")
+    if proc is None or proc.returncode != 0:
+        return (False, set())
+    return (True, {line for line in proc.stdout.splitlines() if line})
+
+
+def tmux_server_up():
+    """True when the user's tmux server is already running.
+
+    connect_start REFUSES to start one. `tmux new-session` starts a
+    server when none is running, and that server outlives the request —
+    so a pane created with no server would make THIS daemon the parent of
+    every session the supervisor later spawns, moving the agents out of
+    the hardened agent unit's namespace and cgroup and into the settings
+    daemon's (which, unlike theirs, keeps NoNewPrivileges off for its
+    sudo'd password helper). The sign-in pane must be a child of the
+    agent unit's server or it must not exist.
+    """
+    return tmux_sessions()[0]
+
+
+def connect_capture(flow_id):
+    """The pane's text, wrapped lines rejoined, scrollback included."""
+    proc = tmux("capture-pane", "-p", "-J", "-S", "-200",
+                "-t", connect_target(flow_id))
+    if proc is None or proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def connect_age(flow_id):
+    proc = tmux("display-message", "-p", "-t", connect_target(flow_id),
+                "#{session_created}")
+    if proc is None or proc.returncode != 0:
+        return None
+    try:
+        return max(0.0, time.time() - int(proc.stdout.strip()))
+    except ValueError:
+        return None
+
+
+def connect_trusted_url(text, hosts):
+    """The first https URL on a host this flow is allowed to send the
+    user to. Host-anchored on purpose: the page turns this into a link
+    the user is asked to trust, so a future CLI change (or anything else
+    that reaches the pane) must not be able to pick the destination."""
+    for match in CONNECT_URL_RE.finditer(text or ""):
+        candidate = match.group(0)
+        while candidate and candidate[-1] in ").,;:'\"":
+            candidate = candidate[:-1]
+        try:
+            parsed = urllib.parse.urlsplit(candidate)
+        except ValueError:
+            continue
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https":
+            continue
+        if any(host == h or host.endswith("." + h) for h in hosts):
+            return candidate
+    return None
+
+
+def connect_user_code(text):
+    """The one-time code a device flow prints in the pane. Searched with
+    URLs removed, so a `code=` query parameter cannot pose as one."""
+    stripped = CONNECT_URL_RE.sub(" ", text or "")
+    for match in CONNECT_CODE_RE.finditer(stripped):
+        code = match.group(1).upper()
+        if code not in CONNECT_PROSE:
+            return code
+    return None
+
+
+def connect_error(text):
+    """A short, redacted tail of the pane for a flow that ended without
+    signing in — the CLI's own words are the only diagnostic there is."""
+    lines = []
+    for raw in (text or "").splitlines():
+        line = CONNECT_EXIT_RE.sub("", raw).strip()
+        line = "".join(ch for ch in line if ch == " " or ch.isprintable())
+        if line:
+            lines.append(line)
+    lines = [x for x in lines
+             if not CONNECT_NOISE_RE.search(x) and not CONNECT_URL_RE.search(x)]
+    blamed = [x for x in lines if CONNECT_BLAME_RE.search(x)]
+    picked = (blamed or lines)[-2:]
+    if not picked:
+        return ""
+    tail = CONNECT_SECRET_RE.sub("[redacted]", " ".join(picked))
+    return tail[:CONNECT_ERROR_MAX]
+
+
+def connect_state(flow, keys=None, tmux_state=None):
+    """What the card shows, derived from the CLI and the pane — never
+    from anything the daemon stored."""
+    flow_id = flow["id"]
+    server_up, live = tmux_sessions() if tmux_state is None else tmux_state
+    running = connect_pane(flow_id) in live
+    status = connect_status(flow)
+    connected, detail = status if status is not None else (False, "")
+    url = code = error = None
+    if running:
+        # A LIVE pane owns the card; the status answer does not get to
+        # overrule it. Reaping a pane because the cached status still says
+        # "connected" killed every "Sign in again" — the card says signed
+        # in, which is exactly why the user pressed the button, so the
+        # pane died within milliseconds of starting (caught by
+        # connect.nix's cancel subtest: "claude stuck in idle").
+        text = connect_capture(flow_id) or ""
+        exited = CONNECT_EXIT_RE.search(text)
+        if exited:
+            # The CLI is done, and its exit code beats a cached status that
+            # predates the exchange: a 0 means it believes the sign-in
+            # worked, so hold the card there until a FRESH probe agrees
+            # rather than flashing "Not signed in" at the moment of
+            # success.
+            if exited.group(1) != "0":
+                state = "failed"
+                error = connect_error(text)
+            elif connected and connect_fresh(flow_id):
+                connect_cancel(flow_id)
+                running = False
+                state = "connected"
+            else:
+                connect_expire(flow_id)
+                state = "exchanging"
+        elif (connect_age(flow_id) or 0) > CONNECT_TTL:
+            connect_cancel(flow_id)
+            state = "expired"
+        else:
+            if flow["prompt_re"] is not None:
+                connect_answer_prompt(flow, text)
+            url = connect_trusted_url(text, flow["hosts"])
+            code = connect_user_code(text) if flow["show_code"] else None
+            state = "waiting" if url else "starting"
+    else:
+        # "checking" is not "signed out": saying the latter before the CLI
+        # has answered would invite a sign-in the box does not need.
+        state = ("connected" if connected
+                 else ("idle" if status is not None else "checking"))
+    keys = read_keys() if keys is None else keys
+    shadow = [k for k in flow["shadow"] if k in keys]
+    return {
+        "id": flow_id,
+        "label": flow["label"],
+        "note": flow["note"],
+        "state": state,
+        "detail": detail,
+        "url": url,
+        "code": code,
+        "error": error,
+        "needs_code": flow["needs_code"],
+        # No tmux server means no session to sign in from, and starting
+        # one HERE is exactly what tmux_server_up() explains we must not
+        # do — so the card says so instead of offering a dead button.
+        "blocked": not server_up,
+        "destructive": flow["destructive"],
+        "shadow": shadow,
+    }
+
+
+def connect_server_path():
+    """The PATH a SESSION's pane gets, read off the tmux server.
+
+    A pane this daemon creates inherits the tmux CLIENT's environment —
+    ours — and this unit deliberately carries no agent PATH (coreutils,
+    findutils, grep, sed, systemd; no git, no gh, no node). That is not a
+    cosmetic difference: `gh auth login` shells out to `git` to read the
+    credential helper /etc/gitconfig configures for github.com, and with
+    no git on PATH it cannot, so it opens with an interactive
+    "Authenticate Git with your GitHub credentials? (Y/n)" that nothing
+    answers — the card sat at "Starting the sign-in…" until the pane
+    expired, with no URL and no code, because gh never got as far as
+    asking GitHub for one.
+
+    The tmux server's global environment IS the agent unit's, so a pane
+    started with it looks like the terminal the user would have used. Only
+    PATH is lifted: the sign-in pane deliberately carries no session
+    secrets (see `unset`), and the env store is the supervisor's job.
+    """
+    proc = tmux("show-environment", "-g", "PATH")
+    if proc is None or proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        # "PATH=..." when set; "-PATH" when the server has it unset.
+        if line.startswith("PATH="):
+            value = line[len("PATH="):]
+            return value or None
+    return None
+
+
+def connect_start(flow):
+    """Start the flow's own sign-in command in its own tmux session."""
+    flow_id = flow["id"]
+    if connect_pane(flow_id) in live_sessions():
+        return connect_state(flow)          # already in flight: idempotent
+    if not tmux_server_up():
+        state = connect_state(flow)
+        state["state"] = "failed"
+        state["error"] = ("No terminal session is running, so there is "
+                          "nowhere to sign in from. Start a session first.")
+        return state
+    inner = " ".join(shlex.quote(a) for a in [flow["bin"]] + flow["start"])
+    if flow["unset"]:
+        inner = ("env " + " ".join("-u " + k for k in flow["unset"]) + " " + inner)
+    # The exit marker turns "the CLI is done" into something the state
+    # machine can see, and the sleep keeps the final screen readable
+    # until then. Both are shell-level, so no CLI has to cooperate.
+    script = "%s; printf '\\n[agent-box] exit=%%s\\n' \"$?\"; sleep %d" % (
+        inner, CONNECT_LINGER)
+    # In the script, not `new-session -e PATH=...`: tmux honours -e for any
+    # other variable but the pane's PATH comes from the CLIENT regardless
+    # (measured on tmux 3.6a — an -e FOO reaches the pane while an -e PATH
+    # beside it is dropped), and this client is the settings daemon.
+    server_path = connect_server_path()
+    if server_path:
+        script = "export PATH=%s; %s" % (shlex.quote(server_path), script)
+    tmux("new-session", "-d", "-s", connect_pane(flow_id),
+         "-x", str(CONNECT_COLS), "-y", str(CONNECT_ROWS), script)
+    return connect_state(flow)
+
+
+def connect_answer_prompt(flow, text):
+    """Press Enter for the user when the CLI is sitting on a keypress it
+    waits for (gh's web flow does this before it starts polling).
+
+    Answered from the pane's CURRENT tail on every render rather than in a
+    bounded loop at start-up: the loop blocked the POST for its whole
+    window and then gave up for good, so a CLI that took longer than that
+    to print its prompt — a slow device-code request is all it takes — was
+    left holding a keypress nobody would ever send, showing the user a URL
+    and a code for a flow that had not started polling and never would.
+
+    Only the last non-empty line is matched, so a prompt that has already
+    been answered (its line is no longer the tail) is not answered twice,
+    and one that is still waiting gets another keypress on the next poll.
+    """
+    line = next((x for x in reversed((text or "").splitlines()) if x.strip()), "")
+    if not flow["prompt_re"].search(line):
+        return False
+    tmux("send-keys", "-t", connect_target(flow["id"]), "C-m")
+    return True
+
+
+def connect_send_code(flow, code):
+    """Type the code the user pasted into the pane, then submit it."""
+    flow_id = flow["id"]
+    if connect_pane(flow_id) not in live_sessions():
+        return connect_state(flow)
+    target = connect_target(flow_id)
+    tmux("send-keys", "-t", target, "-l", code)
+    time.sleep(CONNECT_ENTER_DELAY)
+    tmux("send-keys", "-t", target, "C-m")
+    return connect_state(flow)
+
+
+def connect_cancel(flow_id):
+    tmux("kill-session", "-t", "=" + connect_pane(flow_id))
 
 
 def find_supervisor_pids():
@@ -1211,10 +1899,10 @@ def session_view():
     """The session state the pages actually render: order, name, agent,
     working directory, live-or-starting, stopped.
 
-    Deliberately not the whole of sessions.json — the supervisor folds
-    bookkeeping into that file (hasRun, boxSessionId, clearing
-    initialPrompt on first spawn) and those rewrites must not read as a
-    change worth re-rendering for.
+    Deliberately not the whole of sessions.json — the supervisor still
+    mirrors its bookkeeping into that file for one release (hasRun,
+    boxSessionId, clearing initialPrompt on first spawn; issue #282) and
+    those rewrites must not read as a change worth re-rendering for.
     """
     entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
     live = live_sessions()
@@ -1427,12 +2115,27 @@ WEBHOOKS_SECTION_TPL = """<section>
     <div id="webhooks-list">{webhooks}</div>
   </section>"""
 
-# Root page (HOME mode): a tabbed terminal workspace (issue #119) —
-# one tab per session, the active one shown in an iframe onto the
-# existing per-session ttyd URL (/<user>/?arg=<session>; same origin,
-# so the auth cookie and its WebSocket upgrade work unchanged). Tabs
-# are plain ?tab= links so the page works without JS (each click
-# re-renders with the other terminal); SCRIPT upgrades that to
+# Guided sign-in (issues #207, #208, #313). Hidden entirely when the box
+# passed no AGENT_BOX_CONNECT_BINS. data-busy tells the page whether a
+# flow is mid-flight, which is the only thing its poll loop needs to know.
+CONNECT_SECTION_TPL = """<section>
+    <div class="sec-head">
+      <h2>Connections</h2>
+    </div>
+    <p class="note">Sign in without leaving this page. Each card runs
+    that tool's OWN sign-in command in a terminal you never have to
+    find, and the tool stores its own credential &mdash; this page never
+    sees a token. Setting a key by hand under Environment secrets still
+    works, and still wins.</p>
+    <div id="connect-list" data-busy="{busy}">{cards}</div>
+  </section>"""
+
+# The user's landing page (HOME mode): a tabbed terminal workspace
+# (issue #119) — one tab per session, the active one shown in an iframe
+# onto that session's own path (/<user>/<session>/; same origin, so the
+# auth cookie and its WebSocket upgrade work unchanged). Tabs are plain
+# ?tab= links so the page works without JS (each click re-renders with
+# the other terminal); SCRIPT upgrades that to
 # client-side switching with background tabs kept attached. Session
 # CRUD beyond "add" lives on the settings page.
 #
@@ -1440,6 +2143,26 @@ WEBHOOKS_SECTION_TPL = """<section>
 # #188): it is page-level feedback, and sitting between the tabs and
 # the panes it both prised the tab bar away from the terminal it labels
 # and read as a message from the session in that pane.
+#
+# The (i) hint (issue #327): tmux's `mouse on` (issue #265) claims every
+# button and drag for itself, not just the wheel — there is no tmux/xterm
+# mouse-tracking mode that reports wheel events alone. So a plain
+# click-drag now paints tmux's own copy-mode highlight instead of a
+# browser selection, and it vanishes on mouse-up without reaching the
+# clipboard (ttyd's bundled xterm.js has no OSC 52 support, so nothing
+# server-side can bridge tmux's paste buffer to the browser clipboard
+# either). xterm.js's own fallback is holding Shift (Option on a Mac)
+# while dragging, which forces its native DOM selection — and that in
+# turn is what ttyd auto-copies on selection change. On Mac that fallback
+# also needed a ttyd flag (macOptionClickForcesSelection=true, next to
+# the ttyd ExecStart below) since xterm.js ships it off by default; this
+# hint is the other half — telling people the gesture exists at all.
+# The gesture is spelled out TWICE in the span below, in `title` and in
+# `aria-label`, and that is not a copy-paste slip: `title` is the pointer
+# tooltip, while an `aria-label` REPLACES it as the accessible name and
+# `title` is not read as a description once a name exists. A short name of
+# its own ("Terminal mouse tip") would therefore be the whole of what a
+# screen reader ever announced, so both attributes carry the instructions.
 HOME_BODY = """<body class="ws">
 <div id="msg-slot">{message}</div>
 <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}">
@@ -1447,6 +2170,9 @@ HOME_BODY = """<body class="ws">
   <button type="button" class="btn add" data-toggle="session-editor"
           title="New session" aria-label="New session">+</button>
   <span class="spacer"></span>
+  <span class="hint" tabindex="0"
+        aria-label="Terminal mouse tip. Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text."
+        title="Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text.">&#9432;</span>
   <a class="gear" href="{base}/" title="Settings" aria-label="Settings">&#9881;</a>
 </nav>
 <div id="session-editor" class="editor">
@@ -1473,11 +2199,12 @@ BODY = """<main>
     </svg>
     GitHub
   </a>
-  <a class="back" href="/">&larr; terminal</a>
+  <a class="back" href="{term_home}">&larr; terminal</a>
   <h1><span class="mark">{mark}</span>Settings for {user}</h1>
   <div id="msg-slot">{message}</div>
   {sessions_section}
   {webhooks_section}
+  {connect_section}
   <section>
     <div class="sec-head">
       <h2>Environment secrets</h2>
@@ -1494,11 +2221,15 @@ BODY = """<main>
           <input type="text" name="key" placeholder="KEY_NAME"
                  pattern="[A-Za-z_][A-Za-z0-9_]*" required
                  title="Letters, digits and underscores; must not start with a digit">
-          <input type="password" name="value" placeholder="value" autocomplete="off" required>
+          <textarea name="value" class="secret-value" rows="2" spellcheck="false"
+                    placeholder="value (may span lines &mdash; paste a PEM whole)"
+                    autocomplete="off" required></textarea>
           <button type="submit" class="btn">Save</button>
         </div>
         <p class="note">The value is write-only &mdash; saving replaces any
-        existing value for that key. This page never displays stored values.</p>
+        existing value for that key. This page never displays stored values.
+        A value may span lines, so an x509 key or a PEM can be pasted whole
+        (from a session: <code>agent-box-session env set KEY --stdin</code>).</p>
       </form>
     </div>
     <div id="secrets-list">{keys}</div>
@@ -1653,7 +2384,7 @@ def render_sessions(subs=None):
     rows tagged with a session name made the reader do that join by eye."""
     entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
     base = html.escape(SESS_BASE)
-    user = urllib.parse.quote(USER, safe="")
+    term = html.escape(TERM_HOME)
     if not entries:
         body = '<li class="empty">No sessions defined.</li>'
     else:
@@ -1690,7 +2421,7 @@ def render_sessions(subs=None):
             # inside the row's <summary>: a click whose activation target is
             # the link never reaches the summary's own toggle (measured in
             # chromium, and the same rule the Restart button relies on).
-            found = transcript_of(entries[name])
+            found = transcript_of(name, entries[name])
             topic = transcript_topic(found[0], found[1]) if found else ""
             if found:
                 # Both halves of "which conversation is this": the opening
@@ -1719,11 +2450,10 @@ def render_sessions(subs=None):
             else:
                 subject = ""
             row = (
-                # The name deep-links into the terminal via ttyd's
-                # ?arg= session selector. No userinfo in the href
-                # (issue 56). SESSION_RE names are URL-safe as-is.
+                # The name deep-links into that session's own path. No
+                # userinfo in the href (issue 56).
                 f'<span class="nm">'
-                f'<a class="sess" href="/{user}/?arg={safe}"><code>{safe}</code></a>'
+                f'<a class="sess" href="{term}{safe}/"><code>{safe}</code></a>'
                 f'<span class="meta">{agent}</span>'
                 f'<span class="meta" title="Working directory"><code>{cwd}</code></span>'
                 f'{subject}'
@@ -1970,6 +2700,129 @@ def render_update_line():
     )
 
 
+def render_connect_card(state):
+    """One flow's row, plus the wizard step under it while a sign-in is
+    in flight. Rendered server-side on purpose: the tmux session is the
+    only state, so a reload, a second tab or a daemon restart all show
+    the same step — and the page keeps working without JavaScript."""
+    base = html.escape(BASE)
+    flow_id = html.escape(state["id"])
+    pill = {
+        "connected": ("live", "Signed in" + (" — " + html.escape(state["detail"])
+                                             if state["detail"] else "")),
+        "waiting": ("starting", "Waiting for you"),
+        "starting": ("starting", "Starting…"),
+        "failed": ("failed", "Not signed in"),
+        "expired": ("failed", "Sign-in expired"),
+        "exchanging": ("starting", "Finishing sign-in&hellip;"),
+        "idle": ("stopped", "Not signed in"),
+        "checking": ("stopped", "Checking&hellip;"),
+    }[state["state"]]
+    if state["state"] in ("waiting", "starting", "checking", "exchanging"):
+        label, confirm = None, False
+    elif state["blocked"]:
+        label, confirm = None, False
+    elif state["state"] == "connected":
+        label, confirm = "Sign in again", state["destructive"]
+    else:
+        label, confirm = "Sign in", False
+    action = ""
+    if label:
+        guard = ""
+        if confirm:
+            guard = (' onsubmit="return confirm(\'Sign in again? The current '
+                     'credential is dropped as the new sign-in starts.\');"')
+        action = (
+            f'<form class="inline" method="post" action="{base}/connect/start"{guard}>'
+            f'<input type="hidden" name="flow" value="{flow_id}">'
+            f'<button type="submit" class="btn small">{label}</button></form>'
+        )
+    row = (
+        f'<li class="conn-row"><div class="conn-head">'
+        f'<strong>{html.escape(state["label"])}</strong>'
+        f'<span class="acts"><span class="state" data-state="{pill[0]}">{pill[1]}</span>'
+        f'{action}</span></div>'
+        f'<p class="note">{state["note"]}</p></li>'
+    )
+    step = render_connect_step(state)
+    if state["blocked"]:
+        step = ('<li class="conn-step"><p class="note">No terminal session '
+                'is running, so there is nowhere to sign in from. Add a '
+                'session above first.</p></li>')
+    warn = ""
+    if state["shadow"]:
+        keys = ", ".join("<code>%s</code>" % html.escape(k) for k in state["shadow"])
+        warn = (
+            f'<li class="conn-step"><p class="note conn-warn">{keys} is set '
+            f'under Environment secrets. These CLIs prefer their environment '
+            f'variable over a stored credential, so the value you set by hand '
+            f'is what your sessions use &mdash; signed in here or not.</p></li>'
+        )
+    return row + step + warn
+
+
+def render_connect_step(state):
+    """The wizard body: what the user has to do right now."""
+    base = html.escape(BASE)
+    flow_id = html.escape(state["id"])
+    cancel = (
+        f'<form class="inline" method="post" action="{base}/connect/cancel">'
+        f'<input type="hidden" name="flow" value="{flow_id}">'
+        f'<button type="submit" class="btn small">Cancel</button></form>'
+    )
+    if state["state"] == "starting":
+        return (f'<li class="conn-step"><p class="note">Starting the '
+                f'sign-in&hellip;</p>{cancel}</li>')
+    if state["state"] == "exchanging":
+        return ('<li class="conn-step"><p class="note">The CLI finished '
+                'signing in &mdash; confirming with it now&hellip;</p></li>')
+    if state["state"] in ("failed", "expired") and state["error"]:
+        return (f'<li class="conn-step"><p class="note conn-error">'
+                f'{html.escape(state["error"])}</p></li>')
+    if state["state"] != "waiting":
+        return ""
+    url = html.escape(state["url"], quote=True)
+    parts = [
+        f'<p class="note"><strong>1.</strong> '
+        f'<a href="{url}" target="_blank" rel="noopener noreferrer">'
+        f'Open the sign-in page</a> and approve the request.</p>'
+    ]
+    if state["code"]:
+        parts.append(
+            f'<p class="note"><strong>2.</strong> Enter this code on that '
+            f'page: <code class="conn-code">{html.escape(state["code"])}</code></p>'
+        )
+    if state["needs_code"]:
+        step = "3" if state["code"] else "2"
+        parts.append(
+            f'<form method="post" action="{base}/connect/code" class="row conn-form">'
+            f'<input type="hidden" name="flow" value="{flow_id}">'
+            f'<label class="field conn-field"><span class="note">'
+            f'<strong>{step}.</strong> Paste the code the page gives you back'
+            f'</span>'
+            f'<input type="password" name="code" autocomplete="off" required '
+            f'placeholder="code from the sign-in page"></label>'
+            f'<button type="submit" class="btn">Submit code</button></form>'
+        )
+    parts.append(cancel)
+    return '<li class="conn-step">' + "".join(parts) + "</li>"
+
+
+def render_connect():
+    """Every card, plus the busy flag the page polls on."""
+    keys = read_keys()
+    tmux_state = tmux_sessions()
+    states = [connect_state(flow, keys=keys, tmux_state=tmux_state)
+              for flow in connect_flows()]
+    busy = "1" if any(
+        s["state"] in ("starting", "waiting", "checking", "exchanging")
+        for s in states
+    ) else "0"
+    cards = "".join(render_connect_card(s) for s in states)
+    return CONNECT_SECTION_TPL.format(
+        cards='<ul class="tbl">' + cards + "</ul>", busy=busy)
+
+
 def render_sessions_section(subs=None):
     return SESSIONS_SECTION_TPL.format(
         action_base=html.escape(SESS_BASE),
@@ -2006,6 +2859,7 @@ def render_tabs(names, live, stopped, selected):
     other tabs out of the bar; title carries it in full."""
     items = []
     base = html.escape(SESS_BASE)
+    home = html.escape(TERM_HOME)
     for name in names:
         safe = html.escape(name)
         cur = ' aria-current="page"' if name == selected else ""
@@ -2017,7 +2871,7 @@ def render_tabs(names, live, stopped, selected):
             state = "starting"
         items.append(
             f'<span class="tab-wrap">'
-            f'<a class="tab" data-tab="{safe}" href="/?tab={safe}"{cur}'
+            f'<a class="tab" data-tab="{safe}" href="{home}?tab={safe}"{cur}'
             f' title="{safe}">'
             f'<span class="state" data-state="{state}"></span>'
             f'<span class="tab-name">{safe}</span></a>'
@@ -2080,10 +2934,8 @@ def render_pane(selected, live, stopped):
         return (f'<div class="pane placeholder active" data-pane="{safe}" '
                 f'data-ph="starting">{safe} is starting&hellip; '
                 f'reload in a few seconds.</div>')
-    user = urllib.parse.quote(USER, safe="")
-    # SESSION_RE names are URL-safe as-is.
     return (f'<iframe class="pane active" data-pane="{safe}" data-ph="live" '
-            f'src="/{user}/?arg={safe}" title="{safe} terminal" '
+            f'src="{html.escape(session_url(selected))}" title="{safe} terminal" '
             f'allow="clipboard-read; clipboard-write"></iframe>')
 
 
@@ -2112,6 +2964,7 @@ def render_page(message=""):
         + BODY.format(
             user=html.escape(USER),
             base=html.escape(BASE),
+            term_home=html.escape(TERM_HOME),
             mark=POTATO_SVG,
             keys=render_keys(read_keys()),
             # Every user, primary included: the HOME root page is the
@@ -2121,6 +2974,7 @@ def render_page(message=""):
                 WEBHOOKS_SECTION_TPL.format(webhooks=render_webhooks(watches))
                 if WEBHOOKS else ""
             ),
+            connect_section=render_connect() if connect_flows() else "",
             message=msg_html,
             password_section=(
                 PASSWORD_SECTION.format(base=html.escape(BASE))
@@ -2135,6 +2989,36 @@ def render_page(message=""):
     )
 
 
+def render_users():
+    """The vhost root on a box with more than one terminal user: which of
+    them to open. Every user has their own auth on their own path, so this
+    is a list of links and nothing more — it grants no access, and it says
+    which user this browser is already authenticated as.
+
+    Only the root daemon renders it, so reaching it means holding THAT
+    user's password; everyone else bookmarks their own /<user>/ (which is
+    the page this one links to) and never sees this list.
+    """
+    items = []
+    for name in WEB_USERS:
+        safe = html.escape(name)
+        href = "/" + urllib.parse.quote(name, safe="") + "/"
+        mine = " (you)" if name == USER else ""
+        items.append(
+            f'<li class="conn-row"><div class="conn-head">'
+            f'<strong><a href="{href}">{safe}</a></strong>{mine}</div></li>'
+        )
+    return (
+        render_head("Agent Box")
+        + STYLE
+        + '<main class="wrap"><section class="card"><div class="card-head">'
+        + "<h2>Choose a user</h2></div>"
+        + '<p class="note">Each user has their own terminal, sessions and '
+        + "settings, behind their own sign-in.</p>"
+        + '<ul class="tbl">' + "".join(items) + "</ul></section></main>"
+    )
+
+
 def render_home(message="", selected=None):
     entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
     names = list(entries)
@@ -2143,14 +3027,15 @@ def render_home(message="", selected=None):
     live = live_sessions()
     stopped = {n for n, v in entries.items() if v.get("stopped")}
     # Dismissing keeps the selected tab (SESSION_RE names are URL-safe).
-    msg_html = render_msg(message, "/?tab=" + selected if selected else "/")
+    msg_html = render_msg(
+        message, TERM_HOME + ("?tab=" + selected if selected else ""))
     return (
         render_head("Agent Box &mdash; " + html.escape(USER))
         + STYLE
         + HOME_BODY.format(
             base=html.escape(BASE),
             action_base=html.escape(SESS_BASE),
-            term_base="/%s/" % urllib.parse.quote(USER, safe=""),
+            term_base=html.escape(TERM_HOME),
             tabs=render_tabs(names, live, stopped, selected),
             pane=render_pane(selected, live, stopped),
             new_session_fields=render_new_session_fields(),
@@ -2208,7 +3093,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not SESSION_RE.match(name or "") or name not in entries:
             self._send_html("<h1>404</h1><p>No such session.</p>", status=404)
             return
-        found = transcript_of(entries[name])
+        found = transcript_of(name, entries[name])
         if not found:
             # The panel offers no button in this case, so a request here is
             # a stale page or a hand-made URL: say which of the two states
@@ -2365,6 +3250,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "webhook_forgotten": "Subscriptions cleared — that session now receives nothing.",
         "webhook_kept": "Could not delete that subscription. It may already be gone.",
         "password_changed": "Password changed. Sign in with your new password.",
+        "connect_started": "Sign-in started \u2014 follow the steps under Connections.",
+        "connect_cancelled": "Sign-in cancelled.",
+        "connect_code": "Code sent \u2014 waiting for the sign-in to finish.",
     }
 
     def do_GET(self):
@@ -2406,6 +3294,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if "ok" in params:
             message = self.OK_MESSAGES.get(params["ok"][0], "")
         if HOME and parsed.path == "/":
+            # The vhost root picks a USER. With one terminal user — the norm
+            # — there is nothing to pick, so it lands in that user's space,
+            # carrying the query so an old /?tab=<session> bookmark still
+            # opens on its tab.
+            if len(WEB_USERS) > 1:
+                self._send_html(render_users())
+                return
+            self._redirect(query=parsed.query, page=TERM_HOME)
+            return
+        if parsed.path.rstrip("/") == TERM_BASE:
+            # This user's own landing page — EVERY user's, not just the one
+            # whose daemon also serves the vhost root: /<user>/ is theirs,
+            # and the workspace's forms and feed already address SESS_BASE,
+            # which for a non-primary user is their own settings base. Before
+            # this, a second user's /<user>/ was their raw terminal.
+            #
+            # A box with no session has nothing to show a tab bar for, and
+            # the thing its owner actually needs first is the settings page —
+            # sign in, add a session — so that is where it lands until one
+            # exists.
+            if not [n for n in read_sessions() if SESSION_RE.match(n)]:
+                self._redirect(page=BASE + "/")
+                return
             # ?tab=<session> selects the rendered tab (also the no-JS
             # switching mechanism); anything invalid falls back to the
             # default selection inside render_home.
@@ -2419,6 +3330,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # (read-only, same auth block as the page it lives under).
         if parsed.path.rstrip("/") == BASE + "/status":
             self._send_json(status_payload())
+            return
+        # Guided sign-in state as JSON, for a client that would rather
+        # poll one card than re-fetch the page (read-only: it reports
+        # what the CLI and the pane say, and carries no secret — the
+        # only pane text it can return is a redacted error line).
+        if parsed.path.rstrip("/") == BASE + "/connect":
+            flow = connect_flow((params.get("flow", [""])[0]).strip())
+            if flow is None:
+                self._send_json({"ok": False}, status=404)
+            else:
+                self._send_json({"ok": True, "flow": connect_state(flow)})
             return
         self._send_html(render_page(message))
 
@@ -2518,7 +3440,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._redirect("ok=password_changed")
         elif path == BASE + "/set":
             key = (form.get("key", [""])[0]).strip()
-            value = form.get("value", [""])[0]
+            # A textarea posts its newlines as CRLF (HTML forms, RFC 1866).
+            # Normalize here, so what a session reads back is what was
+            # pasted rather than the same text with stray carriage returns.
+            value = form.get("value", [""])[0].replace("\r\n", "\n").replace("\r", "\n")
             if not KEY_RE.match(key):
                 self._send_html(
                     render_page("Invalid key name. Use letters, digits and "
@@ -2526,8 +3451,56 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     status=400,
                 )
                 return
-            set_key(key, value)
+            # The store refuses a value that holds a NUL (lib/envstore.py: no
+            # environment variable can carry one, and NUL frames the argument
+            # vectors this file feeds). A form cannot TYPE one, but a POST can
+            # carry one, and a 400 saying so beats a traceback in the journal
+            # and a 500 on the page.
+            try:
+                set_key(key, value)
+            except EnvStoreError as exc:
+                self._send_html(
+                    render_page("Could not save that secret — %s." % exc),
+                    status=400,
+                )
+                return
             self._redirect("ok=saved")
+        elif path.startswith(BASE + "/connect/"):
+            # Guided sign-in (issues #207, #208, #313). All three verbs
+            # act on ONE tmux session per flow and store nothing here, so
+            # a repeat POST (double click, stale tab) is harmless: start
+            # returns the flow already in flight, cancel kills a session
+            # that may already be gone.
+            action = path[len(BASE + "/connect/"):]
+            flow = connect_flow((form.get("flow", [""])[0]).strip())
+            if flow is None or action not in ("start", "code", "cancel"):
+                self._send_html("<h1>404</h1>", status=404)
+                return
+            if action == "start":
+                result = connect_start(flow)
+                # A start that could not begin has something to say, and
+                # the card is rebuilt from the pane on the next GET — so
+                # say it here rather than redirecting into a page that no
+                # longer remembers the attempt.
+                if result["state"] == "failed" and result["error"]:
+                    self._send_html(render_page(result["error"]), status=409)
+                    return
+                self._redirect("ok=connect_started")
+            elif action == "cancel":
+                connect_cancel(flow["id"])
+                self._redirect("ok=connect_cancelled")
+            else:
+                code = form.get("code", [""])[0].strip()
+                if not CONNECT_CODE_OK.match(code):
+                    self._send_html(
+                        render_page("That does not look like a sign-in code. "
+                                    "Copy the whole value the sign-in page "
+                                    "shows, with no spaces."),
+                        status=400,
+                    )
+                    return
+                connect_send_code(flow, code)
+                self._redirect("ok=connect_code")
         elif path == BASE + "/delete":
             key = (form.get("key", [""])[0]).strip()
             if KEY_RE.match(key):
@@ -2555,7 +3528,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             # Optional kickoff prompt (first spawn only; the supervisor
             # clears it and resumes on later respawns). boxSessionId is
-            # left null so the supervisor mints a real UUID at spawn.
+            # left null so the supervisor mints a real UUID at spawn — and
+            # keeps it in its own state file from then on, these two fields
+            # being the migration copy it stops writing next release
+            # (issue #282).
             # Browsers submit textarea line endings as CRLF; normalize them
             # before this value reaches the agent as one argv element.
             prompt = form.get("prompt", [""])[0].replace("\r\n", "\n")
@@ -2609,6 +3585,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # but it would go on claiming its topics against the standing
                 # watches until something removes it (#229).
                 prune_filter(name)
+                # Same for the supervisor's record of what this session was
+                # last launched with: an OPTIMISATION only (the supervisor
+                # sweeps the directory against the registry every tick,
+                # because no delete path is guaranteed to run), but it closes
+                # the window in which a re-used name inherits the dead
+                # session's launch id — and with it its transcript (#282).
+                state_path = session_state_path(name)
+                if state_path:
+                    try:
+                        os.remove(state_path)
+                    except OSError:
+                        pass
             self._redirect("ok=session_deleted", self._sess_page(form))
         elif path == SESS_BASE + "/sessions/restart":
             name = (form.get("name", [""])[0]).strip()

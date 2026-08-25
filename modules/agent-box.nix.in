@@ -51,9 +51,21 @@ let
       (defaultAgentsMd
         + lib.optionalString (builtins.match "[[:space:]]*" u.agentsMd == null)
           "\n${u.agentsMd}");
-  # Stable read-only path the seeded ~/AGENTS.md @imports. Refreshed on every
+  # Stable read-only path the seeded ~/AGENTS.md names (and, for claude and
+  # codex, the user-scope pointers symlink at). Refreshed on every
   # `nixos-rebuild switch` (i.e. every box update); readable but not writable
   # under ProtectSystem=strict.
+  # Its own directory rather than /etc/agent-box, for a reason that is now
+  # purely historical: /etc/agent-box WAS tokenDir, which tmpfiles kept
+  # 0700 root:root — the agent user could not traverse into it — and which
+  # the claude-box rename migration would only move while empty. Publishing
+  # guides inside it broke that guard permanently and silently stranded
+  # tokens at the old path (65099d7). tokenDir was then removed outright
+  # (c25f8e5, superseded by the user-owned ~/.config/agent-box/env), so
+  # /etc/agent-box is free again and nothing in this module claims it. The
+  # guides simply never moved back, and renaming them now buys tidiness at
+  # the price of dangling every pointer symlink and every ~/AGENTS.md
+  # already seeded on a deployed box. Don't, unless you also migrate those.
   canonicalAgentsPath = name: "/etc/agent-box-guides/AGENTS.${name}.md";
   # issue #154 Phase 3: the per-user services are systemd %i template
   # units, whose text lives as verbatim, backend-neutral files under
@@ -180,19 +192,67 @@ let
   # single live source for those keys (it is deliberately NOT in the
   # unit's EnvironmentFile, so a DELETED key disappears on restart too).
   # Values are exported literally — never eval'd — so a secret full of
-  # shell metacharacters can't break or inject anything; one pair of
-  # surrounding quotes is stripped to match how systemd read the same
-  # file before. Key charset mirrors the settings daemon's KEY_RE.
-  envExecWrapper = pkgs.writeShellScript "agent-box-env-exec" ''
-    @@include:src/env-exec.sh@@
+  # shell metacharacters can't break or inject anything.
+  #
+  # Python since issue #212, because the format now has continuation lines:
+  # see envStoreLib below for why one parser owns them.
+  envExecWrapper = pkgs.writers.writePython3 "agent-box-env-exec" {
+    # E402: the library is spliced in ABOVE this program, so its own imports
+    # follow module-level code. E501: the prose comments run long.
+    flakeIgnore = [ "E402" "E501" ];
+  } (envStoreLib + ''
+
+
+@@include:src/env-exec.py@@
+  '');
+
+  # The env store's format — ~/.config/agent-box/env and
+  # profiles/<name>.env — has ONE owner (issue #212). Six places used to
+  # parse it independently, so a format CHANGE had to land in six dialects at
+  # once or the file meant different things to different readers; multi-line
+  # values are exactly such a change. Every python program that touches the
+  # file gets this library spliced in ahead of its own code, and the shell
+  # callers go through envStoreCli below.
+  #
+  # Spliced rather than packaged as a python module: the module has to stay a
+  # SINGLE file (the contract at the top of this one), so a real site-packages
+  # library would mean building a derivation to hold one 200-line file. When a
+  # third library appears, that trade flips.
+  envStoreLib = ''
+@@include:src/lib/envstore.py@@
   '';
+
+  # The same library, as a program, for the callers that are not python: the
+  # session CLI's `env` verb, agent-box-profile, and the webhook spawner. NOT
+  # on any PATH — every caller pins its store path (AGENT_BOX_ENVSTORE_BIN),
+  # the convention sessionCli already uses for flock and agent-box-profile, so
+  # a caller cannot silently fall back to a different copy or to none.
+  envStoreCli = pkgs.writers.writePython3Bin "agent-box-envstore" {
+    flakeIgnore = [ "E402" "E501" ];
+  } (envStoreLib + ''
+
+
+@@include:src/envstore-cli.py@@
+  '');
 
   # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
   # quit, so the pane records stopped=true and the supervisor leaves the
   # session down. See src/mark-stopped.sh for the exact semantics.
-  markStopped = name: pkgs.writeShellScript "agent-box-${name}-mark-stopped" ''
-@@include-verbatim:src/mark-stopped.sh@@
-  '';
+  markStopped = name: pkgs.writeShellScript "agent-box-${name}-mark-stopped" (''
+    # This runs as the last command in an agent's pane, so it inherits that
+    # agent's PATH — which may be anything at all. Everything it needs is
+    # pinned here instead: coreutils on a PATH of its own, jq and the registry
+    # lock's flock by store path (flock ships in util-linux only, issue #254),
+    # and the registry of the user this copy was generated for rather than
+    # whatever $HOME the pane carries.
+    export PATH=${pkgs.coreutils}/bin
+    REGISTRY_FILE=${lib.escapeShellArg (userSessionsFile name)}
+    REGISTRY_JQ=${pkgs.jq}/bin/jq
+    REGISTRY_FLOCK=${pkgs.util-linux}/bin/flock
+    REGISTRY_PROG=agent-box-mark-stopped
+  '' + ''
+    @@include:src/mark-stopped.sh@@
+  '');
 
   # Codex Remote Control supervisor (issue 103). Unlike claude's
   # `--remote-control` TUI flag, codex uses a dedicated app-server daemon.
@@ -311,10 +371,10 @@ let
 
   agentRuntimePackages = lib.unique (
     installedAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli ]
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
-    ++ lib.optional webhookEnabled webhookCli
+    ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli ]
     ++ agentBaseTools
     ++ cfg.extraPackages
   );
@@ -350,8 +410,11 @@ let
         workingDirectory =
           if s.workingDirectory != null then s.workingDirectory
           else "/home/${name}";
-        # Runtime state the supervisor manages; seeded so a declared kickoff
-        # prompt fires once and hasRun exists from the start.
+        # The supervisor's own bookkeeping, mirrored here for one more
+        # release (issue #282): it keeps these in
+        # ~/.local/state/agent-box/session/<name>.json now and reads the
+        # registry copy only as a migration fallback. Seeded so a declared
+        # kickoff prompt fires once.
         initialPrompt = s.initialPrompt;
         resumePrompt = s.resumePrompt;
         boxSessionId = null;
@@ -376,8 +439,38 @@ let
     # this CLI, no util-linux) — and a lock that only some writers take is not
     # a lock. util-linux is the only package that ships flock.
     export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
+    # Agent profiles (issue #321): `add --profile` resolves the harness and
+    # its arguments by shelling out to agent-box-profile, and this CLI runs
+    # from PATHs that do not carry it — the webhook receiver unit's PATH is
+    # jq + coreutils + this CLI. Same pin convention as the flock above.
+    export AGENT_BOX_PROFILE_BIN=${profileCli}/bin/agent-box-profile
+    # The env store's one reader/writer (issue #212): `env ls/set/rm` here and
+    # the settings page must agree byte-for-byte about a multi-line value, so
+    # neither owns a parser. Pinned in the wrapper for the same reason as the
+    # flock above — this CLI runs from PATHs that carry almost nothing.
+    export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
   '' + ''
 @@include:src/session-cli.sh@@
+  '');
+
+  # Agent profiles (issue #321): the WORKER, as opposed to the harness that
+  # `--agent` selects — a harness plus the model, effort, appended system
+  # prompt and environment that tell two sessions on one harness apart.
+  #
+  # Deliberately NOT a services.agent-box.* option: a profile is per-user
+  # preference data a user must be able to change from chat with no root and
+  # no rebuild (the precedent set by issue #290/#291), so it lives beside the
+  # env store in ~/.config/agent-box/profiles/ and this CLI is the only writer.
+  # The wrapper injects the same harness list and default the session CLI gets,
+  # so a profile cannot name a harness this box does not install.
+  profileCli = pkgs.writeShellScriptBin "agent-box-profile" (''
+    export AGENT_BOX_AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " (sessionKinds cfg.installAgents))}
+    export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+    # A profile file is the env store in another directory, so it has the same
+    # one parser (issue #212).
+    export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
+  '' + ''
+@@include:src/profile-cli.sh@@
   '');
 
   # Webhook self-service, shipped on every PATH when webhookEnabled (issue #101).
@@ -396,15 +489,26 @@ let
     @@include:src/webhook-cli.sh@@
   '');
 
+  # Who this box acts as on GitHub (issue #261), resolved at RUNTIME from the
+  # token the user's environment carries — the settings page can swap that for
+  # a different account at any time, so the identity cannot be a module option.
+  # Shipped on PATH so a human can ask the same question the plumbing asks.
+  webhookSelfCli = pkgs.writeShellScriptBin "agent-box-webhook-self" ''
+@@include:src/webhook-self.sh@@
+  '';
+
   # Dispatch target for standing watches (local-channels#1): the receiver
   # daemon runs this as LOCAL_WEBHOOK_SPAWN_CMD when a delivery matches a
   # deliver_to:"subagent" subscription. It turns the event batch on stdin into
   # a fresh hook-* session via the sessions file, which the supervisor
   # reconciles within ~2s — the same no-sudo, no-rebuild path the
   # agent-box-session CLI uses. webhook.py already rate-limits and coalesces
-  # spawns; the cap here bounds ACCUMULATION instead, so a watched repo cannot
-  # slowly fill the box with idle hook sessions if spawned agents fail to
-  # clean up after themselves.
+  # spawns; the cap here bounds CONCURRENCY instead, so a watched repo cannot
+  # fill the box with idle hook sessions if spawned agents fail to clean up
+  # after themselves. It counts what is running (live hook-* tmux sessions plus
+  # entries the supervisor is about to start), never how many entries the
+  # registry accumulated — a finished session must not hold a slot forever
+  # (issue #280), which is why the receiver unit below pins AGENT_BOX_TMUX_BIN.
   webhookSpawn = pkgs.writeShellScriptBin "agent-box-webhook-spawn" (''
     # Same pin as sessionCli, and for the same reason (issue #254): the
     # receiver unit's PATH is jq + coreutils + the session CLI, so flock
@@ -416,6 +520,10 @@ let
     # NAME it, because that is the half of "what does this watch launch" the
     # page could not show before (issue #292). Same value sessionCli exports.
     export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+    # This wrapper reads two keys out of the env store, so it reads them with
+    # the store's own parser (issue #212) rather than a fifth copy of the
+    # KEY=value loop.
+    export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
   '' + lib.optionalString (cfg.webhook.hookSessionArgs != [ ]) ''
     # The fleet-wide default for hook-session args (webhook.hookSessionArgs),
     # JSON so multi-word args survive the round trip; the script decodes it
@@ -455,10 +563,19 @@ let
       exit 0
     fi
     # For every entry whose topic is declared: the declaration REPLACES the
-    # managed fields (when/drop/ignoreSenders/note) wholesale — partial merges
-    # would let config and state drift apart. Runtime fields (ttlHours,
-    # renewOnEvent, timestamps) stay the entry's own. Bare-string topics
-    # normalize to the object form webhook.py itself writes.
+    # managed fields (the payload predicates, ignoreSenders, note) wholesale —
+    # partial merges would let config and state drift apart. Runtime fields
+    # (ttlHours, renewOnEvent, timestamps) stay the entry's own. Bare-string
+    # topics normalize to the object form webhook.py itself writes.
+    #
+    # local-webhook 0.19.0 renamed the two predicates when -> include and
+    # drop -> exclude (local-channels#294). It still ACCEPTS the old names on
+    # input, but it persists the new ones, so an applier that wrote `when`
+    # left the entry carrying both: its own `when` plus the daemon's `include`
+    # rewrite of it. Write the new names and delete BOTH pairs, so a declared
+    # entry never keeps a stale second predicate — whichever version last
+    # touched the file. The watchPolicy OPTION keeps its when/drop keys; the
+    # rename is upstream's state format, not this module's interface.
     tmp="$FILE.policy.$$"
     if "$JQ" --slurpfile pol "$POLICY" '
           $pol[0] as $p
@@ -467,9 +584,9 @@ let
               | (if type == "object" then (.topic // "") else "" end) as $t
               | if $t != "" and ($p | has($t)) then
                   $p[$t] as $r
-                  | del(.when, .drop, .ignoreSenders)
-                  | (if $r.when != null then .when = $r.when else . end)
-                  | (if $r.drop != null then .drop = $r.drop else . end)
+                  | del(.when, .drop, .include, .exclude, .ignoreSenders)
+                  | (if $r.when != null then .include = $r.when else . end)
+                  | (if $r.drop != null then .exclude = $r.drop else . end)
                   | (if (($r.ignoreSenders // []) | length) > 0 then .ignoreSenders = $r.ignoreSenders else . end)
                   | (if $r.note != null then .note = $r.note else . end)
                 else . end ]
@@ -715,8 +832,13 @@ let
           there).
 
           AGENTS.md is the cross-vendor agent-instructions convention read
-          natively by codex and opencode, and by claude-code as a fallback
-          when CLAUDE.md is absent. The agent's systemd env exports
+          natively by codex and opencode. claude-code does NOT read it — it
+          discovers CLAUDE.md only (issue #305) — so a claude session also
+          gets two symlinks, seeded IFF absent:
+          <workingDirectory>/CLAUDE.md points at the AGENTS.md beside it, and
+          ~/.claude/CLAUDE.md points at the canonical guide under /etc. Both
+          follow this option: agentsMd = null seeds neither.
+          The agent's systemd env exports
           AGENT_BOX_URL whenever this user has a browser terminal (see
           web.passwordHashFile), so an AGENTS.md that references that variable
           lets the agent answer "where am I reachable?" without hard-coding
@@ -768,17 +890,32 @@ let
       map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
       ++ [ "shell=${utils.toShellPath config.users.users.${name}.shell}" ]
     );
-  # AGENTS.md — cross-vendor agent-instructions file (codex, opencode
-  # native; claude-code as CLAUDE.md fallback). What we SEED into $HOME is
-  # deliberately minimal and EDITABLE: a short notes header plus a claude
-  # `@import` of the read-only canonical guide at canonicalAgentsPath, so
-  # the up-to-date guidance is pulled in at load time without ever
-  # overwriting the agent's own edits. The canonical file itself is
-  # published via environment.etc and refreshed on every box update.
+  # Guided sign-in cards (issues #207, #208, #313): "<id>=<binary>" pairs
+  # naming the CLI each card drives. The settings daemon runs the tool's
+  # OWN sign-in command (`claude auth login`, `codex login --device-auth`,
+  # `gh auth login --web`) in its own tmux session and never handles a
+  # token, so a card exists only where its binary does — an agent left out
+  # of installAgents simply has no card. Absolute paths because that
+  # daemon's unit deliberately carries no agent PATH; a VM test overrides
+  # this variable to point an id at a stub.
+  connectBins = lib.concatStringsSep " " (
+    map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
+    ++ [ "github=${pkgs.gh}/bin/gh" ]
+  );
+
+  # AGENTS.md — cross-vendor agent-instructions file (codex and opencode
+  # read it natively; claude does NOT — it reaches this file only through
+  # the CLAUDE.md symlink seeded in supervisor.sh). What we SEED into $HOME
+  # is deliberately minimal and EDITABLE: a short notes header that NAMES the
+  # read-only canonical guide at canonicalAgentsPath, so the agent's own
+  # edits are never overwritten. The canonical file itself is published via
+  # environment.etc and refreshed on every box update.
   # null (agentsMd = null) opts out of seeding entirely.
-  # NOTE: claude-code expands `@path` imports; codex does not, so on a
-  # codex session the import line shows literally — the guide then has to
-  # be read explicitly from canonicalAgentsPath.
+  # NOTE: this file carries no `@import` of the guide, because no harness
+  # would act on one here — codex does not expand `@path` at all, and claude
+  # never reads AGENTS.md in the first place (issue #305); claude gets the
+  # guide through the ~/.claude/CLAUDE.md symlink in supervisor.sh instead.
+  # Every other harness reads the path named below.
   agentsMdPointer = name: u:
     if u.agentsMd == null then null
     else pkgs.writeText "agent-box-${name}-agents-pointer.md" ''
@@ -787,11 +924,33 @@ let
       This file is yours to edit; anything you add here persists across
       restarts. The canonical agent-box guide (environment, secrets,
       serving files, self-update) is read-only and auto-updated on every
-      box update — it is imported below and also readable directly at
+      box update. A claude session loads it automatically through
+      ~/.claude/CLAUDE.md; on any other harness, read it yourself at
       ${canonicalAgentsPath name}.
-
-      @${canonicalAgentsPath name}
     '';
+
+  # CLAUDE.md — claude-code's ONLY instruction-file name (issue #305).
+  # Measured on claude-code 2.1.233: AGENTS.md is never discovered (in that
+  # binary the name occurs only in its Codex importer and its /init prompt),
+  # so the AGENTS.md seeded above reached no claude session at all. Fixed
+  # with two plain symlinks (seeded IFF absent in supervisor.sh, so a repo
+  # checkout's own CLAUDE.md or a hand edit survives), one per memory SCOPE:
+  #   - PROJECT scope (<workingDirectory>/CLAUDE.md) -> the sibling
+  #     AGENTS.md — the agent's own editable notes.
+  #   - USER scope (~/.claude/CLAUDE.md) -> the canonical guide at
+  #     canonicalAgentsPath.
+  # A symlink is resolved by the filesystem before claude ever sees the
+  # path, so — unlike a claude `@import`, which resolves a PROJECT-scope
+  # target only inside the project tree and drops one above it silently —
+  # there is no scope restriction to route around here; each symlink just
+  # names its target directly. Each file supplies exactly what the other
+  # cannot, and the guide stays live across box updates (canonicalAgentsPath
+  # is a stable environment.etc path that NixOS repoints on every rebuild)
+  # without this symlink ever needing to be reseeded.
+  # Neither symlink needs a generated derivation: the project-scope target
+  # is the constant "AGENTS.md", hardcoded in supervisor.sh; the user-scope
+  # target is exported below as a plain string (canonicalAgentsPath), for
+  # supervisor.sh to `ln -s`.
 
   # The per-user SUPERVISOR (issue #59). One hardened unit per user; the tmux
   # server and every session — including ones added at runtime — are children
@@ -811,11 +970,12 @@ let
     @@include:src/supervisor.sh@@
   '';
 
-  # /clear rotation bookkeeping (issue #223). A SessionStart hook records
-  # the live claude session id — /clear rotates it mid-process — keyed by
-  # the launch id the supervisor put in the pane environment, so the next
-  # respawn resumes the conversation the user actually had, not the
-  # pre-/clear transcript boxSessionId still points at. Injected per spawn
+  # Segment-rotation bookkeeping (issue #223). A SessionStart hook records
+  # the live claude session id — a clear, a compact or a resume rotates it
+  # mid-process — keyed by the launch id the supervisor put in the pane
+  # environment, so the next respawn resumes the conversation the user
+  # actually had, not the segment it was launched with and rotated away
+  # from. Injected per spawn
   # via claude's `--settings` flag (additional settings, merged on top):
   # the user's own settings.json is never touched, sessions outside the
   # supervisor never run the hook, and a rebuild rolls both files forward
@@ -963,7 +1123,10 @@ in
         Caddyfile is module-managed (regenerated every rebuild); each agent
         user's own virtual hosts live in ~/sites/*.caddy (a symlink to
         /var/lib/agent-box-sites/<user>/, which caddy can read) and land
-        with `sudo systemctl reload caddy.service`
+        with `sudo /run/current-system/sw/bin/systemctl reload
+        caddy.service` (the full path matters — a bare `systemctl` resolves
+        through PATH to a Nix store path the sudoers rule won't match, so it
+        silently asks for a password instead)
       '';
 
       domain = lib.mkOption {
@@ -983,7 +1146,8 @@ in
         description = ''
           Which services.agent-box.users entry administers Caddy: it is
           added to the caddy group (so it can edit /var/lib/caddy/Caddyfile)
-          and granted passwordless sudo for `systemctl reload caddy.service`.
+          and granted passwordless sudo for
+          `/run/current-system/sw/bin/systemctl reload caddy.service`.
           Which users get a browser terminal is separate — set
           users.<name>.web.passwordHashFile per user.
         '';
@@ -1010,7 +1174,8 @@ in
       enable = lib.mkEnableOption ''
         an agent-triggerable self-update service. When enabled, every agent
         user's sudo allowlist gains exactly
-        `systemctl start agent-box-update.service` (plus its --no-block
+        `/run/current-system/sw/bin/systemctl start
+        agent-box-update.service` (plus its --no-block
         variant, used by the settings page's Update button) — a root oneshot
         that fast-forwards the box to the upstream repo's latest
         default-branch commit by rewriting `pinFile` (and, when agentNixpkgs
@@ -1134,7 +1299,7 @@ in
       };
       rev = lib.mkOption {
         type = lib.types.str;
-        default = "93c8dac37874bb1531a4d01b2fd6c3a00317718c";
+        default = "6a178f7faaac08fabc7851827b485eb2499823f7";
         description = ''
           Pinned local-channels commit whose local-webhook/webhook.py the
           receiver daemon and the agent-box-webhook CLI run. Claude sessions
@@ -1148,7 +1313,7 @@ in
         # builtins.fetchurl hash of local-webhook/webhook.py at `rev`:
         #   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.py
         # then `nix hash convert --hash-algo sha256 --to sri <base32>`.
-        default = "sha256-K/Vcmvqlbbiy49DkrYFDc+G35kvtQBqOzVUvBtPKVIk=";
+        default = "sha256-jOdU9VP1eXjeVr2PnV8hDpkxBZjgvPKFJY1UyXeTu0Q=";
         description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
       };
       syncSessionPlugin = lib.mkOption {
@@ -1239,15 +1404,18 @@ in
         # the box's own repos, IF one exists. Current policy: spawn a triage
         # session for issues/PRs entering the queue (opened/reopened) unless
         # the box's own login created them, for terminal CI failures whoever
-        # triggered the run, and for an issue or PR somebody ASSIGNS to the box
-        # (a work request, #253); everything else — closes, merges, pushes,
-        # green or in-flight CI — is not worth a session. On a box whose
+        # triggered the run, for an issue or PR somebody ASSIGNS to the box or
+        # a comment that MENTIONS it by name (both direct work requests,
+        # #253/#296), and for any review verdict on a PR the box itself wrote
+        # (#255); everything else — closes, merges, pushes, green or in-flight
+        # CI, reviews of other people's PRs — is not worth a session. On a box whose
         # sessions never subscribed a defangdevs watch this default matches no
         # entry and does nothing; set it to { } to opt out entirely.
         default = {
           "github:defangdevs/*" = {
             note = "standing watch: unowned defangdevs activity (new issues, outside PRs, failing CI, "
-              + "issues/PRs assigned to this box) — "
+              + "issues/PRs assigned to this box, comments that mention it, reviews "
+              + "on its own PRs) — "
               + "rules managed by services.agent-box.webhook.watchPolicy and re-applied when the "
               + "receiver daemon starts, so edit the NixOS config, not this entry";
             when =
@@ -1286,6 +1454,71 @@ in
                       { path = "sender.login"; notIn = [ "defangdevs" ]; }
                     ];
                   }
+                  # Being addressed by name is the most direct work request
+                  # there is, and the one a human reaches for by reflex (#296).
+                  # Assignment above already spawns for the same reason (#253);
+                  # this is that request in the form people actually type. It
+                  # needs local-webhook >= 0.14.0, because a mention lives
+                  # inside free text with no structured field beside it, so no
+                  # in/notIn list of whole values can ever name it
+                  # (local-channels#33). Matching is case-insensitive there, so
+                  # "@DefangDevs" counts.
+                  #
+                  # The sender leaf is load-bearing, not decoration: the box
+                  # quotes the request back when it answers, so without it every
+                  # reply would spawn another session, which would reply again.
+                  #
+                  # Unlike the assignment clause, GitHub restricts nothing here
+                  # — anyone who may comment may type the mention. On a private
+                  # repo that is the same trust set that may open an issue, and
+                  # the opened/reopened clause already spawns for those, so this
+                  # widens nothing on the box's own repos. Revisit it before
+                  # pointing a watch at a PUBLIC repo, where the two sets differ.
+                  {
+                    all = [
+                      { path = "action"; "in" = [ "created" "edited" ]; }
+                      { path = "sender.login"; notIn = [ "defangdevs" ]; }
+                      { path = "comment.body"; contains = [ "@defangdevs" ]; }
+                    ];
+                  }
+                  # A review verdict on a PR the box WROTE is the answer to
+                  # work it is already waiting on, so every verdict starts a
+                  # session — not the approval alone (#255). "Approved" means
+                  # merge it; "changes requested" means fix it; a review whose
+                  # state is only "commented" is a batch of review notes, which
+                  # is the same request in a softer voice. All three are news.
+                  # Nothing else on this event is: a green PR nobody reviewed
+                  # must not merge itself, and the CI clauses below stay
+                  # failure-only for the same reason.
+                  #
+                  # `pull_request.user.login` is what keeps the rule narrow —
+                  # a review on somebody ELSE's PR is that person's business,
+                  # even on the box's own repos. It is a plain `in` leaf on a
+                  # path GitHub already sends, so unlike the mention clause
+                  # this needs no new operator and no pin bump.
+                  #
+                  # Two payload spellings to keep straight. `review.state` is
+                  # LOWERCASE on the webhook ("changes_requested"); the REST
+                  # API spells the same value uppercase, so a rule copied from
+                  # API docs matches nothing. And there is no "denied" state at
+                  # all — "changes_requested" IS the denial.
+                  #
+                  # `action = "dismissed"` is deliberately absent. GitHub
+                  # rewrites review.state to "dismissed" on that action, so it
+                  # cannot ride this clause anyway, and a withdrawn verdict is
+                  # the removal of news rather than news.
+                  #
+                  # The sender leaf does the same job as in the two clauses
+                  # above: the session answers the review on the PR, and a
+                  # self-review must not wake another one.
+                  {
+                    all = [
+                      { path = "action"; "in" = [ "submitted" ]; }
+                      { path = "review.state"; "in" = [ "approved" "changes_requested" "commented" ]; }
+                      { path = "pull_request.user.login"; "in" = [ "defangdevs" ]; }
+                      { path = "sender.login"; notIn = [ "defangdevs" ]; }
+                    ];
+                  }
                   { path = "workflow_run.conclusion"; "in" = ciFailure; }
                   { path = "workflow_job.conclusion"; "in" = ciFailure; }
                   { path = "check_run.conclusion"; "in" = ciFailure; }
@@ -1309,7 +1542,9 @@ in
           policy: local-webhook's built-in failures-only CI brake steps aside
           for it, and every event the rules decline is logged by the daemon,
           so a deliberate drop stays distinguishable from a watch that broke
-          (#170). Requires local-webhook >= 0.11.0 (the webhook.rev pin).
+          (#170). Requires local-webhook >= 0.11.0 (the webhook.rev pin),
+          or >= 0.14.0 for the contains/notContains substring leaves the
+          default's mention rule uses.
         '';
       };
     };
@@ -1405,6 +1640,14 @@ in
           message = "services.agent-box.users.${name}: session name \"${sname}\" must match [A-Za-z0-9_-]{1,150}.";
         }
         {
+          # A session's terminal lives at /<user>/<session>/, so these names
+          # are already spoken for: the more specific route wins and the
+          # session would be unreachable with nothing to say why. Mirrored by
+          # the CLI's RESERVED_NAMES and the daemon's.
+          assertion = !(builtins.elem sname [ "settings" "downloads" "webhook" "sessions" "token" "ws" ]);
+          message = "services.agent-box.users.${name}: session name \"${sname}\" is reserved — /${name}/${sname}/ is already a page on the web UI.";
+        }
+        {
           assertion = builtins.elem (if s.agent != null then s.agent else cfg.agent) cfg.installAgents;
           message = "services.agent-box.users.${name}: session \"${sname}\" uses agent \"${if s.agent != null then s.agent else cfg.agent}\", which is not in services.agent-box.installAgents.";
         }
@@ -1471,7 +1714,8 @@ in
     environment.systemPackages = agentRuntimePackages;
 
     # Canonical, read-only agent guide per user at /etc/agent-box-guides/
-    # AGENTS.<user>.md (see canonicalAgentsPath for why not /etc/agent-box).
+    # AGENTS.<user>.md (canonicalAgentsPath carries the story of that
+    # directory name, and why moving it is not free).
     # environment.etc symlinks are relinked by `nixos-rebuild switch` (which the
     # self-update service runs), so this always tracks the current module while
     # the seeded ~/AGENTS.md — which @imports this path — stays editable. Skipped
@@ -1496,8 +1740,20 @@ in
         "AGENT_BOX_SESSIONS_SEED=${sessionsSeedFile name u}\n"
         + "AGENT_BOX_AGENT_BINS=${agentBinsFor name}\n"
         + "AGENT_BOX_MARK_STOPPED=${markStopped name}\n"
-        + lib.optionalString (agentsMdPointer name u != null)
+        + lib.optionalString (agentsMdPointer name u != null) (
             "AGENT_BOX_AGENTS_POINTER=${agentsMdPointer name u}\n"
+            # Symlink target for the USER-SCOPE guide pointer each harness
+            # reads whatever the session's working directory is: claude's
+            # ~/.claude/CLAUDE.md (issue #305 — AGENTS.md alone reaches no
+            # claude session) and codex's ~/.codex/AGENTS.md. Both matter
+            # for a session working in a SUBDIRECTORY, e.g. a repo checkout:
+            # the seeded ~/AGENTS.md is then out of scope for codex, which
+            # reads project docs from the project root down, so without this
+            # the box guide would reach no codex session doing real work.
+            # Same opt-out as the pointer above; the project-scope symlink's
+            # target is the constant "AGENTS.md", hardcoded in supervisor.sh.
+            + "AGENT_BOX_GUIDE_TARGET=${canonicalAgentsPath name}\n"
+          )
         + lib.optionalString (cfg.web.enable && u.web.passwordHashFile != null) (
             "AGENT_BOX_URL=https://${cfg.web.domain}/${name}/\n"
             + lib.optionalString webhookEnabled
@@ -1568,7 +1824,7 @@ in
             AGENT_BOX_HOSTNAME_BIN = "${pkgs.unixtools.hostname}/bin/hostname";
             AGENT_BOX_ENV_EXEC = "${envExecWrapper}";
             AGENT_BOX_CODEX_RC = "${codexRemoteControl}";
-            # Hook settings for claude spawns — the /clear-rotation record
+            # Hook settings for claude spawns — the segment-rotation record
             # (issue #223) the supervisor follows on respawn.
             AGENT_BOX_CLAUDE_SETTINGS = "${claudeHookSettings}";
           }
@@ -1642,16 +1898,20 @@ in
           # var per instance) is a real per-instance list, so it's just
           # concatenated here rather than needing its own optionalAttrs.
           EnvironmentFile = cfg.environmentFiles ++ u.environmentFiles;
-          # ~/sites is a SYMLINK to /var/lib/agent-box-sites/<name>, so a
-          # write through it resolves outside /home and ProtectSystem=strict
-          # denies it with EROFS unless the target is ALSO listed — but only
-          # when web.enable is on, since that is what gates the tmpfiles
-          # rule that creates the dir; listing it unconditionally fails the
+          # ~/sites and ~/downloads are SYMLINKS to
+          # /var/lib/agent-box-{sites,downloads}/<name>, so a write through
+          # either resolves outside /home and ProtectSystem=strict denies it
+          # with EROFS unless the target is ALSO listed (issue #316) — but
+          # only when web.enable is on, since that is what gates the tmpfiles
+          # rules that create the dirs; listing them unconditionally fails the
           # whole namespace setup with 226/NAMESPACE on a default (web-less)
           # box. systemd path lists accumulate across drop-ins onto the base
           # unit's own ReadWritePaths=/home/%i, so this only ADDS the extra
-          # path, never replaces it.
-          ReadWritePaths = lib.optional cfg.web.enable "/var/lib/agent-box-sites/%i";
+          # paths, never replaces them.
+          ReadWritePaths = lib.optionals cfg.web.enable [
+            "/var/lib/agent-box-sites/%i"
+            "/var/lib/agent-box-downloads/%i"
+          ];
           # NoNewPrivileges would break the sudoAllowlist escape hatch (sudo
           # is setuid root; NNP blocks the euid transition). Enable it only
           # when the effective allowlist is empty — with a non-empty
@@ -1824,10 +2084,19 @@ in
         # No external libraries; skip flake8 style gate (the script is
         # formatted for readability, not lint-perfection) but keep syntax
         # checking that writePython3Bin does by compiling.
-        flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" ];
-      } ''
-        @@include:src/settings-daemon.py@@
-      '';
+        #
+        # E402 and F811 as well, and only here, because of the env-store
+        # library prepended below (issue #212): this daemon's own ~25 imports
+        # follow that library's code, and its `import json`, `os`, `re` and
+        # `tempfile` re-bind four names the library already imported. Nothing
+        # else in the two files shares a name — the library was written to
+        # stay clear of the daemon's globals.
+        flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" "E402" "F811" ];
+      } (envStoreLib + ''
+
+
+@@include:src/settings-daemon.py@@
+      '');
       # Per-connection tmux attach for ttyd (issue #59). ttyd runs with
       # --url-arg, so /<user>/?arg=<session> passes <session> as $1 — ONE
       # ttyd per user serves every session, including runtime-created ones.
@@ -2098,12 +2367,18 @@ in
         // lib.listToAttrs (map (name: lib.nameValuePair "agent-box/units/agent-box-settings-${name}.env" {
           text =
             "AGENT_BOX_PASSWORD_CMD=/run/wrappers/bin/sudo -n ${passwordHelperCmdOf name}\n"
-            + lib.optionalString (name == rootUser)
-                # This daemon also serves the vhost root: GET / is the
-                # session manager (Caddy proxies it here behind the
-                # user's auth) and the session CRUD routes move to
+            + lib.optionalString (name == rootUser) (
+                # This daemon also serves the vhost root: GET / picks a
+                # user (with one terminal user, the norm, it redirects
+                # straight into them), the workspace page moved to
+                # /<user>/, and the session CRUD routes live at
                 # /sessions/*.
                 "AGENT_BOX_HOME=1\n"
+                # Who the root picker can offer. Only meaningful on the
+                # root daemon, and only when there is more than one name
+                # in it.
+                + "AGENT_BOX_WEB_USERS=${lib.concatStringsSep "," terminalUsers}\n"
+              )
             + lib.optionalString webhookEnabled
                 "AGENT_BOX_WEBHOOK_STATE_DIR=${webhookStateDirOf name}\n";
         }) terminalUsers)
@@ -2134,13 +2409,14 @@ in
       }
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-web-terminal@${name}" {
         overrideStrategy = "asDropin";
-        # The attach script (src/attach.sh) resolves tmux and jq from
-        # this PATH instead of baked store paths (issue #154, Phase 2) —
-        # forced for the same reason as "agent-box@"'s PATH (NixOS's own
-        # implicit per-instance default would otherwise win).
+        # The attach script (src/attach.sh) resolves tmux, jq and head
+        # (coreutils) from this PATH instead of baked store paths (issue
+        # #154, Phase 2) — forced for the same reason as "agent-box@"'s
+        # PATH (NixOS's own implicit per-instance default would otherwise
+        # win).
         environment = {
           AGENT_BOX_WEB_DOMAIN = cfg.web.domain;
-          PATH = lib.mkForce (lib.makeBinPath [ pkgs.tmux pkgs.jq attachScript pkgs.ttyd ]);
+          PATH = lib.mkForce (lib.makeBinPath [ pkgs.tmux pkgs.jq pkgs.coreutils attachScript pkgs.ttyd ]);
         };
         # agent-box-attach is given as an absolute path here (not left bare
         # for ttyd's own PATH-based exec, unlike the verbatim unit text)
@@ -2148,7 +2424,7 @@ in
         # dependency on any search-path resolution being merged correctly.
         serviceConfig.ExecStart = [
           ""
-          ''${pkgs.ttyd}/bin/ttyd --writable --url-arg -p ''${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} ${attachScript}/bin/agent-box-attach''
+          ''${pkgs.ttyd}/bin/ttyd --writable --url-arg -p ''${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true ${attachScript}/bin/agent-box-attach''
         ];
       }) terminalUsers))
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-box-settings@${name}" {
@@ -2162,6 +2438,12 @@ in
             AGENT_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
             AGENT_BOX_AGENTS = lib.concatStringsSep "," (sessionKinds cfg.installAgents);
             AGENT_BOX_DEFAULT_AGENT = cfg.agent;
+            # Guided sign-in (issues #207, #208, #313). The daemon starts
+            # these in a tmux session on the AGENT unit's server, so the
+            # credential is written in the same namespace a terminal
+            # sign-in would have written it in. Same value for every
+            # instance, hence host-level.
+            AGENT_BOX_CONNECT_BINS = connectBins;
           }
           // lib.optionalAttrs webhookEnabled {
             # Webhook subscriptions panel (issue #227). The daemon runs
@@ -2194,7 +2476,23 @@ in
             AGENT_BOX_UPDATE_UNIT = "agent-box-update.service";
             AGENT_BOX_SYSTEMCTL = "/run/current-system/sw/bin/systemctl";
           })
-          // { PATH = lib.mkForce (lib.makeBinPath [ settingsDaemon ]); };
+          // {
+            # mkForce for the reason spelled out on the "agent-box@" unit:
+            # NixOS sets a default Environment=PATH= for any declared
+            # systemd.services.<name> at plain priority. The base tools are
+            # KEPT, not replaced — they are what that default provided on
+            # master, and the daemon runs third-party CLIs with its own
+            # environment (guided sign-in, issues #207/#208/#313), so a
+            # PATH holding only agent-box's own bin breaks them.
+            PATH = lib.mkForce (lib.makeBinPath [
+              settingsDaemon
+              pkgs.coreutils
+              pkgs.findutils
+              pkgs.gnugrep
+              pkgs.gnused
+              pkgs.systemd
+            ]);
+          };
         serviceConfig.ExecStart = [ "" "${settingsDaemon}/bin/agent-box-settings" ];
       }) terminalUsers))
       # Webhook receiver daemon (issue #101), one per terminal user, gated on
@@ -2209,7 +2507,22 @@ in
         # child and resolves jq/coreutils/agent-box-session from this
         # PATH instead of baked store paths (issue #154, Phase 2).
         environment = {
+          # Standing watches (deliver_to:"subagent", local-channels#1): a
+          # matching delivery spawns a fresh hook-* session for this user.
+          # webhook.py coalesces bursts and caps concurrent spawns; the
+          # wrapper additionally caps how many hook-* sessions may RUN.
+          # (RECEIVER_ONLY/STATE_DIR/PORT moved to the verbatim unit text
+          # and the per-user env file — issue #154 Phase 3.)
           LOCAL_WEBHOOK_SPAWN_CMD = "${webhookSpawn}/bin/agent-box-webhook-spawn";
+          # The hook-session cap counts live tmux sessions, and tmux is
+          # deliberately not on this unit's PATH (below — the wrapper needs
+          # jq, coreutils and the session CLI, nothing else). So it gets a
+          # pinned binary instead of a wider PATH: the AGENT_BOX_*_BIN
+          # convention the supervisor uses for grep/find and the settings
+          # daemon for tmux. Without it the wrapper cannot tell a finished
+          # hook session from a running one and falls back to counting
+          # registry entries — the very over-counting of issue #280.
+          AGENT_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
           PATH = lib.mkForce (lib.makeBinPath [ pkgs.jq pkgs.coreutils sessionCli ]);
         };
         serviceConfig = {

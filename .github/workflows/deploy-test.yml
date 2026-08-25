@@ -39,7 +39,7 @@ on:
         type: string
         default: ''
       use_spot:
-        description: Deploy the ipv4-full leg as a Spot instance (matches the 1-click default)
+        description: Deploy the ipv4-full leg as a Spot instance (the 1-click default is on-demand; this opts the leg into Spot instead)
         type: boolean
         default: false
 
@@ -60,7 +60,8 @@ jobs:
     #    connectivity smoke tests. On-demand (UseSpot=false): a Spot reclaim
     #    mid-test reads as a black-holed EIP, indistinguishable from a real
     #    provisioning bug (two back-to-back runs on 2026-07-07).
-    #  - ipv6-outputs: exercises the DEFAULT IPv6-only path. The runner can't
+    #  - ipv6-outputs: forces PublicIpv4=false, exercising the IPv6-only opt-out
+    #    from the template's PublicIpv4=true default. The runner can't
     #    connect over IPv6, so this leg only asserts the stack reaches
     #    CREATE_COMPLETE and its outputs populate. That still catches template
     #    resolution bugs (e.g. the old EIPAssoc dependency) and empty-GetAtt bugs
@@ -266,9 +267,31 @@ jobs:
           if [ -z "$iid" ] || [ "$iid" = "None" ]; then
             echo "::error::No InstanceId output to inspect."; exit 1
           fi
-          unit='(Reconfigure the system from EC2 userdata|amazon-init\.service)'
-          fail_re="(Failed to start.*$unit|amazon-init\.service: (Failed|Main process exited))"
-          ok_re="(Finished|Started).*$unit"
+          # Two spellings of "Failed to start", and only one of them is news
+          # (issue 186). systemd names a unit by its DESCRIPTION while the unit
+          # is still loaded, and by its UNIT ID once it is not — and
+          # amazon-init masks itself in the very configuration it is switching
+          # into (aws/template.yaml: `systemd.services.amazon-init.enable =
+          # lib.mkForce false`, so a rebooted box does not re-apply user-data).
+          # So a HEALTHY first boot ends with its own start job cancelled and
+          # the console reading "[FAILED] Failed to start amazon-init.service."
+          # — the unit-id form. Treating that as fatal failed a box that had
+          # provisioned perfectly, twice on master on 2026-08-24 alone, while
+          # its stack signalled FirstBootDone, caddy served a real Let's
+          # Encrypt cert and ttyd was listening.
+          unit_desc='Reconfigure the system from EC2 userdata'
+          fail_re="(Failed to start.*$unit_desc|amazon-init\.service: (Failed|Main process exited))"
+          # The benign form, kept only to explain a timeout: a box that masks
+          # amazon-init and THEN fails activation still goes red, because
+          # nothing below will match ok_re before the poll runs out.
+          masked_re='Failed to start.*amazon-init\.service'
+          # Success needs a marker a vanilla AMI cannot print. "Finished
+          # amazon-init" never appears on a mask-mid-switch boot, so the
+          # activation itself is the witness: amazon-init runs
+          # switch-to-configuration through systemd-run, and only a box being
+          # provisioned from user-data does that.
+          switched_re='switch-to-configuration switch'
+          ok_re="$switched_re"
           # The stock NixOS AMI's fetch-ec2-metadata.service fails OPEN: an
           # IMDS hiccup logs a complaint, writes no user-data file, and exits
           # 0 — then amazon-init "finishes" having provisioned nothing, so
@@ -291,11 +314,15 @@ jobs:
           # the "Failed to start" line — so keep the FIRST snapshot around and
           # dump both on failure to give diagnosis the biggest possible window.
           first_out=""
+          masked_seen=""
           for i in $(seq 1 48); do
             out=$(aws ec2 get-console-output --instance-id "$iid" --latest \
               --query Output --output text 2>/dev/null || true)
             if [ -z "$first_out" ] && [ -n "$out" ]; then
               first_out="$out"
+            fi
+            if printf '%s' "$out" | grep -qE "$masked_re"; then
+              masked_seen=1
             fi
             if printf '%s' "$out" | grep -qE "$fail_re"; then
               echo "::error::amazon-init FAILED - box did not provision (module fetch / nixos-rebuild)."
@@ -321,6 +348,9 @@ jobs:
             echo "[$i/48] provisioning not yet confirmed from console; waiting..."
             sleep 15
           done
+          if [ -n "$masked_seen" ]; then
+            echo "::error::amazon-init was masked mid-switch (the benign spelling, issue 186) but activation never completed - no switch-to-configuration on the console. This box did NOT provision."
+          fi
           echo "::error::Timed out waiting for amazon-init to finish."
           echo "::group::Serial console — LATEST snapshot"
           printf '%s\n' "$out"
@@ -381,7 +411,9 @@ jobs:
             echo "::error::Expected 401 at $root_url without credentials, got $code."
             exit 1
           fi
-          body=$(curl -sS --max-time 10 -u "agent:${WEB_PASSWORD}" "$root_url" || true)
+          # -L: a single-user box's root now redirects into that user's own
+          # space (#334) rather than serving the workspace at "/" directly.
+          body=$(curl -sSL --max-time 10 -u "agent:${WEB_PASSWORD}" "$root_url" || true)
           if echo "$body" | grep -q 'href="https://[^/"]*@'; then
             echo "::error::Workspace at $root_url embeds URL userinfo (user@) in an href — Chrome auto-sends an empty password and typed credentials can't override it (issue 56):"
             echo "$body" | head -20
@@ -396,10 +428,13 @@ jobs:
             echo "$body" | head -20
             exit 1
           fi
-          if echo "$body" | grep -qF 'href="/?tab='; then
+          # Tab links point at TERM_HOME (this user's own path), not root
+          # (#334's render_tabs: href="{home}?tab={name}") — so /agent/?tab=,
+          # not /?tab=.
+          if echo "$body" | grep -qF 'href="/agent/?tab='; then
             echo "::notice::Workspace tab bar lists the sessions (no credentials in the URL)."
           else
-            echo "::error::Workspace at $root_url has no session tabs (href=\"/?tab=\"):"
+            echo "::error::Workspace at $root_url has no session tabs (href=\"/agent/?tab=\"):"
             echo "$body" | head -20
             exit 1
           fi
@@ -534,7 +569,24 @@ jobs:
           fi
           echo "Deleting $STACK_NAME..."
           aws cloudformation delete-stack --stack-name "$STACK_NAME"
-          aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
+          # A teardown that did not happen must not report success. `|| true`
+          # here swallowed DELETE_FAILED and a timed-out wait alike, so a stack
+          # that survived its own destroy step kept billing with a green job
+          # and no signal anywhere. Ask what is actually true afterwards: a
+          # deleted stack is no longer describable BY NAME, and anything else
+          # is a stack somebody has to delete by hand.
+          if ! aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"; then
+            if desc_err=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query 'Stacks[0].StackStatus' --output text 2>&1); then
+              echo "::error::$STACK_NAME did not delete (status $desc_err) - it is STILL BILLING. Delete it by hand: aws cloudformation delete-stack --stack-name $STACK_NAME --region $AWS_REGION"
+              exit 1
+            elif printf '%s' "$desc_err" | grep -qE 'does not exist'; then
+              echo "::notice::wait returned non-zero but $STACK_NAME is gone."
+            else
+              echo "::error::Could not confirm deletion of $STACK_NAME - describe-stacks failed: $desc_err. It may still be billing. Check by hand: aws cloudformation describe-stacks --stack-name $STACK_NAME --region $AWS_REGION"
+              exit 1
+            fi
+          fi
 
       - name: Flag kept stack
         if: ${{ always() && github.event_name == 'workflow_dispatch' && !inputs.destroy }}
