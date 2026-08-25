@@ -139,7 +139,7 @@ in
       # variable the module computes, so the daemon cannot tell the
       # difference — which is the point of naming binaries rather than
       # relying on PATH.
-      systemd.services.agent-box-settings-agent.environment.AGENT_BOX_CONNECT_BINS =
+      systemd.services."agent-box-settings@agent".environment.AGENT_BOX_CONNECT_BINS =
         lib.mkForce "claude=${stubClaude}/bin/claude github=${stubGh}/bin/gh";
 
       system.activationScripts.agent-web-password-hash.text = ''
