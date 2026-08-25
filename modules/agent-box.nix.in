@@ -371,7 +371,7 @@ let
 
   agentRuntimePackages = lib.unique (
     installedAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli ]
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli uploadCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli ]
@@ -495,6 +495,16 @@ let
   # Shipped on PATH so a human can ask the same question the plumbing asks.
   webhookSelfCli = pkgs.writeShellScriptBin "agent-box-webhook-self" ''
 @@include:src/webhook-self.sh@@
+  '';
+
+  # Put a screenshot into an issue or PR without committing it (issue #368).
+  # Not webhook-gated: illustrating a PR is useful on any box. The shipped
+  # guide points at `--help` rather than carrying the recipe, so the three
+  # things that are easy to get wrong (token off argv, fail on 4xx, the
+  # activation delay) live in one testable place instead of in every
+  # transcript that copied a curl line.
+  uploadCli = pkgs.writeShellScriptBin "agent-box-upload" ''
+@@include:src/upload-cli.sh@@
   '';
 
   # Dispatch target for standing watches (local-channels#1): the receiver

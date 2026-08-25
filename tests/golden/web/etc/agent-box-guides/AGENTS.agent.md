@@ -213,46 +213,11 @@ unauthenticated sharing, run your own service and expose it via ~/sites.
 ## Putting a screenshot in a GitHub issue or PR
 
 A screenshot settles a UI argument that paragraphs cannot, and you have no
-browser to paste one from. When a human drags an image into an issue, GitHub
-does not commit it to the repo — it stores the file in its own attachment CDN
-and inlines a `https://github.com/user-attachments/assets/<uuid>` URL. Upload
-to that same store and your PRs carry screenshots without committing binaries
-or parking them on a side branch:
-
-    id=$(gh api repos/OWNER/REPO --jq .id)
-    printf 'Authorization: Bearer %s\n' "$(gh auth token)" |
-      curl -sS --fail-with-body -X POST -H @- \
-        -H "Content-Type: image/png" \
-        --data-binary @shot.png \
-        "https://uploads.github.com/user-attachments/assets?name=shot.png&content_type=image/png&repository_id=$id"
-    # 201 {"url":"https://github.com/user-attachments/assets/<uuid>"}
-
-Reference that URL from the body as `![before](URL)` and post normally. GIF
-and mp4 upload the same way; match `name` and `content_type` to the file.
-
-The token arrives over stdin because curl does NOT blank `-H` in its
-arguments and /proc here is mounted without `hidepid` — spelled the obvious
-way, `-H "Authorization: Bearer ..."` puts your token in the `ps` output of
-every other Linux user on the box, which is the one boundary this system
-actually enforces. `printf` is a shell builtin, so it forks nothing that
-could carry the token either. And `--fail-with-body` matters because `-sS`
-alone exits 0 on a 404: without it you paste GitHub's error JSON into the
-body as if it were a URL.
-
-Two behaviors will fool you into reporting a failure. The URL 404s until
-something references it, and then goes live a few seconds LATER — so post
-first and check after, because a curl run straight after the upload 404s on a
-perfectly good asset. And an asset outlives its reference: deleting the
-comment that carried it does not delete it.
-
-On a public repo the asset is public once live, so never upload a terminal
-shot with a secret in it. Against a PRIVATE repo it stays private — GitHub
-rewrites the URL at render time into a short-lived signed one, so the image
-renders for repo members while the bare URL 404s for everyone, you included.
-
-This endpoint is undocumented — no REST docs, no `gh` subcommand — so it may
-change without notice. If it starts refusing uploads, fall back to
-~/downloads and hand the user a link.
+browser to paste one from. `agent-box-upload FILE --repo OWNER/REPO` puts the
+file in the same store a human's drag-and-drop uses and prints the markdown to
+paste into the body — no binary committed, no screenshot branch. Run
+`agent-box-upload --help` for the caveats that matter, the first being that
+the URL 404s until your comment references it.
 
 ## Serving a web app publicly
 

@@ -22,6 +22,7 @@ web/payloads/agent-box-profile/bin/agent-box-profile -> vm/payloads/agent-box-pr
 web/payloads/agent-box-session/bin/agent-box-session -> vm/payloads/agent-box-session/bin/agent-box-session
 web/payloads/agent-box-spot-monitor -> vm/payloads/agent-box-spot-monitor
 web/payloads/agent-box-supervisor/bin/agent-box-supervisor -> vm/payloads/agent-box-supervisor/bin/agent-box-supervisor
+web/payloads/agent-box-upload/bin/agent-box-upload -> vm/payloads/agent-box-upload/bin/agent-box-upload
 web/units/agent-box-settings@robot.service -> web/units/agent-box-settings@agent.service
 web/units/agent-box-webhook@robot.service -> web/units/agent-box-webhook@agent.service
 web/units/agent-box@robot.service -> web/units/agent-box@agent.service

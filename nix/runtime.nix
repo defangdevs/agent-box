@@ -157,6 +157,8 @@ let
   # generated wrapper prelude.
   cliPayloads = [
     (payload "agent-box-session-bare" "session-cli.sh")
+    # Needs no env wrapper: it resolves its token from gh at runtime.
+    (payload "agent-box-upload" "upload-cli.sh")
   ] ++ lib.optional webhookEnabled (payload "agent-box-webhook-bare" "webhook-cli.sh");
 
   # Tools agents assume exist, kept in step with the module's
