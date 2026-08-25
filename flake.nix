@@ -613,9 +613,32 @@
               check_payload agent-box-update update.sh
               check_payload agent-box-codex-remote-control codex-remote-control.sh
               check_payload agent-box-claude-session-start-hook claude-session-start-hook.sh
-              check_payload agent-box-env-exec env-exec.py
               check_payload agent-box-session-bare session-cli.sh
               check_payload agent-box-upload upload-cli.sh
+
+              # agent-box-env-exec is Python, not shell (issue #212), and it
+              # is not src/env-exec.py verbatim: src/lib/envstore.py is
+              # spliced in above it, exactly as the module's envExecWrapper
+              # does, so what it must equal is that concatenation — checked
+              # with py_compile rather than bash -n.
+              cat "$srcDir/lib/envstore.py" > want_env_exec.py
+              printf '\n\n' >> want_env_exec.py
+              cat "$srcDir/env-exec.py" >> want_env_exec.py
+              if ! diff -u want_env_exec.py \
+                   <(tail -n +2 "$profile/bin/agent-box-env-exec") >/dev/null; then
+                echo "DRIFT: bin/agent-box-env-exec is not src/lib/envstore.py + src/env-exec.py"
+                diff -u want_env_exec.py \
+                  <(tail -n +2 "$profile/bin/agent-box-env-exec") | head -20 || true
+                fail=1
+              else
+                echo "ok: bin/agent-box-env-exec == src/lib/envstore.py + src/env-exec.py"
+              fi
+              python3 -m py_compile "$profile/bin/agent-box-env-exec" \
+                || { echo "SYNTAX: bin/agent-box-env-exec"; fail=1; }
+              if grep -q '@@include' "$profile/bin/agent-box-env-exec"; then
+                echo "MARKER: bin/agent-box-env-exec still has an @@include@@ marker"
+                fail=1
+              fi
 
               # The settings daemon is the one asset in modules/src that is
               # NOT a finished file: it carries @@include@@ markers for

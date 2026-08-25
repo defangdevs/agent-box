@@ -102,6 +102,16 @@ let
   # (etc.) and silently change the semantics of every payload.
   payload = name: file: pkgs.writeShellScriptBin name (readSrc file);
 
+  # env-exec.py is Python, not shell (issue #212), and it is not
+  # self-contained: it calls load() and uses os without importing either,
+  # relying on src/lib/envstore.py being spliced in above it — exactly as
+  # the module's envExecWrapper does. `payload` above would wrap it in a
+  # bash shebang and hand bash a python file to parse.
+  envStoreLib = readSrc "lib/envstore.py";
+  envExecWrapper = pkgs.writers.writePython3Bin "agent-box-env-exec" {
+    flakeIgnore = [ "E402" "E501" ];
+  } (envStoreLib + "\n\n" + readSrc "env-exec.py");
+
   agentPackage = agent:
     if agent == "claude" then agentPkgs.claude-code
     else if agent == "codex" then agentPkgs.codex
@@ -119,7 +129,7 @@ let
     (payload "agent-box-update" "update.sh")
     (payload "agent-box-codex-remote-control" "codex-remote-control.sh")
     (payload "agent-box-claude-session-start-hook" "claude-session-start-hook.sh")
-    (payload "agent-box-env-exec" "env-exec.py")
+    envExecWrapper
     settingsDaemon
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-spawn" "webhook-spawn.sh")
