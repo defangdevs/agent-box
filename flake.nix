@@ -255,21 +255,32 @@
                   }
                 ];
               };
-              knownUnits =
-                builtins.attrNames phantomBaseline.config.systemd.services
-                ++ builtins.attrNames phantomBaseline.config.systemd.sockets;
               hasAt = n: nixpkgs.lib.hasInfix "@" n;
               # "agent-box-settings@agent" -> "agent-box-settings@": the
               # per-instance override target is expected to differ from the
               # baseline's own username, so only the template half is checked.
               templateOf = n: nixpkgs.lib.head (nixpkgs.lib.splitString "@" n) + "@";
-              flatNames = builtins.filter (n: ! hasAt n) knownUnits;
-              templatePrefixes =
-                nixpkgs.lib.unique (map templateOf (builtins.filter hasAt knownUnits));
-              isKnownUnit = name:
+              # services and sockets are DIFFERENT unit types — a name that
+              # exists only as a socket must still fail a
+              # systemd.services.NAME override targeting it (and vice versa),
+              # so each class gets its own flat/template sets rather than one
+              # merged pool.
+              knownByClass = {
+                services = builtins.attrNames phantomBaseline.config.systemd.services;
+                sockets = builtins.attrNames phantomBaseline.config.systemd.sockets;
+              };
+              setsFor = class:
+                let known = knownByClass.${class}; in
+                {
+                  flatNames = builtins.filter (n: ! hasAt n) known;
+                  templatePrefixes =
+                    nixpkgs.lib.unique (map templateOf (builtins.filter hasAt known));
+                };
+              isKnownUnit = class: name:
+                let sets = setsFor class; in
                 if hasAt name
-                then builtins.elem (templateOf name) templatePrefixes
-                else builtins.elem name flatNames;
+                then builtins.elem (templateOf name) sets.templatePrefixes
+                else builtins.elem name sets.flatNames;
 
               # `systemd.services.NAME` / `systemd.sockets.NAME` at attribute-path
               # position, NAME bare ("caddy") or quoted with an "@" instance
@@ -282,7 +293,8 @@
                   matches = builtins.filter builtins.isList
                     (builtins.split pattern (builtins.readFile file));
                 in
-                map (g: { name = builtins.elemAt g 1; inherit file; }) matches;
+                map (g: { class = builtins.elemAt g 0; name = builtins.elemAt g 1; inherit file; })
+                  matches;
 
               # Every test node config and published host example — the two
               # places an override can name a unit that no longer exists.
@@ -293,15 +305,16 @@
               scanFiles = nixFilesIn ./tests ++ nixFilesIn ./hosts;
 
               overrides = builtins.concatMap namesInFile scanFiles;
-              phantoms = builtins.filter (o: ! isKnownUnit o.name) overrides;
+              phantoms = builtins.filter (o: ! isKnownUnit o.class o.name) overrides;
             in
             if phantoms != [ ]
             then
               throw (
                 "phantom systemd unit override(s) — name not found among the " +
-                "module's own rendered units (renamed unit? missing \"@\"?):\n" +
+                "module's own rendered units of that class (renamed unit? " +
+                "wrong class? missing \"@\"?):\n" +
                 nixpkgs.lib.concatMapStringsSep "\n"
-                  (o: "  ${toString o.file}: systemd.services/sockets.${o.name}")
+                  (o: "  ${toString o.file}: systemd.${o.class}.${o.name}")
                   phantoms
               )
             else
