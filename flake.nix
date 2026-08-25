@@ -240,6 +240,86 @@
               printf 'downloads route present in generated Caddyfile\n' > "$out"
             '';
 
+          # Guard: the module's REAL generated Caddyfile (every VM test swaps
+          # in a `tls internal` stand-in) must give each session a path of
+          # its own — /<user>/<session>/ rewritten onto ttyd's own path with
+          # the session in ?arg= — and must keep the bare /<user>/ landing
+          # page pointed at the settings daemon. It also has to PARSE: a
+          # typo in a matcher here takes the whole web UI down at once, and
+          # nothing else in CI adapts this file. Cheap: realises only the
+          # tiny rendered config, then adapts it with stand-in secrets.
+          session-route =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      # A SECOND user, because the point of the scheme is
+                      # hosting several on one Caddy (issue #221): every user
+                      # must get their own landing page and session paths, not
+                      # just the one whose daemon serves the vhost root.
+                      users.bob.web.passwordHashFile = "/var/lib/agent-box-web/bob-hash";
+                      web = {
+                        enable = true;
+                        domain = "sessions.test";
+                        user = "agent";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-session-route-ok"
+              { caddyfile = sys.config.services.caddy.configFile;
+                nativeBuildInputs = [ pkgs.caddy ]; } ''
+              # The landing page is the daemon's, and only without an arg=:
+              # the session routes rewrite onto this same path WITH one, and
+              # ttyd has to keep receiving those.
+              grep -qF 'path /agent/' "$caddyfile"
+              grep -qF 'not query arg=*' "$caddyfile"
+              # One path per session, plus the canonical trailing slash.
+              grep -qF 'path_regexp sess_agent ^/agent/([^/]+)/(.*)$' "$caddyfile"
+              grep -qF 'rewrite @sess_agent /agent/{re.sess_agent.2}?arg={re.sess_agent.1}&{query}' "$caddyfile"
+              grep -qF 'redir @sess_bare_agent /agent/{re.bare_agent.1}/' "$caddyfile"
+              # The names a session may not take are excluded from both, so
+              # the pages that own them keep answering.
+              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/webhook*' "$caddyfile"
+              # Ordering: the rewrite must be emitted before the catch-all it
+              # feeds, and the landing page before it too.
+              rw=$(grep -n 'rewrite @sess_agent' "$caddyfile" | cut -d: -f1)
+              home=$(grep -n 'handle @home_agent {' "$caddyfile" | cut -d: -f1)
+              catchall=$(grep -n 'handle /agent/\* {' "$caddyfile" | cut -d: -f1)
+              [ "$home" -lt "$catchall" ]
+              [ "$rw" -lt "$catchall" ]
+              # And it all parses. The secrets are Caddy env placeholders,
+              # absent in a build sandbox: stand-ins keep basic_auth happy.
+              # One set PER USER — an unset algorithm placeholder collapses to
+              # nothing and Caddy then reads the login name as the algorithm,
+              # which is its own reason to adapt this file in CI.
+              WEB_PASSWORD_ALGORITHM_AGENT=bcrypt \
+              WEB_PASSWORD_HASH_AGENT='$2a$14$ptCNRCTOMkoUnEXBv0kPWuOJHhYtnpBWQZbLFXW/Ehg5AGKQMoS/W' \
+              WEB_COOKIE_SECRET_AGENT=0123456789abcdef \
+              WEB_PASSWORD_ALGORITHM_BOB=bcrypt \
+              WEB_PASSWORD_HASH_BOB='$2a$14$ptCNRCTOMkoUnEXBv0kPWuOJHhYtnpBWQZbLFXW/Ehg5AGKQMoS/W' \
+              WEB_COOKIE_SECRET_BOB=fedcba9876543210 \
+                caddy validate --config "$caddyfile" --adapter caddyfile
+              # The second user gets the same shape, on their own path.
+              grep -qF 'handle @home_bob {' "$caddyfile"
+              grep -qF 'path_regexp sess_bob ^/bob/([^/]+)/(.*)$' "$caddyfile"
+              grep -qF 'rewrite @sess_bob /bob/{re.sess_bob.2}?arg={re.sess_bob.1}&{query}' "$caddyfile"
+              bobrw=$(grep -n 'rewrite @sess_bob' "$caddyfile" | cut -d: -f1)
+              bobcatch=$(grep -n 'handle /bob/\* {' "$caddyfile" | cut -d: -f1)
+              [ "$bobrw" -lt "$bobcatch" ]
+              printf 'per-session routes present for every user, and the Caddyfile adapts\n' > "$out"
+            '';
+
           # Guard (issue #101): the module's REAL generated Caddyfile (the VM
           # test below swaps in a `tls internal` stand-in) must route the
           # webhook path to the user's ingress socket, BEFORE the /<user>/*
@@ -388,6 +468,92 @@
               python3 repo/bin/assemble-module.py --check --repo repo
               touch "$out"
             '';
+
+          # Unit test for the assembler's Nix escaping (issue #244).
+          # module-generated-up-to-date cannot catch an escaping bug — it
+          # regenerates the file with the same assembler, so the check and the
+          # bug agree on the wrong bytes. This one decodes the escaped text the
+          # way Nix's lexer does and round-trips a corpus through it.
+          assemble-module-escaping =
+            pkgs.runCommand "agent-box-assemble-module-escaping"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                assembler = ./bin/assemble-module.py;
+                tests = ./tests/test-assemble-module.py;
+              } ''
+              install -d repo/bin repo/tests
+              cp "$assembler" repo/bin/assemble-module.py
+              cp "$tests" repo/tests/test-assemble-module.py
+              # Not piped into tee: the log has to reach the build output
+              # whether the tests pass or fail, and the exit status has to be
+              # python's own.
+              python3 repo/tests/test-assemble-module.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # Unit test for the env store's format (issue #212). The VM tests
+          # prove one PEM survives one caller at 300+ seconds a run; this
+          # pins the format itself — round trip, no key injection, and the
+          # legacy readings a deployed box's file relies on — in a second,
+          # natively, on every architecture. It also composes and runs the
+          # CLI the way the generated module does, so the library and its
+          # front end cannot drift apart unnoticed.
+          envstore-format =
+            pkgs.runCommand "agent-box-envstore-format"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                envstoreLib = ./modules/src/lib/envstore.py;
+                envstoreCli = ./modules/src/envstore-cli.py;
+                tests = ./tests/test-envstore.py;
+              } ''
+              install -d repo/modules/src/lib repo/tests
+              cp "$envstoreLib" repo/modules/src/lib/envstore.py
+              cp "$envstoreCli" repo/modules/src/envstore-cli.py
+              cp "$tests" repo/tests/test-envstore.py
+              # Not piped into tee: the log has to reach the build output
+              # whether the tests pass or fail, and the exit status has to be
+              # python's own.
+              python3 repo/tests/test-envstore.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # The session registry's write protocol (issues #254, #289). The VM
+          # tests deliberately avoid concurrency — they stop the supervisor, or
+          # write once so the first spawn sees the final config — so a lock
+          # that stopped working would cost 300s a run and still go unnoticed
+          # (issue #285). This runs the real library, composed the way the
+          # generated module composes it, against real concurrent writers, in
+          # about ten seconds on every architecture. It also holds the settings
+          # daemon's fcntl side and the shell side to the same sidecar file,
+          # which is the one agreement nothing else checks.
+          registry-protocol =
+            pkgs.runCommand "agent-box-registry-protocol"
+              {
+                nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.jq pkgs.util-linux pkgs.coreutils ];
+                registryLib = ./modules/src/lib/registry.sh;
+                tests = ./tests/test-registry.py;
+              } ''
+              install -d repo/modules/src/lib repo/tests
+              cp "$registryLib" repo/modules/src/lib/registry.sh
+              cp "$tests" repo/tests/test-registry.py
+              # Not piped into tee: the log has to reach the build output
+              # whether the tests pass or fail, and the exit status has to be
+              # python's own.
+              python3 repo/tests/test-registry.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
         }
         # Everything below boots a guest, so it only exists for `vmSystems`:
         # runNixOSTest wants a same-arch KVM guest (cross-arch falls back to
@@ -398,17 +564,16 @@
           # proof (compiles the system agents would run in).
           vm-closure = self.nixosConfigurations.vm.config.system.build.vm;
 
-          # Interactive VM test: wrong-password basic-auth attempts on the web
-          # terminal get the client IP banned. Needs KVM (or slow TCG); CI
-          # enables /dev/kvm before building this.
-          web-fail2ban = pkgs.testers.runNixOSTest
-            (import ./tests/web-fail2ban.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test: an agent user drops a snippet into ~/sites/
-          # and reloads caddy via the sudoAllowlist rule; the new vhost
-          # serves without any nixos-rebuild.
-          self-serve-domain = pkgs.testers.runNixOSTest
-            (import ./tests/self-serve-domain.nix { agent-box = self.nixosModules.agent-box; });
+          # Interactive VM test for the whole user-facing web surface, in one
+          # guest (issue #312 — this was three tests with the same node
+          # definition): the per-user ~/downloads file drop served behind the
+          # auth gate (issue #132), an agent adding a vhost by writing ~/sites/
+          # and reloading caddy via the sudoAllowlist rule with no
+          # nixos-rebuild (issue #40), and wrong-password basic-auth attempts
+          # getting the client IP banned by the fail2ban jail. Needs KVM (or
+          # slow TCG); CI enables /dev/kvm before building this.
+          web-surface = pkgs.testers.runNixOSTest
+            (import ./tests/web-surface.nix { agent-box = self.nixosModules.agent-box; });
 
           # Interactive VM test: the per-user settings page (issue #36) adds a
           # secret through the browser (behind basic auth), writes the
@@ -416,6 +581,9 @@
           # picks the file up as an optional EnvironmentFile — no rebuild.
           settings-page = pkgs.testers.runNixOSTest
             (import ./tests/settings-page.nix { agent-box = self.nixosModules.agent-box; });
+
+          connect = pkgs.testers.runNixOSTest
+            (import ./tests/connect.nix { agent-box = self.nixosModules.agent-box; });
 
           # Interactive VM test (issue 62): protectMemory defaults — zram
           # swap active, agent unit's OOMScoreAdjust applied, and earlyoom
@@ -429,18 +597,20 @@
           # seeded "main" session starts, `agent-box-session add/rm` brings a
           # second agent up and down as the user (no sudo, no rebuild), the
           # runtime session lives inside the hardened unit's cgroup, and the
-          # settings daemon serves the root session manager page plus its
-          # CRUD routes, all behind the web auth gate.
+          # supervisor's own bookkeeping survives two writers racing it.
           sessions = pkgs.testers.runNixOSTest
             (import ./tests/sessions.nix { agent-box = self.nixosModules.agent-box; });
 
-          # Interactive VM test (issue #132): each web user's ~/downloads
-          # file-drop dir is served behind the terminal's basic auth at
-          # /<user>/downloads/, so an agent can hand a produced file to the
-          # user as a URL — perms/symlink, caddy reachability, and the auth
-          # gate.
-          download-files = pkgs.testers.runNixOSTest
-            (import ./tests/download-files.nix { agent-box = self.nixosModules.agent-box; });
+          # The browser half of the same box (issue #312 — this and `sessions`
+          # were one test that ran for 325s, more than the other five checks
+          # put together, so no amount of --max-jobs could shorten the wave):
+          # the tabbed workspace at /<user>/, the settings page's session
+          # manager, the /sessions/* CRUD routes, the live feed and the
+          # transcript download, all behind the web auth gate. Shares
+          # tests/sessions-common.nix with `sessions`, so both halves drive
+          # the same box.
+          sessions-web = pkgs.testers.runNixOSTest
+            (import ./tests/sessions-web.nix { agent-box = self.nixosModules.agent-box; });
 
           # Interactive VM test (issue #101): the per-user webhook receiver, ON
           # BY DEFAULT. Socket-activated 0660 <user>:caddy ingress, the

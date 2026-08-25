@@ -47,13 +47,34 @@
       .then(function (r) { if (!r.ok) { throw new Error(); } return r.json(); })
       .catch(function () { return null; });
   }
+  // Re-fetch the page this script is running on.
+  //
+  // The daemon can decide the current URL is no longer the right page:
+  // /<user>/ redirects to the settings page once the last session is gone.
+  // Splicing fragments out of THAT answer patches nothing — applyDoc skips an
+  // id the other document does not have — so the tab bar would sit there
+  // showing a session that no longer exists until someone reloaded by hand.
+  // Follow the redirect for real instead.
+  function fetchPage() {
+    var here = window.location.pathname;
+    return fetch(here + window.location.search).then(function (r) {
+      if (r.redirected && new URL(r.url).pathname !== here) {
+        window.location.replace(r.url);
+        return null;
+      }
+      return r.text();
+    });
+  }
   // Re-fetch the current page and patch the live session list/tabs, so
   // the visible list tracks a restart even when nothing was "starting"
   // at submit time (which is what otherwise gates schedulePoll).
   function pollPageOnce() {
-    return fetch(window.location.pathname + window.location.search)
-      .then(function (r) { return r.text(); })
-      .then(function (t) { applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]); wsSync(); })
+    return fetchPage()
+      .then(function (t) {
+        if (t === null) { return; }
+        applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+        wsSync();
+      })
       .catch(function () {});
   }
   // Coalescing wrapper for the live feed, which can report a burst of
@@ -222,9 +243,9 @@
       pollTimer = null;
       // Keep the query string: on the workspace it carries ?tab=, so
       // the fetched tab bar marks the same tab current.
-      fetch(window.location.pathname + window.location.search)
-        .then(function (r) { return r.text(); })
+      fetchPage()
         .then(function (t) {
+          if (t === null) { return; }
           applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
           wsSync();
           schedulePoll();
@@ -233,6 +254,29 @@
   }
   // The burst poll is the no-feed fallback for "starting" → "live"; with
   // the live feed attached the daemon reports that transition itself.
+  // Guided sign-in (issues #207, #208, #313). While a card is
+  // mid-flight its state moves without this page posting anything: the
+  // CLI prints its URL a beat after start, and the sign-in itself
+  // completes in another tab entirely. So re-fetch and swap the section
+  // while it reports itself busy, and stop as soon as it does not —
+  // there is nothing to watch on a page whose cards are all settled.
+  var connectTimer = null;
+  function connectBusy() {
+    var el = document.getElementById("connect-list");
+    return !!el && el.getAttribute("data-busy") === "1";
+  }
+  function connectPoll() {
+    if (connectTimer || !connectBusy()) { return; }
+    connectTimer = window.setTimeout(function () {
+      connectTimer = null;
+      if (document.hidden) { connectPoll(); return; }
+      fetchPage()
+        .then(function (t) { if (t !== null) { applyDoc(parseHTML(t), ["connect-list"]); } })
+        .catch(function () {})
+        .then(function () { connectPoll(); });
+    }, 2500);
+  }
+
   function startPolling(n) {
     if (liveFeed) { return; }
     pollLeft = n;
@@ -369,8 +413,10 @@
     var el;
     if (tabLive(name)) {
       el = document.createElement("iframe");
+      // data-term-base is this user's own path with its trailing slash;
+      // a session hangs off it as a path segment, not a query.
       el.src = tabBar().getAttribute("data-term-base") +
-               "?arg=" + encodeURIComponent(name);
+               encodeURIComponent(name) + "/";
       el.title = name + " terminal";
       el.setAttribute("allow", "clipboard-read; clipboard-write");
       el.className = "pane";
@@ -400,7 +446,8 @@
     document.querySelectorAll("#panes .pane").forEach(function (p) {
       p.classList.toggle("active", p === pane);
     });
-    history.replaceState(null, "", "/?tab=" + encodeURIComponent(name));
+    history.replaceState(null, "", bar.getAttribute("data-term-base") +
+                         "?tab=" + encodeURIComponent(name));
     if (focus && pane.tagName === "IFRAME") {
       try { pane.contentWindow.focus(); } catch (err) { /* cross-origin never happens; be safe */ }
     }
@@ -535,7 +582,7 @@
       var key = form.querySelector("input[name=key]");
       key.value = t.getAttribute("data-edit");
       key.readOnly = true;
-      form.querySelector("input[name=value]").focus();
+      form.querySelector("[name=value]").focus();
       return;
     }
     var el = document.getElementById(t.getAttribute("data-toggle"));
@@ -575,10 +622,12 @@
 
     function afterPost(t) {
       applyDoc(parseHTML(t),
-        ["msg-slot", "secrets-list", "sessions-list", "webhooks-list", "tab-bar"]);
+        ["msg-slot", "secrets-list", "sessions-list", "webhooks-list",
+         "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");
       if (ed) { f.reset(); ed.hidden = true; }
       var added = wsActive();   // the tab the fetched page marks current
+      connectPoll();
       if (tabsBefore && added && tabsBefore.indexOf(added) < 0) { wsSelect(added, true); }
       else if (wasActive && tabEl(wasActive)) { wsSelect(wasActive, false); }
       wsSync();
@@ -712,7 +761,13 @@
   });
   document.addEventListener("focusin", function (e) {
     var input = e.target;
-    if (input && input.hasAttribute && input.hasAttribute("data-dir-input")) { acFetch(input); }
+    if (input && input.hasAttribute && input.hasAttribute("data-dir-input")) {
+      // The field starts on the untouched default "~": select it so the
+      // first keystroke replaces it instead of appending, which is what
+      // produced an invalid "~docu" (issue #308).
+      if (input.value === "~") { input.select(); }
+      acFetch(input);
+    }
   });
   document.addEventListener("focusout", function (e) {
     var input = e.target;
@@ -747,6 +802,7 @@
 
   checkForUpdate();
   liveUpdates();
+  connectPoll();
   // Land in the terminal: focus the server-selected tab's pane.
   if (wsActive()) { wsSelect(wsActive(), true); }
   // Still armed for the moment before the feed reports itself open; it

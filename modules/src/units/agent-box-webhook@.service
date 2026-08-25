@@ -13,6 +13,17 @@ Environment=LOCAL_WEBHOOK_STATE_DIR=/home/%i/.local/state/local-webhook
 Environment=LOCAL_WEBHOOK_PORT=0
 EnvironmentFile=-/etc/agent-box/units/agent-box-webhook-%i.env
 EnvironmentFile=-/etc/agent-box/units/agent-box-webhook-%i.local.env
+# LOCAL_WEBHOOK_SELF: who this box acts as, so "@self" in a standing
+# watch's ignoreSenders resolves (issue #261). Written by
+# agent-box-webhook-self from the token in a SESSION's environment - the
+# only place that token exists - which is why this is a file the receiver
+# reads and not a value the module declares: the identity follows the
+# token, and the token arrives (and is swapped) at runtime. Optional
+# ("-"): absent before the first session resolves it, and on a box whose
+# user never gives the agent a token. Loaded at start, so a re-resolved
+# login reaches the daemon on its next restart; sessions pick it up as
+# they respawn.
+EnvironmentFile=-/home/%i/.local/state/local-webhook/self.env
 ExecStartPre=agent-box-webhook-policy-apply
 ExecStart=agent-box-webhook-receiver
 StandardInput=null

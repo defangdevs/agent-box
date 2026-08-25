@@ -1,14 +1,24 @@
 # agent-box
 
 You run inside an agent-box deployment: a coding agent in a persistent tmux
-session on a locked-down NixOS host. Your browser terminal is at
-$AGENT_BOX_URL (`echo $AGENT_BOX_URL` prints it). Share that URL with anyone
-who needs to view or take over your session; the sign-in username is your
-own login name (`whoami`) and the password was set at deploy time.
+session on a locked-down NixOS host. Your workspace is at $AGENT_BOX_URL
+(`echo $AGENT_BOX_URL` prints it): one tab per session, and each session also
+has a terminal of its own at ${AGENT_BOX_URL}<session>/. Share those URLs
+with anyone who needs to view or take over your session; the sign-in username
+is your own login name (`whoami`) and the password was set at deploy time.
 
 The user connects to this box over the web, so point them at full absolute
 URLs built from $AGENT_BOX_URL — never a bare local path or a link relative
 to the terminal, which a remote user can't act on.
+
+Assume they have no shell here. They may be reading you from a phone, a chat
+client or the web terminal, and cannot run a command you suggest, paste its
+output back, or open a file to see what is in it — you are their hands on
+this machine. So run the command yourself instead of handing over a list to
+try, read the file instead of asking what it contains, and quote the output
+that matters instead of naming the path it lives in. What can only be
+settled on the host, settle on the host; what genuinely cannot, say so
+plainly rather than handing it back.
 
 ## Your environment
 
@@ -29,6 +39,11 @@ to the terminal, which a remote user can't act on.
   Claude Code under ~/.claude/projects/ (plus ~/.claude/history.jsonl),
   Codex under ~/.codex/sessions/. After a respawn, or when you take over
   another agent's session, skim the most recent one before writing code.
+- Your harness's own configuration lives under $HOME and so survives a
+  respawn: ~/.claude/ for Claude Code (settings.json, skills/, commands/,
+  and the transcripts under projects/), ~/.codex/ for Codex. A skill, a
+  slash command or a hook you want the NEXT session to have goes there —
+  and notes for your future self go in ~/AGENTS.md, which is yours to edit.
 - sudo is a tight allowlist (essentially caddy reload + self-update), not
   general root — don't plan around arbitrary sudo.
 
@@ -41,7 +56,12 @@ to the terminal, which a remote user can't act on.
   and `#` comment lines are ignored, so annotate freely). Set them with
   `agent-box-session env set KEY VALUE` (or `env ls` / `env rm KEY`, or the
   settings page); they load on the next session (re)start — e.g. GH_TOKEN is
-  read automatically, so `git clone https://github.com/...` just works.
+  read automatically, so `git clone https://github.com/...` just works. A
+  value may span lines, so a PEM or an SSH key goes in whole:
+  `agent-box-session env set MY_KEY --stdin < key.pem` (--stdin also keeps
+  the value out of the command line, the shell history and `ps`). Such a
+  value is stored double-quoted, which is the one thing to preserve if you
+  ever hand-edit the file.
 - Manage your own sessions without a rebuild:
   `agent-box-session ls|add|rm|stop|restart`. `add` takes an optional name
   plus `--agent claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` —
@@ -52,6 +72,16 @@ to the terminal, which a remote user can't act on.
   not respawned — until `restart NAME` revives it; `rm` delists it for
   good. `restart --all` bounces every session. Listed sessions start
   within ~2s.
+- `--agent` picks the HARNESS (the CLI program). An agent PROFILE is the
+  worker: a harness plus a model, an effort level, an appended system prompt
+  and environment. Make one with `agent-box-profile set NAME
+  HARNESS=claude MODEL=sonnet EFFORT=low KEY=value`, read it back with
+  `agent-box-profile show NAME`, and start it with `agent-box-session add
+  [NAME] --profile PROFILE`. A `-- EXTRA_ARGS` tail still wins over the
+  profile. Profile env is convenience, not isolation: every session of this
+  user can read it out of /proc. A standing webhook watch hands its work to
+  a profile through `agent-box-session env set AGENT_BOX_HOOK_PROFILE NAME`,
+  which is the only way to pick the harness a dispatched hook-* session runs.
 
 ## Slash commands: type them into your own pane
 
@@ -110,13 +140,27 @@ then reload caddy — no rebuild:
       reverse_proxy 127.0.0.1:3000
     }
 
-`sudo systemctl reload caddy.service` picks it up and Caddy gets a Let's
-Encrypt cert on first request if DNS for that name points at this box.
-Reverse-proxy to your process; don't `file_server` from $HOME (caddy can't
-read /home).
+`sudo /run/current-system/sw/bin/systemctl reload caddy.service` picks it up
+and Caddy gets a Let's Encrypt cert on first request if DNS for that name
+points at this box. Reverse-proxy to your process; don't `file_server` from
+$HOME (caddy can't read /home). Use the full path shown, not bare
+`systemctl` — the sudoers rule matches on the exact command path, and a bare
+`systemctl` resolves through PATH to a Nix store path that won't match,
+silently falling back to asking for a password.
 
 ## Updating
 
 Update the box's software with:
-`sudo systemctl start agent-box-update.service`
-(kills the running tmux session — save context first).
+`sudo /run/current-system/sw/bin/systemctl start agent-box-update.service`
+(kills the running tmux session — save context first). As above, the full
+path is required for the passwordless sudo rule to match.
+
+## This platform has its own upstream repo
+
+The box itself — the terminal, session manager, webhook wiring, this guide
+— is github.com/defangdevs/agent-box, the repo the update service above
+pulls from. A bug in that platform is not the same as a bug in the user's
+project: if you hit one, first work around it so your own running session
+is unblocked, then file an issue (or a PR, if you already have the fix)
+upstream so every other deployment gets it too. Search for an existing
+issue before opening one, and don't wait for permission to file it.

@@ -39,6 +39,7 @@ advice() {
     echo "session '$want' is stopped: it is still listed, but nothing will"
     echo "bring it back on its own. Press Start on the settings page, or run:"
     echo "  agent-box-session restart $want"
+    echo "then reload this page — Start does not reconnect this pane on its own."
   else
     echo "session '$want' is starting — the supervisor spawns it within a few"
     echo "seconds. Reload this page."

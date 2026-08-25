@@ -46,7 +46,7 @@ Metadata:
       PublicIpv4:
         default: Allocate a public IPv4 (costs ~$3.60/mo)
       Nat64:
-        default: "IPv6-only mode: reach IPv4-only sites (github.com) via public NAT64"
+        default: "If IPv6-only (PublicIpv4=false): reach IPv4-only sites (github.com) via public NAT64"
       AllowCidr:
         default: IPv4 CIDR allowed to reach 443
       EnableSsm:
@@ -129,13 +129,15 @@ Parameters:
 
   PublicIpv4:
     Type: String
-    Default: 'false'
+    Default: 'true'
     AllowedValues: ['true', 'false']
     Description: >-
-      false (default): IPv6-only. No public IPv4 charge (~$0/mo for the
-      network address). Requires the client to have IPv6 connectivity.
-      true: allocate an Elastic IP for a stable IPv4. ~$3.60/mo per AWS's
-      2024 IPv4 pricing (charged for any public IPv4, EIP or not).
+      true (default): allocate an Elastic IP for a stable IPv4, so the box is
+      reachable regardless of the client's own connectivity. ~$3.60/mo per
+      AWS's 2024 IPv4 pricing (charged for any public IPv4, EIP or not).
+      false: IPv6-only, no public IPv4 charge (~$0/mo for the network
+      address) — set this only if you know the client reaching the box has
+      real IPv6 connectivity (corporate/coffee-shop networks often don't).
 
   Nat64:
     Type: String
@@ -153,18 +155,19 @@ Parameters:
 
   UseSpot:
     Type: String
-    Default: 'true'
+    Default: 'false'
     AllowedValues: ['true', 'false']
     Description: >-
-      true (default): run as a persistent Spot instance (currently ~50-60%
-      cheaper for t4g in the four launch regions — the deep 70-90% Spot
-      discounts don't apply to these small Graviton types).
-      On a Spot interruption AWS stops the instance and restarts the SAME
-      instance in the SAME AZ when capacity returns, so the root volume,
-      IPv6 address, and TLS cert all survive. The live tmux session does
-      not (RAM is lost on any stop). Risk: if this AZ+type pool stays
-      capacity-starved, the box stays stopped until it frees up.
-      false: on-demand (always available, full price).
+      false (default): on-demand (always available, full price). true: run
+      as a persistent Spot instance (currently ~50-60% cheaper for t4g in
+      the four launch regions — the deep 70-90% Spot discounts don't apply
+      to these small Graviton types). On a Spot interruption AWS stops the
+      instance and restarts the SAME instance in the SAME AZ when capacity
+      returns, so the root volume, IPv6 address, and TLS cert all survive.
+      The live tmux session does not (RAM is lost on any stop). Risk: if
+      this AZ+type pool stays capacity-starved, the box stays stopped
+      until it frees up — set this only if you're comfortable with that
+      tradeoff for the lower price.
 
   WebPassword:
     Type: String
@@ -189,15 +192,17 @@ Parameters:
       ## This box (AWS / EC2)
 
       - This is an EC2 instance. The root disk persists but RAM does not: on a
-        reboot or Spot interruption (Spot is the default) the instance stops
-        and later restarts with the same disk, IP, and TLS cert, but the live
-        tmux session is gone. Save working context to disk under your home.
+        reboot (or a Spot interruption, if this stack was launched with
+        UseSpot=true) the instance stops and later restarts with the same
+        disk, IP, and TLS cert, but the live tmux session is gone. Save
+        working context to disk under your home.
       - Your URL is derived from the instance IP via sslip.io and changes if
         the public IP changes, so always read $AGENT_BOX_URL rather than
         hard-coding the hostname.
-      - The box is IPv6-only by default; IPv4-only sites such as github.com
-        are reached through a public NAT64 relay, so expect the occasional
-        IPv4 reachability quirk.
+      - The box has a public IPv4 by default. If this stack was launched with
+        PublicIpv4=false instead (IPv6-only), IPv4-only sites such as
+        github.com are reached through a public NAT64 relay, so expect the
+        occasional IPv4 reachability quirk.
       - Low on disk? Enlarge the EBS root volume in the EC2 console and reboot
         — NixOS grows the filesystem automatically; scheduled nix garbage
         collection also reclaims space.
@@ -212,8 +217,9 @@ Parameters:
       (persistence, sslip.io URL, IPv6/NAT64, growing the disk). Edit or clear
       it to taste; whatever you leave here lands below the built-in default.
       AGENTS.md is the cross-vendor agent-instructions convention read
-      natively by codex and opencode, and by claude-code as a CLAUDE.md
-      fallback. Content is embedded into user-data as a Nix indented string,
+      natively by codex and opencode; claude reads CLAUDE.md instead, and the
+      module seeds pointer files so a claude session picks this text up too.
+      Content is embedded into user-data as a Nix indented string,
       so avoid the sequences `${` and `''` in the body — Nix will otherwise
       try to antiquote / close the string mid-file. Plain $VAR (no braces) is
       fine.
@@ -306,13 +312,13 @@ Mappings:
   # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py — do not edit by hand)
   RegionMap:
     us-east-1:
-      AMI: ami-08c2437d4e9fc6903
+      AMI: ami-0ab0ad49715851e61
     us-west-2:
-      AMI: ami-010c75bea7b8a5505
+      AMI: ami-0a87a54d3b990fb11
     eu-central-1:
-      AMI: ami-032146ebb2743eaee
+      AMI: ami-019a83797574d9161
     eu-west-1:
-      AMI: ami-05d65d15c896c7db4
+      AMI: ami-0dcdf7de64f060400
   # END AMI MAP
 
 Resources:

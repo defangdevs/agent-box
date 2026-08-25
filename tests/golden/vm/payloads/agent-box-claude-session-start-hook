@@ -1,15 +1,16 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
 set -u
 # SessionStart hook for supervisor-spawned claude sessions (issue #223).
-# /clear rotates claude's live session id mid-process: the running process
-# keeps its Remote Control registration but starts a NEW transcript under a
-# new uuid, while sessions.json still holds the id the spawn was launched
-# with. The next respawn would then `--resume` the pre-/clear transcript —
-# resurrecting the conversation the user explicitly cleared away and
-# orphaning the one that replaced it. So on every SessionStart (startup,
-# resume, clear, compact — stdin carries the hook's JSON payload) record the
-# live session id, keyed by the LAUNCH id the supervisor put in the pane
-# environment; the supervisor follows that record on the next respawn.
+# A clear, a compact or a resume rotates claude's live session id
+# mid-process: the running process keeps its Remote Control registration but
+# opens a NEW transcript under a new uuid, while the supervisor still holds
+# the id the spawn was launched with. The next respawn would then `--resume`
+# the segment the user rotated away from — resurrecting a conversation that
+# was deliberately left behind and orphaning the one that replaced it. So on
+# every SessionStart (startup, resume, clear, compact — stdin carries the
+# hook's JSON payload) record the live session id, keyed by the LAUNCH id the
+# supervisor put in the pane environment; the supervisor follows that record
+# on the next respawn.
 #
 # A hook must never break a session, and SessionStart stdout is shown to the
 # user: any missing/invalid input is a SILENT no-op (also the case outside a

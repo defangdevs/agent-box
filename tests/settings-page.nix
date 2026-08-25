@@ -287,6 +287,48 @@
         )
         machine.succeed(agent_env + " | grep -x 'UI_KEEP=stays' >/dev/null")
 
+    # A PEM is the value people actually need this form for (issue #212), and
+    # a browser textarea posts its newlines as CRLF. What the session reads
+    # back must be the text that was pasted: one key, LF line ends, whole.
+    with subtest("a multi-line secret posted from the page reaches a session"):
+        client.succeed(
+            "printf '%s\\r\\n' '-----BEGIN PRIVATE KEY-----' 'MIIBVgIBADANBg==' "
+            "> /tmp/pem && printf '%s' '-----END PRIVATE KEY-----' >> /tmp/pem"
+        )
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "-d 'key=UI_PEM' --data-urlencode 'value@/tmp/pem' "
+            "https://box.test/agent/settings/set | grep -x 303"
+        )
+        # ONE quoted entry in the file, still 0600.
+        machine.succeed(
+            "grep -qx 'UI_PEM=\"-----BEGIN PRIVATE KEY-----' "
+            "/home/agent/.config/agent-box/env"
+        )
+        machine.succeed(
+            "stat -c '%U %a' /home/agent/.config/agent-box/env | grep -x 'agent 600'"
+        )
+        # The page still lists the NAME and never a line of the value.
+        page = client.succeed(f"{curl} -u agent:testpassword https://box.test/agent/settings/")
+        assert "UI_PEM" in page, page
+        assert "BEGIN PRIVATE KEY" not in page, "value must never be rendered"
+        wait_new_pane(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "-d 'name=main' https://box.test/sessions/restart | grep -x 303"
+        )
+        # First and last line both arrive, so the middle did too...
+        machine.wait_until_succeeds(
+            agent_env + " | grep -x 'UI_PEM=-----BEGIN PRIVATE KEY-----' >/dev/null",
+            timeout=30,
+        )
+        machine.succeed(agent_env + " | grep -x -- '-----END PRIVATE KEY-----' >/dev/null")
+        # ...and the CRs the form posted are not in it.
+        machine.fail(agent_env + " | grep \"$(printf '\\r')\" >/dev/null")
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "-d 'key=UI_PEM' https://box.test/agent/settings/delete | grep -x 303"
+        )
+
     # ...and "Restart all" bounces the WHOLE unit (the daemon SIGTERMs the
     # supervisor — no sudo), so unit-level EnvironmentFiles (the host's
     # environmentFiles) are re-read, and a DELETED key is gone from the next

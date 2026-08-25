@@ -47,6 +47,53 @@ handle /@USER@/downloads/* {
     }
   }
 }
+# @USER@'s landing page: the tabbed workspace (and, on a box with no
+# session yet, a redirect to the settings page — a tab bar with nothing
+# in it is not what its owner needs first). Served by the settings daemon,
+# and matched ONLY without an arg= query, which is what separates it from
+# the terminal below: the session routes rewrite to this same path with
+# arg=<session> attached, and ttyd has to keep receiving those.
+@home_@USER@ {
+  path /@USER@/
+  not query arg=*
+}
+handle @home_@USER@ {
+  @cookie_home_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
+  handle @cookie_home_@USER@ {
+    reverse_proxy unix/@SETTINGS_SOCKET@
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
+        @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      reverse_proxy unix/@SETTINGS_SOCKET@
+    }
+  }
+}
+# One path per session: /@USER@/<session>/ is that session's terminal, and
+# everything ttyd asks for from a page loaded there (its ws and token
+# endpoints, resolved relative to the URL in the address bar) hangs off the
+# same prefix. Both are rewritten onto ttyd's own path with the session
+# named in ?arg=, which is the selector --url-arg feeds to the attach
+# wrapper — so a session gets a real URL of its own, and nothing about
+# ttyd's own routing changes.
+#
+# The exclusions are the names this vhost has already spent: no lookahead
+# in RE2, so they are a `not path` beside the regexp rather than part of
+# it, and the session name rules (CLI, daemon, module assertion) refuse
+# exactly this set so no session can be shadowed by one of them.
+@sess_bare_@USER@ {
+  path_regexp bare_@USER@ ^/@USER@/([^/]+)$
+  not path /@USER@/settings /@USER@/downloads /@USER@/webhook /@USER@/token /@USER@/ws
+}
+redir @sess_bare_@USER@ /@USER@/{re.bare_@USER@.1}/
+@sess_@USER@ {
+  path_regexp sess_@USER@ ^/@USER@/([^/]+)/(.*)$
+  not path /@USER@/settings* /@USER@/downloads/* /@USER@/webhook*
+}
+rewrite @sess_@USER@ /@USER@/{re.sess_@USER@.2}?arg={re.sess_@USER@.1}&{query}
 handle /@USER@/* {
   @cookie_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
   handle @cookie_@USER@ {

@@ -11,4 +11,4 @@ Environment=TMUX_TMPDIR=/run/agent-box-%i
 Environment=AGENT_BOX_SESSIONS_FILE=/home/%i/.config/agent-box/sessions.json
 EnvironmentFile=-/etc/agent-box/units/agent-web-terminal-%i.env
 EnvironmentFile=-/etc/agent-box/units/agent-web-terminal-%i.local.env
-ExecStart=ttyd --writable --url-arg -p ${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@${AGENT_BOX_WEB_DOMAIN} agent-box-attach
+ExecStart=ttyd --writable --url-arg -p ${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true agent-box-attach
