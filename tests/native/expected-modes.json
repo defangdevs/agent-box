@@ -33,6 +33,8 @@
   "etc/systemd/system/agent-web-terminal@agent.service.d/10-host.conf": "0o644",
   "etc/systemd/system/agent-web-terminal@robot.service.d/10-host.conf": "0o644",
   "etc/systemd/system/caddy.service": "0o444",
+  "etc/systemd/system/multi-user.target.d/10-agent-box.conf": "0o644",
+  "etc/systemd/system/sockets.target.d/10-agent-box.conf": "0o644",
   "etc/tmpfiles.d/agent-box.conf": "0o644",
   "usr/local/bin/agent-box-session": "0o755",
   "usr/local/bin/agent-box-webhook": "0o755"
