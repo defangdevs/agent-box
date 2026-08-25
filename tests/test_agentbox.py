@@ -178,6 +178,80 @@ class RenderTest(unittest.TestCase):
                 self.assertEqual(proc.returncode, 2, proc.stdout)
                 self.assertIn(expect, proc.stderr)
 
+    def test_caddy_cannot_start_without_the_secrets_oneshot(self):
+        """Reboot safety, locked as a property of the rendered units.
+
+        /run/agent-box-web/env is on tmpfs and caddy.service reads it with an
+        unprefixed EnvironmentFile=, so something has to rewrite it on every
+        boot. Before agent-web-auth-secrets.service existed, only
+        `apply --first-boot` did — and cloud-init runs that once, so the
+        first reboot left caddy in an auto-restart loop and the box with no
+        terminal, settings page or downloads. Verified on live hardware.
+        """
+        caddy = (FIXTURE / "etc/systemd/system/caddy.service").read_text()
+        oneshot = FIXTURE / "etc/systemd/system/agent-web-auth-secrets.service"
+        self.assertIn("EnvironmentFile=/run/agent-box-web/env", caddy)
+        self.assertTrue(
+            oneshot.exists(),
+            "caddy.service requires /run/agent-box-web/env, which is on "
+            "tmpfs — something must rebuild it every boot")
+        unit = oneshot.read_text()
+        self.assertIn("RequiredBy=caddy.service", unit)
+        self.assertIn("Before=caddy.service", unit)
+        self.assertIn("web-secrets", unit)
+
+    def test_web_secrets_rebuilds_the_env_file(self):
+        """`agentbox web-secrets` reprojects /run from what persisted.
+
+        Run against a fake root: the persistent inputs are a hash file and
+        (optionally) a cookie secret, and the output has to be the three
+        keys the Caddyfile binds, with the algorithm sniffed from the hash
+        rather than assumed.
+        """
+        import importlib.util
+        spec = importlib.util.spec_from_loader(
+            "agentbox", importlib.machinery.SourceFileLoader(
+                "agentbox", str(AGENTBOX)))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mod.AUTH_ENV_DIR = str(root / "run")
+            mod.AUTH_ENV_FILE = str(root / "run" / "env")
+            mod.COOKIE_DIR = str(root / "var")
+            argon = "$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA"
+            bcrypt = "$2a$14$abcdefghijklmnopqrstuv"
+            for name, hashed in (("agent", argon), ("web-two", bcrypt)):
+                (root / f"{name}.hash").write_text(hashed + "\n")
+            users = [(n, str(root / f"{n}.hash"))
+                     for n in ("agent", "web-two")]
+            mod.write_auth_env(users)
+            env = dict(
+                line.split("=", 1)
+                for line in Path(mod.AUTH_ENV_FILE).read_text().splitlines())
+            self.assertEqual(env["WEB_PASSWORD_HASH_AGENT"], argon)
+            self.assertEqual(env["WEB_PASSWORD_ALGORITHM_AGENT"], "argon2id")
+            # "-" is not legal in an env var name; it becomes "_".
+            self.assertEqual(env["WEB_PASSWORD_ALGORITHM_WEB_TWO"], "bcrypt")
+            self.assertEqual(len(env["WEB_COOKIE_SECRET_AGENT"]), 64)
+            self.assertEqual(oct(Path(mod.AUTH_ENV_FILE).stat().st_mode
+                                 & 0o777), "0o640")
+
+            # A cookie secret is minted once and then kept: rotating it on
+            # every boot would sign every viewer out at each reboot.
+            first = env["WEB_COOKIE_SECRET_AGENT"]
+            mod.write_auth_env(users)
+            again = dict(
+                line.split("=", 1)
+                for line in Path(mod.AUTH_ENV_FILE).read_text().splitlines())
+            self.assertEqual(first, again["WEB_COOKIE_SECRET_AGENT"])
+
+            # An unrecognized hash is refused, not written out as if caddy
+            # could use it.
+            (root / "agent.hash").write_text("plaintext-oops\n")
+            with self.assertRaises(mod.ConfigError):
+                mod.write_auth_env(users)
+
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
         for unit in (SRC / "units").iterdir():

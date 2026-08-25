@@ -30,12 +30,14 @@ comparison.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -253,6 +255,49 @@ class Renderer:
         if self.spec.web_enable:
             t.file(self.p("/etc/systemd/system/caddy.service"),
                    self.caddy_unit(), 0o444)
+            t.file(self.p("/etc/systemd/system/"
+                          "agent-web-auth-secrets.service"),
+                   self.auth_secrets_unit(), 0o444)
+
+    def auth_secrets_unit(self):
+        """Rebuild caddy's auth environment on every boot.
+
+        /run/agent-box-web/env is on tmpfs and caddy.service reads it with an
+        unprefixed EnvironmentFile=, so a boot that does not recreate it
+        leaves the unit in an auto-restart loop ("Result: resources") and the
+        box with no terminal, no settings page and no downloads. Only
+        `apply --first-boot` used to write it, and cloud-init runs that once
+        — so the first reboot took the whole web front door down. Verified on
+        a live Lightsail box before this unit existed.
+
+        Both inputs persist (/etc/agent-box/<user>.hash and
+        /var/lib/agent-box-web/cookie-secret-<user>), so the projection into
+        /run is cheap to redo. This is the split the NixOS backend already
+        has, where agent-web-auth-secrets.service is requiredBy caddy.service
+        (modules/agent-box.nix.in: webAuthSecretsService) — ported here so
+        the two backends fail, and recover, the same way.
+        """
+        return (
+            "[Unit]\n"
+            "Description=Prepare browser terminal auth env for Caddy\n"
+            "Before=caddy.service\n"
+            # The env file lands in /run/agent-box-web, which tmpfiles makes.
+            "After=systemd-tmpfiles-setup.service\n"
+            "\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            "RemainAfterExit=true\n"
+            # No --config: /etc/agent-box/web-users already answers the
+            # only question this needs (design item 5 in issue #154), so the
+            # unit needs neither a YAML parser nor to know which spelling of
+            # the config file this box was built from.
+            f"ExecStart={self.bin}/agentbox web-secrets\n"
+            "\n"
+            "[Install]\n"
+            # RequiredBy, not WantedBy: caddy cannot start without the file,
+            # so a failure here must stop caddy rather than let it loop.
+            "RequiredBy=caddy.service\n"
+        )
 
     def caddy_unit(self):
         """The web front door.
@@ -336,6 +381,9 @@ class Renderer:
             if self.spec.webhook_enable:
                 t.units.append(f"agent-box-webhook@{u.name}.socket")
         if self.spec.web_enable:
+            # Before caddy: enabling it installs the .requires symlink that
+            # makes caddy depend on it.
+            t.units.append("agent-web-auth-secrets.service")
             t.units.append("caddy.service")
             # The manifest that replaces the module's eval-time per-user loop
             # (design item 5 in issue #154): who has a web login, and where
@@ -864,6 +912,101 @@ def resolve_profile(explicit):
 
 
 # --------------------------------------------------------------------------
+# Web auth secrets
+# --------------------------------------------------------------------------
+
+WEB_USERS_FILE = "/etc/agent-box/web-users"
+AUTH_ENV_DIR = "/run/agent-box-web"
+AUTH_ENV_FILE = "/run/agent-box-web/env"
+COOKIE_DIR = "/var/lib/agent-box-web"
+
+
+def env_key(name):
+    """The suffix caddy's env placeholders use. Mirrors User.env_key."""
+    return name.upper().replace("-", "_")
+
+
+def hash_algorithm(hashed):
+    """Which basic_auth algorithm a stored hash is for.
+
+    Sniffed rather than assumed: first boot always mints argon2id, but the
+    password helper can leave a bcrypt hash behind, and caddy's basic_auth
+    has to be told which one it is.
+    """
+    if hashed.startswith("$argon2id$"):
+        return "argon2id"
+    if hashed.startswith(("$2a$", "$2b$", "$2y$")):
+        return "bcrypt"
+    raise ConfigError(
+        f"unsupported password hash (starts {hashed[:10]!r})")
+
+
+def read_web_users(path=WEB_USERS_FILE):
+    """The web-login manifest: (user, hash file) per line."""
+    entries = []
+    for line in Path(path).read_text().splitlines():
+        if not line.strip():
+            continue
+        name, _, hash_path = line.partition("\t")
+        entries.append((name, hash_path or f"/etc/agent-box/{name}.hash"))
+    return entries
+
+
+def write_auth_env(users):
+    """Project the persistent web secrets into /run for caddy.
+
+    /run is tmpfs and caddy.service reads this file with an unprefixed
+    EnvironmentFile=, so it has to be rewritten on every boot — see
+    Renderer.auth_secrets_unit for what happened when only --first-boot
+    wrote it. Both inputs persist, so this is a projection, not a mint:
+    the only thing created here is a cookie secret that does not exist yet.
+
+    Written atomically, because caddy may be starting while this runs.
+    """
+    Path(AUTH_ENV_DIR).mkdir(parents=True, exist_ok=True)
+    os.chmod(AUTH_ENV_DIR, 0o700)
+    Path(COOKIE_DIR).mkdir(parents=True, exist_ok=True)
+    os.chmod(COOKIE_DIR, 0o700)
+    lines = []
+    for name, hash_path in users:
+        cookie_file = Path(COOKIE_DIR) / f"cookie-secret-{name}"
+        if not (cookie_file.exists() and cookie_file.read_text().strip()):
+            cookie_file.write_text(os.urandom(32).hex() + "\n")
+        os.chmod(cookie_file, 0o600)
+        hashed = Path(hash_path).read_text().strip()
+        key = env_key(name)
+        lines += [
+            f"WEB_COOKIE_SECRET_{key}={cookie_file.read_text().strip()}",
+            f"WEB_PASSWORD_ALGORITHM_{key}={hash_algorithm(hashed)}",
+            f"WEB_PASSWORD_HASH_{key}={hashed}",
+        ]
+    fd, tmp = tempfile.mkstemp(dir=AUTH_ENV_DIR, prefix=".env.")
+    try:
+        os.fchmod(fd, 0o640)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        os.replace(tmp, AUTH_ENV_FILE)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return len(users)
+
+
+def cmd_web_secrets(args):
+    """Rebuild /run/agent-box-web/env — agent-web-auth-secrets.service."""
+    path = args.manifest
+    if not Path(path).is_file():
+        raise ConfigError(
+            f"{path} does not exist — has `agentbox apply` ever run on this "
+            "box? Without the manifest there is no way to know who has a "
+            "web login.")
+    n = write_auth_env(read_web_users(path))
+    print(f"wrote {AUTH_ENV_FILE} for {n} user(s)")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # First boot
 # --------------------------------------------------------------------------
 
@@ -912,10 +1055,12 @@ def first_boot(spec, args):
     if not password and pw_file:
         password = Path(pw_file).read_text().strip()
     if spec.web_enable and password:
+        # Mint only what has to persist. The /run projection belongs to
+        # write_auth_env, which agent-web-auth-secrets.service redoes on
+        # every boot — first boot must not be the only thing that can
+        # produce that file.
         caddy = str(Path(spec.profile) / "bin" / "caddy")
-        Path("/run/agent-box-web").mkdir(parents=True, exist_ok=True)
-        os.chmod("/run/agent-box-web", 0o700)
-        env_lines = []
+        Path("/etc/agent-box").mkdir(parents=True, exist_ok=True)
         for u in spec.users:
             # argon2id, and via stdin — the same algorithm and the same
             # invocation the password helper uses for a later change, so a
@@ -926,18 +1071,10 @@ def first_boot(spec, args):
                 capture_output=True).stdout.strip()
             Path(f"/etc/agent-box/{u.name}.hash").write_text(hashed + "\n")
             os.chmod(f"/etc/agent-box/{u.name}.hash", 0o600)
-            cookie = os.urandom(32).hex()
-            Path("/var/lib/agent-box-web").mkdir(parents=True, exist_ok=True)
-            Path(f"/var/lib/agent-box-web/cookie-secret-{u.name}").write_text(
-                cookie + "\n")
-            env_lines += [
-                f"WEB_PASSWORD_HASH_{u.env_key}={hashed}",
-                f"WEB_PASSWORD_ALGORITHM_{u.env_key}=argon2id",
-                f"WEB_COOKIE_SECRET_{u.env_key}={cookie}",
-            ]
-        Path("/run/agent-box-web/env").write_text(
-            "\n".join(env_lines) + "\n")
-        os.chmod("/run/agent-box-web/env", 0o640)
+        # The manifest does not exist yet (render runs after first_boot), so
+        # the user list is passed straight in.
+        write_auth_env([(u.name, f"/etc/agent-box/{u.name}.hash")
+                        for u in spec.users])
         print(f"hashed the web password for {len(spec.users)} user(s)")
 
     # Write the resolved domain back, so a later plain `agentbox apply`
@@ -1001,6 +1138,13 @@ def main(argv=None):
         "--settle-delay", type=int, default=0,
         help="seconds to wait before the first IP probe")
     a.set_defaults(func=cmd_apply)
+
+    w = sub.add_parser(
+        "web-secrets",
+        help="rebuild /run/agent-box-web/env from the persisted secrets")
+    w.add_argument("--manifest", default=WEB_USERS_FILE,
+                   help=f"web-login manifest (default: {WEB_USERS_FILE})")
+    w.set_defaults(func=cmd_web_secrets)
 
     s = sub.add_parser("signal", help="PUT a CloudFormation WaitCondition signal")
     s.add_argument("url")
