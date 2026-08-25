@@ -1405,9 +1405,23 @@ if __name__ == "__main__":
       mkdir -p "''${REGISTRY_FILE%/*}"
       registry_lock
       if [ ! -s "$REGISTRY_FILE" ]; then
-        if [ -n "''${1:-}" ]; then
+        # A seed is trusted only after it PASSES this shape check (issue #356):
+        # two independent producers (this module's Nix-declared seed and the
+        # native backend's) write the file this reads, and a shape they disagree
+        # on — .sessions as a list instead of an object, seen live on the native
+        # side — used to be installed as-is. The reconcile loop then read a
+        # session name as an array index and jq errored "Cannot index array with
+        # string" every couple of seconds forever, with nothing pointing at the
+        # seed as the cause. Reject it once, loudly, instead.
+        if [ -n "''${1:-}" ] && "$REGISTRY_JQ" -e \
+             '(.version == 1) and (.sessions | type == "object")' \
+             "$1" >/dev/null 2>&1; then
           install -m 0600 "$1" "$REGISTRY_FILE"
         else
+          if [ -n "''${1:-}" ]; then
+            echo "$REGISTRY_PROG: seed $1 is not a valid sessions.json" \
+                 '(want {"version":1,"sessions":{...}}); starting empty instead' >&2
+          fi
           # 0600 like every other writer's output (the daemon's write_sessions, the
           # seed above, and mktemp's own mode in registry_edit): the registry
           # carries kickoff prompts and working directories, and only this user and
@@ -1779,6 +1793,22 @@ done
   # (see the codexFullAccess option, issue 234).
   codexFullAccess = cfg.codexFullAccess && builtins.elem "codex" cfg.installAgents;
 
+  # Defang CLI (issue #363): not in nixpkgs, but DefangLabs/defang ships its
+  # own canonical packaging at pkgs/defang/cli.nix — `buildGo125Module`
+  # against the repo's own `src/`, with a `vendorHash` that is only ever
+  # valid for the go.sum sitting right next to it. Fetching the whole
+  # source tree at one pinned tag and calling THEIR file, rather than
+  # re-deriving a build ourselves, means that hash never needs maintaining
+  # here: it travels with the tag. (The alternative living beside it,
+  # pkgs/defang/default.nix — a fetchurl of the prebuilt release binary —
+  # is explicitly `lib.warn`-marked deprecated upstream and stuck on an old
+  # version; don't reach for that one.)
+  defangSrc = builtins.fetchTarball {
+    url = "https://github.com/DefangLabs/defang/archive/refs/tags/v3.14.1.tar.gz";
+    sha256 = "sha256:0advqwcrjmdfkraw6g5i5czd6hcglfk7yvhcxzy06clkx2j9bh0v";
+  };
+  defangCli = pkgs.callPackage "${defangSrc}/pkgs/defang/cli.nix" { };
+
   # Tools agents assume exist. Nearly all of these are already installed on
   # any NixOS host (system-path.nix's requiredPackages) — but the agent unit
   # runs with the curated PATH below, which does not include
@@ -1822,6 +1852,7 @@ done
     # if closure size matters more than matching a distro.
     pkgs.python3
     pkgs.nano
+    defangCli                 # deploy Compose apps to the cloud (issue #363)
   ];
 
   agentRuntimePackages = lib.unique (
@@ -2102,9 +2133,23 @@ registry_ensure() {
   mkdir -p "''${REGISTRY_FILE%/*}"
   registry_lock
   if [ ! -s "$REGISTRY_FILE" ]; then
-    if [ -n "''${1:-}" ]; then
+    # A seed is trusted only after it PASSES this shape check (issue #356):
+    # two independent producers (this module's Nix-declared seed and the
+    # native backend's) write the file this reads, and a shape they disagree
+    # on — .sessions as a list instead of an object, seen live on the native
+    # side — used to be installed as-is. The reconcile loop then read a
+    # session name as an array index and jq errored "Cannot index array with
+    # string" every couple of seconds forever, with nothing pointing at the
+    # seed as the cause. Reject it once, loudly, instead.
+    if [ -n "''${1:-}" ] && "$REGISTRY_JQ" -e \
+         '(.version == 1) and (.sessions | type == "object")' \
+         "$1" >/dev/null 2>&1; then
       install -m 0600 "$1" "$REGISTRY_FILE"
     else
+      if [ -n "''${1:-}" ]; then
+        echo "$REGISTRY_PROG: seed $1 is not a valid sessions.json" \
+             '(want {"version":1,"sessions":{...}}); starting empty instead' >&2
+      fi
       # 0600 like every other writer's output (the daemon's write_sessions, the
       # seed above, and mktemp's own mode in registry_edit): the registry
       # carries kickoff prompts and working directories, and only this user and
@@ -3856,9 +3901,23 @@ registry_ensure() {
   mkdir -p "''${REGISTRY_FILE%/*}"
   registry_lock
   if [ ! -s "$REGISTRY_FILE" ]; then
-    if [ -n "''${1:-}" ]; then
+    # A seed is trusted only after it PASSES this shape check (issue #356):
+    # two independent producers (this module's Nix-declared seed and the
+    # native backend's) write the file this reads, and a shape they disagree
+    # on — .sessions as a list instead of an object, seen live on the native
+    # side — used to be installed as-is. The reconcile loop then read a
+    # session name as an array index and jq errored "Cannot index array with
+    # string" every couple of seconds forever, with nothing pointing at the
+    # seed as the cause. Reject it once, loudly, instead.
+    if [ -n "''${1:-}" ] && "$REGISTRY_JQ" -e \
+         '(.version == 1) and (.sessions | type == "object")' \
+         "$1" >/dev/null 2>&1; then
       install -m 0600 "$1" "$REGISTRY_FILE"
     else
+      if [ -n "''${1:-}" ]; then
+        echo "$REGISTRY_PROG: seed $1 is not a valid sessions.json" \
+             '(want {"version":1,"sessions":{...}}); starting empty instead' >&2
+      fi
       # 0600 like every other writer's output (the daemon's write_sessions, the
       # seed above, and mktemp's own mode in registry_edit): the registry
       # carries kickoff prompts and working directories, and only this user and
@@ -4797,7 +4856,10 @@ $PROMPT"
   # this variable to point an id at a stub.
   connectBins = lib.concatStringsSep " " (
     map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
-    ++ [ "github=${pkgs.gh}/bin/gh" ]
+    ++ [
+      "github=${pkgs.gh}/bin/gh"
+      "defang=${defangCli}/bin/defang"
+    ]
   );
 
   # AGENTS.md — cross-vendor agent-instructions file (codex and opencode
@@ -5065,9 +5127,23 @@ $PROMPT"
       mkdir -p "''${REGISTRY_FILE%/*}"
       registry_lock
       if [ ! -s "$REGISTRY_FILE" ]; then
-        if [ -n "''${1:-}" ]; then
+        # A seed is trusted only after it PASSES this shape check (issue #356):
+        # two independent producers (this module's Nix-declared seed and the
+        # native backend's) write the file this reads, and a shape they disagree
+        # on — .sessions as a list instead of an object, seen live on the native
+        # side — used to be installed as-is. The reconcile loop then read a
+        # session name as an array index and jq errored "Cannot index array with
+        # string" every couple of seconds forever, with nothing pointing at the
+        # seed as the cause. Reject it once, loudly, instead.
+        if [ -n "''${1:-}" ] && "$REGISTRY_JQ" -e \
+             '(.version == 1) and (.sessions | type == "object")' \
+             "$1" >/dev/null 2>&1; then
           install -m 0600 "$1" "$REGISTRY_FILE"
         else
+          if [ -n "''${1:-}" ]; then
+            echo "$REGISTRY_PROG: seed $1 is not a valid sessions.json" \
+                 '(want {"version":1,"sessions":{...}}); starting empty instead' >&2
+          fi
           # 0600 like every other writer's output (the daemon's write_sessions, the
           # seed above, and mktemp's own mode in registry_edit): the registry
           # carries kickoff prompts and working directories, and only this user and
@@ -8679,10 +8755,36 @@ def parse_gh_status(proc):
     return (False, "")
 
 
+def parse_defang_status(proc):
+    """`defang whoami --json` prints the account as JSON on stdout and
+    exits 0 when signed in; signed out is a non-zero exit with nothing on
+    stdout ("Error: missing bearer token" goes to stderr instead), so the
+    exit code is checked before anything is parsed as JSON.
+
+    email/name come from a userinfo fetch the CLI only makes when it thinks
+    it has a TTY (auth.go's `global.HasTty` gate), which a piped probe never
+    has — so both are commonly absent even while signed in, and the pill
+    falls back to the fields that are always there.
+    """
+    if proc.returncode != 0:
+        return (False, "")
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return (False, "")
+    if not isinstance(data, dict):
+        return (False, "")
+    who = str(data.get("email") or data.get("name")
+              or data.get("workspace") or "signed in")
+    tier = str(data.get("subscriberTier") or "")
+    return (True, "%s (%s)" % (who, tier) if tier else who)
+
+
 CONNECT_PARSERS = {
     "claude": parse_claude_status,
     "codex": parse_codex_status,
     "gh": parse_gh_status,
+    "defang": parse_defang_status,
 }
 
 # One row per flow, in render order. `start` and `status` are argv tails
@@ -8748,6 +8850,26 @@ CONNECT_DEFS = [
         "unset": ("GH_TOKEN", "GITHUB_TOKEN"),
         "shadow": ("GH_TOKEN", "GITHUB_TOKEN"),
         "prompt_re": re.compile(r"Press Enter", re.IGNORECASE),
+        "destructive": False,
+    },
+    {
+        "id": "defang",
+        "label": "Defang",
+        "note": "Runs <code>defang login</code> &mdash; opens Defang's own "
+                "sign-in page in a browser; the CLI polls for your "
+                "approval itself, so there is no code to copy back.",
+        "start": ["login", "--non-interactive=false"],
+        "status": ["whoami", "--json"],
+        "parse": "defang",
+        "hosts": ("defang.io",),
+        # The CLI polls the auth server on its own (auth.go's
+        # StartAuthCodeFlow) until the browser tab approves it — unlike
+        # claude, nothing is ever shown for the user to type back here.
+        "needs_code": False,
+        "show_code": False,
+        "unset": ("DEFANG_ACCESS_TOKEN",),
+        "shadow": ("DEFANG_ACCESS_TOKEN",),
+        "prompt_re": None,
         "destructive": False,
     },
 ]
@@ -12648,9 +12770,19 @@ if __name__ == "__main__":
       # as that user and writes env (0600) inside. Created here so the daemon
       # and the agent unit's optional EnvironmentFile both have a stable path
       # even before the user saves any key.
-      ++ lib.map (name:
+      #
+      # ~/.config itself is declared too (issue #356, the NixOS twin of
+      # #355's native fix): with no ~/.config yet, systemd-tmpfiles creates
+      # it itself, as root, then refuses to descend into it ("Detected
+      # unsafe path transition ... owned by root", exit 73) — so
+      # ~/.config/agent-box is never created and the supervisor's first act
+      # (mkdir ~/.config/agent-box) fails with Permission denied in a
+      # restart loop. Deployed boxes dodge this only because something else
+      # creates ~/.config user-owned first; a fresh home has nothing else to.
+      ++ lib.concatMap (name: [
+        "d /home/${name}/.config 0755 ${name} ${name} - -"
         "d /home/${name}/.config/agent-box 0700 ${name} ${name} - -"
-      ) terminalUsers
+      ]) terminalUsers
       # Webhook ingress socket dir (issue #101). World-traversable parent; the
       # per-user socket files themselves are 0660 <user>:caddy, systemd-created
       # (see systemd.sockets). Only present when webhook.enable is set.

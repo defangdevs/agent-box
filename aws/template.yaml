@@ -787,14 +787,20 @@ Resources:
                 # Don't re-apply user-data on every reboot - protects local edits.
                 systemd.services.amazon-init.enable = lib.mkForce false;
               }
-            - WebHostname: !If
-                - UseIpv4
-                - !Sub "${EIP}.sslip.io"
-                - !Sub
-                  - "${IpDashed}.sslip.io"
-                  - IpDashed: !Join
-                      - '-'
-                      - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
+            # Dashed for both address families (issue 359): IPv6 needs it
+            # (':' isn't a legal DNS label character), and matching it for
+            # IPv4 keeps one hostname shape instead of two, avoids a TLS
+            # failure on the "other" spelling (only the derived shape gets
+            # a cert), and stays a single DNS label if anything ever wants
+            # a *.sslip.io wildcard.
+            - WebHostname: !Sub
+                - "${HostDashed}.sslip.io"
+                - HostDashed: !If
+                    - UseIpv4
+                    - !Join ['-', !Split ['.', !Ref EIP]]
+                    - !Join
+                        - '-'
+                        - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
               WebPasswordBase64:
                 Fn::Base64: !Ref WebPassword
               # First-boot health signal (issue 106): tell CloudFormation the
@@ -855,7 +861,7 @@ Outputs:
       - "https://${Host}.sslip.io/${UserName}/"
       - Host: !If
           - UseIpv4
-          - !Ref EIP
+          - !Join ['-', !Split ['.', !Ref EIP]]
           - !Join
               - '-'
               - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
@@ -873,7 +879,7 @@ Outputs:
       - "${UserName}-main@${Host}.sslip.io"
       - Host: !If
           - UseIpv4
-          - !Ref EIP
+          - !Join ['-', !Split ['.', !Ref EIP]]
           - !Join
               - '-'
               - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]

@@ -44,10 +44,18 @@ Claude Code or Codex.
   Sessions added at runtime derive the same way (`<UserName>-<session>@...`).
   Override per user via `remoteControlName`, or box-wide via
   `services.agent-box.remoteControlHost`, in the NixOS config post-deploy.
-- The hostname `<addr>.sslip.io` is derived at CFN time via `Fn::Split ':'
-  + Fn::Join '-'` on the NetworkInterface's PrimaryIpv6Address (IPv6 mode)
-  or the EIP address (IPv4 mode). Consecutive `::` becomes an empty split
-  element that re-joins as `--` - matches sslip.io's encoding exactly.
+- The hostname `<addr>.sslip.io` is derived at CFN time via `Fn::Split` +
+  `Fn::Join '-'`: on the NetworkInterface's PrimaryIpv6Address, split on
+  `:` (IPv6 mode), or on the EIP address, split on `.` (IPv4 mode) - both
+  address families end up as the same dashed shape, e.g.
+  `63-182-190-210.sslip.io` rather than `63.182.190.210.sslip.io` (issue
+  359; only the derived shape gets a Let's Encrypt cert, so the "other"
+  spelling fails TLS instead of just not existing). Consecutive `::` in an
+  IPv6 address becomes an empty split element that re-joins as `--` -
+  matches sslip.io's encoding exactly. Existing stacks keep whatever
+  shape they baked at first boot: the hostname is written into the NixOS
+  config and the issued certificate, so this only changes newly deployed
+  EC2 stacks, not ones already running.
 - Requires IMDSv2 (`HttpTokens: required`).
 - Disables `amazon-init` after the first successful apply so local edits to
   `/etc/nixos/configuration.nix` survive reboots.
