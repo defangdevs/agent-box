@@ -12,6 +12,8 @@ on:
       - 'modules/agent-box.nix.in'
       - 'modules/src/**'
       - 'bin/assemble-module.py'
+      - 'tests/test-assemble-module.py'
+      - 'tests/test-envstore.py'
       # The mascot mark (issue #185) is embedded into the settings daemon at
       # assemble time, so it is a module source as much as a website asset.
       - 'docs/potato.svg'
@@ -74,6 +76,27 @@ jobs:
       - name: Check generated module is up to date
         run: nix build -L .#checks.x86_64-linux.module-generated-up-to-date && cat result
 
+      # Issue 244: the assembler's Nix escaping, decoded the way Nix's lexer
+      # does. The up-to-date check above cannot see an escaping bug — it
+      # regenerates the file with the same assembler, so both agree on the
+      # wrong bytes.
+      - name: Check assembler escaping
+        run: nix build -L .#checks.x86_64-linux.assemble-module-escaping && cat result
+
+      # The env store's format (issue #212): round trip, no key injection, and
+      # the legacy readings a deployed box's file relies on. A unit test, not
+      # a VM test, because the format is read on the session-spawn path and
+      # every caller has to agree about it — the VM tests below prove one
+      # value survives one caller, which is the end-to-end half.
+      - name: Check env store format
+        run: nix build -L .#checks.x86_64-linux.envstore-format && cat result
+
+      # Issues 254/285/289: the session registry's write protocol — the lock
+      # five writers share, in two languages. The VM tests avoid concurrency
+      # on purpose, so this is what fails when the lock stops locking.
+      - name: Check session registry protocol
+        run: nix build -L .#checks.x86_64-linux.registry-protocol && cat result
+
       # Eval/build check (issue 132): the module's generated Caddyfile carries
       # the authenticated /<user>/downloads/ file-server route.
       - name: Check downloads route in generated Caddyfile
@@ -85,9 +108,12 @@ jobs:
       - name: Check webhook route in generated Caddyfile
         run: nix build -L .#checks.x86_64-linux.webhook-route && cat result
 
-      # Full closure build — the real "module is usable" proof.
+      # Full closure build — the real "module is usable" proof. --max-jobs
+      # auto because nix defaults to ONE: a system closure is hundreds of
+      # small independent derivations and this step served them one at a
+      # time (issue #312).
       - name: Build VM system closure
-        run: nix build -L .#checks.x86_64-linux.vm-closure
+        run: nix build -L --max-jobs auto .#checks.x86_64-linux.vm-closure
 
       # Behavior lock for the portability refactor (issue #154, Phase 0):
       # rendered units/etc/tmpfiles/payload scripts must byte-match the
@@ -111,20 +137,23 @@ jobs:
       # twice over: per-step, and via nix's default max-jobs=1). Ran
       # back-to-back they took ~8 min of the job's ~10; concurrently they
       # bound the job at roughly the slowest wave (~3-4 min).
-      #   --max-jobs 3: ubuntu-latest has 4 vCPUs / 16 GiB and web-fail2ban
-      #     boots TWO qemu nodes — 6 tests at once would thrash and trade
-      #     the saved minutes back as flaky timeouts.
+      #   --max-jobs 3: ubuntu-latest has 4 vCPUs / 16 GiB and web-surface
+      #     boots TWO qemu nodes — all 7 at once would thrash and trade the
+      #     saved minutes back as flaky timeouts. Splitting `sessions` (issue
+      #     #312) does not by itself stop it holding the wave open, which is
+      #     why the long check is started first below; the bound is then the
+      #     greater of its length and the rest of the work over two slots.
       #   --keep-going: one red test doesn't hide the others' results (the
       #     failing drv is still named in the log).
       # What each check covers:
-      #   web-fail2ban      brute-forcing the web terminal's basic auth gets
-      #                     the client banned
-      #   self-serve-domain an agent user adds a virtual host at runtime by
-      #                     writing a snippet to ~/sites/ and reloading caddy
-      #                     — no rebuild
-      #   download-files    (issue 132) per-user ~/downloads served at
-      #                     /<user>/downloads/ behind the terminal's auth —
-      #                     perms/symlink, auth gate, serving, browsable index
+      #   web-surface       (issues 40/132/312) the user-facing web surface in
+      #                     one guest — per-user ~/downloads served at
+      #                     /<user>/downloads/ behind the terminal's auth
+      #                     (perms/symlink, auth gate, serving, browsable
+      #                     index), an agent adding a virtual host at runtime
+      #                     by writing a snippet to ~/sites/ and reloading
+      #                     caddy with no rebuild, and brute-forcing the basic
+      #                     auth getting the client banned
       #   settings-page     the settings page stores a secret through the
       #                     browser and the agent unit picks it up
       #   memory-protection (issue 62) protectMemory — zram swap up,
@@ -132,8 +161,16 @@ jobs:
       #                     a memory hog while the box stays responsive
       #   sessions          (issue 59) runtime session CRUD — seeded main
       #                     session, agent-box-session add/rm with no sudo and
-      #                     no rebuild, cgroup containment, root session
-      #                     manager page behind auth
+      #                     no rebuild, cgroup containment, and two writers
+      #                     racing the registry
+      #   sessions-web      (issue 119) the browser half of the same box —
+      #                     tabbed workspace, settings-page session manager,
+      #                     /sessions/* CRUD, live feed, transcript download
+      #   connect           (issues 207/208/313) the guided sign-in cards —
+      #                     one tmux session per flow driving the tool's own
+      #                     login command (stubbed CLIs), host-anchored URL,
+      #                     code forwarding, success read from the CLI, and
+      #                     the refusal to start a tmux server of its own
       #   webhook           (issue 101) the default-on webhook receiver —
       #                     socket-activated 0660 <user>:caddy ingress, the
       #                     unauthenticated public path beside a still-401ing
@@ -142,11 +179,31 @@ jobs:
       #                     its own filter, and the discovery surface
       - name: Run VM tests
         run: |
-          nix build -L --keep-going --max-jobs 3 \
-            .#checks.x86_64-linux.web-fail2ban \
-            .#checks.x86_64-linux.self-serve-domain \
-            .#checks.x86_64-linux.download-files \
+          # `sessions` is the longest check, so it has to START FIRST. With
+          # three slots the window is its own length only while it begins at
+          # t=0, and nix picks the order itself: measured on run 32649965071,
+          # it landed in the SECOND wave, began 86s in, finished last, and the
+          # window was 86+270=357s while the check itself was only 270s. The
+          # five short checks had already filled the slots.
+          #
+          # Two invocations pin the packing instead of hoping for it: the long
+          # check alone, the other six sharing the remaining two slots. Still
+          # three VM guests at once, so the memory budget below is unchanged
+          # (the long invocation holds ONE test, so its second slot only ever
+          # builds a dependency).
+          nix build -L --max-jobs 2 .#checks.x86_64-linux.sessions &
+          long=$!
+          nix build -L --keep-going --max-jobs 2 \
+            .#checks.x86_64-linux.web-surface \
             .#checks.x86_64-linux.settings-page \
             .#checks.x86_64-linux.memory-protection \
-            .#checks.x86_64-linux.sessions \
-            .#checks.x86_64-linux.webhook
+            .#checks.x86_64-linux.sessions-web \
+            .#checks.x86_64-linux.connect \
+            .#checks.x86_64-linux.webhook &
+          rest=$!
+          # Both are waited on before the step decides, so --keep-going's
+          # promise still holds across the pair: every result reaches the log,
+          # and one red check cannot hide another's.
+          long_status=0; wait "$long" || long_status=$?
+          rest_status=0; wait "$rest" || rest_status=$?
+          [ "$long_status" -eq 0 ] && [ "$rest_status" -eq 0 ]

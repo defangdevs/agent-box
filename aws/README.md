@@ -8,16 +8,17 @@ Claude Code or Codex.
   buttons point here): agent-box on **AWS Lightsail** for one flat monthly
   bundle price. See
   ["Lightsail variant"](#lightsail-variant-lightsail-templateyaml) below.
-- `template.yaml` - the EC2 alternative (Spot pricing, IPv6-only networking,
-  SSM root access, resizable EBS). Most of this document describes it; the
-  Lightsail section covers what differs.
+- `template.yaml` - the EC2 alternative (on-demand with a Spot opt-in, IPv4
+  by default with an IPv6-only opt-out, SSM root access, resizable EBS).
+  Most of this document describes it; the Lightsail section covers what
+  differs.
 
 ## What the template does
 
 - Provisions its own VPC (10.42.0.0/16) with an Amazon-provided IPv6 CIDR,
   a single public subnet with a /64 IPv6 range, IGW + routes for v4 and
   v6. First-boot dependencies are fetched from dual-stack hosts, so the
-  IPv6-only default does not require NAT64/DNS64.
+  IPv6-only launch does not require NAT64/DNS64.
 - Launches one EC2 instance from the latest NixOS 26.05 AMI for the region.
 - Uses EC2 user-data as a NixOS configuration: imports the pinned
   `agent-box` module, sets `services.agent-box.agent` from the `Agent`
@@ -234,29 +235,35 @@ All the extra resources are free (VPC, subnet, route table, IGW, EIP-
 while-attached historical wisdom no longer applies - see the IPv4 note
 below).
 
-### IPv6-first by cost, IPv4 opt-in by connectivity
+### IPv4 by default for reachability, IPv6-only opt-out to save cost
 
 Since **Feb 2024, AWS charges $0.005/hr for every public IPv4 address**
 regardless of attach state (EIP or ephemeral, running or stopped
-instance) - ~$3.60/mo per address. IPv6 is free. So the template
-defaults to `PublicIpv4: false` (IPv6-only, ~$0/mo for the address).
-Users whose clients don't have IPv6 (corporate nets, coffee-shop WiFi)
-set `PublicIpv4: true` at launch to allocate an EIP.
+instance) - ~$3.60/mo per address. IPv6 is free. The template still
+defaults to `PublicIpv4: true` (an EIP, ~$3.60/mo) so a freshly launched
+box is reachable regardless of the client's own connectivity - corporate
+nets and coffee-shop WiFi often lack real IPv6. Users who know their
+client has IPv6 connectivity can set `PublicIpv4: false` at launch to go
+IPv6-only and drop that charge.
 
-### Spot by default (persistent + stop)
+### On-demand by default, Spot opt-in to save cost
 
-`UseSpot` defaults to `true` because cost is the whole point. The spot
-options can't sit on `AWS::EC2::Instance` (it has no `InstanceMarketOptions`),
-so they ride on a conditional `AWS::EC2::LaunchTemplate` that the instance
-references only when `UseSpot=true`. We use a **persistent** request with
+`UseSpot` defaults to `false` (on-demand) so a freshly launched box never
+gets reclaimed mid-session - the same reachability-first reasoning as the
+`PublicIpv4` default above. Users who accept the interruption risk for the
+lower price set `UseSpot: true`. The spot options can't sit on
+`AWS::EC2::Instance` (it has no `InstanceMarketOptions`), so they ride on a
+conditional `AWS::EC2::LaunchTemplate` that the instance references only
+when `UseSpot=true`. We use a **persistent** request with
 `InstanceInterruptionBehavior: stop`: on interruption AWS stops (not
 terminates) the instance and restarts the *same* instance in the *same AZ*
 when capacity returns, so the root EBS, the ENI's IPv6, and the on-disk TLS
 cert all survive. What does not survive is the live tmux session (RAM is
 lost on any stop). Risk: if that one AZ+type pool stays capacity-starved,
 the box stays stopped until it frees up - pick a deep pool. No `MaxPrice` is
-set, so the cap is the on-demand rate. The E2E deploy-test forces
-`UseSpot=false` so CI doesn't depend on spot capacity.
+set, so the cap is the on-demand rate. The E2E deploy-test's `ipv4-full` leg
+runs on-demand by default too (`UseSpot=false`) so CI doesn't depend on spot
+capacity; a `use_spot` dispatch input can opt that leg into Spot instead.
 
 ### Race condition: EIP association vs boot
 
@@ -515,7 +522,8 @@ the end. It runs two legs in parallel:
   Basic auth, unauthenticated requests get 401, the site root serves the
   session manager behind the same auth, the WebSocket upgrade returns 101
   with the auth cookie).
-- **ipv6-outputs** - exercises the DEFAULT IPv6-only path. The runner can't
+- **ipv6-outputs** - exercises the IPv6-only path (`PublicIpv4=false`, an
+  opt-out from the template's default). The runner can't
   connect over IPv6, so it asserts the stack reaches `CREATE_COMPLETE` and its
   outputs are populated (catches blank `PrimaryIpv6Address` bugs).
 

@@ -1,8 +1,9 @@
-# Anything else, including /: @USER@'s tabbed terminal workspace
-# (one tab per session, panes iframing /@USER@/?arg=<session>; plus
-# the /sessions/* CRUD routes), served by the settings daemon behind
-# the SAME cookie-or-basic auth as the terminal — session CRUD must
-# never be reachable unauthenticated.
+# Anything else, including /: the settings daemon behind the SAME
+# cookie-or-basic auth as the terminal — session CRUD must never be
+# reachable unauthenticated. GET / picks a USER and lands in their space
+# (/@USER@/, where the tabbed workspace now lives); the /sessions/* CRUD
+# routes the workspace posts to stay here, at the vhost root, so they are
+# one set of paths no session name can ever shadow.
 # This replaces the old unauthenticated picker (single-user boxes are
 # the norm now); with it gone — and the public sessions.json it fed
 # removed — nothing on this vhost is served without auth. Other

@@ -53,15 +53,49 @@ BANNER = """\
 """
 
 
-def nix_escape(text: str) -> str:
-    """Escape a literal for embedding inside a Nix '' indented string.
+# A run of apostrophes, optionally glued to the `${` that follows it. Matching
+# the two together is what makes the escaping correct: how a quote run has to
+# be escaped depends on whether a `${` escape lands right behind it (#244).
+QUOTE_RUN_OR_ANTIQUOTE = re.compile(r"'+\$\{|'+|\$\{")
 
-    Only `''` and `${` are special there (backslashes are literal). Order
-    matters: escape `''` first, then `${` — the `''${` we emit for `${` must
-    not be re-processed by the `''` rule."""
-    text = text.replace("''", "'''")
-    text = text.replace("${", "''${")
-    return text
+
+def nix_escape(text: str) -> str:
+    r"""Escape a literal for embedding inside a Nix '' indented string.
+
+    Only `''` and `${` are special there (backslashes are literal), so the
+    escaping is two rules: a literal `''` is written `'''`, and a literal
+    `${` is written `''${`.
+
+    They cannot be applied as two independent passes, because Nix lexes a run
+    of apostrophes greedily, three at a time, and *both* `'''` and the `''${`
+    we emit start with `''`. So an apostrophe is only safe unescaped when the
+    lexer cannot glue it onto whatever follows. Two places where it can:
+
+      * directly before a `${` — an ordinary shell line like
+        `echo "key '${KEY}'"`. `'` + `''${` reads as an escaped `''` plus a
+        LIVE antiquotation: a build failure at best (`undefined variable`
+        pointing into the generated module), a silently mangled payload at
+        worst.
+      * at the very end, where the host's closing `''` follows: `'` + `''`
+        reads as an escaped `''` and the string never closes.
+
+    Both are fixed by escaping that apostrophe too, as `''\'`, which leaves the
+    `''` behind it unambiguous. That also makes the result self-contained: it
+    can be spliced anywhere inside an indented string, hard against the
+    closing delimiter included (issue #244)."""
+
+    def escape(match: re.Match) -> str:
+        token = match.group(0)
+        antiquote = token.endswith("${")
+        quotes = len(token) - 2 if antiquote else len(token)
+        pairs, odd = divmod(quotes, 2)
+        out = "'''" * pairs
+        if odd:
+            unsafe = antiquote or match.end() == len(text)
+            out += "''\\'" if unsafe else "'"
+        return out + ("''${" if antiquote else "")
+
+    return QUOTE_RUN_OR_ANTIQUOTE.sub(escape, text)
 
 
 def escaper_for(path: Path):

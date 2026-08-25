@@ -3,7 +3,7 @@
 [Service]
 Environment="AGENT_BOX_WEB_DOMAIN=golden.example.org"
 Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-67/lib/locale/locale-archive"
-Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7b/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-attach/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ttyd-1.7.7/bin"
+Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7b/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-attach/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ttyd-1.7.7/bin"
 Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026b/share/zoneinfo"
 ExecStart=
-ExecStart=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ttyd-1.7.7/bin/ttyd --writable --url-arg -p ${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@${AGENT_BOX_WEB_DOMAIN} /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-attach/bin/agent-box-attach
+ExecStart=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ttyd-1.7.7/bin/ttyd --writable --url-arg -p ${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-attach/bin/agent-box-attach

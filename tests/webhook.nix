@@ -75,6 +75,34 @@
             ];
           };
         };
+        # A second governed watch, for the substring leaves (local-webhook
+        # 0.14.0). Its own topic on purpose: the spawn name is derived from the
+        # key, so sharing local-channels' topic would collide with the session
+        # the opened-issue case above already spawned.
+        "github:defangdevs/mention-demo" = {
+          note = "managed: mention watch (test)";
+          when = {
+            all = [
+              { path = "action"; "in" = [ "created" "edited" ]; }
+              { path = "sender.login"; notIn = [ "box-bot" ]; }
+              { path = "comment.body"; contains = [ "@box-bot" ]; }
+            ];
+          };
+        };
+        # A third governed watch, for the review-verdict clause (#255).
+        # Its own topic for the same reason as mention-demo: one spawn per
+        # key, and the cases below need three declines and one spawn.
+        "github:defangdevs/review-demo" = {
+          note = "managed: review watch (test)";
+          when = {
+            all = [
+              { path = "action"; "in" = [ "submitted" ]; }
+              { path = "review.state"; "in" = [ "approved" "changes_requested" "commented" ]; }
+              { path = "pull_request.user.login"; "in" = [ "box-bot" ]; }
+              { path = "sender.login"; notIn = [ "box-bot" ]; }
+            ];
+          };
+        };
       };
     };
     system.stateVersion = "25.05";
@@ -179,6 +207,37 @@
         "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
         " show-environment -t main | grep -x 'LOCAL_WEBHOOK_PORT=0'"
     )
+    # The identity resolver ships next to the CLI (issue #261): who "@self"
+    # means is a runtime question about the token this box holds, so there is a
+    # command that answers it rather than a value baked in at deploy time.
+    machine.succeed("test -x /run/current-system/sw/bin/agent-box-webhook-self")
+    # A session gets the identity from env-exec, the wrapper the supervisor
+    # runs between tmux and the agent — NOT from the tmux session environment,
+    # which only carries what `new-session -e` put there. So the session-side
+    # assertions run the real wrapper out of the agent unit's own environment.
+    env_exec = machine.succeed(
+        "systemctl show -p Environment --value agent-box@agent.service"
+        " | tr ' ' '\\n' | sed -n 's/^AGENT_BOX_ENV_EXEC=//p'"
+    ).strip()
+    assert env_exec.startswith("/nix/store/"), env_exec
+    machine.succeed(
+        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
+        ' list-panes -t "=main" -F "#{pane_start_command}"'
+        f" | grep -F -- {env_exec} >/dev/null"
+    )
+
+    def session_self():
+        # What a session's agent — and so its webhook peer — would see.
+        return machine.succeed(
+            "sudo -u agent env HOME=/home/agent"
+            " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+            f" {env_exec} sh -c 'echo \"$LOCAL_WEBHOOK_SELF\"'"
+        ).strip()
+
+    # Nothing has resolved yet — no token, no network — and that stays quiet:
+    # the variable is simply absent, exactly as on a box that never writes to
+    # GitHub. (The leg below gives it an identity and watches it appear.)
+    assert session_self() == "", session_self()
     # Claude loads the plugin from the seeded settings — in the object shape
     # `claude plugin install` writes, not a list of records.
     machine.wait_until_succeeds(
@@ -242,8 +301,11 @@
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
-        " agent-box-webhook subscribe defangdevs/agent-box --note 'testing #101' --ttl 0"
+        " agent-box-webhook subscribe defangdevs/agent-box --note 'testing #101' --ttl 8"
     )
+    # --ttl 8 rather than 0: local-webhook 0.20.0 refuses a pinned session
+    # subscription (the cap is MAX_SESSION_TTL_HOURS). Any bounded value
+    # outlasts a VM test that finishes in minutes.
     machine.succeed(
         "jq -e '.topics[0].topic == \"github:defangdevs/agent-box\""
         " and .topics[0].note == \"testing #101\"'"
@@ -487,7 +549,7 @@
     machine.succeed("jq -e '.spawn == true' /home/agent/.local/state/local-webhook/receiver.json")
 
     # --- dispatch brake: a live session that owns the topic (0.10.0, #10) ----
-    # The peer session is subscribed to this very repo (pinned, above), so it is
+    # The peer session is subscribed to this very repo (above), so it is
     # already getting this CI failure. A standing watch is for events NOBODY
     # owns, so it must NOT also spawn an agent — that is what put three hook-*
     # sessions on one PR. The suppression is logged, because a silently skipped
@@ -610,6 +672,18 @@
         " and (.topics[0].note | contains(\"seeded at spawn\"))'"
         f" {hook_filter}"
     )
+    # The topic says what it LISTENS to; the include says what it CLAIMS, and a
+    # claim is what silences the standing watch (issue #251). This session was
+    # spawned for a CI outcome, so it claims CI outcomes — enough to swallow
+    # the second event of the same failing run, and no more. A rule-less entry
+    # here claimed every event on the repo: on 2026-08-24 a session spawned for
+    # one issue silenced the master Deploy test failure four seconds later.
+    machine.succeed(
+        "jq -e '(.topics[0].include.any | map(.path))"
+        " == [\"workflow_run\", \"check_run\", \"check_suite\", \"workflow_job\"]"
+        " and (.topics[0].include.any | all(.notIn == [null]))'"
+        f" {hook_filter}"
+    )
     # ...and the session is told, so it neither re-subscribes nor assumes that
     # being spawned means nobody else is on this.
     assert "already subscribed to github:defangdevs/agent-box" in hook_prompt, hook_prompt
@@ -696,6 +770,76 @@
         f" /home/agent/.local/state/local-webhook/filter.agent-{other}.json"
     )
 
+    # A spawn for a numbered object claims exactly that object (issue #251).
+    # The number comes from LOCAL_WEBHOOK_SPAWN_META, the dispatcher's own
+    # summary of the batch, so this drives the wrapper with the meta the
+    # daemon would export for `issues.assigned` on #4242.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/numbered"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        " LOCAL_WEBHOOK_SPAWN_EVENT=issues"
+        """ LOCAL_WEBHOOK_SPAWN_META='{"event":"issues","action":"assigned","number":"4242"}'"""
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    numbered = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-numbered-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    numbered_filter = (
+        f"/home/agent/.local/state/local-webhook/filter.agent-{numbered}.json"
+    )
+    # Both paths a number can arrive on, and NOT the CI paths: a session
+    # working one issue must not own the repo's CI. Not
+    # workflow_run.pull_requests.0.number either, which reads well and never
+    # matches — the predicate walker steps through dicts only, so a list index
+    # ends the walk (local-channels#46).
+    machine.succeed(
+        "jq -e '(.topics[0].include.any | map(.path)) =="
+        " [\"issue.number\", \"pull_request.number\"]"
+        " and (.topics[0].include.any | all(.in == [4242]))'"
+        f" {numbered_filter}"
+    )
+    # The note names the object, because it is echoed under every delivery and
+    # a fresh-context session reads it to learn why the event matters. It used
+    # to be one fixed sentence, byte-identical across every hook session.
+    machine.succeed(
+        "jq -e '.topics[0].note | contains(\"defangdevs/numbered#4242\")"
+        " and contains(\"issues.assigned\")'"
+        f" {numbered_filter}"
+    )
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {numbered}"
+    )
+
+    # A `number` that is not a number falls back to the CI claim, and the NOTE
+    # falls back with it. The two used to test the value differently, so a meta
+    # like {"number":"n/a"} produced a note saying the session owned KEY#n/a
+    # while the claim covered CI outcomes — a note that describes a claim
+    # nobody holds is worse than no note.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/unnumbered"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        " LOCAL_WEBHOOK_SPAWN_EVENT=issues"
+        """ LOCAL_WEBHOOK_SPAWN_META='{"event":"issues","action":"opened","number":"n/a"}'"""
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    unnumbered = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-unnumbered-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        "jq -e '(.topics[0].include.any | map(.path) | index(\"workflow_run\")) != null"
+        " and (.topics[0].note | contains(\"#\") | not)'"
+        f" /home/agent/.local/state/local-webhook/filter.agent-{unnumbered}.json"
+    )
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {unnumbered}"
+    )
+
     # A long key keeps its WHOLE name (issue #236). The key used to be cut at
     # 24 sanitized characters, which overran the 32 the daemon renders —
     # hook-defangdevs-local-channel-de2d is 34, so that session ran, owned its
@@ -764,6 +908,57 @@
         f"sudo -u agent env HOME=/home/agent agent-box-session rm {overridden}"
     )
 
+    # A `\u0000` ESCAPE in that same override must not split one argument in
+    # two. The value is JSON TEXT: the store it comes from sees six ordinary
+    # characters, and only jq's decode turns them into a real NUL — the very
+    # byte the argument framing below uses as its delimiter. So a user who may
+    # already pick their own hook-session model could otherwise append a flag
+    # nobody wrote, `--dangerously-skip-permissions` being the one that
+    # matters. The store refuses a NUL BYTE; this is the escape, refused after
+    # the decode that creates it, and this asserts the whole path rather than
+    # either half of it.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-session env set AGENT_BOX_HOOK_SESSION_ARGS"
+        " '[\"--model\\u0000--dangerously-skip-permissions\",\"haiku\"]'"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github"
+        " LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/nul-probe"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    nul_probe = machine.succeed(
+        "jq -r '.sessions | keys[]"
+        " | select(startswith(\"hook-defangdevs-nul-probe-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    # No extra args at all: not the two the split would have produced, and not
+    # the `--model haiku` beside them either. A malformed value is refused
+    # whole, which is what the shape check already promised for [1,2].
+    machine.succeed(
+        f"jq -e '.sessions[\"{nul_probe}\"].extraArgs == []'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    # And the operator is told, in the one report that says what a match
+    # launches — a silently dropped override is how this goes unnoticed.
+    refused = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        f" {spawn_cmd} --preamble 'github:defangdevs/*'"
+    )
+    assert "IGNORED, not a JSON array of strings" in refused, refused
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {nul_probe}"
+    )
+    # Back to the plain override, which the next block reports on.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-session env set AGENT_BOX_HOOK_SESSION_ARGS"
+        " '[\"--model\",\"haiku\"]'"
+    )
+
     # --- issue #292: --preamble says what a match LAUNCHES ------------------
     # The override above is invisible unless something reports it: the prompt
     # is only half of what a delivery starts, and the other half is what picks
@@ -803,6 +998,98 @@
     # The SOURCE line, not the closing sentence that names the option either
     # way: the report has to distinguish the two levers, not just mention them.
     assert "come from services.agent-box.webhook.hookSessionArgs" in launch, launch
+
+    # --- issue #321: a standing watch hands work to an agent PROFILE --------
+    # The gap a profile closes here: the spawn passes no --agent, so a match
+    # always started the box default harness, and hookSessionArgs could only
+    # append flags to it. A profile picks the harness, the model, the effort,
+    # an appended system prompt and the session's environment, under one name.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-profile set triage HARNESS=codex MODEL=gpt-5.6 EFFORT=low"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-session env set AGENT_BOX_HOOK_PROFILE triage"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github"
+        " LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/profile-probe"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    profiled = machine.succeed(
+        "jq -r '.sessions | keys[]"
+        " | select(startswith(\"hook-defangdevs-profile-probe-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    # The HARNESS came from the profile — not the box default (claude) — and
+    # the profile's args are mapped for codex, with hookSessionArgs still
+    # appended after them, so the `--` tail keeps the last word.
+    machine.succeed(
+        f"jq -e '.sessions[\"{profiled}\"].agent == \"codex\"'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    machine.succeed(
+        f"jq -e '.sessions[\"{profiled}\"].profile == \"triage\"'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    machine.succeed(
+        f"jq -e '.sessions[\"{profiled}\"].extraArgs"
+        " == [\"-m\", \"gpt-5.6\", \"-c\", \"model_reasoning_effort=low\","
+        " \"--model\", \"sonnet\"]'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    # ...and --preamble names the profile, so the settings page can answer
+    # "what does this watch start" without a second copy of the answer (#292).
+    launch = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        f" {spawn_cmd} --preamble 'github:defangdevs/*'"
+    )
+    assert "agent profile triage" in launch, launch
+    assert "agent-box-profile show triage" in launch, launch
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {profiled}"
+    )
+
+    # A profile that no longer exists must never cost a delivery: the events
+    # are dropped for good if the spawn fails, so the wrapper reports the
+    # unusable name and starts the session on the box default instead.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent agent-box-profile rm triage"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github"
+        " LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/ghost-profile-probe"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    ghosted = machine.succeed(
+        "jq -r '.sessions | keys[]"
+        " | select(startswith(\"hook-defangdevs-ghost-profile-probe-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        f"jq -e '.sessions[\"{ghosted}\"].agent == \"claude\""
+        f" and .sessions[\"{ghosted}\"].profile == null'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    launch = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        f" {spawn_cmd} --preamble 'github:defangdevs/*'"
+    )
+    assert "IGNORED, no such profile" in launch, launch
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {ghosted}"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-session env rm AGENT_BOX_HOOK_PROFILE"
+    )
 
     # An assignment is a work request, not a triage request (#253). The watch's
     # predicate decides WHICH assignments arrive (assignee = the box); this
@@ -928,6 +1215,20 @@
         " agent-box-webhook subscribe defangdevs/local-channels --deliver-to subagent"
         " --note 'to be governed' --ignore-sender human"
     )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/mention-demo --deliver-to subagent"
+        " --note 'to be governed too'"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/review-demo --deliver-to subagent"
+        " --note 'to be governed as well'"
+    )
     machine.succeed("systemctl restart agent-box-webhook@agent.service")
     machine.wait_for_unit("agent-box-webhook@agent.service")
     machine.wait_until_succeeds(
@@ -940,7 +1241,8 @@
     # note replaced; runtime fields (pinned ttl) kept.
     machine.succeed(
         "jq -e '.topics[] | select(.topic == \"github:defangdevs/local-channels\")"
-        " | (.when.any | length == 2) and (has(\"ignoreSenders\") | not)"
+        " | (.include.any | length == 2) and (has(\"when\") | not)"
+        " and (has(\"ignoreSenders\") | not)"
         " and .note == \"managed: rules watch (test)\" and .ttlHours == 0'"
         " /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
@@ -1003,6 +1305,168 @@
         timeout=60,
     )
 
+    # --- a mention in free text spawns a session (#296) ----------------------
+    # The rule the box's own default watch carries: being addressed by name is
+    # a work request, the form a human reaches for by reflex. It needs
+    # local-webhook 0.14.0's `contains` leaf, because a mention lives inside
+    # comment.body with no structured field beside it, so no in/notIn list of
+    # whole values can ever name it (local-channels#33). Until it existed the
+    # watch declined every comment, and an "@box rebase" reached nobody unless
+    # a live session happened to hold the topic.
+    machine.succeed(
+        "jq -e '.topics[] | select(.topic == \"github:defangdevs/mention-demo\")"
+        " | .include.all[] | select(.path == \"comment.body\")"
+        " | .contains == [\"@box-bot\"]'"
+        " /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+
+    def post_comment(name, body, sender):
+        client.succeed(
+            "cat > /tmp/" + name + ".json <<'EOF'\n"
+            '{"action":"created","issue":{"number":42,"title":"a pr"},'
+            '"comment":{"body":"' + body + '"},'
+            '"repository":{"full_name":"defangdevs/mention-demo"},'
+            '"sender":{"login":"' + sender + '"}}\n'
+            "EOF"
+        )
+        sig = client.succeed(
+            "openssl dgst -sha256 -hmac " + secret + " -r /tmp/" + name
+            + ".json | cut -d' ' -f1"
+        ).strip()
+        client.succeed(
+            curl + " -o /dev/null -w '%{http_code}' -X POST"
+            " -H 'content-type: application/json' -H 'x-github-event: issue_comment'"
+            " -H 'x-github-delivery: test-" + name + "'"
+            " -H 'x-hub-signature-256: sha256=" + sig + "'"
+            " --data-binary @/tmp/" + name + ".json"
+            " https://box.test/agent/webhook/github | grep -x 200"
+        )
+
+    declined = (
+        "journalctl -u agent-box-webhook@agent --no-pager"
+        " | grep -c 'not spawning for issue_comment on defangdevs/mention-demo'"
+    )
+
+    # An ordinary comment is not a request, and the decline is said out loud so
+    # it stays distinguishable from a watch that broke (#170).
+    post_comment("mention-plain", "looks good to me", "human")
+    machine.wait_until_succeeds('test "$(' + declined + ')" -ge 1', timeout=30)
+    machine.fail(
+        "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-mention\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+
+    # Same event shape, one substring different — and in the wrong case, which
+    # must not matter: GitHub logins are case-insensitive and so is the leaf.
+    post_comment("mention-hit", "@BOX-BOT please rebase", "human")
+    machine.wait_until_succeeds(
+        "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-mention\"))'"
+        " /home/agent/.config/agent-box/sessions.json",
+        timeout=60,
+    )
+
+    # The box quotes the request back when it answers, so without the sender
+    # leaf every reply would spawn a session that replies again. The echo is
+    # declined at the same stage as the plain comment: a second log line, and
+    # no second spawn behind it.
+    post_comment("mention-echo", "done, @box-bot out", "box-bot")
+    machine.wait_until_succeeds('test "$(' + declined + ')" -ge 2', timeout=30)
+
+    mention_session = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-mention\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent agent-box-session rm " + mention_session
+    )
+
+    # --- a review verdict on the box's OWN PR spawns a session (#255) --------
+    # The hole this closes: the last event that could start a session for a PR
+    # the box wrote was a CI FAILURE. Success ended the box's involvement, so
+    # an approved, green, own PR waited for a human indefinitely — and a
+    # changes-requested review, which is a direct instruction, reached nobody
+    # unless a session happened to still hold the topic. The session that opens
+    # a PR is usually gone by then.
+    #
+    # Every leaf here is `in`/`notIn` on a path GitHub already sends, so unlike
+    # the mention clause above this needs no new operator.
+    machine.succeed(
+        "jq -e '.topics[] | select(.topic == \"github:defangdevs/review-demo\")"
+        " | [.include.all[] | select(.path == \"pull_request.user.login\")]"
+        " | length == 1'"
+        " /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+
+    def post_review(name, state, author, sender, action="submitted"):
+        client.succeed(
+            "cat > /tmp/" + name + ".json <<'EOF'\n"
+            '{"action":"' + action + '",'
+            '"review":{"state":"' + state + '","body":"a verdict"},'
+            '"pull_request":{"number":7,"title":"a pr",'
+            '"user":{"login":"' + author + '"}},'
+            '"repository":{"full_name":"defangdevs/review-demo"},'
+            '"sender":{"login":"' + sender + '"}}\n'
+            "EOF"
+        )
+        sig = client.succeed(
+            "openssl dgst -sha256 -hmac " + secret + " -r /tmp/" + name
+            + ".json | cut -d' ' -f1"
+        ).strip()
+        client.succeed(
+            curl + " -o /dev/null -w '%{http_code}' -X POST"
+            " -H 'content-type: application/json'"
+            " -H 'x-github-event: pull_request_review'"
+            " -H 'x-github-delivery: test-" + name + "'"
+            " -H 'x-hub-signature-256: sha256=" + sig + "'"
+            " --data-binary @/tmp/" + name + ".json"
+            " https://box.test/agent/webhook/github | grep -x 200"
+        )
+
+    declined_review = (
+        "journalctl -u agent-box-webhook@agent --no-pager"
+        " | grep -c 'not spawning for pull_request_review on defangdevs/review-demo'"
+    )
+    review_session = (
+        "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-review\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+
+    # A review on somebody ELSE's PR is that person's business. This is the
+    # leaf that keeps the clause from spawning on every review in the org.
+    post_review("review-other", "changes_requested", "human", "human")
+    machine.wait_until_succeeds('test "$(' + declined_review + ')" -ge 1', timeout=30)
+    machine.fail(review_session)
+
+    # The box reviewing its own PR must not wake itself — same job the sender
+    # leaf does in the assignment and mention clauses.
+    post_review("review-self", "changes_requested", "box-bot", "box-bot")
+    machine.wait_until_succeeds('test "$(' + declined_review + ')" -ge 2', timeout=30)
+
+    # A dismissal is the REMOVAL of a verdict, and GitHub rewrites review.state
+    # to "dismissed" on that action, so it falls outside the state list by
+    # construction. Asserted, not assumed: this is the one exclusion a reader
+    # would otherwise expect to ride the clause.
+    post_review("review-dismissed", "dismissed", "box-bot", "human",
+                action="dismissed")
+    machine.wait_until_succeeds('test "$(' + declined_review + ')" -ge 3', timeout=30)
+    machine.fail(review_session)
+
+    # The verdict that must land. "changes requested" and not "approved" on
+    # purpose: an approval is the case #255 was filed about, and this is the
+    # case Lio asked for on top of it — a denial is an instruction too, and the
+    # payload spells it lowercase, so a rule copied from the REST API's
+    # uppercase spelling would match nothing here.
+    post_review("review-hit", "changes_requested", "box-bot", "human")
+    machine.wait_until_succeeds(review_session, timeout=60)
+
+    verdict_session = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-review\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent agent-box-session rm " + verdict_session
+    )
+
     # --- the settings page shows and deletes subscriptions (#227) -----------
     # Until now the only view of "what is subscribed" was per session, from
     # inside that session. The page is the box-wide one, for the operator:
@@ -1024,7 +1488,7 @@
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
-        " agent-box-webhook subscribe defangdevs/panel --note 'shown in the UI' --ttl 0"
+        " agent-box-webhook subscribe defangdevs/panel --note 'shown in the UI' --ttl 8"
     )
     page = machine.succeed(f"{settings_curl} {settings_page}")
     for want in [
@@ -1100,7 +1564,7 @@
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
-        " agent-box-webhook subscribe defangdevs/panel --note 'back again' --ttl 0"
+        " agent-box-webhook subscribe defangdevs/panel --note 'back again' --ttl 8"
     )
     machine.succeed(f"test -e {main_filter}")
 
@@ -1116,7 +1580,7 @@
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
-        " agent-box-webhook subscribe defangdevs/panel --note 'back again' --ttl 0"
+        " agent-box-webhook subscribe defangdevs/panel --note 'back again' --ttl 8"
     )
 
     # The same for a standing watch — the entry a flood most likely comes
@@ -1179,6 +1643,511 @@
     machine.succeed(
         "test -e /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
+
+    # --- the hook-session ceiling is visible, not merely enforced (#170) -----
+    # A standing watch is the one delivery shape with no session behind it, so
+    # when the spawn wrapper refuses a batch webhook.py drops it and NOBODY got
+    # those events. That refusal used to reach the receiver daemon's journal
+    # and nowhere else, while `ls` and `status` kept reporting a healthy
+    # subscription: four hook sessions whose agents forgot `agent-box-session
+    # rm` made every watch on the box inert, and a wedged box read exactly like
+    # a quiet week. So a refusal is written down, and both listings say it.
+    refused = "/home/agent/.local/state/agent-box/webhook-spawn-refused.json"
+
+    def dispatch_status(cap="", expect=None):
+        # cap: AGENT_BOX_HOOK_SESSION_MAX as the receiver daemon would carry
+        # it. The CLI cannot read the daemon's environment, so raising the
+        # ceiling means raising it for both — which is what this passes.
+        out = machine.succeed(
+            f"{hookenv} {cap} agent-box-webhook status 2>/tmp/cap.err"
+        )
+        err = machine.succeed("cat /tmp/cap.err")
+        if expect is None:
+            assert "hook-* sessions are running" not in err, err
+        else:
+            assert expect in err, err
+        return json.loads(out)["dispatch"]
+
+    # Nothing refused yet: the object is present (so it is a place to look, not
+    # a field that appears only in trouble) and says everything is fine.
+    machine.succeed(f"test ! -e {refused}")
+    d = dispatch_status()
+    assert d["topicCount"] > 0, d
+    assert d["spawnCommand"] is True, d
+    assert d["lastRefusal"] is None, d
+    assert d["hookSessions"]["max"] == 4, d
+    assert d["hookSessions"]["atCapacity"] is False, d
+    assert "warning" not in d, d
+
+    # The session the settings page deleted just above has to be gone from
+    # tmux as well, not only from the registry: since #280 a hook-* pane that
+    # no entry claims is counted too, so a delete still in flight would make
+    # the arithmetic below off by one.
+    machine.wait_until_fails(
+        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
+        f" list-sessions -F '#S' | grep -x {hook_name} >/dev/null",
+        timeout=60,
+    )
+
+    # The issue's own smallest reproduction: lower the ceiling under the hook
+    # sessions this test already accumulated, then drive the wrapper. Capacity
+    # is held by the entries that are not `stopped` (#280), which is every one
+    # of them here — nothing has been stopped yet, and the leg below is where
+    # a stopped entry and a running one are told apart.
+    live = int(machine.succeed(
+        "jq '[.sessions | to_entries[]"
+        " | select((.key | startswith(\"hook-\")) and .value.stopped != true)]"
+        " | length' /home/agent/.config/agent-box/sessions.json"
+    ).strip())
+    assert live >= 1, live
+    drop_env = (
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " AGENT_BOX_HOOK_SESSION_MAX=1"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/dropped"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
+    )
+    rc, refusal_log = machine.execute(drop_env)
+    assert rc == 1, (rc, refusal_log)
+    assert "dropping this batch" in refusal_log, refusal_log
+    # What the refusal is recorded against is what it was refused ON: since
+    # #280 that is the capacity in USE — hook-* sessions running or queued to
+    # start — and no longer the raw key count. Nothing here is `stopped`, so
+    # the two numbers agree; the #280 leg below drives them apart and asserts
+    # the record follows the cap.
+    refused_line = [
+        ln for ln in refusal_log.splitlines() if "hook-* sessions are running" in ln
+    ][0]
+    refused_used = int(refused_line.split(":", 1)[1].split()[0])
+    assert refused_used == live, (refusal_log, live)
+    # The batch is gone, not queued — no session, and the record is the only
+    # thing left of it.
+    machine.fail(
+        "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-dropped\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    rec = json.loads(machine.succeed(f"cat {refused}"))
+    assert rec["count"] == 1, rec
+    assert rec["live"] == refused_used, (rec, refusal_log)
+    assert rec["max"] == 1, rec
+    assert rec["topic"] == "github:defangdevs/*", rec
+    assert rec["key"] == "defangdevs/dropped", rec
+    assert rec["at"] == rec["firstAt"], rec
+
+    # status, at the ceiling: the count against the cap, the batch that was
+    # dropped, and ONE warning field — the same dispatch.warning webhook.py
+    # already sets for a receiver with no spawn command, so there is a single
+    # place to look rather than two.
+    d = dispatch_status(cap="AGENT_BOX_HOOK_SESSION_MAX=1",
+                        expect="hook-* sessions are running")
+    assert d["hookSessions"] == {"live": live, "max": 1, "atCapacity": True}, d
+    assert "DROPPED" in d["warning"], d
+    assert "agent-box-session rm NAME" in d["warning"], d
+    assert d["lastRefusal"]["count"] == 1, d
+
+    # ls says it too — a listing of standing watches is where someone goes to
+    # ask why nothing fires — but on stderr, so its stdout stays byte-for-byte
+    # webhook.py's for anything parsing it.
+    ls_out = machine.succeed(
+        f"{hookenv} AGENT_BOX_HOOK_SESSION_MAX=1 agent-box-webhook ls 2>/tmp/cap.err"
+    )
+    ls_err = machine.succeed("cat /tmp/cap.err")
+    assert "every standing watch is inert" in ls_err, ls_err
+    assert '"dispatch"' in ls_out, ls_out
+    assert "every standing watch is inert" not in ls_out, ls_out
+
+    # Cumulative and never cleared: the dropped batches do not come back, so
+    # "N dropped since T" is the standing fact, not something the next spawn
+    # gets to forget.
+    rc, _ = machine.execute(drop_env)
+    assert rc == 1, rc
+    rec2 = json.loads(machine.succeed(f"cat {refused}"))
+    assert rec2["count"] == 2, rec2
+    assert rec2["firstAt"] == rec["firstAt"], (rec, rec2)
+
+    # Back under the ceiling: no warning anywhere, the history still reported.
+    d = dispatch_status()
+    assert d["hookSessions"]["atCapacity"] is False, d
+    assert "warning" not in d, d
+    assert d["lastRefusal"]["count"] == 2, d
+
+    # ...and the record is history, not a brake — a match still spawns.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/again"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    again = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-again-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(f"sudo -u agent env HOME=/home/agent agent-box-session rm {again}")
+    machine.succeed(f"jq -e '.count == 2' {refused} >/dev/null")
+
+    # A knob that --help documents is a knob someone will typo, and an unusable
+    # value must not refuse every batch for a reason nobody can see: it says so
+    # and falls back to the built-in ceiling.
+    rc, typo_log = machine.execute(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " AGENT_BOX_HOOK_SESSION_MAX=lots"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/typo"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
+    )
+    assert rc == 0, (rc, typo_log)
+    assert "is not a number" in typo_log, typo_log
+    typo = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-typo-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(f"sudo -u agent env HOME=/home/agent agent-box-session rm {typo}")
+
+    # --- the dispatch cap counts what RUNS, not registry keys (issue #280) ---
+    # The cap used to count hook-* keys in sessions.json, and nothing expires a
+    # key: `stopped` is written by the pane epilogue and only
+    # `agent-box-session rm` clears it. So sessions that had long since finished
+    # kept holding dispatch capacity — the origin box sat at 2 of 4 slots held
+    # by corpses with no hook-* tmux session alive at all — and at four every
+    # standing watch went inert, journal-only (#170). Capacity now follows what
+    # the box is running.
+    #
+    # The liveness probe needs tmux, which the receiver unit's PATH deliberately
+    # does not carry (jq, coreutils and the session CLI are all of it), so the
+    # module pins the binary through the unit environment instead — the
+    # AGENT_BOX_*_BIN convention. Asserted first: without it the wrapper cannot
+    # tell a finished hook session from a running one, and would fall straight
+    # back to the count this leg exists to replace.
+    #
+    # One assignment per line, unquoted first: systemd only quotes a value that
+    # needs it (hookSessionArgs' JSON does), and the quotes would otherwise ride
+    # along into the env this leg builds.
+    recv_env = [
+        v.strip('"')
+        for v in machine.succeed(
+            "systemctl show -p Environment --value agent-box-webhook@agent.service"
+            " | tr ' ' '\\n'"
+        ).split("\n")
+    ]
+    recv_path = [v for v in recv_env if v.startswith("PATH=")][0]
+    recv_tmux = [v for v in recv_env if v.startswith("AGENT_BOX_TMUX_BIN=")][0]
+    tmux_bin = recv_tmux.split("=", 1)[1]
+    machine.fail(f"env -i {recv_path} {sw}/sh -c 'command -v tmux'")
+    machine.succeed(f"test -x {tmux_bin}")
+
+    # The wrapper is driven with exactly that environment — the receiver's own
+    # PATH plus the pinned binary — so what the cap can observe here is what it
+    # can observe in production.
+    def cap_spawn(key, maximum, tmux=None, want=True):
+        cmd = (
+            f"sudo -u agent env -i HOME=/home/agent {recv_path}"
+            f" {tmux if tmux else recv_tmux}"
+            f" AGENT_BOX_HOOK_SESSION_MAX={maximum}"
+            " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+            " LOCAL_WEBHOOK_SPAWN_SOURCE=github"
+            f" LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/{key}"
+            f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
+        )
+        return machine.succeed(cmd) if want else machine.fail(cmd)
+
+    def cap_session(key):
+        return machine.succeed(
+            "jq -r '.sessions | keys[]"
+            f" | select(startswith(\"hook-defangdevs-{key}-\"))'"
+            " /home/agent/.config/agent-box/sessions.json"
+        ).strip()
+
+    # Delist what the legs above left, so the arithmetic below is only about
+    # the sessions this one creates.
+    for stale in machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).split():
+        machine.succeed(
+            f"sudo -u agent env HOME=/home/agent agent-box-session rm {stale}"
+        )
+    hook_ls = (
+        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
+        " list-sessions -F '#S'"
+    )
+    hook_keys = (
+        "jq '[.sessions | keys[] | select(startswith(\"hook-\"))] | length'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    assert machine.succeed(hook_keys).strip() == "0"
+
+    # One hook session running, one finished: the shape that wedged the watch.
+    cap_spawn("capbusy", 2)
+    busy = cap_session("capbusy")
+    machine.wait_until_succeeds(f"{hook_ls} | grep -x {busy} >/dev/null", timeout=60)
+    # The probe also has to work from where the receiver runs it, not just from
+    # a login shell: ProtectSystem=strict leaves /run read-only, which does not
+    # stop a tmux CLIENT connecting to the socket there, but a mount namespace
+    # that hid the agent unit's RuntimeDirectory would.
+    machine.succeed(
+        "systemd-run --wait --pipe --uid=agent"
+        " --property=ProtectSystem=strict --property=ProtectHome=false"
+        " --property=ReadWritePaths=/home/agent --property=PrivateDevices=true"
+        " --setenv=TMUX_TMPDIR=/run/agent-box-agent"
+        f" {tmux_bin} -L agent-box list-sessions -F '#S'"
+        f" | grep -x {busy} >/dev/null"
+    )
+    # The second one is stopped only once it has really started, so "finished
+    # entry with no pane" is the state under test and not a spawn still in
+    # flight.
+    cap_spawn("capdone", 2)
+    done = cap_session("capdone")
+    machine.wait_until_succeeds(f"{hook_ls} | grep -x {done} >/dev/null", timeout=60)
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session stop {done}"
+    )
+    machine.succeed(
+        f"jq -e '.sessions[\"{done}\"].stopped == true'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    machine.wait_until_fails(f"{hook_ls} | grep -x {done} >/dev/null", timeout=60)
+
+    # Two hook-* keys at MAX=2, only one of them running. The old count dropped
+    # this batch for good; the new one spends the slot the finished session was
+    # sitting on. (Asserted, not assumed: a stray coalesced dispatch landing
+    # here would otherwise turn the arithmetic below into a puzzle.)
+    assert machine.succeed(hook_keys).strip() == "2"
+    cap_spawn("capfree", 2)
+    free = cap_session("capfree")
+    machine.wait_until_succeeds(f"{hook_ls} | grep -x {free} >/dev/null", timeout=60)
+
+    # ...and the brake is not simply gone: the SAME cap, with both slots now
+    # genuinely running, still drops the batch and says so — the only
+    # difference between this call and the one above is liveness, which is
+    # therefore worth restating as this assertion's precondition.
+    machine.succeed(f"{hook_ls} | grep -x {busy} >/dev/null")
+    machine.succeed(f"{hook_ls} | grep -x {free} >/dev/null")
+    drop = cap_spawn("capblocked", 2, want=False)
+    assert "2 hook-* sessions are running or queued to start" in drop, drop
+    # And the record #170 leaves carries THAT number, not the key count it
+    # replaced: three hook-* entries are listed here and the wrapper refused on
+    # the two that are running. One number, decided once, reported everywhere.
+    assert "recorded in" in drop, drop
+    blocked_rec = json.loads(machine.succeed(f"cat {refused}"))
+    assert blocked_rec["live"] == 2, (blocked_rec, drop)
+    assert blocked_rec["max"] == 2, blocked_rec
+    assert blocked_rec["key"] == "defangdevs/capblocked", blocked_rec
+    machine.fail(
+        "jq -e '.sessions | keys[]"
+        " | select(startswith(\"hook-defangdevs-capblocked\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+
+    # A probe that cannot run must not read as "nothing is running": it falls
+    # back to the old key count, which drops a batch it might have allowed
+    # (three keys, MAX=3) rather than uncapping spawns altogether. The same
+    # call with the pinned tmux working sees two live sessions and spawns.
+    assert machine.succeed(hook_keys).strip() == "3"
+    blind = cap_spawn(
+        "capnoprobe", 3, tmux="AGENT_BOX_TMUX_BIN=/nonexistent/tmux", want=False
+    )
+    assert "cannot ask tmux" in blind, blind
+    cap_spawn("capprobe", 3)
+    probe = cap_session("capprobe")
+    for name in [busy, done, free, probe]:
+        machine.succeed(
+            f"sudo -u agent env HOME=/home/agent agent-box-session rm {name}"
+        )
+
+    # --- who "@self" is, resolved at runtime (issue #261) -------------------
+    # webhook-spawn.sh seeds every dispatched hook-* session with exactly
+    # ignoreSenders ["@self"], and webhook.py resolves that against
+    # LOCAL_WEBHOOK_SELF — which nothing set, so the mute was inert and a hook
+    # session heard its own comments come back. The identity cannot be declared
+    # at deploy time: it is a property of whatever GitHub token the user's
+    # environment carries, and the settings page can swap that token for a
+    # different account at any moment. So a resolver derives it from the token,
+    # caches it keyed by a FINGERPRINT of that token, and both readers — the
+    # session (via env-exec) and the receiver (via EnvironmentFile) — take it
+    # from there.
+    #
+    # `gh` is stubbed because this VM has no route to GitHub; everything else
+    # on this leg is the real path.
+    state = "/home/agent/.local/state/local-webhook"
+    selfenv = f"{state}/self.env"
+    # In the agent's own HOME, with an absolute interpreter from the system
+    # profile: a stub the agent cannot execute would fail INSIDE the resolver,
+    # where gh's stderr is deliberately silenced, and look like "no token".
+    fakebin = "/home/agent/fakebin"
+    machine.succeed(
+        f"sudo -u agent mkdir -p {fakebin}"
+        f" && sudo -u agent tee {fakebin}/gh > /dev/null <<'EOF'\n"
+        f"#!{sw}/sh\n"
+        f'echo "$@" >> {fakebin}/calls\n'
+        'printf "%s\\n" "''${FAKE_LOGIN:-box-bot}"\n'
+        "EOF\n"
+        f"sudo -u agent chmod 755 {fakebin}/gh"
+    )
+    # The stub answers when the agent runs it — asserted here, so a broken stub
+    # cannot masquerade as a broken resolver below.
+    machine.succeed(
+        f"sudo -u agent {fakebin}/gh api user --jq .login | grep -x box-bot >/dev/null"
+    )
+    machine.succeed(f"sudo -u agent rm -f {fakebin}/calls")
+    resolve = (
+        "sudo -u agent env HOME=/home/agent"
+        f" LOCAL_WEBHOOK_STATE_DIR={state}"
+    )
+    with_gh = f"{resolve} PATH={fakebin}:$PATH"
+
+    # First resolution: asks GitHub once, answers with the login, and leaves an
+    # env-file behind — a login is not a secret, so it is world-readable.
+    assert machine.succeed(f"{with_gh} agent-box-webhook-self").strip() == "box-bot"
+    machine.succeed(f"grep -x 'LOCAL_WEBHOOK_SELF=box-bot' {selfenv} >/dev/null")
+    machine.succeed(f"grep -x '# fp=[0-9a-f]*' {selfenv} >/dev/null")
+    machine.succeed(f"stat -c '%U %a' {selfenv} | grep -x 'agent 644'")
+    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == "1"
+
+    # Same token, so the cached answer stands — without gh on PATH at all,
+    # which is what keeps this off the session-start path in the normal case.
+    assert machine.succeed(f"{resolve} agent-box-webhook-self").strip() == "box-bot"
+    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == "1"
+
+    # A DIFFERENT token is a different account until proven otherwise: the
+    # fingerprint no longer matches, so it re-resolves rather than trusting the
+    # cache. This is the case a deploy-time option gets silently wrong.
+    assert machine.succeed(
+        f"{with_gh} GH_TOKEN=second FAKE_LOGIN=other-bot agent-box-webhook-self"
+    ).strip() == "other-bot"
+    machine.succeed(f"grep -x 'LOCAL_WEBHOOK_SELF=other-bot' {selfenv} >/dev/null")
+    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == "2"
+
+    # An explicit LOCAL_WEBHOOK_SELF answers the question itself: echoed back,
+    # no lookup, and the cache is left alone (it describes the token, not this
+    # one-off override).
+    assert machine.succeed(
+        f"{with_gh} LOCAL_WEBHOOK_SELF=someone-else agent-box-webhook-self"
+    ).strip() == "someone-else"
+    machine.succeed(f"grep -x 'LOCAL_WEBHOOK_SELF=other-bot' {selfenv} >/dev/null")
+    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == "2"
+
+    # No gh and a token nothing has resolved: the last known identity beats no
+    # identity — the box did not stop being that account because GitHub was
+    # unreachable — and the failed attempt is stamped.
+    assert machine.succeed(
+        f"{resolve} GH_TOKEN=third agent-box-webhook-self"
+    ).strip() == "other-bot"
+    machine.succeed(f"test -s {state}/.self-attempt")
+    # That stamp is honored ONLY under --throttled, which is how env-exec calls
+    # it: at every session start, so an offline box must not pay a network
+    # timeout per respawn. Same token, gh now reachable, and it still does not
+    # ask — it answers from the last known login instead.
+    before = machine.succeed(f"wc -l < {fakebin}/calls").strip()
+    assert machine.succeed(
+        f"{with_gh} GH_TOKEN=third agent-box-webhook-self --throttled"
+    ).strip() == "other-bot"
+    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == before
+    # A person (or this test) asking directly always gets a real attempt: the
+    # throttle is for the automatic caller, and whoever runs the command has
+    # just done something about the failure. This is not hypothetical — the
+    # session that starts at boot stamps a failed lookup on any box without a
+    # token, and without this rule every later call would inherit that silence
+    # for an hour.
+    assert machine.succeed(
+        f"{with_gh} GH_TOKEN=third FAKE_LOGIN=third-bot agent-box-webhook-self"
+    ).strip() == "third-bot"
+    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() != before
+
+    # Back to the first token for the rest of the leg.
+    machine.succeed(f"{with_gh} agent-box-webhook-self >/dev/null")
+
+    # A session picks it up: env-exec resolves before it execs the agent, so
+    # the session's own webhook peer — the process that filters this session's
+    # deliveries — has the same answer the receiver does. Asserted through the
+    # wrapper itself (see session_self above): the export lands in the agent's
+    # process environment, which is not something tmux can be asked about.
+    assert session_self() == "box-bot", session_self()
+    # An identity set in the env store is the user's own answer, and it beats
+    # the resolved one — the store is read first, and the resolver echoes back
+    # what it finds rather than looking anything up.
+    machine.succeed(
+        "sudo -u agent install -d -m 700 /home/agent/.config/agent-box"
+        " && printf 'LOCAL_WEBHOOK_SELF=hand-picked\\n'"
+        " | sudo -u agent tee /home/agent/.config/agent-box/env > /dev/null"
+    )
+    assert session_self() == "hand-picked", session_self()
+    machine.succeed("sudo -u agent rm -f /home/agent/.config/agent-box/env")
+    assert session_self() == "box-bot", session_self()
+
+    # ... and so does the receiver, which loads the same file as an
+    # EnvironmentFile. Read from the running process, not `systemctl show -p
+    # Environment`: that property lists Environment= only, and the whole point
+    # here is the value that arrives from the file.
+    machine.succeed("systemctl restart agent-box-webhook@agent.service")
+    machine.wait_for_unit("agent-box-webhook@agent.service")
+    machine.wait_until_succeeds(
+        "tr '\\0' '\\n'"
+        " < /proc/$(systemctl show -p MainPID --value agent-box-webhook@agent.service)/environ"
+        " | grep -x 'LOCAL_WEBHOOK_SELF=box-bot' >/dev/null",
+        timeout=30,
+    )
+
+    # --- and now the mute actually mutes ------------------------------------
+    # Driven through a second stand-in peer, because the peer is the process
+    # that filters session deliveries and it reads the value once at startup.
+    # The value comes from the running DAEMON, not a literal, so this cannot
+    # pass on a box where the resolution never reached anyone.
+    self_login = machine.succeed(
+        "tr '\\0' '\\n'"
+        " < /proc/$(systemctl show -p MainPID --value agent-box-webhook@agent.service)/environ"
+        " | sed -n 's/^LOCAL_WEBHOOK_SELF=//p'"
+    ).strip()
+    assert self_login == "box-bot", self_login
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        f" LOCAL_WEBHOOK_STATE_DIR={state}"
+        " LOCAL_WEBHOOK_SESSION=agent-echo"
+        " agent-box-webhook subscribe defangdevs/echo --note 'echo mute (#261)'"
+        " --ignore-sender @self --ttl 8"
+    )
+    machine.succeed(
+        "systemd-run --unit=webhook-echo-peer --uid=agent --setenv=HOME=/home/agent"
+        f" --setenv=LOCAL_WEBHOOK_STATE_DIR={state}"
+        " --setenv=LOCAL_WEBHOOK_SESSION=agent-echo --setenv=LOCAL_WEBHOOK_PORT=0"
+        f" --setenv=LOCAL_WEBHOOK_SELF={self_login}"
+        f" {sw}/sh -c '{sw}/sleep 600 | {python} {script} > /tmp/echo-peer.log 2>&1'"
+    )
+    machine.wait_until_succeeds(f"ls {inst}/agent-echo.*.sock", timeout=30)
+
+    def post_issue(name, sender, delivery):
+        # A non-CI event on purpose: CI outcomes override an ignore list by
+        # design, so they cannot show whether the list resolved at all.
+        client.succeed(
+            f"cat > /tmp/{name}.json <<'EOF'\n"
+            '{"action":"opened","issue":{"number":7,"title":"echo",'
+            '"html_url":"https://box.test/i/7"},'
+            '"repository":{"full_name":"defangdevs/echo"},'
+            f'"sender":{{"login":"{sender}"}}}}\n'
+            "EOF"
+        )
+        sig_e = client.succeed(
+            f"openssl dgst -sha256 -hmac {secret} -r /tmp/{name}.json | cut -d' ' -f1"
+        ).strip()
+        client.succeed(
+            f"{curl} -o /dev/null -w '%{{http_code}}' -X POST"
+            " -H 'content-type: application/json' -H 'x-github-event: issues'"
+            f" -H 'x-github-delivery: {delivery}'"
+            f" -H 'x-hub-signature-256: sha256={sig_e}' --data-binary @/tmp/{name}.json"
+            " https://box.test/agent/webhook/github | grep -x 200"
+        )
+
+    # The box's own action: accepted at the ingress, dropped at the filter.
+    post_issue("echo-self", self_login, "test-echo-self")
+    machine.sleep(3)
+    machine.fail("grep -q 'defangdevs/echo' /tmp/echo-peer.log")
+    # Anyone else on the same topic still gets through, so the mute is a sender
+    # rule and not a dead subscription.
+    post_issue("echo-other", "someone", "test-echo-other")
+    machine.wait_until_succeeds(
+        "grep -q 'defangdevs/echo' /tmp/echo-peer.log", timeout=30
+    )
+    machine.succeed("systemctl stop webhook-echo-peer.service")
 
     # --- syncSessionPlugin: a stale session cache is refreshed at session start
     # (issue #193, option 2) --------------------------------------------------
