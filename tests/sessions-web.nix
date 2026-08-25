@@ -311,12 +311,12 @@ in
         assert 'src="/agent/main/"' not in ws, ws
 
         # The terminal dead end names the verb that actually revives it.
-        # Print the wrapper's path (see the grep -o note below) — running
+        # Print the wrapper's path (see the grep -oE note below) — running
         # the substitution as the command would run the WRAPPER instead.
         attach = machine.succeed(
             "{ systemctl show agent-web-terminal@agent --property=ExecStart "
-            "--value | grep -o '/nix/store/[^ ]*agent-box-attach' "
-            "|| echo /missing; } | head -n1"
+            "--value | grep -oE '/nix/store/[^ ]*/bin/agent-box-attach( |$)' "
+            "|| echo /missing; } | sed 's/ $//' | head -n1"
         ).strip()
         assert attach != "/missing", attach
 
@@ -353,10 +353,17 @@ in
     # Phase 2. `grep -o ... || echo missing`: an empty substitution would
     # leave `grep -q` reading stdin — the backdoor shell then hangs the whole
     # test until the CI timeout (exactly how the rename was first caught).
+    # The pattern must end at a token boundary and name /bin/: Phase 3 made
+    # attachScript a writeShellScriptBin, so the store path CONTAINS
+    # "-agent-box-attach" as a directory as well. A pattern that can stop
+    # short yields a path that does not exist while grep still exits 0, so
+    # the `|| echo /missing` guard never fires and the failure surfaces
+    # later as a confusing "no such file".
     machine.succeed(
         "grep -q -- '-T hyperlinks' "
         "$({ systemctl show agent-web-terminal@agent --property=ExecStart --value "
-        "| grep -o '/nix/store/[^ ]*agent-box-attach' || echo /missing; } | head -n1)"
+        "| grep -oE '/nix/store/[^ ]*/bin/agent-box-attach( |$)' "
+        "|| echo /missing; } | sed 's/ $//' | head -n1)"
     )
 
     # Working-directory picker (issue 131): the add-session form browses the
