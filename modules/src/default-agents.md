@@ -140,15 +140,24 @@ to that same store and your PRs carry screenshots without committing binaries
 or parking them on a side branch:
 
     id=$(gh api repos/OWNER/REPO --jq .id)
-    curl -sS -X POST \
-      -H "Authorization: Bearer $(gh auth token)" \
-      -H "Content-Type: image/png" \
-      --data-binary @shot.png \
-      "https://uploads.github.com/user-attachments/assets?name=shot.png&content_type=image/png&repository_id=$id"
+    printf 'Authorization: Bearer %s\n' "$(gh auth token)" |
+      curl -sS --fail-with-body -X POST -H @- \
+        -H "Content-Type: image/png" \
+        --data-binary @shot.png \
+        "https://uploads.github.com/user-attachments/assets?name=shot.png&content_type=image/png&repository_id=$id"
     # 201 {"url":"https://github.com/user-attachments/assets/<uuid>"}
 
 Reference that URL from the body as `![before](URL)` and post normally. GIF
 and mp4 upload the same way; match `name` and `content_type` to the file.
+
+The token arrives over stdin because curl does NOT blank `-H` in its
+arguments and /proc here is mounted without `hidepid` — spelled the obvious
+way, `-H "Authorization: Bearer ..."` puts your token in the `ps` output of
+every other Linux user on the box, which is the one boundary this system
+actually enforces. `printf` is a shell builtin, so it forks nothing that
+could carry the token either. And `--fail-with-body` matters because `-sS`
+alone exits 0 on a 404: without it you paste GitHub's error JSON into the
+body as if it were a URL.
 
 Two behaviors will fool you into reporting a failure. The URL 404s until
 something references it, and then goes live a few seconds LATER — so post
