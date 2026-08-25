@@ -2409,13 +2409,14 @@ in
       }
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-web-terminal@${name}" {
         overrideStrategy = "asDropin";
-        # The attach script (src/attach.sh) resolves tmux and jq from
-        # this PATH instead of baked store paths (issue #154, Phase 2) —
-        # forced for the same reason as "agent-box@"'s PATH (NixOS's own
-        # implicit per-instance default would otherwise win).
+        # The attach script (src/attach.sh) resolves tmux, jq and head
+        # (coreutils) from this PATH instead of baked store paths (issue
+        # #154, Phase 2) — forced for the same reason as "agent-box@"'s
+        # PATH (NixOS's own implicit per-instance default would otherwise
+        # win).
         environment = {
           AGENT_BOX_WEB_DOMAIN = cfg.web.domain;
-          PATH = lib.mkForce (lib.makeBinPath [ pkgs.tmux pkgs.jq attachScript pkgs.ttyd ]);
+          PATH = lib.mkForce (lib.makeBinPath [ pkgs.tmux pkgs.jq pkgs.coreutils attachScript pkgs.ttyd ]);
         };
         # agent-box-attach is given as an absolute path here (not left bare
         # for ttyd's own PATH-based exec, unlike the verbatim unit text)
