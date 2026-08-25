@@ -334,6 +334,10 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
+        - Key: agent-box:rev
+          Value: !Ref AgentBoxRev
+        - Key: agent-box:agent
+          Value: !Ref Agent
 
   VpcIpv6:
     Type: AWS::EC2::VPCCidrBlock
@@ -347,6 +351,10 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
+        - Key: agent-box:rev
+          Value: !Ref AgentBoxRev
+        - Key: agent-box:agent
+          Value: !Ref Agent
 
   IgwAttach:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -374,6 +382,10 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
+        - Key: agent-box:rev
+          Value: !Ref AgentBoxRev
+        - Key: agent-box:agent
+          Value: !Ref Agent
 
   RouteTable:
     Type: AWS::EC2::RouteTable
@@ -382,6 +394,10 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
+        - Key: agent-box:rev
+          Value: !Ref AgentBoxRev
+        - Key: agent-box:agent
+          Value: !Ref Agent
 
   RouteV4:
     Type: AWS::EC2::Route
@@ -413,6 +429,10 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
+        - Key: agent-box:rev
+          Value: !Ref AgentBoxRev
+        - Key: agent-box:agent
+          Value: !Ref Agent
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 443
@@ -440,6 +460,10 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
+        - Key: agent-box:rev
+          Value: !Ref AgentBoxRev
+        - Key: agent-box:agent
+          Value: !Ref Agent
 
   EIP:
     Type: AWS::EC2::EIP
@@ -449,6 +473,10 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
+        - Key: agent-box:rev
+          Value: !Ref AgentBoxRev
+        - Key: agent-box:agent
+          Value: !Ref Agent
 
   EIPAssoc:
     Type: AWS::EC2::EIPAssociation
@@ -482,7 +510,20 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
+        - Key: agent-box:rev
+          Value: !Ref AgentBoxRev
+        - Key: agent-box:agent
+          Value: !Ref Agent
 
+  # The ONLY resource here that carries no tags, and not by choice:
+  # AWS::IAM::InstanceProfile has no Tags property in CloudFormation, and IAM
+  # resources never receive CloudFormation's automatic aws:cloudformation:*
+  # tags either. So a profile left behind by a failed stack delete (an IAM
+  # user without iam:RemoveRoleFromInstanceProfile hits exactly that) is
+  # untraceable by tag - identify it by its generated name, which embeds the
+  # stack name, or by InstanceRole below, which does carry the agent-box:*
+  # tags. Naming it explicitly would make it greppable but would force
+  # CAPABILITY_NAMED_IAM on every 1-click launch, so we take the tradeoff.
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Condition: UseSsm
@@ -503,6 +544,10 @@ Resources:
           Tags:
             - Key: Name
               Value: !Ref AWS::StackName
+            - Key: agent-box:rev
+              Value: !Ref AgentBoxRev
+            - Key: agent-box:agent
+              Value: !Ref Agent
       LaunchTemplateData:
         InstanceMarketOptions:
           MarketType: spot
@@ -579,9 +624,16 @@ Resources:
       MetadataOptions:
         HttpTokens: required
         HttpPutResponseHopLimit: 2
+      # Without this, the root EBS volume in BlockDeviceMappings stays
+      # untagged — PropagateTagsToVolumeOnCreation defaults to false.
+      PropagateTagsToVolumeOnCreation: true
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
+        - Key: agent-box:rev
+          Value: !Ref AgentBoxRev
+        - Key: agent-box:agent
+          Value: !Ref Agent
       UserData:
         Fn::Base64:
           Fn::Sub:
