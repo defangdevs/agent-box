@@ -92,6 +92,53 @@ handle /agent/downloads/* {
     }
   }
 }
+# agent's landing page: the tabbed workspace (and, on a box with no
+# session yet, a redirect to the settings page — a tab bar with nothing
+# in it is not what its owner needs first). Served by the settings daemon,
+# and matched ONLY without an arg= query, which is what separates it from
+# the terminal below: the session routes rewrite to this same path with
+# arg=<session> attached, and ttyd has to keep receiving those.
+@home_agent {
+  path /agent/
+  not query arg=*
+}
+handle @home_agent {
+  @cookie_home_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
+  handle @cookie_home_agent {
+    reverse_proxy unix//run/agent-box-settings/agent.sock
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+        agent {$WEB_PASSWORD_HASH_AGENT}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      reverse_proxy unix//run/agent-box-settings/agent.sock
+    }
+  }
+}
+# One path per session: /agent/<session>/ is that session's terminal, and
+# everything ttyd asks for from a page loaded there (its ws and token
+# endpoints, resolved relative to the URL in the address bar) hangs off the
+# same prefix. Both are rewritten onto ttyd's own path with the session
+# named in ?arg=, which is the selector --url-arg feeds to the attach
+# wrapper — so a session gets a real URL of its own, and nothing about
+# ttyd's own routing changes.
+#
+# The exclusions are the names this vhost has already spent: no lookahead
+# in RE2, so they are a `not path` beside the regexp rather than part of
+# it, and the session name rules (CLI, daemon, module assertion) refuse
+# exactly this set so no session can be shadowed by one of them.
+@sess_bare_agent {
+  path_regexp bare_agent ^/agent/([^/]+)$
+  not path /agent/settings /agent/downloads /agent/webhook /agent/token /agent/ws
+}
+redir @sess_bare_agent /agent/{re.bare_agent.1}/
+@sess_agent {
+  path_regexp sess_agent ^/agent/([^/]+)/(.*)$
+  not path /agent/settings* /agent/downloads/* /agent/webhook*
+}
+rewrite @sess_agent /agent/{re.sess_agent.2}?arg={re.sess_agent.1}&{query}
 handle /agent/* {
   @cookie_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
   handle @cookie_agent {
@@ -162,6 +209,53 @@ handle /robot/downloads/* {
     }
   }
 }
+# robot's landing page: the tabbed workspace (and, on a box with no
+# session yet, a redirect to the settings page — a tab bar with nothing
+# in it is not what its owner needs first). Served by the settings daemon,
+# and matched ONLY without an arg= query, which is what separates it from
+# the terminal below: the session routes rewrite to this same path with
+# arg=<session> attached, and ttyd has to keep receiving those.
+@home_robot {
+  path /robot/
+  not query arg=*
+}
+handle @home_robot {
+  @cookie_home_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
+  handle @cookie_home_robot {
+    reverse_proxy unix//run/agent-box-settings/robot.sock
+  }
+  handle {
+    route {
+      basic_auth {$WEB_PASSWORD_ALGORITHM_ROBOT} robot {
+        robot {$WEB_PASSWORD_HASH_ROBOT}
+      }
+      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      reverse_proxy unix//run/agent-box-settings/robot.sock
+    }
+  }
+}
+# One path per session: /robot/<session>/ is that session's terminal, and
+# everything ttyd asks for from a page loaded there (its ws and token
+# endpoints, resolved relative to the URL in the address bar) hangs off the
+# same prefix. Both are rewritten onto ttyd's own path with the session
+# named in ?arg=, which is the selector --url-arg feeds to the attach
+# wrapper — so a session gets a real URL of its own, and nothing about
+# ttyd's own routing changes.
+#
+# The exclusions are the names this vhost has already spent: no lookahead
+# in RE2, so they are a `not path` beside the regexp rather than part of
+# it, and the session name rules (CLI, daemon, module assertion) refuse
+# exactly this set so no session can be shadowed by one of them.
+@sess_bare_robot {
+  path_regexp bare_robot ^/robot/([^/]+)$
+  not path /robot/settings /robot/downloads /robot/webhook /robot/token /robot/ws
+}
+redir @sess_bare_robot /robot/{re.bare_robot.1}/
+@sess_robot {
+  path_regexp sess_robot ^/robot/([^/]+)/(.*)$
+  not path /robot/settings* /robot/downloads/* /robot/webhook*
+}
+rewrite @sess_robot /robot/{re.sess_robot.2}?arg={re.sess_robot.1}&{query}
 handle /robot/* {
   @cookie_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
   handle @cookie_robot {
@@ -178,11 +272,12 @@ handle /robot/* {
   }
 }
 
-# Anything else, including /: agent's tabbed terminal workspace
-# (one tab per session, panes iframing /agent/?arg=<session>; plus
-# the /sessions/* CRUD routes), served by the settings daemon behind
-# the SAME cookie-or-basic auth as the terminal — session CRUD must
-# never be reachable unauthenticated.
+# Anything else, including /: the settings daemon behind the SAME
+# cookie-or-basic auth as the terminal — session CRUD must never be
+# reachable unauthenticated. GET / picks a USER and lands in their space
+# (/agent/, where the tabbed workspace now lives); the /sessions/* CRUD
+# routes the workspace posts to stay here, at the vhost root, so they are
+# one set of paths no session name can ever shadow.
 # This replaces the old unauthenticated picker (single-user boxes are
 # the norm now); with it gone — and the public sessions.json it fed
 # removed — nothing on this vhost is served without auth. Other
