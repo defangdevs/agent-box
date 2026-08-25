@@ -613,7 +613,7 @@
               check_payload agent-box-update update.sh
               check_payload agent-box-codex-remote-control codex-remote-control.sh
               check_payload agent-box-claude-session-start-hook claude-session-start-hook.sh
-              check_payload agent-box-env-exec env-exec.sh
+              check_payload agent-box-env-exec env-exec.py
               check_payload agent-box-session-bare session-cli.sh
               check_payload agent-box-upload upload-cli.sh
 

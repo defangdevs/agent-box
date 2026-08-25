@@ -119,7 +119,7 @@ let
     (payload "agent-box-update" "update.sh")
     (payload "agent-box-codex-remote-control" "codex-remote-control.sh")
     (payload "agent-box-claude-session-start-hook" "claude-session-start-hook.sh")
-    (payload "agent-box-env-exec" "env-exec.sh")
+    (payload "agent-box-env-exec" "env-exec.py")
     settingsDaemon
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-spawn" "webhook-spawn.sh")
