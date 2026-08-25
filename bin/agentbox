@@ -23,6 +23,14 @@ issue #154:
 templates used to do inline: settle the public IP, derive the sslip.io
 hostname, hash the web password, and signal the stack's WaitCondition.
 
+    agentbox update
+
+is the native half of the self-update path (issue #358). NixOS rewrites a
+pin file and runs nixos-rebuild; here the software IS the Nix profile, so
+updating means fast-forwarding that profile to a newer rev of this repo and
+re-applying. It is what agent-box-update.service runs, which is in turn what
+the agents' sudo rule and the settings page's Update button trigger.
+
 Render to a tree instead of the live host with `--root DIR` (implies no
 useradd/systemctl); that is what tests/test_agentbox.py diffs against a
 committed expectation, and it is the native half of the Phase 5 spec
@@ -50,6 +58,25 @@ USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 # ttyd ports are assigned in sorted user order, exactly as the module does,
 # so a user added later cannot renumber an existing user's port.
 TTYD_PORT_BASE = 7681
+
+DEFAULT_CONFIG = "/etc/agent-box/config.yaml"
+
+# The self-update unit (issue #358). `agentbox apply` renders it but never
+# enables or starts it: it is on-demand only, triggered through the sudo
+# rule below or by the settings page's Update button. The trigger command
+# is spelled ONCE here because three places have to agree on it byte for
+# byte — the sudoers line, the AGENT_BOX_UPDATE_CMD the settings daemon
+# execs, and the paragraph the shipped guide tells the agent to run. A
+# mismatch between any two of them is issue #353 all over again (a grant
+# that does not match the command asks for a password instead).
+UPDATE_UNIT = "agent-box-update.service"
+SYSTEMCTL = "/usr/bin/systemctl"
+UPDATE_TRIGGER = f"{SYSTEMCTL} start --no-block {UPDATE_UNIT}"
+# The flake output the runtime profile is installed from, and the element
+# name `nix profile` records it under.
+RUNTIME_ATTR = "runtime"
+GITHUB_API = "https://api.github.com"
+REV_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class ConfigError(Exception):
@@ -79,6 +106,89 @@ def load_config(path):
     return data
 
 
+def profile_manifest(profile):
+    """What the installed runtime profile records about its own origin.
+
+    A Nix profile generation is a store path containing manifest.json, so
+    this is a plain file read — no `nix` invocation, no daemon, and it works
+    inside `--root` renders and tests. Returns None when there is no
+    manifest (a plain-directory install, or a test fixture).
+    """
+    try:
+        data = json.loads((Path(profile) / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def manifest_element(manifest, attr=RUNTIME_ATTR):
+    """(name, element) for the runtime entry in a profile manifest.
+
+    Two shapes in the wild: nix >= 2.20 keys `elements` by name, older
+    versions make it a list addressed by index. `nix profile remove` takes
+    exactly that name-or-index, so both are returned as a string usable as
+    an argument.
+    """
+    if not manifest:
+        return None, None
+    elements = manifest.get("elements")
+    if isinstance(elements, dict):
+        items = list(elements.items())
+    elif isinstance(elements, list):
+        items = [(str(i), e) for i, e in enumerate(elements)]
+    else:
+        return None, None
+    for name, element in items:
+        if not isinstance(element, dict):
+            continue
+        if name == attr or str(element.get("attrPath", "")).endswith(
+                f".{attr}"):
+            return name, element
+    # A single-element profile that names itself something else is still
+    # unambiguous — this profile only ever holds the runtime.
+    if len(items) == 1 and isinstance(items[0][1], dict):
+        return items[0]
+    return None, None
+
+
+def parse_flake_url(url):
+    """github:owner/repo[/ref] -> ("owner/repo", "<40-hex rev>" or None).
+
+    Only a locked URL carries a rev; `originalUrl` on a branch-tracking box
+    is the bare `github:owner/repo` (or a branch name, which is a ref and
+    not a rev). Anything that is not a github: flake yields (None, None) —
+    the caller then asks for --repo rather than guessing.
+    """
+    if not url or not url.startswith("github:"):
+        return None, None
+    parts = url[len("github:"):].split("/")
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return None, None
+    repo = f"{parts[0]}/{parts[1]}"
+    rev = parts[2] if len(parts) > 2 and REV_RE.match(parts[2]) else None
+    return repo, rev
+
+
+def profile_origin(profile):
+    """(repo, rev) the runtime profile was actually installed from.
+
+    The profile is the ground truth for "what rev is this box running", and
+    the reason `Spec` does not need a `repo:`/`rev:` config field for it
+    (issue #358's second open question). config.yaml as written by
+    aws/lightsail-native-template.yaml sets neither, so before this the
+    settings page advertised the placeholder defaults — a repo that happened
+    to be right and a rev of forty zeroes — on every native box.
+    """
+    name, element = manifest_element(profile_manifest(profile))
+    if not element:
+        return None, None
+    repo, rev = parse_flake_url(element.get("url") or element.get("uri"))
+    if not repo:
+        repo, _ = parse_flake_url(
+            element.get("originalUrl") or element.get("originalUri"))
+    return repo, rev
+
+
 class Spec:
     """The validated, defaulted view of config.yaml the renderer reads."""
 
@@ -88,8 +198,14 @@ class Spec:
         self.host_label = data.get("hostLabel") or self.domain or "agent-box"
         self.agents = list(data.get("agents") or ["claude"])
         self.default_agent = data.get("defaultAgent") or self.agents[0]
-        self.repo = data.get("repo") or "defangdevs/agent-box"
-        self.rev = data.get("rev") or "0" * 40
+        # Where this box's software came from. The profile's own manifest
+        # wins over the config: a `repo:`/`rev:` key can disagree with what
+        # is actually installed (and on a template-launched box there is no
+        # such key at all), while the manifest cannot — `agentbox update`
+        # rewrites it as part of switching.
+        origin_repo, origin_rev = profile_origin(profile)
+        self.repo = origin_repo or data.get("repo") or "defangdevs/agent-box"
+        self.rev = origin_rev or data.get("rev") or "0" * 40
         self.webhook_repo = (data.get("webhook") or {}).get("repo") or ""
         self.webhook_script = (data.get("webhook") or {}).get("script") or ""
         web = data.get("web") or {}
@@ -201,12 +317,16 @@ def dropin(section_lines):
 
 
 class Renderer:
-    def __init__(self, spec, profile, root=Path("/")):
+    def __init__(self, spec, profile, root=Path("/"), config=DEFAULT_CONFIG):
         self.spec = spec
         self.profile = Path(profile)
         self.root = Path(root)
         self.bin = self.profile / "bin"
         self.share = self.profile / "share" / "agent-box"
+        # Carried into agent-box-update.service's ExecStart: an update
+        # re-applies the SAME config this apply was driven by, so a box
+        # configured from a non-default path keeps working after it.
+        self.config = str(config)
 
     def p(self, *parts):
         """A path inside the render root (so --root DIR renders a tree)."""
@@ -216,6 +336,7 @@ class Renderer:
         t = Tree()
         self.dirs(t)
         self.shared_units(t)
+        self.update_unit(t)
         self.per_user(t)
         self.sudoers(t)
         self.tmpfiles(t)
@@ -261,6 +382,47 @@ class Renderer:
             t.file(self.p("/etc/systemd/system/"
                           "agent-web-auth-secrets.service"),
                    self.auth_secrets_unit(), 0o444)
+
+    def update_unit(self, t):
+        """The on-demand self-update unit (issue #358).
+
+        Deliberately NOT appended to `t.units`: that list is what
+        `cmd_apply` runs `systemctl enable --now` over, so a unit in it
+        would fire an update on every single apply. This one is started by
+        hand — through the agents' sudo rule, the settings page's Update
+        button, or root — which is also why it has no [Install] section and
+        no target drop-in.
+
+        `nix` is not in the runtime profile (the box gets it from the
+        Determinate installer, which puts it in the default profile), and
+        systemd units inherit no PATH, so both are named explicitly along
+        with /usr/bin for systemctl and wall.
+        """
+        path = ":".join([
+            str(self.bin),
+            "/nix/var/nix/profiles/default/bin",
+            "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+        ])
+        t.file(self.p("/etc/systemd/system", UPDATE_UNIT), "".join(
+            line + "\n" for line in [
+                "# Generated by `agentbox apply` — do not edit.",
+                "[Unit]",
+                "Description=Fast-forward agent-box to upstream HEAD "
+                "and re-apply",
+                "After=network-online.target",
+                "Wants=network-online.target",
+                "",
+                "[Service]",
+                "Type=oneshot",
+                f'Environment="PATH={path}"',
+                # Substituting a new runtime closure is minutes of work on a
+                # small box, and the trigger is --no-block, so nothing is
+                # waiting on it. A default 90 s TimeoutStartSec would kill it
+                # mid-switch.
+                "TimeoutStartSec=infinity",
+                f"ExecStart={self.bin}/agentbox update "
+                f"--config {self.config}",
+            ]), 0o444)
 
     def target_wants(self, t):
         """Boot-time enablement for the %i instances.
@@ -549,13 +711,16 @@ class Renderer:
                        f'{self.spec.default_agent}"',
                        f'Environment="AGENT_BOX_REPO={self.spec.repo}"',
                        f'Environment="AGENT_BOX_REV={self.spec.rev}"',
-                       'Environment="AGENT_BOX_SYSTEMCTL=/usr/bin/systemctl"',
+                       f'Environment="AGENT_BOX_SYSTEMCTL={SYSTEMCTL}"',
                        f'Environment="AGENT_BOX_TMUX_BIN={self.bin}/tmux"',
-                       # No AGENT_BOX_UPDATE_CMD/_UNIT (issue #358): there is
-                       # no agent-box-update.service on this backend, so
-                       # leaving both unset hides the settings page's Update
-                       # card and 404s its route — the same fallback the
-                       # module uses when selfUpdate.enable is off.
+                       # The settings page's Update card: _CMD triggers the
+                       # run (sudo, matching the sudoers grant exactly),
+                       # _UNIT is only read back for status. /usr/bin/sudo,
+                       # not NixOS's /run/wrappers/bin/sudo — this is a
+                       # stock distro's sudo (issue #358).
+                       f'Environment="AGENT_BOX_UPDATE_CMD=/usr/bin/sudo -n '
+                       f'{UPDATE_TRIGGER}"',
+                       f'Environment="AGENT_BOX_UPDATE_UNIT={UPDATE_UNIT}"',
                        "ExecStart=",
                        f"ExecStart={self.bin}/agent-box-settings",
                    ]))
@@ -582,9 +747,9 @@ class Renderer:
         ever bound it.
 
         @UPDATE_SECTION@ never expands to the NixOS self-update paragraph:
-        `agentbox apply` renders no agent-box-update.service and grants no
-        sudo rule for it (issue #358), so the guide says so instead of
-        repeating a command that fails with "Unit not found".
+        the mechanism differs (a Nix profile, not a system closure), so the
+        native update service takes a different command and makes a
+        different promise about what restarts (issue #358).
         """
         webhook_section = ""
         if self.spec.webhook_enable:
@@ -592,10 +757,25 @@ class Renderer:
             webhook_section = webhook_md.read_text().rstrip("\n") + "\n\n"
         update_section = (
             "## Updating\n\n"
-            "This box has no self-update path yet — `agentbox apply` renders\n"
-            "no self-update unit or sudo rule for one. Redeploy from a newer\n"
-            "image for now; see "
-            "https://github.com/defangdevs/agent-box/issues/358.\n\n"
+            "Update the box's software with:\n"
+            f"`sudo -n {UPDATE_TRIGGER}`\n"
+            "(the full path is required for the passwordless sudo rule to "
+            "match).\n"
+            "This box is not NixOS: the update fast-forwards the Nix profile "
+            "your\n"
+            "software comes from to the newest commit of the upstream repo, "
+            "renders\n"
+            "the host configuration that release describes, and restarts the "
+            "services\n"
+            "onto it — your own tmux session included, so save context "
+            "first.\n\n"
+            "It refuses a target that is not strictly ahead of the rev you "
+            "are\n"
+            "running, and if the new release fails to apply it rolls the "
+            "profile\n"
+            "back and re-applies the old one. Watch it with `journalctl -fu "
+            f"{UPDATE_UNIT}`;\n"
+            "the box's own rev is on the settings page.\n\n"
         )
         return (text.replace("@WEBHOOK_SECTION@", webhook_section)
                     .replace("@UPDATE_SECTION@", update_section))
@@ -657,10 +837,12 @@ class Renderer:
     def sudoers(self, t):
         """Least-privilege sudo, data-driven from the config.
 
-        Only the exact commands the box needs: reload the web front door
-        and each user's own password helper. There is no self-update grant
-        (issue #358) — `agentbox apply` renders no agent-box-update.service
-        for a rule like that to trigger.
+        Only the exact commands the box needs: reload the web front door,
+        trigger the self-update unit, and each user's own password helper.
+        The update grant is spelled from UPDATE_TRIGGER rather than by hand
+        so it cannot drift from the unit `update_unit` renders or from the
+        command the guide documents (issue #358; #353 for why a grant that
+        does not match the command silently asks for a password).
         """
         lines = [
             "# Generated by `agentbox apply` — do not edit.",
@@ -669,6 +851,7 @@ class Renderer:
             cmds = [f"/etc/agent-box/bin/agent-box-password-{u.name}"]
             if self.spec.web_enable:
                 cmds.append("/usr/bin/systemctl reload caddy.service")
+            cmds.append(UPDATE_TRIGGER)
             cmds += self.spec.sudo_allowlist
             lines.append(f"{u.name} ALL=(root) NOPASSWD: " + ", ".join(cmds))
         t.file(self.p("/etc/sudoers.d/agent-box"),
@@ -879,7 +1062,7 @@ def cmd_apply(args):
     spec = Spec(load_config(args.config), profile)
     if args.first_boot:
         first_boot(spec, args)
-    rend = Renderer(spec, profile, root=args.root or "/")
+    rend = Renderer(spec, profile, root=args.root or "/", config=args.config)
     tree = rend.render()
 
     live = args.root is None
@@ -989,6 +1172,279 @@ def resolve_profile(explicit):
         if (candidate / PROFILE_MARKER).is_dir():
             return candidate
     return candidates[0]
+
+
+# --------------------------------------------------------------------------
+# Self-update (issue #358)
+# --------------------------------------------------------------------------
+
+
+class UpdateError(Exception):
+    """An update that refused to proceed, or failed and was rolled back."""
+
+
+def github_json(url, timeout=30):
+    """One GitHub REST call. Unauthenticated — 60/hour is plenty for this."""
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "agent-box-update",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def wall(message):
+    """Tell every logged-in terminal, and the journal.
+
+    Best effort: a box without util-linux's `wall` still updates, it just
+    updates quietly, so a missing binary must not abort the run.
+    """
+    print(f"agent-box: {message}", flush=True)
+    try:
+        run(["wall", f"agent-box: {message}"], check=False, capture=True)
+    except OSError:
+        pass
+
+
+def nix_cmd(*args):
+    """A nix invocation that works on a host whose nix.conf enables nothing.
+
+    The Determinate installer the templates use turns flakes on globally,
+    but a box whose nix came from somewhere else would fail on the flake
+    URL alone — and the failure would look like a broken update rather than
+    a disabled feature.
+    """
+    return ["nix", "--extra-experimental-features", "nix-command flakes",
+            *args]
+
+
+def profile_generation(profile):
+    """Which generation number the profile symlink points at, or None."""
+    try:
+        target = os.readlink(str(profile))
+    except OSError:
+        return None
+    m = re.search(r"-(\d+)-link$", target)
+    return int(m.group(1)) if m else None
+
+
+def rollback_to(profile, generation):
+    """Walk the profile back to `generation`. True when it got there.
+
+    One `nix profile rollback` at a time rather than a jump, because a
+    failed switch can leave the profile one OR two generations ahead: the
+    remove-then-install below is two operations, so `rollback` (which knows
+    only "the previous one") has to be repeated. The step is bounded and
+    stops the moment a rollback stops moving, so a profile that cannot go
+    further reports failure instead of spinning.
+    """
+    if generation is None:
+        return False
+    for _ in range(8):
+        current = profile_generation(profile)
+        if current is None:
+            return False
+        if current <= generation:
+            return current == generation
+        run(nix_cmd("profile", "rollback", "--profile", str(profile)),
+            check=False)
+        if profile_generation(profile) == current:
+            return False
+    return False
+
+
+def unit_active(unit):
+    return run([SYSTEMCTL, "is-active", "--quiet", unit],
+               check=False).returncode == 0
+
+
+def restart_units(spec, restart_sessions=True):
+    """Restart what a profile swap invalidated but left looking unchanged.
+
+    The rendered units name `<profile>/bin/...` — a path that does not
+    change when the profile does — so `apply` after an update honestly
+    reports "0 change(s)" while every daemon on the box is still running
+    the previous release's code from its already-mapped store path. That
+    was observed on a live native box (issue #358): the settings daemon
+    kept serving the old page until it was restarted by hand. An update
+    therefore restarts these itself; it cannot infer the need from apply.
+
+    Only units that are currently active are touched, so a service the
+    operator deliberately stopped stays stopped. Sessions go LAST: the
+    agent that triggered the update is inside one, and everything else
+    should already be back up by the time its tmux server is replaced.
+    """
+    units = []
+    if spec.web_enable:
+        units.append("agent-web-auth-secrets.service")
+    for u in spec.users:
+        if spec.web_enable:
+            units += [f"agent-web-terminal@{u.name}.service",
+                      f"agent-box-settings@{u.name}.socket",
+                      f"agent-box-settings@{u.name}.service"]
+        if spec.webhook_enable:
+            units += [f"agent-box-webhook@{u.name}.socket",
+                      f"agent-box-webhook@{u.name}.service"]
+    if spec.web_enable:
+        units.append("caddy.service")
+    if restart_sessions:
+        units += [f"agent-box@{u.name}.service" for u in spec.users]
+
+    restarted = []
+    for unit in units:
+        if not unit_active(unit):
+            continue
+        run([SYSTEMCTL, "restart", unit], check=False)
+        restarted.append(unit)
+        print(f"restarted {unit}")
+    return restarted
+
+
+def apply_args(config, profile):
+    """The Namespace `cmd_apply` reads, for an in-process apply."""
+    return argparse.Namespace(
+        config=config, profile=str(profile), root=None, dry_run=False,
+        first_boot=False, settle_delay=0)
+
+
+def cmd_update(args):
+    """Fast-forward the runtime profile to a newer rev of this repo.
+
+    NixOS updates by rewriting a pin file and running nixos-rebuild; none
+    of that exists here. What does exist is the profile the software was
+    installed into, which records its own origin and keeps a generation
+    history — so "what rev am I on", "move to a newer one" and "undo" need
+    no pin-file format of their own (issue #154's "native owns:
+    profile-based update/rollback", spelled out in #358).
+
+    The one part of the NixOS payload worth porting verbatim is its
+    refusal: a target that is not strictly ahead of the running rev means
+    upstream history was rewritten or an older, possibly vulnerable rev is
+    being replayed, and both are refused.
+    """
+    profile = resolve_profile(args.profile)
+    if args.post_switch:
+        return post_switch(args, profile)
+
+    name, element = manifest_element(profile_manifest(profile))
+    if not element:
+        raise ConfigError(
+            f"no runtime element in {profile}/manifest.json — this box's "
+            "software did not come from `nix profile install`, so there is "
+            "no profile here to fast-forward")
+    repo, current = parse_flake_url(element.get("url") or element.get("uri"))
+    if args.repo:
+        repo = args.repo
+    if not repo:
+        raise ConfigError(
+            "cannot tell which repo this profile came from "
+            f"({element.get('url') or element.get('uri')!r}) — pass --repo "
+            "OWNER/REPO")
+    if not current:
+        raise ConfigError(
+            f"the profile's {repo} entry is not locked to a commit, so "
+            "there is nothing to compare a target against")
+
+    target = github_json(
+        f"{GITHUB_API}/repos/{repo}/commits/{args.rev or 'HEAD'}")["sha"]
+    if target == current:
+        print(f"already current: {repo}@{current[:12]}")
+        return 0
+    if args.force:
+        print(f"skipping the fast-forward check for {target[:12]} (--force)")
+    else:
+        status = github_json(
+            f"{GITHUB_API}/repos/{repo}/compare/{current}...{target}"
+        )["status"]
+        if status != "ahead":
+            raise UpdateError(
+                f"refusing update: {target[:12]} is '{status}' of running "
+                f"rev {current[:12]} (need fast-forward)")
+    if args.check:
+        print(f"update available: {current[:12]} -> {target[:12]}")
+        return 0
+
+    flake = f"github:{repo}/{target}#{RUNTIME_ATTR}"
+    wall(f"updating to {repo}@{target[:12]} — services restart, including "
+         "agent sessions. Save context now.")
+    # Realize the new closure BEFORE touching the profile, so the window in
+    # which the profile has no runtime element (between the remove and the
+    # install) is a symlink flip rather than a multi-minute download that
+    # can fail halfway.
+    run(nix_cmd("build", "--no-link", flake))
+
+    generation = profile_generation(profile)
+    try:
+        # Remove-then-install, not a bare install: installing over the
+        # existing entry fails with "An existing package already provides
+        # the following file" and — this is the trap — leaves the OLD
+        # profile in place while a following `apply` reports "0 change(s)",
+        # so the box looks updated and is not (verified by hand on a live
+        # native box, issue #358).
+        run(nix_cmd("profile", "remove", "--profile", str(profile), name))
+        run(nix_cmd("profile", "install", "--profile", str(profile), flake))
+    except subprocess.CalledProcessError as e:
+        rollback_to(profile, generation)
+        wall(f"update to {target[:12]} FAILED at the profile switch — "
+             "rolled back, box unchanged.")
+        raise UpdateError(f"profile switch failed: {e}")
+
+    _, installed = profile_origin(profile)
+    if installed != target:
+        rollback_to(profile, generation)
+        wall(f"update to {target[:12]} FAILED verification — rolled back.")
+        raise UpdateError(
+            f"the profile reports {installed} after installing {target} — "
+            "refusing to call that an update")
+
+    # Hand over to the agentbox that was JUST installed. Continuing
+    # in-process would run the old renderer against the new profile's
+    # assets and config schema — a version skew that shows up as a partial
+    # apply, not as an error. (There is no risk to this running process
+    # itself: store paths are immutable and its pages stay mapped.)
+    child = [str(profile / "bin" / "agentbox"), "update", "--post-switch",
+             "--config", args.config, "--profile", str(profile),
+             "--from-generation", str(generation), "--from-rev", current]
+    if args.no_restart_sessions:
+        child.append("--no-restart-sessions")
+    print(f"switched to {target[:12]}; applying with the new agentbox")
+    return subprocess.run(child).returncode
+
+
+def post_switch(args, profile):
+    """Phase two, always run by the newly installed agentbox.
+
+    Renders the host configuration the new release describes and restarts
+    the services onto it. Anything that goes wrong here puts the profile
+    back where phase one found it and re-applies with that older code, so a
+    failed update leaves a working box rather than a half-switched one.
+    """
+    spec = Spec(load_config(args.config), profile)
+    restart_sessions = not args.no_restart_sessions
+    try:
+        rc = cmd_apply(apply_args(args.config, profile))
+        if rc:
+            raise UpdateError(f"`agentbox apply` exited {rc}")
+        restarted = restart_units(spec, restart_sessions=restart_sessions)
+    except Exception as e:  # noqa: BLE001 - any failure must roll back
+        generation = (int(args.from_generation)
+                      if args.from_generation else None)
+        rolled = rollback_to(profile, generation)
+        # Re-apply with the rolled-back code, as a fresh process for the
+        # same version-skew reason phase one handed over to us.
+        run([str(profile / "bin" / "agentbox"), "apply",
+             "--config", args.config, "--profile", str(profile)], check=False)
+        restart_units(spec, restart_sessions=restart_sessions)
+        wall(f"update FAILED ({e}) — profile "
+             + ("rolled back to the previous release."
+                if rolled else "COULD NOT be rolled back; see journalctl "
+                               f"-u {UPDATE_UNIT}."))
+        print(f"agentbox: update failed: {e}", file=sys.stderr)
+        return 1
+    _, now = profile_origin(profile)
+    wall(f"update applied: now at {(now or '?')[:12]}, "
+         f"{len(restarted)} service(s) restarted.")
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -1202,7 +1658,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     a = sub.add_parser("apply", help="render and apply host configuration")
-    a.add_argument("--config", default="/etc/agent-box/config.yaml")
+    a.add_argument("--config", default=DEFAULT_CONFIG)
     a.add_argument(
         "--profile",
         help="runtime profile path (default: derived from argv[0])")
@@ -1218,6 +1674,38 @@ def main(argv=None):
         "--settle-delay", type=int, default=0,
         help="seconds to wait before the first IP probe")
     a.set_defaults(func=cmd_apply)
+
+    up = sub.add_parser(
+        "update",
+        help="fast-forward the runtime profile to a newer rev and re-apply")
+    up.add_argument("--config", default=DEFAULT_CONFIG)
+    up.add_argument(
+        "--profile",
+        help="runtime profile path (default: derived from argv[0])")
+    up.add_argument(
+        "--repo", metavar="OWNER/REPO",
+        help="repo to update from (default: the one the profile records)")
+    up.add_argument(
+        "--rev", metavar="REF",
+        help="target commit, tag or branch (default: the repo's "
+             "default-branch HEAD)")
+    up.add_argument("--check", action="store_true",
+                    help="report whether an update is available and stop")
+    up.add_argument(
+        "--force", action="store_true",
+        help="skip the fast-forward check — allows moving to a rev that is "
+             "behind or on rewritten history, so only for a deliberate "
+             "downgrade")
+    up.add_argument(
+        "--no-restart-sessions", action="store_true",
+        help="restart the daemons but leave agent sessions running on the "
+             "previous release until they are restarted by hand")
+    # Phase two, invoked by phase one on the newly installed agentbox.
+    up.add_argument("--post-switch", action="store_true",
+                    help=argparse.SUPPRESS)
+    up.add_argument("--from-generation", help=argparse.SUPPRESS)
+    up.add_argument("--from-rev", help=argparse.SUPPRESS)
+    up.set_defaults(func=cmd_update)
 
     w = sub.add_parser(
         "web-secrets",
@@ -1239,6 +1727,12 @@ def main(argv=None):
     except ConfigError as e:
         print(f"agentbox: {e}", file=sys.stderr)
         return 2
+    except UpdateError as e:
+        # 1, not 2: the configuration is fine, the update declined to
+        # proceed (or failed and rolled back). systemd reports it as a
+        # failed unit either way, which is what the settings page reads.
+        print(f"agentbox: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

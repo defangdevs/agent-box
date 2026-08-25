@@ -321,6 +321,27 @@ What that buys over the infect template:
 | Base-OS patching | nixos-rebuild | apt / unattended-upgrades (`agentbox apply` never calls apt) |
 | Rollback | `nixos-rebuild --rollback` | `nix profile rollback --profile /nix/var/nix/profiles/agent-box` |
 
+**Updating a native box** (issue #358) is `sudo systemctl start --no-block
+agent-box-update.service`, the same grant the agent holds on the infect
+template — but a different mechanism behind it, because there is no closure
+to rebuild. The unit runs `agentbox update`, which reads the rev the profile
+records for itself, asks GitHub for the repo's current HEAD, refuses anything
+that is not strictly ahead of what is running (rewritten history, or a replay
+of an older rev), and then swaps the profile with a **remove-then-install**:
+`nix profile install` over an existing entry fails on a file conflict, leaves
+the old profile in place, and the `apply` that follows honestly reports "0
+change(s)" — a box that looks updated and is not. The new rev is verified out
+of the profile afterwards for the same reason.
+
+The apply and the restarts are then handed to the **newly installed**
+`agentbox` as a fresh process, so the release being installed renders its own
+host configuration rather than the outgoing one's renderer doing it. Units
+name `/nix/var/nix/profiles/agent-box/bin/...`, a path that does not move when
+the profile does, so nothing looks changed to systemd and the update restarts
+the services itself; agent sessions go last, since the agent that triggered
+the update is sitting in one. A failure at any step rolls the profile back to
+the generation it started from and re-applies with that older code.
+
 **The launch script must stay bash-guarded.** Lightsail prepends its own
 `#!/bin/sh` preamble to an instance's launch script, so the template's shebang
 is only a comment in the middle of the file cloud-init runs and the payload

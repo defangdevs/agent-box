@@ -21,6 +21,7 @@
   "etc/systemd/system/agent-box-settings@.socket": "0o444",
   "etc/systemd/system/agent-box-settings@agent.service.d/10-host.conf": "0o644",
   "etc/systemd/system/agent-box-settings@robot.service.d/10-host.conf": "0o644",
+  "etc/systemd/system/agent-box-update.service": "0o444",
   "etc/systemd/system/agent-box-webhook@.service": "0o444",
   "etc/systemd/system/agent-box-webhook@.socket": "0o444",
   "etc/systemd/system/agent-box-webhook@agent.service.d/10-host.conf": "0o644",
