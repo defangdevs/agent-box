@@ -140,16 +140,20 @@ then reload caddy — no rebuild:
       reverse_proxy 127.0.0.1:3000
     }
 
-`sudo systemctl reload caddy.service` picks it up and Caddy gets a Let's
-Encrypt cert on first request if DNS for that name points at this box.
-Reverse-proxy to your process; don't `file_server` from $HOME (caddy can't
-read /home).
+`sudo /run/current-system/sw/bin/systemctl reload caddy.service` picks it up
+and Caddy gets a Let's Encrypt cert on first request if DNS for that name
+points at this box. Reverse-proxy to your process; don't `file_server` from
+$HOME (caddy can't read /home). Use the full path shown, not bare
+`systemctl` — the sudoers rule matches on the exact command path, and a bare
+`systemctl` resolves through PATH to a Nix store path that won't match,
+silently falling back to asking for a password.
 
 ## Updating
 
 Update the box's software with:
-`sudo systemctl start agent-box-update.service`
-(kills the running tmux session — save context first).
+`sudo /run/current-system/sw/bin/systemctl start agent-box-update.service`
+(kills the running tmux session — save context first). As above, the full
+path is required for the passwordless sudo rule to match.
 
 ## This platform has its own upstream repo
 

@@ -259,16 +259,20 @@ let
           reverse_proxy 127.0.0.1:3000
         }
 
-    `sudo systemctl reload caddy.service` picks it up and Caddy gets a Let's
-    Encrypt cert on first request if DNS for that name points at this box.
-    Reverse-proxy to your process; don't `file_server` from $HOME (caddy can't
-    read /home).
+    `sudo /run/current-system/sw/bin/systemctl reload caddy.service` picks it up
+    and Caddy gets a Let's Encrypt cert on first request if DNS for that name
+    points at this box. Reverse-proxy to your process; don't `file_server` from
+    $HOME (caddy can't read /home). Use the full path shown, not bare
+    `systemctl` — the sudoers rule matches on the exact command path, and a bare
+    `systemctl` resolves through PATH to a Nix store path that won't match,
+    silently falling back to asking for a password.
 
     ## Updating
 
     Update the box's software with:
-    `sudo systemctl start agent-box-update.service`
-    (kills the running tmux session — save context first).
+    `sudo /run/current-system/sw/bin/systemctl start agent-box-update.service`
+    (kills the running tmux session — save context first). As above, the full
+    path is required for the passwordless sudo rule to match.
 
     ## This platform has its own upstream repo
 
@@ -5809,7 +5813,10 @@ in
         Caddyfile is module-managed (regenerated every rebuild); each agent
         user's own virtual hosts live in ~/sites/*.caddy (a symlink to
         /var/lib/agent-box-sites/<user>/, which caddy can read) and land
-        with `sudo systemctl reload caddy.service`
+        with `sudo /run/current-system/sw/bin/systemctl reload
+        caddy.service` (the full path matters — a bare `systemctl` resolves
+        through PATH to a Nix store path the sudoers rule won't match, so it
+        silently asks for a password instead)
       '';
 
       domain = lib.mkOption {
@@ -5829,7 +5836,8 @@ in
         description = ''
           Which services.agent-box.users entry administers Caddy: it is
           added to the caddy group (so it can edit /var/lib/caddy/Caddyfile)
-          and granted passwordless sudo for `systemctl reload caddy.service`.
+          and granted passwordless sudo for
+          `/run/current-system/sw/bin/systemctl reload caddy.service`.
           Which users get a browser terminal is separate — set
           users.<name>.web.passwordHashFile per user.
         '';
@@ -5856,7 +5864,8 @@ in
       enable = lib.mkEnableOption ''
         an agent-triggerable self-update service. When enabled, every agent
         user's sudo allowlist gains exactly
-        `systemctl start agent-box-update.service` (plus its --no-block
+        `/run/current-system/sw/bin/systemctl start
+        agent-box-update.service` (plus its --no-block
         variant, used by the settings page's Update button) — a root oneshot
         that fast-forwards the box to the upstream repo's latest
         default-branch commit by rewriting `pinFile` (and, when agentNixpkgs
