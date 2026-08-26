@@ -1,0 +1,19 @@
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+set -e
+
+set -euo pipefail
+binDir=/var/lib/agent-box-defang-cli/bin
+stateDir="$(dirname "$binDir")"
+stamp="$stateDir/expr"
+if [ -e "$binDir/defang" ] && [ "$(cat "$stamp" 2>/dev/null || true)" = /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-defang-cli-expr.nix ]; then
+  exit 0
+fi
+install -d -m 0755 "$stateDir"
+/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nix-2.34.8/bin/nix build \
+  --extra-experimental-features 'nix-command flakes' \
+  -f /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-defang-cli-expr.nix \
+  -o "$stateDir/current"
+ln -sfn current/bin "$binDir"
+printf '%s' /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-defang-cli-expr.nix > "$stamp"
+
+

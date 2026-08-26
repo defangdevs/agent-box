@@ -1,0 +1,24 @@
+[Unit]
+After=network-online.target
+Description=Install the Defang CLI in the background
+Wants=network-online.target
+
+[Service]
+Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-67/lib/locale/locale-archive"
+Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.10.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.10.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261/sbin"
+Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026b/share/zoneinfo"
+ExecStart=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-unit-script-agent-box-defang-cli-start/bin/agent-box-defang-cli-start 
+IOSchedulingClass=idle
+MemoryMax=1536M
+Nice=19
+OOMScoreAdjust=1000
+Restart=on-failure
+RestartSec=30s
+StartLimitBurst=5
+StartLimitIntervalSec=10min
+Type=oneshot
+
+[Install]
+WantedBy=multi-user.target
+
+# X-Golden-wantedBy: multi-user.target

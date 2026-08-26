@@ -519,6 +519,10 @@ let
     ++ agentRuntimePackages
     ++ [ pkgs.bashInteractive pkgs.coreutils pkgs.git pkgs.gh pkgs.tmux ]
     ++ lib.optional (effectiveSudoAllowlist != [ ]) "/run/wrappers"
+    # A plain string, not a package — defang lands here once
+    # agent-box-defang-cli.service finishes installing it (issue #373), with
+    # no eval-time build dependency the way a package entry would add.
+    ++ [ (builtins.dirOf defangCliBinDir) ]
   );
   tmuxSocketName = "agent-box";
   runtimeDirectory = name: "agent-box-${name}";
@@ -1826,11 +1830,68 @@ done
   # pkgs/defang/default.nix — a fetchurl of the prebuilt release binary —
   # is explicitly `lib.warn`-marked deprecated upstream and stuck on an old
   # version; don't reach for that one.)
-  defangSrc = builtins.fetchTarball {
-    url = "https://github.com/DefangLabs/defang/archive/refs/tags/v3.14.1.tar.gz";
-    sha256 = "sha256:0advqwcrjmdfkraw6g5i5czd6hcglfk7yvhcxzy06clkx2j9bh0v";
-  };
-  defangCli = pkgs.callPackage "${defangSrc}/pkgs/defang/cli.nix" { };
+  #
+  # This USED to be a plain `let`-bound derivation wired into
+  # environment.systemPackages — which put a ~100 MB Go compile on every
+  # box's FIRST BOOT whenever Cachix didn't already have a substitute,
+  # because the `nix.settings.substituters` trust added below only reaches
+  # /etc/nix/nix.conf during ACTIVATION, which happens AFTER the build that
+  # would need it: the very first `nixos-rebuild switch` always builds
+  # against the OLD nix.conf. That compile OOM'd small (t4g.small, 2 GiB)
+  # instances on first boot (agent-box#373).
+  #
+  # Fix: don't make defangCli part of system.build.toplevel's closure at
+  # all. agent-box-defang-cli.service (below) builds it in the BACKGROUND,
+  # started by multi-user.target — i.e. AFTER the activation that already
+  # wrote the new nix.conf, on the SAME first boot. So by the time it runs,
+  # the Cachix substituter is already trusted and (given a matching
+  # nixpkgs pin — see defangNixpkgsExprUrl/Sha256 below) it substitutes a
+  # prebuilt closure instead of compiling.
+  defangVersion = "v3.15.0";
+  defangSha256 = "sha256-9wfaHVqxJprJUoP5meQEgmRfV6kJugonmO714gaR1tc=";
+  # DefangLabs/defang's own release CI (go.yml's publish-nix-cache job)
+  # builds this exact tag's `defang-cli` and pushes it to the public
+  # `defanglabs.cachix.org` Cachix cache. But a Nix derivation's output hash
+  # is a function of EVERY input, including nixpkgs itself: building
+  # pkgs/defang/cli.nix with THIS host's own nixpkgs (whatever that
+  # happens to be) produces a DIFFERENT derivation than CI's, which
+  # silently misses the cache and falls back to compiling from source — so
+  # this pins the SAME nixpkgs revision DefangLabs/defang's own flake.lock
+  # pins at defangVersion, not this module's `pkgs`. Verified by hand
+  # (2026-08-26): the resulting output path already has a 200 on
+  # https://defanglabs.cachix.org/<hash>.narinfo. Bump both pins together
+  # when moving to a new defang tag:
+  #   curl -sL https://raw.githubusercontent.com/DefangLabs/defang/vX.Y.Z/flake.lock \
+  #     | jq '.nodes.nixpkgs.locked | {url, sha256: .narHash}'
+  defangNixpkgsUrl = "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1057999.afe3d8ac4395/nixexprs.tar.xz";
+  defangNixpkgsSha256 = "sha256-93GX5Q/npwBE92xpHlktxgGztuIP/2kwOMukz+qyJBk=";
+  # The pins above are spliced in as plain TEXT, not as a `builtins.fetchTarball`
+  # result interpolated into this file — that distinction is why this stays
+  # cheap: a derivation reference carries "string context", so embedding one in
+  # any string that ends up in the store (a systemd unit, an /etc file) makes
+  # Nix build it as part of THAT unit's own closure — exactly the eager-build
+  # problem this rewrite exists to undo. `pkgs.writeText` below is a real
+  # derivation too, but a trivial one (it realizes a small text file, not a Go
+  # compile), so it's fine for it to ride along in system.build.toplevel. The
+  # expensive `fetchTarball`+`callPackage` calls only happen when the SERVICE
+  # evaluates this file with its own `nix build`, at runtime.
+  defangCliExpr = pkgs.writeText "agent-box-defang-cli-expr.nix" ''
+    let
+      defangSrc = builtins.fetchTarball {
+        url = "https://github.com/DefangLabs/defang/archive/refs/tags/${defangVersion}.tar.gz";
+        sha256 = "${defangSha256}";
+      };
+      defangPkgs = import (builtins.fetchTarball {
+        url = "${defangNixpkgsUrl}";
+        sha256 = "${defangNixpkgsSha256}";
+      }) { system = builtins.currentSystem; };
+    in
+    defangPkgs.callPackage "''${defangSrc}/pkgs/defang/cli.nix" { }
+  '';
+  # Where the background service installs it (outside the Nix profile, since
+  # nothing here builds it eval-time) — connectBins and the curated agent
+  # PATH below both point at this fixed location instead of a store path.
+  defangCliBinDir = "/var/lib/agent-box-defang-cli/bin";
 
   # Tools agents assume exist. Nearly all of these are already installed on
   # any NixOS host (system-path.nix's requiredPackages) — but the agent unit
@@ -1878,7 +1939,10 @@ done
     # if closure size matters more than matching a distro.
     pkgs.python3
     pkgs.nano
-    defangCli                 # deploy Compose apps to the cloud (issue #363)
+    # defang (issue #363) is deliberately NOT here — see defangCliExpr above.
+    # It's installed in the background by agent-box-defang-cli.service and
+    # reaches PATH via defangCliBinDir in agentBoxExecSearchPath instead, so
+    # listing it here would pull the Go build back into system.build.toplevel.
   ];
 
   agentRuntimePackages = lib.unique (
@@ -5030,12 +5094,15 @@ $PROMPT"
   # token, so a card exists only where its binary does — an agent left out
   # of installAgents simply has no card. Absolute paths because that
   # daemon's unit deliberately carries no agent PATH; a VM test overrides
-  # this variable to point an id at a stub.
+  # this variable to point an id at a stub. defang's path is a plain string,
+  # not `${defangCli}/bin/defang` — it's built in the background (see
+  # defangCliExpr above), so the card just doesn't appear until that
+  # finishes and the path starts existing, same as any other missing binary.
   connectBins = lib.concatStringsSep " " (
     map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
     ++ [
       "github=${pkgs.gh}/bin/gh"
-      "defang=${defangCli}/bin/defang"
+      "defang=${defangCliBinDir}/defang"
     ]
   );
 
@@ -6990,6 +7057,22 @@ in
     # agent unit's path below) — that flake-ref syntax needs both features.
     # List settings merge, so hosts can still extend this.
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
+
+    # Trust DefangLabs' public Cachix cache, so agent-box-defang-cli.service
+    # below substitutes a prebuilt closure instead of compiling Go from
+    # source (agent-box#373). This alone would NOT fix first boot if
+    # defangCli were still built as part of system.build.toplevel: writing
+    # this to /etc/nix/nix.conf is an ACTIVATION step, which runs after the
+    # build that would need it, so the very switch that introduces this
+    # setting still builds under the OLD nix.conf. It works here because the
+    # service is deferred past activation (started by multi-user.target),
+    # so by the time it runs, THIS SAME boot's activation has already
+    # written the new nix.conf. Same public key as DefangLabs/defang's own
+    # flake.nix and README.
+    nix.settings.substituters = [ "https://defanglabs.cachix.org" ];
+    nix.settings.trusted-public-keys = [
+      "defanglabs.cachix.org-1:mTXLTfYprWDrIK50Kz34fhOTreeKlQRZFQcKL7HtHx0="
+    ];
 
     # `git clone https://github.com/...` authenticates with the user's
     # GH_TOKEN out of the box: gh's credential helper reads it from the
@@ -13379,5 +13462,66 @@ if __name__ == "__main__":
         AGENT_BOX_MSG = lib.replaceStrings [ "%" ] [ "%%" ] cfg.spotInterruption.message;
       };
     };
-  })]);
+  })
+
+  # Installs the Defang CLI in the background (agent-box#373) — see
+  # defangCliExpr/defangCliBinDir above for why this exists instead of a
+  # plain environment.systemPackages entry. Started by multi-user.target,
+  # not required by anything: agent sessions and the connect-card daemon
+  # both already tolerate `defang` being absent until this finishes (same
+  # as any agent left out of installAgents has no sign-in card).
+  {
+    systemd.services.agent-box-defang-cli = {
+      description = "Install the Defang CLI in the background";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "network-online.target" ];
+      after = [ "network-online.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        # Transient failures (DNS not ready yet, a Cachix hiccup) get a few
+        # in-boot retries instead of waiting for the next reboot entirely.
+        Restart = "on-failure";
+        RestartSec = "30s";
+        StartLimitIntervalSec = "10min";
+        StartLimitBurst = 5;
+        # This is a fallback path (the substituter above should make it a
+        # download, not a build) but if it EVER does fall back to compiling
+        # — a Cachix outage, a bump to defangVersion before the matching
+        # nixpkgs pin lands — it must not repeat the agent-box#373 OOM in
+        # the background. Lowest scheduling priority, first pick for the
+        # OOM killer, and a hard cap a bit above the ~740 MiB peak anon-rss
+        # measured in that incident's kernel log: past that, systemd kills
+        # just this cgroup instead of earlyoom picking some other victim,
+        # and multi-user.target starts it again next boot.
+        Nice = 19;
+        IOSchedulingClass = "idle";
+        OOMScoreAdjust = 1000;
+        MemoryMax = "1536M";
+      };
+      # No ConditionPathExists gate: that could only ever check "a defang
+      # binary exists somewhere," not "it's the one THIS module currently
+      # pins" — a later defangVersion/nixpkgs bump would then never reach an
+      # already-installed box. The stamp file below records defangCliExpr's
+      # own store path (which changes whenever those pins change), so the
+      # script's own comparison is what decides whether there's anything to
+      # do, and runs on every boot cheaply when there isn't.
+      script = ''
+        set -euo pipefail
+        binDir=${lib.escapeShellArg defangCliBinDir}
+        stateDir="$(dirname "$binDir")"
+        stamp="$stateDir/expr"
+        if [ -e "$binDir/defang" ] && [ "$(cat "$stamp" 2>/dev/null || true)" = ${lib.escapeShellArg defangCliExpr} ]; then
+          exit 0
+        fi
+        install -d -m 0755 "$stateDir"
+        ${config.nix.package}/bin/nix build \
+          --extra-experimental-features 'nix-command flakes' \
+          -f ${defangCliExpr} \
+          -o "$stateDir/current"
+        ln -sfn current/bin "$binDir"
+        printf '%s' ${lib.escapeShellArg defangCliExpr} > "$stamp"
+      '';
+    };
+  }
+  ]);
 }
