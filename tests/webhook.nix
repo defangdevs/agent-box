@@ -298,19 +298,31 @@
     assert len(secret) == 32, secret
 
     # A subscription for THIS session, written through the CLI with no
-    # arguments beyond the topic — the session scope comes from the env.
+    # arguments beyond the topic and an --include for CI-outcome events —
+    # the session scope comes from the env.
+    #
+    # The --include is load-bearing since local-webhook 0.23.0 in a way it
+    # wasn't before: until 0.22.x, ANY live peer subscribed to the topic
+    # claimed a CI-outcome event for the dispatch ownership brake below,
+    # regardless of whether its own entry carried a predicate. 0.23.0 folded
+    # that carve-out into the general rule — a peer claims an event (of any
+    # kind) only when its own include predicate matches it (local-channels#16,
+    # owner_now's docstring) — so a bare topic-only subscription no longer
+    # counts as ownership of the workflow_run failure delivered below.
     machine.succeed(
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
         " agent-box-webhook subscribe defangdevs/agent-box --note 'testing #101' --ttl 8"
+        " --when '{\"path\": \"event\", \"in\": [\"workflow_run\", \"check_run\","
+        " \"check_suite\", \"workflow_job\"]}'"
     )
     # --ttl 8 rather than 0: local-webhook 0.20.0 refuses a pinned session
     # subscription (the cap is MAX_SESSION_TTL_HOURS). Any bounded value
     # outlasts a VM test that finishes in minutes.
     machine.succeed(
         "jq -e '.topics[0].topic == \"github:defangdevs/agent-box\""
-        " and .topics[0].note == \"testing #101\"'"
+        " and .topics[0].note == \"testing #101\" and (.topics[0].include != null)'"
         " /home/agent/.local/state/local-webhook/filter.agent-main.json"
     )
 
