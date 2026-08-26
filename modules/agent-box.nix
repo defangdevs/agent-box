@@ -13476,11 +13476,14 @@ if __name__ == "__main__":
       wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
       after = [ "network-online.target" ];
-      # Skip entirely once installed — cheap, and means a box that already
-      # has it doesn't re-evaluate/re-fetch on every boot.
-      unitConfig.ConditionPathExists = "!${defangCliBinDir}/defang";
       serviceConfig = {
         Type = "oneshot";
+        # Transient failures (DNS not ready yet, a Cachix hiccup) get a few
+        # in-boot retries instead of waiting for the next reboot entirely.
+        Restart = "on-failure";
+        RestartSec = "30s";
+        StartLimitIntervalSec = "10min";
+        StartLimitBurst = 5;
         # This is a fallback path (the substituter above should make it a
         # download, not a build) but if it EVER does fall back to compiling
         # — a Cachix outage, a bump to defangVersion before the matching
@@ -13495,14 +13498,28 @@ if __name__ == "__main__":
         OOMScoreAdjust = 1000;
         MemoryMax = "1536M";
       };
+      # No ConditionPathExists gate: that could only ever check "a defang
+      # binary exists somewhere," not "it's the one THIS module currently
+      # pins" — a later defangVersion/nixpkgs bump would then never reach an
+      # already-installed box. The stamp file below records defangCliExpr's
+      # own store path (which changes whenever those pins change), so the
+      # script's own comparison is what decides whether there's anything to
+      # do, and runs on every boot cheaply when there isn't.
       script = ''
         set -euo pipefail
-        install -d -m 0755 "$(dirname ${lib.escapeShellArg defangCliBinDir})"
+        binDir=${lib.escapeShellArg defangCliBinDir}
+        stateDir="$(dirname "$binDir")"
+        stamp="$stateDir/expr"
+        if [ -e "$binDir/defang" ] && [ "$(cat "$stamp" 2>/dev/null || true)" = ${lib.escapeShellArg defangCliExpr} ]; then
+          exit 0
+        fi
+        install -d -m 0755 "$stateDir"
         ${config.nix.package}/bin/nix build \
           --extra-experimental-features 'nix-command flakes' \
           -f ${defangCliExpr} \
-          -o "$(dirname ${lib.escapeShellArg defangCliBinDir})/current"
-        ln -sfn current/bin ${lib.escapeShellArg defangCliBinDir}
+          -o "$stateDir/current"
+        ln -sfn current/bin "$binDir"
+        printf '%s' ${lib.escapeShellArg defangCliExpr} > "$stamp"
       '';
     };
   }

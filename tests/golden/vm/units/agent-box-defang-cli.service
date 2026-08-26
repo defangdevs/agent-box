@@ -1,6 +1,5 @@
 [Unit]
 After=network-online.target
-ConditionPathExists=!/var/lib/agent-box-defang-cli/bin/defang
 Description=Install the Defang CLI in the background
 Wants=network-online.target
 
@@ -13,6 +12,10 @@ IOSchedulingClass=idle
 MemoryMax=1536M
 Nice=19
 OOMScoreAdjust=1000
+Restart=on-failure
+RestartSec=30s
+StartLimitBurst=5
+StartLimitIntervalSec=10min
 Type=oneshot
 
 [Install]
