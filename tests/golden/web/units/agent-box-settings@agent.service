@@ -16,5 +16,6 @@ Environment="AGENT_BOX_WEBHOOK_SCRIPT=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-67/lib/locale/locale-archive"
 Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-settings/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.10.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261/bin"
 Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026b/share/zoneinfo"
+X-StopIfChanged=false
 ExecStart=
 ExecStart=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-settings/bin/agent-box-settings
