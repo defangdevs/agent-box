@@ -580,31 +580,44 @@
                 srcDir = ./modules/src;
               } ''
               fail=0
-              # bin/<name> must be src/<file>, modulo the added shebang.
+
+              # The tree the assembler resolves markers in: an @@include@@
+              # path is relative to the including file, and
+              # settings-daemon.py's reach out to docs/. Built once, used by
+              # every check below.
+              mkdir -p tree/modules tree/docs
+              cp -r "$srcDir" tree/modules/src
+              cp ${./docs/potato.svg} tree/docs/potato.svg
+
+              # bin/<name> must be RESOLVE(src/<file>), modulo the added
+              # shebang — not src/<file> raw. supervisor.sh, mark-stopped.sh,
+              # session-cli.sh and webhook-spawn.sh each carry an
+              # @@include:lib/registry.sh@@ marker, so demanding the raw
+              # source here would demand exactly the bug this check exists to
+              # catch: the marker text shipped to a box, where it runs as a
+              # command that does not exist and every registry helper below
+              # it is undefined. resolve() is the identity on a file with no
+              # markers, so one rule covers both kinds.
               check_payload() {
                 bin="$profile/bin/$1"
-                src="$srcDir/$2"
                 if [ ! -x "$bin" ]; then
                   echo "MISSING: bin/$1"; fail=1; return
                 fi
-                # writeShellScriptBin prepends a shebang and ends the file
-                # with a newline; the body between must match byte for byte.
-                if ! diff -u <(tail -n +2 "$bin") <(cat "$src"; printf '\n') >/dev/null \
-                  && ! diff -u <(tail -n +2 "$bin") "$src" >/dev/null; then
-                  echo "DRIFT: bin/$1 is not modules/src/$2 verbatim"
-                  diff -u <(tail -n +2 "$bin") "$src" | head -20 || true
+                python3 ${./bin/assemble-module.py} \
+                  --resolve "tree/modules/src/$2" > want
+                # The shebang is line 1; the body after it ends with the
+                # source's own trailing newline and must match byte for byte.
+                if ! diff -u want <(tail -n +2 "$bin") >/dev/null; then
+                  echo "DRIFT: bin/$1 is not resolve(modules/src/$2)"
+                  diff -u want <(tail -n +2 "$bin") | head -20 || true
                   fail=1
                   return
                 fi
                 bash -n "$bin" || { echo "SYNTAX: bin/$1"; fail=1; }
-                # A payload that grows an @@include@@ marker must not be
-                # shipped raw: only bin/assemble-module.py expands those, and
-                # a marker that reaches a box is served as literal text (see
-                # the settings-daemon check below for what that cost).
                 if grep -q '@@include' "$bin"; then
                   echo "MARKER: bin/$1 still has an @@include@@ marker"; fail=1
                 fi
-                echo "ok: bin/$1 == src/$2"
+                echo "ok: bin/$1 == resolve(src/$2)"
               }
               check_payload agent-box-supervisor supervisor.sh
               check_payload agent-box-attach attach.sh
@@ -613,9 +626,44 @@
               check_payload agent-box-update update.sh
               check_payload agent-box-codex-remote-control codex-remote-control.sh
               check_payload agent-box-claude-session-start-hook claude-session-start-hook.sh
-              check_payload agent-box-env-exec env-exec.sh
               check_payload agent-box-session-bare session-cli.sh
               check_payload agent-box-upload upload-cli.sh
+              # Built only when the webhook script is pinned, which the
+              # default runtime is; both are marker payloads.
+              if [ -x "$profile/bin/agent-box-webhook-spawn" ]; then
+                check_payload agent-box-webhook-spawn webhook-spawn.sh
+                check_payload agent-box-webhook-bare webhook-cli.sh
+              fi
+
+              # agent-box-env-exec is Python, not shell (issue #212), and it
+              # is not src/env-exec.py verbatim: src/lib/envstore.py is
+              # spliced in above it, exactly as the module's envExecWrapper
+              # does, so what it must equal is that concatenation — checked
+              # with py_compile rather than bash -n.
+              cat "$srcDir/lib/envstore.py" > want_env_exec.py
+              printf '\n\n' >> want_env_exec.py
+              cat "$srcDir/env-exec.py" >> want_env_exec.py
+              if ! diff -u want_env_exec.py \
+                   <(tail -n +2 "$profile/bin/agent-box-env-exec") >/dev/null; then
+                echo "DRIFT: bin/agent-box-env-exec is not src/lib/envstore.py + src/env-exec.py"
+                diff -u want_env_exec.py \
+                  <(tail -n +2 "$profile/bin/agent-box-env-exec") | head -20 || true
+                fail=1
+              else
+                echo "ok: bin/agent-box-env-exec == src/lib/envstore.py + src/env-exec.py"
+              fi
+              # ast.parse, not `python3 -m py_compile`: py_compile writes a
+              # __pycache__ next to its input, and the input here lives in
+              # the store. It failed with "[Errno 13] Permission denied:
+              # .../bin/__pycache__" and reported it as a SYNTAX error in a
+              # file that is perfectly good Python.
+              python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' \
+                "$profile/bin/agent-box-env-exec" \
+                || { echo "SYNTAX: bin/agent-box-env-exec"; fail=1; }
+              if grep -q '@@include' "$profile/bin/agent-box-env-exec"; then
+                echo "MARKER: bin/agent-box-env-exec still has an @@include@@ marker"
+                fail=1
+              fi
 
               # The settings daemon is the one asset in modules/src that is
               # NOT a finished file: it carries @@include@@ markers for
@@ -623,22 +671,29 @@
               # verbatim put those markers in the served page — no stylesheet
               # and "Uncaught SyntaxError: Invalid or unexpected token" — so
               # what it must equal is the ASSEMBLER's output, not the source.
-              mkdir -p tree/modules tree/docs
-              cp -r "$srcDir" tree/modules/src
-              cp ${./docs/potato.svg} tree/docs/potato.svg
               python3 ${./bin/assemble-module.py} \
                 --resolve tree/modules/src/settings-daemon.py > want.py
               if grep -q '@@include' want.py; then
                 echo "MARKER: resolve() left a marker in settings-daemon.py"
                 fail=1
               fi
-              if ! diff -u want.py <(tail -n +2 "$profile/bin/agent-box-settings") \
+              # ...prepended by the env-store library, exactly as
+              # agent-box-env-exec above and the module's own settingsDaemon
+              # are (issue #212): the page calls load()/keys()/update()/
+              # as_dict() and ENV_HEADER, none of which it defines.
+              {
+                cat "$srcDir/lib/envstore.py"
+                printf '\n\n'
+                cat want.py
+              } > want-settings.py
+              if ! diff -u want-settings.py <(tail -n +2 "$profile/bin/agent-box-settings") \
                    >/dev/null; then
                 echo "DRIFT: bin/agent-box-settings is not resolve(src/settings-daemon.py)"
-                diff -u want.py <(tail -n +2 "$profile/bin/agent-box-settings") | head -20 || true
+                diff -u want-settings.py \
+                  <(tail -n +2 "$profile/bin/agent-box-settings") | head -20 || true
                 fail=1
               else
-                echo "ok: bin/agent-box-settings == resolve(src/settings-daemon.py)"
+                echo "ok: bin/agent-box-settings == src/lib/envstore.py + resolve(src/settings-daemon.py)"
               fi
 
               # Shared assets: the units both backends install verbatim, the
@@ -705,7 +760,16 @@
               } ''
               cp -rT --no-preserve=mode,ownership "$repo" repo
               cd repo
-              python3 tests/test_agentbox.py -v 2>&1 | tail -20
+              # To a file, not a pipe: `... | tail -20` hides everything the
+              # last 20 lines are not, and a failing assertion is usually
+              # further up than the progress output that follows it. It also
+              # stops depending on the builder's shell having pipefail for
+              # the exit status to survive at all.
+              if ! python3 tests/test_agentbox.py -v > render.log 2>&1; then
+                tail -80 render.log
+                exit 1
+              fi
+              tail -5 render.log
 
               # The rendered Caddyfile must be a config caddy accepts. Env
               # placeholders are resolved from a throwaway env file with a

@@ -31,6 +31,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Nothing here writes to the repo — it builds and runs checks, some of them
+# over pull-request-controlled Nix and Python. aws-ci.yml already declares
+# this; CI was relying on the repository default.
+permissions:
+  contents: read
+
 jobs:
   validate:
     name: Validate module & VM
@@ -107,6 +113,22 @@ jobs:
       # cannot authenticate, so an auth gate there silently drops deliveries.
       - name: Check webhook route in generated Caddyfile
         run: nix build -L .#checks.x86_64-linux.webhook-route && cat result
+
+      # Issue #374: the native backend's two flake checks, which nothing
+      # ran until that bug was found by hand. `runtime-profile` builds
+      # packages.<system>.runtime — the profile a native box installs at
+      # first boot — and diffs its payloads against modules/src, so a
+      # renamed asset (env-exec.sh -> .py, which broke the profile's
+      # evaluation outright) fails here instead of on a live launch.
+      # `agentbox-render` runs tests/test_agentbox.py through the flake and
+      # hands the rendered Caddyfile to `caddy validate`; aws-ci.yml runs
+      # the python directly, but only for its own path filter, which does
+      # not include the modules/src assets the render embeds.
+      - name: Check native runtime profile payloads
+        run: nix build -L .#checks.x86_64-linux.runtime-profile && cat result
+
+      - name: Check native renderer output
+        run: nix build -L .#checks.x86_64-linux.agentbox-render && cat result
 
       # Full closure build — the real "module is usable" proof. --max-jobs
       # auto because nix defaults to ONE: a system closure is hundreds of

@@ -78,9 +78,7 @@ let
     } ''
       # The marker paths are relative to the including file, and one of them
       # reaches out to docs/, so the layout has to be rebuilt around it.
-      mkdir -p tree/modules tree/docs
-      cp -r ${src} tree/modules/src
-      cp ${../docs/potato.svg} tree/docs/potato.svg
+      ${resolveTree}
       python3 ${../bin/assemble-module.py} \
         --resolve tree/modules/src/settings-daemon.py > daemon.py
       if grep -q '@@include' daemon.py; then
@@ -88,19 +86,82 @@ let
         echo "serve the marker text as CSS and as JS" >&2
         exit 1
       fi
-      flake8 --show-source --ignore E501,E302,E305,W503,E226 daemon.py
+      # Like env-exec, the daemon is not self-contained: it calls the env
+      # store's load()/keys()/update()/as_dict() and ENV_HEADER, which the
+      # module prepends as envStoreLib (issue #212). Without it the flake8
+      # gate below reports F821 on every one of them — which is what a
+      # native box would have hit at runtime on the settings page's env
+      # endpoints, had the profile ever built.
+      {
+        cat ${src}/lib/envstore.py
+        printf '\n\n'
+        cat daemon.py
+      } > page.py
+      # E402/F811 as well, and only here, for the same reason the module
+      # gives: the daemon's own imports follow the library's code, and four
+      # of them re-bind names the library already imported.
+      flake8 --show-source \
+        --ignore E501,E302,E305,W503,E226,E402,F811 page.py
       mkdir -p $out/bin
       {
         printf '#!%s\n' ${pkgs.python3}/bin/python3
-        cat daemon.py
+        cat page.py
       } > $out/bin/agent-box-settings
       chmod +x $out/bin/agent-box-settings
     '';
 
-  # writeShellScriptBin, not writeShellApplication: the module builds these
-  # the same way, and writeShellApplication would prepend `set -o errexit`
-  # (etc.) and silently change the semantics of every payload.
-  payload = name: file: pkgs.writeShellScriptBin name (readSrc file);
+  # The tree the assembler resolves markers in: the paths in an @@include@@
+  # are relative to the including file, and settings-daemon.py's reach out
+  # to docs/, so the repo layout has to be rebuilt around modules/src.
+  resolveTree = ''
+    mkdir -p tree/modules tree/docs
+    cp -r ${src} tree/modules/src
+    cp ${../docs/potato.svg} tree/docs/potato.svg
+  '';
+
+  # Shell payloads are NOT all finished files (issue #374): supervisor.sh,
+  # mark-stopped.sh, session-cli.sh and webhook-spawn.sh each carry an
+  # @@include:lib/registry.sh@@ marker, the one parser of the session
+  # registry's write protocol. `writeShellScriptBin (readFile ...)` shipped
+  # that marker to the box verbatim — the settings daemon's bug (below) with
+  # a worse ending, since every registry helper a session command calls
+  # would simply not exist.
+  #
+  # So the same treatment: resolve through the assembler's own resolve(),
+  # not a second implementation of the marker syntax, and build a derivation
+  # rather than `readFile` its output into a writer, which would be
+  # import-from-derivation and make `packages.<system>.runtime`
+  # un-evaluatable from another architecture.
+  #
+  # What writeShellScriptBin did is reproduced exactly (runtimeShell shebang,
+  # body verbatim, no `set -o errexit` — writeShellApplication would have
+  # changed the semantics of every payload).
+  payload = name: file: pkgs.runCommand name
+    {
+      nativeBuildInputs = [ pkgs.python3 pkgs.bash ];
+    } ''
+      ${resolveTree}
+      python3 ${../bin/assemble-module.py} \
+        --resolve tree/modules/src/${file} > body
+      if grep -q '@@include' body; then
+        echo "an @@include@@ marker survived resolve() in ${file}" >&2
+        exit 1
+      fi
+      install -d $out/bin
+      { printf '#!%s\n' ${pkgs.runtimeShell}; cat body; } > $out/bin/${name}
+      chmod +x $out/bin/${name}
+      bash -n $out/bin/${name}
+    '';
+
+  # env-exec.py is Python, not shell (issue #212), and it is not
+  # self-contained: it calls load_into() and uses os without importing either,
+  # relying on src/lib/envstore.py being spliced in above it — exactly as
+  # the module's envExecWrapper does. `payload` above would wrap it in a
+  # bash shebang and hand bash a python file to parse.
+  envStoreLib = readSrc "lib/envstore.py";
+  envExecWrapper = pkgs.writers.writePython3Bin "agent-box-env-exec" {
+    flakeIgnore = [ "E402" "E501" ];
+  } (envStoreLib + "\n\n" + readSrc "env-exec.py");
 
   agentPackage = agent:
     if agent == "claude" then agentPkgs.claude-code
@@ -119,7 +180,7 @@ let
     (payload "agent-box-update" "update.sh")
     (payload "agent-box-codex-remote-control" "codex-remote-control.sh")
     (payload "agent-box-claude-session-start-hook" "claude-session-start-hook.sh")
-    (payload "agent-box-env-exec" "env-exec.sh")
+    envExecWrapper
     settingsDaemon
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-spawn" "webhook-spawn.sh")
