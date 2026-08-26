@@ -2014,17 +2014,29 @@
         f" {tmux_bin} -L agent-box list-sessions -F '#S'"
         f" | grep -x {busy} >/dev/null"
     )
-    # The second one is stopped only once it has really started, so "finished
-    # entry with no pane" is the state under test and not a spawn still in
-    # flight.
-    cap_spawn("capdone", 2)
-    done = cap_session("capdone")
+    # The second one is a hook-* KEY with no pane — the divergence between the
+    # key count and what is actually running, which is the whole reason the
+    # fallback below exists. Stopped only once it has really started, so the
+    # state under test is "finished entry", not a spawn still in flight.
+    #
+    # Added DIRECTLY rather than through the spawn wrapper: a wrapper-spawned
+    # session is --ephemeral, so parking it delists it within a tick and there
+    # would be no lingering key left to count. The divergence itself is not
+    # gone with it — a hook-* entry outlives its pane whenever it is listed
+    # while the supervisor is down, caught between respawns, or predates
+    # --ephemeral — so the fallback still has to be conservative, and this is
+    # the deterministic way to put it in that state.
+    done = "hook-defangdevs-capdone-0000"
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session add {done}"
+    )
     machine.wait_until_succeeds(f"{hook_ls} | grep -x {done} >/dev/null", timeout=60)
     machine.succeed(
         f"sudo -u agent env HOME=/home/agent agent-box-session stop {done}"
     )
     machine.succeed(
-        f"jq -e '.sessions[\"{done}\"].stopped == true'"
+        f"jq -e '.sessions[\"{done}\"]"
+        " | .stopped == true and (has(\"ephemeral\") | not)'"
         " /home/agent/.config/agent-box/sessions.json"
     )
     machine.wait_until_fails(f"{hook_ls} | grep -x {done} >/dev/null", timeout=60)
