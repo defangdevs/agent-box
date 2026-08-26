@@ -14,6 +14,13 @@ on:
       - 'bin/assemble-module.py'
       - 'tests/test-assemble-module.py'
       - 'tests/test-envstore.py'
+      # The native-render fixture (issue #154 Phase 4): the renderer under
+      # test, the test itself, and its committed expected/ snapshot must all
+      # re-run agentbox-render when any one changes, or a stale fixture only
+      # surfaces via a manual dispatch (as it did for PR #381).
+      - 'bin/agentbox'
+      - 'tests/test_agentbox.py'
+      - 'tests/native/**'
       # The mascot mark (issue #185) is embedded into the settings daemon at
       # assemble time, so it is a module source as much as a website asset.
       - 'docs/potato.svg'
