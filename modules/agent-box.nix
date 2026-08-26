@@ -103,9 +103,10 @@ let
       dispatched session is subscribed to the event's own repo at spawn, so its red
       CI spawns no sibling — but that seeded claim stops at TOPIC BRANCHES: a failing
       run on a shared ref (`master`, `main`, a release tag like `v1.2.3`) is claimed
-      by no session and always gets a session of its own, however many are live,
-      because a red trunk has to reach somebody. Name that ref in your own
-      `--include` when you pick such a run up.
+      by no session, because a red trunk has to reach somebody. No live session
+      silences it, so the watch spawns for it however many sessions are running — the
+      ceiling below is the one thing left that can refuse the batch. Name that ref in
+      your own `--include` when you pick such a run up.
       Its prompt tells it to `agent-box-session rm NAME` when done — clean
       stale `hook-*` sessions the same way. That cleanup is load-bearing: at most 4
       `hook-*` sessions may RUN at once, and once that ceiling is reached EVERY
