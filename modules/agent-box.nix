@@ -13101,6 +13101,17 @@ if __name__ == "__main__":
       }) terminalUsers))
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-box-settings@${name}" {
         overrideStrategy = "asDropin";
+        # Restart in ONE step, not stop-in-old-config then start-in-new.
+        # This unit is socket-activated, so the default two-step restart
+        # leaves a window: the stop runs before the new configuration's
+        # daemon-reload, and any client still holding the settings page
+        # open reconnects into that window. The socket then starts the
+        # daemon again from systemd's CACHED (old) unit definition, and
+        # switch-to-configuration's later start step finds it already
+        # running. The daemon reads AGENT_BOX_REV from its environment
+        # once at startup, so the survivor serves the PREVIOUS rev — the
+        # Update card then reports an update that is already applied.
+        stopIfChanged = false;
         # See the "agent-box@" comment above: every optional block
         # merges INTO this one `environment` value via nested `//`, not
         # as separate outer `// lib.optionalAttrs {...}` blocks (which
