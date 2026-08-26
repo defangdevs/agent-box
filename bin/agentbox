@@ -1380,13 +1380,21 @@ def cmd_update(args):
         return 0
 
     flake = f"github:{repo}/{target}#{RUNTIME_ATTR}"
-    wall(f"updating to {repo}@{target[:12]} — services restart, including "
-         "agent sessions. Save context now.")
+    # Two notices, not one, and the promise of a restart is in the second:
+    # realizing the closure is the long, failure-prone half, and it happens
+    # BEFORE the profile is touched — so a box that cannot fetch or build
+    # the new release must not have been told its services were going down.
+    wall(f"fetching {repo}@{target[:12]} — nothing has changed yet.")
     # Realize the new closure BEFORE touching the profile, so the window in
     # which the profile has no runtime element (between the remove and the
     # install) is a symlink flip rather than a multi-minute download that
     # can fail halfway.
-    run(nix_cmd("build", "--no-link", flake))
+    try:
+        run(nix_cmd("build", "--no-link", flake))
+    except subprocess.CalledProcessError as e:
+        raise UpdateError(f"building {flake} failed: {e}")
+    wall(f"updating to {repo}@{target[:12]} — services restart, including "
+         "agent sessions. Save context now.")
 
     generation = profile_generation(profile)
     try:

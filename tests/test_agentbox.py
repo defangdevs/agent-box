@@ -563,6 +563,34 @@ class SelfUpdateLogicTest(unittest.TestCase):
         self.assertLess(self.calls.index(removes[0]),
                         self.calls.index(installs[0]))
 
+    def test_a_failed_build_is_reported_and_leaves_the_profile_alone(self):
+        """`main` catches ConfigError and UpdateError — nothing else.
+
+        A substitution or evaluation failure is the likeliest way an update
+        stops, and it must read as a reason in the journal rather than a
+        traceback. The profile is untouched at that point, so the "services
+        restart" notice must not have been sent yet either.
+        """
+        def fail_on_build(cmd, check=True, capture=False):
+            self.calls.append(list(cmd))
+            if "build" in cmd:
+                raise subprocess.CalledProcessError(1, cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        self.mod.run = fail_on_build
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            self._api({"/commits/": {"sha": "2" * 40},
+                       "/compare/": {"status": "ahead"}})
+            with self.quiet() as out, \
+                    self.assertRaises(self.mod.UpdateError) as cm:
+                self.mod.cmd_update(self._args(prof))
+        self.assertIn("failed", str(cm.exception))
+        self.assertNotIn("services restart", out.getvalue())
+        for call in self.calls:
+            self.assertNotIn("remove", call)
+            self.assertNotIn("install", call)
+
     def test_restart_covers_every_daemon_the_profile_swap_invalidated(self):
         """apply reports no change after a swap, so this list is the fix.
 
