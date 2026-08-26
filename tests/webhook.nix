@@ -764,7 +764,7 @@
     # not a second session the assertion below could catch immediately.
     machine.wait_until_succeeds(
         "journalctl -u agent-box-webhook@agent --no-pager"
-        f" | grep 'session agent-{hook_name} is subscribed to it' >/dev/null",
+        f" | grep 'session agent-{hook_name} declared it' >/dev/null",
         timeout=30,
     )
     machine.succeed(
