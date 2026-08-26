@@ -638,14 +638,42 @@ class SelfUpdateLogicTest(unittest.TestCase):
         rollback raise ValueError inside the except handler that exists to
         recover the box — no rollback, no re-apply, no wall notice, and a
         traceback where an operator wanted a working box.
+
+        The flag is built at the very end of phase one, so the switch has
+        to VERIFY for the assertion to see anything: a fake install that
+        lands the target rev gets us there, and the handover is captured
+        from subprocess.run, which is what phase one starts the child with.
         """
+        target = "2" * 40
+        child = []
+        real_run = subprocess.run
+        self.addCleanup(setattr, subprocess, "run", real_run)
+        subprocess.run = lambda cmd, *a, **k: (
+            child.extend(cmd) or subprocess.CompletedProcess(cmd, 0))
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)          # a plain dir, no symlink
             self.assertIsNone(self.mod.profile_generation(prof))
-            self._api({"/commits/": {"sha": "2" * 40},
+            self._api({"/commits/": {"sha": target},
                        "/compare/": {"status": "ahead"}})
-            with self.quiet(), self.assertRaises(self.mod.UpdateError):
-                self.mod.cmd_update(self._args(prof))
+
+            def install(cmd, check=True, capture=False):
+                self.calls.append(list(cmd))
+                if "install" in cmd:
+                    manifest = prof / "manifest.json"
+                    data = json.loads(manifest.read_text())
+                    data["elements"]["runtime"]["url"] = (
+                        f"github:{FAKE_REPO}/{target}")
+                    manifest.write_text(json.dumps(data))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            self.mod.run = install
+            with self.quiet():
+                self.assertEqual(self.mod.cmd_update(self._args(prof)), 0)
+        self.assertTrue(child, "phase one never handed over to phase two")
+        self.assertIn("--post-switch", child)
+        self.assertNotIn("--from-generation", child)
+        for arg in child:
+            self.assertNotEqual(arg, "None")
         for call in self.calls:
             self.assertNotIn("None", call)
 
