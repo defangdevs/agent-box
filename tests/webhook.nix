@@ -710,11 +710,55 @@
     # here claimed every event on the repo: on 2026-08-24 a session spawned for
     # one issue silenced the master Deploy test failure four seconds later.
     machine.succeed(
-        "jq -e '(.topics[0].include.any | map(.path))"
+        "jq -e '(.topics[0].include.all[0].any | map(.path))"
         " == [\"workflow_run\", \"check_run\", \"check_suite\", \"workflow_job\"]"
-        " and (.topics[0].include.any | all(.notIn == [null]))'"
+        " and (.topics[0].include.all[0].any | all(.notIn == [null]))'"
         f" {hook_filter}"
     )
+    # ...and only on a TOPIC BRANCH (#384). A run on a SHARED ref — master, main,
+    # a release tag — is nobody's object: the trunk everyone pushes to, or a
+    # release nobody holds, and a red one has to reach a fresh session whatever
+    # else is live. On 2026-08-26 17:56 UTC it did not: a hook session started
+    # minutes earlier for a PR-branch failure claimed every CI outcome in the
+    # repo, so the master Deploy test failure was logged as claimed and nothing
+    # triaged it. There is no glob or prefix leaf to ask for `v*` with, so
+    # "has a slash in it" is the test, at the four paths a head ref arrives on.
+    machine.succeed(
+        "jq -e '(.topics[0].include.all[1].any | map(.path))"
+        " == [\"workflow_run.head_branch\", \"workflow_job.head_branch\","
+        " \"check_suite.head_branch\", \"check_run.check_suite.head_branch\"]"
+        " and (.topics[0].include.all[1].any | all(.contains == [\"/\"]))'"
+        f" {hook_filter}"
+    )
+    # The shape above is only half the promise: what decides a spawn is the
+    # pinned webhook.py matching that claim against a payload, so ask it. The
+    # brake runs this exact function, and a jq assertion on the JSON cannot
+    # tell a claim that reads right from one that matches nothing (the first
+    # version of this claim named .id, which every real delivery carries and
+    # the fixtures here do not, so it silently never matched).
+    machine.succeed(
+        "cat > /tmp/claimcheck.py <<'PYEOF'\n"
+        "import importlib.util, json, sys\n"
+        "spec = importlib.util.spec_from_file_location('wh', sys.argv[1])\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m)\n"
+        "claim = json.load(open(sys.argv[2]))['topics'][0]['include']\n"
+        "assert m.predicate_error(claim) is None, m.predicate_error(claim)\n"
+        "def wf(b): return {'workflow_run': {'head_branch': b, 'conclusion': 'failure'}}\n"
+        "def cr(b): return {'check_run': {'check_suite': {'head_branch': b}}}\n"
+        "for p in (wf('feat/issue-101'), cr('fix/1-thing')):\n"
+        "    assert m.match_predicate(claim, p), p\n"
+        "for p in (wf('master'), wf('main'), wf('v3.14.1'), cr('master'), cr('v3.14.1')):\n"
+        "    assert not m.match_predicate(claim, p), p\n"
+        "print('claim ok')\n"
+        "PYEOF"
+    )
+    claimcheck = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        f" {python} /tmp/claimcheck.py {script} {hook_filter}"
+    )
+    assert "claim ok" in claimcheck, claimcheck
     # ...and the session is told, so it neither re-subscribes nor assumes that
     # being spawned means nobody else is on this.
     assert "already subscribed to github:defangdevs/agent-box" in hook_prompt, hook_prompt
@@ -775,6 +819,47 @@
         "grep -q 'defangdevs/agent-box' /tmp/hook-peer.log", timeout=30
     )
     machine.succeed("grep -q 'seeded at spawn' /tmp/hook-peer.log")
+
+    # The other half of the same brake: a SHARED ref is out of its reach. That
+    # peer is still live and still claiming this repo's topic-branch CI, and a
+    # failing run on `master` gets its own session anyway — the delivery the
+    # 2026-08-26 incident lost.
+    client.succeed(
+        "cat > /tmp/trunk.json <<'EOF'\n"
+        '{"action":"completed","workflow_run":{"name":"Deploy test",'
+        '"conclusion":"failure","head_branch":"master",'
+        '"html_url":"https://box.test/run/3"},'
+        '"repository":{"full_name":"defangdevs/agent-box"},'
+        '"sender":{"login":"someone"}}\n'
+        "EOF"
+    )
+    sig_trunk = client.succeed(
+        f"openssl dgst -sha256 -hmac {secret} -r /tmp/trunk.json | cut -d' ' -f1"
+    ).strip()
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST"
+        " -H 'content-type: application/json' -H 'x-github-event: workflow_run'"
+        " -H 'x-github-delivery: test-trunk'"
+        f" -H 'x-hub-signature-256: sha256={sig_trunk}' --data-binary @/tmp/trunk.json"
+        " https://box.test/agent/webhook/github | grep -x 200"
+    )
+    # Generously timed on purpose: the dispatcher coalesces events arriving
+    # within SPAWN_WINDOW_S (60) of the last spawn on this key into one
+    # follow-up batch, and re-checks ownership when that batch starts — which
+    # is the path under test, not a shortcut around it.
+    machine.wait_until_succeeds(
+        "jq -e '[.sessions | keys[] | select(startswith(\"hook-\"))] | length == 2'"
+        " /home/agent/.config/agent-box/sessions.json",
+        timeout=180,
+    )
+    trunk_session = machine.succeed(
+        "jq -r '.sessions | keys[] | select(startswith(\"hook-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+        f" | grep -v -x {hook_name}"
+    ).strip()
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {trunk_session}"
+    )
     machine.succeed("systemctl stop webhook-peer-hook.service")
 
     # The seed is the event's own key, never the topic that matched it: a
@@ -863,7 +948,10 @@
         " /home/agent/.config/agent-box/sessions.json"
     ).strip()
     machine.succeed(
-        "jq -e '(.topics[0].include.any | map(.path) | index(\"workflow_run\")) != null"
+        "jq -e '(.topics[0].include.all[0].any | map(.path) | index(\"workflow_run\"))"
+        " != null"
+        " and (.topics[0].include.all[1].any | map(.path)"
+        " | index(\"workflow_run.head_branch\")) != null"
         " and (.topics[0].note | contains(\"#\") | not)'"
         f" /home/agent/.local/state/local-webhook/filter.agent-{unnumbered}.json"
     )
