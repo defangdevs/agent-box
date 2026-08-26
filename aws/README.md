@@ -321,9 +321,10 @@ What that buys over the infect template:
 | Base-OS patching | nixos-rebuild | apt / unattended-upgrades (`agentbox apply` never calls apt) |
 | Rollback | `nixos-rebuild --rollback` | `nix profile rollback --profile /nix/var/nix/profiles/agent-box` |
 
-**Updating a native box** (issue #358) is `sudo systemctl start --no-block
-agent-box-update.service`, the same grant the agent holds on the infect
-template — but a different mechanism behind it, because there is no closure
+**Updating a native box** (issue #358) is `sudo -n /usr/bin/systemctl start
+--no-block agent-box-update.service` — the full path, because sudo matches the
+grant on the exact command line and a bare `systemctl` resolves through PATH
+(#353). It is the same grant the agent holds on the infect template — but a different mechanism behind it, because there is no closure
 to rebuild. The unit runs `agentbox update`, which reads the rev the profile
 records for itself, asks GitHub for the repo's current HEAD, refuses anything
 that is not strictly ahead of what is running (rewritten history, or a replay

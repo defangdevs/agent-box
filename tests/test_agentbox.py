@@ -568,27 +568,82 @@ class SelfUpdateLogicTest(unittest.TestCase):
 
         Unit text names <profile>/bin/..., a path that does not move, so
         nothing looks changed while every daemon still runs the old code.
+        What is live is read from systemd, not derived from the config —
+        the recovery path has to work when the config is the very thing the
+        new release choked on.
         """
-        with tempfile.TemporaryDirectory() as tmp:
-            prof = build_fake_profile(tmp)
-            spec = self.mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
-            self.mod.unit_active = lambda unit: True
-            with self.quiet():
-                restarted = self.mod.restart_units(spec)
-        for user in ("agent", "robot"):
-            for unit in (f"agent-box@{user}.service",
-                         f"agent-web-terminal@{user}.service",
-                         f"agent-box-settings@{user}.socket",
-                         f"agent-box-webhook@{user}.socket"):
-                self.assertIn(unit, restarted)
-        self.assertIn("caddy.service", restarted)
+        live = {
+            "agent-web-auth-secrets.service": ["agent-web-auth-secrets.service"],
+            "agent-web-terminal@*.service": ["agent-web-terminal@agent.service"],
+            "agent-box-settings@*.socket": ["agent-box-settings@agent.socket"],
+            "agent-box-settings@*.service": ["agent-box-settings@agent.service"],
+            "agent-box-webhook@*.socket": ["agent-box-webhook@agent.socket"],
+            # Deliberately stopped by the operator: not listed, not restarted.
+            "agent-box-webhook@*.service": [],
+            "caddy.service": ["caddy.service"],
+            "agent-box@*.service": ["agent-box@agent.service",
+                                    "agent-box@robot.service"],
+        }
+        self.mod.active_units = lambda pattern: live[pattern]
+        with self.quiet():
+            restarted = self.mod.restart_units()
+        self.assertNotIn("agent-box-webhook@agent.service", restarted)
+        for unit in ("agent-web-auth-secrets.service",
+                     "agent-web-terminal@agent.service",
+                     "agent-box-settings@agent.socket",
+                     "agent-box-webhook@agent.socket",
+                     "caddy.service"):
+            self.assertIn(unit, restarted)
         # Sessions last: the agent that asked for the update is in one.
         self.assertEqual(
             restarted[-2:],
             ["agent-box@agent.service", "agent-box@robot.service"])
         with self.quiet():
-            skipped = self.mod.restart_units(spec, restart_sessions=False)
+            skipped = self.mod.restart_units(restart_sessions=False)
         self.assertNotIn("agent-box@agent.service", skipped)
+
+    def test_a_profile_with_no_generation_still_recovers(self):
+        """`--from-generation None` must not reach phase two.
+
+        profile_generation() is None when the profile path is not a
+        generation symlink. Passing str(None) would make phase two's
+        rollback raise ValueError inside the except handler that exists to
+        recover the box — no rollback, no re-apply, no wall notice, and a
+        traceback where an operator wanted a working box.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)          # a plain dir, no symlink
+            self.assertIsNone(self.mod.profile_generation(prof))
+            self._api({"/commits/": {"sha": "2" * 40},
+                       "/compare/": {"status": "ahead"}})
+            with self.quiet(), self.assertRaises(self.mod.UpdateError):
+                self.mod.cmd_update(self._args(prof))
+        for call in self.calls:
+            self.assertNotIn("None", call)
+
+    def test_github_failures_are_reported_not_raised(self):
+        """A rate limit is 60/hour per IP, so the journal must read well.
+
+        `main` catches ConfigError and UpdateError; anything else is a
+        traceback in the journal where an operator wanted a reason.
+        """
+        import urllib.error
+        import urllib.request
+
+        def boom(req, timeout=30):
+            raise urllib.error.HTTPError(
+                req.full_url, 403, "rate limit exceeded", {}, None)
+
+        real = urllib.request.urlopen
+        urllib.request.urlopen = boom
+        self.addCleanup(setattr, urllib.request, "urlopen", real)
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            with self.quiet(), self.assertRaises(self.mod.UpdateError) as cm:
+                self.mod.cmd_update(self._args(prof))
+        self.assertIn("GitHub request failed", str(cm.exception))
+        self.assertEqual(self.calls, [],
+                         "a failed lookup must not touch the profile")
 
 
 def update_fixture():

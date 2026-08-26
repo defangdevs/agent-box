@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -326,7 +327,10 @@ class Renderer:
         # Carried into agent-box-update.service's ExecStart: an update
         # re-applies the SAME config this apply was driven by, so a box
         # configured from a non-default path keeps working after it.
-        self.config = str(config)
+        # Absolute, because a unit runs with WorkingDirectory=/ — a relative
+        # `--config config.yaml` on the apply command line would render an
+        # ExecStart that only fails when someone finally triggers an update.
+        self.config = os.path.abspath(str(config))
 
     def p(self, *parts):
         """A path inside the render root (so --root DIR renders a tree)."""
@@ -1184,13 +1188,22 @@ class UpdateError(Exception):
 
 
 def github_json(url, timeout=30):
-    """One GitHub REST call. Unauthenticated — 60/hour is plenty for this."""
+    """One GitHub REST call. Unauthenticated — 60/hour is plenty for this.
+
+    Failures become UpdateError rather than a traceback: unauthenticated
+    GitHub is 60 requests an hour PER IP, so on a shared address a rate
+    limit is reachable, and "update declined, GitHub said 403" is what the
+    journal should carry.
+    """
     req = urllib.request.Request(url, headers={
         "Accept": "application/vnd.github+json",
         "User-Agent": "agent-box-update",
     })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise UpdateError(f"GitHub request failed ({url}): {e}")
 
 
 def wall(message):
@@ -1253,12 +1266,29 @@ def rollback_to(profile, generation):
     return False
 
 
-def unit_active(unit):
-    return run([SYSTEMCTL, "is-active", "--quiet", unit],
-               check=False).returncode == 0
+# What a profile swap invalidates, in restart order. Sessions are separate
+# and go LAST: the agent that triggered the update is inside one, and
+# everything else should be back up by the time its tmux server is replaced.
+RESTART_PATTERNS = [
+    "agent-web-auth-secrets.service",
+    "agent-web-terminal@*.service",
+    "agent-box-settings@*.socket",
+    "agent-box-settings@*.service",
+    "agent-box-webhook@*.socket",
+    "agent-box-webhook@*.service",
+    "caddy.service",
+]
+SESSION_PATTERN = "agent-box@*.service"
 
 
-def restart_units(spec, restart_sessions=True):
+def active_units(pattern):
+    """The live units matching `pattern`, in systemd's own order."""
+    out = run([SYSTEMCTL, "list-units", "--no-legend", "--plain",
+               "--state=active", pattern], check=False, capture=True).stdout
+    return [line.split()[0] for line in (out or "").splitlines() if line.strip()]
+
+
+def restart_units(restart_sessions=True):
     """Restart what a profile swap invalidated but left looking unchanged.
 
     The rendered units name `<profile>/bin/...` — a path that does not
@@ -1269,34 +1299,19 @@ def restart_units(spec, restart_sessions=True):
     kept serving the old page until it was restarted by hand. An update
     therefore restarts these itself; it cannot infer the need from apply.
 
-    Only units that are currently active are touched, so a service the
-    operator deliberately stopped stays stopped. Sessions go LAST: the
-    agent that triggered the update is inside one, and everything else
-    should already be back up by the time its tmux server is replaced.
+    What is live is read from systemd rather than derived from the config,
+    for two reasons: a service the operator deliberately stopped stays
+    stopped, and the recovery path must work even when the config is the
+    very thing the new release choked on.
     """
-    units = []
-    if spec.web_enable:
-        units.append("agent-web-auth-secrets.service")
-    for u in spec.users:
-        if spec.web_enable:
-            units += [f"agent-web-terminal@{u.name}.service",
-                      f"agent-box-settings@{u.name}.socket",
-                      f"agent-box-settings@{u.name}.service"]
-        if spec.webhook_enable:
-            units += [f"agent-box-webhook@{u.name}.socket",
-                      f"agent-box-webhook@{u.name}.service"]
-    if spec.web_enable:
-        units.append("caddy.service")
-    if restart_sessions:
-        units += [f"agent-box@{u.name}.service" for u in spec.users]
-
+    patterns = RESTART_PATTERNS + ([SESSION_PATTERN] if restart_sessions
+                                   else [])
     restarted = []
-    for unit in units:
-        if not unit_active(unit):
-            continue
-        run([SYSTEMCTL, "restart", unit], check=False)
-        restarted.append(unit)
-        print(f"restarted {unit}")
+    for pattern in patterns:
+        for unit in active_units(pattern):
+            run([SYSTEMCTL, "restart", unit], check=False)
+            restarted.append(unit)
+            print(f"restarted {unit}")
     return restarted
 
 
@@ -1404,7 +1419,13 @@ def cmd_update(args):
     # itself: store paths are immutable and its pages stay mapped.)
     child = [str(profile / "bin" / "agentbox"), "update", "--post-switch",
              "--config", args.config, "--profile", str(profile),
-             "--from-generation", str(generation), "--from-rev", current]
+             "--from-rev", current]
+    # Only when there IS one: a profile path that is not a generation
+    # symlink has no number, and passing the string "None" would make phase
+    # two's rollback raise ValueError inside its own except handler — the
+    # one place that must not throw.
+    if generation is not None:
+        child += ["--from-generation", str(generation)]
     if args.no_restart_sessions:
         child.append("--no-restart-sessions")
     print(f"switched to {target[:12]}; applying with the new agentbox")
@@ -1419,13 +1440,15 @@ def post_switch(args, profile):
     back where phase one found it and re-applies with that older code, so a
     failed update leaves a working box rather than a half-switched one.
     """
-    spec = Spec(load_config(args.config), profile)
     restart_sessions = not args.no_restart_sessions
     try:
+        # Inside the guard: a release that cannot parse this box's config is
+        # exactly what the rollback is for, and a ConfigError escaping here
+        # would leave the profile switched with nothing put back.
         rc = cmd_apply(apply_args(args.config, profile))
         if rc:
             raise UpdateError(f"`agentbox apply` exited {rc}")
-        restarted = restart_units(spec, restart_sessions=restart_sessions)
+        restarted = restart_units(restart_sessions=restart_sessions)
     except Exception as e:  # noqa: BLE001 - any failure must roll back
         generation = (int(args.from_generation)
                       if args.from_generation else None)
@@ -1434,7 +1457,7 @@ def post_switch(args, profile):
         # same version-skew reason phase one handed over to us.
         run([str(profile / "bin" / "agentbox"), "apply",
              "--config", args.config, "--profile", str(profile)], check=False)
-        restart_units(spec, restart_sessions=restart_sessions)
+        restart_units(restart_sessions=restart_sessions)
         wall(f"update FAILED ({e}) — profile "
              + ("rolled back to the previous release."
                 if rolled else "COULD NOT be rolled back; see journalctl "
