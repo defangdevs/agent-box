@@ -58,8 +58,10 @@
       # assertion below checks they land in the session's extraArgs.
       webhook.hookSessionArgs = [ "--model" "sonnet" ];
       # Watch policy (#197) for the SECOND standing watch below. The first
-      # watch (defangdevs/agent-box) deliberately stays rule-less, so the
-      # legacy failures-only brake keeps its own coverage next to this.
+      # watch (defangdevs/agent-box) deliberately stays UNGOVERNED by this
+      # option — it still needs rules to exist at all (0.23.0, issue #380),
+      # which it gets from webhook-cli.sh's own default for a rule-less
+      # GitHub subscribe, exercised next to the Nix-declared kind here.
       webhook.watchPolicy = {
         "github:defangdevs/local-channels" = {
           note = "managed: rules watch (test)";
@@ -296,19 +298,31 @@
     assert len(secret) == 32, secret
 
     # A subscription for THIS session, written through the CLI with no
-    # arguments beyond the topic — the session scope comes from the env.
+    # arguments beyond the topic and an --include for CI-outcome events —
+    # the session scope comes from the env.
+    #
+    # The --include is load-bearing since local-webhook 0.23.0 in a way it
+    # wasn't before: until 0.22.x, ANY live peer subscribed to the topic
+    # claimed a CI-outcome event for the dispatch ownership brake below,
+    # regardless of whether its own entry carried a predicate. 0.23.0 folded
+    # that carve-out into the general rule — a peer claims an event (of any
+    # kind) only when its own include predicate matches it (local-channels#16,
+    # owner_now's docstring) — so a bare topic-only subscription no longer
+    # counts as ownership of the workflow_run failure delivered below.
     machine.succeed(
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
         " agent-box-webhook subscribe defangdevs/agent-box --note 'testing #101' --ttl 8"
+        " --when '{\"path\": \"event\", \"in\": [\"workflow_run\", \"check_run\","
+        " \"check_suite\", \"workflow_job\"]}'"
     )
     # --ttl 8 rather than 0: local-webhook 0.20.0 refuses a pinned session
     # subscription (the cap is MAX_SESSION_TTL_HOURS). Any bounded value
     # outlasts a VM test that finishes in minutes.
     machine.succeed(
         "jq -e '.topics[0].topic == \"github:defangdevs/agent-box\""
-        " and .topics[0].note == \"testing #101\"'"
+        " and .topics[0].note == \"testing #101\" and (.topics[0].include != null)'"
         " /home/agent/.local/state/local-webhook/filter.agent-main.json"
     )
 
@@ -528,6 +542,14 @@
     # --- dispatch: a standing watch spawns a fresh session (0.9.0, #1) ------
     # A deliver_to:"subagent" subscription goes to the SHARED dispatch file,
     # pinned by default, and does not touch the session's own filter.
+    #
+    # No --when/--drop is given here — the documented one-liner in the
+    # shipped guide. local-webhook >= 0.23.0 refuses to CREATE a rule-less
+    # subagent entry outright (issue #380: the built-in failures-only CI
+    # brake that used to stand in for one is gone), so if webhook-cli.sh's own
+    # default-rule fallback ever regressed, this subscribe call itself would
+    # fail here — a box-wide inert watch would no longer wait for an
+    # untriaged issue to surface it.
     machine.succeed(
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
@@ -537,7 +559,7 @@
     )
     machine.succeed(
         "jq -e '.topics[0].topic == \"github:defangdevs/agent-box\""
-        " and .topics[0].ttlHours == 0'"
+        " and .topics[0].ttlHours == 0 and (.topics[0].include != null)'"
         " /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
     # The daemon advertises the spawn wiring, so subscribe could warn if the
@@ -578,13 +600,15 @@
     )
 
     # --- dispatch brake: a green run is not news (local-channels 0.10.1) -----
-    # Nobody owns the topic now and this sender is on no ignore list, so the
-    # OUTCOME is the only thing that can hold the spawn back. Pinned webhook.py
-    # before 0.10.1 read the outcome only to decide whether a CI event could
-    # override an ignored sender, and started a session per green build: one
-    # merge to master cost four hook-* sessions that each concluded "nothing to
-    # do", with the four-session cap then standing between a real failure and
-    # its triage.
+    # Nobody owns the topic now, so the watch's own rules are the only thing
+    # that can hold the spawn back. Before 0.10.1, pinned webhook.py read the
+    # outcome only to decide whether a CI event could override an ignored
+    # sender, and started a session per green build: one merge to master cost
+    # four hook-* sessions that each concluded "nothing to do", with the
+    # four-session cap then standing between a real failure and its triage.
+    # Since 0.23.0 there is no built-in CI vocabulary at all (issue #380) — the
+    # rule-less subscribe above got a default --when from webhook-cli.sh, and
+    # its CI-failure clause is what declines this success outcome.
     client.succeed(
         "cat > /tmp/green.json <<'EOF'\n"
         '{"action":"completed","workflow_run":{"name":"CI","conclusion":"success",'
@@ -602,8 +626,15 @@
         f" -H 'x-hub-signature-256: sha256={sig_green}' --data-binary @/tmp/green.json"
         " https://box.test/agent/webhook/github | grep -x 200"
     )
+    # 'not spawning for workflow_run on defangdevs/agent-box' alone would
+    # already be true from the ownership-brake delivery above (the journal is
+    # cumulative) — 'the subscribed watch declined it' is what is unique to
+    # THIS delivery, distinguishing a rules-declined event from one a live
+    # peer already claimed.
     machine.wait_until_succeeds(
-        "journalctl -u agent-box-webhook@agent --no-pager | grep 'no failing outcome' >/dev/null",
+        "journalctl -u agent-box-webhook@agent --no-pager"
+        " | grep 'not spawning for workflow_run on defangdevs/agent-box — the subscribed"
+        " watch declined it' >/dev/null",
         timeout=30,
     )
     machine.fail(
@@ -733,7 +764,7 @@
     # not a second session the assertion below could catch immediately.
     machine.wait_until_succeeds(
         "journalctl -u agent-box-webhook@agent --no-pager"
-        f" | grep 'session agent-{hook_name} is subscribed to it' >/dev/null",
+        f" | grep 'session agent-{hook_name} declared it' >/dev/null",
         timeout=30,
     )
     machine.succeed(
@@ -1246,7 +1277,9 @@
         " and .note == \"managed: rules watch (test)\" and .ttlHours == 0'"
         " /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
-    # ...while the rule-less agent-box watch was left exactly alone.
+    # ...while the agent-box watch — carrying webhook-cli.sh's own default
+    # rules, not a governed one — was left exactly alone: no watchPolicy
+    # entry names its topic, so the applier never touches it.
     machine.succeed(
         "jq -e '.topics[] | select(.topic == \"github:defangdevs/agent-box\")"
         " | (has(\"when\") or has(\"drop\")) | not'"
