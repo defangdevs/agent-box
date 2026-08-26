@@ -1075,11 +1075,29 @@ in
         # not isolation (issue #135): a sibling session reads it out of
         # /proc/<pid>/environ, which is exactly how this assertion reads it.
         machine.wait_until_succeeds(tmux("has-session -t =worker"), timeout=60)
-        wpid = machine.wait_until_succeeds(
-            tmux('display -p -t "=worker:" "#{pane_pid}"') + " | grep .", timeout=60
-        ).strip()
-        environ = machine.succeed(f"tr '\\0' '\\n' < /proc/{wpid}/environ")
-        assert "PROFILE_TOKEN=sekret" in environ, environ
+        # Same race as the pemsess assertion above: has-session answers before
+        # the pane's `<env-exec wrapper> <shell>` has necessarily finished
+        # exec'ing, so the loaded environment may still be sitting on a child
+        # of the pane pid rather than the pane pid itself. Poll both, exactly
+        # like pemsess does, instead of reading pane_pid once.
+        wpids = (
+            tmux('display -p -t "=worker:" "#{pane_pid}"')
+            + " | xargs -I{} sh -c 'echo {}; pgrep -P {} || true'"
+        )
+        machine.wait_until_succeeds(
+            wpids
+            + " | xargs -I{} sh -c \"tr '\\0' '\\n' < /proc/{}/environ\""
+            + " | grep -x 'PROFILE_TOKEN=sekret' >/dev/null",
+            timeout=60,
+        )
+        examined = machine.succeed(wpids).split()
+        environ = ""
+        for pid in examined:
+            candidate = machine.succeed(f"tr '\\0' '\\n' < /proc/{pid}/environ || true")
+            if "PROFILE_TOKEN=sekret" in candidate:
+                environ = candidate
+                break
+        assert "PROFILE_TOKEN=sekret" in environ, (examined, environ)
         assert "AGENT_BOX_PROFILE=triage" in environ, environ
         # The reserved LAUNCH keys are NOT environment: a system prompt in the
         # environment of everything the agent shells out to is not what a
