@@ -652,7 +652,13 @@
               else
                 echo "ok: bin/agent-box-env-exec == src/lib/envstore.py + src/env-exec.py"
               fi
-              python3 -m py_compile "$profile/bin/agent-box-env-exec" \
+              # ast.parse, not `python3 -m py_compile`: py_compile writes a
+              # __pycache__ next to its input, and the input here lives in
+              # the store. It failed with "[Errno 13] Permission denied:
+              # .../bin/__pycache__" and reported it as a SYNTAX error in a
+              # file that is perfectly good Python.
+              python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' \
+                "$profile/bin/agent-box-env-exec" \
                 || { echo "SYNTAX: bin/agent-box-env-exec"; fail=1; }
               if grep -q '@@include' "$profile/bin/agent-box-env-exec"; then
                 echo "MARKER: bin/agent-box-env-exec still has an @@include@@ marker"
@@ -687,7 +693,7 @@
                   <(tail -n +2 "$profile/bin/agent-box-settings") | head -20 || true
                 fail=1
               else
-                echo "ok: bin/agent-box-settings == resolve(src/settings-daemon.py)"
+                echo "ok: bin/agent-box-settings == src/lib/envstore.py + resolve(src/settings-daemon.py)"
               fi
 
               # Shared assets: the units both backends install verbatim, the
