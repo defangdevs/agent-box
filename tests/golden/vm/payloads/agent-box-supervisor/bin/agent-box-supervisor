@@ -1114,11 +1114,68 @@ sweep_session_state() {
   done
 }
 
+# Delist ONE-SHOT sessions that have been parked (--ephemeral, issue #167's
+# other half).
+#
+# Parking is the right end for a NAMED session: `stopped` keeps its
+# boxSessionId, which is the only record mapping the name to a conversation,
+# so `agent-box-session restart` can resume it. A hook-* session has no such
+# future — it is spawned for one event batch and nobody ever resumes it — so
+# for those the same flag means "finished", and the entry is litter that
+# outlives the work. The preamble does ask the agent to `agent-box-session rm`
+# itself, but that is a request to a MODEL: `/quit` and Ctrl+D reach the clean
+# exit without it, and a session parked by `agent-box-session stop` never had
+# an agent to ask.
+#
+# Only the parked ones. A CRASH takes the post-mortem branch and is never
+# flagged, so a hook session that died stays listed and attachable for
+# inspection, exactly as before.
+#
+# The transcript is untouched — it lives under the harness's own state dir and
+# outlives every registry entry. What goes is the name->conversation mapping,
+# which is what makes the name reusable; sweep_session_state (above) then
+# reclaims the launch id on this same tick, so the next holder of the name
+# cannot inherit this one's transcript.
+reap_ephemeral() {
+  _cand="$($JQ -r '.sessions | to_entries[]
+                   | select(.value.ephemeral == true and .value.stopped == true)
+                   | .key' "$REGISTRY_FILE" 2>/dev/null)" || return 0
+  [ -n "$_cand" ] || return 0
+  _gone=""
+  registry_lock
+  while IFS= read -r _n; do
+    case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
+    # A live pane still owns the name: mark-stopped runs as the epilogue of a
+    # pane that is still exiting. Delisting under it would strand that pane as
+    # an unmanaged tmux session the reconcile loop tolerates forever. Waiting
+    # a tick costs nothing.
+    $TMUX has-session -t "=$_n" 2>/dev/null && continue
+    # Re-read under the lock: `restart` clears the flag, and a session revived
+    # between the candidate scan and here must not be delisted by a decision
+    # taken before it came back.
+    $JQ -e --arg s "$_n" \
+      '.sessions[$s].ephemeral == true and .sessions[$s].stopped == true' \
+      "$REGISTRY_FILE" >/dev/null 2>&1 || continue
+    registry_edit --arg s "$_n" 'del(.sessions[$s])'
+    _gone=1
+  done < <(printf '%s\n' "$_cand")
+  registry_unlock
+  # Startup-only otherwise, on the reasoning that both delete paths prune
+  # their own filter file. This is the third delete path and it cannot, so it
+  # pays for the sweep itself — only on a tick that actually delisted
+  # something, which is rare.
+  if [ -n "$_gone" ]; then
+    sweep_orphan_filters
+  fi
+}
+
 # Reconcile forever; systemd stop tears the whole tree down (ExecStop
 # kill-server + cgroup kill), Restart=always revives a crashed loop.
 # Sessions flagged stopped (a clean agent exit, or agent-box-session
-# stop) stay listed but are left down until a restart clears the flag.
+# stop) stay listed but are left down until a restart clears the flag —
+# except the one-shot ones, which reap_ephemeral delists instead.
 while true; do
+  reap_ephemeral
   sweep_session_state
   while IFS= read -r sname; do
     case "$sname" in

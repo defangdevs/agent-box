@@ -1196,6 +1196,56 @@ in
         assert re.search(r"^quitter\s+claude\s+stopped", ls_out, re.M), ls_out
         machine.succeed(as_agent("agent-box-session rm quitter"))
 
+    with subtest("a one-shot session is delisted, not parked"):
+        # A hook-* session's shape: spawned --ephemeral because nobody will
+        # ever resume it. Both ways of parking one must end in a DELIST, so
+        # the entry cannot outlive the work (before this, a hook agent that
+        # answered its event and quit stayed listed for good — the preamble
+        # asking it to `rm` itself is a request to a model, not a guarantee).
+        #
+        # First the clean-exit path, the one a finished hook agent takes.
+        # `claude --help` exits 0, exactly as /quit does minus the TUI. No
+        # assertion on the intermediate stopped=true: the reap is meant to
+        # follow it within one 2s tick, so only the END state is stable.
+        machine.succeed(as_agent("agent-box-session add gone --ephemeral -- --help"))
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions | has(\"gone\") | not' {sfile}", timeout=120
+        )
+        settle()
+        machine.fail(tmux("has-session -t =gone"))
+        ls_out = machine.succeed(as_agent("agent-box-session ls"))
+        assert not re.search(r"^gone\s", ls_out, re.M), ls_out
+        # The supervisor's per-session state went with it (issue #282), so the
+        # next holder of this name cannot inherit its launch id, and with it
+        # its transcript.
+        machine.succeed(
+            as_agent("test ! -e ~/.local/state/agent-box/session/gone.json")
+        )
+
+        # Then the `stop` path, on a session that is up rather than exiting —
+        # which also pins the flag itself, racelessly.
+        machine.succeed(as_agent("agent-box-session add oneshot --ephemeral"))
+        machine.wait_until_succeeds(tmux("has-session -t =oneshot"), timeout=60)
+        machine.succeed(f"jq -e '.sessions.oneshot.ephemeral == true' {sfile}")
+        stop_out = machine.succeed(as_agent("agent-box-session stop oneshot"))
+        # The message must not promise a `restart` that will never come.
+        assert "one-shot" in stop_out, stop_out
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions | has(\"oneshot\") | not' {sfile}", timeout=120
+        )
+
+    with subtest("a plain session is still parked, not reaped"):
+        # The reap must key on --ephemeral alone. A named session parked by
+        # the very same flag keeps its entry, because its boxSessionId is the
+        # only record mapping the name to a conversation `restart` can resume.
+        machine.succeed(as_agent("agent-box-session add keeper -- --help"))
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions.keeper.stopped == true' {sfile}", timeout=120
+        )
+        settle()
+        machine.succeed(f"jq -e '.sessions | has(\"keeper\")' {sfile}")
+        machine.succeed(as_agent("agent-box-session rm keeper"))
+
     with subtest("stop parks a listed session; restart revives it"):
         machine.succeed(as_agent("agent-box-session stop main"))
         machine.succeed(f"jq -e '.sessions.main.stopped == true' {sfile}")

@@ -40,7 +40,8 @@ kill_session() {
 usage() {
   echo "usage: agent-box-session ls"
   echo "       agent-box-session add [NAME] [--agent AGENT] [--profile PROFILE] [--cwd DIR]"
-  echo "                             [--prompt TEXT] [--resume-prompt TEXT] [-- EXTRA_ARGS...]"
+  echo "                             [--prompt TEXT] [--resume-prompt TEXT] [--ephemeral]"
+  echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
@@ -56,6 +57,10 @@ usage() {
   echo "--agent and a '-- EXTRA_ARGS' tail override what the profile resolved."
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
+  echo "--ephemeral marks a ONE-SHOT session: parking it (a clean agent exit, or"
+  echo "'stop') delists it outright, because nobody is going to resume it. A"
+  echo "CRASH still parks nothing and leaves the post-mortem shell attachable."
+  echo "The transcript is kept either way; only the registry entry goes."
   echo "Listed sessions are (re)started by the per-user supervisor within ~2s."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
@@ -218,7 +223,7 @@ case "$cmd" in
       *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
     agent="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
-    profile=""; has_agent=0
+    profile=""; has_agent=0; ephemeral=0
     while [ $# -gt 0 ]; do
       case "$1" in
         --agent) agent="${2:?--agent needs a value}"; has_agent=1; shift 2 ;;
@@ -226,6 +231,7 @@ case "$cmd" in
         --cwd) cwd="${2:?--cwd needs a value}"; shift 2 ;;
         --prompt) prompt="${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
         --resume-prompt) rprompt="${2?--resume-prompt needs a value}"; has_rprompt=1; shift 2 ;;
+        --ephemeral) ephemeral=1; shift ;;
         --) shift; break ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
@@ -302,8 +308,8 @@ case "$cmd" in
     registry_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
-      --arg prof "$profile" \
-      '.sessions[$n] = {agent: $a, skipPermissions: true, remoteControl: true,
+      --arg prof "$profile" --arg eph "$ephemeral" \
+      '.sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: true,
                         remoteControlName: null,
                         workingDirectory: (if $c == "" then null else $c end),
                         extraArgs: $ARGS.positional,
@@ -311,7 +317,10 @@ case "$cmd" in
                         initialPrompt: (if $pp == "1" then $p else null end),
                         resumePrompt: (if $rpp == "1" then $rp else null end),
                         boxSessionId: (if $bid == "" then null else $bid end),
-                        hasRun: false}' \
+                        hasRun: false}
+                       # Added only when set, so every session that is NOT
+                       # one-shot keeps the entry shape it has always had.
+                       + (if $eph == "1" then {ephemeral: true} else {} end))' \
       --args -- "${sargs[@]}"
     registry_unlock
     # The mascot (issue #185) marks the closest thing this CLI has to
@@ -343,7 +352,9 @@ case "$cmd" in
     # Park a listed session (issue #167): flag it stopped FIRST so the
     # supervisor's post-spawn re-check catches a spawn racing this kill,
     # then take the live session down. The entry (agent, cwd, transcript
-    # id) stays listed for a later 'restart' to revive.
+    # id) stays listed for a later 'restart' to revive — unless the session
+    # is one-shot (--ephemeral), for which parked means finished and the
+    # supervisor reaps the entry on its next tick.
     name="${1:-}"
     valid_name "$name" || { usage >&2; exit 2; }
     registry_ensure
@@ -356,10 +367,19 @@ case "$cmd" in
       echo "no such session: '$name' (see agent-box-session ls)" >&2
       exit 2
     fi
+    # Read before the write, under the same lock the write takes: what is
+    # printed below must describe the entry this command actually parked.
+    eph=0
+    "$JQ" -e --arg n "$name" '.sessions[$n].ephemeral == true' \
+      "$REGISTRY_FILE" >/dev/null 2>&1 && eph=1
     registry_edit --arg n "$name" '.sessions[$n].stopped = true'
     registry_unlock
     kill_session "$name" || exit 1
-    echo "session '$name' stopped — still listed, not respawned; 'agent-box-session restart $name' revives it"
+    if [ "$eph" = 1 ]; then
+      echo "session '$name' stopped — one-shot (--ephemeral), so the supervisor delists it within ~2s; its transcript is kept"
+    else
+      echo "session '$name' stopped — still listed, not respawned; 'agent-box-session restart $name' revives it"
+    fi
     ;;
   restart)
     # Clearing the stopped flag makes restart double as the revive verb
