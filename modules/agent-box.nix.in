@@ -1344,13 +1344,23 @@ in
       };
       rev = lib.mkOption {
         type = lib.types.str;
-        default = "6a178f7faaac08fabc7851827b485eb2499823f7";
+        default = "3f2400760c4f69bcb70c5222a10e57def17fc489";
         description = ''
           Pinned local-channels commit whose local-webhook/webhook.py the
           receiver daemon and the agent-box-webhook CLI run. Claude sessions
           load the plugin from the same repo as a channel, but claude clones
           the marketplace itself and tracks its default branch — this pin only
           governs the copy the box runs.
+
+          0.23.0 (this pin, issue #380) retired the built-in failures-only CI
+          brake for rule-less dispatch entries: a `--deliver-to subagent`
+          watch now MUST carry its own `when`/`drop` rules or webhook_subscribe
+          refuses to create it. `ignoreSenders` also became a pure sender mute
+          with no CI-outcome carve-out. webhook-cli.sh (see subscribeCmd
+          below) fills in a default `when` for a rule-less GitHub subagent
+          subscription so the one-liner in the shipped guide keeps working;
+          watchPolicy is unaffected in shape and, since 0.23.0, is the ONLY
+          thing that still makes the box's own standing watch selective.
         '';
       };
       sha256 = lib.mkOption {
@@ -1358,7 +1368,7 @@ in
         # builtins.fetchurl hash of local-webhook/webhook.py at `rev`:
         #   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.py
         # then `nix hash convert --hash-algo sha256 --to sri <base32>`.
-        default = "sha256-jOdU9VP1eXjeVr2PnV8hDpkxBZjgvPKFJY1UyXeTu0Q=";
+        default = "sha256-0LF/CWddQJcKNxka9238RCkjI8b8jf/85CPAyKSo+Ck=";
         description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
       };
       syncSessionPlugin = lib.mkOption {
@@ -1584,12 +1594,16 @@ in
           filter.dispatch.json (other entries and the entry's own
           topic/ttl/timestamps untouched), replacing whatever ad-hoc rules a
           session left there. A watch carrying when/drop sets its own spawn
-          policy: local-webhook's built-in failures-only CI brake steps aside
-          for it, and every event the rules decline is logged by the daemon,
-          so a deliberate drop stays distinguishable from a watch that broke
-          (#170). Requires local-webhook >= 0.11.0 (the webhook.rev pin),
-          or >= 0.14.0 for the contains/notContains substring leaves the
-          default's mention rule uses.
+          policy: on local-webhook < 0.23.0 the built-in failures-only CI
+          brake stepped aside for a governed entry; 0.23.0 removed that brake
+          outright, so since then this option's when/drop is the ONLY thing
+          deciding whether a governed watch spawns anything at all — there is
+          no built-in vocabulary left to fall back on for a topic this option
+          does not cover (issue #380). Every event the rules decline is still
+          logged by the daemon, so a deliberate drop stays distinguishable
+          from a watch that broke (#170). Requires local-webhook >= 0.11.0
+          (the webhook.rev pin), or >= 0.14.0 for the contains/notContains
+          substring leaves the default's mention rule uses.
         '';
       };
     };

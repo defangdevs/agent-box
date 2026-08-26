@@ -51,9 +51,24 @@ Two delivery shapes:
                          session primed with the event text; bursts coalesce
                          into one. SHARED across sessions and pinned (--ttl
                          0) by default; `ls` shows these under "dispatch".
-                         A CI event spawns only if it reports a FAILURE, and
-                         never while a live session is subscribed to that
-                         topic; new issues and others' PRs always spawn.
+                         local-webhook >= 0.23.0 has no built-in policy: a
+                         subagent watch MUST carry --when/--drop rules or it
+                         is refused outright — there is no failures-only CI
+                         brake standing in for a rule-less one any more. A
+                         GitHub topic (github:owner/repo, or the bare
+                         owner/repo shorthand) with neither flag gets a
+                         DEFAULT --when filled in here — opened/reopened
+                         issues and PRs, an assignment or @mention naming
+                         this box, a review verdict on a PR it wrote, and
+                         terminal CI failure — the same vocabulary
+                         services.agent-box.webhook.watchPolicy's own default
+                         uses, scoped to this box's GitHub login when known.
+                         Pass --when/--drop yourself to replace it, or to
+                         subscribe a non-GitHub source (which gets no
+                         default). A watch's own rules are the only thing
+                         deciding whether it spawns; a live session
+                         subscribed to the same topic still holds first
+                         claim over any watch, GitHub or not.
                          A spawned session is subscribed to the event's own
                          repo for it, so its own CI spawns no sibling.
                          THERE IS A CEILING: at most 4 hook-* sessions may
@@ -70,14 +85,18 @@ Two delivery shapes:
 --ignore-sender LOGIN mutes echoes of that sender's own comments and pushes
 ("@self" is $LOCAL_WEBHOOK_SELF — the login this box acts as, resolved from
 this environment's GitHub token by `agent-box-webhook-self`; with no token and
-no cached answer it matches nobody); CI-outcome events are delivered anyway.
+no cached answer it matches nobody). Since local-webhook 0.23.0 this is a PURE
+sender mute — it also drops that sender's CI-outcome events, where earlier
+versions delivered those anyway. Put the sender check INSIDE --when/--drop
+instead ({"path": "sender.login", "notIn": [...]}) when a CI result from that
+sender should still get through.
 
 --when / --drop attach payload rules to the subscription: deliver (or
 spawn) ONLY events matching --when, never those matching --drop. Rules are
 JSON — {"any"/"all": [...]} over {"path": "a.b.c", "in"/"notIn": [values]}
-leaves. A subscription with rules sets its own policy: the failure-only CI
-brake steps aside for it, and sender muting belongs INSIDE the rules
-({"path": "sender.login", "notIn": [...]}) rather than --ignore-sender.
+leaves. A subagent subscription's rules are its ENTIRE policy (0.23.0 removed
+the built-in failures-only CI fallback), and sender muting belongs INSIDE the
+rules ({"path": "sender.login", "notIn": [...]}) rather than --ignore-sender.
 NOTE: rules on the box's own standing watches may be managed declaratively
 (services.agent-box.webhook.watchPolicy) and re-applied whenever the
 receiver daemon starts — such entries say so in their note; change the
@@ -245,9 +264,92 @@ or agent-box-session rm NAME to delist it for good), or raise \
 AGENT_BOX_HOOK_SESSION_MAX on the receiver daemon unit."
 }
 
+# local-webhook >= 0.23.0 refuses to create a --deliver-to subagent entry
+# that carries neither --when nor --drop (issue #380: the built-in
+# failures-only CI brake that used to stand in for a rule-less one is gone).
+# That is exactly the shape of the one-liner this box's own guide documents
+# (`agent-box-webhook subscribe OWNER/REPO --deliver-to subagent --note ...`),
+# so fill in a default --when here for a GitHub topic left rule-less — the
+# same vocabulary services.agent-box.webhook.watchPolicy's own default uses
+# (opened/reopened, assignment, @mention, a review verdict on our own PR,
+# terminal CI failure), scoped to this box's login when it is known. A
+# non-GitHub topic (a source this vocabulary cannot describe) gets nothing
+# here and falls through to webhook.py's own refusal and its own message.
+ci_failure_json='["failure","timed_out","action_required","startup_failure","stale","error"]'
+default_subagent_when() {
+  self="${LOCAL_WEBHOOK_SELF:-}"
+  if [ -n "$self" ]; then
+    "$JQ" -nc --arg self "$self" --argjson ci "$ci_failure_json" '
+      {any: [
+        {all: [{path:"action", "in":["opened","reopened"]}, {path:"sender.login", notIn:[$self]}]},
+        {all: [{path:"action", "in":["assigned"]}, {path:"assignee.login", "in":[$self]},
+               {path:"sender.login", notIn:[$self]}]},
+        {all: [{path:"action", "in":["created","edited"]}, {path:"sender.login", notIn:[$self]},
+               {path:"comment.body", contains:["@" + $self]}]},
+        {all: [{path:"action", "in":["submitted"]},
+               {path:"review.state", "in":["approved","changes_requested","commented"]},
+               {path:"pull_request.user.login", "in":[$self]}, {path:"sender.login", notIn:[$self]}]},
+        {path:"workflow_run.conclusion", "in":$ci}, {path:"workflow_job.conclusion", "in":$ci},
+        {path:"check_run.conclusion", "in":$ci}, {path:"check_suite.conclusion", "in":$ci},
+        {path:"deployment_status.state", "in":["error","failure"]}, {path:"state", "in":["error","failure"]}
+      ]}'
+  else
+    # No known login: the sender-scoped clauses (assignment, mention, our own
+    # review) cannot be written, so only the sender-agnostic ones apply —
+    # narrower coverage than the box's own watchPolicy default, said out loud
+    # below rather than silently.
+    "$JQ" -nc --argjson ci "$ci_failure_json" '
+      {any: [
+        {path:"action", "in":["opened","reopened"]},
+        {path:"workflow_run.conclusion", "in":$ci}, {path:"workflow_job.conclusion", "in":$ci},
+        {path:"check_run.conclusion", "in":$ci}, {path:"check_suite.conclusion", "in":$ci},
+        {path:"deployment_status.state", "in":["error","failure"]}, {path:"state", "in":["error","failure"]}
+      ]}'
+  fi
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
-  subscribe|unsubscribe)
+  subscribe)
+    ensure_state
+    if [ "${1:-}" != "-h" ] && [ "${1:-}" != "--help" ]; then
+      deliver_to=session; have_when=0; have_drop=0; topic=""; want=""
+      for a in "$@"; do
+        if [ -n "$want" ]; then
+          case "$want" in (deliver-to) deliver_to="$a" ;; esac
+          want=""; continue
+        fi
+        case "$a" in
+          --deliver-to) want=deliver-to ;;
+          --deliver-to=*) deliver_to="${a#--deliver-to=}" ;;
+          --when|--when=*) have_when=1 ;;
+          --drop|--drop=*) have_drop=1 ;;
+          --*) ;;
+          *) [ -n "$topic" ] || topic="$a" ;;
+        esac
+      done
+      if [ "$deliver_to" = subagent ] && [ "$have_when" = 0 ] && [ "$have_drop" = 0 ]; then
+        case "$topic" in
+          (github:*|*/*)
+            w="$(default_subagent_when)"
+            set -- "$@" --when "$w"
+            if [ -n "${LOCAL_WEBHOOK_SELF:-}" ]; then
+              echo "agent-box-webhook: no --when/--drop given for a subagent watch on" \
+                   "$topic — defaulting to the box's own GitHub triage rules, scoped to" \
+                   "$LOCAL_WEBHOOK_SELF; pass --when/--drop yourself to replace them" >&2
+            else
+              echo "agent-box-webhook: no --when/--drop given for a subagent watch on" \
+                   "$topic, and this box's GitHub login is unknown — defaulting to" \
+                   "opened/reopened plus CI failures only (no assignment/mention/review" \
+                   "clauses); pass --when/--drop yourself for the full default" >&2
+            fi
+            ;;
+        esac
+      fi
+    fi
+    exec "$PY" "$SCRIPT" "$cmd" "$@"
+    ;;
+  unsubscribe)
     # webhook.py owns topic parsing, TTL/renew semantics and the filter
     # file — including the per-session LOCAL_WEBHOOK_SESSION scope, which
     # the supervisor already put in this session's environment.
