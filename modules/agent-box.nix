@@ -101,7 +101,12 @@ let
       review on your own PR to spawn a sibling that starts working it (that is
       exactly what happened twice in one hour before local-webhook 0.19.0). A
       dispatched session is subscribed to the event's own repo at spawn, so its red
-      CI spawns no sibling. Its prompt tells it to `agent-box-session rm NAME` when done — clean
+      CI spawns no sibling — but that seeded claim stops at TOPIC BRANCHES: a failing
+      run on a shared ref (`master`, `main`, a release tag like `v1.2.3`) is claimed
+      by no session and always gets a session of its own, however many are live,
+      because a red trunk has to reach somebody. Name that ref in your own
+      `--include` when you pick such a run up.
+      Its prompt tells it to `agent-box-session rm NAME` when done — clean
       stale `hook-*` sessions the same way. That cleanup is load-bearing: at most 4
       `hook-*` sessions may RUN at once, and once that ceiling is reached EVERY
       watch on the box is inert — a matching batch is refused and dropped, never
@@ -4104,7 +4109,11 @@ agent-box-webhook ls). What you own is the OBJECT you were started for, not \
 the whole repository (agent-box#251), so when you open a PR or push a branch, \
 subscribe again naming it — agent-box-webhook subscribe REPO --include with \
 pull_request.number and workflow_run.head_branch — and its CI then reaches you \
-instead of starting a second agent on your work.}"
+instead of starting a second agent on your work. A failing run on a SHARED ref \
+— master, main, a release tag — is claimed by no session, because a red trunk \
+has to reach somebody whatever else is running, so if that is what started \
+you, name that ref the same way or the next event from the same run can start \
+a second agent beside you.}"
 }
 
 # Extra agent-CLI args for hook sessions (webhook.hookSessionArgs), JSON in
@@ -4524,6 +4533,35 @@ fi
 #     id are in the payload but not in the meta this script is given, so it
 #     cannot narrow further today (local-channels#46 asks for them).
 #
+#     Wider than one run, but NOT wide enough to swallow a shared ref (#384).
+#     `master` (or `main`, or a release tag like `v3.14.1`) is nobody's object
+#     — the trunk everyone pushes to, or a release nobody is holding — so a red
+#     one has to reach a fresh triage session whatever else happens to be
+#     alive. Measured cost of the wider claim, 2026-08-26 17:56 UTC: the
+#     master Deploy test went red and the watch logged "not spawning for
+#     workflow_run ... session agent-hook-defangdevs-agent-box-4086 claimed it"
+#     — a hook session started for a PR-branch failure minutes earlier, still
+#     alive, holding every CI outcome in the repo. That is the same shape as
+#     the 2026-08-24 incident above, one notch narrower.
+#
+#     So the CI claim is qualified by the head ref, and a ref with no "/" in
+#     it — `master`, `main`, `v3.14.1`, `release-2` — is treated as shared and
+#     never claimed. `contains: ["/"]` is a substring test, the only shape the
+#     predicate language has for "looks like": there is no glob or prefix leaf
+#     to ask for `v*` with (LEAF_OPS is in/notIn/contains/notContains). It errs
+#     in the safe direction — an unslashed TOPIC branch ("hotfix") loses twin
+#     dedupe, which costs one extra session, while a mis-swallowed red trunk
+#     costs an hour of nobody looking. The head ref sits at a different path
+#     per event shape, so all four are named; an absent path fails `contains`,
+#     which is why the presence leaves above stay as the first half of the
+#     claim rather than being replaced by these.
+#
+#     Cost accepted with it: a session spawned FOR a red trunk claims nothing,
+#     so the second event of that same run can start a twin beside it. The
+#     preamble asks that session to claim the ref by name, which it can read
+#     off its own event text; the exact-run claim this script cannot write is
+#     local-channels#46 again.
+#
 # A numbered claim deliberately does NOT cover that object's CI. A session that
 # opens a PR learns its own branch, and the preamble tells it to re-subscribe
 # with that branch named — a claim it can make precisely and this script
@@ -4540,10 +4578,14 @@ claim_include() {
         {any: [{path: "issue.number", in: [$n]},
                {path: "pull_request.number", in: [$n]}]}
       else
-        {any: [{path: "workflow_run", notIn: [null]},
-               {path: "check_run", notIn: [null]},
-               {path: "check_suite", notIn: [null]},
-               {path: "workflow_job", notIn: [null]}]}
+        {all: [{any: [{path: "workflow_run", notIn: [null]},
+                      {path: "check_run", notIn: [null]},
+                      {path: "check_suite", notIn: [null]},
+                      {path: "workflow_job", notIn: [null]}]},
+               {any: [{path: "workflow_run.head_branch", contains: ["/"]},
+                      {path: "workflow_job.head_branch", contains: ["/"]},
+                      {path: "check_suite.head_branch", contains: ["/"]},
+                      {path: "check_run.check_suite.head_branch", contains: ["/"]}]}]}
       end' 2>/dev/null
 }
 claim_note() {
@@ -4563,7 +4605,7 @@ claim_note() {
     | if $n != "" then
         "seeded at spawn: this session was started for \($key)#\($n)\($what) and claims that object'"'"'s events while it lives"
       else
-        "seeded at spawn: this session was started for \($key)\($what) and claims this repo'"'"'s CI outcomes while it lives"
+        "seeded at spawn: this session was started for \($key)\($what) and claims this repo'"'"'s CI outcomes on TOPIC BRANCHES while it lives (never master or a tag: a shared ref always gets a session of its own)"
       end' 2>/dev/null
 }
 

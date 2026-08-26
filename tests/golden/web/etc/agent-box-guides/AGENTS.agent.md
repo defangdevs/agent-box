@@ -179,7 +179,12 @@ the repo. So scope the subscription when you pick up an object, or expect a
 review on your own PR to spawn a sibling that starts working it (that is
 exactly what happened twice in one hour before local-webhook 0.19.0). A
 dispatched session is subscribed to the event's own repo at spawn, so its red
-CI spawns no sibling. Its prompt tells it to `agent-box-session rm NAME` when done — clean
+CI spawns no sibling — but that seeded claim stops at TOPIC BRANCHES: a failing
+run on a shared ref (`master`, `main`, a release tag like `v1.2.3`) is claimed
+by no session and always gets a session of its own, however many are live,
+because a red trunk has to reach somebody. Name that ref in your own
+`--include` when you pick such a run up.
+Its prompt tells it to `agent-box-session rm NAME` when done — clean
 stale `hook-*` sessions the same way. That cleanup is load-bearing: at most 4
 `hook-*` sessions may RUN at once, and once that ceiling is reached EVERY
 watch on the box is inert — a matching batch is refused and dropped, never
