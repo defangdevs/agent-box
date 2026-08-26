@@ -154,7 +154,7 @@ let
     '';
 
   # env-exec.py is Python, not shell (issue #212), and it is not
-  # self-contained: it calls load() and uses os without importing either,
+  # self-contained: it calls load_into() and uses os without importing either,
   # relying on src/lib/envstore.py being spliced in above it — exactly as
   # the module's envExecWrapper does. `payload` above would wrap it in a
   # bash shebang and hand bash a python file to parse.
