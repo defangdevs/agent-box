@@ -15,6 +15,9 @@ no network. Regenerate the fixture after an intended change with:
     python3 tests/test_agentbox.py --update
 """
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import shutil
@@ -22,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -43,14 +47,48 @@ FAKE_BINS = [
     "agent-box-codex-remote-control", "agent-box-webhook-receiver",
     "agent-box-webhook-spawn", "agent-box-session-bare",
     "agent-box-webhook-bare", "claude", "codex", "tmux", "ttyd", "caddy",
-    "grep", "find", "flock", "hostname",
+    "grep", "find", "flock", "hostname", "agentbox",
 ]
+
+
+# What the fake profile's manifest claims it was installed from. The rev is
+# deliberately NOT the one tests/native/config.json carries, so the fixture
+# shows which of the two the renderer believes (issue #358: the profile is
+# the ground truth, the config field is a fallback that can be stale).
+FAKE_REPO = "defangdevs/agent-box"
+FAKE_REV = "1" * 40
+
+
+def load_agentbox():
+    """Import bin/agentbox as a module, for unit tests of its internals.
+
+    It has no .py suffix (it is a command), so the import machinery needs
+    to be told what it is. Its `if __name__ == "__main__"` guard keeps the
+    import from running main().
+    """
+    loader = SourceFileLoader("agentbox_cli", str(AGENTBOX))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
 
 
 def build_fake_profile(root):
     """A stand-in for the Nix runtime profile, with the real shared assets."""
     prof = Path(root) / "profile"
     (prof / "bin").mkdir(parents=True)
+    (prof / "manifest.json").write_text(json.dumps({
+        "version": 3,
+        "elements": {
+            "runtime": {
+                "active": True,
+                "attrPath": "packages.x86_64-linux.runtime",
+                "originalUrl": f"github:{FAKE_REPO}",
+                "url": f"github:{FAKE_REPO}/{FAKE_REV}",
+                "storePaths": [str(prof)],
+            },
+        },
+    }, indent=2) + "\n")
     for b in FAKE_BINS:
         p = prof / "bin" / b
         p.write_text("#!/bin/sh\n:\n")
@@ -72,7 +110,15 @@ def build_fake_profile(root):
 
 
 def render(tmp, config):
-    """Run `agentbox apply --root`, then normalize the profile path away."""
+    """Run `agentbox apply --root`, then normalize the paths that move.
+
+    The profile lives in a temp dir, and so does nothing else — except the
+    config path, which agent-box-update.service's ExecStart now carries so
+    an update re-applies the same config (and which is tests/native/
+    config.json or .yaml here, i.e. a checkout-dependent absolute path).
+    Both are replaced with tokens so the fixture is a property of the
+    renderer rather than of where the test happened to run.
+    """
     prof = build_fake_profile(tmp)
     out = Path(tmp) / "out"
     proc = subprocess.run(
@@ -84,7 +130,9 @@ def render(tmp, config):
             f"agentbox apply failed ({proc.returncode}):\n{proc.stderr}")
     for path in sorted(out.rglob("*")):
         if path.is_file():
-            text = path.read_text().replace(str(prof), "@PROFILE@")
+            text = (path.read_text()
+                    .replace(str(prof), "@PROFILE@")
+                    .replace(str(config), "@CONFIG@"))
             # Read-only assets (the verbatim units, 0444) have to be made
             # writable for the normalization pass, then set back — the mode
             # is part of what the fixture locks.
@@ -307,6 +355,351 @@ class RenderTest(unittest.TestCase):
                 continue
             self.assertEqual(unit.read_text(), got.read_text(),
                              f"{unit.name} was rewritten, not installed")
+
+
+class SelfUpdateRenderTest(unittest.TestCase):
+    """What `apply` puts on the box so an update can be triggered (#358)."""
+
+    def setUp(self):
+        self.mod = load_agentbox()
+        self.unit = (FIXTURE / "etc/systemd/system"
+                     / self.mod.UPDATE_UNIT).read_text()
+
+    def test_update_unit_is_rendered_but_never_enabled(self):
+        """On-demand only: enabling it would update on every apply.
+
+        `cmd_apply` runs `systemctl enable --now` over Tree.units and
+        `start` over the %i instances, so an update unit that appeared in
+        either list would fire a fast-forward every single time the host
+        configuration is applied — including the apply that an update
+        itself runs, which is a loop.
+        """
+        self.assertIn("[Service]", self.unit)
+        self.assertNotIn("[Install]", self.unit)
+        self.assertIn("ExecStart=@PROFILE@/bin/agentbox update "
+                      "--config @CONFIG@", self.unit)
+        units = RenderTest()._rendered_units()
+        self.assertNotIn(self.mod.UPDATE_UNIT, units)
+        for target in ("multi-user", "sockets"):
+            drop = (FIXTURE / "etc/systemd/system"
+                    / f"{target}.target.d" / "10-agent-box.conf").read_text()
+            self.assertNotIn(self.mod.UPDATE_UNIT, drop)
+
+    def test_the_trigger_is_spelled_identically_everywhere(self):
+        """Three places have to agree on the command, or sudo prompts.
+
+        The sudoers grant matches on the exact command line, so the
+        settings page's Update button and the command the shipped guide
+        tells the agent to run must both be that same string. When they
+        drifted on the NixOS side the symptom was not an error but a
+        password prompt no agent can answer (issue #353).
+        """
+        trigger = self.mod.UPDATE_TRIGGER
+        sudoers = (FIXTURE / "etc/sudoers.d/agent-box").read_text()
+        guide = (FIXTURE / "etc/agent-box-guides/AGENTS.agent.md").read_text()
+        for user in ("agent", "robot"):
+            line = [x for x in sudoers.splitlines()
+                    if x.startswith(f"{user} ALL=")]
+            self.assertTrue(line, f"no sudoers line for {user}")
+            self.assertIn(trigger, line[0])
+        settings = (FIXTURE / "etc/systemd/system"
+                    / "agent-box-settings@agent.service.d"
+                    / "10-host.conf").read_text()
+        self.assertIn(f'Environment="AGENT_BOX_UPDATE_CMD=/usr/bin/sudo -n '
+                      f'{trigger}"', settings)
+        self.assertIn(
+            f'Environment="AGENT_BOX_UPDATE_UNIT={self.mod.UPDATE_UNIT}"',
+            settings)
+        self.assertIn("## Updating", guide)
+        self.assertIn(trigger, guide)
+
+    def test_repo_and_rev_come_from_the_profile_not_the_config(self):
+        """The profile records what is installed; the config can be stale.
+
+        tests/native/config.json still carries the placeholder `repo:`/
+        `rev:` pair, and the fake profile's manifest disagrees with it —
+        the manifest has to win, or a native box goes on advertising a rev
+        of forty zeroes on its settings page (issue #358's second open
+        question).
+        """
+        settings = (FIXTURE / "etc/systemd/system"
+                    / "agent-box-settings@agent.service.d"
+                    / "10-host.conf").read_text()
+        config = json.loads(CONFIG_JSON.read_text())
+        self.assertEqual(config["rev"], "0" * 40)
+        self.assertIn(f'Environment="AGENT_BOX_REV={FAKE_REV}"', settings)
+        self.assertIn(f'Environment="AGENT_BOX_REPO={FAKE_REPO}"', settings)
+
+
+class SelfUpdateLogicTest(unittest.TestCase):
+    """The refusals and the verification, without a network or a nix."""
+
+    def setUp(self):
+        self.mod = load_agentbox()
+        self.calls = []
+        self.mod.run = self._record
+
+    @contextlib.contextmanager
+    def quiet(self):
+        """An update narrates itself to the journal; a test need not.
+
+        Without this the progress lines are the last thing in the build
+        log, which is exactly what the flake check shows on a failure.
+        """
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            yield buf
+
+    def _record(self, cmd, check=True, capture=False):
+        self.calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def _api(self, mapping):
+        def call(url, timeout=30):
+            for fragment, payload in mapping.items():
+                if fragment in url:
+                    return payload
+            raise AssertionError(f"unexpected API call: {url}")
+        self.mod.github_json = call
+
+    def _args(self, prof, **over):
+        import argparse
+        base = dict(profile=str(prof), post_switch=False, repo=None, rev=None,
+                    force=False, check=False, config="/etc/agent-box/x.json",
+                    no_restart_sessions=False, from_generation=None,
+                    from_rev=None)
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def test_flake_url_parsing(self):
+        parse = self.mod.parse_flake_url
+        self.assertEqual(parse(f"github:{FAKE_REPO}/{FAKE_REV}"),
+                         (FAKE_REPO, FAKE_REV))
+        # An unlocked entry: a repo, but no rev to compare against.
+        self.assertEqual(parse("github:defangdevs/agent-box"),
+                         ("defangdevs/agent-box", None))
+        # A branch is a ref, not a rev — it must not be mistaken for one.
+        self.assertEqual(parse("github:defangdevs/agent-box/master"),
+                         ("defangdevs/agent-box", None))
+        self.assertEqual(parse("path:/etc/agent-box"), (None, None))
+        self.assertEqual(parse(None), (None, None))
+
+    def test_manifest_element_handles_both_nix_shapes(self):
+        """nix >= 2.20 keys elements by name; older nix uses a list."""
+        element = {"attrPath": "packages.x86_64-linux.runtime",
+                   "url": f"github:{FAKE_REPO}/{FAKE_REV}"}
+        name, got = self.mod.manifest_element(
+            {"version": 3, "elements": {"runtime": element}})
+        self.assertEqual((name, got), ("runtime", element))
+        name, got = self.mod.manifest_element(
+            {"version": 2, "elements": [element]})
+        self.assertEqual((name, got), ("0", element),
+                         "an indexed element must yield the index `nix "
+                         "profile remove` takes")
+        self.assertEqual(self.mod.manifest_element({}), (None, None))
+
+    def test_already_current_is_not_an_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            self._api({"/commits/": {"sha": FAKE_REV}})
+            with self.quiet():
+                self.assertEqual(self.mod.cmd_update(self._args(prof)), 0)
+        self.assertEqual(self.calls, [],
+                         "an already-current box must not touch its profile")
+
+    def test_non_fast_forward_is_refused(self):
+        """The one part of the NixOS payload worth porting verbatim.
+
+        A target that is not strictly ahead means rewritten history or a
+        replay of an older, possibly vulnerable rev.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            self._api({"/commits/": {"sha": "2" * 40},
+                       "/compare/": {"status": "behind"}})
+            with self.quiet(), self.assertRaises(self.mod.UpdateError) as cm:
+                self.mod.cmd_update(self._args(prof))
+        self.assertIn("fast-forward", str(cm.exception))
+        self.assertEqual(self.calls, [],
+                         "a refused update must not touch the profile")
+
+    def test_force_skips_the_check_but_check_mode_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            self._api({"/commits/": {"sha": "2" * 40},
+                       "/compare/": {"status": "ahead"}})
+            with self.quiet():
+                self.assertEqual(
+                    self.mod.cmd_update(self._args(prof, check=True)), 0)
+            self.assertEqual(self.calls, [])
+            # --force reaches the switch without asking about ancestry at
+            # all: the compare endpoint is never called (it would raise).
+            self._api({"/commits/": {"sha": "2" * 40}})
+            with self.quiet(), self.assertRaises(self.mod.UpdateError):
+                self.mod.cmd_update(self._args(prof, force=True))
+            self.assertTrue(any("build" in c for c in self.calls))
+
+    def test_a_no_op_install_is_reported_as_a_failure(self):
+        """"Still on the old rev" must never be reported as success.
+
+        Installing over an existing entry can exit non-fatally and leave
+        the old profile in place; the following `apply` then says "0
+        change(s)" and the box looks updated while running the previous
+        release (observed by hand on a live native box, issue #358). The
+        profile is therefore re-read afterwards and disagreement is fatal.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)   # manifest keeps saying FAKE_REV
+            self._api({"/commits/": {"sha": "2" * 40},
+                       "/compare/": {"status": "ahead"}})
+            with self.quiet(), self.assertRaises(self.mod.UpdateError) as cm:
+                self.mod.cmd_update(self._args(prof))
+        self.assertIn("refusing to call that an update", str(cm.exception))
+        installs = [c for c in self.calls if "install" in c]
+        removes = [c for c in self.calls if "remove" in c]
+        self.assertTrue(removes and installs,
+                        "the switch is remove-then-install, not a bare "
+                        "install")
+        self.assertLess(self.calls.index(removes[0]),
+                        self.calls.index(installs[0]))
+
+    def test_a_failed_build_is_reported_and_leaves_the_profile_alone(self):
+        """`main` catches ConfigError and UpdateError — nothing else.
+
+        A substitution or evaluation failure is the likeliest way an update
+        stops, and it must read as a reason in the journal rather than a
+        traceback. The profile is untouched at that point, so the "services
+        restart" notice must not have been sent yet either.
+        """
+        def fail_on_build(cmd, check=True, capture=False):
+            self.calls.append(list(cmd))
+            if "build" in cmd:
+                raise subprocess.CalledProcessError(1, cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        self.mod.run = fail_on_build
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            self._api({"/commits/": {"sha": "2" * 40},
+                       "/compare/": {"status": "ahead"}})
+            with self.quiet() as out, \
+                    self.assertRaises(self.mod.UpdateError) as cm:
+                self.mod.cmd_update(self._args(prof))
+        self.assertIn("failed", str(cm.exception))
+        self.assertNotIn("services restart", out.getvalue())
+        for call in self.calls:
+            self.assertNotIn("remove", call)
+            self.assertNotIn("install", call)
+
+    def test_restart_covers_every_daemon_the_profile_swap_invalidated(self):
+        """apply reports no change after a swap, so this list is the fix.
+
+        Unit text names <profile>/bin/..., a path that does not move, so
+        nothing looks changed while every daemon still runs the old code.
+        What is live is read from systemd, not derived from the config —
+        the recovery path has to work when the config is the very thing the
+        new release choked on.
+        """
+        live = {
+            "agent-web-auth-secrets.service": ["agent-web-auth-secrets.service"],
+            "agent-web-terminal@*.service": ["agent-web-terminal@agent.service"],
+            "agent-box-settings@*.socket": ["agent-box-settings@agent.socket"],
+            "agent-box-settings@*.service": ["agent-box-settings@agent.service"],
+            "agent-box-webhook@*.socket": ["agent-box-webhook@agent.socket"],
+            # Deliberately stopped by the operator: not listed, not restarted.
+            "agent-box-webhook@*.service": [],
+            "caddy.service": ["caddy.service"],
+            "agent-box@*.service": ["agent-box@agent.service",
+                                    "agent-box@robot.service"],
+        }
+        self.mod.active_units = lambda pattern: live[pattern]
+        with self.quiet():
+            restarted = self.mod.restart_units()
+        self.assertNotIn("agent-box-webhook@agent.service", restarted)
+        for unit in ("agent-web-auth-secrets.service",
+                     "agent-web-terminal@agent.service",
+                     "agent-box-settings@agent.socket",
+                     "agent-box-webhook@agent.socket",
+                     "caddy.service"):
+            self.assertIn(unit, restarted)
+        # Sessions last: the agent that asked for the update is in one.
+        self.assertEqual(
+            restarted[-2:],
+            ["agent-box@agent.service", "agent-box@robot.service"])
+        with self.quiet():
+            skipped = self.mod.restart_units(restart_sessions=False)
+        self.assertNotIn("agent-box@agent.service", skipped)
+
+    def test_a_profile_with_no_generation_still_recovers(self):
+        """`--from-generation None` must not reach phase two.
+
+        profile_generation() is None when the profile path is not a
+        generation symlink. Passing str(None) would make phase two's
+        rollback raise ValueError inside the except handler that exists to
+        recover the box — no rollback, no re-apply, no wall notice, and a
+        traceback where an operator wanted a working box.
+
+        The flag is built at the very end of phase one, so the switch has
+        to VERIFY for the assertion to see anything: a fake install that
+        lands the target rev gets us there, and the handover is captured
+        from subprocess.run, which is what phase one starts the child with.
+        """
+        target = "2" * 40
+        child = []
+        real_run = subprocess.run
+        self.addCleanup(setattr, subprocess, "run", real_run)
+        subprocess.run = lambda cmd, *a, **k: (
+            child.extend(cmd) or subprocess.CompletedProcess(cmd, 0))
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)          # a plain dir, no symlink
+            self.assertIsNone(self.mod.profile_generation(prof))
+            self._api({"/commits/": {"sha": target},
+                       "/compare/": {"status": "ahead"}})
+
+            def install(cmd, check=True, capture=False):
+                self.calls.append(list(cmd))
+                if "install" in cmd:
+                    manifest = prof / "manifest.json"
+                    data = json.loads(manifest.read_text())
+                    data["elements"]["runtime"]["url"] = (
+                        f"github:{FAKE_REPO}/{target}")
+                    manifest.write_text(json.dumps(data))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            self.mod.run = install
+            with self.quiet():
+                self.assertEqual(self.mod.cmd_update(self._args(prof)), 0)
+        self.assertTrue(child, "phase one never handed over to phase two")
+        self.assertIn("--post-switch", child)
+        self.assertNotIn("--from-generation", child)
+        for arg in child:
+            self.assertNotEqual(arg, "None")
+        for call in self.calls:
+            self.assertNotIn("None", call)
+
+    def test_github_failures_are_reported_not_raised(self):
+        """A rate limit is 60/hour per IP, so the journal must read well.
+
+        `main` catches ConfigError and UpdateError; anything else is a
+        traceback in the journal where an operator wanted a reason.
+        """
+        import urllib.error
+        import urllib.request
+
+        def boom(req, timeout=30):
+            raise urllib.error.HTTPError(
+                req.full_url, 403, "rate limit exceeded", {}, None)
+
+        real = urllib.request.urlopen
+        urllib.request.urlopen = boom
+        self.addCleanup(setattr, urllib.request, "urlopen", real)
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            with self.quiet(), self.assertRaises(self.mod.UpdateError) as cm:
+                self.mod.cmd_update(self._args(prof))
+        self.assertIn("GitHub request failed", str(cm.exception))
+        self.assertEqual(self.calls, [],
+                         "a failed lookup must not touch the profile")
 
 
 def update_fixture():

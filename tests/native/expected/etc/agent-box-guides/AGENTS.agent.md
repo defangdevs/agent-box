@@ -239,9 +239,18 @@ silently falling back to asking for a password.
 
 ## Updating
 
-This box has no self-update path yet — `agentbox apply` renders
-no self-update unit or sudo rule for one. Redeploy from a newer
-image for now; see https://github.com/defangdevs/agent-box/issues/358.
+Update the box's software with:
+`sudo -n /usr/bin/systemctl start --no-block agent-box-update.service`
+(the full path is required for the passwordless sudo rule to match).
+This box is not NixOS: the update fast-forwards the Nix profile your
+software comes from to the newest commit of the upstream repo, renders
+the host configuration that release describes, and restarts the services
+onto it — your own tmux session included, so save context first.
+
+It refuses a target that is not strictly ahead of the rev you are
+running, and if the new release fails to apply it rolls the profile
+back and re-applies the old one. Watch it with `journalctl -fu agent-box-update.service`;
+the box's own rev is on the settings page.
 
 ## This platform has its own upstream repo
 
