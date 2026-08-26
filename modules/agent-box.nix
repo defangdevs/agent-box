@@ -1832,6 +1832,9 @@ done
   agentBaseTools = [
     # text / data
     pkgs.gawk                 # the most common shell idiom after grep/sed
+    pkgs.gnugrep pkgs.gnused pkgs.findutils  # grep/sed/find/xargs (issue #372):
+      # every shell snippet on earth assumes these; ripgrep below is not a
+      # substitute, it just made the gap harder to notice
     pkgs.diffutils pkgs.gnupatch    # compare generated vs committed, apply patches
     pkgs.less                 # git's default pager; without it `git log` fails in a TTY
     pkgs.file                 # identify a blob before cat'ing a binary into context
@@ -2350,7 +2353,9 @@ case "$cmd" in
     if [ -s "$REGISTRY_FILE" ]; then
       "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$REGISTRY_FILE" \
       | while IFS="$(printf '\t')" read -r n a state; do
-        printf '%s\n' "$live" | grep -qxF "$n" && state=live
+        case $'\n'"$live"$'\n' in
+          *$'\n'"$n"$'\n'*) state=live ;;
+        esac
         printf '%-24s %-8s %s\n' "$n" "$a" "$state"
       done
     fi
@@ -6943,13 +6948,14 @@ in
         # silently drop everything set before it.
         environment =
           ({
-            # grep/find/flock/hostname are deliberately not on the agent's
-            # own PATH (see agentBaseTools), so the supervisor's transcript
-            # lookups, the sessions.json lock (issue #254) and the codex
-            # remote-control wrapper's UTS re-exec get pinned binaries
-            # instead (the AGENT_BOX_*_BIN convention) — same store path
-            # for every instance, hence host-level rather than per-user
-            # env-file content.
+            # grep and find are on the agent's own PATH too (agentBaseTools,
+            # issue #372), but flock/hostname never are, and the supervisor's
+            # transcript lookups, the sessions.json lock (issue #254) and the
+            # codex remote-control wrapper's UTS re-exec run outside any
+            # agent session — so all four still get pinned binaries here (the
+            # AGENT_BOX_*_BIN convention) — same store path for every
+            # instance, hence host-level rather than per-user env-file
+            # content.
             AGENT_BOX_GREP_BIN = "${pkgs.gnugrep}/bin/grep";
             AGENT_BOX_FIND_BIN = "${pkgs.findutils}/bin/find";
             AGENT_BOX_FLOCK_BIN = "${pkgs.util-linux}/bin/flock";
