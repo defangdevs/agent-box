@@ -331,22 +331,32 @@ case "$cmd" in
         esac
       done
       if [ "$deliver_to" = subagent ] && [ "$have_when" = 0 ] && [ "$have_drop" = 0 ]; then
+        # A bare "owner/repo" (no "source:" prefix at all) is the github
+        # shorthand; anything with its OWN "source:" prefix — including a
+        # non-github one whose key happens to contain a "/", e.g.
+        # "gitlab:group/project" — must fall through to webhook.py's refusal
+        # instead of getting GitHub-only vocabulary tacked onto it.
+        is_github=0
         case "$topic" in
-          (github:*|*/*)
-            w="$(default_subagent_when)"
-            set -- "$@" --when "$w"
-            if [ -n "${LOCAL_WEBHOOK_SELF:-}" ]; then
-              echo "agent-box-webhook: no --when/--drop given for a subagent watch on" \
-                   "$topic — defaulting to the box's own GitHub triage rules, scoped to" \
-                   "$LOCAL_WEBHOOK_SELF; pass --when/--drop yourself to replace them" >&2
-            else
-              echo "agent-box-webhook: no --when/--drop given for a subagent watch on" \
-                   "$topic, and this box's GitHub login is unknown — defaulting to" \
-                   "opened/reopened plus CI failures only (no assignment/mention/review" \
-                   "clauses); pass --when/--drop yourself for the full default" >&2
-            fi
-            ;;
+          (github:*) is_github=1 ;;
+          (*:*) is_github=0 ;;
+          (*/*) is_github=1 ;;
+          (*) is_github=0 ;;
         esac
+        if [ "$is_github" = 1 ]; then
+          w="$(default_subagent_when)"
+          set -- "$@" --when "$w"
+          if [ -n "${LOCAL_WEBHOOK_SELF:-}" ]; then
+            echo "agent-box-webhook: no --when/--drop given for a subagent watch on" \
+                 "$topic — defaulting to the box's own GitHub triage rules, scoped to" \
+                 "$LOCAL_WEBHOOK_SELF; pass --when/--drop yourself to replace them" >&2
+          else
+            echo "agent-box-webhook: no --when/--drop given for a subagent watch on" \
+                 "$topic, and this box's GitHub login is unknown — defaulting to" \
+                 "opened/reopened plus CI failures only (no assignment/mention/review" \
+                 "clauses); pass --when/--drop yourself for the full default" >&2
+          fi
+        fi
       fi
     fi
     exec "$PY" "$SCRIPT" "$cmd" "$@"

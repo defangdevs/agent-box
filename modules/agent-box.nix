@@ -89,9 +89,11 @@ let
       `agent-box-webhook subscribe` fills in a default `--when` for a rule-less
       GitHub topic like the one-liner above — opened/reopened issues and PRs, an
       assignment or `@mention` naming this box, a review verdict on a PR it wrote,
-      and terminal CI failure, scoped to this box's own GitHub login when known
-      (unscoped, and CI-only, if it isn't). Pass `--when`/`--drop` yourself for
-      different rules, or to subscribe a non-GitHub source, which gets no default.
+      and terminal CI failure, scoped to this box's own GitHub login when known —
+      opened/reopened plus terminal CI failure only (no assignment, mention or
+      review clause, since none can be scoped) when it isn't. Pass
+      `--when`/`--drop` yourself for different rules, or to subscribe a non-GitHub
+      source, which gets no default.
       Every event is only recognised as yours when your subscription's own rules
       match it: a bare repo-wide subscription with no scoping is not a claim,
       because one session must not silence the watch for every unrelated issue in
@@ -3231,22 +3233,32 @@ esac
             esac
           done
           if [ "$deliver_to" = subagent ] && [ "$have_when" = 0 ] && [ "$have_drop" = 0 ]; then
+            # A bare "owner/repo" (no "source:" prefix at all) is the github
+            # shorthand; anything with its OWN "source:" prefix — including a
+            # non-github one whose key happens to contain a "/", e.g.
+            # "gitlab:group/project" — must fall through to webhook.py's refusal
+            # instead of getting GitHub-only vocabulary tacked onto it.
+            is_github=0
             case "$topic" in
-              (github:*|*/*)
-                w="$(default_subagent_when)"
-                set -- "$@" --when "$w"
-                if [ -n "''${LOCAL_WEBHOOK_SELF:-}" ]; then
-                  echo "agent-box-webhook: no --when/--drop given for a subagent watch on" \
-                       "$topic — defaulting to the box's own GitHub triage rules, scoped to" \
-                       "$LOCAL_WEBHOOK_SELF; pass --when/--drop yourself to replace them" >&2
-                else
-                  echo "agent-box-webhook: no --when/--drop given for a subagent watch on" \
-                       "$topic, and this box's GitHub login is unknown — defaulting to" \
-                       "opened/reopened plus CI failures only (no assignment/mention/review" \
-                       "clauses); pass --when/--drop yourself for the full default" >&2
-                fi
-                ;;
+              (github:*) is_github=1 ;;
+              (*:*) is_github=0 ;;
+              (*/*) is_github=1 ;;
+              (*) is_github=0 ;;
             esac
+            if [ "$is_github" = 1 ]; then
+              w="$(default_subagent_when)"
+              set -- "$@" --when "$w"
+              if [ -n "''${LOCAL_WEBHOOK_SELF:-}" ]; then
+                echo "agent-box-webhook: no --when/--drop given for a subagent watch on" \
+                     "$topic — defaulting to the box's own GitHub triage rules, scoped to" \
+                     "$LOCAL_WEBHOOK_SELF; pass --when/--drop yourself to replace them" >&2
+              else
+                echo "agent-box-webhook: no --when/--drop given for a subagent watch on" \
+                     "$topic, and this box's GitHub login is unknown — defaulting to" \
+                     "opened/reopened plus CI failures only (no assignment/mention/review" \
+                     "clauses); pass --when/--drop yourself for the full default" >&2
+              fi
+            fi
           fi
         fi
         exec "$PY" "$SCRIPT" "$cmd" "$@"

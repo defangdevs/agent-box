@@ -167,9 +167,11 @@ MUST carry `--when`/`--drop` rules or it is refused outright, so
 `agent-box-webhook subscribe` fills in a default `--when` for a rule-less
 GitHub topic like the one-liner above — opened/reopened issues and PRs, an
 assignment or `@mention` naming this box, a review verdict on a PR it wrote,
-and terminal CI failure, scoped to this box's own GitHub login when known
-(unscoped, and CI-only, if it isn't). Pass `--when`/`--drop` yourself for
-different rules, or to subscribe a non-GitHub source, which gets no default.
+and terminal CI failure, scoped to this box's own GitHub login when known —
+opened/reopened plus terminal CI failure only (no assignment, mention or
+review clause, since none can be scoped) when it isn't. Pass
+`--when`/`--drop` yourself for different rules, or to subscribe a non-GitHub
+source, which gets no default.
 Every event is only recognised as yours when your subscription's own rules
 match it: a bare repo-wide subscription with no scoping is not a claim,
 because one session must not silence the watch for every unrelated issue in
