@@ -31,6 +31,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Nothing here writes to the repo — it builds and runs checks, some of them
+# over pull-request-controlled Nix and Python. aws-ci.yml already declares
+# this; CI was relying on the repository default.
+permissions:
+  contents: read
+
 jobs:
   validate:
     name: Validate module & VM

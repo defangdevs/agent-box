@@ -671,10 +671,20 @@
                 echo "MARKER: resolve() left a marker in settings-daemon.py"
                 fail=1
               fi
-              if ! diff -u want.py <(tail -n +2 "$profile/bin/agent-box-settings") \
+              # ...prepended by the env-store library, exactly as
+              # agent-box-env-exec above and the module's own settingsDaemon
+              # are (issue #212): the page calls load()/keys()/update()/
+              # as_dict() and ENV_HEADER, none of which it defines.
+              {
+                cat "$srcDir/lib/envstore.py"
+                printf '\n\n'
+                cat want.py
+              } > want-settings.py
+              if ! diff -u want-settings.py <(tail -n +2 "$profile/bin/agent-box-settings") \
                    >/dev/null; then
                 echo "DRIFT: bin/agent-box-settings is not resolve(src/settings-daemon.py)"
-                diff -u want.py <(tail -n +2 "$profile/bin/agent-box-settings") | head -20 || true
+                diff -u want-settings.py \
+                  <(tail -n +2 "$profile/bin/agent-box-settings") | head -20 || true
                 fail=1
               else
                 echo "ok: bin/agent-box-settings == resolve(src/settings-daemon.py)"
@@ -744,7 +754,16 @@
               } ''
               cp -rT --no-preserve=mode,ownership "$repo" repo
               cd repo
-              python3 tests/test_agentbox.py -v 2>&1 | tail -20
+              # To a file, not a pipe: `... | tail -20` hides everything the
+              # last 20 lines are not, and a failing assertion is usually
+              # further up than the progress output that follows it. It also
+              # stops depending on the builder's shell having pipefail for
+              # the exit status to survive at all.
+              if ! python3 tests/test_agentbox.py -v > render.log 2>&1; then
+                tail -80 render.log
+                exit 1
+              fi
+              tail -5 render.log
 
               # The rendered Caddyfile must be a config caddy accepts. Env
               # placeholders are resolved from a throwaway env file with a

@@ -86,11 +86,26 @@ let
         echo "serve the marker text as CSS and as JS" >&2
         exit 1
       fi
-      flake8 --show-source --ignore E501,E302,E305,W503,E226 daemon.py
+      # Like env-exec, the daemon is not self-contained: it calls the env
+      # store's load()/keys()/update()/as_dict() and ENV_HEADER, which the
+      # module prepends as envStoreLib (issue #212). Without it the flake8
+      # gate below reports F821 on every one of them — which is what a
+      # native box would have hit at runtime on the settings page's env
+      # endpoints, had the profile ever built.
+      {
+        cat ${src}/lib/envstore.py
+        printf '\n\n'
+        cat daemon.py
+      } > page.py
+      # E402/F811 as well, and only here, for the same reason the module
+      # gives: the daemon's own imports follow the library's code, and four
+      # of them re-bind names the library already imported.
+      flake8 --show-source \
+        --ignore E501,E302,E305,W503,E226,E402,F811 page.py
       mkdir -p $out/bin
       {
         printf '#!%s\n' ${pkgs.python3}/bin/python3
-        cat daemon.py
+        cat page.py
       } > $out/bin/agent-box-settings
       chmod +x $out/bin/agent-box-settings
     '';
