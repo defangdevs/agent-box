@@ -107,8 +107,13 @@ let
       silences it, so the watch spawns for it however many sessions are running — the
       ceiling below is the one thing left that can refuse the batch. Name that ref in
       your own `--include` when you pick such a run up.
-      Its prompt tells it to `agent-box-session rm NAME` when done — clean
-      stale `hook-*` sessions the same way. That cleanup is load-bearing: at most 4
+      A hook session is spawned `--ephemeral`, so it delists ITSELF: whatever parks
+      it — the agent quitting, or `agent-box-session stop` — the supervisor drops the
+      entry on its next tick, and the transcript stays on disk. Its prompt still asks
+      it to `agent-box-session rm NAME` when done, which is the same end reached
+      sooner. What is NOT reaped is a hook session that CRASHED: a non-zero exit is
+      never parked, so it stays listed and attachable for you to read — `rm` it once
+      you have. That cleanup is load-bearing: at most 4
       `hook-*` sessions may RUN at once, and once that ceiling is reached EVERY
       watch on the box is inert — a matching batch is refused and dropped, never
       queued. A stopped session frees its slot even before it is delisted. So before you conclude a repo has been quiet, run `agent-box-webhook
@@ -2216,7 +2221,8 @@ kill_session() {
 usage() {
   echo "usage: agent-box-session ls"
   echo "       agent-box-session add [NAME] [--agent AGENT] [--profile PROFILE] [--cwd DIR]"
-  echo "                             [--prompt TEXT] [--resume-prompt TEXT] [-- EXTRA_ARGS...]"
+  echo "                             [--prompt TEXT] [--resume-prompt TEXT] [--ephemeral]"
+  echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
@@ -2232,6 +2238,10 @@ usage() {
   echo "--agent and a '-- EXTRA_ARGS' tail override what the profile resolved."
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
+  echo "--ephemeral marks a ONE-SHOT session: parking it (a clean agent exit, or"
+  echo "'stop') delists it outright, because nobody is going to resume it. A"
+  echo "CRASH still parks nothing and leaves the post-mortem shell attachable."
+  echo "The transcript is kept either way; only the registry entry goes."
   echo "Listed sessions are (re)started by the per-user supervisor within ~2s."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
@@ -2394,7 +2404,7 @@ case "$cmd" in
       *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
     agent="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
-    profile=""; has_agent=0
+    profile=""; has_agent=0; ephemeral=0
     while [ $# -gt 0 ]; do
       case "$1" in
         --agent) agent="''${2:?--agent needs a value}"; has_agent=1; shift 2 ;;
@@ -2402,6 +2412,7 @@ case "$cmd" in
         --cwd) cwd="''${2:?--cwd needs a value}"; shift 2 ;;
         --prompt) prompt="''${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
         --resume-prompt) rprompt="''${2?--resume-prompt needs a value}"; has_rprompt=1; shift 2 ;;
+        --ephemeral) ephemeral=1; shift ;;
         --) shift; break ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
@@ -2478,8 +2489,8 @@ case "$cmd" in
     registry_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
-      --arg prof "$profile" \
-      '.sessions[$n] = {agent: $a, skipPermissions: true, remoteControl: true,
+      --arg prof "$profile" --arg eph "$ephemeral" \
+      '.sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: true,
                         remoteControlName: null,
                         workingDirectory: (if $c == "" then null else $c end),
                         extraArgs: $ARGS.positional,
@@ -2487,7 +2498,10 @@ case "$cmd" in
                         initialPrompt: (if $pp == "1" then $p else null end),
                         resumePrompt: (if $rpp == "1" then $rp else null end),
                         boxSessionId: (if $bid == "" then null else $bid end),
-                        hasRun: false}' \
+                        hasRun: false}
+                       # Added only when set, so every session that is NOT
+                       # one-shot keeps the entry shape it has always had.
+                       + (if $eph == "1" then {ephemeral: true} else {} end))' \
       --args -- "''${sargs[@]}"
     registry_unlock
     # The mascot (issue #185) marks the closest thing this CLI has to
@@ -2519,7 +2533,9 @@ case "$cmd" in
     # Park a listed session (issue #167): flag it stopped FIRST so the
     # supervisor's post-spawn re-check catches a spawn racing this kill,
     # then take the live session down. The entry (agent, cwd, transcript
-    # id) stays listed for a later 'restart' to revive.
+    # id) stays listed for a later 'restart' to revive — unless the session
+    # is one-shot (--ephemeral), for which parked means finished and the
+    # supervisor reaps the entry on its next tick.
     name="''${1:-}"
     valid_name "$name" || { usage >&2; exit 2; }
     registry_ensure
@@ -2532,10 +2548,19 @@ case "$cmd" in
       echo "no such session: '$name' (see agent-box-session ls)" >&2
       exit 2
     fi
+    # Read before the write, under the same lock the write takes: what is
+    # printed below must describe the entry this command actually parked.
+    eph=0
+    "$JQ" -e --arg n "$name" '.sessions[$n].ephemeral == true' \
+      "$REGISTRY_FILE" >/dev/null 2>&1 && eph=1
     registry_edit --arg n "$name" '.sessions[$n].stopped = true'
     registry_unlock
     kill_session "$name" || exit 1
-    echo "session '$name' stopped — still listed, not respawned; 'agent-box-session restart $name' revives it"
+    if [ "$eph" = 1 ]; then
+      echo "session '$name' stopped — one-shot (--ephemeral), so the supervisor delists it within ~2s; its transcript is kept"
+    else
+      echo "session '$name' stopped — still listed, not respawned; 'agent-box-session restart $name' revives it"
+    fi
     ;;
   restart)
     # Clearing the stopped flag makes restart double as the revive verb
@@ -4665,12 +4690,20 @@ preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded")"
 # over a profile's own model.
 pflag=()
 [ -n "$hook_profile" ] && pflag=(--profile "$hook_profile")
+# --ephemeral: a hook session exists to work ONE event batch, and nobody
+# resumes it afterwards. Without it a hook agent that finishes and quits
+# cleanly is PARKED (mark-stopped records stopped=true, src/supervisor.sh),
+# so it stays listed for good — the preamble asks the agent to
+# `agent-box-session rm` itself, but that is a request to a model, not a
+# guarantee, and `/quit` reaches the same clean exit without it. The
+# post-mortem branch is unaffected: a hook agent that CRASHES is not parked,
+# so it stays attachable for inspection exactly as before.
 if [ "''${#extra[@]}" -gt 0 ]; then
-  exec agent-box-session add "$name" "''${pflag[@]+"''${pflag[@]}"}" --prompt "$preamble
+  exec agent-box-session add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
 
 $PROMPT" -- "''${extra[@]}"
 fi
-exec agent-box-session add "$name" "''${pflag[@]+"''${pflag[@]}"}" --prompt "$preamble
+exec agent-box-session add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
 
 $PROMPT"
   '');
@@ -6218,11 +6251,68 @@ $PROMPT"
       done
     }
 
+    # Delist ONE-SHOT sessions that have been parked (--ephemeral, issue #167's
+    # other half).
+    #
+    # Parking is the right end for a NAMED session: `stopped` keeps its
+    # boxSessionId, which is the only record mapping the name to a conversation,
+    # so `agent-box-session restart` can resume it. A hook-* session has no such
+    # future — it is spawned for one event batch and nobody ever resumes it — so
+    # for those the same flag means "finished", and the entry is litter that
+    # outlives the work. The preamble does ask the agent to `agent-box-session rm`
+    # itself, but that is a request to a MODEL: `/quit` and Ctrl+D reach the clean
+    # exit without it, and a session parked by `agent-box-session stop` never had
+    # an agent to ask.
+    #
+    # Only the parked ones. A CRASH takes the post-mortem branch and is never
+    # flagged, so a hook session that died stays listed and attachable for
+    # inspection, exactly as before.
+    #
+    # The transcript is untouched — it lives under the harness's own state dir and
+    # outlives every registry entry. What goes is the name->conversation mapping,
+    # which is what makes the name reusable; sweep_session_state (above) then
+    # reclaims the launch id on this same tick, so the next holder of the name
+    # cannot inherit this one's transcript.
+    reap_ephemeral() {
+      _cand="$($JQ -r '.sessions | to_entries[]
+                       | select(.value.ephemeral == true and .value.stopped == true)
+                       | .key' "$REGISTRY_FILE" 2>/dev/null)" || return 0
+      [ -n "$_cand" ] || return 0
+      _gone=""
+      registry_lock
+      while IFS= read -r _n; do
+        case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
+        # A live pane still owns the name: mark-stopped runs as the epilogue of a
+        # pane that is still exiting. Delisting under it would strand that pane as
+        # an unmanaged tmux session the reconcile loop tolerates forever. Waiting
+        # a tick costs nothing.
+        $TMUX has-session -t "=$_n" 2>/dev/null && continue
+        # Re-read under the lock: `restart` clears the flag, and a session revived
+        # between the candidate scan and here must not be delisted by a decision
+        # taken before it came back.
+        $JQ -e --arg s "$_n" \
+          '.sessions[$s].ephemeral == true and .sessions[$s].stopped == true' \
+          "$REGISTRY_FILE" >/dev/null 2>&1 || continue
+        registry_edit --arg s "$_n" 'del(.sessions[$s])'
+        _gone=1
+      done < <(printf '%s\n' "$_cand")
+      registry_unlock
+      # Startup-only otherwise, on the reasoning that both delete paths prune
+      # their own filter file. This is the third delete path and it cannot, so it
+      # pays for the sweep itself — only on a tick that actually delisted
+      # something, which is rare.
+      if [ -n "$_gone" ]; then
+        sweep_orphan_filters
+      fi
+    }
+
     # Reconcile forever; systemd stop tears the whole tree down (ExecStop
     # kill-server + cgroup kill), Restart=always revives a crashed loop.
     # Sessions flagged stopped (a clean agent exit, or agent-box-session
-    # stop) stay listed but are left down until a restart clears the flag.
+    # stop) stay listed but are left down until a restart clears the flag —
+    # except the one-shot ones, which reap_ephemeral delists instead.
     while true; do
+      reap_ephemeral
       sweep_session_state
       while IFS= read -r sname; do
         case "$sname" in

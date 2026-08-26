@@ -67,8 +67,13 @@ by no session, because a red trunk has to reach somebody. No live session
 silences it, so the watch spawns for it however many sessions are running — the
 ceiling below is the one thing left that can refuse the batch. Name that ref in
 your own `--include` when you pick such a run up.
-Its prompt tells it to `agent-box-session rm NAME` when done — clean
-stale `hook-*` sessions the same way. That cleanup is load-bearing: at most 4
+A hook session is spawned `--ephemeral`, so it delists ITSELF: whatever parks
+it — the agent quitting, or `agent-box-session stop` — the supervisor drops the
+entry on its next tick, and the transcript stays on disk. Its prompt still asks
+it to `agent-box-session rm NAME` when done, which is the same end reached
+sooner. What is NOT reaped is a hook session that CRASHED: a non-zero exit is
+never parked, so it stays listed and attachable for you to read — `rm` it once
+you have. That cleanup is load-bearing: at most 4
 `hook-*` sessions may RUN at once, and once that ceiling is reached EVERY
 watch on the box is inert — a matching batch is refused and dropped, never
 queued. A stopped session frees its slot even before it is delisted. So before you conclude a repo has been quiet, run `agent-box-webhook
