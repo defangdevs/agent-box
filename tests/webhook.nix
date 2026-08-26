@@ -948,7 +948,10 @@
         " /home/agent/.config/agent-box/sessions.json"
     ).strip()
     machine.succeed(
-        "jq -e '(.topics[0].include.any | map(.path) | index(\"workflow_run\")) != null"
+        "jq -e '(.topics[0].include.all[0].any | map(.path) | index(\"workflow_run\"))"
+        " != null"
+        " and (.topics[0].include.all[1].any | map(.path)"
+        " | index(\"workflow_run.head_branch\")) != null"
         " and (.topics[0].note | contains(\"#\") | not)'"
         f" /home/agent/.local/state/local-webhook/filter.agent-{unnumbered}.json"
     )
