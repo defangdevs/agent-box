@@ -58,7 +58,9 @@ plainly rather than handing it back.
   arriving the usual way. agent-box never touches apt: everything it
   installs lives in a Nix profile at /nix/var/nix/profiles/agent-box, and
   `agentbox apply` renders the users, units, sudoers and Caddyfile from
-  /etc/agent-box/config.yaml.
+  the box's declared configuration (by default /etc/agent-box/config.yaml;
+  `systemctl cat agent-box-update.service` names the file this box was
+  actually applied from).
 - Two layers, and it pays to know which one you are looking at.
   `apt list --installed` is the distro's; `nix profile list --profile
   /nix/var/nix/profiles/agent-box` is agent-box's. Tools YOU want go in

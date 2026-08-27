@@ -231,8 +231,12 @@ def main():
         print("FAIL: INTERNAL names no payload mentions any more: "
               + ", ".join(stale_internal), file=sys.stderr)
         return 1
-    if (ambiguous("variable", BY_DESIGN, KNOWN_GAPS)
-            or ambiguous("unit", UNITS_BY_DESIGN, UNITS_KNOWN_GAPS)):
+    # Both, then decide: `or` would short-circuit, so a variable clash
+    # would hide every unit clash until someone fixed the first one and
+    # re-ran. One run, every contradiction.
+    bad_vars = ambiguous("variable", BY_DESIGN, KNOWN_GAPS)
+    bad_units = ambiguous("unit", UNITS_BY_DESIGN, UNITS_KNOWN_GAPS)
+    if bad_vars or bad_units:
         return 1
     shared_units = names(SHARED_UNITS, SUPPLIED)
     module = names(GOLDEN, SUPPLIED) | shared_units
