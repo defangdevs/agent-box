@@ -401,11 +401,10 @@ class Renderer:
         """
         if "claude" in self.spec.agents:
             hook = self.bin / "agent-box-claude-session-start-hook"
+            settings = {"hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": str(hook)}]}]}}
             t.file(self.p(CLAUDE_SETTINGS),
-                   json.dumps({"hooks": {"SessionStart": [
-                       {"hooks": [{"type": "command",
-                                   "command": str(hook)}]}]}},
-                              indent=2, sort_keys=True) + "\n")
+                   json.dumps(settings, indent=2, sort_keys=True) + "\n")
         if self.spec.codex_full_access:
             t.dir(self.p("/etc/codex"), 0o755)
             t.file(self.p("/etc/codex/config.toml"),
