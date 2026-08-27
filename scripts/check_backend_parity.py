@@ -174,6 +174,19 @@ def unit_families(paths):
     return out
 
 
+def ambiguous(kind, by_design, known):
+    """Names declared in BOTH exception tables — an unresolved contradiction:
+    is the divergence correct, or a bug someone owns? Checked up front, like
+    INTERNAL staleness below, rather than inside report(), whose by_design-
+    first lookup would otherwise silently resolve the ambiguity for it."""
+    dupes = sorted(set(by_design) & set(known))
+    if dupes:
+        print(f"FAIL: {len(dupes)} {kind} entr(y/ies) declared as both "
+              f"by-design AND a known gap — pick one: "
+              + ", ".join(dupes), file=sys.stderr)
+    return dupes
+
+
 def report(kind, only_module, only_native, by_design, known):
     """Print one section; return (violations, stale entries)."""
     violations, stale = [], []
@@ -217,6 +230,9 @@ def main():
     if stale_internal:
         print("FAIL: INTERNAL names no payload mentions any more: "
               + ", ".join(stale_internal), file=sys.stderr)
+        return 1
+    if (ambiguous("variable", BY_DESIGN, KNOWN_GAPS)
+            or ambiguous("unit", UNITS_BY_DESIGN, UNITS_KNOWN_GAPS)):
         return 1
     shared_units = names(SHARED_UNITS, SUPPLIED)
     module = names(GOLDEN, SUPPLIED) | shared_units
