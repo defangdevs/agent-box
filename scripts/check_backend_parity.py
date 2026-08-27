@@ -117,6 +117,11 @@ KNOWN_GAPS = {
 UNITS_BY_DESIGN = {
     "agent-box-spot-monitor.service":
         "EC2-only, see AGENT_BOX_USERS above",
+    "agent-box-nix-gc.service":
+        "native only, and correct: on NixOS the DEPLOYMENT owns store "
+        "housekeeping (aws/template.yaml sets nix.gc and min-free), a layer "
+        "a native box does not have, so its renderer owns it instead. If the "
+        "module ever grows nix.gc of its own, this line goes away",
 }
 UNITS_KNOWN_GAPS = {
     "fail2ban.service": "#394: the module jails Caddy's 401s; a native box "
