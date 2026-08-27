@@ -416,6 +416,7 @@ class RenderTest(unittest.TestCase):
         # native side ever bound it.
         leaked = re.findall(r"@[A-Z][A-Z_]*@", guide)
         self.assertEqual([], leaked, f"unbound guide token(s): {leaked}")
+
     def test_the_store_has_a_janitor(self):
         """Issue #394: a full root wedges the box — no journal, no profile
         swap, no working agent — and on a native box nobody is around to
@@ -660,7 +661,6 @@ class RenderTest(unittest.TestCase):
         the file/flag pair exists to keep, inverted. Two separate output
         roots cannot see this, which is why this test reuses one.
         """
-        mod = load_agentbox()
         config = json.loads(CONFIG_JSON.read_text())
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
@@ -719,6 +719,127 @@ class RenderTest(unittest.TestCase):
                        if path.endswith("/agent.env")][0]
                 self.assertEqual(want, bool(toml))
                 self.assertEqual(want, "AGENT_BOX_CODEX_FULL_ACCESS" in env)
+
+    def test_the_webhook_dispatcher_is_fully_wired(self):
+        """Issue #394, gap 6. Per-session delivery worked natively; the
+        pieces around it did not, each failing quietly in its own way:
+
+          HOOK_SPAWN_CMD          the standing-watch panel could not print
+                                  the prompt the next match would launch.
+          WEBHOOK_PYTHON          the panel fell back to the daemon's own
+                                  interpreter, which need not carry
+                                  local-webhook's dependencies.
+          WEBHOOK_PINNED_SCRIPT   claude sessions tracked the marketplace's
+                                  default branch instead of the plugin
+                                  version the box pins.
+          HOOK_SESSION_ARGS       no box-wide default for the hook-*
+                                  sessions a watch spawns (issue #216's
+                                  cheaper triage model).
+        """
+        settings = (FIXTURE / "etc/systemd/system"
+                    / "agent-box-settings@agent.service.d"
+                    / "10-host.conf").read_text()
+        self.assertIn("AGENT_BOX_HOOK_SPAWN_CMD=", settings)
+        self.assertIn("AGENT_BOX_WEBHOOK_PYTHON=", settings)
+        env = (FIXTURE / "etc/agent-box/units/agent.env").read_text()
+        self.assertIn("AGENT_BOX_WEBHOOK_PINNED_SCRIPT=", env)
+        wrapper = (FIXTURE / "usr/local/bin/agent-box-webhook").read_text()
+        self.assertIn("AGENT_BOX_HOOK_SESSION_ARGS=", wrapper)
+        # JSON, not a shell list: webhook-spawn.sh parses it with jq
+        # precisely so an argument may contain spaces.
+        args = wrapper.split("AGENT_BOX_HOOK_SESSION_ARGS=", 1)[1]
+        json.loads(args.split("\n")[0].strip().strip("'"))
+
+    def test_a_hook_arg_with_an_apostrophe_survives_the_wrapper(self):
+        """The wrapper is generated shell. JSON does not escape an
+        apostrophe, so `don't` closed the quoted value and broke
+        agent-box-webhook for every caller — not just the one who set it.
+        Also covers webhook: null and hookSessionArgs: null, either of
+        which used to raise in Spec before anything was rendered."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["webhook"]["hookSessionArgs"] = [
+            "--append-system-prompt", "don't guess; ask"]
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "o").render()
+            wrapper = [text for path, (text, _) in tree.files.items()
+                       if path.endswith("bin/agent-box-webhook")][0]
+            line = [x for x in wrapper.splitlines()
+                    if "AGENT_BOX_HOOK_SESSION_ARGS" in x][0]
+            # What the shell would actually assign, per the shell.
+            out = subprocess.run(["sh", "-c", line + "\n"
+                                  "printf %s \"$AGENT_BOX_HOOK_SESSION_ARGS\""],
+                                 capture_output=True, text=True, check=True)
+            self.assertEqual(config["webhook"]["hookSessionArgs"],
+                             json.loads(out.stdout))
+        for empty in ({"webhook": None},
+                      {"webhook": {"enable": True, "script": "/x",
+                                   "hookSessionArgs": None}}):
+            cfg = dict(json.loads(CONFIG_JSON.read_text()), **empty)
+            with tempfile.TemporaryDirectory() as tmp:
+                prof = build_fake_profile(tmp)
+                self.assertEqual([], mod.Spec(cfg, prof).hook_session_args)
+
+    def test_the_root_daemon_knows_every_terminal_user(self):
+        """AGENT_BOX_WEB_USERS is what GET / offers. Only the root daemon
+        serves that page, so only it gets the list."""
+        root = (FIXTURE / "etc/agent-box/units"
+                / "agent-box-settings-agent.env").read_text()
+        self.assertIn("AGENT_BOX_WEB_USERS=agent,robot", root)
+        other = (FIXTURE / "etc/agent-box/units"
+                 / "agent-box-settings-robot.env").read_text()
+        self.assertNotIn("AGENT_BOX_WEB_USERS", other)
+
+    def test_memory_pressure_has_all_three_answers(self):
+        """Issue #62, and #394 gap 9.
+
+        The incident: a swapless box under agent memory pressure never
+        OOM-killed. It thrashed the page cache instead — every fault
+        reading pages straight back off disk — and userspace froze for
+        hours while the health checks stayed green. Nothing was out of
+        memory; everything was too slow to say so.
+
+        Natively this was ONE of the three knobs: OOMScoreAdjust told the
+        kernel which process to kill in a situation the kernel was never
+        going to notice, while the earlyoom binary sat unused in the
+        runtime profile.
+        """
+        units = FIXTURE / "etc/systemd/system"
+        zram = (units / "agent-box-zram.service").read_text()
+        self.assertIn("RemainAfterExit=yes", zram)
+        helper = (FIXTURE / "etc/agent-box/bin/agent-box-zram").read_text()
+        self.assertIn("--algorithm zstd", helper)
+        # Above any disk swap the deployment made (the Lightsail template
+        # writes a 2 GiB file): compressed RAM first, disk when it fills.
+        self.assertIn("--priority 100", helper)
+        early = (units / "agent-box-earlyoom.service").read_text()
+        for arg in ("-m 10", "-s 10", "-r 3600", "--avoid", "--prefer"):
+            self.assertIn(arg, early)
+        # It must outlive what it arbitrates, and start after the swap it
+        # measures.
+        self.assertIn("OOMScoreAdjust=-100", early)
+        self.assertIn("After=agent-box-zram.service", early)
+        sysctl = (FIXTURE / "etc/sysctl.d/60-agent-box-memory.conf").read_text()
+        self.assertIn("vm.swappiness = 180", sysctl)
+        self.assertIn("vm.page-cluster = 0", sysctl)
+
+    def test_protect_memory_false_renders_none_of_it(self):
+        """The knob has to actually be a knob: a host that turns it off
+        gets no units, not units that are installed and idle."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["protectMemory"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "o").render()
+            for name in ("agent-box-zram.service",
+                         "agent-box-earlyoom.service",
+                         "60-agent-box-memory.conf"):
+                self.assertFalse([f for f in tree.files if f.endswith(name)],
+                                 f"{name} rendered with protectMemory off")
 
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
