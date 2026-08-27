@@ -898,9 +898,13 @@ class RenderTest(unittest.TestCase):
                                  f"{f.name} survived protectMemory: false")
             # Removing the unit FILE is not stopping the daemon. The units
             # have to be named for disabling too, or earlyoom keeps running
-            # from the copy systemd already loaded.
-            self.assertEqual(["agent-box-zram.service",
-                              "agent-box-earlyoom.service"],
+            # from the copy systemd already loaded — and named in THIS
+            # order: earlyoom is what kills, so it has to be the one
+            # already stopped when zram's swapoff creates a memory spike
+            # bringing the compressed pages back to RAM, not the one still
+            # running to react to it.
+            self.assertEqual(["agent-box-earlyoom.service",
+                              "agent-box-zram.service"],
                              tree.disable)
 
     def test_a_unit_this_box_never_had_is_not_disabled(self):
@@ -916,6 +920,41 @@ class RenderTest(unittest.TestCase):
             spec = mod.Spec(config, prof)
             tree = mod.Renderer(spec, prof, root=Path(tmp) / "fresh").render()
             self.assertEqual([], tree.disable)
+
+    def test_an_administrator_edited_unit_is_not_disabled(self):
+        """Existence alone is not ownership.
+
+        A unit file present at the name we generate is not necessarily
+        one we generated — an administrator may have taken it over, the
+        same case remove_if_ours already respects. Queuing that unit for
+        disable-and-stop because a file merely exists at its path would
+        stop a service whose file remove_if_ours goes on to leave in
+        place: this box's render deciding a customized unit is torn down,
+        which nothing about protectMemory: false authorizes.
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "one-root"
+            config["protectMemory"] = True
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps(config))
+            spec = mod.Spec(config, prof)
+            mod.Renderer(spec, prof, root=out).render()
+            proc = subprocess.run(
+                [sys.executable, str(AGENTBOX), "apply",
+                 "--config", str(cfg), "--profile", str(prof),
+                 "--root", str(out)], capture_output=True, text=True)
+            self.assertEqual(0, proc.returncode, proc.stderr)
+
+            unit = out / "etc/systemd/system/agent-box-earlyoom.service"
+            unit.write_text("# hand-edited by an administrator\n")
+
+            config["protectMemory"] = False
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=out).render()
+            self.assertNotIn("agent-box-earlyoom.service", tree.disable)
 
     def test_only_an_oomd_we_disabled_is_ever_re_enabled(self):
         """systemd-oomd is the one piece of memory protection that is the

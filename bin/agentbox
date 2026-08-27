@@ -604,15 +604,20 @@ class Renderer:
         backends at least behave alike.
         """
         t.gone(self.p(ZRAM_HELPER))
-        for unit in (ZRAM_UNIT, EARLYOOM_UNIT):
+        # earlyoom before zram: `disable --now` runs in this order, and
+        # earlyoom is the one that kills — leaving it running while zram's
+        # swapoff copies the compressed device back to RAM (a real memory
+        # spike) is exactly the moment it might pick an agent CLI.
+        for unit in (EARLYOOM_UNIT, ZRAM_UNIT):
             path = self.p("/etc/systemd/system", unit)
             t.gone(path)
-            # Only a unit that is actually there. t.gone already no-ops on
-            # a file that is missing, but `systemctl disable` on a name
-            # this box has never had would print an error on every apply of
-            # every box that leaves protectMemory off — noise that trains
-            # the reader to skip apply's output.
-            if path.exists():
+            # Only a unit that is still OURS. Existence alone queued an
+            # administrator's own edited copy for disable-and-stop even
+            # though remove_if_ours would go on to leave that same file
+            # in place — stopping a service whose file survives. Same
+            # shebang-aware header check remove_if_ours uses, so the two
+            # agree on what "ours" means.
+            if generated_by_us(path):
                 t.disable.append(unit)
         t.gone(self.p(MEMORY_SYSCTL))
 
@@ -1666,6 +1671,27 @@ def link_if_changed(link, target, dry_run=False):
     return True
 
 
+def generated_by_us(path):
+    """True if `path` still carries the header apply itself writes.
+
+    A human who took the file over — edited it, or replaced it outright —
+    loses that header, and that is the one thing that makes a file ours
+    to touch: not "does a file exist at this name" (issue #404 review),
+    which is also true of an administrator's own copy.
+
+    A generated SCRIPT carries the header on line two: the shebang has to
+    come first or the kernel will not run it. Without allowing for that,
+    every rendered helper looked like a file we did not write.
+    """
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return False
+    if text.startswith("#!"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+    return text.startswith(GENERATED_HEADER)
+
+
 def remove_if_ours(path, dry_run=False):
     """Delete a file a previous render owned and this one no longer emits.
 
@@ -1676,19 +1702,9 @@ def remove_if_ours(path, dry_run=False):
     force (issue #394: codexFullAccess flipped off).
     """
     path = Path(path)
-    try:
-        text = path.read_text()
-    except OSError:
-        return False
-    # A generated SCRIPT carries the header on line two: the shebang has to
-    # come first or the kernel will not run it. Without allowing for that,
-    # every rendered helper looked like a file we did not write, and the
-    # first thing that needed removing (the zram helper, protectMemory
-    # flipped off) was silently left behind.
-    if text.startswith("#!"):
-        text = text.split("\n", 1)[1] if "\n" in text else ""
-    if not text.startswith(GENERATED_HEADER):
-        print(f"note: {path} is no longer ours to remove — left alone")
+    if not generated_by_us(path):
+        if path.exists():
+            print(f"note: {path} is no longer ours to remove — left alone")
         return False
     if dry_run:
         print(f"would remove {path}")
