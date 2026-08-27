@@ -356,6 +356,30 @@ class RenderTest(unittest.TestCase):
             self.assertEqual(unit.read_text(), got.read_text(),
                              f"{unit.name} was rewritten, not installed")
 
+    def test_settings_gets_connect_bins_for_every_agent(self):
+        """Issue #392: the settings page hides its whole Connections
+        section when AGENT_BOX_CONNECT_BINS is empty, so a renderer that
+        forgets it silently costs the box its guided sign-in — which is
+        exactly how native boxes shipped without one. Asserted by name,
+        not left to the byte fixture: a `--update` regenerates the fixture
+        around whatever the renderer currently emits, so the fixture alone
+        would ratify the variable's removal.
+        """
+        conf = (FIXTURE / "etc/systemd/system"
+                / "agent-box-settings@agent.service.d" / "10-host.conf")
+        line = next((x for x in conf.read_text().splitlines()
+                     if "AGENT_BOX_CONNECT_BINS=" in x), "")
+        self.assertTrue(line, "no AGENT_BOX_CONNECT_BINS in the settings "
+                              "drop-in: the Connections section would be "
+                              "hidden on every native box")
+        ids = {pair.split("=", 1)[0]
+               for pair in line.split("AGENT_BOX_CONNECT_BINS=", 1)[1]
+                               .rstrip('"').split()}
+        agents = set(json.loads(CONFIG_JSON.read_text())["agents"])
+        self.assertTrue(agents <= ids,
+                        f"no sign-in card for {sorted(agents - ids)}")
+        self.assertIn("github", ids, "no sign-in card for gh")
+
 
 class SelfUpdateRenderTest(unittest.TestCase):
     """What `apply` puts on the box so an update can be triggered (#358)."""
