@@ -118,10 +118,13 @@ KNOWN_GAPS = {
 UNITS_BY_DESIGN = {
     "agent-box-spot-monitor.service":
         "EC2-only, see AGENT_BOX_USERS above",
+    "agent-box-nix-gc.service":
+        "native only, and correct: on NixOS the DEPLOYMENT owns store "
+        "housekeeping (aws/template.yaml sets nix.gc and min-free), a layer "
+        "a native box does not have, so its renderer owns it instead. If the "
+        "module ever grows nix.gc of its own, this line goes away",
 }
 UNITS_KNOWN_GAPS = {
-    "fail2ban.service": "#394: the module jails Caddy's 401s; a native box "
-                        "has no brute-force backstop on the terminal",
     "earlyoom.service": "#394 gap 9: the module runs earlyoom as its OOM "
                         "backstop; the native profile SHIPS the earlyoom "
                         "binary and never configures or starts it, so "
@@ -131,6 +134,16 @@ UNITS_KNOWN_GAPS = {
                                     "native runtime profile has no defang "
                                     "at all, which is also why its settings "
                                     "page offers no defang sign-in card",
+}
+
+# Same job, different unit name. The native jail is agent-box-fail2ban so a
+# distro fail2ban installed later keeps its own service and its own config;
+# that is a deliberate naming choice, not a second implementation, so the
+# comparison folds one onto the other instead of reporting both sides as
+# one-sided divergences. fail2ban.service is no longer in UNITS_KNOWN_GAPS
+# above for the same reason: the alias below makes it not a gap at all.
+UNIT_ALIASES = {
+    "fail2ban.service": "agent-box-fail2ban.service",
 }
 
 
@@ -279,7 +292,8 @@ def main():
                     BY_DESIGN, KNOWN_GAPS)
 
     print("\nrendered units:")
-    mod_units = unit_families(module_unit_names())
+    mod_units = {UNIT_ALIASES.get(u, u)
+                 for u in unit_families(module_unit_names())}
     nat_units = unit_families(NATIVE_UNITS.iterdir())
     v2, s2 = report("unit", mod_units - nat_units, nat_units - mod_units,
                     UNITS_BY_DESIGN, UNITS_KNOWN_GAPS)
