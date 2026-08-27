@@ -263,6 +263,19 @@ in
         machine.succeed(
             "jq -e '.theme == \"dark\"' /home/agent/.claude/settings.json"
         )
+        # The "Try the new fullscreen renderer?" upsell sits outside that
+        # wizard and survives hasCompletedOnboarding (issue #395): any
+        # explicit tui setting retires it, seeded here as "default" to
+        # match the classic renderer this box is built around.
+        machine.succeed(
+            "jq -e '.tui == \"default\"' /home/agent/.claude/settings.json"
+        )
+        # Regression guard: the pane itself must never show the upsell text,
+        # not just the settings.json seed that is meant to prevent it. -S -
+        # (not a fixed -50) so the assertion can't pass just because the
+        # upsell scrolled out of a truncated capture window.
+        main_pane = machine.succeed(tmux('capture-pane -p -S - -t "=main:"'))
+        assert "fullscreen renderer" not in main_pane.lower(), main_pane
 
         # The theme seed never clobbers a hand-picked one: /theme writes the
         # same key, and the seeder re-runs on every session start.
