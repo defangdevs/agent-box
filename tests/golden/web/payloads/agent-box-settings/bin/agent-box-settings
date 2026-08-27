@@ -1690,7 +1690,18 @@ CONNECT_DEFS = [
         # that is what the sessions actually use).
         "unset": ("GH_TOKEN", "GITHUB_TOKEN"),
         "shadow": ("GH_TOKEN", "GITHUB_TOKEN"),
-        "prompt_re": re.compile(r"Press Enter", re.IGNORECASE),
+        # gh asks TWO keypress questions, and both have to be answered or
+        # the flow wedges. "Authenticate Git with your GitHub
+        # credentials?" comes FIRST, before gh contacts GitHub at all, and
+        # (contrary to connect_server_path's earlier hope) it is asked
+        # whether or not git is on PATH — so matching only "Press Enter"
+        # left gh blocked on it, no device code was ever printed, and the
+        # card hung at "Starting the sign-in…" (agent-box#400). Enter
+        # accepts the default (Yes), which is what signing in via gh
+        # wants. "Press Enter to open github.com…" is the second.
+        "prompt_re": re.compile(
+            r"Authenticate Git with your GitHub credentials|Press Enter",
+            re.IGNORECASE),
         "destructive": False,
     },
     {
@@ -2020,13 +2031,13 @@ def connect_server_path():
     A pane this daemon creates inherits the tmux CLIENT's environment —
     ours — and this unit deliberately carries no agent PATH (coreutils,
     findutils, grep, sed, systemd; no git, no gh, no node). That is not a
-    cosmetic difference: `gh auth login` shells out to `git` to read the
+    cosmetic difference: `gh auth login` shells out to `git` to set up the
     credential helper /etc/gitconfig configures for github.com, and with
-    no git on PATH it cannot, so it opens with an interactive
-    "Authenticate Git with your GitHub credentials? (Y/n)" that nothing
-    answers — the card sat at "Starting the sign-in…" until the pane
-    expired, with no URL and no code, because gh never got as far as
-    asking GitHub for one.
+    no git on PATH that step cannot run. gh asks "Authenticate Git with
+    your GitHub credentials? (Y/n)" regardless of whether git is present
+    (so PATH alone does not settle it — the daemon answers that keypress,
+    see the github flow's prompt_re and agent-box#400); PATH is what lets
+    the answer actually configure git rather than fail.
 
     The tmux server's global environment IS the agent unit's, so a pane
     started with it looks like the terminal the user would have used. Only
@@ -2048,7 +2059,22 @@ def connect_start(flow):
     """Start the flow's own sign-in command in its own tmux session."""
     flow_id = flow["id"]
     if connect_pane(flow_id) in live_sessions():
-        return connect_state(flow)          # already in flight: idempotent
+        # A listed pane is one of two things: a sign-in genuinely in
+        # flight, or a FINISHED one still lingering in CONNECT_LINGER's
+        # sleep (the wrapper holds the last screen readable after the CLI
+        # exits). Only the first is idempotent. The second is a corpse: a
+        # sign-in that FAILED (the provider's token endpoint 500'd, a
+        # rejected code) would otherwise pin the card to "failed" and make
+        # Start a no-op for the whole linger window, with no way to retry
+        # (agent-box#400). Reap the corpse and start fresh; a pane with no
+        # exit marker yet is still in flight, so leave it be.
+        if not CONNECT_EXIT_RE.search(connect_capture(flow_id) or ""):
+            return connect_state(flow)      # in flight: idempotent
+        connect_cancel(flow_id)
+        for _ in range(50):                 # let tmux free the name (~1s max)
+            if connect_pane(flow_id) not in live_sessions():
+                break
+            time.sleep(0.02)
     if not tmux_server_up():
         state = connect_state(flow)
         state["state"] = "failed"
