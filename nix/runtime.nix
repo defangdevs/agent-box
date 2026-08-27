@@ -163,6 +163,16 @@ let
     flakeIgnore = [ "E402" "E501" ];
   } (envStoreLib + "\n\n" + readSrc "env-exec.py");
 
+  # The env store's one WRITER (issue #212). Spliced the same way env-exec
+  # is, and for the same reason: envstore-cli.py calls into lib/envstore.py
+  # without importing it, exactly as the module's generated wrapper does.
+  # Without this the box could READ the store at session spawn and had no
+  # way to write it — `agent-box-session env set`, which the shipped guide
+  # tells every agent to use for secrets, died on a ${VAR:?} (issue #394).
+  envStoreCli = pkgs.writers.writePython3Bin "agent-box-envstore" {
+    flakeIgnore = [ "E402" "E501" ];
+  } (envStoreLib + "\n\n" + readSrc "envstore-cli.py");
+
   agentPackage = agent:
     if agent == "claude" then agentPkgs.claude-code
     else if agent == "codex" then agentPkgs.codex
@@ -181,6 +191,7 @@ let
     (payload "agent-box-codex-remote-control" "codex-remote-control.sh")
     (payload "agent-box-claude-session-start-hook" "claude-session-start-hook.sh")
     envExecWrapper
+    envStoreCli
     settingsDaemon
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-spawn" "webhook-spawn.sh")
@@ -218,6 +229,10 @@ let
   # generated wrapper prelude.
   cliPayloads = [
     (payload "agent-box-session-bare" "session-cli.sh")
+    # Agent profiles (issue #321): the worker `--profile` selects. Bare, so
+    # `agentbox apply` can pin the env store and the harness list into the
+    # wrapper — this CLI runs from PATHs that carry almost nothing.
+    (payload "agent-box-profile-bare" "profile-cli.sh")
     # Needs no env wrapper: it resolves its token from gh at runtime.
     (payload "agent-box-upload" "upload-cli.sh")
   ] ++ lib.optional webhookEnabled (payload "agent-box-webhook-bare" "webhook-cli.sh");
