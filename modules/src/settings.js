@@ -29,11 +29,17 @@
         function (f) {
           var input = f.querySelector("input[name=code]");
           var flow = f.querySelector("input[name=flow]");
-          if (!input || !flow || !input.value) { return; }
-          codes[flow.value] = {
-            value: input.value, start: input.selectionStart, end: input.selectionEnd
-          };
-          if (input === document.activeElement) { focusedFlow = flow.value; }
+          if (!input || !flow) { return; }
+          var focused = input === document.activeElement;
+          // Record an empty-but-focused input too: a poll landing before
+          // the operator has typed anything must not drop focus off the
+          // field they are about to type into.
+          if (input.value || focused) {
+            codes[flow.value] = {
+              value: input.value, start: input.selectionStart, end: input.selectionEnd
+            };
+          }
+          if (focused) { focusedFlow = flow.value; }
         });
       Array.prototype.forEach.call(
         from.querySelectorAll("form.conn-form"),
