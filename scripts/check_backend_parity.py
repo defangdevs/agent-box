@@ -96,23 +96,18 @@ BY_DESIGN = {
 # shrink: fixing a gap means deleting its line, and the staleness check below
 # makes that mandatory rather than optional.
 KNOWN_GAPS = {
-        "AGENT_BOX_CLAUDE_SETTINGS": "#394: claude starts without the settings "
-                                 "file, so its SessionStart hook never fires",
-    "AGENT_BOX_CODEX_FULL_ACCESS": "#394: codex takes the non-full-access "
-                                   "branch on a native box",
-    "AGENT_BOX_HOOK_SPAWN_CMD": "#394: standing watches cannot spawn a "
-                                "session natively",
-    "AGENT_BOX_HOOK_SESSION_ARGS": "#394: see AGENT_BOX_HOOK_SPAWN_CMD",
-    "AGENT_BOX_WEBHOOK_PYTHON": "#394: see AGENT_BOX_HOOK_SPAWN_CMD",
-    "AGENT_BOX_WEBHOOK_PINNED_SCRIPT": "#394: see AGENT_BOX_HOOK_SPAWN_CMD",
-    "AGENT_BOX_WEB_USERS": "#394: the settings daemon's multi-user branches "
-                           "never engage natively",
-}
+                                }
 
 # Units, by family (instance and template spellings normalized away).
 UNITS_BY_DESIGN = {
     "agent-box-spot-monitor.service":
         "EC2-only, see AGENT_BOX_USERS above",
+    "agent-box-zram.service":
+        "native only, and correct: on NixOS zram comes from the zramSwap "
+        "option, which a generator turns into systemd-zram-setup@zram0 at "
+        "boot — a unit no fixture records because it does not exist until "
+        "the generator runs. Both backends give the box compressed swap; "
+        "only one of them has a unit file to compare",
     "agent-box-nix-gc.service":
         "native only, and correct: on NixOS the DEPLOYMENT owns store "
         "housekeeping (aws/template.yaml sets nix.gc and min-free), a layer "
@@ -120,10 +115,6 @@ UNITS_BY_DESIGN = {
         "module ever grows nix.gc of its own, this line goes away",
 }
 UNITS_KNOWN_GAPS = {
-    "earlyoom.service": "#394 gap 9: the module runs earlyoom as its OOM "
-                        "backstop; the native profile SHIPS the earlyoom "
-                        "binary and never configures or starts it, so "
-                        "protectMemory natively is OOMScoreAdjust alone",
     "agent-box-defang-cli.service": "#394: the module installs the Defang "
                                     "CLI in the background (#373); the "
                                     "native runtime profile has no defang "
@@ -139,6 +130,10 @@ UNITS_KNOWN_GAPS = {
 # above for the same reason: the alias below makes it not a gap at all.
 UNIT_ALIASES = {
     "fail2ban.service": "agent-box-fail2ban.service",
+    # Same daemon, same thresholds; prefixed here because Ubuntu may also
+    # carry a distro earlyoom, and this box's copy comes from the runtime
+    # profile with the box's own arguments.
+    "earlyoom.service": "agent-box-earlyoom.service",
 }
 
 
