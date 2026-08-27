@@ -545,6 +545,28 @@ class RenderTest(unittest.TestCase):
         profile = (FIXTURE / "usr/local/bin/agent-box-profile").read_text()
         self.assertIn("AGENT_BOX_ENVSTORE_BIN=", profile)
 
+    def test_wrappers_generated_without_web(self):
+        """agent-box-session and agent-box-profile must exist even with
+        web.enable: false — the shipped guide tells every agent to run
+        them regardless, and the module's own agentRuntimePackages carries
+        both unconditionally. Their generation used to live inside
+        self.caddy(), which a web-disabled box never calls, so a native
+        box with web.enable: false shipped neither (review on #403)."""
+        data = json.loads(CONFIG_JSON.read_text())
+        data["web"] = {"enable": False}
+        del data["webhook"]
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "no-web.json"
+            cfg.write_text(json.dumps(data))
+            out = render(tmp, cfg)
+            self.assertFalse((out / "etc/agent-box/Caddyfile").exists(),
+                             "web.enable: false should render no Caddyfile")
+            session = (out / "usr/local/bin/agent-box-session").read_text()
+            self.assertIn("AGENT_BOX_ENVSTORE_BIN=", session)
+            self.assertIn("AGENT_BOX_PROFILE_BIN=", session)
+            profile = (out / "usr/local/bin/agent-box-profile").read_text()
+            self.assertIn("AGENT_BOX_ENVSTORE_BIN=", profile)
+
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
         for unit in (SRC / "units").iterdir():
