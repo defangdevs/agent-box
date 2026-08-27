@@ -1,12 +1,18 @@
 name: Publish CFN template to S3
 
 on:
+  # No `paths:` filter. The published templates embed AgentBoxRev/
+  # AgentBoxSha256 pinned to the commit that ran this workflow (see the
+  # "Inject pinned defaults" step below), so ANY push to master makes that
+  # pin stale, not just a push touching the template files themselves. A
+  # `paths:` filter here previously let master drift 30+ commits ahead of
+  # the S3-published templates before anything touched the two YAML files
+  # again — a freshly-launched box came up already 30 commits behind
+  # (issue #408). deploy-test never caught this: it always computes its
+  # own fresh pin from the triggering commit instead of reading the
+  # published template.
   push:
     branches: [ master ]
-    paths:
-      - 'aws/template.yaml'
-      - 'aws/lightsail-template.yaml'
-      - '.github/workflows/publish-template.yml'
   workflow_dispatch:
 
 concurrency:
