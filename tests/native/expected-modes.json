@@ -1,5 +1,6 @@
 {
   "etc/agent-box-guides/AGENTS.agent.md": "0o444",
+  "etc/agent-box-guides/AGENTS.robot.md": "0o444",
   "etc/agent-box/Caddyfile": "0o644",
   "etc/agent-box/bin/agent-box-password-agent": "0o755",
   "etc/agent-box/bin/agent-box-password-robot": "0o755",

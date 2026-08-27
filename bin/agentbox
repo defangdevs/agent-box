@@ -842,6 +842,16 @@ class Renderer:
             ("AGENT_BOX_MARK_STOPPED", f"{self.bin}/agent-box-mark-stopped"),
             ("AGENT_BOX_AGENTS_POINTER",
              f"/etc/agent-box/guides/{u.name}-agents-pointer.md"),
+            # What supervisor.sh symlinks ~/.claude/CLAUDE.md and
+            # $CODEX_HOME/AGENTS.md at (issue #394). Without it a native
+            # box seeded the pointer into $HOME and nothing else, so an
+            # agent working in a checkout BELOW $HOME — which is what a
+            # session doing real work does — stopped seeing the platform
+            # guide entirely: claude only reads CLAUDE.md from the cwd
+            # upward, codex only AGENTS.md from the project root down plus
+            # the one global file.
+            ("AGENT_BOX_GUIDE_TARGET",
+             f"/etc/agent-box-guides/AGENTS.{u.name}.md"),
         ]
         if self.spec.web_enable:
             pairs.append(("AGENT_BOX_URL", u.url))
@@ -1074,16 +1084,21 @@ class Renderer:
                json.dumps({"version": 1, "sessions": sessions},
                           indent=2, sort_keys=True) + "\n", 0o644)
 
+        # Per user, like the module's canonicalAgentsPath: this ran inside
+        # the per-user loop while naming AGENTS.agent.md for everyone, so a
+        # second user overwrote the first user's guide and both pointers
+        # aimed at a file describing one of them.
+        canonical = f"/etc/agent-box-guides/AGENTS.{u.name}.md"
         guide = self.share / "guides" / "default-agents.md"
         pointer = (
             f"# agent-box — {u.name}@{self.spec.host_label}\n\n"
             "The canonical guide is read-only and updated with the box:\n"
-            "@/etc/agent-box-guides/AGENTS.agent.md\n"
+            f"@{canonical}\n"
         )
         t.file(self.p("/etc/agent-box/guides",
                       f"{u.name}-agents-pointer.md"), pointer)
         if guide.is_file():
-            t.file(self.p("/etc/agent-box-guides/AGENTS.agent.md"),
+            t.file(self.p(canonical),
                    self.render_guide(guide.read_text()), 0o444)
 
     # -- sudoers, tmpfiles, caddy -------------------------------------------

@@ -581,6 +581,34 @@ class RenderTest(unittest.TestCase):
             profile = (out / "usr/local/bin/agent-box-profile").read_text()
             self.assertIn("AGENT_BOX_ENVSTORE_BIN=", profile)
 
+    def test_every_user_gets_their_own_canonical_guide(self):
+        """Issue #394. Two things were wrong at once here.
+
+        The guide was written to a hardcoded AGENTS.agent.md from inside
+        the per-user loop, so a second user overwrote the first's copy and
+        both pointers named a file describing one of them. And nothing set
+        AGENT_BOX_GUIDE_TARGET, so supervisor.sh never symlinked the guide
+        into ~/.claude/CLAUDE.md or $CODEX_HOME/AGENTS.md — which is the
+        scope that survives an agent working inside a checkout BELOW $HOME,
+        i.e. what a session doing real work does.
+        """
+        for user in ("agent", "robot"):
+            canonical = FIXTURE / f"etc/agent-box-guides/AGENTS.{user}.md"
+            self.assertTrue(canonical.is_file(),
+                            f"{user} has no canonical guide")
+            pointer = (FIXTURE / "etc/agent-box/guides"
+                       / f"{user}-agents-pointer.md").read_text()
+            self.assertIn(f"@/etc/agent-box-guides/AGENTS.{user}.md", pointer)
+            env = (FIXTURE / "etc/agent-box/units" / f"{user}.env").read_text()
+            self.assertIn(
+                f"AGENT_BOX_GUIDE_TARGET=/etc/agent-box-guides/"
+                f"AGENTS.{user}.md", env)
+        # The host label names the user, so the two guides' pointers must
+        # not be byte-identical — that was the symptom of the overwrite.
+        self.assertNotEqual(
+            (FIXTURE / "etc/agent-box/guides/agent-agents-pointer.md").read_text(),
+            (FIXTURE / "etc/agent-box/guides/robot-agents-pointer.md").read_text())
+
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
         for unit in (SRC / "units").iterdir():
