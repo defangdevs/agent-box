@@ -50,6 +50,7 @@ SHARED = REPO / "modules" / "src"
 GOLDEN = REPO / "tests" / "golden"          # what the module renders
 NATIVE = REPO / "tests" / "native" / "expected"  # what bin/agentbox renders
 MODULE_UNITS = GOLDEN / "web" / "units"
+DUPLICATES = GOLDEN / "DUPLICATES"
 NATIVE_UNITS = NATIVE / "etc" / "systemd" / "system"
 # The %i template units under here (agent-box-settings@.service and
 # friends) are backend-neutral: both renderers install this exact file,
@@ -121,6 +122,15 @@ UNITS_BY_DESIGN = {
 UNITS_KNOWN_GAPS = {
     "fail2ban.service": "#394: the module jails Caddy's 401s; a native box "
                         "has no brute-force backstop on the terminal",
+    "earlyoom.service": "#394 gap 9: the module runs earlyoom as its OOM "
+                        "backstop; the native profile SHIPS the earlyoom "
+                        "binary and never configures or starts it, so "
+                        "protectMemory natively is OOMScoreAdjust alone",
+    "agent-box-defang-cli.service": "#394: the module installs the Defang "
+                                    "CLI in the background (#373); the "
+                                    "native runtime profile has no defang "
+                                    "at all, which is also why its settings "
+                                    "page offers no defang sign-in card",
 }
 
 
@@ -152,6 +162,23 @@ def read_by_payloads():
     return found
 
 
+def module_unit_names():
+    """The web config's REAL unit set.
+
+    tests/golden deduplicates a file whose bytes match one already in the
+    snapshot, recording it as a line in DUPLICATES instead — so the web
+    config's earlyoom.service lives under vm/units/ and reading web/units/
+    alone silently under-reports what the module ships. That is how this
+    check called earlyoom "absent from both backends" when it is absent
+    from exactly one.
+    """
+    names = {p.name for p in MODULE_UNITS.iterdir()}
+    for line in DUPLICATES.read_text().splitlines():
+        if line.startswith("web/units/") and "->" in line:
+            names.add(line.split("->")[0].strip().rsplit("/", 1)[-1])
+    return names
+
+
 def unit_families(paths):
     """Unit names with the instance stripped: agent-box@agent.service and
     agent-box@.service are the same unit, spelled differently by the two
@@ -165,7 +192,7 @@ def unit_families(paths):
     """
     out = set()
     for path in paths:
-        name = path.name
+        name = path if isinstance(path, str) else path.name
         if name.endswith(".d"):
             name = name[:-2]
         if not name.endswith(".service"):
@@ -219,7 +246,8 @@ def report(kind, only_module, only_native, by_design, known):
 
 
 def main():
-    for root in (SHARED, GOLDEN, NATIVE, MODULE_UNITS, NATIVE_UNITS, SHARED_UNITS):
+    for root in (SHARED, GOLDEN, NATIVE, MODULE_UNITS, NATIVE_UNITS,
+                 SHARED_UNITS, DUPLICATES):
         if not root.exists():
             print(f"FAIL: {root} is missing — this check would pass "
                   f"vacuously.", file=sys.stderr)
@@ -251,7 +279,7 @@ def main():
                     BY_DESIGN, KNOWN_GAPS)
 
     print("\nrendered units:")
-    mod_units = unit_families(MODULE_UNITS.iterdir())
+    mod_units = unit_families(module_unit_names())
     nat_units = unit_families(NATIVE_UNITS.iterdir())
     v2, s2 = report("unit", mod_units - nat_units, nat_units - mod_units,
                     UNITS_BY_DESIGN, UNITS_KNOWN_GAPS)
