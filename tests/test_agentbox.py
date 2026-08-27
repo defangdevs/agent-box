@@ -42,14 +42,31 @@ SRC = REPO / "modules" / "src"
 
 # Binaries the renderer names in units, wrappers and env files. Present as
 # empty executables in the fake profile so a rendered path is real.
-FAKE_BINS = [
-    "agent-box-supervisor", "agent-box-attach", "agent-box-settings",
-    "agent-box-mark-stopped", "agent-box-env-exec",
-    "agent-box-codex-remote-control", "agent-box-webhook-receiver",
-    "agent-box-webhook-spawn", "agent-box-session-bare",
-    "agent-box-webhook-bare", "claude", "codex", "tmux", "ttyd", "caddy",
-    "grep", "find", "flock", "hostname", "agentbox",
+def profile_payload_names():
+    """Every agent-box binary nix/runtime.nix puts in the profile.
+
+    Read out of the expression rather than listed here: a hand-maintained
+    copy of a list that already exists is how the settings page lost its
+    Connections section (issue #392) and how `agent-box-session env` was
+    promised on a box that could not run it (#394). The fake profile the
+    render tests build has to be the real profile's shape, or a test can
+    only prove the renderer agrees with the test.
+    """
+    text = (REPO / "nix" / "runtime.nix").read_text()
+    return set(re.findall(
+        r'(?:payload|writePython3Bin|writeShellScriptBin|runCommand)\s+"'
+        r'(agent-box[a-z0-9-]*|agentbox)"', text)) - {"agent-box-assets"}
+
+
+# Third-party binaries the renderer names by path. Not derived: these are
+# nixpkgs packages, not payloads, and the profile lists them as attributes
+# (`with pkgs; [ tmux ttyd ... ]`) whose binary names are not the attribute
+# names in every case.
+FAKE_TOOLS = [
+    "claude", "codex", "tmux", "ttyd", "caddy", "grep", "find", "flock",
+    "hostname", "fail2ban-server", "fail2ban-client", "nft",
 ]
+FAKE_BINS = sorted(profile_payload_names() | set(FAKE_TOOLS))
 
 
 # What the fake profile's manifest claims it was installed from. The rev is
@@ -494,6 +511,39 @@ class RenderTest(unittest.TestCase):
         unit = (FIXTURE / "etc/systemd/system"
                 / "agent-box-fail2ban.service").read_text()
         self.assertIn("-c /etc/agent-box/fail2ban", unit)
+
+    def test_the_guide_promises_only_commands_this_box_has(self):
+        """The guide is shipped to every box and names commands by hand.
+
+        `agent-box-session env set` and `agent-box-profile` were promised
+        to agents on a box where neither worked: the profile shipped no
+        envstore CLI, and the generated wrapper pinned neither, so the
+        first verb read ${AGENT_BOX_ENVSTORE_BIN:?} and died (issue #394).
+        A promise in the shipped guide is a contract with the agent, so
+        check it the same way the rest of the render is checked.
+        """
+        guide = (FIXTURE / "etc/agent-box-guides/AGENTS.agent.md").read_text()
+        promised = set(re.findall(r"`(agent-box-[a-z-]+)", guide))
+        self.assertTrue(promised, "no agent-box-* commands found in the guide")
+        wrappers = {p.name for p
+                    in (FIXTURE / "usr/local/bin").iterdir()}
+        # Anything the guide names is either a generated wrapper or a
+        # payload the profile installs under its own name.
+        payloads = profile_payload_names() | set(FAKE_TOOLS)
+        for cmd in sorted(promised):
+            self.assertTrue(cmd in wrappers or cmd in payloads,
+                            f"the guide promises `{cmd}`, which this box "
+                            f"does not have")
+
+    def test_the_session_cli_can_reach_the_env_store(self):
+        """session-cli.sh reads AGENT_BOX_ENVSTORE_BIN with ${VAR:?}, so an
+        unset value is not a degraded `env` verb — it is an error message
+        instead of a secret being stored."""
+        wrapper = (FIXTURE / "usr/local/bin/agent-box-session").read_text()
+        self.assertIn("AGENT_BOX_ENVSTORE_BIN=", wrapper)
+        self.assertIn("AGENT_BOX_PROFILE_BIN=", wrapper)
+        profile = (FIXTURE / "usr/local/bin/agent-box-profile").read_text()
+        self.assertIn("AGENT_BOX_ENVSTORE_BIN=", profile)
 
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""

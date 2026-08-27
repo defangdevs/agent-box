@@ -96,11 +96,8 @@ BY_DESIGN = {
 # shrink: fixing a gap means deleting its line, and the staleness check below
 # makes that mandatory rather than optional.
 KNOWN_GAPS = {
-    "AGENT_BOX_ENVSTORE_BIN": "#394: `agent-box-session env` fails on a "
-                              "native box; the profile ships no envstore CLI",
-    "AGENT_BOX_PROFILE_BIN": "#394: agent profiles are unavailable natively",
-    "AGENT_BOX_GUIDE_TARGET": "#394: native boxes never symlink the platform "
-                              "guide into ~/.claude/CLAUDE.md",
+    "AGENT_BOX_GUIDE_TARGET": "#394: native boxes never symlink the "
+                              "platform guide into ~/.claude/CLAUDE.md",
     "AGENT_BOX_CLAUDE_SETTINGS": "#394: claude starts without the settings "
                                  "file, so its SessionStart hook never fires",
     "AGENT_BOX_CODEX_FULL_ACCESS": "#394: codex takes the non-full-access "
