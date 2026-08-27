@@ -271,8 +271,10 @@ in
             "jq -e '.tui == \"default\"' /home/agent/.claude/settings.json"
         )
         # Regression guard: the pane itself must never show the upsell text,
-        # not just the settings.json seed that is meant to prevent it.
-        main_pane = machine.succeed(tmux('capture-pane -p -S -50 -t "=main:"'))
+        # not just the settings.json seed that is meant to prevent it. -S -
+        # (not a fixed -50) so the assertion can't pass just because the
+        # upsell scrolled out of a truncated capture window.
+        main_pane = machine.succeed(tmux('capture-pane -p -S - -t "=main:"'))
         assert "fullscreen renderer" not in main_pane.lower(), main_pane
 
         # The theme seed never clobbers a hand-picked one: /theme writes the
