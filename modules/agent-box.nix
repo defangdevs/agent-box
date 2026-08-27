@@ -10586,7 +10586,50 @@ SCRIPT = """<script>
       Array.prototype.forEach.call(
         from.querySelectorAll("details[data-fold]"),
         function (d) { if (open[d.getAttribute("data-fold")]) { d.open = true; } });
+      // A sign-in code the operator is mid-paste is state this HTML does
+      // not carry either: connectPoll swaps #connect-list every 2.5s
+      // while a flow is waiting on its code, and a freshly-rendered
+      // (empty) input used to overwrite whatever had just been typed or
+      // pasted, and steal focus off it too (issue #410). Keyed by flow
+      // id, not the input alone, so two waiting cards can't cross-wire.
+      var codes = {};
+      var focusedFlow = null;
+      Array.prototype.forEach.call(
+        to.querySelectorAll("form.conn-form"),
+        function (f) {
+          var input = f.querySelector("input[name=code]");
+          var flow = f.querySelector("input[name=flow]");
+          if (!input || !flow) { return; }
+          var focused = input === document.activeElement;
+          // Record an empty-but-focused input too: a poll landing before
+          // the operator has typed anything must not drop focus off the
+          // field they are about to type into.
+          if (input.value || focused) {
+            codes[flow.value] = {
+              value: input.value, start: input.selectionStart, end: input.selectionEnd
+            };
+          }
+          if (focused) { focusedFlow = flow.value; }
+        });
+      Array.prototype.forEach.call(
+        from.querySelectorAll("form.conn-form"),
+        function (f) {
+          var input = f.querySelector("input[name=code]");
+          var flow = f.querySelector("input[name=flow]");
+          var saved = input && flow && codes[flow.value];
+          if (saved) { input.value = saved.value; }
+        });
       to.replaceWith(document.importNode(from, true));
+      if (focusedFlow) {
+        var restored = document.querySelector(
+          "#" + id + ' form.conn-form input[name=flow][value="' + focusedFlow + '"]');
+        var input = restored && restored.closest("form").querySelector("input[name=code]");
+        var saved = codes[focusedFlow];
+        if (input && saved) {
+          input.focus();
+          input.setSelectionRange(saved.start, saved.end);
+        }
+      }
     });
   }
   function parseHTML(text) {
