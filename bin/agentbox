@@ -81,6 +81,7 @@ UPDATE_TRIGGER = f"{SYSTEMCTL} start --no-block {UPDATE_UNIT}"
 # renderer owns it. Same policy as that config, deliberately: a store that
 # behaves differently depending on how the box was deployed is a support
 # question nobody can answer from the outside.
+CLAUDE_SETTINGS = "/etc/agent-box/claude-hook-settings.json"
 FAIL2BAN_UNIT = "agent-box-fail2ban.service"
 FAIL2BAN_DIR = "/etc/agent-box/fail2ban"
 FAIL2BAN_JAIL = "agent-web-auth"
@@ -227,6 +228,13 @@ class Spec:
         web = data.get("web") or {}
         self.web_enable = bool(web.get("enable", True))
         self.protect_memory = bool(data.get("protectMemory", True))
+        # Codex autonomy for the WHOLE box (issue 234). Default true, as
+        # the module's option is: the box IS the sandbox, and an agent that
+        # stops to ask a human is a stalled agent. Meaningless without
+        # codex installed, so it follows the agent list.
+        self.codex_full_access = (
+            bool(data.get("codexFullAccess", True))
+            and "codex" in self.agents)
         self.sudo_allowlist = list(data.get("sudoAllowlist") or [])
 
         if self.default_agent not in self.agents:
@@ -367,10 +375,42 @@ class Renderer:
         self.tmpfiles(t)
         self.target_wants(t)
         self.interactive_clis(t)
+        self.agent_defaults(t)
         if self.spec.web_enable:
             self.caddy(t)
             self.fail2ban(t)
         return t
+
+    # -- agent defaults ------------------------------------------------------
+
+    def agent_defaults(self, t):
+        """The two files the agent CLIs themselves read (issue #394).
+
+        claude: a settings file carrying the SessionStart hook, which is how
+        a respawned session finds the segment-rotation record (issue #223).
+        supervisor.sh passes it with --settings, and only when
+        AGENT_BOX_CLAUDE_SETTINGS names one — so on a native box that hook
+        never fired.
+
+        codex: /etc/codex/config.toml, codex's SYSTEM layer, below the
+        user's own ~/.codex/config.toml. It is the only way to reach the
+        app-server daemon serving remote-controlled sessions, which is
+        spawned with a fixed argv and never sees the supervisor's -c
+        overrides. Both keys are required: sandbox_mode alone opens the
+        filesystem and network but leaves approval_policy at "on-request".
+        """
+        if "claude" in self.spec.agents:
+            hook = self.bin / "agent-box-claude-session-start-hook"
+            t.file(self.p(CLAUDE_SETTINGS),
+                   json.dumps({"hooks": {"SessionStart": [
+                       {"hooks": [{"type": "command",
+                                   "command": str(hook)}]}]}},
+                              indent=2, sort_keys=True) + "\n")
+        if self.spec.codex_full_access:
+            t.dir(self.p("/etc/codex"), 0o755)
+            t.file(self.p("/etc/codex/config.toml"),
+                   'approval_policy = "never"\n'
+                   'sandbox_mode = "danger-full-access"\n')
 
     # -- brute force ---------------------------------------------------------
 
@@ -853,6 +893,15 @@ class Renderer:
             ("AGENT_BOX_GUIDE_TARGET",
              f"/etc/agent-box-guides/AGENTS.{u.name}.md"),
         ]
+        if "claude" in self.spec.agents:
+            pairs.append(("AGENT_BOX_CLAUDE_SETTINGS", CLAUDE_SETTINGS))
+        if self.spec.codex_full_access:
+            # Set ONLY when the file above was written: supervisor.sh reads
+            # this as "the box has a system-wide codex config", and a
+            # session with skipPermissions = false uses it to pin the
+            # restricted values back. Exporting it without the file would
+            # make that opt-out fight a default nobody wrote.
+            pairs.append(("AGENT_BOX_CODEX_FULL_ACCESS", "1"))
         if self.spec.web_enable:
             pairs.append(("AGENT_BOX_URL", u.url))
             if self.spec.webhook_enable:

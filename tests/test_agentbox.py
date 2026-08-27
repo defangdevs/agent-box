@@ -609,6 +609,66 @@ class RenderTest(unittest.TestCase):
             (FIXTURE / "etc/agent-box/guides/agent-agents-pointer.md").read_text(),
             (FIXTURE / "etc/agent-box/guides/robot-agents-pointer.md").read_text())
 
+    def test_the_agent_clis_get_their_own_config(self):
+        """Issue #394, gaps 4 and 5.
+
+        Both are files the agent CLIs read for themselves, and both were
+        missing natively:
+
+          claude  supervisor.sh passes --settings only when
+                  AGENT_BOX_CLAUDE_SETTINGS names a file, so the
+                  SessionStart hook (issue #223) never fired on a native
+                  box — silently, since a missing hook looks like a hook
+                  with nothing to say.
+          codex   /etc/codex/config.toml is codex's system layer and the
+                  ONLY way to reach the app-server daemon behind a
+                  remote-controlled session, which is spawned with a fixed
+                  argv. Without it a native codex box asked for approvals
+                  where a NixOS one did not.
+
+        The env var and the file go together on purpose: supervisor.sh
+        treats the var as "the box wrote a system-wide codex config", and
+        a session opting OUT of full access pins the restricted values back
+        because of it.
+        """
+        settings = json.loads(
+            (FIXTURE / "etc/agent-box/claude-hook-settings.json").read_text())
+        hook = (settings["hooks"]["SessionStart"][0]["hooks"][0]["command"])
+        self.assertTrue(hook.endswith("agent-box-claude-session-start-hook"),
+                        f"SessionStart hook is {hook!r}")
+        self.assertTrue(hook.startswith("@PROFILE@/bin/"),
+                        "the hook must be named by absolute path — the "
+                        "agent CLI does not inherit the unit's PATH")
+        toml = (FIXTURE / "etc/codex/config.toml").read_text()
+        self.assertIn('approval_policy = "never"', toml)
+        # Both keys, or the box opens the filesystem and still stops to ask.
+        self.assertIn('sandbox_mode = "danger-full-access"', toml)
+        for user in ("agent", "robot"):
+            env = (FIXTURE / "etc/agent-box/units" / f"{user}.env").read_text()
+            self.assertIn("AGENT_BOX_CLAUDE_SETTINGS="
+                          "/etc/agent-box/claude-hook-settings.json", env)
+            self.assertIn("AGENT_BOX_CODEX_FULL_ACCESS=1", env)
+
+    def test_codex_full_access_is_file_and_flag_together(self):
+        """Never the flag without the file. supervisor.sh reads the flag as
+        evidence the file exists, so setting one alone would make a
+        session's skipPermissions = false opt-out fight a default nobody
+        wrote."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for want in (False, True):
+                config["codexFullAccess"] = want
+                spec = mod.Spec(config, prof)
+                rend = mod.Renderer(spec, prof, root=Path(tmp) / f"o{want}")
+                tree = rend.render()
+                toml = [f for f in tree.files if f.endswith("codex/config.toml")]
+                env = [text for path, (text, _) in tree.files.items()
+                       if path.endswith("/agent.env")][0]
+                self.assertEqual(want, bool(toml))
+                self.assertEqual(want, "AGENT_BOX_CODEX_FULL_ACCESS" in env)
+
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
         for unit in (SRC / "units").iterdir():

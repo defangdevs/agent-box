@@ -96,11 +96,7 @@ BY_DESIGN = {
 # shrink: fixing a gap means deleting its line, and the staleness check below
 # makes that mandatory rather than optional.
 KNOWN_GAPS = {
-        "AGENT_BOX_CLAUDE_SETTINGS": "#394: claude starts without the settings "
-                                 "file, so its SessionStart hook never fires",
-    "AGENT_BOX_CODEX_FULL_ACCESS": "#394: codex takes the non-full-access "
-                                   "branch on a native box",
-    "AGENT_BOX_HOOK_SPAWN_CMD": "#394: standing watches cannot spawn a "
+                "AGENT_BOX_HOOK_SPAWN_CMD": "#394: standing watches cannot spawn a "
                                 "session natively",
     "AGENT_BOX_HOOK_SESSION_ARGS": "#394: see AGENT_BOX_HOOK_SPAWN_CMD",
     "AGENT_BOX_WEBHOOK_PYTHON": "#394: see AGENT_BOX_HOOK_SPAWN_CMD",
