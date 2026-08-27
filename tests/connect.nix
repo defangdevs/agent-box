@@ -79,6 +79,14 @@ in
             # credentials?" that nothing answers, and the card never gets
             # a URL or a code.
             command -v git > ${stateDir}/gh-git 2>/dev/null || true
+            # Real gh, with --git-protocol https, asks this FIRST — before
+            # it contacts GitHub — and blocks on the answer whether or not
+            # git is on PATH. The daemon must recognise and answer this
+            # keypress, or gh never requests a device code and the card
+            # hangs at "Starting the sign-in…" (agent-box#400).
+            printf "? Authenticate Git with your GitHub credentials? (Y/n) "
+            read -r _gitans || exit 1
+            : > ${stateDir}/gh-gitans
             # The shape the REAL device-flow CLIs print: prose that
             # contains the word "code", and the code itself on a line of
             # its own further down. Anchoring the code on "code" rendered
@@ -299,10 +307,16 @@ in
         assert "EE45-B423" in body
         assert "AUTHORIZATION" not in body
 
-    with subtest("the pane can run git, so gh never has to ask about it"):
-        # Empty means the pane inherited this daemon's PATH instead of the
-        # agent unit's — the state the GitHub card hung in.
+    with subtest("the pane can run git, and gh's Git-credential prompt is auto-answered"):
+        # Empty gh-git means the pane inherited this daemon's PATH instead
+        # of the agent unit's, so gh setup-git could not run git at all.
         machine.succeed("test -s ${stateDir}/gh-git")
+        # gh asks "Authenticate Git with your GitHub credentials?" before
+        # it contacts GitHub, even with git present; reaching the code
+        # above at all proves the daemon answered that keypress, and the
+        # marker confirms gh got past it rather than the code being a
+        # decoy (agent-box#400).
+        machine.succeed("test -e ${stateDir}/gh-gitans")
 
     with subtest("gh's keypress prompt is answered however late it arrives"):
         wait_state("github", "connected")
@@ -343,6 +357,25 @@ in
         assert "badcode1" not in failed["error"], failed
         assert "claude.com" not in failed["error"], failed
         assert post("/agent/settings/connect/cancel", "flow=claude") == "303"
+
+    with subtest("a failed sign-in can be retried while its pane still lingers"):
+        # A finished pane lingers in CONNECT_LINGER's sleep so the last
+        # screen stays readable — a FAILED one the same way. Start must
+        # reap that corpse and begin again, not mistake it for a sign-in
+        # already in flight and no-op until the linger elapses, which left
+        # a Codex 500 with no way to retry (agent-box#400).
+        machine.succeed("rm -f ${stateDir}/claude-in")
+        assert post("/agent/settings/connect/start", "flow=claude") == "303"
+        wait_state("claude", "waiting")
+        assert post("/agent/settings/connect/code", "flow=claude&code=badcode2") == "303"
+        wait_state("claude", "failed")
+        # The failed pane is still listed, lingering in the wrapper's sleep.
+        machine.succeed(tmux("has-session -t =_connect-claude"))
+        # Pressing Sign in again reaps it and starts a fresh sign-in.
+        assert post("/agent/settings/connect/start", "flow=claude") == "303"
+        wait_state("claude", "waiting")
+        assert post("/agent/settings/connect/cancel", "flow=claude") == "303"
+        machine.wait_until_fails(tmux("has-session -t =_connect-claude"))
 
     with subtest("cancel kills the pane"):
         machine.succeed("rm -f ${stateDir}/claude-in")
