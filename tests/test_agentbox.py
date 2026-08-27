@@ -699,6 +699,20 @@ class RenderTest(unittest.TestCase):
             ours.write_text(mod.GENERATED_HEADER + "x = 1\n")
             self.assertTrue(mod.remove_if_ours(ours))
             self.assertFalse(ours.exists())
+            # A generated SCRIPT carries the header on line TWO — the
+            # shebang has to be first or the kernel will not run it. Held
+            # by name because the strict first-line test read every
+            # rendered helper as someone else's file, and the first one
+            # that ever needed removing (the zram helper, protectMemory
+            # flipped off) was silently left running.
+            script = Path(tmp) / "ours.sh"
+            script.write_text("#!/bin/sh\n" + mod.GENERATED_HEADER + "true\n")
+            self.assertTrue(mod.remove_if_ours(script))
+            self.assertFalse(script.exists())
+            theirs = Path(tmp) / "theirs.sh"
+            theirs.write_text("#!/bin/sh\necho mine\n")
+            self.assertFalse(mod.remove_if_ours(theirs))
+            self.assertTrue(theirs.exists())
 
     def test_codex_full_access_is_file_and_flag_together(self):
         """Never the flag without the file. supervisor.sh reads the flag as
@@ -840,6 +854,91 @@ class RenderTest(unittest.TestCase):
                          "60-agent-box-memory.conf"):
                 self.assertFalse([f for f in tree.files if f.endswith(name)],
                                  f"{name} rendered with protectMemory off")
+
+    def test_turning_protect_memory_off_takes_the_daemon_with_it(self):
+        """The dangerous transition, applied to ONE root.
+
+        The knob rendering nothing is only half of it. A box applied with
+        protectMemory: true and later false kept the zram device swapped
+        in and earlyoom RUNNING — apply never deletes what a render stops
+        emitting — so a daemon whose whole job is to kill the agent CLIs
+        went on doing it with nothing left in the config that named it.
+        Two separate output roots cannot see this, which is why this test
+        reuses one, exactly as the codexFullAccess test above does.
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "one-root"
+            owned = [out / "etc/systemd/system/agent-box-zram.service",
+                     out / "etc/systemd/system/agent-box-earlyoom.service",
+                     out / "etc/agent-box/bin/agent-box-zram",
+                     out / "etc/sysctl.d/60-agent-box-memory.conf"]
+
+            def render(protect):
+                config["protectMemory"] = protect
+                cfg = Path(tmp) / "config.json"
+                cfg.write_text(json.dumps(config))
+                spec = mod.Spec(config, prof)
+                tree = mod.Renderer(spec, prof, root=out).render()
+                proc = subprocess.run(
+                    [sys.executable, str(AGENTBOX), "apply",
+                     "--config", str(cfg), "--profile", str(prof),
+                     "--root", str(out)], capture_output=True, text=True)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+                return tree
+
+            render(True)
+            for f in owned:
+                self.assertTrue(f.exists(), f"{f.name} not rendered")
+            tree = render(False)
+            for f in owned:
+                self.assertFalse(f.exists(),
+                                 f"{f.name} survived protectMemory: false")
+            # Removing the unit FILE is not stopping the daemon. The units
+            # have to be named for disabling too, or earlyoom keeps running
+            # from the copy systemd already loaded.
+            self.assertEqual(["agent-box-zram.service",
+                              "agent-box-earlyoom.service"],
+                             tree.disable)
+
+    def test_a_unit_this_box_never_had_is_not_disabled(self):
+        """The teardown must be quiet on a box that always had the knob
+        off: `systemctl disable` on a name that was never installed is an
+        error on every apply, and output nobody reads is output that hides
+        the next real problem."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["protectMemory"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "fresh").render()
+            self.assertEqual([], tree.disable)
+
+    def test_only_an_oomd_we_disabled_is_ever_re_enabled(self):
+        """systemd-oomd is the one piece of memory protection that is the
+        DISTRO's, not ours: apply turns it off so it does not race
+        earlyoom. Giving it back on the way down is only correct for a box
+        where we were the one who took it — `is-enabled` reporting
+        "masked", "disabled" or nothing at all means an admin decided
+        this, and apply leaves their decision alone."""
+        mod = load_agentbox()
+
+        def fake_run(cmd, check=True, capture=False):
+            return subprocess.CompletedProcess(cmd, 0, stdout=reply, stderr="")
+
+        with contextlib.ExitStack() as stack:
+            stack.callback(setattr, mod, "run", mod.run)
+            mod.run = fake_run
+            for reply, want in (("enabled\n", True),
+                                ("disabled\n", False),
+                                ("masked\n", False),
+                                ("static\n", False),
+                                ("", False)):
+                self.assertIs(want, mod.unit_is_enabled(mod.OOMD_UNIT),
+                              f"is-enabled said {reply!r}")
 
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
