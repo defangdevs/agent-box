@@ -96,6 +96,15 @@ jobs:
       - name: Check assembler escaping
         run: nix build -L .#checks.x86_64-linux.assemble-module-escaping && cat result
 
+      # Issue 394: the two renderers configure the same shared payloads, and
+      # #392 shipped every native box without the settings page's Connections
+      # section because only one of them set AGENT_BOX_CONNECT_BINS. Neither
+      # the golden fixture nor tests/native/expected could see it — both
+      # ratify whatever their own renderer emits — so this compares the two
+      # against each other and fails on an undeclared difference.
+      - name: Check backend parity (module vs native)
+        run: nix build -L .#checks.x86_64-linux.backend-parity && cat result
+
       # The env store's format (issue #212): round trip, no key injection, and
       # the legacy readings a deployed box's file relies on. A unit test, not
       # a VM test, because the format is read on the session-spawn path and
