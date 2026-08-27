@@ -42,7 +42,7 @@ SRC = REPO / "modules" / "src"
 
 # Binaries the renderer names in units, wrappers and env files. Present as
 # empty executables in the fake profile so a rendered path is real.
-def profile_payload_names():
+def profile_payload_names(webhook=True):
     """Every agent-box binary nix/runtime.nix puts in the profile.
 
     Read out of the expression rather than listed here: a hand-maintained
@@ -53,9 +53,21 @@ def profile_payload_names():
     only prove the renderer agrees with the test.
     """
     text = (REPO / "nix" / "runtime.nix").read_text()
-    return set(re.findall(
-        r'(?:payload|writePython3Bin|writeShellScriptBin|runCommand)\s+"'
-        r'(agent-box[a-z0-9-]*|agentbox)"', text)) - {"agent-box-assets"}
+
+    def declared(chunk):
+        return set(re.findall(
+            r'(?:payload|writePython3Bin|writeShellScriptBin|runCommand)\s+"'
+            r'(agent-box[a-z0-9-]*|agentbox)"', chunk)) - {"agent-box-assets"}
+
+    names = declared(text)
+    if not webhook:
+        # Payloads runtime.nix adds only under `lib.optional(s)
+        # webhookEnabled`. Including them unconditionally would let this
+        # list vouch for a command a webhook-less box does not install —
+        # the list would be right about the file and wrong about the box.
+        for chunk in re.split(r"lib\.optionals?\s+webhookEnabled", text)[1:]:
+            names -= declared(chunk.split("];")[0].split(");")[0])
+    return names
 
 
 # Third-party binaries the renderer names by path. Not derived: these are
@@ -529,7 +541,9 @@ class RenderTest(unittest.TestCase):
                     in (FIXTURE / "usr/local/bin").iterdir()}
         # Anything the guide names is either a generated wrapper or a
         # payload the profile installs under its own name.
-        payloads = profile_payload_names() | set(FAKE_TOOLS)
+        config = json.loads(CONFIG_JSON.read_text())
+        webhook = bool(config.get("webhook", {}).get("enable", False))
+        payloads = profile_payload_names(webhook) | set(FAKE_TOOLS)
         for cmd in sorted(promised):
             self.assertTrue(cmd in wrappers or cmd in payloads,
                             f"the guide promises `{cmd}`, which this box "
