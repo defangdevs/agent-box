@@ -131,6 +131,18 @@ def render(tmp, config):
         raise AssertionError(
             f"agentbox apply failed ({proc.returncode}):\n{proc.stderr}")
     for path in sorted(out.rglob("*")):
+        if path.is_symlink():
+            # A link into the profile is as much a rendered decision as a
+            # file is (the fail2ban jail's action.d, issue #394), so it is
+            # normalized and fixed the same way rather than left as a path
+            # that only existed inside one test run.
+            target = (os.readlink(path)
+                      .replace(str(prof), "@PROFILE@")
+                      .replace(str(config), "@CONFIG@"))
+            if target != os.readlink(path):
+                path.unlink()
+                os.symlink(target, path)
+            continue
         if path.is_file():
             text = (path.read_text()
                     .replace(str(prof), "@PROFILE@")
@@ -149,7 +161,13 @@ def tree_manifest(root):
     """path -> text."""
     manifest = {}
     for path in sorted(Path(root).rglob("*")):
-        if path.is_file():
+        if path.is_symlink():
+            # Recorded as its own kind of entry: a link that silently
+            # became a file (or moved) has to show up in the fixture diff
+            # like any other change to what the box gets.
+            manifest[path.relative_to(root).as_posix()] = (
+                "symlink -> " + os.readlink(path))
+        elif path.is_file():
             manifest[path.relative_to(root).as_posix()] = path.read_text()
     return manifest
 
@@ -158,7 +176,8 @@ def tree_modes(root):
     """path -> mode string, read from the render (never from the fixture)."""
     return {
         path.relative_to(root).as_posix(): oct(path.stat().st_mode & 0o7777)
-        for path in sorted(Path(root).rglob("*")) if path.is_file()
+        for path in sorted(Path(root).rglob("*"))
+        if path.is_file() and not path.is_symlink()
     }
 
 
@@ -416,6 +435,42 @@ class RenderTest(unittest.TestCase):
                              (out / "etc/nix/nix.custom.conf").read_text())
             self.assertTrue(any("nix.custom.conf" in n for n in rend.notes),
                             "skipped the file without saying so")
+
+    def test_the_terminal_has_a_jail_in_front_of_it(self):
+        """Issue #394: the browser terminal is one password on the open
+        internet. The module has always jailed repeated 401s; the native
+        backend shipped the fail2ban BINARY in its runtime profile and
+        never configured or started it, which is the worst of the three
+        states — the tool is there, so nothing looks missing.
+
+        The jail's policy is asserted here; that it PARSES and that its
+        regex matches a real Caddy 401 line is the `fail2ban-jail` flake
+        check, which needs the real package.
+        """
+        jail = (FIXTURE / "etc/agent-box/fail2ban/jail.conf").read_text()
+        for setting in ("maxretry = 5", "findtime = 10m", "bantime = 1h",
+                        "backend = systemd", "[agent-web-auth]",
+                        "enabled = true"):
+            self.assertIn(setting, jail)
+        filt = (FIXTURE / "etc/agent-box/fail2ban/filter.d"
+                / "agent-web-auth.conf").read_text()
+        self.assertIn("_SYSTEMD_UNIT=caddy.service", filt)
+        # One jail, one regex, whichever backend rendered it: the module's
+        # failregex and this one must stay the same string.
+        module = (REPO / "modules/agent-box.nix.in").read_text()
+        regex = [x for x in filt.splitlines() if x.startswith("failregex")]
+        self.assertTrue(regex, "no failregex in the shipped filter")
+        body = regex[0].split("=", 1)[1].strip()
+        self.assertIn(body, module,
+                      "the native failregex has drifted from the module's")
+        # action.d is a link into the profile rather than 40 copied files.
+        link = FIXTURE / "etc/agent-box/fail2ban/action.d"
+        self.assertTrue(link.is_symlink(), "action.d is not a symlink")
+        self.assertEqual("@PROFILE@/etc/fail2ban/action.d",
+                         os.readlink(link))
+        unit = (FIXTURE / "etc/systemd/system"
+                / "agent-box-fail2ban.service").read_text()
+        self.assertIn("-c /etc/agent-box/fail2ban", unit)
 
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
@@ -806,7 +861,7 @@ def update_fixture():
         modes = tree_modes(out)
         if FIXTURE.exists():
             shutil.rmtree(FIXTURE)
-        shutil.copytree(out, FIXTURE)
+        shutil.copytree(out, FIXTURE, symlinks=True)
     MODES.write_text(json.dumps(modes, indent=2, sort_keys=True) + "\n")
     print(f"wrote {FIXTURE} and {MODES.name} — review the diff and commit")
 

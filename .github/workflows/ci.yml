@@ -96,6 +96,12 @@ jobs:
       - name: Check assembler escaping
         run: nix build -L .#checks.x86_64-linux.assemble-module-escaping && cat result
 
+      # Issue 394: the native jail in front of the browser terminal, proven
+      # against a real Caddy 401 line rather than just parsed — `-t` alone
+      # accepts a jail with no filter and no action.
+      - name: Check the fail2ban jail is armed
+        run: nix build -L .#checks.x86_64-linux.fail2ban-jail && cat result
+
       # Issue 394: the two renderers configure the same shared payloads, and
       # #392 shipped every native box without the settings page's Connections
       # section because only one of them set AGENT_BOX_CONNECT_BINS. Neither

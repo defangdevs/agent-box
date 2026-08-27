@@ -123,9 +123,15 @@ UNITS_BY_DESIGN = {
         "a native box does not have, so its renderer owns it instead. If the "
         "module ever grows nix.gc of its own, this line goes away",
 }
-UNITS_KNOWN_GAPS = {
-    "fail2ban.service": "#394: the module jails Caddy's 401s; a native box "
-                        "has no brute-force backstop on the terminal",
+UNITS_KNOWN_GAPS = {}
+
+# Same job, different unit name. The native jail is agent-box-fail2ban so a
+# distro fail2ban installed later keeps its own service and its own config;
+# that is a deliberate naming choice, not a second implementation, so the
+# comparison folds one onto the other instead of reporting both sides as
+# one-sided divergences.
+UNIT_ALIASES = {
+    "fail2ban.service": "agent-box-fail2ban.service",
 }
 
 
@@ -256,7 +262,8 @@ def main():
                     BY_DESIGN, KNOWN_GAPS)
 
     print("\nrendered units:")
-    mod_units = unit_families(MODULE_UNITS.iterdir())
+    mod_units = {UNIT_ALIASES.get(u, u)
+                 for u in unit_families(MODULE_UNITS.iterdir())}
     nat_units = unit_families(NATIVE_UNITS.iterdir())
     v2, s2 = report("unit", mod_units - nat_units, nat_units - mod_units,
                     UNITS_BY_DESIGN, UNITS_KNOWN_GAPS)

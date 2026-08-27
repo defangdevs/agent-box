@@ -821,6 +821,53 @@
               cp parity.log "$out"
             '';
 
+          # Issue #394: the browser terminal is one password on the open
+          # internet, and the jail in front of it is only as good as a
+          # config nobody has ever run. `fail2ban-server -t` alone is not
+          # that proof — it accepts a jail with no filter and no action,
+          # warns, and exits 0 — so this asserts the warnings are absent
+          # AND runs the shipped failregex against a real Caddy 401 line.
+          # A jail that parses but matches nothing is the failure worth
+          # testing for: nobody notices a lock that never clicks.
+          fail2ban-jail =
+            pkgs.runCommand "agent-box-fail2ban-jail-ok"
+              {
+                nativeBuildInputs = [ pkgs.fail2ban ];
+                conf = ./tests/native/expected/etc/agent-box/fail2ban;
+              } ''
+              cp -rT --no-preserve=mode,ownership "$conf" jail
+              # The rendered tree symlinks action.d into the runtime
+              # profile; here the same directory comes from the package the
+              # profile installs.
+              rm -f jail/action.d
+              ln -s ${pkgs.fail2ban}/etc/fail2ban/action.d jail/action.d
+
+              fail2ban-server -t -c jail > test.log 2>&1 || {
+                cat test.log; exit 1; }
+              cat test.log
+              if grep -E "No filter set|No actions were defined" test.log \
+                   > /dev/null; then
+                echo "the jail parsed but is inert — see the warnings above" >&2
+                exit 1
+              fi
+
+              # A Caddy JSON access-log line for a request that carried an
+              # Authorization header and was refused: what a brute-force
+              # attempt against /agent/ actually leaves in the journal.
+              cat > sample.log <<'LINE'
+              {"level":"error","ts":1756315000.1,"logger":"http.log.access","msg":"handled request","request":{"remote_ip":"203.0.113.77","client_ip":"203.0.113.77","proto":"HTTP/2.0","method":"GET","host":"box.example.com","uri":"/agent/","headers":{"Authorization":["REDACTED"],"User-Agent":["curl/8.5.0"]}},"status":401,"size":0}
+              LINE
+              sed -i 's/^ *//' sample.log
+              fail2ban-regex sample.log jail/filter.d/agent-web-auth.conf \
+                > regex.log 2>&1 || { cat regex.log; exit 1; }
+              cat regex.log
+              grep -E "1 matched" regex.log > /dev/null || {
+                echo "the shipped failregex does not match a real Caddy 401 line" >&2
+                exit 1
+              }
+              printf 'fail2ban jail parses, is armed, and matches\n' > "$out"
+            '';
+
           module-generated-up-to-date =
             pkgs.runCommand "agent-box-module-generated-up-to-date"
               {
