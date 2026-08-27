@@ -711,7 +711,8 @@
                 diff -u "$c" "$profile/share/agent-box/caddy/$(basename "$c")" >/dev/null \
                   || { echo "DRIFT: caddy/$(basename "$c")"; fail=1; }
               done
-              for a in default-agents.md default-agents-webhook.md; do
+              for a in default-agents.md default-agents-webhook.md \
+                       default-agents-host-native.md; do
                 diff -u "$srcDir/$a" "$profile/share/agent-box/guides/$a" >/dev/null \
                   || { echo "DRIFT: guides/$a"; fail=1; }
               done

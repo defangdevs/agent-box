@@ -32,7 +32,7 @@ let
   # tokens sit flush against the next heading, so the disabled case leaves
   # no stray blank line and the enabled case supplies its own trailing one.
   defaultAgentsMd = lib.replaceStrings
-    [ "@WEBHOOK_SECTION@" "@UPDATE_SECTION@" ]
+    [ "@WEBHOOK_SECTION@" "@UPDATE_SECTION@" "@HOST_SECTION@" ]
     [ (lib.optionalString webhookEnabled ''
       @@include:src/default-agents-webhook.md@@
 
@@ -45,7 +45,16 @@ let
       (kills the running tmux session — save context first). As above, the full
       path is required for the passwordless sudo rule to match.
 
-    '') ]
+    '')
+      # Which HOST this guide is describing. The two backends install the
+      # same guide and are not the same box underneath it: this one is
+      # NixOS, the native renderer binds its own section for a distro host
+      # with agent-box in a Nix profile. Shipping the NixOS text on both
+      # was how a native box came to tell its agent it ran NixOS.
+      ''
+      @@include:src/default-agents-host-nixos.md@@
+
+    '' ]
     ''
     @@include:src/default-agents.md@@
   '';

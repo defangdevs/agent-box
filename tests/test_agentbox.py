@@ -20,6 +20,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -101,7 +102,8 @@ def build_fake_profile(root):
     for c in SRC.glob("caddyfile-*.caddy"):
         shutil.copy(c, share / "caddy" / c.name)
     (share / "guides").mkdir()
-    for g in ("default-agents.md", "default-agents-webhook.md"):
+    for g in ("default-agents.md", "default-agents-webhook.md",
+              "default-agents-host-native.md"):
         shutil.copy(SRC / g, share / "guides" / g)
     (prof / "libexec" / "agent-box").mkdir(parents=True)
     shutil.copy(SRC / "password-helper.py",
@@ -346,6 +348,26 @@ class RenderTest(unittest.TestCase):
             spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
             rend = mod.Renderer(spec_obj, prof, root=Path(tmp) / "o")
             return list(rend.render().units)
+
+    def test_the_shipped_guide_describes_THIS_host(self):
+        """The guide is shared; the host it describes is not.
+
+        Both backends install the same default-agents.md and bind
+        @HOST_SECTION@ to their own half — NixOS on the module side, a
+        distro box with agent-box in a Nix profile here. Shipping the NixOS
+        text on a native box is not a cosmetic slip: an agent that believes
+        it runs NixOS reaches for nixos-rebuild, reads /etc/nixos, and
+        mistakes what it is able to change.
+        """
+        guide = (FIXTURE / "etc/agent-box-guides/AGENTS.agent.md").read_text()
+        self.assertIn("Your host: a distro box", guide)
+        self.assertNotIn("NixOS host", guide)
+        self.assertNotIn("nixos-rebuild", guide)
+        # An unbound token ships as literal "@NAME@" in the text an agent
+        # reads — which is exactly how @WEBHOOK_SECTION@ shipped before the
+        # native side ever bound it.
+        leaked = re.findall(r"@[A-Z][A-Z_]*@", guide)
+        self.assertEqual([], leaked, f"unbound guide token(s): {leaked}")
 
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
