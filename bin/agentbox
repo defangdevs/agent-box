@@ -717,6 +717,17 @@ class Renderer:
                        f'Environment="AGENT_BOX_REV={self.spec.rev}"',
                        f'Environment="AGENT_BOX_SYSTEMCTL={SYSTEMCTL}"',
                        f'Environment="AGENT_BOX_TMUX_BIN={self.bin}/tmux"',
+                       # The settings page's Connections cards (issue
+                       # #392). The daemon hides that whole section when
+                       # this is empty, which is why a native box had none
+                       # while a module box did. Same "<id>=<binary>"
+                       # convention as AGENT_BOX_AGENT_BINS. No defang
+                       # card: the module offers one, but the runtime
+                       # profile ships no defang CLI, and a card whose
+                       # binary is absent is worse than no card.
+                       'Environment="AGENT_BOX_CONNECT_BINS=' + " ".join(
+                           [f"{a}={self.bin}/{a}" for a in self.spec.agents]
+                           + [f"github={self.bin}/gh"]) + '"',
                        # The settings page's Update card: _CMD triggers the
                        # run (sudo, matching the sudoers grant exactly),
                        # _UNIT is only read back for status. /usr/bin/sudo,
