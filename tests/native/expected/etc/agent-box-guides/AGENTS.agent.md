@@ -1,7 +1,10 @@
 # agent-box
 
 You run inside an agent-box deployment: a coding agent in a persistent tmux
-session on a locked-down NixOS host. Your workspace is at $AGENT_BOX_URL
+session on a locked-down host. (What KIND of host is "Your host" below —
+agent-box deploys as a NixOS system and as a Nix profile on an ordinary
+distro, and the two differ in ways worth knowing before you change
+anything outside $HOME.) Your workspace is at $AGENT_BOX_URL
 (`echo $AGENT_BOX_URL` prints it): one tab per session, and each session also
 has a terminal of its own at ${AGENT_BOX_URL}<session>/. Share those URLs
 with anyone who needs to view or take over your session; the sign-in username
@@ -46,6 +49,39 @@ plainly rather than handing it back.
   and notes for your future self go in ~/AGENTS.md, which is yours to edit.
 - sudo is a tight allowlist of a few narrowly-scoped commands, not general
   root — don't plan around arbitrary sudo.
+
+## Your host: a distro box with agent-box in a Nix profile
+
+- This box is NOT NixOS. The base OS is whatever distro image the
+  deployment started from (Ubuntu, on the ones agent-box ships) and the
+  distro's own package manager still owns it, so its security updates keep
+  arriving the usual way. agent-box never touches apt: everything it
+  installs lives in a Nix profile at /nix/var/nix/profiles/agent-box, and
+  `agentbox apply` renders the users, units, sudoers and Caddyfile from
+  the box's declared configuration (by default /etc/agent-box/config.yaml;
+  `systemctl cat agent-box-update.service` names the file this box was
+  actually applied from).
+- Two layers, and it pays to know which one you are looking at.
+  `apt list --installed` is the distro's; `nix profile list --profile
+  /nix/var/nix/profiles/agent-box` is agent-box's. Tools YOU want go in
+  your own profile with `nix profile add` (below) — you cannot apt-install
+  anything anyway, since that needs a root you do not have.
+- `agentbox` is on your PATH. `agentbox --help` lists what it does, and
+  `agentbox apply --dry-run` prints what the box's declared configuration
+  would change without changing it — the fastest way to see how this host
+  is actually put together.
+- SSH works the way the distro image left it, including a provider's
+  browser-console SSH if it has one, and first-boot output is in
+  /var/log/agent-box-bootstrap.log.
+- **Do not identify this machine from the cloud metadata service.** Where
+  a provider builds its managed product on top of a lower-level one, IMDS
+  describes the machine UNDERNEATH that abstraction: an instance type, a
+  lifecycle, a disk size belonging to the layer you are not billed for.
+  Reasoning "IMDS says instance-type X, therefore I am on the raw
+  service" gets the product, the pricing and the operational model wrong.
+  The notes below this guide say what this deployment is; treat them and
+  the stack that created the box as the authority, and IMDS as a detail
+  about the hardware underneath.
 
 ## Tools, secrets, and sibling sessions
 

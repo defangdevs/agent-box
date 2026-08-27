@@ -792,8 +792,16 @@ class Renderer:
             f"{UPDATE_UNIT}`;\n"
             "the box's own rev is on the settings page.\n\n"
         )
+        # Which HOST this guide is describing. The module binds the NixOS
+        # section here; this box is a distro host with agent-box in a Nix
+        # profile, and saying otherwise is not a cosmetic slip — an agent
+        # that believes it is on NixOS reaches for nixos-rebuild, reads
+        # /etc/nixos, and mistakes what it can change.
+        host_md = self.share / "guides" / "default-agents-host-native.md"
+        host_section = host_md.read_text().rstrip("\n") + "\n\n"
         return (text.replace("@WEBHOOK_SECTION@", webhook_section)
-                    .replace("@UPDATE_SECTION@", update_section))
+                    .replace("@UPDATE_SECTION@", update_section)
+                    .replace("@HOST_SECTION@", host_section))
 
     def user_seed(self, t, u):
         """The declared sessions, seeded on first boot only.

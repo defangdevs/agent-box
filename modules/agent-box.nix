@@ -36,7 +36,7 @@ let
   # tokens sit flush against the next heading, so the disabled case leaves
   # no stray blank line and the enabled case supplies its own trailing one.
   defaultAgentsMd = lib.replaceStrings
-    [ "@WEBHOOK_SECTION@" "@UPDATE_SECTION@" ]
+    [ "@WEBHOOK_SECTION@" "@UPDATE_SECTION@" "@HOST_SECTION@" ]
     [ (lib.optionalString webhookEnabled ''
       ## Getting told, instead of polling (webhooks)
 
@@ -150,12 +150,37 @@ let
       (kills the running tmux session — save context first). As above, the full
       path is required for the passwordless sudo rule to match.
 
-    '') ]
+    '')
+      # Which HOST this guide is describing. The two backends install the
+      # same guide and are not the same box underneath it: this one is
+      # NixOS, the native renderer binds its own section for a distro host
+      # with agent-box in a Nix profile. Shipping the NixOS text on both
+      # was how a native box came to tell its agent it ran NixOS.
+      ''
+      ## Your host: NixOS
+
+      - This box runs NixOS, so the system is BUILT from a configuration rather
+        than installed into. `/etc/nixos/configuration.nix` is the source of
+        truth and `nixos-rebuild switch` is what makes a change to it real.
+        There is no system package manager to install into: use `nix profile
+        add` (below) for tools you need, which lands them in your own profile
+        and survives everything.
+      - Everything outside your home is the read-only Nix store plus generated
+        /etc. A file you need to change that is not under $HOME almost always
+        means editing the box's configuration and rebuilding — which is what
+        the update path below does.
+      - Every rebuild is a generation and the previous one is still on disk, so
+        a bad change is a rollback, not a reinstall.
+
+    '' ]
     ''
     # agent-box
 
     You run inside an agent-box deployment: a coding agent in a persistent tmux
-    session on a locked-down NixOS host. Your workspace is at $AGENT_BOX_URL
+    session on a locked-down host. (What KIND of host is "Your host" below —
+    agent-box deploys as a NixOS system and as a Nix profile on an ordinary
+    distro, and the two differ in ways worth knowing before you change
+    anything outside $HOME.) Your workspace is at $AGENT_BOX_URL
     (`echo $AGENT_BOX_URL` prints it): one tab per session, and each session also
     has a terminal of its own at ''${AGENT_BOX_URL}<session>/. Share those URLs
     with anyone who needs to view or take over your session; the sign-in username
@@ -201,7 +226,7 @@ let
     - sudo is a tight allowlist of a few narrowly-scoped commands, not general
       root — don't plan around arbitrary sudo.
 
-    ## Tools, secrets, and sibling sessions
+    @HOST_SECTION@## Tools, secrets, and sibling sessions
 
     - Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
       (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).

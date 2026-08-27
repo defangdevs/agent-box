@@ -1,7 +1,10 @@
 # agent-box
 
 You run inside an agent-box deployment: a coding agent in a persistent tmux
-session on a locked-down NixOS host. Your workspace is at $AGENT_BOX_URL
+session on a locked-down host. (What KIND of host is "Your host" below —
+agent-box deploys as a NixOS system and as a Nix profile on an ordinary
+distro, and the two differ in ways worth knowing before you change
+anything outside $HOME.) Your workspace is at $AGENT_BOX_URL
 (`echo $AGENT_BOX_URL` prints it): one tab per session, and each session also
 has a terminal of its own at ${AGENT_BOX_URL}<session>/. Share those URLs
 with anyone who needs to view or take over your session; the sign-in username
@@ -47,7 +50,7 @@ plainly rather than handing it back.
 - sudo is a tight allowlist of a few narrowly-scoped commands, not general
   root — don't plan around arbitrary sudo.
 
-## Tools, secrets, and sibling sessions
+@HOST_SECTION@## Tools, secrets, and sibling sessions
 
 - Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
   (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).

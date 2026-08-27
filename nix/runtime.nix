@@ -249,6 +249,7 @@ let
     for u in ${src}/units/*; do install -m444 "$u" $out/share/agent-box/units/; done
     for c in ${src}/caddyfile-*.caddy; do install -m444 "$c" $out/share/agent-box/caddy/; done
     install -m444 ${src}/default-agents.md ${src}/default-agents-webhook.md \
+      ${src}/default-agents-host-native.md \
       $out/share/agent-box/guides/
     install -m444 ${src}/settings.css ${src}/settings.js $out/share/agent-box/web/
     # The password helper is generated per user by `agentbox apply` (it

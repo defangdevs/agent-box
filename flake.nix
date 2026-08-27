@@ -711,7 +711,8 @@
                 diff -u "$c" "$profile/share/agent-box/caddy/$(basename "$c")" >/dev/null \
                   || { echo "DRIFT: caddy/$(basename "$c")"; fail=1; }
               done
-              for a in default-agents.md default-agents-webhook.md; do
+              for a in default-agents.md default-agents-webhook.md \
+                       default-agents-host-native.md; do
                 diff -u "$srcDir/$a" "$profile/share/agent-box/guides/$a" >/dev/null \
                   || { echo "DRIFT: guides/$a"; fail=1; }
               done
@@ -785,6 +786,39 @@
               caddy validate --envfile caddy.env --adapter caddyfile \
                 --config tests/native/expected/etc/agent-box/Caddyfile
               printf 'agentbox render matches tests/native/expected\n' > "$out"
+            '';
+
+          # Issue #394: the two renderers configure the SAME payloads, and
+          # nothing made them agree about how. #392 is what that cost — the
+          # settings daemon's whole Connections section, missing from every
+          # native box because only the module set AGENT_BOX_CONNECT_BINS,
+          # with the payload byte-identical on both. This reads the contract
+          # out of the committed fixtures (no VM, no build) and fails on any
+          # divergence not declared with a reason in the script's tables.
+          backend-parity =
+            pkgs.runCommand "agent-box-backend-parity-ok"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                repo = builtins.path {
+                  path = ./.;
+                  name = "agent-box-src";
+                  filter = path: type:
+                    let base = builtins.baseNameOf path; in
+                    base != "result" && base != ".git";
+                };
+              } ''
+              cp -rT --no-preserve=mode,ownership "$repo" repo
+              cd repo
+              # To a file for the same reason agentbox-render does it: the
+              # declared-divergence table prints above the failure, and a
+              # pipe would cost the exit status.
+              if ! python3 scripts/check_backend_parity.py > parity.log 2>&1
+              then
+                cat parity.log
+                exit 1
+              fi
+              cat parity.log
+              cp parity.log "$out"
             '';
 
           module-generated-up-to-date =
