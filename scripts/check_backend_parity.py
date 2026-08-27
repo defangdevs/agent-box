@@ -49,12 +49,25 @@ REPO = Path(__file__).resolve().parent.parent
 SHARED = REPO / "modules" / "src"
 GOLDEN = REPO / "tests" / "golden"          # what the module renders
 NATIVE = REPO / "tests" / "native" / "expected"  # what bin/agentbox renders
+MODULE_UNITS = GOLDEN / "web" / "units"
+NATIVE_UNITS = NATIVE / "etc" / "systemd" / "system"
+# The %i template units under here (agent-box-settings@.service and
+# friends) are backend-neutral: both renderers install this exact file,
+# byte-for-byte (see modules/agent-box.nix.in's agentBoxUnitsPackage). The
+# module ships it via systemd.packages, which golden-snapshot.py never
+# captures — it only records config.systemd.units, i.e. the Nix-eval
+# drop-in each instance overlays on top. So GOLDEN alone under-reports what
+# the module supplies for these; treat this directory as read by both.
+SHARED_UNITS = SHARED / "units"
 
 VAR = re.compile(r"AGENT_BOX_[A-Z0-9_]+")
 # A backend SUPPLIES a variable when a rendered artifact assigns it: a unit's
 # Environment=, a generated env file's KEY=value, or a generated wrapper's
-# export. All three end up as "<NAME>=" at a word boundary.
-SUPPLIED = re.compile(r"(?:^|[\s\"'])(AGENT_BOX_[A-Z0-9_]+)=", re.MULTILINE)
+# export. All three end up as "<NAME>=" at a word boundary — except systemd's
+# own unquoted `Environment=AGENT_BOX_FOO=bar`, where the boundary is the
+# literal "Environment=" prefix rather than whitespace or a quote.
+SUPPLIED = re.compile(
+    r"(?:^|[\s\"']|(?<=Environment=))(AGENT_BOX_[A-Z0-9_]+)=", re.MULTILINE)
 # Names one payload hands another at runtime. Nothing on the host supplies
 # these, so they are not part of either renderer's contract. Listed rather
 # than detected, because "a payload assigns it" is also true of a name a
@@ -193,7 +206,7 @@ def report(kind, only_module, only_native, by_design, known):
 
 
 def main():
-    for root in (SHARED, GOLDEN, NATIVE):
+    for root in (SHARED, GOLDEN, NATIVE, MODULE_UNITS, NATIVE_UNITS, SHARED_UNITS):
         if not root.exists():
             print(f"FAIL: {root} is missing — this check would pass "
                   f"vacuously.", file=sys.stderr)
@@ -205,8 +218,9 @@ def main():
         print("FAIL: INTERNAL names no payload mentions any more: "
               + ", ".join(stale_internal), file=sys.stderr)
         return 1
-    module = names(GOLDEN, SUPPLIED)
-    native = names(NATIVE, SUPPLIED)
+    shared_units = names(SHARED_UNITS, SUPPLIED)
+    module = names(GOLDEN, SUPPLIED) | shared_units
+    native = names(NATIVE, SUPPLIED) | shared_units
     contract = all_read - set(INTERNAL)
 
     print(f"payload variables in the contract: {len(contract)} "
@@ -217,9 +231,8 @@ def main():
                     BY_DESIGN, KNOWN_GAPS)
 
     print("\nrendered units:")
-    mod_units = unit_families((GOLDEN / "web" / "units").iterdir())
-    nat_units = unit_families(
-        (NATIVE / "etc" / "systemd" / "system").iterdir())
+    mod_units = unit_families(MODULE_UNITS.iterdir())
+    nat_units = unit_families(NATIVE_UNITS.iterdir())
     v2, s2 = report("unit", mod_units - nat_units, nat_units - mod_units,
                     UNITS_BY_DESIGN, UNITS_KNOWN_GAPS)
 
