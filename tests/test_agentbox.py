@@ -372,13 +372,17 @@ class RenderTest(unittest.TestCase):
         self.assertTrue(line, "no AGENT_BOX_CONNECT_BINS in the settings "
                               "drop-in: the Connections section would be "
                               "hidden on every native box")
-        ids = {pair.split("=", 1)[0]
-               for pair in line.split("AGENT_BOX_CONNECT_BINS=", 1)[1]
-                               .rstrip('"').split()}
-        agents = set(json.loads(CONFIG_JSON.read_text())["agents"])
-        self.assertTrue(agents <= ids,
-                        f"no sign-in card for {sorted(agents - ids)}")
-        self.assertIn("github", ids, "no sign-in card for gh")
+        cards = dict(
+            pair.split("=", 1)
+            for pair in line.split("AGENT_BOX_CONNECT_BINS=", 1)[1]
+                            .rstrip('"').split())
+        agents = json.loads(CONFIG_JSON.read_text())["agents"]
+        # The path matters as much as the id: the daemon execs these
+        # verbatim, so an id mapped to a relative or empty path is a card
+        # that fails the moment it is clicked.
+        want = {a: f"@PROFILE@/bin/{a}" for a in agents}
+        want["github"] = "@PROFILE@/bin/gh"
+        self.assertEqual(want, cards)
 
 
 class SelfUpdateRenderTest(unittest.TestCase):
