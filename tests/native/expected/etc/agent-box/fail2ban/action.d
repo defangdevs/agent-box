@@ -1,0 +1,1 @@
+@PROFILE@/etc/fail2ban/action.d

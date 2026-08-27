@@ -238,7 +238,11 @@ let
   ];
 
   # The service side: what the units and the web front door need.
-  serviceTools = with pkgs; [ tmux ttyd caddy bubblewrap which fail2ban earlyoom ];
+  # nftables because the fail2ban jail bans with nftables-multiport:
+  # a ban action whose binary comes from the distro is a lock that
+  # depends on the image having shipped one.
+  serviceTools = with pkgs; [ tmux ttyd caddy bubblewrap which fail2ban
+                              nftables earlyoom ];
 
   # Verbatim shared assets. Both backends install these byte-for-byte; the
   # native `agentbox apply` copies them out of the profile.
