@@ -8,7 +8,7 @@ PartOf=caddy.service
 Type=simple
 Environment=PATH=@PROFILE@/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=@PROFILE@/bin/fail2ban-server -xf -c /etc/agent-box/fail2ban
-ExecStop=@PROFILE@/bin/fail2ban-client stop
+ExecStop=@PROFILE@/bin/fail2ban-client -c /etc/agent-box/fail2ban stop
 RuntimeDirectory=agent-box-fail2ban
 StateDirectory=agent-box-fail2ban
 Restart=on-failure

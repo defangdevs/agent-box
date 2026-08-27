@@ -464,7 +464,7 @@ class Renderer:
                 "Type=simple",
                 f"Environment=PATH={path}",
                 f"ExecStart={self.bin}/fail2ban-server -xf -c {FAIL2BAN_DIR}",
-                f"ExecStop={self.bin}/fail2ban-client stop",
+                f"ExecStop={self.bin}/fail2ban-client -c {FAIL2BAN_DIR} stop",
                 "RuntimeDirectory=agent-box-fail2ban",
                 "StateDirectory=agent-box-fail2ban",
                 "Restart=on-failure",
