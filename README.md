@@ -1,7 +1,8 @@
 # agent-box
 
 Reproducible, multi-user coding-agent sandboxes - one click on AWS, on bare
-metal, or as a VM image, from one declarative config. (Built on NixOS.)
+metal, or as a VM image, from one declarative config. (Built on Nix - as a
+full NixOS system, or as a pinned Nix profile on an ordinary Linux distro.)
 
 Each agent is an **unprivileged user** running a supported agent CLI inside a
 persistent `tmux` session. The only elevated power an agent gets is a tight,
@@ -150,10 +151,12 @@ disposable, snapshot-able KVM guests.
   you're away, state survives reconnects and reboots, and several people (or
   several agents per person) share one host under separate unprivileged
   accounts with systemd-hardened services — see the security model below.
-- **One config, three targets.** The same declarative NixOS module produces
-  the cloud box, the bare-metal multi-user host, and the qcow2 VM image,
-  and a deployed box can fast-forward itself to this repo's latest release
-  on request — no image rebuild pipeline.
+- **One config, either OS.** The same declarative config produces the
+  bare-metal multi-user host, the qcow2 VM image, and the EC2 AMI as a full
+  NixOS system, and renders as an equivalent pinned Nix profile for the
+  Lightsail box, which stays on its stock Ubuntu blueprint. A deployed box
+  can fast-forward itself to this repo's latest release on request — no
+  image rebuild pipeline, on either OS.
 
 ## Quick start (bare metal, multiple users)
 
