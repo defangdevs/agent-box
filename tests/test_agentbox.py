@@ -720,6 +720,46 @@ class RenderTest(unittest.TestCase):
                 self.assertEqual(want, bool(toml))
                 self.assertEqual(want, "AGENT_BOX_CODEX_FULL_ACCESS" in env)
 
+    def test_the_webhook_dispatcher_is_fully_wired(self):
+        """Issue #394, gap 6. Per-session delivery worked natively; the
+        pieces around it did not, each failing quietly in its own way:
+
+          HOOK_SPAWN_CMD          the standing-watch panel could not print
+                                  the prompt the next match would launch.
+          WEBHOOK_PYTHON          the panel fell back to the daemon's own
+                                  interpreter, which need not carry
+                                  local-webhook's dependencies.
+          WEBHOOK_PINNED_SCRIPT   claude sessions tracked the marketplace's
+                                  default branch instead of the plugin
+                                  version the box pins.
+          HOOK_SESSION_ARGS       no box-wide default for the hook-*
+                                  sessions a watch spawns (issue #216's
+                                  cheaper triage model).
+        """
+        settings = (FIXTURE / "etc/systemd/system"
+                    / "agent-box-settings@agent.service.d"
+                    / "10-host.conf").read_text()
+        self.assertIn("AGENT_BOX_HOOK_SPAWN_CMD=", settings)
+        self.assertIn("AGENT_BOX_WEBHOOK_PYTHON=", settings)
+        env = (FIXTURE / "etc/agent-box/units/agent.env").read_text()
+        self.assertIn("AGENT_BOX_WEBHOOK_PINNED_SCRIPT=", env)
+        wrapper = (FIXTURE / "usr/local/bin/agent-box-webhook").read_text()
+        self.assertIn("AGENT_BOX_HOOK_SESSION_ARGS=", wrapper)
+        # JSON, not a shell list: webhook-spawn.sh parses it with jq
+        # precisely so an argument may contain spaces.
+        args = wrapper.split("AGENT_BOX_HOOK_SESSION_ARGS=", 1)[1]
+        json.loads(args.split("\n")[0].strip().strip("'"))
+
+    def test_the_root_daemon_knows_every_terminal_user(self):
+        """AGENT_BOX_WEB_USERS is what GET / offers. Only the root daemon
+        serves that page, so only it gets the list."""
+        root = (FIXTURE / "etc/agent-box/units"
+                / "agent-box-settings-agent.env").read_text()
+        self.assertIn("AGENT_BOX_WEB_USERS=agent,robot", root)
+        other = (FIXTURE / "etc/agent-box/units"
+                 / "agent-box-settings-robot.env").read_text()
+        self.assertNotIn("AGENT_BOX_WEB_USERS", other)
+
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
         for unit in (SRC / "units").iterdir():

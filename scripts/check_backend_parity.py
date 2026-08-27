@@ -96,14 +96,7 @@ BY_DESIGN = {
 # shrink: fixing a gap means deleting its line, and the staleness check below
 # makes that mandatory rather than optional.
 KNOWN_GAPS = {
-                "AGENT_BOX_HOOK_SPAWN_CMD": "#394: standing watches cannot spawn a "
-                                "session natively",
-    "AGENT_BOX_HOOK_SESSION_ARGS": "#394: see AGENT_BOX_HOOK_SPAWN_CMD",
-    "AGENT_BOX_WEBHOOK_PYTHON": "#394: see AGENT_BOX_HOOK_SPAWN_CMD",
-    "AGENT_BOX_WEBHOOK_PINNED_SCRIPT": "#394: see AGENT_BOX_HOOK_SPAWN_CMD",
-    "AGENT_BOX_WEB_USERS": "#394: the settings daemon's multi-user branches "
-                           "never engage natively",
-}
+                                }
 
 # Units, by family (instance and template spellings normalized away).
 UNITS_BY_DESIGN = {
