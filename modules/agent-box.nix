@@ -5486,6 +5486,16 @@ $PROMPT"
     # same sign-in the README already documents as `claude auth login`.
     # Theme is seeded too, but only when unset (`//=`), so /theme sticks.
     #
+    # A separate one-time upsell ("Try the new fullscreen renderer?") sits
+    # outside that onboarding wizard and survives hasCompletedOnboarding, so
+    # it still interrupts a headless session (issue #395). Verified against
+    # claude 2.1.238's bundled source: the upsell's eligibility check has an
+    # unconditional `if (settings.tui !== undefined) return false` before it
+    # ever looks at how many times it has already been shown, so any
+    # explicit tui setting — not just "fullscreen" — retires it for good.
+    # Seeded as "default" (the classic renderer this box is built around),
+    # only when unset (`//=`) so a later `/tui fullscreen` sticks.
+    #
     # Runs before every claude session start (idempotent), which also
     # covers upstream's occasional failure to persist an interactive
     # acceptance (anthropics/claude-code issue 36403). Codex has no such
@@ -5495,7 +5505,7 @@ $PROMPT"
       seed_json "$HOME"/.claude.json --arg wd "$1" \
         '.projects[$wd] = ((.projects[$wd] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})
          | .hasCompletedOnboarding = true'
-      seed_json "$HOME"/.claude/settings.json '.theme //= "dark"'
+      seed_json "$HOME"/.claude/settings.json '.theme //= "dark" | .tui //= "default"'
       if [ "$2" = true ]; then
         seed_json "$HOME"/.claude/settings.json \
           '.skipDangerousModePermissionPrompt = true'

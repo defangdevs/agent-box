@@ -263,6 +263,13 @@ in
         machine.succeed(
             "jq -e '.theme == \"dark\"' /home/agent/.claude/settings.json"
         )
+        # The "Try the new fullscreen renderer?" upsell sits outside that
+        # wizard and survives hasCompletedOnboarding (issue #395): any
+        # explicit tui setting retires it, seeded here as "default" to
+        # match the classic renderer this box is built around.
+        machine.succeed(
+            "jq -e '.tui == \"default\"' /home/agent/.claude/settings.json"
+        )
 
         # The theme seed never clobbers a hand-picked one: /theme writes the
         # same key, and the seeder re-runs on every session start.
