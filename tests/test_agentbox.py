@@ -750,6 +750,38 @@ class RenderTest(unittest.TestCase):
         args = wrapper.split("AGENT_BOX_HOOK_SESSION_ARGS=", 1)[1]
         json.loads(args.split("\n")[0].strip().strip("'"))
 
+    def test_a_hook_arg_with_an_apostrophe_survives_the_wrapper(self):
+        """The wrapper is generated shell. JSON does not escape an
+        apostrophe, so `don't` closed the quoted value and broke
+        agent-box-webhook for every caller — not just the one who set it.
+        Also covers webhook: null and hookSessionArgs: null, either of
+        which used to raise in Spec before anything was rendered."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["webhook"]["hookSessionArgs"] = [
+            "--append-system-prompt", "don't guess; ask"]
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "o").render()
+            wrapper = [text for path, (text, _) in tree.files.items()
+                       if path.endswith("bin/agent-box-webhook")][0]
+            line = [x for x in wrapper.splitlines()
+                    if "AGENT_BOX_HOOK_SESSION_ARGS" in x][0]
+            # What the shell would actually assign, per the shell.
+            out = subprocess.run(["sh", "-c", line + "\n"
+                                  "printf %s \"$AGENT_BOX_HOOK_SESSION_ARGS\""],
+                                 capture_output=True, text=True, check=True)
+            self.assertEqual(config["webhook"]["hookSessionArgs"],
+                             json.loads(out.stdout))
+        for empty in ({"webhook": None},
+                      {"webhook": {"enable": True, "script": "/x",
+                                   "hookSessionArgs": None}}):
+            cfg = dict(json.loads(CONFIG_JSON.read_text()), **empty)
+            with tempfile.TemporaryDirectory() as tmp:
+                prof = build_fake_profile(tmp)
+                self.assertEqual([], mod.Spec(cfg, prof).hook_session_args)
+
     def test_the_root_daemon_knows_every_terminal_user(self):
         """AGENT_BOX_WEB_USERS is what GET / offers. Only the root daemon
         serves that page, so only it gets the list."""
