@@ -436,6 +436,29 @@ class RenderTest(unittest.TestCase):
             self.assertTrue(any("nix.custom.conf" in n for n in rend.notes),
                             "skipped the file without saying so")
 
+    def test_a_foreign_action_d_without_nftables_multiport_is_left_alone(self):
+        """action.d is normally agentbox's own symlink into the profile. A
+        pre-existing real directory there instead is left alone the same
+        way — but if it lacks nftables-multiport.conf, banaction =
+        nftables-multiport can never fire, so the jail would run and log
+        bans it never enforces. Refuse to enable the unit rather than ship
+        that, and say why in a note.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            action_dir = out / "etc/agent-box/fail2ban/action.d"
+            action_dir.mkdir(parents=True)
+            (action_dir / "some-other-action.conf").write_text("")
+            mod = load_agentbox()
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            tree = rend.render()
+            self.assertNotIn(mod.FAIL2BAN_UNIT, tree.units)
+            self.assertTrue(
+                any("nftables-multiport" in n for n in rend.notes),
+                "skipped the jail without saying so")
+
     def test_the_terminal_has_a_jail_in_front_of_it(self):
         """Issue #394: the browser terminal is one password on the open
         internet. The module has always jailed repeated 401s; the native
