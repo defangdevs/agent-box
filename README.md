@@ -18,15 +18,15 @@ Supported agents:
 
 ## 1-click AWS launch
 
-Provisions one AWS Lightsail instance running NixOS with the module + a
-browser terminal (Caddy -> ttyd) already wired up, priced as **one flat
-monthly bundle** (compute + SSD + static IPv4 + a multi-TB transfer
-allowance). Lightsail has no NixOS blueprint, so the box boots the Ubuntu
-24.04 blueprint and converts itself to NixOS in-place on first boot with
-[nixos-infect](https://github.com/elitak/nixos-infect); expect the first
-launch to take ~10-20 minutes while the conversion and the first
-`nixos-rebuild switch` run and Caddy issues a Let's Encrypt cert against
-`<static-ip>.sslip.io`.
+Provisions one AWS Lightsail instance with the agent, the browser terminal
+(Caddy -> ttyd) and everything around them already wired up, priced as **one
+flat monthly bundle** (compute + SSD + static IPv4 + a multi-TB transfer
+allowance). Lightsail has no NixOS blueprint, so the box boots the stock
+Ubuntu 24.04 blueprint and stays Ubuntu: Nix is installed as a plain package
+manager and agent-box lands as a pinned Nix profile. Expect the first launch
+to take a few minutes — installing Nix, substituting the profile, and Caddy
+issuing a Let's Encrypt cert against `<static-ip>.sslip.io`. There is no
+closure to build and no reboot.
 
 | Region | Launch |
 | --- | --- |
@@ -39,7 +39,7 @@ Choose `Agent` (`claude` or `codex`), set a `WebPassword` (any 16&ndash;64
 characters, including password-manager symbols), pick a bundle size,
 launch. The stack reports
 CREATE_COMPLETE only after the box phones home from its first successful
-rebuild — a first boot that goes wrong rolls the
+apply — a first boot that goes wrong rolls the
 stack back visibly instead of leaving a green stack with a dead URL. The agent runs as the
 `UserName` linux user (default `agent`). Lightsail manages the networking, so
 nothing on the account has to be pre-configured. The
@@ -51,25 +51,28 @@ Claude apps doubles as the address you reach it at.
 
 **Cost.** The bundle price is the whole bill — no separate EBS, transfer, or
 public-IPv4 line items. The default `small_3_0` (2 vCPU / 2 GiB / 60 GiB SSD)
-is **$12/mo flat**; bundles range from `micro_3_0` (1 GiB, $7/mo) to
-`xlarge_3_0` (16 GiB, $84/mo). 2 GiB is tight while `nixos-rebuild` evaluates
-a self-update — the template adds a 3 GiB swap file to carry it, so updates
-are slow rather than fatal; pick `medium_3_0` (4 GiB, $24/mo) for comfortable
-rebuild headroom. The attached static IPv4 is included, and the URL survives
-a stop/start (a live tmux session doesn't; RAM is lost on any stop). Delete
-the stack to stop billing.
+is **$12/mo flat**; bundles range from that up to `xlarge_3_0` (16 GiB,
+$84/mo). **2 GiB is the smallest offered**, here and on the EC2 template:
+smaller bundles do boot, but an agent CLI plus a language server plus a build
+is what actually runs on this box, and they leave nothing for it. Pick
+`medium_3_0` (4 GiB, $24/mo) for parallel sessions or heavy builds. The
+attached static IPv4 is included, and the URL survives a stop/start (a live
+tmux session doesn't; RAM is lost on any stop). Delete the stack to stop
+billing.
 
 Out of disk? Lightsail bundles have a fixed SSD — snapshot the instance and
 restore onto a larger bundle to grow. The box also garbage-collects the nix
 store automatically.
 
 **Root shell for debugging.** The browser terminal is an unprivileged `agent`
-user. For a root path onto the box (e.g. to inspect a failed first-boot
-conversion — logs land in `/var/log/agent-box-infect.log`), the template
-leaves port 22 open by default (`DebugSsh`) for key-only root SSH with the
-Lightsail default key: download it from the Lightsail console (Account ->
-SSH keys), then `ssh -i <key> root@<static-ip>`. Password auth stays off;
-set `DebugSsh=false` at launch to keep 22 closed.
+user. For a root path onto the box (e.g. to read
+`/var/log/agent-box-bootstrap.log` after a first boot that timed out), the
+template leaves port 22 open by default (`DebugSsh`) for key-only SSH as
+`ubuntu` with the Lightsail default key: download it from the Lightsail
+console (Account -> SSH keys), then `ssh -i <key> ubuntu@<static-ip>` and
+`sudo -i`. The box is ordinary Ubuntu, so the console's own browser SSH
+works too. Password auth stays off; set `DebugSsh=false` at launch to keep
+22 closed.
 
 **Changing the web password.** Open the settings page (the gear icon next to
 the terminal), choose **Change password**, and enter the current password plus
@@ -83,12 +86,14 @@ next to your terminal; the card also shows the running agent-box rev, linked
 to its GitHub commit), or ask the agent in its terminal to run
 `sudo systemctl start agent-box-update.service` — a root oneshot (alongside
 the caddy reload, the only sudo the agent holds) that fast-forwards the box
-to this repo's latest master, advances the agent-CLI pin to the newest
-nixos-unstable channel release (so `claude` / `codex` stay current even
-though the box itself tracks a stable NixOS release), and runs
-`nixos-rebuild switch`. Have the agent save its working context first: the
-rebuild restarts changed agent services, which kills their running sessions.
-Anything that is not a fast-forward of the running revision is refused.
+to this repo's latest master and applies it: on Lightsail that is a swap of
+the pinned Nix profile followed by `agentbox apply` (the newly installed
+release renders its own configuration), on the EC2 NixOS template a
+`nixos-rebuild switch` that also advances the agent-CLI pin to the newest
+nixos-unstable channel release. Have the agent save its working context
+first: the update restarts changed agent services, which kills their running
+sessions. Anything that is not a fast-forward of the running revision is
+refused, and a failure rolls back to what was running.
 Verifying releases against an offline signing key is tracked in
 [issue 46](https://github.com/defangdevs/agent-box/issues/46).
 

@@ -6,8 +6,10 @@ Claude Code or Codex.
 
 - `lightsail-template.yaml` - the **default** template (the README's Launch
   buttons point here): agent-box on **AWS Lightsail** for one flat monthly
-  bundle price. See
-  ["Lightsail variant"](#lightsail-variant-lightsail-templateyaml) below.
+  bundle price, installed natively on the stock Ubuntu blueprint with Nix.
+  See ["Lightsail variant"](#lightsail-variant-lightsail-templateyaml)
+  below. There is exactly one Lightsail template; the `nixos-infect` one
+  that used to carry this filename is gone (issue #390).
 - `template.yaml` - the EC2 alternative (on-demand with a Spot opt-in, IPv4
   by default with an IPv6-only opt-out, SSM root access, resizable EBS).
   Most of this document describes it; the Lightsail section covers what
@@ -301,79 +303,15 @@ rejected by EC2's API but cfn-lint only checks the group description.
 The template avoids em-dashes anywhere that becomes a rule description
 to sidestep this.
 
-## Native Lightsail variant (`lightsail-native-template.yaml`)
-
-Issue #154 Phase 4: agent-box on Lightsail **without** `nixos-infect`. The
-instance boots the same `ubuntu_24_04` blueprint and stays Ubuntu — Nix is
-installed as a plain package manager (Determinate installer), the pinned
-runtime profile (`nix profile install <ref>#runtime`) brings the payloads,
-tools and agent CLIs, and `agentbox apply --first-boot` renders the users,
-units, sudoers, tmpfiles, Caddyfile and first-boot secrets.
-
-What that buys over the infect template:
-
-| | infect | native |
-|---|---|---|
-| First boot | closure build + relabel + reboot | install Nix, substitute a profile |
-| WaitCondition timeout | 2700 s | 1200 s |
-| Smallest usable bundle | `small_3_0` (2 GiB) | `nano_3_0` (1 GiB) |
-| Debug access after boot | root SSH only (lustrate wiped `ubuntu`) | ordinary Ubuntu, console browser-SSH works |
-| Base-OS patching | nixos-rebuild | apt / unattended-upgrades (`agentbox apply` never calls apt) |
-| Rollback | `nixos-rebuild --rollback` | `nix profile rollback --profile /nix/var/nix/profiles/agent-box` |
-
-**Updating a native box** (issue #358) is `sudo -n /usr/bin/systemctl start
---no-block agent-box-update.service` — the full path, because sudo matches the
-grant on the exact command line and a bare `systemctl` resolves through PATH
-(#353). It is the same grant the agent holds on the infect template — but a different mechanism behind it, because there is no closure
-to rebuild. The unit runs `agentbox update`, which reads the rev the profile
-records for itself, asks GitHub for the repo's current HEAD, refuses anything
-that is not strictly ahead of what is running (rewritten history, or a replay
-of an older rev), and then swaps the profile with a **remove-then-install**:
-`nix profile install` over an existing entry fails on a file conflict, leaves
-the old profile in place, and the `apply` that follows honestly reports "0
-change(s)" — a box that looks updated and is not. The new rev is verified out
-of the profile afterwards for the same reason.
-
-The apply and the restarts are then handed to the **newly installed**
-`agentbox` as a fresh process, so the release being installed renders its own
-host configuration rather than the outgoing one's renderer doing it. Units
-name `/nix/var/nix/profiles/agent-box/bin/...`, a path that does not move when
-the profile does, so nothing looks changed to systemd and the update restarts
-the services itself; agent sessions go last, since the agent that triggered
-the update is sitting in one. A failure at any step rolls the profile back to
-the generation it started from and re-applies with that older code.
-
-**The launch script must stay bash-guarded.** Lightsail prepends its own
-`#!/bin/sh` preamble to an instance's launch script, so the template's shebang
-is only a comment in the middle of the file cloud-init runs and the payload
-executes under dash. That is exactly how the infect template failed — `set
--euxo pipefail` aborted it 19 s into first boot, on every launch it ever had —
-so the native script re-execs itself under bash on its first line and
-`scripts/check_lightsail_userdata.py` fails CI if that guard goes missing (or
-if a bashism appears ahead of it). It is also why the payload is a shell
-script rather than the `#cloud-config` the Phase 4 design sketched: on
-Lightsail the launch script is concatenated *into* a shell script, so a YAML
-cloud-config document could never be parsed as one. A native **EC2** template
-can use `#cloud-config` — nothing is prepended there.
-
-### Validation status
-
-`cfn-lint`, the launch-script dialect check, and `tests/test_agentbox.py`
-(which renders `tests/native/config.{json,yaml}` and diffs it against
-`tests/native/expected`, then hands the rendered Caddyfile to `caddy
-validate`) all run in PR CI. The end-to-end launch has **not** yet been
-exercised on live hardware — treat the first real launch as the acceptance
-test, and read `/var/log/agent-box-bootstrap.log` over SSH if the stack times
-out.
-
 ## Lightsail variant (`lightsail-template.yaml`)
 
-A separate template (not a toggle on the EC2 one) that runs the same
-`services.agent-box` on **AWS Lightsail** instead of EC2. The draw is billing
-shape: Lightsail is one flat monthly bundle that folds compute, the SSD, the
-attached static IPv4, and a multi-TB transfer allowance into a single price,
-with **no separate EBS or public-IPv4 line items**. At the small tier the two
-come out within a few percent of each other:
+A separate template (not a toggle on the EC2 one) that runs agent-box on
+**AWS Lightsail** instead of EC2 — the one the README's 1-click Launch buttons
+point at. The draw is billing shape: Lightsail is one flat monthly bundle that
+folds compute, the SSD, the attached static IPv4, and a multi-TB transfer
+allowance into a single price, with **no separate EBS or public-IPv4 line
+items**. At the small tier the two come out within a few percent of each
+other:
 
 | | EC2 `t4g.small` (this repo's default region set) | Lightsail `small_3_0` |
 | --- | --- | --- |
@@ -388,88 +326,147 @@ Spot, while bundling 2x the disk and a large transfer allowance and removing
 Spot's interruption risk. EC2 keeps the edge on flexibility (arbitrary instance
 types, deep Spot discounts, IaC-native networking).
 
-### How it works (nixos-infect)
+`small_3_0` is both the default and the **smallest bundle offered**: 2 GiB is
+the floor across both templates. The sub-2-GiB bundles do complete a launch on
+the swap file the bootstrap creates, but they leave nothing for the work the
+box exists to do — an agent CLI plus a language server plus a build, not the
+bootstrap.
 
-Lightsail has **no NixOS blueprint** and CloudFormation's `AWS::Lightsail::Instance`
-cannot boot a custom image — it only takes a public `BlueprintId`. So the box
-launches the stock **Ubuntu 24.04** blueprint and converts itself to NixOS
-in-place on first boot with [`nixos-infect`](https://github.com/elitak/nixos-infect)
-(pinned by commit in the `NixosInfectRev` parameter):
+### How it works (Ubuntu + Nix, no NixOS)
 
-- The `UserData` script pre-writes `/etc/nixos/configuration.nix` **before**
-  invoking `nixos-infect`. The script's `makeConf()` early-returns when that
-  file already exists, so it never clobbers our config.
-- `PROVIDER=lightsail` is first-class in `nixos-infect`: it relabels the root
-  filesystem to `nixos` and its generated config imports
-  `virtualisation/amazon-image.nix` — **the same module the EC2 template uses**.
-  Our pre-written config imports that module too, so the platform layer is the
-  proven one; only the delivery (infect over Ubuntu) is new.
-- That baked config is essentially the EC2 template's config minus Spot and
-  NAT64, plus the Lightsail platform bits (`amazon-image.nix` import,
-  `boot.loader.grub.device = "/dev/nvme0n1"`). `services.agent-box`,
-  `selfUpdate`, the web-password-hash activation script, the first-boot
-  WaitCondition signal, disk-GC watchdog, and the `amazon-init` disable all
-  carry over unchanged.
+Lightsail has **no NixOS blueprint** and CloudFormation's
+`AWS::Lightsail::Instance` cannot boot a custom image — it only takes a public
+`BlueprintId`. So the box launches the stock **Ubuntu 24.04** blueprint and
+**stays Ubuntu** (issue #154 Phase 4): Nix is installed as a plain package
+manager (Determinate installer), the pinned runtime profile
+(`nix profile install <ref>#runtime`) brings the payloads, tools and agent
+CLIs, and `agentbox apply --first-boot` renders the users, units, sudoers,
+tmpfiles, Caddyfile and first-boot secrets. `AgentBoxFlakeRef` is what pins a
+box to a revision; `publish-template.yml` injects the commit into the S3 copy
+the Launch buttons use.
+
+### Why there is no `nixos-infect` template any more
+
+This filename used to hold a template that converted the instance to NixOS
+in place with [`nixos-infect`](https://github.com/elitak/nixos-infect). It is
+gone, for two reasons (issue #390):
+
+- **It could not boot.** Lightsail prepends its own `#!/bin/sh` preamble to
+  the launch script, so the template's shebang was only a comment and the
+  script ran under dash — where its first executable line, `set -euxo
+  pipefail`, died 19 s into first boot. Every launch it ever had failed that
+  way, and `scripts/check_lightsail_userdata.py`, written to catch exactly
+  this, had a hand-maintained template list that omitted it.
+- **The native path is better on every axis that mattered:** first boot in
+  minutes instead of tens of minutes (no closure build, no relabel, no
+  reboot), the Lightsail console's browser SSH keeps working because nothing
+  lustrates `/home`, and the base OS keeps getting apt security updates.
+
+Existing infect-based stacks are unaffected — they are NixOS boxes running
+`services.agent-box` and self-updating through `nixos-rebuild` — but there is
+no template to create another. The EC2 template (`template.yaml`) remains the
+NixOS-native deployment.
 
 ### Differences from the EC2 template
 
 - **No VPC/subnet/IGW/SG/EIP/IAM** resources — Lightsail manages networking;
   the per-instance firewall is the `Networking.Ports` block (443 always, 22
-  when `DebugSsh=true`).
+  when `DebugSsh=true`). No `CAPABILITY_IAM` acknowledgment either.
 - **IPv4-native**, so no `PublicIpv4`/`Nat64` parameters and no NAT64 plumbing.
-- **No Spot** (`UseSpot` is gone; `spotInterruption` is disabled in the config).
-- **No `RootVolumeSize`** — the SSD is fixed by the bundle; grow by
-  snapshot-and-restore onto a larger bundle.
+- **No Spot** and no `RootVolumeSize` — the SSD is fixed by the bundle; grow
+  by snapshot-and-restore onto a larger bundle.
 - **A static IP is always attached** (free on Lightsail while attached, and
   stable across a stop/start), so the `sslip.io` URL keeps working. Because the
-  attach happens after instance creation, `UserData` can't reference the static
-  IP without a dependency cycle, so the box discovers its own settled public
-  IPv4 at runtime (a `sleep` past the attach window + a stability poll) and
-  bakes `<ip>.sslip.io`. The stack `Outputs` report the same address via
+  attach happens after instance creation, the launch script can't reference the
+  static IP without a dependency cycle, so the box settles its own public IPv4
+  at runtime (`agentbox apply --first-boot --settle-delay 60`) and bakes
+  `<ip>.sslip.io`. The stack `Outputs` report the same address via
   `GetAtt StaticIp.IpAddress`.
-- **Debug access is root SSH with the Lightsail default key** (`DebugSsh=true`
-  opens 22), not SSM — Lightsail has no Session Manager, and after infection the
-  console's browser-SSH (which logs in as `ubuntu`) stops working. Infect logs
-  land in `/var/log/agent-box-infect.log`.
+- **Debug access is the Lightsail default key over SSH as `ubuntu`**
+  (`DebugSsh=true` opens 22), not SSM — Lightsail has no Session Manager. The
+  console's browser SSH works too. Bootstrap output lands in
+  `/var/log/agent-box-bootstrap.log`.
+
+### Updating a native box
+
+Issue #358: `sudo -n /usr/bin/systemctl start --no-block
+agent-box-update.service` — the full path, because sudo matches the grant on
+the exact command line and a bare `systemctl` resolves through PATH (#353).
+Same grant the agent holds on the EC2 template, different mechanism behind it,
+because there is no closure to rebuild. The unit runs `agentbox update`, which
+reads the rev the profile records for itself, asks GitHub for the repo's
+current HEAD, refuses anything that is not strictly ahead of what is running
+(rewritten history, or a replay of an older rev), and then swaps the profile
+with a **remove-then-install**: `nix profile install` over an existing entry
+fails on a file conflict, leaves the old profile in place, and the `apply` that
+follows honestly reports "0 change(s)" — a box that looks updated and is not.
+The new rev is verified out of the profile afterwards for the same reason.
+
+The apply and the restarts are then handed to the **newly installed**
+`agentbox` as a fresh process, so the release being installed renders its own
+host configuration rather than the outgoing one's renderer doing it. Units
+name `/nix/var/nix/profiles/agent-box/bin/...`, a path that does not move when
+the profile does, so nothing looks changed to systemd and the update restarts
+the services itself; agent sessions go last, since the agent that triggered
+the update is sitting in one. A failure at any step rolls the profile back to
+the generation it started from and re-applies with that older code.
+
+### The launch script must stay bash-guarded
+
+Lightsail prepends its own `#!/bin/sh` preamble to an instance's launch
+script, so the template's shebang is only a comment in the middle of the file
+cloud-init runs and the payload executes under dash. That is exactly how the
+infect template failed, so the script re-execs itself under bash on its first
+line and `scripts/check_lightsail_userdata.py` fails CI if that guard goes
+missing (or if a bashism appears ahead of it, or if the script sources the Nix
+profile before exporting `HOME` — cloud-init provides none, and that aborted a
+live launch 40 s in). The check **discovers** its targets with
+`aws/lightsail*template.yaml` rather than carrying a list, because a list is
+how it came to skip the one template that needed it.
+
+It is also why the payload is a shell script rather than the `#cloud-config`
+the Phase 4 design sketched: on Lightsail the launch script is concatenated
+*into* a shell script, so a YAML cloud-config document could never be parsed
+as one. A native **EC2** template can use `#cloud-config` — nothing is
+prepended there.
 
 ### Deploying (CLI)
 
-The 1-click Launch buttons in the top-level README use the S3-published copy
-of this template (pinned defaults injected by `publish-template.yml`, see
+The 1-click Launch buttons use the S3-published copy of this template (pinned
+`AgentBoxFlakeRef` injected by `publish-template.yml`, see
 ["Publishing to S3"](#publishing-to-s3)). To deploy a working-tree copy
-directly, note `AgentBoxRev`/`AgentBoxSha256` are a pinned pair, exactly as
-for the EC2 template:
+directly:
 
 ```bash
-REV=$(git rev-parse HEAD)   # or any pushed agent-box commit
-SHA=$(nix store prefetch-file --json \
-  "https://raw.githubusercontent.com/defangdevs/agent-box/${REV}/modules/agent-box.nix" \
-  | jq -r .hash)
-
 aws cloudformation deploy \
   --region eu-central-1 \
-  --stack-name agent-box-lightsail \
+  --stack-name agentbox-lightsail \
   --template-file aws/lightsail-template.yaml \
   --parameter-overrides \
       WebPassword='<16-64 chars>' \
-      AgentBoxRev="$REV" \
-      AgentBoxSha256="$SHA"
+      AgentBoxFlakeRef="github:defangdevs/agent-box/$(git rev-parse HEAD)"
 ```
 
-The stack blocks on the first-boot `WaitCondition` (timeout 45 min — a small
-bundle's initial closure build is slow) and then emits `WebURL`,
-`PublicAddress`, `RemoteControlSession`, and an `SshCommand` hint.
+No `--capabilities` needed: the stack creates no IAM. It blocks on the
+first-boot `WaitCondition` (timeout 1200 s) and then emits `WebURL`,
+`PublicAddress`, `RemoteControlSession`, an `SshCommand` hint, and the
+bootstrap log path to read if it times out.
 
 ### Validation status
 
-`cfn-lint` passes and the generated `configuration.nix` parses as valid Nix
-(both checked in PR CI via `aws-ci.yml`). The end-to-end `nixos-infect`
-bootstrap has **not** yet been exercised by an automated live deploy — treat a
-first real launch as the acceptance test. Remaining follow-up:
+`cfn-lint`, the launch-script dialect check, and `tests/test_agentbox.py`
+(which renders `tests/native/config.{json,yaml}` and diffs it against
+`tests/native/expected`, then hands the rendered Caddyfile to `caddy
+validate`) all run in PR CI.
 
-- A Lightsail leg in `deploy-test.yml` (create stack, assert `WebURL` reachable
-  over IPv4, tear down). GitHub runners are IPv4-only and Lightsail is
-  IPv4-native, so unlike the EC2 IPv6-only leg this can smoke-test the live URL.
+The end-to-end launch has also been exercised on live hardware: two Lightsail
+stacks in a lab account (2026-08-25 and 2026-08-27), the second unattended
+from a `master` commit, both reaching a working terminal. Verify a deploy with
+`scripts/ws_smoke.py <WebURL> <password>` — it proves a live tmux session
+rather than a merely reachable ttyd. Still outstanding: a Lightsail leg in
+`deploy-test.yml` (create stack, assert `WebURL` reachable over IPv4, tear
+down). GitHub runners are IPv4-only and Lightsail is IPv4-native, so unlike
+the EC2 IPv6-only leg this can smoke-test the live URL.
 
 ## Refreshing the AMI map
 

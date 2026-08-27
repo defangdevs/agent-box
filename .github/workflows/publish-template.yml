@@ -30,7 +30,8 @@ jobs:
       BUCKET: ${{ vars.AGENT_BOX_BUCKET }}
       # Both templates ship from the same bucket: lightsail-template.yaml is
       # the default the README's Launch buttons point at, template.yaml is the
-      # EC2 alternative.
+      # EC2 alternative. They pin agent-box differently — see the injection
+      # step below.
       TEMPLATES: lightsail-template.yaml template.yaml
       ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
     steps:
@@ -54,15 +55,19 @@ jobs:
           cfn-lint aws/template.yaml aws/lightsail-template.yaml
 
       - name: Inject pinned defaults for the 1-click copies
-        # The source templates deliberately ship without Default: values for
-        # AgentBoxRev / AgentBoxSha256 (see the params' Descriptions), and
-        # with empty Defaults for AgentNixpkgsUrl / AgentNixpkgsSha256 (so
-        # source-template launches like deploy-test fall back to the base
-        # channel) — the 1-click Launch buttons need real values pre-filled,
-        # so we inject pinned values into only the S3 template copies: the
-        # AgentBox pair gets a Default inserted, the AgentNixpkgs pair gets
-        # its empty Default replaced. Both templates declare the four
-        # parameters with identical layout, so one awk serves both.
+        # The source templates deliberately ship without pinned values (see
+        # the params' Descriptions): a source-template launch like
+        # deploy-test then tracks the default branch / the base channel. The
+        # 1-click Launch buttons want a reproducible box, so pinned values go
+        # into the S3 COPIES only.
+        #
+        # The two templates pin agent-box by different means, so they get one
+        # awk each:
+        #   template.yaml (EC2)        fetches modules/agent-box.nix by rev +
+        #                              hash, and pins nixpkgs for the agent
+        #                              CLIs -> four Defaults.
+        #   lightsail-template.yaml    installs the runtime profile from a
+        #                              flake ref -> one Default.
         run: |
           rev="${{ github.sha }}"
           sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/agent-box.nix" \
@@ -70,30 +75,44 @@ jobs:
           agentRelease="$(curl -fsSLo /dev/null -w '%{url_effective}' https://channels.nixos.org/nixos-unstable)"
           agentUrl="${agentRelease%/}/nixexprs.tar.xz"
           agentSha="$(nix-prefetch-url --unpack "$agentUrl")"
+          flakeRef="github:${{ github.repository }}/${rev}"
           echo "Rev: $rev"
           echo "Sha: $sha"
           echo "AgentUrl: $agentUrl"
           echo "AgentSha: $agentSha"
-          for t in $TEMPLATES; do
-            awk -v rev="$rev" -v sha="$sha" -v agentUrl="$agentUrl" -v agentSha="$agentSha" '
-              /^  AgentBoxRev:$/     { rf=1; print; next }
-              rf && /^    Type:/      { print; print "    Default: " rev; rf=0; next }
-              /^  AgentBoxSha256:$/  { sf=1; print; next }
-              sf && /^    Type:/      { print; print "    Default: " sha; sf=0; next }
-              /^  AgentNixpkgsUrl:$/   { sf2=1; print; next }
-              sf2 && /^    Default:/    { print "    Default: " agentUrl; sf2=0; next }
-              /^  AgentNixpkgsSha256:$/  { sf3=1; print; next }
-              sf3 && /^    Default:/    { print "    Default: " agentSha; sf3=0; next }
-              { print }
-            ' "aws/$t" > "aws/filled-$t"
-            if ! grep -qxF "    Default: $rev" "aws/filled-$t" \
-               || ! grep -qxF "    Default: $sha" "aws/filled-$t" \
-               || ! grep -qxF "    Default: $agentUrl" "aws/filled-$t" \
-               || ! grep -qxF "    Default: $agentSha" "aws/filled-$t"; then
-              echo "::error::Default injection failed for $t — expected lines not present in filled template."
-              diff "aws/$t" "aws/filled-$t" || true
+          echo "FlakeRef: $flakeRef"
+
+          awk -v rev="$rev" -v sha="$sha" -v agentUrl="$agentUrl" -v agentSha="$agentSha" '
+            /^  AgentBoxRev:$/     { rf=1; print; next }
+            rf && /^    Type:/      { print; print "    Default: " rev; rf=0; next }
+            /^  AgentBoxSha256:$/  { sf=1; print; next }
+            sf && /^    Type:/      { print; print "    Default: " sha; sf=0; next }
+            /^  AgentNixpkgsUrl:$/   { sf2=1; print; next }
+            sf2 && /^    Default:/    { print "    Default: " agentUrl; sf2=0; next }
+            /^  AgentNixpkgsSha256:$/  { sf3=1; print; next }
+            sf3 && /^    Default:/    { print "    Default: " agentSha; sf3=0; next }
+            { print }
+          ' aws/template.yaml > aws/filled-template.yaml
+          for want in "$rev" "$sha" "$agentUrl" "$agentSha"; do
+            if ! grep -qxF "    Default: $want" aws/filled-template.yaml; then
+              echo "::error::Default injection failed for template.yaml — expected \"Default: $want\" not present in the filled template."
+              diff aws/template.yaml aws/filled-template.yaml || true
               exit 1
             fi
+          done
+
+          awk -v ref="$flakeRef" '
+            /^  AgentBoxFlakeRef:$/ { ff=1; print; next }
+            ff && /^    Default:/    { print "    Default: " ref; ff=0; next }
+            { print }
+          ' aws/lightsail-template.yaml > aws/filled-lightsail-template.yaml
+          if ! grep -qxF "    Default: $flakeRef" aws/filled-lightsail-template.yaml; then
+            echo "::error::Default injection failed for lightsail-template.yaml — expected \"Default: $flakeRef\" not present in the filled template."
+            diff aws/lightsail-template.yaml aws/filled-lightsail-template.yaml || true
+            exit 1
+          fi
+
+          for t in $TEMPLATES; do
             cfn-lint "aws/filled-$t"
           done
 
