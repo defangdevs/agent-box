@@ -176,7 +176,7 @@ def profile_origin(profile):
     The profile is the ground truth for "what rev is this box running", and
     the reason `Spec` does not need a `repo:`/`rev:` config field for it
     (issue #358's second open question). config.yaml as written by
-    aws/lightsail-native-template.yaml sets neither, so before this the
+    aws/lightsail-template.yaml sets neither, so before this the
     settings page advertised the placeholder defaults — a repo that happened
     to be right and a rev of forty zeroes — on every native box.
     """

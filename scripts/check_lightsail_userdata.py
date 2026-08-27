@@ -28,11 +28,12 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-# Every Lightsail launch script, infect-based or native: they all reach the
-# instance through the same wrapper, so they all need the same guard.
-TEMPLATES = [
-    REPO / "aws" / "lightsail-native-template.yaml",
-]
+# Discovered, not listed. Every Lightsail launch script reaches the instance
+# through the same wrapper, so every one of them needs the same guard — and a
+# hand-maintained list is how the guard came to skip the very template the bug
+# shipped in: `lightsail-template.yaml` was never added to it, so CI stayed
+# green over a 1-click template that could not boot (issue #390).
+TEMPLATES = sorted(REPO.glob("aws/lightsail*template.yaml"))
 GUARD = re.compile(r'exec\s+/bin/bash\s+"\$0"')
 # Sourcing the Nix profile snippet, which reads $HOME with no default.
 NIX_PROFILE_SOURCE = re.compile(r'^\s*\.\s+\S*/profile\.d/\S+\.sh')
@@ -151,6 +152,13 @@ def check(template: Path) -> int:
 
 
 def main() -> int:
+    if not TEMPLATES:
+        print(
+            "FAIL: no Lightsail template found under aws/ — the glob that "
+            "feeds this check matched nothing, which would pass vacuously.",
+            file=sys.stderr,
+        )
+        return 1
     return max(check(t) for t in TEMPLATES)
 
 

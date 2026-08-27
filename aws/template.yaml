@@ -110,8 +110,9 @@ Parameters:
       convenience). All choices are Graviton (aarch64) — cheaper than the x86
       equivalents and paired with an aarch64 NixOS AMI in the RegionMap below.
       The t4g.medium default (~$0.034/hr) gives nixos-rebuild the eval
-      headroom self-updates need; t4g.small (~$0.017/hr) runs a single light
-      agent but its 2 GiB is tight during updates.
+      headroom self-updates need. t4g.small (~$0.017/hr) is the smallest
+      offered — 2 GiB is the floor across both templates — and runs a single
+      light agent, but its 2 GiB is tight while a self-update evaluates.
 
   RootVolumeSize:
     Type: Number
