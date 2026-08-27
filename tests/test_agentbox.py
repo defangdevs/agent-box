@@ -416,6 +416,7 @@ class RenderTest(unittest.TestCase):
         # native side ever bound it.
         leaked = re.findall(r"@[A-Z][A-Z_]*@", guide)
         self.assertEqual([], leaked, f"unbound guide token(s): {leaked}")
+
     def test_the_store_has_a_janitor(self):
         """Issue #394: a full root wedges the box — no journal, no profile
         swap, no working agent — and on a native box nobody is around to
@@ -660,7 +661,6 @@ class RenderTest(unittest.TestCase):
         the file/flag pair exists to keep, inverted. Two separate output
         roots cannot see this, which is why this test reuses one.
         """
-        mod = load_agentbox()
         config = json.loads(CONFIG_JSON.read_text())
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
@@ -791,6 +791,55 @@ class RenderTest(unittest.TestCase):
         other = (FIXTURE / "etc/agent-box/units"
                  / "agent-box-settings-robot.env").read_text()
         self.assertNotIn("AGENT_BOX_WEB_USERS", other)
+
+    def test_memory_pressure_has_all_three_answers(self):
+        """Issue #62, and #394 gap 9.
+
+        The incident: a swapless box under agent memory pressure never
+        OOM-killed. It thrashed the page cache instead — every fault
+        reading pages straight back off disk — and userspace froze for
+        hours while the health checks stayed green. Nothing was out of
+        memory; everything was too slow to say so.
+
+        Natively this was ONE of the three knobs: OOMScoreAdjust told the
+        kernel which process to kill in a situation the kernel was never
+        going to notice, while the earlyoom binary sat unused in the
+        runtime profile.
+        """
+        units = FIXTURE / "etc/systemd/system"
+        zram = (units / "agent-box-zram.service").read_text()
+        self.assertIn("RemainAfterExit=yes", zram)
+        helper = (FIXTURE / "etc/agent-box/bin/agent-box-zram").read_text()
+        self.assertIn("--algorithm zstd", helper)
+        # Above any disk swap the deployment made (the Lightsail template
+        # writes a 2 GiB file): compressed RAM first, disk when it fills.
+        self.assertIn("--priority 100", helper)
+        early = (units / "agent-box-earlyoom.service").read_text()
+        for arg in ("-m 10", "-s 10", "-r 3600", "--avoid", "--prefer"):
+            self.assertIn(arg, early)
+        # It must outlive what it arbitrates, and start after the swap it
+        # measures.
+        self.assertIn("OOMScoreAdjust=-100", early)
+        self.assertIn("After=agent-box-zram.service", early)
+        sysctl = (FIXTURE / "etc/sysctl.d/60-agent-box-memory.conf").read_text()
+        self.assertIn("vm.swappiness = 180", sysctl)
+        self.assertIn("vm.page-cluster = 0", sysctl)
+
+    def test_protect_memory_false_renders_none_of_it(self):
+        """The knob has to actually be a knob: a host that turns it off
+        gets no units, not units that are installed and idle."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["protectMemory"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "o").render()
+            for name in ("agent-box-zram.service",
+                         "agent-box-earlyoom.service",
+                         "60-agent-box-memory.conf"):
+                self.assertFalse([f for f in tree.files if f.endswith(name)],
+                                 f"{name} rendered with protectMemory off")
 
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
