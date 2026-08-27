@@ -649,6 +649,57 @@ class RenderTest(unittest.TestCase):
                           "/etc/agent-box/claude-hook-settings.json", env)
             self.assertIn("AGENT_BOX_CODEX_FULL_ACCESS=1", env)
 
+    def test_turning_codex_full_access_off_removes_the_file(self):
+        """The dangerous transition, applied to ONE root.
+
+        A box rendered with codexFullAccess: true and later false kept
+        sandbox_mode = "danger-full-access" on disk — apply never deletes
+        what a render stops emitting — while AGENT_BOX_CODEX_FULL_ACCESS
+        disappeared. Full access still in force, and the flag a session
+        uses to pin the restricted values back gone with it: the contract
+        the file/flag pair exists to keep, inverted. Two separate output
+        roots cannot see this, which is why this test reuses one.
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "one-root"
+            conf = out / "etc/codex/config.toml"
+
+            def apply(full_access):
+                config["codexFullAccess"] = full_access
+                args = [sys.executable, str(AGENTBOX), "apply",
+                        "--config", str(CONFIG_JSON), "--profile", str(prof),
+                        "--root", str(out)]
+                cfg = Path(tmp) / "config.json"
+                cfg.write_text(json.dumps(config))
+                args[args.index("--config") + 1] = str(cfg)
+                proc = subprocess.run(args, capture_output=True, text=True)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+
+            apply(True)
+            self.assertIn("danger-full-access", conf.read_text())
+            apply(False)
+            self.assertFalse(conf.exists(),
+                             "stale full-access config survived the flip")
+
+    def test_a_file_we_did_not_write_is_never_removed(self):
+        """Removal is scoped to the generated header. A human who takes a
+        rendered file over keeps it — a renderer that deletes files it did
+        not write is a footgun aimed at exactly the person least likely to
+        expect it."""
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            mine = Path(tmp) / "config.toml"
+            mine.write_text('approval_policy = "on-request"\n')
+            self.assertFalse(mod.remove_if_ours(mine))
+            self.assertTrue(mine.exists())
+            ours = Path(tmp) / "ours.toml"
+            ours.write_text(mod.GENERATED_HEADER + "x = 1\n")
+            self.assertTrue(mod.remove_if_ours(ours))
+            self.assertFalse(ours.exists())
+
     def test_codex_full_access_is_file_and_flag_together(self):
         """Never the flag without the file. supervisor.sh reads the flag as
         evidence the file exists, so setting one alone would make a
