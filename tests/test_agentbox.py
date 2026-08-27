@@ -368,6 +368,54 @@ class RenderTest(unittest.TestCase):
         # native side ever bound it.
         leaked = re.findall(r"@[A-Z][A-Z_]*@", guide)
         self.assertEqual([], leaked, f"unbound guide token(s): {leaked}")
+    def test_the_store_has_a_janitor(self):
+        """Issue #394: a full root wedges the box — no journal, no profile
+        swap, no working agent — and on a native box nobody is around to
+        run nix-collect-garbage by hand. The NixOS deployments get this
+        from their host config; here the renderer owns it, so assert the
+        three pieces exist rather than trusting the byte fixture, which a
+        --update would happily regenerate without them.
+        """
+        units = FIXTURE / "etc/systemd/system"
+        timer = (units / "agent-box-nix-gc.timer").read_text()
+        self.assertIn("OnCalendar=daily", timer)
+        # A box that was off at the scheduled hour must still collect:
+        # stop/start and Spot boxes are off a lot.
+        self.assertIn("Persistent=true", timer)
+        self.assertIn("WantedBy=timers.target", timer)
+        service = (units / "agent-box-nix-gc.service").read_text()
+        self.assertIn("nix-collect-garbage --delete-older-than 7d", service)
+        # nix is NOT in the runtime profile — it comes from the Determinate
+        # installer's default profile — and a unit inherits no PATH.
+        self.assertIn("/nix/var/nix/profiles/default/bin/nix-collect-garbage",
+                      service)
+        journald = (FIXTURE / "etc/systemd/journald.conf.d/agent-box.conf")
+        self.assertIn("SystemMaxUse=200M", journald.read_text())
+        nixconf = (FIXTURE / "etc/nix/nix.custom.conf").read_text()
+        self.assertIn("min-free = 1073741824", nixconf)
+        self.assertIn("max-free = 5368709120", nixconf)
+
+    def test_a_foreign_nix_custom_conf_is_left_alone(self):
+        """/etc/nix/nix.custom.conf is what Determinate tells a HUMAN to
+        edit, so it is not ours to overwrite. A box that already has one
+        keeps it, and the render says so — a silently skipped setting looks
+        exactly like one that was never implemented.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            (out / "etc/nix").mkdir(parents=True)
+            mine = "min-free = 42\n"
+            (out / "etc/nix/nix.custom.conf").write_text(mine)
+            mod = load_agentbox()
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            tree = rend.render()
+            self.assertNotIn(str(out / "etc/nix/nix.custom.conf"), tree.files)
+            self.assertEqual(mine,
+                             (out / "etc/nix/nix.custom.conf").read_text())
+            self.assertTrue(any("nix.custom.conf" in n for n in rend.notes),
+                            "skipped the file without saying so")
 
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
