@@ -1703,9 +1703,18 @@ def generated_by_us(path):
     A generated SCRIPT carries the header on line two: the shebang has to
     come first or the kernel will not run it. Without allowing for that,
     every rendered helper looked like a file we did not write.
+
+    A symlink at the name is never ours, no matter what it points at
+    (issue #404 review): read_text() follows it transparently, so without
+    this check an administrator who replaced the file with a symlink into
+    their OWN config could still have it read as generated — and then
+    removed, or its unit disabled, out from under them.
     """
+    path = Path(path)
+    if path.is_symlink():
+        return False
     try:
-        text = Path(path).read_text()
+        text = path.read_text()
     except OSError:
         return False
     if text.startswith("#!"):

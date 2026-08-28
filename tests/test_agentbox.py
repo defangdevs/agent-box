@@ -713,6 +713,17 @@ class RenderTest(unittest.TestCase):
             theirs.write_text("#!/bin/sh\necho mine\n")
             self.assertFalse(mod.remove_if_ours(theirs))
             self.assertTrue(theirs.exists())
+            # A symlink at the name is never ours, no matter what it
+            # points at: read_text() follows it, so without a dedicated
+            # check an administrator's OWN symlink into a file that
+            # happens to carry our header would read as generated and get
+            # unlinked out from under them (issue #404 review).
+            elsewhere = Path(tmp) / "elsewhere.toml"
+            elsewhere.write_text(mod.GENERATED_HEADER + "x = 1\n")
+            link = Path(tmp) / "linked.toml"
+            link.symlink_to(elsewhere)
+            self.assertFalse(mod.remove_if_ours(link))
+            self.assertTrue(link.is_symlink())
 
     def test_codex_full_access_is_file_and_flag_together(self):
         """Never the flag without the file. supervisor.sh reads the flag as
