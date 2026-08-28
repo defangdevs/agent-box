@@ -144,6 +144,7 @@ jobs:
                 "ParameterKey=UseSpot,ParameterValue=${{ (inputs.use_spot == true && matrix.public_ipv4 == 'true') && 'true' || matrix.use_spot }}" \
                 "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
                 "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't4g.small (2 vCPU / 2 GiB)' }}" \
+                "ParameterKey=SeedMainSession,ParameterValue=true" \
                 "ParameterKey=EnableSsm,ParameterValue=${{ matrix.public_ipv4 }}" \
                 "ParameterKey=AgentBoxRev,ParameterValue=${{ steps.pin.outputs.rev }}" \
                 "ParameterKey=AgentBoxSha256,ParameterValue=${{ steps.pin.outputs.sha }}" \
