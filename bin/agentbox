@@ -1487,7 +1487,7 @@ class Renderer:
             "renders\n"
             "the host configuration that release describes, and restarts the "
             "services\n"
-            "onto it — your own tmux session included, so save context "
+            "onto it - your own tmux session included, so save context "
             "first.\n\n"
             "It refuses a target that is not strictly ahead of the rev you "
             "are\n"
@@ -1555,7 +1555,7 @@ class Renderer:
         canonical = f"/etc/agent-box-guides/AGENTS.{u.name}.md"
         guide = self.share / "guides" / "default-agents.md"
         pointer = (
-            f"# agent-box — {u.name}@{self.spec.host_label}\n\n"
+            f"# agent-box - {u.name}@{self.spec.host_label}\n\n"
             "The canonical guide is read-only and updated with the box:\n"
             f"@{canonical}\n"
         )

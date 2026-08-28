@@ -1,13 +1,13 @@
 AWSTemplateFormatVersion: '2010-09-09'
 
 Description: >-
-  agent-box on AWS Lightsail — the template the README's 1-click Launch
+  agent-box on AWS Lightsail - the template the README's 1-click Launch
   buttons point at. One Lightsail instance boots the stock Ubuntu 24.04
   blueprint and STAYS Ubuntu: Nix is installed as a plain package manager,
   the pinned runtime profile brings the agent CLIs, tmux, ttyd and Caddy,
   and `agentbox apply` renders the users, units, sudoers, Caddyfile and
   first-boot secrets. No nixos-infect, no root-filesystem relabel, and no
-  reboot — so first boot is minutes rather than tens of minutes, and the
+  reboot - so first boot is minutes rather than tens of minutes, and the
   Lightsail console's browser SSH keeps working (nothing lustrates /home).
   This replaced the nixos-infect template that used to carry this filename
   (issues #154 Phase 4 and #390).
@@ -44,7 +44,7 @@ Metadata:
       UserName:
         default: Linux user the agent runs as
       WebPassword:
-        default: Web terminal password (16-64 chars — save it, AWS masks it)
+        default: Web terminal password (16-64 chars - save it, AWS masks it)
       BundleId:
         default: Lightsail bundle (size / price)
       AgentsMd:
@@ -85,7 +85,7 @@ Parameters:
     Description: Which agent CLI the box's initial session runs.
 
   # The picker annotates each value with vCPU/RAM/price because the
-  # CloudFormation console renders AllowedValues verbatim — there is no
+  # CloudFormation console renders AllowedValues verbatim - there is no
   # separate label field. The Lightsail API only ever sees the first token:
   # the Instance resource splits on the first space. No commas in the values,
   # so `ParameterKey=BundleId,ParameterValue=...` CLI shorthand still parses.
@@ -106,7 +106,7 @@ Parameters:
     Description: >-
       Lightsail bundle (the id before the parenthesis; specs shown for
       convenience). The flat price bundles compute, the SSD, the attached
-      static IPv4 and a multi-TB/month transfer allowance — no separate EBS
+      static IPv4 and a multi-TB/month transfer allowance - no separate EBS
       or public-IPv4 line items like the EC2 template. All are dual-stack
       (IPv4 + IPv6). small_3_0 (2 GiB) is the default and the smallest
       offered: it matches a t4g.small EC2 box and runs a single agent
@@ -130,9 +130,9 @@ Parameters:
         stable, but always read $AGENT_BOX_URL rather than hard-coding it.
       - The base OS is ordinary Ubuntu: apt and unattended-upgrades own it,
         and the Lightsail console's browser SSH works (it logs in as
-        "ubuntu"). agent-box itself never calls apt — it lives in the Nix
+        "ubuntu"). agent-box itself never calls apt - it lives in the Nix
         profile /nix/var/nix/profiles/agent-box.
-      - Low on disk? Lightsail bundles have a fixed SSD — snapshot the
+      - Low on disk? Lightsail bundles have a fixed SSD - snapshot the
         instance and restore it onto a larger bundle to grow. Scheduled nix
         garbage collection reclaims store space in the meantime.
     Description: >-
@@ -168,8 +168,8 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: >-
       Open port 22 for the Lightsail default key. Unlike the nixos-infect
-      template, SSH here keeps working exactly as the blueprint left it —
-      nothing wipes /home or /root — so this is an ordinary Ubuntu box to
+      template, SSH here keeps working exactly as the blueprint left it -
+      nothing wipes /home or /root - so this is an ordinary Ubuntu box to
       debug.
 
 Conditions:
@@ -212,7 +212,7 @@ Resources:
             # launch script, so the shebang above is only a comment in the
             # middle of the file cloud-init actually runs, and the whole
             # thing executes under dash. The nixos-infect template died
-            # exactly there — "set: Illegal option -o pipefail", 19 seconds
+            # exactly there - "set: Illegal option -o pipefail", 19 seconds
             # into first boot, on every launch it ever had. Re-exec under
             # bash first, so the dialect never depends on what AWS puts in
             # front of us. Re-running AWS's preamble is harmless (it
@@ -223,13 +223,13 @@ Resources:
             # "#cloud-config" the Phase 4 design sketched: on Lightsail the
             # launch script is concatenated INTO a shell script, so a YAML
             # cloud-config document could never be parsed as one. A native
-            # EC2 template can use #cloud-config — nothing is prepended there.
+            # EC2 template can use #cloud-config - nothing is prepended there.
             if [ -z "${!BASH_VERSION:-}" ]; then exec /bin/bash "$0" "$@"; fi
             set -euxo pipefail
             exec > >(tee /var/log/agent-box-bootstrap.log) 2>&1
 
             # cloud-init runs the launch script with an almost empty
-            # environment — no HOME. Nix's own profile script dereferences
+            # environment - no HOME. Nix's own profile script dereferences
             # $HOME unguarded (`NIX_LINK=$HOME/.nix-profile`), so sourcing it
             # under `set -u` aborted the whole bootstrap with "HOME: unbound
             # variable" 40 s into first boot, on real hardware. Everything
@@ -301,13 +301,13 @@ Resources:
             # through the environment and is hashed with argon2id, so it is
             # never written to the box's disk in the clear. It IS part of the
             # instance's launch script, though, which anyone holding
-            # lightsail:GetInstance on this account can read — same exposure
+            # lightsail:GetInstance on this account can read - same exposure
             # as the infect template had, and the reason the settings page
             # can change the password afterwards.
             # set +x for this one command: the trace this script runs under
             # writes every expanded word to /var/log/agent-box-bootstrap.log,
             # so leaving it on put the plaintext password in a world-readable
-            # log on the box — which is precisely what "never written to disk"
+            # log on the box - which is precisely what "never written to disk"
             # was supposed to mean.
             set +x
             AGENT_BOX_WEB_PASSWORD=${WebPasswordPlain} \
@@ -322,7 +322,7 @@ Resources:
           - WebPasswordPlain: !Ref WebPassword
             FirstBootHandle: !Ref FirstBootHandle
 
-  # Static IPv4 — free while attached, and stable across a stop/start, so the
+  # Static IPv4 - free while attached, and stable across a stop/start, so the
   # derived sslip.io hostname keeps resolving. The launch script discovers the
   # address at runtime rather than referencing this resource, so there is no
   # dependency cycle.
@@ -375,7 +375,7 @@ Outputs:
     Description: >-
       Debug access with the Lightsail default key (Account -> SSH keys in the
       console). This box is ordinary Ubuntu, so the console's browser SSH
-      works too — it logs in as "ubuntu", which the native path never
+      works too - it logs in as "ubuntu", which the native path never
       removes.
     Value: !Sub
       - 'ssh -i <lightsail-default-key.pem> ubuntu@${Ip}'

@@ -42,7 +42,7 @@ let
 
       Update the box's software with:
       `sudo /run/current-system/sw/bin/systemctl start agent-box-update.service`
-      (kills the running tmux session — save context first). As above, the full
+      (kills the running tmux session - save context first). As above, the full
       path is required for the passwordless sudo rule to match.
 
     '')
@@ -1127,7 +1127,7 @@ let
   agentsMdPointer = name: u:
     if u.agentsMd == null then null
     else pkgs.writeText "agent-box-${name}-agents-pointer.md" ''
-      # agent-box — your notes
+      # agent-box - your notes
 
       This file is yours to edit; anything you add here persists across
       restarts. The canonical agent-box guide (environment, secrets,

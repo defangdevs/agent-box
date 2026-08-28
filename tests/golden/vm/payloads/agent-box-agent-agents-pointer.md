@@ -1,4 +1,4 @@
-# agent-box — your notes
+# agent-box - your notes
 
 This file is yours to edit; anything you add here persists across
 restarts. The canonical agent-box guide (environment, secrets,

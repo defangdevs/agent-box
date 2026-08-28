@@ -33,7 +33,7 @@ Metadata:
           - AgentNixpkgsSha256
     ParameterLabels:
       WebPassword:
-        default: Web terminal password (16-64 chars — save it, AWS masks it)
+        default: Web terminal password (16-64 chars - save it, AWS masks it)
       Agent:
         default: Agent CLI
       UserName:
@@ -93,7 +93,7 @@ Parameters:
       digits, "_" and "-", starting with a letter or "_", max 31 chars.
 
   # The picker annotates each value with vCPU/RAM because the CloudFormation
-  # console renders AllowedValues verbatim — there is no separate label field.
+  # console renders AllowedValues verbatim - there is no separate label field.
   # The EC2 API only ever sees the first token: the Instance resource splits
   # on the first space. No commas in the values, so
   # `ParameterKey=InstanceType,ParameterValue=...` CLI shorthand still parses.
@@ -110,11 +110,11 @@ Parameters:
       - c7g.large (2 vCPU / 4 GiB)
     Description: >-
       EC2 instance type (the part before the parenthesis; vCPU/RAM shown for
-      convenience). All choices are Graviton (aarch64) — cheaper than the x86
+      convenience). All choices are Graviton (aarch64) - cheaper than the x86
       equivalents and paired with an aarch64 NixOS AMI in the RegionMap below.
       The t4g.medium default (~$0.034/hr) gives nixos-rebuild the eval
       headroom self-updates need. t4g.small (~$0.017/hr) is the smallest
-      offered — 2 GiB is the floor across both templates — and runs a single
+      offered - 2 GiB is the floor across both templates - and runs a single
       light agent, but its 2 GiB is tight while a self-update evaluates.
 
   RootVolumeSize:
@@ -128,7 +128,7 @@ Parameters:
       rebuild/self-update, so keep real headroom. NixOS grows the partition
       and filesystem to fill the volume on every boot, which also means you
       can enlarge the volume of a RUNNING box later (EC2 console -> Volumes
-      -> Modify) and simply reboot the instance to claim the space — no
+      -> Modify) and simply reboot the instance to claim the space - no
       in-instance steps. EBS cannot shrink a volume.
 
   PublicIpv4:
@@ -140,7 +140,7 @@ Parameters:
       reachable regardless of the client's own connectivity. ~$3.60/mo per
       AWS's 2024 IPv4 pricing (charged for any public IPv4, EIP or not).
       false: IPv6-only, no public IPv4 charge (~$0/mo for the network
-      address) — set this only if you know the client reaching the box has
+      address) - set this only if you know the client reaching the box has
       real IPv6 connectivity (corporate/coffee-shop networks often don't).
 
   Nat64:
@@ -150,7 +150,7 @@ Parameters:
     Description: >-
       Only relevant when PublicIpv4=false. true (default): the IPv6-only box
       resolves names through a free public DNS64/NAT64 service (nat64.net),
-      so IPv4-only sites — notably github.com — stay reachable. Traffic to
+      so IPv4-only sites - notably github.com - stay reachable. Traffic to
       IPv4-only hosts transits the NAT64 operator's gateways; TLS and SSH
       remain end-to-end encrypted and authenticated, but if you'd rather not
       route through a third party, set false (the box then cannot reach
@@ -164,13 +164,13 @@ Parameters:
     Description: >-
       false (default): on-demand (always available, full price). true: run
       as a persistent Spot instance (currently ~50-60% cheaper for t4g in
-      the four launch regions — the deep 70-90% Spot discounts don't apply
+      the four launch regions - the deep 70-90% Spot discounts don't apply
       to these small Graviton types). On a Spot interruption AWS stops the
       instance and restarts the SAME instance in the SAME AZ when capacity
       returns, so the root volume, IPv6 address, and TLS cert all survive.
       The live tmux session does not (RAM is lost on any stop). Risk: if
       this AZ+type pool stays capacity-starved, the box stays stopped
-      until it frees up — set this only if you're comfortable with that
+      until it frees up - set this only if you're comfortable with that
       tradeoff for the lower price.
 
   SeedMainSession:
@@ -179,10 +179,10 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: >-
       false (default): matches the module's own front-door default for a box
-      with a browser terminal (issue #416) — first boot seeds no session, and
+      with a browser terminal (issue #416) - first boot seeds no session, and
       the settings page is where the first one is started (installing its
       agent CLI on demand). true: seed a running "main" session immediately,
-      the pre-#416 behaviour — set this if you want the box usable as a
+      the pre-#416 behaviour - set this if you want the box usable as a
       terminal the moment it boots, without a trip through the settings page.
 
   WebPassword:
@@ -197,7 +197,7 @@ Parameters:
       Secure cookie so the WebSocket upgrade can authenticate without putting
       the secret in the URL. Use any 16-64 characters; password-manager symbols
       are supported. AWS masks this field with dots after you type it and never
-      emits it in stack outputs, so save it somewhere before you launch — there
+      emits it in stack outputs, so save it somewhere before you launch - there
       is no way to recover it later. Even Claude Code stacks that plan to drive
       the box via Remote Control need this the first time, to complete `claude
       login` in the browser terminal.
@@ -219,24 +219,24 @@ Parameters:
         PublicIpv4=false instead (IPv6-only), IPv4-only sites such as
         github.com are reached through a public NAT64 relay, so expect the
         occasional IPv4 reachability quirk.
-      - Low on disk? Enlarge the EBS root volume in the EC2 console and reboot
-        — NixOS grows the filesystem automatically; scheduled nix garbage
-        collection also reclaims space.
+      - Low on disk? Enlarge the EBS root volume in the EC2 console and
+        reboot - NixOS grows the filesystem automatically; scheduled nix
+        garbage collection also reclaims space.
     Description: >-
       Deployment-specific instructions APPENDED to agent-box's built-in
       default AGENTS.md, which the module always seeds to the agent user's
       ~/AGENTS.md on first agent start (skipped if the file already exists).
-      The built-in default already covers the generic guidance — browser-
+      The built-in default already covers the generic guidance - browser-
       terminal URL ($AGENT_BOX_URL), the read-only-except-$HOME filesystem,
       installing tools with nix, sibling sessions, serving a web app, and
-      self-update — so this default only adds the EC2/CloudFormation specifics
+      self-update - so this default only adds the EC2/CloudFormation specifics
       (persistence, sslip.io URL, IPv6/NAT64, growing the disk). Edit or clear
       it to taste; whatever you leave here lands below the built-in default.
       AGENTS.md is the cross-vendor agent-instructions convention read
       natively by codex and opencode; claude reads CLAUDE.md instead, and the
       module seeds pointer files so a claude session picks this text up too.
       Content is embedded into user-data as a Nix indented string,
-      so avoid the sequences `${` and `''` in the body — Nix will otherwise
+      so avoid the sequences `${` and `''` in the body - Nix will otherwise
       try to antiquote / close the string mid-file. Plain $VAR (no braces) is
       fine.
 
@@ -317,7 +317,7 @@ Conditions:
   UseNat64: !And
     - !Not [!Condition UseIpv4]
     - !Equals [!Ref Nat64, 'true']
-  # The first-boot WaitCondition handle is a presigned S3 URL — an
+  # The first-boot WaitCondition handle is a presigned S3 URL - an
   # IPv4-only endpoint. A box that has neither a public IPv4 nor the NAT64
   # path could never signal it, so the health gate must not exist there:
   # a healthy Nat64=false IPv6-only box would otherwise always "fail".
@@ -325,7 +325,7 @@ Conditions:
   UseSsm: !Equals [!Ref EnableSsm, 'true']
 
 Mappings:
-  # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py — do not edit by hand)
+  # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py - do not edit by hand)
   RegionMap:
     us-east-1:
       AMI: ami-0ab0ad49715851e61
@@ -574,8 +574,8 @@ Resources:
   # First-boot health gate (issue 106). The presigned handle URL needs no
   # IAM: the box PUTs a success signal after its first nixos-rebuild switch
   # completes (see agent-box-first-boot-signal in the user-data config). If
-  # user-data is never applied — e.g. the IMDS 401 race that leaves the box
-  # on the vanilla AMI config while everything reports success — no signal
+  # user-data is never applied - e.g. the IMDS 401 race that leaves the box
+  # on the vanilla AMI config while everything reports success - no signal
   # arrives and the stack goes CREATE_FAILED + rollback after 15 minutes,
   # instead of handing the user a black-holed WebURL.
   FirstBootHandle:
@@ -605,11 +605,11 @@ Resources:
       - SubnetRouteAssoc
     Properties:
       # First token of the annotated picker value (see the InstanceType
-      # parameter) — "t4g.medium (2 vCPU / 4 GiB)" -> "t4g.medium".
+      # parameter) - "t4g.medium (2 vCPU / 4 GiB)" -> "t4g.medium".
       InstanceType: !Select [0, !Split [" ", !Ref InstanceType]]
       ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
       # Root volume. DeviceName must match the AMI's RootDeviceName
-      # (/dev/xvda on official NixOS AMIs) — a mismatch would silently
+      # (/dev/xvda on official NixOS AMIs) - a mismatch would silently
       # attach a SECOND volume instead of sizing the root. NixOS grows the
       # partition + filesystem to fill the volume on boot, so this parameter
       # (and later console enlargements followed by a reboot) needs no
@@ -641,7 +641,7 @@ Resources:
         HttpTokens: required
         HttpPutResponseHopLimit: 2
       # Without this, the root EBS volume in BlockDeviceMappings stays
-      # untagged — PropagateTagsToVolumeOnCreation defaults to false.
+      # untagged - PropagateTagsToVolumeOnCreation defaults to false.
       PropagateTagsToVolumeOnCreation: true
       Tags:
         - Key: Name
@@ -679,7 +679,7 @@ Resources:
                   else if "${AgentNixpkgsUrl}" == "" then null
                   else { url = "${AgentNixpkgsUrl}"; sha256 = "${AgentNixpkgsSha256}"; };
                 # raw.githubusercontent.com is dual-stack (has AAAA); github.com
-                # is IPv4-only — IPv6-only boxes reach it via the Nat64
+                # is IPv4-only - IPv6-only boxes reach it via the Nat64
                 # parameter's public DNS64/NAT64 (spliced in below).
                 # The module is a single file, so no tarball unpack needed.
                 agent-box-module = builtins.fetchurl {
@@ -704,8 +704,8 @@ Resources:
                   # Host suffix for auto-derived Remote Control names. Use the
                   # box's PUBLIC address (the sslip.io hostname the box is
                   # actually reached at) rather than networking.hostName (unset
-                  # on the AWS image) or the internal EC2 fqdn. Every session —
-                  # the seeded "main" and any added at runtime — is then
+                  # on the AWS image) or the internal EC2 fqdn. Every session -
+                  # the seeded "main" and any added at runtime - is then
                   # identifiable in the Claude apps as "<user>-<session>@<host>".
                   remoteControlHost = hostname;
                   users."${UserName}" = {
@@ -725,7 +725,7 @@ Resources:
                     # appends it below its built-in default AGENTS.md. The next
                     # line's leading 14 spaces exactly match the YAML block-
                     # scalar indent, so after YAML strips them the sub token
-                    # lands at column 0 — multi-line AgentsMd values then splice
+                    # lands at column 0 - multi-line AgentsMd values then splice
                     # with each line at column 0, and Nix's dedent leaves them
                     # untouched. Empty AgentsMd (the default) splices to a lone
                     # "\n", which the module treats as whitespace-only and
@@ -752,8 +752,8 @@ Resources:
                   # Handle Spot interruptions gracefully (issue #20): on the
                   # ~2 min IMDS notice, prompt live agent sessions to persist
                   # their context, then cleanly stop the agent units. Tied to
-                  # the UseSpot parameter — 'true'/'false' splice verbatim as
-                  # Nix booleans — so on-demand boxes omit the monitor unit
+                  # the UseSpot parameter - 'true'/'false' splice verbatim as
+                  # Nix booleans - so on-demand boxes omit the monitor unit
                   # outright. (The module already defaults this on and the
                   # monitor self-gates on instance-life-cycle, so leaving it
                   # enabled on a non-Spot box would also be harmless; wiring it
@@ -766,13 +766,13 @@ Resources:
                 # Materialize passwordHashFile from the plaintext CFN parameter
                 # BEFORE any service reads it. Activation scripts run at
                 # nixos-rebuild switch time (first boot from user-data), before
-                # systemd units start — perfect ordering for the module's
+                # systemd units start - perfect ordering for the module's
                 # agent-web-auth-secrets service, which reads the hash. The
                 # file lives outside /nix/store so the plaintext-derived hash
                 # doesn't end up in a world-readable store path.
                 # Subshell: activation snippets share one shell, so a bare
                 # `umask 077` here leaks into the users/etc snippets that run
-                # later — update-users-groups.pl then writes /etc/passwd and
+                # later - update-users-groups.pl then writes /etc/passwd and
                 # /etc/group 0600, nsncd can't read them, and every NSS lookup
                 # (User= resolution, chown by name) fails until reboot.
                 system.activationScripts.agent-web-password-hash.text = ''
@@ -795,7 +795,7 @@ Resources:
 
                 # Disk watchdog. The nix store grows on every rebuild /
                 # self-update and a full root wedges the whole box, agent
-                # included — GC is the recovery nobody is around to run.
+                # included - GC is the recovery nobody is around to run.
                 # min-free/max-free additionally trigger GC mid-build when
                 # free space dips, which is exactly when it matters.
                 nix.gc = {
@@ -836,7 +836,7 @@ Resources:
               # silent vanilla-AMI brick. The marker keeps later reboots from
               # re-PUTting. curl retries cover transient egress hiccups.
               # Conditional (CanSignal) because the handle is an IPv4-only S3
-              # URL — see the CanSignal condition. Inner Fn::Sub resolves the
+              # URL - see the CanSignal condition. Inner Fn::Sub resolves the
               # handle ref only when the resource exists.
               FirstBootSignalConfig: !If
                 - CanSignal
@@ -857,12 +857,12 @@ Resources:
                     };
                 - ''
               # Spliced at column 0 (the placeholder's leading 14 spaces are
-              # the YAML block-scalar indent) — Nix ignores indentation.
+              # the YAML block-scalar indent) - Nix ignores indentation.
               Nat64Config: !If
                 - UseNat64
                 - |
                   # IPv6-only box: resolve through public DNS64 (nat64.net), whose
-                  # NAT64 gateways relay traffic to IPv4-only hosts — notably
+                  # NAT64 gateways relay traffic to IPv4-only hosts - notably
                   # github.com. TLS and SSH stay end-to-end; relaunch with
                   # Nat64=false (or PublicIpv4=true) to avoid the third-party hop.
                   # "~." routes ALL lookups here, overriding the VPC per-link DNS.
@@ -881,7 +881,7 @@ Outputs:
       WebPassword chosen at deployment time. (The URL deliberately carries no
       user@ prefix: Chrome answers the auth challenge with URL userinfo plus an
       EMPTY password, and credentials typed into the prompt cannot override
-      the URL-embedded identity — issue 56.)
+      the URL-embedded identity - issue 56.)
     Value: !Sub
       - "https://${Host}.sslip.io/${UserName}/"
       - Host: !If
