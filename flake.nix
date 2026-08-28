@@ -908,6 +908,30 @@
                 exit 1
               fi
               cat parity.log
+
+              # Negative control, and not a formality: #426 is a variable
+              # BOTH backends supply, in two different units, which the
+              # box-wide comparison above cannot see by construction. So
+              # put that exact bug back — drop AGENT_BOX_WEBHOOK_SCRIPT
+              # from the native settings unit, leaving the copy the
+              # agent-box-webhook CLI wrapper exports — and require a
+              # failure. A check that passes on a tree with #426 in it is
+              # the check we already had.
+              units=tests/native/expected/etc/systemd/system
+              # Both instances: the comparison folds agent-box-settings@agent
+              # and @robot into one family, so dropping the variable from one
+              # user's drop-in leaves the other user still supplying it.
+              sed -i '/AGENT_BOX_WEBHOOK_SCRIPT/d' \
+                "$units"/agent-box-settings@*.service.d/10-host.conf
+              if python3 scripts/check_backend_parity.py > reintroduced.log 2>&1
+              then
+                echo "FAIL: the check passed with issue #426 put back."
+                cat reintroduced.log
+                exit 1
+              fi
+              grep -q "agent-box-settings@.service AGENT_BOX_WEBHOOK_SCRIPT" \
+                reintroduced.log
+              echo "negative control ok: #426 reintroduced, check failed."
               cp parity.log "$out"
             '';
 
@@ -1076,6 +1100,31 @@
                 tests = ./tests/test-webhook-claim.sh;
               } ''
               bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # Issue #425: a box with no webhook panel used to render an
+          # empty string, so its operator could not tell a feature that is
+          # off from one that is wired up wrong — which is how #425 was
+          # reported in the first place. The subject is the golden payload
+          # (the daemon as it actually ships, env-store library and all),
+          # imported under one environment per state.
+          webhook-panel-state =
+            pkgs.runCommand "agent-box-webhook-panel-state"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-webhook-panel-state.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-webhook-panel-state.py
+              python3 repo/tests/test-webhook-panel-state.py > log 2>&1 || {
                 cat log
                 exit 1
               }
