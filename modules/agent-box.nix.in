@@ -338,6 +338,17 @@ let
           builtins.elem (lib.getName pkg) [ "claude-code" "codex" ];
       }
     else pkgs;
+  # Flake ref the supervisor JIT-installs a harness from (issue #416).
+  # selfUpdate.agentNixpkgs is the pin the update service already maintains
+  # for the eager harnesses, so reusing it keeps both halves on one
+  # revision. Without that wiring (a fresh box, or selfUpdate off) fall back
+  # to the same channel it tracks, which is still a far better answer than
+  # the flake registry's `nixpkgs` — that one follows nixpkgs-unstable and
+  # was measured resolving gh 2.98.0 on a box shipping 2.97.0.
+  jitNixpkgsRef =
+    if cfg.selfUpdate.agentNixpkgs != null then cfg.selfUpdate.agentNixpkgs.url
+    else "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
+
   agentPackage = agent:
     if cfg.package != null then cfg.package
     else if agent == "claude" then agentPkgs.claude-code
@@ -491,8 +502,17 @@ let
   # via the agent-box-session CLI or the settings page. The supervisor
   # (mkStart) reconciles tmux sessions against the file and builds each
   # agent command at runtime, so per-agent flag logic lives in that script.
+  # Does this user have a WEB front door — the settings page they can start
+  # a session from? It is the whole premise of seeding nothing (issue #416),
+  # so a user without one keeps the pre-#416 "main" session: a box with no
+  # settings page and no seeded session has no way in but the console.
+  userHasFrontDoor = u: cfg.web.enable && u.web.passwordHashFile != null;
+  seedMain = u:
+    if u.seedMainSession != null then u.seedMainSession
+    else !(userHasFrontDoor u);
   seedSessions = name: u:
     if u.sessions != { } then u.sessions
+    else if !(seedMain u) then { }
     else {
       main = {
         inherit (u) agent skipPermissions remoteControl remoteControlName extraArgs;
@@ -818,9 +838,37 @@ let
           agent-box-session CLI or the settings page. A later rebuild never
           clobbers runtime changes.
 
-          When empty (the default), the per-user agent / skipPermissions /
-          remoteControl* / workingDirectory / extraArgs options below seed a
-          single session named "main" — the pre-sessions behaviour.
+          When empty (the default), whether a single session named "main" is
+          seeded from the per-user agent / skipPermissions / remoteControl* /
+          workingDirectory / extraArgs options below depends on
+          seedMainSession — which, left at its own default, seeds nothing for
+          a user who has a web terminal. See that option.
+        '';
+      };
+
+      seedMainSession = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        example = true;
+        description = ''
+          Whether first boot seeds a single session named "main" for this
+          user when users.<name>.sessions is empty (issue #416).
+
+          null (the default) decides by whether this user has a WEB FRONT
+          DOOR: with a browser terminal (services.agent-box.web.enable and
+          this user's web.passwordHashFile) the box seeds NOTHING and the
+          settings page is where a session is started — which is what lets
+          the agent CLIs be installed on demand rather than shipped in the
+          system closure. Without one, "main" is seeded as before, because a
+          box with neither a settings page nor a session has no way in but
+          the console.
+
+          true or false override that. Set true to keep the pre-#416
+          behaviour on a box that does have a web terminal.
+
+          This only ever affects FIRST boot: sessions.json is authoritative
+          once it exists, so changing this never removes a session an
+          existing box already has.
         '';
       };
       agent = lib.mkOption {
@@ -1975,6 +2023,13 @@ in
             AGENT_BOX_FLOCK_BIN = "${pkgs.util-linux}/bin/flock";
             AGENT_BOX_HOSTNAME_BIN = "${pkgs.unixtools.hostname}/bin/hostname";
             AGENT_BOX_ENV_EXEC = "${envExecWrapper}";
+            # Lazy harnesses (issue #416): where the supervisor fetches an
+            # agent CLI from when a session names one that is not installed.
+            # The SAME pinned channel the module resolves an eagerly
+            # installed harness from, so a box that ships one and JIT-fetches
+            # the other lands on one store path per CLI rather than two.
+            AGENT_BOX_NIXPKGS = jitNixpkgsRef;
+            AGENT_BOX_NIX_BIN = "${config.nix.package}/bin/nix";
             AGENT_BOX_CODEX_RC = "${codexRemoteControl}";
             # Hook settings for claude spawns — the segment-rotation record
             # (issue #223) the supervisor follows on respawn.

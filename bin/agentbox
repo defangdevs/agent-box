@@ -293,6 +293,16 @@ class Spec:
         self.codex_full_access = (
             bool(codex_full_access) and "codex" in self.agents)
         self.sudo_allowlist = list(data.get("sudoAllowlist") or [])
+        # Where a lazily installed harness comes from (issue #416). The
+        # NixOS module reuses selfUpdate.agentNixpkgs — the pin its update
+        # service already maintains — so both halves stay on one revision;
+        # a native box has no such pin, so the channel that pin tracks is
+        # the default and `jitNixpkgs:` overrides it. Deliberately NOT the
+        # flake registry's `nixpkgs`, which follows nixpkgs-unstable and was
+        # measured resolving gh 2.98.0 on a box shipping 2.97.0.
+        self.jit_nixpkgs = (
+            data.get("jitNixpkgs")
+            or "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz")
 
         if self.default_agent not in self.agents:
             raise ConfigError(
@@ -339,7 +349,23 @@ class User:
         self.environment_files = list(data.get("environmentFiles") or [])
         sessions = data.get("sessions")
         if sessions is None:
-            sessions = {"main": {"agent": self.agent}}
+            # Seed nothing when this user has a WEB FRONT DOOR (issue #416):
+            # the settings page is where a session is started, which is what
+            # lets the agent CLIs be fetched on demand instead of shipped.
+            # Without a front door "main" is seeded as before, because a box
+            # with neither a settings page nor a session has no way in but
+            # the console. `seedMainSession:` overrides either way; an
+            # explicit `sessions:` (including {}) always wins outright.
+            # Mirrors seedMain in modules/agent-box.nix.in — the two
+            # backends must answer this the same way.
+            seed_main = data.get("seedMainSession")
+            if seed_main is not None and not isinstance(seed_main, bool):
+                raise ConfigError(
+                    "seedMainSession must be true, false or null, got "
+                    f"{seed_main!r}")
+            if seed_main is None:
+                seed_main = not spec.web_enable
+            sessions = {"main": {"agent": self.agent}} if seed_main else {}
         self.sessions = sessions
         for sname, s in sorted(self.sessions.items()):
             agent = (s or {}).get("agent") or self.agent
@@ -1129,6 +1155,18 @@ class Renderer:
             ("AGENT_BOX_GUIDE_TARGET",
              f"/etc/agent-box-guides/AGENTS.{u.name}.md"),
         ]
+        # Lazy harnesses (issue #416): where the supervisor fetches an agent
+        # CLI from when a session names one the runtime profile was built
+        # without.
+        #
+        # No AGENT_BOX_NIX_BIN here, deliberately. The NixOS module pins a
+        # store path because it HAS one; resolving `nix` at apply time on a
+        # native box would bake THIS host's store path into a generated
+        # file, which is both unreproducible (the native fixture differed
+        # per machine) and wrong after the next nix upgrade. agents.sh
+        # resolves it at runtime from PATH and the two standard install
+        # locations instead.
+        pairs.append(("AGENT_BOX_NIXPKGS", self.spec.jit_nixpkgs))
         if "claude" in self.spec.agents:
             pairs.append(("AGENT_BOX_CLAUDE_SETTINGS", CLAUDE_SETTINGS))
             if self.spec.webhook_enable:

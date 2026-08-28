@@ -202,25 +202,8 @@ sync_webhook_plugin() {
   fi
 }
 
-agent_bin() {
-  # agent_bin NAME — resolve an agent (or "shell") to its binary via
-  # the unit's AGENT_BOX_AGENT_BINS ("name=/path ..." pairs; store and
-  # shell paths never contain whitespace, so word-splitting is safe).
-  for pair in ${AGENT_BOX_AGENT_BINS:?}; do
-    case "$pair" in ("$1"=*) printf '%s\n' "${pair#*=}"; return 0 ;; esac
-  done
-  return 1
-}
-
-# Codex remote-control pairing currently requires the standalone
-# installer layout at ~/.codex/packages/standalone/current/codex.
-# Mirror that fixed path to the provided Codex so pairing works
-# without a curl-installed second copy.
-if cbin="$(agent_bin codex)"; then
-  mkdir -p "$HOME"/.codex/packages/standalone/agent-box-current
-  ln -sfn "$cbin" "$HOME"/.codex/packages/standalone/agent-box-current/codex
-  ln -sfn agent-box-current "$HOME"/.codex/packages/standalone/current
-fi
+@@include:lib/agents.sh@@
+mirror_codex_standalone
 
 # Deliver-once + resume bookkeeping. A session's kickoff prompt
 # (initialPrompt) must fire on the FIRST spawn only; every later respawn
@@ -379,8 +362,16 @@ start_session() {
   [ -n "$sjson" ] || return 0
   agent="$($JQ -r '.agent // empty' <<<"$sjson")"
   if ! bin="$(agent_bin "$agent")"; then
-    echo "session '$sname': agent '$agent' is not installed (see installAgents) — skipping" >&2
-    return 0
+    # Not in the closure and not in the profile yet: fetch it now (issue
+    # #416). This is the JIT half of the lazy-harness model — the box
+    # ships without any agent CLI, and the first session that names one
+    # pays for it. agent_install rate-limits its own failures, so an
+    # offline box does not turn the respawn loop into a network loop.
+    if ! agent_install "$agent" || ! bin="$(agent_bin "$agent")"; then
+      echo "session '$sname': agent '$agent' is not installed and could not be" \
+           "fetched — skipping" >&2
+      return 0
+    fi
   fi
   wd="$($JQ -r '.workingDirectory // empty' <<<"$sjson")"
   [ -n "$wd" ] || wd="$HOME"

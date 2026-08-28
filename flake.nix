@@ -943,6 +943,29 @@
               cp log "$out"
             '';
 
+          # Unit test for lazy harness installation (issue #416). The VM
+          # tests cannot cover this: an install reaches the network, and a
+          # check that goes red when channels.nixos.org is down is a check
+          # that goes red for someone else's outage. nix and flock are
+          # shimmed instead, so every branch — the table still winning, the
+          # refusal to turn a registry name into a path, and the rate limit
+          # that keeps an offline box from making one network call per
+          # respawn — is pinned natively on every architecture.
+          jit-agents =
+            pkgs.runCommand "agent-box-jit-agents"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils ];
+                lib = ./modules/src/lib/agents.sh;
+                tests = ./tests/test-jit-agents.sh;
+              } ''
+              bash "$tests" "$lib" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Unit test for the env store's format (issue #212). The VM tests
           # prove one PEM survives one caller at 300+ seconds a run; this
           # pins the format itself — round trip, no key injection, and the
