@@ -1371,6 +1371,14 @@ class Renderer:
                        f'Environment="PATH={self.bin}"',
                        'Environment="LOCAL_WEBHOOK_SPAWN_CMD='
                        f'{self.bin}/agent-box-webhook-spawn"',
+                       # webhook-spawn.sh names the tmux it starts a
+                       # session with. It falls back to PATH, which does
+                       # carry tmux here — but the module names it, and a
+                       # payload that reads a variable one backend sets and
+                       # the other leaves to PATH is exactly the drift the
+                       # per-unit half of check_backend_parity.py exists to
+                       # stop. Name it on both.
+                       f'Environment="AGENT_BOX_TMUX_BIN={self.bin}/tmux"',
                        "ExecStart=",
                        f"ExecStart={self.bin}/agent-box-webhook-receiver",
                    ]))

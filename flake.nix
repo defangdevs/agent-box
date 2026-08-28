@@ -879,6 +879,30 @@
                 exit 1
               fi
               cat parity.log
+
+              # Negative control, and not a formality: #426 is a variable
+              # BOTH backends supply, in two different units, which the
+              # box-wide comparison above cannot see by construction. So
+              # put that exact bug back — drop AGENT_BOX_WEBHOOK_SCRIPT
+              # from the native settings unit, leaving the copy the
+              # agent-box-webhook CLI wrapper exports — and require a
+              # failure. A check that passes on a tree with #426 in it is
+              # the check we already had.
+              units=tests/native/expected/etc/systemd/system
+              # Both instances: the comparison folds agent-box-settings@agent
+              # and @robot into one family, so dropping the variable from one
+              # user's drop-in leaves the other user still supplying it.
+              sed -i '/AGENT_BOX_WEBHOOK_SCRIPT/d' \
+                "$units"/agent-box-settings@*.service.d/10-host.conf
+              if python3 scripts/check_backend_parity.py > reintroduced.log 2>&1
+              then
+                echo "FAIL: the check passed with issue #426 put back."
+                cat reintroduced.log
+                exit 1
+              fi
+              grep -q "agent-box-settings@.service AGENT_BOX_WEBHOOK_SCRIPT" \
+                reintroduced.log
+              echo "negative control ok: #426 reintroduced, check failed."
               cp parity.log "$out"
             '';
 
