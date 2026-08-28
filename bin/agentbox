@@ -266,11 +266,32 @@ class Spec:
         # strings, exported as JSON because webhook-spawn.sh parses it with
         # jq and a value may contain spaces.
         webhook_cfg = data.get("webhook") or {}
-        self.hook_session_args = list(
-            webhook_cfg.get("hookSessionArgs") or [])
+        hook_session_args = webhook_cfg.get("hookSessionArgs")
+        # A string here would otherwise pass straight through list() as
+        # one character per element — jq would parse each as its own
+        # argument, silently garbling the hook session's command line
+        # (issue #404 review).
+        if hook_session_args is not None and not (
+                isinstance(hook_session_args, list)
+                and all(isinstance(a, str) for a in hook_session_args)):
+            raise ConfigError(
+                "webhook.hookSessionArgs must be a list of strings, got "
+                f"{hook_session_args!r}")
+        self.hook_session_args = list(hook_session_args or [])
+        codex_full_access = data.get("codexFullAccess", True)
+        # A quoted "false" would otherwise pass bool()'s truthiness check
+        # and turn codex loose with danger-full-access — a string typo
+        # silently granting the one thing this knob exists to gate
+        # (issue #404 review). null still means off, same as bool(None):
+        # only a type this config format has no business carrying is
+        # rejected.
+        if codex_full_access is not None and not isinstance(
+                codex_full_access, bool):
+            raise ConfigError(
+                "codexFullAccess must be true, false or null, got "
+                f"{codex_full_access!r}")
         self.codex_full_access = (
-            bool(data.get("codexFullAccess", True))
-            and "codex" in self.agents)
+            bool(codex_full_access) and "codex" in self.agents)
         self.sudo_allowlist = list(data.get("sudoAllowlist") or [])
 
         if self.default_agent not in self.agents:

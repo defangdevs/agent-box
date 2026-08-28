@@ -734,6 +734,41 @@ class RenderTest(unittest.TestCase):
                 self.assertEqual(want, bool(toml))
                 self.assertEqual(want, "AGENT_BOX_CODEX_FULL_ACCESS" in env)
 
+    def test_a_quoted_false_does_not_turn_codex_loose(self):
+        """`bool("false")` is True — a quoted string here would silently
+        grant danger-full-access instead of the false the author wrote
+        (issue #404 review). null is kept meaning off, same as bool(None)
+        always made it; only a type this knob has no business carrying
+        is rejected."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for bad in ("false", "true", 0, 1, [], {}):
+                config["codexFullAccess"] = bad
+                with self.assertRaises(mod.ConfigError):
+                    mod.Spec(config, prof)
+            for ok in (True, False, None):
+                config["codexFullAccess"] = ok
+                mod.Spec(config, prof)  # must not raise
+
+    def test_hook_session_args_rejects_a_bare_string(self):
+        """A bare string is iterable, so list() would silently turn
+        "--model foo" into one argument per CHARACTER instead of raising —
+        exactly the shape a YAML author reaches for by mistake when they
+        mean a single-element list (issue #404 review)."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for bad in ("--model foo", [1, 2], {"a": "b"}, 5):
+                config["webhook"] = {"hookSessionArgs": bad}
+                with self.assertRaises(mod.ConfigError):
+                    mod.Spec(config, prof)
+            for ok in (["--model", "foo"], [], None):
+                config["webhook"] = {"hookSessionArgs": ok}
+                mod.Spec(config, prof)  # must not raise
+
     def test_the_webhook_dispatcher_is_fully_wired(self):
         """Issue #394, gap 6. Per-session delivery worked natively; the
         pieces around it did not, each failing quietly in its own way:
