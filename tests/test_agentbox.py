@@ -487,6 +487,23 @@ class RenderTest(unittest.TestCase):
                         / "10-host.conf").read_text()
             assert "AGENT_BOX_WEBHOOK_SCRIPT" not in settings, settings
 
+    def test_web_off_takes_webhooks_with_it(self):
+        """web.enable = false must gate webhook_enable too (CodeRabbit
+        finding on PR #431): the receiver, CLI and settings panel are all
+        native-web features, so `_webhook_enable` alone is not enough."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "noweb.json"
+            cfg.write_text(json.dumps({
+                "domain": "noweb.example.org",
+                "agents": ["claude"],
+                "web": {"enable": False},
+                "users": {"agent": {"root": True}},
+            }) + "\n")
+            out = render(tmp, cfg)
+            units = out / "etc" / "systemd" / "system"
+            assert not (units / "agent-box-webhook@agent.service.d").exists(), \
+                "web.enable = false still rendered the webhook receiver"
+
     def test_a_quoted_false_does_not_turn_webhooks_loose(self):
         """`bool("false")` is `True` — same trap as codexFullAccess
         (issue #404 review), now caught for webhook.enable too

@@ -394,7 +394,7 @@ class Spec:
 
     @property
     def webhook_enable(self):
-        return bool(self._webhook_enable
+        return bool(self._webhook_enable and self.web_enable
                     and self.webhook_repo and self.webhook_script)
 
 
