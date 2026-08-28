@@ -364,6 +364,15 @@ class User:
                     "seedMainSession must be true, false or null, got "
                     f"{seed_main!r}")
             if seed_main is None:
+                # spec.web_enable alone IS the native equivalent of the
+                # module's `cfg.web.enable && u.web.passwordHashFile != null`.
+                # Native has no per-user opt-out to mirror: `web` is a
+                # box-level setting, there is no per-user passwordHashFile
+                # field, and user_env provisions AGENT_BOX_PASSWORD_CMD for
+                # EVERY user once the box's web is on. So the module's
+                # condition degenerates to cfg.web.enable for every config
+                # native can express, and testing more here would be testing
+                # a state the schema cannot reach.
                 seed_main = not spec.web_enable
             sessions = {"main": {"agent": self.agent}} if seed_main else {}
         self.sessions = sessions

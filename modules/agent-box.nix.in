@@ -346,7 +346,8 @@ let
   # the flake registry's `nixpkgs` — that one follows nixpkgs-unstable and
   # was measured resolving gh 2.98.0 on a box shipping 2.97.0.
   jitNixpkgsRef =
-    if cfg.selfUpdate.agentNixpkgs != null then cfg.selfUpdate.agentNixpkgs.url
+    if cfg.jitNixpkgs != null then cfg.jitNixpkgs
+    else if cfg.selfUpdate.agentNixpkgs != null then cfg.selfUpdate.agentNixpkgs.url
     else "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
 
   agentPackage = agent:
@@ -1184,6 +1185,31 @@ in
         runtime `agent-box-session add --agent codex` needs no rebuild.
         Sessions may only use agents listed here. Default: all supported
         agents.
+      '';
+    };
+
+    jitNixpkgs = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "https://releases.nixos.org/nixpkgs/nixpkgs-25.11pre1/nixexprs.tar.xz";
+      description = ''
+        Flake ref a lazily installed agent CLI is fetched from (issue #416),
+        overriding the default below. `agentbox apply`'s `jitNixpkgs:` is the
+        same knob for the native backend; the two exist so an operator who
+        wants the lazy path pinned can pin it on either.
+
+        Null (the default) uses selfUpdate.agentNixpkgs when that is wired —
+        the pin the update service already maintains, so both halves of the
+        box stay on one revision — and otherwise the nixos-unstable channel
+        that pin tracks.
+
+        That last fallback is MUTABLE: two boxes installing on different days
+        can get different harness versions. It is still the right default,
+        because the alternative it replaced (the flake registry's `nixpkgs`)
+        was measured resolving gh 2.98.0 on a box shipping 2.97.0 — but if
+        you need the lazy path reproducible, set this to an immutable URL.
+        Pinning it by DEFAULT would need its own hash-maintenance path and
+        is deliberately out of scope here.
       '';
     };
 

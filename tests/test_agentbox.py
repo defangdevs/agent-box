@@ -875,6 +875,27 @@ class RenderTest(unittest.TestCase):
             self.assertIn(
                 "AGENT_BOX_NIXPKGS=https://example.invalid/pinned.tar.xz", env)
 
+    def test_both_backends_expose_the_same_jit_pin_knob(self):
+        """`jitNixpkgs` exists on BOTH backends (issue #416). The default
+        fallback is the mutable nixos-unstable channel, which is the right
+        default but not reproducible — so an operator who needs the lazy
+        path pinned must be able to pin it whichever backend they deploy.
+        Native having the knob and the module not would have been an
+        asymmetry this PR introduced."""
+        mod = load_agentbox()
+        module_src = (REPO / "modules" / "agent-box.nix.in").read_text()
+        self.assertIn("jitNixpkgs = lib.mkOption", module_src)
+        self.assertIn("cfg.jitNixpkgs", module_src)
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            self.assertEqual(
+                "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz",
+                mod.Spec(config, prof).jit_nixpkgs)
+            config["jitNixpkgs"] = "https://example.invalid/p.tar.xz"
+            self.assertEqual("https://example.invalid/p.tar.xz",
+                             mod.Spec(config, prof).jit_nixpkgs)
+
     def test_hook_session_args_rejects_a_bare_string(self):
         """A bare string is iterable, so list() would silently turn
         "--model foo" into one argument per CHARACTER instead of raising —
