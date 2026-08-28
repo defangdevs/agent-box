@@ -167,18 +167,48 @@ context still knows what the event is about.
     agent-box-webhook ls                     # what this session listens to
     agent-box-webhook unsubscribe OWNER/REPO # when you wrap up
 
-When you pick up ONE issue or PR, say so with `--include`. That both narrows
+When you pick up ONE issue or PR, say so with `--claim`. That both narrows
 what reaches you and tells a standing watch the work is taken, so a review or
 a comment on it no longer starts a second session on top of you:
 
     agent-box-webhook subscribe OWNER/REPO \
       --note "PR 42: waiting on CI + review" \
-      --include '{"any":[{"path":"pull_request.number","in":[42]},
-                         {"path":"issue.number","in":[42]},
-                         {"path":"workflow_run.head_branch","in":["fix/42-thing"]}]}'
+      --claim 42 --claim branch:fix/42-thing
+
+`--claim` is the whole of it: `42` for an issue or PR by number,
+`branch:NAME` for everything CI reports against a branch. Repeat it, and the
+clauses OR together.
+
+Use the BARE number for a PR, as above. GitHub reports a PR comment as an
+`issue_comment` carrying `issue.number`, not `pull_request.number` — so
+`--claim pr:42` claims the PR itself and leaves comments and reviews ON it
+unclaimed, which is the one event a reviewer is most likely to generate. A
+bare `42` claims both spellings. `pr:42` and `issue:42` exist for when you
+deliberately want only one.
+
+Use it rather than hand-writing `--include`. A claim only covers the payload
+paths it names, and a watch spawns on terminal CI failure reported through six
+event shapes. A claim that names one is SILENTLY unclaimed for the others:
+nothing warns you, a sibling session just turns up. That is how PR #417 ended
+up with two sessions editing the same git worktree.
+
+`--claim branch:` writes five of the six — `workflow_run`, `workflow_job`,
+`check_run`, `check_suite` and `deployment_status` (via `deployment.ref`) —
+plus the push `ref` and `pull_request.head.ref`. The sixth, a bare commit
+**status**, cannot be claimed at all: it carries no scalar branch, only a
+`branches` array, and the payload language indexes lists by number only, so any
+rule would be guessing at an order the payload does not promise. On a repo
+whose CI reports through commit statuses, that shape stays unclaimed — expect a
+sibling there.
+
+`--include` still exists for rules `--claim` cannot express; the two are
+mutually exclusive.
 
 Claude Code has the same as MCP tools (`webhook_subscribe`,
-`webhook_unsubscribe`, `webhook_subscriptions`); both share one list.
+`webhook_unsubscribe`, `webhook_subscriptions`); both share one list. Those
+are local-webhook's own tools and have no `--claim` — they take the raw
+`include` rules — so when you are claiming an object, reach for the CLI and
+let it write them.
 Subscriptions are PER SESSION and expire after an hour (`--ttl HOURS` for a
 longer wait). `--ignore-sender YOU` mutes echoes of your own comments and
 pushes — since local-webhook 0.23.0 this is a PURE sender mute, so it also
