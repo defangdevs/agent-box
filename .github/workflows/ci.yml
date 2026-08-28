@@ -77,6 +77,19 @@ jobs:
       - name: Check multi-user generation
         run: nix build -L .#checks.x86_64-linux.multi-user && cat result
 
+      # Every socket-activated unit restarts in one step (issue #386 and its
+      # webhook-receiver twin). The default two-step restart lets the .socket
+      # re-activate the daemon from systemd's cached OLD unit definition, and
+      # the stale survivor is then never replaced.
+      - name: Check socket-activated units restart in one step
+        run: nix build -L .#checks.x86_64-linux.socket-activated-restart && cat result
+
+      # Issue #362: a unit override naming a unit the module does not render
+      # is a silent no-op. The check has existed since #362 but was never
+      # wired into CI, so it only ran when somebody built it by hand.
+      - name: Check for phantom systemd unit overrides
+        run: nix build -L .#checks.x86_64-linux.phantom-unit-overrides && cat result
+
       # Eval-only guard for issue 51: deployed boxes (CFN user-data +
       # self-update) fetch modules/agent-box.nix as a single file, so any
       # ./sibling reference breaks first boot. Catch it here, not post-merge.
