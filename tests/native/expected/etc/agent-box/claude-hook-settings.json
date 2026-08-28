@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "@PROFILE@/bin/agent-box-claude-session-start-hook",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -416,6 +416,7 @@ class RenderTest(unittest.TestCase):
         # native side ever bound it.
         leaked = re.findall(r"@[A-Z][A-Z_]*@", guide)
         self.assertEqual([], leaked, f"unbound guide token(s): {leaked}")
+
     def test_the_store_has_a_janitor(self):
         """Issue #394: a full root wedges the box — no journal, no profile
         swap, no working agent — and on a native box nobody is around to
@@ -580,6 +581,475 @@ class RenderTest(unittest.TestCase):
             self.assertIn("AGENT_BOX_PROFILE_BIN=", session)
             profile = (out / "usr/local/bin/agent-box-profile").read_text()
             self.assertIn("AGENT_BOX_ENVSTORE_BIN=", profile)
+
+    def test_every_user_gets_their_own_canonical_guide(self):
+        """Issue #394. Two things were wrong at once here.
+
+        The guide was written to a hardcoded AGENTS.agent.md from inside
+        the per-user loop, so a second user overwrote the first's copy and
+        both pointers named a file describing one of them. And nothing set
+        AGENT_BOX_GUIDE_TARGET, so supervisor.sh never symlinked the guide
+        into ~/.claude/CLAUDE.md or $CODEX_HOME/AGENTS.md — which is the
+        scope that survives an agent working inside a checkout BELOW $HOME,
+        i.e. what a session doing real work does.
+        """
+        for user in ("agent", "robot"):
+            canonical = FIXTURE / f"etc/agent-box-guides/AGENTS.{user}.md"
+            self.assertTrue(canonical.is_file(),
+                            f"{user} has no canonical guide")
+            pointer = (FIXTURE / "etc/agent-box/guides"
+                       / f"{user}-agents-pointer.md").read_text()
+            self.assertIn(f"@/etc/agent-box-guides/AGENTS.{user}.md", pointer)
+            env = (FIXTURE / "etc/agent-box/units" / f"{user}.env").read_text()
+            self.assertIn(
+                f"AGENT_BOX_GUIDE_TARGET=/etc/agent-box-guides/"
+                f"AGENTS.{user}.md", env)
+        # The host label names the user, so the two guides' pointers must
+        # not be byte-identical — that was the symptom of the overwrite.
+        self.assertNotEqual(
+            (FIXTURE / "etc/agent-box/guides/agent-agents-pointer.md").read_text(),
+            (FIXTURE / "etc/agent-box/guides/robot-agents-pointer.md").read_text())
+
+    def test_the_agent_clis_get_their_own_config(self):
+        """Issue #394, gaps 4 and 5.
+
+        Both are files the agent CLIs read for themselves, and both were
+        missing natively:
+
+          claude  supervisor.sh passes --settings only when
+                  AGENT_BOX_CLAUDE_SETTINGS names a file, so the
+                  SessionStart hook (issue #223) never fired on a native
+                  box — silently, since a missing hook looks like a hook
+                  with nothing to say.
+          codex   /etc/codex/config.toml is codex's system layer and the
+                  ONLY way to reach the app-server daemon behind a
+                  remote-controlled session, which is spawned with a fixed
+                  argv. Without it a native codex box asked for approvals
+                  where a NixOS one did not.
+
+        The env var and the file go together on purpose: supervisor.sh
+        treats the var as "the box wrote a system-wide codex config", and
+        a session opting OUT of full access pins the restricted values back
+        because of it.
+        """
+        settings = json.loads(
+            (FIXTURE / "etc/agent-box/claude-hook-settings.json").read_text())
+        hook = (settings["hooks"]["SessionStart"][0]["hooks"][0]["command"])
+        self.assertTrue(hook.endswith("agent-box-claude-session-start-hook"),
+                        f"SessionStart hook is {hook!r}")
+        self.assertTrue(hook.startswith("@PROFILE@/bin/"),
+                        "the hook must be named by absolute path — the "
+                        "agent CLI does not inherit the unit's PATH")
+        toml = (FIXTURE / "etc/codex/config.toml").read_text()
+        self.assertIn('approval_policy = "never"', toml)
+        # Both keys, or the box opens the filesystem and still stops to ask.
+        self.assertIn('sandbox_mode = "danger-full-access"', toml)
+        for user in ("agent", "robot"):
+            env = (FIXTURE / "etc/agent-box/units" / f"{user}.env").read_text()
+            self.assertIn("AGENT_BOX_CLAUDE_SETTINGS="
+                          "/etc/agent-box/claude-hook-settings.json", env)
+            self.assertIn("AGENT_BOX_CODEX_FULL_ACCESS=1", env)
+
+    def test_turning_codex_full_access_off_removes_the_file(self):
+        """The dangerous transition, applied to ONE root.
+
+        A box rendered with codexFullAccess: true and later false kept
+        sandbox_mode = "danger-full-access" on disk — apply never deletes
+        what a render stops emitting — while AGENT_BOX_CODEX_FULL_ACCESS
+        disappeared. Full access still in force, and the flag a session
+        uses to pin the restricted values back gone with it: the contract
+        the file/flag pair exists to keep, inverted. Two separate output
+        roots cannot see this, which is why this test reuses one.
+        """
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "one-root"
+            conf = out / "etc/codex/config.toml"
+
+            def apply(full_access):
+                config["codexFullAccess"] = full_access
+                args = [sys.executable, str(AGENTBOX), "apply",
+                        "--config", str(CONFIG_JSON), "--profile", str(prof),
+                        "--root", str(out)]
+                cfg = Path(tmp) / "config.json"
+                cfg.write_text(json.dumps(config))
+                args[args.index("--config") + 1] = str(cfg)
+                proc = subprocess.run(args, capture_output=True, text=True)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+
+            def env_text(user):
+                return (out / "etc/agent-box/units" / f"{user}.env").read_text()
+
+            apply(True)
+            self.assertIn("danger-full-access", conf.read_text())
+            for user in ("agent", "robot"):
+                self.assertIn("AGENT_BOX_CODEX_FULL_ACCESS=1", env_text(user))
+            apply(False)
+            self.assertFalse(conf.exists(),
+                             "stale full-access config survived the flip")
+            for user in ("agent", "robot"):
+                self.assertNotIn("AGENT_BOX_CODEX_FULL_ACCESS", env_text(user),
+                                 "stale full-access flag survived the flip")
+
+    def test_a_file_we_did_not_write_is_never_removed(self):
+        """Removal is scoped to the generated header. A human who takes a
+        rendered file over keeps it — a renderer that deletes files it did
+        not write is a footgun aimed at exactly the person least likely to
+        expect it."""
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            mine = Path(tmp) / "config.toml"
+            mine.write_text('approval_policy = "on-request"\n')
+            self.assertFalse(mod.remove_if_ours(mine))
+            self.assertTrue(mine.exists())
+            ours = Path(tmp) / "ours.toml"
+            ours.write_text(mod.GENERATED_HEADER + "x = 1\n")
+            self.assertTrue(mod.remove_if_ours(ours))
+            self.assertFalse(ours.exists())
+            # A generated SCRIPT carries the header on line TWO — the
+            # shebang has to be first or the kernel will not run it. Held
+            # by name because the strict first-line test read every
+            # rendered helper as someone else's file, and the first one
+            # that ever needed removing (the zram helper, protectMemory
+            # flipped off) was silently left running.
+            script = Path(tmp) / "ours.sh"
+            script.write_text("#!/bin/sh\n" + mod.GENERATED_HEADER + "true\n")
+            self.assertTrue(mod.remove_if_ours(script))
+            self.assertFalse(script.exists())
+            theirs = Path(tmp) / "theirs.sh"
+            theirs.write_text("#!/bin/sh\necho mine\n")
+            self.assertFalse(mod.remove_if_ours(theirs))
+            self.assertTrue(theirs.exists())
+            # A symlink at the name is never ours, no matter what it
+            # points at: read_text() follows it, so without a dedicated
+            # check an administrator's OWN symlink into a file that
+            # happens to carry our header would read as generated and get
+            # unlinked out from under them (issue #404 review).
+            elsewhere = Path(tmp) / "elsewhere.toml"
+            elsewhere.write_text(mod.GENERATED_HEADER + "x = 1\n")
+            link = Path(tmp) / "linked.toml"
+            link.symlink_to(elsewhere)
+            self.assertFalse(mod.remove_if_ours(link))
+            self.assertTrue(link.is_symlink())
+            # The target is an administrator's file too, reached only
+            # through their own symlink — leaving the link alone is not
+            # enough if the target got touched on the way.
+            self.assertTrue(elsewhere.exists())
+            self.assertEqual(mod.GENERATED_HEADER + "x = 1\n",
+                             elsewhere.read_text())
+
+    def test_codex_full_access_is_file_and_flag_together(self):
+        """Never the flag without the file. supervisor.sh reads the flag as
+        evidence the file exists, so setting one alone would make a
+        session's skipPermissions = false opt-out fight a default nobody
+        wrote."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for want in (False, True):
+                config["codexFullAccess"] = want
+                spec = mod.Spec(config, prof)
+                rend = mod.Renderer(spec, prof, root=Path(tmp) / f"o{want}")
+                tree = rend.render()
+                toml = [f for f in tree.files if f.endswith("codex/config.toml")]
+                env = [text for path, (text, _) in tree.files.items()
+                       if path.endswith("/agent.env")][0]
+                self.assertEqual(want, bool(toml))
+                self.assertEqual(want, "AGENT_BOX_CODEX_FULL_ACCESS" in env)
+
+    def test_a_quoted_false_does_not_turn_codex_loose(self):
+        """`bool("false")` is True — a quoted string here would silently
+        grant danger-full-access instead of the false the author wrote
+        (issue #404 review). null is kept meaning off, same as bool(None)
+        always made it; only a type this knob has no business carrying
+        is rejected."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for bad in ("false", "true", 0, 1, [], {}):
+                config["codexFullAccess"] = bad
+                with self.assertRaises(mod.ConfigError):
+                    mod.Spec(config, prof)
+            for ok in (True, False, None):
+                config["codexFullAccess"] = ok
+                mod.Spec(config, prof)  # must not raise
+            # null has to actually BEHAVE like off, not just be accepted:
+            # bool(None) is False, but only a render proves nothing reads
+            # it the other way.
+            config["codexFullAccess"] = None
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "null").render()
+            self.assertFalse(
+                [f for f in tree.files if f.endswith("codex/config.toml")],
+                "codexFullAccess: null rendered the full-access file")
+            env = [text for path, (text, _) in tree.files.items()
+                   if path.endswith("/agent.env")][0]
+            self.assertNotIn("AGENT_BOX_CODEX_FULL_ACCESS", env)
+
+    def test_hook_session_args_rejects_a_bare_string(self):
+        """A bare string is iterable, so list() would silently turn
+        "--model foo" into one argument per CHARACTER instead of raising —
+        exactly the shape a YAML author reaches for by mistake when they
+        mean a single-element list (issue #404 review)."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for bad in ("--model foo", [1, 2], {"a": "b"}, 5):
+                config["webhook"] = {"hookSessionArgs": bad}
+                with self.assertRaises(mod.ConfigError):
+                    mod.Spec(config, prof)
+            for ok in (["--model", "foo"], [], None):
+                config["webhook"] = {"hookSessionArgs": ok}
+                mod.Spec(config, prof)  # must not raise
+
+    def test_the_webhook_dispatcher_is_fully_wired(self):
+        """Issue #394, gap 6. Per-session delivery worked natively; the
+        pieces around it did not, each failing quietly in its own way:
+
+          HOOK_SPAWN_CMD          the standing-watch panel could not print
+                                  the prompt the next match would launch.
+          WEBHOOK_PYTHON          the panel fell back to the daemon's own
+                                  interpreter, which need not carry
+                                  local-webhook's dependencies.
+          WEBHOOK_PINNED_SCRIPT   claude sessions tracked the marketplace's
+                                  default branch instead of the plugin
+                                  version the box pins.
+          HOOK_SESSION_ARGS       no box-wide default for the hook-*
+                                  sessions a watch spawns (issue #216's
+                                  cheaper triage model).
+        """
+        settings = (FIXTURE / "etc/systemd/system"
+                    / "agent-box-settings@agent.service.d"
+                    / "10-host.conf").read_text()
+        self.assertIn("AGENT_BOX_HOOK_SPAWN_CMD=", settings)
+        self.assertIn("AGENT_BOX_WEBHOOK_PYTHON=", settings)
+        env = (FIXTURE / "etc/agent-box/units/agent.env").read_text()
+        self.assertIn("AGENT_BOX_WEBHOOK_PINNED_SCRIPT=", env)
+        wrapper = (FIXTURE / "usr/local/bin/agent-box-webhook").read_text()
+        self.assertIn("AGENT_BOX_HOOK_SESSION_ARGS=", wrapper)
+        # JSON, not a shell list: webhook-spawn.sh parses it with jq
+        # precisely so an argument may contain spaces.
+        args = wrapper.split("AGENT_BOX_HOOK_SESSION_ARGS=", 1)[1]
+        json.loads(args.split("\n")[0].strip().strip("'"))
+
+    def test_a_hook_arg_with_an_apostrophe_survives_the_wrapper(self):
+        """The wrapper is generated shell. JSON does not escape an
+        apostrophe, so `don't` closed the quoted value and broke
+        agent-box-webhook for every caller — not just the one who set it.
+        Also covers webhook: null and hookSessionArgs: null, either of
+        which used to raise in Spec before anything was rendered."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["webhook"]["hookSessionArgs"] = [
+            "--append-system-prompt", "don't guess; ask"]
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "o").render()
+            wrapper = [text for path, (text, _) in tree.files.items()
+                       if path.endswith("bin/agent-box-webhook")][0]
+            line = [x for x in wrapper.splitlines()
+                    if "AGENT_BOX_HOOK_SESSION_ARGS" in x][0]
+            # What the shell would actually assign, per the shell.
+            out = subprocess.run(["sh", "-c", line + "\n"
+                                  "printf %s \"$AGENT_BOX_HOOK_SESSION_ARGS\""],
+                                 capture_output=True, text=True, check=True)
+            self.assertEqual(config["webhook"]["hookSessionArgs"],
+                             json.loads(out.stdout))
+        for empty in ({"webhook": None},
+                      {"webhook": {"enable": True, "script": "/x",
+                                   "hookSessionArgs": None}}):
+            cfg = dict(json.loads(CONFIG_JSON.read_text()), **empty)
+            with tempfile.TemporaryDirectory() as tmp:
+                prof = build_fake_profile(tmp)
+                self.assertEqual([], mod.Spec(cfg, prof).hook_session_args)
+
+    def test_the_root_daemon_knows_every_terminal_user(self):
+        """AGENT_BOX_WEB_USERS is what GET / offers. Only the root daemon
+        serves that page, so only it gets the list."""
+        root = (FIXTURE / "etc/agent-box/units"
+                / "agent-box-settings-agent.env").read_text()
+        self.assertIn("AGENT_BOX_WEB_USERS=agent,robot", root)
+        other = (FIXTURE / "etc/agent-box/units"
+                 / "agent-box-settings-robot.env").read_text()
+        self.assertNotIn("AGENT_BOX_WEB_USERS", other)
+
+    def test_memory_pressure_has_all_three_answers(self):
+        """Issue #62, and #394 gap 9.
+
+        The incident: a swapless box under agent memory pressure never
+        OOM-killed. It thrashed the page cache instead — every fault
+        reading pages straight back off disk — and userspace froze for
+        hours while the health checks stayed green. Nothing was out of
+        memory; everything was too slow to say so.
+
+        Natively this was ONE of the three knobs: OOMScoreAdjust told the
+        kernel which process to kill in a situation the kernel was never
+        going to notice, while the earlyoom binary sat unused in the
+        runtime profile.
+        """
+        units = FIXTURE / "etc/systemd/system"
+        zram = (units / "agent-box-zram.service").read_text()
+        self.assertIn("RemainAfterExit=yes", zram)
+        helper = (FIXTURE / "etc/agent-box/bin/agent-box-zram").read_text()
+        self.assertIn("--algorithm zstd", helper)
+        # Above any disk swap the deployment made (the Lightsail template
+        # writes a 2 GiB file): compressed RAM first, disk when it fills.
+        self.assertIn("--priority 100", helper)
+        early = (units / "agent-box-earlyoom.service").read_text()
+        for arg in ("-m 10", "-s 10", "-r 3600", "--avoid", "--prefer"):
+            self.assertIn(arg, early)
+        # It must outlive what it arbitrates, and start after the swap it
+        # measures.
+        self.assertIn("OOMScoreAdjust=-100", early)
+        self.assertIn("After=agent-box-zram.service", early)
+        sysctl = (FIXTURE / "etc/sysctl.d/60-agent-box-memory.conf").read_text()
+        self.assertIn("vm.swappiness = 180", sysctl)
+        self.assertIn("vm.page-cluster = 0", sysctl)
+
+    def test_protect_memory_false_renders_none_of_it(self):
+        """The knob has to actually be a knob: a host that turns it off
+        gets no units, not units that are installed and idle."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["protectMemory"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "o").render()
+            for name in ("agent-box-zram.service",
+                         "agent-box-earlyoom.service",
+                         "60-agent-box-memory.conf"):
+                self.assertFalse([f for f in tree.files if f.endswith(name)],
+                                 f"{name} rendered with protectMemory off")
+
+    def test_turning_protect_memory_off_takes_the_daemon_with_it(self):
+        """The dangerous transition, applied to ONE root.
+
+        The knob rendering nothing is only half of it. A box applied with
+        protectMemory: true and later false kept the zram device swapped
+        in and earlyoom RUNNING — apply never deletes what a render stops
+        emitting — so a daemon whose whole job is to kill the agent CLIs
+        went on doing it with nothing left in the config that named it.
+        Two separate output roots cannot see this, which is why this test
+        reuses one, exactly as the codexFullAccess test above does.
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "one-root"
+            owned = [out / "etc/systemd/system/agent-box-zram.service",
+                     out / "etc/systemd/system/agent-box-earlyoom.service",
+                     out / "etc/agent-box/bin/agent-box-zram",
+                     out / "etc/sysctl.d/60-agent-box-memory.conf"]
+
+            def render(protect):
+                config["protectMemory"] = protect
+                cfg = Path(tmp) / "config.json"
+                cfg.write_text(json.dumps(config))
+                spec = mod.Spec(config, prof)
+                tree = mod.Renderer(spec, prof, root=out).render()
+                proc = subprocess.run(
+                    [sys.executable, str(AGENTBOX), "apply",
+                     "--config", str(cfg), "--profile", str(prof),
+                     "--root", str(out)], capture_output=True, text=True)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+                return tree
+
+            render(True)
+            for f in owned:
+                self.assertTrue(f.exists(), f"{f.name} not rendered")
+            tree = render(False)
+            for f in owned:
+                self.assertFalse(f.exists(),
+                                 f"{f.name} survived protectMemory: false")
+            # Removing the unit FILE is not stopping the daemon. The units
+            # have to be named for disabling too, or earlyoom keeps running
+            # from the copy systemd already loaded — and named in THIS
+            # order: earlyoom is what kills, so it has to be the one
+            # already stopped when zram's swapoff creates a memory spike
+            # bringing the compressed pages back to RAM, not the one still
+            # running to react to it.
+            self.assertEqual(["agent-box-earlyoom.service",
+                              "agent-box-zram.service"],
+                             tree.disable)
+
+    def test_a_unit_this_box_never_had_is_not_disabled(self):
+        """The teardown must be quiet on a box that always had the knob
+        off: `systemctl disable` on a name that was never installed is an
+        error on every apply, and output nobody reads is output that hides
+        the next real problem."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["protectMemory"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "fresh").render()
+            self.assertEqual([], tree.disable)
+
+    def test_an_administrator_edited_unit_is_not_disabled(self):
+        """Existence alone is not ownership.
+
+        A unit file present at the name we generate is not necessarily
+        one we generated — an administrator may have taken it over, the
+        same case remove_if_ours already respects. Queuing that unit for
+        disable-and-stop because a file merely exists at its path would
+        stop a service whose file remove_if_ours goes on to leave in
+        place: this box's render deciding a customized unit is torn down,
+        which nothing about protectMemory: false authorizes.
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "one-root"
+            config["protectMemory"] = True
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps(config))
+            spec = mod.Spec(config, prof)
+            mod.Renderer(spec, prof, root=out).render()
+            proc = subprocess.run(
+                [sys.executable, str(AGENTBOX), "apply",
+                 "--config", str(cfg), "--profile", str(prof),
+                 "--root", str(out)], capture_output=True, text=True)
+            self.assertEqual(0, proc.returncode, proc.stderr)
+
+            unit = out / "etc/systemd/system/agent-box-earlyoom.service"
+            unit.write_text("# hand-edited by an administrator\n")
+
+            config["protectMemory"] = False
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=out).render()
+            self.assertNotIn("agent-box-earlyoom.service", tree.disable)
+
+    def test_only_an_oomd_we_disabled_is_ever_re_enabled(self):
+        """systemd-oomd is the one piece of memory protection that is the
+        DISTRO's, not ours: apply turns it off so it does not race
+        earlyoom. Giving it back on the way down is only correct for a box
+        where we were the one who took it — `is-enabled` reporting
+        "masked", "disabled" or nothing at all means an admin decided
+        this, and apply leaves their decision alone."""
+        mod = load_agentbox()
+
+        def fake_run(cmd, check=True, capture=False):
+            return subprocess.CompletedProcess(cmd, 0, stdout=reply, stderr="")
+
+        with contextlib.ExitStack() as stack:
+            stack.callback(setattr, mod, "run", mod.run)
+            mod.run = fake_run
+            for reply, want in (("enabled\n", True),
+                                ("disabled\n", False),
+                                ("masked\n", False),
+                                ("static\n", False),
+                                ("", False)):
+                self.assertIs(want, mod.unit_is_enabled(mod.OOMD_UNIT),
+                              f"is-enabled said {reply!r}")
 
     def test_units_are_installed_verbatim(self):
         """The %i template units must be the shared asset, byte for byte."""
