@@ -379,7 +379,9 @@ def dumps(path):
 #   AGENT_BOX_PASSWORD_CMD       no-argument sudo command that verifies
 #                                 and replaces this user's web password
 #   AGENT_BOX_WEBHOOK_SCRIPT     pinned local-webhook webhook.py (empty =
-#                                 no webhook receiver, so no panel)
+#                                 no webhook receiver, so no panel — but
+#                                 the page still says which of "off" and
+#                                 "misconfigured" it is)
 #   AGENT_BOX_WEBHOOK_STATE_DIR  where its filter.*.json files live
 #   AGENT_BOX_WEBHOOK_URL        the receiver endpoint senders POST to
 #   AGENT_BOX_WEBHOOK_PYTHON     interpreter for that script
@@ -494,11 +496,68 @@ WEBHOOK_URL = os.environ.get("AGENT_BOX_WEBHOOK_URL", "")
 # dev run; the module passes the same python the receiver unit uses.
 WEBHOOK_PYTHON = os.environ.get("AGENT_BOX_WEBHOOK_PYTHON", "") or sys.executable
 WEBHOOKS = bool(WEBHOOK_SCRIPT and WEBHOOK_STATE_DIR)
+# Whether the box MEANT to have webhooks: every AGENT_BOX_WEBHOOK_* the
+# unit passed, whether or not it passed the two the panel runs on. Read
+# here with the rest rather than scanned when the page renders, so the
+# panel's answer depends on what this unit was handed and not on whatever
+# a later caller happens to have in its environment.
+WEBHOOK_CONFIGURED = sorted(
+    name for name, value in os.environ.items()
+    if name.startswith("AGENT_BOX_WEBHOOK_") and value)
 # The dispatch script the receiver runs on a match. Run here only in its
 # --preamble mode, which spawns nothing: it prints the prompt the next
 # match would start a session with, so the standing-watch panel shows what
 # a watch DOES instead of restating why it exists (#259).
 HOOK_SPAWN_CMD = os.environ.get("AGENT_BOX_HOOK_SPAWN_CMD", "")
+
+
+def webhook_unavailable():
+    """Why this box shows no webhook panel — or None when it shows one.
+
+    Rendering nothing at all is how #425 came in: a fresh native box had
+    no panel, and the page gave its operator no way to tell a feature that
+    is OFF from one that is wired up wrong. An absence looks the same
+    either way, so the report had to start with a bug hunt. Three states,
+    and only the first is a choice anybody made:
+
+      - Off. No webhook variable reaches this daemon at all, because the
+        box renders no receiver. Nothing is broken; one line says so.
+      - Half configured. Some webhook variable arrived and the ones this
+        panel runs on did not. That is #426 exactly — the module set
+        AGENT_BOX_WEBHOOK_SCRIPT on the settings unit, the native renderer
+        set it only in the agent-box-webhook CLI wrapper, and the panel
+        vanished on every native box.
+      - Pinned at a path that is not there. #425's second half: the
+        declared webhook.py had no owner and nothing installed it. Every
+        route here forks that file, so the panel would render empty and
+        each button would fail for a reason the page never states.
+    """
+    if not (WEBHOOK_CONFIGURED or HOOK_SPAWN_CMD):
+        return ("Off on this box &mdash; nothing here receives deliveries, "
+                "so no standing watch can start a session from one. Turn it "
+                "on in the box&rsquo;s configuration "
+                "(<code>webhook.enable</code>) and apply.")
+    missing = [name for name, value in
+               (("AGENT_BOX_WEBHOOK_SCRIPT", WEBHOOK_SCRIPT),
+                ("AGENT_BOX_WEBHOOK_STATE_DIR", WEBHOOK_STATE_DIR))
+               if not value]
+    if missing:
+        return ("Enabled on this box, but this page was given no "
+                + " and no ".join("<code>%s</code>" % html.escape(name)
+                                  for name in missing)
+                + ", so it cannot show or change subscriptions. The receiver "
+                "itself may well be running: <code>agent-box-webhook ls</code> "
+                "in a session still answers. This is a bug in the box, not a "
+                "setting &mdash; report it with this line.")
+    if not os.path.isfile(WEBHOOK_SCRIPT):
+        return ("Enabled on this box, but the pinned webhook script "
+                "<code>%s</code> is not there, so nothing on this page can "
+                "run. The receiver runs that same file, which means "
+                "deliveries are not arriving either. This is a bug in the "
+                "box, not a setting &mdash; report it with this line."
+                % html.escape(WEBHOOK_SCRIPT))
+    return None
+
 
 # Env var names (KEY_RE) come from the spliced env-store library above: the
 # charset a shell / systemd EnvironmentFile accepts as a variable name, and
@@ -3053,6 +3112,17 @@ WEBHOOKS_SECTION_TPL = """<section>
     <div id="webhooks-list">{webhooks}</div>
   </section>"""
 
+# What stands in for the panel when there is no panel (#425). One heading
+# and one sentence: an operator who came here looking for the webhook
+# section finds it, and finds out in the same glance whether the feature
+# is off or the box is wrong. See webhook_unavailable() for the states.
+WEBHOOK_UNAVAILABLE_TPL = """<section>
+    <div class="sec-head">
+      <h2>Webhook</h2>
+    </div>
+    <p class="note">{text}</p>
+  </section>"""
+
 # The endpoint half. Its own note, so the whole thing can be left out on a
 # box that serves no endpoint (no AGENT_BOX_WEBHOOK_URL) without leaving a
 # paragraph pointing at a URL that is not there.
@@ -5010,7 +5080,8 @@ def render_page(message=""):
     # One pass over the subscription state per render, feeding both
     # panels: it forks the pinned CLI once per session, so the Sessions
     # rows and the standing watches must not each pay for their own.
-    subs, watches = webhook_view() if WEBHOOKS else (None, [])
+    unavailable = webhook_unavailable()
+    subs, watches = webhook_view() if not unavailable else (None, [])
     return (
         render_head("Settings &mdash; " + html.escape(USER))
         + STYLE
@@ -5024,10 +5095,11 @@ def render_page(message=""):
             # terminal workspace, so session CRUD lives here.
             sessions_section=render_sessions_section(subs),
             webhooks_section=(
+                WEBHOOK_UNAVAILABLE_TPL.format(text=unavailable)
+                if unavailable else
                 WEBHOOKS_SECTION_TPL.format(
                     endpoint=render_webhook_endpoint(),
                     webhooks=render_webhooks(watches))
-                if WEBHOOKS else ""
             ),
             connect_section=render_connect() if connect_flows() else "",
             message=msg_html,
