@@ -450,7 +450,18 @@ let
     install -m444 ${pkgs.writeText "agent-box-settings@.service" ''
       [Unit]
       Description=Per-user secrets settings page for %i
-      After=network-online.target agent-box-settings@%i.socket
+      # agent-box@%i is ordered BEFORE this, not merely wanted: /run/agent-box-%i
+      # is that unit's RuntimeDirectory (nothing else creates it — no tmpfiles rule
+      # on either backend), and it is listed in ReadWritePaths below. A path in
+      # ReadWritePaths that does not exist fails the whole namespace setup with
+      # 226/NAMESPACE, so without this ordering the two units — both wanted by
+      # multi-user.target, previously with nothing between them — simply raced on
+      # every boot, and a boot this daemon won left the settings page 502 until
+      # Restart=always came back 5s later. Same directive, same reason, as
+      # agent-web-terminal@.service. NOT a `-` prefix instead: the daemon drives
+      # tmux over the socket in that directory, so it needs the path writable, not
+      # merely tolerated when absent.
+      After=network-online.target agent-box-settings@%i.socket agent-box@%i.service
       Requires=agent-box-settings@%i.socket
       Wants=network-online.target
 

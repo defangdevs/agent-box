@@ -142,6 +142,24 @@
         "systemctl show agent-box-settings@agent --property=User | grep -x 'User=agent'"
     )
 
+    # The daemon lists /run/agent-box-agent in ReadWritePaths, and nothing but
+    # agent-box@agent's own RuntimeDirectory creates it — so it must be
+    # ORDERED after that unit. Both are wanted by multi-user.target, so
+    # without the ordering they raced on every boot, and a boot this daemon
+    # won failed the whole namespace setup with 226/NAMESPACE (the same class
+    # of bug as the ~/sites entry guarded in tests/memory-protection.nix).
+    # Asserted here rather than in tests/golden/: the ordering lives in the
+    # verbatim unit text shipped via systemd.packages, whose raw bytes the
+    # golden snapshot cannot see (issue #299).
+    machine.succeed(
+        "systemctl show agent-box-settings@agent --property=After --value "
+        "| tr ' ' '\\n' | grep -x 'agent-box@agent.service' >/dev/null"
+    )
+    machine.succeed(
+        "systemctl show agent-box-settings@agent --property=ReadWritePaths "
+        "--value | grep /run/agent-box-agent >/dev/null"
+    )
+
     # Issue #49: the daemon listens ONLY on the systemd-owned unix socket —
     # 0660 agent:caddy, no TCP listener for other local users to reach.
     machine.succeed(
