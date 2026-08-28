@@ -80,6 +80,16 @@ then ok "the push ref claim is fully qualified"
 else no "the push ref claim is fully qualified" \
         "$(include_of defangdevs/agent-box --claim branch:fix/42)"; fi
 
+# --- the shape the guide tells you to use --------------------------------
+# A PR is claimed with the BARE number, not pr:N. GitHub reports a comment
+# on a PR as issue_comment with issue.number, so pr:N alone leaves reviews
+# and comments on your own PR unclaimed — which is the #417 collision.
+# Assert the documented example covers both spellings.
+for p in pull_request.number issue.number; do
+  covers "the documented PR claim covers $p" "$p" \
+         defangdevs/agent-box --claim 42 --claim branch:fix/42
+done
+
 # --- narrow forms -------------------------------------------------------
 if include_of defangdevs/agent-box --claim pr:42 \
    | jq -e '[.any[].path] == ["pull_request.number"]' >/dev/null 2>&1

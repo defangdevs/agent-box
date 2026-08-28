@@ -97,14 +97,20 @@ sender should still get through.
 does not start a second session on top of you. SPEC is one of:
 
   42              the issue OR pull request numbered 42
-  pr:42           just the pull request
-  issue:42        just the issue
+  pr:42           ONLY the pull request (see below)
+  issue:42        only the issue
   branch:NAME     everything CI reports against that branch
 
 Repeatable; the clauses OR together. Picking up a PR is normally both:
 
   agent-box-webhook subscribe OWNER/REPO --note "PR 42: CI + review" \
-    --claim pr:42 --claim branch:fix/42-thing
+    --claim 42 --claim branch:fix/42-thing
+
+Use the BARE number for a PR. GitHub reports a PR comment as an
+issue_comment carrying issue.number, not pull_request.number, so pr:42
+claims the PR and leaves the comments and reviews ON it unclaimed — the
+one event a reviewer is most likely to generate. pr:/issue: are for when
+you deliberately want only one.
 
 Prefer this to hand-writing --include. A claim only covers the payload
 paths it names, and CI reports terminal failure under six event shapes —
@@ -388,7 +394,9 @@ claim_clauses() {
     # A bare number claims both, because an agent picking up "42" does not
     # always know whether the events it will see call it an issue or a PR —
     # GitHub itself uses both for the same object (a PR comment arrives as
-    # issue_comment with issue.number).
+    # issue_comment with issue.number). This is why the documented example
+    # uses a bare number for a PR: `pr:42` alone leaves every comment and
+    # review ON that PR unclaimed, which is the #417 collision exactly.
     (number) "$JQ" -nc --argjson n "$_cl_val" \
                '[{path:"pull_request.number", "in":[$n]},
                  {path:"issue.number", "in":[$n]}]' ;;

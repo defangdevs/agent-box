@@ -59,11 +59,18 @@ let
 
           agent-box-webhook subscribe OWNER/REPO \
             --note "PR 42: waiting on CI + review" \
-            --claim pr:42 --claim branch:fix/42-thing
+            --claim 42 --claim branch:fix/42-thing
 
-      `--claim` is the whole of it: `42` for an issue or PR by number, `pr:42` or
-      `issue:42` to be specific, `branch:NAME` for everything CI reports against a
-      branch. Repeat it, and the clauses OR together.
+      `--claim` is the whole of it: `42` for an issue or PR by number,
+      `branch:NAME` for everything CI reports against a branch. Repeat it, and the
+      clauses OR together.
+
+      Use the BARE number for a PR, as above. GitHub reports a PR comment as an
+      `issue_comment` carrying `issue.number`, not `pull_request.number` — so
+      `--claim pr:42` claims the PR itself and leaves comments and reviews ON it
+      unclaimed, which is the one event a reviewer is most likely to generate. A
+      bare `42` claims both spellings. `pr:42` and `issue:42` exist for when you
+      deliberately want only one.
 
       Use it rather than hand-writing `--include`. A claim only covers the payload
       paths it names, and a watch spawns on terminal CI failure reported through six
@@ -3178,14 +3185,20 @@ esac
     does not start a second session on top of you. SPEC is one of:
 
       42              the issue OR pull request numbered 42
-      pr:42           just the pull request
-      issue:42        just the issue
+      pr:42           ONLY the pull request (see below)
+      issue:42        only the issue
       branch:NAME     everything CI reports against that branch
 
     Repeatable; the clauses OR together. Picking up a PR is normally both:
 
       agent-box-webhook subscribe OWNER/REPO --note "PR 42: CI + review" \
-        --claim pr:42 --claim branch:fix/42-thing
+        --claim 42 --claim branch:fix/42-thing
+
+    Use the BARE number for a PR. GitHub reports a PR comment as an
+    issue_comment carrying issue.number, not pull_request.number, so pr:42
+    claims the PR and leaves the comments and reviews ON it unclaimed — the
+    one event a reviewer is most likely to generate. pr:/issue: are for when
+    you deliberately want only one.
 
     Prefer this to hand-writing --include. A claim only covers the payload
     paths it names, and CI reports terminal failure under six event shapes —
@@ -3469,7 +3482,9 @@ esac
         # A bare number claims both, because an agent picking up "42" does not
         # always know whether the events it will see call it an issue or a PR —
         # GitHub itself uses both for the same object (a PR comment arrives as
-        # issue_comment with issue.number).
+        # issue_comment with issue.number). This is why the documented example
+        # uses a bare number for a PR: `pr:42` alone leaves every comment and
+        # review ON that PR unclaimed, which is the #417 collision exactly.
         (number) "$JQ" -nc --argjson n "$_cl_val" \
                    '[{path:"pull_request.number", "in":[$n]},
                      {path:"issue.number", "in":[$n]}]' ;;

@@ -173,11 +173,18 @@ a comment on it no longer starts a second session on top of you:
 
     agent-box-webhook subscribe OWNER/REPO \
       --note "PR 42: waiting on CI + review" \
-      --claim pr:42 --claim branch:fix/42-thing
+      --claim 42 --claim branch:fix/42-thing
 
-`--claim` is the whole of it: `42` for an issue or PR by number, `pr:42` or
-`issue:42` to be specific, `branch:NAME` for everything CI reports against a
-branch. Repeat it, and the clauses OR together.
+`--claim` is the whole of it: `42` for an issue or PR by number,
+`branch:NAME` for everything CI reports against a branch. Repeat it, and the
+clauses OR together.
+
+Use the BARE number for a PR, as above. GitHub reports a PR comment as an
+`issue_comment` carrying `issue.number`, not `pull_request.number` — so
+`--claim pr:42` claims the PR itself and leaves comments and reviews ON it
+unclaimed, which is the one event a reviewer is most likely to generate. A
+bare `42` claims both spellings. `pr:42` and `issue:42` exist for when you
+deliberately want only one.
 
 Use it rather than hand-writing `--include`. A claim only covers the payload
 paths it names, and a watch spawns on terminal CI failure reported through six
