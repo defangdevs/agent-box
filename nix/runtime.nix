@@ -28,8 +28,14 @@
 #     the interactive wrappers.
 { pkgs
 , lib ? pkgs.lib
-  # Which agent CLIs to bundle. Mirrors services.agent-box.installAgents.
-, installAgents ? [ "claude" "codex" ]
+  # Which agent CLIs to BUNDLE. Mirrors services.agent-box.eagerAgents, and
+  # like it, empty by default since issue #416: claude-code and codex were
+  # measured at 472 and 565 MiB, they barely overlap, and a session fetches
+  # the one it needs into the user's own profile on first use. Which agents
+  # a box may RUN is a host-config question (`agents:` in the config the
+  # renderer reads), not a profile one — so this list only decides what the
+  # profile pays for.
+, eagerAgents ? [ ]
   # Resolve the fast-moving agent CLIs from a pinned nixos-unstable, exactly
   # as the module's selfUpdate.agentNixpkgs wiring does. Null = host pkgs.
 , agentPkgs ? pkgs
@@ -180,7 +186,7 @@ let
   agentPackage = agent:
     if agent == "claude" then agentPkgs.claude-code
     else if agent == "codex" then agentPkgs.codex
-    else throw "nix/runtime.nix: unknown agent \"${agent}\" in installAgents";
+    else throw "nix/runtime.nix: unknown agent \"${agent}\" in eagerAgents";
 
   webhookEnabled = localWebhookScript != null;
 
@@ -308,7 +314,7 @@ pkgs.buildEnv {
   name = "agent-box-runtime";
   paths = unitPayloads ++ cliPayloads ++ baseTools ++ serviceTools
           ++ [ agentboxCli pythonForHelper ]
-          ++ map agentPackage installAgents
+          ++ map agentPackage eagerAgents
           ++ [ assets ];
   # A profile is a user-visible PATH: keep man pages, drop nothing silently.
   extraOutputsToInstall = [ "man" ];

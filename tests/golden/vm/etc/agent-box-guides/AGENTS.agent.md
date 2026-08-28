@@ -90,6 +90,15 @@ plainly rather than handing it back.
   not respawned — until `restart NAME` revives it; `rm` delists it for
   good. `restart --all` bounces every session. Listed sessions start
   within ~2s.
+- Agent CLIs are usually installed ON DEMAND, not shipped with the box: the
+  first session that names a harness fetches it into your own profile, which
+  takes as long as the download does and prints `session: fetching '<name>'`
+  while it runs. So `command -v codex` can come back empty on a box that is
+  perfectly able to run a codex session — start one, or press the sign-in
+  card on the settings page, rather than concluding the harness is
+  unavailable. The same is true of any other CLI: `nix profile add
+  nixpkgs#<pkg>` puts it in `~/.nix-profile/bin`, which is FIRST on your
+  PATH, so an install is visible to a pane that is already running.
 - `--agent` picks the HARNESS (the CLI program). An agent PROFILE is the
   worker: a harness plus a model, an effort level, an appended system prompt
   and environment. Make one with `agent-box-profile set NAME

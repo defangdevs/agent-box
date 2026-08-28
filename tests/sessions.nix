@@ -18,8 +18,9 @@
 #   - stop semantics (issue 167): a clean agent exit (or agent-box-session
 #     stop) parks the session — listed, flagged stopped, left down — and
 #     restart clears the flag and revives it,
-#   - both agent CLIs installed regardless of what sessions run
-#     (installAgents default),
+#   - both agent CLIs installed regardless of what sessions run — this box
+#     asks for them with eagerAgents, which since issue #416 is what puts a
+#     harness in the closure instead of fetching it on first use,
 #   - the instruction files each harness reads (issue #305): the editable
 #     AGENTS.md plus a user-scope pointer at the canonical guide under the
 #     name that harness discovers — ~/.claude/CLAUDE.md for claude (which
@@ -101,8 +102,11 @@ in
     )
     machine.succeed(f"grep -qF 'rcname=$USER-$sname' {start_script}")
 
-    # Both agent CLIs are installed even though no session uses codex yet
-    # (installAgents defaults to all supported agents).
+    # Both agent CLIs are installed even though no session uses codex yet:
+    # this box lists both in eagerAgents. On a DEFAULT box that list is empty
+    # and neither is here until a session asks (issue #416) — the rendering
+    # of which is locked by the golden fixture, not by a VM that cannot
+    # reach the network to prove the fetch.
     machine.succeed("test -x /run/current-system/sw/bin/claude")
     machine.succeed("test -x /run/current-system/sw/bin/codex")
     machine.succeed("su -s /bin/sh agent -c 'test -x /home/agent/.codex/packages/standalone/current/codex'")

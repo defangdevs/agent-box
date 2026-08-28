@@ -23,6 +23,12 @@
     services.agent-box = {
       enable = true;
       agent = "claude";
+      # Both harnesses in the CLOSURE, not fetched on first use (issue #416).
+      # This test drives the real claude and codex CLIs, and a VM test has no
+      # network to fetch them over — the same reason it opts back into a
+      # seeded "main" below. Keeping them eager here is also what preserves
+      # coverage of the eager path now that it is no longer the default.
+      eagerAgents = [ "claude" "codex" ];
       # Leave the host label unset so auto-derived Remote Control names fall
       # back to the public web.domain rather than the internal kernel
       # hostname (issue: derived names showed the internal EC2 fqdn).

@@ -294,6 +294,15 @@ let
       not respawned — until `restart NAME` revives it; `rm` delists it for
       good. `restart --all` bounces every session. Listed sessions start
       within ~2s.
+    - Agent CLIs are usually installed ON DEMAND, not shipped with the box: the
+      first session that names a harness fetches it into your own profile, which
+      takes as long as the download does and prints `session: fetching '<name>'`
+      while it runs. So `command -v codex` can come back empty on a box that is
+      perfectly able to run a codex session — start one, or press the sign-in
+      card on the settings page, rather than concluding the harness is
+      unavailable. The same is true of any other CLI: `nix profile add
+      nixpkgs#<pkg>` puts it in `~/.nix-profile/bin`, which is FIRST on your
+      PATH, so an install is visible to a pane that is already running.
     - `--agent` picks the HARNESS (the CLI program). An agent PROFILE is the
       worker: a harness plus a model, an effort level, an appended system prompt
       and environment. Make one with `agent-box-profile set NAME
@@ -1947,11 +1956,25 @@ done
     if cfg.package != null then cfg.package
     else if agent == "claude" then agentPkgs.claude-code
     else agentPkgs.codex;
-  installedAgentPackages = map agentPackage cfg.installAgents;
-  installedCodexPackage = lib.optional (builtins.elem "codex" cfg.installAgents) (agentPackage "codex");
-  # Box-wide codex autonomy is on only when codex is actually installed:
-  # /etc/codex/config.toml would otherwise configure a CLI that is not there
-  # (see the codexFullAccess option, issue 234).
+  # The harnesses baked into the system closure — EMPTY by default since
+  # issue #416. `installAgents` is the ALLOW-list (which agents a session may
+  # name); this is the much smaller question of which of them the box pays
+  # for at build time. Measured on a live aarch64 box at this flake.lock:
+  # claude-code is 344 MiB and codex 508 MiB, and they barely overlap — the
+  # native runtime profile drops from 1.4 GiB to 800 MiB with both gone.
+  #
+  # Everything else still works because the lazy path is already in place
+  # (PR #417): agent_bin falls through to ~/.nix-profile/bin, which is FIRST
+  # on the session PATH, and agent_install fetches from the box's own pinned
+  # nixpkgs on the first session that asks for a harness.
+  eagerAgentPackages = map agentPackage cfg.eagerAgents;
+  # Box-wide codex autonomy is on only where codex may RUN — not where it is
+  # eagerly installed. Since #416 a codex session installs its harness on
+  # first use, and /etc/codex/config.toml has to be there before that
+  # session starts, not after; gating on eagerAgents would mean the file
+  # never appeared on a lazy box. installAgents is the right question:
+  # writing it for a box that can never run codex is the case the guard
+  # exists for (see the codexFullAccess option, issue 234).
   codexFullAccess = cfg.codexFullAccess && builtins.elem "codex" cfg.installAgents;
 
   # Defang CLI (issue #363): not in nixpkgs, but DefangLabs/defang ships its
@@ -2080,7 +2103,7 @@ done
   ];
 
   agentRuntimePackages = lib.unique (
-    installedAgentPackages
+    eagerAgentPackages
     ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli uploadCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
@@ -5530,24 +5553,42 @@ $PROMPT"
   # against (AGENT_BOX_AGENT_BINS). "shell" (issue #113): the user's login
   # shell as a pseudo-agent — always resolvable, independent of
   # installAgents. Store and shell paths never contain whitespace.
+  #
+  # Only the EAGER harnesses appear here, and since #416 that list is empty
+  # by default. A harness with no entry is not an error: agent_bin falls
+  # through to ~/.nix-profile/bin and, failing that, agent_install fetches
+  # it. Listing a lazy harness as `<name>=/home/<u>/.nix-profile/bin/<name>`
+  # would be the same answer spelled worse — the fallback already computes
+  # that path from $HOME, and a table entry naming a missing binary is the
+  # case agent_bin has to defend against anyway (the native backend has no
+  # store paths to name, so it always names the profile layout).
   agentBinsFor = name:
     lib.concatStringsSep " " (
-      map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
+      map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.eagerAgents
       ++ [ "shell=${utils.toShellPath config.users.users.${name}.shell}" ]
     );
   # Guided sign-in cards (issues #207, #208, #313): "<id>=<binary>" pairs
   # naming the CLI each card drives. The settings daemon runs the tool's
   # OWN sign-in command (`claude auth login`, `codex login --device-auth`,
   # `gh auth login --web`) in its own tmux session and never handles a
-  # token, so a card exists only where its binary does — an agent left out
-  # of installAgents simply has no card. Absolute paths because that
-  # daemon's unit deliberately carries no agent PATH; a VM test overrides
-  # this variable to point an id at a stub. defang's path is a plain string,
-  # not `${defangCli}/bin/defang` — it's built in the background (see
-  # defangCliExpr above), so the card just doesn't appear until that
-  # finishes and the path starts existing, same as any other missing binary.
+  # token. Absolute paths because that daemon's unit deliberately carries
+  # no agent PATH; a VM test overrides this variable to point an id at a
+  # stub.
+  #
+  # This is per-card STATE, not the card LIST — since #416 the list is the
+  # daemon's own CONNECT_DEFS, so a harness that is not here still gets a
+  # card, one that offers to install it. Which is the only thing that makes
+  # a lazy box usable: with the CLIs out of the closure, a card that existed
+  # only where its binary did would be a chicken-and-egg — no card to press,
+  # and pressing it is how you get the CLI. So only the EAGER harnesses are
+  # named here; for the rest the daemon resolves ~/.nix-profile/bin itself.
+  #
+  # defang's path is a plain string, not `${defangCli}/bin/defang` — it's
+  # built in the background (see defangCliExpr above), so the card just
+  # doesn't appear until that finishes and the path starts existing, same as
+  # any other missing binary.
   connectBins = lib.concatStringsSep " " (
-    map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.installAgents
+    map (a: "${a}=${lib.getExe (agentPackage a)}") cfg.eagerAgents
     ++ [
       "github=${pkgs.gh}/bin/gh"
       "defang=${defangCliBinDir}/defang"
@@ -7092,18 +7133,55 @@ in
       type = lib.types.nullOr lib.types.package;
       default = null;
       defaultText = lib.literalExpression ''null (pkgs.claude-code for agent = "claude"; pkgs.codex for agent = "codex")'';
-      description = "Package to run for every agent user. Leave null to use the selected agent's default package.";
+      description = ''
+        Package to run for every agent user. Leave null to use the selected
+        agent's default package.
+
+        Only consulted for a harness in `eagerAgents` — a lazily installed
+        one comes from `jitNixpkgs` by attribute name, which is a nixpkgs
+        ref rather than a package value and cannot carry a local override.
+        So setting this with an empty `eagerAgents` would do nothing at all,
+        and an assertion refuses that combination rather than letting a
+        pinned build silently not be the one that runs.
+      '';
     };
 
     installAgents = lib.mkOption {
       type = lib.types.listOf (lib.types.enum supportedAgents);
       default = supportedAgents;
       description = ''
-        Agent CLIs installed on the box — system PATH and every agent unit's
-        PATH — independently of what any session currently runs, so a
-        runtime `agent-box-session add --agent codex` needs no rebuild.
-        Sessions may only use agents listed here. Default: all supported
-        agents.
+        Agent CLIs this box may run — the ALLOW-list a session's `agent` is
+        validated against, independently of what any session currently runs,
+        so a runtime `agent-box-session add --agent codex` needs no rebuild.
+        Default: all supported agents.
+
+        Since issue #416 this no longer means "built into the system
+        closure". A listed harness that is not also in `eagerAgents` is
+        fetched into the user's own profile the first time a session asks
+        for it. Use `eagerAgents` to pay for one at build time instead.
+      '';
+    };
+
+    eagerAgents = lib.mkOption {
+      type = lib.types.listOf (lib.types.enum supportedAgents);
+      default = [ ];
+      example = [ "claude" ];
+      description = ''
+        Agent CLIs built into the system closure and put on the system and
+        agent PATHs at rebuild time, instead of being fetched on first use
+        (issue #416). Must be a subset of `installAgents`.
+
+        Empty by default, which is the whole point of the lazy model: the
+        two bundled harnesses were measured on aarch64 at 344 MiB
+        (claude-code) and 508 MiB (codex), they barely overlap, and nothing
+        needs them until a session actually names one. The equivalent native
+        runtime profile goes from 1.4 GiB to 800 MiB with both dropped.
+
+        Set this when first use must not wait on a download or reach the
+        network at all — an air-gapped box, an image that has to boot
+        straight into a working agent, or a harness you have pinned with
+        `package`. It costs closure and it costs a rebuild to move, which is
+        exactly what the default avoids.
       '';
     };
 
@@ -7756,6 +7834,26 @@ in
     } {
       assertion = cfg.installAgents != [ ];
       message = "services.agent-box.installAgents must not be empty.";
+    } {
+      # `package` is read by agentPackage, and agentPackage is now reached
+      # only through eagerAgents. Overriding the harness build and then
+      # fetching a different one from nixpkgs anyway is never what anybody
+      # meant, and it would be invisible.
+      assertion = cfg.package == null || cfg.eagerAgents != [ ];
+      message =
+        "services.agent-box.package is set but eagerAgents is empty, so "
+        + "nothing would use it: a lazily installed harness comes from "
+        + "jitNixpkgs by name. List the agents this package is for in "
+        + "services.agent-box.eagerAgents.";
+    } {
+      # An eager harness that is not allowed would be paid for in closure
+      # and then refused at session start, which is the worst of both.
+      assertion = lib.subtractLists cfg.installAgents cfg.eagerAgents == [ ];
+      message =
+        "services.agent-box.eagerAgents must be a subset of installAgents; "
+        + "these are not allowed: "
+        + lib.concatStringsSep ", " (lib.subtractLists cfg.installAgents cfg.eagerAgents)
+        + ".";
     }] ++ lib.concatLists (lib.mapAttrsToList (name: u:
       lib.concatLists (lib.mapAttrsToList (sname: s: [
         {
@@ -10095,11 +10193,23 @@ def connect_flows():
     then this user's own profile, which is where a lazy install lands and
     is already first on a session's PATH. flow["bin"] is None when
     neither has it — the card then offers to install it.
+
+    Mirroring agent_bin includes its existence check, which matters more
+    now than it reads. A table entry can name a binary that is not there:
+    the native backend builds the table from a fixed layout
+    ("<profile>/bin/claude") whether or not the profile was built with that
+    harness, and the module names defang at the path its BACKGROUND unit
+    will eventually install it to (issue #373). Taking such an entry at its
+    word reported "Signed in?"-able state for a CLI that cannot be
+    executed, and shadowed the profile copy a lazy install had just put
+    down.
     """
     flows = []
     for spec in CONNECT_DEFS:
         flow = dict(spec)
         binary = CONNECT_BINS.get(spec["id"])
+        if binary and not os.access(binary, os.X_OK):
+            binary = None
         if not binary and spec["attr"]:
             candidate = os.path.join(
                 os.path.expanduser("~"), ".nix-profile", "bin", spec["binary"])

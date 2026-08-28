@@ -804,9 +804,22 @@
               # The tools a session's PATH is expected to have, and the
               # services the units drive. A missing one is a native box that
               # boots and then cannot serve, so name them explicitly.
+              #
+              # The agent harnesses are NOT in this list (issue #416): the
+              # profile ships none by default, and a session fetches the one
+              # it names into the user's own profile on first use. Their
+              # absence is the feature — 1.4 GiB of profile closure down to
+              # 800 MiB, measured on aarch64 — so assert it, rather than
+              # leaving a check that would pass again the day somebody put
+              # them back by accident.
               for b in agent-box-settings tmux ttyd caddy jq gh git python3 \
-                       bwrap flock claude codex; do
+                       bwrap flock; do
                 [ -x "$profile/bin/$b" ] || { echo "MISSING: bin/$b"; fail=1; }
+              done
+              for b in claude codex; do
+                if [ -e "$profile/bin/$b" ]; then
+                  echo "EAGER: bin/$b"; fail=1
+                fi
               done
 
               [ "$fail" -eq 0 ] || exit 1
