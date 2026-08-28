@@ -161,6 +161,11 @@ in
         enable = true;
         agent = "claude";
         installAgents = [ "claude" ];
+        # claude eagerly, because the seeded "main" below has to bring a
+        # tmux server up and a VM test cannot fetch a harness. codex is
+        # deliberately left out of BOTH lists, which is what makes the
+        # "not installed, offers to fetch it" card below a real case.
+        eagerAgents = [ "claude" ];
         users.agent = {
           web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
           # This test predates the front door (issue #416): its sign-in

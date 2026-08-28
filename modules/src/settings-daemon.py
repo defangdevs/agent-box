@@ -1589,11 +1589,23 @@ def connect_flows():
     then this user's own profile, which is where a lazy install lands and
     is already first on a session's PATH. flow["bin"] is None when
     neither has it — the card then offers to install it.
+
+    Mirroring agent_bin includes its existence check, which matters more
+    now than it reads. A table entry can name a binary that is not there:
+    the native backend builds the table from a fixed layout
+    ("<profile>/bin/claude") whether or not the profile was built with that
+    harness, and the module names defang at the path its BACKGROUND unit
+    will eventually install it to (issue #373). Taking such an entry at its
+    word reported "Signed in?"-able state for a CLI that cannot be
+    executed, and shadowed the profile copy a lazy install had just put
+    down.
     """
     flows = []
     for spec in CONNECT_DEFS:
         flow = dict(spec)
         binary = CONNECT_BINS.get(spec["id"])
+        if binary and not os.access(binary, os.X_OK):
+            binary = None
         if not binary and spec["attr"]:
             candidate = os.path.join(
                 os.path.expanduser("~"), ".nix-profile", "bin", spec["binary"])

@@ -32,6 +32,9 @@
     services.agent-box = {
       enable = true;
       agent = "claude";
+      # Its seeded "main" below runs the real claude, and a VM test cannot
+      # fetch one (issue #416).
+      eagerAgents = [ "claude" ];
       users.agent = {
         web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
         # This test predates the front door (issue #416) and its subject is

@@ -44,6 +44,10 @@
     services.agent-box = {
       enable = true;
       agent = "claude";
+      # Real harnesses, no network to fetch them over (issue #416): the
+      # seeded "main" and every dispatched hook session run claude, and the
+      # profile subtest starts a codex one.
+      eagerAgents = [ "claude" "codex" ];
       users.agent = {
         web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
         # This test predates the front door (issue #416) and its subject is

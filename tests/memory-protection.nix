@@ -16,6 +16,10 @@
     services.agent-box = {
       enable = true;
       agent = "claude";
+      # No web front door here, so this box still seeds a "main" session
+      # (issue #416) — and its subject is memory protection, not harness
+      # downloads, so give it the CLI rather than a doomed offline fetch.
+      eagerAgents = [ "claude" ];
       users.agent = { };
     };
     system.stateVersion = "25.05";
