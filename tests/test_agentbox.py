@@ -487,6 +487,25 @@ class RenderTest(unittest.TestCase):
                         / "10-host.conf").read_text()
             assert "AGENT_BOX_WEBHOOK_SCRIPT" not in settings, settings
 
+    def test_a_quoted_false_does_not_turn_webhooks_loose(self):
+        """`bool("false")` is `True` — same trap as codexFullAccess
+        (issue #404 review), now caught for webhook.enable too
+        (CodeRabbit finding on PR #431). null is kept meaning off."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for bad in ("false", "true", 0, 1, [], {}):
+                config["webhook"] = {"enable": bad}
+                with self.assertRaises(mod.ConfigError):
+                    mod.Spec(config, prof)
+            for ok in (True, False, None):
+                config["webhook"] = {"enable": ok}
+                mod.Spec(config, prof)  # must not raise
+            config["webhook"] = {"enable": None}
+            spec = mod.Spec(config, prof)
+            self.assertFalse(spec.webhook_enable)
+
     def test_the_store_has_a_janitor(self):
         """Issue #394: a full root wedges the box — no journal, no profile
         swap, no working agent — and on a native box nobody is around to

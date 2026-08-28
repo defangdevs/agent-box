@@ -299,11 +299,20 @@ class Spec:
         # older profile with no asset leaves the script empty, and webhooks
         # stay off rather than rendering units around a missing file.
         wh = data.get("webhook") or {}
+        webhook_enable = wh.get("enable", True)
+        # A quoted "false" would otherwise pass bool()'s truthiness check
+        # and enable webhooks anyway — same trap as codexFullAccess above
+        # (issue #404 review). null still means off, same as bool(None).
+        if webhook_enable is not None and not isinstance(
+                webhook_enable, bool):
+            raise ConfigError(
+                "webhook.enable must be true, false or null, got "
+                f"{webhook_enable!r}")
         pin = profile_webhook_pin(profile)
         self.webhook_repo = wh.get("repo") or pin.get("repo") or ""
         self.webhook_script = (wh.get("script")
                                or profile_webhook_script(profile) or "")
-        self._webhook_enable = bool(wh.get("enable", True))
+        self._webhook_enable = bool(webhook_enable)
         web = data.get("web") or {}
         self.web_enable = bool(web.get("enable", True))
         self.protect_memory = bool(data.get("protectMemory", True))
