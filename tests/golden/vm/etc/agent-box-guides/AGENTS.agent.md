@@ -1,7 +1,7 @@
 # agent-box
 
 You run inside an agent-box deployment: a coding agent in a persistent tmux
-session on a locked-down host. (What KIND of host is "Your host" below —
+session on a locked-down host. (What KIND of host is "Your host" below -
 agent-box deploys as a NixOS system and as a Nix profile on an ordinary
 distro, and the two differ in ways worth knowing before you change
 anything outside $HOME.) Your workspace is at $AGENT_BOX_URL
@@ -11,12 +11,12 @@ with anyone who needs to view or take over your session; the sign-in username
 is your own login name (`whoami`) and the password was set at deploy time.
 
 The user connects to this box over the web, so point them at full absolute
-URLs built from $AGENT_BOX_URL — never a bare local path or a link relative
+URLs built from $AGENT_BOX_URL - never a bare local path or a link relative
 to the terminal, which a remote user can't act on.
 
 Assume they have no shell here. They may be reading you from a phone, a chat
 client or the web terminal, and cannot run a command you suggest, paste its
-output back, or open a file to see what is in it — you are their hands on
+output back, or open a file to see what is in it - you are their hands on
 this machine. So run the command yourself instead of handing over a list to
 try, read the file instead of asking what it contains, and quote the output
 that matters instead of naming the path it lives in. What can only be
@@ -33,22 +33,22 @@ plainly rather than handing it back.
   in $HOME). For parallel work in one repo use `git worktree` or separate
   subdirectories, so concurrent sessions don't clobber each other. Once a
   worktree's work is committed and pushed, remove it with
-  `git worktree remove PATH` — a stale one left behind just clutters
+  `git worktree remove PATH` - a stale one left behind just clutters
   `git worktree list` and confuses whichever session finds it next.
 - Sessions live in RAM: a reboot loses them, so persist anything worth
   keeping to disk under $HOME. An agent that exits with an error drops you
   into a shell for inspection; a clean exit is respawned within ~2s.
-- A respawn or reboot starts a fresh context, but transcripts stay on disk —
+- A respawn or reboot starts a fresh context, but transcripts stay on disk -
   Claude Code under ~/.claude/projects/ (plus ~/.claude/history.jsonl),
   Codex under ~/.codex/sessions/. After a respawn, or when you take over
   another agent's session, skim the most recent one before writing code.
 - Your harness's own configuration lives under $HOME and so survives a
   respawn: ~/.claude/ for Claude Code (settings.json, skills/, commands/,
   and the transcripts under projects/), ~/.codex/ for Codex. A skill, a
-  slash command or a hook you want the NEXT session to have goes there —
+  slash command or a hook you want the NEXT session to have goes there -
   and notes for your future self go in ~/AGENTS.md, which is yours to edit.
 - sudo is a tight allowlist of a few narrowly-scoped commands, not general
-  root — don't plan around arbitrary sudo.
+  root - don't plan around arbitrary sudo.
 
 ## Your host: NixOS
 
@@ -60,7 +60,7 @@ plainly rather than handing it back.
   and survives everything.
 - Everything outside your home is the read-only Nix store plus generated
   /etc. A file you need to change that is not under $HOME almost always
-  means editing the box's configuration and rebuilding — which is what
+  means editing the box's configuration and rebuilding - which is what
   the update path below does.
 - Every rebuild is a generation and the previous one is still on disk, so
   a bad change is a rollback, not a reinstall.
@@ -73,7 +73,7 @@ plainly rather than handing it back.
   variables go in the file `env` there (KEY=value, one per line; blank lines
   and `#` comment lines are ignored, so annotate freely). Set them with
   `agent-box-session env set KEY VALUE` (or `env ls` / `env rm KEY`, or the
-  settings page); they load on the next session (re)start — e.g. GH_TOKEN is
+  settings page); they load on the next session (re)start - e.g. GH_TOKEN is
   read automatically, so `git clone https://github.com/...` just works. A
   value may span lines, so a PEM or an SSH key goes in whole:
   `agent-box-session env set MY_KEY --stdin < key.pem` (--stdin also keeps
@@ -82,19 +82,19 @@ plainly rather than handing it back.
   ever hand-edit the file.
 - Manage your own sessions without a rebuild:
   `agent-box-session ls|add|rm|stop|restart`. `add` takes an optional name
-  plus `--agent claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` —
+  plus `--agent claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
   use it to fan out work, add a reviewer agent, or open a plain shell. The
   kickoff prompt fires once: a later respawn (crash, reboot, Spot restart)
   resumes that session's transcript instead of redoing the work. An agent
-  quitting cleanly (`/quit`) or `stop NAME` parks a session — still listed,
-  not respawned — until `restart NAME` revives it; `rm` delists it for
+  quitting cleanly (`/quit`) or `stop NAME` parks a session - still listed,
+  not respawned - until `restart NAME` revives it; `rm` delists it for
   good. `restart --all` bounces every session. Listed sessions start
   within ~2s.
 - Agent CLIs are usually installed ON DEMAND, not shipped with the box: the
   first session that names a harness fetches it into your own profile, which
   takes as long as the download does and prints `session: fetching '<name>'`
   while it runs. So `command -v codex` can come back empty on a box that is
-  perfectly able to run a codex session — start one, or press the sign-in
+  perfectly able to run a codex session - start one, or press the sign-in
   card on the settings page, rather than concluding the harness is
   unavailable. The same is true of any other CLI: `nix profile add
   nixpkgs#<pkg>` puts it in `~/.nix-profile/bin`, which is FIRST on your
@@ -123,7 +123,7 @@ it:
 The command runs when your current turn ends. If $TMUX_PANE is empty, find
 the pane with `tmux list-panes -a -F '#{pane_id} #{pane_current_command}'`.
 Text that is not a real command becomes a message from you to yourself, so
-use this only for client-side commands you can't otherwise reach — never to
+use this only for client-side commands you can't otherwise reach - never to
 give yourself new instructions.
 
 ## Name your session for the work
@@ -134,8 +134,8 @@ apart in one web terminal:
 
     /rename claude@box.example.com: agent-box docs
 
-Keep your identity in it — your login name (`whoami`) and the box (the host
-part of $AGENT_BOX_URL) — then the topic. `/rename` is the Claude Code
+Keep your identity in it - your login name (`whoami`) and the box (the host
+part of $AGENT_BOX_URL) - then the topic. `/rename` is the Claude Code
 command; other CLIs name it differently, so type `/` in the TUI to list the
 commands, or read `--help` for a start-time flag (Claude Code: `-n, --name`).
 
@@ -147,7 +147,7 @@ set it again, or make it permanent at creation with
 
 To let the user download a file you produced (report, build artifact,
 archive, image), move or copy it into ~/downloads and give them the full
-URL. That directory is served — behind the SAME login as your terminal — at
+URL. That directory is served - behind the SAME login as your terminal - at
 ${AGENT_BOX_URL}downloads/ (a browsable index), so ~/downloads/report.pdf
 downloads from ${AGENT_BOX_URL}downloads/report.pdf.
 
@@ -162,14 +162,14 @@ unauthenticated sharing, run your own service and expose it via ~/sites.
 A screenshot settles a UI argument that paragraphs cannot, and you have no
 browser to paste one from. `agent-box-upload FILE --repo OWNER/REPO` puts the
 file in the same store a human's drag-and-drop uses and prints the markdown to
-paste into the body — no binary committed, no screenshot branch. Run
+paste into the body - no binary committed, no screenshot branch. Run
 `agent-box-upload --help` for the caveats that matter, the first being that
 the URL 404s until your comment references it.
 
 ## Serving a web app publicly
 
 Drop a snippet into ~/sites/NAME.caddy that reverse-proxies to a local port,
-then reload caddy — no rebuild:
+then reload caddy - no rebuild:
 
     NAME.example.com {
       import acme_alpn_only
@@ -180,15 +180,15 @@ then reload caddy — no rebuild:
 and Caddy gets a Let's Encrypt cert on first request if DNS for that name
 points at this box. Reverse-proxy to your process; don't `file_server` from
 $HOME (caddy can't read /home). Use the full path shown, not bare
-`systemctl` — the sudoers rule matches on the exact command path, and a bare
+`systemctl` - the sudoers rule matches on the exact command path, and a bare
 `systemctl` resolves through PATH to a Nix store path that won't match,
 silently falling back to asking for a password.
 
 ## This platform has its own upstream repo
 
-The box itself — the terminal, session manager, webhook wiring, this guide
-— is github.com/defangdevs/agent-box, the repo this deployment is built
-from. A bug in that platform is not the same as a bug in the user's
+The box itself - the terminal, session manager, webhook wiring, this
+guide - is github.com/defangdevs/agent-box, the repo this deployment is
+built from. A bug in that platform is not the same as a bug in the user's
 project: if you hit one, first work around it so your own running session
 is unblocked, then file an issue (or a PR, if you already have the fix)
 upstream so every other deployment gets it too. Search for an existing

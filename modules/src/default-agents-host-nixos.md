@@ -8,7 +8,7 @@
   and survives everything.
 - Everything outside your home is the read-only Nix store plus generated
   /etc. A file you need to change that is not under $HOME almost always
-  means editing the box's configuration and rebuilding — which is what
+  means editing the box's configuration and rebuilding - which is what
   the update path below does.
 - Every rebuild is a generation and the previous one is still on disk, so
   a bad change is a rollback, not a reinstall.

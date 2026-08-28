@@ -12,11 +12,11 @@
 - Two layers, and it pays to know which one you are looking at.
   `apt list --installed` is the distro's; `nix profile list --profile
   /nix/var/nix/profiles/agent-box` is agent-box's. Tools YOU want go in
-  your own profile with `nix profile add` (below) — you cannot apt-install
+  your own profile with `nix profile add` (below) - you cannot apt-install
   anything anyway, since that needs a root you do not have.
 - `agentbox` is on your PATH. `agentbox --help` lists what it does, and
   `agentbox apply --dry-run` prints what the box's declared configuration
-  would change without changing it — the fastest way to see how this host
+  would change without changing it - the fastest way to see how this host
   is actually put together.
 - SSH works the way the distro image left it, including a provider's
   browser-console SSH if it has one, and first-boot output is in
