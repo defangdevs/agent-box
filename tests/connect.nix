@@ -275,17 +275,38 @@ in
         raise Exception(f"{flow} stuck in {state(flow)['state']}, wanted {want}")
 
 
-    with subtest("cards render for the installed CLIs only"):
+    with subtest("every card renders, installed or not"):
         body = get("/agent/settings/")
         assert "Connections" in body, body[:400]
         assert "Claude Code" in body
         assert "GitHub" in body
         assert "Defang" in body
-        # codex is not in installAgents, so it has no card.
-        assert ">Codex<" not in body
+        # codex is NOT in installAgents and has no stub binary, and it
+        # still gets a card (issue #416). That is the whole point of the
+        # lazy box: with the CLIs out of the closure, a card that only
+        # existed where its binary did was a chicken-and-egg — no card to
+        # press, and pressing it is how you get the CLI.
+        assert ">Codex<" in body, body[:400]
         wait_state("claude", "idle")
         wait_state("github", "idle")
         wait_state("defang", "idle")
+
+    with subtest("an uninstalled CLI says so, and offers to fetch it"):
+        # The distinction is not cosmetic: "Not signed in" would send the
+        # user looking for an OAuth flow, when what is missing is a
+        # download.
+        assert state("codex")["installed"] is False
+        assert state("codex")["installable"] is True
+        assert state("claude")["installed"] is True
+        body = get("/agent/settings/")
+        assert "Not installed" in body, body[:400]
+        assert "Install &amp; sign in" in body or "Install & sign in" in body
+
+    with subtest("defang is never offered as an install"):
+        # It is not in nixpkgs and comes from its own background unit, so
+        # a card must not offer to fetch it from a package source that has
+        # never heard of it.
+        assert state("defang")["installable"] is False
 
     with subtest("start opens one pane and the card links the trusted URL"):
         assert post("/agent/settings/connect/start", "flow=claude") == "303"

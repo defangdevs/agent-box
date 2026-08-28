@@ -1305,16 +1305,23 @@ class Renderer:
                        f'Environment="AGENT_BOX_SYSTEMCTL={SYSTEMCTL}"',
                        f'Environment="AGENT_BOX_TMUX_BIN={self.bin}/tmux"',
                        # The settings page's Connections cards (issue
-                       # #392). The daemon hides that whole section when
-                       # this is empty, which is why a native box had none
-                       # while a module box did. Same "<id>=<binary>"
-                       # convention as AGENT_BOX_AGENT_BINS. No defang
-                       # card: the module offers one, but the runtime
-                       # profile ships no defang CLI, and a card whose
-                       # binary is absent is worse than no card.
+                       # #392). Same "<id>=<binary>" convention as
+                       # AGENT_BOX_AGENT_BINS, and it names only what this
+                       # profile actually ships. It is no longer the card
+                       # LIST, though (issue #416): a card also appears for
+                       # a CLI the daemon could fetch, which is what makes
+                       # a box that ships none of them usable. Still no
+                       # defang card here — the runtime profile has no
+                       # defang and it is not in nixpkgs either, so nothing
+                       # could fetch it, and the daemon drops a card that
+                       # can neither act nor be acted on.
                        'Environment="AGENT_BOX_CONNECT_BINS=' + " ".join(
                            [f"{a}={self.bin}/{a}" for a in self.spec.agents]
                            + [f"github={self.bin}/gh"]) + '"',
+                       # Where a card fetches a CLI this profile does not
+                       # ship (issue #416) — the same pinned source the
+                       # supervisor's lazy harness install uses.
+                       f'Environment="AGENT_BOX_NIXPKGS={self.spec.jit_nixpkgs}"',
                        # The settings page's Update card: _CMD triggers the
                        # run (sudo, matching the sudoers grant exactly),
                        # _UNIT is only read back for status. /usr/bin/sudo,
