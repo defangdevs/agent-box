@@ -5864,7 +5864,13 @@ $PROMPT"
       # AGENT_BOX_NIXPKGS is the SAME pinned channel the module resolves the
       # eager harnesses from, so a box that also ships one gets a byte-
       # identical store path here rather than a second copy.
-      if NIXPKGS_ALLOW_UNFREE=1 "$_ai_nix" profile add --impure \
+      #
+      # BOUNDED, same reason as the flock above: this runs inside the
+      # supervisor's reconcile loop, so a wedged fetch (a stalled substituter,
+      # a hung download) must not stop every OTHER session from starting.
+      # Giving up sets the cooldown marker below and the next pass retries.
+      if NIXPKGS_ALLOW_UNFREE=1 timeout "''${AGENT_BOX_JIT_INSTALL_TIMEOUT_S:-1800}" \
+           "$_ai_nix" profile add --impure \
            "$AGENT_BOX_NIXPKGS#$_ai_attr" >&2; then
         rm -f "$_ai_marker"
         exec 8>&-
@@ -5874,7 +5880,12 @@ $PROMPT"
         [ "$_ai_agent" = codex ] && mirror_codex_standalone
         return 0
       fi
-      printf '%s\n' "$_ai_now" > "$_ai_marker"
+      # Stamp the marker at WRITE time, not with the pre-attempt $_ai_now: the
+      # flock wait and the install itself can together run long past
+      # AGENT_BOX_JIT_RETRY_S, and a marker backdated to before the attempt
+      # would already read as expired on the very next reconcile pass —
+      # defeating the cooldown it exists to enforce.
+      printf '%s\n' "$(date +%s)" > "$_ai_marker"
       exec 8>&-
       echo "session: could not fetch '$_ai_agent' — is the box offline?" >&2
       return 1
