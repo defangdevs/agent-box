@@ -2777,6 +2777,32 @@ in
       # sessions over IPC.
       // lib.optionalAttrs webhookEnabled (lib.listToAttrs (map (name: lib.nameValuePair "agent-box-webhook@${name}" {
         overrideStrategy = "asDropin";
+        # Restart in ONE step, for the same reason the settings daemon
+        # above does (PR #386) — this is the module's OTHER
+        # socket-activated unit, and it had the same hole. The default
+        # two-step restart stops the receiver in the OLD configuration,
+        # before the new one's daemon-reload, while its .socket keeps
+        # LISTENING (the socket's own definition is fully %i-derived, so
+        # it never changes and is never restarted). A delivery landing in
+        # that window re-activates the daemon from systemd's CACHED old
+        # unit definition, and switch-to-configuration's later start step
+        # then finds it already running and leaves it alone — so the
+        # survivor keeps serving the PREVIOUS generation's environment
+        # until somebody reboots or restarts it by hand.
+        #
+        # Worse here than on the settings page, because every value below
+        # is a store path the survivor holds open: LOCAL_WEBHOOK_SPAWN_CMD
+        # (how a standing watch spawns a hook-* session), the PATH the
+        # spawn wrapper resolves agent-box-session from, and the
+        # ExecStartPre that enforces the governed watch policy. Once nix
+        # garbage collection reclaims that generation the spawn command is
+        # simply gone, and every matching standing-watch batch is DROPPED
+        # (never queued, agent-box#301) with the reason only in the
+        # root-owned journal. The window opens on essentially every
+        # rebuild, since a store-path bump is enough to change this
+        # drop-in — and an update is exactly when a merge's own CI
+        # deliveries are in flight.
+        stopIfChanged = false;
         # The spawn wrapper (src/webhook-spawn.sh) runs as this unit's
         # child and resolves jq/coreutils/agent-box-session from this
         # PATH instead of baked store paths (issue #154, Phase 2).

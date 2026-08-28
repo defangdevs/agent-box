@@ -53,18 +53,48 @@ let
           agent-box-webhook ls                     # what this session listens to
           agent-box-webhook unsubscribe OWNER/REPO # when you wrap up
 
-      When you pick up ONE issue or PR, say so with `--include`. That both narrows
+      When you pick up ONE issue or PR, say so with `--claim`. That both narrows
       what reaches you and tells a standing watch the work is taken, so a review or
       a comment on it no longer starts a second session on top of you:
 
           agent-box-webhook subscribe OWNER/REPO \
             --note "PR 42: waiting on CI + review" \
-            --include '{"any":[{"path":"pull_request.number","in":[42]},
-                               {"path":"issue.number","in":[42]},
-                               {"path":"workflow_run.head_branch","in":["fix/42-thing"]}]}'
+            --claim 42 --claim branch:fix/42-thing
+
+      `--claim` is the whole of it: `42` for an issue or PR by number,
+      `branch:NAME` for everything CI reports against a branch. Repeat it, and the
+      clauses OR together.
+
+      Use the BARE number for a PR, as above. GitHub reports a PR comment as an
+      `issue_comment` carrying `issue.number`, not `pull_request.number` — so
+      `--claim pr:42` claims the PR itself and leaves comments and reviews ON it
+      unclaimed, which is the one event a reviewer is most likely to generate. A
+      bare `42` claims both spellings. `pr:42` and `issue:42` exist for when you
+      deliberately want only one.
+
+      Use it rather than hand-writing `--include`. A claim only covers the payload
+      paths it names, and a watch spawns on terminal CI failure reported through six
+      event shapes. A claim that names one is SILENTLY unclaimed for the others:
+      nothing warns you, a sibling session just turns up. That is how PR #417 ended
+      up with two sessions editing the same git worktree.
+
+      `--claim branch:` writes five of the six — `workflow_run`, `workflow_job`,
+      `check_run`, `check_suite` and `deployment_status` (via `deployment.ref`) —
+      plus the push `ref` and `pull_request.head.ref`. The sixth, a bare commit
+      **status**, cannot be claimed at all: it carries no scalar branch, only a
+      `branches` array, and the payload language indexes lists by number only, so any
+      rule would be guessing at an order the payload does not promise. On a repo
+      whose CI reports through commit statuses, that shape stays unclaimed — expect a
+      sibling there.
+
+      `--include` still exists for rules `--claim` cannot express; the two are
+      mutually exclusive.
 
       Claude Code has the same as MCP tools (`webhook_subscribe`,
-      `webhook_unsubscribe`, `webhook_subscriptions`); both share one list.
+      `webhook_unsubscribe`, `webhook_subscriptions`); both share one list. Those
+      are local-webhook's own tools and have no `--claim` — they take the raw
+      `include` rules — so when you are claiming an object, reach for the CLI and
+      let it write them.
       Subscriptions are PER SESSION and expire after an hour (`--ttl HOURS` for a
       longer wait). `--ignore-sender YOU` mutes echoes of your own comments and
       pushes — since local-webhook 0.23.0 this is a PURE sender mute, so it also
@@ -450,7 +480,18 @@ let
     install -m444 ${pkgs.writeText "agent-box-settings@.service" ''
       [Unit]
       Description=Per-user secrets settings page for %i
-      After=network-online.target agent-box-settings@%i.socket
+      # agent-box@%i is ordered BEFORE this, not merely wanted: /run/agent-box-%i
+      # is that unit's RuntimeDirectory (nothing else creates it — no tmpfiles rule
+      # on either backend), and it is listed in ReadWritePaths below. A path in
+      # ReadWritePaths that does not exist fails the whole namespace setup with
+      # 226/NAMESPACE, so without this ordering the two units — both wanted by
+      # multi-user.target, previously with nothing between them — simply raced on
+      # every boot, and a boot this daemon won left the settings page 502 until
+      # Restart=always came back 5s later. Same directive, same reason, as
+      # agent-web-terminal@.service. NOT a `-` prefix instead: the daemon drives
+      # tmux over the socket in that directory, so it needs the path writable, not
+      # merely tolerated when absent.
+      After=network-online.target agent-box-settings@%i.socket agent-box@%i.service
       Requires=agent-box-settings@%i.socket
       Wants=network-online.target
 
@@ -3108,6 +3149,7 @@ esac
                                              [--deliver-to session|subagent]
                                              [--renew-on-event] [--ignore-sender LOGIN]...
                                              [--when JSON] [--drop JSON]
+                                             [--claim SPEC]...
            agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent]
            agent-box-webhook ls
            agent-box-webhook status
@@ -3175,6 +3217,42 @@ esac
     versions delivered those anyway. Put the sender check INSIDE --when/--drop
     instead ({"path": "sender.login", "notIn": [...]}) when a CI result from that
     sender should still get through.
+
+    --claim says "I have picked this up", and is the reason a standing watch
+    does not start a second session on top of you. SPEC is one of:
+
+      42              the issue OR pull request numbered 42
+      pr:42           ONLY the pull request (see below)
+      issue:42        only the issue
+      branch:NAME     everything CI reports against that branch
+
+    Repeatable; the clauses OR together. Picking up a PR is normally both:
+
+      agent-box-webhook subscribe OWNER/REPO --note "PR 42: CI + review" \
+        --claim 42 --claim branch:fix/42-thing
+
+    Use the BARE number for a PR. GitHub reports a PR comment as an
+    issue_comment carrying issue.number, not pull_request.number, so pr:42
+    claims the PR and leaves the comments and reviews ON it unclaimed — the
+    one event a reviewer is most likely to generate. pr:/issue: are for when
+    you deliberately want only one.
+
+    Prefer this to hand-writing --include. A claim only covers the payload
+    paths it names, and CI reports terminal failure under six event shapes —
+    so a hand-written claim that names one is silently unclaimed for the rest.
+    That is not hypothetical: it is how PR #417 got a second session editing
+    the same git worktree as the first.
+
+    --claim branch: writes five of the six (workflow_run.head_branch,
+    workflow_job.head_branch, check_run.check_suite.head_branch,
+    check_suite.head_branch, deployment.ref), plus the push ref and
+    pull_request.head.ref, which are not CI. The sixth, a bare commit status,
+    CANNOT be claimed: it carries no scalar branch, only a `branches` array,
+    and the payload language indexes lists by number only. If your repo's CI
+    reports through commit statuses, you stay exposed on that one shape.
+
+    --claim and --include are mutually exclusive; write --include yourself
+    only for rules --claim cannot express.
 
     --when / --drop attach payload rules to the subscription: deliver (or
     spawn) ONLY events matching --when, never those matching --drop. Rules are
@@ -3393,26 +3471,167 @@ esac
       fi
     }
 
+    # --claim SPEC (issue #420): the ergonomic way to say "I have picked this up".
+    #
+    # A claim is what stops a standing watch spawning a second session on top of
+    # you, and it only works for the paths it actually names. Hand-written, that
+    # is six clauses of JSON per claim — and an incomplete one fails SILENTLY:
+    # nothing warns you, a sibling just turns up. On PR #417 exactly that
+    # happened, because the documented example scoped workflow_run and a
+    # check_run failure went unclaimed.
+    #
+    # So the vocabulary lives here instead of in every agent's head:
+    #
+    #   --claim 42                 the issue OR pull request numbered 42
+    #   --claim pr:42              just the pull request
+    #   --claim issue:42           just the issue
+    #   --claim branch:fix/42      everything CI reports against that branch
+    #
+    # Repeatable, and the clauses OR together — `--claim pr:42 --claim
+    # branch:fix/42-thing` is the normal shape for picking up a PR.
+    claim_clauses() {
+      # claim_clauses SPEC — the JSON clauses for one spec, as a JSON array.
+      _cl_spec=$1
+      case "$_cl_spec" in
+        (pr:*)     _cl_kind=pr;     _cl_val=''${_cl_spec#pr:} ;;
+        (issue:*)  _cl_kind=issue;  _cl_val=''${_cl_spec#issue:} ;;
+        (branch:*) _cl_kind=branch; _cl_val=''${_cl_spec#branch:} ;;
+        (*)        _cl_kind=number; _cl_val=$_cl_spec ;;
+      esac
+      if [ -z "$_cl_val" ]; then
+        echo "agent-box-webhook: --claim $_cl_spec has an empty value" >&2
+        return 1
+      fi
+      case "$_cl_kind" in
+        (pr|issue|number)
+          case "$_cl_val" in
+            (*[!0-9]*)
+              echo "agent-box-webhook: --claim $_cl_spec is not a number;" \
+                   "use branch:NAME to claim a branch" >&2
+              return 1 ;;
+          esac ;;
+      esac
+      case "$_cl_kind" in
+        (pr)     "$JQ" -nc --argjson n "$_cl_val" \
+                   '[{path:"pull_request.number", "in":[$n]}]' ;;
+        (issue)  "$JQ" -nc --argjson n "$_cl_val" \
+                   '[{path:"issue.number", "in":[$n]}]' ;;
+        # A bare number claims both, because an agent picking up "42" does not
+        # always know whether the events it will see call it an issue or a PR —
+        # GitHub itself uses both for the same object (a PR comment arrives as
+        # issue_comment with issue.number). This is why the documented example
+        # uses a bare number for a PR: `pr:42` alone leaves every comment and
+        # review ON that PR unclaimed, which is the #417 collision exactly.
+        (number) "$JQ" -nc --argjson n "$_cl_val" \
+                   '[{path:"pull_request.number", "in":[$n]},
+                     {path:"issue.number", "in":[$n]}]' ;;
+        # A watch treats terminal failure as spawn-worthy under SIX event
+        # shapes; this claims five of them by branch. workflow_run alone is
+        # what the old documented example covered, so a red check_run,
+        # check_suite or workflow_job on your own branch each spawned a
+        # sibling. deployment_status carries its branch as deployment.ref.
+        # `ref` catches the push itself, and pull_request.head.ref a PR event
+        # whose number you did not claim.
+        #
+        # The sixth, a bare commit status, is NOT claimable and cannot be made
+        # so here: it carries no scalar branch, only a `branches` ARRAY, and
+        # the predicate language indexes a list by number only (webhook.py
+        # get_path — an all-digits segment, no wildcard). `branches.0.name`
+        # would be a guess at an order the payload does not promise, which is
+        # worse than an honest gap: it would look claimed and match nothing.
+        (branch) "$JQ" -nc --arg b "$_cl_val" \
+                   '[{path:"workflow_run.head_branch", "in":[$b]},
+                     {path:"workflow_job.head_branch", "in":[$b]},
+                     {path:"check_run.check_suite.head_branch", "in":[$b]},
+                     {path:"check_suite.head_branch", "in":[$b]},
+                     {path:"deployment.ref", "in":[$b]},
+                     {path:"pull_request.head.ref", "in":[$b]},
+                     {path:"ref", "in":["refs/heads/" + $b]}]' ;;
+      esac
+    }
+
     cmd="''${1:-}"; shift || true
     case "$cmd" in
       subscribe)
         ensure_state
         if [ "''${1:-}" != "-h" ] && [ "''${1:-}" != "--help" ]; then
           deliver_to=session; have_when=0; have_drop=0; topic=""; want=""
-          for a in "$@"; do
+          have_include=0; claims=""
+          # Filter --claim out of the argument list as we scan it: webhook.py has
+          # never heard of that flag, so it is translated to --include below and
+          # must not survive into the exec. Rotate idiom — take from the front,
+          # append the keepers to the back, exactly $# times — so this stays
+          # POSIX and never mangles an argument containing whitespace.
+          argc=$#
+          while [ "$argc" -gt 0 ]; do
+            a=$1; shift; argc=$((argc - 1))
             if [ -n "$want" ]; then
-              case "$want" in (deliver-to) deliver_to="$a" ;; esac
-              want=""; continue
+              case "$want" in
+                (deliver-to) deliver_to="$a" ;;
+                (claim)
+                  # Reject the empty value HERE. claim_clauses has its own
+                  # guard, but it is unreachable for this: an empty spec
+                  # vanishes in the unquoted word-split below, so the loop
+                  # never calls it and the CLI would emit {"any":[]} — a rule
+                  # matching NOTHING — and exit 0. That is the worst failure
+                  # this flag can have: you believe you are claimed and
+                  # subscribed, and no event ever arrives.
+                  if [ -z "$a" ]; then
+                    echo "agent-box-webhook: --claim needs a value" >&2
+                    exit 2
+                  fi
+                  claims="$claims $a"; want=""; continue ;;
+              esac
+              want=""
+              set -- "$@" "$a"; continue
             fi
             case "$a" in
               --deliver-to) want=deliver-to ;;
               --deliver-to=*) deliver_to="''${a#--deliver-to=}" ;;
               --when|--when=*) have_when=1 ;;
               --drop|--drop=*) have_drop=1 ;;
+              --include|--include=*) have_include=1 ;;
+              --claim) want=claim; continue ;;
+              --claim=*)
+                if [ -z "''${a#--claim=}" ]; then
+                  echo "agent-box-webhook: --claim= needs a value" >&2
+                  exit 2
+                fi
+                claims="$claims ''${a#--claim=}"; continue ;;
               --*) ;;
               *) [ -n "$topic" ] || topic="$a" ;;
             esac
+            set -- "$@" "$a"
           done
+          if [ -n "$want" ]; then
+            echo "agent-box-webhook: --$want needs a value" >&2
+            exit 2
+          fi
+          if [ -n "$claims" ]; then
+            if [ "$have_include" = 1 ]; then
+              echo "agent-box-webhook: pass --claim OR --include, not both —" \
+                   "--claim builds the --include for you; write --include" \
+                   "yourself if you need rules --claim cannot express" >&2
+              exit 2
+            fi
+            all="[]"
+            # Unquoted on purpose: claims is a space-separated list this script
+            # built, and a spec cannot contain whitespace (a branch name cannot).
+            for c in $claims; do
+              one="$(claim_clauses "$c")" || exit 2
+              all="$("$JQ" -nc --argjson a "$all" --argjson b "$one" '$a + $b')"
+            done
+            # Backstop, independent of how the list was built: an empty `any`
+            # matches nothing at all, so emitting one would silently subscribe
+            # this session to silence. If a future edit ever produces one,
+            # fail loudly here instead.
+            if [ "$("$JQ" -nc --argjson a "$all" '$a | length')" = 0 ]; then
+              echo "agent-box-webhook: --claim produced no rules; refusing to" \
+                   "subscribe to a filter that matches nothing" >&2
+              exit 2
+            fi
+            set -- "$@" --include "$("$JQ" -nc --argjson any "$all" '{any:$any}')"
+          fi
           if [ "$deliver_to" = subagent ] && [ "$have_when" = 0 ] && [ "$have_drop" = 0 ]; then
             # A bare "owner/repo" (no "source:" prefix at all) is the github
             # shorthand; anything with its OWN "source:" prefix — including a
@@ -14434,6 +14653,32 @@ if __name__ == "__main__":
       # sessions over IPC.
       // lib.optionalAttrs webhookEnabled (lib.listToAttrs (map (name: lib.nameValuePair "agent-box-webhook@${name}" {
         overrideStrategy = "asDropin";
+        # Restart in ONE step, for the same reason the settings daemon
+        # above does (PR #386) — this is the module's OTHER
+        # socket-activated unit, and it had the same hole. The default
+        # two-step restart stops the receiver in the OLD configuration,
+        # before the new one's daemon-reload, while its .socket keeps
+        # LISTENING (the socket's own definition is fully %i-derived, so
+        # it never changes and is never restarted). A delivery landing in
+        # that window re-activates the daemon from systemd's CACHED old
+        # unit definition, and switch-to-configuration's later start step
+        # then finds it already running and leaves it alone — so the
+        # survivor keeps serving the PREVIOUS generation's environment
+        # until somebody reboots or restarts it by hand.
+        #
+        # Worse here than on the settings page, because every value below
+        # is a store path the survivor holds open: LOCAL_WEBHOOK_SPAWN_CMD
+        # (how a standing watch spawns a hook-* session), the PATH the
+        # spawn wrapper resolves agent-box-session from, and the
+        # ExecStartPre that enforces the governed watch policy. Once nix
+        # garbage collection reclaims that generation the spawn command is
+        # simply gone, and every matching standing-watch batch is DROPPED
+        # (never queued, agent-box#301) with the reason only in the
+        # root-owned journal. The window opens on essentially every
+        # rebuild, since a store-path bump is enough to change this
+        # drop-in — and an update is exactly when a merge's own CI
+        # deliveries are in flight.
+        stopIfChanged = false;
         # The spawn wrapper (src/webhook-spawn.sh) runs as this unit's
         # child and resolves jq/coreutils/agent-box-session from this
         # PATH instead of baked store paths (issue #154, Phase 2).
