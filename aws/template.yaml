@@ -26,6 +26,7 @@ Metadata:
         Parameters:
           - AllowCidr
           - EnableSsm
+          - SeedMainSession
           - AgentBoxRev
           - AgentBoxSha256
           - AgentNixpkgsUrl
@@ -51,6 +52,8 @@ Metadata:
         default: IPv4 CIDR allowed to reach 443
       EnableSsm:
         default: Enable SSM Session Manager root access
+      SeedMainSession:
+        default: Seed a running "main" session on first boot
       AgentsMd:
         default: AGENTS.md seeded on first agent start
       AgentBoxRev:
@@ -169,6 +172,18 @@ Parameters:
       this AZ+type pool stays capacity-starved, the box stays stopped
       until it frees up — set this only if you're comfortable with that
       tradeoff for the lower price.
+
+  SeedMainSession:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      false (default): matches the module's own front-door default for a box
+      with a browser terminal (issue #416) — first boot seeds no session, and
+      the settings page is where the first one is started (installing its
+      agent CLI on demand). true: seed a running "main" session immediately,
+      the pre-#416 behaviour — set this if you want the box usable as a
+      terminal the moment it boots, without a trip through the settings page.
 
   WebPassword:
     Type: String
@@ -696,6 +711,15 @@ Resources:
                   users."${UserName}" = {
                     environment = { TERM = "xterm-256color"; };
                     web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                    # 'true'/'false' splice verbatim as Nix booleans, same
+                    # trick as UseSpot below. Default 'false' matches what
+                    # seedMainSession's own null default already resolves to
+                    # on this template (web.enable is always on here), so a
+                    # plain launch behaves exactly as before this parameter
+                    # existed; only a caller that opts in (e.g. deploy-test,
+                    # to keep exercising a live ttyd/tmux session) sees a
+                    # change.
+                    seedMainSession = ${SeedMainSession};
                     # The AGENTS.md ADDENDUM from the CFN AgentsMd parameter,
                     # spliced as-is into a Nix indented string; the module
                     # appends it below its built-in default AGENTS.md. The next
