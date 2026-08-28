@@ -276,6 +276,11 @@ class Spec:
         self.profile = profile
         self.domain = data.get("domain") or ""
         self.host_label = data.get("hostLabel") or self.domain or "agent-box"
+        # Whether the label was pinned in config, or fell back to the domain
+        # above. first_boot resolves an "auto"/"" domain AFTER the spec is
+        # built, so a derived label has to be carried forward with the
+        # resolved domain — otherwise it stays frozen at the placeholder.
+        self.host_label_from_domain = not data.get("hostLabel")
         self.agents = list(data.get("agents") or ["claude"])
         self.default_agent = data.get("defaultAgent") or self.agents[0]
         # Where this box's software came from. The profile's own manifest
@@ -2536,6 +2541,8 @@ def first_boot(spec, args):
     if spec.domain in ("", "auto", "sslip.io"):
         ip = settle_public_ip(initial=args.settle_delay)
         spec.domain = ip.replace(".", "-") + ".sslip.io"
+        if spec.host_label_from_domain:
+            spec.host_label = spec.domain
         print(f"derived domain {spec.domain} from {ip}")
 
     password = os.environ.get("AGENT_BOX_WEB_PASSWORD", "")
