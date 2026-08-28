@@ -5709,8 +5709,14 @@ $PROMPT"
     # call per respawn, and a lock so two sessions starting at once do not both
     # pay for the same download. Under ~/.local/state like the session side
     # files, so a reboot keeps them and a fresh $HOME starts clean.
-    AGENT_BOX_JIT_DIR="''${AGENT_BOX_JIT_DIR:-$HOME/.local/state/agent-box/jit}"
-    AGENT_BOX_JIT_LOCK="''${AGENT_BOX_JIT_LOCK:-$AGENT_BOX_JIT_DIR/install.lock}"
+    #
+    # Plain locals, NOT AGENT_BOX_* names: neither backend supplies these and
+    # neither should, but scripts/check_backend_parity.py reads any assigned
+    # AGENT_BOX_<NAME>= as a host contract one side was missing. Tests point
+    # them somewhere scratch by setting $HOME, which is the only input they
+    # have.
+    _jit_dir="$HOME/.local/state/agent-box/jit"
+    _jit_lock="$_jit_dir/install.lock"
 
     agent_bin() {
       # agent_bin NAME — resolve an agent (or "shell") to its binary via
@@ -5812,8 +5818,8 @@ $PROMPT"
       # rate-limits itself: a session that cannot start is respawned every
       # couple of seconds, so an install that fails offline must not become a
       # network call per respawn.
-      mkdir -p "$AGENT_BOX_JIT_DIR"
-      _ai_marker="$AGENT_BOX_JIT_DIR/$_ai_agent.failed"
+      mkdir -p "$_jit_dir"
+      _ai_marker="$_jit_dir/$_ai_agent.failed"
       _ai_now="$(date +%s)"
       _ai_retry="''${AGENT_BOX_JIT_RETRY_S:-300}"
       if [ -s "$_ai_marker" ]; then
@@ -5836,8 +5842,8 @@ $PROMPT"
       # it starting or reaping every OTHER session too. Generous enough for a
       # real download over a slow link, and giving up just means this pass
       # skips the session and the next one retries.
-      mkdir -p "$(dirname "$AGENT_BOX_JIT_LOCK")"
-      exec 8>>"$AGENT_BOX_JIT_LOCK"
+      mkdir -p "$(dirname "$_jit_lock")"
+      exec 8>>"$_jit_lock"
       if ! "''${AGENT_BOX_FLOCK_BIN:?}" -w "''${AGENT_BOX_JIT_LOCK_WAIT_S:-900}" 8; then
         exec 8>&-
         echo "session: another session is still fetching a harness; leaving" \

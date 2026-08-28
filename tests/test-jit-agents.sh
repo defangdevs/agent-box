@@ -40,8 +40,11 @@ setup() {
   HOME=$work/home.$1
   rm -rf "$HOME"; mkdir -p "$HOME/.nix-profile/bin"
   export HOME
-  export AGENT_BOX_JIT_DIR="$HOME/.local/state/agent-box/jit"
-  export AGENT_BOX_JIT_LOCK="$AGENT_BOX_JIT_DIR/install.lock"
+  # The bookkeeping paths are derived from $HOME, not from environment
+  # knobs (scripts/check_backend_parity.py reads an assigned AGENT_BOX_*
+  # name as a host contract), so pointing $HOME at a scratch dir is what
+  # isolates a case.
+  JIT_DIR="$HOME/.local/state/agent-box/jit"
   export AGENT_BOX_NIXPKGS="https://example.invalid/nixpkgs.tar.xz"
   export AGENT_BOX_NIX_BIN="$work/bin/nix"
   export AGENT_BOX_FLOCK_BIN="$work/bin/flock"
@@ -189,7 +192,7 @@ agent_install claude >/dev/null 2>&1
 is "a second attempt inside the window does not call nix again" \
    "1" "$(wc -l < "$NIX_CALLS")"
 # Wind the marker back past the retry window and it tries once more.
-printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$AGENT_BOX_JIT_DIR/claude.failed"
+printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$JIT_DIR/claude.failed"
 agent_install claude >/dev/null 2>&1
 is "an attempt after the window calls nix again" \
    "2" "$(wc -l < "$NIX_CALLS")"
@@ -198,9 +201,9 @@ is "an attempt after the window calls nix again" \
 # again or this call never reaches nix at all (which is exactly what the
 # rate limit is for).
 unset NIX_FAIL
-printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$AGENT_BOX_JIT_DIR/claude.failed"
+printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$JIT_DIR/claude.failed"
 agent_install claude >/dev/null 2>&1
-if [ -e "$AGENT_BOX_JIT_DIR/claude.failed" ]; then
+if [ -e "$JIT_DIR/claude.failed" ]; then
   no "a successful install clears the cooldown marker" "marker still there"
 else
   ok "a successful install clears the cooldown marker"
