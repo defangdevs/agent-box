@@ -39,8 +39,29 @@ a.sess:hover { text-decoration: underline; }
 /* Subscription rows (issue #227) wrap: a topic carries an expiry and the
    note saying why it exists, which does not fit one line on a phone. */
 .nm.wh { flex-wrap: wrap; row-gap: 2px; }
-.nm.wh code { color: #e6edf3; }
+/* The endpoint rows are one long URL each and a topic can be 140
+   characters, so break inside the code rather than pushing the panel
+   wider than the phone it is read on. */
+.nm.wh code { color: #e6edf3; overflow-wrap: anywhere; }
 .wh-note { flex-basis: 100%; margin: 0; font-size: 12px; }
+/* The secret line under a payload URL: its own line in the wrapping row,
+   with the mask/value and the Show + Copy buttons on it. */
+.wh-secret { flex-basis: 100%; display: flex; align-items: center;
+             gap: 8px; flex-wrap: wrap; }
+.wh-secret code { color: #8b949e; overflow-wrap: anywhere; }
+/* A revealed secret reads as a value, not as placeholder text. */
+.wh-secret code[data-shown] { color: #e6edf3; }
+.icon.ismall { font-size: 12px; padding: 2px 8px; }
+/* Both icons ship in a copy button; CSS picks which one is showing, so
+   the tick needs no icon markup in the script. Only a SUCCESSFUL copy
+   swaps to the tick — a failure stays the copy icon, in red, with the
+   title saying to select the value instead, because a tick that means
+   "nothing was copied" is the one signal worse than no signal. */
+.icopy span { display: inline-flex; }
+.icopy .co, .icopy[data-copied="1"] .ci { display: none; }
+.icopy[data-copied="1"] .co { display: inline-flex; }
+.icopy[data-copied="1"] { color: #3fb950; }
+.icopy[data-copied="0"] { color: #f85149; }
 /* A session row folds open onto its own subscriptions (issue #227), so
    the <li> stops being the flex row and its <summary> becomes one. */
 .tbl li.foldrow { display: block; padding: 0; }

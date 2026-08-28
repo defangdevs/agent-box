@@ -141,6 +141,12 @@ let
       everything. Any sender that HMAC-SHA256-signs its body works, not just
       GitHub: `agent-box-webhook setup stripe` adds a second source.
 
+      The user has no shell here, so do not hand them either command: the settings
+      page's Webhook panel carries the payload URL per source AND that source's
+      secret, each with a copy button, at ''${AGENT_BOX_URL}settings/ — that is the
+      link to give someone who is registering the webhook in the sender, and it
+      saves you reading a 32-hex secret out to them.
+
     '')
       (lib.optionalString cfg.selfUpdate.enable ''
       ## Updating
@@ -7940,6 +7946,7 @@ in
 #   AGENT_BOX_WEBHOOK_SCRIPT     pinned local-webhook webhook.py (empty =
 #                                 no webhook receiver, so no panel)
 #   AGENT_BOX_WEBHOOK_STATE_DIR  where its filter.*.json files live
+#   AGENT_BOX_WEBHOOK_URL        the receiver endpoint senders POST to
 #   AGENT_BOX_WEBHOOK_PYTHON     interpreter for that script
 #   AGENT_BOX_CONNECT_BINS       "<id>=<binary>" pairs for the guided
 #                                 sign-in cards (claude, codex, github)
@@ -8042,6 +8049,12 @@ PASSWORD_CMD = os.environ.get("AGENT_BOX_PASSWORD_CMD", "")
 # topic parsing, TTL stamping, the atomic replace and its lock.
 WEBHOOK_SCRIPT = os.environ.get("AGENT_BOX_WEBHOOK_SCRIPT", "")
 WEBHOOK_STATE_DIR = os.environ.get("AGENT_BOX_WEBHOOK_STATE_DIR", "")
+# Where a sender POSTs, printed on the panel so the URL to register is on
+# the page instead of behind `agent-box-webhook url` in a session.
+# Set by the module for a terminal user whenever the receiver is enabled,
+# which is exactly when caddy serves that path; empty on a dev rig, and
+# then the panel simply says nothing about the endpoint.
+WEBHOOK_URL = os.environ.get("AGENT_BOX_WEBHOOK_URL", "")
 # Interpreter for the above. The daemon's own is a fine fallback for a
 # dev run; the module passes the same python the receiver unit uses.
 WEBHOOK_PYTHON = os.environ.get("AGENT_BOX_WEBHOOK_PYTHON", "") or sys.executable
@@ -8088,6 +8101,10 @@ RESERVED_NAMES = frozenset(("settings", "downloads", "webhook", "sessions",
 # than a quoting defence — it keeps a malformed form value from reaching
 # the subscription file at all.
 TOPIC_RE = re.compile(r"^[A-Za-z0-9_.:/*-]{1,128}$")
+# A webhook source name, as `agent-box-webhook setup` validates it
+# (letters, digits, _ and -). The secret route resolves a name to a file
+# inside the state dir, so this is the check that keeps a path out of it.
+SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # The agent user's home. A session's working directory defaults to it
 # and the working-directory picker (below) browses within it: the
@@ -8776,6 +8793,76 @@ def webhook_state_dir():
         or os.environ.get("LOCAL_WEBHOOK_STATE_DIR")
         or os.path.join(HOME_DIR, ".local", "state", "local-webhook")
     )
+
+
+def webhook_sources():
+    """Which senders are set up: (default source, sorted names).
+
+    Read straight from the receiver's sources.json rather than through a
+    CLI, because this is not webhook.py's subscription format — it is the
+    small file `agent-box-webhook setup` writes, and the only thing wanted
+    here is which per-source paths exist to paste into a sender. The
+    secret is deliberately not read: it lives in its own 0600 file, it is
+    printed once by `setup`, and a page that echoed it would turn a
+    browser tab into a place credentials leak from.
+
+    No file (or an unreadable one) means no secret has been minted yet,
+    which is exactly the state in which the endpoint rejects everything.
+    """
+    try:
+        with open(os.path.join(webhook_state_dir(), "sources.json"),
+                  encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return "", []
+    if not isinstance(data, dict):
+        return "", []
+    sources = data.get("sources")
+    names = sorted(sources) if isinstance(sources, dict) else []
+    default = data.get("defaultSource")
+    return (default if isinstance(default, str) else ""), names
+
+
+def webhook_secret(source):
+    """One source's HMAC secret, or "" if there is none to read.
+
+    Same resolution as the CLI's own `secret_of`: `secretFile` (relative
+    names are inside the state dir), else an inline `secret`. Duplicated
+    here rather than shelled out to because `agent-box-webhook` is not on
+    this daemon's PATH — it is the agent's CLI, in the agent's profile,
+    and putting it there to read one file would widen what the web
+    daemon can run for no gain.
+
+    Why the page serves this at all: registering a webhook needs the URL
+    AND the secret, and the operator doing it has a browser, not a shell.
+    It is no new exposure — the same login already opens a terminal on
+    this box, where the file is one `cat` away, and `agent-box-webhook
+    setup` re-prints it on demand. It is fetched on click and never
+    rendered into the page, so it stays out of screenshots, out of the
+    live feed's DOM swaps, and out of the HTML the browser keeps.
+    """
+    if not source:
+        return ""
+    state = webhook_state_dir()
+    try:
+        with open(os.path.join(state, "sources.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        entry = (data.get("sources") or {}).get(source) or {}
+    except (OSError, ValueError, AttributeError):
+        return ""
+    if not isinstance(entry, dict):
+        return ""
+    path = entry.get("secretFile")
+    if isinstance(path, str) and path:
+        if not os.path.isabs(path):
+            path = os.path.join(state, path)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+    inline = entry.get("secret")
+    return inline.strip() if isinstance(inline, str) else ""
 
 
 def prune_filter(name):
@@ -10063,8 +10150,29 @@ STYLE = """<style>
   /* Subscription rows (issue #227) wrap: a topic carries an expiry and the
      note saying why it exists, which does not fit one line on a phone. */
   .nm.wh { flex-wrap: wrap; row-gap: 2px; }
-  .nm.wh code { color: #e6edf3; }
+  /* The endpoint rows are one long URL each and a topic can be 140
+     characters, so break inside the code rather than pushing the panel
+     wider than the phone it is read on. */
+  .nm.wh code { color: #e6edf3; overflow-wrap: anywhere; }
   .wh-note { flex-basis: 100%; margin: 0; font-size: 12px; }
+  /* The secret line under a payload URL: its own line in the wrapping row,
+     with the mask/value and the Show + Copy buttons on it. */
+  .wh-secret { flex-basis: 100%; display: flex; align-items: center;
+               gap: 8px; flex-wrap: wrap; }
+  .wh-secret code { color: #8b949e; overflow-wrap: anywhere; }
+  /* A revealed secret reads as a value, not as placeholder text. */
+  .wh-secret code[data-shown] { color: #e6edf3; }
+  .icon.ismall { font-size: 12px; padding: 2px 8px; }
+  /* Both icons ship in a copy button; CSS picks which one is showing, so
+     the tick needs no icon markup in the script. Only a SUCCESSFUL copy
+     swaps to the tick — a failure stays the copy icon, in red, with the
+     title saying to select the value instead, because a tick that means
+     "nothing was copied" is the one signal worse than no signal. */
+  .icopy span { display: inline-flex; }
+  .icopy .co, .icopy[data-copied="1"] .ci { display: none; }
+  .icopy[data-copied="1"] .co { display: inline-flex; }
+  .icopy[data-copied="1"] { color: #3fb950; }
+  .icopy[data-copied="0"] { color: #f85149; }
   /* A session row folds open onto its own subscriptions (issue #227), so
      the <li> stops being the flex row and its <summary> becomes one. */
   .tbl li.foldrow { display: block; padding: 0; }
@@ -10330,20 +10438,38 @@ SESSIONS_SECTION_TPL = """<section>
     <div id="sessions-list">{sessions}</div>
   </section>"""
 
-# Standing watches (issue #227), settings page only: the workspace root
+# The webhook panel (issue #227), settings page only: the workspace root
 # is a terminal, not a manager. Hidden entirely when the box serves no
-# webhook receiver. A session's OWN subscriptions are not here — they
-# fold open under that session's row in the panel above.
+# webhook receiver. Two halves, in the order the work happens: the
+# endpoint a sender has to be pointed at, then the standing watches a
+# delivery starts a session from. A session's OWN subscriptions are in
+# neither — they fold open under that session's row in the panel above.
+#
+# Called "Webhook", not "Standing watches": the panel now answers "where
+# do deliveries come in" as well as "what do they start", and the list's
+# own header still says which of the two it is.
 WEBHOOKS_SECTION_TPL = """<section>
     <div class="sec-head">
-      <h2>Standing watches</h2>
+      <h2>Webhook</h2>
     </div>
+    {endpoint}
     <p class="note">A standing watch belongs to no session: a matching
     event starts a NEW one. Subscriptions that deliver INTO a session are
     listed under that session above. Deleting either takes effect on the
     next delivery &mdash; no restart.</p>
     <div id="webhooks-list">{webhooks}</div>
   </section>"""
+
+# The endpoint half. Its own note, so the whole thing can be left out on a
+# box that serves no endpoint (no AGENT_BOX_WEBHOOK_URL) without leaving a
+# paragraph pointing at a URL that is not there.
+WEBHOOK_ENDPOINT_TPL = """<p class="note">Where a sender POSTs. Register a
+    payload URL below in the sender &mdash; on GitHub, repo Settings &rarr;
+    Webhooks &rarr; Add webhook, content type <code>application/json</code>
+    &mdash; with that source's secret, which the copy button hands over.
+    Both fields are needed: anything this box cannot verify against the
+    secret is rejected, so the URL alone delivers nothing.</p>
+    {rows}"""
 
 # Guided sign-in (issues #207, #208, #313). Hidden entirely when the box
 # passed no AGENT_BOX_CONNECT_BINS. data-busy tells the page whether a
@@ -10551,6 +10677,25 @@ ICON_DOWNLOAD = (
     '<path d="M7.47 10.78a.75.75 0 0 0 1.06 0l3.75-3.75a.749.749 0 0 0-.326-1.275.749.749 0 0 0'
     '-.734.215L8.75 8.689V1.75a.75.75 0 0 0-1.5 0v6.939L4.78 5.97a.749.749 0 0 0-1.275.326.749'
     '.749 0 0 0 .215.734ZM3.75 13a.75.75 0 0 0 0 1.5h8.5a.75.75 0 0 0 0-1.5Z"/></svg>'
+)
+# What the secret row shows until someone asks for the value. Eight
+# bullets, not the real length: even a length is a hint nobody needs on a
+# page that may be on screen in a call.
+SECRET_MASK = "&bull;" * 8
+
+ICON_COPY = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5'
+    'c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 '
+    '9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"/>'
+    '<path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 '
+    '14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25'
+    'h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg>'
+)
+ICON_CHECK = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L1.72 9.78a.751.751 '
+    '0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 11.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"/></svg>'
 )
 ICON_TRASH = (
     '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
@@ -11162,6 +11307,105 @@ SCRIPT = """<script>
     if (armedX && e.target === armedX) { disarmX(); }
   });
 
+  // The Webhook panel's copy buttons (payload URL, secret) and the
+  // secret's Show toggle. The panel exists so the operator never needs a
+  // shell here, and selecting a 60-character URL or a 32-hex secret by
+  // hand — on a phone, in a terminal-shaped page — is the step that goes
+  // wrong. With no JS the URL is still there to select; the secret is
+  // not, and that is the cost of keeping it out of the HTML.
+  function legacyCopy(text) {
+    // navigator.clipboard needs a secure context; this is the fallback
+    // for a plain-http dev rig, where it is simply absent. The textarea
+    // must be in the document and selectable, so it is moved off-screen
+    // rather than hidden — display:none has no selection to copy.
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    var ok = false;
+    try {
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      ok = document.execCommand("copy");
+    } catch (err) { ok = false; }
+    ta.remove();
+    return ok;
+  }
+  function copyText(text) {
+    if (!text) { return Promise.resolve(false); }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(
+        function () { return true; },
+        function () { return legacyCopy(text); });
+    }
+    return Promise.resolve(legacyCopy(text));
+  }
+  // The tick, and the reason a failure has to say so: a copy button that
+  // looks identical whether or not the clipboard took the value sends the
+  // operator to paste nothing into a sender's form.
+  var COPIED_MS = 1500;
+  function flashCopy(btn, ok) {
+    var title = ok ? "Copied" : "Could not copy — select the value instead";
+    btn.setAttribute("data-copied", ok ? "1" : "0");
+    btn.setAttribute("title", title);
+    window.setTimeout(function () {
+      if (!btn.isConnected) { return; }
+      btn.removeAttribute("data-copied");
+      btn.setAttribute("title", "Copy to clipboard");
+    }, COPIED_MS);
+  }
+  // Fetched per click and never kept: the value is in the clipboard or in
+  // the row the operator revealed, and nowhere else in this page.
+  function fetchSecret(url) {
+    return fetch(url, { headers: { "Accept": "application/json" } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) { return (j && j.ok && j.secret) || ""; })
+      .catch(function () { return ""; });
+  }
+  document.addEventListener("click", function (e) {
+    var b = e.target && e.target.closest ? e.target.closest(".icopy") : null;
+    if (!b) { return; }
+    e.preventDefault();
+    var plain = b.getAttribute("data-copy");
+    if (plain) { copyText(plain).then(function (ok) { flashCopy(b, ok); }); return; }
+    var url = b.getAttribute("data-secret-url");
+    if (!url) { return; }
+    fetchSecret(url).then(function (secret) {
+      if (!secret) { flashCopy(b, false); return; }
+      return copyText(secret).then(function (ok) { flashCopy(b, ok); });
+    });
+  });
+  document.addEventListener("click", function (e) {
+    var b = e.target && e.target.closest ? e.target.closest("[data-reveal]") : null;
+    if (!b) { return; }
+    e.preventDefault();
+    var row = b.closest(".wh-secret");
+    var out = row ? row.querySelector("[data-secret-out]") : null;
+    if (!out) { return; }
+    if (out.hasAttribute("data-shown")) {
+      out.textContent = out.getAttribute("data-mask") || "";
+      out.removeAttribute("data-shown");
+      b.textContent = "Show";
+      b.setAttribute("title", "Show the secret");
+      return;
+    }
+    fetchSecret(b.getAttribute("data-secret-url")).then(function (secret) {
+      if (!out.isConnected) { return; }
+      if (!secret) {
+        b.setAttribute("title", "No secret yet — run agent-box-webhook setup");
+        return;
+      }
+      out.setAttribute("data-mask", out.textContent);
+      out.textContent = secret;
+      out.setAttribute("data-shown", "1");
+      b.textContent = "Hide";
+      b.setAttribute("title", "Hide the secret");
+    });
+  });
+
   // Dismissing the feedback banner ("Session added", "Key saved"…),
   // issue #246. Its x is a link back to the same page without the ?ok=
   // that raised it, which is how a scriptless browser dismisses; here
@@ -11709,6 +11953,88 @@ def render_webhook_row(topic, meta, note, key, dispatch, fold=""):
     )
 
 
+def copy_button(attrs, what):
+    """A one-click copy for a value the operator has to paste elsewhere.
+
+    `attrs` is either data-copy="<the text>" for a value already in the
+    page, or data-secret-url="<route>" for one the button has to fetch
+    first. Both icons ship in the button and CSS picks which one shows,
+    so the "copied" tick needs no icon markup in the script."""
+    return (
+        '<button type="button" class="icon icopy" %s '
+        'aria-label="Copy %s" title="Copy to clipboard">'
+        '<span class="ci">%s</span><span class="co">%s</span></button>'
+        % (attrs, what, ICON_COPY, ICON_CHECK)
+    )
+
+
+def render_webhook_endpoint():
+    """What to register in the sender: the payload URL and the secret,
+    per configured source, each with a copy button.
+
+    Both were previously reachable only by running `agent-box-webhook
+    setup`/`url` inside a session, which is the wrong place for them:
+    registering a webhook is a browser job, done with the sender's own
+    settings open in the next tab, by an operator who may have no shell
+    here at all — and the two values are pasted, not read, so the button
+    matters as much as the value.
+
+    A row per configured source, because the per-source path is what the
+    sender's Payload URL field wants, and the default source's row says
+    so — a URL registered with no source on the end routes there. With no
+    source configured there is nothing to paste yet, and saying so is
+    more use than printing a URL that rejects every delivery.
+
+    The secret is NOT rendered: the row shows a mask, and Show/Copy fetch
+    it from {BASE}/webhooks/secret on the click. Same reasoning as
+    webhook_secret() — the value is the operator's to have, but a value
+    that is not in the HTML cannot leak through a screenshot of this page
+    or through the live feed's DOM swaps."""
+    if not WEBHOOK_URL:
+        return ""
+    base = html.escape(WEBHOOK_URL.rstrip("/"))
+    route = html.escape(BASE) + "/webhooks/secret?source="
+    default, names = webhook_sources()
+    rows = []
+    for name in names:
+        safe = html.escape(name)
+        secret_route = route + urllib.parse.quote(name, safe="")
+        # Naming the default is not decoration: a URL registered with no
+        # source on the end routes to it, so this is the one row that also
+        # explains an endpoint someone pasted bare months ago.
+        tag = (" (default &mdash; a URL with no source lands here)"
+               if name == default else "")
+        rows.append(
+            '<li><span class="nm wh"><code>%s/%s</code>'
+            '<span class="meta">%s%s</span>'
+            '<span class="wh-secret"><span class="meta">Secret</span>'
+            '<code data-secret-out>%s</code>'
+            '<button type="button" class="icon ismall" data-reveal '
+            'data-secret-url="%s" aria-label="Show the %s secret" '
+            'title="Show the secret">Show</button>%s</span>'
+            '</span>'
+            '<span class="acts">%s</span></li>'
+            % (base, safe, safe, tag,
+               SECRET_MASK, secret_route, safe,
+               copy_button('data-secret-url="%s"' % secret_route,
+                           "the %s secret" % safe),
+               copy_button('data-copy="%s/%s"' % (base, safe),
+                           "the %s payload URL" % safe))
+        )
+    if not rows:
+        rows.append(
+            '<li class="empty">No sender is set up yet, so this box rejects '
+            'every delivery. Run <code>agent-box-webhook setup</code> in a '
+            'session: it mints the secret, prints it once, and prints the '
+            'payload URL to register &mdash; <code>%s/&lt;source&gt;</code>.'
+            '</li>' % base
+        )
+    return WEBHOOK_ENDPOINT_TPL.format(
+        rows=('<ul class="tbl"><li class="tbl-head">Payload URL</li>'
+              + "".join(rows) + "</ul>")
+    )
+
+
 def render_webhooks(watches):
     """The standing watches. Session subscriptions are NOT here: they
     belong to a session and are folded into its row above. A standing
@@ -12054,7 +12380,9 @@ def render_page(message=""):
             # terminal workspace, so session CRUD lives here.
             sessions_section=render_sessions_section(subs),
             webhooks_section=(
-                WEBHOOKS_SECTION_TPL.format(webhooks=render_webhooks(watches))
+                WEBHOOKS_SECTION_TPL.format(
+                    endpoint=render_webhook_endpoint(),
+                    webhooks=render_webhooks(watches))
                 if WEBHOOKS else ""
             ),
             connect_section=render_connect() if connect_flows() else "",
@@ -12418,6 +12746,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # poll one card than re-fetch the page (read-only: it reports
         # what the CLI and the pane say, and carries no secret — the
         # only pane text it can return is a redacted error line).
+        # One source's HMAC secret, for the Webhook panel's Show/Copy
+        # buttons (see webhook_secret()). GET, because it changes nothing
+        # and a cross-site page cannot read this response: no CORS
+        # headers, so the browser withholds the body even with the
+        # operator's credentials attached. no-store comes from
+        # _send_json, so it is never written to the browser's cache.
+        if parsed.path.rstrip("/") == BASE + "/webhooks/secret" and WEBHOOKS:
+            source = (params.get("source", [""])[0]).strip()
+            secret = webhook_secret(source) if SOURCE_RE.match(source or "") else ""
+            if not secret:
+                self._send_json({"ok": False}, status=404)
+            else:
+                self._send_json({"ok": True, "source": source, "secret": secret})
+            return
         if parsed.path.rstrip("/") == BASE + "/connect":
             flow = connect_flow((params.get("flow", [""])[0]).strip())
             if flow is None:
@@ -13328,8 +13670,16 @@ if __name__ == "__main__":
                 # in it.
                 + "AGENT_BOX_WEB_USERS=${lib.concatStringsSep "," terminalUsers}\n"
               )
-            + lib.optionalString webhookEnabled
-                "AGENT_BOX_WEBHOOK_STATE_DIR=${webhookStateDirOf name}\n";
+            + lib.optionalString webhookEnabled (
+                "AGENT_BOX_WEBHOOK_STATE_DIR=${webhookStateDirOf name}\n"
+                # The same endpoint URL the agent unit exports (see
+                # AGENT_BOX_WEBHOOK_URL there), so the Webhook panel can
+                # print what to paste into the sender. Derived from the
+                # same webhookPathOf, and gated on the same condition,
+                # because a terminal user is exactly the case where caddy
+                # serves that path.
+                + "AGENT_BOX_WEBHOOK_URL=https://${cfg.web.domain}${webhookPathOf name}\n"
+              );
         }) terminalUsers)
         // lib.optionalAttrs webhookEnabled (lib.listToAttrs (map (name: lib.nameValuePair "agent-box/units/agent-box-webhook-${name}.env" {
           text = "LOCAL_WEBHOOK_STATE_DIR=${webhookStateDirOf name}\n";

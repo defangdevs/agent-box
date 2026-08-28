@@ -1619,8 +1619,33 @@
         "1 subscription",              # and counted on that session's row
         f'data-fold="subs-{hook_name}"',   # a spawned session's seeded topic
         "Standing watch",              # the shared dispatch list, its own panel
+        # The endpoint half of the same panel: what to register in the
+        # sender, per configured source, paste-ready with a copy button.
+        # Until this, both halves were reachable only by running
+        # `agent-box-webhook url`/`setup` in a session — a shell the
+        # operator reading this page may not have.
+        "Payload URL",
+        "https://box.test/agent/webhook/github",
+        'data-copy="https://box.test/agent/webhook/github"',
+        'data-secret-url="/agent/settings/webhooks/secret?source=github"',
     ]:
         assert want in page, "%s missing from the settings page" % want
+    # The secret is fetched on click, never rendered: a screenshot of this
+    # page, and every DOM the live feed swaps in, are free of it.
+    assert secret not in page, "the webhook secret is in the settings page HTML"
+    # ... and the route the buttons fetch it from hands over that same
+    # secret, for a name that resolves to a configured source and nothing
+    # else (a traversal attempt is a 404, not a file read).
+    got = machine.succeed(
+        f"{settings_curl} '{settings_page}webhooks/secret?source=github'"
+    )
+    assert json.loads(got) == {"ok": True, "source": "github",
+                               "secret": secret}, got
+    for bad in ["source=nope", "source=../github", "source="]:
+        machine.succeed(
+            f"{settings_curl} -o /dev/null -w '%{{http_code}}'"
+            f" '{settings_page}webhooks/secret?{bad}' | grep -x 404"
+        )
     # The standing watches are NOT session-scoped, so they are the one thing
     # that must not have moved into a session's fold.
     watches = page.split("Standing watch")[-1]

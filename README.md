@@ -482,7 +482,15 @@ On by default (`webhook.enable`), needs `web.enable`. How it fits together:
   as sessions that are actually running, so a finished one frees its slot even
   if nobody delisted it. The spawned session's prompt tells it to remove itself
   when done.
-- The **settings page** shows every subscription on the box, with a delete for
+- The **settings page**'s **Webhook** panel carries both halves of what a
+  sender's form asks for — the payload URL per configured source and that
+  source's secret — each with a **copy button**, so registering a webhook needs
+  no shell on the box. The secret is not rendered into the page: the row shows a
+  mask, and **Show**/**Copy** fetch it from `{base}/webhooks/secret` on the
+  click, which keeps it out of screenshots of this page and out of the live
+  feed's DOM swaps. No new exposure either way — the same login opens a terminal
+  where that file is one `cat` away.
+- That same page shows every subscription on the box, with a delete for
   each — for when a watch turns into a flood. Until then that state was
   readable only from inside a session, and only for that session. A session's
   own topics fold open under that session's row in **Sessions**, with the note

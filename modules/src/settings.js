@@ -592,6 +592,105 @@
     if (armedX && e.target === armedX) { disarmX(); }
   });
 
+  // The Webhook panel's copy buttons (payload URL, secret) and the
+  // secret's Show toggle. The panel exists so the operator never needs a
+  // shell here, and selecting a 60-character URL or a 32-hex secret by
+  // hand — on a phone, in a terminal-shaped page — is the step that goes
+  // wrong. With no JS the URL is still there to select; the secret is
+  // not, and that is the cost of keeping it out of the HTML.
+  function legacyCopy(text) {
+    // navigator.clipboard needs a secure context; this is the fallback
+    // for a plain-http dev rig, where it is simply absent. The textarea
+    // must be in the document and selectable, so it is moved off-screen
+    // rather than hidden — display:none has no selection to copy.
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    var ok = false;
+    try {
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      ok = document.execCommand("copy");
+    } catch (err) { ok = false; }
+    ta.remove();
+    return ok;
+  }
+  function copyText(text) {
+    if (!text) { return Promise.resolve(false); }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(
+        function () { return true; },
+        function () { return legacyCopy(text); });
+    }
+    return Promise.resolve(legacyCopy(text));
+  }
+  // The tick, and the reason a failure has to say so: a copy button that
+  // looks identical whether or not the clipboard took the value sends the
+  // operator to paste nothing into a sender's form.
+  var COPIED_MS = 1500;
+  function flashCopy(btn, ok) {
+    var title = ok ? "Copied" : "Could not copy — select the value instead";
+    btn.setAttribute("data-copied", ok ? "1" : "0");
+    btn.setAttribute("title", title);
+    window.setTimeout(function () {
+      if (!btn.isConnected) { return; }
+      btn.removeAttribute("data-copied");
+      btn.setAttribute("title", "Copy to clipboard");
+    }, COPIED_MS);
+  }
+  // Fetched per click and never kept: the value is in the clipboard or in
+  // the row the operator revealed, and nowhere else in this page.
+  function fetchSecret(url) {
+    return fetch(url, { headers: { "Accept": "application/json" } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) { return (j && j.ok && j.secret) || ""; })
+      .catch(function () { return ""; });
+  }
+  document.addEventListener("click", function (e) {
+    var b = e.target && e.target.closest ? e.target.closest(".icopy") : null;
+    if (!b) { return; }
+    e.preventDefault();
+    var plain = b.getAttribute("data-copy");
+    if (plain) { copyText(plain).then(function (ok) { flashCopy(b, ok); }); return; }
+    var url = b.getAttribute("data-secret-url");
+    if (!url) { return; }
+    fetchSecret(url).then(function (secret) {
+      if (!secret) { flashCopy(b, false); return; }
+      return copyText(secret).then(function (ok) { flashCopy(b, ok); });
+    });
+  });
+  document.addEventListener("click", function (e) {
+    var b = e.target && e.target.closest ? e.target.closest("[data-reveal]") : null;
+    if (!b) { return; }
+    e.preventDefault();
+    var row = b.closest(".wh-secret");
+    var out = row ? row.querySelector("[data-secret-out]") : null;
+    if (!out) { return; }
+    if (out.hasAttribute("data-shown")) {
+      out.textContent = out.getAttribute("data-mask") || "";
+      out.removeAttribute("data-shown");
+      b.textContent = "Show";
+      b.setAttribute("title", "Show the secret");
+      return;
+    }
+    fetchSecret(b.getAttribute("data-secret-url")).then(function (secret) {
+      if (!out.isConnected) { return; }
+      if (!secret) {
+        b.setAttribute("title", "No secret yet — run agent-box-webhook setup");
+        return;
+      }
+      out.setAttribute("data-mask", out.textContent);
+      out.textContent = secret;
+      out.setAttribute("data-shown", "1");
+      b.textContent = "Hide";
+      b.setAttribute("title", "Hide the secret");
+    });
+  });
+
   // Dismissing the feedback banner ("Session added", "Key saved"…),
   // issue #246. Its x is a link back to the same page without the ?ok=
   // that raised it, which is how a scriptless browser dismisses; here

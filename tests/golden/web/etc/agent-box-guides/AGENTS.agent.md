@@ -237,6 +237,12 @@ ready-made `gh api` command too. Until a secret exists the endpoint rejects
 everything. Any sender that HMAC-SHA256-signs its body works, not just
 GitHub: `agent-box-webhook setup stripe` adds a second source.
 
+The user has no shell here, so do not hand them either command: the settings
+page's Webhook panel carries the payload URL per source AND that source's
+secret, each with a copy button, at ${AGENT_BOX_URL}settings/ — that is the
+link to give someone who is registering the webhook in the sender, and it
+saves you reading a 32-hex secret out to them.
+
 ## Handing a file to the user
 
 To let the user download a file you produced (report, build artifact,
