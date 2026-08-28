@@ -31,6 +31,7 @@ usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
        agent-box-webhook status
        agent-box-webhook url
        agent-box-webhook setup [SOURCE]
+       agent-box-webhook rotate [SOURCE]
 
 Route webhook events to an agent instead of polling for them. TOPIC is
 "source:key" — a bare "owner/repo" means github:owner/repo, and "owner/*"
@@ -560,6 +561,76 @@ Or, for events no session owns, a standing watch that spawns a fresh
 session per event batch instead of interrupting this one:
   agent-box-webhook subscribe OWNER/REPO --deliver-to subagent --note "triage"
 EOF
+    ;;
+  rotate)
+    # Mint a NEW secret for a source that already exists, so a leaked one can
+    # be replaced. `setup` deliberately reuses an existing secret (it is the
+    # idempotent "make this work" command), which left no way to change one.
+    #
+    # Deliberately a HARD cutover: the receiver verifies against exactly one
+    # secret per source (webhook.py's source_secret), so from the moment this
+    # returns, a delivery still signed with the old secret is answered 401 —
+    # and GitHub does not retry, so events in the window between here and
+    # updating the sender are lost, not delayed. Say so, loudly, rather than
+    # implying an overlap that does not exist (an overlap needs the receiver
+    # to accept a previous secret: defangdevs/local-channels#49).
+    src="${1:-}"
+    if [ -z "$src" ]; then
+      src="$("$JQ" -r '.defaultSource // "github"' "$SOURCES" 2>/dev/null || echo github)"
+    fi
+    valid_source "$src" || { echo "invalid source name '$src' (letters, digits, _ and - only)" >&2; exit 2; }
+    url="$(endpoint)"
+    ensure_state
+    entry="$("$JQ" -c --arg s "$src" '.sources[$s] // empty' "$SOURCES" 2>/dev/null || true)"
+    if [ -z "$entry" ]; then
+      echo "agent-box-webhook: no source '$src' to rotate — run: agent-box-webhook setup $src" >&2
+      exit 1
+    fi
+    # An inline `secret` in sources.json WINS over secretFile in the receiver,
+    # so rotating the file while an inline value sits there would change
+    # nothing and say it had. Move the source onto its file and drop the
+    # inline key in the same edit.
+    inline="$("$JQ" -r --arg s "$src" '.sources[$s].secret // ""' "$SOURCES" 2>/dev/null || true)"
+    file="$("$JQ" -r --arg s "$src" '.sources[$s].secretFile // ""' "$SOURCES" 2>/dev/null || true)"
+    # No secretFile yet (a hand-written inline-only source): give it the same
+    # name setup would have, and record it below.
+    declared="$file"
+    [ -n "$file" ] || file="$src.secret"
+    case "$file" in (/*) path="$file" ;; (*) path="$STATE_DIR/$file" ;; esac
+    secret="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+    umask 077
+    tmp="$(mktemp "$path.XXXXXX")"
+    printf '%s' "$secret" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$path"
+    if [ -n "$inline" ] || [ "$declared" != "$file" ]; then
+      tmp="$(mktemp "$SOURCES.XXXXXX")"
+      if "$JQ" --arg s "$src" --arg f "$file" \
+           '.sources[$s] = ((.sources[$s] // {}) | del(.secret) | .secretFile = $f)' \
+           "$SOURCES" > "$tmp"; then
+        chmod 600 "$tmp"; mv "$tmp" "$SOURCES"
+      else
+        rm -f "$tmp"; exit 1
+      fi
+    fi
+    cat <<EOF
+rotated $src — new secret written to $path (0600)
+
+UPDATE THE SENDER NOW. Deliveries signed with the old secret are rejected
+(401) from this moment, and GitHub does not retry them.
+
+  Payload URL   $url/$src
+  Secret        $secret
+EOF
+    if [ "$src" = github ]; then
+      cat <<EOF
+
+In the repo: Settings -> Webhooks -> the hook -> Secret. With admin rights,
+find the hook id and patch it in place:
+  gh api repos/OWNER/REPO/hooks --jq '.[] | "\(.id) \(.config.url)"'
+  gh api -X PATCH repos/OWNER/REPO/hooks/HOOK_ID -f 'config[secret]=$secret'
+EOF
+    fi
     ;;
   ""|-h|--help|help) usage ;;
   *) usage >&2; exit 2 ;;

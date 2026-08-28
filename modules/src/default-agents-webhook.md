@@ -106,3 +106,10 @@ page's Webhook panel carries the payload URL per source AND that source's
 secret, each with a copy button, at ${AGENT_BOX_URL}settings/ — that is the
 link to give someone who is registering the webhook in the sender, and it
 saves you reading a 32-hex secret out to them.
+
+A leaked secret is replaced with `agent-box-webhook rotate [SOURCE]`, or the
+Rotate button on that same panel. It is a hard cutover — the receiver knows
+exactly one secret per source — so deliveries signed with the old secret are
+answered 401 from that moment and GitHub does not retry them. Rotate when the
+sender can be updated straight away, and say so when you hand the new secret
+over.

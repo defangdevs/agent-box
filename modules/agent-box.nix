@@ -147,6 +147,13 @@ let
       link to give someone who is registering the webhook in the sender, and it
       saves you reading a 32-hex secret out to them.
 
+      A leaked secret is replaced with `agent-box-webhook rotate [SOURCE]`, or the
+      Rotate button on that same panel. It is a hard cutover — the receiver knows
+      exactly one secret per source — so deliveries signed with the old secret are
+      answered 401 from that moment and GitHub does not retry them. Rotate when the
+      sender can be updated straight away, and say so when you hand the new secret
+      over.
+
     '')
       (lib.optionalString cfg.selfUpdate.enable ''
       ## Updating
@@ -3059,6 +3066,7 @@ esac
            agent-box-webhook status
            agent-box-webhook url
            agent-box-webhook setup [SOURCE]
+           agent-box-webhook rotate [SOURCE]
 
     Route webhook events to an agent instead of polling for them. TOPIC is
     "source:key" — a bare "owner/repo" means github:owner/repo, and "owner/*"
@@ -3588,6 +3596,76 @@ esac
     session per event batch instead of interrupting this one:
       agent-box-webhook subscribe OWNER/REPO --deliver-to subagent --note "triage"
     EOF
+        ;;
+      rotate)
+        # Mint a NEW secret for a source that already exists, so a leaked one can
+        # be replaced. `setup` deliberately reuses an existing secret (it is the
+        # idempotent "make this work" command), which left no way to change one.
+        #
+        # Deliberately a HARD cutover: the receiver verifies against exactly one
+        # secret per source (webhook.py's source_secret), so from the moment this
+        # returns, a delivery still signed with the old secret is answered 401 —
+        # and GitHub does not retry, so events in the window between here and
+        # updating the sender are lost, not delayed. Say so, loudly, rather than
+        # implying an overlap that does not exist (an overlap needs the receiver
+        # to accept a previous secret: defangdevs/local-channels#49).
+        src="''${1:-}"
+        if [ -z "$src" ]; then
+          src="$("$JQ" -r '.defaultSource // "github"' "$SOURCES" 2>/dev/null || echo github)"
+        fi
+        valid_source "$src" || { echo "invalid source name '$src' (letters, digits, _ and - only)" >&2; exit 2; }
+        url="$(endpoint)"
+        ensure_state
+        entry="$("$JQ" -c --arg s "$src" '.sources[$s] // empty' "$SOURCES" 2>/dev/null || true)"
+        if [ -z "$entry" ]; then
+          echo "agent-box-webhook: no source '$src' to rotate — run: agent-box-webhook setup $src" >&2
+          exit 1
+        fi
+        # An inline `secret` in sources.json WINS over secretFile in the receiver,
+        # so rotating the file while an inline value sits there would change
+        # nothing and say it had. Move the source onto its file and drop the
+        # inline key in the same edit.
+        inline="$("$JQ" -r --arg s "$src" '.sources[$s].secret // ""' "$SOURCES" 2>/dev/null || true)"
+        file="$("$JQ" -r --arg s "$src" '.sources[$s].secretFile // ""' "$SOURCES" 2>/dev/null || true)"
+        # No secretFile yet (a hand-written inline-only source): give it the same
+        # name setup would have, and record it below.
+        declared="$file"
+        [ -n "$file" ] || file="$src.secret"
+        case "$file" in (/*) path="$file" ;; (*) path="$STATE_DIR/$file" ;; esac
+        secret="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+        umask 077
+        tmp="$(mktemp "$path.XXXXXX")"
+        printf '%s' "$secret" > "$tmp"
+        chmod 600 "$tmp"
+        mv "$tmp" "$path"
+        if [ -n "$inline" ] || [ "$declared" != "$file" ]; then
+          tmp="$(mktemp "$SOURCES.XXXXXX")"
+          if "$JQ" --arg s "$src" --arg f "$file" \
+               '.sources[$s] = ((.sources[$s] // {}) | del(.secret) | .secretFile = $f)' \
+               "$SOURCES" > "$tmp"; then
+            chmod 600 "$tmp"; mv "$tmp" "$SOURCES"
+          else
+            rm -f "$tmp"; exit 1
+          fi
+        fi
+        cat <<EOF
+    rotated $src — new secret written to $path (0600)
+
+    UPDATE THE SENDER NOW. Deliveries signed with the old secret are rejected
+    (401) from this moment, and GitHub does not retry them.
+
+      Payload URL   $url/$src
+      Secret        $secret
+    EOF
+        if [ "$src" = github ]; then
+          cat <<EOF
+
+    In the repo: Settings -> Webhooks -> the hook -> Secret. With admin rights,
+    find the hook id and patch it in place:
+      gh api repos/OWNER/REPO/hooks --jq '.[] | "\(.id) \(.config.url)"'
+      gh api -X PATCH repos/OWNER/REPO/hooks/HOOK_ID -f 'config[secret]=$secret'
+    EOF
+        fi
         ;;
       ""|-h|--help|help) usage ;;
       *) usage >&2; exit 2 ;;
@@ -8865,6 +8943,76 @@ def webhook_secret(source):
     return inline.strip() if isinstance(inline, str) else ""
 
 
+def webhook_secret_path(source):
+    """The file a source's secret lives in, or "" if the page must not
+    write it.
+
+    Only the shape `agent-box-webhook setup` produces is rotatable from
+    here: an entry with a `secretFile` inside the state dir, and no inline
+    `secret` (which the receiver prefers over the file, so rotating the
+    file under one would change nothing and claim it had). Anything else
+    is a hand-written source, and editing sources.json is the CLI's job —
+    it owns that format, with jq, in one place. The page refuses and says
+    which command to run instead.
+    """
+    if not SOURCE_RE.match(source or ""):
+        return ""
+    state = webhook_state_dir()
+    try:
+        with open(os.path.join(state, "sources.json"), encoding="utf-8") as fh:
+            entry = ((json.load(fh).get("sources") or {}).get(source) or {})
+    except (OSError, ValueError, AttributeError):
+        return ""
+    if not isinstance(entry, dict) or entry.get("secret"):
+        return ""
+    path = entry.get("secretFile")
+    if not isinstance(path, str) or not path:
+        return ""
+    full = os.path.realpath(path if os.path.isabs(path)
+                            else os.path.join(state, path))
+    # The path comes out of a file the user owns, so this is not a
+    # privilege boundary — it is a bound on what a web POST can overwrite:
+    # this source's own secret inside the state dir, nothing else.
+    if os.path.dirname(full) != os.path.realpath(state):
+        return ""
+    return full
+
+
+def webhook_rotate(source):
+    """Mint a new secret for one source. True if it was replaced.
+
+    Same 32 hex characters `agent-box-webhook setup` mints, from the same
+    kernel CSPRNG, written 0600 through a tempfile in the same directory
+    so a delivery mid-read never sees half a secret.
+
+    A HARD cutover, deliberately: the receiver verifies against exactly
+    one secret per source, so a delivery still signed with the old value
+    is rejected from here on, and GitHub does not retry — the banner and
+    the button's confirm say so, because an overlap is not ours to
+    invent (defangdevs/local-channels#49).
+    """
+    path = webhook_secret_path(source)
+    if not path:
+        return False
+    secret = secrets.token_hex(16)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
+                                   prefix=".secret.")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(secret)
+            os.replace(tmp, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
+    except OSError as exc:
+        sys.stderr.write("webhook: rotate %s: %s\n" % (source, exc))
+        return False
+    return True
+
+
 def prune_filter(name):
     """Drop one session's webhook filter file — the same cleanup
     'agent-box-session rm' does (#229). webhook.py reads
@@ -10452,7 +10600,7 @@ WEBHOOKS_SECTION_TPL = """<section>
     <div class="sec-head">
       <h2>Webhook</h2>
     </div>
-    {endpoint}
+    <div id="webhook-endpoint">{endpoint}</div>
     <p class="note">A standing watch belongs to no session: a matching
     event starts a NEW one. Subscriptions that deliver INTO a session are
     listed under that session above. Deleting either takes effect on the
@@ -11479,8 +11627,8 @@ SCRIPT = """<script>
 
     function afterPost(t) {
       applyDoc(parseHTML(t),
-        ["msg-slot", "secrets-list", "sessions-list", "webhooks-list",
-         "connect-list", "tab-bar"]);
+        ["msg-slot", "secrets-list", "sessions-list", "webhook-endpoint",
+         "webhooks-list", "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");
       if (ed) { f.reset(); ed.hidden = true; }
       var added = wsActive();   // the tab the fetched page marks current
@@ -11968,6 +12116,28 @@ def copy_button(attrs, what):
     )
 
 
+def rotate_form(source):
+    """Replace one source's secret, from the page.
+
+    A form, not a fetch button: with no JS it still works, like every
+    other action here. The confirm() is not ceremony — this is a hard
+    cutover (see webhook_rotate()), so the dialog is where someone finds
+    out that the sender has to be updated before it says the words on a
+    banner they have already triggered."""
+    safe = html.escape(source)
+    return (
+        '<form class="inline" method="post" action="%s/webhooks/rotate" '
+        'onsubmit="return confirm(\'Rotate the %s secret? Deliveries signed '
+        'with the old secret are rejected until you paste the new one into '
+        'the sender, and GitHub does not retry them.\');">'
+        '<input type="hidden" name="source" value="%s">'
+        '<button type="submit" class="icon ismall" '
+        'aria-label="Rotate the %s secret" '
+        'title="Mint a new secret">Rotate</button></form>'
+        % (html.escape(BASE), safe, safe, safe)
+    )
+
+
 def render_webhook_endpoint():
     """What to register in the sender: the payload URL and the secret,
     per configured source, each with a copy button.
@@ -12011,13 +12181,14 @@ def render_webhook_endpoint():
             '<code data-secret-out>%s</code>'
             '<button type="button" class="icon ismall" data-reveal '
             'data-secret-url="%s" aria-label="Show the %s secret" '
-            'title="Show the secret">Show</button>%s</span>'
+            'title="Show the secret">Show</button>%s%s</span>'
             '</span>'
             '<span class="acts">%s</span></li>'
             % (base, safe, safe, tag,
                SECRET_MASK, secret_route, safe,
                copy_button('data-secret-url="%s"' % secret_route,
                            "the %s secret" % safe),
+               rotate_form(name),
                copy_button('data-copy="%s/%s"' % (base, safe),
                            "the %s payload URL" % safe))
         )
@@ -12657,6 +12828,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "session_started": "Session started — it comes up within a few seconds.",
         "update": "Box update started — the system rebuilds in the "
                   "background and this page may briefly go away.",
+        "webhook_rotated": ("Secret rotated. Copy the new one into the sender "
+                            "now — deliveries signed with the old secret are "
+                            "rejected from this moment, and GitHub does not "
+                            "retry them."),
+        "webhook_kept_secret": ("Could not rotate that secret. A source whose "
+                                "secret is written into sources.json by hand "
+                                "is the CLI's to change: run "
+                                "`agent-box-webhook rotate SOURCE` in a "
+                                "session."),
         "webhook_deleted": "Subscription deleted — it stops at the next delivery.",
         "webhook_forgotten": "Subscriptions cleared — that session now receives nothing.",
         "webhook_kept": "Could not delete that subscription. It may already be gone.",
@@ -13063,6 +13243,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             ok = webhook_unsubscribe(key, topic, dispatch)
             self._redirect("ok=webhook_deleted" if ok else "ok=webhook_kept")
+        elif path == BASE + "/webhooks/rotate" and WEBHOOKS:
+            # Replace one source's secret. The page's only webhook WRITE:
+            # everything else here reads, and topic edits go through
+            # webhook.py's own CLI. Bounded by webhook_secret_path() to a
+            # secret file inside the state dir belonging to a configured
+            # source that setup itself created.
+            source = (form.get("source", [""])[0]).strip()
+            ok = webhook_rotate(source)
+            self._redirect("ok=webhook_rotated" if ok else "ok=webhook_kept_secret")
         elif path == BASE + "/webhooks/forget" and WEBHOOKS:
             # Remove one session's whole filter file. Same bound as the
             # unsubscribe route: one of THIS user's own listed sessions,

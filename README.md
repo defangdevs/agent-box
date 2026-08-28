@@ -456,6 +456,7 @@ agent-box-webhook setup                     # mint an HMAC secret, print the URL
 # register that URL + secret in the repo (Settings -> Webhooks -> Add webhook)
 agent-box-webhook subscribe OWNER/REPO --note "PR 42: waiting on CI"
 agent-box-webhook ls                        # what this session listens to
+agent-box-webhook rotate                    # replace a leaked secret
 ```
 
 On by default (`webhook.enable`), needs `web.enable`. How it fits together:
@@ -489,7 +490,13 @@ On by default (`webhook.enable`), needs `web.enable`. How it fits together:
   mask, and **Show**/**Copy** fetch it from `{base}/webhooks/secret` on the
   click, which keeps it out of screenshots of this page and out of the live
   feed's DOM swaps. No new exposure either way — the same login opens a terminal
-  where that file is one `cat` away.
+  where that file is one `cat` away. **Rotate** on the same row mints a new
+  secret (as does `agent-box-webhook rotate [SOURCE]`), which is a **hard
+  cutover**: the receiver verifies against exactly one secret per source, so
+  deliveries still signed with the old one are rejected from that moment and
+  GitHub does not retry them — update the sender before anything you care about
+  fires. A no-loss overlap needs the receiver to accept a previous secret,
+  which is [local-channels#49](https://github.com/defangdevs/local-channels/issues/49).
 - That same page shows every subscription on the box, with a delete for
   each — for when a watch turns into a flood. Until then that state was
   readable only from inside a session, and only for that session. A session's

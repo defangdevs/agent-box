@@ -764,8 +764,8 @@
 
     function afterPost(t) {
       applyDoc(parseHTML(t),
-        ["msg-slot", "secrets-list", "sessions-list", "webhooks-list",
-         "connect-list", "tab-bar"]);
+        ["msg-slot", "secrets-list", "sessions-list", "webhook-endpoint",
+         "webhooks-list", "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");
       if (ed) { f.reset(); ed.hidden = true; }
       var added = wsActive();   // the tab the fetched page marks current
