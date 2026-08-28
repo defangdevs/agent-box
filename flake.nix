@@ -213,6 +213,28 @@
           # of a flat "agent-box-<user>" unit.
           wanted = [ "agent-box@alice" "agent-box@bob" "agent-box@coder" "agent-box@ci" ];
           missing = builtins.filter (n: ! builtins.hasAttr n services) wanted;
+
+          # A fully-featured eval — web on, so every per-user unit the module
+          # can render (terminal, settings, webhook) is rendered, and
+          # `config.systemd.services` is the ground truth for "what did the
+          # module actually define". Shared by the two checks below that both
+          # need that ground truth rather than a hand-maintained name list.
+          webBaseline = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.agent-box
+              ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+              {
+                services.agent-box = {
+                  enable = true;
+                  agent = "claude";
+                  users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                  web = { enable = true; domain = "phantom-unit.test"; user = "agent"; };
+                };
+                system.stateVersion = "25.05";
+              }
+            ];
+          };
         in
         {
           # Eval-level assertion; cheap.
@@ -237,24 +259,63 @@
           # same blind spot as the sweep that missed this in the first place:
           # it can only reject names it already knows about. Eval knows what
           # actually got rendered, so it catches a name nobody anticipated.
+          # Guard (this file's `webBaseline`, agent-box#386 + this change): a
+          # socket-activated unit MUST set stopIfChanged = false. NixOS's
+          # default two-step restart stops such a unit in the OLD
+          # configuration, before the new one's daemon-reload, while its
+          # .socket keeps listening — so a client (or a webhook delivery)
+          # arriving in that window re-activates the daemon from systemd's
+          # CACHED old unit definition, and switch-to-configuration's later
+          # start step then finds it already running and leaves the stale
+          # survivor in place until the next reboot. It cost the settings
+          # page a wrong rev (#386) and the webhook receiver a spawn command
+          # pointing into a garbage-collected generation.
+          #
+          # The socket-activation relation is declared in the VERBATIM unit
+          # text shipped via systemd.packages, not in the Nix attrs, so it is
+          # read from that text — which is also what makes this catch a unit
+          # nobody thought to list here. `%i` templates only: every
+          # socket-activated unit the module has is per-user.
+          socket-activated-restart =
+            let
+              unitDir = ./modules/src/units;
+              templates = builtins.filter (n: nixpkgs.lib.hasSuffix "@.service" n)
+                (builtins.attrNames (builtins.readDir unitDir));
+              # Either direction counts: Requires= is what makes the socket
+              # start the daemon, After= alone still means the socket outlives
+              # the service's stop and can re-activate it.
+              activated = builtins.filter
+                (n: nixpkgs.lib.hasInfix ".socket" (builtins.readFile (unitDir + "/${n}")))
+                templates;
+              svc = webBaseline.config.systemd.services;
+              # "agent-box-settings@.service" -> the baseline's own instance.
+              instanceOf = n: (nixpkgs.lib.removeSuffix "@.service" n) + "@agent";
+              offenders = builtins.filter
+                (n:
+                  let i = instanceOf n; in
+                  builtins.hasAttr i svc && svc.${i}.stopIfChanged != false)
+                activated;
+            in
+            if offenders != [ ]
+            then
+              throw (
+                "socket-activated unit(s) without stopIfChanged = false — the " +
+                "two-step restart lets the .socket re-activate the daemon from " +
+                "systemd's cached OLD unit definition, and the stale survivor " +
+                "is never replaced (agent-box#386):\n" +
+                nixpkgs.lib.concatMapStringsSep "\n"
+                  (n: "  ${n} -> systemd.services.\"${instanceOf n}\"")
+                  offenders
+              )
+            else
+              pkgs.runCommand "agent-box-socket-activated-restart-ok" { } ''
+                printf 'stopIfChanged = false on: %s\n' \
+                  ${nixpkgs.lib.escapeShellArg (toString activated)} > "$out"
+              '';
+
           phantom-unit-overrides =
             let
-              phantomBaseline = nixpkgs.lib.nixosSystem {
-                inherit system;
-                modules = [
-                  self.nixosModules.agent-box
-                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
-                  {
-                    services.agent-box = {
-                      enable = true;
-                      agent = "claude";
-                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
-                      web = { enable = true; domain = "phantom-unit.test"; user = "agent"; };
-                    };
-                    system.stateVersion = "25.05";
-                  }
-                ];
-              };
+              phantomBaseline = webBaseline;
               hasAt = n: nixpkgs.lib.hasInfix "@" n;
               # "agent-box-settings@agent" -> "agent-box-settings@": the
               # per-instance override target is expected to differ from the
