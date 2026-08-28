@@ -67,7 +67,7 @@ covers "a bare number claims issue.number too" \
 # spawned a sibling.
 for p in workflow_run.head_branch workflow_job.head_branch \
          check_run.check_suite.head_branch check_suite.head_branch \
-         pull_request.head.ref ref; do
+         deployment.ref pull_request.head.ref ref; do
   covers "branch: claims $p" "$p" defangdevs/agent-box --claim branch:fix/42
 done
 
@@ -93,8 +93,18 @@ else no "issue: claims only the issue"; fi
 # --- claims OR together; --claim=X spelling works -----------------------
 n=$(include_of defangdevs/agent-box --claim pr:42 --claim branch:fix/42 \
     | jq '.any | length')
-[ "$n" = 7 ] && ok "repeated claims OR together (1 + 6 clauses)" \
+[ "$n" = 8 ] && ok "repeated claims OR together (1 + 7 clauses)" \
   || no "repeated claims OR together" "got $n clauses"
+
+# The one shape a claim CANNOT cover, asserted so nobody "fixes" it with a
+# guess: a bare commit status carries only a `branches` ARRAY, and
+# webhook.py's get_path indexes lists by number alone (no wildcard). A
+# branches.0.name rule would look claimed and match nothing.
+if include_of defangdevs/agent-box --claim branch:fix/42 \
+   | jq -e '[.any[].path] | any(startswith("branches"))' >/dev/null 2>&1
+then no "commit status is left unclaimed, not guessed at" \
+        "a branches[] rule crept in"
+else ok "commit status is left unclaimed, not guessed at"; fi
 n=$(include_of defangdevs/agent-box --claim=pr:42 | jq '.any | length')
 [ "$n" = 1 ] && ok "--claim=SPEC is accepted too" \
   || no "--claim=SPEC is accepted too" "got $n"

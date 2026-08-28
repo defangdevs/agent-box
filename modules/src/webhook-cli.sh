@@ -107,13 +107,21 @@ Repeatable; the clauses OR together. Picking up a PR is normally both:
     --claim pr:42 --claim branch:fix/42-thing
 
 Prefer this to hand-writing --include. A claim only covers the payload
-paths it names, and CI reports terminal failure under six of them
-(workflow_run, workflow_job, check_run, check_suite, deployment_status,
-commit status) — so a hand-written claim that names one is silently
-unclaimed for the rest. That is not hypothetical: it is how PR #417 got a
-second session editing the same git worktree as the first. --claim writes
-all of them for you. --claim and --include are mutually exclusive; write
---include yourself only for rules --claim cannot express.
+paths it names, and CI reports terminal failure under six event shapes —
+so a hand-written claim that names one is silently unclaimed for the rest.
+That is not hypothetical: it is how PR #417 got a second session editing
+the same git worktree as the first.
+
+--claim branch: writes five of the six (workflow_run.head_branch,
+workflow_job.head_branch, check_run.check_suite.head_branch,
+check_suite.head_branch, deployment.ref), plus the push ref and
+pull_request.head.ref, which are not CI. The sixth, a bare commit status,
+CANNOT be claimed: it carries no scalar branch, only a `branches` array,
+and the payload language indexes lists by number only. If your repo's CI
+reports through commit statuses, you stay exposed on that one shape.
+
+--claim and --include are mutually exclusive; write --include yourself
+only for rules --claim cannot express.
 
 --when / --drop attach payload rules to the subscription: deliver (or
 spawn) ONLY events matching --when, never those matching --drop. Rules are
@@ -384,16 +392,26 @@ claim_clauses() {
     (number) "$JQ" -nc --argjson n "$_cl_val" \
                '[{path:"pull_request.number", "in":[$n]},
                  {path:"issue.number", "in":[$n]}]' ;;
-    # Every shape CI reports a branch under. workflow_run alone is what the
-    # old documented example covered, and it is one of five: a red
-    # check_run, check_suite or workflow_job on your own branch would each
-    # have spawned a sibling. `ref` catches the push itself, and
-    # pull_request.head.ref a PR event whose number you did not claim.
+    # A watch treats terminal failure as spawn-worthy under SIX event
+    # shapes; this claims five of them by branch. workflow_run alone is
+    # what the old documented example covered, so a red check_run,
+    # check_suite or workflow_job on your own branch each spawned a
+    # sibling. deployment_status carries its branch as deployment.ref.
+    # `ref` catches the push itself, and pull_request.head.ref a PR event
+    # whose number you did not claim.
+    #
+    # The sixth, a bare commit status, is NOT claimable and cannot be made
+    # so here: it carries no scalar branch, only a `branches` ARRAY, and
+    # the predicate language indexes a list by number only (webhook.py
+    # get_path — an all-digits segment, no wildcard). `branches.0.name`
+    # would be a guess at an order the payload does not promise, which is
+    # worse than an honest gap: it would look claimed and match nothing.
     (branch) "$JQ" -nc --arg b "$_cl_val" \
                '[{path:"workflow_run.head_branch", "in":[$b]},
                  {path:"workflow_job.head_branch", "in":[$b]},
                  {path:"check_run.check_suite.head_branch", "in":[$b]},
                  {path:"check_suite.head_branch", "in":[$b]},
+                 {path:"deployment.ref", "in":[$b]},
                  {path:"pull_request.head.ref", "in":[$b]},
                  {path:"ref", "in":["refs/heads/" + $b]}]' ;;
   esac

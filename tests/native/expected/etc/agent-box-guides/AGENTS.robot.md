@@ -180,12 +180,19 @@ a comment on it no longer starts a second session on top of you:
 branch. Repeat it, and the clauses OR together.
 
 Use it rather than hand-writing `--include`. A claim only covers the payload
-paths it names, and a watch spawns on terminal CI failure reported through
-six of them — `workflow_run`, `workflow_job`, `check_run`, `check_suite`,
-`deployment_status` and a bare commit status. A claim that names one is
-SILENTLY unclaimed for the others: nothing warns you, a sibling session just
-turns up. That is how PR #417 ended up with two sessions editing the same git
-worktree. `--claim branch:` writes every shape for you.
+paths it names, and a watch spawns on terminal CI failure reported through six
+event shapes. A claim that names one is SILENTLY unclaimed for the others:
+nothing warns you, a sibling session just turns up. That is how PR #417 ended
+up with two sessions editing the same git worktree.
+
+`--claim branch:` writes five of the six — `workflow_run`, `workflow_job`,
+`check_run`, `check_suite` and `deployment_status` (via `deployment.ref`) —
+plus the push `ref` and `pull_request.head.ref`. The sixth, a bare commit
+**status**, cannot be claimed at all: it carries no scalar branch, only a
+`branches` array, and the payload language indexes lists by number only, so any
+rule would be guessing at an order the payload does not promise. On a repo
+whose CI reports through commit statuses, that shape stays unclaimed — expect a
+sibling there.
 
 `--include` still exists for rules `--claim` cannot express; the two are
 mutually exclusive.
