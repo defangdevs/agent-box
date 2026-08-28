@@ -265,6 +265,59 @@ class RenderTest(unittest.TestCase):
                              "a re-apply wanted to rewrite files:\n"
                              + second.stdout)
 
+    def test_first_boot_carries_a_derived_label_to_the_resolved_domain(self):
+        """A derived host label must move with an auto-resolved domain.
+
+        host_label defaults from domain at spec-build time, but first_boot
+        resolves an "auto" domain AFTER the spec is built. Leaving the label
+        frozen ships the placeholder into the pointer seeded once into $HOME
+        (~/AGENTS.md), which then reads "agent@auto" forever — the /etc
+        pointer is re-rendered on the next apply, but the supervisor seeds
+        the $HOME copy exactly once.
+        """
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps(
+                {"domain": "auto", "users": {"agent": {}}}))
+            spec = mod.Spec(json.loads(cfg.read_text()), prof)
+            self.assertEqual("auto", spec.host_label)  # frozen at build time
+            args = type("A", (), {"settle_delay": 0, "config": str(cfg)})()
+            orig = mod.settle_public_ip
+            mod.settle_public_ip = lambda **k: "203.0.113.7"
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mod.first_boot(spec, args)
+            finally:
+                mod.settle_public_ip = orig
+            self.assertEqual("203-0-113-7.sslip.io", spec.domain)
+            self.assertEqual(spec.domain, spec.host_label,
+                             "a derived label must move with the domain")
+            self.assertEqual("203-0-113-7.sslip.io",
+                             json.loads(cfg.read_text())["domain"])
+
+    def test_first_boot_leaves_an_explicit_label_alone(self):
+        """A hostLabel pinned in config is not a placeholder — keep it."""
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps(
+                {"domain": "auto", "hostLabel": "my-box",
+                 "users": {"agent": {}}}))
+            spec = mod.Spec(json.loads(cfg.read_text()), prof)
+            args = type("A", (), {"settle_delay": 0, "config": str(cfg)})()
+            orig = mod.settle_public_ip
+            mod.settle_public_ip = lambda **k: "203.0.113.7"
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mod.first_boot(spec, args)
+            finally:
+                mod.settle_public_ip = orig
+            self.assertEqual("my-box", spec.host_label)
+            self.assertEqual("203-0-113-7.sslip.io", spec.domain)
+
     def test_rejects_bad_config(self):
         cases = [
             ({"users": {}}, "at least one user"),
