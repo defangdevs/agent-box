@@ -696,6 +696,15 @@ Resources:
                   users."${UserName}" = {
                     environment = { TERM = "xterm-256color"; };
                     web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                    # This template always names exactly one Agent, so seeding
+                    # "main" with it costs nothing extra in closure size over
+                    # what the launch already installs — unlike the generic
+                    # module default (issue #416), which leaves a multi-agent
+                    # box's session unseeded so an unused harness is never
+                    # pulled in. Without this, first boot has no session and
+                    # every CFN-launched box (deploy-test included) lands on
+                    # the settings page instead of a live terminal.
+                    seedMainSession = true;
                     # The AGENTS.md ADDENDUM from the CFN AgentsMd parameter,
                     # spliced as-is into a Nix indented string; the module
                     # appends it below its built-in default AGENTS.md. The next
