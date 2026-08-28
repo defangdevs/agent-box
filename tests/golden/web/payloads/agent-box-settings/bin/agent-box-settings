@@ -4458,18 +4458,26 @@ def render_webhook_row(topic, meta, note, key, dispatch, fold=""):
     )
 
 
-def copy_button(attrs, what):
+def copy_button(what, value=None, secret_url=None):
     """A one-click copy for a value the operator has to paste elsewhere.
 
-    `attrs` is either data-copy="<the text>" for a value already in the
-    page, or data-secret-url="<route>" for one the button has to fetch
-    first. Both icons ship in the button and CSS picks which one shows,
-    so the "copied" tick needs no icon markup in the script."""
+    Either `value` — text already in the page, copied straight from the
+    attribute — or `secret_url`, a route the button fetches on the click
+    (which is how a secret gets copied without being rendered).
+
+    Takes VALUES and escapes them here, rather than an `attrs` fragment
+    the caller assembles: a parameter that is raw markup makes escaping
+    the caller's job to remember every time, on a button whose whole
+    purpose is handling credentials (#421 review). Both icons ship inside
+    it and CSS picks which one shows, so the "copied" tick needs no icon
+    markup in the script."""
+    attr = ('data-copy="%s"' % html.escape(value, quote=True) if value
+            else 'data-secret-url="%s"' % html.escape(secret_url or "", quote=True))
     return (
         '<button type="button" class="icon icopy" %s '
         'aria-label="Copy %s" title="Copy to clipboard">'
         '<span class="ci">%s</span><span class="co">%s</span></button>'
-        % (attrs, what, ICON_COPY, ICON_CHECK)
+        % (attr, html.escape(what, quote=True), ICON_COPY, ICON_CHECK)
     )
 
 
@@ -4519,13 +4527,16 @@ def render_webhook_endpoint():
     or through the live feed's DOM swaps."""
     if not WEBHOOK_URL:
         return ""
-    base = html.escape(WEBHOOK_URL.rstrip("/"))
-    route = html.escape(BASE) + "/webhooks/secret?source="
+    # Raw values, escaped at the point of use — copy_button() and
+    # rotate_form() take values, not markup, and escape their own.
+    endpoint = WEBHOOK_URL.rstrip("/")
+    base = html.escape(endpoint)
     default, names = webhook_sources()
     rows = []
     for name in names:
         safe = html.escape(name)
-        secret_route = route + urllib.parse.quote(name, safe="")
+        secret_route = (BASE + "/webhooks/secret?source="
+                        + urllib.parse.quote(name, safe=""))
         # Naming the default is not decoration: a URL registered with no
         # source on the end routes to it, so this is the one row that also
         # explains an endpoint someone pasted bare months ago.
@@ -4542,12 +4553,11 @@ def render_webhook_endpoint():
             '</span>'
             '<span class="acts">%s</span></li>'
             % (base, safe, safe, tag,
-               SECRET_MASK, secret_route, safe,
-               copy_button('data-secret-url="%s"' % secret_route,
-                           "the %s secret" % safe),
+               SECRET_MASK, html.escape(secret_route, quote=True), safe,
+               copy_button("the %s secret" % name, secret_url=secret_route),
                rotate_form(name),
-               copy_button('data-copy="%s/%s"' % (base, safe),
-                           "the %s payload URL" % safe))
+               copy_button("the %s payload URL" % name,
+                           value="%s/%s" % (endpoint, name)))
         )
     if not rows:
         rows.append(
