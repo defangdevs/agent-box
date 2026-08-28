@@ -332,12 +332,23 @@ in
     # The -c overrides above never arrive: `app-server daemon start` parses
     # them and then spawns the app-server with a fixed argv. A phone paired to
     # this daemon therefore kept asking for approvals while the wrapper
-    # assertions above passed. services.agent-box.codexFullAccess writes
-    # codex's SYSTEM config layer instead, which every codex entry point reads.
+    # assertions above passed. services.agent-box.codexFullAccess renders the
+    # canonical file at /etc/codex/config.toml, which every codex entry point
+    # reads only once supervisor.sh has symlinked it into place below (issue
+    # 428 — codex itself has no /etc system layer; without that symlink a
+    # session falls back to codex's own workspace-write default, which
+    # unshares a user namespace and crashes under this session's confinement).
     machine.succeed("grep -F 'approval_policy = \"never\"' /etc/codex/config.toml")
     machine.succeed(
         "grep -F 'sandbox_mode = \"danger-full-access\"' /etc/codex/config.toml"
     )
+    # supervisor.sh symlinked it into the "helper" session's own config
+    # scope — the file codex actually opens — rather than leaving the box
+    # default sitting unread at /etc/codex/config.toml (issue 428).
+    helper_config_link = machine.succeed(
+        as_agent("readlink -f /home/agent/.codex/config.toml")
+    ).strip()
+    assert helper_config_link == "/etc/codex/config.toml", helper_config_link
     # End-to-end, against the same binary the daemon runs: a thread that names
     # no policy — what the Codex apps open — must come back fully autonomous.
     # `thread/start` needs neither a login nor the network, so this works in

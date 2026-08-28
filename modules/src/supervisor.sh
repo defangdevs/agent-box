@@ -604,9 +604,11 @@ start_session() {
         # fixed argv, so the process that serves every remote thread runs on
         # the box's config alone — measured on a live box, and the reason a
         # paired phone still asked for approvals. What actually applies is
-        # /etc/codex/config.toml (services.agent-box.codexFullAccess). The
-        # flags stay: they cost nothing and become correct the day upstream
-        # forwards them.
+        # $CODEX_HOME/config.toml, symlinked to /etc/codex/config.toml by the
+        # AGENT_BOX_CODEX_FULL_ACCESS block below (services.agent-box.
+        # codexFullAccess, issue 428 — codex itself never reads the /etc
+        # path). The flags stay: they cost nothing and become correct the
+        # day upstream forwards them.
         #
         # remoteControlName is claude-only: the codex daemon takes
         # its machine name from gethostname(2) with no override, so the
@@ -723,6 +725,24 @@ start_session() {
     if [ ! -e "$cxhome/AGENTS.md" ]; then
       mkdir -p "$cxhome"
       ln -s "$AGENT_BOX_GUIDE_TARGET" "$cxhome/AGENTS.md"
+    fi
+  fi
+  # codex has no /etc system layer (issue 428): /etc/codex/config.toml
+  # (services.agent-box.codexFullAccess) is never read by codex on its own —
+  # only $CODEX_HOME/config.toml is. Without a copy there, codex falls back
+  # to its documented default (workspace-write), which tries to unshare a
+  # user namespace and crashes under this session's confinement
+  # (`unshare: write failed /proc/self/uid_map`). AGENT_BOX_CODEX_FULL_ACCESS
+  # is set only when the box actually wrote /etc/codex/config.toml, so
+  # symlink it in IFF the session has no config.toml of its own yet — a
+  # user's own file still wins. This is the only way the daemon behind a
+  # remote-controlled session (fixed argv, no launch-time override, issue
+  # 234) ever sees the box's autonomy default too.
+  if [ "$agent" = codex ] && [ -n "${AGENT_BOX_CODEX_FULL_ACCESS:-}" ]; then
+    cxhome="${CODEX_HOME:-$HOME/.codex}"
+    if [ ! -e "$cxhome/config.toml" ]; then
+      mkdir -p "$cxhome"
+      ln -s /etc/codex/config.toml "$cxhome/config.toml"
     fi
   fi
   # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn

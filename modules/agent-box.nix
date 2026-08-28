@@ -6599,9 +6599,11 @@ $PROMPT"
             # fixed argv, so the process that serves every remote thread runs on
             # the box's config alone — measured on a live box, and the reason a
             # paired phone still asked for approvals. What actually applies is
-            # /etc/codex/config.toml (services.agent-box.codexFullAccess). The
-            # flags stay: they cost nothing and become correct the day upstream
-            # forwards them.
+            # $CODEX_HOME/config.toml, symlinked to /etc/codex/config.toml by the
+            # AGENT_BOX_CODEX_FULL_ACCESS block below (services.agent-box.
+            # codexFullAccess, issue 428 — codex itself never reads the /etc
+            # path). The flags stay: they cost nothing and become correct the
+            # day upstream forwards them.
             #
             # remoteControlName is claude-only: the codex daemon takes
             # its machine name from gethostname(2) with no override, so the
@@ -6718,6 +6720,24 @@ $PROMPT"
         if [ ! -e "$cxhome/AGENTS.md" ]; then
           mkdir -p "$cxhome"
           ln -s "$AGENT_BOX_GUIDE_TARGET" "$cxhome/AGENTS.md"
+        fi
+      fi
+      # codex has no /etc system layer (issue 428): /etc/codex/config.toml
+      # (services.agent-box.codexFullAccess) is never read by codex on its own —
+      # only $CODEX_HOME/config.toml is. Without a copy there, codex falls back
+      # to its documented default (workspace-write), which tries to unshare a
+      # user namespace and crashes under this session's confinement
+      # (`unshare: write failed /proc/self/uid_map`). AGENT_BOX_CODEX_FULL_ACCESS
+      # is set only when the box actually wrote /etc/codex/config.toml, so
+      # symlink it in IFF the session has no config.toml of its own yet — a
+      # user's own file still wins. This is the only way the daemon behind a
+      # remote-controlled session (fixed argv, no launch-time override, issue
+      # 234) ever sees the box's autonomy default too.
+      if [ "$agent" = codex ] && [ -n "''${AGENT_BOX_CODEX_FULL_ACCESS:-}" ]; then
+        cxhome="''${CODEX_HOME:-$HOME/.codex}"
+        if [ ! -e "$cxhome/config.toml" ]; then
+          mkdir -p "$cxhome"
+          ln -s /etc/codex/config.toml "$cxhome/config.toml"
         fi
       fi
       # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
@@ -7099,9 +7119,11 @@ in
         as does every other codex entry point (browser-terminal TUI,
         `codex exec` from a shell session).
 
-        /etc/codex/config.toml is codex's SYSTEM layer: a user's own
-        ~/.codex/config.toml still overrides it, so this is a default and
-        not a lock. Ignored when codex is not in installAgents.
+        codex has no system layer of its own (issue 428): it reads only
+        $CODEX_HOME/config.toml (~/.codex/config.toml by default), so
+        supervisor.sh symlinks this file in there IFF the session has none
+        of its own yet — a default, not a lock. Ignored when codex is not
+        in installAgents.
 
         Per-session skipPermissions = false cannot undo this for a
         remote-controlled codex session: the app-server daemon is one per
@@ -7856,13 +7878,15 @@ in
           );
     }) cfg.users
     # Codex autonomy for the WHOLE box (issue 234, see codexFullAccess).
-    # codex reads /etc/codex/config.toml as its system layer, below the
-    # user's own ~/.codex/config.toml, so this sets a default a human can
-    # still override. It is the only way to reach the app-server daemon that
-    # serves remote-controlled codex sessions: that process is spawned with a
-    # fixed argv and never sees the supervisor's -c overrides. Both keys are
-    # required — default_permissions = ":danger-full-access" opens the
-    # filesystem and the network but leaves approval_policy at "on-request".
+    # codex has no system layer of its own (issue 428) — this file is the
+    # canonical rendering, and supervisor.sh symlinks it into each session's
+    # $CODEX_HOME/config.toml IFF absent, so this sets a default a human can
+    # still override. That symlinking is the only way to reach the
+    # app-server daemon that serves remote-controlled codex sessions: that
+    # process is spawned with a fixed argv and never sees the supervisor's
+    # -c overrides. Both keys are required — default_permissions =
+    # ":danger-full-access" opens the filesystem and the network but leaves
+    # approval_policy at "on-request".
     // lib.optionalAttrs codexFullAccess {
       "codex/config.toml".text = ''
         approval_policy = "never"
