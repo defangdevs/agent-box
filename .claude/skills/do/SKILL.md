@@ -35,7 +35,7 @@ You are an autonomous task executor for `defangdevs/agent-box`. Take the task ab
 
 ## Phase 2 — Worktree
 
-```
+```bash
 git worktree add ../agent-box-<slug> -b <type>/<issue>-<slug> origin/master
 ```
 
