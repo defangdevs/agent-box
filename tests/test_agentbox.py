@@ -789,6 +789,113 @@ class RenderTest(unittest.TestCase):
                    if path.endswith("/agent.env")][0]
             self.assertNotIn("AGENT_BOX_CODEX_FULL_ACCESS", env)
 
+    def test_a_web_box_seeds_no_session_and_a_console_box_still_does(self):
+        """The front door (issue #416). A user with a browser terminal and
+        no declared sessions gets an EMPTY seed — the settings page is
+        where a session is started, which is what lets the agent CLIs be
+        fetched on demand instead of shipped in the image. A box with no
+        web has no front door, so it keeps the "main" it always seeded:
+        neither a settings page nor a session leaves no way in but the
+        console. This must match seedMain in modules/agent-box.nix.in — two
+        backends answering it differently is the same box behaving two
+        ways."""
+        mod = load_agentbox()
+        base = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for web, want in ((True, []), (False, ["main"])):
+                config = json.loads(json.dumps(base))
+                config["web"] = {"enable": web}
+                # No "sessions" key at all: this is the defaulting path.
+                config["users"] = {"agent": {}}
+                spec = mod.Spec(config, prof)
+                rend = mod.Renderer(spec, prof, root=Path(tmp) / f"w{web}")
+                tree = rend.render()
+                seed = [text for path, (text, _) in tree.files.items()
+                        if path.endswith("agent-sessions.json")][0]
+                self.assertEqual(
+                    want, sorted(json.loads(seed)["sessions"]),
+                    f"web.enable={web} seeded the wrong sessions")
+
+    def test_seed_main_session_overrides_the_front_door_either_way(self):
+        """The escape hatch, and the type check on it. `seedMainSession:
+        true` keeps the pre-#416 session on a web box; false removes it
+        from a console box. A quoted "false" is truthy, so it would
+        silently seed the session the author asked not to have — the same
+        trap codexFullAccess had."""
+        mod = load_agentbox()
+        base = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for web, seed_main, want in ((True, True, ["main"]),
+                                         (False, False, [])):
+                config = json.loads(json.dumps(base))
+                config["web"] = {"enable": web}
+                config["users"] = {"agent": {"seedMainSession": seed_main}}
+                spec = mod.Spec(config, prof)
+                tree = mod.Renderer(
+                    spec, prof,
+                    root=Path(tmp) / f"o{web}{seed_main}").render()
+                seed = [text for path, (text, _) in tree.files.items()
+                        if path.endswith("agent-sessions.json")][0]
+                self.assertEqual(want, sorted(json.loads(seed)["sessions"]))
+            for bad in ("false", "true", 0, 1, []):
+                config = json.loads(json.dumps(base))
+                config["users"] = {"agent": {"seedMainSession": bad}}
+                with self.assertRaises(mod.ConfigError):
+                    mod.Spec(config, prof)
+
+    def test_the_jit_source_is_pinned_and_carries_no_host_store_path(self):
+        """Lazy harnesses fetch from the box's OWN pinned nixpkgs, not the
+        flake registry — that one follows nixpkgs-unstable and was measured
+        resolving gh 2.98.0 on a box shipping 2.97.0. And nothing here may
+        name a /nix/store path: resolving `nix` at apply time baked the
+        BUILDING host's store path into a generated file, so the fixture
+        differed per machine and would break on the next nix upgrade.
+        agents.sh resolves it at runtime instead."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "jit").render()
+            env = [text for path, (text, _) in tree.files.items()
+                   if path.endswith("/agent.env")][0]
+            self.assertIn("AGENT_BOX_NIXPKGS=", env)
+            self.assertNotIn("AGENT_BOX_NIX_BIN", env)
+            line = [ln for ln in env.splitlines()
+                    if ln.startswith("AGENT_BOX_NIXPKGS=")][0]
+            self.assertNotIn("/nix/store/", line)
+            # An override has to actually reach the unit.
+            config["jitNixpkgs"] = "https://example.invalid/pinned.tar.xz"
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "jit2").render()
+            env = [text for path, (text, _) in tree.files.items()
+                   if path.endswith("/agent.env")][0]
+            self.assertIn(
+                "AGENT_BOX_NIXPKGS=https://example.invalid/pinned.tar.xz", env)
+
+    def test_both_backends_expose_the_same_jit_pin_knob(self):
+        """`jitNixpkgs` exists on BOTH backends (issue #416). The default
+        fallback is the mutable nixos-unstable channel, which is the right
+        default but not reproducible — so an operator who needs the lazy
+        path pinned must be able to pin it whichever backend they deploy.
+        Native having the knob and the module not would have been an
+        asymmetry this PR introduced."""
+        mod = load_agentbox()
+        module_src = (REPO / "modules" / "agent-box.nix.in").read_text()
+        self.assertIn("jitNixpkgs = lib.mkOption", module_src)
+        self.assertIn("cfg.jitNixpkgs", module_src)
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            self.assertEqual(
+                "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz",
+                mod.Spec(config, prof).jit_nixpkgs)
+            config["jitNixpkgs"] = "https://example.invalid/p.tar.xz"
+            self.assertEqual("https://example.invalid/p.tar.xz",
+                             mod.Spec(config, prof).jit_nixpkgs)
+
     def test_hook_session_args_rejects_a_bare_string(self):
         """A bare string is iterable, so list() would silently turn
         "--model foo" into one argument per CHARACTER instead of raising —

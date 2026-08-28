@@ -1839,6 +1839,18 @@ done
           builtins.elem (lib.getName pkg) [ "claude-code" "codex" ];
       }
     else pkgs;
+  # Flake ref the supervisor JIT-installs a harness from (issue #416).
+  # selfUpdate.agentNixpkgs is the pin the update service already maintains
+  # for the eager harnesses, so reusing it keeps both halves on one
+  # revision. Without that wiring (a fresh box, or selfUpdate off) fall back
+  # to the same channel it tracks, which is still a far better answer than
+  # the flake registry's `nixpkgs` — that one follows nixpkgs-unstable and
+  # was measured resolving gh 2.98.0 on a box shipping 2.97.0.
+  jitNixpkgsRef =
+    if cfg.jitNixpkgs != null then cfg.jitNixpkgs
+    else if cfg.selfUpdate.agentNixpkgs != null then cfg.selfUpdate.agentNixpkgs.url
+    else "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
+
   agentPackage = agent:
     if cfg.package != null then cfg.package
     else if agent == "claude" then agentPkgs.claude-code
@@ -1992,8 +2004,17 @@ done
   # via the agent-box-session CLI or the settings page. The supervisor
   # (mkStart) reconciles tmux sessions against the file and builds each
   # agent command at runtime, so per-agent flag logic lives in that script.
+  # Does this user have a WEB front door — the settings page they can start
+  # a session from? It is the whole premise of seeding nothing (issue #416),
+  # so a user without one keeps the pre-#416 "main" session: a box with no
+  # settings page and no seeded session has no way in but the console.
+  userHasFrontDoor = u: cfg.web.enable && u.web.passwordHashFile != null;
+  seedMain = u:
+    if u.seedMainSession != null then u.seedMainSession
+    else !(userHasFrontDoor u);
   seedSessions = name: u:
     if u.sessions != { } then u.sessions
+    else if !(seedMain u) then { }
     else {
       main = {
         inherit (u) agent skipPermissions remoteControl remoteControlName extraArgs;
@@ -4958,9 +4979,37 @@ $PROMPT"
           agent-box-session CLI or the settings page. A later rebuild never
           clobbers runtime changes.
 
-          When empty (the default), the per-user agent / skipPermissions /
-          remoteControl* / workingDirectory / extraArgs options below seed a
-          single session named "main" — the pre-sessions behaviour.
+          When empty (the default), whether a single session named "main" is
+          seeded from the per-user agent / skipPermissions / remoteControl* /
+          workingDirectory / extraArgs options below depends on
+          seedMainSession — which, left at its own default, seeds nothing for
+          a user who has a web terminal. See that option.
+        '';
+      };
+
+      seedMainSession = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        example = true;
+        description = ''
+          Whether first boot seeds a single session named "main" for this
+          user when users.<name>.sessions is empty (issue #416).
+
+          null (the default) decides by whether this user has a WEB FRONT
+          DOOR: with a browser terminal (services.agent-box.web.enable and
+          this user's web.passwordHashFile) the box seeds NOTHING and the
+          settings page is where a session is started — which is what lets
+          the agent CLIs be installed on demand rather than shipped in the
+          system closure. Without one, "main" is seeded as before, because a
+          box with neither a settings page nor a session has no way in but
+          the console.
+
+          true or false override that. Set true to keep the pre-#416
+          behaviour on a box that does have a web terminal.
+
+          This only ever affects FIRST boot: sessions.json is authoritative
+          once it exists, so changing this never removes a session an
+          existing box already has.
         '';
       };
       agent = lib.mkOption {
@@ -5644,13 +5693,202 @@ $PROMPT"
       fi
     }
 
+    # Harness resolution and lazy installation (issue #416).
+    #
+    # Sourced by the supervisor, and unit-tested directly by
+    # tests/test-jit-agents.sh — which is the reason it is a lib rather than a
+    # run of straight-line code in supervisor.sh: everything here is decided by
+    # what is on disk and what the network does, and neither is reachable from a
+    # VM test that has to stay offline.
+    #
+    # From the environment: $HOME and $AGENT_BOX_AGENT_BINS always;
+    # $AGENT_BOX_NIXPKGS and $AGENT_BOX_FLOCK_BIN for installs.
+    # $AGENT_BOX_NIX_BIN is optional — see agent_install.
+
+    # Where the lazy-harness machinery (issue #416) keeps its bookkeeping: a
+    # per-harness cooldown marker so a failing install cannot become one network
+    # call per respawn, and a lock so two sessions starting at once do not both
+    # pay for the same download. Under ~/.local/state like the session side
+    # files, so a reboot keeps them and a fresh $HOME starts clean.
+    #
+    # Plain locals, NOT AGENT_BOX_* names: neither backend supplies these and
+    # neither should, but scripts/check_backend_parity.py reads any assigned
+    # AGENT_BOX_<NAME>= as a host contract one side was missing. Tests point
+    # them somewhere scratch by setting $HOME, which is the only input they
+    # have.
+    _jit_dir="$HOME/.local/state/agent-box/jit"
+    _jit_lock="$_jit_dir/install.lock"
+
     agent_bin() {
       # agent_bin NAME — resolve an agent (or "shell") to its binary via
       # the unit's AGENT_BOX_AGENT_BINS ("name=/path ..." pairs; store and
       # shell paths never contain whitespace, so word-splitting is safe).
+      #
+      # A JIT-installed harness (issue #416) is NOT in that table and never
+      # can be: the table is built at EVAL time from installAgents, while a
+      # lazily installed CLI lands in the user's own profile long after the
+      # system closure was fixed. ~/.nix-profile/bin is FIRST on the session
+      # PATH, so resolving it here finds exactly the binary a pane would —
+      # and, because that directory is already on PATH, an install performed
+      # now is visible to a pane that is ALREADY running.
+      #
+      # The table still wins when it has an entry, so an eagerly installed
+      # harness keeps its pinned store path and nothing about a conventional
+      # box changes — but only if that path is really there. The native
+      # backend builds this table from a fixed layout ("<profile>/bin/claude")
+      # rather than from resolved store paths, so an entry can name a harness
+      # the runtime profile was built without; returning it would exec into
+      # nothing AND shadow the profile copy a JIT install just put down.
       for pair in ''${AGENT_BOX_AGENT_BINS:?}; do
-        case "$pair" in ("$1"=*) printf '%s\n' "''${pair#*=}"; return 0 ;; esac
+        case "$pair" in
+          ("$1"=*)
+            _ab_path=''${pair#*=}
+            # Falling through is only ever useful for something a profile
+            # could supply instead. "shell" is the login shell and has no
+            # second source, so it resolves from the table unconditionally,
+            # exactly as it always did — a missing one must fail at exec with
+            # the path in the message, not vanish into "not installed".
+            if [ -x "$_ab_path" ] || ! agent_attr "$1" >/dev/null 2>&1; then
+              printf '%s\n' "$_ab_path"
+              return 0
+            fi
+            break
+            ;;
+        esac
       done
+      # Only ever a harness name we know; never an arbitrary string off the
+      # registry turned into a path.
+      agent_attr "$1" >/dev/null 2>&1 || return 1
+      if [ -x "$HOME/.nix-profile/bin/$1" ]; then
+        printf '%s\n' "$HOME/.nix-profile/bin/$1"
+        return 0
+      fi
+      return 1
+    }
+
+    agent_attr() {
+      # agent_attr NAME — the nixpkgs attribute a harness installs from.
+      # Not derivable from the binary name (claude's is claude-code), and
+      # deliberately a closed set: this is the only place a session's
+      # registry data is allowed to name something to install.
+      case "$1" in
+        (claude) printf 'claude-code\n' ;;
+        (codex)  printf 'codex\n' ;;
+        (*) return 1 ;;
+      esac
+    }
+
+    agent_install() {
+      # agent_install NAME — fetch a harness into the user's own profile
+      # (issue #416).
+      #
+      # Lazy harnesses are what let the box ship without ~1 GB of agent CLI
+      # in its closure: nothing is installed until a session actually asks
+      # for one. The cost is paid once, at first use, and the result is a
+      # normal profile generation — a GC root, rollback-able, and upgraded
+      # with `nix profile upgrade` instead of a system rebuild.
+      _ai_agent="$1"
+      _ai_attr="$(agent_attr "$_ai_agent")" || return 1
+      if [ -z "''${AGENT_BOX_NIXPKGS:-}" ]; then
+        echo "session: '$_ai_agent' is not installed and cannot be fetched" \
+             "(no AGENT_BOX_NIXPKGS in this unit)" >&2
+        return 1
+      fi
+      # The NixOS module pins a store path; a native box cannot, because
+      # resolving one at apply time would bake that host's nix into a generated
+      # file and break on the next upgrade. So resolve here, at use, and cover
+      # both install layouts: multi-user Nix puts nix in the default profile,
+      # which is NOT on the native session PATH, while single-user puts it in
+      # the user profile, which is.
+      _ai_nix="''${AGENT_BOX_NIX_BIN:-}"
+      if [ -z "$_ai_nix" ]; then
+        for _ai_cand in \
+            "$(command -v nix 2>/dev/null || true)" \
+            /nix/var/nix/profiles/default/bin/nix \
+            "$HOME/.nix-profile/bin/nix"; do
+          if [ -n "$_ai_cand" ] && [ -x "$_ai_cand" ]; then _ai_nix=$_ai_cand; break; fi
+        done
+      fi
+      if [ -z "$_ai_nix" ]; then
+        echo "session: '$_ai_agent' is not installed and cannot be fetched" \
+             "(no nix on this box)" >&2
+        return 1
+      fi
+
+      # One attempt per retry window, for the same reason seed_claude_state
+      # rate-limits itself: a session that cannot start is respawned every
+      # couple of seconds, so an install that fails offline must not become a
+      # network call per respawn.
+      mkdir -p "$_jit_dir"
+      _ai_marker="$_jit_dir/$_ai_agent.failed"
+      _ai_now="$(date +%s)"
+      _ai_retry="''${AGENT_BOX_JIT_RETRY_S:-300}"
+      if [ -s "$_ai_marker" ]; then
+        read -r _ai_ts _ai_rest < "$_ai_marker" || true
+        case "''${_ai_ts:-x}" in (""|*[!0-9]*) _ai_ts=0 ;; esac
+        if [ $((_ai_now - _ai_ts)) -lt "$_ai_retry" ]; then
+          echo "session: '$_ai_agent' install failed $((_ai_now - _ai_ts))s ago," \
+               "not retrying for another $((_ai_retry - _ai_now + _ai_ts))s" >&2
+          return 1
+        fi
+      fi
+
+      # Serialize installs across this user's sessions. `nix profile` takes
+      # its own profile lock, but two sessions racing here would still both
+      # pay the download; worse, the loser's error is indistinguishable from
+      # a real failure and would set the cooldown marker above.
+      #
+      # BOUNDED, not a plain flock: the supervisor's reconcile loop calls this
+      # from start_session, so waiting forever on a wedged install would stop
+      # it starting or reaping every OTHER session too. Generous enough for a
+      # real download over a slow link, and giving up just means this pass
+      # skips the session and the next one retries.
+      mkdir -p "$(dirname "$_jit_lock")"
+      exec 8>>"$_jit_lock"
+      if ! "''${AGENT_BOX_FLOCK_BIN:?}" -w "''${AGENT_BOX_JIT_LOCK_WAIT_S:-900}" 8; then
+        exec 8>&-
+        echo "session: another session is still fetching a harness; leaving" \
+             "'$_ai_agent' for the next pass" >&2
+        return 1
+      fi
+      # The winner of the race installed it while we waited; nothing to do.
+      if [ -x "$HOME/.nix-profile/bin/$_ai_agent" ]; then
+        exec 8>&-
+        return 0
+      fi
+
+      echo "session: fetching '$_ai_agent' ($_ai_attr) from the box's pinned" \
+           "nixpkgs — first use of this harness, so this can take a few minutes" >&2
+      # --impure + NIXPKGS_ALLOW_UNFREE: claude-code is unfree, and a profile
+      # install gets none of the module's allowUnfreePredicate (that governs
+      # the module's OWN second nixpkgs import, not this user's profile).
+      # AGENT_BOX_NIXPKGS is the SAME pinned channel the module resolves the
+      # eager harnesses from, so a box that also ships one gets a byte-
+      # identical store path here rather than a second copy.
+      #
+      # BOUNDED, same reason as the flock above: this runs inside the
+      # supervisor's reconcile loop, so a wedged fetch (a stalled substituter,
+      # a hung download) must not stop every OTHER session from starting.
+      # Giving up sets the cooldown marker below and the next pass retries.
+      if NIXPKGS_ALLOW_UNFREE=1 timeout "''${AGENT_BOX_JIT_INSTALL_TIMEOUT_S:-1800}" \
+           "$_ai_nix" profile add --impure \
+           "$AGENT_BOX_NIXPKGS#$_ai_attr" >&2; then
+        rm -f "$_ai_marker"
+        exec 8>&-
+        # A freshly installed codex needs the standalone layout its
+        # remote-control pairing looks for. The boot-time call to this ran
+        # before the binary existed, so it found nothing to mirror.
+        [ "$_ai_agent" = codex ] && mirror_codex_standalone
+        return 0
+      fi
+      # Stamp the marker at WRITE time, not with the pre-attempt $_ai_now: the
+      # flock wait and the install itself can together run long past
+      # AGENT_BOX_JIT_RETRY_S, and a marker backdated to before the attempt
+      # would already read as expired on the very next reconcile pass —
+      # defeating the cooldown it exists to enforce.
+      printf '%s\n' "$(date +%s)" > "$_ai_marker"
+      exec 8>&-
+      echo "session: could not fetch '$_ai_agent' — is the box offline?" >&2
       return 1
     }
 
@@ -5658,11 +5896,17 @@ $PROMPT"
     # installer layout at ~/.codex/packages/standalone/current/codex.
     # Mirror that fixed path to the provided Codex so pairing works
     # without a curl-installed second copy.
-    if cbin="$(agent_bin codex)"; then
+    #
+    # A function, not a straight-line block, because a JIT-installed codex
+    # (issue #416) does not exist yet when this file is sourced: agent_install
+    # calls this again once the binary is really there.
+    mirror_codex_standalone() {
+      cbin="$(agent_bin codex)" || return 0
       mkdir -p "$HOME"/.codex/packages/standalone/agent-box-current
       ln -sfn "$cbin" "$HOME"/.codex/packages/standalone/agent-box-current/codex
       ln -sfn agent-box-current "$HOME"/.codex/packages/standalone/current
-    fi
+    }
+    mirror_codex_standalone
 
     # Deliver-once + resume bookkeeping. A session's kickoff prompt
     # (initialPrompt) must fire on the FIRST spawn only; every later respawn
@@ -5821,8 +6065,16 @@ $PROMPT"
       [ -n "$sjson" ] || return 0
       agent="$($JQ -r '.agent // empty' <<<"$sjson")"
       if ! bin="$(agent_bin "$agent")"; then
-        echo "session '$sname': agent '$agent' is not installed (see installAgents) — skipping" >&2
-        return 0
+        # Not in the closure and not in the profile yet: fetch it now (issue
+        # #416). This is the JIT half of the lazy-harness model — the box
+        # ships without any agent CLI, and the first session that names one
+        # pays for it. agent_install rate-limits its own failures, so an
+        # offline box does not turn the respawn loop into a network loop.
+        if ! agent_install "$agent" || ! bin="$(agent_bin "$agent")"; then
+          echo "session '$sname': agent '$agent' is not installed and could not be" \
+               "fetched — skipping" >&2
+          return 0
+        fi
       fi
       wd="$($JQ -r '.workingDirectory // empty' <<<"$sjson")"
       [ -n "$wd" ] || wd="$HOME"
@@ -6511,6 +6763,31 @@ in
         runtime `agent-box-session add --agent codex` needs no rebuild.
         Sessions may only use agents listed here. Default: all supported
         agents.
+      '';
+    };
+
+    jitNixpkgs = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "https://releases.nixos.org/nixpkgs/nixpkgs-25.11pre1/nixexprs.tar.xz";
+      description = ''
+        Flake ref a lazily installed agent CLI is fetched from (issue #416),
+        overriding the default below. `agentbox apply`'s `jitNixpkgs:` is the
+        same knob for the native backend; the two exist so an operator who
+        wants the lazy path pinned can pin it on either.
+
+        Null (the default) uses selfUpdate.agentNixpkgs when that is wired —
+        the pin the update service already maintains, so both halves of the
+        box stay on one revision — and otherwise the nixos-unstable channel
+        that pin tracks.
+
+        That last fallback is MUTABLE: two boxes installing on different days
+        can get different harness versions. It is still the right default,
+        because the alternative it replaced (the flake registry's `nixpkgs`)
+        was measured resolving gh 2.98.0 on a box shipping 2.97.0 — but if
+        you need the lazy path reproducible, set this to an immutable URL.
+        Pinning it by DEFAULT would need its own hash-maintenance path and
+        is deliberately out of scope here.
       '';
     };
 
@@ -7350,6 +7627,13 @@ in
             AGENT_BOX_FLOCK_BIN = "${pkgs.util-linux}/bin/flock";
             AGENT_BOX_HOSTNAME_BIN = "${pkgs.unixtools.hostname}/bin/hostname";
             AGENT_BOX_ENV_EXEC = "${envExecWrapper}";
+            # Lazy harnesses (issue #416): where the supervisor fetches an
+            # agent CLI from when a session names one that is not installed.
+            # The SAME pinned channel the module resolves an eagerly
+            # installed harness from, so a box that ships one and JIT-fetches
+            # the other lands on one store path per CLI rather than two.
+            AGENT_BOX_NIXPKGS = jitNixpkgsRef;
+            AGENT_BOX_NIX_BIN = "${config.nix.package}/bin/nix";
             AGENT_BOX_CODEX_RC = "${codexRemoteControl}";
             # Hook settings for claude spawns — the segment-rotation record
             # (issue #223) the supervisor follows on respawn.

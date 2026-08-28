@@ -90,6 +90,15 @@ BY_DESIGN = {
     "AGENT_BOX_GRACE": "spot monitor, see AGENT_BOX_USERS",
     "AGENT_BOX_MSG": "spot monitor, see AGENT_BOX_USERS",
     "AGENT_BOX_POLL": "spot monitor, see AGENT_BOX_USERS",
+    "AGENT_BOX_NIX_BIN": "lazy harnesses (#416): the module pins nix as a "
+                         "store path because it HAS one. A native box does "
+                         "not — resolving `nix` at apply time would bake "
+                         "the BUILDING host's store path into a generated "
+                         "file and break on the next nix upgrade — so "
+                         "lib/agents.sh resolves it at USE from PATH and "
+                         "the two standard install layouts. Both backends "
+                         "reach the same binary; only one can name it "
+                         "ahead of time",
 }
 
 # Divergences that are BUGS, each owned by an issue. This table must only ever

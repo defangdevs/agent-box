@@ -12,7 +12,6 @@ web/etc/agent-box-guides/AGENTS.robot.md -> web/etc/agent-box-guides/AGENTS.agen
 web/etc/codex/config.toml -> vm/etc/codex/config.toml
 web/payloads/agent-box-agent-agents-pointer.md -> vm/payloads/agent-box-agent-agents-pointer.md
 web/payloads/agent-box-agent-mark-stopped -> vm/payloads/agent-box-agent-mark-stopped
-web/payloads/agent-box-agent-sessions.json -> vm/payloads/agent-box-agent-sessions.json
 web/payloads/agent-box-claude-hook-settings.json -> vm/payloads/agent-box-claude-hook-settings.json
 web/payloads/agent-box-claude-session-start-hook -> vm/payloads/agent-box-claude-session-start-hook
 web/payloads/agent-box-codex-remote-control -> vm/payloads/agent-box-codex-remote-control
@@ -20,6 +19,7 @@ web/payloads/agent-box-defang-cli-expr.nix -> vm/payloads/agent-box-defang-cli-e
 web/payloads/agent-box-env-exec -> vm/payloads/agent-box-env-exec
 web/payloads/agent-box-envstore/bin/agent-box-envstore -> vm/payloads/agent-box-envstore/bin/agent-box-envstore
 web/payloads/agent-box-profile/bin/agent-box-profile -> vm/payloads/agent-box-profile/bin/agent-box-profile
+web/payloads/agent-box-robot-sessions.json -> web/payloads/agent-box-agent-sessions.json
 web/payloads/agent-box-session/bin/agent-box-session -> vm/payloads/agent-box-session/bin/agent-box-session
 web/payloads/agent-box-spot-monitor -> vm/payloads/agent-box-spot-monitor
 web/payloads/agent-box-supervisor/bin/agent-box-supervisor -> vm/payloads/agent-box-supervisor/bin/agent-box-supervisor
