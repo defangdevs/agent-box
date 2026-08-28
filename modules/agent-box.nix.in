@@ -194,6 +194,12 @@ let
   # repo is fetched separately, at runtime, by claude itself (see the seeded
   # extraKnownMarketplaces below). Lazy: only forced when webhookEnabled
   # references it.
+  # The pinned webhook.py, from the ONE file both backends read (issue #425).
+  # Spliced verbatim by bin/assemble-module.py, so the generated module keeps
+  # these values as literals and stays a single self-contained file.
+  webhookPin =
+@@include-verbatim:../nix/webhook-pin.nix@@
+  ;
   localWebhookScript = builtins.fetchurl {
     url = "https://raw.githubusercontent.com/${cfg.webhook.repo}/${cfg.webhook.rev}/local-webhook/webhook.py";
     sha256 = cfg.webhook.sha256;
@@ -1489,12 +1495,12 @@ in
       };
       repo = lib.mkOption {
         type = lib.types.str;
-        default = "defangdevs/local-channels";
+        default = webhookPin.repo;
         description = "GitHub owner/repo of the local-channels plugin marketplace.";
       };
       rev = lib.mkOption {
         type = lib.types.str;
-        default = "3f2400760c4f69bcb70c5222a10e57def17fc489";
+        default = webhookPin.rev;
         description = ''
           Pinned local-channels commit whose local-webhook/webhook.py the
           receiver daemon and the agent-box-webhook CLI run. Claude sessions
@@ -1518,7 +1524,7 @@ in
         # builtins.fetchurl hash of local-webhook/webhook.py at `rev`:
         #   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.py
         # then `nix hash convert --hash-algo sha256 --to sri <base32>`.
-        default = "sha256-0LF/CWddQJcKNxka9238RCkjI8b8jf/85CPAyKSo+Ck=";
+        default = webhookPin.sha256;
         description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
       };
       syncSessionPlugin = lib.mkOption {

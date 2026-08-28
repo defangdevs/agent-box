@@ -134,6 +134,17 @@ def build_fake_profile(root):
     for g in ("default-agents.md", "default-agents-webhook.md",
               "default-agents-host-native.md"):
         shutil.copy(SRC / g, share / "guides" / g)
+    # The pinned local-webhook the profile ships (issue #425), and the pin it
+    # came from. A box needs no webhook config because these are here — so a
+    # fake profile without them would test the pre-#425 world.
+    (share / "local-webhook").mkdir()
+    (share / "local-webhook" / "webhook.py").write_text(
+        "#!/usr/bin/env python3\n# stand-in for the pinned local-webhook\n")
+    (share / "local-webhook" / "pin.json").write_text(json.dumps({
+        "repo": "defangdevs/local-channels",
+        "rev": "f" * 40,
+        "sha256": "sha256-" + "A" * 43 + "=",
+    }) + "\n")
     (prof / "libexec" / "agent-box").mkdir(parents=True)
     shutil.copy(SRC / "password-helper.py",
                 prof / "libexec" / "agent-box" / "password-helper.py")
@@ -416,6 +427,65 @@ class RenderTest(unittest.TestCase):
         # native side ever bound it.
         leaked = re.findall(r"@[A-Z][A-Z_]*@", guide)
         self.assertEqual([], leaked, f"unbound guide token(s): {leaked}")
+
+    def test_webhooks_need_no_config_at_all(self):
+        """A box with no `webhook:` key still gets webhooks (issue #425).
+
+        The Lightsail template writes exactly such a config, and
+        webhook_enable used to be `bool(repo and script)` — both
+        hand-declared — so every box it launched had the receiver, the
+        Caddy route, the CLI and the whole settings panel silently absent,
+        while the NixOS template (webhook.enable default true) had them.
+
+        The profile now ships the pinned script and its pin, so both values
+        have a source. What must NOT come back is a path from the config
+        that nothing installs: the rendered script is the profile's own.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "bare.json"
+            cfg.write_text(json.dumps({
+                "domain": "bare.example.org",
+                "agents": ["claude"],
+                "web": {"enable": True},
+                "users": {"agent": {"root": True}},
+            }) + "\n")
+            out = render(tmp, cfg)
+            units = out / "etc" / "systemd" / "system"
+            assert (units / "agent-box-webhook@agent.service.d").is_dir(), \
+                "no receiver drop-in: webhooks off on a config that says nothing"
+            settings = (units / "agent-box-settings@agent.service.d"
+                        / "10-host.conf").read_text()
+            want = ('Environment="AGENT_BOX_WEBHOOK_SCRIPT=@PROFILE@'
+                    '/share/agent-box/local-webhook/webhook.py"')
+            assert want in settings, settings
+            env = (out / "etc" / "agent-box" / "units"
+                   / "agent-box-settings-agent.env").read_text()
+            assert "AGENT_BOX_WEBHOOK_STATE_DIR=" in env, env
+            # The marketplace repo the supervisor pins claude's plugin to
+            # comes from the pin beside the script, not from a config key.
+            agent_unit = (units / "agent-box@agent.service.d"
+                          / "10-host.conf").read_text()
+            assert ("AGENT_BOX_WEBHOOK_REPO=defangdevs/local-channels"
+                    in agent_unit), agent_unit
+
+    def test_webhooks_can_still_be_turned_off(self):
+        """`webhook.enable = false` is the opt-out, matching the module."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "off.json"
+            cfg.write_text(json.dumps({
+                "domain": "off.example.org",
+                "agents": ["claude"],
+                "web": {"enable": True},
+                "webhook": {"enable": False},
+                "users": {"agent": {"root": True}},
+            }) + "\n")
+            out = render(tmp, cfg)
+            units = out / "etc" / "systemd" / "system"
+            assert not (units / "agent-box-webhook@agent.service.d").exists(), \
+                "webhook.enable = false still rendered the receiver"
+            settings = (units / "agent-box-settings@agent.service.d"
+                        / "10-host.conf").read_text()
+            assert "AGENT_BOX_WEBHOOK_SCRIPT" not in settings, settings
 
     def test_the_store_has_a_janitor(self):
         """Issue #394: a full root wedges the box — no journal, no profile

@@ -214,6 +214,41 @@ def parse_flake_url(url):
     return repo, rev
 
 
+# Where nix/runtime.nix installs the pinned local-webhook, and the pin it was
+# fetched with (issue #425). Both are profile-relative, so they follow a
+# profile update the way every other native payload does.
+WEBHOOK_ASSET_DIR = ("share", "agent-box", "local-webhook")
+
+
+def profile_webhook_script(profile):
+    """The pinned webhook.py inside the profile, or "" if this profile has
+    none (a pre-#425 profile was built with no pin, so it shipped no webhook
+    payloads at all — claiming a script that is not there would render a
+    receiver unit around a missing file)."""
+    if not profile:
+        return ""
+    path = Path(profile).joinpath(*WEBHOOK_ASSET_DIR, "webhook.py")
+    return str(path) if path.exists() else ""
+
+
+def profile_webhook_pin(profile):
+    """The pin that script was fetched with: {repo, rev, sha256}.
+
+    The supervisor needs the MARKETPLACE repo to pin claude's local-webhook
+    plugin, and this renderer cannot evaluate Nix — so runtime.nix ships the
+    pin as data beside the script, and nix/webhook-pin.nix stays its one home.
+    """
+    if not profile:
+        return {}
+    path = Path(profile).joinpath(*WEBHOOK_ASSET_DIR, "pin.json")
+    try:
+        with path.open(encoding="utf-8") as fh:
+            pin = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return pin if isinstance(pin, dict) else {}
+
+
 def profile_origin(profile):
     """(repo, rev) the runtime profile was actually installed from.
 
@@ -251,8 +286,24 @@ class Spec:
         origin_repo, origin_rev = profile_origin(profile)
         self.repo = origin_repo or data.get("repo") or "defangdevs/agent-box"
         self.rev = origin_rev or data.get("rev") or "0" * 40
-        self.webhook_repo = (data.get("webhook") or {}).get("repo") or ""
-        self.webhook_script = (data.get("webhook") or {}).get("script") or ""
+        # Webhooks (issue #425). The profile ships the pinned webhook.py and
+        # the pin it came from, so a box needs NO webhook config at all: the
+        # script is the profile's copy, the marketplace repo comes from the
+        # pin beside it, and `enable` defaults true exactly as the module's
+        # option does. Before this, `webhook.repo` + `webhook.script` had to
+        # be declared by hand — the Lightsail template declares neither, so
+        # every box it launched had webhooks silently off while the NixOS
+        # template had them on.
+        #
+        # A config value still wins, for a box pinned to its own copy. An
+        # older profile with no asset leaves the script empty, and webhooks
+        # stay off rather than rendering units around a missing file.
+        wh = data.get("webhook") or {}
+        pin = profile_webhook_pin(profile)
+        self.webhook_repo = wh.get("repo") or pin.get("repo") or ""
+        self.webhook_script = (wh.get("script")
+                               or profile_webhook_script(profile) or "")
+        self._webhook_enable = bool(wh.get("enable", True))
         web = data.get("web") or {}
         self.web_enable = bool(web.get("enable", True))
         self.protect_memory = bool(data.get("protectMemory", True))
@@ -334,7 +385,8 @@ class Spec:
 
     @property
     def webhook_enable(self):
-        return bool(self.webhook_repo and self.webhook_script)
+        return bool(self._webhook_enable
+                    and self.webhook_repo and self.webhook_script)
 
 
 class User:

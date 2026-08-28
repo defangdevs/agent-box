@@ -620,6 +620,32 @@ let
   # repo is fetched separately, at runtime, by claude itself (see the seeded
   # extraKnownMarketplaces below). Lazy: only forced when webhookEnabled
   # references it.
+  # The pinned webhook.py, from the ONE file both backends read (issue #425).
+  # Spliced verbatim by bin/assemble-module.py, so the generated module keeps
+  # these values as literals and stays a single self-contained file.
+  webhookPin =
+# The pinned local-webhook (webhook.py) the box RUNS — one home, read by both
+# backends.
+#
+# The NixOS module used to hold these three constants as option defaults, which
+# made them unreachable from a package build: `#runtime` is not a NixOS eval, so
+# it was built with no pin at all and the native profile silently shipped none
+# of the webhook payloads (issue #425). bin/assemble-module.py splices this file
+# into the generated module verbatim, so the module stays a single
+# self-contained file and the option defaults still read as literals there.
+#
+# Bumping the pin: change `rev`, then
+#   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.py
+#   nix hash convert --hash-algo sha256 --to sri <base32>
+# and put the SRI hash in `sha256`. Run `nix run .#assemble` afterwards — the
+# generated module carries a copy of these values, and CI's
+# module-generated-up-to-date check fails until it matches.
+{
+  repo = "defangdevs/local-channels";
+  rev = "3f2400760c4f69bcb70c5222a10e57def17fc489";
+  sha256 = "sha256-0LF/CWddQJcKNxka9238RCkjI8b8jf/85CPAyKSo+Ck=";
+}
+  ;
   localWebhookScript = builtins.fetchurl {
     url = "https://raw.githubusercontent.com/${cfg.webhook.repo}/${cfg.webhook.rev}/local-webhook/webhook.py";
     sha256 = cfg.webhook.sha256;
@@ -7151,12 +7177,12 @@ in
       };
       repo = lib.mkOption {
         type = lib.types.str;
-        default = "defangdevs/local-channels";
+        default = webhookPin.repo;
         description = "GitHub owner/repo of the local-channels plugin marketplace.";
       };
       rev = lib.mkOption {
         type = lib.types.str;
-        default = "3f2400760c4f69bcb70c5222a10e57def17fc489";
+        default = webhookPin.rev;
         description = ''
           Pinned local-channels commit whose local-webhook/webhook.py the
           receiver daemon and the agent-box-webhook CLI run. Claude sessions
@@ -7180,7 +7206,7 @@ in
         # builtins.fetchurl hash of local-webhook/webhook.py at `rev`:
         #   nix-prefetch-url https://raw.githubusercontent.com/<repo>/<rev>/local-webhook/webhook.py
         # then `nix hash convert --hash-algo sha256 --to sri <base32>`.
-        default = "sha256-0LF/CWddQJcKNxka9238RCkjI8b8jf/85CPAyKSo+Ck=";
+        default = webhookPin.sha256;
         description = "builtins.fetchurl hash of the pinned local-webhook/webhook.py.";
       };
       syncSessionPlugin = lib.mkOption {
