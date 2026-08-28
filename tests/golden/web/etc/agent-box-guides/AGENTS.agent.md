@@ -171,6 +171,13 @@ is not hypothetical: it happened on PR #417, where a `check_run` failure
 spawned a sibling that began editing the same git worktree the owning
 session was committing from.
 
+The example above leaves out `deployment_status` and bare commit `status`
+on purpose, not by oversight: both carry the branch under a different shape
+(`status` puts it in a `branches[]` array, not a single field a `--include`
+path can match), so a predicate for them needs a shape you have actually
+seen fire on your repo, not a copy-pasted guess. Add one only once you have
+a real payload to match against.
+
 Claude Code has the same as MCP tools (`webhook_subscribe`,
 `webhook_unsubscribe`, `webhook_subscriptions`); both share one list.
 Subscriptions are PER SESSION and expire after an hour (`--ttl HOURS` for a
