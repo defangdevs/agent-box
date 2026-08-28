@@ -2622,8 +2622,16 @@ in
                 # in it.
                 + "AGENT_BOX_WEB_USERS=${lib.concatStringsSep "," terminalUsers}\n"
               )
-            + lib.optionalString webhookEnabled
-                "AGENT_BOX_WEBHOOK_STATE_DIR=${webhookStateDirOf name}\n";
+            + lib.optionalString webhookEnabled (
+                "AGENT_BOX_WEBHOOK_STATE_DIR=${webhookStateDirOf name}\n"
+                # The same endpoint URL the agent unit exports (see
+                # AGENT_BOX_WEBHOOK_URL there), so the Webhook panel can
+                # print what to paste into the sender. Derived from the
+                # same webhookPathOf, and gated on the same condition,
+                # because a terminal user is exactly the case where caddy
+                # serves that path.
+                + "AGENT_BOX_WEBHOOK_URL=https://${cfg.web.domain}${webhookPathOf name}\n"
+              );
         }) terminalUsers)
         // lib.optionalAttrs webhookEnabled (lib.listToAttrs (map (name: lib.nameValuePair "agent-box/units/agent-box-webhook-${name}.env" {
           text = "LOCAL_WEBHOOK_STATE_DIR=${webhookStateDirOf name}\n";

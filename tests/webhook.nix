@@ -1625,8 +1625,34 @@
         "1 subscription",              # and counted on that session's row
         f'data-fold="subs-{hook_name}"',   # a spawned session's seeded topic
         "Standing watch",              # the shared dispatch list, its own panel
+        # The endpoint half of the same panel: what to register in the
+        # sender, per configured source, paste-ready with a copy button.
+        # Until this, both halves were reachable only by running
+        # `agent-box-webhook url`/`setup` in a session — a shell the
+        # operator reading this page may not have.
+        "Payload URL",
+        "https://box.test/agent/webhook/github",
+        'data-copy="https://box.test/agent/webhook/github"',
+        'data-secret-url="/agent/settings/webhooks/secret?source=github"',
     ]:
         assert want in page, "%s missing from the settings page" % want
+    # The secret is fetched on click, never rendered: a screenshot of this
+    # page, and every DOM the live feed swaps in, are free of it.
+    assert secret not in page, "the webhook secret is in the settings page HTML"
+    # ... and the route the buttons fetch it from hands over that same
+    # secret, for a name that resolves to a configured source and nothing
+    # else (a traversal attempt is a 404, not a file read).
+    got = machine.succeed(
+        f"{settings_curl} '{settings_page}webhooks/secret?source=github'"
+    )
+    assert json.loads(got) == {"ok": True, "source": "github",
+                               "secret": secret}, got
+    for bad in ["source=nope", "source=../github", "source="]:
+        machine.succeed(
+            f"{settings_curl} -o /dev/null -w '%{{http_code}}'"
+            f" '{settings_page}webhooks/secret?{bad}' | grep -x 404"
+        )
+
     # The standing watches are NOT session-scoped, so they are the one thing
     # that must not have moved into a session's fold.
     watches = page.split("Standing watch")[-1]
@@ -1644,6 +1670,109 @@
     # And the note is no longer a paragraph on the row itself.
     assert 'wh-note">standing watch: triage' not in page, page
 
+    # --- rotating a secret, from the page (#421) ----------------------------
+    # A leaked secret has to be replaceable, and `setup` deliberately reuses
+    # an existing one (it is the idempotent "make this work" command), so
+    # until now nothing could change it. Rotation is a HARD cutover — the
+    # receiver verifies against exactly one secret per source — which is what
+    # the last two assertions here pin down: the old signature stops working
+    # and the new one starts, with no restart in between (sources.json and
+    # the secret file are re-read per delivery).
+    secret_file = "/home/agent/.local/state/local-webhook/github.secret"
+    rotate_post = (
+        f"{settings_curl} -o /dev/null -w '%{{http_code}}' -X POST"
+        " -H 'Origin: http://localhost'"
+        " -H 'Referer: http://localhost/agent/settings/'"
+        f" -d source=github {settings_page}webhooks/rotate"
+    )
+    machine.succeed(f"{rotate_post} | grep -x 303")
+    rotated = machine.succeed(f"cat {secret_file}").strip()
+    assert len(rotated) == 32 and rotated != secret, rotated
+    # Still the agent's own 0600 file, not something the daemon left behind
+    # readable or owned by root.
+    machine.succeed(f"stat -c '%U %a' {secret_file} | grep -x 'agent 600'")
+    # ...and the panel's own route serves the new value, not a cached old one.
+    got = machine.succeed(
+        f"{settings_curl} '{settings_page}webhooks/secret?source=github'"
+    )
+    assert json.loads(got)["secret"] == rotated, got
+    # A source whose secret is written into sources.json BY HAND is the CLI's
+    # to change: an inline `secret` wins over `secretFile` in the receiver, so
+    # rotating the file under one would change nothing and claim it had. The
+    # page refuses instead of lying (303 either way — the banner differs).
+    sources_file = "/home/agent/.local/state/local-webhook/sources.json"
+    fake = "x" * 32
+    # cp, not mv: it writes through the existing inode, so the file keeps the
+    # agent's ownership and its 0600 even though the driver runs as root.
+    machine.succeed(
+        "jq '.sources.inlined = {secret: \"" + fake + "\"}' "
+        + sources_file + " > /tmp/src.json"
+    )
+    machine.succeed("cp /tmp/src.json " + sources_file)
+    machine.succeed(
+        f"{settings_curl} -o /dev/null -w '%{{http_code}}' -X POST"
+        " -H 'Origin: http://localhost'"
+        " -H 'Referer: http://localhost/agent/settings/'"
+        f" -d source=inlined {settings_page}webhooks/rotate | grep -x 303"
+    )
+    machine.succeed(
+        "jq -e '.sources.inlined | keys == [\"secret\"]' "
+        + sources_file + " >/dev/null"
+    )
+    # The CLI is the one that can: it owns the sources.json format, so it
+    # moves the source onto a file and drops the inline key.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " AGENT_BOX_WEBHOOK_URL=https://box.test/agent/webhook"
+        " agent-box-webhook rotate inlined"
+    )
+    machine.succeed(
+        "jq -e '.sources.inlined == {secretFile: \"inlined.secret\"}' "
+        + sources_file + " >/dev/null"
+    )
+
+    # The cutover, end to end on the public path: the ORIGINAL secret's
+    # signature is now refused, and the rotated one is accepted.
+    client.succeed(
+        "cat > /tmp/rotated.json <<'EOF'\n"
+        '{"action":"opened","issue":{"number":9001,"title":"after rotation"},'
+        '"repository":{"full_name":"defangdevs/panel"},"sender":{"login":"someone"}}\n'
+        "EOF"
+    )
+    old_sig = client.succeed(
+        f"openssl dgst -sha256 -hmac {secret} -r /tmp/rotated.json | cut -d' ' -f1"
+    ).strip()
+    new_sig = client.succeed(
+        f"openssl dgst -sha256 -hmac {rotated} -r /tmp/rotated.json | cut -d' ' -f1"
+    ).strip()
+    rotated_post = (
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST"
+        " -H 'content-type: application/json' -H 'x-github-event: issues'"
+        " --data-binary @/tmp/rotated.json"
+    )
+    client.succeed(
+        f"{rotated_post} -H 'x-github-delivery: rotated-old'"
+        f" -H 'x-hub-signature-256: sha256={old_sig}'"
+        f" https://box.test/agent/webhook/github | grep -x 401"
+    )
+    client.succeed(
+        f"{rotated_post} -H 'x-github-delivery: rotated-new'"
+        f" -H 'x-hub-signature-256: sha256={new_sig}'"
+        f" https://box.test/agent/webhook/github | grep -x 200"
+    )
+    # Put the original back: every signature later in this script is made
+    # with `secret`, and the receiver re-reads the file per delivery, so this
+    # is also the proof that a change either way needs no restart.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent sh -c"
+        f" 'printf %s {secret} > {secret_file}'"
+    )
+    client.succeed(
+        f"{rotated_post} -H 'x-github-delivery: rotated-restored'"
+        f" -H 'x-hub-signature-256: sha256={old_sig}'"
+        f" https://box.test/agent/webhook/github | grep -x 200"
+    )
     # Delete a session subscription. 303 back to the page, and the topic is
     # gone from that session's filter file — the receiver re-reads it per
     # delivery, so nothing needs restarting.

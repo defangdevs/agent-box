@@ -59,6 +59,7 @@
 #   AGENT_BOX_WEBHOOK_SCRIPT     pinned local-webhook webhook.py (empty =
 #                                 no webhook receiver, so no panel)
 #   AGENT_BOX_WEBHOOK_STATE_DIR  where its filter.*.json files live
+#   AGENT_BOX_WEBHOOK_URL        the receiver endpoint senders POST to
 #   AGENT_BOX_WEBHOOK_PYTHON     interpreter for that script
 #   AGENT_BOX_CONNECT_BINS       "<id>=<binary>" pairs for the guided
 #                                 sign-in cards (claude, codex, github)
@@ -161,6 +162,12 @@ PASSWORD_CMD = os.environ.get("AGENT_BOX_PASSWORD_CMD", "")
 # topic parsing, TTL stamping, the atomic replace and its lock.
 WEBHOOK_SCRIPT = os.environ.get("AGENT_BOX_WEBHOOK_SCRIPT", "")
 WEBHOOK_STATE_DIR = os.environ.get("AGENT_BOX_WEBHOOK_STATE_DIR", "")
+# Where a sender POSTs, printed on the panel so the URL to register is on
+# the page instead of behind `agent-box-webhook url` in a session.
+# Set by the module for a terminal user whenever the receiver is enabled,
+# which is exactly when caddy serves that path; empty on a dev rig, and
+# then the panel simply says nothing about the endpoint.
+WEBHOOK_URL = os.environ.get("AGENT_BOX_WEBHOOK_URL", "")
 # Interpreter for the above. The daemon's own is a fine fallback for a
 # dev run; the module passes the same python the receiver unit uses.
 WEBHOOK_PYTHON = os.environ.get("AGENT_BOX_WEBHOOK_PYTHON", "") or sys.executable
@@ -207,6 +214,10 @@ RESERVED_NAMES = frozenset(("settings", "downloads", "webhook", "sessions",
 # than a quoting defence — it keeps a malformed form value from reaching
 # the subscription file at all.
 TOPIC_RE = re.compile(r"^[A-Za-z0-9_.:/*-]{1,128}$")
+# A webhook source name, as `agent-box-webhook setup` validates it
+# (letters, digits, _ and -). The secret route resolves a name to a file
+# inside the state dir, so this is the check that keeps a path out of it.
+SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # The agent user's home. A session's working directory defaults to it
 # and the working-directory picker (below) browses within it: the
@@ -895,6 +906,146 @@ def webhook_state_dir():
         or os.environ.get("LOCAL_WEBHOOK_STATE_DIR")
         or os.path.join(HOME_DIR, ".local", "state", "local-webhook")
     )
+
+
+def webhook_sources():
+    """Which senders are set up: (default source, sorted names).
+
+    Read straight from the receiver's sources.json rather than through a
+    CLI, because this is not webhook.py's subscription format — it is the
+    small file `agent-box-webhook setup` writes, and the only thing wanted
+    here is which per-source paths exist to paste into a sender. The
+    secret is deliberately not read: it lives in its own 0600 file, it is
+    printed once by `setup`, and a page that echoed it would turn a
+    browser tab into a place credentials leak from.
+
+    No file (or an unreadable one) means no secret has been minted yet,
+    which is exactly the state in which the endpoint rejects everything.
+    """
+    try:
+        with open(os.path.join(webhook_state_dir(), "sources.json"),
+                  encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return "", []
+    if not isinstance(data, dict):
+        return "", []
+    sources = data.get("sources")
+    names = sorted(sources) if isinstance(sources, dict) else []
+    default = data.get("defaultSource")
+    return (default if isinstance(default, str) else ""), names
+
+
+def webhook_secret(source):
+    """One source's HMAC secret, or "" if there is none to read.
+
+    Same resolution as the CLI's own `secret_of`: `secretFile` (relative
+    names are inside the state dir), else an inline `secret`. Duplicated
+    here rather than shelled out to because `agent-box-webhook` is not on
+    this daemon's PATH — it is the agent's CLI, in the agent's profile,
+    and putting it there to read one file would widen what the web
+    daemon can run for no gain.
+
+    Why the page serves this at all: registering a webhook needs the URL
+    AND the secret, and the operator doing it has a browser, not a shell.
+    It is no new exposure — the same login already opens a terminal on
+    this box, where the file is one `cat` away, and `agent-box-webhook
+    setup` re-prints it on demand. It is fetched on click and never
+    rendered into the page, so it stays out of screenshots, out of the
+    live feed's DOM swaps, and out of the HTML the browser keeps.
+    """
+    if not source:
+        return ""
+    state = webhook_state_dir()
+    try:
+        with open(os.path.join(state, "sources.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        entry = (data.get("sources") or {}).get(source) or {}
+    except (OSError, ValueError, AttributeError):
+        return ""
+    if not isinstance(entry, dict):
+        return ""
+    path = entry.get("secretFile")
+    if isinstance(path, str) and path:
+        if not os.path.isabs(path):
+            path = os.path.join(state, path)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+    inline = entry.get("secret")
+    return inline.strip() if isinstance(inline, str) else ""
+
+
+def webhook_secret_path(source):
+    """The file a source's secret lives in, or "" if the page must not
+    write it.
+
+    Only the shape `agent-box-webhook setup` produces is rotatable from
+    here: an entry with a `secretFile` inside the state dir, and no inline
+    `secret` (which the receiver prefers over the file, so rotating the
+    file under one would change nothing and claim it had). Anything else
+    is a hand-written source, and editing sources.json is the CLI's job —
+    it owns that format, with jq, in one place. The page refuses and says
+    which command to run instead.
+    """
+    if not SOURCE_RE.match(source or ""):
+        return ""
+    state = webhook_state_dir()
+    try:
+        with open(os.path.join(state, "sources.json"), encoding="utf-8") as fh:
+            entry = ((json.load(fh).get("sources") or {}).get(source) or {})
+    except (OSError, ValueError, AttributeError):
+        return ""
+    if not isinstance(entry, dict) or entry.get("secret"):
+        return ""
+    path = entry.get("secretFile")
+    if not isinstance(path, str) or not path:
+        return ""
+    full = os.path.realpath(path if os.path.isabs(path)
+                            else os.path.join(state, path))
+    # The path comes out of a file the user owns, so this is not a
+    # privilege boundary — it is a bound on what a web POST can overwrite:
+    # this source's own secret inside the state dir, nothing else.
+    if os.path.dirname(full) != os.path.realpath(state):
+        return ""
+    return full
+
+
+def webhook_rotate(source):
+    """Mint a new secret for one source. True if it was replaced.
+
+    Same 32 hex characters `agent-box-webhook setup` mints, from the same
+    kernel CSPRNG, written 0600 through a tempfile in the same directory
+    so a delivery mid-read never sees half a secret.
+
+    A HARD cutover, deliberately: the receiver verifies against exactly
+    one secret per source, so a delivery still signed with the old value
+    is rejected from here on, and GitHub does not retry — the banner and
+    the button's confirm say so, because an overlap is not ours to
+    invent (defangdevs/local-channels#49).
+    """
+    path = webhook_secret_path(source)
+    if not path:
+        return False
+    secret = secrets.token_hex(16)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
+                                   prefix=".secret.")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(secret)
+            os.replace(tmp, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
+    except OSError as exc:
+        sys.stderr.write("webhook: rotate %s: %s\n" % (source, exc))
+        return False
+    return True
 
 
 def prune_filter(name):
@@ -2172,20 +2323,38 @@ SESSIONS_SECTION_TPL = """<section>
     <div id="sessions-list">{sessions}</div>
   </section>"""
 
-# Standing watches (issue #227), settings page only: the workspace root
+# The webhook panel (issue #227), settings page only: the workspace root
 # is a terminal, not a manager. Hidden entirely when the box serves no
-# webhook receiver. A session's OWN subscriptions are not here — they
-# fold open under that session's row in the panel above.
+# webhook receiver. Two halves, in the order the work happens: the
+# endpoint a sender has to be pointed at, then the standing watches a
+# delivery starts a session from. A session's OWN subscriptions are in
+# neither — they fold open under that session's row in the panel above.
+#
+# Called "Webhook", not "Standing watches": the panel now answers "where
+# do deliveries come in" as well as "what do they start", and the list's
+# own header still says which of the two it is.
 WEBHOOKS_SECTION_TPL = """<section>
     <div class="sec-head">
-      <h2>Standing watches</h2>
+      <h2>Webhook</h2>
     </div>
+    <div id="webhook-endpoint">{endpoint}</div>
     <p class="note">A standing watch belongs to no session: a matching
     event starts a NEW one. Subscriptions that deliver INTO a session are
     listed under that session above. Deleting either takes effect on the
     next delivery &mdash; no restart.</p>
     <div id="webhooks-list">{webhooks}</div>
   </section>"""
+
+# The endpoint half. Its own note, so the whole thing can be left out on a
+# box that serves no endpoint (no AGENT_BOX_WEBHOOK_URL) without leaving a
+# paragraph pointing at a URL that is not there.
+WEBHOOK_ENDPOINT_TPL = """<p class="note">Where a sender POSTs. Register a
+    payload URL below in the sender &mdash; on GitHub, repo Settings &rarr;
+    Webhooks &rarr; Add webhook, content type <code>application/json</code>
+    &mdash; with that source's secret, which the copy button hands over.
+    Both fields are needed: anything this box cannot verify against the
+    secret is rejected, so the URL alone delivers nothing.</p>
+    {rows}"""
 
 # Guided sign-in (issues #207, #208, #313). Hidden entirely when the box
 # passed no AGENT_BOX_CONNECT_BINS. data-busy tells the page whether a
@@ -2393,6 +2562,25 @@ ICON_DOWNLOAD = (
     '<path d="M7.47 10.78a.75.75 0 0 0 1.06 0l3.75-3.75a.749.749 0 0 0-.326-1.275.749.749 0 0 0'
     '-.734.215L8.75 8.689V1.75a.75.75 0 0 0-1.5 0v6.939L4.78 5.97a.749.749 0 0 0-1.275.326.749'
     '.749 0 0 0 .215.734ZM3.75 13a.75.75 0 0 0 0 1.5h8.5a.75.75 0 0 0 0-1.5Z"/></svg>'
+)
+# What the secret row shows until someone asks for the value. Eight
+# bullets, not the real length: even a length is a hint nobody needs on a
+# page that may be on screen in a call.
+SECRET_MASK = "&bull;" * 8
+
+ICON_COPY = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5'
+    'c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 '
+    '9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"/>'
+    '<path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 '
+    '14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25'
+    'h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg>'
+)
+ICON_CHECK = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L1.72 9.78a.751.751 '
+    '0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 11.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"/></svg>'
 )
 ICON_TRASH = (
     '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
@@ -2695,6 +2883,121 @@ def render_webhook_row(topic, meta, note, key, dispatch, fold=""):
         f'The &lt;&hellip;&gt; parts come from the event.</p>'
         f'<pre>{html.escape(fold)}</pre></div>'
         f'</details></li>'
+    )
+
+
+def copy_button(what, value=None, secret_url=None):
+    """A one-click copy for a value the operator has to paste elsewhere.
+
+    Either `value` — text already in the page, copied straight from the
+    attribute — or `secret_url`, a route the button fetches on the click
+    (which is how a secret gets copied without being rendered).
+
+    Takes VALUES and escapes them here, rather than an `attrs` fragment
+    the caller assembles: a parameter that is raw markup makes escaping
+    the caller's job to remember every time, on a button whose whole
+    purpose is handling credentials (#421 review). Both icons ship inside
+    it and CSS picks which one shows, so the "copied" tick needs no icon
+    markup in the script."""
+    attr = ('data-copy="%s"' % html.escape(value, quote=True) if value
+            else 'data-secret-url="%s"' % html.escape(secret_url or "", quote=True))
+    return (
+        '<button type="button" class="icon icopy" %s '
+        'aria-label="Copy %s" title="Copy to clipboard">'
+        '<span class="ci">%s</span><span class="co">%s</span></button>'
+        % (attr, html.escape(what, quote=True), ICON_COPY, ICON_CHECK)
+    )
+
+
+def rotate_form(source):
+    """Replace one source's secret, from the page.
+
+    A form, not a fetch button: with no JS it still works, like every
+    other action here. The confirm() is not ceremony — this is a hard
+    cutover (see webhook_rotate()), so the dialog is where someone finds
+    out that the sender has to be updated before it says the words on a
+    banner they have already triggered."""
+    safe = html.escape(source)
+    return (
+        '<form class="inline" method="post" action="%s/webhooks/rotate" '
+        'onsubmit="return confirm(\'Rotate the %s secret? Deliveries signed '
+        'with the old secret are rejected until you paste the new one into '
+        'the sender, and GitHub does not retry them.\');">'
+        '<input type="hidden" name="source" value="%s">'
+        '<button type="submit" class="icon ismall" '
+        'aria-label="Rotate the %s secret" '
+        'title="Mint a new secret">Rotate</button></form>'
+        % (html.escape(BASE), safe, safe, safe)
+    )
+
+
+def render_webhook_endpoint():
+    """What to register in the sender: the payload URL and the secret,
+    per configured source, each with a copy button.
+
+    Both were previously reachable only by running `agent-box-webhook
+    setup`/`url` inside a session, which is the wrong place for them:
+    registering a webhook is a browser job, done with the sender's own
+    settings open in the next tab, by an operator who may have no shell
+    here at all — and the two values are pasted, not read, so the button
+    matters as much as the value.
+
+    A row per configured source, because the per-source path is what the
+    sender's Payload URL field wants, and the default source's row says
+    so — a URL registered with no source on the end routes there. With no
+    source configured there is nothing to paste yet, and saying so is
+    more use than printing a URL that rejects every delivery.
+
+    The secret is NOT rendered: the row shows a mask, and Show/Copy fetch
+    it from {BASE}/webhooks/secret on the click. Same reasoning as
+    webhook_secret() — the value is the operator's to have, but a value
+    that is not in the HTML cannot leak through a screenshot of this page
+    or through the live feed's DOM swaps."""
+    if not WEBHOOK_URL:
+        return ""
+    # Raw values, escaped at the point of use — copy_button() and
+    # rotate_form() take values, not markup, and escape their own.
+    endpoint = WEBHOOK_URL.rstrip("/")
+    base = html.escape(endpoint)
+    default, names = webhook_sources()
+    rows = []
+    for name in names:
+        safe = html.escape(name)
+        secret_route = (BASE + "/webhooks/secret?source="
+                        + urllib.parse.quote(name, safe=""))
+        # Naming the default is not decoration: a URL registered with no
+        # source on the end routes to it, so this is the one row that also
+        # explains an endpoint someone pasted bare months ago.
+        tag = (" (default &mdash; a URL with no source lands here)"
+               if name == default else "")
+        rows.append(
+            '<li><span class="nm wh"><code>%s/%s</code>'
+            '<span class="meta">%s%s</span>'
+            '<span class="wh-secret"><span class="meta">Secret</span>'
+            '<code data-secret-out>%s</code>'
+            '<button type="button" class="icon ismall" data-reveal '
+            'data-secret-url="%s" aria-label="Show the %s secret" '
+            'title="Show the secret">Show</button>%s%s</span>'
+            '</span>'
+            '<span class="acts">%s</span></li>'
+            % (base, safe, safe, tag,
+               SECRET_MASK, html.escape(secret_route, quote=True), safe,
+               copy_button("the %s secret" % name, secret_url=secret_route),
+               rotate_form(name),
+               copy_button("the %s payload URL" % name,
+                           value="%s/%s" % (endpoint, name)))
+        )
+    if not rows:
+        rows.append(
+            '<li class="empty">No sender is set up yet, so this box rejects '
+            'every delivery. Run <code>agent-box-webhook setup</code> in a '
+            'session: it mints the secret, prints it once, and prints the '
+            'payload URL to register &mdash; <code>%s/&lt;source&gt;</code>.'
+            '</li>' % base
+        )
+    return WEBHOOK_ENDPOINT_TPL.format(
+        rows=('<ul class="tbl"><li class="tbl-head">Payload URL</li>'
+              + "".join(rows) + "</ul>")
     )
 
 
@@ -3043,7 +3346,9 @@ def render_page(message=""):
             # terminal workspace, so session CRUD lives here.
             sessions_section=render_sessions_section(subs),
             webhooks_section=(
-                WEBHOOKS_SECTION_TPL.format(webhooks=render_webhooks(watches))
+                WEBHOOKS_SECTION_TPL.format(
+                    endpoint=render_webhook_endpoint(),
+                    webhooks=render_webhooks(watches))
                 if WEBHOOKS else ""
             ),
             connect_section=render_connect() if connect_flows() else "",
@@ -3318,6 +3623,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "session_started": "Session started — it comes up within a few seconds.",
         "update": "Box update started — the system rebuilds in the "
                   "background and this page may briefly go away.",
+        "webhook_rotated": ("Secret rotated. Copy the new one into the sender "
+                            "now — deliveries signed with the old secret are "
+                            "rejected from this moment, and GitHub does not "
+                            "retry them."),
+        "webhook_kept_secret": ("Could not rotate that secret. A source whose "
+                                "secret is written into sources.json by hand "
+                                "is the CLI's to change: run "
+                                "`agent-box-webhook rotate SOURCE` in a "
+                                "session."),
         "webhook_deleted": "Subscription deleted — it stops at the next delivery.",
         "webhook_forgotten": "Subscriptions cleared — that session now receives nothing.",
         "webhook_kept": "Could not delete that subscription. It may already be gone.",
@@ -3407,6 +3721,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # poll one card than re-fetch the page (read-only: it reports
         # what the CLI and the pane say, and carries no secret — the
         # only pane text it can return is a redacted error line).
+        # One source's HMAC secret, for the Webhook panel's Show/Copy
+        # buttons (see webhook_secret()). GET, because it changes nothing
+        # and a cross-site page cannot read this response: no CORS
+        # headers, so the browser withholds the body even with the
+        # operator's credentials attached. no-store comes from
+        # _send_json, so it is never written to the browser's cache.
+        if parsed.path.rstrip("/") == BASE + "/webhooks/secret" and WEBHOOKS:
+            source = (params.get("source", [""])[0]).strip()
+            secret = webhook_secret(source) if SOURCE_RE.match(source or "") else ""
+            if not secret:
+                self._send_json({"ok": False}, status=404)
+            else:
+                self._send_json({"ok": True, "source": source, "secret": secret})
+            return
         if parsed.path.rstrip("/") == BASE + "/connect":
             flow = connect_flow((params.get("flow", [""])[0]).strip())
             if flow is None:
@@ -3710,6 +4038,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             ok = webhook_unsubscribe(key, topic, dispatch)
             self._redirect("ok=webhook_deleted" if ok else "ok=webhook_kept")
+        elif path == BASE + "/webhooks/rotate" and WEBHOOKS:
+            # Replace one source's secret. The page's only webhook WRITE:
+            # everything else here reads, and topic edits go through
+            # webhook.py's own CLI. Bounded by webhook_secret_path() to a
+            # secret file inside the state dir belonging to a configured
+            # source that setup itself created.
+            source = (form.get("source", [""])[0]).strip()
+            ok = webhook_rotate(source)
+            self._redirect("ok=webhook_rotated" if ok else "ok=webhook_kept_secret")
         elif path == BASE + "/webhooks/forget" and WEBHOOKS:
             # Remove one session's whole filter file. Same bound as the
             # unsubscribe route: one of THIS user's own listed sessions,
