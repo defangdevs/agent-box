@@ -9601,6 +9601,14 @@ CONNECT_BLAME_RE = re.compile(
 # Absolute paths, not $PATH: this daemon's unit deliberately carries no
 # agent PATH, and naming the binary also lets a VM test point an id at a
 # stub. A flow whose id is absent here has no card.
+# Where a card fetches its CLI from when the box does not ship it (issue
+# #416) — the same pinned source the supervisor's lazy harness install
+# uses, so a box that fetches claude from a session and gh from a card
+# lands on one nixpkgs, not two. Empty disables the install offer rather
+# than guessing at a channel.
+CONNECT_NIXPKGS = os.environ.get("AGENT_BOX_NIXPKGS", "")
+CONNECT_NIX_BIN = os.environ.get("AGENT_BOX_NIX_BIN") or "nix"
+
 CONNECT_BINS = {}
 for _pair in os.environ.get("AGENT_BOX_CONNECT_BINS", "").split():
     if "=" in _pair:
@@ -9712,6 +9720,8 @@ CONNECT_PARSERS = {
 CONNECT_DEFS = [
     {
         "id": "claude",
+        "binary": "claude",
+        "attr": "claude-code",
         "label": "Claude Code",
         "note": "Runs <code>claude auth login</code> &mdash; your Claude "
                 "subscription or Console account. The CLI stores the "
@@ -9729,6 +9739,8 @@ CONNECT_DEFS = [
     },
     {
         "id": "codex",
+        "binary": "codex",
+        "attr": "codex",
         "label": "Codex",
         "note": "Runs <code>codex login --device-auth</code> &mdash; enter "
                 "the code on the page it prints. The CLI stores the "
@@ -9749,6 +9761,8 @@ CONNECT_DEFS = [
     },
     {
         "id": "github",
+        "binary": "gh",
+        "attr": "gh",
         "label": "GitHub",
         "note": "Runs <code>gh auth login --web</code> &mdash; GitHub's own "
                 "device flow. No app to register, no token to copy, and "
@@ -9784,6 +9798,8 @@ CONNECT_DEFS = [
     },
     {
         "id": "defang",
+        "binary": "defang",
+        "attr": None,
         "label": "Defang",
         "note": "Runs <code>defang login</code> &mdash; opens Defang's own "
                 "sign-in page in a browser; the CLI polls for your "
@@ -9810,13 +9826,36 @@ _connect_lock = threading.Lock()
 
 
 def connect_flows():
-    """The cards this box can actually show: a flow per installed CLI."""
+    """Every card this box can show, installed or not (issue #416).
+
+    A card used to exist only where its binary did, which made the lazy
+    box a chicken-and-egg: with the CLIs out of the closure there was no
+    GitHub card to press, and pressing it is how you would get gh. So the
+    card list is CONNECT_DEFS, and the binary is per-card STATE.
+
+    Resolution order mirrors the supervisor's agent_bin: the eval-time
+    table first (an eagerly installed CLI keeps its pinned store path),
+    then this user's own profile, which is where a lazy install lands and
+    is already first on a session's PATH. flow["bin"] is None when
+    neither has it — the card then offers to install it.
+    """
     flows = []
     for spec in CONNECT_DEFS:
+        flow = dict(spec)
         binary = CONNECT_BINS.get(spec["id"])
-        if binary:
-            flow = dict(spec)
-            flow["bin"] = binary
+        if not binary and spec["attr"]:
+            candidate = os.path.join(
+                os.path.expanduser("~"), ".nix-profile", "bin", spec["binary"])
+            if os.access(candidate, os.X_OK):
+                binary = candidate
+        flow["bin"] = binary
+        # Never a DEAD card: one whose CLI is absent and which cannot be
+        # installed from here has no button and nothing to say, which is
+        # worse than not being there (the reasoning agentbox already
+        # applied when it left defang out of a native box's cards). A card
+        # therefore appears when the CLI is here, OR when pressing it
+        # would get it.
+        if binary or flow["attr"]:
             flows.append(flow)
     return flows
 
@@ -9866,6 +9905,10 @@ def connect_status_env(flow):
 def connect_run(flow, args, timeout=15):
     """Run one of the flow's own subcommands. None on any failure —
     a missing binary or a hung status call must not 500 the page."""
+    # Not installed yet (issue #416): there is nothing to ask, and asking
+    # would be a TypeError on None rather than the "no" the card wants.
+    if not flow["bin"]:
+        return None
     try:
         return subprocess.run(
             [flow["bin"]] + list(args),
@@ -10094,6 +10137,12 @@ def connect_state(flow, keys=None, tmux_state=None):
         "code": code,
         "error": error,
         "needs_code": flow["needs_code"],
+        # False means the CLI is not on this box yet, so the button offers
+        # to fetch it first (issue #416). A card with no `attr` can never
+        # be installed from here — defang comes from its own background
+        # unit — so it reports itself installed only when it really is.
+        "installed": bool(flow["bin"]),
+        "installable": bool(flow["attr"]),
         # No tmux server means no session to sign in from, and starting
         # one HERE is exactly what tmux_server_up() explains we must not
         # do — so the card says so instead of offering a dead button.
@@ -10159,9 +10208,48 @@ def connect_start(flow):
         state["error"] = ("No terminal session is running, so there is "
                           "nowhere to sign in from. Start a session first.")
         return state
-    inner = " ".join(shlex.quote(a) for a in [flow["bin"]] + flow["start"])
+    # Not installed yet (issue #416): fetch it first, in THIS pane, so the
+    # download has somewhere visible to happen. The card is already
+    # watching this pane, so progress and any failure land where the user
+    # is looking rather than in a journal they cannot read.
+    #
+    # The binary it will land at is the same path connect_flows would have
+    # resolved, so the sign-in half needs no special case.
+    binary = flow["bin"]
+    prelude = ""
+    if not binary:
+        if not flow["attr"]:
+            state = connect_state(flow)
+            state["state"] = "failed"
+            state["error"] = ("%s is not installed on this box, and cannot "
+                              "be installed from here." % flow["label"])
+            return state
+        if not CONNECT_NIXPKGS:
+            state = connect_state(flow)
+            state["state"] = "failed"
+            state["error"] = ("%s is not installed, and this box has no "
+                              "package source configured to fetch it from."
+                              % flow["label"])
+            return state
+        binary = os.path.join(
+            os.path.expanduser("~"), ".nix-profile", "bin", flow["binary"])
+        # --profile names the profile explicitly for the same reason the
+        # path above does: ~/.nix-profile is what a session's PATH already
+        # looks in, so an install landing anywhere else would succeed and
+        # still leave the card saying "not installed".
+        prelude = (
+            "echo '[agent-box] fetching %s — first use on this box, this "
+            "can take a few minutes'; NIXPKGS_ALLOW_UNFREE=1 %s profile add "
+            "--impure --profile %s %s || exit 1; " % (
+                flow["label"],
+                shlex.quote(CONNECT_NIX_BIN),
+                shlex.quote(os.path.join(os.path.expanduser("~"),
+                                         ".nix-profile")),
+                shlex.quote("%s#%s" % (CONNECT_NIXPKGS, flow["attr"]))))
+    inner = " ".join(shlex.quote(a) for a in [binary] + flow["start"])
     if flow["unset"]:
         inner = ("env " + " ".join("-u " + k for k in flow["unset"]) + " " + inner)
+    inner = prelude + inner
     # The exit marker turns "the CLI is done" into something the state
     # machine can see, and the sleep keeps the final screen readable
     # until then. Both are shell-level, so no CLI has to cooperate.
@@ -12592,12 +12680,24 @@ def render_connect_card(state):
         "idle": ("stopped", "Not signed in"),
         "checking": ("stopped", "Checking&hellip;"),
     }[state["state"]]
+    if not state["installed"] and state["state"] in ("idle", "checking",
+                                                     "failed"):
+        # "Not signed in" would be a half-truth for a CLI that is not even
+        # here; the distinction matters because the fix is different (wait
+        # for a download, not go through an OAuth flow).
+        pill = ("stopped", "Not installed")
     if state["state"] in ("waiting", "starting", "checking", "exchanging"):
         label, confirm = None, False
     elif state["blocked"]:
         label, confirm = None, False
     elif state["state"] == "connected":
         label, confirm = "Sign in again", state["destructive"]
+    elif not state["installed"]:
+        # The CLI is not on this box yet (issue #416). Same button, same
+        # pane — it just fetches first, and the label says so rather than
+        # letting a several-minute download look like a hung sign-in.
+        label, confirm = ("Install & sign in", False) if state["installable"] \
+            else (None, False)
     else:
         label, confirm = "Sign in", False
     action = ""
@@ -12618,6 +12718,12 @@ def render_connect_card(state):
         f'{action}</span></div>'
         f'<p class="note">{state["note"]}</p></li>'
     )
+    if not state["installed"] and state["installable"]:
+        row = row.replace(
+            '</p></li>',
+            ' This box does not ship it — the button fetches it into your '
+            'own Nix profile first, which is a one-off of a few minutes.'
+            '</p></li>', 1)
     step = render_connect_step(state)
     if state["blocked"]:
         step = ('<li class="conn-step"><p class="note">No terminal session '
@@ -14237,6 +14343,12 @@ if __name__ == "__main__":
             # sign-in would have written it in. Same value for every
             # instance, hence host-level.
             AGENT_BOX_CONNECT_BINS = connectBins;
+            # Where a card fetches a CLI the box does not ship (issue
+            # #416). The SAME pinned source the supervisor's lazy harness
+            # install uses, so claude fetched from a session and gh
+            # fetched from a card land on one nixpkgs rather than two.
+            AGENT_BOX_NIXPKGS = jitNixpkgsRef;
+            AGENT_BOX_NIX_BIN = "${config.nix.package}/bin/nix";
           }
           // lib.optionalAttrs webhookEnabled {
             # Webhook subscriptions panel (issue #227). The daemon runs
