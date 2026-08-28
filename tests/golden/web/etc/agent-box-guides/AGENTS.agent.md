@@ -157,7 +157,19 @@ a comment on it no longer starts a second session on top of you:
       --note "PR 42: waiting on CI + review" \
       --include '{"any":[{"path":"pull_request.number","in":[42]},
                          {"path":"issue.number","in":[42]},
-                         {"path":"workflow_run.head_branch","in":["fix/42-thing"]}]}'
+                         {"path":"workflow_run.head_branch","in":["fix/42-thing"]},
+                         {"path":"workflow_job.head_branch","in":["fix/42-thing"]},
+                         {"path":"check_run.check_suite.head_branch","in":["fix/42-thing"]},
+                         {"path":"check_suite.head_branch","in":["fix/42-thing"]}]}'
+
+Name EVERY CI shape, not just `workflow_run`. A standing watch spawns on
+terminal failure reported through any of `workflow_run`, `workflow_job`,
+`check_run`, `check_suite`, `deployment_status` or a bare commit `status` —
+so a claim that scopes only `workflow_run` leaves the other paths unclaimed,
+and a red check on YOUR branch starts a second session on top of you. That
+is not hypothetical: it happened on PR #417, where a `check_run` failure
+spawned a sibling that began editing the same git worktree the owning
+session was committing from.
 
 Claude Code has the same as MCP tools (`webhook_subscribe`,
 `webhook_unsubscribe`, `webhook_subscriptions`); both share one list.
