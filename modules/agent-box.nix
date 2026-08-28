@@ -1578,10 +1578,22 @@ if __name__ == "__main__":
 rcname=$1; shift
 if [ -n "$rcname" ] && [ -z "''${AGENT_BOX_CODEX_UTS:-}" ]; then
   export AGENT_BOX_CODEX_UTS=1
-  exec unshare --user --map-current-user --keep-caps --uts \
-    bash -c \
-    '"''${AGENT_BOX_HOSTNAME_BIN:-hostname}" "$1" || exit 1; shift; exec "$@"' \
-    -- "$rcname" "$0" "$rcname" "$@"
+  # The UTS-hostname trick needs an unprivileged user namespace, and not
+  # every host allows one: Ubuntu ships kernel.apparmor_restrict_unprivileged_userns=1
+  # by default, so on a native (non-NixOS) box `unshare --user` fails while
+  # writing /proc/self/uid_map ("Operation not permitted") — issue #428. This
+  # is the session's foreground `exec`, so that failure took the whole codex
+  # session down with it, dropping the pane to a bare shell. The label is
+  # cosmetic (it only sets serverName in the Codex apps), so probe once and
+  # skip the re-exec when namespaces are denied: the session then runs under
+  # the kernel hostname instead of crashing. `unshare ... true` costs a fast
+  # fork and leaves no namespace behind.
+  if unshare --user --map-current-user --keep-caps --uts true 2>/dev/null; then
+    exec unshare --user --map-current-user --keep-caps --uts \
+      bash -c \
+      '"''${AGENT_BOX_HOSTNAME_BIN:-hostname}" "$1" || exit 1; shift; exec "$@"' \
+      -- "$rcname" "$0" "$rcname" "$@"
+  fi
 fi
 codex=$1; shift
 stop() { "$codex" app-server daemon stop >/dev/null 2>&1 || true; }
