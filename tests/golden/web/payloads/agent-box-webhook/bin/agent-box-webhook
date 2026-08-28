@@ -26,6 +26,7 @@ usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
                                          [--deliver-to session|subagent]
                                          [--renew-on-event] [--ignore-sender LOGIN]...
                                          [--when JSON] [--drop JSON]
+                                         [--claim SPEC]...
        agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent]
        agent-box-webhook ls
        agent-box-webhook status
@@ -93,6 +94,28 @@ sender mute — it also drops that sender's CI-outcome events, where earlier
 versions delivered those anyway. Put the sender check INSIDE --when/--drop
 instead ({"path": "sender.login", "notIn": [...]}) when a CI result from that
 sender should still get through.
+
+--claim says "I have picked this up", and is the reason a standing watch
+does not start a second session on top of you. SPEC is one of:
+
+  42              the issue OR pull request numbered 42
+  pr:42           just the pull request
+  issue:42        just the issue
+  branch:NAME     everything CI reports against that branch
+
+Repeatable; the clauses OR together. Picking up a PR is normally both:
+
+  agent-box-webhook subscribe OWNER/REPO --note "PR 42: CI + review" \
+    --claim pr:42 --claim branch:fix/42-thing
+
+Prefer this to hand-writing --include. A claim only covers the payload
+paths it names, and CI reports terminal failure under six of them
+(workflow_run, workflow_job, check_run, check_suite, deployment_status,
+commit status) — so a hand-written claim that names one is silently
+unclaimed for the rest. That is not hypothetical: it is how PR #417 got a
+second session editing the same git worktree as the first. --claim writes
+all of them for you. --claim and --include are mutually exclusive; write
+--include yourself only for rules --claim cannot express.
 
 --when / --drop attach payload rules to the subscription: deliver (or
 spawn) ONLY events matching --when, never those matching --drop. Rules are
@@ -311,26 +334,129 @@ default_subagent_when() {
   fi
 }
 
+# --claim SPEC (issue #420): the ergonomic way to say "I have picked this up".
+#
+# A claim is what stops a standing watch spawning a second session on top of
+# you, and it only works for the paths it actually names. Hand-written, that
+# is six clauses of JSON per claim — and an incomplete one fails SILENTLY:
+# nothing warns you, a sibling just turns up. On PR #417 exactly that
+# happened, because the documented example scoped workflow_run and a
+# check_run failure went unclaimed.
+#
+# So the vocabulary lives here instead of in every agent's head:
+#
+#   --claim 42                 the issue OR pull request numbered 42
+#   --claim pr:42              just the pull request
+#   --claim issue:42           just the issue
+#   --claim branch:fix/42      everything CI reports against that branch
+#
+# Repeatable, and the clauses OR together — `--claim pr:42 --claim
+# branch:fix/42-thing` is the normal shape for picking up a PR.
+claim_clauses() {
+  # claim_clauses SPEC — the JSON clauses for one spec, as a JSON array.
+  _cl_spec=$1
+  case "$_cl_spec" in
+    (pr:*)     _cl_kind=pr;     _cl_val=${_cl_spec#pr:} ;;
+    (issue:*)  _cl_kind=issue;  _cl_val=${_cl_spec#issue:} ;;
+    (branch:*) _cl_kind=branch; _cl_val=${_cl_spec#branch:} ;;
+    (*)        _cl_kind=number; _cl_val=$_cl_spec ;;
+  esac
+  if [ -z "$_cl_val" ]; then
+    echo "agent-box-webhook: --claim $_cl_spec has an empty value" >&2
+    return 1
+  fi
+  case "$_cl_kind" in
+    (pr|issue|number)
+      case "$_cl_val" in
+        (*[!0-9]*)
+          echo "agent-box-webhook: --claim $_cl_spec is not a number;" \
+               "use branch:NAME to claim a branch" >&2
+          return 1 ;;
+      esac ;;
+  esac
+  case "$_cl_kind" in
+    (pr)     "$JQ" -nc --argjson n "$_cl_val" \
+               '[{path:"pull_request.number", "in":[$n]}]' ;;
+    (issue)  "$JQ" -nc --argjson n "$_cl_val" \
+               '[{path:"issue.number", "in":[$n]}]' ;;
+    # A bare number claims both, because an agent picking up "42" does not
+    # always know whether the events it will see call it an issue or a PR —
+    # GitHub itself uses both for the same object (a PR comment arrives as
+    # issue_comment with issue.number).
+    (number) "$JQ" -nc --argjson n "$_cl_val" \
+               '[{path:"pull_request.number", "in":[$n]},
+                 {path:"issue.number", "in":[$n]}]' ;;
+    # Every shape CI reports a branch under. workflow_run alone is what the
+    # old documented example covered, and it is one of five: a red
+    # check_run, check_suite or workflow_job on your own branch would each
+    # have spawned a sibling. `ref` catches the push itself, and
+    # pull_request.head.ref a PR event whose number you did not claim.
+    (branch) "$JQ" -nc --arg b "$_cl_val" \
+               '[{path:"workflow_run.head_branch", "in":[$b]},
+                 {path:"workflow_job.head_branch", "in":[$b]},
+                 {path:"check_run.check_suite.head_branch", "in":[$b]},
+                 {path:"check_suite.head_branch", "in":[$b]},
+                 {path:"pull_request.head.ref", "in":[$b]},
+                 {path:"ref", "in":["refs/heads/" + $b]}]' ;;
+  esac
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
   subscribe)
     ensure_state
     if [ "${1:-}" != "-h" ] && [ "${1:-}" != "--help" ]; then
       deliver_to=session; have_when=0; have_drop=0; topic=""; want=""
-      for a in "$@"; do
+      have_include=0; claims=""
+      # Filter --claim out of the argument list as we scan it: webhook.py has
+      # never heard of that flag, so it is translated to --include below and
+      # must not survive into the exec. Rotate idiom — take from the front,
+      # append the keepers to the back, exactly $# times — so this stays
+      # POSIX and never mangles an argument containing whitespace.
+      argc=$#
+      while [ "$argc" -gt 0 ]; do
+        a=$1; shift; argc=$((argc - 1))
         if [ -n "$want" ]; then
-          case "$want" in (deliver-to) deliver_to="$a" ;; esac
-          want=""; continue
+          case "$want" in
+            (deliver-to) deliver_to="$a" ;;
+            (claim) claims="$claims $a"; want=""; continue ;;
+          esac
+          want=""
+          set -- "$@" "$a"; continue
         fi
         case "$a" in
           --deliver-to) want=deliver-to ;;
           --deliver-to=*) deliver_to="${a#--deliver-to=}" ;;
           --when|--when=*) have_when=1 ;;
           --drop|--drop=*) have_drop=1 ;;
+          --include|--include=*) have_include=1 ;;
+          --claim) want=claim; continue ;;
+          --claim=*) claims="$claims ${a#--claim=}"; continue ;;
           --*) ;;
           *) [ -n "$topic" ] || topic="$a" ;;
         esac
+        set -- "$@" "$a"
       done
+      if [ -n "$want" ]; then
+        echo "agent-box-webhook: --$want needs a value" >&2
+        exit 2
+      fi
+      if [ -n "$claims" ]; then
+        if [ "$have_include" = 1 ]; then
+          echo "agent-box-webhook: pass --claim OR --include, not both —" \
+               "--claim builds the --include for you; write --include" \
+               "yourself if you need rules --claim cannot express" >&2
+          exit 2
+        fi
+        all="[]"
+        # Unquoted on purpose: claims is a space-separated list this script
+        # built, and a spec cannot contain whitespace (a branch name cannot).
+        for c in $claims; do
+          one="$(claim_clauses "$c")" || exit 2
+          all="$("$JQ" -nc --argjson a "$all" --argjson b "$one" '$a + $b')"
+        done
+        set -- "$@" --include "$("$JQ" -nc --argjson any "$all" '{any:$any}')"
+      fi
       if [ "$deliver_to" = subagent ] && [ "$have_when" = 0 ] && [ "$have_drop" = 0 ]; then
         # A bare "owner/repo" (no "source:" prefix at all) is the github
         # shorthand; anything with its OWN "source:" prefix — including a

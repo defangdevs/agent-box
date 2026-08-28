@@ -13,37 +13,34 @@ context still knows what the event is about.
     agent-box-webhook ls                     # what this session listens to
     agent-box-webhook unsubscribe OWNER/REPO # when you wrap up
 
-When you pick up ONE issue or PR, say so with `--include`. That both narrows
+When you pick up ONE issue or PR, say so with `--claim`. That both narrows
 what reaches you and tells a standing watch the work is taken, so a review or
 a comment on it no longer starts a second session on top of you:
 
     agent-box-webhook subscribe OWNER/REPO \
       --note "PR 42: waiting on CI + review" \
-      --include '{"any":[{"path":"pull_request.number","in":[42]},
-                         {"path":"issue.number","in":[42]},
-                         {"path":"workflow_run.head_branch","in":["fix/42-thing"]},
-                         {"path":"workflow_job.head_branch","in":["fix/42-thing"]},
-                         {"path":"check_run.check_suite.head_branch","in":["fix/42-thing"]},
-                         {"path":"check_suite.head_branch","in":["fix/42-thing"]}]}'
+      --claim pr:42 --claim branch:fix/42-thing
 
-Name EVERY CI shape, not just `workflow_run`. A standing watch spawns on
-terminal failure reported through any of `workflow_run`, `workflow_job`,
-`check_run`, `check_suite`, `deployment_status` or a bare commit `status` —
-so a claim that scopes only `workflow_run` leaves the other paths unclaimed,
-and a red check on YOUR branch starts a second session on top of you. That
-is not hypothetical: it happened on PR #417, where a `check_run` failure
-spawned a sibling that began editing the same git worktree the owning
-session was committing from.
+`--claim` is the whole of it: `42` for an issue or PR by number, `pr:42` or
+`issue:42` to be specific, `branch:NAME` for everything CI reports against a
+branch. Repeat it, and the clauses OR together.
 
-The example above leaves out `deployment_status` and bare commit `status`
-on purpose, not by oversight: both carry the branch under a different shape
-(`status` puts it in a `branches[]` array, not a single field a `--include`
-path can match), so a predicate for them needs a shape you have actually
-seen fire on your repo, not a copy-pasted guess. Add one only once you have
-a real payload to match against.
+Use it rather than hand-writing `--include`. A claim only covers the payload
+paths it names, and a watch spawns on terminal CI failure reported through
+six of them — `workflow_run`, `workflow_job`, `check_run`, `check_suite`,
+`deployment_status` and a bare commit status. A claim that names one is
+SILENTLY unclaimed for the others: nothing warns you, a sibling session just
+turns up. That is how PR #417 ended up with two sessions editing the same git
+worktree. `--claim branch:` writes every shape for you.
+
+`--include` still exists for rules `--claim` cannot express; the two are
+mutually exclusive.
 
 Claude Code has the same as MCP tools (`webhook_subscribe`,
-`webhook_unsubscribe`, `webhook_subscriptions`); both share one list.
+`webhook_unsubscribe`, `webhook_subscriptions`); both share one list. Those
+are local-webhook's own tools and have no `--claim` — they take the raw
+`include` rules — so when you are claiming an object, reach for the CLI and
+let it write them.
 Subscriptions are PER SESSION and expire after an hour (`--ttl HOURS` for a
 longer wait). `--ignore-sender YOU` mutes echoes of your own comments and
 pushes — since local-webhook 0.23.0 this is a PURE sender mute, so it also

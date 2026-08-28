@@ -966,6 +966,28 @@
               cp log "$out"
             '';
 
+          # Unit test for `subscribe --claim` (issues #419, #420). A claim
+          # is what stops a standing watch spawning a second session onto
+          # work already in hand, and its failure mode is SILENT — an
+          # incomplete claim warns about nothing, a sibling just turns up.
+          # So which payload paths a claim covers is pinned here byte for
+          # byte, with webhook.py shimmed to print its argv: no daemon, no
+          # network, and it runs natively on every architecture.
+          webhook-claim =
+            pkgs.runCommand "agent-box-webhook-claim"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.jq pkgs.gawk ];
+                script = ./modules/src/webhook-cli.sh;
+                tests = ./tests/test-webhook-claim.sh;
+              } ''
+              bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Unit test for the env store's format (issue #212). The VM tests
           # prove one PEM survives one caller at 300+ seconds a run; this
           # pins the format itself — round trip, no key injection, and the
