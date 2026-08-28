@@ -541,8 +541,14 @@ class Renderer:
             "  stop)",
             '    [ -r "$dev_file" ] || exit 0',
             '    dev=$(cat "$dev_file")',
-            '    swapoff "$dev" || true',
-            '    zramctl --reset "$dev" || true',
+            # No `|| true`: `set -e` is what makes this safe. A failed
+            # swapoff or reset stops the script before the rm below, so
+            # the device stays on record — deleting it on a teardown that
+            # did not actually happen is how a still-active zram swap
+            # loses the only file naming which device it is (issue #404
+            # review).
+            '    swapoff "$dev"',
+            '    zramctl --reset "$dev"',
             '    rm -f "$dev_file"',
             "    ;;",
             "esac",
@@ -1715,7 +1721,12 @@ def generated_by_us(path):
         return False
     try:
         text = path.read_text()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # An administrator's own binary, or a file in another encoding,
+        # is exactly the kind of file this check exists to leave alone —
+        # UnicodeDecodeError is not an OSError, so without this it would
+        # crash apply instead of just saying "not ours" (issue #404
+        # review).
         return False
     if text.startswith("#!"):
         text = text.split("\n", 1)[1] if "\n" in text else ""

@@ -678,11 +678,19 @@ class RenderTest(unittest.TestCase):
                 proc = subprocess.run(args, capture_output=True, text=True)
                 self.assertEqual(0, proc.returncode, proc.stderr)
 
+            def env_text(user):
+                return (out / "etc/agent-box/units" / f"{user}.env").read_text()
+
             apply(True)
             self.assertIn("danger-full-access", conf.read_text())
+            for user in ("agent", "robot"):
+                self.assertIn("AGENT_BOX_CODEX_FULL_ACCESS=1", env_text(user))
             apply(False)
             self.assertFalse(conf.exists(),
                              "stale full-access config survived the flip")
+            for user in ("agent", "robot"):
+                self.assertNotIn("AGENT_BOX_CODEX_FULL_ACCESS", env_text(user),
+                                 "stale full-access flag survived the flip")
 
     def test_a_file_we_did_not_write_is_never_removed(self):
         """Removal is scoped to the generated header. A human who takes a
@@ -724,6 +732,12 @@ class RenderTest(unittest.TestCase):
             link.symlink_to(elsewhere)
             self.assertFalse(mod.remove_if_ours(link))
             self.assertTrue(link.is_symlink())
+            # The target is an administrator's file too, reached only
+            # through their own symlink — leaving the link alone is not
+            # enough if the target got touched on the way.
+            self.assertTrue(elsewhere.exists())
+            self.assertEqual(mod.GENERATED_HEADER + "x = 1\n",
+                             elsewhere.read_text())
 
     def test_codex_full_access_is_file_and_flag_together(self):
         """Never the flag without the file. supervisor.sh reads the flag as
@@ -762,6 +776,18 @@ class RenderTest(unittest.TestCase):
             for ok in (True, False, None):
                 config["codexFullAccess"] = ok
                 mod.Spec(config, prof)  # must not raise
+            # null has to actually BEHAVE like off, not just be accepted:
+            # bool(None) is False, but only a render proves nothing reads
+            # it the other way.
+            config["codexFullAccess"] = None
+            spec = mod.Spec(config, prof)
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "null").render()
+            self.assertFalse(
+                [f for f in tree.files if f.endswith("codex/config.toml")],
+                "codexFullAccess: null rendered the full-access file")
+            env = [text for path, (text, _) in tree.files.items()
+                   if path.endswith("/agent.env")][0]
+            self.assertNotIn("AGENT_BOX_CODEX_FULL_ACCESS", env)
 
     def test_hook_session_args_rejects_a_bare_string(self):
         """A bare string is iterable, so list() would silently turn

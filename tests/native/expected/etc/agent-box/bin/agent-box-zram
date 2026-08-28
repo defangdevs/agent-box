@@ -16,8 +16,8 @@ case "${1:-start}" in
   stop)
     [ -r "$dev_file" ] || exit 0
     dev=$(cat "$dev_file")
-    swapoff "$dev" || true
-    zramctl --reset "$dev" || true
+    swapoff "$dev"
+    zramctl --reset "$dev"
     rm -f "$dev_file"
     ;;
 esac
