@@ -3516,7 +3516,19 @@ esac
             if [ -n "$want" ]; then
               case "$want" in
                 (deliver-to) deliver_to="$a" ;;
-                (claim) claims="$claims $a"; want=""; continue ;;
+                (claim)
+                  # Reject the empty value HERE. claim_clauses has its own
+                  # guard, but it is unreachable for this: an empty spec
+                  # vanishes in the unquoted word-split below, so the loop
+                  # never calls it and the CLI would emit {"any":[]} — a rule
+                  # matching NOTHING — and exit 0. That is the worst failure
+                  # this flag can have: you believe you are claimed and
+                  # subscribed, and no event ever arrives.
+                  if [ -z "$a" ]; then
+                    echo "agent-box-webhook: --claim needs a value" >&2
+                    exit 2
+                  fi
+                  claims="$claims $a"; want=""; continue ;;
               esac
               want=""
               set -- "$@" "$a"; continue
@@ -3528,7 +3540,12 @@ esac
               --drop|--drop=*) have_drop=1 ;;
               --include|--include=*) have_include=1 ;;
               --claim) want=claim; continue ;;
-              --claim=*) claims="$claims ''${a#--claim=}"; continue ;;
+              --claim=*)
+                if [ -z "''${a#--claim=}" ]; then
+                  echo "agent-box-webhook: --claim= needs a value" >&2
+                  exit 2
+                fi
+                claims="$claims ''${a#--claim=}"; continue ;;
               --*) ;;
               *) [ -n "$topic" ] || topic="$a" ;;
             esac
@@ -3552,6 +3569,15 @@ esac
               one="$(claim_clauses "$c")" || exit 2
               all="$("$JQ" -nc --argjson a "$all" --argjson b "$one" '$a + $b')"
             done
+            # Backstop, independent of how the list was built: an empty `any`
+            # matches nothing at all, so emitting one would silently subscribe
+            # this session to silence. If a future edit ever produces one,
+            # fail loudly here instead.
+            if [ "$("$JQ" -nc --argjson a "$all" '$a | length')" = 0 ]; then
+              echo "agent-box-webhook: --claim produced no rules; refusing to" \
+                   "subscribe to a filter that matches nothing" >&2
+              exit 2
+            fi
             set -- "$@" --include "$("$JQ" -nc --argjson any "$all" '{any:$any}')"
           fi
           if [ "$deliver_to" = subagent ] && [ "$have_when" = 0 ] && [ "$have_drop" = 0 ]; then

@@ -132,6 +132,27 @@ run defangdevs/agent-box --claim fix/42 >/dev/null
   && ok "a bare branch name is refused, and says to use branch:" \
   || no "a bare branch name is refused" "$(cat "$work/err")"
 
+# An EMPTY value is the dangerous one: it used to vanish in the word-split
+# that builds the rule list, so claim_clauses' own guard never ran and the
+# CLI emitted {"any":[]} — a filter matching NOTHING — and exited 0. You
+# would believe you were claimed and subscribed, and no event would ever
+# arrive. Both spellings, and never a silent success.
+for empty_form in "--claim=" "--claim "; do
+  case "$empty_form" in
+    "--claim=") run defangdevs/agent-box --claim= >"$work/out" ;;
+    *)          run defangdevs/agent-box --claim "" >"$work/out" ;;
+  esac
+  st=$?
+  if [ "$st" -eq 0 ]; then
+    no "an empty [$empty_form] value is refused" \
+       "exited 0, argv: $(tr '\n' ' ' < "$work/out")"
+  elif grep -q '{"any":\[\]}' "$work/out"; then
+    no "an empty [$empty_form] value is refused" "emitted an empty filter"
+  else
+    ok "an empty [$empty_form] value is refused"
+  fi
+done
+
 run defangdevs/agent-box --claim >/dev/null
 [ $? -ne 0 ] && ok "a --claim with no value is refused" \
   || no "a --claim with no value is refused"
