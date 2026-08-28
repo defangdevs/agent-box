@@ -1,4 +1,5 @@
 ---
+name: do
 description: End-to-end task execution for agent-box — research, plan, implement, review, and merge via PR. Tracked entirely in the GitHub issue/PR; no local state file.
 argument-hint: <task description, or an existing issue number>
 ---
@@ -20,7 +21,7 @@ You are an autonomous task executor for `defangdevs/agent-box`. Take the task ab
 1. If the user gave an issue number, use it (`gh issue view <n> --repo defangdevs/agent-box`).
 2. Otherwise search open issues for a match (`gh issue list --repo defangdevs/agent-box --search "..."`). Only open a new one if nothing fits.
 3. Assign yourself: `gh issue edit <n> --repo defangdevs/agent-box --add-assignee @me`.
-4. Build a `TodoWrite` list mirroring Phases 1–7 — your in-session view only.
+4. Build an in-session task list mirroring Phases 1–7 (`TodoWrite` in Claude Code; your harness's own plan/task tool otherwise) — your in-session view only, not the record of truth.
 5. Post the plan as an issue comment before writing any code. After this, phase-boundary updates go into the issue body (or the PR body once one exists) as edited checklist items — edits don't notify watchers the way new comments do. Reserve new comments for real milestones: plan posted, PR opened, PR merged.
 
 ## Phase 1 — Research
@@ -64,10 +65,10 @@ Fix failures before proceeding, then check off validation in the issue/PR body.
 
 ## Phase 5 — Review
 
-| Touches | Reviewer | Checks |
+| Touches | Run | Checks |
 |---|---|---|
-| Always | `/code-review` | correctness, reuse/simplification, efficiency |
-| `**/auth*`, `**/secret*`, `**/*token*`, webhook routing, sudo rules, Caddy auth config | `/security-review` | credential handling, auth bypass, OWASP |
+| Always | a full code review pass (Claude Code: `/code-review`; otherwise review the diff yourself with the same rigor) | correctness, reuse/simplification, efficiency |
+| `**/auth*`, `**/secret*`, `**/*token*`, webhook routing, sudo rules, Caddy auth config | a security-focused pass (Claude Code: `/security-review`) | credential handling, auth bypass, OWASP |
 | `aws/**`, anything with IAM/networking impact | manual self-check | cost, IAM, networking, migration impact — call these out explicitly in the PR body per `AGENTS.md` |
 
 **Hard stop:** don't open the PR until every triggered reviewer is addressed. Record PASS/ADDRESSED against each in the issue/PR body.
