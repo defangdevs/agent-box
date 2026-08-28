@@ -523,6 +523,26 @@ class RenderTest(unittest.TestCase):
             spec = mod.Spec(config, prof)
             self.assertFalse(spec.webhook_enable)
 
+    def test_a_quoted_false_does_not_turn_the_web_front_door_loose(self):
+        """Same trap, same fix, for `web.enable` (CodeRabbit finding on PR
+        #431): it now gates webhook_enable too, so a stringly-typed
+        "false" must not slip past bool() and enable both."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for bad in ("false", "true", 0, 1, [], {}):
+                config["web"] = {"enable": bad}
+                with self.assertRaises(mod.ConfigError):
+                    mod.Spec(config, prof)
+            for ok in (True, False, None):
+                config["web"] = {"enable": ok}
+                mod.Spec(config, prof)  # must not raise
+            config["web"] = {"enable": None}
+            spec = mod.Spec(config, prof)
+            self.assertFalse(spec.web_enable)
+            self.assertFalse(spec.webhook_enable)
+
     def test_the_store_has_a_janitor(self):
         """Issue #394: a full root wedges the box — no journal, no profile
         swap, no working agent — and on a native box nobody is around to

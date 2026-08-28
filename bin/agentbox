@@ -314,7 +314,14 @@ class Spec:
                                or profile_webhook_script(profile) or "")
         self._webhook_enable = bool(webhook_enable)
         web = data.get("web") or {}
-        self.web_enable = bool(web.get("enable", True))
+        web_enable = web.get("enable", True)
+        # Same trap, same fix (CodeRabbit finding on PR #431): web.enable
+        # now gates webhook_enable too, so a quoted "false" here would
+        # silently turn webhooks loose as well. null still means off.
+        if web_enable is not None and not isinstance(web_enable, bool):
+            raise ConfigError(
+                f"web.enable must be true, false or null, got {web_enable!r}")
+        self.web_enable = bool(web_enable)
         self.protect_memory = bool(data.get("protectMemory", True))
         # Codex autonomy for the WHOLE box (issue 234). Default true, as
         # the module's option is: the box IS the sandbox, and an agent that
