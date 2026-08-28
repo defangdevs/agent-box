@@ -1335,12 +1335,24 @@ class Renderer:
                        f'{UPDATE_TRIGGER}"',
                        f'Environment="AGENT_BOX_UPDATE_UNIT={UPDATE_UNIT}"',
                    ] + ([
-                       # The standing-watch panel (issue #227) shells out to
-                       # the SAME script and interpreter the receiver runs,
-                       # so the panel cannot drift from the semantics the
-                       # receiver implements. Without the interpreter the
-                       # daemon falls back to its own, which need not have
-                       # local-webhook's dependencies.
+                       # The webhook panel (issue #227) shells out to the
+                       # SAME script and interpreter the receiver runs, so
+                       # the panel cannot drift from the semantics the
+                       # receiver implements.
+                       #
+                       # The SCRIPT is what the daemon gates the whole panel
+                       # on (WEBHOOKS = bool(WEBHOOK_SCRIPT and
+                       # WEBHOOK_STATE_DIR)), so leaving it out hid every
+                       # webhook row on every native box — the endpoint and
+                       # secret, the standing watches, and each session's
+                       # subscription fold — exactly the #392 shape, and
+                       # invisible to a fixture that ratifies what the
+                       # renderer already emits (issue #425).
+                       f'Environment="AGENT_BOX_WEBHOOK_SCRIPT='
+                       f'{self.spec.webhook_script}"',
+                       # Without the interpreter the daemon falls back to
+                       # its own, which need not have local-webhook's
+                       # dependencies.
                        f'Environment="AGENT_BOX_WEBHOOK_PYTHON='
                        f'{self.bin}/python3"',
                        # --preamble mode only: the panel prints the prompt
