@@ -29,6 +29,12 @@
       remoteControlHost = "";
       users.agent = {
         web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+        # This test predates the front door (issue #416) and its subject is
+        # what happens WITH a session running, so it opts back in to the
+        # seeded "main" a web box no longer gets by default. Without this
+        # the supervisor starts no tmux server at all and every assertion
+        # below fails on "error connecting to .../tmux-1000/agent-box".
+        seedMainSession = true;
       };
       web = {
         enable = true;

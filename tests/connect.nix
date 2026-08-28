@@ -163,6 +163,15 @@ in
         installAgents = [ "claude" ];
         users.agent = {
           web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+          # This test predates the front door (issue #416): its sign-in
+          # panes are children of the agent unit's tmux server, and
+          # connect_start REFUSES to create that server itself (it would
+          # reparent every later session into the settings daemon's
+          # cgroup). So it needs the seeded "main" a web box no longer
+          # gets by default — including for the subtest below that KILLS
+          # every session to prove the card reports "blocked" rather than
+          # offering a dead button.
+          seedMainSession = true;
         };
         web = {
           enable = true;
