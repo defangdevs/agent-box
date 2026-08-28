@@ -37,6 +37,10 @@
   # wrapper around it; without a pin there is nothing to wrap, so the webhook
   # payloads are simply left out rather than shipped broken.
 , localWebhookScript ? null
+  # Where that script came from, shipped into the profile as data so the native
+  # renderer can read the marketplace repo without evaluating Nix. Defaults to
+  # the same file the module's option defaults read.
+, webhookPin ? import ./webhook-pin.nix
 }:
 let
   src = ../modules/src;
@@ -180,6 +184,28 @@ let
 
   webhookEnabled = localWebhookScript != null;
 
+  # The pinned webhook.py, installed into the profile beside the other shared
+  # assets (guides, units, caddy snippets). The native renderer points the CLI
+  # and the settings panel at THIS path, and the receiver wrapper below execs
+  # the same file, so a native box has one answer to "which webhook.py do we
+  # run" instead of a store path for the daemon and a hand-declared path for
+  # everything else (issue #425).
+  webhookScriptAsset = pkgs.runCommand "agent-box-local-webhook" { } ''
+    install -Dm444 ${localWebhookScript} \
+      $out/share/agent-box/local-webhook/webhook.py
+    install -Dm444 ${webhookPinFile} \
+      $out/share/agent-box/local-webhook/pin.json
+  '';
+  # The pin as data, for `agentbox apply`: the supervisor needs the MARKETPLACE
+  # repo (AGENT_BOX_WEBHOOK_REPO, which doubles as its enable flag) to pin
+  # claude's local-webhook plugin, and the renderer is a python script with no
+  # way to evaluate Nix. Shipping the pin beside the script keeps
+  # nix/webhook-pin.nix the single home for it (issue #425).
+  webhookPinFile = pkgs.writeText "agent-box-webhook-pin.json"
+    (builtins.toJSON webhookPin);
+  webhookScriptFile =
+    "${webhookScriptAsset}/share/agent-box/local-webhook/webhook.py";
+
   # Unit-driven payloads: a systemd unit (or ttyd) execs these by bare name,
   # with every value they need supplied by the generated env file.
   unitPayloads = [
@@ -196,8 +222,9 @@ let
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-spawn" "webhook-spawn.sh")
     (pkgs.writeShellScriptBin "agent-box-webhook-receiver" ''
-      exec ${pkgs.python3}/bin/python3 ${localWebhookScript} "$@"
+      exec ${pkgs.python3}/bin/python3 ${webhookScriptFile} "$@"
     '')
+    webhookScriptAsset
   ];
 
   # The native configuration layer itself (bin/agentbox). It ships in the

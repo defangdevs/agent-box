@@ -132,6 +132,22 @@
           # embeds — see nix/runtime.nix.
           runtime = import ./nix/runtime.nix {
             pkgs = nixpkgs.legacyPackages.${system};
+            # The pinned webhook.py, from the same file the module's
+            # services.agent-box.webhook.{repo,rev,sha256} defaults read
+            # (nix/webhook-pin.nix). Without it runtime.nix has no pin to
+            # wrap, so the profile shipped NONE of the webhook payloads and
+            # every native box rendered a receiver unit, a CLI wrapper and a
+            # spawn command pointing at binaries that were not there — issue
+            # #425. builtins.fetchurl, as the module does it: a hash is given,
+            # so it is pure, and no build step stands between the pin and the
+            # profile.
+            localWebhookScript =
+              let pin = import ./nix/webhook-pin.nix; in
+              builtins.fetchurl {
+                url = "https://raw.githubusercontent.com/${pin.repo}/${pin.rev}"
+                      + "/local-webhook/webhook.py";
+                sha256 = pin.sha256;
+              };
             # The bundled agent CLIs are unfree, and a flake package has no
             # host configuration.nix to carry an allowUnfreePredicate — so
             # allow exactly those two here, the same set (and the same
@@ -942,13 +958,18 @@
                 # same bytes — so this one asset outside modules/src is part
                 # of the module's source set too.
                 mark = ./docs/potato.svg;
+                # Same reasoning as the mark: the webhook pin is one file
+                # outside modules/src that the template splices, because both
+                # backends have to read the pin from ONE place (issue #425).
+                pin = ./nix/webhook-pin.nix;
               } ''
-              install -d repo/bin repo/modules repo/docs
+              install -d repo/bin repo/modules repo/docs repo/nix
               cp "$assembler" repo/bin/assemble-module.py
               cp "$template" repo/modules/agent-box.nix.in
               cp "$committed" repo/modules/agent-box.nix
               cp -r "$srcDir" repo/modules/src
               cp "$mark" repo/docs/potato.svg
+              cp "$pin" repo/nix/webhook-pin.nix
               python3 repo/bin/assemble-module.py --check --repo repo
               touch "$out"
             '';
