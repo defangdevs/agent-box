@@ -1940,6 +1940,30 @@ def systemd_units_live(prefix):
     return [line.split()[0] for line in out.splitlines() if line.strip()]
 
 
+def zram_module_available():
+    """True unless `modprobe zram` (agent-box-zram.service's ExecStart)
+    can be proven to fail — a --dry-run, so this never actually loads it.
+
+    Some kernels (Azure's linux-azure Ubuntu images, issue #435) split
+    zram out into linux-modules-extra-$(uname -r), which the marketplace
+    image does not install; modprobe then aborts under the unit's
+    `set -eu` and zram silently never comes up. Only a missing modprobe
+    binary reports available rather than warn on a guess — any OTHER
+    failure to even run it (e.g. permissions) is not proof the module is
+    fine, and staying quiet there is exactly the silent-degradation this
+    check exists to catch.
+    """
+    try:
+        return subprocess.run(
+            ["modprobe", "--dry-run", "--quiet", "zram"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
 def cmd_apply(args):
     profile = resolve_profile(args.profile)
     spec = Spec(load_config(args.config), profile)
@@ -1997,6 +2021,19 @@ def cmd_apply(args):
             # Also on the way DOWN: our file has just been removed, so this
             # is what lets whatever else sets these values have them back.
             run(["sysctl", "--system"], check=False)
+        if spec.protect_memory and not zram_module_available():
+            # #435: linux-azure Ubuntu images ship no zram module (it is
+            # split into linux-modules-extra-$(uname -r), which the
+            # marketplace image does not install) — agent-box-zram.service
+            # then fails at ExecStart and nothing else surfaces it; the box
+            # quietly runs on disk swap only. Caught here, not inside the
+            # unit, because this is a one-time apply-time diagnosis, not
+            # something to shell out for on every start/stop.
+            rend.notes.append(
+                "zram unavailable on this kernel (modprobe zram would "
+                "fail) — install linux-modules-extra-$(uname -r) (or your "
+                "distro's equivalent) and re-apply; until then "
+                f"{ZRAM_UNIT} fails and the box runs on disk swap only")
         if spec.protect_memory:
             # Exactly one OOM daemon, explicitly. Ubuntu enables
             # systemd-oomd by default and it overlaps earlyoom — two
