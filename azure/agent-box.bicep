@@ -34,7 +34,7 @@
 @maxLength(32)
 param userName string = 'agent'
 
-@description('Password for the browser terminal. Use 16-64 characters of A-Z a-z 0-9 . _ ~ - only: the bootstrap passes it to the renderer through the environment, and characters outside that set are not quoted for. Hashed with argon2id on first boot, so the plaintext never lands on the box\'s disk, and it travels in the extension\'s encrypted protectedSettings rather than in readable instance metadata. Change it later from the box\'s own settings page.')
+@description('Password for the browser terminal, 16-64 characters. Any character is safe: it reaches the bootstrap base64-encoded, so nothing in it can break out of the shell literal it lands in. Hashed with argon2id on first boot, so the plaintext never lands on the box\'s disk, and it travels in the extension\'s encrypted protectedSettings rather than in readable instance metadata. Change it later from the box\'s own settings page.')
 @secure()
 @minLength(16)
 @maxLength(64)
@@ -106,8 +106,18 @@ param nixInstallerUrl string = 'https://install.determinate.systems/nix'
 @description('Source range allowed to reach the terminal (and SSH). A CIDR, or an Azure service tag such as Internet.')
 param allowCidr string = '0.0.0.0/0'
 
-@description('Open port 22. Unlike an image-rebuild path, SSH here keeps working exactly as the Ubuntu image left it - nothing wipes /home or /root - so this is an ordinary Ubuntu box to debug.')
-param debugSsh bool = true
+// Default false, where the AWS templates default their DebugSsh to true. Not
+// caution for its own sake: on Lightsail, SSH is the only way to read
+// /var/log/agent-box-bootstrap.log after a first boot that went wrong, so the
+// port has to be open by default for the box to be debuggable at all. Azure
+// has managed boot diagnostics, so the serial console reaches the same box
+// authenticated through Azure RBAC instead of through a credential on an open
+// port - strictly better, and it works with 22 shut. Leaving 22 open by
+// default would also mean a portal user who picks authenticationType=password
+// for convenience gets SSH password auth exposed to allowCidr, which defaults
+// to the whole internet.
+@description('Open port 22 to allowCidr. Off by default: the portal\'s serial console already gives debug access, authenticated through Azure RBAC rather than through a credential on an open port. Turn it on for an ordinary SSH session - the box is ordinary Ubuntu, and nothing here wipes /home or /root.')
+param debugSsh bool = false
 
 @description('Linux user for SSH/serial-console debug access. NOT the agent user - the agent runs as userName.')
 param adminUsername string = 'azureuser'
@@ -149,7 +159,13 @@ var imageSkuBySize = {
   Standard_B2als_v2: 'server'
 }
 
-var linuxConfiguration = {
+// Both arms are spelled out rather than leaving the password one null, so the
+// consequence of picking password auth is visible in the source instead of
+// being inferred from an absent property: choosing it DOES enable SSH password
+// authentication, to whatever allowCidr allows, whenever debugSsh is on.
+var linuxConfiguration = authenticationType == 'password' ? {
+  disablePasswordAuthentication: false
+} : {
   disablePasswordAuthentication: true
   ssh: {
     publicKeys: [
@@ -299,13 +315,21 @@ AGENTBOX_AGENTSMD
 # environment and is hashed with argon2id, so it is never written to the box's
 # disk in the clear.
 #
+# It arrives here BASE64-ENCODED, and that is load-bearing rather than tidy.
+# Bicep has no pattern constraint for a parameter - only minLength/maxLength -
+# so nothing can reject a password containing a single quote, and a raw
+# substitution into the literal below would let one close the quote and run the
+# rest of the password as root during first boot. Base64's alphabet is
+# A-Za-z0-9+/= , so the encoded form cannot break out of any quoting.
+#
 # set +x for this one command: the trace this script runs under writes every
 # expanded word to /var/log/agent-box-bootstrap.log, so leaving it on would put
-# the plaintext password in a readable log on the box - which is precisely what
-# "never written to disk" is supposed to mean. The extension also copies our
-# stdout into /var/lib/waagent/custom-script/download/0/stdout.
+# the password - encoded, which is not a secret-keeping measure - in a readable
+# log on the box, which is precisely what "never written to disk" is supposed to
+# mean. The extension also copies our stdout into
+# /var/lib/waagent/custom-script/download/0/stdout.
 set +x
-AGENT_BOX_WEB_PASSWORD='@@WEBPASSWORD@@' \
+AGENT_BOX_WEB_PASSWORD="$(printf %s '@@WEBPASSWORD@@' | base64 -d)" \
   "$AGENTBOX" apply --first-boot --settle-delay 60
 set -x
 
@@ -322,7 +346,10 @@ var bootstrap = replace(replace(replace(replace(replace(replace(
   '@@AGENT@@', agent),
   '@@USER@@', userName),
   '@@AGENTSMD@@', agentsMd),
-  '@@WEBPASSWORD@@', webPassword)
+  // base64, not the plaintext: see the comment above the apply, and
+  // check_secrets() in scripts/check_azure_template.py, which fails if this
+  // ever goes back to a raw substitution.
+  '@@WEBPASSWORD@@', base64(webPassword))
 
 // ---------------------------------------------------------------------------
 
@@ -420,7 +447,7 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
       computerName: namePrefix
       adminUsername: adminUsername
       adminPassword: authenticationType == 'password' ? adminPasswordOrKey : null
-      linuxConfiguration: authenticationType == 'password' ? null : linuxConfiguration
+      linuxConfiguration: linuxConfiguration
     }
     networkProfile: {
       networkInterfaces: [

@@ -95,8 +95,18 @@ better deal.
 offers nothing in between: `B2pts_v2` (1 GiB) is the only smaller 2-vCPU
 Ampere size and it does not survive substituting the profile.
 
-Unlike a Lightsail bundle the OS disk is resizable later: deallocate the VM,
-`az disk update --size-gb`, start it, grow the filesystem.
+Unlike a Lightsail bundle the OS disk is resizable later — grow only, and only
+while the VM is deallocated:
+
+```bash
+az vm deallocate -g agent-box -n agent-box-vm
+disk=$(az vm show -g agent-box -n agent-box-vm --query storageProfile.osDisk.name -o tsv)
+az disk update -g agent-box -n "$disk" --size-gb 128
+az vm start -g agent-box -n agent-box-vm
+```
+
+Then grow the filesystem on the box (`growpart /dev/sda 1 && resize2fs
+/dev/sda1`; cloud-init does it for you on many images).
 
 ## Deploying
 
@@ -117,11 +127,15 @@ certificate against `<addr>.sslip.io`. There is no closure to build and no
 reboot. Read the URL, the address and the Remote Control session name from
 `properties.outputs`.
 
-`webPassword` accepts 16-64 characters of `A-Z a-z 0-9 . _ ~ -` only. The
-bootstrap passes it to the renderer through the environment and quotes it for
-that set; anything outside it is not quoted for. (The AWS templates enforce
-this with an `AllowedPattern`, which Bicep has no equivalent of — hence the
-narrower charset than the AWS form's "any password-manager symbol".)
+`webPassword` is 16-64 characters, and any character is safe. Bicep has no
+`AllowedPattern` equivalent — a parameter can be constrained by length and by a
+list of allowed values, but not by a pattern — so nothing can reject a password
+containing a single quote, and a raw substitution into the bootstrap's shell
+literal would let one close the quote and run its own tail as root during first
+boot. The template substitutes `base64(webPassword)` and the script decodes it,
+so the encoded form (`A-Za-z0-9+/=`) is all the shell ever sees.
+`scripts/check_azure_template.py` renders the script with a deliberately
+hostile password and fails if the plaintext appears anywhere in it.
 
 ### If the deployment fails
 
@@ -130,13 +144,37 @@ bootstrap failed. The reason is on the box, which is still running:
 
 ```bash
 az vm extension show -g agent-box --vm-name agent-box-vm \
-  -n agent-box-bootstrap --query "instanceView.substatuses[].message" -o tsv
+  -n agent-box-bootstrap --instance-view \
+  --query "instanceView.substatuses[].message" -o tsv
 ```
+
+`--instance-view` is not optional there: without it `instanceView` comes back
+null and the query prints nothing, which reads like a clean run rather than a
+missing flag.
 
 On the box itself, `/var/log/agent-box-bootstrap.log` has the full trace (the
 handler keeps its own copy of the same stream under
-`/var/lib/waagent/custom-script/download/0/`). Boot diagnostics are on, so the
-portal's serial console works even with `debugSsh=false`.
+`/var/lib/waagent/custom-script/download/0/`). Getting onto the box needs no
+open port: boot diagnostics are on, so the portal's serial console works at the
+`debugSsh=false` default, authenticated through Azure RBAC.
+
+### SSH, and why it is off by default
+
+`debugSsh` defaults to **false**, where the AWS templates default `DebugSsh` to
+true. Not caution for its own sake — on Lightsail, SSH is the only way to read
+the bootstrap log after a first boot that went wrong, so the port has to be
+open by default for the box to be debuggable at all. Azure's serial console
+reaches the same box through Azure RBAC instead of through a credential on an
+open port, so 22 buys nothing that is not already there.
+
+It also removes a sharp edge. `authenticationType=password` is the convenient
+choice on the portal form, and it does exactly what it says: the VM accepts SSH
+password authentication. With 22 open to `allowCidr`, which defaults to the
+whole internet, that is a password prompt on the public internet. Both arms of
+`linuxConfiguration` are spelled out in the Bicep rather than leaving the
+password one null, so this is visible in the source instead of inferred from an
+absent property. Prefer `sshPublicKey` (the default); if you do want password
+auth, narrow `allowCidr`.
 
 ## Pinning
 

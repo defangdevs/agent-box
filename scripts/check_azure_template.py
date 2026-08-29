@@ -41,6 +41,7 @@ Three separate failures this catches, none of which a schema linter can:
    `webPassword` stops being a `securestring`.
 """
 import argparse
+import base64
 import json
 import re
 import shutil
@@ -64,16 +65,24 @@ BASHISMS = (
     ("<<<", "here-strings are bash-only"),
 )
 
+# A password that would break out of a single-quoted shell literal, and run the
+# tail of itself as root, if the template ever substituted it raw. Bicep cannot
+# constrain a parameter's characters — only its length — so nothing upstream
+# rejects one of these. The template base64-encodes it instead, which is why
+# SAMPLE carries the ENCODED form below and check_bootstrap asserts the
+# plaintext never appears in the rendered script.
+HOSTILE_PASSWORD = "p'; touch /tmp/pwned; '$x `id` \"q\""
+
 # Values only need to be representative: this renders the script, it does not
-# deploy it. They deliberately include the punctuation the real parameters
-# allow, so a quoting mistake in the template shows up as a parse error.
+# deploy it. They deliberately carry the punctuation a real parameter can, so a
+# quoting mistake in the template shows up as a parse error.
 SAMPLE = {
     "@@NIXINSTALLER@@": "https://install.determinate.systems/nix",
     "@@FLAKEREF@@": "github:defangdevs/agent-box/0123456789abcdef",
     "@@AGENT@@": "claude",
     "@@USER@@": "agent",
     "@@AGENTSMD@@": "## This box\n\n- A line with 'quotes' and $dollars.\n",
-    "@@WEBPASSWORD@@": "aA0._~-aA0._~-aA0",
+    "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
 }
 
 # Which parameter's defaultValue feeds which marker. The script is rendered a
@@ -164,6 +173,46 @@ def render_bootstrap(template: dict, values: dict | None = None) -> str:
     return script
 
 
+def check_chain_covers_markers(template: dict) -> int:
+    """Every marker in the script must be substituted by the Bicep itself.
+
+    Rendering with SAMPLE proves the script is well-formed once every marker is
+    replaced — it cannot prove the TEMPLATE replaces them. Drop a `replace()`
+    from the chain in the .bicep while leaving its marker in the script and the
+    render here still substitutes it from SAMPLE and reports OK, while the
+    deployed VM runs a literal `@@MARKER@@`. So compare the two directly: the
+    compiled `bootstrap` variable is the whole `replace()` chain as one ARM
+    expression, and a marker it substitutes appears in it quoted.
+    """
+    variables = template.get("variables", {})
+    script = variables.get("bootstrapTemplate", "")
+    chain = variables.get("bootstrap", "")
+    missing = [m for m in sorted(set(PLACEHOLDER.findall(script)))
+               if f"'{m}'" not in chain]
+    if missing:
+        print(
+            f"FAIL: marker(s) {missing} appear in the bootstrap script but are "
+            "not substituted by the template's replace() chain, so a deployed "
+            "box would run the literal marker.\n"
+            "       Add the missing replace() to `var bootstrap` in "
+            "azure/agent-box.bicep (and its value to SAMPLE here).",
+            file=sys.stderr,
+        )
+        return 1
+    unused = [m for m in SAMPLE if m not in script]
+    if unused:
+        print(
+            f"FAIL: SAMPLE define(s) {sorted(unused)}, which the script no "
+            "longer uses. Drop them, or this check is testing a marker nothing "
+            "renders.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"OK: all {len(SAMPLE)} markers are substituted by the template's own "
+          "replace() chain.")
+    return 0
+
+
 def defaults_render(template: dict) -> dict:
     """SAMPLE, but with every marker that has a parameter default taking it."""
     values = dict(SAMPLE)
@@ -189,6 +238,18 @@ def check_bootstrap(template: dict, values: dict, label: str) -> int:
             f"FAIL: placeholder(s) {sorted(set(left))} survive substitution — the "
             "Bicep replace() chain and the script have drifted apart, so the VM "
             "would run a literal marker.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if HOSTILE_PASSWORD in script:
+        print(
+            f"FAIL: the rendered bootstrap ({label}) contains the web password "
+            "in the clear. The template must substitute base64(webPassword), "
+            "not the plaintext: Bicep cannot constrain a parameter's "
+            "characters, so a password holding a single quote would close the "
+            "shell literal it lands in and run its own tail as root during "
+            "first boot.",
             file=sys.stderr,
         )
         return 1
@@ -273,6 +334,17 @@ def check_secrets(template: dict) -> int:
         )
         return 1
 
+    chain = template.get("variables", {}).get("bootstrap", "")
+    if "base64(parameters('webPassword'))" not in chain:
+        print(
+            "FAIL: the replace() chain does not substitute "
+            "base64(parameters('webPassword')). A raw substitution puts the "
+            "password inside a shell literal it can close - see "
+            "HOSTILE_PASSWORD above.",
+            file=sys.stderr,
+        )
+        return 1
+
     exposed = []
     for res in template.get("resources", []):
         if res.get("type") != "Microsoft.Compute/virtualMachines/extensions":
@@ -318,6 +390,7 @@ def main() -> int:
 
     template = json.loads(COMPILED.read_text())
     rc = max(
+        check_chain_covers_markers(template),
         check_bootstrap(template, SAMPLE, "hostile sample values"),
         check_bootstrap(template, defaults_render(template), "template defaults"),
         check_secrets(template),
