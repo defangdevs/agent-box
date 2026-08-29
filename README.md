@@ -143,8 +143,9 @@ own vnet, NSG and static public IPv4.
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fdefangdevs%2Fagent-box%2Fmaster%2Fazure%2Fagent-box.json)
 
 Pick a resource group and region, choose `agent` (`claude` or `codex`), set a
-`webPassword` (16&ndash;64 characters of `A-Z a-z 0-9 . _ ~ -`), paste an SSH
-public key for the debug account, deploy. The deployment reports success only
+`webPassword` (any 16&ndash;64 characters &mdash; it reaches the box
+base64-encoded, so password-manager symbols are safe), paste an SSH public key
+for the debug account, deploy. The deployment reports success only
 once the box has finished its first `agentbox apply` &mdash; on Azure that
 needs no signalling handshake, because an ARM deployment waits on the VM
 extension that runs the bootstrap and a failed apply fails the deployment. The

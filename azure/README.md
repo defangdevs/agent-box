@@ -137,6 +137,11 @@ so the encoded form (`A-Za-z0-9+/=`) is all the shell ever sees.
 `scripts/check_azure_template.py` renders the script with a deliberately
 hostile password and fails if the plaintext appears anywhere in it.
 
+That covers the template. Your own shell is still your problem on the CLI path
+above: quote the value so the local shell passes it through intact (single
+quotes, or `--parameters webPassword="$(cat pw.txt)"`). The portal form has no
+such hazard.
+
 ### If the deployment fails
 
 The extension's exit code is the deployment's, so a failure means the
