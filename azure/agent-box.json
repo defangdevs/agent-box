@@ -1,0 +1,355 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.39",
+      "templateHash": "9141299851795259086"
+    }
+  },
+  "parameters": {
+    "userName": {
+      "type": "string",
+      "defaultValue": "agent",
+      "minLength": 1,
+      "maxLength": 32,
+      "metadata": {
+        "description": "Linux user that owns the agent sessions, and the login name for the browser terminal."
+      }
+    },
+    "webPassword": {
+      "type": "securestring",
+      "minLength": 16,
+      "maxLength": 64,
+      "metadata": {
+        "description": "Password for the browser terminal. Use 16-64 characters of A-Z a-z 0-9 . _ ~ - only: the bootstrap passes it to the renderer through the environment, and characters outside that set are not quoted for. Hashed with argon2id on first boot, so the plaintext never lands on the box's disk, and it travels in the extension's encrypted protectedSettings rather than in readable instance metadata. Change it later from the box's own settings page."
+      }
+    },
+    "agent": {
+      "type": "string",
+      "defaultValue": "claude",
+      "allowedValues": [
+        "claude",
+        "codex"
+      ],
+      "metadata": {
+        "description": "Which agent CLI the box's initial session runs."
+      }
+    },
+    "vmSizeChoice": {
+      "type": "string",
+      "defaultValue": "Standard_B2pls_v2 (2 vCPU / 4 GiB / ARM Ampere / ~$21.90 mo)",
+      "allowedValues": [
+        "Standard_B2pls_v2 (2 vCPU / 4 GiB / ARM Ampere / ~$21.90 mo)",
+        "Standard_B2ps_v2 (2 vCPU / 8 GiB / ARM Ampere / ~$30.66 mo)",
+        "Standard_B4pls_v2 (4 vCPU / 8 GiB / ARM Ampere / ~$43.80 mo)",
+        "Standard_B4ps_v2 (4 vCPU / 16 GiB / ARM Ampere / ~$61.32 mo)",
+        "Standard_B2als_v2 (2 vCPU / 4 GiB / x64 AMD / ~$24.82 mo)"
+      ],
+      "metadata": {
+        "description": "VM size (the id before the parenthesis; specs and compute-only westus3 price shown for convenience). ARM Ampere is cheaper than x64 at every RAM tier - the x64 size is here for regions with no Ampere capacity."
+      }
+    },
+    "osDiskSizeGB": {
+      "type": "int",
+      "defaultValue": 64,
+      "minValue": 30,
+      "maxValue": 2048,
+      "metadata": {
+        "description": "OS disk size in GiB. Unlike a Lightsail bundle this is resizable later (stop the VM, grow the disk, grow the filesystem) - so start small."
+      }
+    },
+    "agentsMd": {
+      "type": "string",
+      "defaultValue": "## This box (Azure)\n\n- This is an Azure Linux VM running Ubuntu with agent-box installed through\n  Nix. The OS disk persists but RAM does not: a reboot or a\n  deallocate/start loses the live tmux session, so save working context to\n  disk under your home. The public IP is a Standard SKU static address, so\n  the public address (and your URL) survives a stop/start.\n- Your URL is derived from that static IP via sslip.io. It is stable, but\n  always read $AGENT_BOX_URL rather than hard-coding it.\n- The base OS is ordinary Ubuntu: apt and unattended-upgrades own it, and\n  the Azure portal's serial console works (boot diagnostics are on).\n  agent-box itself never calls apt - it lives in the Nix profile\n  /nix/var/nix/profiles/agent-box.\n- Low on disk? The OS disk is resizable: deallocate the VM, grow the disk in\n  the portal or with `az disk update --size-gb`, start it, then grow the\n  filesystem. Scheduled nix garbage collection reclaims store space in the\n  meantime.\n",
+      "metadata": {
+        "description": "Deployment-specific instructions APPENDED to the box's AGENTS.md (the agent's standing instructions), below the built-in platform guide. Empty = just that guide."
+      }
+    },
+    "agentBoxFlakeRef": {
+      "type": "string",
+      "defaultValue": "github:defangdevs/agent-box",
+      "metadata": {
+        "description": "Flake reference the runtime profile is installed from. Pin it to a revision (github:defangdevs/agent-box/<sha>) for a reproducible box; the bare ref tracks the default branch. The AWS 1-click templates get this pinned at publish time; the Azure button serves the committed template straight from GitHub, so pinning here is yours to do."
+      }
+    },
+    "nixInstallerUrl": {
+      "type": "string",
+      "defaultValue": "https://install.determinate.systems/nix",
+      "metadata": {
+        "description": "Nix installer. The Determinate installer is used deliberately: it supports SELinux (so the same script serves RHEL), survives distro upgrades, and enables flakes out of the box."
+      }
+    },
+    "allowCidr": {
+      "type": "string",
+      "defaultValue": "0.0.0.0/0",
+      "metadata": {
+        "description": "Source range allowed to reach the terminal (and SSH). A CIDR, or an Azure service tag such as Internet."
+      }
+    },
+    "debugSsh": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Open port 22. Unlike an image-rebuild path, SSH here keeps working exactly as the Ubuntu image left it - nothing wipes /home or /root - so this is an ordinary Ubuntu box to debug."
+      }
+    },
+    "adminUsername": {
+      "type": "string",
+      "defaultValue": "azureuser",
+      "metadata": {
+        "description": "Linux user for SSH/serial-console debug access. NOT the agent user - the agent runs as userName."
+      }
+    },
+    "authenticationType": {
+      "type": "string",
+      "defaultValue": "sshPublicKey",
+      "allowedValues": [
+        "sshPublicKey",
+        "password"
+      ],
+      "metadata": {
+        "description": "Whether adminPasswordOrKey below is an SSH public key or a password. Azure will not create a Linux VM with neither, even when SSH is closed at the NSG."
+      }
+    },
+    "adminPasswordOrKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "SSH public key (ssh-ed25519 AAAA...) or admin password for adminUsername, per authenticationType. This is the debug credential, not the browser terminal password."
+      }
+    },
+    "namePrefix": {
+      "type": "string",
+      "defaultValue": "agent-box",
+      "minLength": 1,
+      "maxLength": 40,
+      "metadata": {
+        "description": "Prefix for every resource name in the group."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region. Defaults to the resource group's."
+      }
+    }
+  },
+  "variables": {
+    "vmSize": "[split(parameters('vmSizeChoice'), ' ')[0]]",
+    "imageSkuBySize": {
+      "Standard_B2pls_v2": "server-arm64",
+      "Standard_B2ps_v2": "server-arm64",
+      "Standard_B4pls_v2": "server-arm64",
+      "Standard_B4ps_v2": "server-arm64",
+      "Standard_B2als_v2": "server"
+    },
+    "linuxConfiguration": {
+      "disablePasswordAuthentication": true,
+      "ssh": {
+        "publicKeys": [
+          {
+            "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+            "keyData": "[parameters('adminPasswordOrKey')]"
+          }
+        ]
+      }
+    },
+    "sshRule": "[if(parameters('debugSsh'), createArray(createObject('name', 'ssh', 'properties', createObject('priority', 1001, 'protocol', 'Tcp', 'access', 'Allow', 'direction', 'Inbound', 'sourceAddressPrefix', parameters('allowCidr'), 'sourcePortRange', '*', 'destinationAddressPrefix', '*', 'destinationPortRange', '22'))), createArray())]",
+    "httpsRule": {
+      "name": "https",
+      "properties": {
+        "priority": 1000,
+        "protocol": "Tcp",
+        "access": "Allow",
+        "direction": "Inbound",
+        "sourceAddressPrefix": "[parameters('allowCidr')]",
+        "sourcePortRange": "*",
+        "destinationAddressPrefix": "*",
+        "destinationPortRange": "443"
+      }
+    },
+    "bootstrapTemplate": "#!/usr/bin/env bash\n# agent-box native bootstrap, run once as root by the CustomScript extension.\n#\n# The handler decodes protectedSettings.script to a file and executes it, so\n# the shebang above is honoured - but the guard below costs nothing and keeps\n# the dialect independent of what any future handler does with it. The AWS\n# twin of this script needs the guard for real: Lightsail PREPENDS its own\n# \"#!/bin/sh\" preamble, which ran the whole thing under dash and killed every\n# launch the old template ever had (issue #390).\nif [ -z \"${BASH_VERSION:-}\" ]; then exec /bin/bash \"$0\" \"$@\"; fi\nset -euxo pipefail\nexec > >(tee /var/log/agent-box-bootstrap.log) 2>&1\n\n# The extension handler runs with an almost empty environment - no HOME. Nix's\n# own profile script dereferences $HOME unguarded (NIX_LINK=$HOME/.nix-profile),\n# so sourcing it under `set -u` aborts the bootstrap with \"HOME: unbound\n# variable\". Everything after this line wants a HOME too: `nix profile add`\n# writes ~/.cache/nix, and the agent CLIs read ~/.config.\nexport HOME=\"${HOME:-/root}\"\nexport DEBIAN_FRONTEND=noninteractive\n\n# CustomScript can start while cloud-init is still running its own apt phase,\n# and two apt-get runs fight over the dpkg lock. Wait it out, then still take\n# the lock with a timeout rather than failing the deployment on a race.\ncloud-init status --wait || true\nAPT=\"apt-get -o DPkg::Lock::Timeout=600 -qq\"\n\n# zram. Azure's linux-azure kernel splits the zram module into a separate\n# linux-modules-extra package that the Ubuntu marketplace images do not\n# install, so agent-box-zram.service fails on every Azure box and the box\n# silently drops to disk swap alone (issue #435). This is the Azure-image half\n# of that bug; whatever module-side fix #435 lands can drop these two lines.\n# Non-fatal: a box without compressed swap is degraded, not broken - earlyoom\n# still runs - and a kernel with no matching package must not fail the deploy.\n$APT update || true\n$APT install -y \"linux-modules-extra-$(uname -r)\" || \\\n  echo \"WARNING: linux-modules-extra unavailable; zram will be missing (issue #435)\"\n\n# Swap. There is no closure build on this path, but substituting the profile\n# peaks high enough to be worth carrying, and the agent's own work leans on it.\nif ! swapon --show=NAME --noheadings | grep -qx /agent-box-swap; then\n  fallocate -l 2G /agent-box-swap || \\\n    dd if=/dev/zero of=/agent-box-swap bs=1M count=2048\n  chmod 600 /agent-box-swap\n  mkswap /agent-box-swap\n  swapon /agent-box-swap\n  echo '/agent-box-swap none swap sw 0 0' >> /etc/fstab\nfi\n\n# Nix as a package manager. Not NixOS: this box stays Ubuntu, so apt keeps\n# owning the base OS (and unattended-upgrades keeps patching it).\n# `agentbox apply` never calls apt.\ncurl -fsSL \"@@NIXINSTALLER@@\" | sh -s -- install linux --no-confirm --determinate\n# `set +u` around a script we do not own: the installer's profile snippet is\n# free to reference whatever the next release wants, and it must not be able to\n# abort the bootstrap.\nset +u\n. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh\nset -u\n\n# The runtime profile: payloads, tools, agent CLIs, shared assets. A system\n# profile, so `nix profile rollback --profile ...` is the undo button and no\n# user's own profile is touched.\nnix profile install \\\n  --profile /nix/var/nix/profiles/agent-box \\\n  \"@@FLAKEREF@@#runtime\"\nAGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox\n\n# The box's declared state. Everything host-specific the renderer needs, and\n# nothing it can discover for itself: `domain: auto` tells --first-boot to\n# settle the public IPv4 and derive the sslip.io hostname from it. That works\n# unchanged on Azure because settle_public_ip asks checkip.amazonaws.com rather\n# than a cloud's own metadata service.\ninstall -d -m 0755 /etc/agent-box\ncat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'\ndomain: auto\nagents: [claude, codex]\ndefaultAgent: @@AGENT@@\nweb:\n  enable: true\nusers:\n  @@USER@@:\n    root: true\n    sessions:\n      main:\n        agent: @@AGENT@@\nAGENTBOX_CONFIG\n\n# Extra standing instructions for the agent, if the deployment gave any.\ninstall -d -m 0755 /etc/agent-box-guides\ncat > /etc/agent-box-guides/AGENTS.stack.md <<'AGENTBOX_AGENTSMD'\n@@AGENTSMD@@\nAGENTBOX_AGENTSMD\n\n# Render and start everything. The password reaches the renderer through the\n# environment and is hashed with argon2id, so it is never written to the box's\n# disk in the clear.\n#\n# set +x for this one command: the trace this script runs under writes every\n# expanded word to /var/log/agent-box-bootstrap.log, so leaving it on would put\n# the plaintext password in a readable log on the box - which is precisely what\n# \"never written to disk\" is supposed to mean. The extension also copies our\n# stdout into /var/lib/waagent/custom-script/download/0/stdout.\nset +x\nAGENT_BOX_WEB_PASSWORD='@@WEBPASSWORD@@' \\\n  \"$AGENTBOX\" apply --first-boot --settle-delay 60\nset -x\n\n# No signal step. This script's exit code is the deployment's: a failed apply\n# exits non-zero above (set -e), the extension goes to Failed, and the ARM\n# deployment fails instead of reporting a box that does not work.\necho \"agent-box bootstrap complete\"\n",
+    "bootstrap": "[replace(replace(replace(replace(replace(replace(variables('bootstrapTemplate'), '@@NIXINSTALLER@@', parameters('nixInstallerUrl')), '@@FLAKEREF@@', parameters('agentBoxFlakeRef')), '@@AGENT@@', parameters('agent')), '@@USER@@', parameters('userName')), '@@AGENTSMD@@', parameters('agentsMd')), '@@WEBPASSWORD@@', parameters('webPassword'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}-pip', parameters('namePrefix'))]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "publicIPAddressVersion": "IPv4"
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}-nsg', parameters('namePrefix'))]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "securityRules": "[concat(createArray(variables('httpsRule')), variables('sshRule'))]"
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}-vnet', parameters('namePrefix'))]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "10.42.0.0/16"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "default",
+            "properties": {
+              "addressPrefix": "10.42.0.0/24",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nsg', parameters('namePrefix')))]"
+              }
+            }
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nsg', parameters('namePrefix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}-nic', parameters('namePrefix'))]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "subnet": {
+                "id": "[reference(resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('namePrefix'))), '2024-05-01').subnets[0].id]"
+              },
+              "privateIPAllocationMethod": "Dynamic",
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix')))]"
+              }
+            }
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix')))]",
+        "[resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('namePrefix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2024-07-01",
+      "name": "[format('{0}-vm', parameters('namePrefix'))]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[variables('vmSize')]"
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "Canonical",
+            "offer": "ubuntu-24_04-lts",
+            "sku": "[variables('imageSkuBySize')[variables('vmSize')]]",
+            "version": "latest"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "diskSizeGB": "[parameters('osDiskSizeGB')]",
+            "managedDisk": {
+              "storageAccountType": "StandardSSD_LRS"
+            }
+          }
+        },
+        "osProfile": {
+          "computerName": "[parameters('namePrefix')]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "adminPassword": "[if(equals(parameters('authenticationType'), 'password'), parameters('adminPasswordOrKey'), null())]",
+          "linuxConfiguration": "[if(equals(parameters('authenticationType'), 'password'), null(), variables('linuxConfiguration'))]"
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-nic', parameters('namePrefix')))]"
+            }
+          ]
+        },
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": true
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-nic', parameters('namePrefix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines/extensions",
+      "apiVersion": "2024-07-01",
+      "name": "[format('{0}/{1}', format('{0}-vm', parameters('namePrefix')), 'agent-box-bootstrap')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "publisher": "Microsoft.Azure.Extensions",
+        "type": "CustomScript",
+        "typeHandlerVersion": "2.1",
+        "autoUpgradeMinorVersion": true,
+        "protectedSettings": {
+          "script": "[base64(variables('bootstrap'))]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/virtualMachines', format('{0}-vm', parameters('namePrefix')))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "webUrl": {
+      "type": "string",
+      "metadata": {
+        "description": "Browser terminal. Sign in with the userName and the webPassword chosen at deployment time. The first load waits on Caddy's ACME certificate. (The URL deliberately carries no user@ prefix: Chrome answers the auth challenge with URL userinfo plus an EMPTY password, and credentials typed into the prompt cannot override the URL-embedded identity.)"
+      },
+      "value": "[format('https://{0}/{1}/', format('{0}.sslip.io', replace(reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress, '.', '-')), parameters('userName'))]"
+    },
+    "remoteControlSession": {
+      "type": "string",
+      "metadata": {
+        "description": "Claude Remote Control session name. After finishing `claude login` once in the browser terminal, the Claude desktop and mobile apps can drive this session. Only meaningful when agent=claude."
+      },
+      "value": "[format('{0}-main@{1}', parameters('userName'), format('{0}.sslip.io', replace(reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress, '.', '-')))]"
+    },
+    "publicAddress": {
+      "type": "string",
+      "metadata": {
+        "description": "Static public IPv4 address."
+      },
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress]"
+    },
+    "sshCommand": {
+      "type": "string",
+      "metadata": {
+        "description": "Debug access. Closed at the NSG unless debugSsh is true; the portal's serial console works either way."
+      },
+      "value": "[format('ssh {0}@{1}', parameters('adminUsername'), reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress)]"
+    },
+    "bootstrapLog": {
+      "type": "string",
+      "metadata": {
+        "description": "Where first-boot output lands if the deployment fails. The extension handler keeps its own copy of the same stream under /var/lib/waagent/custom-script/download/0/."
+      },
+      "value": "/var/log/agent-box-bootstrap.log"
+    }
+  }
+}

@@ -1,0 +1,44 @@
+name: Azure template CI
+
+on:
+  push:
+    branches: [ master ]
+    paths: &azure-ci-paths
+      - 'azure/**'
+      - 'scripts/check_azure_template.py'
+      - '.github/workflows/azure-ci.yml'
+  pull_request:
+    paths: *azure-ci-paths
+  workflow_dispatch:
+
+concurrency:
+  group: azure-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate the Azure Bicep template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Pinned, because the compiled JSON embeds the compiling CLI's version
+      # and a version-derived templateHash. check_azure_template.py ignores
+      # that block when it diffs, so a local build with another version is not
+      # a tripwire - but pinning here keeps CI comparing like with like, so a
+      # real language-level change between Bicep releases surfaces as a diff
+      # rather than as noise.
+      - name: Install the pinned Bicep CLI
+        run: |
+          az bicep install --version "$(cat azure/.bicep-version)"
+          az bicep version
+
+      # Recompiles and diffs (the committed JSON is what the README's Deploy
+      # button hands the portal, so an edit that never reached it ships
+      # nothing), renders the bootstrap and parses it under bash, and fails if
+      # the web password leaves the extension's protectedSettings.
+      - name: Check the compiled template and the bootstrap it carries
+        run: python3 scripts/check_azure_template.py
