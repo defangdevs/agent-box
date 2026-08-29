@@ -1212,8 +1212,14 @@ class RenderTest(unittest.TestCase):
             run.return_value = subprocess.CompletedProcess([], 1)
             self.assertFalse(mod.zram_module_available())
 
-            run.side_effect = OSError("no modprobe")
+            run.side_effect = FileNotFoundError("no modprobe")
             self.assertTrue(mod.zram_module_available())
+
+            # A different OSError (e.g. permissions) is not proof the
+            # module is fine — staying quiet there is exactly the
+            # silent-degradation this check exists to catch.
+            run.side_effect = PermissionError("denied")
+            self.assertFalse(mod.zram_module_available())
 
     def test_protect_memory_false_renders_none_of_it(self):
         """The knob has to actually be a knob: a host that turns it off
