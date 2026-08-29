@@ -1,7 +1,7 @@
 # agent-box
 
-Reproducible, multi-user coding-agent sandboxes - one click on AWS, on bare
-metal, or as a VM image, from one declarative config. (Built on Nix - as a
+Reproducible, multi-user coding-agent sandboxes - one click on AWS or Azure, on
+bare metal, or as a VM image, from one declarative config. (Built on Nix - as a
 full NixOS system, or as a pinned Nix profile on an ordinary Linux distro.)
 
 Each agent is an **unprivileged user** running a supported agent CLI inside a
@@ -133,6 +133,44 @@ The full cost breakdown, the Spot stop-not-terminate behavior, SSM root
 access, and the other design notes live in
 [aws/README.md](./aws/README.md); template source:
 [`aws/template.yaml`](./aws/template.yaml).
+
+## 1-click Azure launch
+
+The same native Ubuntu + Nix box on one Azure Linux VM, from a Bicep template.
+Nothing on the subscription has to be pre-configured: the deployment brings its
+own vnet, NSG and static public IPv4.
+
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fdefangdevs%2Fagent-box%2Fmaster%2Fazure%2Fagent-box.json)
+
+Pick a resource group and region, choose `agent` (`claude` or `codex`), set a
+`webPassword` (any 16&ndash;64 characters &mdash; it reaches the box
+base64-encoded, so password-manager symbols are safe), paste an SSH public key
+for the debug account, deploy. The deployment reports success only
+once the box has finished its first `agentbox apply` &mdash; on Azure that
+needs no signalling handshake, because an ARM deployment waits on the VM
+extension that runs the bootstrap and a failed apply fails the deployment. The
+`webUrl` output is `https://<addr>.sslip.io/<userName>/`: open it, sign in as
+the `userName` (default `agent`) with your `webPassword`, complete the agent's
+one-time sign-in, done. `<userName>-main@<addr>.sslip.io` is the Claude Remote
+Control session name.
+
+**Cost.** Azure has no Lightsail-style bundle, so the bill is three line items
+rather than one. A default box in westus3 &mdash; `Standard_B2pls_v2`
+(2 vCPU / 4 GiB, ARM Ampere) + a 64 GiB Standard SSD + the static IPv4 &mdash;
+is **~$30/mo**, against $24/mo flat for the equivalent Lightsail bundle.
+westus3 is the cheapest region for Ampere, and Ampere is the cheapest at every
+RAM tier. Delete the resource group to stop billing.
+
+**One difference from the AWS buttons worth knowing:** the AWS 1-click
+templates are republished on every push with the publishing commit baked in, so
+a 1-click AWS box is pinned. The Azure button serves the committed template
+straight from GitHub, so it tracks `master` &mdash; pin a box by setting
+`agentBoxFlakeRef` to `github:defangdevs/agent-box/<sha>` on the form.
+
+Design notes, the CLI path, what to do when a deployment fails, and the known
+gaps (IPv4-only; the Azure kernel's missing `zram`) live in
+[azure/README.md](./azure/README.md); template source:
+[`azure/agent-box.bicep`](./azure/agent-box.bicep).
 
 ## Why
 
