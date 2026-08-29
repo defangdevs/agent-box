@@ -28,6 +28,7 @@ import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 AGENTBOX = REPO / "bin" / "agentbox"
@@ -1196,6 +1197,23 @@ class RenderTest(unittest.TestCase):
         sysctl = (FIXTURE / "etc/sysctl.d/60-agent-box-memory.conf").read_text()
         self.assertIn("vm.swappiness = 180", sysctl)
         self.assertIn("vm.page-cluster = 0", sysctl)
+
+    def test_zram_module_available(self):
+        """Issue #435: Azure's linux-azure kernel ships no zram module, so
+        `modprobe zram` fails and agent-box-zram.service dies at boot with
+        nothing else to say why. `apply` has to ask first, with a --dry-run
+        that never actually loads a module a caller may not want loaded."""
+        mod = load_agentbox()
+        with mock.patch.object(mod.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0)
+            self.assertTrue(mod.zram_module_available())
+            self.assertIn("--dry-run", run.call_args.args[0])
+
+            run.return_value = subprocess.CompletedProcess([], 1)
+            self.assertFalse(mod.zram_module_available())
+
+            run.side_effect = OSError("no modprobe")
+            self.assertTrue(mod.zram_module_available())
 
     def test_protect_memory_false_renders_none_of_it(self):
         """The knob has to actually be a knob: a host that turns it off
