@@ -283,10 +283,13 @@ hand-edit a governed entry (its note says so), and don't mute a HUMAN's login
 to silence close/merge echoes - the rules already drop those while keeping
 that person's new issues and PRs spawning.
 
-One-time per box, so deliveries can arrive at all:
+One-time per sender, so its deliveries can arrive at all:
 
-    agent-box-webhook setup   # prints the endpoint URL + a fresh HMAC secret
-    agent-box-webhook url     # print them again later
+    agent-box-webhook setup github   # that source's endpoint URL, plus its
+                                     # HMAC secret - minted on the first run
+                                     # for a source, reprinted on the later ones
+    agent-box-webhook url            # the endpoint and which sources exist;
+                                     # NOT the secret - rerun setup for that
 
 then register that URL and secret in the repo (Settings -> Webhooks -> Add
 webhook, content type `application/json`, pick the events); `setup` prints a

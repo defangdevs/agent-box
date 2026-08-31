@@ -160,10 +160,13 @@ let
       to silence close/merge echoes - the rules already drop those while keeping
       that person's new issues and PRs spawning.
 
-      One-time per box, so deliveries can arrive at all:
+      One-time per sender, so its deliveries can arrive at all:
 
-          agent-box-webhook setup   # prints the endpoint URL + a fresh HMAC secret
-          agent-box-webhook url     # print them again later
+          agent-box-webhook setup github   # that source's endpoint URL, plus its
+                                           # HMAC secret - minted on the first run
+                                           # for a source, reprinted on the later ones
+          agent-box-webhook url            # the endpoint and which sources exist;
+                                           # NOT the secret - rerun setup for that
 
       then register that URL and secret in the repo (Settings -> Webhooks -> Add
       webhook, content type `application/json`, pick the events); `setup` prints a
@@ -3313,10 +3316,14 @@ esac
     `warning` — the same field `ls` sets when the receiver has no spawn command
     — is present exactly when a match right now would spawn nothing.
 
-    One-time per box, to make deliveries possible at all:
-      agent-box-webhook setup      # mints the HMAC secret, prints URL + secret
+    One-time per SENDER, to make its deliveries possible at all:
+      agent-box-webhook setup github   # prints that source's URL and its HMAC
+                                       # secret, minting the secret on first run
+                                       # and reusing it on later ones
     then register that URL + secret in the sender (GitHub: repo Settings ->
     Webhooks -> Add webhook, content type application/json, pick the events).
+    SOURCE is any sender that signs its body the same way (`setup stripe`, and
+    so on); it defaults to github, and each source gets its own path and secret.
     USAGE
     }
 
@@ -3834,7 +3841,7 @@ esac
           printf 'per-source path: %s/<source>  (bare %s -> %s)\n' \
             "$url" "$url" "$("$JQ" -r '.defaultSource // "github"' "$SOURCES")"
         else
-          echo 'sources:  (none yet — run: agent-box-webhook setup)'
+          echo 'sources:  (none yet — run: agent-box-webhook setup SOURCE, e.g. github)'
         fi
         ;;
       setup)
@@ -11435,13 +11442,44 @@ WEBHOOK_UNAVAILABLE_TPL = """<section>
 # The endpoint half. Its own note, so the whole thing can be left out on a
 # box that serves no endpoint (no AGENT_BOX_WEBHOOK_URL) without leaving a
 # paragraph pointing at a URL that is not there.
-WEBHOOK_ENDPOINT_TPL = """<p class="note">Where a sender POSTs. Register a
-    payload URL below in the sender &mdash; on GitHub, repo Settings &rarr;
-    Webhooks &rarr; Add webhook, content type <code>application/json</code>
-    &mdash; with that source's secret, which the copy button hands over.
-    Both fields are needed: anything this box cannot verify against the
-    secret is rejected, so the URL alone delivers nothing.</p>
-    {rows}"""
+#
+# What a webhook IS, in plain words and without assuming GitHub: the
+# receiver verifies an HMAC over the body and nothing else, so a repo, a
+# CI system, a payment processor and a home-grown script are all the same
+# kind of sender to this box. Shared by both states below, because the
+# answer must not depend on whether a sender happens to be set up yet.
+WEBHOOK_LEAD = ("Another service can tell this box when something happens "
+                "&mdash; a commit or a review on a repo, a build finishing, "
+                "a payment &mdash; and an agent hears about it instead of "
+                "having to keep checking. Any sender that can sign what it "
+                "sends will do; GitHub is just the usual one.")
+
+# The table is for senders that ARE set up. Everything a reader needs in
+# order to make sense of the rows goes in this paragraph above it, never
+# in a row of its own: `.tbl li` is a flex row, so prose dropped into the
+# list is laid out as though its sentences were columns.
+WEBHOOK_ENDPOINT_TPL = """<p class="note">%s To connect a sender, give it
+    the payload URL for its source together with that source's secret
+    &mdash; the copy buttons hand over both. It needs both: this box
+    rejects anything it cannot verify against the secret, so the URL on
+    its own delivers nothing. On GitHub that is the repo's Settings
+    &rarr; Webhooks &rarr; Add webhook, with content type
+    <code>application/json</code>.</p>
+    {rows}""" % WEBHOOK_LEAD
+
+# No sender configured: no table at all, because an empty one is a header
+# over a paragraph of prose. The command NAMES its source rather than
+# leaning on the `github` default — the panel is source-neutral, and a
+# reader connecting Stripe should not have to discover that the argument
+# exists.
+WEBHOOK_ENDPOINT_EMPTY_TPL = """<p class="note">%s</p>
+    <p class="note">No sender is set up yet, so this box rejects every
+    delivery. Run <code>agent-box-webhook setup SOURCE</code> in a
+    session, naming the sender you are connecting &mdash;
+    <code>agent-box-webhook setup github</code> for a GitHub repo,
+    <code>agent-box-webhook setup stripe</code> for Stripe. It mints that
+    source's secret, prints it once, and prints the payload URL to
+    register: <code>{base}/&lt;source&gt;</code>.</p>""" % WEBHOOK_LEAD
 
 # Guided sign-in (issues #207, #208, #313). Hidden entirely when the box
 # passed no AGENT_BOX_CONNECT_BINS. data-busy tells the page whether a
@@ -13075,13 +13113,9 @@ def render_webhook_endpoint():
                            value="%s/%s" % (endpoint, name)))
         )
     if not rows:
-        rows.append(
-            '<li class="empty">No sender is set up yet, so this box rejects '
-            'every delivery. Run <code>agent-box-webhook setup</code> in a '
-            'session: it mints the secret, prints it once, and prints the '
-            'payload URL to register &mdash; <code>%s/&lt;source&gt;</code>.'
-            '</li>' % base
-        )
+        # Prose, not a one-row table: the table's job is to list the
+        # senders that exist, and there are none to list.
+        return WEBHOOK_ENDPOINT_EMPTY_TPL.format(base=base)
     return WEBHOOK_ENDPOINT_TPL.format(
         rows=('<ul class="tbl"><li class="tbl-head">Payload URL</li>'
               + "".join(rows) + "</ul>")
