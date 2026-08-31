@@ -307,11 +307,20 @@ in
         assert "Not installed" in body, body[:400]
         assert "Install &amp; sign in" in body or "Install & sign in" in body
 
-    with subtest("defang is never offered as an install"):
-        # It is not in nixpkgs and comes from its own background unit, so
-        # a card must not offer to fetch it from a package source that has
-        # never heard of it.
-        assert state("defang")["installable"] is False
+    with subtest("defang offers an install, from its pinned expression"):
+        # It is not in nixpkgs, so the card cannot fetch it from
+        # AGENT_BOX_NIXPKGS the way codex does — asking a package source
+        # that has never heard of it would fail every time. It is
+        # installable all the same, from the pinned expression the module
+        # names in AGENT_BOX_CONNECT_EXPRS (issue #461).
+        #
+        # That distinction is the whole fix. On NixOS the background unit
+        # has usually already put defang down, so this only ever repairs a
+        # card. On a NATIVE box nothing installs defang at all, and before
+        # the expression existed the daemon dropped the card entirely
+        # rather than show a dead one — a Defang card on NixOS and none on
+        # Lightsail or Azure, from one line of gating.
+        assert state("defang")["installable"] is True
 
     with subtest("start opens one pane and the card links the trusted URL"):
         assert post("/agent/settings/connect/start", "flow=claude") == "303"

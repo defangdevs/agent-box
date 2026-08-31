@@ -1989,16 +1989,14 @@ done
   # exists for (see the codexFullAccess option, issue 234).
   codexFullAccess = cfg.codexFullAccess && builtins.elem "codex" cfg.installAgents;
 
-  # Defang CLI (issue #363): not in nixpkgs, but DefangLabs/defang ships its
-  # own canonical packaging at pkgs/defang/cli.nix — `buildGo125Module`
-  # against the repo's own `src/`, with a `vendorHash` that is only ever
-  # valid for the go.sum sitting right next to it. Fetching the whole
-  # source tree at one pinned tag and calling THEIR file, rather than
-  # re-deriving a build ourselves, means that hash never needs maintaining
-  # here: it travels with the tag. (The alternative living beside it,
-  # pkgs/defang/default.nix — a fetchurl of the prebuilt release binary —
-  # is explicitly `lib.warn`-marked deprecated upstream and stuck on an old
-  # version; don't reach for that one.)
+  # Defang CLI (issue #363): not in nixpkgs, so it is fetched from a pinned
+  # EXPRESSION rather than from an attribute. The pins, and the reasoning
+  # behind each one, live in modules/src/defang-cli.nix — one file, shared
+  # with the native backend, which installs the same closure on demand from
+  # the settings page's Defang card (issue #461). Keeping them there rather
+  # than here is what stops the two backends drifting onto different defang
+  # builds: a different build is a different output hash, and a different
+  # output hash is a missed binary cache and a 100 MB Go compile.
   #
   # This USED to be a plain `let`-bound derivation wired into
   # environment.systemPackages — which put a ~100 MB Go compile on every
@@ -2013,28 +2011,10 @@ done
   # all. agent-box-defang-cli.service (below) builds it in the BACKGROUND,
   # started by multi-user.target — i.e. AFTER the activation that already
   # wrote the new nix.conf, on the SAME first boot. So by the time it runs,
-  # the Cachix substituter is already trusted and (given a matching
-  # nixpkgs pin — see defangNixpkgsExprUrl/Sha256 below) it substitutes a
-  # prebuilt closure instead of compiling.
-  defangVersion = "v3.15.0";
-  defangSha256 = "sha256-9wfaHVqxJprJUoP5meQEgmRfV6kJugonmO714gaR1tc=";
-  # DefangLabs/defang's own release CI (go.yml's publish-nix-cache job)
-  # builds this exact tag's `defang-cli` and pushes it to the public
-  # `defanglabs.cachix.org` Cachix cache. But a Nix derivation's output hash
-  # is a function of EVERY input, including nixpkgs itself: building
-  # pkgs/defang/cli.nix with THIS host's own nixpkgs (whatever that
-  # happens to be) produces a DIFFERENT derivation than CI's, which
-  # silently misses the cache and falls back to compiling from source — so
-  # this pins the SAME nixpkgs revision DefangLabs/defang's own flake.lock
-  # pins at defangVersion, not this module's `pkgs`. Verified by hand
-  # (2026-08-26): the resulting output path already has a 200 on
-  # https://defanglabs.cachix.org/<hash>.narinfo. Bump both pins together
-  # when moving to a new defang tag:
-  #   curl -sL https://raw.githubusercontent.com/DefangLabs/defang/vX.Y.Z/flake.lock \
-  #     | jq '.nodes.nixpkgs.locked | {url, sha256: .narHash}'
-  defangNixpkgsUrl = "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1057999.afe3d8ac4395/nixexprs.tar.xz";
-  defangNixpkgsSha256 = "sha256-93GX5Q/npwBE92xpHlktxgGztuIP/2kwOMukz+qyJBk=";
-  # The pins above are spliced in as plain TEXT, not as a `builtins.fetchTarball`
+  # the Cachix substituter is already trusted and it substitutes a prebuilt
+  # closure instead of compiling.
+  #
+  # The expression is spliced in as plain TEXT, not as a `builtins.fetchTarball`
   # result interpolated into this file — that distinction is why this stays
   # cheap: a derivation reference carries "string context", so embedding one in
   # any string that ends up in the store (a systemd unit, an /etc file) makes
@@ -2045,14 +2025,49 @@ done
   # expensive `fetchTarball`+`callPackage` calls only happen when the SERVICE
   # evaluates this file with its own `nix build`, at runtime.
   defangCliExpr = pkgs.writeText "agent-box-defang-cli-expr.nix" ''
+    # The Defang CLI, pinned. ONE source of truth for both backends: the NixOS
+    # module names this file for agent-box-defang-cli.service's background
+    # install, and nix/runtime.nix ships it into the runtime profile's share
+    # dir so a native box's settings page can install it from the Defang card
+    # (issue #461).
+    #
+    # Not in nixpkgs, so there is no `attr` a card could fetch. DefangLabs/defang
+    # ships its own canonical packaging at pkgs/defang/cli.nix - `buildGo125Module`
+    # against the repo's own src/, with a vendorHash that is only ever valid for
+    # the go.sum sitting next to it. Fetching the whole source tree at one pinned
+    # tag and calling THEIR file, rather than re-deriving a build here, means that
+    # hash never needs maintaining: it travels with the tag. (The file beside it,
+    # pkgs/defang/default.nix - a fetchurl of the prebuilt release binary - is
+    # lib.warn-marked deprecated upstream and stuck on an old version; don't reach
+    # for that one.)
+    #
+    # The nixpkgs pin is NOT this box's nixpkgs, and that is the whole point. A
+    # derivation's output hash is a function of every input, nixpkgs included, so
+    # building cli.nix against whatever nixpkgs the host happens to have produces a
+    # DIFFERENT derivation than DefangLabs' release CI built, silently misses the
+    # binary cache, and compiles ~100 MB of Go instead - which is what OOM'd a
+    # 2 GiB box in issue #373. So this pins the revision DefangLabs/defang's own
+    # flake.lock pins at the tag below.
+    #
+    # Verified 2026-08-31: both architectures are prebuilt in the public cache, so
+    # an install substitutes rather than builds -
+    #   x86_64-linux   /nix/store/pxa0iq32xsp8pql6k2nn2gsgcll4fzf0-defang-cli-git
+    #   aarch64-linux  /nix/store/yayqldvzrg66lpajmcpnf9h5jvgvlxyd-defang-cli-git
+    # both HTTP 200 at https://defanglabs.cachix.org/<hash>.narinfo. The closure is
+    # 104.8 MiB over 4 paths, which is why it is fetched ON DEMAND and not shipped
+    # in the runtime profile.
+    #
+    # Bump all three pins together when moving to a new defang tag:
+    #   curl -sL https://raw.githubusercontent.com/DefangLabs/defang/vX.Y.Z/flake.lock \
+    #     | jq '.nodes.nixpkgs.locked | {url, sha256: .narHash}'
     let
       defangSrc = builtins.fetchTarball {
-        url = "https://github.com/DefangLabs/defang/archive/refs/tags/${defangVersion}.tar.gz";
-        sha256 = "${defangSha256}";
+        url = "https://github.com/DefangLabs/defang/archive/refs/tags/v3.15.0.tar.gz";
+        sha256 = "sha256-9wfaHVqxJprJUoP5meQEgmRfV6kJugonmO714gaR1tc=";
       };
       defangPkgs = import (builtins.fetchTarball {
-        url = "${defangNixpkgsUrl}";
-        sha256 = "${defangNixpkgsSha256}";
+        url = "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1057999.afe3d8ac4395/nixexprs.tar.xz";
+        sha256 = "sha256-93GX5Q/npwBE92xpHlktxgGztuIP/2kwOMukz+qyJBk=";
       }) { system = builtins.currentSystem; };
     in
     defangPkgs.callPackage "''${defangSrc}/pkgs/defang/cli.nix" { }
@@ -10116,6 +10131,24 @@ for _pair in os.environ.get("AGENT_BOX_CONNECT_BINS", "").split():
         if _flow_id and _flow_bin:
             CONNECT_BINS[_flow_id] = _flow_bin
 
+# The OTHER way a card can fetch its CLI: a pinned Nix expression file, as
+# "<id>=<absolute path>" pairs (AGENT_BOX_CONNECT_EXPRS, same convention as
+# CONNECT_BINS above). For a CLI that is IN nixpkgs, `attr` is the whole
+# story and this is empty; this exists for one that is not, which today
+# means defang (issue #461) and tomorrow whatever else #449's list grows
+# that nixpkgs does not carry.
+#
+# It is a path rather than an inline expression because both backends
+# already have somewhere to put a file that must not drift: the module
+# writes it to the store, and the runtime profile ships it under
+# share/agent-box/. One file, one set of pins, both backends.
+CONNECT_EXPRS = {}
+for _pair in os.environ.get("AGENT_BOX_CONNECT_EXPRS", "").split():
+    if "=" in _pair:
+        _flow_id, _flow_expr = _pair.split("=", 1)
+        if _flow_id and _flow_expr:
+            CONNECT_EXPRS[_flow_id] = _flow_expr
+
 
 def parse_claude_status(proc):
     """`claude auth status` answers JSON — the one structured signal in
@@ -10299,6 +10332,9 @@ CONNECT_DEFS = [
     {
         "id": "defang",
         "binary": "defang",
+        # No nixpkgs attribute: defang is not in nixpkgs. It is fetched from
+        # a pinned expression instead, named by AGENT_BOX_CONNECT_EXPRS, so
+        # this card is installable on both backends (issue #461).
         "attr": None,
         "label": "Defang",
         "note": "Runs <code>defang login</code> &mdash; opens Defang's own "
@@ -10352,10 +10388,15 @@ def connect_flows():
     flows = []
     for spec in CONNECT_DEFS:
         flow = dict(spec)
+        # Where this card would fetch the CLI from, if it is missing: a
+        # nixpkgs attribute, or a pinned expression file for a CLI nixpkgs
+        # does not carry (issue #461). Either one makes the card live.
+        flow["expr"] = CONNECT_EXPRS.get(spec["id"])
+        fetchable = bool(spec["attr"] or flow["expr"])
         binary = CONNECT_BINS.get(spec["id"])
         if binary and not os.access(binary, os.X_OK):
             binary = None
-        if not binary and spec["attr"]:
+        if not binary and fetchable:
             candidate = os.path.join(
                 os.path.expanduser("~"), ".nix-profile", "bin", spec["binary"])
             if os.access(candidate, os.X_OK):
@@ -10366,8 +10407,8 @@ def connect_flows():
         # worse than not being there (the reasoning agentbox already
         # applied when it left defang out of a native box's cards). A card
         # therefore appears when the CLI is here, OR when pressing it
-        # would get it.
-        if binary or flow["attr"]:
+        # would get it — from nixpkgs, or from a pinned expression.
+        if binary or fetchable:
             flows.append(flow)
     return flows
 
@@ -10650,11 +10691,11 @@ def connect_state(flow, keys=None, tmux_state=None):
         "error": error,
         "needs_code": flow["needs_code"],
         # False means the CLI is not on this box yet, so the button offers
-        # to fetch it first (issue #416). A card with no `attr` can never
-        # be installed from here — defang comes from its own background
-        # unit — so it reports itself installed only when it really is.
+        # to fetch it first (issue #416). A card with neither an `attr` nor
+        # a pinned expression can never be installed from here, so it
+        # reports itself installed only when it really is.
         "installed": bool(flow["bin"]),
-        "installable": bool(flow["attr"]),
+        "installable": bool(flow["attr"] or flow["expr"]),
         # No tmux server means no session to sign in from, and starting
         # one HERE is exactly what tmux_server_up() explains we must not
         # do — so the card says so instead of offering a dead button.
@@ -10730,19 +10771,26 @@ def connect_start(flow):
     binary = flow["bin"]
     prelude = ""
     if not binary:
-        if not flow["attr"]:
+        if not flow["attr"] and not flow["expr"]:
             state = connect_state(flow)
             state["state"] = "failed"
             state["error"] = ("%s is not installed on this box, and cannot "
                               "be installed from here." % flow["label"])
             return state
-        if not CONNECT_NIXPKGS:
+        if flow["attr"] and not CONNECT_NIXPKGS:
             state = connect_state(flow)
             state["state"] = "failed"
             state["error"] = ("%s is not installed, and this box has no "
                               "package source configured to fetch it from."
                               % flow["label"])
             return state
+        # An expression wins over an attr when a card somehow has both: it
+        # is the PINNED one, and pinning is the only reason a card carries
+        # an expression at all.
+        if flow["expr"]:
+            source = ["--file", flow["expr"], ""]
+        else:
+            source = ["%s#%s" % (CONNECT_NIXPKGS, flow["attr"])]
         binary = os.path.join(
             os.path.expanduser("~"), ".nix-profile", "bin", flow["binary"])
         # --profile names the profile explicitly for the same reason the
@@ -10757,7 +10805,7 @@ def connect_start(flow):
                 shlex.quote(CONNECT_NIX_BIN),
                 shlex.quote(os.path.join(os.path.expanduser("~"),
                                          ".nix-profile")),
-                shlex.quote("%s#%s" % (CONNECT_NIXPKGS, flow["attr"]))))
+                " ".join(shlex.quote(a) for a in source)))
     inner = " ".join(shlex.quote(a) for a in [binary] + flow["start"])
     if flow["unset"]:
         inner = ("env " + " ".join("-u " + k for k in flow["unset"]) + " " + inner)
@@ -15349,6 +15397,13 @@ if __name__ == "__main__":
             # sign-in would have written it in. Same value for every
             # instance, hence host-level.
             AGENT_BOX_CONNECT_BINS = connectBins;
+            # Cards whose CLI is fetched from a pinned EXPRESSION instead
+            # of a nixpkgs attribute, because nixpkgs does not carry it
+            # (issue #461). Set here as well as on a native box so both
+            # backends install byte-identical closures; on NixOS the
+            # background unit has usually already put defang down, and
+            # this is what repairs the card if it has not.
+            AGENT_BOX_CONNECT_EXPRS = "defang=${defangCliExpr}";
             # Where a card fetches a CLI the box does not ship (issue
             # #416). The SAME pinned source the supervisor's lazy harness
             # install uses, so claude fetched from a session and gh

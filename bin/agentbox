@@ -1054,7 +1054,24 @@ class Renderer:
         t.dir(self.p("/etc/nix"), 0o755)
         t.file(path, header
                + "min-free = 1073741824\n"    # start GC below 1 GiB free
-               + "max-free = 5368709120\n")   # ... and free up to 5 GiB
+               + "max-free = 5368709120\n"    # ... and free up to 5 GiB
+               # The Defang card fetches a ~105 MiB closure from a pinned
+               # expression (issue #461). DefangLabs' own release CI pushes
+               # that exact build here for both x86_64 and aarch64, so with
+               # this line the card SUBSTITUTES in seconds; without it the
+               # same click is a ~100 MB Go compile, which is what OOM'd a
+               # 2 GiB box in #373. The NixOS module sets the same pair via
+               # nix.settings, so both backends fetch identically.
+               #
+               # extra-* so this ADDS to whatever the Determinate installer
+               # already configured rather than replacing cache.nixos.org.
+               # It goes in the daemon's own config on purpose: a
+               # substituter named here is used for every user, whereas one
+               # passed on the command line is ignored for anybody who is
+               # not a trusted-user, which the agent deliberately is not.
+               + "extra-substituters = https://defanglabs.cachix.org\n"
+               + "extra-trusted-public-keys = defanglabs.cachix.org-1:"
+                 "mTXLTfYprWDrIK50Kz34fhOTreeKlQRZFQcKL7HtHx0=\n")
 
     # -- base-OS patching ----------------------------------------------------
 
@@ -1643,14 +1660,21 @@ class Renderer:
                        # profile actually ships. It is no longer the card
                        # LIST, though (issue #416): a card also appears for
                        # a CLI the daemon could fetch, which is what makes
-                       # a box that ships none of them usable. Still no
-                       # defang card here — the runtime profile has no
-                       # defang and it is not in nixpkgs either, so nothing
-                       # could fetch it, and the daemon drops a card that
-                       # can neither act nor be acted on.
+                       # a box that ships none of them usable. defang is
+                       # not named here because the profile does not ship
+                       # it — the card fetches it, see CONNECT_EXPRS below.
                        'Environment="AGENT_BOX_CONNECT_BINS=' + " ".join(
                            [f"{a}={self.bin}/{a}" for a in self.spec.agents]
                            + [f"github={self.bin}/gh"]) + '"',
+                       # The Defang card (issue #461). defang is not in
+                       # nixpkgs, so AGENT_BOX_NIXPKGS below cannot reach
+                       # it and the card used to be dropped here entirely —
+                       # a NixOS box had one and a native box did not.
+                       # Naming the pinned expression the profile ships
+                       # makes the card installable on both, from one set
+                       # of pins, for one output path.
+                       f'Environment="AGENT_BOX_CONNECT_EXPRS='
+                       f'defang={self.share}/defang-cli.nix"',
                        # Where a card fetches a CLI this profile does not
                        # ship (issue #416) — the same pinned source the
                        # supervisor's lazy harness install uses.

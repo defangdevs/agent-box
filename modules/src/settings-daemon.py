@@ -1444,6 +1444,24 @@ for _pair in os.environ.get("AGENT_BOX_CONNECT_BINS", "").split():
         if _flow_id and _flow_bin:
             CONNECT_BINS[_flow_id] = _flow_bin
 
+# The OTHER way a card can fetch its CLI: a pinned Nix expression file, as
+# "<id>=<absolute path>" pairs (AGENT_BOX_CONNECT_EXPRS, same convention as
+# CONNECT_BINS above). For a CLI that is IN nixpkgs, `attr` is the whole
+# story and this is empty; this exists for one that is not, which today
+# means defang (issue #461) and tomorrow whatever else #449's list grows
+# that nixpkgs does not carry.
+#
+# It is a path rather than an inline expression because both backends
+# already have somewhere to put a file that must not drift: the module
+# writes it to the store, and the runtime profile ships it under
+# share/agent-box/. One file, one set of pins, both backends.
+CONNECT_EXPRS = {}
+for _pair in os.environ.get("AGENT_BOX_CONNECT_EXPRS", "").split():
+    if "=" in _pair:
+        _flow_id, _flow_expr = _pair.split("=", 1)
+        if _flow_id and _flow_expr:
+            CONNECT_EXPRS[_flow_id] = _flow_expr
+
 
 def parse_claude_status(proc):
     """`claude auth status` answers JSON — the one structured signal in
@@ -1627,6 +1645,9 @@ CONNECT_DEFS = [
     {
         "id": "defang",
         "binary": "defang",
+        # No nixpkgs attribute: defang is not in nixpkgs. It is fetched from
+        # a pinned expression instead, named by AGENT_BOX_CONNECT_EXPRS, so
+        # this card is installable on both backends (issue #461).
         "attr": None,
         "label": "Defang",
         "note": "Runs <code>defang login</code> &mdash; opens Defang's own "
@@ -1680,10 +1701,15 @@ def connect_flows():
     flows = []
     for spec in CONNECT_DEFS:
         flow = dict(spec)
+        # Where this card would fetch the CLI from, if it is missing: a
+        # nixpkgs attribute, or a pinned expression file for a CLI nixpkgs
+        # does not carry (issue #461). Either one makes the card live.
+        flow["expr"] = CONNECT_EXPRS.get(spec["id"])
+        fetchable = bool(spec["attr"] or flow["expr"])
         binary = CONNECT_BINS.get(spec["id"])
         if binary and not os.access(binary, os.X_OK):
             binary = None
-        if not binary and spec["attr"]:
+        if not binary and fetchable:
             candidate = os.path.join(
                 os.path.expanduser("~"), ".nix-profile", "bin", spec["binary"])
             if os.access(candidate, os.X_OK):
@@ -1694,8 +1720,8 @@ def connect_flows():
         # worse than not being there (the reasoning agentbox already
         # applied when it left defang out of a native box's cards). A card
         # therefore appears when the CLI is here, OR when pressing it
-        # would get it.
-        if binary or flow["attr"]:
+        # would get it — from nixpkgs, or from a pinned expression.
+        if binary or fetchable:
             flows.append(flow)
     return flows
 
@@ -1978,11 +2004,11 @@ def connect_state(flow, keys=None, tmux_state=None):
         "error": error,
         "needs_code": flow["needs_code"],
         # False means the CLI is not on this box yet, so the button offers
-        # to fetch it first (issue #416). A card with no `attr` can never
-        # be installed from here — defang comes from its own background
-        # unit — so it reports itself installed only when it really is.
+        # to fetch it first (issue #416). A card with neither an `attr` nor
+        # a pinned expression can never be installed from here, so it
+        # reports itself installed only when it really is.
         "installed": bool(flow["bin"]),
-        "installable": bool(flow["attr"]),
+        "installable": bool(flow["attr"] or flow["expr"]),
         # No tmux server means no session to sign in from, and starting
         # one HERE is exactly what tmux_server_up() explains we must not
         # do — so the card says so instead of offering a dead button.
@@ -2058,19 +2084,26 @@ def connect_start(flow):
     binary = flow["bin"]
     prelude = ""
     if not binary:
-        if not flow["attr"]:
+        if not flow["attr"] and not flow["expr"]:
             state = connect_state(flow)
             state["state"] = "failed"
             state["error"] = ("%s is not installed on this box, and cannot "
                               "be installed from here." % flow["label"])
             return state
-        if not CONNECT_NIXPKGS:
+        if flow["attr"] and not CONNECT_NIXPKGS:
             state = connect_state(flow)
             state["state"] = "failed"
             state["error"] = ("%s is not installed, and this box has no "
                               "package source configured to fetch it from."
                               % flow["label"])
             return state
+        # An expression wins over an attr when a card somehow has both: it
+        # is the PINNED one, and pinning is the only reason a card carries
+        # an expression at all.
+        if flow["expr"]:
+            source = ["--file", flow["expr"], ""]
+        else:
+            source = ["%s#%s" % (CONNECT_NIXPKGS, flow["attr"])]
         binary = os.path.join(
             os.path.expanduser("~"), ".nix-profile", "bin", flow["binary"])
         # --profile names the profile explicitly for the same reason the
@@ -2085,7 +2118,7 @@ def connect_start(flow):
                 shlex.quote(CONNECT_NIX_BIN),
                 shlex.quote(os.path.join(os.path.expanduser("~"),
                                          ".nix-profile")),
-                shlex.quote("%s#%s" % (CONNECT_NIXPKGS, flow["attr"]))))
+                " ".join(shlex.quote(a) for a in source)))
     inner = " ".join(shlex.quote(a) for a in [binary] + flow["start"])
     if flow["unset"]:
         inner = ("env " + " ".join("-u " + k for k in flow["unset"]) + " " + inner)

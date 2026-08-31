@@ -157,16 +157,19 @@ UNITS_BY_DESIGN = {
         "module ever grows nix.gc of its own, this line goes away",
 }
 UNITS_KNOWN_GAPS = {
-    "agent-box-defang-cli.service": "#449: the module installs the Defang "
-                                    "CLI in the background (#373); the "
-                                    "native runtime profile has no defang "
-                                    "at all, and defang is not in nixpkgs, "
-                                    "so the settings page cannot offer a "
-                                    "card that could fetch it either "
-                                    "(bin/agentbox drops the card rather "
-                                    "than show a dead one). #394's last "
-                                    "open item, re-homed on the issue that "
-                                    "will decide it",
+    "agent-box-defang-cli.service": "#461: a PRE-fetch, not the card. The "
+                                    "module pulls the Defang CLI in the "
+                                    "background (#373) so a NixOS card is "
+                                    "usable the moment the page loads; a "
+                                    "native box fetches the SAME pinned "
+                                    "closure from the card itself, on "
+                                    "demand (AGENT_BOX_CONNECT_EXPRS). Both "
+                                    "backends now show the card, so what is "
+                                    "one-sided is only the eager fetch — and "
+                                    "making it two-sided would spend 105 MiB "
+                                    "of every native first boot, inside the "
+                                    "deployment's wait, on a CLI most boxes "
+                                    "never use",
 }
 
 # Same job, different unit name. The native jail is agent-box-fail2ban so a
