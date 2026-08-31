@@ -124,6 +124,15 @@ jobs:
       - name: Check backend parity (module vs native)
         run: nix build -L .#checks.x86_64-linux.backend-parity && cat result
 
+      # Issue #451: the parity check above is keyed on AGENT_BOX_* names, so
+      # it cannot see a tmpfiles rule, a sudoers grant or the seed JSON —
+      # which is where #356's twin-schema bugs lived. This one first proves
+      # both backends were asked for the SAME box (tests/native/config.json is
+      # generated from the golden configuration's own options) and then
+      # compares what each made of it.
+      - name: Check one spec, both backends
+        run: nix build -L .#checks.x86_64-linux.one-spec-both-backends && cat result
+
       # The env store's format (issue #212): round trip, no key injection, and
       # the legacy readings a deployed box's file relies on. A unit test, not
       # a VM test, because the format is read on the session-spawn path and
