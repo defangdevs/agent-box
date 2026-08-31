@@ -91,6 +91,27 @@ actually in force.
 
 Follow existing formatting: two-space indentation for Nix and TypeScript, four spaces for Python, and trailing semicolons in TypeScript. Use kebab-case for Nix check names and filenames, descriptive camelCase for Nix locals, and `UPPER_SNAKE_CASE` for environment variables. Keep comments focused on security constraints or non-obvious deployment behavior. No repository-wide formatter is configured, so match adjacent code.
 
+### Icons in the web UI
+
+Every icon on the settings and workspace pages is inline SVG from
+[Octicons](https://primer.style/octicons/) (MIT), sized in px by CSS. Take
+new ones from that set and inline them next to `ICON_LOCK` in
+`modules/src/settings-daemon.py`: a `viewBox="0 0 16 16"` path with
+`fill="currentColor"`, pasted into the page so the response stays
+self-contained (the pages load no external asset, and Caddy serves no icon
+font).
+
+Never spell an icon as a text glyph. It reads as the cheaper option and is
+not: a code point carrying `Emoji_Presentation` — `U+2699` GEAR is the one
+that bit us (PR #448) — is drawn from the platform's COLOUR emoji font on iOS and
+Android, so the settings gear arrived as a shaded 3D emoji beside a flat
+monochrome (i), visibly larger and in the wrong palette. `font-size` does
+not fix that; it only scales the emoji, and which glyph a font hands back
+is not ours to choose. A code point the platform has no glyph for at all
+(`U+24D8` CIRCLED LATIN SMALL LETTER I, on a plain Linux font set) renders
+as tofu. Neither failure is visible in the desktop browser the page tends to
+get written in — the desktop merely looks a little uneven.
+
 ## Testing Guidelines
 
 Use `pkgs.testers.runNixOSTest` for service and VM behavior; name tests after the capability under test. Use Playwright `*.spec.ts` files only for behavior requiring a real browser or deployed instance. Add regression coverage with each behavioral fix. There is no numeric coverage threshold; CI expects every relevant named flake check to pass.

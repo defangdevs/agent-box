@@ -271,12 +271,19 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
 .tab-empty { color: #8b949e; font-size: 13px; padding: 6px 8px 8px; }
 .tabs .btn.add { margin: 0 4px 6px; padding: 2px 9px; }
 .tabs .spacer { flex: 1; }
-.tabs .hint { color: #8b949e; font-size: 16px; padding: 2px 6px 8px;
-              cursor: help; }
-.tabs .hint:hover, .tabs .hint:focus-visible { color: #e6edf3; }
-.tabs a.gear { color: #8b949e; text-decoration: none; font-size: 20px;
-               padding: 2px 8px 8px; }
-.tabs a.gear:hover { color: #e6edf3; }
+/* The two trailing controls, (i) and the gear. They are inline SVG
+   because the text glyphs they replace could not be held to one size:
+   U+2699 GEAR is an Emoji_Presentation code point, so a phone swapped in
+   its colour emoji font and drew a shaded 3D gear beside a flat (i) —
+   see the note on HOME_BODY. So size the BOX here, once, for both. */
+.tabs .hint, .tabs a.gear { display: flex; color: #8b949e;
+                            padding: 0 7px 9px; }
+.tabs .hint { cursor: help; }
+.tabs a.gear { text-decoration: none; }
+.tabs .hint svg, .tabs a.gear svg { width: 18px; height: 18px;
+                                    display: block; }
+.tabs .hint:hover, .tabs .hint:focus-visible, .tabs a.gear:hover {
+  color: #e6edf3; }
 .ws .editor, .ws .msg { margin: 8px; flex: none; }
 .panes { position: relative; flex: 1; min-height: 0; }
 .pane { position: absolute; inset: 0; width: 100%; height: 100%;
