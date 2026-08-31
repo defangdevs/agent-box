@@ -6,8 +6,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # push AMI-map bump directly to master
-  actions: write    # dispatch publish-template.yml (see "Publish the bump" below)
+  contents: write        # push the bump branch, then squash-merge it
+  pull-requests: write   # open + merge the bump PR (master requires one, see below)
+  actions: write         # dispatch publish-template.yml (see "Publish the bump" below)
 
 concurrency:
   group: refresh-amis
@@ -24,8 +25,14 @@ jobs:
       - name: Regenerate AMI map
         run: python3 scripts/refresh_amis.py
 
+      # master's "Require conversation resolution" ruleset rejects a direct
+      # push with GH013 — "Changes must be made through a pull request." It
+      # requires 0 approvals and no status checks, so a bot-opened PR can
+      # merge itself immediately; only the PR step is new.
       - name: Commit if changed
         id: commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if git diff --quiet aws/template.yaml; then
             echo "No AMI changes."
@@ -34,9 +41,15 @@ jobs:
           fi
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
+          branch="chore/refresh-amis-$(date -u +%Y%m%d)"
+          git checkout -b "$branch"
           git add aws/template.yaml
           git commit -m "Refresh NixOS AMI map (26.05)"
-          git push
+          git push origin "$branch"
+          pr_url=$(gh pr create --base master --head "$branch" \
+            --title "Refresh NixOS AMI map (26.05)" \
+            --body "Automated AMI map refresh (scheduled).")
+          gh pr merge "$pr_url" --squash --delete-branch
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       # Commits pushed with GITHUB_TOKEN do not trigger workflows, so the push
