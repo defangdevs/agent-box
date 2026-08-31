@@ -87,6 +87,13 @@ SUDOERS_KNOWN_GAPS = {
 }
 
 
+# What this run could not check. A skip that prints and returns 0 reads
+# exactly like a pass — the failure mode this file has now hit twice (a
+# silently-skipped test, then a check that could not fail at all) — so
+# anything skipped is named here and the closing line refuses to say "OK".
+SKIPPED = []
+
+
 def fail(msg):
     print(f"FAIL: {msg}", file=sys.stderr)
     return 1
@@ -113,13 +120,17 @@ def check_spec(generated):
         # the two DIALECTS of the committed config can still be held to each
         # other — that half needs no module, and it is the half that failed
         # in CI when this file was written.
+        SKIPPED.append("the module evaluation (no --spec)")
         print("spec: SKIPPED (no --spec; the flake check does this half)")
-        return check_spec_yaml(json.loads(CONFIG.read_text()))
+        return check_spec_yaml(json.loads(CONFIG.read_text()), required=False)
     want = json.loads(Path(generated).read_text())
     got = json.loads(CONFIG.read_text())
     if want == got:
         print("spec: tests/native/config.json matches the module's options")
-        return check_spec_yaml(want)
+        # required: --spec means the flake check, whose derivation carries
+        # pyyaml. If it cannot import there, the dependency was dropped and
+        # the check is broken — not partial.
+        return check_spec_yaml(want, required=True)
     lines = []
     for key in sorted(set(want) | set(got)):
         if want.get(key) != got.get(key):
@@ -137,7 +148,7 @@ def check_spec(generated):
 
 
 
-def check_spec_yaml(want):
+def check_spec_yaml(want, required):
     """The YAML dialect is the same box, not a third mirror.
 
     tests/test_agentbox.py renders both dialects and compares the trees, so a
@@ -148,6 +159,17 @@ def check_spec_yaml(want):
     try:
         import yaml
     except ImportError:
+        if required:
+            return fail(
+                "PyYAML is not importable, so tests/native/config.yaml was "
+                "not checked — and this run was asked to check it. The "
+                "one-spec-both-backends derivation carries pyyaml, so this "
+                "means the dependency was dropped: the check is broken, not "
+                "partial.")
+        # Standalone, on a box without pyyaml (this is the common case —
+        # hard-failing here would make the no-Nix path unusable for the
+        # comparisons that DO run). Named in the closing line instead.
+        SKIPPED.append("config.yaml (no PyYAML)")
         print("spec: config.yaml SKIPPED (no PyYAML)")
         return 0
     got = yaml.safe_load(CONFIG_YAML.read_text())
@@ -308,6 +330,12 @@ def main():
         print(f"\n{bad} divergence(s) between the two backends for ONE spec.",
               file=sys.stderr)
         return 1
+    if SKIPPED:
+        print("\nPARTIAL: the comparisons that ran agree, but this run did "
+              "not check " + ", ".join(SKIPPED) + ".")
+        print("Not a pass — for that, run "
+              "`nix build .#checks.<system>.one-spec-both-backends`.")
+        return 0
     print("\nOK: one spec, and both backends render it the same.")
     return 0
 
