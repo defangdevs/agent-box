@@ -235,6 +235,20 @@ jobs:
       #                     exists), IPC fan-out into a session peer applying
       #                     its own filter, and the discovery surface
       - name: Run VM tests
+        # The JOB timeout above cancels the run, and GitHub reports a
+        # cancelled run exactly like one that `cancel-in-progress`
+        # superseded — so a hang here is indistinguishable from routine
+        # noise, and the standing webhook watch (which spawns on
+        # `failure`/`timed_out`, never on `cancelled`) stays silent for it.
+        # A STEP timeout fails the step instead, so the job goes red and
+        # the hang gets reported.
+        #
+        # The step timeout has to beat the JOB timeout to the hang, and the
+        # steps above spend up to 219s first (measured over eight green
+        # master runs), so the step budget is 25min - 3.7min = 21.3min, not
+        # 25. 18 is under that and still 1.8x the slowest green step (596s
+        # over the same eight runs).
+        timeout-minutes: 18
         run: |
           # `sessions` is the longest check, so it has to START FIRST. With
           # three slots the window is its own length only while it begins at
