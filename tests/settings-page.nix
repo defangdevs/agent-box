@@ -442,6 +442,52 @@
         f"status should surface the failed update run: {status}"
     )
 
+    # The Danger zone's third row: "Reboot box". A kernel or libc patch
+    # installs on disk and only takes effect at a boot, unattended patching
+    # deliberately never reboots, and nothing inside the box could — so
+    # without this card such an update never finishes at all.
+    assert "Reboot box" in page, "Danger zone should offer a reboot"
+    assert 'id="reboot-status"' in page, "Reboot card should have a status target"
+    # It stays quiet until the distro says a reboot would apply something.
+    # NixOS never writes that marker, so this box says nothing until the
+    # test writes one itself.
+    assert "A reboot is pending" not in page, (
+        "the reboot card should be silent with no marker file"
+    )
+    machine.succeed(
+        "touch /run/reboot-required; "
+        "printf 'linux-image-6.8.0-test\\nlibc6\\n' > /run/reboot-required.pkgs"
+    )
+    pending = client.succeed(
+        f"{curl} -u agent:testpassword https://box.test/agent/settings/"
+    )
+    assert "A reboot is pending" in pending, (
+        "the card should report the distro's pending-reboot marker"
+    )
+    assert "linux-image-6.8.0-test" in pending, (
+        "the card should name what asked for the reboot"
+    )
+    machine.succeed("rm -f /run/reboot-required /run/reboot-required.pkgs")
+
+    # The grant behind that button, read back from sudo itself rather than
+    # from the file we wrote: sudoers matches on the exact command line, so
+    # a rule that differs from AGENT_BOX_REBOOT_CMD by one flag does not
+    # error — it asks for a password no agent can answer (issue #353).
+    # Listing it is as far as this test goes on purpose: actually running it
+    # would reboot the machine the rest of the suite is talking to.
+    machine.succeed(
+        "su -s /bin/sh agent -c '/run/wrappers/bin/sudo -n -l' > /tmp/sudo-l"
+    )
+    machine.succeed(
+        "grep -F '/run/current-system/sw/bin/systemctl reboot --no-block' "
+        "/tmp/sudo-l > /dev/null"
+    )
+    # mallory (not an agent-box user) has no such grant.
+    machine.fail(
+        "su -s /bin/sh mallory -c '/run/wrappers/bin/sudo -n "
+        "/run/current-system/sw/bin/systemctl reboot --no-block'"
+    )
+
     # mallory (not an agent-box user) must not be able to trigger an update.
     machine.fail(
         "su -s /bin/sh mallory -c '/run/wrappers/bin/sudo -n "

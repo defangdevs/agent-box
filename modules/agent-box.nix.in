@@ -319,6 +319,15 @@ let
   # answer the HTTP request before the rebuild (possibly) restarts the daemon
   # itself. A separate literal because sudoers matches argv exactly.
   updateStartNoBlockCmd = "/run/current-system/sw/bin/systemctl start --no-block agent-box-update.service";
+  # The settings page's "Reboot box" button. --no-block for the same reason
+  # the update trigger has it, only more so: the daemon must answer the
+  # request before systemd starts stopping units, and the daemon is one of
+  # the units. Spelled ONCE because sudoers matches argv exactly and three
+  # places have to agree on it (the rule, the AGENT_BOX_REBOOT_CMD the
+  # daemon execs, and the VM test that proves the grant matches) — the #353
+  # trap, where a grant that differs by one flag silently asks for a
+  # password instead.
+  rebootCmd = "/run/current-system/sw/bin/systemctl reboot --no-block";
   effectiveSudoAllowlist =
     cfg.sudoAllowlist
     ++ lib.optional cfg.web.enable caddyReloadCmd
@@ -1393,6 +1402,33 @@ in
           default sshd jail along.
         '';
       };
+
+      rebootButton = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Offer "Reboot box" in the settings page's Danger zone. A kernel
+          or libc patch installs on disk and only takes effect at a boot,
+          and nothing on the box reboots by itself, so without this a box
+          reached only through its browser terminal has no way to finish
+          such an update at all.
+
+          The grant it needs is
+          `/run/current-system/sw/bin/systemctl reboot --no-block`, given
+          to the ROOT terminal user alone — the one whose terminal the
+          vhost root serves, which is `web.user` when that user has a
+          browser terminal of its own and otherwise the first terminal
+          user in sorted order (see `rootUser`) — a reboot is the
+          one Danger-zone action that crosses the user boundary
+          ("Restart all" bounces the caller's own unit and takes no sudo),
+          so on a multi-user box it must not become one user's power over
+          another's sessions. Note what that means for a session: the
+          settings daemon runs as that user, so the same grant is
+          reachable from that user's shell — an agent can reboot the box
+          too. Set this false to keep the machine's power state entirely
+          outside the box.
+        '';
+      };
     };
 
     selfUpdate = {
@@ -2317,6 +2353,10 @@ in
         if lib.elem webUser terminalUsers then webUser
         else if terminalUsers != [ ] then lib.head terminalUsers
         else null;
+      # "Reboot box" (see web.rebootButton). Root user only, and only when
+      # there IS one: the button lives on the settings page, and a box with
+      # no terminal user serves no settings page to put it on.
+      rebootButton = cfg.web.rebootButton && rootUser != null;
       portOf = lib.listToAttrs (lib.imap0 (i: n: lib.nameValuePair n (ttydPortBase + i)) terminalUsers);
       # Public URL base path for a user's settings page (Caddy does not strip
       # a prefix, so the daemon matches this full path).
@@ -2629,7 +2669,16 @@ in
           command = "${passwordHelperCmdOf name} \"\"";
           options = [ "NOPASSWD" ];
         }];
-      }) terminalUsers;
+      }) terminalUsers
+      # And the root user alone may reboot the machine (web.rebootButton).
+      # Kept out of the box-wide effectiveSudoAllowlist for the same reason
+      # the password helper is: "Restart all" bounces the caller's OWN unit,
+      # but a reboot takes every user's sessions down, so it must not become
+      # one agent user's power over another's work.
+      ++ lib.optional rebootButton {
+        users = [ rootUser ];
+        commands = [{ command = rebootCmd; options = [ "NOPASSWD" ]; }];
+      };
 
       # Brute-force protection: count 401s on the terminal vhost that carried
       # an Authorization header (Caddy logs it as ["REDACTED"] when present),
@@ -2801,6 +2850,13 @@ in
             # here, unlike AGENT_BOX_UPDATE_CMD, which triggers the run.
             AGENT_BOX_UPDATE_UNIT = "agent-box-update.service";
             AGENT_BOX_SYSTEMCTL = "/run/current-system/sw/bin/systemctl";
+          }
+          // lib.optionalAttrs (rebootButton && name == rootUser) {
+            # The Danger zone's "Reboot box" (web.rebootButton). Set for
+            # the root user's daemon only, matching the sudo rule above —
+            # the daemon hides the card and 404s the route without it, so
+            # another user's page cannot even ask.
+            AGENT_BOX_REBOOT_CMD = "/run/wrappers/bin/sudo -n ${rebootCmd}";
           })
           // {
             # mkForce for the reason spelled out on the "agent-box@" unit:

@@ -213,6 +213,32 @@
     })();
   }
 
+  // The one Danger-zone action whose progress cannot be polled: the box
+  // takes this daemon down with it. So this watcher looks for the
+  // OPPOSITE of the other two — the status feed has to go AWAY first,
+  // and only a poll that succeeds AFTER that dip means the box is back.
+  // Without the dip requirement the first poll, answered by the daemon
+  // that is still shutting down, would report success and reload into a
+  // page that is about to vanish.
+  function watchReboot(url) {
+    var el = document.getElementById("reboot-status");
+    if (!el) { return; }
+    var dipped = false, tries = 0, MAX = 240;   // ~10 min at 2.5s
+    setStatus(el, "checking", "Rebooting — this page comes back by itself…");
+    (function tick() {
+      if (tries++ > MAX) {
+        setStatus(el, "blocked",
+                  "The box has not come back — check the cloud console.");
+        return;
+      }
+      fetchStatus(url).then(function (s) {
+        if (!s) { dipped = true; window.setTimeout(tick, 2500); return; }
+        if (dipped) { window.location.reload(); return; }
+        window.setTimeout(tick, 2500);
+      });
+    })();
+  }
+
   // The page itself never waits on GitHub. Once it is visible, make a
   // single compare request: GitHub reports whether repository HEAD is
   // ahead of the running revision and provides the commit count. The
@@ -830,6 +856,22 @@
     }
     if (poll === "restart" && statusUrl) {
       post().then(function (t) { afterPost(t); watchRestart(statusUrl); });
+      return;
+    }
+    if (poll === "reboot" && statusUrl) {
+      // Do NOT hang the watcher off the response: the daemon answers
+      // before it triggers the shutdown, but that answer travels while
+      // systemd is already stopping units, so it can be lost. Whichever
+      // comes first — the response or a short timer — starts the watch,
+      // and the rejection path counts as an answer for the same reason.
+      var started = false;
+      var begin = function () {
+        if (started) { return; }
+        started = true;
+        watchReboot(statusUrl);
+      };
+      post().then(begin, begin);
+      window.setTimeout(begin, 1500);
       return;
     }
     post().then(function (t) { afterPost(t); startPolling(8); });

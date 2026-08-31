@@ -74,7 +74,12 @@ in
   # caddy reload itself (caddyReloadCmd, modules/agent-box.nix.in:316) — which
   # is why the golden sudoers carries it twice.
   sudoAllowlist = cfg.sudoAllowlist;
-  web.enable = cfg.web.enable;
+  web = { enable = cfg.web.enable; }
+    # Only when turned OFF, for the reason `session` above emits only
+    # non-defaults: both backends default the reboot button on, and writing
+    # that default out would hide a divergence in either default behind an
+    # explicit value.
+    // lib.optionalAttrs (!cfg.web.rebootButton) { rebootButton = false; };
   webhook = {
     enable = cfg.webhook.enable;
     repo = cfg.webhook.repo;
