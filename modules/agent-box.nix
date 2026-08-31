@@ -13284,12 +13284,15 @@ def render_connect_card(state):
             f'is what your sessions use &mdash; signed in here or not.</p></div>'
         )
     # Open on anything the operator has to act on or read right now: a flow
-    # mid-run, a fresh error, or the "no session to sign in from" note. Idle
-    # and connected cards — nothing more to say — stay closed (issue #449).
+    # mid-run, a fresh error, the "no session to sign in from" note, or a
+    # shadow-env warning (it renders inside this same <details>, so a
+    # closed card would hide it). Idle and connected cards with nothing
+    # else to say stay closed (issue #449).
     open_now = (
         state["state"] in ("waiting", "starting", "checking", "exchanging")
         or (state["state"] in ("failed", "expired") and state["error"])
         or state["blocked"]
+        or state["shadow"]
     )
     return (
         f'<li class="foldrow conn-row">'
