@@ -571,8 +571,16 @@ class Tree:
         self.files = {}      # path -> (text, mode)
         self.dirs = []       # (path, mode, owner, group)
         self.links = []      # (link, target)
-        # Paths a PREVIOUS render owned and this one does not. apply
-        # deletes only files still carrying our generated header.
+        # Paths a PREVIOUS render owned and this one does not, as
+        # (path, verbatim). apply deletes only files it can still prove are
+        # ours: normally that is the generated header, but some things we
+        # render carry no comment syntax to put one in (the web-users TSV) or
+        # are installed byte-for-byte from the profile and shared with the
+        # NixOS backend, where our header would be a lie (the %i template
+        # units). For those, `verbatim` is the exact text this box would have
+        # written; a file that still matches it byte for byte is as
+        # provably-ours as a header, and one that does not is somebody's edit
+        # and stays. None means header-only.
         self.remove = []
         self.units = []      # unit names to enable
         self.disable = []    # unit names to disable
@@ -586,17 +594,32 @@ class Tree:
     def link(self, link, target):
         self.links.append((str(link), str(target)))
 
-    def gone(self, path):
-        self.remove.append(str(path))
+    def gone(self, path, verbatim=None):
+        self.remove.append((str(path), verbatim))
 
 
 def env_file(pairs):
-    """Render an EnvironmentFile. Keys sorted for a stable diff."""
-    return "".join(f"{k}={v}\n" for k, v in pairs if v not in (None, ""))
+    """Render an EnvironmentFile. Keys sorted for a stable diff.
+
+    Carries the generated header — systemd's EnvironmentFile syntax takes
+    `#` comments, and without one apply could not prove these files were
+    still its own, so the per-user env of a feature that got turned off
+    stayed on disk forever (issue #413). It also tells an administrator
+    reading /etc/agent-box/units/ who writes the file.
+    """
+    return GENERATED_HEADER + "".join(
+        f"{k}={v}\n" for k, v in pairs if v not in (None, ""))
 
 
 def dropin(section_lines):
-    return "[Unit]\n\n[Service]\n" + "".join(f"{l}\n" for l in section_lines)
+    """A per-instance drop-in, with the generated header.
+
+    Same reason env_file carries one: without it apply cannot prove the
+    drop-in is still its own, so the host config of a feature that got
+    turned off outlived the feature (issue #413).
+    """
+    return (GENERATED_HEADER + "[Unit]\n\n[Service]\n"
+            + "".join(f"{l}\n" for l in section_lines))
 
 
 class Renderer:
@@ -646,6 +669,10 @@ class Renderer:
         if self.spec.web_enable:
             self.caddy(t)
             self.fail2ban(t)
+        else:
+            self.web_off(t)
+        if not self.spec.webhook_enable:
+            self.webhook_off(t)
         return t
 
     # -- agent defaults ------------------------------------------------------
@@ -966,6 +993,142 @@ class Renderer:
                 "WantedBy=multi-user.target",
             ]))
         t.units.append(FAIL2BAN_UNIT)
+
+    # -- turning the web off -------------------------------------------------
+
+    def would_have_written(self, *methods):
+        """The files a render with the feature ON would have produced.
+
+        Enumerating them by hand is how the list goes stale: the next person
+        to add a file to caddy() has no reason to look here, and a forgotten
+        entry is invisible (the file simply survives). So ask the renderer
+        instead — run the same methods into a throwaway Tree and take their
+        `files`. Nothing is written; only `.files` is read, so the dirs,
+        links and units those methods also collect are discarded.
+
+        Guarded, because this runs on a box that may never have had the
+        feature: caddy() reads the Caddyfile fragments out of the profile
+        and raises if one grew a token it does not know. A box that cannot
+        reconstruct what it would have written still gets the units stopped
+        (that half needs no reconstruction) and says what it could not do.
+        """
+        scratch = Tree()
+        try:
+            for method in methods:
+                method(scratch)
+        except (ConfigError, OSError) as exc:
+            self.notes.append(
+                f"could not reconstruct what the disabled feature would have "
+                f"rendered ({exc}) — its units are stopped and disabled, but "
+                f"its files are left in place; remove them by hand")
+            return {}
+        return scratch.files
+
+    def web_off(self, t):
+        """web.enable: false has to take the box OFF the public internet.
+
+        `apply` never deletes what a render stops emitting, and caddy,
+        fail2ban and agent-web-auth-secrets are PLAIN units, so nothing
+        reconciled them: the per-user %i instances stopped (cmd_apply walks
+        those prefixes) and caddy went on listening on 80/443 with the
+        terminal's basic auth in front of an upstream that no longer
+        existed, while the jail went on watching a log nobody wrote. Same
+        defect as codexFullAccess (#394) and protectMemory (#404), with a
+        public listener on the other end — issue #413.
+
+        Order matters, and it is the reverse of how they come up. fail2ban
+        is `PartOf=caddy.service`, so stopping caddy would stop it anyway;
+        disabling it first means it is never briefly jailing a service that
+        is on its way down. agent-web-auth-secrets goes last because caddy
+        `Requires=` it: dropping the dependency before the dependant leaves
+        systemd pulling a unit we just disabled back in.
+        """
+        for unit in (FAIL2BAN_UNIT, "caddy.service",
+                     "agent-web-auth-secrets.service"):
+            path = self.p("/etc/systemd/system", unit)
+            # caddy.service and agent-web-auth-secrets.service are rendered
+            # from methods on this class, so their text is reproducible; the
+            # fail2ban unit carries the header and needs no witness.
+            verbatim = {
+                "caddy.service": self.caddy_unit,
+                "agent-web-auth-secrets.service": self.auth_secrets_unit,
+            }.get(unit)
+            verbatim = verbatim() if verbatim else None
+            t.gone(path, verbatim)
+            if generated_by_us(path) or (
+                    verbatim is not None and self.same_text(path, verbatim)):
+                t.disable.append(unit)
+        # The %i templates for the two web families, installed byte-for-byte
+        # from the profile (shared_units) — so the profile's own copy is the
+        # witness that they are still ours.
+        self.gone_shared_units(t, ("agent-web-terminal@", "agent-box-settings@"))
+        for u in self.spec.users:
+            for name in (f"agent-web-terminal-{u.name}.env",
+                         f"agent-box-settings-{u.name}.env"):
+                t.gone(self.p("/etc/agent-box/units", name))
+            for unit in (f"agent-web-terminal@{u.name}.service",
+                         f"agent-box-settings@{u.name}.service"):
+                t.gone(self.p("/etc/systemd/system", f"{unit}.d",
+                              "10-host.conf"))
+        # The manifest carries no comment syntax its reader tolerates
+        # (read_web_users would parse a header line as a user), so it is
+        # removed on the byte-identical witness instead.
+        t.gone(self.p(WEB_USERS_FILE), self.web_users_text())
+        for path, (text, _mode) in self.would_have_written(
+                self.caddy, self.fail2ban).items():
+            t.gone(path, text)
+        # NOT removed: /etc/agent-box/<user>.hash and the cookie secrets
+        # under /var/lib/agent-box-web. They are credentials this renderer
+        # does not mint and cannot re-derive — `apply --first-boot` and the
+        # password helper own them — so turning the terminal off keeps the
+        # password for turning it back on. Nothing reads them while caddy is
+        # down. Same for the action.d symlink under the fail2ban dir: a
+        # symlink is never "ours" (generated_by_us refuses one deliberately),
+        # and it points into the profile, so it is inert once the jail is.
+
+    def webhook_off(self, t):
+        """webhook.enable: false, the same shape, smaller.
+
+        The %i instances are stopped by cmd_apply's prefix walk; what
+        survived was the CLI wrapper telling an agent to subscribe to a
+        receiver that is not listening, plus the templates and env files.
+        """
+        self.gone_shared_units(t, ("agent-box-webhook@",))
+        for u in self.spec.users:
+            t.gone(self.p("/etc/agent-box/units",
+                          f"agent-box-webhook-{u.name}.env"))
+            t.gone(self.p("/etc/systemd/system",
+                          f"agent-box-webhook@{u.name}.service.d",
+                          "10-host.conf"))
+        t.gone(self.p("/usr/local/bin/agent-box-webhook"))
+
+    def gone_shared_units(self, t, prefixes):
+        """Queue the profile-installed %i templates matching `prefixes`.
+
+        Witnessed by the profile's own copy: `shared_units` writes these
+        byte-for-byte, so an unmodified file on disk is still exactly what
+        we put there. They cannot carry the generated header — the same
+        bytes are the NixOS backend's units, where "generated by agentbox
+        apply" would be false.
+        """
+        src = self.share / "units"
+        if not src.is_dir():
+            return
+        for unit in sorted(src.iterdir()):
+            if unit.name.startswith(tuple(prefixes)):
+                t.gone(self.p("/etc/systemd/system", unit.name),
+                       unit.read_text())
+
+    def web_users_text(self):
+        return "".join(f"{u.name}\t/etc/agent-box/{u.name}.hash\n"
+                       for u in self.spec.users)
+
+    @staticmethod
+    def same_text(path, text):
+        try:
+            return Path(path).read_text() == text
+        except (OSError, UnicodeDecodeError):
+            return False
 
     # -- store housekeeping -------------------------------------------------
 
@@ -1435,10 +1598,9 @@ class Renderer:
             # The manifest that replaces the module's eval-time per-user loop
             # (design item 5 in issue #154): who has a web login, and where
             # their password hash lives.
-            t.file(self.p("/etc/agent-box/web-users"),
-                   "".join(f"{u.name}\t/etc/agent-box/{u.name}.hash\n"
-                           for u in self.spec.users),
-                   0o600)
+            # web_users_text, not a second copy: web_off has to reproduce
+            # this file byte for byte to prove it is still ours to remove.
+            t.file(self.p(WEB_USERS_FILE), self.web_users_text(), 0o600)
 
     def user_env(self, t, u):
         agent_bins = " ".join(
@@ -1943,7 +2105,7 @@ class Renderer:
         q = shlex.quote
         t.file(self.p("/usr/local/bin/agent-box-session"),
                "#!/bin/sh\n"
-               "# Generated by `agentbox apply`.\n"
+               "# Generated by `agentbox apply` — do not edit.\n"
                f"export AGENT_BOX_AGENTS={q(agents)}\n"
                f"export AGENT_BOX_DEFAULT_AGENT={q(self.spec.default_agent)}\n"
                f"export AGENT_BOX_FLOCK_BIN={q(f'{self.bin}/flock')}\n"
@@ -1966,7 +2128,7 @@ class Renderer:
         # the same one parser.
         t.file(self.p("/usr/local/bin/agent-box-profile"),
                "#!/bin/sh\n"
-               "# Generated by `agentbox apply`.\n"
+               "# Generated by `agentbox apply` — do not edit.\n"
                f"export AGENT_BOX_AGENTS={q(agents)}\n"
                f"export AGENT_BOX_DEFAULT_AGENT={q(self.spec.default_agent)}\n"
                f"export AGENT_BOX_ENVSTORE_BIN="
@@ -2023,7 +2185,13 @@ class Renderer:
             parts.append(bind("terminal", u))
         parts.append(bind("root", root_user))
         parts.append("}\n")
-        t.file(self.p("/etc/agent-box/Caddyfile"), "\n".join(parts), 0o644)
+        # GENERATED_HEADER first: the fragment's own banner is shared with
+        # the module and speaks NixOS ("the next nixos-rebuild"), so it is
+        # not a marker of who wrote THIS file. Without a header of ours,
+        # web_off could not prove the Caddyfile was still ours to remove and
+        # a disabled terminal left its vhost config on disk.
+        t.file(self.p("/etc/agent-box/Caddyfile"),
+               GENERATED_HEADER + "\n".join(parts), 0o644)
 
         # The per-user password helper. It crosses sudo, so its paths are
         # compiled in here rather than read from env — an env-supplied path
@@ -2067,7 +2235,7 @@ class Renderer:
         if self.spec.webhook_enable:
             t.file(self.p("/usr/local/bin/agent-box-webhook"),
                    "#!/bin/sh\n"
-                   "# Generated by `agentbox apply`.\n"
+                   "# Generated by `agentbox apply` — do not edit.\n"
                    f"export AGENT_BOX_WEBHOOK_SCRIPT="
                    f"{shlex.quote(self.spec.webhook_script)}\n"
                    f"export AGENT_BOX_HOOK_SESSION_ARGS="
@@ -2176,7 +2344,7 @@ def generated_by_us(path):
     return text.startswith(GENERATED_HEADER)
 
 
-def remove_if_ours(path, dry_run=False):
+def remove_if_ours(path, dry_run=False, verbatim=None):
     """Delete a file a previous render owned and this one no longer emits.
 
     Only ours: the file has to still carry the generated header, so a
@@ -2184,9 +2352,22 @@ def remove_if_ours(path, dry_run=False):
     which is the point — a renderer that removes files it did not write is
     a footgun, and one that never removes anything leaves stale policy in
     force (issue #394: codexFullAccess flipped off).
+
+    `verbatim` is the second way to prove ownership, for the files that
+    cannot carry the header: the caller passes the exact text this box would
+    have written, and a byte-identical file on disk is ours by construction.
+    It is strictly narrower than the header check, not wider — an edited file
+    no longer matches, so it is left alone for the same reason and with the
+    same message.
     """
     path = Path(path)
-    if not generated_by_us(path):
+    ours = generated_by_us(path)
+    if not ours and verbatim is not None and not path.is_symlink():
+        try:
+            ours = path.read_text() == verbatim
+        except (OSError, UnicodeDecodeError):
+            ours = False
+    if not ours:
         if path.exists():
             print(f"note: {path} is no longer ours to remove — left alone")
         return False
@@ -2293,8 +2474,11 @@ def cmd_apply(args):
         if link_if_changed(link, target, args.dry_run):
             changed += 1
     removed = set()
-    for path in sorted(tree.remove):
-        if remove_if_ours(path, args.dry_run):
+    # By path only: two entries for the same path (one witnessed, one
+    # not) are not orderable against each other, and the order of the
+    # witnesses would not mean anything if they were.
+    for path, verbatim in sorted(tree.remove, key=lambda e: e[0]):
+        if remove_if_ours(path, args.dry_run, verbatim):
             removed.add(path)
             changed += 1
 
