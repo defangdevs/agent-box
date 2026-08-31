@@ -11144,9 +11144,11 @@ STYLE = """<style>
      The full-size triangles (U+25B6/U+25BC), not the SMALL ones: the small
      pair is a hairline next to 14px row text, which read as no affordance
      at all. Both have Emoji_Presentation=No, so no colour-emoji fallback. */
-  .tbl li.foldrow summary .nm::before { content: "▶"; color: #8b949e;
-                                        font-size: 12px; flex: none; }
-  .tbl li.foldrow details[open] summary .nm::before { content: "▼"; }
+  .tbl li.foldrow summary .nm::before,
+  .tbl li.foldrow summary .conn-head strong::before { content: "▶ ";
+                                        color: #8b949e; font-size: 12px; }
+  .tbl li.foldrow details[open] summary .nm::before,
+  .tbl li.foldrow details[open] summary .conn-head strong::before { content: "▼ "; }
   /* The fold body: an inset table with no border of its own, so its rows
      read as belonging to the session above them. */
   ul.tbl.subs { margin: 0; border: 0; border-radius: 0; background: #0d1117; }
@@ -11179,16 +11181,21 @@ STYLE = """<style>
   .state[data-state=stopped] { color: #8b949e; }
   .state[data-state=failed] { color: #f85149; }
   /* Guided sign-in cards (issues #207, #208, #313): a wizard step is a
-     full-width row under the flow it belongs to, so the steps read in
-     order instead of competing with the pill for the same line. */
-  .tbl li.conn-step { display: block; padding: 10px 16px 12px;
-                      background: #161b22; }
+     full-width block under the flow it belongs to, so the steps read in
+     order instead of competing with the pill for the same line. A <div>,
+     not an <li> — issue #449 moved these inside a <details>, where a bare
+     <li> (no enclosing <ul>/<ol>) is no longer valid markup. */
+  .tbl li.conn-row .conn-step { display: block; padding: 10px 16px 12px;
+                                background: #161b22; }
   .conn-step .note:first-child { margin-top: 0; }
   .conn-step form { margin-top: 8px; }
-  .tbl li.conn-row { display: block; padding: 12px 16px; }
+  /* The row itself folds like a session row (issue #449); .tbl li.foldrow
+     above already gives the <li> display:block/padding:0 and the <summary>
+     its padding, hover and layout. This just lays out the head's two
+     halves and gives the note its own top margin under the summary. */
   .conn-head { display: flex; align-items: center; justify-content: space-between;
                gap: 12px; }
-  .conn-row .note { margin: 4px 0 0; }
+  .tbl li.conn-row > details > .note { margin: 4px 16px 0; }
   .conn-warn { color: #d29922; }
   .conn-code { font-size: 15px; letter-spacing: 1px; color: #e6edf3; }
   .conn-error { color: #f85149; }
@@ -13200,7 +13207,14 @@ def render_connect_card(state):
     """One flow's row, plus the wizard step under it while a sign-in is
     in flight. Rendered server-side on purpose: the tmux session is the
     only state, so a reload, a second tab or a daemon restart all show
-    the same step — and the page keeps working without JavaScript."""
+    the same step — and the page keeps working without JavaScript.
+
+    The row folds like a session row (issue #449): the connection list
+    only grows, so a card with nothing to say must take one line, not a
+    full paragraph. It opens by default only while it needs the operator
+    right now — see the `open_now` rule below — so pressing "Sign in"
+    never lands on a page where the wizard it just started is invisible
+    until the row is expanded by hand."""
     base = html.escape(BASE)
     flow_id = html.escape(state["id"])
     pill = {
@@ -13245,34 +13259,47 @@ def render_connect_card(state):
             f'<input type="hidden" name="flow" value="{flow_id}">'
             f'<button type="submit" class="btn small">{label}</button></form>'
         )
-    row = (
-        f'<li class="conn-row"><div class="conn-head">'
-        f'<strong>{html.escape(state["label"])}</strong>'
+    head = (
+        f'<div class="conn-head"><strong>{html.escape(state["label"])}</strong>'
         f'<span class="acts"><span class="state" data-state="{pill[0]}">{pill[1]}</span>'
         f'{action}</span></div>'
-        f'<p class="note">{state["note"]}</p></li>'
     )
+    note = state["note"]
     if not state["installed"] and state["installable"]:
-        row = row.replace(
-            '</p></li>',
-            ' This box does not ship it — the button fetches it into your '
-            'own Nix profile first, which is a one-off of a few minutes.'
-            '</p></li>', 1)
+        note += (' This box does not ship it — the button fetches it into '
+                 'your own Nix profile first, which is a one-off of a few '
+                 'minutes.')
     step = render_connect_step(state)
     if state["blocked"]:
-        step = ('<li class="conn-step"><p class="note">No terminal session '
+        step = ('<div class="conn-step"><p class="note">No terminal session '
                 'is running, so there is nowhere to sign in from. Add a '
-                'session above first.</p></li>')
+                'session above first.</p></div>')
     warn = ""
     if state["shadow"]:
         keys = ", ".join("<code>%s</code>" % html.escape(k) for k in state["shadow"])
         warn = (
-            f'<li class="conn-step"><p class="note conn-warn">{keys} is set '
+            f'<div class="conn-step"><p class="note conn-warn">{keys} is set '
             f'under Environment secrets. These CLIs prefer their environment '
             f'variable over a stored credential, so the value you set by hand '
-            f'is what your sessions use &mdash; signed in here or not.</p></li>'
+            f'is what your sessions use &mdash; signed in here or not.</p></div>'
         )
-    return row + step + warn
+    # Open on anything the operator has to act on or read right now: a flow
+    # mid-run, a fresh error, the "no session to sign in from" note, or a
+    # shadow-env warning (it renders inside this same <details>, so a
+    # closed card would hide it). Idle and connected cards with nothing
+    # else to say stay closed (issue #449).
+    open_now = (
+        state["state"] in ("waiting", "starting", "checking", "exchanging")
+        or (state["state"] in ("failed", "expired") and state["error"])
+        or state["blocked"]
+        or state["shadow"]
+    )
+    return (
+        f'<li class="foldrow conn-row">'
+        f'<details data-fold="conn-{flow_id}"{" open" if open_now else ""}>'
+        f'<summary>{head}</summary><p class="note">{note}</p>{step}{warn}'
+        f'</details></li>'
+    )
 
 
 def render_connect_step(state):
@@ -13285,14 +13312,14 @@ def render_connect_step(state):
         f'<button type="submit" class="btn small">Cancel</button></form>'
     )
     if state["state"] == "starting":
-        return (f'<li class="conn-step"><p class="note">Starting the '
-                f'sign-in&hellip;</p>{cancel}</li>')
+        return (f'<div class="conn-step"><p class="note">Starting the '
+                f'sign-in&hellip;</p>{cancel}</div>')
     if state["state"] == "exchanging":
-        return ('<li class="conn-step"><p class="note">The CLI finished '
-                'signing in &mdash; confirming with it now&hellip;</p></li>')
+        return ('<div class="conn-step"><p class="note">The CLI finished '
+                'signing in &mdash; confirming with it now&hellip;</p></div>')
     if state["state"] in ("failed", "expired") and state["error"]:
-        return (f'<li class="conn-step"><p class="note conn-error">'
-                f'{html.escape(state["error"])}</p></li>')
+        return (f'<div class="conn-step"><p class="note conn-error">'
+                f'{html.escape(state["error"])}</p></div>')
     if state["state"] != "waiting":
         return ""
     url = html.escape(state["url"], quote=True)
@@ -13319,7 +13346,7 @@ def render_connect_step(state):
             f'<button type="submit" class="btn">Submit code</button></form>'
         )
     parts.append(cancel)
-    return '<li class="conn-step">' + "".join(parts) + "</li>"
+    return '<div class="conn-step">' + "".join(parts) + "</div>"
 
 
 def render_connect():
