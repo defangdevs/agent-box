@@ -1072,12 +1072,14 @@ class Renderer:
         # as an option is ignored for anybody outside trusted-users, which
         # the agent deliberately is not.
         cache_host = "defanglabs.cachix.org"
-        cache = (f"# agent-box (issue #461): the settings page's Defang card\n"
-                 f"# fetches a pinned closure from this cache instead of\n"
-                 f"# compiling it. Additive — remove if you do not want it.\n"
-                 f"extra-substituters = https://{cache_host}\n"
-                 f"extra-trusted-public-keys = {cache_host}-1:"
-                 f"mTXLTfYprWDrIK50Kz34fhOTreeKlQRZFQcKL7HtHx0=\n")
+        cache_banner = (
+            "# agent-box (issue #461): the settings page's Defang card\n"
+            "# fetches a pinned closure from this cache instead of\n"
+            "# compiling it. Additive — remove if you do not want it.\n")
+        cache_sub = f"extra-substituters = https://{cache_host}\n"
+        cache_key = (f"extra-trusted-public-keys = {cache_host}-1:"
+                     f"mTXLTfYprWDrIK50Kz34fhOTreeKlQRZFQcKL7HtHx0=\n")
+        cache = cache_banner + cache_sub + cache_key
         path = self.p("/etc/nix/nix.custom.conf")
         try:
             existing = path.read_text()
@@ -1094,12 +1096,23 @@ class Renderer:
             f"{path}: not written by agentbox — nix min-free/max-free left "
             f"unset; add them yourself to keep the store from filling the "
             f"root filesystem mid-build")
-        if cache_host in existing:
+        # The two lines are checked SEPARATELY, because a half-configured
+        # file is the case that actually bites: a substituter without its
+        # public key is refused by nix and silently falls back to building,
+        # which is the very compile this exists to avoid. Keying the whole
+        # block off one probe would look configured and behave unconfigured.
+        want = ""
+        if f"https://{cache_host}" not in existing:
+            want += cache_sub
+        if f"{cache_host}-1:" not in existing:
+            want += cache_key
+        if not want:
             return
         self.notes.append(
-            f"{path}: appended the {cache_host} substituter so the Defang "
-            f"card can fetch rather than compile")
-        t.file(path, existing.rstrip("\n") + "\n\n" + cache)
+            f"{path}: appended the {cache_host} "
+            f"{'substituter and key' if want == cache_sub + cache_key else 'setting it was missing'} "
+            f"so the Defang card can fetch rather than compile")
+        t.file(path, existing.rstrip("\n") + "\n\n" + cache_banner + want)
 
     # -- base-OS patching ----------------------------------------------------
 

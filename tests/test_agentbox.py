@@ -679,6 +679,35 @@ class RenderTest(unittest.TestCase):
             self.assertNotIn(str(conf), again.files,
                              "appended the substituter a second time")
 
+    def test_a_half_configured_defang_cache_is_completed(self):
+        """A substituter without its public key is REFUSED by nix, which
+        falls back to building — the ~100 MB compile the cache exists to
+        avoid. So the two lines are probed separately: a file carrying only
+        one of them looks configured to a single probe and behaves
+        unconfigured in practice.
+        """
+        mod = load_agentbox()
+        sub = "extra-substituters = https://defanglabs.cachix.org"
+        key = "extra-trusted-public-keys = defanglabs.cachix.org-1:"
+        for name, present, missing in (("key only", key, sub),
+                                       ("substituter only", sub, key)):
+            with self.subTest(name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    prof = build_fake_profile(tmp)
+                    out = Path(tmp) / "out"
+                    (out / "etc/nix").mkdir(parents=True)
+                    conf = out / "etc/nix/nix.custom.conf"
+                    conf.write_text("# theirs\n" + present + "whatever\n")
+                    spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()),
+                                        prof)
+                    rend = mod.Renderer(spec_obj, prof, root=out)
+                    written = rend.render().files[str(conf)][0]
+                    self.assertIn(missing, written,
+                                  "left the box half-configured")
+                    self.assertEqual(
+                        1, written.count(present),
+                        "duplicated the half that was already there")
+
     def test_the_base_os_patches_itself_without_a_reboot(self):
         """The distro still owns its packages, but nobody here can answer
         the two questions an unattended patch run asks: may I restart this

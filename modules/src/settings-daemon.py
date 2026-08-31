@@ -2090,7 +2090,11 @@ def connect_start(flow):
             state["error"] = ("%s is not installed on this box, and cannot "
                               "be installed from here." % flow["label"])
             return state
-        if flow["attr"] and not CONNECT_NIXPKGS:
+        # Only the `attr` path needs a package source. A card with a pinned
+        # expression does not, so it must not be failed for the lack of one
+        # — the source selection below already prefers the expression, and
+        # a guard that fired first would contradict it.
+        if flow["attr"] and not flow["expr"] and not CONNECT_NIXPKGS:
             state = connect_state(flow)
             state["state"] = "failed"
             state["error"] = ("%s is not installed, and this box has no "
