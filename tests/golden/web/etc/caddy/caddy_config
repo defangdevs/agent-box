@@ -1,5 +1,5 @@
-# This file is module-managed by services.agent-box — edits here get
-# OVERWRITTEN on the next nixos-rebuild. To add your own virtual host,
+# This file is managed by services.agent-box — edits here get OVERWRITTEN on
+# the next nixos-rebuild switch. To add your own virtual host,
 # drop a *.caddy snippet into ~/sites/ (which is a symlink into
 # /var/lib/agent-box-sites/<you>/, a caddy-readable location) and
 # reload with: sudo systemctl reload caddy.service
