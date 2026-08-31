@@ -41,17 +41,27 @@ if "$JQ" --slurpfile pol "$POLICY" '
               | (if $r.note != null then .note = $r.note else . end)
             else . end ]
     ' "$FILE" > "$tmp"; then
-  mv -f "$tmp" "$FILE"
-  # Say which watches are governed — and when none is, that the policy is
-  # idle: a rule that silently applied to nothing reads like a rule that
-  # worked (#170).
-  "$JQ" -r --slurpfile pol "$POLICY" '
-        [ .topics[] | if type == "string" then . else (.topic // "") end ] as $subs
-        | [ ($pol[0] | keys[]) | select(. as $t | $subs | index($t)) ]
-        | if length > 0 then "agent-box-webhook-policy: enforced declared rules on " + join(", ")
-          else "agent-box-webhook-policy: no declared topic is subscribed; policy idle" end
-      ' "$FILE" >&2
+  if mv -f "$tmp" "$FILE"; then
+    # Say which watches are governed — and when none is, that the policy is
+    # idle: a rule that silently applied to nothing reads like a rule that
+    # worked (#170). Best-effort: this is a report, not the enforcement
+    # itself, so a failure here must not undo it or fail the unit.
+    "$JQ" -r --slurpfile pol "$POLICY" '
+          [ .topics[] | if type == "string" then . else (.topic // "") end ] as $subs
+          | [ ($pol[0] | keys[]) | select(. as $t | $subs | index($t)) ]
+          | if length > 0 then "agent-box-webhook-policy: enforced declared rules on " + join(", ")
+            else "agent-box-webhook-policy: no declared topic is subscribed; policy idle" end
+        ' "$FILE" >&2 || true
+  else
+    rm -f "$tmp" || true
+    echo "agent-box-webhook-policy: could not replace $FILE; receiver starts with it unchanged" >&2
+  fi
 else
-  rm -f "$tmp"
+  rm -f "$tmp" || true
   echo "agent-box-webhook-policy: could not rewrite $FILE; receiver starts with it unchanged" >&2
 fi
+# A policy failure must never keep the receiver down (see the module's
+# webhookPolicyApply comment) — every path above already reports its own
+# problem to the unit's log, so exit clean regardless of what a best-effort
+# step above returned.
+exit 0
