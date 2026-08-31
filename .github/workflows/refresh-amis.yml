@@ -41,7 +41,7 @@ jobs:
           fi
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          branch="chore/refresh-amis-$(date -u +%Y%m%d)"
+          branch="chore/refresh-amis-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           git checkout -b "$branch"
           git add aws/template.yaml
           git commit -m "Refresh NixOS AMI map (26.05)"
