@@ -108,6 +108,30 @@ BY_DESIGN = {
                          "the two standard install layouts. Both backends "
                          "reach the same binary; only one can name it "
                          "ahead of time",
+    "AGENT_BOX_WEBHOOK_POLICY_FILE": "issue #457: both backends bake this "
+                                     "into the agent-box-webhook-policy-apply "
+                                     "wrapper they build around the shared "
+                                     "modules/src/webhook-policy-apply.sh "
+                                     "(module: modules/agent-box.nix.in's "
+                                     "webhookPolicyApply; native: "
+                                     "nix/runtime.nix's own "
+                                     "writeShellScriptBin) — real Nix "
+                                     "derivations, built and run by neither "
+                                     "renderer's fixture. tests/native/"
+                                     "expected can only ever show the "
+                                     "native side one-sided: "
+                                     "test_agentbox.py's fake profile "
+                                     "stubs EVERY profile binary as an "
+                                     "empty `#!/bin/sh\\n:\\n` "
+                                     "(build_fake_profile's FAKE_BINS "
+                                     "loop), so no profile payload's real "
+                                     "body — this one included — is ever "
+                                     "in that fixture to find. GOLDEN sees "
+                                     "the module's copy only because the "
+                                     "NixOS golden snapshot captures the "
+                                     "actual store-built payload; native "
+                                     "has no equivalent capture to give "
+                                     "this checker",
 }
 
 # Divergences that are BUGS, each owned by an issue. This table must only ever
