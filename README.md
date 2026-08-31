@@ -85,14 +85,18 @@ and signs out every browser by rotating the authentication-cookie secret.
 **Updating the box.** Click "Update box" on the settings page (the gear icon
 next to your terminal; the card also shows the running agent-box rev, linked
 to its GitHub commit), or ask the agent in its terminal to run
-`sudo systemctl start agent-box-update.service` — a root oneshot (alongside
+`sudo systemctl start --no-block agent-box-update.service` — a root oneshot (alongside
 the caddy reload, the only sudo the agent holds) that fast-forwards the box
 to this repo's latest master and applies it: on Lightsail that is a swap of
 the pinned Nix profile followed by `agentbox apply` (the newly installed
 release renders its own configuration), on the EC2 NixOS template a
 `nixos-rebuild switch` that also advances the agent-CLI pin to the newest
-nixos-unstable channel release. Have the agent save its working context
-first: the update restarts changed agent services, which kills their running
+nixos-unstable channel release. The sudo rule matches the command's full
+path, which differs by backend (`/run/current-system/sw/bin/systemctl` on
+NixOS, `/usr/bin/systemctl` natively) — the box's own guide at
+`/etc/agent-box-guides/` gives the agent the exact line for the box it is on.
+Have the agent save its working context first: the update restarts changed
+agent services, which kills their running
 sessions. Anything that is not a fast-forward of the running revision is
 refused, and a failure rolls back to what was running.
 Verifying releases against an offline signing key is tracked in
@@ -301,7 +305,7 @@ when the browser cannot reach a local callback (see the
 [Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)),
 so no callback relay is needed. If an older deployed box still shows the
 legacy flow, update it from the settings page or run
-`sudo systemctl start agent-box-update.service`, then retry
+`sudo systemctl start --no-block agent-box-update.service`, then retry
 `claude auth login`.
 
 The auth code input is hidden like a password, so pasting gives no visible

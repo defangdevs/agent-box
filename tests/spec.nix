@@ -93,18 +93,12 @@ in
   users = lib.mapAttrs user cfg.users;
 }
 # The "@<host>" suffix of auto-derived Remote Control session names. Emitted
-# verbatim, not derived, because the two backends DISAGREE about the default
-# and this is where that shows: the module's remoteControlHost defaults to
-# config.networking.fqdnOrHostName — "nixos" on this configuration, and its
-# documented "when empty, fall back to web.domain" arm is reachable only by
-# setting the option to "" explicitly — while the native Spec has no hostname
-# to read and derives the label from `domain`
-# (bin/agentbox's Spec.host_label). So an otherwise identical pair of boxes
-# names its sessions "agent-main@nixos" on NixOS and
-# "agent-main@golden.example.org" natively. aws/template.yaml papers over it by
-# setting remoteControlHost to the box's sslip host; a bare-metal host that
-# never sets it does not. Tracked in the PR that added this file, not fixed
-# here: changing a default changes live session names.
+# only when the module's option is set, because an unset one now means the
+# same thing on both backends: derive the label from the domain. (It did not
+# always — remoteControlHost defaulted to config.networking.fqdnOrHostName,
+# so a NixOS box named its sessions "agent-main@nixos" where an otherwise
+# identical native box said "agent-main@golden.example.org". Reported by this
+# check on its first run and fixed by making "" the module's default.)
 // lib.optionalAttrs (cfg.remoteControlHost != "") {
   hostLabel = cfg.remoteControlHost;
 }

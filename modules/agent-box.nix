@@ -212,9 +212,11 @@ let
       ## Updating
 
       Update the box's software with:
-      `sudo /run/current-system/sw/bin/systemctl start agent-box-update.service`
+      `sudo ${updateStartCmd}`
       (kills the running tmux session - save context first). As above, the full
-      path is required for the passwordless sudo rule to match.
+      path is required for the passwordless sudo rule to match, and so is the
+      --no-block: sudoers compares the whole command line, so dropping a flag
+      makes the rule miss and sudo ask for a password instead.
 
     '')
       # Which HOST this guide is describing. The two backends install the
@@ -1944,11 +1946,22 @@ done
   # virtual host and reload without root — pooled with the user-supplied
   # sudoAllowlist so NoNewPrivileges + sudo rules see the same list.
   caddyReloadCmd = "/run/current-system/sw/bin/systemctl reload caddy.service";
-  updateStartCmd = "/run/current-system/sw/bin/systemctl start agent-box-update.service";
-  # --no-block variant for the settings page's Update button: the daemon must
-  # answer the HTTP request before the rebuild (possibly) restarts the daemon
-  # itself. A separate literal because sudoers matches argv exactly.
-  updateStartNoBlockCmd = "/run/current-system/sw/bin/systemctl start --no-block agent-box-update.service";
+  # The self-update trigger, spelled ONCE, for the same reason rebootCmd
+  # below is: sudoers matches argv exactly, so every place that names this
+  # command has to agree on it character for character — the sudo rule, the
+  # AGENT_BOX_UPDATE_CMD the settings daemon execs for its Update button, and
+  # the line the shipped guide tells an agent to type.
+  #
+  # --no-block is what the daemon needs (it must answer the HTTP request
+  # before the rebuild restarts the daemon itself) and costs the guide's
+  # reader nothing: the update kills the tmux session either way, so a
+  # blocking wait only means the shell dies mid-command instead of after it.
+  # It used to be two literals, the blocking one for the guide and this one
+  # for the button, which meant a NixOS box granted root two ways into the
+  # same unit while the native backend granted one (`UPDATE_TRIGGER`,
+  # bin/agentbox) — the divergence one-spec-both-backends reported as
+  # SUDOERS_KNOWN_GAPS, and a second way in that nothing documented.
+  updateStartCmd = "/run/current-system/sw/bin/systemctl start --no-block agent-box-update.service";
   # The settings page's "Reboot box" button. --no-block for the same reason
   # the update trigger has it, only more so: the daemon must answer the
   # request before systemd starts stopping units, and the daemon is one of
@@ -1961,7 +1974,7 @@ done
   effectiveSudoAllowlist =
     cfg.sudoAllowlist
     ++ lib.optional cfg.web.enable caddyReloadCmd
-    ++ lib.optionals cfg.selfUpdate.enable [ updateStartCmd updateStartNoBlockCmd ];
+    ++ lib.optional cfg.selfUpdate.enable updateStartCmd;
   # Agent CLIs (claude-code, codex) move much faster than any host channel.
   # When the host wires selfUpdate.agentNixpkgs (from the pin file the update
   # service maintains — see that option), resolve just the agent packages from
@@ -5601,11 +5614,11 @@ exit 0
           Remote Control session name (claude sessions only — codex derives
           its own name from the hostname). When null, defaults to
           "<user>-<session>@<host>", where <host> is
-          services.agent-box.remoteControlHost (fqdnOrHostName by default,
-          the public sslip.io host on the AWS image), else the public
-          services.agent-box.web.domain, else the live kernel hostname when
-          both are empty at build time. When no host is resolvable the
-          "@<host>" suffix is omitted (just "<user>-<session>").
+          services.agent-box.remoteControlHost (empty by default; the AWS
+          image sets it to the box's public sslip.io host), else the public
+          services.agent-box.web.domain, else networking.fqdnOrHostName.
+          When no host is resolvable the "@<host>" suffix is omitted (just
+          "<user>-<session>").
         '';
       };
       workingDirectory = lib.mkOption {
@@ -5754,10 +5767,10 @@ exit 0
           Remote Control session name, used to correlate the session to this box
           from the Claude apps. Keep it shell-safe (no spaces/quotes). This seeds
           the "main" session; when null it defaults to "<user>-main@<host>",
-          where <host> is services.agent-box.remoteControlHost (fqdnOrHostName by
-          default, the public sslip.io host on the AWS image), else the public
-          web.domain, else the live kernel hostname when both are empty at build
-          time; the "@<host>" suffix is omitted when no host is resolvable.
+          where <host> is services.agent-box.remoteControlHost (empty by
+          default; the AWS image sets it to the box's public sslip.io host),
+          else the public web.domain, else networking.fqdnOrHostName; the
+          "@<host>" suffix is omitted when no host is resolvable.
         '';
       };
       workingDirectory = lib.mkOption {
@@ -5865,7 +5878,7 @@ exit 0
   hostLabel =
     if cfg.remoteControlHost != "" then cfg.remoteControlHost
     else if cfg.web.enable && cfg.web.domain != "" then cfg.web.domain
-    else "";
+    else config.networking.fqdnOrHostName;
   # "name=/path" pairs the supervisor's agent_bin() resolves sessions
   # against (AGENT_BOX_AGENT_BINS). "shell" (issue #113): the user's login
   # shell as a pseudo-agent — always resolvable, independent of
@@ -7440,6 +7453,25 @@ in
   options.services.agent-box = {
     enable = lib.mkEnableOption "reproducible multi-user coding agent host";
 
+    # Not a knob: what this module RENDERS, published so a test can read it
+    # rather than reconstruct it. `internal` keeps it out of the generated
+    # option docs; `readOnly` means only the module's own definition stands.
+    internal = {
+      tmpfilesRules = lib.mkOption {
+        internal = true;
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = ''
+          Every systemd-tmpfiles rule this module contributes, in the order it
+          contributes them. Exists so the golden snapshot can capture exactly
+          the module's rules; it used to filter the whole system's rules for
+          the substring "agent-box", which dropped the /home/<user>/.config
+          rules (a path named after the user, not after agent-box) and left
+          the behavior lock blind to them.
+        '';
+      };
+    };
+
     agent = lib.mkOption {
       type = lib.types.enum supportedAgents;
       default = "claude";
@@ -7557,19 +7589,27 @@ in
 
     remoteControlHost = lib.mkOption {
       type = lib.types.str;
-      default = config.networking.fqdnOrHostName;
-      defaultText = lib.literalExpression "config.networking.fqdnOrHostName";
+      default = "";
       example = "my-agent-box";
       description = ''
         Host label used as the "@<host>" suffix of auto-derived Remote
         Control session names (see users.<name>.sessions.<name>.remoteControlName).
-        Defaults to the box's fqdnOrHostName; the AWS image sets it to the
-        box's public sslip.io host so a box is identifiable AND reachable in
-        the Claude apps even when networking.hostName is unset. When empty,
-        the name falls back to the public web.domain (the address the box is
-        reachable at), and only if that is also unset to the live kernel
-        hostname at start time — which on a cloud box is the internal,
-        non-routable fqdn.
+
+        Left empty (the default), the label is the public web.domain — the
+        address the box is actually reachable at — and, on a box with no web
+        terminal, networking.fqdnOrHostName.
+
+        This used to DEFAULT to networking.fqdnOrHostName, which made the
+        web.domain arm documented but unreachable: only an explicit
+        `remoteControlHost = ""` ever got there, which is why
+        tests/sessions-common.nix had to write exactly that to exercise the
+        behavior this text describes. Two otherwise identical boxes then named
+        their sessions "agent-main@nixos" on NixOS and
+        "agent-main@golden.example.org" on the native backend, whose Spec
+        derives the label from the domain (bin/agentbox's Spec.host_label);
+        aws/template.yaml papered over it by setting this option to the box's
+        sslip host, and a bare-metal host that never set it did not. Reported
+        by one-spec-both-backends (#451, #455).
       '';
     };
 
@@ -7710,9 +7750,9 @@ in
       enable = lib.mkEnableOption ''
         an agent-triggerable self-update service. When enabled, every agent
         user's sudo allowlist gains exactly
-        `/run/current-system/sw/bin/systemctl start
-        agent-box-update.service` (plus its --no-block
-        variant, used by the settings page's Update button) — a root oneshot
+        `/run/current-system/sw/bin/systemctl start --no-block
+        agent-box-update.service` — one command, the same one the shipped
+        guide and the settings page's Update button use — a root oneshot
         that fast-forwards the box to the upstream repo's latest
         default-branch commit by rewriting `pinFile` (and, when agentNixpkgs
         is wired, advances `agentPinFile` to the latest nixos-unstable
@@ -15383,37 +15423,17 @@ if __name__ == "__main__":
           mv "$tmp" /run/agent-box-web/env
         '';
       };
-    in
-    {
-      assertions = [
-        {
-          assertion = cfg.users ? ${webUser};
-          message =
-            "services.agent-box.web.user = \"${webUser}\" but that user "
-            + "isn't defined in services.agent-box.users.";
-        }
-        {
-          assertion = terminalUsers != [ ];
-          message =
-            "services.agent-box.web.enable is true but no user has "
-            + "web.passwordHashFile set, so no terminal would be served.";
-        }
-        {
-          assertion = lib.length (lib.unique (map envName terminalUsers)) == lib.length terminalUsers;
-          message =
-            "services.agent-box: web-terminal user names must stay distinct "
-            + "after sanitizing to env-var form ([A-Z0-9_]).";
-        }
-      ];
-
-      # The top-level Caddyfile is module-managed (see managedCaddyfile above);
-      # each agent user's own virtual hosts live in per-user snippet files at
-      # /var/lib/agent-box-sites/<user>/*.caddy, symlinked into their $HOME
-      # as ~/sites/. Reload via the sudo rule added to effectiveSudoAllowlist.
-
-      networking.firewall.allowedTCPPorts = [ 443 ];
-
-      systemd.tmpfiles.rules = [
+      # Every tmpfiles rule this module contributes, bound once so it has a
+      # NAME. The golden snapshot used to recover this list by filtering the
+      # whole system's rules for the substring "agent-box" — which silently
+      # dropped the two `/home/<user>/.config` rules below, because a path
+      # named after the USER contains no such substring. #370 added them and
+      # the behavior lock could not see them, so `one-spec-both-backends`
+      # went on reporting a divergence from the native renderer that had
+      # already been fixed. A predicate that can miss is the wrong shape for
+      # an inventory; the module states its own instead (see
+      # internal.tmpfilesRules).
+      tmpfilesRules = [
         "d /var/lib/agent-box-web 0700 root root - -"
         "d /run/agent-box-web 0700 root root - -"
         # Snippet dirs: parent is world-traversable so caddy (primary group
@@ -15464,6 +15484,42 @@ if __name__ == "__main__":
       # per-user socket files themselves are 0660 <user>:caddy, systemd-created
       # (see systemd.sockets). Only present when webhook.enable is set.
       ++ lib.optional webhookEnabled "d ${webhookSocketDir} 0755 root root - -";
+    in
+    {
+      assertions = [
+        {
+          assertion = cfg.users ? ${webUser};
+          message =
+            "services.agent-box.web.user = \"${webUser}\" but that user "
+            + "isn't defined in services.agent-box.users.";
+        }
+        {
+          assertion = terminalUsers != [ ];
+          message =
+            "services.agent-box.web.enable is true but no user has "
+            + "web.passwordHashFile set, so no terminal would be served.";
+        }
+        {
+          assertion = lib.length (lib.unique (map envName terminalUsers)) == lib.length terminalUsers;
+          message =
+            "services.agent-box: web-terminal user names must stay distinct "
+            + "after sanitizing to env-var form ([A-Z0-9_]).";
+        }
+      ];
+
+      # The top-level Caddyfile is module-managed (see managedCaddyfile above);
+      # each agent user's own virtual hosts live in per-user snippet files at
+      # /var/lib/agent-box-sites/<user>/*.caddy, symlinked into their $HOME
+      # as ~/sites/. Reload via the sudo rule added to effectiveSudoAllowlist.
+
+      networking.firewall.allowedTCPPorts = [ 443 ];
+
+      systemd.tmpfiles.rules = tmpfilesRules;
+      # The same list, under a name the golden snapshot can ask for by
+      # hand instead of recovering with a substring match (see
+      # tmpfilesRules above). Internal: it is this module's own
+      # inventory of what it renders, not a knob.
+      services.agent-box.internal.tmpfilesRules = tmpfilesRules;
 
       services.caddy = {
         enable = true;
@@ -15655,7 +15711,7 @@ if __name__ == "__main__":
           // lib.optionalAttrs cfg.selfUpdate.enable {
             # --no-block so the daemon's HTTP response goes out before
             # the rebuild (possibly) restarts the daemon itself.
-            AGENT_BOX_UPDATE_CMD = "/run/wrappers/bin/sudo -n ${updateStartNoBlockCmd}";
+            AGENT_BOX_UPDATE_CMD = "/run/wrappers/bin/sudo -n ${updateStartCmd}";
             # Running rev + repo, rendered on the Update card as a
             # GitHub commit link and used for its non-blocking compare
             # request.

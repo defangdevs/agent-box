@@ -147,8 +147,9 @@ giving up reproducibility (the pin is URL + hash, and Hydra has the binaries).
 
 Two triggers, both privilege-checked the same way: the "Update box" button on
 each user's settings page, and the agent running
-`sudo systemctl start agent-box-update.service` in its terminal — the
-sudoers entries match those literal commands, so no arguments, environment
+`sudo /run/current-system/sw/bin/systemctl start --no-block
+agent-box-update.service` in its terminal — the sudoers entry matches that
+literal command, full path included, so no arguments, environment
 or paths cross the privilege boundary; the caller can only say "go". Save
 any working context first: the rebuild restarts changed agent services,
 killing their sessions mid-update.

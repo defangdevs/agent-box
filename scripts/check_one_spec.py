@@ -64,27 +64,22 @@ SUBSTRATE = [
 ]
 
 # Divergences that are CORRECT. Each needs a reason a reader can check.
-TMPFILES_BY_DESIGN = {
-    "d /home/@USER@/.config 0755 @USER@ @USER@ - -":
-        "native only, and correct: systemd-tmpfiles will not create "
-        "/home/<u>/.config/agent-box unless its parent exists, and on a "
-        "distro nothing else has made it by first apply. On NixOS the user's "
-        "home is populated by the activation script before tmpfiles runs",
-}
+#
+# `d /home/@USER@/.config 0755 …` used to sit here, reasoned as native-only.
+# It never was: #370 gave the module the same rule a week before this check
+# was written, and the golden fixture could not show it because the snapshot
+# recovered the module's rules by grepping the whole system's for the
+# substring "agent-box" — which a path named after the USER does not contain.
+# The exception described the blind spot, not the box. The manifest now asks
+# the module for its own inventory (flake.nix -> internal.tmpfilesRules), so
+# both sides render both rules and there is nothing to declare.
+TMPFILES_BY_DESIGN = {}
 
 SUDOERS_BY_DESIGN = {}
 
 # Divergences that are BUGS, each owned by an issue. Only ever shrinks.
 TMPFILES_KNOWN_GAPS = {}
-SUDOERS_KNOWN_GAPS = {
-    "systemctl start agent-box-update.service":
-        "#451: the module grants BOTH `systemctl start agent-box-update"
-        ".service` and the `--no-block` spelling its own guide and settings "
-        "page use; the native renderer spells the grant once, from "
-        "UPDATE_TRIGGER, so it cannot drift from the unit (#358). The extra "
-        "blocking grant is module-only and harmless, but it is a second way "
-        "in that nothing documents",
-}
+SUDOERS_KNOWN_GAPS = {}
 
 
 # What this run could not check. A skip that prints and returns 0 reads

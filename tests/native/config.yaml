@@ -7,7 +7,6 @@ agents:
 codexFullAccess: true
 defaultAgent: claude
 domain: golden.example.org
-hostLabel: nixos
 protectMemory: true
 repo: defangdevs/agent-box
 rev: '0000000000000000000000000000000000000000'

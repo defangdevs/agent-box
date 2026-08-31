@@ -85,8 +85,15 @@
                   sys.config.systemd.units);
               etc = lib.mapAttrs (n: e: "${e.source}")
                 (lib.filterAttrs (n: e: etcFilter n) sys.config.environment.etc);
-              tmpfiles = builtins.filter (r: lib.hasInfix "agent-box" r)
-                sys.config.systemd.tmpfiles.rules;
+              # The module's OWN rules, stated by the module. This was a
+              # filter over the whole system's rules for the substring
+              # "agent-box", which is a predicate that can miss: #370's two
+              # `d /home/<user>/.config` rules are named after the user, so
+              # the lock never captured them and `one-spec-both-backends`
+              # kept reporting a native-vs-NixOS divergence that had been
+              # fixed a week earlier. An inventory has to come from the thing
+              # being inventoried.
+              tmpfiles = sys.config.services.agent-box.internal.tmpfilesRules;
             };
           # The manifest string keeps its Nix string context, so building it
           # realizes everything the captured texts reference — which is what
