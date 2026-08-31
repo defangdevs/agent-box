@@ -361,6 +361,14 @@ in
         down = dead_end("main")
         assert "agent-box-session restart main" in down, down
         assert "agent-box-session add main" not in down, down
+        # ...and it does NOT offer the keypress here. The wrapper only offers
+        # it on a pty, because this driver's own backdoor shell runs on
+        # /dev/hvc0 — a tty with nobody behind it — and `su -c` passes that
+        # down: gated on [ -t 0 ], the offer's wait-for-a-keypress loop hung
+        # this call until CI timed out (25 minutes, run 33421803747). This
+        # assertion is that gate's regression test; the pty case is its own
+        # subtest below.
+        assert "Press Enter" not in down, down
         # ...and a name the box really has never heard of still says add.
         gone = dead_end("ghost")
         assert "agent-box-session add ghost" in gone, gone

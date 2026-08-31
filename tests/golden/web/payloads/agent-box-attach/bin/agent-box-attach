@@ -34,6 +34,21 @@ reg() {   # reg FILTER — ask jq about "$want", false on any error
   jq -e --arg s "$want" "$1" "$SESSIONS" >/dev/null 2>&1
 }
 stopped_now() { reg '.sessions[$s].stopped == true'; }
+# Is there a person at the other end of this pane? ttyd runs the wrapper on a
+# pty, which is what makes the offer below pressable at all.
+#
+# NOT [ -t 0 ]: that is true of things with no reader too, and one of them is
+# CI. A NixOS VM test's backdoor shell runs with `exec < /dev/hvc0` — a virtio
+# console, a tty with nobody behind it — and `su -c` passes it down, so the
+# offer's wait-for-a-keypress loop hung the sessions-web test until the job
+# timed out (PR #452, run 33421803747). A pty is /dev/pts/N and a console is
+# not, which separates ttyd (and a human's ssh) from every automated caller.
+interactive() {
+  case "$(readlink /proc/self/fd/0 2>/dev/null)" in
+    (/dev/pts/*) return 0 ;;
+  esac
+  return 1
+}
 live_list() {
   echo ""
   echo "Live sessions:"
@@ -88,7 +103,13 @@ start_it() {
 # >128 = the timeout expired, anything else = EOF, which is the browser tab
 # closing and the only reason to stop.
 offer() {
-  while :; do
+  # Bounded at 30 minutes, not endless: a pane nobody has touched for that
+  # long costs a process per open connection, and a bound is also what keeps
+  # a wrong answer from interactive() above to a slow caller rather than a
+  # hung one. ttyd reconnects when this exits, so the offer comes straight
+  # back for a pane somebody IS looking at.
+  waited=0
+  while [ "$waited" -lt 600 ]; do
     attach_when_live 1 || true
     rc=0
     read -r -t 3 _key || rc=$?
@@ -97,7 +118,9 @@ offer() {
     elif [ "$rc" -le 128 ]; then
       exit 0
     fi
+    waited=$((waited + 1))
   done
+  exit 1
 }
 want="${1:-}"
 case "$want" in (*[!A-Za-z0-9_-]*) want="" ;; esac
@@ -124,8 +147,9 @@ if [ -n "$want" ]; then
     echo ""
     # A pane with no terminal on the other end (a script, a VM test, the
     # `su -c` shape a test driver uses) cannot press anything, so it keeps
-    # the printed advice and the 5s retry it has always had.
-    if [ -t 0 ]; then
+    # the printed advice and the 5s retry it has always had — see
+    # interactive() for why that is not [ -t 0 ].
+    if interactive; then
       echo "  Press Enter to start it here — this pane then attaches to it."
       echo ""
       echo "  Start on the settings page does the same, as does:"
@@ -147,7 +171,7 @@ if [ -n "$want" ]; then
   # A minute of waiting for a real terminal, five seconds for anything else:
   # a caller with no pty is a script reading this output, not somebody
   # watching a pane, and it has always had the 5s-and-exit retry.
-  if [ -t 0 ]; then
+  if interactive; then
     attach_when_live 120 || true
   else
     attach_when_live 10 || true
@@ -157,7 +181,7 @@ if [ -n "$want" ]; then
   if stopped_now; then
     echo ""
     echo "'$want' parked itself instead of coming up (a clean agent exit)."
-    if [ -t 0 ]; then
+    if interactive; then
       echo "Press Enter to start it again."
       offer
     fi
