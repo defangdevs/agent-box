@@ -47,6 +47,7 @@ REPO = Path(__file__).resolve().parent.parent
 GOLDEN = REPO / "tests" / "golden" / "web"
 NATIVE = REPO / "tests" / "native" / "expected"
 CONFIG = REPO / "tests" / "native" / "config.json"
+CONFIG_YAML = REPO / "tests" / "native" / "config.yaml"
 
 # Substrate spellings of the same thing. Applied to both sides before any
 # comparison, so a rule that differs ONLY in where the binary lives compares
@@ -114,7 +115,7 @@ def check_spec(generated):
     got = json.loads(CONFIG.read_text())
     if want == got:
         print("spec: tests/native/config.json matches the module's options")
-        return 0
+        return check_spec_yaml(want)
     lines = []
     for key in sorted(set(want) | set(got)):
         if want.get(key) != got.get(key):
@@ -130,6 +131,29 @@ def check_spec(generated):
           "\nThen re-render the native fixture: "
           "python3 tests/test_agentbox.py --update")
 
+
+
+def check_spec_yaml(want):
+    """The YAML dialect is the same box, not a third mirror.
+
+    tests/test_agentbox.py renders both dialects and compares the trees, so a
+    drifted config.yaml fails there too — as a 269k-character assertion diff
+    (that is how this file's own drift surfaced in CI). Comparing the parsed
+    config here says which KEY moved instead.
+    """
+    try:
+        import yaml
+    except ImportError:
+        print("spec: config.yaml SKIPPED (no PyYAML)")
+        return 0
+    got = yaml.safe_load(CONFIG_YAML.read_text())
+    if want == got:
+        print("spec: config.yaml describes the same box")
+        return 0
+    keys = sorted(k for k in set(want) | set(got) if want.get(k) != got.get(k))
+    return fail("tests/native/config.yaml has drifted from config.json: "
+                + ", ".join(keys)
+                + "\n  Regenerate: nix run .#update-native-config")
 
 # --------------------------------------------------------------------------
 # 2. Two witnesses
