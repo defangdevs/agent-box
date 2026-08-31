@@ -11226,6 +11226,14 @@ STYLE = """<style>
   textarea { width: 100%; resize: vertical; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .new-session-row { align-items: flex-end; }
+  /* One control height for the whole row. Chrome's UA sheet forces
+     line-height:normal on <select> and ignores an author line-height, so
+     the agent picker rendered ~3px shorter than the working-directory
+     input beside it and the row read as stepped. box-sizing is already
+     border-box, so this height covers the padding and the border. */
+  .new-session-row select,
+  .new-session-row input.cwd,
+  .new-session-row .btn { height: 34px; }
   .prompt-row { margin-top: 12px; }
   /* Working-directory combobox (issue #131): the input plus an
      absolutely-positioned suggestions list the daemon fills one
