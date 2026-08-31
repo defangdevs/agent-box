@@ -20,7 +20,16 @@ DEFAULT_AGENT="${AGENT_BOX_DEFAULT_AGENT:?}"
 # /etc/profile, so an SSH login shell did exactly that.
 export TMUX_TMPDIR="/run/agent-box-${USER:-$(id -un)}"
 
-t() { tmux -L agent-box "$@"; }
+# tmux, which is NOT on every PATH this CLI runs from: the webhook receiver
+# unit's PATH is jq, coreutils and this script, deliberately (src/webhook-spawn.sh
+# says so where it pins the same binary). A `tmux` that cannot be run makes
+# every verb here answer as if no session were live — `ls` reports a running
+# session as merely `starting` (issue #287), and `peers` would report a busy
+# box as empty, which is the reading a yield rule must never get. So take the
+# pinned path when the caller has one, exactly as the settings daemon and the
+# spawn wrapper do; unset means the PATH tmux, which is what a pane has.
+TMUX_BIN="${AGENT_BOX_TMUX_BIN:-tmux}"
+t() { "$TMUX_BIN" -L agent-box "$@"; }
 
 # A kill that did not happen must never be reported as a removal (issue
 # #268): the entry leaves sessions.json while the session keeps running, and
@@ -39,6 +48,7 @@ kill_session() {
 
 usage() {
   echo "usage: agent-box-session ls"
+  echo "       agent-box-session peers"
   echo "       agent-box-session add [NAME] [--agent AGENT] [--profile PROFILE] [--cwd DIR]"
   echo "                             [--prompt TEXT] [--resume-prompt TEXT] [--ephemeral]"
   echo "                             [-- EXTRA_ARGS...]"
@@ -62,6 +72,9 @@ usage() {
   echo "CRASH still parks nothing and leaves the post-mortem shell attachable."
   echo "The transcript is kept either way; only the registry entry goes."
   echo "Listed sessions are (re)started by the per-user supervisor within ~2s."
+  echo "peers: the OTHER live sessions, where each one works and what it claims"
+  echo "(its webhook subscriptions) — ask before you touch a worktree, a branch"
+  echo "or an issue somebody else may already have."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
   echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
@@ -213,6 +226,132 @@ case "$cmd" in
         printf '%-24s %-8s %s\n' "$n" '-' 'unmanaged'
       fi
     done
+    ;;
+  peers)
+    # Who ELSE is live, where they work, and what they claim.
+    #
+    # `ls` says which sessions EXIST. It does not say what any of them is
+    # doing, and that is the question that decides whether a second session
+    # may touch an object. Three facts settle it between cooperating agents,
+    # and each one lives somewhere else: liveness in tmux, the working
+    # directory in the registry, and the webhook claim in that session's own
+    # filter file — which nothing else could read, because agent-box-webhook
+    # only ever reads its OWN (defangdevs/local-channels#27). So a session
+    # asking "is anybody already on this?" had no way to find out: PR #417's
+    # dispatched session walked into a live session's git worktree and
+    # committed over it, and said afterwards that nothing in
+    # `agent-box-session ls` distinguished an owned worktree from an
+    # abandoned one (issue #420).
+    #
+    # The caller that needs this most is a dispatched hook-* session: it was
+    # started by an EVENT, not by a person, so it knows nothing about the
+    # session that may already own the object. Its spawn preamble therefore
+    # carries this output verbatim (src/webhook-spawn.sh) and tells it to
+    # yield to any interactive session that has the work — the snapshot goes
+    # stale as it runs, so the command exists for it to ask again.
+    #
+    # A READER, so it takes no lock (lib/registry.sh), and it must stay one:
+    # the webhook spawn wrapper runs this while HOLDING the registry lock
+    # across its exec into `add`, so a lock taken here would deadlock every
+    # dispatch on the box.
+    #
+    # Coordination, never containment: a session is not a security boundary
+    # (the wiki's Users-vs-Sessions page), and this tells a cooperating agent
+    # what its neighbours are doing. It cannot stop one that ignores it.
+    if ! "$TMUX_BIN" -V >/dev/null 2>&1; then
+      # An empty answer is the honest one for a box whose tmux server is
+      # down, but "I could not ask" must never read as "nobody is live" —
+      # that is the reading that makes a yield rule fail open.
+      echo "agent-box-session: cannot ask tmux which sessions are live (tmux did not run)" >&2
+      exit 1
+    fi
+    live="$(t list-sessions -F '#S' 2>/dev/null || true)"
+    # The caller's own session, so it is not reported as its own neighbour.
+    # $TMUX names the pane's session for anything running inside one; the
+    # supervisor's LOCAL_WEBHOOK_SESSION (<user>-<session>) is the fallback
+    # for a process whose $TMUX did not survive, and neither exists in a
+    # plain `su -c` — where every live session genuinely is a peer.
+    me="$(t display-message -p '#S' 2>/dev/null || true)"
+    user="$(id -un)"
+    if [ -z "$me" ] && [ -n "${LOCAL_WEBHOOK_SESSION:-}" ]; then
+      me="${LOCAL_WEBHOOK_SESSION#"$user-"}"
+    fi
+    # The state dir local-webhook keeps its per-session filter files in,
+    # spelled the same way prune_filter above spells it.
+    sd="${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
+    peers=0
+    out=""
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      [ "$n" != "$me" ] || continue
+      peers=$((peers + 1))
+      agent="-"; cwd="-"; unmanaged=""
+      if [ -s "$REGISTRY_FILE" ]; then
+        # One read per session, and a session tmux knows but the registry
+        # does not is reported as `unmanaged` rather than skipped: it is
+        # running, so it can be in your files (issue #284).
+        meta="$("$JQ" -r --arg n "$n" '
+          if (.sessions | has($n)) then
+            [(.sessions[$n].agent // "-"),
+             (.sessions[$n].workingDirectory // "-")] | @tsv
+          else "-\t-\tunmanaged" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
+        IFS="$(printf '\t')" read -r agent cwd unmanaged <<<"$meta"
+        [ -n "$agent" ] || agent="-"
+        [ -n "$cwd" ] || cwd="-"
+        # No recorded working directory means the supervisor starts it in
+        # $HOME — say that, rather than a dash a reader has to interpret. It
+        # is where the session STARTED either way: an agent can cd anywhere,
+        # so this narrows where to look and never proves where it is.
+        [ "$cwd" != "-" ] || cwd="$HOME (its default)"
+      fi
+      # hook-* is the name every dispatched session gets (webhook-spawn.sh),
+      # and the rank the yield rule turns on: a hook session was started by
+      # an event, an interactive one by a person or by the box's own config.
+      # A session tmux knows and the registry does not keeps BOTH facts: it
+      # is running whoever started it, so it can be in your files.
+      [ "$agent" != "-" ] || agent="agent unknown"
+      kind="interactive"
+      case "$n" in (hook-*) kind="dispatched (hook session)" ;; esac
+      [ -z "$unmanaged" ] || kind="$kind, not in the registry"
+      out="$out$(printf '%s — %s, %s, cwd %s' "$n" "$agent" "$kind" "$cwd")"$'\n'
+      ff="$sd/filter.$user-$n.json"
+      claims=""
+      if [ -s "$ff" ]; then
+        # An entry with NO `include` predicate is deliberately not a claim —
+        # the dispatcher spawns for such an event anyway (local-channels#16),
+        # because one session must not silence a watch for every unrelated
+        # object in a repo. Say which kind each topic is: "subscribed" and
+        # "claimed" are different answers to "is this session on my object?".
+        claims="$("$JQ" -r '
+          if (.enabled // true) == false then
+            "    claims nothing — its subscriptions are switched off"
+          elif ((.topics // []) | length) == 0 then
+            "    claims nothing — subscribed to no topic"
+          else
+            .topics[]
+            | "    " + (if .include then "CLAIMS " else "listens to (no predicate, so not a claim) " end)
+              + (.topic // "?")
+              + (if (.note // "") == "" then ""
+                 else " — note: \"" + ((.note | gsub("[\r\n\t]"; " "))[:200]) + "\"" end)
+          end' "$ff" 2>/dev/null)" || claims=""
+        [ -n "$claims" ] || claims="    claims nothing — its filter file is unreadable"
+      else
+        claims="    claims nothing — no subscription file, so an event on its work spawns a session beside it"
+      fi
+      out="$out$claims"$'\n'
+    done <<<"$live"
+    if [ "$peers" = 0 ]; then
+      echo "No other session is live on this box."
+    else
+      printf '%s live session(s) beside you, and what each one says it is working on:\n' "$peers"
+      printf '%s' "$out"
+      # The reading that matters, printed with the facts rather than left in
+      # a guide: this is what the rule in a hook session's spawn preamble
+      # (src/webhook-spawn.sh) and in the shipped guide turn on.
+      echo "A note is what that session chose to say; a CLAIM is what suppresses"
+      echo "a standing watch. Neither proves the session is idle — read its pane"
+      echo "(tmux -L agent-box capture-pane -pt NAME | tail -40) or ask it."
+    fi
     ;;
   add)
     # NAME is optional and positional: a leading non-flag arg is the name,

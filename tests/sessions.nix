@@ -518,6 +518,55 @@ in
     assert "main" in listing and "helper" in listing, listing
     assert "codex" in listing, listing
 
+    # --- peers: who else is live, where, and what they claim (#420) --------
+    # The question no session could ask. `ls` above says which sessions
+    # EXIST; it never says what one is doing, and a session's webhook claims
+    # live in a file only that session reads (defangdevs/local-channels#27).
+    # So a second session walked into a live one's git worktree and committed
+    # over it (#417), and a dispatched session pushed to a branch another
+    # session owned three times in one evening (#319). A hook session's spawn
+    # prompt now carries this output and is told to yield on it, so what it
+    # yields on is asserted here.
+    peers_out = machine.succeed(as_agent("agent-box-session peers"))
+    assert re.search(r"^main .*claude, interactive, cwd /home/agent",
+                     peers_out, re.M), peers_out
+    assert re.search(r"^helper .*codex, interactive, cwd /home/agent",
+                     peers_out, re.M), peers_out
+    # Said, not left blank: a session with no claim is exactly the one whose
+    # work a standing watch will start a second agent onto.
+    assert peers_out.count("no subscription file") >= 2, peers_out
+
+    # The caller is not its own neighbour. In a pane that is $TMUX; for a
+    # process whose $TMUX did not survive it is the supervisor's own
+    # LOCAL_WEBHOOK_SESSION (<user>-<session>), which is what su has here.
+    mine = machine.succeed(
+        as_agent("env LOCAL_WEBHOOK_SESSION=agent-main agent-box-session peers")
+    )
+    assert not re.search(r"^main ", mine, re.M), mine
+    assert re.search(r"^helper ", mine, re.M), mine
+
+    # A CLAIM and a bare subscription are different answers and must not be
+    # collapsed: only a topic with an include predicate suppresses a standing
+    # watch (local-channels#16), so a session listening to a whole repo has
+    # NOT told the box the object is taken. The note is folded onto one line,
+    # because it is agent-written text landing in another agent's prompt.
+    machine.succeed(as_agent(
+        "mkdir -p ~/.local/state/local-webhook; "
+        "cat > ~/.local/state/local-webhook/filter.agent-helper.json <<'EOF'\n"
+        '{"enabled":true,"topics":['
+        '{"topic":"github:defangdevs/agent-box","note":"PR 42:\\tholding it",'
+        '"include":{"any":[{"path":"pull_request.number","in":[42]}]}},'
+        '{"topic":"github:defangdevs/other","note":"just watching"}]}\n'
+        "EOF"
+    ))
+    claims_out = machine.succeed(as_agent("agent-box-session peers"))
+    assert "CLAIMS github:defangdevs/agent-box" in claims_out, claims_out
+    assert 'note: "PR 42: holding it"' in claims_out, claims_out
+    assert "not a claim) github:defangdevs/other" in claims_out, claims_out
+    machine.succeed(
+        as_agent("rm ~/.local/state/local-webhook/filter.agent-helper.json")
+    )
+
     # --- auto-named add: no NAME → derived from the agent -----------------
     # First codex-derived name is the bare agent name (no session is literally
     # "codex" yet — "helper" runs codex but under its own name).
