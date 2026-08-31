@@ -314,7 +314,7 @@ def main():
     parser.add_argument("--spec", help="module-evaluated config JSON")
     args = parser.parse_args()
 
-    for path in (GOLDEN, NATIVE, CONFIG):
+    for path in (GOLDEN, NATIVE, CONFIG, CONFIG_YAML):
         if not path.exists():
             return fail(f"missing fixture {path}")
 
