@@ -575,6 +575,48 @@ Any sender that HMAC-signs its raw body works, not just GitHub —
 `/<user>/webhook/stripe`. Set `services.agent-box.webhook.enable = false` to
 omit the daemon, socket, and public path entirely.
 
+### Worked example: a non-GitHub service, end to end (Linear)
+
+Everything below is done by the agent, from `$HOME`, with no rebuild and no
+root — the point being that a user can just *ask* for it. The user's only two
+steps are in the browser: mint a personal API key at `linear.app/settings/api`,
+and paste it into the settings page's secrets panel as `LINEAR_API_KEY`. That
+panel exists so a secret never travels through the chat, the tmux scrollback,
+or the model's context.
+
+```bash
+# 1. Act on Linear. The official remote MCP server accepts an API key as a
+#    bearer token, which sidesteps an OAuth callback a headless box cannot
+#    receive. ${...} is stored literally and expanded at load, so the key
+#    stays in the env store and out of ~/.claude.json.
+claude mcp add --transport http linear https://mcp.linear.app/mcp \
+  --header "Authorization: Bearer \${LINEAR_API_KEY}" -s user
+
+# 2. Hear from Linear. setup writes Linear's wire config — its signature
+#    header is Linear-Signature, not GitHub's — and prints a webhookCreate
+#    mutation you can run with the same key, so registering needs no browser.
+agent-box-webhook setup linear
+
+# 3. Route it. Topics key on the team, and a Linear payload names the entity
+#    in `type` and the verb in `action`, so rules read on those.
+agent-box-webhook subscribe linear:ENG --note "ENG issues" \
+  --when '{"path":"action","in":["create"]}'
+```
+
+Two caveats worth knowing before you start. A Project, Document or Initiative
+event carries no team and therefore no routing key, so it reaches nobody —
+keyless payloads are deliberately undeliverable. And Linear delivers **over
+IPv4 only**: the nine egress addresses it publishes are all IPv4 (Google
+Cloud), so an IPv6-only box — the EC2 default — needs an IPv4 address before
+any delivery arrives, exactly as it does for GitHub. Unlike GitHub, Linear does
+retry: three attempts, after 1 minute, 1 hour and 6 hours, and it wants a
+`200` within 5 seconds.
+
+Adding another such sender is the same three steps. If it signs in its own
+header, teach `source_template` in `modules/src/webhook-cli.sh` its shape —
+otherwise it gets GitHub's defaults and every delivery is answered `401` with
+nothing to say why.
+
 ## VM image
 
 Build from the same config:

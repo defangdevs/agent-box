@@ -2512,6 +2512,84 @@
         timeout=60,
     )
 
+    # --- a sender that is not GitHub ---------------------------------------
+    # local-webhook is source-generic, but every one of its per-source keys
+    # DEFAULTS to GitHub's, so a bare `setup <sender>` used to configure a
+    # source that answers that sender's every delivery 401 — while printing
+    # instructions naming x-hub-signature-256. `setup` now writes the wire
+    # config of the senders the box knows, and reports the header it actually
+    # configured.
+    linear_setup = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " AGENT_BOX_WEBHOOK_URL=https://box.test/agent/webhook"
+        " agent-box-webhook setup linear"
+    )
+    assert "hex, in linear-signature" in linear_setup, linear_setup
+    assert "https://box.test/agent/webhook/linear" in linear_setup, linear_setup
+    machine.succeed(
+        "jq -e '.sources.linear | .signatureHeader == \"linear-signature\""
+        " and .keyPath == \"data.team.key\" and .format == \"generic\""
+        " and .secretFile == \"linear.secret\"' " + sources_file + " >/dev/null"
+    )
+    # github's own entry is untouched — a template for one source must not
+    # rewrite another, and defaultSource still points at whatever was first.
+    machine.succeed(
+        "jq -e '.sources.github == {secretFile: \"github.secret\"}"
+        " and .defaultSource == \"github\"' " + sources_file + " >/dev/null"
+    )
+
+    # A box that ran the OLD setup carries a linear source configured to read
+    # GitHub's header — a source that 401s forever. Re-running setup repairs
+    # it in place (the secret is deliberately reused), and a hand-tuned key
+    # survives, because the file wins over the template.
+    machine.succeed(
+        "jq '.sources.linear = {secretFile: \"linear.secret\", keyPath: \"organizationId\"}' "
+        + sources_file + " > /tmp/broken.json"
+    )
+    machine.succeed("cp /tmp/broken.json " + sources_file)
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " AGENT_BOX_WEBHOOK_URL=https://box.test/agent/webhook"
+        " agent-box-webhook setup linear >/dev/null"
+    )
+    machine.succeed(
+        "jq -e '.sources.linear | .signatureHeader == \"linear-signature\""
+        " and .keyPath == \"organizationId\"' " + sources_file + " >/dev/null"
+    )
+
+    # End to end on the public path, in Linear's own shape: bare hex (no
+    # "sha256=" prefix) in Linear-Signature, the routing key nested at
+    # data.team.key, and the event name in the payload's own `type` because
+    # Linear sends no event header at all.
+    linear_secret = machine.succeed(
+        "cat /home/agent/.local/state/local-webhook/linear.secret"
+    ).strip()
+    client.succeed(
+        "cat > /tmp/linear.json <<'EOF'\n"
+        '{"action":"create","type":"Issue","organizationId":"org1",'
+        '"data":{"identifier":"ENG-42","title":"from the VM test",'
+        '"team":{"key":"ENG"}},"actor":{"name":"someone"}}\n'
+        "EOF"
+    )
+    linear_sig = client.succeed(
+        f"openssl dgst -sha256 -hmac {linear_secret} -r /tmp/linear.json | cut -d' ' -f1"
+    ).strip()
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST"
+        f" -H 'Linear-Signature: {linear_sig}'"
+        " -H 'Content-Type: application/json' --data-binary @/tmp/linear.json"
+        " https://box.test/agent/webhook/linear | grep -x 200"
+    )
+    # ...and it still fails closed on the header it was not told to read.
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST"
+        f" -H 'x-hub-signature-256: sha256={linear_sig}'"
+        " -H 'Content-Type: application/json' --data-binary @/tmp/linear.json"
+        " https://box.test/agent/webhook/linear | grep -x 401"
+    )
+
     # The daemon is the ingress owner and survives every delivery — the box's
     # endpoint must not depend on which sessions happen to be alive.
     machine.succeed("systemctl is-active agent-box-webhook@agent.service")
