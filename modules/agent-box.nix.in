@@ -1415,7 +1415,10 @@ in
 
           The grant it needs is
           `/run/current-system/sw/bin/systemctl reboot --no-block`, given
-          to the ROOT terminal user (`web.user`) alone — a reboot is the
+          to the ROOT terminal user alone — the one whose terminal the
+          vhost root serves, which is `web.user` when that user has a
+          browser terminal of its own and otherwise the first terminal
+          user in sorted order (see `rootUser`) — a reboot is the
           one Danger-zone action that crosses the user boundary
           ("Restart all" bounces the caller's own unit and takes no sudo),
           so on a multi-user box it must not become one user's power over
