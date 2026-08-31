@@ -103,7 +103,7 @@ font).
 
 Never spell an icon as a text glyph. It reads as the cheaper option and is
 not: a code point carrying `Emoji_Presentation` — `U+2699` GEAR is the one
-that bit us — is drawn from the platform's COLOUR emoji font on iOS and
+that bit us (PR #448) — is drawn from the platform's COLOUR emoji font on iOS and
 Android, so the settings gear arrived as a shaded 3D emoji beside a flat
 monochrome (i), visibly larger and in the wrong palette. `font-size` does
 not fix that; it only scales the emoji, and which glyph a font hands back

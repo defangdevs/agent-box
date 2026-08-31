@@ -90,7 +90,7 @@ in
     assert "workingDirectory" not in root_page, root_page
 
     # The two controls at the end of the tab bar, (i) and the gear, are
-    # inline SVG rather than text glyphs (PR #NNN). U+2699 GEAR carries
+    # inline SVG rather than text glyphs (PR #448). U+2699 GEAR carries
     # Emoji_Presentation, so iOS and Android drew it from their COLOUR
     # emoji font: a shaded 3D gear beside a flat monochrome (i), bigger
     # than it and in the wrong palette. Assert the code points are ABSENT
