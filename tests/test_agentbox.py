@@ -1677,6 +1677,89 @@ class SelfUpdateRenderTest(unittest.TestCase):
         self.assertIn("## Updating", guide)
         self.assertIn(trigger, guide)
 
+    def test_only_the_root_user_may_reboot_the_box(self):
+        """The Danger zone's "Reboot box", and the boundary it respects.
+
+        "Restart all" bounces the caller's OWN unit and needs no sudo at
+        all; a reboot takes every user's sessions down with it. So the
+        grant and the variable that unlocks the card go to the root user
+        alone — otherwise a second terminal user's page is a button that
+        kills the first user's work, which is the same thing the per-user
+        password helper grant exists to prevent.
+        """
+        trigger = self.mod.REBOOT_TRIGGER
+        sudoers = (FIXTURE / "etc/sudoers.d/agent-box").read_text()
+        lines = {line.split()[0]: line for line in sudoers.splitlines()
+                 if " ALL=" in line}
+        self.assertIn(trigger, lines["agent"])
+        self.assertNotIn(trigger, lines["robot"],
+                         "a non-root terminal user was granted the reboot")
+        # Same string on both sides of sudo, or the grant does not match
+        # the command and sudo asks for a password instead (issue #353).
+        want = f'Environment="AGENT_BOX_REBOOT_CMD=/usr/bin/sudo -n {trigger}"'
+        for user, present in (("agent", True), ("robot", False)):
+            conf = (FIXTURE / "etc/systemd/system"
+                    / f"agent-box-settings@{user}.service.d"
+                    / "10-host.conf").read_text()
+            self.assertEqual(present, want in conf,
+                             f"AGENT_BOX_REBOOT_CMD for {user}")
+        # --no-block is not decoration: the daemon has to answer the
+        # request before systemd starts stopping units, and it is one of
+        # the units being stopped.
+        self.assertIn("--no-block", trigger)
+
+    def test_turning_the_reboot_button_off_takes_the_grant_with_it(self):
+        """The knob is not just cosmetic. A box that hides the card while
+        keeping `sudo systemctl reboot` in sudoers would have given away
+        the whole point of turning it off — the button is the visible
+        half, the grant is the half that matters."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["web"] = dict(config.get("web") or {}, rebootButton=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "no-reboot"
+            spec = mod.Spec(config, prof)
+            self.assertFalse(spec.reboot_button)
+            tree = mod.Renderer(spec, prof, root=out).render()
+            sudoers = tree.files[str(out / "etc/sudoers.d/agent-box")][0]
+            self.assertNotIn(mod.REBOOT_TRIGGER, sudoers)
+            conf = tree.files[str(out / "etc/systemd/system"
+                                  / "agent-box-settings@agent.service.d"
+                                  / "10-host.conf")][0]
+            self.assertNotIn("AGENT_BOX_REBOOT_CMD", conf)
+
+    def test_a_quoted_false_does_not_hand_out_the_reboot(self):
+        """The trap the other booleans here guard: a string is truthy, so
+        `rebootButton: "false"` would grant the very thing it was written
+        to withhold. null still means off."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for bad in ("false", "true", 1):
+                config["web"] = dict(config.get("web") or {},
+                                     rebootButton=bad)
+                with self.assertRaises(mod.ConfigError, msg=repr(bad)):
+                    mod.Spec(config, prof)
+
+    def test_a_console_box_has_no_reboot_button_to_gate(self):
+        """No web, no settings page, no card — and therefore no reason to
+        hand anyone a root reboot. The grant follows the button, not the
+        default."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["web"] = {"enable": False}
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "console"
+            spec = mod.Spec(config, prof)
+            self.assertFalse(spec.reboot_button)
+            tree = mod.Renderer(spec, prof, root=out).render()
+            self.assertNotIn(
+                mod.REBOOT_TRIGGER,
+                tree.files[str(out / "etc/sudoers.d/agent-box")][0])
+
     def test_repo_and_rev_come_from_the_profile_not_the_config(self):
         """The profile records what is installed; the config can be stale.
 

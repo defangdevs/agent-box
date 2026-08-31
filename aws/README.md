@@ -451,9 +451,15 @@ more about a current kernel than about long-lived sessions:
   logged-in user and without it the reboot is skipped forever. A bare `true`
   is rejected: unattended-upgrades reads that as "now", i.e. a reboot the
   moment a kernel patch lands.
-- `sudoAllowlist: ["/usr/bin/systemctl reboot"]`, which hands the agent the
-  reboot it otherwise has no way to perform, to take when its own work is at
-  a safe point.
+- **"Reboot box"** in the settings page's Danger zone (`web.rebootButton`,
+  default on). The card stays quiet until `/var/run/reboot-required` exists
+  and then names the packages that asked, so the button answers a question
+  the page is already showing. Its grant —
+  `/usr/bin/systemctl reboot --no-block` — goes to the root terminal user
+  alone, which also means an agent in that user's sessions can reboot the
+  box from a shell: the settings daemon runs as that user, so there is no
+  such thing as a page-only capability here. `web: {rebootButton: false}`
+  removes both the card and the grant.
 
 `osUpdates: {enable: false}` renders neither file (and removes ours if a
 previous apply wrote them) — the setting for a host whose package manager is

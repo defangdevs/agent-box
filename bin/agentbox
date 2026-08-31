@@ -74,6 +74,13 @@ DEFAULT_CONFIG = "/etc/agent-box/config.yaml"
 UPDATE_UNIT = "agent-box-update.service"
 SYSTEMCTL = "/usr/bin/systemctl"
 UPDATE_TRIGGER = f"{SYSTEMCTL} start --no-block {UPDATE_UNIT}"
+# The settings page's "Reboot box" button. Spelled once for the same reason
+# UPDATE_TRIGGER is — the sudoers line and the AGENT_BOX_REBOOT_CMD the
+# daemon execs have to agree byte for byte, and a grant that differs by one
+# flag asks for a password instead of running (#353). --no-block so the
+# daemon's HTTP answer is already on the wire when systemd starts stopping
+# units, this daemon among them.
+REBOOT_TRIGGER = f"{SYSTEMCTL} reboot --no-block"
 # Store housekeeping (issue #394). A full root wedges the whole box —
 # no journal, no profile swap, and an agent that cannot write — and on a
 # native box nobody is around to run `nix-collect-garbage` by hand. The
@@ -349,6 +356,18 @@ class Spec:
             raise ConfigError(
                 f"web.enable must be true, false or null, got {web_enable!r}")
         self.web_enable = bool(web_enable)
+        # "Reboot box" in the settings page's Danger zone (the module's
+        # web.rebootButton). Default on: a kernel or libc patch installs on
+        # disk and takes effect at a boot, unattended patching deliberately
+        # never reboots (see APT_CONF), and nobody inside the box can — so
+        # without the button such an update never finishes at all. Same
+        # quoted-"false" guard as web.enable above; null still means off.
+        reboot_button = web.get("rebootButton", True)
+        if reboot_button is not None and not isinstance(reboot_button, bool):
+            raise ConfigError(
+                "web.rebootButton must be true, false or null, got "
+                f"{reboot_button!r}")
+        self.reboot_button = bool(reboot_button) and self.web_enable
         self.protect_memory = bool(data.get("protectMemory", True))
         # Base-OS patching (see APT_CONF). Default on, because the failure
         # it prevents is silent: an unattended patch run that installs a
@@ -1644,7 +1663,7 @@ class Renderer:
                        f'Environment="AGENT_BOX_UPDATE_CMD=/usr/bin/sudo -n '
                        f'{UPDATE_TRIGGER}"',
                        f'Environment="AGENT_BOX_UPDATE_UNIT={UPDATE_UNIT}"',
-                   ] + ([
+                   ] + self.reboot_env(u) + ([
                        # The webhook panel (issue #227) shells out to the
                        # SAME script and interpreter the receiver runs, so
                        # the panel cannot drift from the semantics the
@@ -1750,6 +1769,22 @@ class Renderer:
                     .replace("@UPDATE_SECTION@", update_section)
                     .replace("@HOST_SECTION@", host_section))
 
+    def reboot_env(self, u):
+        """AGENT_BOX_REBOOT_CMD, for the root user's settings daemon only.
+
+        The Danger zone's "Reboot box" (the module's web.rebootButton).
+        Spelled from the same constant as the sudoers line so the two
+        cannot drift — a grant that differs from the command by one flag
+        asks for a password instead of running it (#353). Another user's
+        daemon never sees the variable, so its page hides the card and
+        404s the route: a reboot takes every user's sessions with it, and
+        that is not one agent user's call to make about another's work.
+        """
+        if not (self.spec.reboot_button and u is self.spec.root_user):
+            return []
+        return [f'Environment="AGENT_BOX_REBOOT_CMD=/usr/bin/sudo -n '
+                f'{REBOOT_TRIGGER}"']
+
     def user_seed(self, t, u):
         """The declared sessions, seeded on first boot only.
 
@@ -1834,6 +1869,14 @@ class Renderer:
             if self.spec.web_enable:
                 cmds.append("/usr/bin/systemctl reload caddy.service")
             cmds.append(UPDATE_TRIGGER)
+            # Rebooting the machine goes to the ROOT user alone (the one
+            # whose settings page carries the button), not to every agent
+            # user: "Restart all" bounces the caller's own unit and needs no
+            # sudo at all, but a reboot takes every user's sessions with it,
+            # and one user's power over another's work is exactly what the
+            # per-user password grant above exists to avoid.
+            if self.spec.reboot_button and u is self.spec.root_user:
+                cmds.append(REBOOT_TRIGGER)
             cmds += self.spec.sudo_allowlist
             lines.append(f"{u.name} ALL=(root) NOPASSWD: " + ", ".join(cmds))
         t.file(self.p("/etc/sudoers.d/agent-box"),

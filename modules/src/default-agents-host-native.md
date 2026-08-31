@@ -20,13 +20,14 @@
   `Unattended-Upgrade::Automatic-Reboot` line in that apt file rather than
   assuming either way.
   A KERNEL patch is the exception - it only takes effect at a boot, and
-  the box tells you one is waiting by creating /var/run/reboot-required.
-  Assume that is not yours to act on: rebooting needs the cloud console,
-  or a `sudo` grant this box hands out only if the deployment asked for
-  one (`sudo -ln` lists what you actually have). So when you see that
-  file, say so to the person you are working with (`cat
-  /var/run/reboot-required.pkgs` lists which packages want it) instead of
-  looking for a way around it.
+  the box tells you one is waiting by creating /var/run/reboot-required
+  (`cat /var/run/reboot-required.pkgs` names what asked). Say so to the
+  person you are working with when you see it. There IS a way to finish
+  it - "Reboot box" in the settings page's Danger zone, and the same
+  command as a sudo grant if `sudo -ln` lists `systemctl reboot` for you
+  - but a reboot kills every session on this box, yours included, so it
+  is a thing to be asked for rather than a thing to decide. Ask, unless
+  you were already told to.
 - Two layers, and it pays to know which one you are looking at.
   `apt list --installed` is the distro's; `nix profile list --profile
   /nix/var/nix/profiles/agent-box` is agent-box's. Tools YOU want go in

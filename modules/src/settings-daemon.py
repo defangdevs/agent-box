@@ -152,6 +152,24 @@ REV = os.environ.get("AGENT_BOX_REV", "")
 # is unprivileged — no sudo, unlike the trigger in UPDATE_CMD.
 UPDATE_UNIT = os.environ.get("AGENT_BOX_UPDATE_UNIT", "")
 SYSTEMCTL = os.environ.get("AGENT_BOX_SYSTEMCTL", "")
+# Full sudo command line that reboots the whole box. Set for the ROOT
+# terminal user only — a reboot is the one Danger-zone action that
+# crosses the user boundary (Restart all bounces the caller's own unit
+# and needs no sudo at all), so on a multi-user box it must not be one
+# user's power over another's sessions. Empty everywhere else, which
+# hides the card and 404s the route.
+#
+# Its whole reason to exist: a kernel or libc patch installs on disk and
+# takes effect at a boot, and unattended patching deliberately never
+# reboots (see the box's apt policy). Without this the box has no way to
+# finish those updates at all — nobody inside it can reboot.
+REBOOT_CMD = os.environ.get("AGENT_BOX_REBOOT_CMD", "")
+# The distro's own "a reboot would apply something" marker: Debian and
+# Ubuntu's update machinery creates it, and the .pkgs file beside it
+# lists what asked. Both are world-readable, so the card reports WHY a
+# reboot is pending with no privilege at all. A NixOS box has neither
+# file and simply shows the card with no reason line.
+REBOOT_REQUIRED = "/run/reboot-required"
 # Per-user, no-argument privileged helper (issue 91). Passwords are sent
 # as JSON on stdin, never argv or environment, and helper output is never
 # reflected into HTTP responses.
@@ -2190,6 +2208,46 @@ def update_box():
         sys.stderr.write("update_box: %s\n" % exc)
 
 
+def reboot_box():
+    """Trigger the reboot through the allowlisted sudo command.
+
+    The caller sends its HTTP response BEFORE calling this (see the
+    /reboot route): --no-block returns immediately, but systemd starts
+    stopping units at once, and this daemon is one of them — a response
+    written afterwards can lose the race with its own socket going away.
+    """
+    try:
+        proc = subprocess.run(REBOOT_CMD.split(), check=False, capture_output=True)
+        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
+    except OSError as exc:
+        sys.stderr.write("reboot_box: %s\n" % exc)
+
+
+def reboot_pending():
+    """What the distro says a reboot would apply: (pending, packages).
+
+    Read, never inferred: `pending` is the existence of the marker file
+    the package manager itself creates, and `packages` is the list it
+    wrote beside it. A box that has never needed a reboot has neither
+    file, which is not an error — it is the answer.
+    """
+    if not os.path.exists(REBOOT_REQUIRED):
+        return False, []
+    try:
+        with open(REBOOT_REQUIRED + ".pkgs", encoding="utf-8") as fh:
+            names = [line.strip() for line in fh if line.strip()]
+    except OSError:
+        names = []
+    # Deduplicated (the file repeats a package that asked twice) and
+    # capped: this is a one-line reason on a card, not a manifest.
+    seen, packages = set(), []
+    for name in names:
+        if name not in seen and len(packages) < 6:
+            seen.add(name)
+            packages.append(name)
+    return True, packages
+
+
 def update_service_state():
     """Read-only state of the box update oneshot, for the UI progress
     line. Returns None when self-update is off (no unit wired) or
@@ -2709,6 +2767,7 @@ BODY = """<main>
         </form>
       </li>
       {update_row}
+      {reboot_row}
     </ul>
   </section>
 </main>
@@ -2754,6 +2813,25 @@ UPDATE_ROW = """<li>
               data-status="{base}/status"
               onsubmit="return confirm('Update the box now? This rebuilds the system and may restart the agent sessions.');">
           <button type="submit" class="btn danger-btn">Update box</button>
+        </form>
+      </li>"""
+
+# Last in the Danger zone, because it is the widest: the machine, not a
+# service. The note says what comes back by itself, so the choice is
+# about the minute of downtime rather than about losing the box.
+REBOOT_ROW = """<li>
+        <span class="dz"><strong>Reboot box</strong>
+        <span class="note">Reboots the whole machine. Every session is
+        killed and the box is unreachable for about a minute; the
+        sessions then come back on their own, minus whatever was in
+        flight. This is the only way to finish a kernel or libc update:
+        those install on disk and take effect at a boot, and unattended
+        patching never reboots by itself.{reboot_line}
+        <span id="reboot-status" class="update-state" aria-live="polite"></span></span></span>
+        <form method="post" action="{base}/reboot" data-poll="reboot"
+              data-status="{base}/status"
+              onsubmit="return confirm('Reboot the box now? Every session is killed and the box is unreachable for about a minute.');">
+          <button type="submit" class="btn danger-btn">Reboot box</button>
         </form>
       </li>"""
 
@@ -3296,6 +3374,25 @@ def render_agent_options():
     return "".join(items)
 
 
+def render_reboot_line():
+    """Why a reboot is worth pressing, or nothing at all.
+
+    A red button with no reason gets pressed out of curiosity; one that
+    answers a question the box is already asking gets pressed when it
+    should be. So the card stays silent until the distro says a reboot
+    would apply something, and then names what.
+    """
+    pending, packages = reboot_pending()
+    if not pending:
+        return ""
+    reason = ""
+    if packages:
+        reason = " (" + html.escape(", ".join(packages)) + ")"
+    return ("<br><strong>A reboot is pending</strong>" + reason
+            + " &mdash; patches are installed on disk and take effect at "
+              "the next boot.")
+
+
 def render_update_line():
     """Running rev plus a progressively enhanced GitHub update status.
 
@@ -3666,6 +3763,11 @@ def render_page(message=""):
                 UPDATE_ROW.format(base=html.escape(BASE), update_line=render_update_line())
                 if UPDATE_CMD else ""
             ),
+            reboot_row=(
+                REBOOT_ROW.format(base=html.escape(BASE),
+                                  reboot_line=render_reboot_line())
+                if REBOOT_CMD else ""
+            ),
         )
         + SCRIPT
     )
@@ -3930,6 +4032,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "session_started": "Session started — it comes up within a few seconds.",
         "update": "Box update started — the system rebuilds in the "
                   "background and this page may briefly go away.",
+        "rebooting": "Reboot requested — the box goes away for about a "
+                     "minute. Reload this page once it is back.",
         "webhook_rotated": ("Secret rotated. Copy the new one into the sender "
                             "now — deliveries signed with the old secret are "
                             "rejected from this moment, and GitHub does not "
@@ -4386,6 +4490,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == BASE + "/update" and UPDATE_CMD:
             update_box()
             self._redirect("ok=update")
+        elif path == BASE + "/reboot" and REBOOT_CMD:
+            # Answer FIRST, then reboot. Every other action here can
+            # respond afterwards because the daemon survives it; this one
+            # is stopped by the shutdown it just asked for, so a response
+            # written after the trigger races its own socket. Flushed
+            # explicitly rather than trusting the handler to get another
+            # turn — it may not.
+            self._redirect("ok=rebooting")
+            with contextlib.suppress(OSError):
+                self.wfile.flush()
+            reboot_box()
         else:
             self._send_html("<h1>404</h1>", status=404)
 
