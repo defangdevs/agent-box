@@ -1415,7 +1415,10 @@ class RenderTest(unittest.TestCase):
         renderer currently emits. Hence a test that reads the template.
         """
         def options(execstart):
-            return dict(re.findall(r"-t (\w+)=(\S+)", execstart))
+            # A LIST, not a dict: a restatement can also gain a duplicate
+            # `-t`, and ttyd takes the last one — which a dict would hide by
+            # collapsing the pair silently (CodeRabbit, PR #454).
+            return re.findall(r"-t ([\w-]+)=(\S+)", execstart)
 
         template = next(
             x for x in (SRC / "units" / "agent-web-terminal@.service")
@@ -1428,12 +1431,21 @@ class RenderTest(unittest.TestCase):
             override = [x for x in conf.read_text().splitlines()
                         if x.startswith("ExecStart=")][-1]
             got, want = options(override), options(template)
-            # Values differ where the template interpolates (%i, ${VAR}) and
-            # the renderer substitutes; the OPTION SET must not.
             self.assertEqual(
-                sorted(want), sorted(got),
+                sorted(n for n, _ in want), sorted(n for n, _ in got),
                 f"agent-web-terminal@{user} drops or invents a ttyd option "
                 f"the shared template does not have")
+            # Values too, wherever the template's is a literal. Only the
+            # interpolating ones (%i, ${VAR}) may differ — the renderer
+            # substitutes those — so comparing names alone would accept
+            # `macOptionClickForcesSelection=false`, which is the same bug
+            # this test exists for with one word changed.
+            literal = {n: v for n, v in want
+                       if "%i" not in v and "${" not in v}
+            self.assertEqual(
+                literal, {n: v for n, v in got if n in literal},
+                f"agent-web-terminal@{user} changes the VALUE of a ttyd "
+                f"option the shared template pins")
 
 
 class SelfUpdateRenderTest(unittest.TestCase):
