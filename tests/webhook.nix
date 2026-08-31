@@ -2529,7 +2529,7 @@
     assert "https://box.test/agent/webhook/linear" in linear_setup, linear_setup
     machine.succeed(
         "jq -e '.sources.linear | .signatureHeader == \"linear-signature\""
-        " and .keyPath == \"data.team.key\" and .format == \"generic\""
+        " and .keyPath == \"data.teamId\" and .format == \"generic\""
         " and .secretFile == \"linear.secret\"' " + sources_file + " >/dev/null"
     )
     # github's own entry is untouched — a template for one source must not
@@ -2559,10 +2559,49 @@
         " and .keyPath == \"organizationId\"' " + sources_file + " >/dev/null"
     )
 
+    # setup must not lose a secret that only ever lived inline in the JSON
+    # (hand-added, or a source configured before secretFile existed): secret_of
+    # finds it through the inline `.secret` fallback, but the merge below
+    # unconditionally forces secretFile onto the entry, so without writing the
+    # secret out first that would point at a file that never existed —
+    # discarding the only place the secret was readable from.
+    inline_secret = "y" * 32
+    machine.succeed(
+        "jq '.sources.legacy = {secret: \"" + inline_secret + "\"}' "
+        + sources_file + " > /tmp/legacy.json"
+    )
+    machine.succeed("cp /tmp/legacy.json " + sources_file)
+    legacy_setup = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " AGENT_BOX_WEBHOOK_URL=https://box.test/agent/webhook"
+        " agent-box-webhook setup legacy"
+    )
+    assert "reusing the existing secret" in legacy_setup, legacy_setup
+    assert inline_secret in legacy_setup, legacy_setup
+    machine.succeed(
+        "cat /home/agent/.local/state/local-webhook/legacy.secret | grep -x "
+        + inline_secret
+    )
+    machine.succeed(
+        "jq -e '.sources.legacy.secretFile == \"legacy.secret\"' "
+        + sources_file + " >/dev/null"
+    )
+    # ...and the secret is still findable now that secretFile is what points
+    # at it — the whole point of writing the file out.
+    resetup = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " AGENT_BOX_WEBHOOK_URL=https://box.test/agent/webhook"
+        " agent-box-webhook setup legacy"
+    )
+    assert inline_secret in resetup, resetup
+
     # End to end on the public path, in Linear's own shape: bare hex (no
-    # "sha256=" prefix) in Linear-Signature, the routing key nested at
-    # data.team.key, and the event name in the payload's own `type` because
-    # Linear sends no event header at all.
+    # "sha256=" prefix) in Linear-Signature, the routing key at the bare ID
+    # data.teamId (Linear ships no nested team object), and the event name
+    # in the payload's own `type` because Linear sends no event header at
+    # all.
     linear_secret = machine.succeed(
         "cat /home/agent/.local/state/local-webhook/linear.secret"
     ).strip()
@@ -2570,7 +2609,7 @@
         "cat > /tmp/linear.json <<'EOF'\n"
         '{"action":"create","type":"Issue","organizationId":"org1",'
         '"data":{"identifier":"ENG-42","title":"from the VM test",'
-        '"team":{"key":"ENG"}},"actor":{"name":"someone"}}\n'
+        '"teamId":"team_eng"},"actor":{"name":"someone"}}\n'
         "EOF"
     )
     linear_sig = client.succeed(

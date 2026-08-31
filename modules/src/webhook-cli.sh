@@ -200,11 +200,15 @@ source_template() {
       # in Linear-Signature. Its payload names the entity in `type` (Issue,
       # Comment, Project) and the verb in `action` (create/update/remove), so
       # no event header exists to read. Keyed on the team so a topic is
-      # linear:ENG — the closest thing Linear has to owner/repo granularity.
-      # Note that a Project, Document or Initiative event carries no team and
-      # so no key, which means it reaches nobody: keyless payloads are
+      # linear:<TEAM ID> — the closest thing Linear has to owner/repo
+      # granularity. Linear's webhook payloads carry related objects as bare
+      # IDs, never nested — data.teamId, not data.team.key — so that is the
+      # path to read; a nested team object never arrives and a keyPath
+      # expecting one would silently match nothing. A Comment event has no
+      # team field at all (only data.issueId), joining Project, Document and
+      # Initiative events in reaching nobody: keyless payloads are
       # deliberately undeliverable upstream. Teams are what issues live in.
-      printf '%s' '{"format":"generic","signatureHeader":"linear-signature","keyPath":"data.team.key","senderPath":"actor.name"}'
+      printf '%s' '{"format":"generic","signatureHeader":"linear-signature","keyPath":"data.teamId","senderPath":"actor.name"}'
       ;;
     *) printf '%s' '{}' ;;
   esac
@@ -728,6 +732,16 @@ case "$cmd" in
     if [ -n "$existing" ]; then
       secret="$existing"
       note="already configured — reusing the existing secret"
+      # secret_of also returns a value found only through the inline
+      # `.secret` fallback (no secretFile field on this entry at all). The
+      # merge below unconditionally forces secretFile onto the entry, so
+      # without writing the secret out first that path would point at a file
+      # that never existed — losing the only place the secret was readable
+      # from.
+      if [ ! -f "$STATE_DIR/$src.secret" ]; then
+        umask 077
+        printf '%s' "$secret" > "$STATE_DIR/$src.secret"
+      fi
     else
       # 32 hex chars from the kernel CSPRNG; GitHub accepts any string.
       secret="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
@@ -781,10 +795,16 @@ API key in \$LINEAR_API_KEY, register it from here — no browser needed:
                            "allPublicTeams":true,
                            "resourceTypes":["Issue","Comment","IssueLabel"]}}}'
 
-Topics are keyed on the team, so subscribe to linear:<TEAM KEY> (linear:ENG).
+Topics are keyed on the team's ID, not its short key — Linear's webhook
+payloads carry data.teamId, never a nested team object, so linear:ENG would
+never match. Look yours up with the same key:
+  curl -sS https://api.linear.app/graphql \\
+    -H "Authorization: \$LINEAR_API_KEY" -H 'Content-Type: application/json' \\
+    -d '{"query":"{teams{nodes{id key name}}}"}'
 A Linear payload names the entity in \`type\` and the verb in \`action\`, so its
-rules read on those, not on GitHub's event names:
-  agent-box-webhook subscribe linear:ENG --note "ENG issues" \\
+rules read on those, not on GitHub's event names. A Comment event carries no
+team field at all, so it reaches no team-keyed subscription:
+  agent-box-webhook subscribe linear:<TEAM ID> --note "issues for that team" \\
     --when '{"path":"action","in":["create"]}'
 EOF
     fi

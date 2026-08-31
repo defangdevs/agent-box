@@ -213,17 +213,28 @@ let
 
           agent-box-webhook setup linear      # prints the URL, the secret, AND a
                                               # ready-made webhookCreate mutation
-          agent-box-webhook subscribe linear:ENG --note "ENG issues" \
+          agent-box-webhook subscribe linear:<TEAM ID> --note "issues for that team" \
             --when '{"path":"action","in":["create"]}'
 
       Linear delivers over IPv4 ONLY - every egress address it publishes is IPv4 -
       so an IPv6-only box receives nothing until it has an IPv4 address, exactly as
       with GitHub. Unlike GitHub it retries: 1 minute, 1 hour, 6 hours.
 
-      Topics are keyed on the TEAM (`linear:ENG`), which is the closest thing Linear
-      has to `owner/repo`. A Project, Document or Initiative event carries no team,
-      so it has no key and reaches nobody - teams are what issues live in. A Linear
-      payload names the entity in `type` (`Issue`, `Comment`) and the verb in
+      Topics are keyed on the team's ID (`linear:<TEAM ID>`), the closest thing
+      Linear has to `owner/repo`. Look yours up with the same key Linear's MCP
+      server uses:
+
+          curl -sS https://api.linear.app/graphql \
+            -H "Authorization: $LINEAR_API_KEY" -H 'Content-Type: application/json' \
+            -d '{"query":"{teams{nodes{id key name}}}"}'
+
+      The ID, not the short key printed alongside it (`ENG`), is what to route on:
+      Linear's webhook payloads carry related objects as bare IDs, never nested, so
+      `data.teamId` is what arrives and `linear:ENG` never matches anything. A
+      Comment event carries no team field at all (only `data.issueId`), joining
+      Project, Document and Initiative events in reaching nobody - keyless payloads
+      are deliberately undeliverable upstream; teams are what issues live in. A
+      Linear payload names the entity in `type` (`Issue`, `Comment`) and the verb in
       `action` (`create`/`update`/`remove`), so write rules on those; GitHub's event
       names mean nothing here, and since local-webhook 0.24.0 a non-GitHub
       subscription is no longer seeded with them.
@@ -233,7 +244,7 @@ let
       cannot receive:
 
           claude mcp add --transport http linear https://mcp.linear.app/mcp \
-            --header "Authorization: Bearer ''${LINEAR_API_KEY}" -s user
+            --header "Authorization: Bearer \''${LINEAR_API_KEY}" -s user
 
       The `''${...}` is stored literally and expanded when the server loads, so the key
       lives only in the env store. Ask the user to paste it into the settings page's
@@ -3623,11 +3634,15 @@ esac
           # in Linear-Signature. Its payload names the entity in `type` (Issue,
           # Comment, Project) and the verb in `action` (create/update/remove), so
           # no event header exists to read. Keyed on the team so a topic is
-          # linear:ENG — the closest thing Linear has to owner/repo granularity.
-          # Note that a Project, Document or Initiative event carries no team and
-          # so no key, which means it reaches nobody: keyless payloads are
+          # linear:<TEAM ID> — the closest thing Linear has to owner/repo
+          # granularity. Linear's webhook payloads carry related objects as bare
+          # IDs, never nested — data.teamId, not data.team.key — so that is the
+          # path to read; a nested team object never arrives and a keyPath
+          # expecting one would silently match nothing. A Comment event has no
+          # team field at all (only data.issueId), joining Project, Document and
+          # Initiative events in reaching nobody: keyless payloads are
           # deliberately undeliverable upstream. Teams are what issues live in.
-          printf '%s' '{"format":"generic","signatureHeader":"linear-signature","keyPath":"data.team.key","senderPath":"actor.name"}'
+          printf '%s' '{"format":"generic","signatureHeader":"linear-signature","keyPath":"data.teamId","senderPath":"actor.name"}'
           ;;
         *) printf '%s' '{}' ;;
       esac
@@ -4151,6 +4166,16 @@ esac
         if [ -n "$existing" ]; then
           secret="$existing"
           note="already configured — reusing the existing secret"
+          # secret_of also returns a value found only through the inline
+          # `.secret` fallback (no secretFile field on this entry at all). The
+          # merge below unconditionally forces secretFile onto the entry, so
+          # without writing the secret out first that path would point at a file
+          # that never existed — losing the only place the secret was readable
+          # from.
+          if [ ! -f "$STATE_DIR/$src.secret" ]; then
+            umask 077
+            printf '%s' "$secret" > "$STATE_DIR/$src.secret"
+          fi
         else
           # 32 hex chars from the kernel CSPRNG; GitHub accepts any string.
           secret="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
@@ -4204,10 +4229,16 @@ esac
                                "allPublicTeams":true,
                                "resourceTypes":["Issue","Comment","IssueLabel"]}}}'
 
-    Topics are keyed on the team, so subscribe to linear:<TEAM KEY> (linear:ENG).
+    Topics are keyed on the team's ID, not its short key — Linear's webhook
+    payloads carry data.teamId, never a nested team object, so linear:ENG would
+    never match. Look yours up with the same key:
+      curl -sS https://api.linear.app/graphql \\
+        -H "Authorization: \$LINEAR_API_KEY" -H 'Content-Type: application/json' \\
+        -d '{"query":"{teams{nodes{id key name}}}"}'
     A Linear payload names the entity in \`type\` and the verb in \`action\`, so its
-    rules read on those, not on GitHub's event names:
-      agent-box-webhook subscribe linear:ENG --note "ENG issues" \\
+    rules read on those, not on GitHub's event names. A Comment event carries no
+    team field at all, so it reaches no team-keyed subscription:
+      agent-box-webhook subscribe linear:<TEAM ID> --note "issues for that team" \\
         --when '{"path":"action","in":["create"]}'
     EOF
         fi
