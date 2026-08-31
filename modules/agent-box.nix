@@ -11328,12 +11328,19 @@ STYLE = """<style>
   .tab-empty { color: #8b949e; font-size: 13px; padding: 6px 8px 8px; }
   .tabs .btn.add { margin: 0 4px 6px; padding: 2px 9px; }
   .tabs .spacer { flex: 1; }
-  .tabs .hint { color: #8b949e; font-size: 16px; padding: 2px 6px 8px;
-                cursor: help; }
-  .tabs .hint:hover, .tabs .hint:focus-visible { color: #e6edf3; }
-  .tabs a.gear { color: #8b949e; text-decoration: none; font-size: 20px;
-                 padding: 2px 8px 8px; }
-  .tabs a.gear:hover { color: #e6edf3; }
+  /* The two trailing controls, (i) and the gear. They are inline SVG
+     because the text glyphs they replace could not be held to one size:
+     U+2699 GEAR is an Emoji_Presentation code point, so a phone swapped in
+     its colour emoji font and drew a shaded 3D gear beside a flat (i) —
+     see the note on HOME_BODY. So size the BOX here, once, for both. */
+  .tabs .hint, .tabs a.gear { display: flex; color: #8b949e;
+                              padding: 0 7px 9px; }
+  .tabs .hint { cursor: help; }
+  .tabs a.gear { text-decoration: none; }
+  .tabs .hint svg, .tabs a.gear svg { width: 18px; height: 18px;
+                                      display: block; }
+  .tabs .hint:hover, .tabs .hint:focus-visible, .tabs a.gear:hover {
+    color: #e6edf3; }
   .ws .editor, .ws .msg { margin: 8px; flex: none; }
   .panes { position: relative; flex: 1; min-height: 0; }
   .pane { position: absolute; inset: 0; width: 100%; height: 100%;
@@ -11484,6 +11491,18 @@ CONNECT_SECTION_TPL = """<section>
 # `title` is not read as a description once a name exists. A short name of
 # its own ("Terminal mouse tip") would therefore be the whole of what a
 # screen reader ever announced, so both attributes carry the instructions.
+#
+# Both trailing icons are inline SVG (ICON_INFO/ICON_GEAR below), not the
+# text glyphs U+24D8/U+2699 they used to be. Two reasons, and the second
+# is the one a desktop browser hides: U+2699 GEAR carries
+# Emoji_Presentation, so iOS and Android substitute their COLOR emoji
+# font for it — the settings control turned up as a shaded 3D gear next
+# to a flat monochrome (i), visibly bigger and in the wrong palette,
+# while the same page on a desktop looked merely a little uneven. Nothing
+# in CSS fixes that: font-size only scales the emoji, and the glyph a
+# font hands back is not ours to pick. Sized in px as SVG, the pair is
+# the same 18px box everywhere and inherits currentColor like every
+# other icon on the page.
 HOME_BODY = """<body class="ws">
 <div id="msg-slot">{message}</div>
 <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}">
@@ -11493,8 +11512,8 @@ HOME_BODY = """<body class="ws">
   <span class="spacer"></span>
   <span class="hint" tabindex="0"
         aria-label="Terminal mouse tip. Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text."
-        title="Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text.">&#9432;</span>
-  <a class="gear" href="{base}/" title="Settings" aria-label="Settings">&#9881;</a>
+        title="Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text.">{icon_info}</span>
+  <a class="gear" href="{base}/" title="Settings" aria-label="Settings">{icon_gear}</a>
 </nav>
 <div id="session-editor" class="editor">
   <form method="post" action="{action_base}/sessions/add">
@@ -11622,6 +11641,42 @@ UPDATE_ROW = """<li>
 
 # Octicons (MIT) inlined so the page stays a single self-contained
 # response.
+ICON_INFO = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13Z'
+    'M6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 '
+    '0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"/></svg>'
+)
+ICON_GEAR = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M8 0a8.2 8.2 0 0 1 .701.031C9.444.095 9.99.645 10.16 1.29l.288 1.107c.018.066.079'
+    '.158.212.224.231.114.454.243.668.386.123.082.233.09.299.071l1.103-.303c.644-.176 1.392.021 '
+    '1.82.63.27.385.506.792.704 1.218.315.675.111 1.422-.364 1.891l-.814.806c-.049.048-.098.147'
+    '-.088.294.016.257.016.515 0 .772-.01.147.038.246.088.294l.814.806c.475.469.679 1.216.364 '
+    '1.891a7.977 7.977 0 0 1-.704 1.217c-.428.61-1.176.807-1.82.63l-1.102-.302c-.067-.019-.177'
+    '-.011-.3.071a5.909 5.909 0 0 1-.668.386c-.133.066-.194.158-.211.224l-.29 1.106c-.168.646'
+    '-.715 1.196-1.458 1.26a8.006 8.006 0 0 1-1.402 0c-.743-.064-1.289-.614-1.458-1.26l-.289'
+    '-1.106c-.018-.066-.079-.158-.212-.224a5.738 5.738 0 0 1-.668-.386c-.123-.082-.233-.09-.299'
+    '-.071l-1.103.303c-.644.176-1.392-.021-1.82-.63a8.12 8.12 0 0 1-.704-1.218c-.315-.675-.111'
+    '-1.422.363-1.891l.815-.806c.05-.048.098-.147.088-.294a6.214 6.214 0 0 1 0-.772c.01-.147'
+    '-.038-.246-.088-.294l-.815-.806C.635 6.045.431 5.298.746 4.623a7.92 7.92 0 0 1 .704-1.217'
+    'c.428-.61 1.176-.807 1.82-.63l1.102.302c.067.019.177.011.3-.071.214-.143.437-.272.668-.386'
+    '.133-.066.194-.158.211-.224l.29-1.106C6.009.645 6.556.095 7.299.03 7.53.01 7.764 0 8 0Z'
+    'm-.571 1.525c-.036.003-.108.036-.137.146l-.289 1.105c-.147.561-.549.967-.998 1.189-.173.086'
+    '-.34.183-.5.29-.417.278-.97.423-1.529.27l-1.103-.303c-.109-.03-.175.016-.195.045-.22.312'
+    '-.412.644-.573.99-.014.031-.021.11.059.19l.815.806c.411.406.562.957.53 1.456a4.709 4.709 0 '
+    '0 0 0 .582c.032.499-.119 1.05-.53 1.456l-.815.806c-.081.08-.073.159-.059.19.162.346.353.677'
+    '.573.989.02.03.085.076.195.046l1.102-.303c.56-.153 1.113-.008 1.53.27.161.107.328.204.501'
+    '.29.447.222.85.629.997 1.189l.289 1.105c.029.109.101.143.137.146a6.6 6.6 0 0 0 1.142 0c.036'
+    '-.003.108-.036.137-.146l.289-1.105c.147-.561.549-.967.998-1.189.173-.086.34-.183.5-.29.417'
+    '-.278.97-.423 1.529-.27l1.103.303c.109.029.175-.016.195-.045.22-.313.411-.644.573-.99.014'
+    '-.031.021-.11-.059-.19l-.815-.806c-.411-.406-.562-.957-.53-1.456a4.709 4.709 0 0 0 0-.582c'
+    '-.032-.499.119-1.05.53-1.456l.815-.806c.081-.08.073-.159.059-.19a6.464 6.464 0 0 0-.573'
+    '-.989c-.02-.03-.085-.076-.195-.046l-1.102.303c-.56.153-1.113.008-1.53-.27a4.44 4.44 0 0 0'
+    '-.501-.29c-.447-.222-.85-.629-.997-1.189l-.289-1.105c-.029-.11-.101-.143-.137-.146a6.6 6.6 '
+    '0 0 0-1.142 0ZM11 8a3 3 0 1 1-6 0 3 3 0 0 1 6 0ZM9.5 8a1.5 1.5 0 1 0-3.001.001A1.5 1.5 0 0 '
+    '0 9.5 8Z"/></svg>'
+)
 ICON_LOCK = (
     '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
     '<path d="M4 4a4 4 0 0 1 8 0v2h.25c.966 0 1.75.784 1.75 1.75v5.5A1.75 1.75 0 0 1 12.25 15'
@@ -13469,6 +13524,8 @@ def render_home(message="", selected=None):
             pane=render_pane(selected, live, stopped),
             new_session_fields=render_new_session_fields(),
             message=msg_html,
+            icon_info=ICON_INFO,
+            icon_gear=ICON_GEAR,
         )
         + SCRIPT
     )

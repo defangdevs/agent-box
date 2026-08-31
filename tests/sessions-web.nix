@@ -89,6 +89,22 @@ in
     assert 'src="/agent/main/"' in root_page, root_page
     assert "workingDirectory" not in root_page, root_page
 
+    # The two controls at the end of the tab bar, (i) and the gear, are
+    # inline SVG rather than text glyphs (PR #NNN). U+2699 GEAR carries
+    # Emoji_Presentation, so iOS and Android drew it from their COLOUR
+    # emoji font: a shaded 3D gear beside a flat monochrome (i), bigger
+    # than it and in the wrong palette. Assert the code points are ABSENT
+    # (entity spellings included — the old markup emitted `&#9881;`, so a
+    # test looking only for the literal character would have passed), not
+    # merely that an <svg> is there: the glyph renders acceptably on the
+    # desktop a contributor checks the page from, so nothing but the
+    # absence of the glyph keeps the regression out.
+    for control in ('class="hint"', 'class="gear"'):
+        at = root_page.index(control)
+        assert "<svg" in root_page[at:at + 400], root_page[at:at + 400]
+    for glyph in ("⚙", "&#9881;", "&#x2699;", "ⓘ", "&#9432;", "&#x24d8;"):
+        assert glyph not in root_page, glyph
+
     # The add/delete banner is page-level feedback, so it renders ABOVE the
     # tab bar (issue 188) — below the tabs it read as a message from the
     # terminal in the pane underneath it. An empty slot when there is no
