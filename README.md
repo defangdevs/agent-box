@@ -85,7 +85,7 @@ and signs out every browser by rotating the authentication-cookie secret.
 **Updating the box.** Click "Update box" on the settings page (the gear icon
 next to your terminal; the card also shows the running agent-box rev, linked
 to its GitHub commit), or ask the agent in its terminal to run
-`sudo systemctl start agent-box-update.service` — a root oneshot (alongside
+`sudo systemctl start --no-block agent-box-update.service` — a root oneshot (alongside
 the caddy reload, the only sudo the agent holds) that fast-forwards the box
 to this repo's latest master and applies it: on Lightsail that is a swap of
 the pinned Nix profile followed by `agentbox apply` (the newly installed
@@ -301,7 +301,7 @@ when the browser cannot reach a local callback (see the
 [Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)),
 so no callback relay is needed. If an older deployed box still shows the
 legacy flow, update it from the settings page or run
-`sudo systemctl start agent-box-update.service`, then retry
+`sudo systemctl start --no-block agent-box-update.service`, then retry
 `claude auth login`.
 
 The auth code input is hidden like a password, so pasting gives no visible

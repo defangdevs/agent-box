@@ -336,9 +336,11 @@ silently falling back to asking for a password.
 ## Updating
 
 Update the box's software with:
-`sudo /run/current-system/sw/bin/systemctl start agent-box-update.service`
+`sudo /run/current-system/sw/bin/systemctl start --no-block agent-box-update.service`
 (kills the running tmux session - save context first). As above, the full
-path is required for the passwordless sudo rule to match.
+path is required for the passwordless sudo rule to match, and so is the
+--no-block: sudoers compares the whole command line, so dropping a flag
+makes the rule miss and sudo ask for a password instead.
 
 ## This platform has its own upstream repo
 

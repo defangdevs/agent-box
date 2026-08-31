@@ -742,7 +742,7 @@ Resources:
                     user = "${UserName}";
                   };
                   # Lets the agent update the box on request:
-                  #   sudo systemctl start agent-box-update.service
+                  #   sudo systemctl start --no-block agent-box-update.service
                   # fast-forwards the pin above to upstream HEAD and rebuilds.
                   selfUpdate = {
                     enable = true;

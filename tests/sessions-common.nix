@@ -29,10 +29,14 @@
       # seeded "main" below. Keeping them eager here is also what preserves
       # coverage of the eager path now that it is no longer the default.
       eagerAgents = [ "claude" "codex" ];
-      # Leave the host label unset so auto-derived Remote Control names fall
-      # back to the public web.domain rather than the internal kernel
-      # hostname (issue: derived names showed the internal EC2 fqdn).
-      remoteControlHost = "";
+      # remoteControlHost is deliberately NOT set: the assertion below is
+      # about the DEFAULT, which is that auto-derived Remote Control names
+      # take their suffix from the public web.domain rather than the internal
+      # kernel hostname (issue: derived names showed the internal EC2 fqdn).
+      # This test used to have to write `remoteControlHost = ""` by hand,
+      # because the default was fqdnOrHostName and the documented web.domain
+      # arm was unreachable without it — so it proved the arm worked while
+      # proving nothing about what a box actually gets.
       users.agent = {
         web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
         # This test predates the front door (issue #416) and its subject is

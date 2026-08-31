@@ -10,7 +10,7 @@ Environment="AGENT_BOX_FIND_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-find
 Environment="AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock"
 Environment="AGENT_BOX_GREP_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/bin/grep"
 Environment="AGENT_BOX_HOSTNAME_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-hostname-hostname-debian-3.25/bin/hostname"
-Environment="AGENT_BOX_HOST_LABEL=nixos"
+Environment="AGENT_BOX_HOST_LABEL=golden.example.org"
 Environment="AGENT_BOX_NIXPKGS=https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz"
 Environment="AGENT_BOX_NIX_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nix-2.34.8/bin/nix"
 Environment="AGENT_BOX_WEBHOOK_PINNED_SCRIPT=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-webhook.py"
