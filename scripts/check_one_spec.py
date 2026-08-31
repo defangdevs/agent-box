@@ -109,8 +109,12 @@ def users():
 
 def check_spec(generated):
     if generated is None:
-        print("spec: SKIPPED (no --spec; run the flake check for this half)")
-        return 0
+        # Without Nix there is no module evaluation to compare against, but
+        # the two DIALECTS of the committed config can still be held to each
+        # other — that half needs no module, and it is the half that failed
+        # in CI when this file was written.
+        print("spec: SKIPPED (no --spec; the flake check does this half)")
+        return check_spec_yaml(json.loads(CONFIG.read_text()))
     want = json.loads(Path(generated).read_text())
     got = json.loads(CONFIG.read_text())
     if want == got:

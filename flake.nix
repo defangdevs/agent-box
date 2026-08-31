@@ -968,7 +968,18 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               } ''
               cp -rT --no-preserve=mode,ownership "$repo" repo
               cd repo
-              python3 scripts/check_one_spec.py --spec "$spec" | tee "$out"
+              # To a file, then copied — NOT `| tee "$out"`, which returns
+              # tee's status: the builder's shell has no pipefail, so a
+              # detected divergence would have written $out and exited 0, and
+              # this check would have gone green on exactly the failure it
+              # exists to report (CodeRabbit, PR #455). Same shape as
+              # agentbox-render above, for the same reason.
+              if ! python3 scripts/check_one_spec.py --spec "$spec" > report; then
+                cat report
+                exit 1
+              fi
+              cat report
+              cp report "$out"
             '';
 
           # Issue #394: the two renderers configure the SAME payloads, and
