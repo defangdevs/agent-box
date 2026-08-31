@@ -82,6 +82,7 @@ SAMPLE = {
     "@@AGENT@@": "claude",
     "@@USER@@": "agent",
     "@@AGENTSMD@@": "## This box\n\n- A line with 'quotes' and $dollars.\n",
+    "@@SEEDMAINSESSION@@": "false",
     "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
 }
 

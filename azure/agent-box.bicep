@@ -47,6 +47,9 @@ param webPassword string
 ])
 param agent string = 'claude'
 
+@description('false (default): matches the module\'s own front-door default for a box with a browser terminal (issue #416) - first boot seeds no session, and the settings page is where the first one is started (installing its agent CLI on demand). true: seed a running "main" session immediately, the pre-#416 behaviour - set this if you want the box usable as a terminal the moment it boots, without a trip through the settings page.')
+param seedMainSession bool = false
+
 // The picker annotates each value with vCPU/RAM/price because the portal's
 // generated form renders allowed values verbatim - there is no separate label
 // field, exactly as with the Lightsail template's BundleId. Only the first
@@ -289,7 +292,10 @@ AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
 # nothing it can discover for itself: `domain: auto` tells --first-boot to
 # settle the public IPv4 and derive the sslip.io hostname from it. That works
 # unchanged on Azure because settle_public_ip asks checkip.amazonaws.com rather
-# than a cloud's own metadata service.
+# than a cloud's own metadata service. No `sessions:` key by default -
+# `agentbox apply` seeds none itself on a web-enabled box (issue #416/#468),
+# landing first boot on the settings page instead of a started agent session.
+# seedMainSession=true opts back into the pre-#416 behaviour.
 install -d -m 0755 /etc/agent-box
 cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
 domain: auto
@@ -300,10 +306,14 @@ web:
 users:
   @@USER@@:
     root: true
+AGENTBOX_CONFIG
+if [ "@@SEEDMAINSESSION@@" = "true" ]; then
+  cat >> /etc/agent-box/config.yaml <<'AGENTBOX_SESSIONS'
     sessions:
       main:
         agent: @@AGENT@@
-AGENTBOX_CONFIG
+AGENTBOX_SESSIONS
+fi
 
 # Extra standing instructions for the agent, if the deployment gave any.
 install -d -m 0755 /etc/agent-box-guides
@@ -339,13 +349,14 @@ set -x
 echo "agent-box bootstrap complete"
 '''
 
-var bootstrap = replace(replace(replace(replace(replace(replace(
+var bootstrap = replace(replace(replace(replace(replace(replace(replace(
   bootstrapTemplate,
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
   '@@AGENT@@', agent),
   '@@USER@@', userName),
   '@@AGENTSMD@@', agentsMd),
+  '@@SEEDMAINSESSION@@', string(seedMainSession)),
   // base64, not the plaintext: see the comment above the apply, and
   // check_secrets() in scripts/check_azure_template.py, which fails if this
   // ever goes back to a raw substitution.

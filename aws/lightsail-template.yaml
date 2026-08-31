@@ -19,6 +19,7 @@ Metadata:
           default: Box
         Parameters:
           - Agent
+          - SeedMainSession
           - UserName
           - WebPassword
       - Label:
@@ -41,6 +42,8 @@ Metadata:
     ParameterLabels:
       Agent:
         default: Agent CLI
+      SeedMainSession:
+        default: Start a session immediately (instead of the settings page)
       UserName:
         default: Linux user the agent runs as
       WebPassword:
@@ -83,6 +86,18 @@ Parameters:
     Default: claude
     AllowedValues: [claude, codex]
     Description: Which agent CLI the box's initial session runs.
+
+  SeedMainSession:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      false (default): matches the module's own front-door default for a box
+      with a browser terminal (issue #416) - first boot seeds no session, and
+      the settings page is where the first one is started (installing its
+      agent CLI on demand). true: seed a running "main" session immediately,
+      the pre-#416 behaviour - set this if you want the box usable as a
+      terminal the moment it boots, without a trip through the settings page.
 
   # The picker annotates each value with vCPU/RAM/price because the
   # CloudFormation console renders AllowedValues verbatim - there is no
@@ -273,7 +288,11 @@ Resources:
             # The box's declared state. Everything host-specific the renderer
             # needs, and nothing it can discover for itself: `domain: auto`
             # tells --first-boot to settle the public IPv4 and derive the
-            # sslip.io hostname from it.
+            # sslip.io hostname from it. No `sessions:` key by default -
+            # `agentbox apply` seeds none itself on a web-enabled box (issue
+            # #416/#468), landing first boot on the settings page instead of a
+            # started agent session. SeedMainSession=true opts back into the
+            # pre-#416 behaviour.
             install -d -m 0755 /etc/agent-box
             cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
             domain: auto
@@ -284,10 +303,14 @@ Resources:
             users:
               @USER@:
                 root: true
+            AGENTBOX_CONFIG
+            if [ "${SeedMainSession}" = "true" ]; then
+              cat >> /etc/agent-box/config.yaml <<'AGENTBOX_SESSIONS'
                 sessions:
                   main:
                     agent: @AGENT@
-            AGENTBOX_CONFIG
+            AGENTBOX_SESSIONS
+            fi
             sed -i "s|@AGENT@|${Agent}|g; s|@USER@|${UserName}|g" \
               /etc/agent-box/config.yaml
 
