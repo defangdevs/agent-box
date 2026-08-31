@@ -176,6 +176,10 @@ Linear end to end, none of which needs a rebuild or root:
     agent-box-webhook subscribe linear:ENG --note "ENG issues" \
       --when '{"path":"action","in":["create"]}'
 
+Linear delivers over IPv4 ONLY - every egress address it publishes is IPv4 -
+so an IPv6-only box receives nothing until it has an IPv4 address, exactly as
+with GitHub. Unlike GitHub it retries: 1 minute, 1 hour, 6 hours.
+
 Topics are keyed on the TEAM (`linear:ENG`), which is the closest thing Linear
 has to `owner/repo`. A Project, Document or Initiative event carries no team,
 so it has no key and reaches nobody - teams are what issues live in. A Linear

@@ -605,9 +605,12 @@ agent-box-webhook subscribe linear:ENG --note "ENG issues" \
 
 Two caveats worth knowing before you start. A Project, Document or Initiative
 event carries no team and therefore no routing key, so it reaches nobody —
-keyless payloads are deliberately undeliverable. And Linear, like GitHub, may
-only deliver over IPv4: on an IPv6-only box (the EC2 default) give the instance
-an IPv4 address before expecting deliveries.
+keyless payloads are deliberately undeliverable. And Linear delivers **over
+IPv4 only**: the nine egress addresses it publishes are all IPv4 (Google
+Cloud), so an IPv6-only box — the EC2 default — needs an IPv4 address before
+any delivery arrives, exactly as it does for GitHub. Unlike GitHub, Linear does
+retry: three attempts, after 1 minute, 1 hour and 6 hours, and it wants a
+`200` within 5 seconds.
 
 Adding another such sender is the same three steps. If it signs in its own
 header, teach `source_template` in `modules/src/webhook-cli.sh` its shape —
