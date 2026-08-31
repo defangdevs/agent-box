@@ -42,8 +42,10 @@ plainly rather than handing it back.
   it claims - and read its pane
   (`tmux -L agent-box capture-pane -pt NAME | tail -40`) or message it if the
   answer matters. A session started by a webhook (a `hook-*` name) always
-  yields to one a person started: an event is a weaker reason to be in a
-  file than somebody asking.
+  yields to an interactive one - a session a person or this box's own
+  configuration started - because an event is a weaker reason to be in a file
+  than somebody asking. Two `hook-*` sessions are equals: neither defers, but
+  whichever already holds the object keeps it and the other hands over.
 - Sessions live in RAM: a reboot loses them, so persist anything worth
   keeping to disk under $HOME. An agent that exits with an error drops you
   into a shell for inspection; a clean exit is respawned within ~2s.

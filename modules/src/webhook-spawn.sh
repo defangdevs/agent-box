@@ -45,14 +45,25 @@ rather than a code change. Handle any other event in the batch normally."
 # the event loses. Yielding costs one spawn slot and nothing else, while
 # taking work that is already held costs the owner their uncommitted tree.
 #
+# One rank, stated the same way in all three places that state it (here, both
+# halves of the shipped guide, and the list this prompt carries): INTERACTIVE
+# outranks dispatched, and two dispatched sessions are equals. The list marks
+# a sibling hook session as dispatched, so "everything below you" would have
+# been the wrong reading — an equal that holds the object gets a handoff, not
+# a deference, and one holding nothing gets neither.
+#
 # A function rather than a constant so the way out carries the real session
 # name — "remove yourself" with nothing to run is how a session concludes that
 # staying is easier.
 yield_text() {
   printf '%s' "YIELD TO A LIVE SESSION. You are a hook session: an event \
-started you, not a person. Every session listed at the end of this prompt \
-outranks you. Do not read the absence of a claim as evidence that nobody is \
-on this — a session that never claimed its work is still doing it. So before \
+started you, not a person. Every session marked interactive in the list at \
+the end of this prompt — one a person or this box's own configuration started \
+— outranks you. A sibling hook session is your equal rather than your senior: \
+it does not outrank you, but if it already has the object then one of you is \
+redundant, so hand over rather than both working it. Do not read the absence \
+of a claim as evidence that nobody is on this — a session that never claimed \
+its work is still doing it. So before \
 you edit a file, push, comment, merge, close, delete or deploy, settle \
 whether one of them already has this object: its claim, its note, its working \
 directory and its pane (tmux -L agent-box capture-pane -pt NAME | tail -40) \

@@ -536,9 +536,14 @@ in
     # work a standing watch will start a second agent onto.
     assert peers_out.count("no subscription file") >= 2, peers_out
 
-    # The caller is not its own neighbour. In a pane that is $TMUX; for a
-    # process whose $TMUX did not survive it is the supervisor's own
-    # LOCAL_WEBHOOK_SESSION (<user>-<session>), which is what su has here.
+    # The caller is not its own neighbour, and is identified ONLY from $TMUX
+    # (a pane) or the supervisor's LOCAL_WEBHOOK_SESSION (<user>-<session>).
+    # Never from tmux's own idea of a current session: `display-message` with
+    # no client does not fail, it answers with the most recently ACTIVE
+    # session — so asking it from a caller that has no pane (the webhook spawn
+    # wrapper, or this su) would drop whichever session was busiest from the
+    # very list that exists to reveal it. The assertions above are that case,
+    # and this one is the identification working when it can:
     mine = machine.succeed(
         as_agent("env LOCAL_WEBHOOK_SESSION=agent-main agent-box-session peers")
     )
@@ -566,6 +571,19 @@ in
     machine.succeed(
         as_agent("rm ~/.local/state/local-webhook/filter.agent-helper.json")
     )
+
+    # The rank the yield rule turns on is read off the NAME: hook-* is what
+    # every webhook-dispatched session is called, and it must be told apart
+    # from a session a person or the config started — a dispatched session
+    # defers to the second and merely hands off to the first. A `shell`
+    # session, because it stays up for the length of the assertion.
+    machine.succeed(as_agent("agent-box-session add hook-rank-probe --agent shell"))
+    machine.wait_until_succeeds(tmux("has-session -t =hook-rank-probe"), timeout=60)
+    ranks = machine.succeed(as_agent("agent-box-session peers"))
+    assert re.search(r"^hook-rank-probe .*dispatched \(hook session\)",
+                     ranks, re.M), ranks
+    assert re.search(r"^main .*interactive", ranks, re.M), ranks
+    machine.succeed(as_agent("agent-box-session rm hook-rank-probe"))
 
     # --- auto-named add: no NAME → derived from the agent -----------------
     # First codex-derived name is the bare agent name (no session is literally

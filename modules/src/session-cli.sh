@@ -267,12 +267,24 @@ case "$cmd" in
     fi
     live="$(t list-sessions -F '#S' 2>/dev/null || true)"
     # The caller's own session, so it is not reported as its own neighbour.
-    # $TMUX names the pane's session for anything running inside one; the
-    # supervisor's LOCAL_WEBHOOK_SESSION (<user>-<session>) is the fallback
-    # for a process whose $TMUX did not survive, and neither exists in a
-    # plain `su -c` — where every live session genuinely is a peer.
-    me="$(t display-message -p '#S' 2>/dev/null || true)"
+    #
+    # The $TMUX guard is load-bearing, not a shortcut. `display-message` with
+    # no target does not FAIL outside a pane: with no client to ask, tmux
+    # falls back to the most recently active session and prints that name
+    # (verified — two sessions on a fresh server, no $TMUX, and it answers
+    # `beta`). Unguarded, a caller with no pane of its own — the webhook spawn
+    # wrapper, a cron job, a `su -c` — would therefore drop the most recently
+    # active session from the list, which is exactly the session most likely
+    # to be the busy owner this command exists to reveal. So ask tmux only
+    # when there IS a client; otherwise take the supervisor's own
+    # LOCAL_WEBHOOK_SESSION (<user>-<session>), which every pane carries; and
+    # failing both, exclude nothing, because then every live session really is
+    # a peer.
     user="$(id -un)"
+    me=""
+    if [ -n "${TMUX:-}" ]; then
+      me="$(t display-message -p '#S' 2>/dev/null || true)"
+    fi
     if [ -z "$me" ] && [ -n "${LOCAL_WEBHOOK_SESSION:-}" ]; then
       me="${LOCAL_WEBHOOK_SESSION#"$user-"}"
     fi

@@ -689,6 +689,13 @@
     assert "YIELD TO A LIVE SESSION" in hook_prompt, hook_prompt
     assert "agent-box-session peers" in hook_prompt, hook_prompt
     assert "Never merge a PR" in hook_prompt, hook_prompt
+    # One rank, and the same one the list marks and both guide halves state:
+    # INTERACTIVE outranks dispatched, two dispatched sessions are equals.
+    # "everything listed outranks you" would be the wrong rule, because a
+    # sibling hook session appears in that list too — an equal holding the
+    # object gets a handoff, not a deference.
+    assert "marked interactive" in hook_prompt, hook_prompt
+    assert "sibling hook session is your equal" in hook_prompt, hook_prompt
     # ...and the facts it yields on: every other live session, rendered by the
     # CLI. The supervisor is stopped here, so it took the tmux server down
     # with it (ExecStop) and NOBODY is live — which the prompt must say in
@@ -925,10 +932,13 @@
     assert "YIELD TO A LIVE SESSION" in other_prompt, other_prompt
     assert any(ln.startswith("main ") and "interactive" in ln
                for ln in plines), other_prompt
-    assert any(ln.startswith(hook_name + " ") and "dispatched (hook session)" in ln
-               for ln in plines), other_prompt
     # A session is never its own neighbour: the snapshot is taken before the
     # session exists, so its name can only appear in the cleanup line.
+    #
+    # Deliberately no assertion here on the OTHER hook sessions this test
+    # spawned. They run a real agent CLI with no credentials, so whether one
+    # is still in tmux by now is not this test's business — the rank MARKING
+    # is asserted against a session held up on purpose, in tests/sessions.nix.
     assert not any(ln.startswith(other + " ") for ln in plines), other_prompt
     machine.succeed(
         "jq -e '.topics[0].topic == \"github:defangdevs/elsewhere\"'"

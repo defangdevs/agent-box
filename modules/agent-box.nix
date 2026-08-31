@@ -138,22 +138,24 @@ let
       ceiling below is the one thing left that can refuse the batch. Name that ref in
       your own `--include` when you pick such a run up.
 
-      None of that is watertight, so a `hook-*` session has one more rule: it
-      YIELDS to any session a person started. A claim only brakes the watch when the
-      session doing the work remembered to declare it, in a shape the payload can be
-      asked about - and a forgotten claim, or an event shape a claim cannot name,
-      leaves a fresh agent walking into a worktree somebody is committing from. The
-      missing claim is not evidence that the work is free. So a dispatched session is
-      told, and gets the facts to act on it: its prompt carries what
-      `agent-box-session peers` reported at spawn - every other live session, where
-      it works, what it claims - and it re-runs that command rather than trusting the
-      snapshot. If one of those sessions has the object, hand it what the event said
-      and `agent-box-session rm` yourself; that is the whole job done, because the
-      event reached somebody with the context. If nobody has it, the work is yours -
-      investigate, report, push to a branch you created, and leave anything
-      irreversible on work you did not start (merging a PR, closing an issue,
-      deleting a branch, deploying) to whoever started it. Green checks are not
-      authority to take that decision.
+      None of that is watertight, so a `hook-*` session has one more rule: it YIELDS
+      to any INTERACTIVE session - one a person or this box's own configuration
+      started, which is what `peers` marks them - while a sibling `hook-*` session
+      is its equal, so whichever of the two already holds the object keeps it. A
+      claim only brakes the watch when the session doing the work remembered to
+      declare it, in a shape the payload can be asked about - and a forgotten claim,
+      or an event shape a claim cannot name, leaves a fresh agent walking into a
+      worktree somebody is committing from. The missing claim is not evidence that
+      the work is free. So a dispatched session is told, and gets the facts to act
+      on it: its prompt carries what `agent-box-session peers` reported at spawn -
+      every other live session, where it works, what it claims - and it re-runs that
+      command rather than trusting the snapshot. If one of those sessions has the
+      object, hand it what the event said and `agent-box-session rm` yourself; that
+      is the whole job done, because the event reached somebody with the context. If
+      nobody has it, the work is yours - investigate, report, push to a branch you
+      created, and leave anything irreversible on work you did not start (merging a
+      PR, closing an issue, deleting a branch, deploying) to whoever started it.
+      Green checks are not authority to take that decision.
 
       A hook session is spawned `--ephemeral`, so it delists ITSELF: whatever parks
       it - the agent quitting, or `agent-box-session stop` - the supervisor drops the
@@ -282,8 +284,10 @@ let
       it claims - and read its pane
       (`tmux -L agent-box capture-pane -pt NAME | tail -40`) or message it if the
       answer matters. A session started by a webhook (a `hook-*` name) always
-      yields to one a person started: an event is a weaker reason to be in a
-      file than somebody asking.
+      yields to an interactive one - a session a person or this box's own
+      configuration started - because an event is a weaker reason to be in a file
+      than somebody asking. Two `hook-*` sessions are equals: neither defers, but
+      whichever already holds the object keeps it and the other hands over.
     - Sessions live in RAM: a reboot loses them, so persist anything worth
       keeping to disk under $HOME. An agent that exits with an error drops you
       into a shell for inspection; a clean exit is respawned within ~2s.
@@ -2703,12 +2707,24 @@ case "$cmd" in
     fi
     live="$(t list-sessions -F '#S' 2>/dev/null || true)"
     # The caller's own session, so it is not reported as its own neighbour.
-    # $TMUX names the pane's session for anything running inside one; the
-    # supervisor's LOCAL_WEBHOOK_SESSION (<user>-<session>) is the fallback
-    # for a process whose $TMUX did not survive, and neither exists in a
-    # plain `su -c` — where every live session genuinely is a peer.
-    me="$(t display-message -p '#S' 2>/dev/null || true)"
+    #
+    # The $TMUX guard is load-bearing, not a shortcut. `display-message` with
+    # no target does not FAIL outside a pane: with no client to ask, tmux
+    # falls back to the most recently active session and prints that name
+    # (verified — two sessions on a fresh server, no $TMUX, and it answers
+    # `beta`). Unguarded, a caller with no pane of its own — the webhook spawn
+    # wrapper, a cron job, a `su -c` — would therefore drop the most recently
+    # active session from the list, which is exactly the session most likely
+    # to be the busy owner this command exists to reveal. So ask tmux only
+    # when there IS a client; otherwise take the supervisor's own
+    # LOCAL_WEBHOOK_SESSION (<user>-<session>), which every pane carries; and
+    # failing both, exclude nothing, because then every live session really is
+    # a peer.
     user="$(id -un)"
+    me=""
+    if [ -n "''${TMUX:-}" ]; then
+      me="$(t display-message -p '#S' 2>/dev/null || true)"
+    fi
     if [ -z "$me" ] && [ -n "''${LOCAL_WEBHOOK_SESSION:-}" ]; then
       me="''${LOCAL_WEBHOOK_SESSION#"$user-"}"
     fi
@@ -4776,14 +4792,25 @@ rather than a code change. Handle any other event in the batch normally."
 # the event loses. Yielding costs one spawn slot and nothing else, while
 # taking work that is already held costs the owner their uncommitted tree.
 #
+# One rank, stated the same way in all three places that state it (here, both
+# halves of the shipped guide, and the list this prompt carries): INTERACTIVE
+# outranks dispatched, and two dispatched sessions are equals. The list marks
+# a sibling hook session as dispatched, so "everything below you" would have
+# been the wrong reading — an equal that holds the object gets a handoff, not
+# a deference, and one holding nothing gets neither.
+#
 # A function rather than a constant so the way out carries the real session
 # name — "remove yourself" with nothing to run is how a session concludes that
 # staying is easier.
 yield_text() {
   printf '%s' "YIELD TO A LIVE SESSION. You are a hook session: an event \
-started you, not a person. Every session listed at the end of this prompt \
-outranks you. Do not read the absence of a claim as evidence that nobody is \
-on this — a session that never claimed its work is still doing it. So before \
+started you, not a person. Every session marked interactive in the list at \
+the end of this prompt — one a person or this box's own configuration started \
+— outranks you. A sibling hook session is your equal rather than your senior: \
+it does not outrank you, but if it already has the object then one of you is \
+redundant, so hand over rather than both working it. Do not read the absence \
+of a claim as evidence that nobody is on this — a session that never claimed \
+its work is still doing it. So before \
 you edit a file, push, comment, merge, close, delete or deploy, settle \
 whether one of them already has this object: its claim, its note, its working \
 directory and its pane (tmux -L agent-box capture-pane -pt NAME | tail -40) \
