@@ -35,6 +35,17 @@ plainly rather than handing it back.
   worktree's work is committed and pushed, remove it with
   `git worktree remove PATH` - a stale one left behind just clutters
   `git worktree list` and confuses whichever session finds it next.
+- A worktree, a branch or an issue somebody else is holding looks exactly
+  like an abandoned one: `git worktree list` says a worktree exists, not
+  whose it is. Ask before you touch one - `agent-box-session peers` names
+  every OTHER live session, the directory it works in and the webhook topics
+  it claims - and read its pane
+  (`tmux -L agent-box capture-pane -pt NAME | tail -40`) or message it if the
+  answer matters. A session started by a webhook (a `hook-*` name) always
+  yields to an interactive one - a session a person or this box's own
+  configuration started - because an event is a weaker reason to be in a file
+  than somebody asking. Two `hook-*` sessions are equals: neither defers, but
+  whichever already holds the object keeps it and the other hands over.
 - Sessions live in RAM: a reboot loses them, so persist anything worth
   keeping to disk under $HOME. An agent that exits with an error drops you
   into a shell for inspection; a clean exit is respawned within ~2s.
@@ -81,7 +92,7 @@ plainly rather than handing it back.
   value is stored double-quoted, which is the one thing to preserve if you
   ever hand-edit the file.
 - Manage your own sessions without a rebuild:
-  `agent-box-session ls|add|rm|stop|restart`. `add` takes an optional name
+  `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
   plus `--agent claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
   use it to fan out work, add a reviewer agent, or open a plain shell. The
   kickoff prompt fires once: a later respawn (crash, reboot, Spot restart)
@@ -242,6 +253,26 @@ by no session, because a red trunk has to reach somebody. No live session
 silences it, so the watch spawns for it however many sessions are running - the
 ceiling below is the one thing left that can refuse the batch. Name that ref in
 your own `--include` when you pick such a run up.
+
+None of that is watertight, so a `hook-*` session has one more rule: it YIELDS
+to any INTERACTIVE session - one a person or this box's own configuration
+started, which is what `peers` marks them - while a sibling `hook-*` session
+is its equal, so whichever of the two already holds the object keeps it. A
+claim only brakes the watch when the session doing the work remembered to
+declare it, in a shape the payload can be asked about - and a forgotten claim,
+or an event shape a claim cannot name, leaves a fresh agent walking into a
+worktree somebody is committing from. The missing claim is not evidence that
+the work is free. So a dispatched session is told, and gets the facts to act
+on it: its prompt carries what `agent-box-session peers` reported at spawn -
+every other live session, where it works, what it claims - and it re-runs that
+command rather than trusting the snapshot. If one of those sessions has the
+object, hand it what the event said and `agent-box-session rm` yourself; that
+is the whole job done, because the event reached somebody with the context. If
+nobody has it, the work is yours - investigate, report, push to a branch you
+created, and leave anything irreversible on work you did not start (merging a
+PR, closing an issue, deleting a branch, deploying) to whoever started it.
+Green checks are not authority to take that decision.
+
 A hook session is spawned `--ephemeral`, so it delists ITSELF: whatever parks
 it - the agent quitting, or `agent-box-session stop` - the supervisor drops the
 entry on its next tick, and the transcript stays on disk. Its prompt still asks

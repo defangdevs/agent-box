@@ -680,6 +680,31 @@
     assert "standing watch: triage" in hook_prompt, hook_prompt
     assert "webhook dispatcher" in hook_prompt, hook_prompt   # trusted preamble
     assert "agent-box-session rm hook-" in hook_prompt, hook_prompt  # cleanup duty
+    # The standing boundary (#319, #379, #420): a claim only brakes the watch
+    # when the session doing the work remembered to declare it, so the fresh
+    # agent is told outright that it ranks below a session a person started,
+    # and what to do about it. Three sessions pushed to a branch another
+    # session owned, and one was a check-run away from merging a PR it had
+    # not opened, on prompts that said none of this.
+    assert "YIELD TO A LIVE SESSION" in hook_prompt, hook_prompt
+    assert "agent-box-session peers" in hook_prompt, hook_prompt
+    assert "Never merge a PR" in hook_prompt, hook_prompt
+    # One rank, and the same one the list marks and both guide halves state:
+    # INTERACTIVE outranks dispatched, two dispatched sessions are equals.
+    # "everything listed outranks you" would be the wrong rule, because a
+    # sibling hook session appears in that list too — an equal holding the
+    # object gets a handoff, not a deference.
+    assert "marked interactive" in hook_prompt, hook_prompt
+    assert "sibling hook session is your equal" in hook_prompt, hook_prompt
+    # ...and the facts it yields on: every other live session, rendered by the
+    # CLI. The supervisor is stopped here, so it took the tmux server down
+    # with it (ExecStop) and NOBODY is live — which the prompt must say in
+    # those words. It is also proof the probe RAN: tmux is deliberately not on
+    # the receiver unit's PATH, so a CLI that could not reach the pinned
+    # AGENT_BOX_TMUX_BIN would land the "could not ask" wording instead, and
+    # that difference is the whole value of the block.
+    assert "No other session is live on this box." in hook_prompt, hook_prompt
+    assert "Could not ask which sessions are live" not in hook_prompt, hook_prompt
     # The key names the repo, so the tab is readable: hook-defangdevs-agent-box-XXXX.
     machine.succeed(
         "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-agent-box-\"))'"
@@ -891,6 +916,30 @@
         "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-elsewhere-\"))'"
         " /home/agent/.config/agent-box/sessions.json"
     ).strip()
+    # The same spawn with the supervisor UP, which is the state a real
+    # dispatch lands in: sessions are live, so the yield rule has something to
+    # name. Both ranks must be in there and be told apart — `main` was
+    # started by this box's own configuration and outranks the new session,
+    # while the hook-* session spawned earlier is its equal and does not.
+    # Before this the prompt carried no such list, and the spawned session
+    # said afterwards that nothing distinguished an owned worktree from an
+    # abandoned one (#420).
+    other_prompt = machine.succeed(
+        f"jq -r '.sessions[\"{other}\"].initialPrompt'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    plines = other_prompt.splitlines()
+    assert "YIELD TO A LIVE SESSION" in other_prompt, other_prompt
+    assert any(ln.startswith("main ") and "interactive" in ln
+               for ln in plines), other_prompt
+    # A session is never its own neighbour: the snapshot is taken before the
+    # session exists, so its name can only appear in the cleanup line.
+    #
+    # Deliberately no assertion here on the OTHER hook sessions this test
+    # spawned. They run a real agent CLI with no credentials, so whether one
+    # is still in tmux by now is not this test's business — the rank MARKING
+    # is asserted against a session held up on purpose, in tests/sessions.nix.
+    assert not any(ln.startswith(other + " ") for ln in plines), other_prompt
     machine.succeed(
         "jq -e '.topics[0].topic == \"github:defangdevs/elsewhere\"'"
         f" /home/agent/.local/state/local-webhook/filter.agent-{other}.json"
