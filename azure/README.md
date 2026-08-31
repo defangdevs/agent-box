@@ -28,6 +28,13 @@ user choose Claude Code or Codex.
   `agentbox apply --first-boot`. The box **stays Ubuntu** — apt and
   unattended-upgrades keep owning the base OS; agent-box lives entirely in
   `/nix/var/nix/profiles/agent-box` and never calls apt after first boot.
+  It does write that patching down as policy: `agentbox apply` renders
+  `/etc/apt/apt.conf.d/52-agent-box-unattended` and
+  `/etc/needrestart/conf.d/50-agent-box.conf`, so security patches install
+  unattended, the daemons they obsolete restart in place, no agent session
+  is ever restarted by an apt run, and the box never reboots itself. See
+  "Base-OS patching" in `aws/README.md` for the whole policy — it is the
+  renderer's, so both clouds get the same one.
 - **Basic-auth-to-cookie web auth**, identical to the AWS path. The terminal
   lives at `/<userName>/` (default `/agent/`); Caddy prompts for the
   `userName` and the `webPassword`, sets an
