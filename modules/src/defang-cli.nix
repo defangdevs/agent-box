@@ -24,8 +24,8 @@
 #
 # Verified 2026-08-31: both architectures are prebuilt in the public cache, so
 # an install substitutes rather than builds -
-#   x86_64-linux   /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-defang-cli-git
-#   aarch64-linux  /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-defang-cli-git
+#   x86_64-linux   /nix/store/pxa0iq32xsp8pql6k2nn2gsgcll4fzf0-defang-cli-git
+#   aarch64-linux  /nix/store/yayqldvzrg66lpajmcpnf9h5jvgvlxyd-defang-cli-git
 # both HTTP 200 at https://defanglabs.cachix.org/<hash>.narinfo. The closure is
 # 104.8 MiB over 4 paths, which is why it is fetched ON DEMAND and not shipped
 # in the runtime profile.

@@ -403,16 +403,14 @@ let
   # exists for (see the codexFullAccess option, issue 234).
   codexFullAccess = cfg.codexFullAccess && builtins.elem "codex" cfg.installAgents;
 
-  # Defang CLI (issue #363): not in nixpkgs, but DefangLabs/defang ships its
-  # own canonical packaging at pkgs/defang/cli.nix — `buildGo125Module`
-  # against the repo's own `src/`, with a `vendorHash` that is only ever
-  # valid for the go.sum sitting right next to it. Fetching the whole
-  # source tree at one pinned tag and calling THEIR file, rather than
-  # re-deriving a build ourselves, means that hash never needs maintaining
-  # here: it travels with the tag. (The alternative living beside it,
-  # pkgs/defang/default.nix — a fetchurl of the prebuilt release binary —
-  # is explicitly `lib.warn`-marked deprecated upstream and stuck on an old
-  # version; don't reach for that one.)
+  # Defang CLI (issue #363): not in nixpkgs, so it is fetched from a pinned
+  # EXPRESSION rather than from an attribute. The pins, and the reasoning
+  # behind each one, live in modules/src/defang-cli.nix — one file, shared
+  # with the native backend, which installs the same closure on demand from
+  # the settings page's Defang card (issue #461). Keeping them there rather
+  # than here is what stops the two backends drifting onto different defang
+  # builds: a different build is a different output hash, and a different
+  # output hash is a missed binary cache and a 100 MB Go compile.
   #
   # This USED to be a plain `let`-bound derivation wired into
   # environment.systemPackages — which put a ~100 MB Go compile on every
@@ -427,28 +425,10 @@ let
   # all. agent-box-defang-cli.service (below) builds it in the BACKGROUND,
   # started by multi-user.target — i.e. AFTER the activation that already
   # wrote the new nix.conf, on the SAME first boot. So by the time it runs,
-  # the Cachix substituter is already trusted and (given a matching
-  # nixpkgs pin — see defangNixpkgsExprUrl/Sha256 below) it substitutes a
-  # prebuilt closure instead of compiling.
-  defangVersion = "v3.15.0";
-  defangSha256 = "sha256-9wfaHVqxJprJUoP5meQEgmRfV6kJugonmO714gaR1tc=";
-  # DefangLabs/defang's own release CI (go.yml's publish-nix-cache job)
-  # builds this exact tag's `defang-cli` and pushes it to the public
-  # `defanglabs.cachix.org` Cachix cache. But a Nix derivation's output hash
-  # is a function of EVERY input, including nixpkgs itself: building
-  # pkgs/defang/cli.nix with THIS host's own nixpkgs (whatever that
-  # happens to be) produces a DIFFERENT derivation than CI's, which
-  # silently misses the cache and falls back to compiling from source — so
-  # this pins the SAME nixpkgs revision DefangLabs/defang's own flake.lock
-  # pins at defangVersion, not this module's `pkgs`. Verified by hand
-  # (2026-08-26): the resulting output path already has a 200 on
-  # https://defanglabs.cachix.org/<hash>.narinfo. Bump both pins together
-  # when moving to a new defang tag:
-  #   curl -sL https://raw.githubusercontent.com/DefangLabs/defang/vX.Y.Z/flake.lock \
-  #     | jq '.nodes.nixpkgs.locked | {url, sha256: .narHash}'
-  defangNixpkgsUrl = "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1057999.afe3d8ac4395/nixexprs.tar.xz";
-  defangNixpkgsSha256 = "sha256-93GX5Q/npwBE92xpHlktxgGztuIP/2kwOMukz+qyJBk=";
-  # The pins above are spliced in as plain TEXT, not as a `builtins.fetchTarball`
+  # the Cachix substituter is already trusted and it substitutes a prebuilt
+  # closure instead of compiling.
+  #
+  # The expression is spliced in as plain TEXT, not as a `builtins.fetchTarball`
   # result interpolated into this file — that distinction is why this stays
   # cheap: a derivation reference carries "string context", so embedding one in
   # any string that ends up in the store (a systemd unit, an /etc file) makes
@@ -459,17 +439,7 @@ let
   # expensive `fetchTarball`+`callPackage` calls only happen when the SERVICE
   # evaluates this file with its own `nix build`, at runtime.
   defangCliExpr = pkgs.writeText "agent-box-defang-cli-expr.nix" ''
-    let
-      defangSrc = builtins.fetchTarball {
-        url = "https://github.com/DefangLabs/defang/archive/refs/tags/${defangVersion}.tar.gz";
-        sha256 = "${defangSha256}";
-      };
-      defangPkgs = import (builtins.fetchTarball {
-        url = "${defangNixpkgsUrl}";
-        sha256 = "${defangNixpkgsSha256}";
-      }) { system = builtins.currentSystem; };
-    in
-    defangPkgs.callPackage "''${defangSrc}/pkgs/defang/cli.nix" { }
+    @@include:src/defang-cli.nix@@
   '';
   # Where the background service installs it (outside the Nix profile, since
   # nothing here builds it eval-time) — connectBins and the curated agent
@@ -2869,6 +2839,13 @@ in
             # sign-in would have written it in. Same value for every
             # instance, hence host-level.
             AGENT_BOX_CONNECT_BINS = connectBins;
+            # Cards whose CLI is fetched from a pinned EXPRESSION instead
+            # of a nixpkgs attribute, because nixpkgs does not carry it
+            # (issue #461). Set here as well as on a native box so both
+            # backends install byte-identical closures; on NixOS the
+            # background unit has usually already put defang down, and
+            # this is what repairs the card if it has not.
+            AGENT_BOX_CONNECT_EXPRS = "defang=${defangCliExpr}";
             # Where a card fetches a CLI the box does not ship (issue
             # #416). The SAME pinned source the supervisor's lazy harness
             # install uses, so claude fetched from a session and gh

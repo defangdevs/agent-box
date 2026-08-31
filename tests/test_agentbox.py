@@ -624,11 +624,13 @@ class RenderTest(unittest.TestCase):
         self.assertIn("min-free = 1073741824", nixconf)
         self.assertIn("max-free = 5368709120", nixconf)
 
-    def test_a_foreign_nix_custom_conf_is_left_alone(self):
+    def test_a_foreign_nix_custom_conf_keeps_its_scalars(self):
         """/etc/nix/nix.custom.conf is what Determinate tells a HUMAN to
-        edit, so it is not ours to overwrite. A box that already has one
-        keeps it, and the render says so — a silently skipped setting looks
-        exactly like one that was never implemented.
+        edit, so a value somebody set there is not ours to overrule.
+        min-free is a SCALAR — nix takes the last occurrence — so appending
+        ours would silently win. It is skipped, and the render says so: a
+        silently skipped setting looks exactly like one that was never
+        implemented.
         """
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
@@ -640,11 +642,71 @@ class RenderTest(unittest.TestCase):
             spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
             rend = mod.Renderer(spec_obj, prof, root=out)
             tree = rend.render()
-            self.assertNotIn(str(out / "etc/nix/nix.custom.conf"), tree.files)
-            self.assertEqual(mine,
-                             (out / "etc/nix/nix.custom.conf").read_text())
-            self.assertTrue(any("nix.custom.conf" in n for n in rend.notes),
-                            "skipped the file without saying so")
+            written = tree.files[str(out / "etc/nix/nix.custom.conf")][0]
+            self.assertIn(mine, written, "clobbered a human's own setting")
+            self.assertEqual(1, written.count("min-free"),
+                             "appended a scalar that would win by being last")
+            self.assertTrue(any("min-free" in n for n in rend.notes),
+                            "skipped the scalars without saying so")
+
+    def test_a_foreign_nix_custom_conf_still_gets_the_defang_cache(self):
+        """The substituter is ADDITIVE, so unlike the scalars above it can
+        be added to a file we do not own without taking anything away.
+
+        It has to be. The Determinate installer writes this file on
+        essentially every box, so the foreign path is the NORMAL one — a
+        substituter that only landed on a file agentbox owns would never
+        reach a real box, and every Defang card would compile ~100 MB of Go
+        instead of fetching it (issues #461, #373).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            (out / "etc/nix").mkdir(parents=True)
+            theirs = "# Written by the Determinate installer\nmax-jobs = 2\n"
+            conf = out / "etc/nix/nix.custom.conf"
+            conf.write_text(theirs)
+            mod = load_agentbox()
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            written = rend.render().files[str(conf)][0]
+            self.assertIn("max-jobs = 2", written)
+            self.assertIn("extra-substituters = https://defanglabs.cachix.org",
+                          written)
+            # Idempotent: a second apply must not stack the block up again.
+            conf.write_text(written)
+            again = mod.Renderer(spec_obj, prof, root=out).render()
+            self.assertNotIn(str(conf), again.files,
+                             "appended the substituter a second time")
+
+    def test_a_half_configured_defang_cache_is_completed(self):
+        """A substituter without its public key is REFUSED by nix, which
+        falls back to building — the ~100 MB compile the cache exists to
+        avoid. So the two lines are probed separately: a file carrying only
+        one of them looks configured to a single probe and behaves
+        unconfigured in practice.
+        """
+        mod = load_agentbox()
+        sub = "extra-substituters = https://defanglabs.cachix.org"
+        key = "extra-trusted-public-keys = defanglabs.cachix.org-1:"
+        for name, present, missing in (("key only", key, sub),
+                                       ("substituter only", sub, key)):
+            with self.subTest(name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    prof = build_fake_profile(tmp)
+                    out = Path(tmp) / "out"
+                    (out / "etc/nix").mkdir(parents=True)
+                    conf = out / "etc/nix/nix.custom.conf"
+                    conf.write_text("# theirs\n" + present + "whatever\n")
+                    spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()),
+                                        prof)
+                    rend = mod.Renderer(spec_obj, prof, root=out)
+                    written = rend.render().files[str(conf)][0]
+                    self.assertIn(missing, written,
+                                  "left the box half-configured")
+                    self.assertEqual(
+                        1, written.count(present),
+                        "duplicated the half that was already there")
 
     def test_the_base_os_patches_itself_without_a_reboot(self):
         """The distro still owns its packages, but nobody here can answer

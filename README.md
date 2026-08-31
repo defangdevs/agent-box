@@ -258,6 +258,15 @@ registration or personal access token anywhere in the flow. GitHub in
 particular needs no PAT and no GitHub App: `gh` ships GitHub's own
 device-flow client.
 
+A card also appears for a CLI the box does not ship yet, and installs it on
+the click (issue #416) — otherwise a lazy box would be a chicken-and-egg, with
+no card to press and pressing it the only way to get the CLI. Claude, Codex
+and GitHub come from nixpkgs. Defang is not in nixpkgs, so it comes from a
+pinned expression instead (`modules/src/defang-cli.nix`, issue #461): ~105 MiB
+fetched from DefangLabs' own binary cache on first use, on whichever backend
+you are running. A NixOS box normally has it already, from a background unit
+that fetches it at first boot.
+
 Setting `GH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` or
 `DEFANG_ACCESS_TOKEN` by hand under Environment secrets keeps working, and
 keeps winning: every one of these CLIs prefers its environment variable over

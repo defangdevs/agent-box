@@ -320,6 +320,12 @@ let
       ${src}/default-agents-host-native.md \
       $out/share/agent-box/guides/
     install -m444 ${src}/settings.css ${src}/settings.js $out/share/agent-box/web/
+    # The pinned Defang CLI expression (issue #461). Shipped as a FILE, not
+    # as the built closure: the card fetches it on demand, so a box that
+    # never presses it never pays the 105 MiB. It is the same file the
+    # module splices into agent-box-defang-cli-expr.nix, so both backends
+    # resolve to one output path and share one binary cache hit.
+    install -m444 ${src}/defang-cli.nix $out/share/agent-box/
     # The password helper is generated per user by `agentbox apply` (it
     # crosses sudo, so its paths must not come from env); the template it
     # renders from lives here.
