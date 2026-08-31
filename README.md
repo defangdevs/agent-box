@@ -91,8 +91,12 @@ to this repo's latest master and applies it: on Lightsail that is a swap of
 the pinned Nix profile followed by `agentbox apply` (the newly installed
 release renders its own configuration), on the EC2 NixOS template a
 `nixos-rebuild switch` that also advances the agent-CLI pin to the newest
-nixos-unstable channel release. Have the agent save its working context
-first: the update restarts changed agent services, which kills their running
+nixos-unstable channel release. The sudo rule matches the command's full
+path, which differs by backend (`/run/current-system/sw/bin/systemctl` on
+NixOS, `/usr/bin/systemctl` natively) — the box's own guide at
+`/etc/agent-box-guides/` gives the agent the exact line for the box it is on.
+Have the agent save its working context first: the update restarts changed
+agent services, which kills their running
 sessions. Anything that is not a fast-forward of the running revision is
 refused, and a failure rolls back to what was running.
 Verifying releases against an offline signing key is tracked in

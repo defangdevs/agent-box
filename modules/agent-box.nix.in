@@ -777,11 +777,11 @@ let
           Remote Control session name (claude sessions only — codex derives
           its own name from the hostname). When null, defaults to
           "<user>-<session>@<host>", where <host> is
-          services.agent-box.remoteControlHost (fqdnOrHostName by default,
-          the public sslip.io host on the AWS image), else the public
-          services.agent-box.web.domain, else the live kernel hostname when
-          both are empty at build time. When no host is resolvable the
-          "@<host>" suffix is omitted (just "<user>-<session>").
+          services.agent-box.remoteControlHost (empty by default; the AWS
+          image sets it to the box's public sslip.io host), else the public
+          services.agent-box.web.domain, else networking.fqdnOrHostName.
+          When no host is resolvable the "@<host>" suffix is omitted (just
+          "<user>-<session>").
         '';
       };
       workingDirectory = lib.mkOption {
@@ -930,10 +930,10 @@ let
           Remote Control session name, used to correlate the session to this box
           from the Claude apps. Keep it shell-safe (no spaces/quotes). This seeds
           the "main" session; when null it defaults to "<user>-main@<host>",
-          where <host> is services.agent-box.remoteControlHost (fqdnOrHostName by
-          default, the public sslip.io host on the AWS image), else the public
-          web.domain, else the live kernel hostname when both are empty at build
-          time; the "@<host>" suffix is omitted when no host is resolvable.
+          where <host> is services.agent-box.remoteControlHost (empty by
+          default; the AWS image sets it to the box's public sslip.io host),
+          else the public web.domain, else networking.fqdnOrHostName; the
+          "@<host>" suffix is omitted when no host is resolvable.
         '';
       };
       workingDirectory = lib.mkOption {
@@ -1475,9 +1475,9 @@ in
       enable = lib.mkEnableOption ''
         an agent-triggerable self-update service. When enabled, every agent
         user's sudo allowlist gains exactly
-        `/run/current-system/sw/bin/systemctl start
-        agent-box-update.service` (plus its --no-block
-        variant, used by the settings page's Update button) — a root oneshot
+        `/run/current-system/sw/bin/systemctl start --no-block
+        agent-box-update.service` — one command, the same one the shipped
+        guide and the settings page's Update button use — a root oneshot
         that fast-forwards the box to the upstream repo's latest
         default-branch commit by rewriting `pinFile` (and, when agentNixpkgs
         is wired, advances `agentPinFile` to the latest nixos-unstable
