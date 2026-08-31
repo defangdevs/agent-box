@@ -184,6 +184,44 @@ endpoint() {
   fi
 }
 
+# source_template SOURCE — the wire config that sender needs, as a jq object.
+#
+# local-webhook is source-generic: signatureHeader / keyPath / senderPath /
+# eventHeader are per-source keys in sources.json, and every one of them
+# DEFAULTS TO GITHUB'S. So a sender that signs in its own header was set up
+# here into a configuration that answers its every delivery 401, and the
+# instructions printed below said `x-hub-signature-256` while the sender used
+# something else. An agent that trusts its own tooling registered the webhook
+# and then watched a silent endpoint. Sources we know the shape of are written
+# correctly the first time; anything else still gets GitHub's defaults, which
+# is what `setup stripe` has always meant.
+source_template() {
+  case "$1" in
+    linear)
+      # Linear signs the raw body with HMAC-SHA256, hex, no "sha256=" prefix,
+      # in Linear-Signature. Its payload names the entity in `type` (Issue,
+      # Comment, Project) and the verb in `action` (create/update/remove), so
+      # no event header exists to read. Keyed on the team so a topic is
+      # linear:ENG — the closest thing Linear has to owner/repo granularity.
+      # Note that a Project, Document or Initiative event carries no team and
+      # so no key, which means it reaches nobody: keyless payloads are
+      # deliberately undeliverable upstream. Teams are what issues live in.
+      printf '%s' '{"format":"generic","signatureHeader":"linear-signature","keyPath":"data.team.key","senderPath":"actor.name"}'
+      ;;
+    *) printf '%s' '{}' ;;
+  esac
+}
+
+# source_sig_header SOURCE — the header that source's signature arrives in,
+# read back from what is actually configured so the printed instructions can
+# never drift from the file.
+source_sig_header() {
+  h=""
+  [ -f "$SOURCES" ] && h="$("$JQ" -r --arg s "$1" '.sources[$s].signatureHeader // empty' "$SOURCES" 2>/dev/null || true)"
+  [ -n "$h" ] || h="x-hub-signature-256"
+  printf '%s' "$h"
+}
+
 secret_of() {
   # secret_of SOURCE — echo the configured secret, or nothing.
   [ -f "$SOURCES" ] || return 0
@@ -698,18 +736,29 @@ case "$cmd" in
       umask 077
       printf '%s' "$secret" > "$STATE_DIR/$src.secret"
       note="secret written to $STATE_DIR/$src.secret (0600)"
-      # Merge, never clobber: another source may already be configured, and
-      # defaultSource must keep pointing at whatever was set up first.
-      [ -f "$SOURCES" ] || printf '{"sources":{}}\n' > "$SOURCES"
-      tmp="$(mktemp "$SOURCES.XXXXXX")"
-      if "$JQ" --arg s "$src" \
-           '.sources = ((.sources // {}) + {($s): (((.sources // {})[$s]) // {} | .secretFile = ($s + ".secret"))})
-            | .defaultSource = (.defaultSource // $s)' "$SOURCES" > "$tmp"; then
-        chmod 600 "$tmp"; mv "$tmp" "$SOURCES"
-      else
-        rm -f "$tmp"; exit 1
-      fi
     fi
+    # Write the source entry on EVERY run, not only the one that minted the
+    # secret. `setup` is the idempotent "make this work" command, and a box
+    # that ran it before this template existed has a linear source configured
+    # to read GitHub's signature header — i.e. a source that 401s forever with
+    # no way to repair it short of hand-editing JSON. Re-running setup now
+    # fixes such an entry.
+    #
+    # Precedence, innermost first: the template supplies what the sender needs,
+    # anything already in the file WINS over it (a hand-tuned keyPath survives
+    # a re-run), and secretFile is authoritative. Merge, never clobber: another
+    # source may already be configured, and defaultSource must keep pointing at
+    # whatever was set up first.
+    [ -f "$SOURCES" ] || printf '{"sources":{}}\n' > "$SOURCES"
+    tmp="$(mktemp "$SOURCES.XXXXXX")"
+    if "$JQ" --arg s "$src" --argjson tmpl "$(source_template "$src")" \
+         '.sources = ((.sources // {}) + {($s): ($tmpl + ((((.sources // {})[$s]) // {})) | .secretFile = ($s + ".secret"))})
+          | .defaultSource = (.defaultSource // $s)' "$SOURCES" > "$tmp"; then
+      chmod 600 "$tmp"; mv "$tmp" "$SOURCES"
+    else
+      rm -f "$tmp"; exit 1
+    fi
+    sig_header="$(source_sig_header "$src")"
     cat <<EOF
 $note
 
@@ -717,11 +766,30 @@ Register this in the sender ($src):
   Payload URL   $url/$src
   Secret        $secret
   Content type  application/json
-  Signature     HMAC-SHA256 of the raw body, hex, in x-hub-signature-256
+  Signature     HMAC-SHA256 of the raw body, hex, in $sig_header
 EOF
     # The one-liner is only correct for GitHub; another sender has its own
     # registration flow (and possibly its own signature header, which
     # sources.json's signatureHeader covers).
+    if [ "$src" = linear ]; then
+      cat <<EOF
+
+In Linear: Settings -> API -> Webhooks -> New webhook. Or, with a personal
+API key in \$LINEAR_API_KEY, register it from here — no browser needed:
+  curl -sS https://api.linear.app/graphql \\
+    -H "Authorization: \$LINEAR_API_KEY" -H 'Content-Type: application/json' \\
+    -d '{"query":"mutation(\$i:WebhookCreateInput!){webhookCreate(input:\$i){success}}",
+         "variables":{"i":{"url":"$url/$src","secret":"$secret",
+                           "allPublicTeams":true,
+                           "resourceTypes":["Issue","Comment","IssueLabel"]}}}'
+
+Topics are keyed on the team, so subscribe to linear:<TEAM KEY> (linear:ENG).
+A Linear payload names the entity in \`type\` and the verb in \`action\`, so its
+rules read on those, not on GitHub's event names:
+  agent-box-webhook subscribe linear:ENG --note "ENG issues" \\
+    --when '{"path":"action","in":["create"]}'
+EOF
+    fi
     if [ "$src" = github ]; then
       cat <<EOF
 
