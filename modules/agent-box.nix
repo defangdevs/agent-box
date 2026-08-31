@@ -15381,9 +15381,10 @@ if __name__ == "__main__":
       # can't read /home. See the comment block at the top of the rendered
       # file below (agents will read that from the running box).
       managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
-      lib.replaceStrings [ "@DOMAIN@" ] [ cfg.web.domain ] ''
-        # This file is module-managed by services.agent-box — edits here get
-        # OVERWRITTEN on the next nixos-rebuild. To add your own virtual host,
+      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" ]
+        [ cfg.web.domain "services.agent-box" "nixos-rebuild switch" ] ''
+        # This file is managed by @MANAGED_BY@ — edits here get OVERWRITTEN on
+        # the next @APPLY_CMD@. To add your own virtual host,
         # drop a *.caddy snippet into ~/sites/ (which is a symlink into
         # /var/lib/agent-box-sites/<you>/, a caddy-readable location) and
         # reload with: sudo systemctl reload caddy.service

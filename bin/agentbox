@@ -2225,6 +2225,8 @@ class Renderer:
         def bind(name, user=None):
             text = (frag / f"caddyfile-{name}.caddy").read_text()
             text = text.replace("@DOMAIN@", self.spec.domain)
+            text = text.replace("@MANAGED_BY@", "agentbox apply")
+            text = text.replace("@APPLY_CMD@", "agentbox apply")
             if user is not None:
                 # Bind every token the fragments carry. The values mirror the
                 # module's helpers one for one (settingsSocketOf,

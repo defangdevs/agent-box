@@ -2521,7 +2521,8 @@ in
       # can't read /home. See the comment block at the top of the rendered
       # file below (agents will read that from the running box).
       managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
-      lib.replaceStrings [ "@DOMAIN@" ] [ cfg.web.domain ] ''
+      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" ]
+        [ cfg.web.domain "services.agent-box" "nixos-rebuild switch" ] ''
         @@include:src/caddyfile-header.caddy@@
       ''
       + lib.concatMapStringsSep "\n"
