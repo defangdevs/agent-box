@@ -285,9 +285,11 @@ that person's new issues and PRs spawning.
 
 One-time per sender, so its deliveries can arrive at all:
 
-    agent-box-webhook setup github   # that source's endpoint URL + a fresh
-                                     # HMAC secret, printed once
-    agent-box-webhook url            # print them again later
+    agent-box-webhook setup github   # that source's endpoint URL, plus its
+                                     # HMAC secret - minted on the first run
+                                     # for a source, reprinted on the later ones
+    agent-box-webhook url            # the endpoint and which sources exist;
+                                     # NOT the secret - rerun setup for that
 
 then register that URL and secret in the repo (Settings -> Webhooks -> Add
 webhook, content type `application/json`, pick the events); `setup` prints a

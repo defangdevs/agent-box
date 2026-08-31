@@ -162,9 +162,11 @@ let
 
       One-time per sender, so its deliveries can arrive at all:
 
-          agent-box-webhook setup github   # that source's endpoint URL + a fresh
-                                           # HMAC secret, printed once
-          agent-box-webhook url            # print them again later
+          agent-box-webhook setup github   # that source's endpoint URL, plus its
+                                           # HMAC secret - minted on the first run
+                                           # for a source, reprinted on the later ones
+          agent-box-webhook url            # the endpoint and which sources exist;
+                                           # NOT the secret - rerun setup for that
 
       then register that URL and secret in the repo (Settings -> Webhooks -> Add
       webhook, content type `application/json`, pick the events); `setup` prints a
@@ -3315,8 +3317,9 @@ esac
     — is present exactly when a match right now would spawn nothing.
 
     One-time per SENDER, to make its deliveries possible at all:
-      agent-box-webhook setup github   # mints that source's HMAC secret,
-                                       # prints it once with the URL to register
+      agent-box-webhook setup github   # prints that source's URL and its HMAC
+                                       # secret, minting the secret on first run
+                                       # and reusing it on later ones
     then register that URL + secret in the sender (GitHub: repo Settings ->
     Webhooks -> Add webhook, content type application/json, pick the events).
     SOURCE is any sender that signs its body the same way (`setup stripe`, and
