@@ -411,6 +411,54 @@ the services itself; agent sessions go last, since the agent that triggered
 the update is sitting in one. A failure at any step rolls the profile back to
 the generation it started from and re-applies with that older code.
 
+### Base-OS patching (unattended, and reboot-free)
+
+That update path moves agent-box's own software. The Ubuntu underneath it is
+still apt's, and `agentbox apply` still never calls apt — but it does write
+down the two answers an unattended patch run needs from a machine nobody is
+sitting at:
+
+- **`/etc/apt/apt.conf.d/52-agent-box-unattended`** keeps the periodic jobs
+  on (a box whose `20auto-upgrades` never got written patches nothing and
+  looks exactly like one that is current), cleans up old kernels and stale
+  `.deb`s so patching cannot fill the root disk, and says
+  `Unattended-Upgrade::Automatic-Reboot "false"`. It does **not** touch
+  `Allowed-Origins`: which pockets are security pockets is Ubuntu's call, and
+  an apt list assignment appends rather than replaces, so restating it could
+  only duplicate the distro's list or — with a `#clear` — narrow it.
+- **`/etc/needrestart/conf.d/50-agent-box.conf`** sets `$nrconf{restart} =
+  'a'`, which is the half that makes "no reboot" honest: needrestart's
+  default is interactive, and an interactive needrestart run
+  non-interactively (exactly how unattended-upgrades runs it) falls back to
+  **list-only**, so the patch lands and the vulnerable process keeps running
+  until a reboot. It then excludes one unit family from those automatic
+  restarts — `agent-box@`, whose `ExecStop` is `tmux -L agent-box
+  kill-server`, so restarting it because libc moved is every session on the
+  box dying mid-task. The exclusion is *merged* into needrestart's own hash
+  (`conf.d` is eval'd after the shipped config), never assigned over it,
+  which would drop its exclusions for dbus and the network stack on the way
+  past.
+
+A **kernel** patch is the one thing this cannot finish: it installs on disk
+and takes effect at a boot. The box says so in `/var/run/reboot-required`, and
+the shipped guide tells the agent to report that rather than go looking for a
+reboot it has no grant for. Two ways to close that gap when a deployment cares
+more about a current kernel than about long-lived sessions:
+
+- `osUpdates: {automaticReboot: "03:00"}` in `/etc/agent-box/config.yaml` —
+  renders `Automatic-Reboot "true"` at that hour, with
+  `Automatic-Reboot-WithUsers "true"`, because an agent session counts as a
+  logged-in user and without it the reboot is skipped forever. A bare `true`
+  is rejected: unattended-upgrades reads that as "now", i.e. a reboot the
+  moment a kernel patch lands.
+- `sudoAllowlist: ["/usr/bin/systemctl reboot"]`, which hands the agent the
+  reboot it otherwise has no way to perform, to take when its own work is at
+  a safe point.
+
+`osUpdates: {enable: false}` renders neither file (and removes ours if a
+previous apply wrote them) — the setting for a host whose package manager is
+not apt, which should be patching through `dnf-automatic` instead.
+
 ### The launch script must stay bash-guarded
 
 Lightsail prepends its own `#!/bin/sh` preamble to an instance's launch
