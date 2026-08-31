@@ -99,6 +99,29 @@
           { nativeBuildInputs = [ pkgs.python3 ]; inherit manifest; } ''
           python3 ${./bin/golden-snapshot.py} "$manifest" "$out"
         '';
+
+      # One spec, two backends (issue #451). The native renderer's config
+      # schema was a third hand-mirrored copy of the option tree, and the two
+      # test configs that drove the two fixtures had drifted into describing
+      # different boxes — so nothing could compare what the backends produced
+      # for the SAME box. tests/spec.nix evaluates the golden web
+      # configuration's own options into that JSON, `nix run
+      # .#update-native-config` commits it, and the one-spec-both-backends
+      # check below fails when the committed copy has drifted.
+      #
+      # Same eval as goldenSnapshotFor's `web` entry, deliberately: the point
+      # is that both fixtures come from one configuration.
+      nativeConfigFor = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          sys = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [ self.nixosModules.agent-box ./hosts/vm.nix ./tests/golden-web.nix ];
+          };
+        in
+        pkgs.writeText "agent-box-native-config.json"
+          (builtins.toJSON
+            (import ./tests/spec.nix { lib = nixpkgs.lib; } sys.config));
     in
     {
       # The portable module. Import into any NixOS host:
@@ -124,6 +147,12 @@
           # golden-snapshot check, materialized into tests/golden by
           # `nix run .#update-golden`.
           golden-snapshot = goldenSnapshotFor system;
+
+          # The native renderer's config, evaluated from the golden web
+          # configuration's own options (issue #451) — input of the
+          # one-spec-both-backends check, materialized into
+          # tests/native/config.json by `nix run .#update-native-config`.
+          native-config = nativeConfigFor system;
 
           # The runtime profile a non-NixOS host installs instead of a system
           # closure (issue #154 Phase 4):
@@ -181,6 +210,25 @@
             type = "app";
             program = "${pkgs.writeShellScript "agent-box-assemble" ''
               exec ${pkgs.python3}/bin/python3 "$PWD/bin/assemble-module.py" "$@"
+            ''}";
+          };
+
+          # `nix run .#update-native-config` — regenerate the committed
+          # tests/native/config.json from the golden web configuration's own
+          # options (issue #451). Run it after a module option change that
+          # the native schema should carry, then regenerate the native
+          # fixture with `python3 tests/test_agentbox.py --update`; both
+          # diffs belong in the same pull request.
+          update-native-config = {
+            type = "app";
+            program = "${pkgs.writeShellScript "agent-box-update-native-config" ''
+              set -euo pipefail
+              out=$(nix build --no-link --print-out-paths "$PWD#native-config")
+              ${pkgs.python3}/bin/python3 -c 'import json,sys
+data = json.load(open(sys.argv[1]))
+open(sys.argv[2], "w").write(json.dumps(data, indent=2, sort_keys=True) + "\n")' \
+                "$out" "$PWD/tests/native/config.json"
+              echo "wrote tests/native/config.json from $out — review the diff and commit"
             ''}";
           };
 
@@ -876,6 +924,35 @@
               caddy validate --envfile caddy.env --adapter caddyfile \
                 --config tests/native/expected/etc/agent-box/Caddyfile
               printf 'agentbox render matches tests/native/expected\n' > "$out"
+            '';
+
+          # Issue #451: the parity check below guards the CONFIGURATION each
+          # backend hands the shared payloads, keyed on AGENT_BOX_* names. It
+          # is blind to everything with no such name in it — tmpfiles rules,
+          # sudoers grants, the seed JSON two hand-written producers emit,
+          # which are #356's actual bugs. Nothing could compare those,
+          # because the two fixtures were rendered from two hand-mirrored
+          # configurations that had drifted into describing different boxes.
+          # So: tests/native/config.json is now GENERATED from the golden web
+          # configuration's own options (tests/spec.nix), this check fails if
+          # the committed copy has drifted from it, and only then compares
+          # what the two backends made of that one box.
+          one-spec-both-backends =
+            pkgs.runCommand "agent-box-one-spec-both-backends"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                spec = nativeConfigFor system;
+                repo = builtins.path {
+                  path = ./.;
+                  name = "agent-box-src";
+                  filter = path: type:
+                    let base = builtins.baseNameOf path; in
+                    base != "result" && base != ".git";
+                };
+              } ''
+              cp -rT --no-preserve=mode,ownership "$repo" repo
+              cd repo
+              python3 scripts/check_one_spec.py --spec "$spec" | tee "$out"
             '';
 
           # Issue #394: the two renderers configure the SAME payloads, and

@@ -12,13 +12,32 @@
 #     matters, nothing here ever runs).
 # Values are frozen: changing any of them rewrites tests/golden/web and
 # defeats the point of the fixture.
+#
+# Issue #451 (PR 1) added the sessions and the per-user environment below. They
+# are not new coverage for the module: tests/native/config.json already
+# declared exactly this box, by hand, and the two hand-mirrored configs had
+# drifted into describing DIFFERENT boxes (no sessions here, two per user
+# there), which is what made every cross-backend comparison of the two
+# fixtures apples-to-oranges. tests/native/config.json is now generated from
+# THIS file (tests/spec.nix), so the shape lives here once and both fixtures
+# describe one box — including the seed JSON, whose two producers are #356's
+# twin-schema bug.
 { ... }:
 {
   services.agent-box = {
-    users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash-agent";
+    users.agent = {
+      web.passwordHashFile = "/var/lib/agent-box-web/password-hash-agent";
+      sessions = {
+        main = { };
+        review = { agent = "codex"; workingDirectory = "/home/agent/agent-box"; };
+      };
+    };
     users.robot = {
       agent = "codex";
       web.passwordHashFile = "/var/lib/agent-box-web/password-hash-robot";
+      sessions.main = { agent = "codex"; };
+      environment.AGENT_BOX_EXTRA = "1";
+      environmentFiles = [ "/etc/agent-box/robot.extra.env" ];
     };
     web = {
       enable = true;
