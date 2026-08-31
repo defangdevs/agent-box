@@ -212,6 +212,14 @@ let
   webhookScriptFile =
     "${webhookScriptAsset}/share/agent-box/local-webhook/webhook.py";
 
+  # Native has no webhook.watchPolicy OPTION to render (that is a NixOS-only
+  # module setting) — ship an empty policy so agent-box-webhook-policy-apply
+  # (below) is a real, runnable binary that is simply always idle, rather
+  # than the receiver unit's ExecStartPre pointing at a name the profile
+  # never shipped at all (issue #457).
+  emptyWebhookWatchPolicyFile =
+    pkgs.writeText "agent-box-webhook-watch-policy.json" (builtins.toJSON { });
+
   # Unit-driven payloads: a systemd unit (or ttyd) execs these by bare name,
   # with every value they need supplied by the generated env file.
   unitPayloads = [
@@ -230,6 +238,14 @@ let
     (pkgs.writeShellScriptBin "agent-box-webhook-receiver" ''
       exec ${pkgs.python3}/bin/python3 ${webhookScriptFile} "$@"
     '')
+    # The body (src/webhook-policy-apply.sh) is the SAME file the module
+    # includes for this binary — bare jq/mv/rm resolved from the unit's PATH,
+    # config taken from AGENT_BOX_WEBHOOK_POLICY_FILE — so this is the one
+    # place the two backends could still diverge: which file that variable
+    # points at.
+    (pkgs.writeShellScriptBin "agent-box-webhook-policy-apply" (''
+      export AGENT_BOX_WEBHOOK_POLICY_FILE=${emptyWebhookWatchPolicyFile}
+    '' + readSrc "webhook-policy-apply.sh"))
     webhookScriptAsset
   ];
 

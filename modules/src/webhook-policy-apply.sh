@@ -1,5 +1,3 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
-export AGENT_BOX_WEBHOOK_POLICY_FILE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook-watch-policy.json
 set -eu
 # jq/coreutils resolve from the webhook daemon unit's PATH (issue #154,
 # Phase 2), same convention as webhook-spawn.sh.
@@ -57,4 +55,3 @@ else
   rm -f "$tmp"
   echo "agent-box-webhook-policy: could not rewrite $FILE; receiver starts with it unchanged" >&2
 fi
-

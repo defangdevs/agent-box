@@ -707,61 +707,16 @@ let
   # down, so every branch here exits 0.
   webhookWatchPolicyFile = pkgs.writeText "agent-box-webhook-watch-policy.json"
     (builtins.toJSON cfg.webhook.watchPolicy);
-  # writeShellScriptBin (issue #154 Phase 3): the webhook receiver unit's
-  # ExecStartPre names this binary bare, resolved via ExecSearchPath.
-  webhookPolicyApply = pkgs.writeShellScriptBin "agent-box-webhook-policy-apply" ''
-    set -eu
-    JQ=${pkgs.jq}/bin/jq
-    FILE="''${LOCAL_WEBHOOK_STATE_DIR:?}/filter.dispatch.json"
-    POLICY=${webhookWatchPolicyFile}
-    if [ ! -s "$FILE" ]; then
-      echo "agent-box-webhook-policy: no dispatch file yet; nothing to govern" >&2
-      exit 0
-    fi
-    # For every entry whose topic is declared: the declaration REPLACES the
-    # managed fields (the payload predicates, ignoreSenders, note) wholesale —
-    # partial merges would let config and state drift apart. Runtime fields
-    # (ttlHours, renewOnEvent, timestamps) stay the entry's own. Bare-string
-    # topics normalize to the object form webhook.py itself writes.
-    #
-    # local-webhook 0.19.0 renamed the two predicates when -> include and
-    # drop -> exclude (local-channels#294). It still ACCEPTS the old names on
-    # input, but it persists the new ones, so an applier that wrote `when`
-    # left the entry carrying both: its own `when` plus the daemon's `include`
-    # rewrite of it. Write the new names and delete BOTH pairs, so a declared
-    # entry never keeps a stale second predicate — whichever version last
-    # touched the file. The watchPolicy OPTION keeps its when/drop keys; the
-    # rename is upstream's state format, not this module's interface.
-    tmp="$FILE.policy.$$"
-    if "$JQ" --slurpfile pol "$POLICY" '
-          $pol[0] as $p
-          | .topics = [ (.topics // [])[]
-              | (if type == "string" then {topic: .} else . end)
-              | (if type == "object" then (.topic // "") else "" end) as $t
-              | if $t != "" and ($p | has($t)) then
-                  $p[$t] as $r
-                  | del(.when, .drop, .include, .exclude, .ignoreSenders)
-                  | (if $r.when != null then .include = $r.when else . end)
-                  | (if $r.drop != null then .exclude = $r.drop else . end)
-                  | (if (($r.ignoreSenders // []) | length) > 0 then .ignoreSenders = $r.ignoreSenders else . end)
-                  | (if $r.note != null then .note = $r.note else . end)
-                else . end ]
-        ' "$FILE" > "$tmp"; then
-      ${pkgs.coreutils}/bin/mv -f "$tmp" "$FILE"
-      # Say which watches are governed — and when none is, that the policy is
-      # idle: a rule that silently applied to nothing reads like a rule that
-      # worked (#170).
-      "$JQ" -r --slurpfile pol "$POLICY" '
-            [ .topics[] | if type == "string" then . else (.topic // "") end ] as $subs
-            | [ ($pol[0] | keys[]) | select(. as $t | $subs | index($t)) ]
-            | if length > 0 then "agent-box-webhook-policy: enforced declared rules on " + join(", ")
-              else "agent-box-webhook-policy: no declared topic is subscribed; policy idle" end
-          ' "$FILE" >&2
-    else
-      ${pkgs.coreutils}/bin/rm -f "$tmp"
-      echo "agent-box-webhook-policy: could not rewrite $FILE; receiver starts with it unchanged" >&2
-    fi
-  '';
+  # The body (src/webhook-policy-apply.sh) is backend-neutral (issue #154,
+  # Phase 2 style — bare jq/mv/rm resolved from the unit's PATH, config taken
+  # from env) so nix/runtime.nix can ship the same binary for a native box
+  # (issue #457): NixOS is the only backend with a webhook.watchPolicy OPTION
+  # to render, but the enforcement script itself does not need to know that.
+  webhookPolicyApply = pkgs.writeShellScriptBin "agent-box-webhook-policy-apply" (''
+    export AGENT_BOX_WEBHOOK_POLICY_FILE=${webhookWatchPolicyFile}
+  '' + ''
+@@include:src/webhook-policy-apply.sh@@
+  '');
 
   # One session = one agent CLI in one tmux session. These options are the
   # FIRST-BOOT SEED only (see users.<name>.sessions); at runtime the same
