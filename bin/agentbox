@@ -1374,11 +1374,29 @@ class Renderer:
                        # shared binaries with no per-box wrapper to bake.
                        'Environment="AGENT_BOX_SESSION_BIN='
                        '/usr/local/bin/agent-box-session"',
+                       # This override exists ONLY to absolutize the two
+                       # binaries: the shared template's ExecStart names
+                       # `ttyd` and `agent-box-attach` bare, and this unit
+                       # carries no agent PATH. Every FLAG here is therefore
+                       # a restatement of
+                       # modules/src/units/agent-web-terminal@.service and
+                       # must stay identical to it —
+                       # macOptionClickForcesSelection (issue #327: the Mac
+                       # Option-drag gesture xterm.js ships off, which the
+                       # shipped guide tells every user to use) was dropped
+                       # here for exactly as long as the two spellings were
+                       # maintained by hand. The backend-parity check cannot
+                       # see it: that check is keyed on AGENT_BOX_* names and
+                       # this is a bare ttyd flag, so
+                       # test_ttyd_override_keeps_every_flag_the_template_sets
+                       # reads the template instead. #451 removes the
+                       # restatement.
                        "ExecStart=",
                        f"ExecStart={self.bin}/ttyd --writable --url-arg "
                        f"-p {u.ttyd_port} -i 127.0.0.1 -b /{u.name} "
                        "-t disableLeaveAlert=true "
                        f"-t titleFixed={u.name}@{self.spec.domain} "
+                       "-t macOptionClickForcesSelection=true "
                        f"{self.bin}/agent-box-attach",
                    ]))
             t.file(self.p("/etc/systemd/system",

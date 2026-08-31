@@ -1398,6 +1398,55 @@ class RenderTest(unittest.TestCase):
         want["github"] = "@PROFILE@/bin/gh"
         self.assertEqual(want, cards)
 
+    def test_ttyd_override_keeps_every_flag_the_template_sets(self):
+        """The terminal drop-in overrides ExecStart only to absolutize two
+        binaries — `ttyd` and `agent-box-attach` are bare in the shared
+        template and this unit carries no agent PATH — so every `-t` client
+        option is a RESTATEMENT of
+        modules/src/units/agent-web-terminal@.service and must match it.
+
+        Restating drops things: macOptionClickForcesSelection (#327, the Mac
+        Option-drag selection the shipped guide tells every user to use) was
+        in the template and in the module's override, and missing from this
+        one, for as long as the three spellings were maintained by hand. The
+        backend-parity check cannot see that class — it is keyed on
+        AGENT_BOX_* names and these are bare ttyd flags — and neither can the
+        byte fixture, which `--update` regenerates around whatever the
+        renderer currently emits. Hence a test that reads the template.
+        """
+        def options(execstart):
+            # A LIST, not a dict: a restatement can also gain a duplicate
+            # `-t`, and ttyd takes the last one — which a dict would hide by
+            # collapsing the pair silently (CodeRabbit, PR #454).
+            return re.findall(r"-t ([\w-]+)=(\S+)", execstart)
+
+        template = next(
+            x for x in (SRC / "units" / "agent-web-terminal@.service")
+            .read_text().splitlines() if x.startswith("ExecStart="))
+        for user in ("agent", "robot"):
+            conf = (FIXTURE / "etc/systemd/system"
+                    / f"agent-web-terminal@{user}.service.d" / "10-host.conf")
+            # The LAST ExecStart= line: the first is the empty reset that
+            # systemd requires before a template's own value can be replaced.
+            override = [x for x in conf.read_text().splitlines()
+                        if x.startswith("ExecStart=")][-1]
+            got, want = options(override), options(template)
+            self.assertEqual(
+                sorted(n for n, _ in want), sorted(n for n, _ in got),
+                f"agent-web-terminal@{user} drops or invents a ttyd option "
+                f"the shared template does not have")
+            # Values too, wherever the template's is a literal. Only the
+            # interpolating ones (%i, ${VAR}) may differ — the renderer
+            # substitutes those — so comparing names alone would accept
+            # `macOptionClickForcesSelection=false`, which is the same bug
+            # this test exists for with one word changed.
+            literal = {n: v for n, v in want
+                       if "%i" not in v and "${" not in v}
+            self.assertEqual(
+                literal, {n: v for n, v in got if n in literal},
+                f"agent-web-terminal@{user} changes the VALUE of a ttyd "
+                f"option the shared template pins")
+
 
 class SelfUpdateRenderTest(unittest.TestCase):
     """What `apply` puts on the box so an update can be triggered (#358)."""

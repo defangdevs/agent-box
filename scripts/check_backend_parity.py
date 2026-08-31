@@ -133,11 +133,16 @@ UNITS_BY_DESIGN = {
         "module ever grows nix.gc of its own, this line goes away",
 }
 UNITS_KNOWN_GAPS = {
-    "agent-box-defang-cli.service": "#394: the module installs the Defang "
+    "agent-box-defang-cli.service": "#449: the module installs the Defang "
                                     "CLI in the background (#373); the "
                                     "native runtime profile has no defang "
-                                    "at all, which is also why its settings "
-                                    "page offers no defang sign-in card",
+                                    "at all, and defang is not in nixpkgs, "
+                                    "so the settings page cannot offer a "
+                                    "card that could fetch it either "
+                                    "(bin/agentbox drops the card rather "
+                                    "than show a dead one). #394's last "
+                                    "open item, re-homed on the issue that "
+                                    "will decide it",
 }
 
 # Same job, different unit name. The native jail is agent-box-fail2ban so a
