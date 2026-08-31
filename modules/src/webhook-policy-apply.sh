@@ -1,5 +1,3 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
-export AGENT_BOX_WEBHOOK_POLICY_FILE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook-watch-policy.json
 set -eu
 # jq/coreutils resolve from the webhook daemon unit's PATH (issue #154,
 # Phase 2), same convention as webhook-spawn.sh.
@@ -67,4 +65,3 @@ fi
 # problem to the unit's log, so exit clean regardless of what a best-effort
 # step above returned.
 exit 0
-

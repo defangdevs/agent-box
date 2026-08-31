@@ -1691,6 +1691,11 @@ class Renderer:
                        f'Environment="AGENT_BOX_TMUX_BIN={self.bin}/tmux"',
                        "ExecStart=",
                        f"ExecStart={self.bin}/agent-box-webhook-receiver",
+                       # Ships in the profile as of issue #457 — until then
+                       # this named a binary the profile never built, and the
+                       # unit crash-looped on ExecStartPre 203/EXEC forever.
+                       "ExecStartPre=",
+                       f"ExecStartPre={self.bin}/agent-box-webhook-policy-apply",
                    ]))
 
     def render_guide(self, text):
