@@ -3938,8 +3938,9 @@ SCRIPT = """<script>
     // The Start button render_pane puts in a stopped pane, built the same
     // way here: a pane this script swapped in must carry it too, or the
     // button is there until the first live-feed refresh and gone after it.
-    // A real form, posting the route the session row posts to — no back=
-    // field, so the redirect lands back on the workspace with this tab up.
+    // A real form, posting the route the session row posts to, with the
+    // same back=workspace field, so the redirect lands back on the
+    // workspace with this tab up.
     var f = document.createElement("form");
     f.className = "inline";
     f.method = "post";
