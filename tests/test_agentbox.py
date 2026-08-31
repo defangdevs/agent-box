@@ -1398,6 +1398,43 @@ class RenderTest(unittest.TestCase):
         want["github"] = "@PROFILE@/bin/gh"
         self.assertEqual(want, cards)
 
+    def test_ttyd_override_keeps_every_flag_the_template_sets(self):
+        """The terminal drop-in overrides ExecStart only to absolutize two
+        binaries — `ttyd` and `agent-box-attach` are bare in the shared
+        template and this unit carries no agent PATH — so every `-t` client
+        option is a RESTATEMENT of
+        modules/src/units/agent-web-terminal@.service and must match it.
+
+        Restating drops things: macOptionClickForcesSelection (#327, the Mac
+        Option-drag selection the shipped guide tells every user to use) was
+        in the template and in the module's override, and missing from this
+        one, for as long as the three spellings were maintained by hand. The
+        backend-parity check cannot see that class — it is keyed on
+        AGENT_BOX_* names and these are bare ttyd flags — and neither can the
+        byte fixture, which `--update` regenerates around whatever the
+        renderer currently emits. Hence a test that reads the template.
+        """
+        def options(execstart):
+            return dict(re.findall(r"-t (\w+)=(\S+)", execstart))
+
+        template = next(
+            x for x in (SRC / "units" / "agent-web-terminal@.service")
+            .read_text().splitlines() if x.startswith("ExecStart="))
+        for user in ("agent", "robot"):
+            conf = (FIXTURE / "etc/systemd/system"
+                    / f"agent-web-terminal@{user}.service.d" / "10-host.conf")
+            # The LAST ExecStart= line: the first is the empty reset that
+            # systemd requires before a template's own value can be replaced.
+            override = [x for x in conf.read_text().splitlines()
+                        if x.startswith("ExecStart=")][-1]
+            got, want = options(override), options(template)
+            # Values differ where the template interpolates (%i, ${VAR}) and
+            # the renderer substitutes; the OPTION SET must not.
+            self.assertEqual(
+                sorted(want), sorted(got),
+                f"agent-web-terminal@{user} drops or invents a ttyd option "
+                f"the shared template does not have")
+
 
 class SelfUpdateRenderTest(unittest.TestCase):
     """What `apply` puts on the box so an update can be triggered (#358)."""
