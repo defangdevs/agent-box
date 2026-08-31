@@ -2619,7 +2619,8 @@ CONNECT_SECTION_TPL = """<section>
 # other icon on the page.
 HOME_BODY = """<body class="ws">
 <div id="msg-slot">{message}</div>
-<nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}">
+<nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}"
+     data-sess-base="{action_base}">
   {tabs}
   <button type="button" class="btn add" data-toggle="session-editor"
           title="New session" aria-label="New session">+</button>
@@ -2697,6 +2698,8 @@ BODY = """<main>
         <span class="note">Restarts the whole agent service: every
         session comes back with the current secrets and token files.
         Live sessions are killed &mdash; unsaved in-flight work is lost.
+        A stopped session stays stopped, because parking one is
+        deliberate: press Start on its own row to bring it back.
         <span id="restart-status" class="update-state" aria-live="polite"></span></span></span>
         <form method="post" action="{base}/restart" data-poll="restart"
               data-status="{base}/status"
@@ -3565,9 +3568,21 @@ def render_pane(selected, live, stopped):
         return '<div class="pane placeholder active">No session selected.</div>'
     safe = html.escape(selected)
     if selected in stopped and selected not in live:
+        # The Start button lives HERE, not only in the settings page's session
+        # row: this pane is what the operator is looking at when they find out
+        # the session is down, and sending them to another page to press a
+        # button that changes THIS pane is a detour with a reload at the end
+        # of it. Same route the row posts to, and no back= field, so it
+        # returns to the workspace with this session's tab selected.
         return (f'<div class="pane placeholder active" data-pane="{safe}" '
-                f'data-ph="stopped">{safe} is stopped &mdash; Start on '
-                f'the settings page revives it.</div>')
+                f'data-ph="stopped">'
+                f'<span class="ph-msg">{safe} is stopped &mdash; nothing '
+                f'starts it on its own.</span>'
+                f'<form class="inline" method="post" '
+                f'action="{html.escape(SESS_BASE)}/sessions/restart">'
+                f'<input type="hidden" name="name" value="{safe}">'
+                f'<button type="submit" class="btn small">Start</button>'
+                f'</form></div>')
     if selected not in live:
         return (f'<div class="pane placeholder active" data-pane="{safe}" '
                 f'data-ph="starting">{safe} is starting&hellip; '
@@ -4289,7 +4304,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         write_sessions(sessions)
                         ok = "ok=session_started"
                 kill_session(name)
-            self._redirect(ok, self._sess_page(form))
+            back_page = self._sess_page(form)
+            # On the workspace, land on the tab of the session just started —
+            # the pane's own Start button posts here, and dropping the operator
+            # back on some other tab hides the very thing they asked for.
+            if HOME and back_page == SESS_PAGE and SESSION_RE.match(name):
+                ok += "&tab=" + name
+            self._redirect(ok, back_page)
         elif path == BASE + "/webhooks/unsubscribe" and WEBHOOKS:
             topic = (form.get("topic", [""])[0]).strip()
             key = (form.get("key", [""])[0]).strip()

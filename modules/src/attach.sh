@@ -5,11 +5,17 @@ set -u
 # so a dead end can tell a name this box knows from one it does not.
 T="tmux -T hyperlinks -L agent-box"
 SESSIONS="${AGENT_BOX_SESSIONS_FILE:-}"
-# The mascot (issue #185), for the two dead ends below: both are
-# full-screen "nothing to attach to" moments, so the art costs
-# nothing and softens a failure. printf per line, not a heredoc: the
-# assembler re-indents this script into the module's Nix indented
-# string, where a heredoc terminator would ride on that indent.
+# The session CLI, pinned by the generated wrapper: this pane STARTS a
+# session it found stopped, and the web-terminal unit's PATH is tmux, jq,
+# coreutils and this script. Clearing the stopped flag is the registry's
+# write protocol (issue #254), so it goes through the one program that
+# implements it rather than through a second jq edit of its own.
+SESSION_CLI="${AGENT_BOX_SESSION_BIN:-agent-box-session}"
+# The mascot (issue #185), for the dead ends below: each is a full-screen
+# "nothing to attach to" moment, so the art costs nothing and softens a
+# failure. printf per line, not a heredoc: the assembler re-indents this
+# script into the module's Nix indented string, where a heredoc terminator
+# would ride on that indent.
 potato() {
   printf '%s\n' \
     "             .-~~~~~~~~~~~~-." \
@@ -21,41 +27,143 @@ potato() {
     "             \`~-..........-~'" \
     ""
 }
-# What to say about a requested name that has no tmux session. The
-# registry is what tells the three cases apart, and every one of them used
-# to get "create it with: agent-box-session add" — advice that FAILS on a
-# name the registry already carries, which is what the settings page's
-# session links hand you for any session that is not live (issue #241).
 reg() {   # reg FILTER — ask jq about "$want", false on any error
   [ -n "$SESSIONS" ] || return 1
   jq -e --arg s "$want" "$1" "$SESSIONS" >/dev/null 2>&1
 }
-advice() {
-  if ! reg '.sessions | has($s)'; then
-    echo "no session named '$want' — nothing on this box is listed under that"
-    echo "name. Add one from the settings page, or run:"
-    echo "  agent-box-session add $want"
-  elif reg '.sessions[$s].stopped == true'; then
-    echo "session '$want' is stopped: it is still listed, but nothing will"
-    echo "bring it back on its own. Press Start on the settings page, or run:"
+stopped_now() { reg '.sessions[$s].stopped == true'; }
+live_list() {
+  echo ""
+  echo "Live sessions:"
+  $T list-sessions -F '  #S' 2>/dev/null || echo "  (none)"
+}
+# Attach the moment the session exists — $1 half-second tries, so the same
+# helper answers "is it up right now" and "wait for the supervisor to bring
+# it up". Never returns on success: the pane BECOMES the terminal.
+attach_when_live() {
+  n=0
+  while :; do
+    if $T has-session -t "=$want" 2>/dev/null; then
+      exec $T attach -t "=$want"
+    fi
+    n=$((n + 1))
+    [ "$n" -lt "$1" ] || return 1
+    sleep 0.5
+  done
+}
+# Start a stopped session from this pane, then attach to it.
+# The operator is already looking at the pane that has to change, and the
+# settings page was the only place that could make it change — a detour that
+# also ends with "now reload the terminal", because pressing Start there
+# leaves this pane on a stale message.
+start_it() {
+  echo ""
+  echo "starting '$want'…"
+  if ! "$SESSION_CLI" restart "$want" >/dev/null 2>&1; then
+    echo "could not start '$want' from here. Press Start on the settings"
+    echo "page, or run:"
     echo "  agent-box-session restart $want"
-    echo "then reload this page — Start does not reconnect this pane on its own."
-  else
-    echo "session '$want' is starting — the supervisor spawns it within a few"
-    echo "seconds. Reload this page."
+    return 0
   fi
+  # ~2s for a listed session; a FIRST spawn fetches the agent CLI, which
+  # takes as long as the download does, so falling out of this wait is not
+  # a failure — the offer loop keeps watching.
+  attach_when_live 120 || true
+  if stopped_now; then
+    echo "'$want' came up and parked itself again: an agent that exits"
+    echo "cleanly stops its own session, which is not a Start that did"
+    echo "nothing. Its transcript is on the settings page (download icon)."
+  else
+    echo "'$want' has not come up yet — a first spawn fetches its agent"
+    echo "CLI, which can take minutes. Still waiting."
+  fi
+}
+# Wait for a keypress and for the session at the same time: a Start pressed
+# on the settings page, a restart from another pane or the agent CLI arriving
+# all bring the session up while this pane sits here, and the pane the
+# operator is watching should attach to it rather than hold a stale message.
+# read's exit status tells the three cases apart: 0 = a line was typed,
+# >128 = the timeout expired, anything else = EOF, which is the browser tab
+# closing and the only reason to stop.
+offer() {
+  while :; do
+    attach_when_live 1 || true
+    rc=0
+    read -r -t 3 _key || rc=$?
+    if [ "$rc" = 0 ]; then
+      start_it
+    elif [ "$rc" -le 128 ]; then
+      exit 0
+    fi
+  done
 }
 want="${1:-}"
 case "$want" in (*[!A-Za-z0-9_-]*) want="" ;; esac
 if [ -n "$want" ]; then
-  if $T has-session -t "=$want" 2>/dev/null; then
-    exec $T attach -t "=$want"
-  fi
+  attach_when_live 1 || true
   potato
-  advice
-  echo ""
-  echo "Live sessions:"
-  $T list-sessions -F '  #S' 2>/dev/null || echo "  (none)"
+  # What to say about a requested name that has no tmux session. The
+  # registry is what tells the three cases apart, and every one of them used
+  # to get "create it with: agent-box-session add" — advice that FAILS on a
+  # name the registry already carries, which is what the settings page's
+  # session links hand you for any session that is not live (issue #241).
+  if ! reg '.sessions | has($s)'; then
+    echo "no session named '$want' — nothing on this box is listed under that"
+    echo "name. Add one from the settings page, or run:"
+    echo "  agent-box-session add $want"
+    live_list
+    sleep 5
+    exit 1
+  fi
+  if stopped_now; then
+    echo "session '$want' is stopped: it is still listed, but nothing starts"
+    echo "it on its own — an agent that exits cleanly parks its session"
+    echo "this way."
+    echo ""
+    # A pane with no terminal on the other end (a script, a VM test, the
+    # `su -c` shape a test driver uses) cannot press anything, so it keeps
+    # the printed advice and the 5s retry it has always had.
+    if [ -t 0 ]; then
+      echo "  Press Enter to start it here — this pane then attaches to it."
+      echo ""
+      echo "  Start on the settings page does the same, as does:"
+      echo "    agent-box-session restart $want"
+      live_list
+      offer
+    else
+      echo "Press Start on the settings page, or run:"
+      echo "  agent-box-session restart $want"
+      echo "then reload this page — Start does not reconnect this pane on its own."
+      live_list
+      sleep 5
+      exit 1
+    fi
+  fi
+  echo "session '$want' is starting — the supervisor spawns it within a few"
+  echo "seconds, and this pane attaches to it by itself."
+  live_list
+  # A minute of waiting for a real terminal, five seconds for anything else:
+  # a caller with no pty is a script reading this output, not somebody
+  # watching a pane, and it has always had the 5s-and-exit retry.
+  if [ -t 0 ]; then
+    attach_when_live 120 || true
+  else
+    attach_when_live 10 || true
+  fi
+  # A minute with nothing to attach to: report what the registry says NOW,
+  # because a session that parked itself meanwhile is a different message.
+  if stopped_now; then
+    echo ""
+    echo "'$want' parked itself instead of coming up (a clean agent exit)."
+    if [ -t 0 ]; then
+      echo "Press Enter to start it again."
+      offer
+    fi
+  else
+    echo ""
+    echo "'$want' is still not up — the supervisor may be fetching its agent"
+    echo "CLI. Reload this page to keep waiting."
+  fi
   sleep 5
   exit 1
 fi

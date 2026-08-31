@@ -290,4 +290,8 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
         border: 0; visibility: hidden; }
 .pane.active { visibility: visible; }
 .pane.placeholder { display: flex; align-items: center;
-                    justify-content: center; color: #8b949e; }
+                    justify-content: center; gap: 10px;
+                    flex-wrap: wrap; color: #8b949e; }
+/* The pane's own Start button (a stopped session): the message keeps the
+   muted placeholder colour, the button is a button. */
+.pane.placeholder .ph-msg { color: inherit; }

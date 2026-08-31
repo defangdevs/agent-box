@@ -1361,6 +1361,19 @@ class Renderer:
                           "10-host.conf"),
                    dropin([
                        f'Environment="PATH={self.bin}"',
+                       # The attach wrapper STARTS a session it found
+                       # stopped, which means clearing the stopped flag —
+                       # the registry's write protocol, so it goes through
+                       # the session CLI rather than a jq edit of its own.
+                       # The generated wrapper, not the -bare payload in
+                       # self.bin: the prelude above is where the CLI's
+                       # required AGENT_BOX_AGENTS comes from, and without
+                       # it the CLI exits on the spot. The module bakes the
+                       # same value into its attach wrapper; here it is unit
+                       # environment, because this backend's payloads are
+                       # shared binaries with no per-box wrapper to bake.
+                       'Environment="AGENT_BOX_SESSION_BIN='
+                       '/usr/local/bin/agent-box-session"',
                        "ExecStart=",
                        f"ExecStart={self.bin}/ttyd --writable --url-arg "
                        f"-p {u.ttyd_port} -i 127.0.0.1 -b /{u.name} "

@@ -2438,9 +2438,17 @@ in
       # ttyd ExecStart passes this bare ("agent-box-attach"), resolved
       # via that unit's PATH (ttyd execs it directly, not through
       # systemd, so it needs the runtime PATH, not just ExecSearchPath).
-      attachScript = pkgs.writeShellScriptBin "agent-box-attach" ''
+      # A stopped session is STARTED from the pane the operator is already
+      # looking at, which means clearing the stopped flag — the
+      # registry's write protocol, so it goes through the one program that
+      # implements it. Pinned in the wrapper for the same reason the session
+      # CLI pins its own flock: this script runs from the web-terminal unit's
+      # PATH, which is tmux, jq, coreutils and itself.
+      attachScript = pkgs.writeShellScriptBin "agent-box-attach" (''
+        export AGENT_BOX_SESSION_BIN=${sessionCli}/bin/agent-box-session
+      '' + ''
         @@include:src/attach.sh@@
-      '';
+      '');
       # Per-user env var suffix for the Caddyfile placeholders; linux user
       # names may contain chars that are invalid in env var names.
       envName = n: lib.toUpper (lib.stringAsChars (c: if builtins.match "[a-zA-Z0-9]" c != null then c else "_") n);

@@ -325,6 +325,17 @@ in
         assert 'data-ph="stopped"' in ws, ws
         assert "main is stopped" in ws, ws
         assert 'src="/agent/main/"' not in ws, ws
+        # ...and the pane offers the start itself. Both stopped surfaces used
+        # to end in "go to the settings page": a detour to press a button
+        # that changes the pane the operator was already looking at, and one
+        # that ends with a reload, because a Start pressed elsewhere does not
+        # reconnect a terminal. The pane's form posts the same route the
+        # session row posts to, with no back= field, so it comes back here.
+        pane = ws[ws.index('data-ph="stopped"'):]
+        pane = pane[:pane.index("</div>")]
+        assert "/sessions/restart" in pane, pane
+        assert ">Start</button>" in pane, pane
+        assert "settings page" not in pane, pane
 
         # The terminal dead end names the verb that actually revives it.
         # Print the wrapper's path (see the grep -oE note below) — running
@@ -362,6 +373,42 @@ in
             f"{curl} -u agent:testpassword 'https://box.test/agent/?tab=main'"
         )
         assert 'data-ph="live"' in live_ws, live_ws
+
+    # The terminal pane is the other surface that could only send the
+    # operator elsewhere, and it is the one they are looking at when they
+    # find out the session is down. Given a terminal on the other end it
+    # offers the start on a keypress, and attaches to what it started.
+    #
+    # On its OWN session, not on main: the keypress reaches the pane that is
+    # attached, and a shell session is a pane where that costs nothing —
+    # main runs the real claude, whose TUI would be the thing answering a
+    # keystroke from a test. `script` supplies the pty the wrapper checks
+    # for (with nothing interactive on the other end it keeps the printed
+    # advice dead_end() reads above), and a bare newline is the keypress.
+    # Bounded by `timeout`, because past the offer this wrapper is meant not
+    # to return: it BECOMES the terminal.
+    with subtest("a stopped session starts from its own pane"):
+        machine.succeed(as_agent("agent-box-session add pane --agent shell"))
+        machine.wait_until_succeeds(tmux("has-session -t =pane"), timeout=60)
+        machine.succeed(as_agent("agent-box-session stop pane"))
+        machine.wait_until_fails(tmux("has-session -t =pane"), timeout=60)
+
+        offered = machine.succeed(as_agent(
+            "printf '\\n' | timeout 20 script -q -c "
+            "'env TMUX_TMPDIR=/run/agent-box-agent "
+            f"AGENT_BOX_SESSIONS_FILE={sfile} {attach} pane' /dev/null || true"
+        ))
+        assert "Press Enter to start it" in offered, offered
+        machine.wait_until_succeeds(tmux("has-session -t =pane"), timeout=60)
+        # The stopped flag is what kept the supervisor away, so the start had
+        # to clear it — through the session CLI, which this wrapper reaches
+        # by the store path its own generated wrapper pins (the web-terminal
+        # unit's PATH is tmux, jq, coreutils and the wrapper itself).
+        machine.succeed(
+            f"jq -e '.sessions.pane | has(\"stopped\") | not' {sfile} >/dev/null"
+        )
+        machine.succeed(as_agent("agent-box-session rm pane"))
+        settle()
 
     # ttyd serves per-session deep links: the unit runs with --url-arg.
     machine.succeed("systemctl cat agent-web-terminal@agent | grep -- --url-arg >/dev/null")
