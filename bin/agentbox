@@ -117,6 +117,28 @@ NIX_GC_UNIT = "agent-box-nix-gc.service"
 NIX_GC_TIMER = "agent-box-nix-gc.timer"
 NIX_GC_AGE = "7d"
 NIX_PROFILE_BIN = "/nix/var/nix/profiles/default/bin"
+# Base-OS patching, unattended and reboot-free. `agentbox apply` still never
+# CALLS apt — the distro keeps owning its own packages — but on this box
+# nobody is there to answer the two questions an unattended patch run asks:
+# "may I restart this service?" and "may I reboot?". There is no operator at
+# a console, an agent has no reboot grant, and on a Spot/Lightsail box the
+# only human who could reboot is wherever the cloud console is. Leaving both
+# unanswered is the worst outcome: the patch is installed, the vulnerable
+# code keeps running in a daemon nobody restarted, and /var/run/reboot-
+# required grows a file nobody reads. So the answers are written down.
+#
+# 52-, so it sorts after Ubuntu's own 20auto-upgrades and
+# 50unattended-upgrades and wins on the keys it repeats. Allowed-Origins is
+# deliberately NOT among them: which pockets are security pockets is the
+# distro's call (Ubuntu's own file lists -security plus the two ESM ones),
+# and an apt list assignment appends rather than replaces, so restating it
+# here could only duplicate or — with a #clear — silently narrow it.
+APT_CONF = "/etc/apt/apt.conf.d/52-agent-box-unattended"
+NEEDRESTART_CONF = "/etc/needrestart/conf.d/50-agent-box.conf"
+# HH:MM, the only form unattended-upgrades' Automatic-Reboot-Time accepts
+# besides "now" (which reboots the moment a patch lands — never what a box
+# running an agent's work wants).
+REBOOT_TIME_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 # The flake output the runtime profile is installed from, and the element
 # name `nix profile` records it under.
 RUNTIME_ATTR = "runtime"
@@ -328,6 +350,53 @@ class Spec:
                 f"web.enable must be true, false or null, got {web_enable!r}")
         self.web_enable = bool(web_enable)
         self.protect_memory = bool(data.get("protectMemory", True))
+        # Base-OS patching (see APT_CONF). Default on, because the failure
+        # it prevents is silent: an unattended patch run that installs a
+        # fix and restarts nothing looks exactly like one that worked.
+        # Written as apt + needrestart policy, so a host whose package
+        # manager is neither (RHEL, and its own dnf-automatic) should set
+        # `osUpdates: {enable: false}` rather than collect two inert files.
+        # `or {}` would be the trap in its most direct form: it folds
+        # `osUpdates: false` — the obvious way to write "off" — into an
+        # empty mapping, whose `enable` then defaults to TRUE, so the one
+        # spelling that means "do not touch my box's patching" is the one
+        # that turns it on (CodeRabbit on PR #453). Only an absent key is
+        # absent; anything else has to be a mapping, and the message names
+        # the spelling that works.
+        os_updates = data.get("osUpdates")
+        if os_updates is None:
+            os_updates = {}
+        if not isinstance(os_updates, dict):
+            raise ConfigError(
+                f"osUpdates must be a mapping, got {os_updates!r} — to turn "
+                "base-OS patch policy off, write `osUpdates: {enable: false}`")
+        os_updates_enable = os_updates.get("enable", True)
+        # The quoted-"false" trap the other booleans here already guard
+        # against (issue #404 review): a string is truthy, so `enable:
+        # "false"` would turn the thing ON. null still means off.
+        if os_updates_enable is not None and not isinstance(
+                os_updates_enable, bool):
+            raise ConfigError(
+                "osUpdates.enable must be true, false or null, got "
+                f"{os_updates_enable!r}")
+        self.os_updates_enable = bool(os_updates_enable)
+        # Off by default: nobody on this box can perform a reboot, but a
+        # box that reboots ITSELF at an arbitrary moment is worse — it
+        # takes every live agent session with it. A deployment that would
+        # rather have a current kernel than a long-lived session gives a
+        # time, and gets a reboot only at that time.
+        reboot = os_updates.get("automaticReboot", False)
+        if reboot is True:
+            raise ConfigError(
+                "osUpdates.automaticReboot must be a \"HH:MM\" time, not "
+                "true — `true` alone means unattended-upgrades' \"now\", "
+                "which reboots the moment a kernel patch lands")
+        if reboot not in (False, None) and not (
+                isinstance(reboot, str) and REBOOT_TIME_RE.match(reboot)):
+            raise ConfigError(
+                "osUpdates.automaticReboot must be false or a \"HH:MM\" "
+                f"time, got {reboot!r}")
+        self.os_updates_reboot = reboot or ""
         # Codex autonomy for the WHOLE box (issue 234). Default true, as
         # the module's option is: the box IS the sandbox, and an agent that
         # stops to ask a human is a stalled agent. Meaningless without
@@ -541,6 +610,10 @@ class Renderer:
         self.shared_units(t)
         self.update_unit(t)
         self.nix_gc(t)
+        if self.spec.os_updates_enable:
+            self.os_updates(t)
+        else:
+            self.os_updates_off(t)
         self.per_user(t)
         self.sudoers(t)
         self.tmpfiles(t)
@@ -963,6 +1036,139 @@ class Renderer:
         t.file(path, header
                + "min-free = 1073741824\n"    # start GC below 1 GiB free
                + "max-free = 5368709120\n")   # ... and free up to 5 GiB
+
+    # -- base-OS patching ----------------------------------------------------
+
+    def os_updates(self, t):
+        """Let the distro patch itself in place, and never reboot for it.
+
+        Two files, and neither one runs apt: they answer, in advance, the
+        two questions an unattended patch run asks a machine that has
+        nobody sitting at it.
+
+          apt          keep the periodic jobs on (a box whose 20auto-
+                       upgrades never got written patches NOTHING, and
+                       looks identical to one that is up to date), and say
+                       explicitly that a patch may not reboot the box.
+                       Nobody here can perform a reboot — an agent has no
+                       such grant, and the operator is wherever the cloud
+                       console is — so an automatic one would be a session
+                       killed at an hour nobody chose.
+
+          needrestart  restart the daemons a patch obsoleted, in place.
+                       This is the half that makes "no reboot" honest:
+                       needrestart's default is interactive, and an
+                       interactive needrestart run non-interactively (which
+                       is exactly how unattended-upgrades runs it) falls
+                       back to LIST ONLY. The patched daemon then keeps
+                       running the code it was patched for until a reboot
+                       that, on this box, never comes.
+
+        The one thing that must NOT be restarted is the unit that owns an
+        agent's tmux server: `agent-box@%i.service` stops with
+        `tmux -L agent-box kill-server`, so "restart it because libc moved"
+        is every session on the box dying mid-task at 06:00. That
+        exclusion is MERGED into needrestart's own hash rather than
+        assigned over it — conf.d snippets are eval'd after the shipped
+        config, and replacing the hash would quietly drop its exclusions
+        (dbus, the display managers, the network stack) along the way.
+
+        What this cannot fix is a kernel: it patches on disk and takes
+        effect at a boot. The box says so through /var/run/reboot-required
+        (the shipped guide points at it), and `osUpdates.automaticReboot:
+        "HH:MM"` is there for a deployment that would rather take the
+        restart than run an old kernel.
+        """
+        t.dir(self.p("/etc/apt"), 0o755)
+        t.dir(self.p("/etc/apt/apt.conf.d"), 0o755)
+        # `#` starts a comment in apt.conf too (only #include and #clear
+        # are directives), so the generated header is the same one every
+        # other rendered file carries — which is what makes this file
+        # removable again when osUpdates goes off.
+        lines = [
+            GENERATED_HEADER.rstrip("\n"),
+            "//",
+            "// Base-OS security patching for a box with no operator at a",
+            "// console. Ubuntu's own 50unattended-upgrades still chooses",
+            "// WHICH pockets are patched; this file only says that the",
+            "// periodic jobs run, and what may happen afterwards.",
+            'APT::Periodic::Enable "1";',
+            'APT::Periodic::Update-Package-Lists "1";',
+            'APT::Periodic::Download-Upgradeable-Packages "1";',
+            'APT::Periodic::Unattended-Upgrade "1";',
+            # Downloaded .debs are the one part of this that grows without
+            # bound on a small root disk.
+            'APT::Periodic::AutocleanInterval "7";',
+            "",
+        ]
+        if self.spec.os_updates_reboot:
+            lines += [
+                "// This deployment asked for a nightly reboot rather than",
+                "// a kernel that only updates on disk. WithUsers, because",
+                "// an agent session IS a logged-in user: without it the",
+                "// reboot is skipped for as long as anyone is attached,",
+                "// which on this box is always.",
+                'Unattended-Upgrade::Automatic-Reboot "true";',
+                'Unattended-Upgrade::Automatic-Reboot-WithUsers "true";',
+                "Unattended-Upgrade::Automatic-Reboot-Time "
+                f'"{self.spec.os_updates_reboot}";',
+            ]
+        else:
+            lines += [
+                "// Never: the agent sessions this box exists to run live",
+                "// in RAM, and nothing here can decide that now is a good",
+                "// moment to lose them. Kernel patches therefore wait for",
+                "// a reboot somebody performs on purpose.",
+                'Unattended-Upgrade::Automatic-Reboot "false";',
+            ]
+        lines += [
+            "",
+            "// Housekeeping, so unattended patching cannot fill the root",
+            "// filesystem it is supposed to be protecting.",
+            'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";',
+            'Unattended-Upgrade::Remove-New-Unused-Dependencies "true";',
+            # Each package upgraded in its own dpkg run, so an interrupted
+            # patch window (a Spot reclaim) leaves whole packages behind
+            # rather than a half-configured one.
+            'Unattended-Upgrade::MinimalSteps "true";',
+            # No mail on this box; the journal is where anyone looks.
+            'Unattended-Upgrade::SyslogEnable "true";',
+        ]
+        t.file(self.p(APT_CONF), "".join(line + "\n" for line in lines))
+
+        t.dir(self.p("/etc/needrestart"), 0o755)
+        t.dir(self.p("/etc/needrestart/conf.d"), 0o755)
+        t.file(self.p(NEEDRESTART_CONF), "".join(line + "\n" for line in [
+            GENERATED_HEADER.rstrip("\n"),
+            "#",
+            "# Restart what a patch obsoleted, instead of waiting for a",
+            "# reboot nobody here can perform. needrestart's default is",
+            "# interactive, and an interactive needrestart run",
+            "# non-interactively (unattended-upgrades) falls back to list",
+            "# only — the patch lands and the vulnerable process keeps",
+            "# running.",
+            "$nrconf{restart} = 'a';",
+            "",
+            "# ...but never the unit that owns an agent's tmux server: its",
+            "# ExecStop is `tmux -L agent-box kill-server`, so a restart",
+            "# here is every session on this box dying mid-task because a",
+            "# library moved. Merged into needrestart's own hash (conf.d",
+            "# is eval'd after it), so its shipped exclusions survive.",
+            "$nrconf{override_rc}->{qr(^agent-box@)} = 0;",
+        ]))
+
+    def os_updates_off(self, t):
+        """And turning it off has to take the policy back down.
+
+        Same shape as memory_protection_off: apply never deletes what a
+        render merely stops emitting, so a box applied once with
+        osUpdates on and then off would keep patching under rules its
+        configuration no longer mentions. Only files still carrying our
+        header are removed (remove_if_ours), so an administrator who took
+        either one over keeps it.
+        """
+        t.gone(self.p(APT_CONF))
+        t.gone(self.p(NEEDRESTART_CONF))
 
     # -- host directories ---------------------------------------------------
 
