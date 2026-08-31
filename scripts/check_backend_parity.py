@@ -168,6 +168,15 @@ UNIT_ALIASES = {
 # those names are one-sided box-wide, so they are one-sided in whatever unit
 # carries them, and the reason is written once where it belongs.
 UNIT_VARS_BY_DESIGN = {
+    "agent-web-terminal@.service AGENT_BOX_SESSION_BIN":
+        "the attach wrapper needs the session CLI to start a stopped "
+        "session from its pane, and each backend hands it over where that "
+        "backend has a place to: the module BAKES it into the wrapper it "
+        "builds per box (writeShellScriptBin, so the store path is pinned "
+        "the way it pins flock for the session CLI), while the native "
+        "renderer ships one shared binary and no wrapper, so the value is "
+        "this unit's environment. Both name a real agent-box-session; only "
+        "one of them has a generated script to put it in",
 }
 UNIT_VARS_KNOWN_GAPS = {
 }

@@ -11361,7 +11361,11 @@ STYLE = """<style>
           border: 0; visibility: hidden; }
   .pane.active { visibility: visible; }
   .pane.placeholder { display: flex; align-items: center;
-                      justify-content: center; color: #8b949e; }
+                      justify-content: center; gap: 10px;
+                      flex-wrap: wrap; color: #8b949e; }
+  /* The pane's own Start button (a stopped session): the message keeps the
+     muted placeholder colour, the button is a button. */
+  .pane.placeholder .ph-msg { color: inherit; }
 </style>
 """
 
@@ -11550,7 +11554,8 @@ CONNECT_SECTION_TPL = """<section>
 # other icon on the page.
 HOME_BODY = """<body class="ws">
 <div id="msg-slot">{message}</div>
-<nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}">
+<nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}"
+     data-sess-base="{action_base}">
   {tabs}
   <button type="button" class="btn add" data-toggle="session-editor"
           title="New session" aria-label="New session">+</button>
@@ -11562,6 +11567,7 @@ HOME_BODY = """<body class="ws">
 </nav>
 <div id="session-editor" class="editor">
   <form method="post" action="{action_base}/sessions/add">
+    <input type="hidden" name="back" value="workspace">
     {new_session_fields}
   </form>
 </div>
@@ -11628,6 +11634,8 @@ BODY = """<main>
         <span class="note">Restarts the whole agent service: every
         session comes back with the current secrets and token files.
         Live sessions are killed &mdash; unsaved in-flight work is lost.
+        A stopped session stays stopped, because parking one is
+        deliberate: press Start on its own row to bring it back.
         <span id="restart-status" class="update-state" aria-live="polite"></span></span></span>
         <form method="post" action="{base}/restart" data-poll="restart"
               data-status="{base}/status"
@@ -12212,8 +12220,40 @@ SCRIPT = """<script>
     // Mirrors render_pane: a stopped session is not coming up on its
     // own, so don't promise that it is starting.
     return tabState(name) === "stopped"
-      ? name + " is stopped — Start on the settings page revives it."
+      ? name + " is stopped — nothing starts it on its own."
       : name + " is starting…";
+  }
+  function startForm(name) {
+    // The Start button render_pane puts in a stopped pane, built the same
+    // way here: a pane this script swapped in must carry it too, or the
+    // button is there until the first live-feed refresh and gone after it.
+    // A real form, posting the route the session row posts to, with the
+    // same back=workspace field, so the redirect lands back on the
+    // workspace with this tab up.
+    var f = document.createElement("form");
+    f.className = "inline";
+    f.method = "post";
+    f.action = (tabBar().getAttribute("data-sess-base") || "") +
+               "/sessions/restart";
+    var hidden = document.createElement("input");
+    hidden.type = "hidden";
+    hidden.name = "name";
+    hidden.value = name;
+    // Where to come back to, named the way render_pane names it: /<user>/
+    // is a workspace for every user, and the route's own default is the
+    // settings page for anyone but the primary one.
+    var back = document.createElement("input");
+    back.type = "hidden";
+    back.name = "back";
+    back.value = "workspace";
+    var btn = document.createElement("button");
+    btn.type = "submit";
+    btn.className = "btn small";
+    btn.textContent = "Start";
+    f.appendChild(hidden);
+    f.appendChild(back);
+    f.appendChild(btn);
+    return f;
   }
   function paneState(name) {
     // The three states a pane is built for; data-ph records which one the
@@ -12245,8 +12285,12 @@ SCRIPT = """<script>
       el.className = "pane";
     } else {
       el = document.createElement("div");
-      el.textContent = placeholderText(name);
       el.className = "pane placeholder";
+      var msg = document.createElement("span");
+      msg.className = "ph-msg";
+      msg.textContent = placeholderText(name);
+      el.appendChild(msg);
+      if (want === "stopped") { el.appendChild(startForm(name)); }
     }
     el.setAttribute("data-ph", want);
     el.setAttribute("data-pane", name);
@@ -13468,9 +13512,25 @@ def render_pane(selected, live, stopped):
         return '<div class="pane placeholder active">No session selected.</div>'
     safe = html.escape(selected)
     if selected in stopped and selected not in live:
+        # The Start button lives HERE, not only in the settings page's session
+        # row: this pane is what the operator is looking at when they find out
+        # the session is down, and sending them to another page to press a
+        # button that changes THIS pane is a detour with a reload at the end
+        # of it. Same route the row posts to, and back=workspace, so it
+        # returns to the workspace with this session's tab selected. Named
+        # explicitly rather than left to SESS_PAGE's default: /<user>/ is a
+        # workspace for EVERY user, while that default is the settings page
+        # for anyone but the primary one (CodeRabbit on PR #452).
         return (f'<div class="pane placeholder active" data-pane="{safe}" '
-                f'data-ph="stopped">{safe} is stopped &mdash; Start on '
-                f'the settings page revives it.</div>')
+                f'data-ph="stopped">'
+                f'<span class="ph-msg">{safe} is stopped &mdash; nothing '
+                f'starts it on its own.</span>'
+                f'<form class="inline" method="post" '
+                f'action="{html.escape(SESS_BASE)}/sessions/restart">'
+                f'<input type="hidden" name="name" value="{safe}">'
+                f'<input type="hidden" name="back" value="workspace">'
+                f'<button type="submit" class="btn small">Start</button>'
+                f'</form></div>')
     if selected not in live:
         return (f'<div class="pane placeholder active" data-pane="{safe}" '
                 f'data-ph="starting">{safe} is starting&hellip; '
@@ -13953,7 +14013,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         section lives there for every user now), else SESS_PAGE (the
         HOME workspace's own add form)."""
         back = form.get("back", [""])[0]
-        return BASE + "/" if back == "settings" else SESS_PAGE
+        if back == "settings":
+            return BASE + "/"
+        # back=workspace names /<user>/ for EVERY user, which SESS_PAGE only
+        # resolves to for the primary one (for a second web user it is that
+        # user's settings page). The workspace's own forms carry it, so a
+        # Start pressed in a pane comes back to the pane.
+        if back == "workspace":
+            return TERM_HOME
+        return SESS_PAGE
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -14135,7 +14203,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # On the workspace, land on the new session's tab (gen_session_name
             # returns a SESSION_RE-shaped name, so it is URL-safe as-is).
             query = "ok=session_added"
-            if HOME and back_page == SESS_PAGE:
+            if back_page == TERM_HOME:
                 query += "&tab=" + name
             self._redirect(query, back_page)
         elif path == SESS_BASE + "/sessions/delete":
@@ -14192,7 +14260,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         write_sessions(sessions)
                         ok = "ok=session_started"
                 kill_session(name)
-            self._redirect(ok, self._sess_page(form))
+            back_page = self._sess_page(form)
+            # On the workspace, land on the tab of the session just started —
+            # the pane's own Start button posts here, and dropping the operator
+            # back on some other tab hides the very thing they asked for.
+            if back_page == TERM_HOME and SESSION_RE.match(name):
+                ok += "&tab=" + name
+            self._redirect(ok, back_page)
         elif path == BASE + "/webhooks/unsubscribe" and WEBHOOKS:
             topic = (form.get("topic", [""])[0]).strip()
             key = (form.get("key", [""])[0]).strip()
@@ -14295,7 +14369,15 @@ if __name__ == "__main__":
       # ttyd ExecStart passes this bare ("agent-box-attach"), resolved
       # via that unit's PATH (ttyd execs it directly, not through
       # systemd, so it needs the runtime PATH, not just ExecSearchPath).
-      attachScript = pkgs.writeShellScriptBin "agent-box-attach" ''
+      # A stopped session is STARTED from the pane the operator is already
+      # looking at, which means clearing the stopped flag — the
+      # registry's write protocol, so it goes through the one program that
+      # implements it. Pinned in the wrapper for the same reason the session
+      # CLI pins its own flock: this script runs from the web-terminal unit's
+      # PATH, which is tmux, jq, coreutils and itself.
+      attachScript = pkgs.writeShellScriptBin "agent-box-attach" (''
+        export AGENT_BOX_SESSION_BIN=${sessionCli}/bin/agent-box-session
+      '' + ''
         set -u
         # tmux, jq and head resolve from the web-terminal unit's PATH; the socket
         # name is the module-wide constant. The sessions registry arrives as unit
@@ -14303,11 +14385,17 @@ if __name__ == "__main__":
         # so a dead end can tell a name this box knows from one it does not.
         T="tmux -T hyperlinks -L agent-box"
         SESSIONS="''${AGENT_BOX_SESSIONS_FILE:-}"
-        # The mascot (issue #185), for the two dead ends below: both are
-        # full-screen "nothing to attach to" moments, so the art costs
-        # nothing and softens a failure. printf per line, not a heredoc: the
-        # assembler re-indents this script into the module's Nix indented
-        # string, where a heredoc terminator would ride on that indent.
+        # The session CLI, pinned by the generated wrapper: this pane STARTS a
+        # session it found stopped, and the web-terminal unit's PATH is tmux, jq,
+        # coreutils and this script. Clearing the stopped flag is the registry's
+        # write protocol (issue #254), so it goes through the one program that
+        # implements it rather than through a second jq edit of its own.
+        SESSION_CLI="''${AGENT_BOX_SESSION_BIN:-agent-box-session}"
+        # The mascot (issue #185), for the dead ends below: each is a full-screen
+        # "nothing to attach to" moment, so the art costs nothing and softens a
+        # failure. printf per line, not a heredoc: the assembler re-indents this
+        # script into the module's Nix indented string, where a heredoc terminator
+        # would ride on that indent.
         potato() {
           printf '%s\n' \
             "             .-~~~~~~~~~~~~-." \
@@ -14319,41 +14407,167 @@ if __name__ == "__main__":
             "             \`~-..........-~'" \
             ""
         }
-        # What to say about a requested name that has no tmux session. The
-        # registry is what tells the three cases apart, and every one of them used
-        # to get "create it with: agent-box-session add" — advice that FAILS on a
-        # name the registry already carries, which is what the settings page's
-        # session links hand you for any session that is not live (issue #241).
         reg() {   # reg FILTER — ask jq about "$want", false on any error
           [ -n "$SESSIONS" ] || return 1
           jq -e --arg s "$want" "$1" "$SESSIONS" >/dev/null 2>&1
         }
-        advice() {
-          if ! reg '.sessions | has($s)'; then
-            echo "no session named '$want' — nothing on this box is listed under that"
-            echo "name. Add one from the settings page, or run:"
-            echo "  agent-box-session add $want"
-          elif reg '.sessions[$s].stopped == true'; then
-            echo "session '$want' is stopped: it is still listed, but nothing will"
-            echo "bring it back on its own. Press Start on the settings page, or run:"
+        stopped_now() { reg '.sessions[$s].stopped == true'; }
+        # Is there a person at the other end of this pane? ttyd runs the wrapper on a
+        # pty, which is what makes the offer below pressable at all.
+        #
+        # NOT [ -t 0 ]: that is true of things with no reader too, and one of them is
+        # CI. A NixOS VM test's backdoor shell runs with `exec < /dev/hvc0` — a virtio
+        # console, a tty with nobody behind it — and `su -c` passes it down, so the
+        # offer's wait-for-a-keypress loop hung the sessions-web test until the job
+        # timed out (PR #452, run 33421803747). A pty is /dev/pts/N and a console is
+        # not, which separates ttyd (and a human's ssh) from every automated caller.
+        interactive() {
+          case "$(readlink /proc/self/fd/0 2>/dev/null)" in
+            (/dev/pts/*) return 0 ;;
+          esac
+          return 1
+        }
+        live_list() {
+          echo ""
+          echo "Live sessions:"
+          $T list-sessions -F '  #S' 2>/dev/null || echo "  (none)"
+        }
+        # Attach the moment the session exists — $1 half-second tries, so the same
+        # helper answers "is it up right now" and "wait for the supervisor to bring
+        # it up". Never returns on success: the pane BECOMES the terminal.
+        attach_when_live() {
+          n=0
+          while :; do
+            if $T has-session -t "=$want" 2>/dev/null; then
+              exec $T attach -t "=$want"
+            fi
+            n=$((n + 1))
+            [ "$n" -lt "$1" ] || return 1
+            sleep 0.5
+          done
+        }
+        # Start a stopped session from this pane, then attach to it.
+        # The operator is already looking at the pane that has to change, and the
+        # settings page was the only place that could make it change — a detour that
+        # also ends with "now reload the terminal", because pressing Start there
+        # leaves this pane on a stale message.
+        start_it() {
+          echo ""
+          echo "starting '$want'…"
+          if ! "$SESSION_CLI" restart "$want" >/dev/null 2>&1; then
+            echo "could not start '$want' from here. Press Start on the settings"
+            echo "page, or run:"
             echo "  agent-box-session restart $want"
-            echo "then reload this page — Start does not reconnect this pane on its own."
-          else
-            echo "session '$want' is starting — the supervisor spawns it within a few"
-            echo "seconds. Reload this page."
+            return 0
           fi
+          # ~2s for a listed session; a FIRST spawn fetches the agent CLI, which
+          # takes as long as the download does, so falling out of this wait is not
+          # a failure — the offer loop keeps watching.
+          attach_when_live 120 || true
+          if stopped_now; then
+            echo "'$want' came up and parked itself again: an agent that exits"
+            echo "cleanly stops its own session, which is not a Start that did"
+            echo "nothing. Its transcript is on the settings page (download icon)."
+          else
+            echo "'$want' has not come up yet — a first spawn fetches its agent"
+            echo "CLI, which can take minutes. Still waiting."
+          fi
+        }
+        # Wait for a keypress and for the session at the same time: a Start pressed
+        # on the settings page, a restart from another pane or the agent CLI arriving
+        # all bring the session up while this pane sits here, and the pane the
+        # operator is watching should attach to it rather than hold a stale message.
+        # read's exit status tells the three cases apart: 0 = a line was typed,
+        # >128 = the timeout expired, anything else = EOF, which is the browser tab
+        # closing and the only reason to stop.
+        offer() {
+          # Bounded at 30 minutes, not endless: a pane nobody has touched for that
+          # long costs a process per open connection, and a bound is also what keeps
+          # a wrong answer from interactive() above to a slow caller rather than a
+          # hung one. ttyd reconnects when this exits, so the offer comes straight
+          # back for a pane somebody IS looking at.
+          waited=0
+          while [ "$waited" -lt 600 ]; do
+            attach_when_live 1 || true
+            rc=0
+            read -r -t 3 _key || rc=$?
+            if [ "$rc" = 0 ]; then
+              start_it
+            elif [ "$rc" -le 128 ]; then
+              exit 0
+            fi
+            waited=$((waited + 1))
+          done
+          exit 1
         }
         want="''${1:-}"
         case "$want" in (*[!A-Za-z0-9_-]*) want="" ;; esac
         if [ -n "$want" ]; then
-          if $T has-session -t "=$want" 2>/dev/null; then
-            exec $T attach -t "=$want"
-          fi
+          attach_when_live 1 || true
           potato
-          advice
-          echo ""
-          echo "Live sessions:"
-          $T list-sessions -F '  #S' 2>/dev/null || echo "  (none)"
+          # What to say about a requested name that has no tmux session. The
+          # registry is what tells the three cases apart, and every one of them used
+          # to get "create it with: agent-box-session add" — advice that FAILS on a
+          # name the registry already carries, which is what the settings page's
+          # session links hand you for any session that is not live (issue #241).
+          if ! reg '.sessions | has($s)'; then
+            echo "no session named '$want' — nothing on this box is listed under that"
+            echo "name. Add one from the settings page, or run:"
+            echo "  agent-box-session add $want"
+            live_list
+            sleep 5
+            exit 1
+          fi
+          if stopped_now; then
+            echo "session '$want' is stopped: it is still listed, but nothing starts"
+            echo "it on its own — an agent that exits cleanly parks its session"
+            echo "this way."
+            echo ""
+            # A pane with no terminal on the other end (a script, a VM test, the
+            # `su -c` shape a test driver uses) cannot press anything, so it keeps
+            # the printed advice and the 5s retry it has always had — see
+            # interactive() for why that is not [ -t 0 ].
+            if interactive; then
+              echo "  Press Enter to start it here — this pane then attaches to it."
+              echo ""
+              echo "  Start on the settings page does the same, as does:"
+              echo "    agent-box-session restart $want"
+              live_list
+              offer
+            else
+              echo "Press Start on the settings page, or run:"
+              echo "  agent-box-session restart $want"
+              echo "then reload this page — Start does not reconnect this pane on its own."
+              live_list
+              sleep 5
+              exit 1
+            fi
+          fi
+          echo "session '$want' is starting — the supervisor spawns it within a few"
+          echo "seconds, and this pane attaches to it by itself."
+          live_list
+          # A minute of waiting for a real terminal, five seconds for anything else:
+          # a caller with no pty is a script reading this output, not somebody
+          # watching a pane, and it has always had the 5s-and-exit retry.
+          if interactive; then
+            attach_when_live 120 || true
+          else
+            attach_when_live 10 || true
+          fi
+          # A minute with nothing to attach to: report what the registry says NOW,
+          # because a session that parked itself meanwhile is a different message.
+          if stopped_now; then
+            echo ""
+            echo "'$want' parked itself instead of coming up (a clean agent exit)."
+            if interactive; then
+              echo "Press Enter to start it again."
+              offer
+            fi
+          else
+            echo ""
+            echo "'$want' is still not up — the supervisor may be fetching its agent"
+            echo "CLI. Reload this page to keep waiting."
+          fi
           sleep 5
           exit 1
         fi
@@ -14369,7 +14583,7 @@ if __name__ == "__main__":
         echo "no live sessions yet — the supervisor may still be starting them."
         sleep 5
         exit 1
-      '';
+      '');
       # Per-user env var suffix for the Caddyfile placeholders; linux user
       # names may contain chars that are invalid in env var names.
       envName = n: lib.toUpper (lib.stringAsChars (c: if builtins.match "[a-zA-Z0-9]" c != null then c else "_") n);

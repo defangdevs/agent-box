@@ -432,8 +432,40 @@
     // Mirrors render_pane: a stopped session is not coming up on its
     // own, so don't promise that it is starting.
     return tabState(name) === "stopped"
-      ? name + " is stopped — Start on the settings page revives it."
+      ? name + " is stopped — nothing starts it on its own."
       : name + " is starting…";
+  }
+  function startForm(name) {
+    // The Start button render_pane puts in a stopped pane, built the same
+    // way here: a pane this script swapped in must carry it too, or the
+    // button is there until the first live-feed refresh and gone after it.
+    // A real form, posting the route the session row posts to, with the
+    // same back=workspace field, so the redirect lands back on the
+    // workspace with this tab up.
+    var f = document.createElement("form");
+    f.className = "inline";
+    f.method = "post";
+    f.action = (tabBar().getAttribute("data-sess-base") || "") +
+               "/sessions/restart";
+    var hidden = document.createElement("input");
+    hidden.type = "hidden";
+    hidden.name = "name";
+    hidden.value = name;
+    // Where to come back to, named the way render_pane names it: /<user>/
+    // is a workspace for every user, and the route's own default is the
+    // settings page for anyone but the primary one.
+    var back = document.createElement("input");
+    back.type = "hidden";
+    back.name = "back";
+    back.value = "workspace";
+    var btn = document.createElement("button");
+    btn.type = "submit";
+    btn.className = "btn small";
+    btn.textContent = "Start";
+    f.appendChild(hidden);
+    f.appendChild(back);
+    f.appendChild(btn);
+    return f;
   }
   function paneState(name) {
     // The three states a pane is built for; data-ph records which one the
@@ -465,8 +497,12 @@
       el.className = "pane";
     } else {
       el = document.createElement("div");
-      el.textContent = placeholderText(name);
       el.className = "pane placeholder";
+      var msg = document.createElement("span");
+      msg.className = "ph-msg";
+      msg.textContent = placeholderText(name);
+      el.appendChild(msg);
+      if (want === "stopped") { el.appendChild(startForm(name)); }
     }
     el.setAttribute("data-ph", want);
     el.setAttribute("data-pane", name);
