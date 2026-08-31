@@ -110,6 +110,43 @@ class WebhookPanelState(unittest.TestCase):
         self.assertIsNone(module.webhook_unavailable())
         self.assertTrue(module.WEBHOOKS)
 
+    def test_no_sender_yet_is_prose_and_not_a_one_row_table(self):
+        """The table lists the senders that exist. With none, it is a
+        header over a paragraph of documentation — and `.tbl li` is a flex
+        row, so that paragraph came out laid across the row as columns.
+        The explanation belongs in the note above the table instead."""
+        module = daemon_with(
+            AGENT_BOX_WEBHOOK_SCRIPT=self.script,
+            AGENT_BOX_WEBHOOK_STATE_DIR=self.state,
+            AGENT_BOX_WEBHOOK_URL="https://box.example/agent/webhook",
+        )
+        html = module.render_webhook_endpoint()
+        self.assertNotIn("Payload URL", html)
+        self.assertNotIn("<ul", html)
+        self.assertIn("No sender is set up yet", html)
+        # The command names its source: the panel is not GitHub-only, and
+        # `setup` leaning on its default hid the argument entirely.
+        self.assertIn("agent-box-webhook setup SOURCE", html)
+        self.assertIn("agent-box-webhook setup github", html)
+        self.assertIn("https://box.example/agent/webhook/&lt;source&gt;", html)
+
+    def test_a_configured_sender_gets_the_table_back(self):
+        """And the same paragraph still says what a webhook is, without
+        making the reader take GitHub's word for it."""
+        with open(os.path.join(self.state, "sources.json"), "w") as fh:
+            fh.write('{"defaultSource": "stripe",'
+                     ' "sources": {"stripe": {"secretFile": "stripe.secret"}}}')
+        module = daemon_with(
+            AGENT_BOX_WEBHOOK_SCRIPT=self.script,
+            AGENT_BOX_WEBHOOK_STATE_DIR=self.state,
+            AGENT_BOX_WEBHOOK_URL="https://box.example/agent/webhook",
+        )
+        html = module.render_webhook_endpoint()
+        self.assertIn("Payload URL", html)
+        self.assertIn("https://box.example/agent/webhook/stripe", html)
+        self.assertNotIn("No sender is set up yet", html)
+        self.assertIn("GitHub is just the usual one", html)
+
     def test_the_explanation_is_rendered_as_the_webhook_section(self):
         """Under its own heading, so an operator looking for the panel
         finds the reason where the panel would have been."""
