@@ -1125,8 +1125,20 @@ class Renderer:
 
     @staticmethod
     def same_text(path, text):
+        """Is the file at `path` byte-for-byte the text we would write?
+
+        A symlink is never ours, for the same reason generated_by_us refuses
+        one: read_text() follows it, so an administrator who replaced our
+        unit with a link into their own config would otherwise pass the
+        witness and have the unit stopped out from under them. This function
+        gates `systemctl disable --now`, so getting that wrong is worse than
+        the removal case remove_if_ours already guards.
+        """
+        path = Path(path)
+        if path.is_symlink():
+            return False
         try:
-            return Path(path).read_text() == text
+            return path.read_text() == text
         except (OSError, UnicodeDecodeError):
             return False
 

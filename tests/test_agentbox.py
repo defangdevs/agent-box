@@ -1511,6 +1511,13 @@ class RenderTest(unittest.TestCase):
             render(True)
             for f in owned:
                 self.assertTrue(f.exists(), f"{f.name} not rendered")
+            # The credentials, as a live box would have them after
+            # --first-boot and a password change.
+            hash_file = out / "etc/agent-box/agent.hash"
+            cookie_file = out / "var/lib/agent-box-web/cookie-secret-agent"
+            for f in (hash_file, cookie_file):
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text("kept\n")
             tree = render(False)
             for f in owned:
                 self.assertFalse(f.exists(),
@@ -1526,9 +1533,15 @@ class RenderTest(unittest.TestCase):
                              tree.disable)
             # The password and cookie secrets are deliberately NOT removed:
             # turning the terminal off must not throw away the credential
-            # needed to turn it back on.
-            self.assertTrue((out / "etc/agent-box/agent.hash").exists()
-                            or True)
+            # needed to turn it back on. `apply` never writes these (
+            # --first-boot and the password helper do), so the test has to
+            # put them there before asserting they survive — an assertion
+            # about a file this render never creates would pass for the
+            # wrong reason.
+            for f in (hash_file, cookie_file):
+                self.assertTrue(f.exists(),
+                                f"{f.name} was removed with the terminal")
+                self.assertEqual("kept\n", f.read_text())
 
     def test_turning_webhooks_off_removes_the_cli_that_promises_them(self):
         """The same shape, smaller (#413).
@@ -1610,6 +1623,47 @@ class RenderTest(unittest.TestCase):
             self.assertTrue(template.exists(),
                             "an edited template unit was deleted")
             self.assertIn("no longer ours to remove", out_text)
+
+    def test_a_symlinked_web_unit_is_not_disabled(self):
+        """A symlink is never ours, and this path stops a service.
+
+        `same_text` reads through a symlink, so an administrator who
+        replaced caddy.service with a link into their own config could have
+        had a byte-identical target satisfy the witness and the unit
+        `disable --now`-d out from under them — while remove_if_ours, which
+        refuses symlinks, correctly left the link alone. The half that
+        stops a daemon must be at least as careful as the half that deletes
+        a file (CodeRabbit on #465).
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "one-root"
+            unit = out / "etc/systemd/system/caddy.service"
+
+            def render(enable):
+                config["web"] = dict(config["web"], enable=enable)
+                cfg = Path(tmp) / "config.json"
+                cfg.write_text(json.dumps(config))
+                spec = mod.Spec(config, prof)
+                tree = mod.Renderer(spec, prof, root=out).render()
+                proc = subprocess.run(
+                    [sys.executable, str(AGENTBOX), "apply",
+                     "--config", str(cfg), "--profile", str(prof),
+                     "--root", str(out)], capture_output=True, text=True)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+                return tree
+
+            render(True)
+            # Their own copy, byte-identical, reached through a link.
+            theirs = Path(tmp) / "their-caddy.service"
+            theirs.write_text(unit.read_text())
+            unit.unlink()
+            unit.symlink_to(theirs)
+            tree = render(False)
+            self.assertNotIn("caddy.service", tree.disable)
+            self.assertTrue(unit.is_symlink(), "the link was removed")
 
     def test_a_unit_this_box_never_had_is_not_disabled(self):
         """The teardown must be quiet on a box that always had the knob
