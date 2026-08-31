@@ -840,6 +840,13 @@
                 nativeBuildInputs = [
                   (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
                   pkgs.caddy
+                  # The two config formats this render does NOT own: apt
+                  # reads back the unattended-upgrade policy (dpkg only so
+                  # apt agrees it has a packaging system at all), perl
+                  # parses the needrestart snippet.
+                  pkgs.apt
+                  pkgs.dpkg
+                  pkgs.perl
                 ];
                 repo = builtins.path {
                   path = ./.;
@@ -875,6 +882,41 @@
               done > caddy.env
               caddy validate --envfile caddy.env --adapter caddyfile \
                 --config tests/native/expected/etc/agent-box/Caddyfile
+
+              # Same idea for the base-OS patch policy, and here the stakes
+              # are higher than a service that fails to start: a syntax
+              # error in ANY file under /etc/apt/apt.conf.d breaks every
+              # apt invocation on the box, so the render would take the
+              # distro's own security patching down with it. apt itself is
+              # the only honest judge of that, and it also proves the keys
+              # land where they are meant to (`Dir::Bin::dpkg`, because a
+              # Nix builder has no /usr/bin/dpkg and apt refuses to run
+              # without one).
+              apt=tests/native/expected/etc/apt/apt.conf.d/52-agent-box-unattended
+              apt-config -c "$apt" -o "Dir::Bin::dpkg=$(command -v dpkg)" \
+                dump > apt.dump
+              for key in \
+                'APT::Periodic::Unattended-Upgrade "1"' \
+                'Unattended-Upgrade::Automatic-Reboot "false"' ; do
+                grep -F "$key;" apt.dump > /dev/null \
+                  || { echo "apt did not read back: $key"; cat apt.dump; \
+                       exit 1; }
+              done
+              # Negative control: apt-config exits 0 on a file it could not
+              # parse when the parse error is only a warning, so prove the
+              # check above can actually fail.
+              sed 's/"1";/"1"/' "$apt" > broken.conf
+              if apt-config -c broken.conf -o \
+                  "Dir::Bin::dpkg=$(command -v dpkg)" dump > /dev/null 2>&1
+              then
+                echo "FAIL: apt-config accepted a config with a syntax error"
+                exit 1
+              fi
+
+              # needrestart's snippets are Perl, eval'd into the daemon's
+              # own namespace: a snippet that does not parse is a `die` in
+              # needrestart, which is a patch run that restarts nothing.
+              perl -c tests/native/expected/etc/needrestart/conf.d/50-agent-box.conf
               printf 'agentbox render matches tests/native/expected\n' > "$out"
             '';
 

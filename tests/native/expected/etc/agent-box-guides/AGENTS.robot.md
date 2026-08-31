@@ -61,6 +61,24 @@ plainly rather than handing it back.
   the box's declared configuration (by default /etc/agent-box/config.yaml;
   `systemctl cat agent-box-update.service` names the file this box was
   actually applied from).
+- Those base-OS patches install and take effect UNATTENDED, with no
+  reboot: `agentbox apply` writes the policy (see
+  /etc/apt/apt.conf.d/52-agent-box-unattended and
+  /etc/needrestart/conf.d/50-agent-box.conf), so unattended-upgrades
+  patches and needrestart restarts the affected daemons in place. Your own
+  session is excluded from those restarts by name, so an apt run cannot
+  kill it. By DEFAULT the box also never reboots itself, but a deployment
+  can opt in to a nightly reboot, so read the
+  `Unattended-Upgrade::Automatic-Reboot` line in that apt file rather than
+  assuming either way.
+  A KERNEL patch is the exception - it only takes effect at a boot, and
+  the box tells you one is waiting by creating /var/run/reboot-required.
+  Assume that is not yours to act on: rebooting needs the cloud console,
+  or a `sudo` grant this box hands out only if the deployment asked for
+  one (`sudo -ln` lists what you actually have). So when you see that
+  file, say so to the person you are working with (`cat
+  /var/run/reboot-required.pkgs` lists which packages want it) instead of
+  looking for a way around it.
 - Two layers, and it pays to know which one you are looking at.
   `apt list --installed` is the distro's; `nix profile list --profile
   /nix/var/nix/profiles/agent-box` is agent-box's. Tools YOU want go in
