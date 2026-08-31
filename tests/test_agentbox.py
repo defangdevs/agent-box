@@ -749,9 +749,16 @@ class RenderTest(unittest.TestCase):
                 config["osUpdates"] = {"enable": bad}
                 with self.assertRaises(mod.ConfigError, msg=repr(bad)):
                     mod.Spec(config, prof)
-            config["osUpdates"] = "yes"
-            with self.assertRaises(mod.ConfigError):
-                mod.Spec(config, prof)
+            # A FALSY non-mapping is the dangerous half: `osUpdates:
+            # false` is the obvious way to write "off", and folding it
+            # into an empty mapping (`data.get(...) or {}`) would default
+            # `enable` back to true — the one spelling meaning "leave my
+            # box's patching alone" turning it on. Only an absent key is
+            # absent.
+            for bad in ("yes", False, 0, [], ""):
+                config["osUpdates"] = bad
+                with self.assertRaises(mod.ConfigError, msg=repr(bad)):
+                    mod.Spec(config, prof)
 
     def test_turning_os_updates_off_takes_the_policy_with_it(self):
         """apply never deletes what a render merely stops emitting, so

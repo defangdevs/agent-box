@@ -32,7 +32,8 @@ user choose Claude Code or Codex.
   `/etc/apt/apt.conf.d/52-agent-box-unattended` and
   `/etc/needrestart/conf.d/50-agent-box.conf`, so security patches install
   unattended, the daemons they obsolete restart in place, no agent session
-  is ever restarted by an apt run, and the box never reboots itself. See
+  is ever restarted by an apt run, and the box does not reboot itself
+  unless the deployment opts in with `osUpdates.automaticReboot`. See
   "Base-OS patching" in `aws/README.md` for the whole policy — it is the
   renderer's, so both clouds get the same one.
 - **Basic-auth-to-cookie web auth**, identical to the AWS path. The terminal

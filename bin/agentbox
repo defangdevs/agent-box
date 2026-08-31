@@ -356,10 +356,20 @@ class Spec:
         # Written as apt + needrestart policy, so a host whose package
         # manager is neither (RHEL, and its own dnf-automatic) should set
         # `osUpdates: {enable: false}` rather than collect two inert files.
-        os_updates = data.get("osUpdates") or {}
+        # `or {}` would be the trap in its most direct form: it folds
+        # `osUpdates: false` — the obvious way to write "off" — into an
+        # empty mapping, whose `enable` then defaults to TRUE, so the one
+        # spelling that means "do not touch my box's patching" is the one
+        # that turns it on (CodeRabbit on PR #453). Only an absent key is
+        # absent; anything else has to be a mapping, and the message names
+        # the spelling that works.
+        os_updates = data.get("osUpdates")
+        if os_updates is None:
+            os_updates = {}
         if not isinstance(os_updates, dict):
             raise ConfigError(
-                f"osUpdates must be a mapping, got {os_updates!r}")
+                f"osUpdates must be a mapping, got {os_updates!r} — to turn "
+                "base-OS patch policy off, write `osUpdates: {enable: false}`")
         os_updates_enable = os_updates.get("enable", True)
         # The quoted-"false" trap the other booleans here already guard
         # against (issue #404 review): a string is truthy, so `enable:
