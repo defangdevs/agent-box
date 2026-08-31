@@ -325,16 +325,16 @@ Conditions:
   UseSsm: !Equals [!Ref EnableSsm, 'true']
 
 Mappings:
-  # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py - do not edit by hand)
+  # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py — do not edit by hand)
   RegionMap:
     us-east-1:
-      AMI: ami-0ab0ad49715851e61
+      AMI: ami-0543c16202af6c35d
     us-west-2:
-      AMI: ami-0a87a54d3b990fb11
+      AMI: ami-0bab6db6d7ea95e07
     eu-central-1:
-      AMI: ami-019a83797574d9161
+      AMI: ami-05895f3f233eabe46
     eu-west-1:
-      AMI: ami-0dcdf7de64f060400
+      AMI: ami-0bdc1730623cf70a5
   # END AMI MAP
 
 Resources:
