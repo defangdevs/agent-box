@@ -289,7 +289,12 @@ AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
 # nothing it can discover for itself: `domain: auto` tells --first-boot to
 # settle the public IPv4 and derive the sslip.io hostname from it. That works
 # unchanged on Azure because settle_public_ip asks checkip.amazonaws.com rather
-# than a cloud's own metadata service.
+# than a cloud's own metadata service. No `sessions:` key - `agentbox apply`
+# seeds none itself on a web-enabled box (issue #416/#468), landing first boot
+# on the settings page instead of a started agent session. No opt-in back to
+# the pre-#416 behaviour: a session seeded before the box's first sign-in
+# cannot do anything anyway, since its agent CLI still has to authenticate
+# first (issue #469).
 install -d -m 0755 /etc/agent-box
 cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
 domain: auto
@@ -300,9 +305,6 @@ web:
 users:
   @@USER@@:
     root: true
-    sessions:
-      main:
-        agent: @@AGENT@@
 AGENTBOX_CONFIG
 
 # Extra standing instructions for the agent, if the deployment gave any.
