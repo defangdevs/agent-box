@@ -1524,6 +1524,209 @@ class RenderTest(unittest.TestCase):
                               "agent-box-zram.service"],
                              tree.disable)
 
+    def test_turning_web_off_takes_the_public_listener_with_it(self):
+        """Issue #413, and the worst instance of this defect class.
+
+        The %i instances stop on their own (cmd_apply walks those unit
+        prefixes), but caddy, the fail2ban jail and agent-web-auth-secrets
+        are PLAIN units nothing reconciled — so a box whose owner set
+        web.enable: false kept a public listener on 80/443, with the
+        terminal's basic auth in front of an upstream that no longer
+        existed, and a jail watching a log nobody wrote. Two output roots
+        cannot see this; one root, applied twice, can.
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "one-root"
+            owned = [
+                out / "etc/systemd/system/caddy.service",
+                out / "etc/systemd/system/agent-web-auth-secrets.service",
+                out / "etc/systemd/system/agent-box-fail2ban.service",
+                out / "etc/systemd/system/agent-web-terminal@.service",
+                out / "etc/systemd/system/agent-box-settings@.service",
+                out / "etc/agent-box/Caddyfile",
+                out / "etc/agent-box/web-users",
+                out / "etc/agent-box/fail2ban/jail.conf",
+                out / "etc/agent-box/fail2ban/fail2ban.conf",
+                out / "etc/agent-box/bin/agent-box-password-agent",
+                out / "etc/agent-box/units/agent-web-terminal-agent.env",
+                out / "etc/agent-box/units/agent-box-settings-agent.env",
+                out / ("etc/systemd/system/agent-web-terminal@agent"
+                       ".service.d/10-host.conf"),
+            ]
+
+            def render(enable):
+                config["web"] = dict(config["web"], enable=enable)
+                cfg = Path(tmp) / "config.json"
+                cfg.write_text(json.dumps(config))
+                tree = mod.Renderer(mod.Spec(config, prof), prof,
+                                    root=out).render()
+                proc = subprocess.run(
+                    [sys.executable, str(AGENTBOX), "apply",
+                     "--config", str(cfg), "--profile", str(prof),
+                     "--root", str(out)], capture_output=True, text=True)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+                return tree
+
+            render(True)
+            for f in owned:
+                self.assertTrue(f.exists(), f"{f.name} not rendered")
+            # The credentials, as a live box would have them after
+            # --first-boot and a password change.
+            hash_file = out / "etc/agent-box/agent.hash"
+            cookie_file = out / "var/lib/agent-box-web/cookie-secret-agent"
+            for f in (hash_file, cookie_file):
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text("kept\n")
+            tree = render(False)
+            for f in owned:
+                self.assertFalse(f.exists(),
+                                 f"{f.name} survived web.enable: false")
+            # Removing a unit file is not stopping the daemon. The three
+            # plain units have to be named for disabling too, in the order
+            # that never leaves a dependant running without what it
+            # requires: the jail (PartOf=caddy) first, the secrets caddy
+            # Requires= last.
+            self.assertEqual(["agent-box-fail2ban.service",
+                              "caddy.service",
+                              "agent-web-auth-secrets.service"],
+                             tree.disable)
+            # The password and cookie secrets are deliberately NOT removed:
+            # turning the terminal off must not throw away the credential
+            # needed to turn it back on. `apply` never writes these (
+            # --first-boot and the password helper do), so the test has to
+            # put them there before asserting they survive — an assertion
+            # about a file this render never creates would pass for the
+            # wrong reason.
+            for f in (hash_file, cookie_file):
+                self.assertTrue(f.exists(),
+                                f"{f.name} was removed with the terminal")
+                self.assertEqual("kept\n", f.read_text())
+
+    def test_turning_webhooks_off_removes_the_cli_that_promises_them(self):
+        """The same shape, smaller (#413).
+
+        What survived here was a wrapper on every agent's PATH telling it to
+        subscribe to a receiver that is not listening — the failure mode is
+        an agent waiting for deliveries that can never arrive.
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "one-root"
+            owned = [
+                out / "usr/local/bin/agent-box-webhook",
+                out / "etc/systemd/system/agent-box-webhook@.service",
+                out / "etc/systemd/system/agent-box-webhook@.socket",
+                out / "etc/agent-box/units/agent-box-webhook-agent.env",
+                out / ("etc/systemd/system/agent-box-webhook@agent"
+                       ".service.d/10-host.conf"),
+            ]
+
+            def render(enable):
+                config["webhook"] = dict(config.get("webhook", {}),
+                                         enable=enable)
+                cfg = Path(tmp) / "config.json"
+                cfg.write_text(json.dumps(config))
+                proc = subprocess.run(
+                    [sys.executable, str(AGENTBOX), "apply",
+                     "--config", str(cfg), "--profile", str(prof),
+                     "--root", str(out)], capture_output=True, text=True)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+
+            render(True)
+            for f in owned:
+                self.assertTrue(f.exists(), f"{f.name} not rendered")
+            render(False)
+            for f in owned:
+                self.assertFalse(f.exists(),
+                                 f"{f.name} survived webhook.enable: false")
+
+    def test_an_edited_web_file_survives_the_teardown(self):
+        """The witness is narrower than the header, not wider.
+
+        A file with no comment syntax (web-users) and one shared verbatim
+        with the NixOS backend (a %i template) are removed on a
+        byte-identical match rather than a generated header. That must
+        still refuse an administrator's edit — otherwise the second proof
+        of ownership is a way around the first.
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "one-root"
+            manifest = out / "etc/agent-box/web-users"
+            template = out / "etc/systemd/system/agent-web-terminal@.service"
+
+            def render(enable):
+                config["web"] = dict(config["web"], enable=enable)
+                cfg = Path(tmp) / "config.json"
+                cfg.write_text(json.dumps(config))
+                proc = subprocess.run(
+                    [sys.executable, str(AGENTBOX), "apply",
+                     "--config", str(cfg), "--profile", str(prof),
+                     "--root", str(out)], capture_output=True, text=True)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+                return proc.stdout
+
+            render(True)
+            manifest.write_text("mine\t/srv/mine.hash\n")
+            # The templates land 0444, so taking one over means making it
+            # writable first — which is exactly what an administrator does.
+            template.chmod(0o644)
+            template.write_text("[Unit]\nDescription=mine\n")
+            out_text = render(False)
+            self.assertTrue(manifest.exists(),
+                            "an edited web-users was deleted")
+            self.assertTrue(template.exists(),
+                            "an edited template unit was deleted")
+            self.assertIn("no longer ours to remove", out_text)
+
+    def test_a_symlinked_web_unit_is_not_disabled(self):
+        """A symlink is never ours, and this path stops a service.
+
+        `same_text` reads through a symlink, so an administrator who
+        replaced caddy.service with a link into their own config could have
+        had a byte-identical target satisfy the witness and the unit
+        `disable --now`-d out from under them — while remove_if_ours, which
+        refuses symlinks, correctly left the link alone. The half that
+        stops a daemon must be at least as careful as the half that deletes
+        a file (CodeRabbit on #465).
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "one-root"
+            unit = out / "etc/systemd/system/caddy.service"
+
+            def render(enable):
+                config["web"] = dict(config["web"], enable=enable)
+                cfg = Path(tmp) / "config.json"
+                cfg.write_text(json.dumps(config))
+                spec = mod.Spec(config, prof)
+                tree = mod.Renderer(spec, prof, root=out).render()
+                proc = subprocess.run(
+                    [sys.executable, str(AGENTBOX), "apply",
+                     "--config", str(cfg), "--profile", str(prof),
+                     "--root", str(out)], capture_output=True, text=True)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+                return tree
+
+            render(True)
+            # Their own copy, byte-identical, reached through a link.
+            theirs = Path(tmp) / "their-caddy.service"
+            theirs.write_text(unit.read_text())
+            unit.unlink()
+            unit.symlink_to(theirs)
+            tree = render(False)
+            self.assertNotIn("caddy.service", tree.disable)
+            self.assertTrue(unit.is_symlink(), "the link was removed")
+
     def test_a_unit_this_box_never_had_is_not_disabled(self):
         """The teardown must be quiet on a box that always had the knob
         off: `systemctl disable` on a name that was never installed is an
