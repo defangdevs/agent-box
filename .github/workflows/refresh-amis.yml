@@ -6,8 +6,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # push AMI-map bump directly to master
-  actions: write    # dispatch publish-template.yml (see "Publish the bump" below)
+  contents: write        # push the AMI-map bump to a branch and merge its PR
+  pull-requests: write   # open + merge that PR (master requires PRs — ruleset 21491459)
+  actions: write         # dispatch publish-template.yml (see "Publish the bump" below)
 
 concurrency:
   group: refresh-amis
@@ -26,6 +27,8 @@ jobs:
 
       - name: Commit if changed
         id: commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if git diff --quiet aws/template.yaml; then
             echo "No AMI changes."
@@ -34,17 +37,31 @@ jobs:
           fi
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
+          branch="chore/refresh-amis-${{ github.run_id }}"
+          git checkout -b "$branch"
           git add aws/template.yaml
           git commit -m "Refresh NixOS AMI map (26.05)"
-          git push
+          git push origin "$branch"
+          gh pr create --base "$GITHUB_REF_NAME" --head "$branch" \
+            --title "Refresh NixOS AMI map (26.05)" \
+            --body "Automated weekly AMI map refresh."
+          gh pr merge "$branch" --squash --delete-branch
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      # Commits pushed with GITHUB_TOKEN do not trigger workflows, so the push
-      # above never fired publish-template.yml (which watches pushes touching
-      # aws/template.yaml) — the refreshed AMI map stayed on master and never
-      # reached the S3 template the 1-click Launch buttons serve. That is not
-      # theoretical: 5542d8f (2026-07-06) landed the only AMI bump so far, and
-      # there is no publish run for it in 60 runs going back to 2026-07-04.
+      # master's "Require conversation resolution" ruleset (21491459, added
+      # 2026-08-25) rejects a direct push with GH013 — every change now has to
+      # go through a PR. The step above opens one from a throwaway branch and
+      # merges it immediately: the ruleset requires 0 approving reviews, so
+      # nothing blocks a same-run merge, and this stays inside the same
+      # trust boundary as before (GITHUB_TOKEN, own repo, generated content).
+      #
+      # Commits pushed (or merged) with GITHUB_TOKEN do not trigger workflows,
+      # so neither the old direct push nor this merge fires publish-template.yml
+      # (which watches pushes touching aws/template.yaml) — the refreshed AMI
+      # map would stay on master and never reach the S3 template the 1-click
+      # Launch buttons serve. That is not theoretical: 5542d8f (2026-07-06)
+      # landed the only AMI bump so far, and there was no publish run for it in
+      # 60 runs going back to 2026-07-04.
       #
       # Dispatching explicitly closes the loop while keeping this job on
       # GITHUB_TOKEN. The alternative — pushing under a PAT or GitHub App so the
