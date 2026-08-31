@@ -336,6 +336,11 @@ in
         assert "/sessions/restart" in pane, pane
         assert ">Start</button>" in pane, pane
         assert "settings page" not in pane, pane
+        # back=workspace, spelled out: /<user>/ is a workspace for EVERY
+        # user, while the route's default destination is the settings page
+        # for anyone but the primary one, so a pane's Start would have taken
+        # a second web user away from the pane it belongs to.
+        assert 'name="back" value="workspace"' in pane, pane
 
         # The terminal dead end names the verb that actually revives it.
         # Print the wrapper's path (see the grep -oE note below) — running
@@ -389,6 +394,22 @@ in
     # to return: it BECOMES the terminal.
     with subtest("a stopped session starts from its own pane"):
         machine.succeed(as_agent("agent-box-session add pane --agent shell"))
+        machine.wait_until_succeeds(tmux("has-session -t =pane"), timeout=60)
+        machine.succeed(as_agent("agent-box-session stop pane"))
+        machine.wait_until_fails(tmux("has-session -t =pane"), timeout=60)
+
+        # What the pane's own button posts: back=workspace lands on the
+        # workspace — for the primary user and for any other — and the
+        # started session's own tab is the one that comes up, because
+        # dropping the operator on some other tab hides the thing they asked
+        # for. Raw Location header, as above: what the daemon emits is the
+        # contract.
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /dev/null -D - "
+            "-d 'name=pane&back=workspace' "
+            "https://box.test/sessions/restart "
+            "| grep -i '^location: /agent/?ok=session_started&tab=pane'"
+        )
         machine.wait_until_succeeds(tmux("has-session -t =pane"), timeout=60)
         machine.succeed(as_agent("agent-box-session stop pane"))
         machine.wait_until_fails(tmux("has-session -t =pane"), timeout=60)

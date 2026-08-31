@@ -2632,6 +2632,7 @@ HOME_BODY = """<body class="ws">
 </nav>
 <div id="session-editor" class="editor">
   <form method="post" action="{action_base}/sessions/add">
+    <input type="hidden" name="back" value="workspace">
     {new_session_fields}
   </form>
 </div>
@@ -3572,8 +3573,11 @@ def render_pane(selected, live, stopped):
         # row: this pane is what the operator is looking at when they find out
         # the session is down, and sending them to another page to press a
         # button that changes THIS pane is a detour with a reload at the end
-        # of it. Same route the row posts to, and no back= field, so it
-        # returns to the workspace with this session's tab selected.
+        # of it. Same route the row posts to, and back=workspace, so it
+        # returns to the workspace with this session's tab selected. Named
+        # explicitly rather than left to SESS_PAGE's default: /<user>/ is a
+        # workspace for EVERY user, while that default is the settings page
+        # for anyone but the primary one (CodeRabbit on PR #452).
         return (f'<div class="pane placeholder active" data-pane="{safe}" '
                 f'data-ph="stopped">'
                 f'<span class="ph-msg">{safe} is stopped &mdash; nothing '
@@ -3581,6 +3585,7 @@ def render_pane(selected, live, stopped):
                 f'<form class="inline" method="post" '
                 f'action="{html.escape(SESS_BASE)}/sessions/restart">'
                 f'<input type="hidden" name="name" value="{safe}">'
+                f'<input type="hidden" name="back" value="workspace">'
                 f'<button type="submit" class="btn small">Start</button>'
                 f'</form></div>')
     if selected not in live:
@@ -4065,7 +4070,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         section lives there for every user now), else SESS_PAGE (the
         HOME workspace's own add form)."""
         back = form.get("back", [""])[0]
-        return BASE + "/" if back == "settings" else SESS_PAGE
+        if back == "settings":
+            return BASE + "/"
+        # back=workspace names /<user>/ for EVERY user, which SESS_PAGE only
+        # resolves to for the primary one (for a second web user it is that
+        # user's settings page). The workspace's own forms carry it, so a
+        # Start pressed in a pane comes back to the pane.
+        if back == "workspace":
+            return TERM_HOME
+        return SESS_PAGE
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -4247,7 +4260,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # On the workspace, land on the new session's tab (gen_session_name
             # returns a SESSION_RE-shaped name, so it is URL-safe as-is).
             query = "ok=session_added"
-            if HOME and back_page == SESS_PAGE:
+            if back_page == TERM_HOME:
                 query += "&tab=" + name
             self._redirect(query, back_page)
         elif path == SESS_BASE + "/sessions/delete":
@@ -4308,7 +4321,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # On the workspace, land on the tab of the session just started —
             # the pane's own Start button posts here, and dropping the operator
             # back on some other tab hides the very thing they asked for.
-            if HOME and back_page == SESS_PAGE and SESSION_RE.match(name):
+            if back_page == TERM_HOME and SESSION_RE.match(name):
                 ok += "&tab=" + name
             self._redirect(ok, back_page)
         elif path == BASE + "/webhooks/unsubscribe" and WEBHOOKS:
