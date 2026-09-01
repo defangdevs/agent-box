@@ -2923,6 +2923,15 @@ in
             # fetched from a card land on one nixpkgs rather than two.
             AGENT_BOX_NIXPKGS = jitNixpkgsRef;
             AGENT_BOX_NIX_BIN = "${config.nix.package}/bin/nix";
+            # Agent profiles (issue #321, step 5). The page reads and writes
+            # profile FILES itself, with the env store's own parser — but the
+            # mapping from a profile's keys to harness arguments lives in
+            # exactly ONE place, and it is not here: `agent-box-profile
+            # launch` resolves it for `agent-box-session add --profile` too,
+            # so what the page shows and what a session gets cannot drift.
+            # Pinned rather than resolved from PATH, like every other
+            # AGENT_BOX_*_BIN on this unit.
+            AGENT_BOX_PROFILE_BIN = "${profileCli}/bin/agent-box-profile";
           }
           // lib.optionalAttrs webhookEnabled {
             # Webhook subscriptions panel (issue #227). The daemon runs
