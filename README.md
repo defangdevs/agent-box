@@ -4,8 +4,8 @@ Reproducible, multi-user coding-agent sandboxes - one click on AWS or Azure, on
 bare metal, or as a VM image, from one declarative config. (Built on Nix - as a
 full NixOS system, or as a pinned Nix profile on an ordinary Linux distro.)
 
-Each agent is an **unprivileged user** running a supported agent CLI inside a
-persistent `tmux` session. The only elevated power an agent gets is a tight,
+Each agent is an **unprivileged user** running a supported **harness** (the
+agent CLI itself: `claude` or `codex`) inside a persistent `tmux` session. The only elevated power an agent gets is a tight,
 explicit passwordless-`sudo` allowlist. Custom tokens (e.g. `GH_TOKEN`) are
 injected via drop-in `EnvironmentFile`s that never enter the world-readable Nix
 store.
@@ -54,7 +54,7 @@ Claude apps doubles as the address you reach it at.
 public-IPv4 line items. The default `small_3_0` (2 vCPU / 2 GiB / 60 GiB SSD)
 is **$12/mo flat**; bundles range from that up to `xlarge_3_0` (16 GiB,
 $84/mo). **2 GiB is the smallest offered**, here and on the EC2 template:
-smaller bundles do boot, but an agent CLI plus a language server plus a build
+smaller bundles do boot, but a harness plus a language server plus a build
 is what actually runs on this box, and they leave nothing for it. Pick
 `medium_3_0` (4 GiB, $24/mo) for parallel sessions or heavy builds. The
 attached static IPv4 is included, and the URL survives a stop/start (a live
@@ -362,13 +362,14 @@ agent-box therefore runs the daemon in a private UTS namespace whose hostname
 is the box's public address, so it appears as e.g. `1-2-3-4.sslip.io` rather
 than an internal cloud hostname. `remoteControlName` remains Claude-only.
 
-## Sessions (any user can run any agent — no rebuild)
+## Sessions (any user can run any harness — no rebuild)
 
-A linux user account and an agent CLI are decoupled: each user runs one or
-more **sessions**, and each session is one agent (Claude Code or Codex) in
+A linux user account and a harness are decoupled: each user runs one or
+more **sessions**, and each session is one harness (Claude Code or Codex) in
 its own tmux session, all supervised by that user's single hardened
-`agent-box-<name>.service`. All supported agent CLIs are installed
-regardless of what any session runs (`installAgents`). The pseudo-agent
+`agent-box-<name>.service`. Which harnesses the box installs is
+`installAgents` (default: all supported), and it is independent of what
+any session actually runs. The pseudo-harness
 `shell` runs the user's login shell instead — a supervised plain terminal
 for manual investigation or clean-up that respawns on exit and gets a
 terminal tab in the web workspace like any other session.
@@ -385,7 +386,7 @@ agent-box-session peers                     # the OTHER live sessions: where eac
 agent-box-session add --agent codex         # auto-named "codex" (or "codex-XXXX")
 agent-box-session add review --agent codex  # or name it yourself; starts within ~2s
 agent-box-session add scratch --cwd ~/proj -- --model opus
-agent-box-session add tidy --agent shell    # plain login shell, no agent
+agent-box-session add tidy --agent shell    # plain login shell, the pseudo-harness
 agent-box-session restart review
 agent-box-session rm review                 # delist + kill
 ```
@@ -417,7 +418,7 @@ the settings list) within a second, without a reload.
 
 **Downloading a transcript.** Each session's row on the settings page carries
 a download button for that session's own conversation, as the JSONL file the
-agent CLI keeps under `$HOME` — for archiving a run, attaching it to a bug
+harness keeps under `$HOME` — for archiving a run, attaching it to a bug
 report, or reading it outside the box. It hands over the transcript the
 session is writing *now*: after `/clear`, that is the conversation on screen,
 not the one that was cleared away. A session with no transcript to point at
@@ -442,7 +443,7 @@ post-mortem shell open instead of being respawned over; delisted sessions
 stay gone.
 
 **Harness or agent profile?** `--agent` selects the **harness** — the CLI
-program (`claude`, `codex`, or the `shell` pseudo-agent). An **agent
+program (`claude`, `codex`, or the `shell` pseudo-harness). An **agent
 profile** is the *worker*: a harness plus the model, the effort level, an
 appended system prompt and the environment that tell two sessions on the
 same harness apart. Profiles are per-user runtime data too, in
@@ -672,24 +673,38 @@ sops-nix, etc.) use `environmentFiles` instead.
 
 ## Options
 
+**A note on `agent` in option names.** Three words are kept apart everywhere
+else in this README and in the CLIs: a **harness** is the CLI program
+(`claude`, `codex`, the `shell` pseudo-harness), an **agent profile** is a
+harness plus the model, effort, system prompt and env that make a *worker*,
+and an **agent** is the unprivileged user the box runs one of these as. The
+Nix options below predate that split and were not renamed, because renaming
+them breaks every existing host config. So read them with this mapping:
+`services.agent-box.agent`, `users.<name>.agent` and
+`users.<name>.sessions.<s>.agent` all name a **harness**, and `installAgents`
+is the set of **harnesses** to install. Everywhere a name says *agent* and
+means the user account — `environmentFiles`, `extraPackages`, `sudoAllowlist`
+— it is the user. No option names a profile: profiles are runtime data
+(`agent-box-profile`), never a rebuild.
+
 All under `services.agent-box`:
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `enable` | `false` | Turn the module on. |
-| `agent` | `"claude"` | Default agent CLI: `"claude"` or `"codex"`. |
+| `agent` | `"claude"` | Default **harness**: `"claude"` or `"codex"`. |
 | `package` | selected agent default | Override package to run for every agent user. |
-| `installAgents` | all supported | Agent CLIs installed on the box (independent of what sessions run). |
+| `installAgents` | all supported | Harnesses installed on the box (independent of what sessions run). |
 | `codexFullAccess` | `true` | Run codex with no approval prompts and no sandbox, box-wide, via `/etc/codex/config.toml`. The box is the sandbox. That file is codex's *system* config layer, so a user's own `~/.codex/config.toml` still overrides it — and it is the only path that reaches the app-server daemon behind a remote-controlled codex session. |
 | `remoteControlHost` | `fqdnOrHostName` | Host label for the `@<host>` suffix of auto-derived Remote Control names. Empty -> falls back to the public `web.domain`, then the live kernel hostname. The AWS image sets it to the box's public sslip.io host. |
 | `users.<name>.sessions.<s>.*` | `{}` | Seed sessions (first boot only): per session `agent`, `skipPermissions`, `remoteControl`, `remoteControlName`, `workingDirectory`, `extraArgs`. Empty = the legacy per-user options below seed a session named `main`. |
-| `users.<name>.agent` | `null` | Agent for the default `main` session; null uses `services.agent-box.agent`. |
-| `users.<name>.skipPermissions` | `true` | Pass the selected agent's autonomy flag. |
+| `users.<name>.agent` | `null` | Harness for the default `main` session; null uses `services.agent-box.agent`. |
+| `users.<name>.skipPermissions` | `true` | Pass the selected harness's autonomy flag. |
 | `users.<name>.remoteControl` | `true` | Make the session drivable from the agent's apps: claude gets `--remote-control`; codex runs the `codex remote-control` daemon instead of its TUI. |
 | `users.<name>.remoteControlName` | `<name>-main@<host>` | Claude Remote Control session name (null -> `<user>-<session>@<host>`, where `<host>` is `remoteControlHost`). Ignored for Codex (its daemon names itself from the hostname). |
-| `users.<name>.workingDirectory` | `/home/<name>` | Agent startup directory. |
+| `users.<name>.workingDirectory` | `/home/<name>` | Session startup directory. |
 | `users.<name>.extraGroups` | `[]` | Extra groups for the user. |
-| `users.<name>.extraArgs` | `[]` | Extra args appended to the selected agent CLI. |
+| `users.<name>.extraArgs` | `[]` | Extra args appended to the selected harness. |
 | `users.<name>.environmentFiles` | `[]` | Extra `EnvironmentFile` paths for this agent. |
 | `users.<name>.environment` | `{}` | Extra (non-secret) env vars for this agent's service. |
 | `sudoAllowlist` | `[]` | Passwordless sudo commands granted to every agent. |
@@ -704,7 +719,7 @@ All under `services.agent-box`:
 The module treats each agent as an untrusted process running inside its own
 unprivileged user account, on a machine the operator already treats as a
 sandbox host (VM, throwaway EC2 box, etc.). The OS layer is what contains a
-compromised agent - the agent CLI's in-tool approval prompts are *deliberately*
+compromised agent - the harness's in-tool approval prompts are *deliberately*
 off by default (`skipPermissions = true`), so nothing in the agent itself gates
 arbitrary command execution as the agent user.
 
@@ -782,7 +797,7 @@ arbitrary command execution as the agent user.
   contains the damage to what those credentials allow. Scope tokens to the
   repos and roles the agent actually needs, and size each key by what it
   could do in an attacker's hands.
-- **Agent autonomy flags** grant full autonomy inside the agent CLI. Prefer the
+- **Agent autonomy flags** grant full autonomy inside the harness. Prefer the
   VM target for anything you'd not lose sleep over an attacker doing as the
   agent user - a KVM guest is a
   much stronger blast-radius boundary than a container.
@@ -815,4 +830,4 @@ Maintainer and continuity notes live in the
 ## License
 
 MIT - see [LICENSE](./LICENSE). Note this license covers the flake/module only;
-agent CLIs ship under their own terms.
+the harnesses ship under their own terms.

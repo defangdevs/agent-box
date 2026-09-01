@@ -386,7 +386,7 @@ let
       not respawned - until `restart NAME` revives it; `rm` delists it for
       good. `restart --all` bounces every session. Listed sessions start
       within ~2s.
-    - Agent CLIs are usually installed ON DEMAND, not shipped with the box: the
+    - Harnesses are usually installed ON DEMAND, not shipped with the box: the
       first session that names a harness fetches it into your own profile, which
       takes as long as the download does and prints `session: fetching '<name>'`
       while it runs. So `command -v codex` can come back empty on a box that is
@@ -435,7 +435,7 @@ let
     command; other CLIs name it differently, so type `/` in the TUI to list the
     commands, or read `--help` for a start-time flag (Claude Code: `-n, --name`).
 
-    The name belongs to the agent CLI, not to agent-box, so a respawn loses it:
+    The name belongs to the harness, not to agent-box, so a respawn loses it:
     set it again, or make it permanent at creation with
     `agent-box-session add work --agent claude -- -n "claude: PR 42"`.
 
@@ -12153,9 +12153,10 @@ SESSIONS_SECTION_TPL = """<section>
       <h2>Sessions</h2>
       <button type="button" class="btn" data-toggle="session-editor">Add session</button>
     </div>
-    <p class="note">Each session is one agent CLI in its own terminal
-    tab. New sessions start within a few seconds &mdash; no rebuild,
-    no sudo. Click a session to open its terminal.</p>
+    <p class="note">Each session is one harness &mdash; the agent CLI
+    itself &mdash; in its own terminal tab. New sessions start within a
+    few seconds &mdash; no rebuild, no sudo. Click a session to open its
+    terminal.</p>
     <div id="session-editor" class="editor">
       <form method="post" action="{action_base}/sessions/add">
         <input type="hidden" name="back" value="settings">
