@@ -289,8 +289,8 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
 .tabs a.gear { text-decoration: none; }
 .tabs .hint svg, .tabs a.gear svg { width: 18px; height: 18px;
                                     display: block; }
-.tabs .hint:hover, .tabs .hint:focus-visible, .tabs a.gear:hover {
-  color: #e6edf3; }
+.tabs .hint:hover, .tabs .hint:focus-visible,
+.tabs a.gear:hover, .tabs a.gear:focus-visible { color: #e6edf3; }
 .ws .editor, .ws .msg { margin: 8px; flex: none; }
 .panes { position: relative; flex: 1; min-height: 0; }
 .pane { position: absolute; inset: 0; width: 100%; height: 100%;
