@@ -800,6 +800,32 @@ class RenderTest(unittest.TestCase):
             self.assertIn('helper = !', written)
             self.assertNotIn("stale", written)
 
+    def test_a_dangling_gitconfig_symlink_is_left_alone(self):
+        """`Path.exists()` follows a symlink and is False for a DANGLING
+        one — an administrator's own link to a not-yet-created target. That
+        must not read as empty ground: without a symlink-aware check the
+        foreign-file branch is skipped and the render replaces their link
+        with a plain file, exactly the failure `generated_by_us` (used for
+        every other rendered file) already refuses for a live symlink
+        (CodeRabbit review, PR #498).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            out.mkdir(parents=True)
+            conf = out / "etc/gitconfig"
+            conf.parent.mkdir(parents=True)
+            conf.symlink_to(out / "etc/gitconfig.d/nonexistent")
+            mod = load_agentbox()
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            tree = rend.render()
+            self.assertNotIn(str(conf), tree.files,
+                             "clobbered a dangling /etc/gitconfig symlink")
+            self.assertTrue(conf.is_symlink(), "the symlink was removed")
+            self.assertTrue(any("gitconfig" in n for n in rend.notes),
+                            "skipped the foreign symlink without saying so")
+
     def test_the_base_os_patches_itself_without_a_reboot(self):
         """The distro still owns its packages, but nobody here can answer
         the two questions an unattended patch run asks: may I restart this

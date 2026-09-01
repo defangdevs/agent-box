@@ -2438,7 +2438,7 @@ class Renderer:
         discarding whatever they put there.
         """
         path = self.p("/etc/gitconfig")
-        if path.exists() and not generated_by_us(path):
+        if (path.exists() or path.is_symlink()) and not generated_by_us(path):
             self.notes.append(
                 f"{path}: not written by agentbox — left alone; add a "
                 f"credential.helper for https://github.com and "
