@@ -151,6 +151,8 @@ def check_no_drift() -> int:
             f"FAIL: {COMPILED.relative_to(REPO)} does not match a fresh build of "
             f"{BICEP.relative_to(REPO)}.\n"
             "       Rebuild and commit both:\n"
+            "         nix run .#compile-azure-bicep\n"
+            "       or, without Nix:\n"
             "         cd azure && az bicep build --file agent-box.bicep",
             file=sys.stderr,
         )

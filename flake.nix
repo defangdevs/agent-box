@@ -265,6 +265,23 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               echo "wrote tests/golden from $out — review the diff and commit"
             ''}";
           };
+
+          # `nix run .#compile-azure-bicep` — regenerate the committed
+          # azure/agent-box.json from azure/agent-box.bicep. Run from the
+          # repo root; edits the working tree in place. Uses nixpkgs' own
+          # `bicep` rather than the CI-pinned `az bicep` (azure/.bicep-version):
+          # check_azure_template.py strips the version-derived `_generator`
+          # block before diffing, so any Bicep CLI produces an equivalent
+          # build and nothing outside the flake needs installing.
+          compile-azure-bicep = {
+            type = "app";
+            program = "${pkgs.writeShellScript "agent-box-compile-azure-bicep" ''
+              set -euo pipefail
+              ${pkgs.bicep}/bin/bicep build "$PWD/azure/agent-box.bicep" \
+                --outfile "$PWD/azure/agent-box.json"
+              echo "wrote azure/agent-box.json from azure/agent-box.bicep — review the diff and commit"
+            ''}";
+          };
         });
 
       # CI validation entrypoints (`nix build .#checks.<system>.<name>`).
