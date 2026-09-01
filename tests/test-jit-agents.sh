@@ -183,6 +183,37 @@ else
      "no symlink at ~/.codex/packages/standalone/current/codex"
 fi
 
+# --- the standalone mirror survives a pre-existing REAL directory ------
+# issue #95: a curl-installed Codex with an unusual manual layout can leave
+# `current` as a real directory instead of a symlink. `ln -sfn` cannot
+# unlink a non-empty directory, so the naive version of this silently
+# created `current/agent-box-current` INSIDE it and left the stale layout
+# in place. A fresh VM never has a pre-existing directory there, so this
+# case can only be caught here, not by the sessions VM test.
+setup codexmirror_realdir
+export AGENT_BOX_AGENT_BINS="shell=/bin/bash"
+mkdir -p "$HOME/.codex/packages/standalone/current"
+: > "$HOME/.codex/packages/standalone/current/stale-marker"
+agent_install codex >/dev/null 2>&1
+if [ -L "$HOME/.codex/packages/standalone/current" ]; then
+  ok "a pre-existing real 'current' directory is replaced with a symlink"
+else
+  no "a pre-existing real 'current' directory is replaced with a symlink" \
+     "current is still a real directory, not a symlink"
+fi
+if [ -x "$HOME/.codex/packages/standalone/current/codex" ]; then
+  ok "the replaced symlink resolves to the mirrored codex binary"
+else
+  no "the replaced symlink resolves to the mirrored codex binary" \
+     "no executable at current/codex"
+fi
+if [ -e "$HOME/.codex/packages/standalone/current/stale-marker" ]; then
+  no "the stale directory's contents are gone, not nested underneath" \
+     "stale-marker still resolves through current"
+else
+  ok "the stale directory's contents are gone, not nested underneath"
+fi
+
 # --- failure is rate-limited -------------------------------------------
 setup cooldown
 export NIX_FAIL=1

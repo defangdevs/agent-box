@@ -656,7 +656,34 @@ mirror_codex_standalone() {
   cbin="$(agent_bin codex)" || return 0
   mkdir -p "$HOME"/.codex/packages/standalone/agent-box-current
   ln -sfn "$cbin" "$HOME"/.codex/packages/standalone/agent-box-current/codex
-  ln -sfn agent-box-current "$HOME"/.codex/packages/standalone/current
+  # `ln -sfn` only replaces `current` when it is already a symlink or a
+  # plain file (issue #95). If a curl-installed Codex ever leaves `current`
+  # as a REAL directory — an unusual manual layout, but a possible one —
+  # `-sfn` can't unlink a non-empty directory, so it silently creates
+  # `current/agent-box-current` INSIDE it instead of replacing it, and
+  # remote-control pairing keeps resolving the stale copy underneath.
+  #
+  # Clear a real directory first (the `-L` check excludes a
+  # symlink-to-a-directory, which `-sfn` already replaces correctly, so
+  # this only ever fires on the broken layout). `rename()` cannot swap a
+  # symlink over a non-empty directory in one step, so this branch is not
+  # atomic: a session reading `current` between the `rm -rf` and the `mv`
+  # below sees it briefly missing. That is an acceptable one-time cost to
+  # repair the broken layout, and every run after this one takes the
+  # atomic path below, because `current` is a symlink from here on.
+  #
+  # Build the new symlink under a temp name in the same directory and
+  # rename it over `current` — `rename()` is atomic, so a session reading
+  # `current` mid-update here sees either the old or the new target, never
+  # a missing path (except immediately following the repair above).
+  _mcs_current="$HOME/.codex/packages/standalone/current"
+  if [ -d "$_mcs_current" ] && [ ! -L "$_mcs_current" ]; then
+    rm -rf "$_mcs_current"
+  fi
+  _mcs_tmp="$_mcs_current.tmp.$$"
+  rm -f "$_mcs_tmp"
+  ln -sfn agent-box-current "$_mcs_tmp"
+  mv -T "$_mcs_tmp" "$_mcs_current"
 }
 mirror_codex_standalone
 
