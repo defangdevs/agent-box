@@ -297,6 +297,9 @@ usage() {
   echo "--profile names an agent profile (agent-box-profile ls): a harness plus"
   echo "a model, an effort level, an appended system prompt and session env."
   echo "--agent and a '-- EXTRA_ARGS' tail override what the profile resolved."
+  echo '--cwd is where the session starts (default $HOME, shared by every'
+  echo "session). To work a repo another session is already in, give this one"
+  echo "a checkout of its own: git worktree add ~/worktrees/NAME -b BRANCH."
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
   echo "--ephemeral marks a ONE-SHOT session: parking it (a clean agent exit, or"

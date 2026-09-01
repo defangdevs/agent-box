@@ -646,6 +646,48 @@ class Renderer:
         """A path inside the render root (so --root DIR renders a tree)."""
         return self.root / Path(*parts).relative_to("/")
 
+    def load_contract(self, name):
+        """A binding contract manifest (issue #451, #154 Phase 5).
+
+        share/agent-box/contract/<name>.json is the SAME file
+        modules/agent-box.nix.in embeds via @@include + builtins.fromJSON
+        (nix/runtime.nix installs it verbatim, in the same build as this
+        script) — this is the native half of that single source. Unlike
+        profile_webhook_pin's tolerance for a pre-#425 profile with no
+        webhook payloads at all, a profile new enough to run THIS code
+        always ships its contracts alongside it, so a missing or invalid
+        manifest here is a packaging bug, not a feature being off — it
+        fails loudly rather than silently rendering an unconfigured unit.
+        """
+        path = self.share / "contract" / f"{name}.json"
+        with path.open(encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def contract_bin(self, entry):
+        """Resolve one manifest entry to this backend's bin path.
+
+        A manifest entry names a PROGRAM, never a path — every native
+        payload lives flat in the profile's bin/, so resolution is just
+        self.bin/<program>. An unknown kind is a hard error: the whole
+        point of #451 is that a binding gap fails the render loudly
+        instead of silently shipping an unconfigured unit.
+
+        "hook-spawn" is the one exception (issue #471 review): that
+        program needs the box's own hookSessionArgs config baked in, which
+        a flat self.bin/<program> lookup cannot carry on native (every
+        other profile binary is config-independent, built once and shared
+        by every box on the profile). The module's side of this same kind
+        has no equivalent gap — contractPrograms there points it straight
+        at webhookSpawn, which already bakes the same config in at Nix
+        eval time — so only this backend needs the special case.
+        """
+        if entry["kind"] == "hook-spawn":
+            return "/etc/agent-box/bin/agent-box-webhook-spawn"
+        if entry["kind"] != "bin":
+            raise ValueError(
+                f"agent-box: contract entry has unknown kind {entry['kind']!r}")
+        return f"{self.bin}/{entry['program']}"
+
     def render(self):
         t = Tree()
         self.dirs(t)
@@ -1938,31 +1980,31 @@ class Renderer:
                        f"ExecStart={self.bin}/agent-box-settings",
                    ]))
         if self.spec.webhook_enable:
+            # Env vars and Exec directives come from the shared binding
+            # contract (issue #451) instead of being hand-written here —
+            # modules/agent-box.nix.in's contractBin is the module's half
+            # of the same resolution. PATH stays hand-written: on native
+            # every payload lives flat in one profile bin dir, so it is
+            # simply that dir, not a name a contract entry could usefully
+            # carry (the module's PATH is a curated store-path list —
+            # legitimately different per backend).
+            contract = self.load_contract("agent-box-webhook")
             t.file(self.p("/etc/systemd/system",
                           f"agent-box-webhook@{u.name}.service.d",
                           "10-host.conf"),
                    dropin([
                        f'Environment="PATH={self.bin}"',
-                       # Through the generated wrapper, not the bare
-                       # profile binary — see AGENT_BOX_HOOK_SPAWN_CMD
-                       # above (issue #471 review).
-                       'Environment="LOCAL_WEBHOOK_SPAWN_CMD='
-                       '/etc/agent-box/bin/agent-box-webhook-spawn"',
-                       # webhook-spawn.sh names the tmux it starts a
-                       # session with. It falls back to PATH, which does
-                       # carry tmux here — but the module names it, and a
-                       # payload that reads a variable one backend sets and
-                       # the other leaves to PATH is exactly the drift the
-                       # per-unit half of check_backend_parity.py exists to
-                       # stop. Name it on both.
-                       f'Environment="AGENT_BOX_TMUX_BIN={self.bin}/tmux"',
+                   ] + [
+                       f'Environment="{e["name"]}={self.contract_bin(e)}"'
+                       for e in contract["env"]
+                   ] + [
                        "ExecStart=",
-                       f"ExecStart={self.bin}/agent-box-webhook-receiver",
+                       f"ExecStart={self.contract_bin(contract['execStart'][0])}",
                        # Ships in the profile as of issue #457 — until then
                        # this named a binary the profile never built, and the
                        # unit crash-looped on ExecStartPre 203/EXEC forever.
                        "ExecStartPre=",
-                       f"ExecStartPre={self.bin}/agent-box-webhook-policy-apply",
+                       f"ExecStartPre={self.contract_bin(contract['execStartPre'][0])}",
                    ]))
 
     def render_guide(self, text):

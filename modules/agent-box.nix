@@ -326,9 +326,13 @@ let
       exception is ~/sites, a symlink out to a caddy-readable dir (see "Serving
       a web app publicly").
     - $HOME is SHARED by every one of your tmux sessions (same user, all start
-      in $HOME). For parallel work in one repo use `git worktree` or separate
-      subdirectories, so concurrent sessions don't clobber each other. Once a
-      worktree's work is committed and pushed, remove it with
+      in $HOME unless `--cwd` sent them elsewhere), so two sessions in one clone
+      edit the same files. Give yours a checkout of its own: ~/worktrees is
+      shipped empty for exactly this, and `git worktree add ~/worktrees/NAME -b
+      BRANCH` (run from the clone, not from $HOME) is the whole move.
+      `ls ~/worktrees` then reads as the work in flight on this box.
+      For anything that is not a git repo, a subdirectory of your own does the
+      same job. Once a worktree's work is committed and pushed, remove it with
       `git worktree remove PATH` - a stale one left behind just clutters
       `git worktree list` and confuses whichever session finds it next.
     - A worktree, a branch or an issue somebody else is holding looks exactly
@@ -2594,6 +2598,9 @@ usage() {
   echo "--profile names an agent profile (agent-box-profile ls): a harness plus"
   echo "a model, an effort level, an appended system prompt and session env."
   echo "--agent and a '-- EXTRA_ARGS' tail override what the profile resolved."
+  echo '--cwd is where the session starts (default $HOME, shared by every'
+  echo "session). To work a repo another session is already in, give this one"
+  echo "a checkout of its own: git worktree add ~/worktrees/NAME -b BRANCH."
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
   echo "--ephemeral marks a ONE-SHOT session: parking it (a clean agent exit, or"
@@ -5740,6 +5747,59 @@ fi
 exit 0
   '');
 
+  # Binding contract (issue #451, #154 Phase 5): which env vars and Exec
+  # directives the agent-box-webhook@ unit gets is data, not a hand-written
+  # chain of lib.optionalAttrs — modules/src/contract/agent-box-webhook.json
+  # is the ONE file both this module and bin/agentbox's Renderer read (the
+  # native side installs it verbatim under share/agent-box/contract/, see
+  # nix/runtime.nix). Embedded like every other modules/src asset, so the
+  # generated module stays self-contained.
+  webhookContract = builtins.fromJSON ''
+{
+  "unit": "agent-box-webhook@",
+  "condition": "webhook",
+  "env": [
+    { "name": "LOCAL_WEBHOOK_SPAWN_CMD", "kind": "hook-spawn", "program": "agent-box-webhook-spawn" },
+    { "name": "AGENT_BOX_TMUX_BIN", "kind": "bin", "program": "tmux" }
+  ],
+  "execStartPre": [
+    { "kind": "bin", "program": "agent-box-webhook-policy-apply" }
+  ],
+  "execStart": [
+    { "kind": "bin", "program": "agent-box-webhook-receiver" }
+  ]
+}
+  '';
+  # A manifest entry only ever names a PROGRAM, never a store path (native's
+  # side of the same contract resolves every program to "${self.bin}/name").
+  # This is the module's half of that resolution: program name -> the
+  # derivation that provides it. Add an entry here, not a new hand-written
+  # environment/serviceConfig line, when a future contract references a new
+  # program.
+  contractPrograms = {
+    "agent-box-webhook-spawn" = webhookSpawn;
+    "agent-box-webhook-receiver" = webhookReceiverBin;
+    "agent-box-webhook-policy-apply" = webhookPolicyApply;
+    tmux = pkgs.tmux;
+  };
+  # Resolve one manifest entry to the value this backend binds it to. An
+  # unknown kind or program is a hard error at eval time (the whole point of
+  # #451: a binding gap becomes a build failure, not a silently-absent
+  # feature caught later by scripts/check_backend_parity.py).
+  # "hook-spawn" resolves exactly like "bin" here: webhookSpawn already
+  # bakes the box's own webhook.hookSessionArgs into itself at eval time
+  # (see its definition above), so the module has no equivalent to native's
+  # gap — a plain self.bin/<program> lookup that carries no such config
+  # (issue #471 review). The two kinds only need to differ on that backend.
+  contractBin = entry:
+    if entry.kind != "bin" && entry.kind != "hook-spawn" then
+      throw "agent-box: contract entry has unknown kind '${entry.kind}'"
+    else
+      let
+        drv = contractPrograms.${entry.program} or
+          (throw "agent-box: contract references unknown program '${entry.program}'");
+      in "${drv}/bin/${entry.program}";
+
   # One session = one agent CLI in one tmux session. These options are the
   # FIRST-BOOT SEED only (see users.<name>.sessions); at runtime the same
   # fields live as JSON in ~/.config/agent-box/sessions.json.
@@ -6396,6 +6456,19 @@ exit 0
     # "the file was empty when I looked" must not survive another writer's
     # decision (issue #289).
     registry_ensure "''${AGENT_BOX_SESSIONS_SEED:?}"
+
+    # Ship ~/worktrees, empty (issue #126). $HOME is shared by every session of
+    # this user, so two of them in one clone edit the same files, and the fix is
+    # a `git worktree` per session. The guide has said so for a while; what it
+    # could not say was WHERE, so each session invented a path (~/wt, ~/work,
+    # a sibling of the clone) and no session could read the others' at a glance.
+    # A directory that is already there is the cheap half of #126 — the auto-
+    # worktree the issue asks for still has to decide cleanup and collision.
+    #
+    # On every start, not just the first: an agent that removed it gets it back,
+    # and a home that predates this release gains it. Best effort — a mkdir that
+    # fails must never keep sessions from starting.
+    mkdir -p "$HOME"/worktrees 2>/dev/null || :
 
     seed_json() {
       # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
@@ -11992,8 +12065,8 @@ STYLE = """<style>
   .tabs a.gear { text-decoration: none; }
   .tabs .hint svg, .tabs a.gear svg { width: 18px; height: 18px;
                                       display: block; }
-  .tabs .hint:hover, .tabs .hint:focus-visible, .tabs a.gear:hover {
-    color: #e6edf3; }
+  .tabs .hint:hover, .tabs .hint:focus-visible,
+  .tabs a.gear:hover, .tabs a.gear:focus-visible { color: #e6edf3; }
   .ws .editor, .ws .msg { margin: 8px; flex: none; }
   .panes { position: relative; flex: 1; min-height: 0; }
   .pane { position: absolute; inset: 0; width: 100%; height: 100%;
@@ -15994,28 +16067,27 @@ if __name__ == "__main__":
         # The spawn wrapper (src/webhook-spawn.sh) runs as this unit's
         # child and resolves jq/coreutils/agent-box-session from this
         # PATH instead of baked store paths (issue #154, Phase 2).
-        environment = {
-          # Standing watches (deliver_to:"subagent", local-channels#1): a
-          # matching delivery spawns a fresh hook-* session for this user.
-          # webhook.py coalesces bursts and caps concurrent spawns; the
-          # wrapper additionally caps how many hook-* sessions may RUN.
-          # (RECEIVER_ONLY/STATE_DIR/PORT moved to the verbatim unit text
-          # and the per-user env file — issue #154 Phase 3.)
-          LOCAL_WEBHOOK_SPAWN_CMD = "${webhookSpawn}/bin/agent-box-webhook-spawn";
-          # The hook-session cap counts live tmux sessions, and tmux is
-          # deliberately not on this unit's PATH (below — the wrapper needs
-          # jq, coreutils and the session CLI, nothing else). So it gets a
-          # pinned binary instead of a wider PATH: the AGENT_BOX_*_BIN
-          # convention the supervisor uses for grep/find and the settings
-          # daemon for tmux. Without it the wrapper cannot tell a finished
-          # hook session from a running one and falls back to counting
-          # registry entries — the very over-counting of issue #280.
-          AGENT_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
+        #
+        # LOCAL_WEBHOOK_SPAWN_CMD and AGENT_BOX_TMUX_BIN come from the
+        # shared binding contract (webhookContract, issue #451) instead of
+        # being hand-written here — see the comment by contractBin above
+        # for what that buys. AGENT_BOX_TMUX_BIN specifically is a pinned
+        # binary rather than a wider PATH entry because the hook-session
+        # cap counts live tmux sessions and tmux is deliberately not on
+        # this unit's PATH; without it the wrapper falls back to counting
+        # registry entries, the over-counting of issue #280. PATH itself
+        # stays hand-written below: it is the one legitimately-different
+        # value in this unit, a curated store-path list here vs. a single
+        # profile bin dir natively, not a name a contract entry could
+        # usefully carry.
+        environment = (lib.listToAttrs (map
+          (e: lib.nameValuePair e.name (contractBin e))
+          webhookContract.env)) // {
           PATH = lib.mkForce (lib.makeBinPath [ pkgs.jq pkgs.coreutils sessionCli ]);
         };
         serviceConfig = {
-          ExecStartPre = [ "" "${webhookPolicyApply}/bin/agent-box-webhook-policy-apply" ];
-          ExecStart = [ "" "${webhookReceiverBin}/bin/agent-box-webhook-receiver" ];
+          ExecStartPre = [ "" (contractBin (lib.elemAt webhookContract.execStartPre 0)) ];
+          ExecStart = [ "" (contractBin (lib.elemAt webhookContract.execStart 0)) ];
         };
       }) terminalUsers));
       # No systemd.sockets overrides: the settings daemon's listening

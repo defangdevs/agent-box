@@ -313,9 +313,13 @@ let
   assets = pkgs.runCommand "agent-box-assets" { } ''
     install -d $out/share/agent-box/units $out/share/agent-box/caddy \
                $out/share/agent-box/guides $out/share/agent-box/web \
-               $out/libexec/agent-box
+               $out/share/agent-box/contract $out/libexec/agent-box
     for u in ${src}/units/*; do install -m444 "$u" $out/share/agent-box/units/; done
     for c in ${src}/caddyfile-*.caddy; do install -m444 "$c" $out/share/agent-box/caddy/; done
+    # The binding contract (issue #451): the SAME manifest the module
+    # embeds via @@include + builtins.fromJSON, installed verbatim so
+    # bin/agentbox's Renderer reads the identical bytes at render time.
+    for j in ${src}/contract/*.json; do install -m444 "$j" $out/share/agent-box/contract/; done
     install -m444 ${src}/default-agents.md ${src}/default-agents-webhook.md \
       ${src}/default-agents-host-native.md \
       $out/share/agent-box/guides/

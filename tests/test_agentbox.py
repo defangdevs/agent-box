@@ -135,6 +135,9 @@ def build_fake_profile(root):
     for g in ("default-agents.md", "default-agents-webhook.md",
               "default-agents-host-native.md"):
         shutil.copy(SRC / g, share / "guides" / g)
+    (share / "contract").mkdir()
+    for j in (SRC / "contract").glob("*.json"):
+        shutil.copy(j, share / "contract" / j.name)
     # The pinned local-webhook the profile ships (issue #425), and the pin it
     # came from. A box needs no webhook config because these are here — so a
     # fake profile without them would test the pre-#425 world.
