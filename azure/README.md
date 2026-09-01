@@ -207,7 +207,8 @@ a follow-up, not a limitation of the template.
 ## Updating the template
 
 1. Edit `agent-box.bicep`.
-2. Recompile: `cd azure && az bicep build --file agent-box.bicep`.
+2. Recompile: `nix run .#compile-azure-bicep` (from the repo root), or
+   `cd azure && az bicep build --file agent-box.bicep` if you don't have Nix.
 3. `python3 scripts/check_azure_template.py` — recompiles and diffs, renders
    the bootstrap and parses it under `bash -n`, and checks the password stays
    in `protectedSettings`. This is what `azure-ci.yml` runs.
