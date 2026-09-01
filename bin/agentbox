@@ -1973,7 +1973,7 @@ class Renderer:
                        # else to reach a real invocation from on native —
                        # the module instead bakes it into webhookSpawn
                        # itself at Nix eval time.
-                       f'Environment="AGENT_BOX_HOOK_SPAWN_CMD='
+                       'Environment="AGENT_BOX_HOOK_SPAWN_CMD='
                        '/etc/agent-box/bin/agent-box-webhook-spawn"',
                    ] if self.spec.webhook_enable else []) + [
                        "ExecStart=",
