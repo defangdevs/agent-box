@@ -1316,6 +1316,78 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # Eval regression for selfUpdate.checkout's two assertions
+          # (issue #242, PR #478 review). Both guard a value whose only
+          # other feedback is a background job failing with EROFS in a
+          # journal nobody reads, so what matters is that the REFUSAL
+          # happens at eval — and `..`, `.` and the empty component are
+          # exactly the inputs a first pass at "must be relative" lets
+          # through.
+          #
+          # It reads config.assertions rather than forcing toplevel:
+          # inspecting the list is what says WHICH assertion fired, where
+          # a failed build would only say that something did.
+          checkout-options =
+            let
+              evalWith = extra: (nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: {
+                    imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ];
+                  })
+                  {
+                    services.agent-box = nixpkgs.lib.recursiveUpdate {
+                      enable = true;
+                      users.agent = { };
+                      selfUpdate = {
+                        enable = true;
+                        rev = "0000000000000000000000000000000000000000";
+                      };
+                    } extra;
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              }).config.assertions;
+              failed = extra:
+                builtins.filter (a: !a.assertion) (evalWith extra);
+              # Does SOME assertion fire, and does its message name the
+              # option under test? Keyed on the option path, so a config
+              # rejected for an unrelated reason cannot pass for a hit.
+              rejects = option: extra:
+                builtins.any
+                  (a: nixpkgs.lib.hasInfix option a.message)
+                  (failed extra);
+              path = p: { selfUpdate.checkout.path = p; };
+              cases =
+                # Accepted: a plain name and a subdirectory.
+                map (p: { label = "accepts ${p}"; ok = !(rejects "checkout.path" (path p)); })
+                  [ "agent-box" "src/agent-box" ]
+                # Refused: every way out of /home/<maintainer>.
+                ++ map (p: { label = "refuses ${builtins.toJSON p}"; ok = rejects "checkout.path" (path p); })
+                  [ "/srv/agent-box" "../agent-box" "src/../../agent-box" "." "" "a//b" "agent-box/" ]
+                ++ [
+                  { label = "accepts a maintainer that exists";
+                    ok = !(rejects "checkout.maintainer"
+                      { selfUpdate.checkout.maintainer = "agent"; }); }
+                  { label = "refuses a maintainer that does not";
+                    ok = rejects "checkout.maintainer"
+                      { selfUpdate.checkout.maintainer = "nobody"; }; }
+                  { label = "accepts a null maintainer";
+                    ok = !(rejects "checkout.maintainer"
+                      { selfUpdate.checkout.maintainer = null; }); }
+                ];
+              bad = builtins.filter (c: !c.ok) cases;
+            in
+            assert bad == [ ] || throw ("agent-box: checkout option assertions "
+              + "did not behave as expected: "
+              + builtins.concatStringsSep ", " (map (c: c.label) bad));
+            pkgs.runCommand "agent-box-checkout-options-ok" { } ''
+              printf '%s\n' ${nixpkgs.lib.escapeShellArg
+                (builtins.concatStringsSep "\n" (map (c: "ok   " + c.label) cases))} \
+                | tee "$out"
+            '';
+
           # Unit test for the shipped source checkout (issue #242). Its
           # dangerous branches are the ones that do NOTHING: this runs
           # unattended at every supervisor start, in a tree sibling

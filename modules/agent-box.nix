@@ -8508,13 +8508,14 @@ in
         path = lib.mkOption {
           type = lib.types.str;
           default = "agent-box";
-          example = "/srv/agent-box";
+          example = "src/agent-box";
           description = ''
             Where the checkout lands, relative to the maintainer's home —
             the default is ~/agent-box, and a subdirectory ("src/agent-box")
             works too.
 
-            Relative only, and asserted: the agent unit runs
+            Strictly inside that home, and asserted: no leading "/", no ".."
+            or "." component, and no empty one. The agent unit runs
             ProtectSystem=strict with ReadWritePaths=/home/%i, so a tree
             outside the home is denied with EROFS, and naming it in
             ReadWritePaths instead fails the whole namespace with
@@ -8923,12 +8924,42 @@ in
 
   config = lib.mkIf cfg.enable (lib.mkMerge [{
     assertions = [{
-      assertion = !(lib.hasPrefix "/" cfg.selfUpdate.checkout.path);
+      # checkout.path is joined onto /home/<maintainer>, and the agent unit
+      # grants ReadWritePaths=/home/%i and nothing else. So every way of
+      # leaving that directory is refused HERE, at eval — not as EROFS
+      # inside a background job's journal, which is where the first version
+      # of this assertion left "../agent-box" to be discovered. An empty or
+      # "." component is refused for a different reason: it resolves to the
+      # home ITSELF, and a clone straight into $HOME is not something to
+      # find out about afterwards.
+      assertion =
+        let
+          path = cfg.selfUpdate.checkout.path;
+        in
+        !(lib.hasPrefix "/" path)
+        && lib.all (part: part != "" && part != "." && part != "..")
+          (lib.splitString "/" path);
       message =
-        "services.agent-box.selfUpdate.checkout.path is relative to the "
-        + "maintainer's home and must not start with '/': the agent unit's "
-        + "ProtectSystem=strict would deny a checkout outside /home with "
-        + "EROFS. Got \"" + cfg.selfUpdate.checkout.path + "\".";
+        "services.agent-box.selfUpdate.checkout.path must stay inside the "
+        + "maintainer's home: no leading '/', no '..' or '.' component and "
+        + "no empty one. The agent unit's ProtectSystem=strict grants "
+        + "/home/<maintainer> and nothing else, so anything else is denied "
+        + "with EROFS at the first clone. Got \""
+        + cfg.selfUpdate.checkout.path + "\".";
+    } {
+      # A maintainer nobody defined is worse than an error: checkoutEnabled
+      # goes true, checkoutDir names /home/<nobody>/..., and then no
+      # agent-box@<user> unit matches it — so the variables are never
+      # supplied, nothing is ever cloned, and the box looks like a box whose
+      # checkout simply failed.
+      assertion = cfg.selfUpdate.checkout.maintainer == null
+        || cfg.users ? ${cfg.selfUpdate.checkout.maintainer};
+      message =
+        "services.agent-box.selfUpdate.checkout.maintainer = "
+        + "\"" + (toString cfg.selfUpdate.checkout.maintainer) + "\" but "
+        + "that user isn't defined in services.agent-box.users, so no "
+        + "agent-box@<user> unit would carry the checkout and none would "
+        + "ever be created.";
     } {
       assertion = cfg.users != { };
       message = "services.agent-box.enable is true but no users are defined in services.agent-box.users.";
