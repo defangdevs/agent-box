@@ -1267,6 +1267,7 @@
     )
 
     # --- issue #321, last step: the WATCH names its own profile -------------
+    dispatch_file = "/home/agent/.local/state/local-webhook/filter.dispatch.json"
     # AGENT_BOX_HOOK_PROFILE above is box-wide: every dispatched session on the
     # box gets one worker. What it cannot say is "cheap triage for new issues,
     # something that can actually fix things for a red build" — two watches on
@@ -1399,6 +1400,34 @@
         f" {spawn_cmd} --preamble github:defangdevs/no-watch-profile"
     )
     assert "agent profile boxwide" in launch, launch
+
+    # Both guards again, this time through the path --preamble actually uses
+    # in production: the DISPATCH FILE. Nothing sets LOCAL_WEBHOOK_SPAWN_CONFIG
+    # for the settings page — it names a topic and the script goes and reads
+    # the watch — so a regression that stringified a numeric profile only in
+    # the file branch would sail past the two assertions above. The file is
+    # documented as hand-editable, so these are values a box can really hold.
+    machine.succeed(f"cp {dispatch_file} /tmp/dispatch.bak")
+    machine.succeed(
+        "jq '.topics += ["
+        " {topic: \"github:defangdevs/numeric-profile\", ttlHours: 0,"
+        "  include: {path: \"event\", in: [\"issues\"]},"
+        "  spawnConfig: {profile: 5}},"
+        " {topic: \"github:defangdevs/ghost-watch\", ttlHours: 0,"
+        "  include: {path: \"event\", in: [\"issues\"]},"
+        "  spawnConfig: {profile: \"ghost\"}}]'"
+        f" {dispatch_file} > /tmp/hand-edited.json"
+    )
+    machine.succeed(f"sudo -u agent cp /tmp/hand-edited.json {dispatch_file}")
+    for topic in ("numeric-profile", "ghost-watch"):
+        launch = machine.succeed(
+            "sudo -u agent env HOME=/home/agent"
+            " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+            f" {spawn_cmd} --preamble github:defangdevs/{topic}"
+        )
+        assert "agent profile boxwide" in launch, (topic, launch)
+        assert "agent profile 5" not in launch, (topic, launch)
+    machine.succeed(f"sudo -u agent cp /tmp/dispatch.bak {dispatch_file}")
 
     # --profile= (empty) clears it on a re-subscribe; two adjacent single
     # quotes cannot be written in this Nix string, hence the = form.
