@@ -1376,6 +1376,30 @@
     )
     assert "agent profile boxwide" in launch, launch
 
+    # An unusable WATCH profile must not cost the box-wide one. It used to:
+    # the watch's name displaced the box-wide one BEFORE validation, so one
+    # typo in one watch's --profile downgraded every event it matched from the
+    # operator's chosen worker to the raw box default.
+    launch = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_CONFIG='{\"profile\": \"ghost\"}'"
+        f" {spawn_cmd} --preamble github:defangdevs/no-watch-profile"
+    )
+    assert "agent profile boxwide" in launch, launch
+    assert "IGNORED, no such profile" not in launch, launch
+    # A non-string value is ignored rather than stringified into a name.
+    # webhook.py drops one when it reads the filter file, so no delivery
+    # carries it — but that file is documented as hand-editable, and
+    # --preamble reads it directly.
+    launch = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_CONFIG='{\"profile\": 5}'"
+        f" {spawn_cmd} --preamble github:defangdevs/no-watch-profile"
+    )
+    assert "agent profile boxwide" in launch, launch
+
     # --profile= (empty) clears it on a re-subscribe; two adjacent single
     # quotes cannot be written in this Nix string, hence the = form.
     machine.succeed(
@@ -1827,8 +1851,27 @@
         " LOCAL_WEBHOOK_SESSION=agent-main"
         " agent-box-webhook subscribe defangdevs/panel --note 'shown in the UI' --ttl 8"
     )
+    # A standing watch with its own --profile, rendered by the DAEMON. The
+    # panel prints the spawn wrapper's --preamble, and that lookup reads the
+    # dispatch file with jq — which the settings unit's forced PATH does not
+    # carry (it is the daemon, coreutils, findutils, gnugrep, gnused, systemd).
+    # jq is pinned as AGENT_BOX_JQ_BIN for exactly this: every jq use in that
+    # script is guarded, so an unfound binary is silent, and the panel would
+    # name the box-wide worker for a watch that overrides it.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-profile set panelbot HARNESS=codex MODEL=gpt-5.6"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/panel-profile"
+        " --deliver-to subagent --profile panelbot"
+    )
     page = machine.succeed(f"{settings_curl} {settings_page}")
     for want in [
+        "agent profile panelbot",      # the watch's own worker, via jq
         "github:defangdevs/panel",     # this session's own subscription...
         "shown in the UI",             # ...and the note saying why it exists
         'data-fold="subs-main"',       # folded under the session it delivers to
