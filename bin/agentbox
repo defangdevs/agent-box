@@ -758,6 +758,7 @@ class Renderer:
         self.sudoers(t)
         self.tmpfiles(t)
         self.target_wants(t)
+        self.tmux(t)
         self.interactive_clis(t)
         self.agent_defaults(t)
         if self.spec.protect_memory:
@@ -2387,6 +2388,19 @@ class Renderer:
             lines.append("d /run/agent-box-webhook 0755 root root - -")
         t.file(self.p("/etc/tmpfiles.d/agent-box.conf"),
                "\n".join(lines) + "\n")
+
+    def tmux(self, t):
+        """System-wide /etc/tmux.conf: `set -g mouse on` (issue #495).
+
+        Without it, a mouse wheel scroll is forwarded to the foreground
+        program as arrow-key presses instead of scrolling tmux's own pane
+        history — tmux's default fallback for apps that don't handle the
+        mouse themselves. The module got this in #265 via NixOS's
+        `programs.tmux`, which renders the same file; the native renderer
+        never grew the equivalent, so every native box (e.g. Lightsail)
+        still had the bug.
+        """
+        t.file(self.p("/etc/tmux.conf"), GENERATED_HEADER + "set -g mouse on\n")
 
     def interactive_clis(self, t):
         """agent-box-session and agent-box-profile, on every box.
