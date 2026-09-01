@@ -26,7 +26,7 @@ usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
                                          [--deliver-to session|subagent]
                                          [--renew-on-event] [--ignore-sender LOGIN]...
                                          [--when JSON] [--drop JSON]
-                                         [--claim SPEC]...
+                                         [--claim SPEC]... [--profile NAME]
        agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent]
        agent-box-webhook ls
        agent-box-webhook status
@@ -130,6 +130,22 @@ reports through commit statuses, you stay exposed on that one shape.
 
 --claim and --include are mutually exclusive; write --include yourself
 only for rules --claim cannot express.
+
+--profile NAME (subagent watches only) names the agent profile the sessions
+THIS watch spawns start on — a harness, a model, an effort level, an appended
+system prompt (agent-box-profile ls). It beats the box-wide
+AGENT_BOX_HOOK_PROFILE, so one repo can triage new issues cheaply and put
+something stronger on a red build:
+
+    agent-box-webhook subscribe OWNER/REPO --deliver-to subagent \
+      --when '{"any":[{"path":"action","in":["opened"]}]}' \
+      --profile cheap-triage --note "standing watch: new issues"
+
+It is stored on the subscription as spawnConfig.profile (webhook.py's
+--spawn-config), so `agent-box-webhook ls` shows it. --profile '' clears it.
+A profile that does not exist when an event arrives is reported and ignored,
+and the session starts on the box default — a delivery is never dropped for
+a renamed profile.
 
 --when / --drop attach payload rules to the subscription: deliver (or
 spawn) ONLY events matching --when, never those matching --drop. Rules are
@@ -479,7 +495,7 @@ case "$cmd" in
     ensure_state
     if [ "${1:-}" != "-h" ] && [ "${1:-}" != "--help" ]; then
       deliver_to=session; have_when=0; have_drop=0; topic=""; want=""
-      have_include=0; claims=""
+      have_include=0; claims=""; profile=""; have_profile=0
       # Filter --claim out of the argument list as we scan it: webhook.py has
       # never heard of that flag, so it is translated to --include below and
       # must not survive into the exec. Rotate idiom — take from the front,
@@ -504,6 +520,7 @@ case "$cmd" in
                 exit 2
               fi
               claims="$claims $a"; want=""; continue ;;
+            (profile) profile="$a"; have_profile=1; want=""; continue ;;
           esac
           want=""
           set -- "$@" "$a"; continue
@@ -521,6 +538,13 @@ case "$cmd" in
               exit 2
             fi
             claims="$claims ${a#--claim=}"; continue ;;
+          # Filtered out like --claim, and for the same reason: webhook.py
+          # spells this --spawn-config profile=NAME, and the agent-box word for
+          # the thing is "profile" (issue #321). Empty is legal — it clears the
+          # profile on a re-subscribe — so, unlike --claim, only the missing
+          # VALUE is an error.
+          --profile) want=profile; continue ;;
+          --profile=*) profile="${a#--profile=}"; have_profile=1; continue ;;
           --*) ;;
           *) [ -n "$topic" ] || topic="$a" ;;
         esac
@@ -529,6 +553,35 @@ case "$cmd" in
       if [ -n "$want" ]; then
         echo "agent-box-webhook: --$want needs a value" >&2
         exit 2
+      fi
+      if [ "$have_profile" = 1 ]; then
+        # A session subscription spawns nothing, so a profile on one would be a
+        # setting no code path reads. webhook.py refuses it too; saying it here
+        # names the flag the caller actually typed.
+        if [ "$deliver_to" != subagent ]; then
+          echo "agent-box-webhook: --profile only applies to a standing watch —" \
+               "it names the worker a spawned session starts on, and a session" \
+               "subscription spawns nothing; add --deliver-to subagent" >&2
+          exit 2
+        fi
+        case "$profile" in
+          ("") set -- "$@" --no-spawn-config ;;
+          (*[!A-Za-z0-9_-]*)
+            echo "agent-box-webhook: --profile '$profile' is not a valid profile" \
+                 "name (A-Za-z0-9_-)" >&2
+            exit 2 ;;
+          (*)
+            # A warning, never a refusal: profiles are runtime data, and
+            # subscribing a watch before creating its profile is a legitimate
+            # order to do things in. The spawn falls back to the box default
+            # and says so if the profile is still missing when an event lands.
+            if [ ! -r "$HOME/.config/agent-box/profiles/$profile.env" ]; then
+              echo "agent-box-webhook: no profile '$profile' on this box yet" \
+                   "(agent-box-profile ls) — subscribing anyway; a match starts" \
+                   "the box default until you create it" >&2
+            fi
+            set -- "$@" --spawn-config "profile=$profile" ;;
+        esac
       fi
       if [ -n "$claims" ]; then
         if [ "$have_include" = 1 ]; then

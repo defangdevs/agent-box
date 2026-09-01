@@ -181,14 +181,52 @@ fi
 # source of "".
 [ -z "$hook_profile" ] || [ -n "$hook_profile_source" ] \
   || hook_profile_source="the AGENT_BOX_HOOK_PROFILE environment variable"
+
+# The WATCH's own answer, which beats both box-wide settings above — the last
+# step of issue #321. AGENT_BOX_HOOK_PROFILE names ONE worker for every
+# dispatched session on the box; a watch carrying spawnConfig.profile is naming
+# the worker for its own events only, and the narrower answer is the one whoever
+# wrote it meant. That is what lets cheap triage handle new issues while a red
+# build starts something that can actually fix it.
+#
+# It arrives in LOCAL_WEBHOOK_SPAWN_CONFIG (local-channels 0.25.0), the one
+# variable the dispatcher fills from the matched subscription rather than from
+# the event. Older receivers set nothing, and an entry with no config sets `{}`,
+# so both read as "no watch-level answer" and the box-wide setting stands.
+#
+# --preamble has no delivery and so no variable: the settings page asks what a
+# named TOPIC would start, so that mode reads the watch straight out of the
+# dispatch file. Same precedence either way, because the page must not advertise
+# a worker the spawn would not use.
+watch_config=""
+if [ -n "${LOCAL_WEBHOOK_SPAWN_CONFIG:-}" ]; then
+  watch_config="$LOCAL_WEBHOOK_SPAWN_CONFIG"
+elif [ "${1:-}" = "--preamble" ] && [ -n "${2:-}" ] && [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ]; then
+  # Best effort, like every other read here: no file, bad JSON or no such topic
+  # all mean "this watch names no profile", never a failed render.
+  watch_config=$("$JQ" -r --arg t "$2" \
+    '[(.topics // [])[] | select(type == "object" and (.topic // "") == $t)][0]
+     | (if type == "object" then (.spawnConfig // {}) else {} end) | tojson' \
+    "$LOCAL_WEBHOOK_STATE_DIR/filter.dispatch.json" 2>/dev/null) || watch_config=""
+fi
+if [ -n "$watch_config" ]; then
+  watch_profile=$("$JQ" -r 'if type == "object" then (.profile // empty) else empty end' \
+    <<<"$watch_config" 2>/dev/null) || watch_profile=""
+  if [ -n "$watch_profile" ]; then
+    hook_profile="$watch_profile"
+    hook_profile_source="this watch's own spawnConfig.profile"
+  fi
+fi
+
 if [ -n "$hook_profile" ]; then
   # Checked HERE, not left to `agent-box-session add --profile`, which exits 2
   # on an unknown profile: that exit would drop the batch, and the events do
   # not come back. Name charset first (it reaches a file path), then the file.
   case "$hook_profile" in
     (*[!A-Za-z0-9_-]*)
-      echo "agent-box-webhook-spawn: AGENT_BOX_HOOK_PROFILE '$hook_profile' is not a" \
-           "valid profile name; starting this session on the box default" >&2
+      echo "agent-box-webhook-spawn: profile '$hook_profile' (from" \
+           "$hook_profile_source) is not a valid profile name; starting this" \
+           "session on the box default" >&2
       hook_profile_source="$hook_profile_source — IGNORED, not a valid profile name"
       hook_profile=""
       ;;
@@ -265,7 +303,8 @@ environment come from that profile ($hook_profile_source) — read it back with 
     printf '%s\n' "No agent profile is set, so a match starts the box default \
 harness. Pick a worker for every LATER hook session with: agent-box-profile \
 set triage HARNESS=claude MODEL=sonnet EFFORT=low && agent-box-session env set \
-AGENT_BOX_HOOK_PROFILE triage"
+AGENT_BOX_HOOK_PROFILE triage — or for THIS watch alone, re-subscribe it with \
+'agent-box-webhook subscribe TOPIC --deliver-to subagent --profile triage'."
   fi
   if [ -n "$hook_args_source" ]; then
     printf 'The arguments after the agent come from %s.\n' "$hook_args_source"

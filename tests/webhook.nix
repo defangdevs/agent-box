@@ -1265,6 +1265,162 @@
     machine.succeed(
         f"sudo -u agent env HOME=/home/agent agent-box-session rm {ghosted}"
     )
+
+    # --- issue #321, last step: the WATCH names its own profile -------------
+    # AGENT_BOX_HOOK_PROFILE above is box-wide: every dispatched session on the
+    # box gets one worker. What it cannot say is "cheap triage for new issues,
+    # something that can actually fix things for a red build" — two watches on
+    # one repo reached the spawn wrapper as the same six strings, all of them
+    # about the EVENT. local-webhook 0.25.0 adds the seventh, about the WATCH.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-profile set boxwide HARNESS=claude MODEL=sonnet"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-profile set watchbot HARNESS=codex MODEL=gpt-5.6 EFFORT=low"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " agent-box-session env set AGENT_BOX_HOOK_PROFILE boxwide"
+    )
+    # --profile is agent-box's word for it; webhook.py stores it as
+    # spawnConfig.profile, so the CLI translates rather than teaching the bus a
+    # new concept.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/watch-profile"
+        " --deliver-to subagent --profile watchbot"
+        " --note 'standing watch: its own worker'"
+    )
+    machine.succeed(
+        "jq -e '[.topics[] | select(.topic =="
+        " \"github:defangdevs/watch-profile\")][0].spawnConfig.profile"
+        " == \"watchbot\"'"
+        " /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+    # ...and it comes back out of the listing, where an operator looks.
+    listing = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main agent-box-webhook ls"
+    )
+    assert "watchbot" in listing, listing
+
+    # The watch beats the box-wide setting: both are in force here, and the
+    # session starts on the WATCH's harness.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github"
+        " LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/watch-profile"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC=github:defangdevs/watch-profile"
+        " LOCAL_WEBHOOK_SPAWN_CONFIG='{\"profile\": \"watchbot\"}'"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    per_watch = machine.succeed(
+        "jq -r '.sessions | keys[]"
+        " | select(startswith(\"hook-defangdevs-watch-profile-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        f"jq -e '.sessions[\"{per_watch}\"].profile == \"watchbot\""
+        f" and .sessions[\"{per_watch}\"].agent == \"codex\"'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {per_watch}"
+    )
+    # An entry that names no profile leaves the box-wide setting standing, so
+    # the new field never quietly disables the old one.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github"
+        " LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/no-watch-profile"
+        " LOCAL_WEBHOOK_SPAWN_TOPIC=github:defangdevs/no-watch-profile"
+        " LOCAL_WEBHOOK_SPAWN_CONFIG={}"
+        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
+    )
+    fellback = machine.succeed(
+        "jq -r '.sessions | keys[]"
+        " | select(startswith(\"hook-defangdevs-no-watch-profile-\"))'"
+        " /home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.succeed(
+        f"jq -e '.sessions[\"{fellback}\"].profile == \"boxwide\"'"
+        " /home/agent/.config/agent-box/sessions.json"
+    )
+    machine.succeed(
+        f"sudo -u agent env HOME=/home/agent agent-box-session rm {fellback}"
+    )
+
+    # --preamble has no delivery, so it reads the watch out of the dispatch
+    # file. The settings page prints exactly this, and a page naming the
+    # box-wide worker for a watch that overrides it would be a lie the operator
+    # only finds out about from a session that already started (#292).
+    launch = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        f" {spawn_cmd} --preamble github:defangdevs/watch-profile"
+    )
+    assert "agent profile watchbot" in launch, launch
+    assert "spawnConfig.profile" in launch, launch
+    # A topic with no watch-level profile still reports the box-wide one.
+    launch = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        f" {spawn_cmd} --preamble github:defangdevs/no-watch-profile"
+    )
+    assert "agent profile boxwide" in launch, launch
+
+    # --profile= (empty) clears it on a re-subscribe; two adjacent single
+    # quotes cannot be written in this Nix string, hence the = form.
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/watch-profile"
+        " --deliver-to subagent --profile="
+    )
+    machine.succeed(
+        "jq -e '[.topics[] | select(.topic =="
+        " \"github:defangdevs/watch-profile\")][0] | has(\"spawnConfig\") | not'"
+        " /home/agent/.local/state/local-webhook/filter.dispatch.json"
+    )
+
+    # Refused where it would do nothing: a session subscription spawns no
+    # session, so a profile on one is a setting nothing reads.
+    machine.fail(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/watch-profile --profile watchbot"
+    )
+    # ...and a name that could escape into a file path is refused outright,
+    # unlike a merely-absent profile, which is a warning.
+    machine.fail(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook subscribe defangdevs/watch-profile"
+        " --deliver-to subagent --profile ../escape"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SESSION=agent-main"
+        " agent-box-webhook unsubscribe defangdevs/watch-profile"
+        " --deliver-to subagent"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent agent-box-profile rm watchbot"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent agent-box-profile rm boxwide"
+    )
     machine.succeed(
         "sudo -u agent env HOME=/home/agent"
         " agent-box-session env rm AGENT_BOX_HOOK_PROFILE"

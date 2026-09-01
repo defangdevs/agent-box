@@ -482,6 +482,19 @@ the spawn wrapper's own `--preamble`, so there is one copy of the answer). A
 renamed or deleted profile is reported and ignored — a delivery is never
 dropped over it.
 
+That setting is box-wide. A single watch names its own worker, which beats it:
+
+```bash
+agent-box-webhook subscribe OWNER/REPO --deliver-to subagent \
+  --when '{"any":[{"path":"action","in":["opened"]}]}' \
+  --profile cheap-triage --note "standing watch: new issues"
+```
+
+So one repo can triage new issues cheaply and put something stronger on a red
+build. The choice is stored on the subscription itself (`spawnConfig.profile`,
+local-webhook 0.25.0) and shown by `agent-box-webhook ls`; `--profile ''`
+clears it.
+
 **New user or new session?** A user is the trust boundary; a session is a
 unit of work, and sessions of one user are *not* isolated from each other.
 The decision rule, the measurements behind it, and what "1 user = 1
