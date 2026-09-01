@@ -286,9 +286,9 @@ let
       a branch or has uncommitted changes, so your work is never at risk.
 
       The checkout is SHARED by every session of that user, exactly like a
-      repo you cloned yourself. Work in `git worktree add --detach` under
-      your own directory and push from there - never commit in the shared
-      tree.
+      repo you cloned yourself, so it is what ~/worktrees is for: run
+      `git worktree add ~/worktrees/NAME --detach ${"$"}{AGENT_BOX_CHECKOUT_REV}`
+      from the checkout and work there. Never commit in the shared tree.
 
       Changing this box means the same round trip as changing any other
       repo: edit, `nix run .#assemble`, run the checks, push to the `fork`
@@ -784,13 +784,17 @@ let
     else if names != [ ] then lib.head names
     else null;
   checkoutEnabled = checkoutMaintainer != null;
-  # Relative paths hang off the maintainer's home, which is what almost
-  # every deployment wants (~/agent-box); an absolute one is taken as given
-  # so a host with a bigger volume elsewhere can say so.
+  # Always under the maintainer's home, and the assertion below enforces it.
+  # The agent unit runs ProtectSystem=strict with ReadWritePaths=/home/%i,
+  # so a tree anywhere else is denied with EROFS — and the obvious repair,
+  # naming it in ReadWritePaths, fails the whole namespace with 226/NAMESPACE
+  # whenever the path does not exist yet (the trap issue #316 already
+  # documents two hundred lines below). The clone's atomic publish needs the
+  # PARENT writable too, which an added ReadWritePaths entry on the checkout
+  # itself would not give. A deployment that needs more room gives the home
+  # more room; on AWS that is the root volume the README already documents.
   checkoutDir =
     if !checkoutEnabled then null
-    else if lib.hasPrefix "/" cfg.selfUpdate.checkout.path then
-      cfg.selfUpdate.checkout.path
     else "/home/${checkoutMaintainer}/${cfg.selfUpdate.checkout.path}";
 
   # Per-user webhook receiver (local-channels local-webhook plugin, issue #101).
@@ -4800,6 +4804,11 @@ if [ -z "$dir" ]; then
   exit 0
 fi
 
+case "$dir" in
+  (/*) ;;
+  (*) say "AGENT_BOX_CHECKOUT_DIR must be absolute, got '$dir'"; exit 1 ;;
+esac
+
 url=''${AGENT_BOX_CHECKOUT_URL:-}
 rev=''${AGENT_BOX_CHECKOUT_REV:-}
 if [ -z "$url" ] || [ -z "$rev" ]; then
@@ -4828,27 +4837,50 @@ export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=60
 
 # --- 1. the tree ------------------------------------------------------
 if [ ! -e "$dir/.git" ]; then
+  # Clone into a SIBLING and rename, so $dir either does not exist or is a
+  # finished tree — never something in between.
+  #
+  # git writes $dir/.git within the first moments of a clone and cleans it
+  # up only when the clone itself fails. A signal is not a failure: this
+  # runs in the background, in the agent unit's cgroup, which systemd kills
+  # on every stop, restart and reboot. Cloned straight into $dir, one
+  # unlucky reboot would leave a .git with no HEAD — and every later run
+  # would skip the clone (the test above), fail to read HEAD, and refuse to
+  # touch the tree. That is a checkout no boot can repair, on the exact code
+  # path a first boot takes.
+  #
+  # A fixed sibling name rather than mktemp: an interrupted run leaves
+  # exactly one of these, and the next one reclaims it instead of leaving a
+  # new partial clone behind on every reboot. Nothing but this script writes
+  # that path — $dir comes from the module, not from anything at runtime,
+  # and was required to be absolute above.
+  incoming="$dir.incoming"
+  rm -rf "$incoming"
   say "cloning $url into $dir"
-  # Not `git()`: there is no repo to be -C inside of yet.
-  if command git clone --quiet "$url" "$dir"; then
-    # Detach HERE rather than falling through to step 2: a fresh clone is on
-    # the remote's default BRANCH, and step 2 refuses to move a tree that is
-    # on a branch (it cannot tell one somebody adopted from one git just
-    # made). Without this the very first run would leave the tree on master
-    # — describing whatever upstream had merged since this box was built,
-    # which is the confidently-wrong answer the whole feature exists to
-    # prevent.
-    if git checkout --quiet --detach "$rev"; then
-      say "cloned and parked on $rev"
-    else
-      say "cloned, but $rev is not in $url — the tree reads $(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
-      exit 1
-    fi
-  else
-    # git removes the directory it created when a clone fails, so a retry
-    # is clean. Nothing else here can run, but the exit code is what an
-    # agent re-running this by hand needs to see.
+  # Not `git()`: there is no repo to be -C inside of yet, and what there is
+  # is not at $dir.
+  if ! command git clone --quiet "$url" "$incoming"; then
     say "clone failed (offline, or the repo is private to this box's token) — re-run me later"
+    rm -rf "$incoming"
+    exit 1
+  fi
+  # Detach HERE rather than falling through to step 2: a fresh clone is on
+  # the remote's default BRANCH, and step 2 refuses to move a tree that is
+  # on a branch (it cannot tell one somebody adopted from one git just
+  # made). Without this the very first run would leave the tree on master —
+  # describing whatever upstream had merged since this box was built, which
+  # is the confidently-wrong answer the whole feature exists to prevent.
+  if ! command git -C "$incoming" checkout --quiet --detach "$rev"; then
+    say "cloned, but $rev is not in $url — discarding the partial tree"
+    rm -rf "$incoming"
+    exit 1
+  fi
+  # The publish. A rename within one directory is atomic, which is what
+  # makes the paragraph above true.
+  if mv "$incoming" "$dir"; then
+    say "cloned and parked on $rev"
+  else
+    say "could not move $incoming into place — leaving it for the next run"
     exit 1
   fi
 fi
@@ -8478,9 +8510,16 @@ in
           default = "agent-box";
           example = "/srv/agent-box";
           description = ''
-            Where the checkout lands. A relative path hangs off the
-            maintainer's home (the default is ~/agent-box); an absolute one
-            is used as given, for a host that keeps it on another volume.
+            Where the checkout lands, relative to the maintainer's home —
+            the default is ~/agent-box, and a subdirectory ("src/agent-box")
+            works too.
+
+            Relative only, and asserted: the agent unit runs
+            ProtectSystem=strict with ReadWritePaths=/home/%i, so a tree
+            outside the home is denied with EROFS, and naming it in
+            ReadWritePaths instead fails the whole namespace with
+            226/NAMESPACE until something else creates it (issue #316). A
+            box that needs more room for it gives the home more room.
           '';
         };
 
@@ -8884,6 +8923,13 @@ in
 
   config = lib.mkIf cfg.enable (lib.mkMerge [{
     assertions = [{
+      assertion = !(lib.hasPrefix "/" cfg.selfUpdate.checkout.path);
+      message =
+        "services.agent-box.selfUpdate.checkout.path is relative to the "
+        + "maintainer's home and must not start with '/': the agent unit's "
+        + "ProtectSystem=strict would deny a checkout outside /home with "
+        + "EROFS. Got \"" + cfg.selfUpdate.checkout.path + "\".";
+    } {
       assertion = cfg.users != { };
       message = "services.agent-box.enable is true but no users are defined in services.agent-box.users.";
     } {

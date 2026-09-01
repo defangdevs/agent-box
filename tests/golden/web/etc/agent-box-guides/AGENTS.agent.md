@@ -444,9 +444,9 @@ re-parks it after a box update; it refuses to touch a tree that is on
 a branch or has uncommitted changes, so your work is never at risk.
 
 The checkout is SHARED by every session of that user, exactly like a
-repo you cloned yourself. Work in `git worktree add --detach` under
-your own directory and push from there - never commit in the shared
-tree.
+repo you cloned yourself, so it is what ~/worktrees is for: run
+`git worktree add ~/worktrees/NAME --detach ${AGENT_BOX_CHECKOUT_REV}`
+from the checkout and work there. Never commit in the shared tree.
 
 Changing this box means the same round trip as changing any other
 repo: edit, `nix run .#assemble`, run the checks, push to the `fork`

@@ -92,66 +92,86 @@ INTERNAL = {
     "AGENT_BOX_CODEX_UTS": "codex-remote-control.sh re-execs itself",
 }
 
-# Divergences that are CORRECT. Each needs a reason a reader can check.
+# Divergences that are CORRECT. Each needs a reason a reader can check —
+# and the SIDE it is allowed to be on, which is load-bearing rather than
+# decoration. A bare reason excuses a name in EITHER direction, so the day a
+# divergence flips (the module stops supplying a name and the native
+# renderer starts) the check would print "ok (by design) ... native only"
+# and pass, which is the opposite of what the entry was written to say.
+# With the side recorded, a flip is an undeclared divergence like any other.
 BY_DESIGN = {
-    "AGENT_BOX_USERS": "spot monitor: EC2-only, and the native path's own "
-                       "deployment (Lightsail) has no Spot to monitor",
-    "AGENT_BOX_GRACE": "spot monitor, see AGENT_BOX_USERS",
-    "AGENT_BOX_MSG": "spot monitor, see AGENT_BOX_USERS",
-    "AGENT_BOX_POLL": "spot monitor, see AGENT_BOX_USERS",
-    "AGENT_BOX_NIX_BIN": "lazy harnesses (#416): the module pins nix as a "
-                         "store path because it HAS one. A native box does "
-                         "not — resolving `nix` at apply time would bake "
-                         "the BUILDING host's store path into a generated "
-                         "file and break on the next nix upgrade — so "
-                         "lib/agents.sh resolves it at USE from PATH and "
-                         "the two standard install layouts. Both backends "
-                         "reach the same binary; only one can name it "
-                         "ahead of time",
-    "AGENT_BOX_WEBHOOK_POLICY_FILE": "issue #457: both backends bake this "
-                                     "into the agent-box-webhook-policy-apply "
-                                     "wrapper they build around the shared "
-                                     "modules/src/webhook-policy-apply.sh "
-                                     "(module: modules/agent-box.nix.in's "
-                                     "webhookPolicyApply; native: "
-                                     "nix/runtime.nix's own "
-                                     "writeShellScriptBin) — real Nix "
-                                     "derivations, built and run by neither "
-                                     "renderer's fixture. tests/native/"
-                                     "expected can only ever show the "
-                                     "native side one-sided: "
-                                     "test_agentbox.py's fake profile "
-                                     "stubs EVERY profile binary as an "
-                                     "empty `#!/bin/sh\\n:\\n` "
-                                     "(build_fake_profile's FAKE_BINS "
-                                     "loop), so no profile payload's real "
-                                     "body — this one included — is ever "
-                                     "in that fixture to find. GOLDEN sees "
-                                     "the module's copy only because the "
-                                     "NixOS golden snapshot captures the "
-                                     "actual store-built payload; native "
-                                     "has no equivalent capture to give "
-                                     "this checker",
-    "AGENT_BOX_HOOK_SESSION_ARGS": "same shape as AGENT_BOX_WEBHOOK_POLICY_"
-                                   "FILE above. modules/src/webhook-spawn.sh "
-                                   "reassigns this name from the on-disk "
-                                   "override (`AGENT_BOX_HOOK_SESSION_ARGS="
-                                   "$val`, read back from the env store), "
-                                   "which SUPPLIED's regex reads as a "
-                                   "backend supplying it — it is the shared "
-                                   "payload consuming its own override, not "
-                                   "either renderer's configuration. Native "
-                                   "builds this same script as a real Nix "
-                                   "derivation too (nix/runtime.nix's "
-                                   "`payload \"agent-box-webhook-spawn\" "
-                                   "\"webhook-spawn.sh\"`), so production "
-                                   "native output carries the line just "
-                                   "like the module's; tests/native/"
-                                   "expected can't show it because "
-                                   "test_agentbox.py's fixture renders via "
-                                   "Python only and never builds this Nix "
-                                   "payload, while the golden snapshot "
-                                   "captures the real store-built one",
+    "AGENT_BOX_USERS": (
+        "module",
+        "spot monitor: EC2-only, and the native path's own "
+        "deployment (Lightsail) has no Spot to monitor"),
+    "AGENT_BOX_GRACE": (
+        "module",
+        "spot monitor, see AGENT_BOX_USERS"),
+    "AGENT_BOX_MSG": (
+        "module",
+        "spot monitor, see AGENT_BOX_USERS"),
+    "AGENT_BOX_POLL": (
+        "module",
+        "spot monitor, see AGENT_BOX_USERS"),
+    "AGENT_BOX_NIX_BIN": (
+        "module",
+        "lazy harnesses (#416): the module pins nix as a "
+        "store path because it HAS one. A native box does "
+        "not — resolving `nix` at apply time would bake "
+        "the BUILDING host's store path into a generated "
+        "file and break on the next nix upgrade — so "
+        "lib/agents.sh resolves it at USE from PATH and "
+        "the two standard install layouts. Both backends "
+        "reach the same binary; only one can name it "
+        "ahead of time"),
+    "AGENT_BOX_WEBHOOK_POLICY_FILE": (
+        "module",
+        "issue #457: both backends bake this "
+        "into the agent-box-webhook-policy-apply "
+        "wrapper they build around the shared "
+        "modules/src/webhook-policy-apply.sh "
+        "(module: modules/agent-box.nix.in's "
+        "webhookPolicyApply; native: "
+        "nix/runtime.nix's own "
+        "writeShellScriptBin) — real Nix "
+        "derivations, built and run by neither "
+        "renderer's fixture. tests/native/"
+        "expected can only ever show the "
+        "native side one-sided: "
+        "test_agentbox.py's fake profile "
+        "stubs EVERY profile binary as an "
+        "empty `#!/bin/sh\\n:\\n` "
+        "(build_fake_profile's FAKE_BINS "
+        "loop), so no profile payload's real "
+        "body — this one included — is ever "
+        "in that fixture to find. GOLDEN sees "
+        "the module's copy only because the "
+        "NixOS golden snapshot captures the "
+        "actual store-built payload; native "
+        "has no equivalent capture to give "
+        "this checker"),
+    "AGENT_BOX_HOOK_SESSION_ARGS": (
+        "module",
+        "same shape as AGENT_BOX_WEBHOOK_POLICY_"
+        "FILE above. modules/src/webhook-spawn.sh "
+        "reassigns this name from the on-disk "
+        "override (`AGENT_BOX_HOOK_SESSION_ARGS="
+        "$val`, read back from the env store), "
+        "which SUPPLIED's regex reads as a "
+        "backend supplying it — it is the shared "
+        "payload consuming its own override, not "
+        "either renderer's configuration. Native "
+        "builds this same script as a real Nix "
+        "derivation too (nix/runtime.nix's "
+        "`payload \"agent-box-webhook-spawn\" "
+        "\"webhook-spawn.sh\"`), so production "
+        "native output carries the line just "
+        "like the module's; tests/native/"
+        "expected can't show it because "
+        "test_agentbox.py's fixture renders via "
+        "Python only and never builds this Nix "
+        "payload, while the golden snapshot "
+        "captures the real store-built one"),
 }
 
 # One reason, cited by the four entries below, so it has one home rather
@@ -165,49 +185,58 @@ CHECKOUT_GAP = (
     "(modules/src/update.sh); a native box has neither — `agentbox update` "
     "takes the profile head, with no rev to fast-forward onto (bin/agentbox, "
     "issue #358) — so wiring these names there would ship a tree with no way "
-    "to become the running system. Native follows once #451 PR 2 gives both "
-    "renderers one binding contract; delete these entries then")
+    "to become the running system. Note that #451 PR 2 landing (#476, #481) "
+    "does NOT clear this on its own, which is what the first draft of this "
+    "entry assumed: agent-box@'s contract binds fixed PROGRAM names, and "
+    "these four are a path, a URL, a rev and a flag — per-deployment values "
+    "the contract deliberately leaves hand-written. What clears it is #358 "
+    "giving `agentbox update` a rev to update TO; delete these entries then")
 
 # Divergences that are BUGS, each owned by an issue. This table must only ever
 # shrink: fixing a gap means deleting its line, and the staleness check below
 # makes that mandatory rather than optional.
 KNOWN_GAPS = {
-    "AGENT_BOX_CHECKOUT_DIR": CHECKOUT_GAP,
-    "AGENT_BOX_CHECKOUT_FORK": CHECKOUT_GAP,
-    "AGENT_BOX_CHECKOUT_REV": CHECKOUT_GAP,
-    "AGENT_BOX_CHECKOUT_URL": CHECKOUT_GAP,
+    "AGENT_BOX_CHECKOUT_DIR": ("module", CHECKOUT_GAP),
+    "AGENT_BOX_CHECKOUT_FORK": ("module", CHECKOUT_GAP),
+    "AGENT_BOX_CHECKOUT_REV": ("module", CHECKOUT_GAP),
+    "AGENT_BOX_CHECKOUT_URL": ("module", CHECKOUT_GAP),
 }
 
 # Units, by family (instance and template spellings normalized away).
 UNITS_BY_DESIGN = {
-    "agent-box-spot-monitor.service":
-        "EC2-only, see AGENT_BOX_USERS above",
-    "agent-box-zram.service":
+    "agent-box-spot-monitor.service": (
+        "module",
+        "EC2-only, see AGENT_BOX_USERS above"),
+    "agent-box-zram.service": (
+        "native",
         "native only, and correct: on NixOS zram comes from the zramSwap "
         "option, which a generator turns into systemd-zram-setup@zram0 at "
         "boot — a unit no fixture records because it does not exist until "
         "the generator runs. Both backends give the box compressed swap; "
-        "only one of them has a unit file to compare",
-    "agent-box-nix-gc.service":
+        "only one of them has a unit file to compare"),
+    "agent-box-nix-gc.service": (
+        "native",
         "native only, and correct: on NixOS the DEPLOYMENT owns store "
         "housekeeping (aws/template.yaml sets nix.gc and min-free), a layer "
         "a native box does not have, so its renderer owns it instead. If the "
-        "module ever grows nix.gc of its own, this line goes away",
+        "module ever grows nix.gc of its own, this line goes away"),
 }
 UNITS_KNOWN_GAPS = {
-    "agent-box-defang-cli.service": "#461: a PRE-fetch, not the card. The "
-                                    "module pulls the Defang CLI in the "
-                                    "background (#373) so a NixOS card is "
-                                    "usable the moment the page loads; a "
-                                    "native box fetches the SAME pinned "
-                                    "closure from the card itself, on "
-                                    "demand (AGENT_BOX_CONNECT_EXPRS). Both "
-                                    "backends now show the card, so what is "
-                                    "one-sided is only the eager fetch — and "
-                                    "making it two-sided would spend 105 MiB "
-                                    "of every native first boot, inside the "
-                                    "deployment's wait, on a CLI most boxes "
-                                    "never use",
+    "agent-box-defang-cli.service": (
+        "module",
+        "#461: a PRE-fetch, not the card. The "
+        "module pulls the Defang CLI in the "
+        "background (#373) so a NixOS card is "
+        "usable the moment the page loads; a "
+        "native box fetches the SAME pinned "
+        "closure from the card itself, on "
+        "demand (AGENT_BOX_CONNECT_EXPRS). Both "
+        "backends now show the card, so what is "
+        "one-sided is only the eager fetch — and "
+        "making it two-sided would spend 105 MiB "
+        "of every native first boot, inside the "
+        "deployment's wait, on a CLI most boxes "
+        "never use"),
 }
 
 # Same job, different unit name. The native jail is agent-box-fail2ban so a
@@ -233,7 +262,8 @@ UNIT_ALIASES = {
 # those names are one-sided box-wide, so they are one-sided in whatever unit
 # carries them, and the reason is written once where it belongs.
 UNIT_VARS_BY_DESIGN = {
-    "agent-web-terminal@.service AGENT_BOX_SESSION_BIN":
+    "agent-web-terminal@.service AGENT_BOX_SESSION_BIN": (
+        "native",
         "the attach wrapper needs the session CLI to start a stopped "
         "session from its pane, and each backend hands it over where that "
         "backend has a place to: the module BAKES it into the wrapper it "
@@ -241,7 +271,7 @@ UNIT_VARS_BY_DESIGN = {
         "the way it pins flock for the session CLI), while the native "
         "renderer ships one shared binary and no wrapper, so the value is "
         "this unit's environment. Both name a real agent-box-session; only "
-        "one of them has a generated script to put it in",
+        "one of them has a generated script to put it in"),
 }
 UNIT_VARS_KNOWN_GAPS = {
 }
@@ -405,14 +435,25 @@ def ambiguous(kind, by_design, known):
 
 
 def report(kind, only_module, only_native, by_design, known):
-    """Print one section; return (violations, stale entries)."""
+    """Print one section; return (violations, stale entries).
+
+    An entry excuses its name only on the side it was written for. A name
+    that turns up on the OTHER side is a violation like an undeclared one:
+    the entry describes a divergence that no longer exists in the direction
+    it was reasoned about, and its reason is evidence for nothing.
+    """
     violations, stale = [], []
     for name in sorted(only_module | only_native):
-        where = "module only" if name in only_module else "native only"
-        if name in by_design:
-            print(f"  ok (by design)  {name:34} {where} — {by_design[name]}")
+        side = "module" if name in only_module else "native"
+        where = f"{side} only"
+        entry = by_design.get(name) or known.get(name)
+        if entry is not None and entry[0] != side:
+            violations.append((name, f"{where}, but its entry is written for "
+                                     f"{entry[0]} only"))
+        elif name in by_design:
+            print(f"  ok (by design)  {name:34} {where} — {by_design[name][1]}")
         elif name in known:
-            print(f"  known gap       {name:34} {where} — {known[name]}")
+            print(f"  known gap       {name:34} {where} — {known[name][1]}")
         else:
             violations.append((name, where))
     for name in sorted(set(by_design) | set(known)):

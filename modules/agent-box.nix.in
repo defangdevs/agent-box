@@ -63,9 +63,9 @@ let
       a branch or has uncommitted changes, so your work is never at risk.
 
       The checkout is SHARED by every session of that user, exactly like a
-      repo you cloned yourself. Work in `git worktree add --detach` under
-      your own directory and push from there - never commit in the shared
-      tree.
+      repo you cloned yourself, so it is what ~/worktrees is for: run
+      `git worktree add ~/worktrees/NAME --detach ${"$"}{AGENT_BOX_CHECKOUT_REV}`
+      from the checkout and work there. Never commit in the shared tree.
 
       Changing this box means the same round trip as changing any other
       repo: edit, `nix run .#assemble`, run the checks, push to the `fork`
@@ -218,13 +218,17 @@ let
     else if names != [ ] then lib.head names
     else null;
   checkoutEnabled = checkoutMaintainer != null;
-  # Relative paths hang off the maintainer's home, which is what almost
-  # every deployment wants (~/agent-box); an absolute one is taken as given
-  # so a host with a bigger volume elsewhere can say so.
+  # Always under the maintainer's home, and the assertion below enforces it.
+  # The agent unit runs ProtectSystem=strict with ReadWritePaths=/home/%i,
+  # so a tree anywhere else is denied with EROFS — and the obvious repair,
+  # naming it in ReadWritePaths, fails the whole namespace with 226/NAMESPACE
+  # whenever the path does not exist yet (the trap issue #316 already
+  # documents two hundred lines below). The clone's atomic publish needs the
+  # PARENT writable too, which an added ReadWritePaths entry on the checkout
+  # itself would not give. A deployment that needs more room gives the home
+  # more room; on AWS that is the root volume the README already documents.
   checkoutDir =
     if !checkoutEnabled then null
-    else if lib.hasPrefix "/" cfg.selfUpdate.checkout.path then
-      cfg.selfUpdate.checkout.path
     else "/home/${checkoutMaintainer}/${cfg.selfUpdate.checkout.path}";
 
   # Per-user webhook receiver (local-channels local-webhook plugin, issue #101).
@@ -1771,9 +1775,16 @@ in
           default = "agent-box";
           example = "/srv/agent-box";
           description = ''
-            Where the checkout lands. A relative path hangs off the
-            maintainer's home (the default is ~/agent-box); an absolute one
-            is used as given, for a host that keeps it on another volume.
+            Where the checkout lands, relative to the maintainer's home —
+            the default is ~/agent-box, and a subdirectory ("src/agent-box")
+            works too.
+
+            Relative only, and asserted: the agent unit runs
+            ProtectSystem=strict with ReadWritePaths=/home/%i, so a tree
+            outside the home is denied with EROFS, and naming it in
+            ReadWritePaths instead fails the whole namespace with
+            226/NAMESPACE until something else creates it (issue #316). A
+            box that needs more room for it gives the home more room.
           '';
         };
 
@@ -2177,6 +2188,13 @@ in
 
   config = lib.mkIf cfg.enable (lib.mkMerge [{
     assertions = [{
+      assertion = !(lib.hasPrefix "/" cfg.selfUpdate.checkout.path);
+      message =
+        "services.agent-box.selfUpdate.checkout.path is relative to the "
+        + "maintainer's home and must not start with '/': the agent unit's "
+        + "ProtectSystem=strict would deny a checkout outside /home with "
+        + "EROFS. Got \"" + cfg.selfUpdate.checkout.path + "\".";
+    } {
       assertion = cfg.users != { };
       message = "services.agent-box.enable is true but no users are defined in services.agent-box.users.";
     } {

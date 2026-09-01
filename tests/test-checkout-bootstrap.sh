@@ -83,6 +83,14 @@ unset AGENT_BOX_CHECKOUT_DIR AGENT_BOX_CHECKOUT_REV
 if run; then ok "no AGENT_BOX_CHECKOUT_DIR exits 0"
 else no "no AGENT_BOX_CHECKOUT_DIR exits 0" "$(cat "$work/out")"; fi
 
+# --- a relative dir: refuse. The clone publishes by renaming a SIBLING of
+# this path, so "absolute" is a precondition of the step below, not taste.
+export AGENT_BOX_CHECKOUT_DIR=box
+export AGENT_BOX_CHECKOUT_REV=$REV_ONE
+if run; then no "a relative dir is an error" "exited 0"
+else ok "a relative dir is an error"; fi
+unset AGENT_BOX_CHECKOUT_REV
+
 # --- a dir but no rev: refuse rather than guess -------------------------
 export AGENT_BOX_CHECKOUT_DIR="$work/box"
 if run; then no "no rev is an error" "exited 0"
@@ -105,6 +113,38 @@ fi
 if [ "$(git -C "$AGENT_BOX_CHECKOUT_DIR" rev-parse --abbrev-ref HEAD)" = "HEAD" ]; then
   ok "clone is left detached"
 else no "clone is left detached" "on a branch"; fi
+
+# --- the clone is published by rename, so it is never half a tree -------
+# git writes .git early and cleans up only after ITS OWN failure; a SIGKILL
+# mid-clone is not a failure. Cloned straight into place, one unlucky reboot
+# would leave a .git with no HEAD — which every later run would skip (the
+# "no .git" test), fail to read, and refuse to touch. A checkout no boot can
+# repair, on the code path a first boot takes. The rename is what makes that
+# state unreachable, so both halves are pinned: no leftover after success...
+if [ ! -e "$AGENT_BOX_CHECKOUT_DIR.incoming" ]; then
+  ok "the staging tree is gone once the clone is published"
+else no "the staging tree is gone once the clone is published" "still there"; fi
+
+# ...and a leftover from a killed run is reclaimed rather than inherited.
+rm -rf "$AGENT_BOX_CHECKOUT_DIR"
+mkdir -p "$AGENT_BOX_CHECKOUT_DIR.incoming/.git"   # what a SIGKILL leaves
+run
+if [ "$(head_of "$AGENT_BOX_CHECKOUT_DIR")" = "$AGENT_BOX_CHECKOUT_REV" ] \
+   && [ ! -e "$AGENT_BOX_CHECKOUT_DIR.incoming" ]; then
+  ok "an interrupted clone is reclaimed by the next run"
+else
+  no "an interrupted clone is reclaimed by the next run" "$(cat "$work/out")"
+fi
+
+# A rev the remote does not have leaves NOTHING behind — publishing a tree
+# parked on the wrong commit is the failure this whole script exists to
+# avoid, so a half-right tree is worse than none.
+rm -rf "$AGENT_BOX_CHECKOUT_DIR"
+AGENT_BOX_CHECKOUT_REV=0000000000000000000000000000000000000000 run
+if [ ! -e "$AGENT_BOX_CHECKOUT_DIR" ] && [ ! -e "$AGENT_BOX_CHECKOUT_DIR.incoming" ]; then
+  ok "an unreachable rev publishes nothing"
+else no "an unreachable rev publishes nothing" "$(cat "$work/out")"; fi
+fresh "$AGENT_BOX_CHECKOUT_DIR" "$REV_ONE"
 
 # --- second run over the same tree: idempotent, no re-clone ------------
 marker="$AGENT_BOX_CHECKOUT_DIR/.mine"
