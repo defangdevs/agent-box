@@ -1236,9 +1236,10 @@ class RenderTest(unittest.TestCase):
                 rend = mod.Renderer(
                     spec, prof, root=Path(tmp) / f"o{len(allowlist)}")
                 tree = rend.render()
-                dropin = [text for path, (text, _) in tree.files.items()
-                          if path.endswith(
-                              "agent-box@agent.service.d/10-host.conf")][0]
+                dropin = next(
+                    text for path, (text, _) in tree.files.items()
+                    if path.endswith(
+                        "agent-box@agent.service.d/10-host.conf"))
                 self.assertIn("NoNewPrivileges=false", dropin)
 
     def test_a_web_box_seeds_no_session_and_a_console_box_still_does(self):
