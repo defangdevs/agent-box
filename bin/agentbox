@@ -759,6 +759,7 @@ class Renderer:
         self.tmpfiles(t)
         self.target_wants(t)
         self.tmux(t)
+        self.gitconfig(t)
         self.interactive_clis(t)
         self.agent_defaults(t)
         if self.spec.protect_memory:
@@ -2408,12 +2409,48 @@ class Renderer:
         whatever they put there (CodeRabbit review on PR #496).
         """
         path = self.p("/etc/tmux.conf")
-        if path.exists() and not generated_by_us(path):
+        if foreign_file(path):
             self.notes.append(
                 f"{path}: not written by agentbox — left alone; add "
                 f"`set -g mouse on` yourself so mouse wheel scroll works")
             return
         t.file(path, GENERATED_HEADER + "set -g mouse on\n")
+
+    def gitconfig(self, t):
+        """System-wide /etc/gitconfig: gh's credential helper for github.com
+        and gist.github.com.
+
+        `gh` reads GH_TOKEN from the environment for its own API calls, but
+        plain `git` does not — it authenticates over HTTPS through whatever
+        credential helper is configured, and without one a `git clone
+        https://github.com/...` of a private repo either prompts (and hangs,
+        non-interactively) or falls back to anonymous. NixOS's
+        `programs.git` covers this with a system-wide helper so it works in
+        every session without touching a user's own `~/.gitconfig`; the
+        native renderer never grew the equivalent, so a native box's git
+        never picks up GH_TOKEN at all, the same shape as #495's tmux gap.
+
+        /etc/gitconfig is a general system file, not one of agentbox's own
+        names, so a box can reach `apply` with one already in place — same
+        situation as /etc/tmux.conf and /etc/nix/nix.custom.conf. Only touch
+        it when it is empty ground or already carries our header; otherwise
+        leave the administrator's file alone and say so, rather than
+        discarding whatever they put there.
+        """
+        path = self.p("/etc/gitconfig")
+        if foreign_file(path):
+            self.notes.append(
+                f"{path}: not written by agentbox — left alone; add a "
+                f"credential.helper for https://github.com and "
+                f"https://gist.github.com yourself so `git clone` can use "
+                f"GH_TOKEN")
+            return
+        gh = f"{self.bin}/gh"
+        t.file(path, GENERATED_HEADER
+               + '[credential "https://github.com"]\n'
+               + f"\thelper = !{gh} auth git-credential\n"
+               + '[credential "https://gist.github.com"]\n'
+               + f"\thelper = !{gh} auth git-credential\n")
 
     def interactive_clis(self, t):
         """agent-box-session and agent-box-profile, on every box.
@@ -2712,6 +2749,32 @@ def generated_by_us(path):
     if text.startswith("#!"):
         text = text.split("\n", 1)[1] if "\n" in text else ""
     return text.startswith(GENERATED_HEADER)
+
+
+def foreign_file(path):
+    """True if `path` holds administrator content this render must not
+    touch — as opposed to empty ground, safe to write like an absent path.
+
+    Used for general system files (/etc/tmux.conf, /etc/gitconfig) that can
+    already exist before `apply` ever runs, unlike agentbox's own names.
+
+    A symlink is foreign regardless of what it points at, dangling or not:
+    `Path.exists()` follows a symlink and is False for a dangling one, which
+    would otherwise read as empty ground and get replaced with a regular
+    file (CodeRabbit review, PR #498) — the same reason `generated_by_us`
+    itself never calls a symlink its own.
+
+    An EMPTY regular file is not foreign: it carries no administrator
+    content to lose, so it is empty ground the same as no file at all — only
+    a non-empty file that lacks our header is somebody else's (CodeRabbit
+    review, PR #498).
+    """
+    path = Path(path)
+    if path.is_symlink():
+        return not generated_by_us(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    return not generated_by_us(path)
 
 
 def remove_if_ours(path, dry_run=False, verbatim=None):

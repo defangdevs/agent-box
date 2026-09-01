@@ -25,6 +25,7 @@
   "etc/agent-box/web-users": "0o600",
   "etc/apt/apt.conf.d/52-agent-box-unattended": "0o644",
   "etc/codex/config.toml": "0o644",
+  "etc/gitconfig": "0o644",
   "etc/needrestart/conf.d/50-agent-box.conf": "0o644",
   "etc/nix/nix.custom.conf": "0o644",
   "etc/sudoers.d/agent-box": "0o440",
