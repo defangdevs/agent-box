@@ -2399,8 +2399,21 @@ class Renderer:
         `programs.tmux`, which renders the same file; the native renderer
         never grew the equivalent, so every native box (e.g. Lightsail)
         still had the bug.
+
+        /etc/tmux.conf is a general system file, not one of agentbox's own
+        names, so a box can reach `apply` with one already in place — same
+        situation as /etc/nix/nix.custom.conf below. Only touch it when it
+        is empty ground or already carries our header; otherwise leave the
+        administrator's file alone and say so, rather than discarding
+        whatever they put there (CodeRabbit review on PR #496).
         """
-        t.file(self.p("/etc/tmux.conf"), GENERATED_HEADER + "set -g mouse on\n")
+        path = self.p("/etc/tmux.conf")
+        if path.exists() and not generated_by_us(path):
+            self.notes.append(
+                f"{path}: not written by agentbox — left alone; add "
+                f"`set -g mouse on` yourself so mouse wheel scroll works")
+            return
+        t.file(path, GENERATED_HEADER + "set -g mouse on\n")
 
     def interactive_clis(self, t):
         """agent-box-session and agent-box-profile, on every box.
