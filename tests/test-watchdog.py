@@ -123,16 +123,19 @@ class FilterPrefix(unittest.TestCase):
     """The filter files carry the agent user's login, not the word "agent"."""
 
     def setUp(self):
-        self.old = os.environ.get("USER")
+        # One saved value PER VARIABLE. Saving only USER and restoring both
+        # from it would overwrite a LOGNAME that differed, and leak that into
+        # every test that ran afterwards (#486 review).
+        self.old = {key: os.environ.get(key) for key in ("USER", "LOGNAME")}
         os.environ["USER"] = "robot"
         os.environ["LOGNAME"] = "robot"
 
     def tearDown(self):
-        for key in ("USER", "LOGNAME"):
-            if self.old is None:
+        for key, value in self.old.items():
+            if value is None:
                 os.environ.pop(key, None)
             else:
-                os.environ[key] = self.old
+                os.environ[key] = value
 
     def test_prefix_follows_the_user(self):
         # The supervisor names these from LOCAL_WEBHOOK_SESSION=$USER-$sname.
