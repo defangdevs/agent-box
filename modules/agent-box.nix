@@ -7505,11 +7505,17 @@ esac
       #
       # Clear a real directory first (the `-L` check excludes a
       # symlink-to-a-directory, which `-sfn` already replaces correctly, so
-      # this only ever fires on the broken layout). Then swap the entry
-      # atomically: build the new symlink under a temp name in the same
-      # directory and rename it over `current` — `rename()` is atomic, so a
-      # session reading `current` mid-update sees either the old or the new
-      # target, never a missing path.
+      # this only ever fires on the broken layout). `rename()` cannot swap a
+      # symlink over a non-empty directory in one step, so this branch is not
+      # atomic: a session reading `current` between the `rm -rf` and the `mv`
+      # below sees it briefly missing. That is an acceptable one-time cost to
+      # repair the broken layout, and every run after this one takes the
+      # atomic path below, because `current` is a symlink from here on.
+      #
+      # Build the new symlink under a temp name in the same directory and
+      # rename it over `current` — `rename()` is atomic, so a session reading
+      # `current` mid-update here sees either the old or the new target, never
+      # a missing path (except immediately following the repair above).
       _mcs_current="$HOME/.codex/packages/standalone/current"
       if [ -d "$_mcs_current" ] && [ ! -L "$_mcs_current" ]; then
         rm -rf "$_mcs_current"
