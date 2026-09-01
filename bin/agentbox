@@ -759,6 +759,7 @@ class Renderer:
         self.tmpfiles(t)
         self.target_wants(t)
         self.tmux(t)
+        self.gitconfig(t)
         self.interactive_clis(t)
         self.agent_defaults(t)
         if self.spec.protect_memory:
@@ -2414,6 +2415,42 @@ class Renderer:
                 f"`set -g mouse on` yourself so mouse wheel scroll works")
             return
         t.file(path, GENERATED_HEADER + "set -g mouse on\n")
+
+    def gitconfig(self, t):
+        """System-wide /etc/gitconfig: gh's credential helper for github.com
+        and gist.github.com.
+
+        `gh` reads GH_TOKEN from the environment for its own API calls, but
+        plain `git` does not — it authenticates over HTTPS through whatever
+        credential helper is configured, and without one a `git clone
+        https://github.com/...` of a private repo either prompts (and hangs,
+        non-interactively) or falls back to anonymous. NixOS's
+        `programs.git` covers this with a system-wide helper so it works in
+        every session without touching a user's own `~/.gitconfig`; the
+        native renderer never grew the equivalent, so a native box's git
+        never picks up GH_TOKEN at all, the same shape as #495's tmux gap.
+
+        /etc/gitconfig is a general system file, not one of agentbox's own
+        names, so a box can reach `apply` with one already in place — same
+        situation as /etc/tmux.conf and /etc/nix/nix.custom.conf. Only touch
+        it when it is empty ground or already carries our header; otherwise
+        leave the administrator's file alone and say so, rather than
+        discarding whatever they put there.
+        """
+        path = self.p("/etc/gitconfig")
+        if path.exists() and not generated_by_us(path):
+            self.notes.append(
+                f"{path}: not written by agentbox — left alone; add a "
+                f"credential.helper for https://github.com and "
+                f"https://gist.github.com yourself so `git clone` can use "
+                f"GH_TOKEN")
+            return
+        gh = f"{self.bin}/gh"
+        t.file(path, GENERATED_HEADER
+               + '[credential "https://github.com"]\n'
+               + f"\thelper = !{gh} auth git-credential\n"
+               + '[credential "https://gist.github.com"]\n'
+               + f"\thelper = !{gh} auth git-credential\n")
 
     def interactive_clis(self, t):
         """agent-box-session and agent-box-profile, on every box.

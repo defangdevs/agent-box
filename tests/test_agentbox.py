@@ -755,6 +755,51 @@ class RenderTest(unittest.TestCase):
             written = rend.render().files[str(conf)][0]
             self.assertEqual(mod.GENERATED_HEADER + "set -g mouse on\n", written)
 
+    def test_a_foreign_gitconfig_is_left_alone(self):
+        """/etc/gitconfig is a general system file, not one of agentbox's
+        own names, so a box can already have one — an administrator's own
+        settings, or a distro default — before `apply` ever runs. Clobbering
+        it would discard that on the very first run, so a foreign file is
+        left in place and the render says so.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            out.mkdir(parents=True)
+            theirs = "[user]\n\tname = someone\n"
+            conf = out / "etc/gitconfig"
+            conf.parent.mkdir(parents=True)
+            conf.write_text(theirs)
+            mod = load_agentbox()
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            tree = rend.render()
+            self.assertNotIn(str(conf), tree.files,
+                             "clobbered a foreign /etc/gitconfig")
+            self.assertEqual(theirs, conf.read_text(),
+                             "clobbered a foreign /etc/gitconfig")
+            self.assertTrue(any("gitconfig" in n for n in rend.notes),
+                            "skipped the foreign file without saying so")
+
+    def test_a_generated_gitconfig_is_kept_current(self):
+        """Once agentbox owns the file (it carries the generated header),
+        re-applying still overwrites it — the header is what proves a
+        previous render, not a human, owns the content.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            out.mkdir(parents=True)
+            mod = load_agentbox()
+            conf = out / "etc/gitconfig"
+            conf.parent.mkdir(parents=True)
+            conf.write_text(mod.GENERATED_HEADER + "[user]\n\tname = stale\n")
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            written = rend.render().files[str(conf)][0]
+            self.assertIn('helper = !', written)
+            self.assertNotIn("stale", written)
+
     def test_the_base_os_patches_itself_without_a_reboot(self):
         """The distro still owns its packages, but nobody here can answer
         the two questions an unattended patch run asks: may I restart this
