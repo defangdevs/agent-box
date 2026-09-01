@@ -2409,7 +2409,7 @@ class Renderer:
         whatever they put there (CodeRabbit review on PR #496).
         """
         path = self.p("/etc/tmux.conf")
-        if path.exists() and not generated_by_us(path):
+        if foreign_file(path):
             self.notes.append(
                 f"{path}: not written by agentbox — left alone; add "
                 f"`set -g mouse on` yourself so mouse wheel scroll works")
@@ -2438,7 +2438,7 @@ class Renderer:
         discarding whatever they put there.
         """
         path = self.p("/etc/gitconfig")
-        if (path.exists() or path.is_symlink()) and not generated_by_us(path):
+        if foreign_file(path):
             self.notes.append(
                 f"{path}: not written by agentbox — left alone; add a "
                 f"credential.helper for https://github.com and "
@@ -2749,6 +2749,32 @@ def generated_by_us(path):
     if text.startswith("#!"):
         text = text.split("\n", 1)[1] if "\n" in text else ""
     return text.startswith(GENERATED_HEADER)
+
+
+def foreign_file(path):
+    """True if `path` holds administrator content this render must not
+    touch — as opposed to empty ground, safe to write like an absent path.
+
+    Used for general system files (/etc/tmux.conf, /etc/gitconfig) that can
+    already exist before `apply` ever runs, unlike agentbox's own names.
+
+    A symlink is foreign regardless of what it points at, dangling or not:
+    `Path.exists()` follows a symlink and is False for a dangling one, which
+    would otherwise read as empty ground and get replaced with a regular
+    file (CodeRabbit review, PR #498) — the same reason `generated_by_us`
+    itself never calls a symlink its own.
+
+    An EMPTY regular file is not foreign: it carries no administrator
+    content to lose, so it is empty ground the same as no file at all — only
+    a non-empty file that lacks our header is somebody else's (CodeRabbit
+    review, PR #498).
+    """
+    path = Path(path)
+    if path.is_symlink():
+        return not generated_by_us(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    return not generated_by_us(path)
 
 
 def remove_if_ours(path, dry_run=False, verbatim=None):

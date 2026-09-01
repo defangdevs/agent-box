@@ -826,6 +826,56 @@ class RenderTest(unittest.TestCase):
             self.assertTrue(any("gitconfig" in n for n in rend.notes),
                             "skipped the foreign symlink without saying so")
 
+    def test_a_dangling_tmux_conf_symlink_is_left_alone(self):
+        """Same failure as the gitconfig case above, in the method it was
+        first found next to: `Path.exists()` is False for a dangling
+        symlink, so without a symlink-aware check the render would replace
+        an administrator's own not-yet-resolved link with a plain file
+        (CodeRabbit review, PR #498).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            out.mkdir(parents=True)
+            conf = out / "etc/tmux.conf"
+            conf.parent.mkdir(parents=True)
+            conf.symlink_to(out / "etc/tmux.conf.d/nonexistent")
+            mod = load_agentbox()
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            tree = rend.render()
+            self.assertNotIn(str(conf), tree.files,
+                             "clobbered a dangling /etc/tmux.conf symlink")
+            self.assertTrue(conf.is_symlink(), "the symlink was removed")
+            self.assertTrue(any("tmux.conf" in n for n in rend.notes),
+                            "skipped the foreign symlink without saying so")
+
+    def test_an_empty_config_file_is_not_foreign(self):
+        """`path.exists()` is true for an EMPTY regular file, but it never
+        carries our header — so treating "exists and not ours" as foreign
+        would leave a zero-byte /etc/tmux.conf or /etc/gitconfig unconfigured
+        forever, indistinguishable from an administrator's real file. An
+        empty file has no content to lose, so it is empty ground, the same
+        as no file at all (CodeRabbit review, PR #498).
+        """
+        for name, marker in (("etc/tmux.conf", "set -g mouse on"),
+                             ("etc/gitconfig", "helper = !")):
+            with self.subTest(name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    prof = build_fake_profile(tmp)
+                    out = Path(tmp) / "out"
+                    out.mkdir(parents=True)
+                    conf = out / name
+                    conf.parent.mkdir(parents=True)
+                    conf.write_text("")
+                    mod = load_agentbox()
+                    spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()),
+                                        prof)
+                    rend = mod.Renderer(spec_obj, prof, root=out)
+                    written = rend.render().files[str(conf)][0]
+                    self.assertIn(marker, written,
+                                 "left an empty file unconfigured")
+
     def test_the_base_os_patches_itself_without_a_reboot(self):
         """The distro still owns its packages, but nobody here can answer
         the two questions an unattended patch run asks: may I restart this
