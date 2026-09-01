@@ -4,6 +4,7 @@
   "etc/agent-box/Caddyfile": "0o644",
   "etc/agent-box/bin/agent-box-password-agent": "0o755",
   "etc/agent-box/bin/agent-box-password-robot": "0o755",
+  "etc/agent-box/bin/agent-box-webhook-spawn": "0o755",
   "etc/agent-box/bin/agent-box-zram": "0o755",
   "etc/agent-box/claude-hook-settings.json": "0o644",
   "etc/agent-box/fail2ban/fail2ban.conf": "0o644",

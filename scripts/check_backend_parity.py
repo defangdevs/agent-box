@@ -132,6 +132,26 @@ BY_DESIGN = {
                                      "actual store-built payload; native "
                                      "has no equivalent capture to give "
                                      "this checker",
+    "AGENT_BOX_HOOK_SESSION_ARGS": "same shape as AGENT_BOX_WEBHOOK_POLICY_"
+                                   "FILE above. modules/src/webhook-spawn.sh "
+                                   "reassigns this name from the on-disk "
+                                   "override (`AGENT_BOX_HOOK_SESSION_ARGS="
+                                   "$val`, read back from the env store), "
+                                   "which SUPPLIED's regex reads as a "
+                                   "backend supplying it — it is the shared "
+                                   "payload consuming its own override, not "
+                                   "either renderer's configuration. Native "
+                                   "builds this same script as a real Nix "
+                                   "derivation too (nix/runtime.nix's "
+                                   "`payload \"agent-box-webhook-spawn\" "
+                                   "\"webhook-spawn.sh\"`), so production "
+                                   "native output carries the line just "
+                                   "like the module's; tests/native/"
+                                   "expected can't show it because "
+                                   "test_agentbox.py's fixture renders via "
+                                   "Python only and never builds this Nix "
+                                   "payload, while the golden snapshot "
+                                   "captures the real store-built one",
 }
 
 # Divergences that are BUGS, each owned by an issue. This table must only ever

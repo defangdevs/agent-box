@@ -1346,45 +1346,87 @@ class RenderTest(unittest.TestCase):
           HOOK_SESSION_ARGS       no box-wide default for the hook-*
                                   sessions a watch spawns (issue #216's
                                   cheaper triage model).
+
+        HOOK_SESSION_ARGS is unset here (the fixture's hookSessionArgs is
+        `[]`) — issue #471: it must be exported only when non-empty, the
+        same "unset when empty" rule the module follows, or webhook-spawn.sh
+        always reports its box-wide default as set. The wrapper still names
+        WHERE that default lives (AGENT_BOX_HOOK_ARGS_OPTION_NAME)
+        unconditionally, so --preamble's report can say so even when nothing
+        is configured; see test_a_hook_arg_with_an_apostrophe_survives_the_
+        wrapper for the non-empty case.
+
+        AGENT_BOX_HOOK_SPAWN_CMD and LOCAL_WEBHOOK_SPAWN_CMD must both point
+        at the GENERATED wrapper under /etc/agent-box/bin, not the bare
+        profile binary (issue #471 review): the receiver and the settings
+        panel's --preamble preview invoke a spawn command directly, never
+        through agent-box-webhook above, so pointing either at the bare
+        binary would mean the box-wide hookSessionArgs default never
+        reaches an actual automated spawn on native — only a hand-run
+        `agent-box-webhook` call would see it.
         """
         settings = (FIXTURE / "etc/systemd/system"
                     / "agent-box-settings@agent.service.d"
                     / "10-host.conf").read_text()
-        self.assertIn("AGENT_BOX_HOOK_SPAWN_CMD=", settings)
+        self.assertIn(
+            "AGENT_BOX_HOOK_SPAWN_CMD=/etc/agent-box/bin/"
+            "agent-box-webhook-spawn", settings)
         self.assertIn("AGENT_BOX_WEBHOOK_PYTHON=", settings)
+        webhook_dropin = (FIXTURE / "etc/systemd/system"
+                          / "agent-box-webhook@agent.service.d"
+                          / "10-host.conf").read_text()
+        self.assertIn(
+            "LOCAL_WEBHOOK_SPAWN_CMD=/etc/agent-box/bin/"
+            "agent-box-webhook-spawn", webhook_dropin)
         env = (FIXTURE / "etc/agent-box/units/agent.env").read_text()
         self.assertIn("AGENT_BOX_WEBHOOK_PINNED_SCRIPT=", env)
         wrapper = (FIXTURE / "usr/local/bin/agent-box-webhook").read_text()
-        self.assertIn("AGENT_BOX_HOOK_SESSION_ARGS=", wrapper)
-        # JSON, not a shell list: webhook-spawn.sh parses it with jq
-        # precisely so an argument may contain spaces.
-        args = wrapper.split("AGENT_BOX_HOOK_SESSION_ARGS=", 1)[1]
-        json.loads(args.split("\n")[0].strip().strip("'"))
+        self.assertIn("AGENT_BOX_HOOK_ARGS_OPTION_NAME=", wrapper)
+        self.assertNotIn("AGENT_BOX_HOOK_SESSION_ARGS=", wrapper)
+        spawn_wrapper = (FIXTURE / "etc/agent-box/bin"
+                        / "agent-box-webhook-spawn").read_text()
+        self.assertIn("AGENT_BOX_HOOK_ARGS_OPTION_NAME=", spawn_wrapper)
+        self.assertNotIn("AGENT_BOX_HOOK_SESSION_ARGS=", spawn_wrapper)
 
     def test_a_hook_arg_with_an_apostrophe_survives_the_wrapper(self):
         """The wrapper is generated shell. JSON does not escape an
         apostrophe, so `don't` closed the quoted value and broke
         agent-box-webhook for every caller — not just the one who set it.
         Also covers webhook: null and hookSessionArgs: null, either of
-        which used to raise in Spec before anything was rendered."""
+        which used to raise in Spec before anything was rendered.
+
+        Both generated wrappers get checked (agent-box-webhook and the
+        narrower agent-box-webhook-spawn one the receiver and the settings
+        panel actually invoke, issue #471 review) — the apostrophe hazard
+        is in shlex.quote's output, shared by both.
+        """
         mod = load_agentbox()
         config = json.loads(CONFIG_JSON.read_text())
         config["webhook"]["hookSessionArgs"] = [
             "--append-system-prompt", "don't guess; ask"]
         with tempfile.TemporaryDirectory() as tmp:
+            custom_config = Path(tmp) / "custom-config.json"
             prof = build_fake_profile(tmp)
             spec = mod.Spec(config, prof)
-            tree = mod.Renderer(spec, prof, root=Path(tmp) / "o").render()
-            wrapper = [text for path, (text, _) in tree.files.items()
-                       if path.endswith("bin/agent-box-webhook")][0]
-            line = [x for x in wrapper.splitlines()
-                    if "AGENT_BOX_HOOK_SESSION_ARGS" in x][0]
-            # What the shell would actually assign, per the shell.
-            out = subprocess.run(["sh", "-c", line + "\n"
-                                  "printf %s \"$AGENT_BOX_HOOK_SESSION_ARGS\""],
-                                 capture_output=True, text=True, check=True)
-            self.assertEqual(config["webhook"]["hookSessionArgs"],
-                             json.loads(out.stdout))
+            tree = mod.Renderer(spec, prof, root=Path(tmp) / "o",
+                                config=custom_config).render()
+            for name in ("usr/local/bin/agent-box-webhook",
+                         "etc/agent-box/bin/agent-box-webhook-spawn"):
+                wrapper = [text for path, (text, _) in tree.files.items()
+                           if path.endswith(name)][0]
+                # The option-name label follows the actual --config path
+                # (issue #471 review), not a hard-coded "config.yaml" —
+                # load_config() also accepts JSON and a custom path.
+                self.assertIn(str(custom_config), wrapper)
+                line = [x for x in wrapper.splitlines()
+                        if "AGENT_BOX_HOOK_SESSION_ARGS" in x][0]
+                # What the shell would actually assign, per the shell.
+                out = subprocess.run(
+                    ["sh", "-c",
+                     line + "\nprintf %s \"$AGENT_BOX_HOOK_SESSION_ARGS\""],
+                    capture_output=True, text=True, check=True)
+                self.assertEqual(config["webhook"]["hookSessionArgs"],
+                                 json.loads(out.stdout))
         for empty in ({"webhook": None},
                       {"webhook": {"enable": True, "script": "/x",
                                    "hookSessionArgs": None}}):
