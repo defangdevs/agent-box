@@ -1395,6 +1395,69 @@ reap_ephemeral() {
   fi
 }
 
+
+# The assignment sweep (services.agent-box.watchdog), hung off this loop
+# rather than a systemd timer.
+#
+# A timer would be the obvious home, but it would need its own unit family,
+# its own per-user instance and its own binding on both backends — and the
+# loop below already runs once per user, with that user's HOME, PATH and env
+# store, which is exactly the context the sweep needs. The cost here is a
+# timestamp comparison every 2s.
+#
+# It runs DETACHED: the sweep talks to GitHub, so it can block for as long as
+# a network timeout, and the reconcile loop must never be the thing waiting on
+# that. A sweep that overruns simply leaves $watchdog_next in the past and
+# starts again on the tick after it finishes — never a second copy beside the
+# first, which is what the jobs check below is for.
+WATCHDOG_BIN="${AGENT_BOX_WATCHDOG_BIN:-}"
+WATCHDOG_INTERVAL="${AGENT_BOX_WATCHDOG_INTERVAL:-1800}"
+case "$WATCHDOG_INTERVAL" in
+  (*[!0-9]*|"") WATCHDOG_INTERVAL=1800 ;;
+esac
+# Strip leading zeros before the value ever reaches $(( )), which reads them
+# as octal: "08" is an arithmetic ERROR that would abort the tick, and "030"
+# would quietly mean 24 seconds instead of 30 (#486 review). The digits-only
+# case above cannot catch either, because both ARE digits.
+while :; do
+  case "$WATCHDOG_INTERVAL" in
+    (0[0-9]*) WATCHDOG_INTERVAL=${WATCHDOG_INTERVAL#0} ;;
+    (*) break ;;
+  esac
+done
+watchdog_next=0
+watchdog_pid=""
+maybe_sweep_assignments() {
+  [ -n "$WATCHDOG_BIN" ] || return 0
+  # Still running from a previous tick: let it finish. Two sweeps at once
+  # would both read "nothing is working on this issue" and both start a
+  # session for it — the duplicate-agent outcome the sweep exists to avoid.
+  #
+  # Asked with `jobs -rp`, NOT with `kill -0`: the sweep is a background child
+  # of this shell, so between exiting and being reaped it is a zombie, and
+  # `kill -0` answers "alive" for a zombie. Nothing here ever waits, so that
+  # reading would be permanent and the sweep would never run again after its
+  # first tick. Querying jobs both filters to genuinely running children and
+  # reaps the finished one.
+  if [ -n "$watchdog_pid" ]; then
+    _running=" $(jobs -rp 2>/dev/null | tr '\n' ' ')"
+    case "$_running" in
+      (*" $watchdog_pid "*) return 0 ;;
+    esac
+    watchdog_pid=""
+  fi
+  _now=$(date +%s 2>/dev/null) || return 0
+  [ "$_now" -ge "$watchdog_next" ] || return 0
+  # Set the next deadline BEFORE starting, not after it returns: a sweep that
+  # dies without being reaped must not pin the deadline in the past and turn
+  # this into a spawn-per-tick loop.
+  watchdog_next=$((_now + WATCHDOG_INTERVAL))
+  # stdout dropped, stderr kept: the one-line summary in the journal is what
+  # makes a sweep that found nothing distinguishable from one that never ran.
+  "$WATCHDOG_BIN" >/dev/null &
+  watchdog_pid=$!
+}
+
 # Reconcile forever; systemd stop tears the whole tree down (ExecStop
 # kill-server + cgroup kill), Restart=always revives a crashed loop.
 # Sessions flagged stopped (a clean agent exit, or agent-box-session
@@ -1403,6 +1466,7 @@ reap_ephemeral() {
 while true; do
   reap_ephemeral
   sweep_session_state
+  maybe_sweep_assignments
   while IFS= read -r sname; do
     case "$sname" in
       (*[!A-Za-z0-9_-]*|"") continue ;;

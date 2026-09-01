@@ -1341,6 +1341,32 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # about ten seconds on every architecture. It also holds the settings
           # daemon's fcntl side and the shell side to the same sidecar file,
           # which is the one agreement nothing else checks.
+          # The stalled-assignment classifier (modules/src/watchdog.py). Its
+          # inputs are a GitHub timeline and other sessions' live claims, so a
+          # VM test would cost minutes a run to assert one case; the
+          # classifier performs no I/O of its own precisely so the rules can
+          # be asserted here instead.
+          watchdog-classifier =
+            pkgs.runCommand "agent-box-watchdog-classifier"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                watchdog = ./modules/src/watchdog.py;
+                tests = ./tests/test-watchdog.py;
+              } ''
+              install -d repo/modules/src repo/tests
+              cp "$watchdog" repo/modules/src/watchdog.py
+              cp "$tests" repo/tests/test-watchdog.py
+              # Not piped into tee: the log has to reach the build output
+              # whether the tests pass or fail, and the exit status has to be
+              # python's own.
+              python3 repo/tests/test-watchdog.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           registry-protocol =
             pkgs.runCommand "agent-box-registry-protocol"
               {

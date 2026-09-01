@@ -504,6 +504,9 @@ let
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli ]
+    # On PATH only when the sweep is on, so its presence tells an agent the
+    # box is watching its own assignments (same rule as webhookCli above).
+    ++ lib.optionals cfg.watchdog.enable [ watchdogCli ]
     ++ agentBaseTools
     ++ cfg.extraPackages
   );
@@ -643,6 +646,67 @@ let
   # transcript that copied a curl line.
   uploadCli = pkgs.writeShellScriptBin "agent-box-upload" ''
 @@include:src/upload-cli.sh@@
+  '';
+
+  # The level-triggered half of "an assignment means do the work".
+  #
+  # webhookSpawn below is edge-triggered: it fires once, the moment GitHub
+  # says `assigned`, and whatever it starts is the only agent that issue will
+  # ever get. If that session is refused by the ceiling, killed by a Spot
+  # interruption, stopped by hand, or simply answers the issue with a comment
+  # and calls itself done, the assignment stays open with no PR behind it and
+  # nothing on the box ever looks again.
+  #
+  # This asks the standing question instead — for every issue assigned to this
+  # box right now, is there work in flight? — and starts one `wd-<repo>-<n>`
+  # session for each that has none. See src/watchdog.py for why the answer is
+  # read from open PRs and from other sessions' own claims, and why every
+  # uncertain reading counts as "in flight".
+  watchdogCli = pkgs.writeShellScriptBin "agent-box-watchdog" (''
+    # Pinned rather than inherited: this runs from the supervisor's PATH as
+    # well as from an agent's, and the two are not the same set (issue #154,
+    # Phase 2 — the AGENT_BOX_*_BIN convention).
+    export AGENT_BOX_GH_BIN=${pkgs.gh}/bin/gh
+    export AGENT_BOX_SESSION_BIN=${sessionCli}/bin/agent-box-session
+    # Declared defaults, each overridable per box with `agent-box-session env
+    # set`: which repos an agent user is answerable for, and how hard to press
+    # them, are preferences rather than system-level facts, and the agent user
+    # cannot edit /etc/nixos to change a Nix option.
+    # Both are integers the option type already validated, so they can be
+    # interpolated straight into the "${VAR:-N}" form.
+    export AGENT_BOX_WATCHDOG_COOLDOWN="''${AGENT_BOX_WATCHDOG_COOLDOWN:-${toString cfg.watchdog.cooldown}}"
+    export AGENT_BOX_WATCHDOG_MAX_ATTEMPTS="''${AGENT_BOX_WATCHDOG_MAX_ATTEMPTS:-${toString cfg.watchdog.maxAttempts}}"
+    # These two are free-form config, so their defaults are set by a BARE
+    # ASSIGNMENT, where escapeShellArg's quoting is real quoting. Inside a
+    # double-quoted "''${VAR:-...}" the quotes it adds are literal characters
+    # instead, so every repo name arrived wrapped in apostrophes and matched
+    # nothing (#486 review).
+    #
+    # Tested with `+set` rather than `:-` for the same reason: an operator who
+    # exports an EMPTY value is asking for the unrestricted sweep, and must
+    # not be handed the declared default straight back.
+    if [ -z "''${AGENT_BOX_WATCHDOG_AGENT+set}" ]; then
+      AGENT_BOX_WATCHDOG_AGENT=${lib.escapeShellArg cfg.watchdog.agent}
+    fi
+    export AGENT_BOX_WATCHDOG_AGENT
+  '' + lib.optionalString (cfg.watchdog.repos != [ ]) ''
+    if [ -z "''${AGENT_BOX_WATCHDOG_REPOS+set}" ]; then
+      AGENT_BOX_WATCHDOG_REPOS=${lib.escapeShellArg (lib.concatStringsSep " " cfg.watchdog.repos)}
+    fi
+    export AGENT_BOX_WATCHDOG_REPOS
+  '' + ''
+    exec ${watchdogProgram} "$@"
+  '');
+
+  # The body, its own derivation so the wrapper above stays readable. E501
+  # matches the other writePython3 users here: the prose comments carrying
+  # this file's reasoning do not fit in 79 columns. Note that flakeIgnore
+  # REPLACES flake8's default ignore list rather than adding to it, so W503
+  # is live under this gate — src/watchdog.py is written to pass it.
+  watchdogProgram = pkgs.writers.writePython3 "agent-box-watchdog-run" {
+    flakeIgnore = [ "E501" ];
+  } ''
+@@include:src/watchdog.py@@
   '';
 
   # Dispatch target for standing watches (local-channels#1): the receiver
@@ -1917,6 +1981,106 @@ in
       };
     };
 
+    # The standing sweep over this box's own assignments.
+    #
+    # Defaults ON for the same reason webhook.enable does: the failure it
+    # catches is INVISIBLE. An assignment that never became a PR looks exactly
+    # like an assignment nobody has got to yet, and the only thing that
+    # notices is a human re-reading the issue list days later. An opt-in
+    # needing a root /etc/nixos edit plus a rebuild — which the agent user
+    # cannot do — would be switched on by nobody, and the boxes that most need
+    # it are the ones whose operator never looks.
+    #
+    # It costs one GitHub search plus one timeline read per assigned issue per
+    # interval, and it does nothing at all on a box with no GitHub token.
+    watchdog = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        example = false;
+        description = ''
+          Periodically look for open issues assigned to this box's GitHub
+          identity that no open PR references and no live session claims, and
+          start one agent session per stalled issue (named wd-<repo>-<number>,
+          so a second sweep over the same issue is a no-op).
+
+          This is the level-triggered counterpart to the standing watch's
+          `assigned` clause, which fires once per assignment and never looks
+          again. Sessions it starts share the hook-* ceiling
+          (AGENT_BOX_HOOK_SESSION_MAX, default 4): the two families are the
+          same resource, so a box full of hook-* sessions does not get a
+          second fleet stacked on top of them.
+
+          Inert on a box with no GitHub token — with no identity there are no
+          assignments to sweep.
+        '';
+      };
+
+      interval = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 1800;
+        example = 600;
+        description = ''
+          Seconds between sweeps. The supervisor runs the sweep in the
+          background off its own reconcile loop, so this is a floor rather
+          than a schedule: a sweep that overruns delays the next one instead
+          of running a second copy beside it.
+
+          Short intervals buy very little. The thing being watched is an issue
+          nobody has opened a PR for, which is a state measured in hours.
+        '';
+      };
+
+      cooldown = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 6;
+        example = 24;
+        description = ''
+          Hours before the same stalled issue is picked up again, counted from
+          the last session started for it. The session name already makes a
+          repeat a no-op while that session is LISTED; this bounds the case
+          where it has been removed and the issue is still open.
+        '';
+      };
+
+      maxAttempts = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 3;
+        example = 0;
+        description = ''
+          Give up on an issue after this many sessions have been started for
+          it with no PR to show for it. An issue that survives three agents is
+          waiting on a person, and starting a fourth is how a watchdog turns
+          into a nuisance that gets switched off.
+
+          0 never gives up. `agent-box-watchdog --json` reports the issues it
+          has given up on, so they stay visible.
+        '';
+      };
+
+      repos = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "defangdevs/agent-box" ];
+        description = ''
+          Restrict the sweep to these owner/repo names. Empty (the default)
+          sweeps every repo the box has an assigned issue in AND can push to —
+          push access being the test for "ours to fix", so an issue this box
+          merely REPORTED upstream is never mistaken for work it owes.
+        '';
+      };
+
+      agent = lib.mkOption {
+        type = lib.types.str;
+        default = "claude";
+        example = "codex";
+        description = ''
+          Harness the sweep starts its sessions with, passed to
+          `agent-box-session add --agent`.
+        '';
+      };
+    };
+
     spotInterruption = {
       # Defaults to true (not mkEnableOption): the monitor is self-gating and
       # harmless on a non-Spot box, so the safe default is "on" — a Spot box
@@ -2244,6 +2408,22 @@ in
             # Hook settings for claude spawns — the segment-rotation record
             # (issue #223) the supervisor follows on respawn.
             AGENT_BOX_CLAUDE_SETTINGS = "${claudeHookSettings}";
+          }
+          // lib.optionalAttrs cfg.watchdog.enable {
+            # The assignment sweep, run off the supervisor's own reconcile
+            # loop (src/supervisor.sh, maybe_sweep_assignments).
+            #
+            # NOT in the binding contract above, for the same reason
+            # AGENT_BOX_CODEX_RC is not: that manifest binds fixed programs
+            # that every box gets, and these two are conditional on an option.
+            # The interval is not a program name at all, so no contract entry
+            # could express it.
+            #
+            # Pinned by store path rather than left to PATH: the supervisor's
+            # PATH is not an agent's, and a sweep that silently resolved to
+            # nothing would look exactly like a box with no stalled work.
+            AGENT_BOX_WATCHDOG_BIN = "${watchdogCli}/bin/agent-box-watchdog";
+            AGENT_BOX_WATCHDOG_INTERVAL = toString cfg.watchdog.interval;
           }
           // lib.optionalAttrs (hostLabel != "") {
             # Host suffix for auto-derived Remote Control session names.
