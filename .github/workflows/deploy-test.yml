@@ -66,9 +66,18 @@ jobs:
     #    CREATE_COMPLETE and its outputs populate. That still catches template
     #    resolution bugs (e.g. the old EIPAssoc dependency) and empty-GetAtt bugs
     #    (e.g. a blank PrimaryIpv6Address -> "https://.sslip.io/").
-    #    DISABLED: fails first boot on every run since the 26.05 AMI landed, so
-    #    it only kept master red at ~39 min a run. Re-enable when issue 190 is
-    #    fixed: https://github.com/defangdevs/agent-box/issues/190
+    #    Re-enabled with SSM diagnostics (issue 190): the leg has failed first
+    #    boot on every run since the 26.05 AMI landed (amazon-init dies before
+    #    switch-to-configuration, journal-only, no signal on the console), and
+    #    it was disabled outright rather than kept red at ~39 min a run with
+    #    zero diagnostic value. EnableSsm no longer rides public_ipv4 (below),
+    #    so this leg now gets a root shell path even though amazon-init never
+    #    switches — the stock AMI's amazon-ssm-agent runs unconditionally
+    #    pre-switch, it only needed the instance profile. `continue-on-error`
+    #    keeps this leg's still-expected-until-190-is-diagnosed failure from
+    #    reddening the workflow conclusion (and hiding the next real
+    #    regression on ipv4-full) while it still runs and still captures
+    #    evidence every push. Drop continue-on-error once 190 is fixed.
     strategy:
       fail-fast: false
       matrix:
@@ -76,9 +85,13 @@ jobs:
           - leg: ipv4-full
             public_ipv4: "true"
             use_spot: "false"
-          # - leg: ipv6-outputs
-          #   public_ipv4: "false"
-          #   use_spot: "false"
+          - leg: ipv6-outputs
+            public_ipv4: "false"
+            use_spot: "false"
+    # ipv6-outputs is expected to fail until issue 190 is diagnosed and fixed
+    # (see the strategy comment above) — don't let its known-red leg flip the
+    # overall workflow conclusion and mask a real ipv4-full regression.
+    continue-on-error: ${{ matrix.leg == 'ipv6-outputs' }}
     # Fork? Override with a repo-scoped var AGENT_BOX_ENVIRONMENT, or edit the fallback.
     environment: ${{ vars.AGENT_BOX_ENVIRONMENT || 'defang-agent-box' }}
     # Room for one FirstBootDone-timeout retry (issue 112): two create waits
@@ -134,7 +147,14 @@ jobs:
       - name: Create stack
         id: create
         run: |
-          # PublicIpv4 / UseSpot come from the matrix leg (see the job comment).
+          # PublicIpv4/UseSpot come from the matrix leg (see the job comment).
+          # EnableSsm is now unconditionally true on BOTH legs (issue 190):
+          # the stock AMI's amazon-ssm-agent runs unconditionally pre-switch
+          # (aws/template.yaml's EnableSsm description), so attaching the
+          # instance profile gives a root-shell diagnostic path even on a box
+          # whose amazon-init dies before switch-to-configuration ever runs —
+          # previously only ipv4-full got this, leaving ipv6-outputs with no
+          # way to read its (journal-only) amazon-init failure at all.
           create() {
             aws cloudformation create-stack \
               --stack-name "$STACK_NAME" \
@@ -145,7 +165,7 @@ jobs:
                 "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
                 "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't4g.small (2 vCPU / 2 GiB)' }}" \
                 "ParameterKey=SeedMainSession,ParameterValue=true" \
-                "ParameterKey=EnableSsm,ParameterValue=${{ matrix.public_ipv4 }}" \
+                "ParameterKey=EnableSsm,ParameterValue=true" \
                 "ParameterKey=AgentBoxRev,ParameterValue=${{ steps.pin.outputs.rev }}" \
                 "ParameterKey=AgentBoxSha256,ParameterValue=${{ steps.pin.outputs.sha }}" \
               --on-failure DO_NOTHING \
@@ -154,16 +174,68 @@ jobs:
             echo "::notice::Waiting for stack ${STACK_NAME} to reach CREATE_COMPLETE..."
             aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
           }
+
+          # Pull whatever a FAILED-to-provision instance can still tell us,
+          # BEFORE the stack (and the instance) is deleted — this evidence is
+          # otherwise destroyed. get-console-output only ever returns amazon-
+          # init's terminal "Failed to start ..." line (it logs journal-only,
+          # aws/template.yaml:456,601), so the pre-switch journal itself —
+          # where an IPv6-only DNS/resolver failure would actually show up —
+          # is only reachable via SSM. EnableSsm=true above means the agent
+          # (already running pre-switch on the stock AMI) has a chance to
+          # register even though amazon-init never got to switch-to-
+          # configuration; best-effort throughout, since a box that also
+          # can't reach SSM's endpoints leaves us with the console dump alone.
+          dump_diagnostics() {
+            local iid="$1" label="$2"
+            if [ -z "$iid" ] || [ "$iid" = "None" ]; then
+              echo "::warning::No instance id for the $label attempt; nothing to dump."
+              return 0
+            fi
+            echo "::group::Serial console — $label attempt ($iid)"
+            aws ec2 get-console-output --instance-id "$iid" --latest \
+              --query Output --output text || true
+            echo "::endgroup::"
+            cid=$(aws ssm send-command --instance-ids "$iid" \
+              --document-name AWS-RunShellScript \
+              --parameters 'commands=[
+                "systemctl status amazon-init --no-pager -l 2>&1 || true",
+                "echo ---amazon-init-journal---; journalctl -u amazon-init --no-pager 2>&1 || true",
+                "echo ---resolvectl---; resolvectl status 2>&1 || true; cat /etc/resolv.conf 2>&1 || true",
+                "echo ---networkd-journal---; journalctl -u systemd-networkd -u systemd-resolved --no-pager 2>&1 | tail -100 || true",
+                "echo ---live-fetch-probe---; curl -6 -sSv --max-time 10 -o /dev/null https://raw.githubusercontent.com/ 2>&1 || true"
+              ]' \
+              --query Command.CommandId --output text 2>/dev/null) || {
+                echo "::warning::SSM send-command failed for the $label attempt (agent never registered, or missing IAM perms) - console dump above is all we have."
+                return 0
+              }
+            status=Pending
+            for i in $(seq 1 24); do
+              status=$(aws ssm get-command-invocation --command-id "$cid" --instance-id "$iid" \
+                --query Status --output text 2>/dev/null || echo Pending)
+              case "$status" in Success|Failed|Cancelled|TimedOut) break;; esac
+              sleep 5
+            done
+            echo "::group::SSM pre-switch journal — $label attempt ($iid, status: $status)"
+            aws ssm get-command-invocation --command-id "$cid" --instance-id "$iid" \
+              --query StandardOutputContent --output text 2>/dev/null || true
+            aws ssm get-command-invocation --command-id "$cid" --instance-id "$iid" \
+              --query StandardErrorContent --output text 2>/dev/null || true
+            echo "::endgroup::"
+          }
+
           if create; then exit 0; fi
+          first_iid=$(aws cloudformation describe-stack-resources --stack-name "$STACK_NAME" \
+            --logical-resource-id Instance \
+            --query 'StackResources[0].PhysicalResourceId' --output text 2>/dev/null || true)
+          dump_diagnostics "$first_iid" "first"
 
           # Retry ONCE, and only for the known-intermittent first-boot flake
           # (issue 112): the box occasionally comes up unprovisioned (issue 84,
           # fetch-ec2-metadata failing open), so FirstBootDone never signals
           # and the WaitCondition times out. Any other failure (template bug,
           # quota, IAM) stays a hard failure — retrying those would only mask
-          # them. NOTE for issue 84: grab the failed instance's serial console
-          # BEFORE deleting the stack; this evidence is otherwise destroyed,
-          # and the ipv6-outputs leg has no other diagnostic path (no SSM).
+          # them.
           reason=$(aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
             --query 'StackEvents[?LogicalResourceId==`FirstBootDone` && ResourceStatus==`CREATE_FAILED`].ResourceStatusReason | [0]' \
             --output text 2>/dev/null || true)
@@ -171,31 +243,32 @@ jobs:
             *"WaitCondition timed out"*) ;;
             *) echo "::error::Stack creation failed for a reason other than the FirstBootDone timeout; not retrying."; exit 1 ;;
           esac
-          iid=$(aws cloudformation describe-stack-resources --stack-name "$STACK_NAME" \
-            --logical-resource-id Instance \
-            --query 'StackResources[0].PhysicalResourceId' --output text 2>/dev/null || true)
-          if [ -n "$iid" ] && [ "$iid" != "None" ]; then
-            echo "::group::Serial console of the FAILED first attempt ($iid) — issue 84 evidence"
-            aws ec2 get-console-output --instance-id "$iid" --latest \
-              --query Output --output text || true
-            echo "::endgroup::"
-          fi
           # Persistent Spot requests can re-open and snag stack deletion (same
           # hazard the Destroy step guards); cancel best-effort here too so a
           # Spot dispatch run can't wedge the retry.
-          if [ -n "$iid" ] && [ "$iid" != "None" ]; then
+          if [ -n "$first_iid" ] && [ "$first_iid" != "None" ]; then
             sirs=$(aws ec2 describe-spot-instance-requests \
-              --filters "Name=instance-id,Values=$iid" \
+              --filters "Name=instance-id,Values=$first_iid" \
               --query 'SpotInstanceRequests[].SpotInstanceRequestId' \
               --output text 2>/dev/null || true)
             if [ -n "$sirs" ]; then
               aws ec2 cancel-spot-instance-requests --spot-instance-request-ids $sirs || true
             fi
           fi
-          echo "::warning::FirstBootDone timed out (issue 112 flake); deleting the failed stack and retrying once."
+          echo "::warning::FirstBootDone timed out (issue 112 flake, or the issue-190 ipv6-outputs first-boot failure); deleting the failed stack and retrying once."
           aws cloudformation delete-stack --stack-name "$STACK_NAME"
           aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
-          create
+
+          # Capture the SAME diagnostics for the retry attempt before failing
+          # for good — this is the leg's LAST chance to see anything before
+          # "Dump failed stack events" (CFN event reasons only, no
+          # console/journal) is all that's left.
+          if create; then exit 0; fi
+          second_iid=$(aws cloudformation describe-stack-resources --stack-name "$STACK_NAME" \
+            --logical-resource-id Instance \
+            --query 'StackResources[0].PhysicalResourceId' --output text 2>/dev/null || true)
+          dump_diagnostics "$second_iid" "second (final)"
+          exit 1
 
       - name: Dump failed stack events
         if: failure() && steps.create.outcome == 'failure'
@@ -508,14 +581,18 @@ jobs:
       - name: Diagnose auth state via SSM
         # When a smoke test fails, pull unit status, file listings, and
         # journals off the box before it's destroyed (issues 53/84). Runs on
-        # EVERY ipv4-full failure — the failures are intermittent, so
-        # dispatch-only diagnostics kept missing them (EnableSsm rides
-        # matrix.public_ipv4: the SSM agent can't reach its IPv4-only
-        # endpoints from the IPv6-only leg, which also keeps that leg on the
-        # pure template defaults). Deliberately does NOT cat secret files
-        # (hash, cookie secret, caddy env) or user-data into the public log —
-        # file presence, perms, and journals cover the diagnostic need.
-        if: ${{ failure() && matrix.public_ipv4 == 'true' }}
+        # EVERY failure that reaches this point — the failures are
+        # intermittent, so dispatch-only diagnostics kept missing them.
+        # EnableSsm is unconditionally true now (issue 190), so this also
+        # covers the rare case where ipv6-outputs reaches CREATE_COMPLETE but
+        # a later assertion (e.g. "Assert amazon-init provisioned the box")
+        # fails; the far more common ipv6-outputs failure is a Create-stack
+        # timeout, which never reaches this step — that path has its own SSM
+        # capture inline (see the "Create stack" step's dump_diagnostics).
+        # Deliberately does NOT cat secret files (hash, cookie secret, caddy
+        # env) or user-data into the public log — file presence, perms, and
+        # journals cover the diagnostic need.
+        if: failure()
         run: |
           iid='${{ steps.outputs.outputs.instance_id }}'
           if [ -z "$iid" ] || [ "$iid" = "None" ]; then
