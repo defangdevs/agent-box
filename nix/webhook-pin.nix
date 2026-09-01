@@ -16,6 +16,6 @@
 # module-generated-up-to-date check fails until it matches.
 {
   repo = "defangdevs/local-channels";
-  rev = "0662d299082f837dd2e4e9144745e82be8f3dd01";
-  sha256 = "sha256-MXhibGlei70BZt6sAO2h6EMRyoA4LrsiHi/015m3MPM=";
+  rev = "789b374020842715cda66105fbbebf3267148e3f";
+  sha256 = "sha256-cEvfs1jiMpY+uyhdJH/zSTypNUsZ1FbFALE6KYfN/UM=";
 }

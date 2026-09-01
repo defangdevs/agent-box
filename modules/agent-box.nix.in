@@ -1692,6 +1692,16 @@ in
           subscription so the one-liner in the shipped guide keeps working;
           watchPolicy is unaffected in shape and, since 0.23.0, is the ONLY
           thing that still makes the box's own standing watch selective.
+
+          0.26.0 (this pin) adds delivery INTO a codex session, which until now
+          could only MANAGE subscriptions: `subscribe` run inside one starts a
+          detached peer that hands each event to `codex queue`, landing it as a
+          message at that session's next turn boundary. The module needs
+          nothing for it - the peer is started by the session's own CLI call
+          and resolves `codex` from that session's PATH - but the shipped
+          guide's webhook section now says so. Two versions came between:
+          0.24.0 stopped dressing a foreign sender in GitHub's shape, and
+          0.25.0 lets a watch carry a `spawnConfig` for its spawn command.
         '';
       };
       sha256 = lib.mkOption {
