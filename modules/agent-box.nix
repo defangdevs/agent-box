@@ -5792,6 +5792,33 @@ exit 0
   ]
 }
   '';
+  # modules/src/contract/agent-box-settings.json — the third unit family.
+  # Unlike the previous two, some of its entries only apply when webhookEnabled
+  # (the panel's script/interpreter/hook-spawn vars), so each entry carries a
+  # "condition" name resolved by contractConditionHolds below instead of the
+  # whole manifest applying unconditionally.
+  settingsContract = builtins.fromJSON ''
+{
+  "unit": "agent-box-settings@",
+  "env": [
+    { "name": "AGENT_BOX_TMUX_BIN", "kind": "bin", "program": "tmux", "condition": "always" },
+    { "name": "AGENT_BOX_WEBHOOK_PYTHON", "kind": "bin", "program": "python3", "condition": "webhook" },
+    { "name": "AGENT_BOX_HOOK_SPAWN_CMD", "kind": "hook-spawn", "program": "agent-box-webhook-spawn", "condition": "webhook" }
+  ],
+  "execStart": [
+    { "kind": "bin", "program": "agent-box-settings" }
+  ]
+}
+  '';
+  # A small, deliberately closed vocabulary of conditions a contract entry
+  # can be gated on (issue #451) — not a general expression language. Add a
+  # name here only when a real THIRD condition shows up, matching whatever
+  # boolean this module already computes for it (never invent a new one just
+  # for the contract).
+  contractConditionHolds = cond:
+    if cond == "always" then true
+    else if cond == "webhook" then webhookEnabled
+    else throw "agent-box: contract entry has unknown condition '${cond}'";
   # A manifest entry only ever names a PROGRAM, never a store path (native's
   # side of the same contract resolves every program to "${self.bin}/name").
   # This is the module's half of that resolution: program name -> the
@@ -5814,6 +5841,7 @@ exit 0
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";
     "agent-box-supervisor" = "${supervisorScript}/bin/agent-box-supervisor";
+    python3 = webhookPython;
   };
   # Resolve one manifest entry to the value this backend binds it to. An
   # unknown kind or program is a hard error at eval time (the whole point of
@@ -15204,6 +15232,21 @@ def main():
 if __name__ == "__main__":
     main()
       '');
+      # "agent-box-settings" (this unit's own ExecStart program) can't live
+      # in the module's shared, outer-scope contractPrograms: settingsDaemon
+      # above is a local of this config block, not of the outer `let` where
+      # contractPrograms/contractBin are defined (issue #451) — hoisting it
+      # up would be a detour just to satisfy one lookup. A local extension
+      # of the same registry keeps that scoping where it already is.
+      settingsContractPrograms = contractPrograms // {
+        "agent-box-settings" = "${settingsDaemon}/bin/agent-box-settings";
+      };
+      settingsContractBin = entry:
+        if entry.kind != "bin" then
+          throw "agent-box: contract entry has unknown kind '${entry.kind}'"
+        else
+          settingsContractPrograms.${entry.program} or
+            (throw "agent-box: contract references unknown program '${entry.program}'");
       # Per-connection tmux attach for ttyd (issue #59). ttyd runs with
       # --url-arg, so /<user>/?arg=<session> passes <session> as $1 — ONE
       # ttyd per user serves every session, including runtime-created ones.
@@ -15986,8 +16029,18 @@ if __name__ == "__main__":
         # as separate outer `// lib.optionalAttrs {...}` blocks (which
         # would each shallow-replace the whole attrset in turn).
         environment =
-          ({
-            AGENT_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
+          ((lib.listToAttrs (map
+            (e: lib.nameValuePair e.name (contractBin e))
+            (builtins.filter (e: contractConditionHolds e.condition) settingsContract.env)))
+          // {
+            # AGENT_BOX_TMUX_BIN, AGENT_BOX_WEBHOOK_PYTHON and
+            # AGENT_BOX_HOOK_SPAWN_CMD come from the shared binding
+            # contract above (issue #451) instead of being hand-written
+            # here — modules/src/contract/agent-box-settings.json's
+            # per-entry "condition" is what keeps the latter two gated on
+            # webhookEnabled, matching this unit's other webhook-only vars
+            # below, while AGENT_BOX_TMUX_BIN's "always" applies
+            # unconditionally like it always has.
             AGENT_BOX_AGENTS = lib.concatStringsSep "," (sessionKinds cfg.installAgents);
             AGENT_BOX_DEFAULT_AGENT = cfg.agent;
             # Guided sign-in (issues #207, #208, #313). The daemon starts
@@ -16020,11 +16073,6 @@ if __name__ == "__main__":
             # runs, hence host-level (the per-user state dir is in the
             # env file above).
             AGENT_BOX_WEBHOOK_SCRIPT = localWebhookScript;
-            AGENT_BOX_WEBHOOK_PYTHON = webhookPython;
-            # Same script the receiver runs on a match, for its
-            # --preamble mode only: the standing-watch panel prints the
-            # prompt the next match would launch (#259).
-            AGENT_BOX_HOOK_SPAWN_CMD = "${webhookSpawn}/bin/agent-box-webhook-spawn";
           }
           // lib.optionalAttrs cfg.selfUpdate.enable {
             # --no-block so the daemon's HTTP response goes out before
@@ -16065,7 +16113,7 @@ if __name__ == "__main__":
               pkgs.systemd
             ]);
           };
-        serviceConfig.ExecStart = [ "" "${settingsDaemon}/bin/agent-box-settings" ];
+        serviceConfig.ExecStart = [ "" (settingsContractBin (lib.elemAt settingsContract.execStart 0)) ];
       }) terminalUsers))
       # Webhook receiver daemon (issue #101), one per terminal user, gated on
       # webhook.enable. Runs webhook.py (via the agent-box-webhook-receiver

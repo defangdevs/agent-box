@@ -1906,6 +1906,23 @@ class Renderer:
                        "-t macOptionClickForcesSelection=true "
                        f"{self.bin}/agent-box-attach",
                    ]))
+            # AGENT_BOX_TMUX_BIN, AGENT_BOX_WEBHOOK_PYTHON and
+            # AGENT_BOX_HOOK_SPAWN_CMD come from the shared binding contract
+            # (issue #451) instead of being hand-written here — each
+            # entry's "condition" (checked by settings_contract_env below)
+            # is what keeps the latter two gated on webhook_enable while
+            # AGENT_BOX_TMUX_BIN's "always" applies unconditionally, same
+            # as before. AGENT_BOX_SYSTEMCTL stays hand-written: unlike
+            # these three, it does not resolve to a path inside self.bin on
+            # either backend (module: /run/current-system/sw/bin/systemctl;
+            # native: SYSTEMCTL = /usr/bin/systemctl), so "bin" kind
+            # resolution doesn't fit it.
+            settings_contract = self.load_contract("agent-box-settings")
+
+            def settings_contract_env(condition):
+                return [e for e in settings_contract["env"]
+                        if e["condition"] == condition]
+
             t.file(self.p("/etc/systemd/system",
                           f"agent-box-settings@{u.name}.service.d",
                           "10-host.conf"),
@@ -1918,7 +1935,10 @@ class Renderer:
                        f'Environment="AGENT_BOX_REPO={self.spec.repo}"',
                        f'Environment="AGENT_BOX_REV={self.spec.rev}"',
                        f'Environment="AGENT_BOX_SYSTEMCTL={SYSTEMCTL}"',
-                       f'Environment="AGENT_BOX_TMUX_BIN={self.bin}/tmux"',
+                   ] + [
+                       f'Environment="{e["name"]}={self.contract_bin(e)}"'
+                       for e in settings_contract_env("always")
+                   ] + [
                        # The settings page's Connections cards (issue
                        # #392). Same "<id>=<binary>" convention as
                        # AGENT_BOX_AGENT_BINS, and it names only what this
@@ -1968,24 +1988,13 @@ class Renderer:
                        # renderer already emits (issue #425).
                        f'Environment="AGENT_BOX_WEBHOOK_SCRIPT='
                        f'{self.spec.webhook_script}"',
-                       # Without the interpreter the daemon falls back to
-                       # its own, which need not have local-webhook's
-                       # dependencies.
-                       f'Environment="AGENT_BOX_WEBHOOK_PYTHON='
-                       f'{self.bin}/python3"',
-                       # --preamble mode only: the panel prints the prompt
-                       # the next match would launch (issue #259). Routed
-                       # through the generated wrapper (caddy(), issue
-                       # #471 review) rather than the bare profile binary:
-                       # the box-wide hookSessionArgs default has nowhere
-                       # else to reach a real invocation from on native —
-                       # the module instead bakes it into webhookSpawn
-                       # itself at Nix eval time.
-                       'Environment="AGENT_BOX_HOOK_SPAWN_CMD='
-                       '/etc/agent-box/bin/agent-box-webhook-spawn"',
+                   ] + [
+                       f'Environment="{e["name"]}={self.contract_bin(e)}"'
+                       for e in settings_contract_env("webhook")
                    ] if self.spec.webhook_enable else []) + [
                        "ExecStart=",
-                       f"ExecStart={self.bin}/agent-box-settings",
+                       f"ExecStart="
+                       f"{self.contract_bin(settings_contract['execStart'][0])}",
                    ]))
         if self.spec.webhook_enable:
             # Env vars and Exec directives come from the shared binding
