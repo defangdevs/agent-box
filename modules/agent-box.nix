@@ -9190,7 +9190,10 @@ in
           one describes the WATCH, which is what `agent-box-webhook subscribe
           --profile NAME` writes and what lets a watch name the agent profile
           its own sessions start on. AGENT_BOX_HOOK_PROFILE stays the box-wide
-          fallback.
+          fallback. The same release queues dispatch batches per (key,
+          spawnConfig) rather than per key, so two watches on one repo cannot
+          coalesce into a single spawn that would hand one watch's events to
+          the other's worker.
 
           0.23.0 (issue #380) retired the built-in failures-only CI
           brake for rule-less dispatch entries: a `--deliver-to subagent`
