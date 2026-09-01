@@ -1186,16 +1186,55 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # regenerates the file with the same assembler, so the check and the
           # bug agree on the wrong bytes. This one decodes the escaped text the
           # way Nix's lexer does and round-trips a corpus through it.
+          # Issue #51 makes the repo the distribution channel for the one
+          # third-party asset the settings page loads: a deployed box fetches
+          # modules/agent-box.nix as a single file and the pages pull nothing
+          # from a CDN, so a vendored copy is the only shape available. This
+          # verifies each copy still hashes to the pin that records where it
+          # came from — an edited, truncated or swapped file fails here rather
+          # than shipping to every box — and that no vendored file is
+          # unpinned, unused, or undeclared.
+          #
+          # The upstream half (`--upstream`, "is there a newer release?") is
+          # deliberately NOT here: it needs network, which a Nix build does not
+          # get. .github/workflows/vendor-updates.yml runs it weekly instead.
+          vendor-integrity =
+            pkgs.runCommand "agent-box-vendor-integrity"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                checker = ./scripts/check_vendor.py;
+                vendor = ./modules/src/vendor;
+                daemon = ./modules/src/settings-daemon.py;
+              } ''
+              install -d repo/scripts repo/modules/src
+              cp "$checker" repo/scripts/check_vendor.py
+              cp -r "$vendor" repo/modules/src/vendor
+              cp "$daemon" repo/modules/src/settings-daemon.py
+              cd repo
+              python3 scripts/check_vendor.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           assemble-module-escaping =
             pkgs.runCommand "agent-box-assemble-module-escaping"
               {
                 nativeBuildInputs = [ pkgs.python3 ];
                 assembler = ./bin/assemble-module.py;
                 tests = ./tests/test-assemble-module.py;
+                # The tests round-trip the REAL vendored assets through the
+                # Python-host dialect, not just a synthetic corpus: a bump
+                # replaces one of those files wholesale, so the new bytes have
+                # to survive the escaper before they can land.
+                vendor = ./modules/src/vendor;
               } ''
-              install -d repo/bin repo/tests
+              install -d repo/bin repo/tests repo/modules/src
               cp "$assembler" repo/bin/assemble-module.py
               cp "$tests" repo/tests/test-assemble-module.py
+              cp -r "$vendor" repo/modules/src/vendor
               # Not piped into tee: the log has to reach the build output
               # whether the tests pass or fail, and the exit status has to be
               # python's own.

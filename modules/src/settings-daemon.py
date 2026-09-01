@@ -3134,7 +3134,21 @@ ICON_TRASH = (
 # is still "starting" so the state flips to "live" on its own. The
 # inline confirm() guards run before the submit event reaches us — a
 # dismissed dialog cancels the event, so we only see accepted ones.
+# Idiomorph (0BSD) morphs the live DOM toward re-rendered HTML instead of
+# replacing it, which is what lets a swap keep focus, caret and scroll. It is
+# vendored rather than fetched: the pages load no external asset, and a
+# deployed box fetches this module as a single file (issue #51), so there is
+# no second request to make. modules/src/vendor/vendor.json is its pin —
+# `python3 scripts/check_vendor.py` verifies it and reports upstream releases.
+# Its own <script> element, not a concatenation: a minified bundle that
+# happens to end without a semicolon would otherwise let ASI glue it onto the
+# IIFE that opens settings.js, turning the pair into a call. Two elements are
+# parsed independently, so an upstream bump cannot introduce that. The `var`
+# still lands on window, which is how settings.js reaches it.
 SCRIPT = """<script>
+@@include:vendor/idiomorph.min.js@@
+</script>
+<script>
 @@include:settings.js@@
 </script>
 """

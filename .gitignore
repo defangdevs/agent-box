@@ -1,4 +1,8 @@
 __pycache__/
 tests/e2e/test-results/
+# The documented invocation is `playwright test -c tests/e2e` FROM THE REPO
+# ROOT, and playwright resolves its output dir against the cwd — so the run
+# actually writes here, not next to the config.
+test-results/
 result
 result-*
