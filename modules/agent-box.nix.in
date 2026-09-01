@@ -710,6 +710,41 @@ let
 @@include:src/webhook-policy-apply.sh@@
   '');
 
+  # Binding contract (issue #451, #154 Phase 5): which env vars and Exec
+  # directives the agent-box-webhook@ unit gets is data, not a hand-written
+  # chain of lib.optionalAttrs — modules/src/contract/agent-box-webhook.json
+  # is the ONE file both this module and bin/agentbox's Renderer read (the
+  # native side installs it verbatim under share/agent-box/contract/, see
+  # nix/runtime.nix). Embedded like every other modules/src asset, so the
+  # generated module stays self-contained.
+  webhookContract = builtins.fromJSON ''
+@@include:src/contract/agent-box-webhook.json@@
+  '';
+  # A manifest entry only ever names a PROGRAM, never a store path (native's
+  # side of the same contract resolves every program to "${self.bin}/name").
+  # This is the module's half of that resolution: program name -> the
+  # derivation that provides it. Add an entry here, not a new hand-written
+  # environment/serviceConfig line, when a future contract references a new
+  # program.
+  contractPrograms = {
+    "agent-box-webhook-spawn" = webhookSpawn;
+    "agent-box-webhook-receiver" = webhookReceiverBin;
+    "agent-box-webhook-policy-apply" = webhookPolicyApply;
+    tmux = pkgs.tmux;
+  };
+  # Resolve one manifest entry to the value this backend binds it to. An
+  # unknown kind or program is a hard error at eval time (the whole point of
+  # #451: a binding gap becomes a build failure, not a silently-absent
+  # feature caught later by scripts/check_backend_parity.py).
+  contractBin = entry:
+    if entry.kind != "bin" then
+      throw "agent-box: contract entry has unknown kind '${entry.kind}'"
+    else
+      let
+        drv = contractPrograms.${entry.program} or
+          (throw "agent-box: contract references unknown program '${entry.program}'");
+      in "${drv}/bin/${entry.program}";
+
   # One session = one agent CLI in one tmux session. These options are the
   # FIRST-BOOT SEED only (see users.<name>.sessions); at runtime the same
   # fields live as JSON in ~/.config/agent-box/sessions.json.
@@ -2948,28 +2983,27 @@ in
         # The spawn wrapper (src/webhook-spawn.sh) runs as this unit's
         # child and resolves jq/coreutils/agent-box-session from this
         # PATH instead of baked store paths (issue #154, Phase 2).
-        environment = {
-          # Standing watches (deliver_to:"subagent", local-channels#1): a
-          # matching delivery spawns a fresh hook-* session for this user.
-          # webhook.py coalesces bursts and caps concurrent spawns; the
-          # wrapper additionally caps how many hook-* sessions may RUN.
-          # (RECEIVER_ONLY/STATE_DIR/PORT moved to the verbatim unit text
-          # and the per-user env file — issue #154 Phase 3.)
-          LOCAL_WEBHOOK_SPAWN_CMD = "${webhookSpawn}/bin/agent-box-webhook-spawn";
-          # The hook-session cap counts live tmux sessions, and tmux is
-          # deliberately not on this unit's PATH (below — the wrapper needs
-          # jq, coreutils and the session CLI, nothing else). So it gets a
-          # pinned binary instead of a wider PATH: the AGENT_BOX_*_BIN
-          # convention the supervisor uses for grep/find and the settings
-          # daemon for tmux. Without it the wrapper cannot tell a finished
-          # hook session from a running one and falls back to counting
-          # registry entries — the very over-counting of issue #280.
-          AGENT_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
+        #
+        # LOCAL_WEBHOOK_SPAWN_CMD and AGENT_BOX_TMUX_BIN come from the
+        # shared binding contract (webhookContract, issue #451) instead of
+        # being hand-written here — see the comment by contractBin above
+        # for what that buys. AGENT_BOX_TMUX_BIN specifically is a pinned
+        # binary rather than a wider PATH entry because the hook-session
+        # cap counts live tmux sessions and tmux is deliberately not on
+        # this unit's PATH; without it the wrapper falls back to counting
+        # registry entries, the over-counting of issue #280. PATH itself
+        # stays hand-written below: it is the one legitimately-different
+        # value in this unit, a curated store-path list here vs. a single
+        # profile bin dir natively, not a name a contract entry could
+        # usefully carry.
+        environment = (lib.listToAttrs (map
+          (e: lib.nameValuePair e.name (contractBin e))
+          webhookContract.env)) // {
           PATH = lib.mkForce (lib.makeBinPath [ pkgs.jq pkgs.coreutils sessionCli ]);
         };
         serviceConfig = {
-          ExecStartPre = [ "" "${webhookPolicyApply}/bin/agent-box-webhook-policy-apply" ];
-          ExecStart = [ "" "${webhookReceiverBin}/bin/agent-box-webhook-receiver" ];
+          ExecStartPre = [ "" (contractBin (lib.elemAt webhookContract.execStartPre 0)) ];
+          ExecStart = [ "" (contractBin (lib.elemAt webhookContract.execStart 0)) ];
         };
       }) terminalUsers));
       # No systemd.sockets overrides: the settings daemon's listening
