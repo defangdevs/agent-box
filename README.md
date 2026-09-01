@@ -367,8 +367,9 @@ than an internal cloud hostname. `remoteControlName` remains Claude-only.
 A linux user account and a harness are decoupled: each user runs one or
 more **sessions**, and each session is one harness (Claude Code or Codex) in
 its own tmux session, all supervised by that user's single hardened
-`agent-box-<name>.service`. All supported harnesses are installed
-regardless of what any session runs (`installAgents`). The pseudo-harness
+`agent-box-<name>.service`. Which harnesses the box installs is
+`installAgents` (default: all supported), and it is independent of what
+any session actually runs. The pseudo-harness
 `shell` runs the user's login shell instead — a supervised plain terminal
 for manual investigation or clean-up that respawns on exit and gets a
 terminal tab in the web workspace like any other session.
@@ -385,7 +386,7 @@ agent-box-session peers                     # the OTHER live sessions: where eac
 agent-box-session add --agent codex         # auto-named "codex" (or "codex-XXXX")
 agent-box-session add review --agent codex  # or name it yourself; starts within ~2s
 agent-box-session add scratch --cwd ~/proj -- --model opus
-agent-box-session add tidy --agent shell    # plain login shell, no harness
+agent-box-session add tidy --agent shell    # plain login shell, the pseudo-harness
 agent-box-session restart review
 agent-box-session rm review                 # delist + kill
 ```
