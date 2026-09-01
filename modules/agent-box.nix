@@ -95,6 +95,20 @@ let
       are local-webhook's own tools and have no `--claim` - they take the raw
       `include` rules - so when you are claiming an object, reach for the CLI and
       let it write them.
+
+      A CODEX session receives deliveries the same way it manages them: through the
+      CLI. Run `agent-box-webhook subscribe` from INSIDE the codex session and it
+      also starts a small delivery peer for that session's own thread, because codex
+      has no channel to attach at startup. Each event then arrives as a queued
+      message: an idle session wakes at once, one that is mid-turn gets it when that
+      turn ends. The peer stops itself when your last subscription goes, and
+      `agent-box-webhook status` names the thread and the peer - look there first if
+      subscriptions look healthy but nothing arrives. Subscribe from a shell OUTSIDE
+      the session (a `shell` session, a script, a spawn wrapper) and there is no
+      thread to deliver to: the subscription is written, the claim counts, and
+      nothing lands - so a codex session that inherited a seeded subscription should
+      re-run the subscribe itself to wire delivery.
+
       Subscriptions are PER SESSION and expire after an hour (`--ttl HOURS` for a
       longer wait). `--ignore-sender YOU` mutes echoes of your own comments and
       pushes - since local-webhook 0.23.0 this is a PURE sender mute, so it also
@@ -863,8 +877,8 @@ let
 # module-generated-up-to-date check fails until it matches.
 {
   repo = "defangdevs/local-channels";
-  rev = "0662d299082f837dd2e4e9144745e82be8f3dd01";
-  sha256 = "sha256-MXhibGlei70BZt6sAO2h6EMRyoA4LrsiHi/015m3MPM=";
+  rev = "789b374020842715cda66105fbbebf3267148e3f";
+  sha256 = "sha256-cEvfs1jiMpY+uyhdJH/zSTypNUsZ1FbFALE6KYfN/UM=";
 }
   ;
   localWebhookScript = builtins.fetchurl {
@@ -8942,6 +8956,16 @@ in
           subscription so the one-liner in the shipped guide keeps working;
           watchPolicy is unaffected in shape and, since 0.23.0, is the ONLY
           thing that still makes the box's own standing watch selective.
+
+          0.26.0 (this pin) adds delivery INTO a codex session, which until now
+          could only MANAGE subscriptions: `subscribe` run inside one starts a
+          detached peer that hands each event to `codex queue`, landing it as a
+          message at that session's next turn boundary. The module needs
+          nothing for it - the peer is started by the session's own CLI call
+          and resolves `codex` from that session's PATH - but the shipped
+          guide's webhook section now says so. Two versions came between:
+          0.24.0 stopped dressing a foreign sender in GitHub's shape, and
+          0.25.0 lets a watch carry a `spawnConfig` for its spawn command.
         '';
       };
       sha256 = lib.mkOption {

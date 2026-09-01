@@ -215,6 +215,20 @@ Claude Code has the same as MCP tools (`webhook_subscribe`,
 are local-webhook's own tools and have no `--claim` - they take the raw
 `include` rules - so when you are claiming an object, reach for the CLI and
 let it write them.
+
+A CODEX session receives deliveries the same way it manages them: through the
+CLI. Run `agent-box-webhook subscribe` from INSIDE the codex session and it
+also starts a small delivery peer for that session's own thread, because codex
+has no channel to attach at startup. Each event then arrives as a queued
+message: an idle session wakes at once, one that is mid-turn gets it when that
+turn ends. The peer stops itself when your last subscription goes, and
+`agent-box-webhook status` names the thread and the peer - look there first if
+subscriptions look healthy but nothing arrives. Subscribe from a shell OUTSIDE
+the session (a `shell` session, a script, a spawn wrapper) and there is no
+thread to deliver to: the subscription is written, the claim counts, and
+nothing lands - so a codex session that inherited a seeded subscription should
+re-run the subscribe itself to wire delivery.
+
 Subscriptions are PER SESSION and expire after an hour (`--ttl HOURS` for a
 longer wait). `--ignore-sender YOU` mutes echoes of your own comments and
 pushes - since local-webhook 0.23.0 this is a PURE sender mute, so it also
