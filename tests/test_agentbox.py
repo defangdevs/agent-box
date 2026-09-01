@@ -2259,6 +2259,14 @@ class SelfUpdateLogicTest(unittest.TestCase):
             # --check asks a question. It must not be the verb that MOVES
             # the tree, or "is there an update" would half-apply one.
             self.assertEqual([c[0] for c in self.source_calls], ["check"])
+            # And it must ask about the SAME branch the update would take,
+            # or `--check --branch stable` reports the default branch's tip
+            # and the update that follows moves somewhere else.
+            self._source("2" * 40)
+            with self.quiet():
+                self.mod.cmd_update(
+                    self._args(prof, check=True, branch="stable"))
+            self.assertEqual(self.source_calls[0][2]["branch"], "stable")
             # --force is carried through to the tree manager, which owns the
             # guard it skips; the renderer does not second-guess ancestry.
             self._source("2" * 40)
@@ -2409,6 +2417,26 @@ class SelfUpdateLogicTest(unittest.TestCase):
             self.assertNotEqual(arg, "None")
         for call in self.calls:
             self.assertNotIn("None", call)
+
+    def test_a_stalled_source_tree_is_bounded(self):
+        """The update unit sets TimeoutStartSec=infinity, so nothing else is.
+
+        A fetch that hangs rather than fails would leave
+        agent-box-update.service active forever and the settings page
+        reporting an update in progress. The bound belongs here, and its
+        expiry has to read like every other refused update.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            self.mod.SOURCE_TIMEOUT = 0.2
+            cli = prof / "bin" / "agent-box-source"
+            cli.write_text("#!/bin/sh\nsleep 30\n")
+            os.chmod(cli, 0o755)
+            with self.quiet(), self.assertRaises(self.mod.UpdateError) as cm:
+                self.mod.cmd_update(self._args(prof))
+        self.assertIn("timed out", str(cm.exception))
+        self.assertEqual(self.calls, [],
+                         "a stalled pull must not touch the profile")
 
     def test_a_source_tree_failure_is_reported_not_raised(self):
         """`main` catches ConfigError and UpdateError — nothing else.

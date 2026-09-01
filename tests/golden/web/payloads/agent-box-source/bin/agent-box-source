@@ -85,6 +85,17 @@ clone_if_missing() {
   rm -rf "$incoming"
   say "cloning $url into $dir"
   mkdir -p "$(dirname "$dir")" || die "cannot create $(dirname "$dir")"
+  # $dir exists but holds no .git — a tmpfiles rule that created the
+  # directory, or an interrupted run that left something behind. `mv` into an
+  # EXISTING directory moves the source INSIDE it, so the publish below would
+  # silently produce $dir/<basename>.incoming instead of $dir: a nested
+  # checkout, a $dir that still has no .git, and a clone attempted again on
+  # every later run. Reclaim it when it is empty, and refuse loudly when it
+  # is not, rather than nesting.
+  if [ -e "$dir" ]; then
+    rmdir "$dir" 2>/dev/null || true
+    [ -e "$dir" ] && die "$dir exists and is not a checkout — move it aside"
+  fi
   command git clone --quiet "$url" "$incoming" \
     || { rm -rf "$incoming"; die "clone of $url failed — offline, or the repo is not public"; }
   mv "$incoming" "$dir" || { rm -rf "$incoming"; die "could not move $incoming into place"; }
@@ -126,11 +137,12 @@ target_rev() {
   if [ -n "$ref" ]; then
     fetch
     git fetch --quiet origin "$ref" || die "origin has no ref '$ref'"
-    git rev-parse FETCH_HEAD^{commit} || die "'$ref' does not name a commit"
+    git rev-parse --verify --quiet 'FETCH_HEAD^{commit}' \
+      || die "'$ref' does not name a commit"
   else
     fetch
     resolve_branch
-    git rev-parse "refs/remotes/origin/$branch^{commit}" \
+    git rev-parse --verify --quiet "refs/remotes/origin/$branch^{commit}" \
       || die "origin has no branch '$branch'"
   fi
 }
@@ -201,7 +213,7 @@ case "${1:-}" in
     ;;
 
   (rev)
-    git rev-parse HEAD || die "$dir has no HEAD to read"
+    git rev-parse --verify --quiet HEAD || die "$dir has no HEAD to read"
     ;;
 
   (*)

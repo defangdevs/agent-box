@@ -436,8 +436,11 @@ is not a descendant of the rev the box is running. The first update
 clones it (so a box that has never updated does not have it yet); every
 later one moves it. The tree is root-owned and you cannot write it:
 that is deliberate, since whatever writes it decides what root builds.
-Read it freely - `git -C /var/lib/agent-box/src log -1` is exactly
-what the box runs.
+Read it freely - `git -C /var/lib/agent-box/src log -1` names the rev
+the box runs. The one exception is an update in flight: the tree moves
+FIRST and the rebuild follows it, so between the two - and after a
+rebuild that failed and could not put the tree back, which the wall
+notice says - it reads ahead of the running system.
 
 ## This box ships its own sources
 

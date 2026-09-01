@@ -78,7 +78,15 @@ else
   # its fast-forward from a rev this box never ran, and would make an agent
   # reading the tree describe a box that failed to build.
   if [ "$update_module" = 1 ]; then
-    agent-box-source reset "$CURRENT_REV" || true
+    # `reset` can fail — it resolves the tracked branch, which needs either
+    # AGENT_BOX_SRC_BRANCH or a readable origin/HEAD, and the network is
+    # exactly what a box in this branch may have lost. Say which of the two
+    # happened instead of asserting the good one: the guide tells agents that
+    # the tree names the rev the box runs, so a tree left ahead of a failed
+    # rebuild is a wrong answer somebody will read. The next pull realigns it.
+    tree_state="rolled back"
+    agent-box-source reset "$CURRENT_REV" \
+      || tree_state="NOT rolled back, it still reads past $CURRENT_REV"
     if [ -e "$PIN_FILE.prev" ]; then
       mv "$PIN_FILE.prev" "$PIN_FILE"
     else
@@ -92,6 +100,6 @@ else
       rm -f "$AGENT_PIN_FILE"
     fi
   fi
-  wall "agent-box: update to $target FAILED — source tree and pins rolled back, system unchanged. See: journalctl -u agent-box-update" || true
+  wall "agent-box: update to $target FAILED — pins rolled back, source tree ${tree_state:-rolled back}, system unchanged. See: journalctl -u agent-box-update" || true
   exit 1
 fi

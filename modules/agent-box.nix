@@ -277,8 +277,11 @@ let
       clones it (so a box that has never updated does not have it yet); every
       later one moves it. The tree is root-owned and you cannot write it:
       that is deliberate, since whatever writes it decides what root builds.
-      Read it freely - `git -C ${cfg.selfUpdate.srcDir} log -1` is exactly
-      what the box runs.
+      Read it freely - `git -C ${cfg.selfUpdate.srcDir} log -1` names the rev
+      the box runs. The one exception is an update in flight: the tree moves
+      FIRST and the rebuild follows it, so between the two - and after a
+      rebuild that failed and could not put the tree back, which the wall
+      notice says - it reads ahead of the running system.
 
     '' + lib.optionalString checkoutEnabled ''
       ## This box ships its own sources
@@ -6126,6 +6129,17 @@ clone_if_missing() {
   rm -rf "$incoming"
   say "cloning $url into $dir"
   mkdir -p "$(dirname "$dir")" || die "cannot create $(dirname "$dir")"
+  # $dir exists but holds no .git — a tmpfiles rule that created the
+  # directory, or an interrupted run that left something behind. `mv` into an
+  # EXISTING directory moves the source INSIDE it, so the publish below would
+  # silently produce $dir/<basename>.incoming instead of $dir: a nested
+  # checkout, a $dir that still has no .git, and a clone attempted again on
+  # every later run. Reclaim it when it is empty, and refuse loudly when it
+  # is not, rather than nesting.
+  if [ -e "$dir" ]; then
+    rmdir "$dir" 2>/dev/null || true
+    [ -e "$dir" ] && die "$dir exists and is not a checkout — move it aside"
+  fi
   command git clone --quiet "$url" "$incoming" \
     || { rm -rf "$incoming"; die "clone of $url failed — offline, or the repo is not public"; }
   mv "$incoming" "$dir" || { rm -rf "$incoming"; die "could not move $incoming into place"; }
@@ -6167,11 +6181,12 @@ target_rev() {
   if [ -n "$ref" ]; then
     fetch
     git fetch --quiet origin "$ref" || die "origin has no ref '$ref'"
-    git rev-parse FETCH_HEAD^{commit} || die "'$ref' does not name a commit"
+    git rev-parse --verify --quiet 'FETCH_HEAD^{commit}' \
+      || die "'$ref' does not name a commit"
   else
     fetch
     resolve_branch
-    git rev-parse "refs/remotes/origin/$branch^{commit}" \
+    git rev-parse --verify --quiet "refs/remotes/origin/$branch^{commit}" \
       || die "origin has no branch '$branch'"
   fi
 }
@@ -6242,7 +6257,7 @@ case "''${1:-}" in
     ;;
 
   (rev)
-    git rev-parse HEAD || die "$dir has no HEAD to read"
+    git rev-parse --verify --quiet HEAD || die "$dir has no HEAD to read"
     ;;
 
   (*)
@@ -9817,7 +9832,15 @@ in
           # its fast-forward from a rev this box never ran, and would make an agent
           # reading the tree describe a box that failed to build.
           if [ "$update_module" = 1 ]; then
-            agent-box-source reset "$CURRENT_REV" || true
+            # `reset` can fail — it resolves the tracked branch, which needs either
+            # AGENT_BOX_SRC_BRANCH or a readable origin/HEAD, and the network is
+            # exactly what a box in this branch may have lost. Say which of the two
+            # happened instead of asserting the good one: the guide tells agents that
+            # the tree names the rev the box runs, so a tree left ahead of a failed
+            # rebuild is a wrong answer somebody will read. The next pull realigns it.
+            tree_state="rolled back"
+            agent-box-source reset "$CURRENT_REV" \
+              || tree_state="NOT rolled back, it still reads past $CURRENT_REV"
             if [ -e "$PIN_FILE.prev" ]; then
               mv "$PIN_FILE.prev" "$PIN_FILE"
             else
@@ -9831,7 +9854,7 @@ in
               rm -f "$AGENT_PIN_FILE"
             fi
           fi
-          wall "agent-box: update to $target FAILED — source tree and pins rolled back, system unchanged. See: journalctl -u agent-box-update" || true
+          wall "agent-box: update to $target FAILED — pins rolled back, source tree ''${tree_state:-rolled back}, system unchanged. See: journalctl -u agent-box-update" || true
           exit 1
         fi
       '';

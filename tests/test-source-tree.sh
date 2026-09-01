@@ -239,6 +239,34 @@ run rev
 [ "$rc" = 0 ] && [ "$(out)" = "$REV_ONE" ] \
   && ok "rev prints HEAD" || no "rev prints HEAD" "rc=$rc out=$(out)"
 
+# --- a $dir that exists but is not a checkout ---------------------------
+# `mv src.incoming src` moves the clone INSIDE an existing src, so the
+# publish would quietly produce src/src.incoming: a nested checkout, a $dir
+# that still has no .git, and a clone re-attempted on every later run. An
+# empty directory (a tmpfiles rule, an interrupted run) is reclaimed; one
+# with anything in it is somebody's, and is refused rather than nested.
+rm -rf "$dir"; mkdir -p "$dir"
+AGENT_BOX_SRC_REV="$REV_ONE" run pull
+[ "$rc" = 0 ] && [ -e "$dir/.git" ] && [ ! -e "$dir/src.incoming" ] \
+  && ok "an empty pre-existing directory is reclaimed, not nested into" \
+  || no "an empty pre-existing directory is reclaimed, not nested into" \
+       "rc=$rc $(ls -a "$dir" 2>/dev/null | tr '\n' ' ')"
+
+rm -rf "$dir"; mkdir -p "$dir"; : > "$dir/somebody-elses-file"
+AGENT_BOX_SRC_REV="$REV_ONE" run pull
+[ "$rc" != 0 ] && said "is not a checkout" && [ ! -e "$dir/.git" ] \
+  && ok "a non-empty pre-existing directory is refused" \
+  || no "a non-empty pre-existing directory is refused" "rc=$rc"
+
+# --- an unresolvable ref writes nothing to stdout -----------------------
+# `check` returns the rev ON STDOUT, so a bare `git rev-parse` echoing the
+# argument it could not resolve would hand the caller that string as a rev.
+at "$REV_ONE"
+AGENT_BOX_SRC_BRANCH=no-such-branch run check
+[ "$rc" != 0 ] && [ -z "$(out)" ] \
+  && ok "a failed check prints no rev at all" \
+  || no "a failed check prints no rev at all" "rc=$rc out=$(out)"
+
 # --- a clone that cannot happen -----------------------------------------
 # Offline, or a repo this box's token cannot read. It must fail loudly and
 # leave nothing behind: a half-clone at $dir would be skipped by every later

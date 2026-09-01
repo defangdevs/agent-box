@@ -159,6 +159,13 @@ REV_RE = re.compile(r"^[0-9a-f]{40}$")
 # "what does an update do" has one answer on both.
 SRC_DIR = "/var/lib/agent-box/src"
 SOURCE_CLI = "agent-box-source"
+# Long enough for a first clone of this repo on a small box, short enough
+# that a stalled fetch does not leave the update unit running forever: the
+# unit sets TimeoutStartSec=infinity (a switch legitimately takes minutes),
+# so systemd bounds nothing here. source-tree.sh's own low-speed guard
+# covers a stalled HTTP transfer; this covers everything else that can wedge
+# a git process.
+SOURCE_TIMEOUT = 900
 # owner/repo out of an https or ssh GitHub remote, so a git+file: profile can
 # still say which repo it came from (the settings page links the commit).
 GITHUB_REMOTE_RE = re.compile(
@@ -2167,7 +2174,13 @@ class Renderer:
             "whatever\n"
             "writes it decides what root installs. Read it freely - "
             f"`git -C {SRC_DIR} log -1`\n"
-            "is exactly what the box runs.\n\n"
+            "names the rev the box runs. The one exception is an update in "
+            "flight: the\n"
+            "tree moves FIRST and the profile swap follows it, so between "
+            "the two - and\n"
+            "after a swap that failed and rolled the profile back - it reads "
+            "ahead of\n"
+            "what is installed.\n\n"
             "This box is not NixOS, so what follows the pull is a profile "
             "swap and\n"
             "not a system rebuild: the release renders the host "
@@ -3094,7 +3107,16 @@ def source_tree(profile, verb, *rest, src=SRC_DIR, url=None, rev=None,
     if force:
         env["AGENT_BOX_SRC_FORCE"] = "1"
     cmd = [str(profile / "bin" / SOURCE_CLI), verb, *rest]
-    out = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                             timeout=SOURCE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # An UpdateError, not a traceback: `main` turns this into a reason in
+        # the journal and a failed unit, which is what the settings page
+        # reads. Nothing has been installed at this point.
+        raise UpdateError(
+            f"{SOURCE_CLI} {verb} timed out after {SOURCE_TIMEOUT}s — the "
+            "tree was not moved")
     sys.stderr.write(out.stderr)
     if out.returncode != 0:
         raise UpdateError(
@@ -3153,7 +3175,7 @@ def cmd_update(args):
         # the same one a later `update` would act on without having already
         # half-acted on it.
         target = source_tree(profile, "check", src=src, url=url,
-                             ref=args.rev)
+                             branch=args.branch, ref=args.rev)
         if target == current:
             print(f"already current: {repo}@{current[:12]}")
             return 0

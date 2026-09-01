@@ -470,7 +470,10 @@ are running. The first update clones it (so a box that has never
 updated does not have it yet); every later one moves it. The tree is
 root-owned and you cannot write it: that is deliberate, since whatever
 writes it decides what root installs. Read it freely - `git -C /var/lib/agent-box/src log -1`
-is exactly what the box runs.
+names the rev the box runs. The one exception is an update in flight: the
+tree moves FIRST and the profile swap follows it, so between the two - and
+after a swap that failed and rolled the profile back - it reads ahead of
+what is installed.
 
 This box is not NixOS, so what follows the pull is a profile swap and
 not a system rebuild: the release renders the host configuration it
