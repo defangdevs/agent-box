@@ -5799,6 +5799,12 @@ exit 0
   ],
   "execStart": [
     { "kind": "bin", "program": "agent-box-supervisor" }
+  ],
+  "directives": [
+    { "name": "ReadWritePaths", "kind": "paths", "condition": "web",
+      "templates": ["/var/lib/agent-box-sites/%i", "/var/lib/agent-box-downloads/%i"] },
+    { "name": "NoNewPrivileges", "kind": "bool", "condition": "no-sudo-allowlist" },
+    { "name": "OOMScoreAdjust", "kind": "literal", "condition": "protect-memory", "value": 500 }
   ]
 }
   '';
@@ -5828,7 +5834,29 @@ exit 0
   contractConditionHolds = cond:
     if cond == "always" then true
     else if cond == "webhook" then webhookEnabled
+    else if cond == "web" then cfg.web.enable
+    else if cond == "no-sudo-allowlist" then effectiveSudoAllowlist == [ ]
+    else if cond == "protect-memory" then cfg.protectMemory
     else throw "agent-box: contract entry has unknown condition '${cond}'";
+  # A non-env serviceConfig field (ReadWritePaths/NoNewPrivileges/
+  # OOMScoreAdjust, issue #451's OP) named in a contract's "directives"
+  # list, looked up by name. Three kinds today:
+  #   "paths"   — a list of "%i"-templated strings, present only when the
+  #               condition holds (systemd itself expands "%i" per
+  #               instance, so the module passes the template through
+  #               unchanged — native has to substitute the username itself).
+  #   "bool"    — the directive's value IS the named condition, and it is
+  #               ALWAYS present (unlike "literal" below) — NoNewPrivileges
+  #               must say true or false explicitly, never be silently
+  #               absent, or it falls back to systemd's permissive "no"
+  #               default with no line in the shared unit template to
+  #               catch that (issue #480-shaped: a real behavior gap this
+  #               refactor found and fixed on the native side).
+  #   "literal" — a fixed value, present only when the condition holds.
+  agentBoxDirective = name:
+    lib.findFirst (d: d.name == name)
+      (throw "agent-box: no contract directive named '${name}' in agent-box@'s manifest")
+      agentBoxContract.directives;
   # A manifest entry only ever names a PROGRAM, never a store path (native's
   # side of the same contract resolves every program to "${self.bin}/name").
   # This is the module's half of that resolution: program name -> the
@@ -8851,25 +8879,35 @@ in
           # whole namespace setup with 226/NAMESPACE on a default (web-less)
           # box. systemd path lists accumulate across drop-ins onto the base
           # unit's own ReadWritePaths=/home/%i, so this only ADDS the extra
-          # paths, never replaces them.
-          ReadWritePaths = lib.optionals cfg.web.enable [
-            "/var/lib/agent-box-sites/%i"
-            "/var/lib/agent-box-downloads/%i"
-          ];
+          # paths, never replaces them. Templates and condition come from
+          # the shared contract (issue #451) now, not hand-written here.
+          ReadWritePaths =
+            let readWritePaths = agentBoxDirective "ReadWritePaths"; in
+            lib.optionals (contractConditionHolds readWritePaths.condition)
+              readWritePaths.templates;
           # NoNewPrivileges would break the sudoAllowlist escape hatch (sudo
           # is setuid root; NNP blocks the euid transition). Enable it only
           # when the effective allowlist is empty — with a non-empty
           # allowlist (from cfg.sudoAllowlist or the web-implied caddy
           # reload) we've traded some containment for scoped elevation as a
-          # host choice. Same for every instance, hence host-level.
-          NoNewPrivileges = effectiveSudoAllowlist == [ ];
-        } // lib.optionalAttrs cfg.protectMemory {
-          # Sacrifice agent work first under memory pressure: the kernel OOM
-          # killer and earlyoom both weigh oom_score_adj, so a runaway agent
-          # process dies before sshd/caddy/SSM — and Restart=always brings
-          # the session back fresh instead of leaving a frozen box.
-          OOMScoreAdjust = lib.mkDefault 500;
-        };
+          # host choice. Same for every instance, hence host-level. Kind
+          # "bool" (see agentBoxDirective above): the value IS the
+          # condition, and this line is ALWAYS present — the contract
+          # migration found that native only emitted the false case,
+          # leaving a box with an empty allowlist at systemd's permissive
+          # default instead of this explicit true (fixed alongside).
+          NoNewPrivileges =
+            contractConditionHolds (agentBoxDirective "NoNewPrivileges").condition;
+        } // (
+          let oomScoreAdjust = agentBoxDirective "OOMScoreAdjust"; in
+          lib.optionalAttrs (contractConditionHolds oomScoreAdjust.condition) {
+            # Sacrifice agent work first under memory pressure: the kernel
+            # OOM killer and earlyoom both weigh oom_score_adj, so a runaway
+            # agent process dies before sshd/caddy/SSM — and Restart=always
+            # brings the session back fresh instead of leaving a frozen box.
+            OOMScoreAdjust = lib.mkDefault oomScoreAdjust.value;
+          }
+        );
       }
     )) cfg.users);
 

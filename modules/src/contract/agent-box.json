@@ -10,5 +10,11 @@
   ],
   "execStart": [
     { "kind": "bin", "program": "agent-box-supervisor" }
+  ],
+  "directives": [
+    { "name": "ReadWritePaths", "kind": "paths", "condition": "web",
+      "templates": ["/var/lib/agent-box-sites/%i", "/var/lib/agent-box-downloads/%i"] },
+    { "name": "NoNewPrivileges", "kind": "bool", "condition": "no-sudo-allowlist" },
+    { "name": "OOMScoreAdjust", "kind": "literal", "condition": "protect-memory", "value": 500 }
   ]
 }

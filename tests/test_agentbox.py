@@ -1207,6 +1207,41 @@ class RenderTest(unittest.TestCase):
                    if path.endswith("/agent.env")][0]
             self.assertNotIn("AGENT_BOX_CODEX_FULL_ACCESS", env)
 
+    def test_new_privileges_directive_is_never_omitted(self):
+        """NoNewPrivileges must be an explicit true/false, never absent.
+
+        The shared agent-box@ unit carries no NoNewPrivileges line of its
+        own, so an omitted line quietly falls back to systemd's permissive
+        default instead of a deliberate choice — this renderer's behavior
+        before the #451 contract migration named the gap: it emitted the
+        line only when sudoAllowlist was non-empty.
+
+        Always renders false here, regardless of the configured allowlist:
+        UPDATE_TRIGGER is granted to every user unconditionally (native has
+        no selfUpdate.enable to gate it on, unlike the module), so a
+        native box's session always has a real sudo escape hatch. The
+        "locked down, no escape hatch at all" branch the module can reach
+        (selfUpdate.enable = web.enable = false, no custom allowlist) is
+        not reachable on native at all — a real, permanent asymmetry
+        between the two backends' update architectures (#154), not
+        something this renderer needs to close (see
+        Renderer.implied_sudo_commands)."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for allowlist in ([], ["some-cmd"]):
+                config["sudoAllowlist"] = allowlist
+                spec = mod.Spec(config, prof)
+                rend = mod.Renderer(
+                    spec, prof, root=Path(tmp) / f"o{len(allowlist)}")
+                tree = rend.render()
+                dropin = next(
+                    text for path, (text, _) in tree.files.items()
+                    if path.endswith(
+                        "agent-box@agent.service.d/10-host.conf"))
+                self.assertIn("NoNewPrivileges=false", dropin)
+
     def test_a_web_box_seeds_no_session_and_a_console_box_still_does(self):
         """The front door (issue #416). A user with a browser terminal and
         no declared sessions gets an EMPTY seed — the settings page is

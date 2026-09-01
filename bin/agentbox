@@ -1853,16 +1853,60 @@ class Renderer:
         if self.spec.webhook_enable:
             lines.insert(2, 'Environment="AGENT_BOX_WEBHOOK_REPO='
                             f'{self.spec.webhook_repo}"')
-        if self.spec.protect_memory:
-            # Same knob as the module: the supervisor is the last thing that
-            # should be killed when the box runs out of memory.
-            lines.append("OOMScoreAdjust=500")
-        if self.spec.sudo_allowlist:
-            lines.append("NoNewPrivileges=false")
-        if self.spec.web_enable:
-            lines.append(f"ReadWritePaths=/var/lib/agent-box-sites/{u.name}")
+        # ReadWritePaths/NoNewPrivileges/OOMScoreAdjust come from the shared
+        # contract's "directives" list (issue #451) instead of being
+        # hand-written here — modules/agent-box.nix.in's agentBoxDirective
+        # is the module's half. Each directive names the condition that
+        # gates it; "no-sudo-allowlist" and "protect-memory" aren't
+        # self.spec.* booleans directly (the former is a negation, and both
+        # need a name shared with the module's own condition vocabulary).
+        agent_box_directive_conditions = {
+            "web": self.spec.web_enable,
+            "protect-memory": self.spec.protect_memory,
+            # Mirrors the module's effectiveSudoAllowlist (CodeRabbit
+            # review on #487): the configured allowlist PLUS whatever
+            # config flags imply a real grant. self.spec.sudo_allowlist
+            # alone missed the two grants sudoers() always adds — caddy
+            # reload when web_enable, and (unlike the module, which can
+            # turn this off via selfUpdate.enable) an UNCONDITIONAL update
+            # trigger on every native box — so a box with only those
+            # implied grants and no custom allowlist would have had this
+            # condition true and NoNewPrivileges=true, silently blocking
+            # `sudo -n systemctl start --no-block agent-box-update.service`
+            # and the caddy reload. implied_sudo_commands() is the same
+            # list sudoers() grants beyond the per-user password helper,
+            # so the two cannot drift apart again.
+            "no-sudo-allowlist": not (
+                self.spec.sudo_allowlist + self.implied_sudo_commands()),
+        }
+        agent_box_directives = {
+            d["name"]: d for d in agent_box_contract["directives"]}
+
+        def agent_box_directive_holds(name):
+            return agent_box_directive_conditions[
+                agent_box_directives[name]["condition"]]
+
+        if agent_box_directive_holds("OOMScoreAdjust"):
+            # Same knob as the module: the supervisor is the last thing
+            # that should be killed when the box runs out of memory.
             lines.append(
-                f"ReadWritePaths=/var/lib/agent-box-downloads/{u.name}")
+                "OOMScoreAdjust="
+                f"{agent_box_directives['OOMScoreAdjust']['value']}")
+        # ALWAYS present, never gated on presence (kind "bool") — unlike
+        # the two directives above. Before this fix, an empty sudo
+        # allowlist (the common case: no sudoAllowlist configured) left
+        # this line out entirely on native, so it fell back to systemd's
+        # own default (NoNewPrivileges=no, i.e. permissive) instead of the
+        # module's explicit `true` for the identical configuration — a
+        # native box was less hardened than a NixOS one asked for the same
+        # box. Fixed here by always emitting the directive, matching the
+        # module's own unconditional boolean.
+        lines.append(
+            "NoNewPrivileges="
+            f"{'true' if agent_box_directive_holds('NoNewPrivileges') else 'false'}")
+        if agent_box_directive_holds("ReadWritePaths"):
+            for template in agent_box_directives["ReadWritePaths"]["templates"]:
+                lines.append(f"ReadWritePaths={template.replace('%i', u.name)}")
         for f in u.environment_files:
             lines.append(f"EnvironmentFile=-{f}")
         t.file(self.p("/etc/systemd/system",
@@ -2158,6 +2202,37 @@ class Renderer:
 
     # -- sudoers, tmpfiles, caddy -------------------------------------------
 
+    def implied_sudo_commands(self):
+        """Sudo grants a config flag implies, beyond the explicit allowlist.
+
+        The SAME list sudoers() grants every user in addition to their own
+        password helper — factored out so the agent-box@ unit's
+        "no-sudo-allowlist" directive condition (issue #451) can't drift
+        from what sudoers() actually grants (a Major finding on #487's
+        review: it originally checked only self.spec.sudo_allowlist,
+        missing these two implied grants entirely).
+
+        Box-wide, not per-user (mirrors the module's effectiveSudoAllowlist,
+        which is likewise not per-user) — unlike sudoers()'s own per-user
+        reboot grant, which stays local to that method since it has no
+        session-side "escape hatch" framing to mirror here.
+
+        UPDATE_TRIGGER is unconditional: native has no selfUpdate.enable to
+        gate it on (the "agentbox update" trigger ships in every profile),
+        unlike the module, which can turn it off. So this list is NEVER
+        actually empty on native — "no-sudo-allowlist" can be true on a
+        NixOS box (selfUpdate.enable = web.enable = false, no custom
+        allowlist) but never on a native one. Not a bug: the same
+        deliberately-unconverged update mechanism #154 already accepted,
+        just visible here as one more condition that can't reach native's
+        "locked down" branch.
+        """
+        cmds = []
+        if self.spec.web_enable:
+            cmds.append("/usr/bin/systemctl reload caddy.service")
+        cmds.append(UPDATE_TRIGGER)
+        return cmds
+
     def sudoers(self, t):
         """Least-privilege sudo, data-driven from the config.
 
@@ -2180,9 +2255,7 @@ class Renderer:
             # NixOS, for no gain. Found by the one-spec-both-backends
             # comparison (issue #451).
             cmds = [f'/etc/agent-box/bin/agent-box-password-{u.name} ""']
-            if self.spec.web_enable:
-                cmds.append("/usr/bin/systemctl reload caddy.service")
-            cmds.append(UPDATE_TRIGGER)
+            cmds += self.implied_sudo_commands()
             # Rebooting the machine goes to the ROOT user alone (the one
             # whose settings page carries the button), not to every agent
             # user: "Restart all" bounces the caller's own unit and needs no
