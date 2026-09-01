@@ -93,17 +93,37 @@ import urllib.parse
 # modules/agent-box.nix.in, the same seam envExecWrapper and envStoreCli use).
 # This daemon is the file's main writer and does NOT shell out to the CLI: a
 # secret must not travel through the argv of a helper process to get written.
-# The names that library defines — KEY_RE, ENV_HEADER, as_dict/load/keys/update
-# — are therefore already bound here and are used below.
+# The names that library defines — KEY_RE, ENV_HEADER, PROFILE_RESERVED,
+# as_dict/load/keys/update/profile_header — are therefore already bound here
+# and are used below. PROFILE_RESERVED in particular is NOT redefined here:
+# env-exec skips exactly those keys when it exports a profile's environment
+# at spawn, so a second copy could classify a key as environment that the
+# spawn path then refuses to export, and the profile's value would silently
+# never reach the session.
 
 USER = os.environ.get("AGENT_BOX_SETTINGS_USER", "agent")
 ENV_FILE = os.environ["AGENT_BOX_SETTINGS_ENV_FILE"]
 # Agent profiles (issue #321) live beside the env store, one file per profile.
-# Only the preamble cache key reads this: a watch's launch report names the
+# The preamble cache key reads this too: a watch's launch report names the
 # profile AGENT_BOX_HOOK_PROFILE picks and whether it still exists, so
 # creating or deleting a profile changes that report without touching the env
-# file. The page has no profile editor yet (that is step 5 of #321).
+# file.
 PROFILES_DIR = os.path.join(os.path.dirname(ENV_FILE), "profiles")
+# The profile CLI, pinned by the unit (step 5 of #321). The page reads and
+# writes profile FILES itself, with the same parser as the env store — but it
+# never maps a profile onto harness arguments, because that mapping lives in
+# exactly one place, `agent-box-profile launch` (#337). A second copy here
+# would drift, and then what this page shows and what a session gets would
+# disagree. Empty on a box whose unit predates this: the editor still works,
+# only the resolved launch line and its warnings go missing.
+PROFILE_BIN = os.environ.get("AGENT_BOX_PROFILE_BIN", "")
+# Same charset and length the CLI's valid_name() enforces (profile-cli.sh):
+# one file per profile, so the name is also a path component.
+PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# PROFILE_RESERVED (the launch config) comes from the env store above, which
+# is also what env-exec skips at spawn. Every OTHER key in a profile is
+# session environment, and is listed by NAME only — a profile is exactly
+# where a token ends up.
 BASE = os.environ.get("AGENT_BOX_SETTINGS_BASE", "/settings").rstrip("/")
 PORT = int(os.environ.get("AGENT_BOX_SETTINGS_PORT", "8080"))
 TMUX_SOCKET = os.environ.get("AGENT_BOX_TMUX_SOCKET", "agent-box")
@@ -393,6 +413,104 @@ def set_key(key, value):
 
 def delete_key(key):
     update(ENV_FILE, [], ENV_HEADER, drop=[key])
+
+
+def profile_path(name):
+    return os.path.join(PROFILES_DIR, name + ".env")
+
+
+def read_profiles():
+    """name -> {"reserved": {KEY: value}, "env": [KEY, ...]}.
+
+    A profile file IS an env-store file in another directory, so it is read
+    by the store's one parser (issue #212) rather than by a KEY=value loop of
+    this page's own — which is what lets a SYSTEM_PROMPT span lines here, in
+    `agent-box-profile show`, and at spawn, all three alike.
+
+    Reserved values come back because the editor pre-fills them. The env half
+    is names only, and no caller is given the values: `agent-box-profile show`
+    and `env ls` both keep that rule, and a profile is where a token ends up.
+    """
+    out = {}
+    try:
+        names = sorted(os.listdir(PROFILES_DIR))
+    except OSError:
+        return out
+    for entry in names:
+        if not entry.endswith(".env"):
+            continue
+        name = entry[:-len(".env")]
+        if not PROFILE_NAME_RE.match(name):
+            continue
+        data = as_dict(load(profile_path(name)))
+        out[name] = {
+            "reserved": {k: data.get(k, "") for k in PROFILE_RESERVED},
+            "env": sorted(k for k in data if k not in PROFILE_RESERVED),
+        }
+    return out
+
+
+def profile_write(name, assignments, drop=(), must_exist=False):
+    """One read-modify-write on a profile, under the store's own lock.
+
+    `must_exist` belongs to that same critical section, not to an
+    `os.path.exists` in the caller: outside the lock a concurrent
+    /profiles/delete lands between the check and the write, and the write
+    recreates the profile that was just deleted. Returns False when it was
+    gone.
+    """
+    return update(profile_path(name), assignments, profile_header(name),
+                  drop=drop, must_exist=must_exist)
+
+
+def profile_remove(name):
+    """Delete under the SAME lock profile_write takes. Without it a save can
+    read the file, this can unlink it, and the save can then write it back —
+    a profile the operator deleted, quietly recreated."""
+    path = profile_path(name)
+    try:
+        with locked(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    except OSError:
+        # The lock itself is unavailable (the directory is gone, say). There
+        # is then nothing to delete either.
+        pass
+
+
+def profile_launch(name, harness=""):
+    """`agent-box-profile launch` for `name`, or None when it cannot answer.
+
+    The ONE resolver (#337): the harness a profile starts and the arguments
+    it starts with are its answer, not this page's. Used on write (so a
+    profile that sets something its harness cannot use says so at once,
+    rather than at the next session start) and on session add.
+    """
+    # Callers check PROFILE_BIN themselves before offering a profile at all
+    # (see render_profile_options), so reaching here without one is a bug
+    # rather than a state to report — but returning None would report it as
+    # "that profile is gone", which is the wrong thing to go looking for.
+    if not PROFILE_BIN:
+        return None
+    try:
+        out = subprocess.run(
+            [PROFILE_BIN, "launch", name] + ([harness] if harness else []),
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        resolved = json.loads(out.stdout)
+    except ValueError:
+        return None
+    # json.loads takes any JSON value. A resolver that printed `[]`, `"x"` or
+    # `null` would reach .get() below as an AttributeError — a 500 with a
+    # traceback, in place of the answer this function exists to give.
+    return resolved if isinstance(resolved, dict) else None
 
 
 @contextlib.contextmanager
@@ -2532,7 +2650,9 @@ STYLE = """<style>
 # Shared by the settings-page and workspace add forms so their layout,
 # accessibility, and autocomplete behaviour cannot drift apart.
 NEW_SESSION_FIELDS_TPL = """<div class="row new-session-row">
-  <select name="agent">{agents}</select>
+  <select name="agent" aria-label="Harness">{agents}</select>
+  <select id="profile-picker" name="profile" aria-label="Agent profile"
+          title="Agent profile: a harness plus its model, effort and system prompt">{profiles}</select>
   <span class="cwd-control">
     <label for="new-session-cwd">Working directory</label>
     <span class="combo">
@@ -2548,7 +2668,9 @@ NEW_SESSION_FIELDS_TPL = """<div class="row new-session-row">
   <button type="submit" class="btn">Add session</button>
 </div>
 <p class="note">Where the agent starts. Defaults to your home directory
-(<code>~</code>); type to browse folders one level at a time.</p>
+(<code>~</code>); type to browse folders one level at a time. A profile
+brings its own harness, model and system prompt, so picking one overrides
+the harness on its left.</p>
 <div class="row prompt-row">
   <textarea name="prompt" rows="2"
             placeholder="kickoff prompt (optional) &mdash; the task to start on; a respawn resumes it"></textarea>
@@ -2576,6 +2698,51 @@ SESSIONS_SECTION_TPL = """<section>
       </form>
     </div>
     <div id="sessions-list">{sessions}</div>
+  </section>"""
+
+# The agent-profiles panel (issue #321, step 5), settings page only — like
+# the webhook panel, the workspace root is a terminal and not a manager.
+#
+# It sits directly UNDER Sessions on purpose: a profile has no life of its
+# own, it is a thing you pick in the row above, and the two panels read in
+# the order the work happens. The note says which way the override runs,
+# because the session row now has two controls that both name a harness.
+PROFILES_SECTION_TPL = """<section>
+    <div class="sec-head">
+      <h2>Agent profiles</h2>
+      <button type="button" class="btn" data-toggle="profile-editor">Add profile</button>
+    </div>
+    <p class="note">A profile is a <em>worker</em>: a harness plus the model,
+    effort and system prompt that tell two sessions on one harness apart.
+    Pick one in the session row above, or hand every dispatched webhook
+    session to one with <code>AGENT_BOX_HOOK_PROFILE</code>. Editing a profile
+    changes what starts <em>next</em> &mdash; a running session keeps the
+    arguments it started with.</p>
+    <div id="profile-editor" class="editor">
+      <form method="post" action="{base}/profiles/set">
+        <div class="row">
+          <input type="text" name="name" placeholder="profile name" class="pname"
+                 pattern="[A-Za-z0-9_-]{{1,64}}" required autocomplete="off"
+                 aria-label="Profile name"
+                 title="Letters, digits, underscore and hyphen; at most 64 characters">
+          <select name="HARNESS" aria-label="Harness">{harnesses}</select>
+          <input type="text" name="MODEL" placeholder="model (optional)"
+                 autocomplete="off" aria-label="Model">
+          <input type="text" name="EFFORT" placeholder="effort (optional)"
+                 autocomplete="off" aria-label="Effort">
+          <button type="submit" class="btn">Save</button>
+        </div>
+        <div class="row prompt-row">
+          <textarea name="SYSTEM_PROMPT" rows="2" spellcheck="false"
+                    placeholder="appended system prompt (optional) &mdash; standing instructions for every session on this profile"></textarea>
+        </div>
+        <p class="note">Saving an existing name updates it. A blank field
+        clears that key rather than keeping the old value, so this form is
+        the whole launch config &mdash; environment keys are added per
+        profile, on its own row below.</p>
+      </form>
+    </div>
+    <div id="profiles-list">{profiles}</div>
   </section>"""
 
 # The webhook panel (issue #227), settings page only: the workspace root
@@ -2755,6 +2922,7 @@ BODY = """<main>
   <h1><span class="mark">{mark}</span>Settings for {user}</h1>
   <div id="msg-slot">{message}</div>
   {sessions_section}
+  {profiles_section}
   {webhooks_section}
   {connect_section}
   <section>
@@ -2993,6 +3161,139 @@ def render_keys(keys):
     return '<ul class="tbl"><li class="tbl-head">Name</li>' + body + "</ul>"
 
 
+def render_profile_options(profiles):
+    """The session row's profile <select>. "no profile" FIRST and selected,
+    because a session started with no profile is what every session on this
+    box was until now — the picker adds a choice, it does not take the
+    default away.
+
+    Offers nothing at all without a resolver. The settings unit is socket
+    activated with stopIfChanged = false, so a daemon that survived an
+    update can still be running on the environment it started with — and on
+    one that predates AGENT_BOX_PROFILE_BIN, every pick would fail. A
+    picker that cannot work is worse than no picker: it sends the operator
+    looking for a deleted profile."""
+    if not PROFILE_BIN:
+        return '<option value="">&mdash; no profile &mdash;</option>'
+    items = ['<option value="">&mdash; no profile &mdash;</option>']
+    for name in sorted(profiles):
+        safe = html.escape(name)
+        harness = html.escape(profiles[name]["reserved"].get("HARNESS") or "")
+        label = f"{safe} ({harness})" if harness else safe
+        items.append(f'<option value="{safe}">{label}</option>')
+    return "".join(items)
+
+
+def render_harness_options(selected=""):
+    """The profile editor's harness <select>. Unlike the session row's, this
+    one has a blank entry: HARNESS is optional in a profile file, and a
+    profile that names none resolves to the box default the same way a
+    session with no --agent does."""
+    items = ['<option value="">&mdash; box default &mdash;</option>']
+    for agent in AGENTS:
+        safe = html.escape(agent)
+        sel = " selected" if agent == selected else ""
+        items.append(f'<option value="{safe}"{sel}>{safe}</option>')
+    return "".join(items)
+
+
+def render_profiles(profiles):
+    """The profiles list. Each row folds open onto its launch config and its
+    environment KEY NAMES — never a value, the rule `agent-box-profile show`
+    and `env ls` already keep, and the one that matters most here because a
+    profile is exactly where a token ends up."""
+    base = html.escape(BASE)
+    rows = []
+    for name in sorted(profiles):
+        safe = html.escape(name)
+        res = profiles[name]["reserved"]
+        # The summary line answers "what worker is this" without a click:
+        # the harness, then whatever narrows it.
+        bits = []
+        for key in ("HARNESS", "MODEL", "EFFORT"):
+            if res.get(key):
+                bits.append(html.escape(res[key]))
+        if res.get("SYSTEM_PROMPT"):
+            bits.append("system prompt")
+        env_keys = profiles[name]["env"]
+        if env_keys:
+            bits.append("%d env key%s" % (len(env_keys), "" if len(env_keys) == 1 else "s"))
+        # Each bit was escaped as it went in, so the join must NOT be
+        # escaped again: a MODEL holding "&" or "<" would render as visible
+        # entity text ("&amp;lt;").
+        meta = " · ".join(bits) if bits else "empty"
+        # Environment keys, by name. Each gets its own delete button rather
+        # than a form field to blank: dropping a key and setting it to the
+        # empty string are different states in the store, and only one of
+        # them is what "remove this" means.
+        chips = []
+        for key in env_keys:
+            k = html.escape(key)
+            chips.append(
+                f'<li><span class="nm">{ICON_LOCK}<code>{k}</code></span>'
+                f'<span class="acts"><form class="inline" method="post" '
+                f'action="{base}/profiles/delkey" '
+                f'onsubmit="return confirm(\'Remove {k} from profile {safe}?\');">'
+                f'<input type="hidden" name="name" value="{safe}">'
+                f'<input type="hidden" name="key" value="{k}">'
+                f'<button type="submit" class="icon idanger" aria-label="Remove" '
+                f'title="Remove {k} from {safe}">{ICON_TRASH}</button></form>'
+                f'</span></li>'
+            )
+        env_list = ('<ul class="tbl subs">' + "".join(chips) + "</ul>") if chips else (
+            '<p class="note">No environment keys.</p>')
+        # Pre-filled edit form: the launch fields come back as they are
+        # stored, so an edit is an edit and not a retype. SYSTEM_PROMPT is a
+        # textarea for the same reason it is one above — it can span lines.
+        prompt_val = html.escape(res.get("SYSTEM_PROMPT") or "")
+        rows.append(
+            f'<li class="foldrow prof-row"><details><summary>'
+            f'<span class="nm"><code>{safe}</code></span>'
+            f'<span class="meta">{meta}</span>'
+            f'<span class="acts"><form class="inline" method="post" '
+            f'action="{base}/profiles/delete" '
+            f'onsubmit="return confirm(\'Delete profile {safe}? Sessions already '
+            f'running keep what they started with.\');">'
+            f'<input type="hidden" name="name" value="{safe}">'
+            f'<button type="submit" class="icon idanger" aria-label="Delete" '
+            f'title="Delete profile {safe}">{ICON_TRASH}</button></form></span>'
+            f'</summary><div class="fold">'
+            f'<form method="post" action="{base}/profiles/set">'
+            f'<input type="hidden" name="name" value="{safe}">'
+            f'<div class="row">'
+            f'<select name="HARNESS" aria-label="Harness for {safe}">'
+            f'{render_harness_options(res.get("HARNESS") or "")}</select>'
+            f'<input type="text" name="MODEL" value="{html.escape(res.get("MODEL") or "")}" '
+            f'placeholder="model" autocomplete="off" aria-label="Model for {safe}">'
+            f'<input type="text" name="EFFORT" value="{html.escape(res.get("EFFORT") or "")}" '
+            f'placeholder="effort" autocomplete="off" aria-label="Effort for {safe}">'
+            f'<button type="submit" class="btn">Save</button></div>'
+            f'<div class="row prompt-row"><textarea name="SYSTEM_PROMPT" rows="2" '
+            f'spellcheck="false" placeholder="appended system prompt" '
+            f'aria-label="System prompt for {safe}">{prompt_val}</textarea></div>'
+            f'</form>'
+            f'<p class="note">Environment for sessions started with this '
+            f'profile, applied at every spawn on top of your secrets. This is '
+            f'convenience, <strong>not</strong> isolation: sessions of one '
+            f'user are not separated, so a sibling session reads these out of '
+            f'<code>/proc</code>. Values are never shown here.</p>'
+            f'{env_list}'
+            f'<form class="row" method="post" action="{base}/profiles/setkey">'
+            f'<input type="hidden" name="name" value="{safe}">'
+            f'<input type="text" name="key" placeholder="KEY_NAME" required '
+            f'pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off" '
+            f'aria-label="Environment key for {safe}">'
+            f'<input type="password" name="value" placeholder="value" required '
+            f'autocomplete="off" aria-label="Value for that key">'
+            f'<button type="submit" class="btn">Add</button></form>'
+            f'</div></details></li>'
+        )
+    body = "".join(rows) if rows else (
+        '<li class="empty">No profiles yet &mdash; every session starts on '
+        'the harness picked above.</li>')
+    return '<ul class="tbl"><li class="tbl-head">Profile</li>' + body + "</ul>"
+
+
 def display_cwd(value):
     """Compact working-directory label for a session row: "~" for the
     default (stored None), and an absolute path is shown home-relative
@@ -3022,6 +3323,24 @@ def render_sessions(subs=None):
         for name in sorted(entries):
             safe = html.escape(name)
             agent = html.escape(str(entries[name].get("agent") or "?"))
+            # Which WORKER this session is, when it is more than a bare
+            # harness (#321). The registry records the profile NAME, so this
+            # answers "what was it started as" even after the profile itself
+            # was edited or deleted — which is the honest answer, since the
+            # arguments it is running with were resolved at create time.
+            prof = entries[name].get("profile")
+            prof_tag = ""
+            if prof:
+                # Its own balanced fragment, not a `</span><span…` splice
+                # appended to `agent`: that spliced form was correct only
+                # while the caller below wrapped `agent` in exactly one
+                # <span>, so moving `agent` into an attribute or a different
+                # element would have emitted broken markup with nothing to
+                # say so.
+                pf = html.escape(str(prof))
+                prof_tag = (f'<span class="meta prof-tag" '
+                            f'title="Agent profile it was started with">'
+                            f'{pf}</span>')
             cwd = html.escape(display_cwd(entries[name].get("workingDirectory")))
             # stopped = listed but deliberately down (clean agent exit or
             # agent-box-session stop); the same route revives it.
@@ -3084,6 +3403,7 @@ def render_sessions(subs=None):
                 f'<span class="nm">'
                 f'<a class="sess" href="{term}{safe}/"><code>{safe}</code></a>'
                 f'<span class="meta">{agent}</span>'
+                f'{prof_tag}'
                 f'<span class="meta" title="Working directory"><code>{cwd}</code></span>'
                 f'{subject}'
                 f'<span class="state" data-state="{state}">{state}</span>'
@@ -3620,18 +3940,26 @@ def render_connect():
         cards='<ul class="tbl">' + cards + "</ul>", busy=busy)
 
 
-def render_sessions_section(subs=None):
+def render_sessions_section(subs=None, profiles=None):
     return SESSIONS_SECTION_TPL.format(
         action_base=html.escape(SESS_BASE),
-        new_session_fields=render_new_session_fields(),
+        new_session_fields=render_new_session_fields(profiles),
         sessions=render_sessions(subs),
     )
 
 
-def render_new_session_fields():
+def render_new_session_fields(profiles=None):
+    """Both add-session forms, settings page and workspace, come from here so
+    their layout cannot drift (that is why the template is shared). The
+    profile picker is passed IN rather than read here: the settings page
+    already reads the profiles for its own panel, and one page render must
+    not scan the directory twice."""
+    if profiles is None:
+        profiles = read_profiles()
     return NEW_SESSION_FIELDS_TPL.format(
         action_base=html.escape(SESS_BASE),
         agents=render_agent_options(),
+        profiles=render_profile_options(profiles),
     )
 
 
@@ -3772,6 +4100,10 @@ def render_page(message=""):
     # rows and the standing watches must not each pay for their own.
     unavailable = webhook_unavailable()
     subs, watches = webhook_view() if not unavailable else (None, [])
+    # One directory scan per render, feeding the picker in the Sessions row
+    # and the panel below it — the same rule the subscription pass above
+    # states, for the same reason.
+    profiles = read_profiles()
     return (
         render_head("Settings &mdash; " + html.escape(USER))
         + STYLE
@@ -3783,7 +4115,12 @@ def render_page(message=""):
             keys=render_keys(read_keys()),
             # Every user, primary included: the HOME root page is the
             # terminal workspace, so session CRUD lives here.
-            sessions_section=render_sessions_section(subs),
+            sessions_section=render_sessions_section(subs, profiles),
+            profiles_section=PROFILES_SECTION_TPL.format(
+                base=html.escape(BASE),
+                harnesses=render_harness_options(),
+                profiles=render_profiles(profiles),
+            ),
             webhooks_section=(
                 WEBHOOK_UNAVAILABLE_TPL.format(text=unavailable)
                 if unavailable else
@@ -4088,6 +4425,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "connect_started": "Sign-in started \u2014 follow the steps under Connections.",
         "connect_cancelled": "Sign-in cancelled.",
         "connect_code": "Code sent \u2014 waiting for the sign-in to finish.",
+        "profile_saved": "Profile saved. Sessions started from now on use it.",
+        "profile_deleted": ("Profile deleted. Sessions already running keep "
+                            "the arguments and environment they started with."),
+        "profile_key_saved": ("Key added to the profile. Sessions on it pick "
+                              "it up at their next start."),
+        "profile_key_deleted": ("Key removed from the profile. Sessions on it "
+                                "drop it at their next start."),
     }
 
     def do_GET(self):
@@ -4358,6 +4702,124 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 connect_send_code(flow, code)
                 self._redirect("ok=connect_code")
+        elif path.startswith(BASE + "/profiles/"):
+            # Agent profiles (#321, step 5). Four verbs on one runtime
+            # directory; none of them touches a running session, which is why
+            # every message below says "from now on" rather than "applied".
+            action = path[len(BASE + "/profiles/"):]
+            name = (form.get("name", [""])[0]).strip()
+            if action not in ("set", "delete", "setkey", "delkey"):
+                self._send_html("<h1>404</h1>", status=404)
+                return
+            if not PROFILE_NAME_RE.match(name):
+                self._send_html(
+                    render_page("Invalid profile name. Use letters, digits, "
+                                "'_' and '-', at most 64 characters."),
+                    status=400,
+                )
+                return
+            if action == "delete":
+                profile_remove(name)
+                self._redirect("ok=profile_deleted")
+                return
+            if action == "delkey":
+                key = (form.get("key", [""])[0]).strip()
+                # A reserved key is launch config and is cleared by saving the
+                # form with that field blank; letting this route drop one too
+                # would give the same state two doors and no reason to prefer
+                # either.
+                # Only on a profile that EXISTS. update() writes the file
+                # whether or not the load found one, so deleting a key from a
+                # profile that is gone would have created an empty one — with
+                # just the header, no harness — and then listed it in the
+                # panel and the picker. A stale tab whose profile was deleted
+                # in another one reaches exactly this path.
+                if KEY_RE.match(key) and key not in PROFILE_RESERVED:
+                    # must_exist, checked INSIDE the lock: update() writes
+                    # the file whether or not the load found one, so removing
+                    # a key from a profile that is gone would create an empty
+                    # one — header only, no harness — and the panel and the
+                    # picker would then offer it. A stale tab whose profile
+                    # was deleted in another one reaches exactly this path.
+                    profile_write(name, [], drop=[key], must_exist=True)
+                self._redirect("ok=profile_key_deleted")
+                return
+            if action == "setkey":
+                key = (form.get("key", [""])[0]).strip()
+                value = form.get("value", [""])[0]
+                value = value.replace("\r\n", "\n").replace("\r", "\n")
+                if not KEY_RE.match(key) or key in PROFILE_RESERVED:
+                    self._send_html(
+                        render_page(
+                            "Invalid environment key. Use letters, digits and "
+                            "underscores; do not start with a digit. %s are "
+                            "launch config \u2014 set them in the form above."
+                            % ", ".join(PROFILE_RESERVED)),
+                        status=400,
+                    )
+                    return
+                # Same must_exist guard as delkey, for the same stale-tab
+                # reason: this form only ever appears inside an existing
+                # profile's fold, so reaching it for a profile that is gone
+                # means the page is out of date — and resurrecting it here,
+                # with one env key and no launch config, is not what either
+                # the operator or the form asked for. Creating a profile is
+                # /profiles/set's job.
+                try:
+                    written = profile_write(name, [(key, value)],
+                                            must_exist=True)
+                except EnvStoreError as exc:
+                    self._send_html(
+                        render_page("Could not save that key \u2014 %s." % exc),
+                        status=400)
+                    return
+                if not written:
+                    self._send_html(
+                        render_page("No profile named '%s' — it may have "
+                                    "just been deleted." % name),
+                        status=404)
+                    return
+                self._redirect("ok=profile_key_saved")
+                return
+            # set: the launch config, as a whole. A blank field DROPS its key
+            # rather than storing an empty value, so the form shows the whole
+            # truth about a profile — an empty MODEL that is present in the
+            # file would resolve to `--model ''` and start nothing.
+            assignments, drop = [], []
+            for key in PROFILE_RESERVED:
+                value = form.get(key, [""])[0].replace("\r\n", "\n").replace("\r", "\n")
+                if key != "SYSTEM_PROMPT":
+                    value = value.strip()
+                if value:
+                    assignments.append((key, value))
+                else:
+                    drop.append(key)
+            harness = dict(assignments).get("HARNESS", "")
+            if harness and harness not in AGENTS:
+                self._send_html(
+                    render_page("Unknown harness. Available: "
+                                + ", ".join(AGENTS)),
+                    status=400)
+                return
+            try:
+                profile_write(name, assignments, drop=drop)
+            except EnvStoreError as exc:
+                self._send_html(
+                    render_page("Could not save that profile \u2014 %s." % exc),
+                    status=400)
+                return
+            # The resolver has the last word on what this profile actually
+            # starts, so a key its harness cannot use is reported HERE and not
+            # at the next session start (codex has no --append-system-prompt).
+            resolved = profile_launch(name)
+            warnings = (resolved or {}).get("warnings") or []
+            if warnings:
+                # render_msg escapes the banner text itself, so this stays
+                # plain: escaping here would show the entities.
+                self._send_html(render_page(
+                    "Profile saved, with a warning: " + " ".join(warnings)))
+                return
+            self._redirect("ok=profile_saved")
         elif path == BASE + "/delete":
             key = (form.get("key", [""])[0]).strip()
             if KEY_RE.match(key):
@@ -4374,6 +4836,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     status=400,
                 )
                 return
+            # An agent profile (#321), if one was picked. The profile's
+            # harness WINS over the select on its left, rather than the
+            # CLI's order where an explicit --agent overrides it: a select
+            # always posts a value, so this form cannot tell "chose claude"
+            # from "left it alone", and a rule that depends on a difference
+            # the page cannot see would be a guess. `agent-box-session add
+            # --profile P --agent H` is still the way to say the other thing.
+            profile = (form.get("profile", [""])[0]).strip()
+            pargs = []
+            if profile and not PROFILE_BIN:
+                # Said plainly, because the two are fixed differently: this
+                # one is a restart of the settings daemon, not a hunt for a
+                # profile that is sitting right there in the list.
+                self._send_html(
+                    render("This box has no profile resolver configured, so "
+                           "a session cannot be started from a profile. "
+                           "Restart the settings service and try again."),
+                    status=503,
+                )
+                return
+            if profile:
+                if not PROFILE_NAME_RE.match(profile):
+                    self._send_html(render("Invalid profile name."), status=400)
+                    return
+                # Resolved by agent-box-profile, the one place the mapping
+                # from profile keys to harness arguments lives (#337) — and
+                # resolved HERE, at create time, so a later edit to the
+                # profile does not change what a running session was started
+                # with (the rule webhook.hookSessionArgs already states).
+                # The row's selection is handed to the RESOLVER when the
+                # profile names no harness of its own — not corrected after
+                # it, because the arguments are harness-specific. Without
+                # this, a profile carrying only MODEL/EFFORT resolved to the
+                # box default and discarded the selection, so neither the
+                # profile nor the operator decided which harness ran. One
+                # file, not read_profiles(): the whole directory is not
+                # needed to answer a question about one profile.
+                own_harness = as_dict(
+                    load(profile_path(profile))).get("HARNESS", "").strip()
+                resolved = profile_launch(profile,
+                                          "" if own_harness else agent)
+                if resolved is None:
+                    self._send_html(
+                        render("Could not resolve profile '%s'. It may have "
+                               "just been deleted." % profile),
+                        status=400,
+                    )
+                    return
+                agent = resolved.get("harness") or agent
+                if agent not in AGENTS:
+                    self._send_html(
+                        render("Profile '%s' names a harness this box does "
+                               "not have. Available: %s"
+                               % (profile, ", ".join(AGENTS))),
+                        status=400,
+                    )
+                    return
+                pargs = [str(a) for a in (resolved.get("args") or [])]
             # Working directory (issue #131): the field defaults to
             # "~" (home); resolve_session_cwd stores that as None (the
             # supervisor's default) and any other path as an absolute
@@ -4412,7 +4932,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "remoteControl": True,
                     "remoteControlName": None,
                     "workingDirectory": cwd,
-                    "extraArgs": [],
+                    "extraArgs": pargs,
+                    # The NAME, not just the resolved arguments: the spawn
+                    # wrapper re-reads it at every start to apply the
+                    # profile's environment, so a rotated token in a profile
+                    # reaches this session on its next restart while the
+                    # arguments above stay as they were created.
+                    "profile": profile or None,
                     "initialPrompt": prompt or None,
                     "resumePrompt": None,
                     "boxSessionId": None,

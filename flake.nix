@@ -1302,6 +1302,32 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The settings page's agent-profile panel (issue #321, step 5).
+          # Same shape and same subject as webhook-panel-state above: the
+          # GOLDEN PAYLOAD, which is the daemon as it actually ships with
+          # the env-store library prepended. Natively runnable on every
+          # architecture, in seconds — the VM tests cannot pin "a value is
+          # never rendered" or "the profile NAME is recorded on the
+          # session" at anything like this price.
+          profile-panel =
+            pkgs.runCommand "agent-box-profile-panel"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-profile-panel.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-profile-panel.py
+              python3 repo/tests/test-profile-panel.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Unit test for the env store's format (issue #212). The VM tests
           # prove one PEM survives one caller at 300+ seconds a run; this
           # pins the format itself — round trip, no key injection, and the

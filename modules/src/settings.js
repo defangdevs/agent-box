@@ -825,9 +825,16 @@
     var statusUrl = f.getAttribute("data-status");
 
     function afterPost(t) {
+      // profiles-list AND profile-picker: saving a profile changes both
+      // the panel that lists it and the <select> in the row above, and the
+      // picker is inside the add-session form rather than in any list, so
+      // it has an id of its own to be swapped by. Without them a profile
+      // created here stayed invisible until a full reload — and the picker
+      // could not offer the profile the operator had just made.
       applyDoc(parseHTML(t),
-        ["msg-slot", "secrets-list", "sessions-list", "webhook-endpoint",
-         "webhooks-list", "connect-list", "tab-bar"]);
+        ["msg-slot", "secrets-list", "sessions-list", "profiles-list",
+         "profile-picker", "webhook-endpoint", "webhooks-list",
+         "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");
       if (ed) { f.reset(); ed.hidden = true; }
       var added = wsActive();   // the tab the fetched page marks current

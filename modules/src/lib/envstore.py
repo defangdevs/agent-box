@@ -291,18 +291,28 @@ def locked(path):
         handle.close()
 
 
-def update(path, assignments, header="", drop=()):
+def update(path, assignments, header="", drop=(), must_exist=False):
     """Rewrite `path` with `drop` and the assigned keys removed, then append.
 
     One read-modify-write under the lock, so `set` keeps the file's order for
     untouched keys and moves a re-set key to the end — the behavior the shell
     `env_rewrite` and the daemon's `set_key` both had — and a concurrent
     writer cannot drop the key this one did not touch.
+
+    `must_exist` refuses to CREATE the file, and is why the check belongs
+    here rather than in the caller: an `os.path.exists` before this call sits
+    outside the lock, so a concurrent delete lands between the two and the
+    write recreates the file the other writer had just removed — with values
+    from a form that may itself be stale. Returns whether anything was
+    written; False only ever means "it was gone".
     """
     with locked(path):
+        if must_exist and not os.path.exists(path):
+            return False
         doomed = set(drop) | {key for key, _ in assignments}
         kept = [(k, v) for (k, v) in load(path) if k not in doomed]
         save(path, kept + list(assignments), header)
+        return True
 
 
 def keys(path):

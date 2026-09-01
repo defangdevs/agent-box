@@ -302,3 +302,21 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
 /* The pane's own Start button (a stopped session): the message keeps the
    muted placeholder colour, the button is a button. */
 .pane.placeholder .ph-msg { color: inherit; }
+/* Agent profiles (issue #321, step 5). The row folds like a session row —
+   .tbl li.foldrow above already gives the <li> and its <summary> their
+   layout, caret and hover — so this only styles what is INSIDE the fold,
+   plus the one-word tag a session row grows when it was started from a
+   profile. */
+.prof-row .fold { padding: 4px 16px 14px 40px; background: #0d1117; }
+.prof-row .fold .note { margin: 10px 0 0; }
+.prof-row .fold form.row { margin-top: 10px; }
+/* The env sub-list reuses ul.tbl.subs (inset, no border of its own), and
+   its rows keep that list's left inset rather than the fold's. */
+.prof-row .fold ul.tbl.subs { margin: 8px 0 0 -24px; }
+/* Which profile a session was started with. A tag, not a second harness
+   name: the harness beside it is what runs, this is what chose it. */
+.prof-tag { border: 1px solid #30363d; border-radius: 999px;
+            padding: 1px 8px; }
+/* The profile name field is narrower than a secret KEY field — a profile
+   name is a word, and the row carries four controls before the button. */
+input.pname { width: 150px; }

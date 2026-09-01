@@ -1784,6 +1784,13 @@ class Renderer:
             settings = [
                 ("AGENT_BOX_PASSWORD_CMD",
                  f"/usr/bin/sudo -n /etc/agent-box/bin/agent-box-password-{u.name}"),
+                # Agent profiles (issue #321, step 5). The settings page
+                # resolves a profile onto harness arguments by running this,
+                # never by mapping the keys itself — one resolver, shared
+                # with `agent-box-session add --profile`. Named here for the
+                # same reason the module pins a store path: the unit's PATH
+                # is systemd's default, and this wrapper is not on it.
+                ("AGENT_BOX_PROFILE_BIN", "/usr/local/bin/agent-box-profile"),
             ]
             if u is self.spec.root_user:
                 settings.append(("AGENT_BOX_HOME", "1"))
