@@ -76,7 +76,7 @@ for line in open(path):
     if line and not line.startswith("#") and "=" in line:
         key, value = line.split("=", 1)
         store[key] = value.strip('"')
-harness = override or store.get("HARNESS") or "claude"
+harness = override or store.get("HARNESS") or "claude"  # box default last
 args = []
 if store.get("MODEL"):
     args += ["--model", store["MODEL"]]
@@ -401,6 +401,51 @@ class ProfileRoutes(ProfileFixture):
                   profile="triage", cwd="~", prompt="")
         self.assertEqual(list(self.read_sessions().values())[0]["agent"],
                          "claude")
+
+    def test_a_profile_with_no_harness_uses_the_row_selection(self):
+        """Otherwise neither the profile nor the operator decides. The
+        resolver falls back to the box default when a profile names no
+        HARNESS, so passing no override discarded the row's selection and
+        started claude for a profile carrying only a model — while the note
+        under the row said the profile supplies the harness."""
+        _, base = self.serve()
+        self.write_profile("modelonly", "MODEL=opus\n")
+        self.post(base, "/sessions/add", back="settings", agent="codex",
+                  profile="modelonly", cwd="~", prompt="")
+        entry = list(self.read_sessions().values())[0]
+        self.assertEqual(entry["agent"], "codex")
+        self.assertEqual(entry["profile"], "modelonly")
+
+    def test_a_profile_that_names_a_harness_still_wins(self):
+        """The override is passed ONLY when the profile names none, so the
+        rule above it is unchanged."""
+        _, base = self.serve()
+        self.write_profile("triage", "HARNESS=claude\n")
+        self.post(base, "/sessions/add", back="settings", agent="codex",
+                  profile="triage", cwd="~", prompt="")
+        self.assertEqual(list(self.read_sessions().values())[0]["agent"],
+                         "claude")
+
+    def test_removing_a_key_never_creates_a_profile(self):
+        """update() writes the file whether or not the load found one, so
+        this used to create an empty profile — header only, no harness —
+        and then list it in the panel and offer it in the picker. A stale
+        tab whose profile was deleted in another one reaches this path."""
+        _, base = self.serve()
+        self.post(base, "/profiles/delkey", name="ghost", key="SOME_KEY")
+        self.assertIsNone(self.profile_text("ghost"))
+        self.assertEqual(os.listdir(self.profiles), [])
+
+    def test_adding_a_key_to_a_missing_profile_is_a_404(self):
+        """Creating a profile is /profiles/set's job. This form only ever
+        appears inside an existing profile's fold, so reaching it for one
+        that is gone means the page is stale."""
+        _, base = self.serve()
+        status, body = self.post(base, "/profiles/setkey", name="ghost",
+                                 key="TOKEN", value="x")
+        self.assertEqual(status, 404)
+        self.assertIn("No profile named", body)
+        self.assertEqual(os.listdir(self.profiles), [])
 
     def test_adding_a_session_with_no_profile_is_unchanged(self):
         """The picker adds a choice. Everything that worked before it must

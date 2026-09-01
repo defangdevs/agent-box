@@ -4720,7 +4720,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # form with that field blank; letting this route drop one too
                 # would give the same state two doors and no reason to prefer
                 # either.
-                if KEY_RE.match(key) and key not in PROFILE_RESERVED:
+                # Only on a profile that EXISTS. update() writes the file
+                # whether or not the load found one, so deleting a key from a
+                # profile that is gone would have created an empty one — with
+                # just the header, no harness — and then listed it in the
+                # panel and the picker. A stale tab whose profile was deleted
+                # in another one reaches exactly this path.
+                if (KEY_RE.match(key) and key not in PROFILE_RESERVED
+                        and os.path.exists(profile_path(name))):
                     profile_write(name, [], drop=[key])
                 self._redirect("ok=profile_key_deleted")
                 return
@@ -4737,6 +4744,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             % ", ".join(PROFILE_RESERVED)),
                         status=400,
                     )
+                    return
+                # Same existence guard as delkey, for the same stale-tab
+                # reason: this form only ever appears inside an existing
+                # profile's fold, so reaching it for a profile that is gone
+                # means the page is out of date — and resurrecting it here,
+                # with one env key and no launch config, is not what either
+                # the operator or the form asked for. Creating a profile is
+                # /profiles/set's job.
+                if not os.path.exists(profile_path(name)):
+                    self._send_html(
+                        render_page("No profile named '%s' — it may have "
+                                    "just been deleted." % name),
+                        status=404)
                     return
                 try:
                     profile_write(name, [(key, value)])
@@ -4831,7 +4851,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # resolved HERE, at create time, so a later edit to the
                 # profile does not change what a running session was started
                 # with (the rule webhook.hookSessionArgs already states).
-                resolved = profile_launch(profile)
+                # The row's selection is handed to the RESOLVER when the
+                # profile names no harness of its own — not corrected after
+                # it, because the arguments are harness-specific. Without
+                # this, a profile carrying only MODEL/EFFORT resolved to the
+                # box default and discarded the selection, so neither the
+                # profile nor the operator decided which harness ran. One
+                # file, not read_profiles(): the whole directory is not
+                # needed to answer a question about one profile.
+                own_harness = as_dict(
+                    load(profile_path(profile))).get("HARNESS", "").strip()
+                resolved = profile_launch(profile,
+                                          "" if own_harness else agent)
                 if resolved is None:
                     self._send_html(
                         render("Could not resolve profile '%s'. It may have "
