@@ -431,21 +431,63 @@ class ProfileRoutes(ProfileFixture):
         this used to create an empty profile — header only, no harness —
         and then list it in the panel and offer it in the picker. A stale
         tab whose profile was deleted in another one reaches this path."""
-        _, base = self.serve()
+        module, base = self.serve()
         self.post(base, "/profiles/delkey", name="ghost", key="SOME_KEY")
         self.assertIsNone(self.profile_text("ghost"))
-        self.assertEqual(os.listdir(self.profiles), [])
+        # No PROFILE is created. Taking the store's lock does leave its own
+        # ghost.env.lock sidecar behind, which is why this asserts on what
+        # the page can see rather than on the directory being empty:
+        # read_profiles() reads *.env, so a stray lock file is not a profile.
+        self.assertEqual(module.read_profiles(), {})
+        self.assertEqual([f for f in os.listdir(self.profiles)
+                          if f.endswith(".env")], [])
+
+    def test_a_delete_landing_mid_write_does_not_resurrect_the_profile(self):
+        """The existence check has to be INSIDE the lock. Outside it, a
+        concurrent /profiles/delete lands between the check and the write,
+        and the write recreates the profile that was just removed — with
+        values from a form that may itself be stale.
+
+        Forced, not hoped for: the store's lock is held here, the write is
+        started on a thread and blocks on it, the profile is deleted, and
+        only then is the lock released. That is exactly the interleaving,
+        every run."""
+        module = self.daemon()
+        self.write_profile("triage", "HARNESS=claude\n")
+        path = module.profile_path("triage")
+        result = {}
+        with module.locked(path):
+            thread = threading.Thread(
+                target=lambda: result.update(
+                    written=module.profile_write(
+                        "triage", [("TOKEN", "x")], must_exist=True)))
+            thread.start()
+            # The writer is now blocked on the lock we hold. Delete the file
+            # under it — the unlink needs no lock of its own to reach the
+            # filesystem, which is the whole point of the race.
+            thread.join(0.3)
+            self.assertTrue(thread.is_alive(),
+                            "the write did not block on the lock, so this "
+                            "test is not exercising the race it names")
+            os.unlink(path)
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "the write never finished")
+        self.assertIs(result.get("written"), False)
+        self.assertFalse(os.path.exists(path),
+                         "the write recreated a deleted profile")
 
     def test_adding_a_key_to_a_missing_profile_is_a_404(self):
         """Creating a profile is /profiles/set's job. This form only ever
         appears inside an existing profile's fold, so reaching it for one
         that is gone means the page is stale."""
-        _, base = self.serve()
+        module, base = self.serve()
         status, body = self.post(base, "/profiles/setkey", name="ghost",
                                  key="TOKEN", value="x")
         self.assertEqual(status, 404)
         self.assertIn("No profile named", body)
-        self.assertEqual(os.listdir(self.profiles), [])
+        self.assertEqual(module.read_profiles(), {})
+        self.assertEqual([f for f in os.listdir(self.profiles)
+                          if f.endswith(".env")], [])
 
     def test_adding_a_session_with_no_profile_is_unchanged(self):
         """The picker adds a choice. Everything that worked before it must

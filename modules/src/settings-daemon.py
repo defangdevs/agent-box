@@ -450,9 +450,17 @@ def read_profiles():
     return out
 
 
-def profile_write(name, assignments, drop=()):
-    """One read-modify-write on a profile, under the store's own lock."""
-    update(profile_path(name), assignments, profile_header(name), drop=drop)
+def profile_write(name, assignments, drop=(), must_exist=False):
+    """One read-modify-write on a profile, under the store's own lock.
+
+    `must_exist` belongs to that same critical section, not to an
+    `os.path.exists` in the caller: outside the lock a concurrent
+    /profiles/delete lands between the check and the write, and the write
+    recreates the profile that was just deleted. Returns False when it was
+    gone.
+    """
+    return update(profile_path(name), assignments, profile_header(name),
+                  drop=drop, must_exist=must_exist)
 
 
 def profile_remove(name):
@@ -4726,9 +4734,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # just the header, no harness — and then listed it in the
                 # panel and the picker. A stale tab whose profile was deleted
                 # in another one reaches exactly this path.
-                if (KEY_RE.match(key) and key not in PROFILE_RESERVED
-                        and os.path.exists(profile_path(name))):
-                    profile_write(name, [], drop=[key])
+                if KEY_RE.match(key) and key not in PROFILE_RESERVED:
+                    # must_exist, checked INSIDE the lock: update() writes
+                    # the file whether or not the load found one, so removing
+                    # a key from a profile that is gone would create an empty
+                    # one — header only, no harness — and the panel and the
+                    # picker would then offer it. A stale tab whose profile
+                    # was deleted in another one reaches exactly this path.
+                    profile_write(name, [], drop=[key], must_exist=True)
                 self._redirect("ok=profile_key_deleted")
                 return
             if action == "setkey":
@@ -4745,25 +4758,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         status=400,
                     )
                     return
-                # Same existence guard as delkey, for the same stale-tab
+                # Same must_exist guard as delkey, for the same stale-tab
                 # reason: this form only ever appears inside an existing
                 # profile's fold, so reaching it for a profile that is gone
                 # means the page is out of date — and resurrecting it here,
                 # with one env key and no launch config, is not what either
                 # the operator or the form asked for. Creating a profile is
                 # /profiles/set's job.
-                if not os.path.exists(profile_path(name)):
-                    self._send_html(
-                        render_page("No profile named '%s' — it may have "
-                                    "just been deleted." % name),
-                        status=404)
-                    return
                 try:
-                    profile_write(name, [(key, value)])
+                    written = profile_write(name, [(key, value)],
+                                            must_exist=True)
                 except EnvStoreError as exc:
                     self._send_html(
                         render_page("Could not save that key \u2014 %s." % exc),
                         status=400)
+                    return
+                if not written:
+                    self._send_html(
+                        render_page("No profile named '%s' — it may have "
+                                    "just been deleted." % name),
+                        status=404)
                     return
                 self._redirect("ok=profile_key_saved")
                 return

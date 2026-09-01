@@ -292,18 +292,28 @@ def locked(path):
         handle.close()
 
 
-def update(path, assignments, header="", drop=()):
+def update(path, assignments, header="", drop=(), must_exist=False):
     """Rewrite `path` with `drop` and the assigned keys removed, then append.
 
     One read-modify-write under the lock, so `set` keeps the file's order for
     untouched keys and moves a re-set key to the end — the behavior the shell
     `env_rewrite` and the daemon's `set_key` both had — and a concurrent
     writer cannot drop the key this one did not touch.
+
+    `must_exist` refuses to CREATE the file, and is why the check belongs
+    here rather than in the caller: an `os.path.exists` before this call sits
+    outside the lock, so a concurrent delete lands between the two and the
+    write recreates the file the other writer had just removed — with values
+    from a form that may itself be stale. Returns whether anything was
+    written; False only ever means "it was gone".
     """
     with locked(path):
+        if must_exist and not os.path.exists(path):
+            return False
         doomed = set(drop) | {key for key, _ in assignments}
         kept = [(k, v) for (k, v) in load(path) if k not in doomed]
         save(path, kept + list(assignments), header)
+        return True
 
 
 def keys(path):
@@ -772,9 +782,17 @@ def read_profiles():
     return out
 
 
-def profile_write(name, assignments, drop=()):
-    """One read-modify-write on a profile, under the store's own lock."""
-    update(profile_path(name), assignments, profile_header(name), drop=drop)
+def profile_write(name, assignments, drop=(), must_exist=False):
+    """One read-modify-write on a profile, under the store's own lock.
+
+    `must_exist` belongs to that same critical section, not to an
+    `os.path.exists` in the caller: outside the lock a concurrent
+    /profiles/delete lands between the check and the write, and the write
+    recreates the profile that was just deleted. Returns False when it was
+    gone.
+    """
+    return update(profile_path(name), assignments, profile_header(name),
+                  drop=drop, must_exist=must_exist)
 
 
 def profile_remove(name):
@@ -6427,9 +6445,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # just the header, no harness — and then listed it in the
                 # panel and the picker. A stale tab whose profile was deleted
                 # in another one reaches exactly this path.
-                if (KEY_RE.match(key) and key not in PROFILE_RESERVED
-                        and os.path.exists(profile_path(name))):
-                    profile_write(name, [], drop=[key])
+                if KEY_RE.match(key) and key not in PROFILE_RESERVED:
+                    # must_exist, checked INSIDE the lock: update() writes
+                    # the file whether or not the load found one, so removing
+                    # a key from a profile that is gone would create an empty
+                    # one — header only, no harness — and the panel and the
+                    # picker would then offer it. A stale tab whose profile
+                    # was deleted in another one reaches exactly this path.
+                    profile_write(name, [], drop=[key], must_exist=True)
                 self._redirect("ok=profile_key_deleted")
                 return
             if action == "setkey":
@@ -6446,25 +6469,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         status=400,
                     )
                     return
-                # Same existence guard as delkey, for the same stale-tab
+                # Same must_exist guard as delkey, for the same stale-tab
                 # reason: this form only ever appears inside an existing
                 # profile's fold, so reaching it for a profile that is gone
                 # means the page is out of date — and resurrecting it here,
                 # with one env key and no launch config, is not what either
                 # the operator or the form asked for. Creating a profile is
                 # /profiles/set's job.
-                if not os.path.exists(profile_path(name)):
-                    self._send_html(
-                        render_page("No profile named '%s' — it may have "
-                                    "just been deleted." % name),
-                        status=404)
-                    return
                 try:
-                    profile_write(name, [(key, value)])
+                    written = profile_write(name, [(key, value)],
+                                            must_exist=True)
                 except EnvStoreError as exc:
                     self._send_html(
                         render_page("Could not save that key \u2014 %s." % exc),
                         status=400)
+                    return
+                if not written:
+                    self._send_html(
+                        render_page("No profile named '%s' — it may have "
+                                    "just been deleted." % name),
+                        status=404)
                     return
                 self._redirect("ok=profile_key_saved")
                 return
