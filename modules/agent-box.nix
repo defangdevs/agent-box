@@ -4728,11 +4728,28 @@ fi
     # set`: which repos an agent user is answerable for, and how hard to press
     # them, are preferences rather than system-level facts, and the agent user
     # cannot edit /etc/nixos to change a Nix option.
+    # Both are integers the option type already validated, so they can be
+    # interpolated straight into the "${VAR:-N}" form.
     export AGENT_BOX_WATCHDOG_COOLDOWN="''${AGENT_BOX_WATCHDOG_COOLDOWN:-${toString cfg.watchdog.cooldown}}"
     export AGENT_BOX_WATCHDOG_MAX_ATTEMPTS="''${AGENT_BOX_WATCHDOG_MAX_ATTEMPTS:-${toString cfg.watchdog.maxAttempts}}"
-    export AGENT_BOX_WATCHDOG_AGENT="''${AGENT_BOX_WATCHDOG_AGENT:-${cfg.watchdog.agent}}"
+    # These two are free-form config, so their defaults are set by a BARE
+    # ASSIGNMENT, where escapeShellArg's quoting is real quoting. Inside a
+    # double-quoted "''${VAR:-...}" the quotes it adds are literal characters
+    # instead, so every repo name arrived wrapped in apostrophes and matched
+    # nothing (#486 review).
+    #
+    # Tested with `+set` rather than `:-` for the same reason: an operator who
+    # exports an EMPTY value is asking for the unrestricted sweep, and must
+    # not be handed the declared default straight back.
+    if [ -z "''${AGENT_BOX_WATCHDOG_AGENT+set}" ]; then
+      AGENT_BOX_WATCHDOG_AGENT=${lib.escapeShellArg cfg.watchdog.agent}
+    fi
+    export AGENT_BOX_WATCHDOG_AGENT
   '' + lib.optionalString (cfg.watchdog.repos != [ ]) ''
-    export AGENT_BOX_WATCHDOG_REPOS="''${AGENT_BOX_WATCHDOG_REPOS:-${lib.escapeShellArg (lib.concatStringsSep " " cfg.watchdog.repos)}}"
+    if [ -z "''${AGENT_BOX_WATCHDOG_REPOS+set}" ]; then
+      AGENT_BOX_WATCHDOG_REPOS=${lib.escapeShellArg (lib.concatStringsSep " " cfg.watchdog.repos)}
+    fi
+    export AGENT_BOX_WATCHDOG_REPOS
   '' + ''
     exec ${watchdogProgram} "$@"
   '');
@@ -4773,6 +4790,7 @@ fi
 # one interval, while a spawn too many costs a duplicate agent on work already
 # in flight (#251, #319, #419).
 import argparse
+import getpass
 import json
 import os
 import re
@@ -5036,6 +5054,26 @@ def listed_sessions():
     return None if sessions is None else set(sessions)
 
 
+def _filter_prefix():
+    """The prefix local-webhook gives THIS user's per-session filter files.
+
+    The supervisor names them from `LOCAL_WEBHOOK_SESSION=$USER-$sname`, so
+    the prefix carries the agent user's login, not the literal "agent". This
+    was hardcoded as `filter.agent-` and so matched nothing on a box whose
+    agent user has any other name — the repo's own fixtures ship a `robot`
+    user. No filter file matched, every issue looked unclaimed, and the sweep
+    would have started a session beside a live one that already owned it:
+    exactly the duplicate-agent outcome this file exists to prevent
+    (#486 review).
+    """
+    try:
+        user = getpass.getuser()
+    except (KeyError, OSError):
+        # No name for our own uid. "Cannot tell", never "nobody claims it".
+        return None
+    return f"filter.{user}-" if user else None
+
+
 def _filter_dir():
     return os.environ.get("LOCAL_WEBHOOK_STATE_DIR") or os.path.join(
         os.path.expanduser("~"), ".local", "state", "local-webhook")
@@ -5060,15 +5098,18 @@ def claimed_by_live_session(live):
     """
     if live is None:
         return None
+    prefix = _filter_prefix()
+    if prefix is None:
+        return None
     claimed = {}
     try:
         entries = os.listdir(_filter_dir())
     except OSError:
         return None
     for name in entries:
-        if not (name.startswith("filter.agent-") and name.endswith(".json")):
+        if not (name.startswith(prefix) and name.endswith(".json")):
             continue
-        session = name[len("filter.agent-"):-len(".json")]
+        session = name[len(prefix):-len(".json")]
         if session not in live:
             continue
         try:
@@ -8383,6 +8424,16 @@ exit 0
     case "$WATCHDOG_INTERVAL" in
       (*[!0-9]*|"") WATCHDOG_INTERVAL=1800 ;;
     esac
+    # Strip leading zeros before the value ever reaches $(( )), which reads them
+    # as octal: "08" is an arithmetic ERROR that would abort the tick, and "030"
+    # would quietly mean 24 seconds instead of 30 (#486 review). The digits-only
+    # case above cannot catch either, because both ARE digits.
+    while :; do
+      case "$WATCHDOG_INTERVAL" in
+        (0[0-9]*) WATCHDOG_INTERVAL=''${WATCHDOG_INTERVAL#0} ;;
+        (*) break ;;
+      esac
+    done
     watchdog_next=0
     watchdog_pid=""
     maybe_sweep_assignments() {

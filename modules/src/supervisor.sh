@@ -990,6 +990,16 @@ WATCHDOG_INTERVAL="${AGENT_BOX_WATCHDOG_INTERVAL:-1800}"
 case "$WATCHDOG_INTERVAL" in
   (*[!0-9]*|"") WATCHDOG_INTERVAL=1800 ;;
 esac
+# Strip leading zeros before the value ever reaches $(( )), which reads them
+# as octal: "08" is an arithmetic ERROR that would abort the tick, and "030"
+# would quietly mean 24 seconds instead of 30 (#486 review). The digits-only
+# case above cannot catch either, because both ARE digits.
+while :; do
+  case "$WATCHDOG_INTERVAL" in
+    (0[0-9]*) WATCHDOG_INTERVAL=${WATCHDOG_INTERVAL#0} ;;
+    (*) break ;;
+  esac
+done
 watchdog_next=0
 watchdog_pid=""
 maybe_sweep_assignments() {

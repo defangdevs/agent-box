@@ -672,11 +672,28 @@ let
     # set`: which repos an agent user is answerable for, and how hard to press
     # them, are preferences rather than system-level facts, and the agent user
     # cannot edit /etc/nixos to change a Nix option.
+    # Both are integers the option type already validated, so they can be
+    # interpolated straight into the "${VAR:-N}" form.
     export AGENT_BOX_WATCHDOG_COOLDOWN="''${AGENT_BOX_WATCHDOG_COOLDOWN:-${toString cfg.watchdog.cooldown}}"
     export AGENT_BOX_WATCHDOG_MAX_ATTEMPTS="''${AGENT_BOX_WATCHDOG_MAX_ATTEMPTS:-${toString cfg.watchdog.maxAttempts}}"
-    export AGENT_BOX_WATCHDOG_AGENT="''${AGENT_BOX_WATCHDOG_AGENT:-${cfg.watchdog.agent}}"
+    # These two are free-form config, so their defaults are set by a BARE
+    # ASSIGNMENT, where escapeShellArg's quoting is real quoting. Inside a
+    # double-quoted "''${VAR:-...}" the quotes it adds are literal characters
+    # instead, so every repo name arrived wrapped in apostrophes and matched
+    # nothing (#486 review).
+    #
+    # Tested with `+set` rather than `:-` for the same reason: an operator who
+    # exports an EMPTY value is asking for the unrestricted sweep, and must
+    # not be handed the declared default straight back.
+    if [ -z "''${AGENT_BOX_WATCHDOG_AGENT+set}" ]; then
+      AGENT_BOX_WATCHDOG_AGENT=${lib.escapeShellArg cfg.watchdog.agent}
+    fi
+    export AGENT_BOX_WATCHDOG_AGENT
   '' + lib.optionalString (cfg.watchdog.repos != [ ]) ''
-    export AGENT_BOX_WATCHDOG_REPOS="''${AGENT_BOX_WATCHDOG_REPOS:-${lib.escapeShellArg (lib.concatStringsSep " " cfg.watchdog.repos)}}"
+    if [ -z "''${AGENT_BOX_WATCHDOG_REPOS+set}" ]; then
+      AGENT_BOX_WATCHDOG_REPOS=${lib.escapeShellArg (lib.concatStringsSep " " cfg.watchdog.repos)}
+    fi
+    export AGENT_BOX_WATCHDOG_REPOS
   '' + ''
     exec ${watchdogProgram} "$@"
   '');

@@ -119,6 +119,44 @@ class SessionNaming(unittest.TestCase):
             self.assertNotEqual(name, reserved)
 
 
+class FilterPrefix(unittest.TestCase):
+    """The filter files carry the agent user's login, not the word "agent"."""
+
+    def setUp(self):
+        self.old = os.environ.get("USER")
+        os.environ["USER"] = "robot"
+        os.environ["LOGNAME"] = "robot"
+
+    def tearDown(self):
+        for key in ("USER", "LOGNAME"):
+            if self.old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = self.old
+
+    def test_prefix_follows_the_user(self):
+        # The supervisor names these from LOCAL_WEBHOOK_SESSION=$USER-$sname.
+        # Hardcoding "filter.agent-" matched NOTHING on a box whose agent user
+        # is called anything else — and this repo's own fixtures ship a
+        # `robot` user. Every issue then looked unclaimed and the sweep would
+        # have started a session beside the live one already holding it.
+        self.assertEqual(wd._filter_prefix(), "filter.robot-")
+
+    def test_claims_are_found_under_that_prefix(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "filter.robot-main.json").write_text(json.dumps({
+                "topics": [{"topic": "github:o/r",
+                            "include": {"any": [
+                                {"path": "issue.number", "in": [7]}]}}]}),
+                encoding="utf-8")
+            os.environ["LOCAL_WEBHOOK_STATE_DIR"] = d
+            try:
+                claimed = wd.claimed_by_live_session({"main"})
+            finally:
+                os.environ.pop("LOCAL_WEBHOOK_STATE_DIR", None)
+        self.assertTrue(wd.claims_cover(claimed, "o/r", 7))
+
+
 class Capacity(unittest.TestCase):
     """Both spawned families count against the one ceiling."""
 

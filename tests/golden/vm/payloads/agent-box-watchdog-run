@@ -27,6 +27,7 @@
 # one interval, while a spawn too many costs a duplicate agent on work already
 # in flight (#251, #319, #419).
 import argparse
+import getpass
 import json
 import os
 import re
@@ -290,6 +291,26 @@ def listed_sessions():
     return None if sessions is None else set(sessions)
 
 
+def _filter_prefix():
+    """The prefix local-webhook gives THIS user's per-session filter files.
+
+    The supervisor names them from `LOCAL_WEBHOOK_SESSION=$USER-$sname`, so
+    the prefix carries the agent user's login, not the literal "agent". This
+    was hardcoded as `filter.agent-` and so matched nothing on a box whose
+    agent user has any other name — the repo's own fixtures ship a `robot`
+    user. No filter file matched, every issue looked unclaimed, and the sweep
+    would have started a session beside a live one that already owned it:
+    exactly the duplicate-agent outcome this file exists to prevent
+    (#486 review).
+    """
+    try:
+        user = getpass.getuser()
+    except (KeyError, OSError):
+        # No name for our own uid. "Cannot tell", never "nobody claims it".
+        return None
+    return f"filter.{user}-" if user else None
+
+
 def _filter_dir():
     return os.environ.get("LOCAL_WEBHOOK_STATE_DIR") or os.path.join(
         os.path.expanduser("~"), ".local", "state", "local-webhook")
@@ -314,15 +335,18 @@ def claimed_by_live_session(live):
     """
     if live is None:
         return None
+    prefix = _filter_prefix()
+    if prefix is None:
+        return None
     claimed = {}
     try:
         entries = os.listdir(_filter_dir())
     except OSError:
         return None
     for name in entries:
-        if not (name.startswith("filter.agent-") and name.endswith(".json")):
+        if not (name.startswith(prefix) and name.endswith(".json")):
             continue
-        session = name[len("filter.agent-"):-len(".json")]
+        session = name[len(prefix):-len(".json")]
         if session not in live:
             continue
         try:

@@ -463,7 +463,19 @@ class Spec:
         # it catches is the same on both backends: an issue assigned to this
         # box that never became a PR, which is indistinguishable from one
         # nobody has got to yet.
-        watchdog_cfg = data.get("watchdog") or {}
+        # NOT `or {}`: that reads `watchdog: false` — which plainly means
+        # "off" — as an absent section and turns the sweep ON with defaults,
+        # and lets a truthy non-mapping reach .get() as an AttributeError
+        # instead of a ConfigError (#486 review).
+        watchdog_cfg = data.get("watchdog")
+        if watchdog_cfg is None:
+            watchdog_cfg = {}
+        elif watchdog_cfg is False:
+            watchdog_cfg = {"enable": False}
+        elif not isinstance(watchdog_cfg, dict):
+            raise ConfigError(
+                "watchdog must be a mapping (or false), got "
+                f"{watchdog_cfg!r}")
         watchdog_enable = watchdog_cfg.get("enable", True)
         if watchdog_enable is not None and not isinstance(
                 watchdog_enable, bool):
@@ -2344,11 +2356,20 @@ class Renderer:
                    "export AGENT_BOX_WATCHDOG_MAX_ATTEMPTS="
                    "\"${AGENT_BOX_WATCHDOG_MAX_ATTEMPTS:-"
                    f"{self.spec.watchdog_max_attempts}}}\"\n"
-                   "export AGENT_BOX_WATCHDOG_AGENT="
-                   "\"${AGENT_BOX_WATCHDOG_AGENT:-"
-                   f"{self.spec.watchdog_agent}}}\"\n"
-                   + (f"export AGENT_BOX_WATCHDOG_REPOS="
-                      f"\"${{AGENT_BOX_WATCHDOG_REPOS:-{repos}}}\"\n"
+                   # Free-form config, so the default is set by a BARE
+                   # ASSIGNMENT where shlex.quote's quoting is real quoting,
+                   # and tested with `+set` so an operator who exports an
+                   # empty value keeps it. The module's half is written the
+                   # same way, for the same reason (#486 review).
+                   "if [ -z \"${AGENT_BOX_WATCHDOG_AGENT+set}\" ]; then\n"
+                   f"  AGENT_BOX_WATCHDOG_AGENT={q(self.spec.watchdog_agent)}\n"
+                   "fi\n"
+                   "export AGENT_BOX_WATCHDOG_AGENT\n"
+                   + (("if [ -z \"${AGENT_BOX_WATCHDOG_REPOS+set}\" ]; "
+                       "then\n"
+                       f"  AGENT_BOX_WATCHDOG_REPOS={q(repos)}\n"
+                       "fi\n"
+                       "export AGENT_BOX_WATCHDOG_REPOS\n")
                       if repos else "")
                    + f'exec {self.bin}/agent-box-watchdog-run "$@"\n', 0o755)
         # A profile file is the env store in another directory, so it has
