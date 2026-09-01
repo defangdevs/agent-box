@@ -4695,6 +4695,13 @@ fi
     # the store's own parser (issue #212) rather than a fifth copy of the
     # KEY=value loop.
     export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
+    # Named once so --preamble's report and the fallback line it prints can
+    # say where the fleet-wide default LIVES without hard-coding backend
+    # prose into the shared script (issue #471 — the same shape #466 fixed
+    # for the Caddyfile banner). Exported unconditionally, unlike the value
+    # below: the option exists, and this describes it, whether or not it is
+    # currently set to anything.
+    export AGENT_BOX_HOOK_ARGS_OPTION_NAME=${lib.escapeShellArg "the NixOS option services.agent-box.webhook.hookSessionArgs"}
   '' + lib.optionalString (cfg.webhook.hookSessionArgs != [ ]) ''
     # The fleet-wide default for hook-session args (webhook.hookSessionArgs),
     # JSON so multi-word args survive the round trip; the script decodes it
@@ -5069,7 +5076,7 @@ hook_args_file="$HOME/.config/agent-box/env"
 ENVSTORE="''${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
 hook_args_source=""
 if [ -n "''${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
-  hook_args_source="services.agent-box.webhook.hookSessionArgs (NixOS config)"
+  hook_args_source="''${AGENT_BOX_HOOK_ARGS_OPTION_NAME:-the fleet-wide default}"
 fi
 # The same file also names the agent PROFILE a standing watch hands work to
 # (issue #321): AGENT_BOX_HOOK_PROFILE. That is the whole point of a profile
@@ -5201,8 +5208,9 @@ agent CLI defaults (for claude, your default model)."
 root, running sessions keep the arguments they started with:"
   printf '  agent-box-session env set AGENT_BOX_HOOK_SESSION_ARGS %s\n' \
     "$hook_args_example"
-  printf '%s\n' "That file wins over the NixOS option \
-services.agent-box.webhook.hookSessionArgs, which is the fallback."
+  printf '%s\n' "That file wins over \
+''${AGENT_BOX_HOOK_ARGS_OPTION_NAME:-the fleet-wide default}, which is the \
+fallback."
 }
 
 # --preamble TOPIC [NOTE]: print what a match on TOPIC would launch — the

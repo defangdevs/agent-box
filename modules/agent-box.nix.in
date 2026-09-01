@@ -672,6 +672,13 @@ let
     # the store's own parser (issue #212) rather than a fifth copy of the
     # KEY=value loop.
     export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
+    # Named once so --preamble's report and the fallback line it prints can
+    # say where the fleet-wide default LIVES without hard-coding backend
+    # prose into the shared script (issue #471 — the same shape #466 fixed
+    # for the Caddyfile banner). Exported unconditionally, unlike the value
+    # below: the option exists, and this describes it, whether or not it is
+    # currently set to anything.
+    export AGENT_BOX_HOOK_ARGS_OPTION_NAME=${lib.escapeShellArg "the NixOS option services.agent-box.webhook.hookSessionArgs"}
   '' + lib.optionalString (cfg.webhook.hookSessionArgs != [ ]) ''
     # The fleet-wide default for hook-session args (webhook.hookSessionArgs),
     # JSON so multi-word args survive the round trip; the script decodes it

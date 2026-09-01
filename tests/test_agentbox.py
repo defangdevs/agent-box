@@ -1343,6 +1343,15 @@ class RenderTest(unittest.TestCase):
           HOOK_SESSION_ARGS       no box-wide default for the hook-*
                                   sessions a watch spawns (issue #216's
                                   cheaper triage model).
+
+        HOOK_SESSION_ARGS is unset here (the fixture's hookSessionArgs is
+        `[]`) — issue #471: it must be exported only when non-empty, the
+        same "unset when empty" rule the module follows, or webhook-spawn.sh
+        always reports its box-wide default as set. The wrapper still names
+        WHERE that default lives (AGENT_BOX_HOOK_ARGS_OPTION_NAME)
+        unconditionally, so --preamble's report can say so even when nothing
+        is configured; see test_a_hook_arg_with_an_apostrophe_survives_the_
+        wrapper for the non-empty case.
         """
         settings = (FIXTURE / "etc/systemd/system"
                     / "agent-box-settings@agent.service.d"
@@ -1352,11 +1361,8 @@ class RenderTest(unittest.TestCase):
         env = (FIXTURE / "etc/agent-box/units/agent.env").read_text()
         self.assertIn("AGENT_BOX_WEBHOOK_PINNED_SCRIPT=", env)
         wrapper = (FIXTURE / "usr/local/bin/agent-box-webhook").read_text()
-        self.assertIn("AGENT_BOX_HOOK_SESSION_ARGS=", wrapper)
-        # JSON, not a shell list: webhook-spawn.sh parses it with jq
-        # precisely so an argument may contain spaces.
-        args = wrapper.split("AGENT_BOX_HOOK_SESSION_ARGS=", 1)[1]
-        json.loads(args.split("\n")[0].strip().strip("'"))
+        self.assertIn("AGENT_BOX_HOOK_ARGS_OPTION_NAME=", wrapper)
+        self.assertNotIn("AGENT_BOX_HOOK_SESSION_ARGS=", wrapper)
 
     def test_a_hook_arg_with_an_apostrophe_survives_the_wrapper(self):
         """The wrapper is generated shell. JSON does not escape an
