@@ -1,0 +1,11 @@
+{
+  "unit": "agent-box-settings@",
+  "env": [
+    { "name": "AGENT_BOX_TMUX_BIN", "kind": "bin", "program": "tmux", "condition": "always" },
+    { "name": "AGENT_BOX_WEBHOOK_PYTHON", "kind": "bin", "program": "python3", "condition": "webhook" },
+    { "name": "AGENT_BOX_HOOK_SPAWN_CMD", "kind": "hook-spawn", "program": "agent-box-webhook-spawn", "condition": "webhook" }
+  ],
+  "execStart": [
+    { "kind": "bin", "program": "agent-box-settings" }
+  ]
+}
