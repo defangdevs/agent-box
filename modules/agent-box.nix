@@ -12455,15 +12455,20 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
         // the top level — the fold below then closes under the operator with
         // nothing to show for it.
         callbacks: {
-          // Which rows are folded open is state this HTML does not carry:
-          // <details open> is reflected to the attribute when the operator
-          // clicks it, and the server re-renders every row closed. A faithful
-          // morph would therefore close it under them, so `open` is the one
-          // attribute the live DOM keeps authority over. Scoped to
-          // details[data-fold]: a <details> the server does drive still gets
-          // updated normally.
+          // Which rows the operator folded open is state this HTML does not
+          // carry: <details open> is reflected to the attribute when they
+          // click it, and the server re-renders a row it is not driving as
+          // closed. A faithful morph would therefore close it under them.
+          //
+          // Only the REMOVAL is vetoed, though. The server does drive this
+          // attribute in one direction: a connection card renders itself
+          // `open` while its sign-in flow is waiting, starting, exchanging or
+          // failed (settings-daemon.py, conn_row), which is how the code the
+          // operator has to paste comes into view. Vetoing an ADD as well
+          // would leave that wizard collapsed with the code inside it.
           beforeAttributeUpdated: function (name, node, type) {
-            if (name === "open" && node.matches("details[data-fold]")) {
+            if (name === "open" && type === "remove"
+                && node.matches("details[data-fold]")) {
               return false;
             }
           }

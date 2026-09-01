@@ -80,24 +80,24 @@ jobs:
             fi
 
             gh issue create --repo "$REPO" --title "$title" --body "$(cat <<EOF
-\`$name\` is vendored at \`$pinned\`; upstream's latest release is \`$latest\`.
+          \`$name\` is vendored at \`$pinned\`; upstream's latest release is \`$latest\`.
 
-The pin lives in \`modules/src/vendor/vendor.json\`. To bump it:
+          The pin lives in \`modules/src/vendor/vendor.json\`. To bump it:
 
-\`\`\`
-python3 scripts/check_vendor.py --update $name
-nix run .#assemble
-python3 tests/test-assemble-module.py
-nix run .#update-golden
-\`\`\`
+          \`\`\`
+          python3 scripts/check_vendor.py --update $name
+          nix run .#assemble
+          python3 tests/test-assemble-module.py
+          nix run .#update-golden
+          \`\`\`
 
-Then review both diffs and open a PR. The escaping tests round-trip the new
-bytes through the Python-string host they get embedded in, so a release that
-introduces something the assembler cannot carry fails there rather than on a
-box.
+          Then review both diffs and open a PR. The escaping tests round-trip the new
+          bytes through the Python-string host they get embedded in, so a release that
+          introduces something the assembler cannot carry fails there rather than on a
+          box.
 
-Not automated on purpose: this asset is served in a page on every deployed
-box, so the version change wants a human on it. Filed by [vendor-updates.yml]($RUN_URL).
-EOF
-)"
+          Not automated on purpose: this asset is served in a page on every deployed
+          box, so the version change wants a human on it. Filed by [vendor-updates.yml]($RUN_URL).
+          EOF
+          )"
           done

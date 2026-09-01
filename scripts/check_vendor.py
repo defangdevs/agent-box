@@ -92,10 +92,14 @@ def check_integrity(packages: list) -> list:
         if used_by and not (REPO / used_by).exists():
             problems.append(f"{name}: used_by names a file that does not exist: {used_by}")
 
-    for path in sorted(VENDOR.iterdir()):
-        if path.is_file() and path.name not in NOT_AN_ASSET and path.name not in pinned:
+    # rglob, not iterdir: a pin's `path` may name a subdirectory, and an asset
+    # dropped into one would otherwise be embedded while escaping this check
+    # entirely — which is the single thing it exists to prevent.
+    for path in sorted(VENDOR.rglob("*")):
+        rel = path.relative_to(VENDOR).as_posix()
+        if path.is_file() and rel not in NOT_AN_ASSET and rel not in pinned:
             problems.append(
-                f"{path.name}: vendored but not pinned — add it to "
+                f"{rel}: vendored but not pinned — add it to "
                 f"{MANIFEST.relative_to(REPO)} so it gets verified and tracked."
             )
     return problems
