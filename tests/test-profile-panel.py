@@ -229,6 +229,31 @@ class ProfilePanel(ProfileFixture):
         self.assertNotIn("<script>", html)
         self.assertIn("&lt;script&gt;", html)
 
+    def test_the_summary_line_is_escaped_exactly_once(self):
+        """Its parts are escaped as they go in, so escaping the join too
+        turns "&" into visible entity text. The test above does not catch
+        that on its own: the same value also reaches the edit form's value
+        attribute, where it IS escaped once, so the assertion passes on
+        that copy while the summary is wrong."""
+        self.write_profile("p", "HARNESS=claude\nMODEL=a&b\n")
+        module = self.daemon()
+        html = module.render_profiles(module.read_profiles())
+        # The summary is the <span class="meta"> in the row's <summary>.
+        meta = html.split('<span class="meta">')[1].split("</span>")[0]
+        self.assertIn("a&amp;b", meta)
+        self.assertNotIn("&amp;amp;", meta)
+
+    def test_no_resolver_means_no_picker_and_a_clear_refusal(self):
+        """The settings unit is socket activated with stopIfChanged=false,
+        so a daemon that survived an update can still be running on the
+        environment it started with. Offering a picker that cannot work
+        sends the operator hunting for a profile that is sitting right
+        there in the list."""
+        self.write_profile("triage", "HARNESS=claude\n")
+        module = self.daemon(AGENT_BOX_PROFILE_BIN="")
+        options = module.render_profile_options(module.read_profiles())
+        self.assertNotIn("triage", options)
+
 
 class ProfileRoutes(ProfileFixture):
     """The four POST verbs, driven over HTTP against the real handler.
@@ -240,6 +265,7 @@ class ProfileRoutes(ProfileFixture):
 
     def serve(self, **extra):
         module = self.daemon(**extra)
+        self.module = module
         server = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), module.Handler)
         self.addCleanup(server.server_close)
@@ -382,6 +408,57 @@ class ProfileRoutes(ProfileFixture):
         self.assertEqual(entry["agent"], "codex")
         self.assertIsNone(entry["profile"])
         self.assertEqual(entry["extraArgs"], [])
+
+    def test_a_resolver_that_prints_a_non_object_is_not_a_500(self):
+        """json.loads takes any JSON value; .get() on a list is an
+        AttributeError, which would be a traceback in the journal and a 500
+        on the page instead of the answer this path is written to give."""
+        with open(self.launch, "w") as handle:
+            handle.write("#!%s\nprint('[]')\n" % sys.executable)
+        os.chmod(self.launch, 0o755)
+        _, base = self.serve()
+        self.write_profile("triage", "HARNESS=claude\n")
+        status, body = self.post(base, "/sessions/add", back="settings",
+                                 agent="claude", profile="triage", cwd="~",
+                                 prompt="")
+        self.assertEqual(status, 400)
+        self.assertIn("Could not resolve profile", body)
+
+    def test_a_box_with_no_resolver_says_so_rather_than_blaming_the_profile(self):
+        """The two are fixed differently: one is a restart of this daemon,
+        the other is a hunt for a profile that was deleted."""
+        _, base = self.serve(AGENT_BOX_PROFILE_BIN="")
+        self.write_profile("triage", "HARNESS=claude\n")
+        status, body = self.post(base, "/sessions/add", back="settings",
+                                 agent="claude", profile="triage", cwd="~",
+                                 prompt="")
+        self.assertEqual(status, 503)
+        self.assertIn("no profile resolver", body)
+        self.assertNotIn("may have just been deleted", body)
+        self.assertEqual(self.read_sessions(), {})
+
+    def test_deleting_a_profile_waits_for_a_write_in_flight(self):
+        """Otherwise a save can read the file, the delete can unlink it,
+        and the save can write it back — a profile the operator deleted,
+        quietly recreated. Asserted by holding the store's own lock and
+        watching the delete wait for it, rather than by reading the source
+        for the word "locked"."""
+        module = self.daemon()
+        self.write_profile("triage", "HARNESS=claude\n")
+        path = module.profile_path("triage")
+        done = threading.Event()
+        with module.locked(path):
+            thread = threading.Thread(
+                target=lambda: (module.profile_remove("triage"), done.set()))
+            thread.start()
+            # While the lock is held the delete cannot have happened. A
+            # generous wait, because proving a negative on a thread that is
+            # meant to be blocked is the one case where a sleep is the test.
+            self.assertFalse(done.wait(0.5))
+            self.assertTrue(os.path.exists(path))
+        thread.join(5)
+        self.assertTrue(done.is_set(), "the delete never completed")
+        self.assertIsNone(self.profile_text("triage"))
 
     def test_a_profile_that_vanished_between_render_and_submit_is_an_error(self):
         """Not a session quietly started as something else."""

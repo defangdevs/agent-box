@@ -93,8 +93,13 @@ import urllib.parse
 # modules/agent-box.nix.in, the same seam envExecWrapper and envStoreCli use).
 # This daemon is the file's main writer and does NOT shell out to the CLI: a
 # secret must not travel through the argv of a helper process to get written.
-# The names that library defines — KEY_RE, ENV_HEADER, as_dict/load/keys/update
-# — are therefore already bound here and are used below.
+# The names that library defines — KEY_RE, ENV_HEADER, PROFILE_RESERVED,
+# as_dict/load/keys/update/profile_header — are therefore already bound here
+# and are used below. PROFILE_RESERVED in particular is NOT redefined here:
+# env-exec skips exactly those keys when it exports a profile's environment
+# at spawn, so a second copy could classify a key as environment that the
+# spawn path then refuses to export, and the profile's value would silently
+# never reach the session.
 
 USER = os.environ.get("AGENT_BOX_SETTINGS_USER", "agent")
 ENV_FILE = os.environ["AGENT_BOX_SETTINGS_ENV_FILE"]
@@ -115,9 +120,10 @@ PROFILE_BIN = os.environ.get("AGENT_BOX_PROFILE_BIN", "")
 # Same charset and length the CLI's valid_name() enforces (profile-cli.sh):
 # one file per profile, so the name is also a path component.
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-# Launch config. Every OTHER key in a profile is session environment, and is
-# listed by NAME only — a profile is exactly where a token ends up.
-PROFILE_RESERVED = ("HARNESS", "MODEL", "EFFORT", "SYSTEM_PROMPT")
+# PROFILE_RESERVED (the launch config) comes from the env store above, which
+# is also what env-exec skips at spawn. Every OTHER key in a profile is
+# session environment, and is listed by NAME only — a profile is exactly
+# where a token ends up.
 BASE = os.environ.get("AGENT_BOX_SETTINGS_BASE", "/settings").rstrip("/")
 PORT = int(os.environ.get("AGENT_BOX_SETTINGS_PORT", "8080"))
 TMUX_SOCKET = os.environ.get("AGENT_BOX_TMUX_SOCKET", "agent-box")
@@ -450,9 +456,19 @@ def profile_write(name, assignments, drop=()):
 
 
 def profile_remove(name):
+    """Delete under the SAME lock profile_write takes. Without it a save can
+    read the file, this can unlink it, and the save can then write it back —
+    a profile the operator deleted, quietly recreated."""
+    path = profile_path(name)
     try:
-        os.unlink(profile_path(name))
+        with locked(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     except OSError:
+        # The lock itself is unavailable (the directory is gone, say). There
+        # is then nothing to delete either.
         pass
 
 
@@ -464,6 +480,10 @@ def profile_launch(name, harness=""):
     profile that sets something its harness cannot use says so at once,
     rather than at the next session start) and on session add.
     """
+    # Callers check PROFILE_BIN themselves before offering a profile at all
+    # (see render_profile_options), so reaching here without one is a bug
+    # rather than a state to report — but returning None would report it as
+    # "that profile is gone", which is the wrong thing to go looking for.
     if not PROFILE_BIN:
         return None
     try:
@@ -476,9 +496,13 @@ def profile_launch(name, harness=""):
     if out.returncode != 0:
         return None
     try:
-        return json.loads(out.stdout)
+        resolved = json.loads(out.stdout)
     except ValueError:
         return None
+    # json.loads takes any JSON value. A resolver that printed `[]`, `"x"` or
+    # `null` would reach .get() below as an AttributeError — a 500 with a
+    # traceback, in place of the answer this function exists to give.
+    return resolved if isinstance(resolved, dict) else None
 
 
 @contextlib.contextmanager
@@ -2619,7 +2643,7 @@ STYLE = """<style>
 # accessibility, and autocomplete behaviour cannot drift apart.
 NEW_SESSION_FIELDS_TPL = """<div class="row new-session-row">
   <select name="agent" aria-label="Harness">{agents}</select>
-  <select name="profile" aria-label="Agent profile"
+  <select id="profile-picker" name="profile" aria-label="Agent profile"
           title="Agent profile: a harness plus its model, effort and system prompt">{profiles}</select>
   <span class="cwd-control">
     <label for="new-session-cwd">Working directory</label>
@@ -3133,7 +3157,16 @@ def render_profile_options(profiles):
     """The session row's profile <select>. "no profile" FIRST and selected,
     because a session started with no profile is what every session on this
     box was until now — the picker adds a choice, it does not take the
-    default away."""
+    default away.
+
+    Offers nothing at all without a resolver. The settings unit is socket
+    activated with stopIfChanged = false, so a daemon that survived an
+    update can still be running on the environment it started with — and on
+    one that predates AGENT_BOX_PROFILE_BIN, every pick would fail. A
+    picker that cannot work is worse than no picker: it sends the operator
+    looking for a deleted profile."""
+    if not PROFILE_BIN:
+        return '<option value="">&mdash; no profile &mdash;</option>'
     items = ['<option value="">&mdash; no profile &mdash;</option>']
     for name in sorted(profiles):
         safe = html.escape(name)
@@ -3177,7 +3210,10 @@ def render_profiles(profiles):
         env_keys = profiles[name]["env"]
         if env_keys:
             bits.append("%d env key%s" % (len(env_keys), "" if len(env_keys) == 1 else "s"))
-        meta = html.escape(" · ".join(bits)) if bits else "empty"
+        # Each bit was escaped as it went in, so the join must NOT be
+        # escaped again: a MODEL holding "&" or "<" would render as visible
+        # entity text ("&amp;lt;").
+        meta = " · ".join(bits) if bits else "empty"
         # Environment keys, by name. Each gets its own delete button rather
         # than a form field to blank: dropping a key and setting it to the
         # empty string are different states in the store, and only one of
@@ -4766,6 +4802,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # --profile P --agent H` is still the way to say the other thing.
             profile = (form.get("profile", [""])[0]).strip()
             pargs = []
+            if profile and not PROFILE_BIN:
+                # Said plainly, because the two are fixed differently: this
+                # one is a restart of the settings daemon, not a hunt for a
+                # profile that is sitting right there in the list.
+                self._send_html(
+                    render("This box has no profile resolver configured, so "
+                           "a session cannot be started from a profile. "
+                           "Restart the settings service and try again."),
+                    status=503,
+                )
+                return
             if profile:
                 if not PROFILE_NAME_RE.match(profile):
                     self._send_html(render("Invalid profile name."), status=400)
