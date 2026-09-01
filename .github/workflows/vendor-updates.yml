@@ -1,0 +1,103 @@
+name: Vendored asset updates
+
+# The "receiving updates" half of vendoring. CI's vendor-integrity check
+# proves each vendored file still matches its pin, but a Nix build has no
+# network and so can never notice that upstream released something newer — a
+# pin would just sit at whatever version somebody happened to vendor, which is
+# how a vendored dependency quietly becomes a fork.
+#
+# This runs scripts/check_vendor.py --upstream weekly and files ONE issue per
+# stale pin, reusing it rather than opening a duplicate each week. It does not
+# bump anything: a vendored asset lands in a page every box serves, so the
+# actual version change goes through a human-reviewed PR (`--update NAME`).
+# That is the difference from refresh-amis.yml, which self-merges a generated
+# map nobody reads.
+
+on:
+  schedule:
+    - cron: '41 6 * * 2'   # Tuesdays 06:41 UTC (off the hour, and off AMI day)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: vendor-updates
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check pins against upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      # Exit 2 means "integrity fine, but a pin is behind" — the only
+      # outcome that should file anything. Exit 1 is a broken pin, which CI
+      # already fails on, so let it fail here too rather than filing an issue
+      # about it.
+      - name: Check upstream
+        id: check
+        run: |
+          set +e
+          python3 scripts/check_vendor.py --upstream | tee report.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [ "$status" -eq 1 ]; then
+            echo "A vendored file does not match its pin — that is CI's failure to report."
+            exit 1
+          fi
+          exit 0
+
+      - name: File or update an issue for each stale pin
+        if: steps.check.outputs.status == '2'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # "  name: pinned vX, upstream vY  BEHIND"
+          grep 'BEHIND' report.txt | while read -r line; do
+            name=$(echo "$line" | awk -F: '{gsub(/ /,"",$1); print $1}')
+            pinned=$(echo "$line" | awk '{print $3}' | tr -d ',')
+            latest=$(echo "$line" | awk '{print $5}')
+            title="vendor: $name is behind upstream ($pinned -> $latest)"
+
+            # One issue per package, not per run. An open one gets a comment;
+            # a new one is opened only when none is open.
+            existing=$(gh issue list --repo "$REPO" --state open \
+              --search "vendor: $name is behind upstream in:title" \
+              --json number --jq '.[0].number')
+
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$REPO" --body \
+                "Still behind as of $(date -u +%Y-%m-%d): pinned \`$pinned\`, upstream \`$latest\`. ([run]($RUN_URL))"
+              gh issue edit "$existing" --repo "$REPO" --title "$title"
+              continue
+            fi
+
+            gh issue create --repo "$REPO" --title "$title" --body "$(cat <<EOF
+\`$name\` is vendored at \`$pinned\`; upstream's latest release is \`$latest\`.
+
+The pin lives in \`modules/src/vendor/vendor.json\`. To bump it:
+
+\`\`\`
+python3 scripts/check_vendor.py --update $name
+nix run .#assemble
+python3 tests/test-assemble-module.py
+nix run .#update-golden
+\`\`\`
+
+Then review both diffs and open a PR. The escaping tests round-trip the new
+bytes through the Python-string host they get embedded in, so a release that
+introduces something the assembler cannot carry fails there rather than on a
+box.
+
+Not automated on purpose: this asset is served in a page on every deployed
+box, so the version change wants a human on it. Filed by [vendor-updates.yml]($RUN_URL).
+EOF
+)"
+          done

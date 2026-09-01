@@ -66,7 +66,9 @@ async function openSecretEditor(page: Page) {
 async function saveKey(page: Page, key: string, value: string) {
   await openSecretEditor(page);
   await addForm(page).locator('input[name="key"]').fill(key);
-  await addForm(page).locator('input[name="value"]').fill(value);
+  // A <textarea>, not an <input>, since a secret may span lines (a PEM is
+  // pasted whole). The attribute selector matches whichever it is.
+  await addForm(page).locator('[name="value"]').fill(value);
   await addForm(page).getByRole('button', { name: 'Save' }).click();
   await expect(page.locator('.msg')).toHaveText(/Key saved/);
 }
@@ -221,6 +223,53 @@ test('SPA layer: saving and deleting never triggers a full page load', async ({ 
   await deleteKey(page, key);
 
   expect(await page.evaluate(() => (window as any).__noReloadMarker)).toBe(true);
+});
+
+// The live swap patches the DOM toward re-rendered HTML rather than replacing
+// it (idiomorph, vendored under modules/src/vendor). These pin the two
+// properties that were previously hand-restored after every replaceWith and
+// would silently regress the moment the morph options are wrong — as they did
+// while this was written: idiomorph reads lifecycle hooks from `callbacks`,
+// and a `beforeAttributeUpdated` left at the top level is ignored without a
+// word, which closes every folded row on the next swap.
+test('morph: a folded-open connection row survives a swap of its region', async ({ browser }) => {
+  const page = await authedPage(browser);
+  await page.goto(SETTINGS_PATH);
+
+  const row = page.locator('details[data-fold]').first();
+  await row.waitFor();
+  expect(await row.evaluate((el: HTMLDetailsElement) => el.open)).toBe(false);
+  await row.locator('summary').click();
+  expect(await row.evaluate((el: HTMLDetailsElement) => el.open)).toBe(true);
+
+  // Saving a secret posts and patches #connect-list among its regions, so
+  // this is the real swap path rather than a hand-called helper.
+  const key = uniqueKey();
+  await saveKey(page, key, 'fold-check');
+  expect(await row.evaluate((el: HTMLDetailsElement) => el.open)).toBe(true);
+  await deleteKey(page, key);
+  expect(await row.evaluate((el: HTMLDetailsElement) => el.open)).toBe(true);
+});
+
+test('morph: a swap patches a region in place instead of replacing it', async ({ browser }) => {
+  const page = await authedPage(browser);
+  await page.goto(SETTINGS_PATH);
+
+  // An expando is invisible to the server and cannot survive re-rendering:
+  // it is still there afterwards only if THIS node was patched rather than
+  // thrown away. That is what keeps focus, caret, scroll and a mid-paste
+  // value across the 2.5s connect poll (issue #410).
+  await page.locator('#connect-list button').first().evaluate((el: any) => {
+    el.__morphProbe = 'kept';
+  });
+
+  const key = uniqueKey();
+  await saveKey(page, key, 'identity-check');
+
+  const probe = await page.locator('#connect-list button').first()
+    .evaluate((el: any) => el.__morphProbe);
+  expect(probe).toBe('kept');
+  await deleteKey(page, key);
 });
 
 test('dismissing the delete confirm keeps the key; accepting removes it', async ({ browser }) => {

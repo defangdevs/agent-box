@@ -20,9 +20,10 @@ A line matching `<indent>@@include:<relpath>@@` (relative to the including
 file's directory) is replaced by the target file's contents:
   * nested includes in the target are resolved first;
   * the target is escaped for the STRING SYNTAX of the including file — Nix
-    indented-string escaping when the host is a `.nix`/`.in` file, none
-    otherwise (Python triple-quote hosts store their assets verbatim; the
-    round-trip guarded by the up-to-date CI check catches an asset needing more);
+    indented-string escaping when the host is a `.nix`/`.in` file, Python
+    triple-quote-string escaping when it is a `.py`, none otherwise. Both
+    dialects are no-op for a payload that contains nothing special, which is
+    why the assets predating either escaper did not move when it landed;
   * every non-blank line is re-indented to the marker's own indentation
     (blank lines stay empty), so a dedented, col-0 source file (real Python the
     linters accept) round-trips back to its indented in-string form byte-exact.
@@ -98,9 +99,57 @@ def nix_escape(text: str) -> str:
     return QUOTE_RUN_OR_ANTIQUOTE.sub(escape, text)
 
 
+# Any run of double quotes. Whether it needs escaping depends on its length
+# AND on what follows it, the same way a Nix apostrophe run does — so the run
+# is matched whole and judged in one place.
+DOUBLE_QUOTE_RUN = re.compile(r'"+')
+
+
+def python_escape(text: str) -> str:
+    r"""Escape a literal for embedding inside a Python triple-quoted string.
+
+    The three assets that predate this escaper (settings.js, settings.css,
+    potato.svg) carry no backslash and no quote run, so they round-trip
+    through it byte-identically — deliberately, because the generated module
+    must not move when the escaper is introduced. A VENDORED asset is what
+    makes it necessary: minified JavaScript carries regex escapes (`/[\s\S]/`
+    in idiomorph), and inside a non-raw triple-quoted host Python eats it.
+
+    Two rules, applied in this order:
+
+      * `\` becomes `\\`. Python leaves an UNRECOGNIZED escape (`\s`, `\S`,
+        `\/`) alone today, so an unescaped payload can look fine while
+        emitting a SyntaxWarning per occurrence — and that warning is slated
+        to become a SyntaxError. The RECOGNIZED ones need no future Python to
+        bite: `\n` inside a JavaScript regex literal (`/[\n]/`) lands in the
+        source as an actual newline, which is a syntax error there, and a bad
+        `\x` fails the parse outright. None of it is visible to the
+        up-to-date CI check, which regenerates with this same assembler and
+        so agrees with itself — issue #244's lesson, on the other dialect.
+
+      * a run of `"` is escaped quote by quote when it could reach the host's
+        closing delimiter: 3 or more anywhere, or ANY run at the very end,
+        where the closing delimiter follows it directly. A run of one or two
+        mid-payload is legal inside a triple-quoted string and is left alone,
+        which is the whole reason the pre-existing assets do not move.
+        Escaping the trailing case too makes the result splice-able anywhere,
+        hard against the delimiter included — the same property nix_escape
+        gives its own output (issue #244)."""
+    text = text.replace("\\", "\\\\")
+
+    def escape(match: re.Match) -> str:
+        run = match.group(0)
+        unsafe = len(run) >= 3 or match.end() == len(text)
+        return ('\\"' * len(run)) if unsafe else run
+
+    return DOUBLE_QUOTE_RUN.sub(escape, text)
+
+
 def escaper_for(path: Path):
     if path.suffix in (".nix", ".in"):
         return nix_escape
+    if path.suffix == ".py":
+        return python_escape
     return lambda s: s
 
 
@@ -168,8 +217,10 @@ def main() -> int:
     args = ap.parse_args()
     if args.resolve:
         # Same resolve() the module assembly uses, so the two backends
-        # cannot disagree about what a marker means. Non-.nix hosts get the
-        # identity escaper, so a .py asset comes out as plain Python.
+        # cannot disagree about what a marker means. A .py host escapes its
+        # children for a Python string exactly as the module assembly does,
+        # so the daemon the native profile builds this way is byte-identical
+        # to the one embedded in the module.
         sys.stdout.write(resolve(args.resolve.resolve()))
         return 0
     out_path = args.repo / "modules" / "agent-box.nix"

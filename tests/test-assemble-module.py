@@ -15,6 +15,7 @@ file round-trips identically through `nix-instantiate --eval --json`. Run
 `python3 tests/test-assemble-module.py --nix` to redo that (needs nix on PATH);
 plain `python3 tests/test-assemble-module.py` uses the model and needs nothing.
 """
+import ast
 import importlib.util
 import itertools
 import json
@@ -184,6 +185,105 @@ class TestIncludeMarkers(unittest.TestCase):
             out = self._repo(Path(td), "@@include-verbatim:src/payload.sh@@", payload)
         self.assertIn("""    echo "key '${K}'\"""", out)
 
+
+def python_corpus() -> list:
+    """Every string up to 5 characters over the alphabet that can go wrong.
+
+    `"` is what can close the host early, `\\` is what Python eats, and `n`/`x`
+    are there because `\\n` and `\\x` are the RECOGNIZED escapes — the two that
+    corrupt a payload with no warning at all. `a` stands in for an ordinary
+    character. 3906 strings, which covers every quote-run length and
+    backslash adjacency the two rules can compose into.
+    """
+    alphabet = ['"', "\\", "n", "x", "a"]
+    out = [""]
+    for n in range(1, 6):
+        out += ["".join(t) for t in itertools.product(alphabet, repeat=n)]
+    return out
+
+
+class TestPythonEscape(unittest.TestCase):
+    """The `.py`-host dialect, decoded by the real Python parser.
+
+    No model is needed here, unlike the Nix side: `ast.literal_eval` IS the
+    thing the generated file will be parsed by, so the round-trip is exact
+    rather than a reimplementation that could agree with the bug.
+    """
+
+    @staticmethod
+    def _read_back(escaped: str):
+        return ast.literal_eval('"""' + escaped + '"""')
+
+    def test_leaves_ordinary_text_alone(self):
+        # The property the pre-existing assets depend on: settings.js,
+        # settings.css and potato.svg carry no backslash and no quote run, so
+        # introducing this escaper had to leave modules/agent-box.nix
+        # byte-identical. Anything that breaks these cases moves the module.
+        for text in ("", "no specials", 'a "quoted" word', 'say "" here', "x'y"):
+            self.assertEqual(am.python_escape(text), text)
+
+    def test_known_escapes(self):
+        for text, want in [
+            (r"/[\s\S]*?/", r"/[\\s\\S]*?/"),
+            ("\\", "\\\\"),
+            # A recognized escape: unescaped, `\n` would reach the generated
+            # file as a real newline and break the JavaScript around it.
+            (r"/[\n]/", r"/[\\n]/"),
+            # Three quotes close the host; two do not.
+            ('a"""b', 'a\\"\\"\\"b'),
+            ('a""b', 'a""b'),
+            # ANY run at the end abuts the host's closing delimiter.
+            ('trailing"', 'trailing\\"'),
+            ('trailing""', 'trailing\\"\\"'),
+            # Backslash first, so the quote rule's own backslashes survive.
+            ('\\"""', '\\\\\\"\\"\\"'),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(am.python_escape(text), want)
+                self.assertEqual(self._read_back(want), text)
+
+    def test_corpus_round_trips_through_real_python(self):
+        for text in python_corpus():
+            with self.subTest(text=text):
+                self.assertEqual(self._read_back(am.python_escape(text)), text)
+
+    def test_vendored_assets_round_trip(self):
+        """The assets this escaper exists for, as committed.
+
+        A vendored file is replaced wholesale on every upstream bump, so the
+        bump — not a reviewed edit — is what introduces new bytes into a
+        Python string host. This runs over whatever is committed, so the next
+        version has to survive the same round trip before it can land.
+        """
+        vendor = REPO / "modules" / "src" / "vendor"
+        assets = sorted(vendor.glob("*.js"))
+        self.assertTrue(assets, f"no vendored assets found under {vendor}")
+        for path in assets:
+            with self.subTest(asset=path.name):
+                text = path.read_text()
+                self.assertEqual(self._read_back(am.python_escape(text)), text)
+
+
+class TestPythonHostIncludes(unittest.TestCase):
+    """The `.py` dialect as the assembler actually reaches it, via resolve()."""
+
+    def _resolve(self, tmp, payload):
+        src = tmp / "modules" / "src"
+        src.mkdir(parents=True)
+        (src / "payload.js").write_text(payload)
+        host = src / "daemon.py"
+        host.write_text('SCRIPT = """<script>\n@@include:payload.js@@\n</script>\n"""\n')
+        return am.resolve(host)
+
+    def test_include_into_a_py_host_survives_python(self):
+        payload = 'var re = /<svg(\\s[^>]*>|>)([\\s\\S]*?)<\\/svg>/;\n'
+        with tempfile.TemporaryDirectory() as td:
+            out = self._resolve(Path(td), payload)
+        # The resolved host must parse, and the string it defines must hold
+        # the payload byte-for-byte.
+        ns = {}
+        exec(compile(out, "daemon.py", "exec"), ns)
+        self.assertEqual(ns["SCRIPT"], "<script>\n" + payload + "</script>\n")
 
 def check_against_real_nix() -> int:
     """Round-trip the corpus through `nix-instantiate` instead of the model."""

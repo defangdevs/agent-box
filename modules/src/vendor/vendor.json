@@ -1,0 +1,33 @@
+{
+  "_readme": [
+    "Third-party assets vendored into this repo verbatim, and the pins that",
+    "track them upstream. scripts/check_vendor.py is the tool: it verifies",
+    "every file still hashes to its pin (offline, no Nix), reports when",
+    "upstream has moved (--upstream), and performs the bump (--update NAME).",
+    "",
+    "Each file is byte-identical to the artifact at `url`, so `sha256` is",
+    "upstream's own hash and anyone can re-derive it. Never edit a vendored",
+    "file in place -- a local patch makes the pin unverifiable. Patch upstream,",
+    "or carry the change in our own code next to the include.",
+    "",
+    "Why vendored and not fetched: deployed boxes fetch modules/agent-box.nix",
+    "as ONE file (issue #51) and the settings daemon serves pages that load no",
+    "external asset, so a CDN reference is not available to us even in",
+    "principle. See AGENTS.md, 'Vendoring a third-party asset'."
+  ],
+  "packages": [
+    {
+      "name": "idiomorph",
+      "version": "0.7.4",
+      "tag": "v0.7.4",
+      "repo": "bigskysoftware/idiomorph",
+      "path": "idiomorph.min.js",
+      "url": "https://raw.githubusercontent.com/bigskysoftware/idiomorph/v0.7.4/dist/idiomorph.min.js",
+      "url_template": "https://raw.githubusercontent.com/{repo}/{tag}/dist/idiomorph.min.js",
+      "sha256": "0eb0f881553bd509fe7a7e3064a1089141e089583c506c1217e885a2e608b4a4",
+      "license": "0BSD",
+      "used_by": "modules/src/settings-daemon.py (SCRIPT), for applyDoc() in modules/src/settings.js",
+      "note": "DOM morphing for the settings/workspace live swap. Replaces a wholesale replaceWith(), whose collateral damage -- lost focus, lost caret, a folded row snapping shut under the operator (issue #410) -- was being hand-repaired after every swap."
+    }
+  ]
+}

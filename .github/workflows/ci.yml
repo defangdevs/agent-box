@@ -13,6 +13,9 @@ on:
       - 'modules/src/**'
       - 'bin/assemble-module.py'
       - 'tests/test-assemble-module.py'
+      # The vendored third-party assets under modules/src/vendor are matched
+      # by 'modules/src/**' above; this is the checker that verifies them.
+      - 'scripts/check_vendor.py'
       - 'tests/test-envstore.py'
       # The native-render fixture (issue #154 Phase 4): the renderer under
       # test, the test itself, and its committed expected/ snapshot must all
@@ -108,6 +111,15 @@ jobs:
       # wrong bytes.
       - name: Check assembler escaping
         run: nix build -L .#checks.x86_64-linux.assemble-module-escaping && cat result
+
+      # Issue #51 makes this repo the distribution channel for the one
+      # third-party asset the settings page loads: boxes fetch the module as a
+      # single file and the pages load nothing from a CDN, so it is vendored.
+      # This proves each vendored file still hashes to the pin recording where
+      # it came from, and that none is unpinned or unused. The "is there a
+      # newer release?" half needs network and runs in vendor-updates.yml.
+      - name: Check vendored assets match their pins
+        run: nix build -L .#checks.x86_64-linux.vendor-integrity && cat result
 
       # Issue 394: the native jail in front of the browser terminal, proven
       # against a real Caddy 401 line rather than just parsed — `-t` alone

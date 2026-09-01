@@ -49,6 +49,7 @@ Keep the module self-contained: deployed boxes fetch `modules/agent-box.nix` as 
 - `nix build -L .#checks.<system>.module-generated-up-to-date` verifies the committed module matches its sources (`<system>` is your host's, e.g. `aarch64-linux`).
 - `nix build -L .#checks.<system>.assemble-module-escaping` runs `tests/test-assemble-module.py`, the unit tests for the assembler's Nix escaping (issue #244). The up-to-date check above cannot catch an escaping bug — it regenerates the file with the same assembler, so the check and the bug agree on the wrong bytes. Runnable without Nix too: `python3 tests/test-assemble-module.py`, or `--nix` to round-trip the corpus through `nix-instantiate` instead of the lexer model.
 - `nix build -L .#checks.<system>.backend-parity` compares what the NixOS module and the native renderer supply to the SAME shared payloads under `modules/src/` — every `AGENT_BOX_*` variable and every rendered service — and fails on a difference not declared in `scripts/check_backend_parity.py`. Runnable without Nix too: `python3 scripts/check_backend_parity.py`. Its two tables are the point: `BY_DESIGN` for a difference that is correct (with the reason), `KNOWN_GAPS` for one that is a bug (with its issue). Both are staleness-checked, so a gap you fix must be deleted from the table in the same change. Issue #392 — the settings page's Connections section, missing from every native box because only the module set `AGENT_BOX_CONNECT_BINS` — is the failure this exists to catch; neither backend's fixture could see it, because each ratifies whatever its own renderer emits.
+- `nix build -L .#checks.<system>.vendor-integrity` verifies every third-party file under `modules/src/vendor/` still hashes to the pin recorded in `modules/src/vendor/vendor.json`. Runnable without Nix too: `python3 scripts/check_vendor.py`. Add `--upstream` (needs network, so it is not in the Nix check) to ask each forge whether a newer release exists — `.github/workflows/vendor-updates.yml` does that weekly and files an issue.
 - `nix flake metadata` validates flake inputs and basic evaluation.
 - `nix build .#packages.x86_64-linux.vm` builds the bootable qcow2 image under `result/`.
 - `nix build -L .#checks.<system>.multi-user` runs the quick module/configuration assertion.
@@ -87,6 +88,45 @@ localhost without Caddy's basic auth in front of it, so
 serving. Read that before trusting upstream docs about which version does
 what; `systemctl cat agent-web-terminal-<user>` gives the port and the flags
 actually in force.
+
+## Vendoring a third-party asset
+
+The settings and workspace pages load **no external asset** — no CDN, no font
+host, no second request — and a deployed box fetches `modules/agent-box.nix` as
+a single file (issue #51). So a dependency the page needs cannot be linked; it
+has to live in the repo and be embedded like every other payload. That is why
+`modules/src/vendor/` exists, and why it is deliberately small: today it holds
+one file, idiomorph (0BSD, 3.3 KB gzipped), which the live swap in
+`modules/src/settings.js` morphs with.
+
+Before adding a second one, weigh what it actually costs here, which is more
+than the download: the bytes are inlined into **every** page response, and the
+settings page re-fetches itself on every session change, so a 50 KB library is
+50 KB per poll on a box someone reads from a phone. That is the reasoning that
+kept htmx out and let idiomorph in — the useful 3 KB of that ecosystem without
+the 50 KB of it.
+
+The rules, all enforced by `scripts/check_vendor.py`:
+
+- **Pin it.** Every file under `modules/src/vendor/` needs an entry in
+  `vendor.json` recording repo, tag, exact source URL, sha256 and license. A
+  vendored file with no pin fails the check.
+- **Never edit a vendored file in place.** It is byte-identical to the artifact
+  at its `url`, so the recorded hash is *upstream's* and anyone can re-derive
+  it. A local patch makes that unverifiable. Patch upstream, or keep the change
+  in our own code next to the include.
+- **Bump with the tool**, never by hand:
+  `python3 scripts/check_vendor.py --update NAME`, then `nix run .#assemble`,
+  `python3 tests/test-assemble-module.py` and `nix run .#update-golden`.
+- **Mind the escaping.** A vendored asset is included into a Python
+  triple-quoted host in `settings-daemon.py`, so `bin/assemble-module.py`
+  escapes it for that dialect the way it already did for Nix. Minified
+  JavaScript is exactly what needs it — `/[\s\S]/` in a non-raw host loses its
+  backslashes — and `tests/test-assemble-module.py` round-trips the committed
+  vendored files through it so a bump that introduces something unrepresentable
+  fails there rather than on a box.
+- **Give it its own `<script>` element.** Concatenating a minified bundle above
+  our own IIFE is one missing semicolon away from ASI gluing them into a call.
 
 ## Coding Style & Naming Conventions
 

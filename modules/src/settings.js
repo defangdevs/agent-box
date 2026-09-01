@@ -1,65 +1,52 @@
 (function () {
   "use strict";
+  // Patch the live DOM toward a freshly-rendered document, one region at a
+  // time. Rendering stays entirely server-side; this only decides how the
+  // new HTML replaces the old.
+  //
+  // It MORPHS rather than replaces. The old `to.replaceWith(newNode)` threw
+  // away every piece of state the server does not render — focus, the caret,
+  // scroll position, which rows were folded open — and each one had to be
+  // scraped off the doomed subtree and reapplied afterwards, keyed by hand
+  // (issue #410 was the second such rescue, for a sign-in code being pasted
+  // while #connect-list swapped underneath it). Idiomorph walks the two trees
+  // and touches only what actually differs, so an untouched input is never
+  // re-created and keeps all of that natively.
+  //
+  // Nothing here is a live-DOM read of the incoming document: `doc` is an
+  // inert DOMParser document, so its iframes never load and its scripts never
+  // run.
   function applyDoc(doc, ids) {
     ids.forEach(function (id) {
       var from = doc.getElementById(id);
       var to = document.getElementById(id);
       if (!from || !to) { return; }
-      // Which rows the operator has folded open is state this HTML does
-      // not carry: the live feed replaces #sessions-list on every session
-      // change, so without this a subscription fold snaps shut under
-      // whoever just opened it. data-fold is the row's identity.
-      var open = {};
-      Array.prototype.forEach.call(
-        to.querySelectorAll("details[data-fold][open]"),
-        function (d) { open[d.getAttribute("data-fold")] = 1; });
-      Array.prototype.forEach.call(
-        from.querySelectorAll("details[data-fold]"),
-        function (d) { if (open[d.getAttribute("data-fold")]) { d.open = true; } });
-      // A sign-in code the operator is mid-paste is state this HTML does
-      // not carry either: connectPoll swaps #connect-list every 2.5s
-      // while a flow is waiting on its code, and a freshly-rendered
-      // (empty) input used to overwrite whatever had just been typed or
-      // pasted, and steal focus off it too (issue #410). Keyed by flow
-      // id, not the input alone, so two waiting cards can't cross-wire.
-      var codes = {};
-      var focusedFlow = null;
-      Array.prototype.forEach.call(
-        to.querySelectorAll("form.conn-form"),
-        function (f) {
-          var input = f.querySelector("input[name=code]");
-          var flow = f.querySelector("input[name=flow]");
-          if (!input || !flow) { return; }
-          var focused = input === document.activeElement;
-          // Record an empty-but-focused input too: a poll landing before
-          // the operator has typed anything must not drop focus off the
-          // field they are about to type into.
-          if (input.value || focused) {
-            codes[flow.value] = {
-              value: input.value, start: input.selectionStart, end: input.selectionEnd
-            };
+      window.Idiomorph.morph(to, from, {
+        // The focused element's VALUE is the operator's, not the server's:
+        // #connect-list re-renders every 2.5s while a sign-in flow waits, and
+        // the rendered (empty) input must not overwrite a half-typed code
+        // (issue #410). restoreFocus is on by default and puts focus and
+        // selection back if the focused node does have to be replaced.
+        ignoreActiveValue: true,
+        // NOTE: these belong under `callbacks`, not beside the options above.
+        // Idiomorph reads them from there and silently ignores a hook left at
+        // the top level — the fold below then closes under the operator with
+        // nothing to show for it.
+        callbacks: {
+          // Which rows are folded open is state this HTML does not carry:
+          // <details open> is reflected to the attribute when the operator
+          // clicks it, and the server re-renders every row closed. A faithful
+          // morph would therefore close it under them, so `open` is the one
+          // attribute the live DOM keeps authority over. Scoped to
+          // details[data-fold]: a <details> the server does drive still gets
+          // updated normally.
+          beforeAttributeUpdated: function (name, node, type) {
+            if (name === "open" && node.matches("details[data-fold]")) {
+              return false;
+            }
           }
-          if (focused) { focusedFlow = flow.value; }
-        });
-      Array.prototype.forEach.call(
-        from.querySelectorAll("form.conn-form"),
-        function (f) {
-          var input = f.querySelector("input[name=code]");
-          var flow = f.querySelector("input[name=flow]");
-          var saved = input && flow && codes[flow.value];
-          if (saved) { input.value = saved.value; }
-        });
-      to.replaceWith(document.importNode(from, true));
-      if (focusedFlow) {
-        var restored = document.querySelector(
-          "#" + id + ' form.conn-form input[name=flow][value="' + focusedFlow + '"]');
-        var input = restored && restored.closest("form").querySelector("input[name=code]");
-        var saved = codes[focusedFlow];
-        if (input && saved) {
-          input.focus();
-          input.setSelectionRange(saved.start, saved.end);
         }
-      }
+      });
     });
   }
   function parseHTML(text) {
