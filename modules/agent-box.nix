@@ -12104,9 +12104,10 @@ SESSIONS_SECTION_TPL = """<section>
       <h2>Sessions</h2>
       <button type="button" class="btn" data-toggle="session-editor">Add session</button>
     </div>
-    <p class="note">Each session is one agent CLI in its own terminal
-    tab. New sessions start within a few seconds &mdash; no rebuild,
-    no sudo. Click a session to open its terminal.</p>
+    <p class="note">Each session is one harness &mdash; the agent CLI
+    itself &mdash; in its own terminal tab. New sessions start within a
+    few seconds &mdash; no rebuild, no sudo. Click a session to open its
+    terminal.</p>
     <div id="session-editor" class="editor">
       <form method="post" action="{action_base}/sessions/add">
         <input type="hidden" name="back" value="settings">
