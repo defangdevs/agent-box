@@ -1856,7 +1856,21 @@ class Renderer:
         agent_box_directive_conditions = {
             "web": self.spec.web_enable,
             "protect-memory": self.spec.protect_memory,
-            "no-sudo-allowlist": not self.spec.sudo_allowlist,
+            # Mirrors the module's effectiveSudoAllowlist (CodeRabbit
+            # review on #487): the configured allowlist PLUS whatever
+            # config flags imply a real grant. self.spec.sudo_allowlist
+            # alone missed the two grants sudoers() always adds — caddy
+            # reload when web_enable, and (unlike the module, which can
+            # turn this off via selfUpdate.enable) an UNCONDITIONAL update
+            # trigger on every native box — so a box with only those
+            # implied grants and no custom allowlist would have had this
+            # condition true and NoNewPrivileges=true, silently blocking
+            # `sudo -n systemctl start --no-block agent-box-update.service`
+            # and the caddy reload. implied_sudo_commands() is the same
+            # list sudoers() grants beyond the per-user password helper,
+            # so the two cannot drift apart again.
+            "no-sudo-allowlist": not (
+                self.spec.sudo_allowlist + self.implied_sudo_commands()),
         }
         agent_box_directives = {
             d["name"]: d for d in agent_box_contract["directives"]}
@@ -2181,6 +2195,37 @@ class Renderer:
 
     # -- sudoers, tmpfiles, caddy -------------------------------------------
 
+    def implied_sudo_commands(self):
+        """Sudo grants a config flag implies, beyond the explicit allowlist.
+
+        The SAME list sudoers() grants every user in addition to their own
+        password helper — factored out so the agent-box@ unit's
+        "no-sudo-allowlist" directive condition (issue #451) can't drift
+        from what sudoers() actually grants (a Major finding on #487's
+        review: it originally checked only self.spec.sudo_allowlist,
+        missing these two implied grants entirely).
+
+        Box-wide, not per-user (mirrors the module's effectiveSudoAllowlist,
+        which is likewise not per-user) — unlike sudoers()'s own per-user
+        reboot grant, which stays local to that method since it has no
+        session-side "escape hatch" framing to mirror here.
+
+        UPDATE_TRIGGER is unconditional: native has no selfUpdate.enable to
+        gate it on (the "agentbox update" trigger ships in every profile),
+        unlike the module, which can turn it off. So this list is NEVER
+        actually empty on native — "no-sudo-allowlist" can be true on a
+        NixOS box (selfUpdate.enable = web.enable = false, no custom
+        allowlist) but never on a native one. Not a bug: the same
+        deliberately-unconverged update mechanism #154 already accepted,
+        just visible here as one more condition that can't reach native's
+        "locked down" branch.
+        """
+        cmds = []
+        if self.spec.web_enable:
+            cmds.append("/usr/bin/systemctl reload caddy.service")
+        cmds.append(UPDATE_TRIGGER)
+        return cmds
+
     def sudoers(self, t):
         """Least-privilege sudo, data-driven from the config.
 
@@ -2203,9 +2248,7 @@ class Renderer:
             # NixOS, for no gain. Found by the one-spec-both-backends
             # comparison (issue #451).
             cmds = [f'/etc/agent-box/bin/agent-box-password-{u.name} ""']
-            if self.spec.web_enable:
-                cmds.append("/usr/bin/systemctl reload caddy.service")
-            cmds.append(UPDATE_TRIGGER)
+            cmds += self.implied_sudo_commands()
             # Rebooting the machine goes to the ROOT user alone (the one
             # whose settings page carries the button), not to every agent
             # user: "Restart all" bounces the caller's own unit and needs no

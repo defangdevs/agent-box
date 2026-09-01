@@ -2349,8 +2349,9 @@ in
           # paths, never replaces them. Templates and condition come from
           # the shared contract (issue #451) now, not hand-written here.
           ReadWritePaths =
-            lib.optionals (contractConditionHolds (agentBoxDirective "ReadWritePaths").condition)
-              (agentBoxDirective "ReadWritePaths").templates;
+            let readWritePaths = agentBoxDirective "ReadWritePaths"; in
+            lib.optionals (contractConditionHolds readWritePaths.condition)
+              readWritePaths.templates;
           # NoNewPrivileges would break the sudoAllowlist escape hatch (sudo
           # is setuid root; NNP blocks the euid transition). Enable it only
           # when the effective allowlist is empty — with a non-empty
@@ -2362,14 +2363,18 @@ in
           # migration found that native only emitted the false case,
           # leaving a box with an empty allowlist at systemd's permissive
           # default instead of this explicit true (fixed alongside).
-          NoNewPrivileges = contractConditionHolds (agentBoxDirective "NoNewPrivileges").condition;
-        } // lib.optionalAttrs (contractConditionHolds (agentBoxDirective "OOMScoreAdjust").condition) {
-          # Sacrifice agent work first under memory pressure: the kernel OOM
-          # killer and earlyoom both weigh oom_score_adj, so a runaway agent
-          # process dies before sshd/caddy/SSM — and Restart=always brings
-          # the session back fresh instead of leaving a frozen box.
-          OOMScoreAdjust = lib.mkDefault (agentBoxDirective "OOMScoreAdjust").value;
-        };
+          NoNewPrivileges =
+            contractConditionHolds (agentBoxDirective "NoNewPrivileges").condition;
+        } // (
+          let oomScoreAdjust = agentBoxDirective "OOMScoreAdjust"; in
+          lib.optionalAttrs (contractConditionHolds oomScoreAdjust.condition) {
+            # Sacrifice agent work first under memory pressure: the kernel
+            # OOM killer and earlyoom both weigh oom_score_adj, so a runaway
+            # agent process dies before sshd/caddy/SSM — and Restart=always
+            # brings the session back fresh instead of leaving a frozen box.
+            OOMScoreAdjust = lib.mkDefault oomScoreAdjust.value;
+          }
+        );
       }
     )) cfg.users);
 
