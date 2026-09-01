@@ -1567,6 +1567,12 @@ if __name__ == "__main__":
       # writing the file that decides which sessions exist with no lock at all.
       { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null \
         || { mkdir -p "''${REGISTRY_FILE%/*}" 2>/dev/null
+             # mkdir -p only applies a mode when it creates every missing
+             # component and does so under umask (issue #78): the tmpfiles
+             # rule that is supposed to leave this 0700 can lose a boot-order
+             # race against this user's own creation, so chmod it explicitly
+             # like the python writer's save() already does.
+             chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
              { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
         || return 0
       # Bounded, never an unbounded wait: nothing may park the supervisor's
@@ -1651,6 +1657,10 @@ if __name__ == "__main__":
       # webhook batch behind it is never redelivered. An operator who wants the
       # declared set back deletes sessions.json and restarts the unit.
       mkdir -p "''${REGISTRY_FILE%/*}"
+      # Same self-heal as registry_lock's fallback branch above: a bare mkdir -p
+      # lands on umask (~0755) whenever it loses the boot-order race against the
+      # tmpfiles rule that means to leave this 0700 (issue #78).
+      chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
       registry_lock
       if [ ! -s "$REGISTRY_FILE" ]; then
         # A seed is trusted only after it PASSES this shape check (issue #356):
@@ -2440,6 +2450,12 @@ registry_lock() {
   # writing the file that decides which sessions exist with no lock at all.
   { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null \
     || { mkdir -p "''${REGISTRY_FILE%/*}" 2>/dev/null
+         # mkdir -p only applies a mode when it creates every missing
+         # component and does so under umask (issue #78): the tmpfiles
+         # rule that is supposed to leave this 0700 can lose a boot-order
+         # race against this user's own creation, so chmod it explicitly
+         # like the python writer's save() already does.
+         chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
          { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
     || return 0
   # Bounded, never an unbounded wait: nothing may park the supervisor's
@@ -2524,6 +2540,10 @@ registry_ensure() {
   # webhook batch behind it is never redelivered. An operator who wants the
   # declared set back deletes sessions.json and restarts the unit.
   mkdir -p "''${REGISTRY_FILE%/*}"
+  # Same self-heal as registry_lock's fallback branch above: a bare mkdir -p
+  # lands on umask (~0755) whenever it loses the boot-order race against the
+  # tmpfiles rule that means to leave this 0700 (issue #78).
+  chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
   registry_lock
   if [ ! -s "$REGISTRY_FILE" ]; then
     # A seed is trusted only after it PASSES this shape check (issue #356):
@@ -4844,6 +4864,12 @@ registry_lock() {
   # writing the file that decides which sessions exist with no lock at all.
   { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null \
     || { mkdir -p "''${REGISTRY_FILE%/*}" 2>/dev/null
+         # mkdir -p only applies a mode when it creates every missing
+         # component and does so under umask (issue #78): the tmpfiles
+         # rule that is supposed to leave this 0700 can lose a boot-order
+         # race against this user's own creation, so chmod it explicitly
+         # like the python writer's save() already does.
+         chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
          { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
     || return 0
   # Bounded, never an unbounded wait: nothing may park the supervisor's
@@ -4928,6 +4954,10 @@ registry_ensure() {
   # webhook batch behind it is never redelivered. An operator who wants the
   # declared set back deletes sessions.json and restarts the unit.
   mkdir -p "''${REGISTRY_FILE%/*}"
+  # Same self-heal as registry_lock's fallback branch above: a bare mkdir -p
+  # lands on umask (~0755) whenever it loses the boot-order race against the
+  # tmpfiles rule that means to leave this 0700 (issue #78).
+  chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
   registry_lock
   if [ ! -s "$REGISTRY_FILE" ]; then
     # A seed is trusted only after it PASSES this shape check (issue #356):
@@ -6424,6 +6454,12 @@ exit 0
       # writing the file that decides which sessions exist with no lock at all.
       { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null \
         || { mkdir -p "''${REGISTRY_FILE%/*}" 2>/dev/null
+             # mkdir -p only applies a mode when it creates every missing
+             # component and does so under umask (issue #78): the tmpfiles
+             # rule that is supposed to leave this 0700 can lose a boot-order
+             # race against this user's own creation, so chmod it explicitly
+             # like the python writer's save() already does.
+             chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
              { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
         || return 0
       # Bounded, never an unbounded wait: nothing may park the supervisor's
@@ -6508,6 +6544,10 @@ exit 0
       # webhook batch behind it is never redelivered. An operator who wants the
       # declared set back deletes sessions.json and restarts the unit.
       mkdir -p "''${REGISTRY_FILE%/*}"
+      # Same self-heal as registry_lock's fallback branch above: a bare mkdir -p
+      # lands on umask (~0755) whenever it loses the boot-order race against the
+      # tmpfiles rule that means to leave this 0700 (issue #78).
+      chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
       registry_lock
       if [ ! -s "$REGISTRY_FILE" ]; then
         # A seed is trusted only after it PASSES this shape check (issue #356):
