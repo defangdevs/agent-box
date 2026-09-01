@@ -39,6 +39,18 @@
         "| grep agent-box-sites >/dev/null"
     )
 
+    # The other half of being the web-off box: ~/worktrees, the directory the
+    # shipped guide tells every agent to put its worktrees in (issue #126),
+    # comes from the supervisor and not from the web-gated tmpfiles rules —
+    # so a box with no web terminal gets it too. Agent-owned because the
+    # supervisor runs as the agent; a root-owned one would be unwritable by
+    # the only process that has any use for it.
+    # wait_until_succeeds, not succeed: Type=exec calls the unit active as
+    # soon as the supervisor is exec'd, a moment before it runs the mkdir.
+    machine.wait_until_succeeds("test -d /home/agent/worktrees")
+    owner = machine.succeed("stat -c '%U' /home/agent/worktrees").strip()
+    assert owner == "agent", f"~/worktrees owned by {owner}, want agent"
+
     # zram swap is active and sized to RAM (memoryPercent = 100)
     print(machine.succeed("swapon --show"))
     machine.succeed("swapon --show=NAME --noheadings | grep zram0 >/dev/null")
