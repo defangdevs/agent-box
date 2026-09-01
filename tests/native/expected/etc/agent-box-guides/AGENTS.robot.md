@@ -30,9 +30,13 @@ plainly rather than handing it back.
   exception is ~/sites, a symlink out to a caddy-readable dir (see "Serving
   a web app publicly").
 - $HOME is SHARED by every one of your tmux sessions (same user, all start
-  in $HOME). For parallel work in one repo use `git worktree` or separate
-  subdirectories, so concurrent sessions don't clobber each other. Once a
-  worktree's work is committed and pushed, remove it with
+  in $HOME unless `--cwd` sent them elsewhere), so two sessions in one clone
+  edit the same files. Give yours a checkout of its own: ~/worktrees is
+  shipped empty for exactly this, and `git worktree add ~/worktrees/NAME -b
+  BRANCH` (run from the clone, not from $HOME) is the whole move.
+  `ls ~/worktrees` then reads as the work in flight on this box.
+  For anything that is not a git repo, a subdirectory of your own does the
+  same job. Once a worktree's work is committed and pushed, remove it with
   `git worktree remove PATH` - a stale one left behind just clutters
   `git worktree list` and confuses whichever session finds it next.
 - A worktree, a branch or an issue somebody else is holding looks exactly

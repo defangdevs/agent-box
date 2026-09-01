@@ -326,9 +326,13 @@ let
       exception is ~/sites, a symlink out to a caddy-readable dir (see "Serving
       a web app publicly").
     - $HOME is SHARED by every one of your tmux sessions (same user, all start
-      in $HOME). For parallel work in one repo use `git worktree` or separate
-      subdirectories, so concurrent sessions don't clobber each other. Once a
-      worktree's work is committed and pushed, remove it with
+      in $HOME unless `--cwd` sent them elsewhere), so two sessions in one clone
+      edit the same files. Give yours a checkout of its own: ~/worktrees is
+      shipped empty for exactly this, and `git worktree add ~/worktrees/NAME -b
+      BRANCH` (run from the clone, not from $HOME) is the whole move.
+      `ls ~/worktrees` then reads as the work in flight on this box.
+      For anything that is not a git repo, a subdirectory of your own does the
+      same job. Once a worktree's work is committed and pushed, remove it with
       `git worktree remove PATH` - a stale one left behind just clutters
       `git worktree list` and confuses whichever session finds it next.
     - A worktree, a branch or an issue somebody else is holding looks exactly
@@ -2594,6 +2598,9 @@ usage() {
   echo "--profile names an agent profile (agent-box-profile ls): a harness plus"
   echo "a model, an effort level, an appended system prompt and session env."
   echo "--agent and a '-- EXTRA_ARGS' tail override what the profile resolved."
+  echo '--cwd is where the session starts (default $HOME, shared by every'
+  echo "session). To work a repo another session is already in, give this one"
+  echo "a checkout of its own: git worktree add ~/worktrees/NAME -b BRANCH."
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
   echo "--ephemeral marks a ONE-SHOT session: parking it (a clean agent exit, or"
@@ -6436,6 +6443,19 @@ exit 0
     # "the file was empty when I looked" must not survive another writer's
     # decision (issue #289).
     registry_ensure "''${AGENT_BOX_SESSIONS_SEED:?}"
+
+    # Ship ~/worktrees, empty (issue #126). $HOME is shared by every session of
+    # this user, so two of them in one clone edit the same files, and the fix is
+    # a `git worktree` per session. The guide has said so for a while; what it
+    # could not say was WHERE, so each session invented a path (~/wt, ~/work,
+    # a sibling of the clone) and no session could read the others' at a glance.
+    # A directory that is already there is the cheap half of #126 — the auto-
+    # worktree the issue asks for still has to decide cleanup and collision.
+    #
+    # On every start, not just the first: an agent that removed it gets it back,
+    # and a home that predates this release gains it. Best effort — a mkdir that
+    # fails must never keep sessions from starting.
+    mkdir -p "$HOME"/worktrees 2>/dev/null || :
 
     seed_json() {
       # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it

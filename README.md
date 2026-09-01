@@ -390,6 +390,17 @@ agent-box-session restart review
 agent-box-session rm review                 # delist + kill
 ```
 
+**One session, one directory.** Every session of a user starts in the same
+`$HOME` unless `--cwd` sent it elsewhere, so two of them in one clone edit the
+same files. Every box ships an empty `~/worktrees` as the place to fix that:
+`git -C <clone> worktree add ~/worktrees/<name> -b <branch>` gives a session a
+checkout of its own (the command is `git`'s, so it needs the clone, not
+`$HOME`), `--cwd ~/worktrees/<name>` starts the session there, and
+`ls ~/worktrees` reads as the work in flight on the box. The seeded `AGENTS.md` tells agents the same, and
+`agent-box-session peers` says which directory each live session is in.
+Convention, not enforcement — [#126](https://github.com/defangdevs/agent-box/issues/126)
+tracks handing a new session a worktree automatically.
+
 The site root (web setups) picks a user and lands in their space:
 `https://<domain>/` sends you to `https://<domain>/<user>/`, which is a
 tabbed workspace, one tab per session, behind the same login as the

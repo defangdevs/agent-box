@@ -244,6 +244,19 @@ WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
 # decision (issue #289).
 registry_ensure "${AGENT_BOX_SESSIONS_SEED:?}"
 
+# Ship ~/worktrees, empty (issue #126). $HOME is shared by every session of
+# this user, so two of them in one clone edit the same files, and the fix is
+# a `git worktree` per session. The guide has said so for a while; what it
+# could not say was WHERE, so each session invented a path (~/wt, ~/work,
+# a sibling of the clone) and no session could read the others' at a glance.
+# A directory that is already there is the cheap half of #126 — the auto-
+# worktree the issue asks for still has to decide cleanup and collision.
+#
+# On every start, not just the first: an agent that removed it gets it back,
+# and a home that predates this release gains it. Best effort — a mkdir that
+# fails must never keep sessions from starting.
+mkdir -p "$HOME"/worktrees 2>/dev/null || :
+
 seed_json() {
   # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
   # if missing. A file jq can't parse is left untouched: the dialog
