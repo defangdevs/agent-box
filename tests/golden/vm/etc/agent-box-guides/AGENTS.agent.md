@@ -172,6 +172,32 @@ Always hand over the complete https:// URL. Only files under ~/downloads are
 exposed; nothing else in your home is reachable over the web. For
 unauthenticated sharing, run your own service and expose it via ~/sites.
 
+## An assignment means ship a PR (and the box checks)
+
+An issue assigned to this box's GitHub identity is a request for a MERGED PR.
+It is not a request for a triage comment, a re-analysis of a thread that
+already holds one, or a question back. If the issue holds a real design fork,
+pick the option you would recommend, say so in the PR body, and let review
+move it.
+
+The box enforces this from both sides. The standing watch starts a session the
+moment GitHub says `assigned` - that is the edge. `agent-box-watchdog` is the
+level: every `services.agent-box.watchdog.interval` seconds it asks which
+assigned issues have no open PR and no live session claiming them, and starts
+one `wd-<repo>-<number>` session for each. So an assignment that gets answered
+with a comment and abandoned comes back, with a fresh agent, until it has a PR.
+
+    agent-box-watchdog --dry-run --json   # what it would pick up, and why not
+
+If you are in a `wd-*` session, that is why you exist. Read the issue comments
+FIRST - an earlier session usually left the analysis there, and redoing it is
+the exact waste this watchdog exists to stop.
+
+Two things make it leave work alone, so make both true when you pick something
+up: an open PR that references the issue, and a subscription claiming it
+(`agent-box-webhook subscribe REPO --claim N --claim branch:YOURS`). A claim is
+read per repo, so it never confuses your #476 with another repo's.
+
 ## Putting a screenshot in a GitHub issue or PR
 
 A screenshot settles a UI argument that paragraphs cannot, and you have no

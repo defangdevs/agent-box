@@ -298,6 +298,26 @@ def profile_origin(profile):
     return repo, rev
 
 
+def _positive_int(cfg, key, default, section, allow_zero=False):
+    """One integer option, validated the way the module's type would.
+
+    A config typo must fail the apply, not silently degrade a running box to
+    a default it never asked for — the same contract lib.types.ints.positive
+    gives the module.
+    """
+    value = cfg.get(key, default)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(
+            f"{section}.{key} must be an integer, got {value!r}")
+    if value < 0 or (value == 0 and not allow_zero):
+        raise ConfigError(
+            f"{section}.{key} must be "
+            f"{'0 or more' if allow_zero else 'greater than 0'}, got {value}")
+    return value
+
+
 class Spec:
     """The validated, defaulted view of config.yaml the renderer reads."""
 
@@ -438,6 +458,40 @@ class Spec:
                 "webhook.hookSessionArgs must be a list of strings, got "
                 f"{hook_session_args!r}")
         self.hook_session_args = list(hook_session_args or [])
+        # The assignment sweep (services.agent-box.watchdog on the module
+        # side). Same defaults as the module's options, because the failure
+        # it catches is the same on both backends: an issue assigned to this
+        # box that never became a PR, which is indistinguishable from one
+        # nobody has got to yet.
+        watchdog_cfg = data.get("watchdog") or {}
+        watchdog_enable = watchdog_cfg.get("enable", True)
+        if watchdog_enable is not None and not isinstance(
+                watchdog_enable, bool):
+            raise ConfigError(
+                f"watchdog.enable must be a bool, got {watchdog_enable!r}")
+        self.watchdog_enable = bool(watchdog_enable)
+        self.watchdog_interval = _positive_int(
+            watchdog_cfg, "interval", 1800, "watchdog")
+        self.watchdog_cooldown = _positive_int(
+            watchdog_cfg, "cooldown", 6, "watchdog")
+        # 0 is legal here and means "never give up", so this one is unsigned
+        # rather than positive — the module's option says the same.
+        self.watchdog_max_attempts = _positive_int(
+            watchdog_cfg, "maxAttempts", 3, "watchdog", allow_zero=True)
+        watchdog_repos = watchdog_cfg.get("repos")
+        if watchdog_repos is not None and not (
+                isinstance(watchdog_repos, list)
+                and all(isinstance(r, str) for r in watchdog_repos)):
+            raise ConfigError(
+                "watchdog.repos must be a list of strings, got "
+                f"{watchdog_repos!r}")
+        self.watchdog_repos = list(watchdog_repos or [])
+        watchdog_agent = watchdog_cfg.get("agent", "claude")
+        if not isinstance(watchdog_agent, str) or not watchdog_agent:
+            raise ConfigError(
+                f"watchdog.agent must be a harness name, got "
+                f"{watchdog_agent!r}")
+        self.watchdog_agent = watchdog_agent
         codex_full_access = data.get("codexFullAccess", True)
         # A quoted "false" would otherwise pass bool()'s truthiness check
         # and turn codex loose with danger-full-access — a string typo
@@ -1846,6 +1900,15 @@ class Renderer:
         if self.spec.webhook_enable:
             lines.insert(2, 'Environment="AGENT_BOX_WEBHOOK_REPO='
                             f'{self.spec.webhook_repo}"')
+        if self.spec.watchdog_enable:
+            # Not from the binding contract above: that manifest binds fixed
+            # programs every box gets, while these two are conditional on an
+            # option, and the interval is not a program name at all. The
+            # module's half is the matching lib.optionalAttrs block.
+            lines.insert(2, 'Environment="AGENT_BOX_WATCHDOG_BIN='
+                            f'{self.bin}/agent-box-watchdog"')
+            lines.insert(3, 'Environment="AGENT_BOX_WATCHDOG_INTERVAL='
+                            f'{self.spec.watchdog_interval}"')
         if self.spec.protect_memory:
             # Same knob as the module: the supervisor is the last thing that
             # should be killed when the box runs out of memory.
@@ -2260,6 +2323,34 @@ class Renderer:
                f"export AGENT_BOX_PROFILE_BIN="
                f"{q('/usr/local/bin/agent-box-profile')}\n"
                f'exec {self.bin}/agent-box-session-bare "$@"\n', 0o755)
+        if self.spec.watchdog_enable:
+            # The native half of the module's watchdogCli wrapper: the same
+            # pinned binaries and the same declared defaults, each still
+            # overridable per box with `agent-box-session env set` because
+            # which repos an agent user is answerable for is a preference,
+            # not a system-level fact. modules/src/watchdog.py itself carries
+            # no backend-specific text — a config-source label baked into a
+            # shared payload is exactly what #471 was.
+            repos = " ".join(self.spec.watchdog_repos)
+            t.file(self.p("/usr/local/bin/agent-box-watchdog"),
+                   "#!/bin/sh\n"
+                   "# Generated by `agentbox apply` — do not edit.\n"
+                   f"export AGENT_BOX_GH_BIN={q(f'{self.bin}/gh')}\n"
+                   f"export AGENT_BOX_SESSION_BIN="
+                   f"{q('/usr/local/bin/agent-box-session')}\n"
+                   "export AGENT_BOX_WATCHDOG_COOLDOWN="
+                   "\"${AGENT_BOX_WATCHDOG_COOLDOWN:-"
+                   f"{self.spec.watchdog_cooldown}}}\"\n"
+                   "export AGENT_BOX_WATCHDOG_MAX_ATTEMPTS="
+                   "\"${AGENT_BOX_WATCHDOG_MAX_ATTEMPTS:-"
+                   f"{self.spec.watchdog_max_attempts}}}\"\n"
+                   "export AGENT_BOX_WATCHDOG_AGENT="
+                   "\"${AGENT_BOX_WATCHDOG_AGENT:-"
+                   f"{self.spec.watchdog_agent}}}\"\n"
+                   + (f"export AGENT_BOX_WATCHDOG_REPOS="
+                      f"\"${{AGENT_BOX_WATCHDOG_REPOS:-{repos}}}\"\n"
+                      if repos else "")
+                   + f'exec {self.bin}/agent-box-watchdog-run "$@"\n', 0o755)
         # A profile file is the env store in another directory, so it has
         # the same one parser.
         t.file(self.p("/usr/local/bin/agent-box-profile"),

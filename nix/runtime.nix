@@ -233,6 +233,21 @@ let
     envExecWrapper
     envStoreCli
     settingsDaemon
+    # The assignment sweep, shipped whatever the config says: `agentbox
+    # apply` decides whether the supervisor points at it, and a profile that
+    # withheld the binary would turn a config flip into a dangling
+    # ExecStart-by-name — the same reasoning as the always-shipped
+    # agent-box-webhook-policy-apply above.
+    #
+    # writePython3Bin, not `payload`: watchdog.py is Python, and `payload`
+    # would give it a bash shebang and hand bash a Python file to parse (the
+    # envExecWrapper note above is the same trap). flakeIgnore REPLACES
+    # flake8's defaults rather than adding to them, so W503 is live under
+    # this gate — the source is written to pass it, and the module's half
+    # names the same list.
+    (pkgs.writers.writePython3Bin "agent-box-watchdog-run" {
+      flakeIgnore = [ "E501" ];
+    } (readSrc "watchdog.py"))
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-spawn" "webhook-spawn.sh")
     (pkgs.writeShellScriptBin "agent-box-webhook-receiver" ''

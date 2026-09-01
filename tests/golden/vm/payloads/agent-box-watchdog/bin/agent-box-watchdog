@@ -1,0 +1,15 @@
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+# Pinned rather than inherited: this runs from the supervisor's PATH as
+# well as from an agent's, and the two are not the same set (issue #154,
+# Phase 2 — the AGENT_BOX_*_BIN convention).
+export AGENT_BOX_GH_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gh-2.96.0/bin/gh
+export AGENT_BOX_SESSION_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-session/bin/agent-box-session
+# Declared defaults, each overridable per box with `agent-box-session env
+# set`: which repos an agent user is answerable for, and how hard to press
+# them, are preferences rather than system-level facts, and the agent user
+# cannot edit /etc/nixos to change a Nix option.
+export AGENT_BOX_WATCHDOG_COOLDOWN="${AGENT_BOX_WATCHDOG_COOLDOWN:-6}"
+export AGENT_BOX_WATCHDOG_MAX_ATTEMPTS="${AGENT_BOX_WATCHDOG_MAX_ATTEMPTS:-3}"
+export AGENT_BOX_WATCHDOG_AGENT="${AGENT_BOX_WATCHDOG_AGENT:-claude}"
+exec /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-watchdog-run "$@"
+

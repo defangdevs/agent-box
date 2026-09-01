@@ -23,6 +23,8 @@ web/payloads/agent-box-session/bin/agent-box-session -> vm/payloads/agent-box-se
 web/payloads/agent-box-spot-monitor -> vm/payloads/agent-box-spot-monitor
 web/payloads/agent-box-supervisor/bin/agent-box-supervisor -> vm/payloads/agent-box-supervisor/bin/agent-box-supervisor
 web/payloads/agent-box-upload/bin/agent-box-upload -> vm/payloads/agent-box-upload/bin/agent-box-upload
+web/payloads/agent-box-watchdog-run -> vm/payloads/agent-box-watchdog-run
+web/payloads/agent-box-watchdog/bin/agent-box-watchdog -> vm/payloads/agent-box-watchdog/bin/agent-box-watchdog
 web/payloads/unit-script-agent-box-defang-cli-start/bin/agent-box-defang-cli-start -> vm/payloads/unit-script-agent-box-defang-cli-start/bin/agent-box-defang-cli-start
 web/units/agent-box-defang-cli.service -> vm/units/agent-box-defang-cli.service
 web/units/agent-box-webhook@robot.service -> web/units/agent-box-webhook@agent.service

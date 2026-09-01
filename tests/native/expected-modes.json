@@ -57,5 +57,6 @@
   "etc/tmpfiles.d/agent-box.conf": "0o644",
   "usr/local/bin/agent-box-profile": "0o755",
   "usr/local/bin/agent-box-session": "0o755",
+  "usr/local/bin/agent-box-watchdog": "0o755",
   "usr/local/bin/agent-box-webhook": "0o755"
 }
