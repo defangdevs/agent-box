@@ -1175,7 +1175,8 @@
     assert "claude --model sonnet" in launch, launch
     # The SOURCE line, not the closing sentence that names the option either
     # way: the report has to distinguish the two levers, not just mention them.
-    assert "come from services.agent-box.webhook.hookSessionArgs" in launch, launch
+    assert ("come from the NixOS option "
+            "services.agent-box.webhook.hookSessionArgs") in launch, launch
 
     # --- issue #321: a standing watch hands work to an agent PROFILE --------
     # The gap a profile closes here: the spawn passes no --agent, so a match
