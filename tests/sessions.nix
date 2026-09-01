@@ -66,6 +66,17 @@ in
 
     # --- first boot: legacy options seeded a "main" session --------------
     machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=120)
+    # Issue #78: this disk is fresh on every run, so ~/.config does not
+    # exist yet when tmpfiles processes the rules — the exact condition
+    # under which the parent-dir rule (#356) matters. Before that fix,
+    # tmpfiles auto-created ~/.config itself as root, then refused to
+    # descend into it ("Detected unsafe path transition ... owned by
+    # root", exit 73) and silently skipped the child rule below. Asserting
+    # the directory itself, not just the file inside it, is what actually
+    # proves that path rather than assuming it from the file's existence.
+    machine.succeed(
+        "stat -c '%U %a' /home/agent/.config/agent-box | grep -x 'agent 700'"
+    )
     machine.succeed(
         "stat -c '%U %a' /home/agent/.config/agent-box/sessions.json "
         "| grep -x 'agent 600'"
