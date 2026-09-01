@@ -597,20 +597,27 @@ claude mcp add --transport http linear https://mcp.linear.app/mcp \
 #    mutation you can run with the same key, so registering needs no browser.
 agent-box-webhook setup linear
 
-# 3. Route it. Topics key on the team, and a Linear payload names the entity
-#    in `type` and the verb in `action`, so rules read on those.
-agent-box-webhook subscribe linear:ENG --note "ENG issues" \
+# 3. Route it. Topics key on the team's ID (data.teamId — Linear's payloads
+#    carry related objects as bare IDs, never nested, so the short key
+#    printed alongside it, e.g. "ENG", never matches). Look yours up:
+#      curl -sS https://api.linear.app/graphql \
+#        -H "Authorization: $LINEAR_API_KEY" -H 'Content-Type: application/json' \
+#        -d '{"query":"{teams{nodes{id key name}}}"}'
+#    A Linear payload names the entity in `type` and the verb in `action`,
+#    so rules read on those.
+agent-box-webhook subscribe linear:<TEAM ID> --note "issues for that team" \
   --when '{"path":"action","in":["create"]}'
 ```
 
-Two caveats worth knowing before you start. A Project, Document or Initiative
-event carries no team and therefore no routing key, so it reaches nobody —
-keyless payloads are deliberately undeliverable. And Linear delivers **over
-IPv4 only**: the nine egress addresses it publishes are all IPv4 (Google
-Cloud), so an IPv6-only box — the EC2 default — needs an IPv4 address before
-any delivery arrives, exactly as it does for GitHub. Unlike GitHub, Linear does
-retry: three attempts, after 1 minute, 1 hour and 6 hours, and it wants a
-`200` within 5 seconds.
+Three caveats worth knowing before you start. A Project, Document or
+Initiative event carries no team and therefore no routing key, so it reaches
+nobody — keyless payloads are deliberately undeliverable, and a Comment event
+joins them: it carries only `data.issueId`, no team field at all. And Linear
+delivers **over IPv4 only**: the nine egress addresses it publishes are all
+IPv4 (Google Cloud), so an IPv6-only box — the EC2 default — needs an IPv4
+address before any delivery arrives, exactly as it does for GitHub. Unlike
+GitHub, Linear does retry: three attempts, after 1 minute, 1 hour and 6
+hours, and it wants a `200` within 5 seconds.
 
 Adding another such sender is the same three steps. If it signs in its own
 header, teach `source_template` in `modules/src/webhook-cli.sh` its shape —

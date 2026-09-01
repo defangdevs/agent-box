@@ -366,17 +366,28 @@ Linear end to end, none of which needs a rebuild or root:
 
     agent-box-webhook setup linear      # prints the URL, the secret, AND a
                                         # ready-made webhookCreate mutation
-    agent-box-webhook subscribe linear:ENG --note "ENG issues" \
+    agent-box-webhook subscribe linear:<TEAM ID> --note "issues for that team" \
       --when '{"path":"action","in":["create"]}'
 
 Linear delivers over IPv4 ONLY - every egress address it publishes is IPv4 -
 so an IPv6-only box receives nothing until it has an IPv4 address, exactly as
 with GitHub. Unlike GitHub it retries: 1 minute, 1 hour, 6 hours.
 
-Topics are keyed on the TEAM (`linear:ENG`), which is the closest thing Linear
-has to `owner/repo`. A Project, Document or Initiative event carries no team,
-so it has no key and reaches nobody - teams are what issues live in. A Linear
-payload names the entity in `type` (`Issue`, `Comment`) and the verb in
+Topics are keyed on the team's ID (`linear:<TEAM ID>`), the closest thing
+Linear has to `owner/repo`. Look yours up with the same key Linear's MCP
+server uses:
+
+    curl -sS https://api.linear.app/graphql \
+      -H "Authorization: $LINEAR_API_KEY" -H 'Content-Type: application/json' \
+      -d '{"query":"{teams{nodes{id key name}}}"}'
+
+The ID, not the short key printed alongside it (`ENG`), is what to route on:
+Linear's webhook payloads carry related objects as bare IDs, never nested, so
+`data.teamId` is what arrives and `linear:ENG` never matches anything. A
+Comment event carries no team field at all (only `data.issueId`), joining
+Project, Document and Initiative events in reaching nobody - keyless payloads
+are deliberately undeliverable upstream; teams are what issues live in. A
+Linear payload names the entity in `type` (`Issue`, `Comment`) and the verb in
 `action` (`create`/`update`/`remove`), so write rules on those; GitHub's event
 names mean nothing here, and since local-webhook 0.24.0 a non-GitHub
 subscription is no longer seeded with them.
@@ -386,7 +397,7 @@ there is nothing to install, and the API key avoids an OAuth callback this box
 cannot receive:
 
     claude mcp add --transport http linear https://mcp.linear.app/mcp \
-      --header "Authorization: Bearer ${LINEAR_API_KEY}" -s user
+      --header "Authorization: Bearer \${LINEAR_API_KEY}" -s user
 
 The `${...}` is stored literally and expanded when the server loads, so the key
 lives only in the env store. Ask the user to paste it into the settings page's
