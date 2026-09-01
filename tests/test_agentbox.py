@@ -1207,6 +1207,30 @@ class RenderTest(unittest.TestCase):
                    if path.endswith("/agent.env")][0]
             self.assertNotIn("AGENT_BOX_CODEX_FULL_ACCESS", env)
 
+    def test_no_sudo_allowlist_locks_new_privileges(self):
+        """NoNewPrivileges must be an explicit true/false, never absent.
+
+        The shared agent-box@ unit template carries no NoNewPrivileges
+        line of its own, so an empty sudoAllowlist has to render an
+        EXPLICIT NoNewPrivileges=true — omitting the line (this renderer's
+        behavior before the #451 contract migration named the gap) falls
+        back to systemd's permissive default instead, silently leaving a
+        native box less hardened than a NixOS one given the identical
+        (empty) config."""
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for allowlist, want in (([], "true"), (["some-cmd"], "false")):
+                config["sudoAllowlist"] = allowlist
+                spec = mod.Spec(config, prof)
+                rend = mod.Renderer(spec, prof, root=Path(tmp) / f"o{want}")
+                tree = rend.render()
+                dropin = [text for path, (text, _) in tree.files.items()
+                          if path.endswith(
+                              "agent-box@agent.service.d/10-host.conf")][0]
+                self.assertIn(f"NoNewPrivileges={want}", dropin)
+
     def test_a_web_box_seeds_no_session_and_a_console_box_still_does(self):
         """The front door (issue #416). A user with a browser terminal and
         no declared sessions gets an EMPTY seed — the settings page is

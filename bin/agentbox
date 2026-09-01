@@ -1846,16 +1846,46 @@ class Renderer:
         if self.spec.webhook_enable:
             lines.insert(2, 'Environment="AGENT_BOX_WEBHOOK_REPO='
                             f'{self.spec.webhook_repo}"')
-        if self.spec.protect_memory:
-            # Same knob as the module: the supervisor is the last thing that
-            # should be killed when the box runs out of memory.
-            lines.append("OOMScoreAdjust=500")
-        if self.spec.sudo_allowlist:
-            lines.append("NoNewPrivileges=false")
-        if self.spec.web_enable:
-            lines.append(f"ReadWritePaths=/var/lib/agent-box-sites/{u.name}")
+        # ReadWritePaths/NoNewPrivileges/OOMScoreAdjust come from the shared
+        # contract's "directives" list (issue #451) instead of being
+        # hand-written here — modules/agent-box.nix.in's agentBoxDirective
+        # is the module's half. Each directive names the condition that
+        # gates it; "no-sudo-allowlist" and "protect-memory" aren't
+        # self.spec.* booleans directly (the former is a negation, and both
+        # need a name shared with the module's own condition vocabulary).
+        agent_box_directive_conditions = {
+            "web": self.spec.web_enable,
+            "protect-memory": self.spec.protect_memory,
+            "no-sudo-allowlist": not self.spec.sudo_allowlist,
+        }
+        agent_box_directives = {
+            d["name"]: d for d in agent_box_contract["directives"]}
+
+        def agent_box_directive_holds(name):
+            return agent_box_directive_conditions[
+                agent_box_directives[name]["condition"]]
+
+        if agent_box_directive_holds("OOMScoreAdjust"):
+            # Same knob as the module: the supervisor is the last thing
+            # that should be killed when the box runs out of memory.
             lines.append(
-                f"ReadWritePaths=/var/lib/agent-box-downloads/{u.name}")
+                "OOMScoreAdjust="
+                f"{agent_box_directives['OOMScoreAdjust']['value']}")
+        # ALWAYS present, never gated on presence (kind "bool") — unlike
+        # the two directives above. Before this fix, an empty sudo
+        # allowlist (the common case: no sudoAllowlist configured) left
+        # this line out entirely on native, so it fell back to systemd's
+        # own default (NoNewPrivileges=no, i.e. permissive) instead of the
+        # module's explicit `true` for the identical configuration — a
+        # native box was less hardened than a NixOS one asked for the same
+        # box. Fixed here by always emitting the directive, matching the
+        # module's own unconditional boolean.
+        lines.append(
+            "NoNewPrivileges="
+            f"{'true' if agent_box_directive_holds('NoNewPrivileges') else 'false'}")
+        if agent_box_directive_holds("ReadWritePaths"):
+            for template in agent_box_directives["ReadWritePaths"]["templates"]:
+                lines.append(f"ReadWritePaths={template.replace('%i', u.name)}")
         for f in u.environment_files:
             lines.append(f"EnvironmentFile=-{f}")
         t.file(self.p("/etc/systemd/system",
