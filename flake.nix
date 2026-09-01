@@ -1360,7 +1360,19 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                   (a: nixpkgs.lib.hasInfix option a.message)
                   (failed extra);
               path = p: { selfUpdate.checkout.path = p; };
+              srcDir = d: { selfUpdate.srcDir = d; };
               cases =
+                # srcDir decides what ROOT builds, so its assertion is the
+                # trust boundary and not a convenience: accepted cases must
+                # keep working, and every path with an agent-writable
+                # ancestor must be refused.
+                map (d: { label = "accepts srcDir ${builtins.toJSON d}"; ok = !(rejects "selfUpdate.srcDir" (srcDir d)); })
+                  [ "/var/lib/agent-box/src" "/var/lib/agent-box-src" "/var/lib/a/b/c" ]
+                ++ map (d: { label = "refuses srcDir ${builtins.toJSON d}"; ok = rejects "selfUpdate.srcDir" (srcDir d); })
+                  [ "/home/agent/src" "/home/agent/agent-box" "/tmp/src" "/var/tmp/src"
+                    "/var/lib" "/var/libel/src" "relative/src" ""
+                    "/var/lib/../../home/agent/src" "/var/lib//src" "/var/lib/./src" ]
+                ++
                 # Accepted: a plain name and a subdirectory.
                 map (p: { label = "accepts ${p}"; ok = !(rejects "checkout.path" (path p)); })
                   [ "agent-box" "src/agent-box" ]

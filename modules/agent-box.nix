@@ -6112,6 +6112,15 @@ export GIT_TERMINAL_PROMPT=0
 unset GIT_ASKPASS SSH_ASKPASS
 export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=60
 
+# Every git below runs AS ROOT in a tree fetched from the network, and
+# `checkout`/`merge` are exactly the commands git runs hooks for. The module
+# already confines the tree to /var/lib so nothing but root can put a hook
+# there; this is the second lock, and it costs one environment variable:
+# core.hooksPath at a path that holds no hooks means no hook is ever found.
+# GIT_CONFIG_* rather than `git -c`, so it covers `git clone` too — which
+# runs before the tree this is protecting even exists.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
+
 git() { command git -C "$dir" "$@"; }
 
 # --- the tree exists --------------------------------------------------
@@ -6174,6 +6183,27 @@ fetch() {
   git fetch --quiet --prune origin || die "fetch from $url failed — offline?"
 }
 
+# What rev does the remote have for a ref, asked WITHOUT a tree — no clone,
+# no fetch, no .git touched. This is what makes `check` a question: "is there
+# an update" must not be the thing that creates the checkout, and on a box
+# that has never updated the tree does not exist yet, so the alternative was
+# cloning the whole repo to answer.
+#
+# ls-remote prints "<sha>\t<ref>" per matching ref. An annotated tag matches
+# twice — the tag object, and the commit it peels to as "<ref>^{}" — and the
+# peeled line is the one a caller means by "the rev of v1.2.3".
+remote_rev() {
+  out=$(command git ls-remote "$url" "$@" 2>/dev/null) \
+    || die "cannot reach $url — offline?"
+  [ -n "$out" ] || return 1
+  peeled=$(printf '%s\n' "$out" | grep '\^{}$' | head -n 1 | cut -f1)
+  if [ -n "$peeled" ]; then
+    printf '%s\n' "$peeled"
+  else
+    printf '%s\n' "$out" | head -n 1 | cut -f1
+  fi
+}
+
 # What are we aiming at? Either a named ref, fetched by name, or the head of
 # the tracked branch. Both end as a bare rev, so everything downstream is
 # ref-shaped in exactly one place.
@@ -6193,8 +6223,16 @@ target_rev() {
 
 case "''${1:-}" in
   (check)
-    clone_if_missing
-    target_rev
+    # Deliberately NOT clone_if_missing/target_rev: see remote_rev above.
+    # With no branch configured the remote's own HEAD is the tracked branch,
+    # which is the same answer resolve_branch reaches through origin/HEAD.
+    if [ -n "$ref" ]; then
+      remote_rev "$ref" || die "origin has no ref '$ref'"
+    elif [ -n "$branch" ]; then
+      remote_rev "refs/heads/$branch" || die "origin has no branch '$branch'"
+    else
+      remote_rev HEAD || die "$url has no HEAD"
+    fi
     ;;
 
   (pull)
@@ -8656,6 +8694,12 @@ in
           build source would make that user root-equivalent (issue #127 —
           users are the trust boundary). The maintainer's own working copy is
           a different tree with a different owner; see `checkout`.
+
+          Asserted, not just documented: the path must be a normalized one
+          under /var/lib. Owning the directory is not enough — a writable
+          ANCESTOR lets the whole thing be swapped for a tree whose git hooks
+          then run as root under the next update. A host that needs the tree
+          on another volume mounts that volume under /var/lib.
         '';
       };
 
@@ -9219,6 +9263,34 @@ in
 
   config = lib.mkIf cfg.enable (lib.mkMerge [{
     assertions = [{
+      # The whole security argument for building from a local tree is that
+      # nothing but root can write it: agent-box-source runs `git checkout`
+      # and `git merge` in that tree AS ROOT, and a tree an agent can
+      # replace is a tree whose .git/hooks run as root the next time the
+      # allowed `systemctl start agent-box-update.service` fires. Ownership
+      # of the directory is not enough — a writable ANCESTOR lets the whole
+      # directory be swapped — so the option is confined to /var/lib, which
+      # is root-managed by systemd convention and is where the default
+      # already lives. A host that needs the tree on another volume mounts
+      # it under /var/lib rather than pointing this at /home.
+      #
+      # This is the option's own guard. modules/src/source-tree.sh also
+      # runs git with core.hooksPath pointed at nothing, so a tree that
+      # somehow does carry hooks cannot run them either way.
+      assertion =
+        let
+          dir = cfg.selfUpdate.srcDir;
+        in
+        lib.hasPrefix "/var/lib/" dir
+        && lib.all (part: part != "" && part != "." && part != "..")
+          (lib.drop 1 (lib.splitString "/" dir));
+      message =
+        "services.agent-box.selfUpdate.srcDir must be an absolute, "
+        + "normalized path under /var/lib — root builds the box from that "
+        + "tree, so an agent-writable ancestor anywhere above it (a home, "
+        + "/tmp) would let an agent choose what root builds and run git "
+        + "hooks as root. Got \"" + cfg.selfUpdate.srcDir + "\".";
+    } {
       # checkout.path is joined onto /home/<maintainer>, and the agent unit
       # grants ReadWritePaths=/home/%i and nothing else. So every way of
       # leaving that directory is refused HERE, at eval — not as EROFS

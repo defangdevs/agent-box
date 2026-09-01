@@ -26,6 +26,7 @@ SCRIPT=${1:?usage: test-source-tree.sh PATH/TO/source-tree.sh}
 [ -f "$SCRIPT" ] || { echo "no such script: $SCRIPT" >&2; exit 2; }
 SCRIPT=$(cd "$(dirname "$SCRIPT")" && pwd)/$(basename "$SCRIPT")
 
+BASH_BIN=$(command -v bash)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -177,12 +178,37 @@ AGENT_BOX_SRC_URL="$rewritten" AGENT_BOX_SRC_REV="$REV_THREE" AGENT_BOX_SRC_FORC
   || no "--force moves anyway, and says so" "rc=$rc head=$(head_of "$dir")"
 
 # --- check: an answer, not an action ------------------------------------
+# It reads the REMOTE. "Is there an update" must not be the thing that
+# creates the checkout or fetches into it — and on a box that has never
+# updated there is no tree to consult in the first place, so the alternative
+# was cloning the whole repo to answer a question.
 at "$REV_ONE"
 run check
 [ "$rc" = 0 ] && [ "$(out)" = "$REV_THREE" ] \
   && ok "check reports the tip" || no "check reports the tip" "rc=$rc out=$(out)"
 [ "$(head_of "$dir")" = "$REV_ONE" ] \
   && ok "check does not move the tree" || no "check does not move the tree" "$(head_of "$dir")"
+before_fetch=$(git -C "$dir" rev-parse refs/remotes/origin/master)
+git -C "$dir" update-ref refs/remotes/origin/master "$REV_ONE"
+run check
+[ "$(git -C "$dir" rev-parse refs/remotes/origin/master)" = "$REV_ONE" ] \
+  && ok "check does not fetch into the tree either" \
+  || no "check does not fetch into the tree either" "$(git -C "$dir" rev-parse refs/remotes/origin/master) != $REV_ONE"
+git -C "$dir" update-ref refs/remotes/origin/master "$before_fetch"
+
+rm -rf "$dir"
+run check
+[ "$rc" = 0 ] && [ "$(out)" = "$REV_THREE" ] && [ ! -e "$dir" ] \
+  && ok "check works with no tree at all, and creates none" \
+  || no "check works with no tree at all, and creates none" "rc=$rc out=$(out) dir=$([ -e "$dir" ] && echo exists)"
+
+AGENT_BOX_SRC_REF=v-two run check
+[ "$rc" = 0 ] && [ "$(out)" = "$REV_TWO" ] \
+  && ok "check resolves an explicit ref" || no "check resolves an explicit ref" "rc=$rc out=$(out)"
+
+AGENT_BOX_SRC_REF=no-such-ref run check
+[ "$rc" != 0 ] && [ -z "$(out)" ] \
+  && ok "check refuses a ref that does not exist" || no "check refuses a ref that does not exist" "rc=$rc out=$(out)"
 
 # --- an explicit ref ----------------------------------------------------
 # `agentbox update --rev v-two`: fetched by name, and still through the
@@ -238,6 +264,37 @@ run reset
 run rev
 [ "$rc" = 0 ] && [ "$(out)" = "$REV_ONE" ] \
   && ok "rev prints HEAD" || no "rev prints HEAD" "rc=$rc out=$(out)"
+
+# --- git hooks in the tree never run ------------------------------------
+# Every git here runs AS ROOT, and a pull runs both commands git fires hooks
+# for: `git checkout -B` on the realign (post-checkout) and `git merge` on
+# the fast-forward (post-merge). The module confines the tree to /var/lib so
+# nothing but root can put a hook there; this is the second lock, and it is
+# the one that still holds if the first is ever bypassed.
+#
+# The tree starts AHEAD of the running rev so the realign actually happens —
+# otherwise the pull is a merge alone and post-checkout is never reached,
+# which is a test that passes without the lock in place.
+at "$REV_THREE"
+mkdir -p "$dir/.git/hooks"
+for h in post-checkout post-merge; do
+  cat > "$dir/.git/hooks/$h" <<HOOK
+#!$BASH_BIN
+: > "$work/HOOK-RAN-$h"
+HOOK
+  chmod +x "$dir/.git/hooks/$h"
+done
+rm -f "$work"/HOOK-RAN-*
+AGENT_BOX_SRC_REV="$REV_ONE" run pull
+[ "$rc" = 0 ] && [ "$(head_of "$dir")" = "$REV_THREE" ] \
+  && ok "the hooked tree still pulls (realign, then fast-forward)" \
+  || no "the hooked tree still pulls (realign, then fast-forward)" "rc=$rc head=$(head_of "$dir")"
+[ ! -e "$work/HOOK-RAN-post-checkout" ] \
+  && ok "the realign's checkout runs no post-checkout hook" \
+  || no "the realign's checkout runs no post-checkout hook" "the hook ran as this script's user"
+[ ! -e "$work/HOOK-RAN-post-merge" ] \
+  && ok "the fast-forward runs no post-merge hook" \
+  || no "the fast-forward runs no post-merge hook" "the hook ran as this script's user"
 
 # --- a $dir that exists but is not a checkout ---------------------------
 # `mv src.incoming src` moves the clone INSIDE an existing src, so the

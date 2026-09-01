@@ -1701,6 +1701,12 @@ in
           build source would make that user root-equivalent (issue #127 —
           users are the trust boundary). The maintainer's own working copy is
           a different tree with a different owner; see `checkout`.
+
+          Asserted, not just documented: the path must be a normalized one
+          under /var/lib. Owning the directory is not enough — a writable
+          ANCESTOR lets the whole thing be swapped for a tree whose git hooks
+          then run as root under the next update. A host that needs the tree
+          on another volume mounts that volume under /var/lib.
         '';
       };
 
@@ -2264,6 +2270,34 @@ in
 
   config = lib.mkIf cfg.enable (lib.mkMerge [{
     assertions = [{
+      # The whole security argument for building from a local tree is that
+      # nothing but root can write it: agent-box-source runs `git checkout`
+      # and `git merge` in that tree AS ROOT, and a tree an agent can
+      # replace is a tree whose .git/hooks run as root the next time the
+      # allowed `systemctl start agent-box-update.service` fires. Ownership
+      # of the directory is not enough — a writable ANCESTOR lets the whole
+      # directory be swapped — so the option is confined to /var/lib, which
+      # is root-managed by systemd convention and is where the default
+      # already lives. A host that needs the tree on another volume mounts
+      # it under /var/lib rather than pointing this at /home.
+      #
+      # This is the option's own guard. modules/src/source-tree.sh also
+      # runs git with core.hooksPath pointed at nothing, so a tree that
+      # somehow does carry hooks cannot run them either way.
+      assertion =
+        let
+          dir = cfg.selfUpdate.srcDir;
+        in
+        lib.hasPrefix "/var/lib/" dir
+        && lib.all (part: part != "" && part != "." && part != "..")
+          (lib.drop 1 (lib.splitString "/" dir));
+      message =
+        "services.agent-box.selfUpdate.srcDir must be an absolute, "
+        + "normalized path under /var/lib — root builds the box from that "
+        + "tree, so an agent-writable ancestor anywhere above it (a home, "
+        + "/tmp) would let an agent choose what root builds and run git "
+        + "hooks as root. Got \"" + cfg.selfUpdate.srcDir + "\".";
+    } {
       # checkout.path is joined onto /home/<maintainer>, and the agent unit
       # grants ReadWritePaths=/home/%i and nothing else. So every way of
       # leaving that directory is refused HERE, at eval — not as EROFS
