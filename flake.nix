@@ -785,6 +785,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               check_payload agent-box-mark-stopped mark-stopped.sh
               check_payload agent-box-spot-monitor spot-monitor.sh
               check_payload agent-box-update update.sh
+              check_payload agent-box-source source-tree.sh
               check_payload agent-box-codex-remote-control codex-remote-control.sh
               check_payload agent-box-claude-session-start-hook claude-session-start-hook.sh
               check_payload agent-box-session-bare session-cli.sh
@@ -1396,6 +1397,29 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # watching. `origin` is a local repository and `gh` is a shim,
           # so there is no network here and it runs natively on every
           # architecture — which is where the VM tests cannot go.
+          # The box's own source tree (issue #242) — the thing "update the
+          # box" now moves, and the fast-forward guard that replaced a
+          # GitHub API compare. Root runs this unattended and the tree it
+          # leaves behind is what the next rebuild BUILDS, so the refusals
+          # (a rewritten history, a downgrade, a baseline the tree has never
+          # heard of) are worth more assertions than the happy path.
+          # `origin` is a local repository, so there is no network here and
+          # it runs natively on every architecture.
+          source-tree =
+            pkgs.runCommand "agent-box-source-tree"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.git pkgs.gnugrep ];
+                script = ./modules/src/source-tree.sh;
+                tests = ./tests/test-source-tree.sh;
+              } ''
+              bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           checkout-bootstrap =
             pkgs.runCommand "agent-box-checkout-bootstrap"
               {

@@ -678,14 +678,33 @@ Resources:
                   then import /etc/nixos/agent-box-agent-pin.nix
                   else if "${AgentNixpkgsUrl}" == "" then null
                   else { url = "${AgentNixpkgsUrl}"; sha256 = "${AgentNixpkgsSha256}"; };
+                # Where the module comes from. Once the box holds its own
+                # source tree the module is imported OUT of it: "update box"
+                # is `git pull` in that tree and a rebuild from the checked-out
+                # files, no copy fetched (issue #242). The tree is root-owned
+                # and root-written - agent-box-update.service clones it on its
+                # first run and fast-forwards it on every later one.
+                #
+                # Before that tree exists there is nothing to import, so first
+                # boot falls back to the launch-time pin and fetches the one
+                # generated file, exactly as every box did before this. Same
+                # pathExists dance as the pin above, and the same guarantee:
+                # the updater keeps both at the same rev, so the fallback is a
+                # slower way to reach the identical module, never a different
+                # one.
+                #
                 # raw.githubusercontent.com is dual-stack (has AAAA); github.com
                 # is IPv4-only - IPv6-only boxes reach it via the Nat64
                 # parameter's public DNS64/NAT64 (spliced in below).
                 # The module is a single file, so no tarball unpack needed.
-                agent-box-module = builtins.fetchurl {
-                  url = "https://raw.githubusercontent.com/defangdevs/agent-box/${!pin.rev}/modules/agent-box.nix";
-                  sha256 = pin.sha256;
-                };
+                localModule = /var/lib/agent-box/src/modules/agent-box.nix;
+                agent-box-module =
+                  if builtins.pathExists localModule
+                  then localModule
+                  else builtins.fetchurl {
+                    url = "https://raw.githubusercontent.com/defangdevs/agent-box/${!pin.rev}/modules/agent-box.nix";
+                    sha256 = pin.sha256;
+                  };
                 hostname = "${WebHostname}";
                 # Fn::Sub receives a base64 projection of WebPassword so every
                 # password-manager symbol remains inert Nix source. The

@@ -47,6 +47,16 @@ let
       --no-block: sudoers compares the whole command line, so dropping a flag
       makes the rule miss and sudo ask for a password instead.
 
+      That is a `git pull`. Root keeps this box's own checkout of the repo at
+      `${cfg.selfUpdate.srcDir}` and rebuilds FROM it, so an update is a
+      fast-forward of that tree - which is also why it refuses anything that
+      is not a descendant of the rev the box is running. The first update
+      clones it (so a box that has never updated does not have it yet); every
+      later one moves it. The tree is root-owned and you cannot write it:
+      that is deliberate, since whatever writes it decides what root builds.
+      Read it freely - `git -C ${cfg.selfUpdate.srcDir} log -1` is exactly
+      what the box runs.
+
     '' + lib.optionalString checkoutEnabled ''
       ## This box ships its own sources
 
@@ -69,10 +79,12 @@ let
 
       Changing this box means the same round trip as changing any other
       repo: edit, `nix run .#assemble`, run the checks, push to the `fork`
-      remote if you have one, and open a PR. What the box RUNS still comes
-      from the repo the deployment pinned, fetched by root as a hash-pinned
-      file - so a commit only reaches this machine after the update above,
-      and only when the deployment points at the repo you pushed to.
+      remote if you have one, and open a PR. Editing THIS tree changes
+      nothing about what the box runs - the box rebuilds from root's own
+      checkout (see Updating above), which only ever fast-forwards along the
+      repo the deployment points at. So a commit reaches this machine once it
+      is merged there and the update above runs; a commit that only exists
+      here reaches nothing.
 
     '')
       # Which HOST this guide is describing. The two backends install the
@@ -791,6 +803,17 @@ let
   '' + ''
 @@include:src/webhook-policy-apply.sh@@
   '');
+
+  # The tree the box is BUILT FROM (issue #242). Backend-neutral like every
+  # other Phase-2 payload — bare git resolved from the unit's PATH,
+  # configuration taken from AGENT_BOX_SRC_* — so nix/runtime.nix ships the
+  # same binary and `agentbox update` drives it with the same three verbs
+  # this module's updater uses. That matters more here than for most
+  # payloads: "what does an update DO" is the one answer the two backends
+  # must not give differently.
+  sourceTree = pkgs.writeShellScriptBin "agent-box-source" ''
+@@include:src/source-tree.sh@@
+  '';
 
   # Binding contract (issue #451, #154 Phase 5): which env vars and Exec
   # directives the agent-box-webhook@ unit gets is data, not a hand-written
@@ -1628,24 +1651,65 @@ in
         `/run/current-system/sw/bin/systemctl start --no-block
         agent-box-update.service` — one command, the same one the shipped
         guide and the settings page's Update button use — a root oneshot
-        that fast-forwards the box to the upstream repo's latest
-        default-branch commit by rewriting `pinFile` (and, when agentNixpkgs
-        is wired, advances `agentPinFile` to the latest nixos-unstable
-        channel release so agent CLIs stay fresh) and running
-        `nixos-rebuild switch`.
+        that fast-forwards the box's own source tree (`srcDir`) to the
+        upstream repo's latest default-branch commit with
+        `git merge --ff-only`, and runs `nixos-rebuild switch` against it
+        (and, when agentNixpkgs is wired, advances `agentPinFile` to the
+        latest nixos-unstable channel release so agent CLIs stay fresh).
+        "Update the box" is `git pull` and a rebuild from the checked-out
+        files (issue #242) — no API query, no fetched copy of the module.
         The privilege boundary is trigger-only: no arguments, environment or
         paths cross sudo; the update source and logic are fixed in the unit.
         NOTE: the rebuild restarts agent services, so running sessions die —
         agents should save their working context before triggering it.
         Release signature verification is future work (tracked upstream);
-        until then the updater trusts the pinned GitHub repo as published,
-        hash-pinning only what it fetched
+        until then the updater trusts the configured GitHub repo as
+        published, and refuses anything that is not a descendant of the rev
+        the box is running
       '';
 
       repo = lib.mkOption {
         type = lib.types.str;
         default = "defangdevs/agent-box";
         description = "GitHub owner/repo the update service pulls from.";
+      };
+
+      srcDir = lib.mkOption {
+        type = lib.types.str;
+        default = "/var/lib/agent-box/src";
+        description = ''
+          The box's own source tree — a git checkout of `repo` that root
+          keeps, and the thing an update MOVES. `sudo systemctl start
+          agent-box-update.service` fast-forwards this tree with
+          `git merge --ff-only` and rebuilds; there is no API query and no
+          fetched copy of the module (issue #242).
+
+          The host configuration must import the module out of this tree
+          when it exists — `imports = [ /var/lib/agent-box/src/modules/agent-box.nix ]`
+          behind the same `builtins.pathExists` dance `pinFile` already uses,
+          see aws/template.yaml for the reference wiring. A host that does
+          not is not broken: the updater still writes `pinFile`, so a
+          configuration.nix from before this existed keeps fetching the same
+          rev the tree was just moved to. It just pays for a download of what
+          is already on its disk.
+
+          ROOT-owned, and outside every agent's home on purpose: whoever can
+          write this tree decides what root builds, so an agent-writable
+          build source would make that user root-equivalent (issue #127 —
+          users are the trust boundary). The maintainer's own working copy is
+          a different tree with a different owner; see `checkout`.
+        '';
+      };
+
+      branch = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "master";
+        description = ''
+          Branch of `repo` the source tree follows. Null reads the remote's
+          own default branch rather than assuming one, so a repo that renames
+          its default does not silently become un-updatable.
+        '';
       };
 
       rev = lib.mkOption {
@@ -1664,11 +1728,19 @@ in
         type = lib.types.str;
         default = "/etc/nixos/agent-box-pin.nix";
         description = ''
-          File the updater atomically rewrites with
-          `{ rev = "..."; sha256 = "..."; }`. The host configuration must
-          import the module at exactly this pin when the file exists (see
-          aws/template.yaml for the reference wiring); otherwise the update
-          rebuilds against a stale module and silently no-ops.
+          File the updater atomically rewrites after each fast-forward:
+          `{ rev = "..."; sha256 = "..."; }` — the rev the source tree was
+          moved to, and the flat sha256 of that tree's own
+          `modules/agent-box.nix`.
+
+          Since issue #242 this is the RECORD, not the mechanism: a host
+          wired the current way imports the module out of `srcDir` and never
+          reads the hash. It is still written because a configuration.nix
+          from before that change fetches the module BY this pin, and
+          advancing it is what keeps such a box updating to the same rev the
+          tree just moved to instead of freezing on the last pin it ever
+          saw. Either wiring lands on the same rev; only one of them pays
+          for a download of what is already on the disk.
         '';
       };
 
@@ -1714,13 +1786,13 @@ in
       # Issue #242: "agent-box should ship with its own fork". The box
       # fetches one generated file and never saw its own sources, so it
       # could not answer for itself and an agent could not fix it. The
-      # checkout is step 1 of that issue's design B — the source ships, the
-      # agent edits it, pushes to a fork, opens a PR — and it is the whole
-      # of what this option does. It deliberately does NOT make the local
-      # tree a build source: `repo` stays a deploy-time choice and root
-      # still fetches a hash-pinned file from GitHub, so the agent user
-      # gains no privilege (issue #127 — a rebuild from an agent-writable
-      # path is root-equivalence for every user on the box).
+      # checkout is the agent's WORKING COPY — the source ships, the agent
+      # edits it, pushes to a fork, opens a PR. It is not the tree the box
+      # BUILDS from: that is `srcDir`, root-owned, and the two are separate
+      # on purpose. A rebuild from an agent-writable path would make that
+      # user root-equivalent (issue #127 — users are the trust boundary), so
+      # a fix reaches the running box the way any other change does: through
+      # the repo, and the next `git pull`.
       checkout = {
         enable = lib.mkOption {
           type = lib.types.bool;
@@ -2694,15 +2766,31 @@ in
     systemd.services.agent-box-update = {
       description = "Fast-forward agent-box to upstream HEAD and rebuild";
       # No wantedBy — on-demand only, via the agents' sudo rule (or root).
-      path = [ pkgs.curl pkgs.jq pkgs.openssl pkgs.coreutils pkgs.util-linux pkgs.nix ];
+      # No jq any more: the update is a `git merge --ff-only`, not a GitHub
+      # API query, so nothing here parses JSON. curl stays for the one
+      # remaining network call — the nixos-unstable channel redirect.
+      path = [ pkgs.curl pkgs.openssl pkgs.coreutils pkgs.util-linux pkgs.nix pkgs.git sourceTree ];
       environment = {
         REPO = cfg.selfUpdate.repo;
         CURRENT_REV = cfg.selfUpdate.rev;
         PIN_FILE = cfg.selfUpdate.pinFile;
         AGENT_PIN_FILE = cfg.selfUpdate.agentPinFile;
+        # What agent-box-source reads. The rev is the ancestry baseline: the
+        # tree is realigned to the rev the box RUNS before the fast-forward,
+        # so the guard measures from what is actually running and not from
+        # wherever the tree happened to be left.
+        AGENT_BOX_SRC_DIR = cfg.selfUpdate.srcDir;
+        AGENT_BOX_SRC_URL = "https://github.com/${cfg.selfUpdate.repo}.git";
+        AGENT_BOX_SRC_REV = cfg.selfUpdate.rev;
+        # git reads a config file relative to HOME and warns (or, with some
+        # safe.directory setups, refuses) without one. The unit inherits no
+        # HOME of its own.
+        HOME = "/root";
         # nixos-rebuild resolves <nixpkgs> via NIX_PATH, which systemd units
         # don't inherit; point it at root's channel (the NixOS AMI default).
         NIX_PATH = "nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:nixos-config=/etc/nixos/configuration.nix";
+      } // lib.optionalAttrs (cfg.selfUpdate.branch != null) {
+        AGENT_BOX_SRC_BRANCH = cfg.selfUpdate.branch;
       };
       serviceConfig.Type = "oneshot";
       script = ''

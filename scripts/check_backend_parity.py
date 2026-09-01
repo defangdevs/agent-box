@@ -99,6 +99,30 @@ INTERNAL = {
 # renderer starts) the check would print "ok (by design) ... native only"
 # and pass, which is the opposite of what the entry was written to say.
 # With the side recorded, a flip is an undeclared divergence like any other.
+# Cited by the four AGENT_BOX_SRC_* entries below. Both backends run the SAME
+# tree manager (modules/src/source-tree.sh, shipped as agent-box-source by
+# nix/runtime.nix and embedded by the module) with the same four variables —
+# what differs is the LAYER that binds them, and only one of the two layers is
+# a file a fixture can show. The module's updater is a unit script, so its
+# values are Environment= lines in agent-box-update.service. Native's updater
+# is a program: `agentbox update` builds the same environment in memory and
+# execs the payload (bin/agentbox's source_tree), because the values depend on
+# what the profile manifest says the box is currently running — which is not
+# known at `agentbox apply` time, when units are rendered. Writing them into
+# the unit natively would freeze the running rev at render time, which is the
+# one value that must be read fresh.
+SRC_TREE_BINDING = (
+    "issue #242: the update is `git pull` on both backends, driven by the "
+    "same agent-box-source payload with the same AGENT_BOX_SRC_* names. The "
+    "module binds them in agent-box-update.service because its updater IS a "
+    "unit script; native binds them in-process (bin/agentbox's source_tree) "
+    "because AGENT_BOX_SRC_REV is the profile's currently-installed rev, read "
+    "at update time and unknowable at `agentbox apply` time. A unit line "
+    "natively would freeze that rev at render. AGENT_BOX_SRC_BRANCH is the "
+    "fourth of these and has no entry: it is only rendered when a deployment "
+    "pins selfUpdate.branch, which the golden host does not, so an entry for "
+    "it would be a stale line by the next run of this check")
+
 BY_DESIGN = {
     "AGENT_BOX_USERS": (
         "module",
@@ -172,6 +196,9 @@ BY_DESIGN = {
         "Python only and never builds this Nix "
         "payload, while the golden snapshot "
         "captures the real store-built one"),
+    "AGENT_BOX_SRC_DIR": ("module", SRC_TREE_BINDING),
+    "AGENT_BOX_SRC_URL": ("module", SRC_TREE_BINDING),
+    "AGENT_BOX_SRC_REV": ("module", SRC_TREE_BINDING),
 }
 
 # One reason, cited by the four entries below, so it has one home rather
@@ -179,18 +206,17 @@ BY_DESIGN = {
 # subtracts everything already declared here, on the reasoning that a
 # one-sided name is one-sided in whatever unit carries it.
 CHECKOUT_GAP = (
-    "#242 decision 5(a): the shipped source checkout is NixOS-only for now, "
-    "and this is the reviewed divergence rather than the discovered one. "
-    "The round trip it serves ends in a pin file and `nixos-rebuild switch` "
-    "(modules/src/update.sh); a native box has neither — `agentbox update` "
-    "takes the profile head, with no rev to fast-forward onto (bin/agentbox, "
-    "issue #358) — so wiring these names there would ship a tree with no way "
-    "to become the running system. Note that #451 PR 2 landing (#476, #481) "
-    "does NOT clear this on its own, which is what the first draft of this "
-    "entry assumed: agent-box@'s contract binds fixed PROGRAM names, and "
-    "these four are a path, a URL, a rev and a flag — per-deployment values "
-    "the contract deliberately leaves hand-written. What clears it is #358 "
-    "giving `agentbox update` a rev to update TO; delete these entries then")
+    "#242: the MAINTAINER's working checkout (~/agent-box) is NixOS-only for "
+    "now, and this is the reviewed divergence rather than the discovered one. "
+    "Not for the reason an earlier draft of this entry gave — that a native "
+    "box has no way to make a tree the running system — which stopped being "
+    "true when the update became `git pull` on both backends (see "
+    "SRC_TREE_BINDING above). What is left is plumbing: these four are "
+    "PER-USER values, so the native side needs them in Spec, in config.yaml "
+    "and in Renderer.user_env, and the one-spec-both-backends check (#451 PR "
+    "1) requires the module to export them into the spec it generates "
+    "tests/native/config.json from. That is the work; nothing about the "
+    "native model refuses it. Delete these entries when it lands")
 
 # Divergences that are BUGS, each owned by an issue. This table must only ever
 # shrink: fixing a gap means deleting its line, and the staleness check below

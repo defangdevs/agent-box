@@ -149,8 +149,20 @@ REBOOT_TIME_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 # The flake output the runtime profile is installed from, and the element
 # name `nix profile` records it under.
 RUNTIME_ATTR = "runtime"
-GITHUB_API = "https://api.github.com"
 REV_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# The box's own source tree (issue #242). Root-owned, outside every agent's
+# home, and the thing `agentbox update` MOVES: an update is `git pull` in
+# this tree followed by installing the flake it holds, not an API query for a
+# rev and a fetch of a remote closure. Same path and same manager
+# (agent-box-source, modules/src/source-tree.sh) as the NixOS backend, so
+# "what does an update do" has one answer on both.
+SRC_DIR = "/var/lib/agent-box/src"
+SOURCE_CLI = "agent-box-source"
+# owner/repo out of an https or ssh GitHub remote, so a git+file: profile can
+# still say which repo it came from (the settings page links the commit).
+GITHUB_REMOTE_RE = re.compile(
+    r"^(?:https://github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?$")
 
 
 class ConfigError(Exception):
@@ -232,7 +244,20 @@ def parse_flake_url(url):
     is the bare `github:owner/repo` (or a branch name, which is a ref and
     not a rev). Anything that is not a github: flake yields (None, None) —
     the caller then asks for --repo rather than guessing.
+
+    Since issue #242 a box that has updated at least once is installed from
+    its own source tree instead, `git+file:///var/lib/agent-box/src?rev=...`.
+    That URL names a rev and no repo, so it answers half the question here
+    and `source_repo` answers the other half from the tree's own remote.
     """
+    if url and url.startswith("git+file:"):
+        rev = None
+        query = url.split("?", 1)[1] if "?" in url else ""
+        for pair in query.split("&"):
+            key, _, value = pair.partition("=")
+            if key == "rev" and REV_RE.match(value):
+                rev = value
+        return None, rev
     if not url or not url.startswith("github:"):
         return None, None
     parts = url[len("github:"):].split("/")
@@ -241,6 +266,26 @@ def parse_flake_url(url):
     repo = f"{parts[0]}/{parts[1]}"
     rev = parts[2] if len(parts) > 2 and REV_RE.match(parts[2]) else None
     return repo, rev
+
+
+def source_repo(src=SRC_DIR):
+    """"owner/repo" the source tree's `origin` points at, or None.
+
+    The only place a git+file: profile can learn which repo it is a checkout
+    OF. Every failure — no tree, no git, no remote, a remote that is not
+    GitHub — is a None and not an error: this feeds a display string and an
+    optional default, never a decision.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", src, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    match = GITHUB_REMOTE_RE.match(out.stdout.strip())
+    return match.group(1) if match else None
 
 
 # Where nix/runtime.nix installs the pinned local-webhook, and the pin it was
@@ -295,6 +340,10 @@ def profile_origin(profile):
     if not repo:
         repo, _ = parse_flake_url(
             element.get("originalUrl") or element.get("originalUri"))
+    if not repo:
+        # A box installed from its own source tree (issue #242): the flake
+        # URL is a local path and carries no owner/repo, so ask the tree.
+        repo = source_repo()
     return repo, rev
 
 
@@ -2086,9 +2135,11 @@ class Renderer:
         ever bound it.
 
         @UPDATE_SECTION@ never expands to the NixOS self-update paragraph:
-        the mechanism differs (a Nix profile, not a system closure), so the
-        native update service takes a different command and makes a
-        different promise about what restarts (issue #358).
+        both backends now update by `git pull` on the same root-owned source
+        tree (issue #242), but what happens after the pull differs — a Nix
+        profile swap here, a system closure there — so the native service
+        takes a different command and makes a different promise about what
+        restarts (issue #358).
         """
         webhook_section = ""
         if self.spec.webhook_enable:
@@ -2100,21 +2151,34 @@ class Renderer:
             f"`sudo -n {UPDATE_TRIGGER}`\n"
             "(the full path is required for the passwordless sudo rule to "
             "match).\n"
-            "This box is not NixOS: the update fast-forwards the Nix profile "
-            "your\n"
-            "software comes from to the newest commit of the upstream repo, "
-            "renders\n"
-            "the host configuration that release describes, and restarts the "
-            "services\n"
-            "onto it - your own tmux session included, so save context "
-            "first.\n\n"
-            "It refuses a target that is not strictly ahead of the rev you "
-            "are\n"
-            "running, and if the new release fails to apply it rolls the "
-            "profile\n"
-            "back and re-applies the old one. Watch it with `journalctl -fu "
-            f"{UPDATE_UNIT}`;\n"
-            "the box's own rev is on the settings page.\n\n"
+            "That is a `git pull`. Root keeps this box's own checkout of "
+            "the repo\n"
+            f"at {SRC_DIR} and installs the Nix profile your software comes "
+            "from\n"
+            "straight out of it, so an update is a fast-forward of that "
+            "tree - which\n"
+            "is also why it refuses anything that is not a descendant of the "
+            "rev you\n"
+            "are running. The first update clones it (so a box that has "
+            "never\n"
+            "updated does not have it yet); every later one moves it. The "
+            "tree is\n"
+            "root-owned and you cannot write it: that is deliberate, since "
+            "whatever\n"
+            "writes it decides what root installs. Read it freely - "
+            f"`git -C {SRC_DIR} log -1`\n"
+            "is exactly what the box runs.\n\n"
+            "This box is not NixOS, so what follows the pull is a profile "
+            "swap and\n"
+            "not a system rebuild: the release renders the host "
+            "configuration it\n"
+            "describes and restarts the services onto it - your own tmux "
+            "session\n"
+            "included, so save context first. If the new release fails to "
+            "apply, the\n"
+            "profile rolls back and the old one is re-applied. Watch it with "
+            "`journalctl -fu\n"
+            f"{UPDATE_UNIT}`; the box's own rev is on the settings page.\n\n"
         )
         # Which HOST this guide is describing. The module binds the NixOS
         # section here; this box is a distro host with agent-box in a Nix
@@ -2892,25 +2956,6 @@ class UpdateError(Exception):
     """An update that refused to proceed, or failed and was rolled back."""
 
 
-def github_json(url, timeout=30):
-    """One GitHub REST call. Unauthenticated — 60/hour is plenty for this.
-
-    Failures become UpdateError rather than a traceback: unauthenticated
-    GitHub is 60 requests an hour PER IP, so on a shared address a rate
-    limit is reachable, and "update declined, GitHub said 403" is what the
-    journal should carry.
-    """
-    req = urllib.request.Request(url, headers={
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "agent-box-update",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        raise UpdateError(f"GitHub request failed ({url}): {e}")
-
-
 def wall(message):
     """Tell every logged-in terminal, and the journal.
 
@@ -3027,25 +3072,63 @@ def apply_args(config, profile):
         first_boot=False, settle_delay=0)
 
 
+def source_tree(profile, verb, *rest, src=SRC_DIR, url=None, rev=None,
+                branch=None, ref=None, force=False):
+    """Run agent-box-source and return its stdout, stripped.
+
+    The tree manager is a payload, not renderer code: the SAME
+    modules/src/source-tree.sh the NixOS updater runs (nix/runtime.nix ships
+    it into the profile). Everything it needs arrives as AGENT_BOX_SRC_*, so
+    the two backends cannot drift on what "fast-forward the box" means —
+    only on what they do with the rev it returns.
+    """
+    env = dict(os.environ, AGENT_BOX_SRC_DIR=src)
+    if url:
+        env["AGENT_BOX_SRC_URL"] = url
+    if rev:
+        env["AGENT_BOX_SRC_REV"] = rev
+    if branch:
+        env["AGENT_BOX_SRC_BRANCH"] = branch
+    if ref:
+        env["AGENT_BOX_SRC_REF"] = ref
+    if force:
+        env["AGENT_BOX_SRC_FORCE"] = "1"
+    cmd = [str(profile / "bin" / SOURCE_CLI), verb, *rest]
+    out = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    sys.stderr.write(out.stderr)
+    if out.returncode != 0:
+        raise UpdateError(
+            f"{SOURCE_CLI} {verb} failed — see the lines above")
+    return out.stdout.strip()
+
+
 def cmd_update(args):
-    """Fast-forward the runtime profile to a newer rev of this repo.
+    """Fast-forward the box's source tree and install the flake it holds.
 
-    NixOS updates by rewriting a pin file and running nixos-rebuild; none
-    of that exists here. What does exist is the profile the software was
-    installed into, which records its own origin and keeps a generation
-    history — so "what rev am I on", "move to a newer one" and "undo" need
-    no pin-file format of their own (issue #154's "native owns:
-    profile-based update/rollback", spelled out in #358).
+    Updating is `git pull` (issue #242): the box keeps a checkout of this
+    repo at SRC_DIR and installs the runtime flake straight out of it, so
+    the sources the box runs are on the box and the update mechanism is the
+    one an agent already knows. NixOS reaches the same place by rebuilding
+    against that tree; here the profile is the switch, which is what keeps
+    "what rev am I on", "move to a newer one" and "undo" free of any
+    pin-file format of their own (issue #154's "native owns: profile-based
+    update/rollback", spelled out in #358).
 
-    The one part of the NixOS payload worth porting verbatim is its
-    refusal: a target that is not strictly ahead of the running rev means
-    upstream history was rewritten or an older, possibly vulnerable rev is
-    being replayed, and both are refused.
+    The refusal is now git's, not a server's: `git merge --ff-only` inside
+    agent-box-source rejects a target that is not a descendant of the
+    running rev, which is what upstream history rewrites and replays of
+    older, possibly vulnerable revs both look like. --force is still the one
+    documented way past it.
+
+    The tree is ROOT-owned and outside every agent's home, because whoever
+    can write it decides what root installs (issue #127 — users are the
+    trust boundary). An agent's own working copy is a separate checkout.
     """
     profile = resolve_profile(args.profile)
     if args.post_switch:
         return post_switch(args, profile)
 
+    src = args.src
     name, element = manifest_element(profile_manifest(profile))
     if not element:
         raise ConfigError(
@@ -3053,8 +3136,7 @@ def cmd_update(args):
             "software did not come from `nix profile install`, so there is "
             "no profile here to fast-forward")
     repo, current = parse_flake_url(element.get("url") or element.get("uri"))
-    if args.repo:
-        repo = args.repo
+    repo = args.repo or repo or source_repo(src)
     if not repo:
         raise ConfigError(
             "cannot tell which repo this profile came from "
@@ -3065,26 +3147,31 @@ def cmd_update(args):
             f"the profile's {repo} entry is not locked to a commit, so "
             "there is nothing to compare a target against")
 
-    target = github_json(
-        f"{GITHUB_API}/repos/{repo}/commits/{args.rev or 'HEAD'}")["sha"]
-    if target == current:
-        print(f"already current: {repo}@{current[:12]}")
-        return 0
-    if args.force:
-        print(f"skipping the fast-forward check for {target[:12]} (--force)")
-    else:
-        status = github_json(
-            f"{GITHUB_API}/repos/{repo}/compare/{current}...{target}"
-        )["status"]
-        if status != "ahead":
-            raise UpdateError(
-                f"refusing update: {target[:12]} is '{status}' of running "
-                f"rev {current[:12]} (need fast-forward)")
+    url = f"https://github.com/{repo}.git"
     if args.check:
+        # Fetch and report. `check` never moves the tree, so the answer is
+        # the same one a later `update` would act on without having already
+        # half-acted on it.
+        target = source_tree(profile, "check", src=src, url=url,
+                             ref=args.rev)
+        if target == current:
+            print(f"already current: {repo}@{current[:12]}")
+            return 0
         print(f"update available: {current[:12]} -> {target[:12]}")
         return 0
 
-    flake = f"github:{repo}/{target}#{RUNTIME_ATTR}"
+    target = source_tree(profile, "pull", src=src, url=url, rev=current,
+                         branch=args.branch, ref=args.rev, force=args.force)
+    if target == current:
+        print(f"already current: {repo}@{current[:12]}")
+        return 0
+
+    # ?rev= is not decoration: the profile manifest records the URL it was
+    # installed from, and that rev is how a later run (and the settings
+    # page) reads back which commit this box is on. A bare git+file: URL
+    # would lock to whatever the tree's HEAD happened to be and record no
+    # rev at all.
+    flake = f"git+file://{src}?rev={target}#{RUNTIME_ATTR}"
     # Two notices, not one, and the promise of a restart is in the second:
     # realizing the closure is the long, failure-prone half, and it happens
     # BEFORE the profile is touched — so a box that cannot fetch or build
@@ -3427,6 +3514,14 @@ def main(argv=None):
         "--rev", metavar="REF",
         help="target commit, tag or branch (default: the repo's "
              "default-branch HEAD)")
+    up.add_argument(
+        "--branch", metavar="NAME",
+        help="branch the source tree tracks (default: the remote's own "
+             "default branch)")
+    up.add_argument(
+        "--src", default=SRC_DIR, metavar="DIR",
+        help=f"the box's source tree, cloned on first use (default: "
+             f"{SRC_DIR})")
     up.add_argument("--check", action="store_true",
                     help="report whether an update is available and stop")
     up.add_argument(

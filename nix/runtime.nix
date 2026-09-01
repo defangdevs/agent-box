@@ -228,6 +228,11 @@ let
     (payload "agent-box-mark-stopped" "mark-stopped.sh")
     (payload "agent-box-spot-monitor" "spot-monitor.sh")
     (payload "agent-box-update" "update.sh")
+    # The box's own source tree manager (issue #242). Not a unit payload in
+    # the usual sense — `agentbox update` execs it rather than systemd — but
+    # it ships the same way, from the same file the NixOS updater embeds, so
+    # "fast-forward the box" is one implementation and not two.
+    (payload "agent-box-source" "source-tree.sh")
     (payload "agent-box-codex-remote-control" "codex-remote-control.sh")
     (payload "agent-box-claude-session-start-hook" "claude-session-start-hook.sh")
     envExecWrapper

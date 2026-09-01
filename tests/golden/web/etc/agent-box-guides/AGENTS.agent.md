@@ -429,6 +429,16 @@ path is required for the passwordless sudo rule to match, and so is the
 --no-block: sudoers compares the whole command line, so dropping a flag
 makes the rule miss and sudo ask for a password instead.
 
+That is a `git pull`. Root keeps this box's own checkout of the repo at
+`/var/lib/agent-box/src` and rebuilds FROM it, so an update is a
+fast-forward of that tree - which is also why it refuses anything that
+is not a descendant of the rev the box is running. The first update
+clones it (so a box that has never updated does not have it yet); every
+later one moves it. The tree is root-owned and you cannot write it:
+that is deliberate, since whatever writes it decides what root builds.
+Read it freely - `git -C /var/lib/agent-box/src log -1` is exactly
+what the box runs.
+
 ## This box ships its own sources
 
 A checkout of the repo this box is BUILT from lives at
@@ -450,10 +460,12 @@ from the checkout and work there. Never commit in the shared tree.
 
 Changing this box means the same round trip as changing any other
 repo: edit, `nix run .#assemble`, run the checks, push to the `fork`
-remote if you have one, and open a PR. What the box RUNS still comes
-from the repo the deployment pinned, fetched by root as a hash-pinned
-file - so a commit only reaches this machine after the update above,
-and only when the deployment points at the repo you pushed to.
+remote if you have one, and open a PR. Editing THIS tree changes
+nothing about what the box runs - the box rebuilds from root's own
+checkout (see Updating above), which only ever fast-forwards along the
+repo the deployment points at. So a commit reaches this machine once it
+is merged there and the update above runs; a commit that only exists
+here reaches nothing.
 
 ## This platform has its own upstream repo
 
