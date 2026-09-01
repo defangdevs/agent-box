@@ -13964,10 +13964,18 @@ def render_sessions(subs=None):
             # was edited or deleted — which is the honest answer, since the
             # arguments it is running with were resolved at create time.
             prof = entries[name].get("profile")
+            prof_tag = ""
             if prof:
+                # Its own balanced fragment, not a `</span><span…` splice
+                # appended to `agent`: that spliced form was correct only
+                # while the caller below wrapped `agent` in exactly one
+                # <span>, so moving `agent` into an attribute or a different
+                # element would have emitted broken markup with nothing to
+                # say so.
                 pf = html.escape(str(prof))
-                agent += (f'</span><span class="meta prof-tag" '
-                          f'title="Agent profile it was started with">{pf}')
+                prof_tag = (f'<span class="meta prof-tag" '
+                            f'title="Agent profile it was started with">'
+                            f'{pf}</span>')
             cwd = html.escape(display_cwd(entries[name].get("workingDirectory")))
             # stopped = listed but deliberately down (clean agent exit or
             # agent-box-session stop); the same route revives it.
@@ -14030,6 +14038,7 @@ def render_sessions(subs=None):
                 f'<span class="nm">'
                 f'<a class="sess" href="{term}{safe}/"><code>{safe}</code></a>'
                 f'<span class="meta">{agent}</span>'
+                f'{prof_tag}'
                 f'<span class="meta" title="Working directory"><code>{cwd}</code></span>'
                 f'{subject}'
                 f'<span class="state" data-state="{state}">{state}</span>'

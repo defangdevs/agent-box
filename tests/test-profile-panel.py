@@ -219,6 +219,10 @@ class ProfilePanel(ProfileFixture):
         html = module.render_sessions()
         self.assertIn("prof-tag", html)
         self.assertIn(">triage<", html)
+        # The tag is its own balanced fragment. It was once a
+        # `</span><span…` splice appended to the harness name, correct only
+        # while the caller wrapped that name in exactly one <span>.
+        self.assertEqual(html.count("<span"), html.count("</span>"))
 
     def test_a_profile_name_is_escaped_into_the_page(self):
         """The name reaches an href-less attribute and a confirm() string,
