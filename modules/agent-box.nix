@@ -270,6 +270,48 @@ let
       --no-block: sudoers compares the whole command line, so dropping a flag
       makes the rule miss and sudo ask for a password instead.
 
+      That is a `git pull`. Root keeps this box's own checkout of the repo at
+      `${cfg.selfUpdate.srcDir}` and rebuilds FROM it, so an update is a
+      fast-forward of that tree - which is also why it refuses anything that
+      is not a descendant of the rev the box is running. The first update
+      clones it (so a box that has never updated does not have it yet); every
+      later one moves it. The tree is root-owned and you cannot write it:
+      that is deliberate, since whatever writes it decides what root builds.
+      Read it freely - `git -C ${cfg.selfUpdate.srcDir} log -1` names the rev
+      the box runs. The one exception is an update in flight: the tree moves
+      FIRST and the rebuild follows it, so between the two - and after a
+      rebuild that failed and could not put the tree back, which the wall
+      notice says - it reads ahead of the running system.
+
+    '' + lib.optionalString checkoutEnabled ''
+      ## This box ships its own sources
+
+      A checkout of the repo this box is BUILT from lives at
+      `${checkoutDir}`, owned by the user `${checkoutMaintainer}`. Read it
+      before you answer a question about how this box works: what the box
+      actually does is in that tree, and a general memory of agent-box is
+      not the same thing.
+
+      It is parked on the exact rev the box runs (detached HEAD - `git -C
+      ${checkoutDir} log -1` names it), so what you read is what is
+      installed. `agent-box-checkout` re-creates it if it goes missing and
+      re-parks it after a box update; it refuses to touch a tree that is on
+      a branch or has uncommitted changes, so your work is never at risk.
+
+      The checkout is SHARED by every session of that user, exactly like a
+      repo you cloned yourself, so it is what ~/worktrees is for: run
+      `git worktree add ~/worktrees/NAME --detach ${"$"}{AGENT_BOX_CHECKOUT_REV}`
+      from the checkout and work there. Never commit in the shared tree.
+
+      Changing this box means the same round trip as changing any other
+      repo: edit, `nix run .#assemble`, run the checks, push to the `fork`
+      remote if you have one, and open a PR. Editing THIS tree changes
+      nothing about what the box runs - the box rebuilds from root's own
+      checkout (see Updating above), which only ever fast-forwards along the
+      repo the deployment points at. So a commit reaches this machine once it
+      is merged there and the update above runs; a commit that only exists
+      here reaches nothing.
+
     '')
       # Which HOST this guide is describing. The two backends install the
       # same guide and are not the same box underneath it: this one is
@@ -732,6 +774,43 @@ let
   # and reads each file through its world-read bit (default 0644). Symlinked
   # into $HOME as ~/downloads so the agent never touches /var/lib directly.
   downloadsDirOf = name: "/var/lib/agent-box-downloads/${name}";
+
+  # The box's own sources, on the box (issue #242). A deployed box fetches
+  # ONE file — the generated modules/agent-box.nix, by rev + sha256 (issue
+  # #51) — so until now it had never seen the tree it is built from, and an
+  # agent asked about its own box answered from a model of agent-box rather
+  # than from this one. PR #293 settled that the source ships with each
+  # operator; these three bindings are where the module says WHOSE it is and
+  # WHERE it lands, and modules/src/checkout-cli.sh is what puts it there.
+  #
+  # ONE maintainer owns it, not every agent user (issue #242 decision 2).
+  # A session is not a security boundary and neither is a home directory
+  # here: N checkouts would be N copies of the same tree, each drifting from
+  # the running rev on its own schedule, and the answer surface would stop
+  # having a single answer. Which user, in the same order the settings
+  # page's rootUser picks: the web user when it is one of ours, else the
+  # first user by name. checkout.maintainer overrides it.
+  checkoutMaintainer =
+    let names = lib.attrNames cfg.users; in
+    if !(cfg.selfUpdate.enable && cfg.selfUpdate.checkout.enable) then null
+    else if cfg.selfUpdate.checkout.maintainer != null then
+      cfg.selfUpdate.checkout.maintainer
+    else if cfg.users ? ${cfg.web.user} then cfg.web.user
+    else if names != [ ] then lib.head names
+    else null;
+  checkoutEnabled = checkoutMaintainer != null;
+  # Always under the maintainer's home, and the assertion below enforces it.
+  # The agent unit runs ProtectSystem=strict with ReadWritePaths=/home/%i,
+  # so a tree anywhere else is denied with EROFS — and the obvious repair,
+  # naming it in ReadWritePaths, fails the whole namespace with 226/NAMESPACE
+  # whenever the path does not exist yet (the trap issue #316 already
+  # documents two hundred lines below). The clone's atomic publish needs the
+  # PARENT writable too, which an added ReadWritePaths entry on the checkout
+  # itself would not give. A deployment that needs more room gives the home
+  # more room; on AWS that is the root volume the README already documents.
+  checkoutDir =
+    if !checkoutEnabled then null
+    else "/home/${checkoutMaintainer}/${cfg.selfUpdate.checkout.path}";
 
   # Per-user webhook receiver (local-channels local-webhook plugin, issue #101).
   # One receiver-only daemon per web user owns a UNIX-socket HTTP ingress
@@ -2245,6 +2324,9 @@ done
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli ]
+    # Same "presence tells an agent the feature is live" reasoning as the
+    # two above: a box with no shipped checkout has no agent-box-checkout.
+    ++ lib.optional checkoutEnabled checkoutCli
     ++ agentBaseTools
     ++ cfg.extraPackages
   );
@@ -4685,6 +4767,202 @@ else
 fi
   '';
 
+  # Bootstraps and re-aligns the shipped checkout (issue #242). On the
+  # agent's PATH as well as the supervisor's, because "my checkout is gone"
+  # and "the box updated past my tree" both want the same idempotent run,
+  # and an agent that can name the repair does not have to reconstruct it.
+  checkoutCli = pkgs.writeShellScriptBin "agent-box-checkout" ''
+# agent-box-checkout — put the box's OWN sources on the box (issue #242).
+#
+# A deployed box fetches exactly one file, the generated
+# modules/agent-box.nix, by rev + sha256 (the single-file contract, issue
+# #51). It never saw the sources it is built from, so an agent asked "why
+# does my box do X" had nothing to read and answered from a model of
+# agent-box instead of from this box's agent-box. PR #293 settled that the
+# box ships the source with each operator; this is the step that puts it
+# there.
+#
+# What it does, in order, each step idempotent and independently skippable:
+#
+#   1. clone $AGENT_BOX_CHECKOUT_URL into $AGENT_BOX_CHECKOUT_DIR,
+#   2. park it on $AGENT_BOX_CHECKOUT_REV — the rev this box is RUNNING,
+#      not the remote's head, because a tree that describes a different box
+#      is worse than no tree (a wrong answer given confidently),
+#   3. add a `fork` remote, when a token allows, so an agent can push work
+#      and open a PR without write access to upstream.
+#
+# It is NOT a sync. Step 2 fetches only to reach a rev the box already runs,
+# and only from the state this script itself leaves behind — detached HEAD,
+# clean tree. Anything else (a branch checked out, a modified file, a
+# rebase in progress) is somebody's work, and the tree is left exactly as
+# found with a line in the journal saying so. Nothing here ever decides what
+# the box RUNS: that is still the root updater fetching a hash-pinned file
+# from the deploy-time selfUpdate.repo, and no agent-writable path reaches
+# it (issue #127 — a local tree as the build source would make the agent
+# root-equivalent).
+#
+# The supervisor runs this in the background at every start, through the
+# env-exec wrapper so the fork step sees the user's GH_TOKEN. Re-running it
+# by hand is the supported repair for "my checkout is gone".
+set -u
+
+prog=agent-box-checkout
+say() { printf '%s: %s\n' "$prog" "$*" >&2; }
+
+dir=''${AGENT_BOX_CHECKOUT_DIR:-}
+if [ -z "$dir" ]; then
+  # Not the maintainer, checkout disabled, or a backend that does not
+  # render this yet (the native one — issue #242 decision 5(a), declared in
+  # scripts/check_backend_parity.py). Silent-ish and successful: the
+  # supervisor calls this unconditionally.
+  say "no checkout is configured for this user — nothing to do"
+  exit 0
+fi
+
+case "$dir" in
+  (/*) ;;
+  (*) say "AGENT_BOX_CHECKOUT_DIR must be absolute, got '$dir'"; exit 1 ;;
+esac
+
+url=''${AGENT_BOX_CHECKOUT_URL:-}
+rev=''${AGENT_BOX_CHECKOUT_REV:-}
+if [ -z "$url" ] || [ -z "$rev" ]; then
+  say "AGENT_BOX_CHECKOUT_URL/_REV are unset — refusing to guess where $dir comes from"
+  exit 1
+fi
+
+git() { command git -C "$dir" "$@"; }
+rc=0
+
+# This runs unattended, in the background, at boot. Two ways a network fetch
+# can stop being a background job and become a wedged one:
+#
+#   - a credential prompt. Cloning a repo the box's token cannot read makes
+#     git ask for a username, and there is nobody to answer — so it must
+#     fail instead of waiting. GIT_TERMINAL_PROMPT=0 is the documented lever
+#     and the askpass helpers are cleared because they are the other way a
+#     prompt can appear.
+#   - a transfer that stalls rather than fails. A half-open connection has no
+#     timeout of its own, so the low-speed guard supplies one: under 1 kB/s
+#     for a minute is a dead transfer, and the next supervisor start retries
+#     it for free.
+export GIT_TERMINAL_PROMPT=0
+unset GIT_ASKPASS SSH_ASKPASS
+export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=60
+
+# --- 1. the tree ------------------------------------------------------
+if [ ! -e "$dir/.git" ]; then
+  # Clone into a SIBLING and rename, so $dir either does not exist or is a
+  # finished tree — never something in between.
+  #
+  # git writes $dir/.git within the first moments of a clone and cleans it
+  # up only when the clone itself fails. A signal is not a failure: this
+  # runs in the background, in the agent unit's cgroup, which systemd kills
+  # on every stop, restart and reboot. Cloned straight into $dir, one
+  # unlucky reboot would leave a .git with no HEAD — and every later run
+  # would skip the clone (the test above), fail to read HEAD, and refuse to
+  # touch the tree. That is a checkout no boot can repair, on the exact code
+  # path a first boot takes.
+  #
+  # A fixed sibling name rather than mktemp: an interrupted run leaves
+  # exactly one of these, and the next one reclaims it instead of leaving a
+  # new partial clone behind on every reboot. Nothing but this script writes
+  # that path — $dir comes from the module, not from anything at runtime,
+  # and was required to be absolute above.
+  incoming="$dir.incoming"
+  rm -rf "$incoming"
+  say "cloning $url into $dir"
+  # Not `git()`: there is no repo to be -C inside of yet, and what there is
+  # is not at $dir.
+  if ! command git clone --quiet "$url" "$incoming"; then
+    say "clone failed (offline, or the repo is private to this box's token) — re-run me later"
+    rm -rf "$incoming"
+    exit 1
+  fi
+  # Detach HERE rather than falling through to step 2: a fresh clone is on
+  # the remote's default BRANCH, and step 2 refuses to move a tree that is
+  # on a branch (it cannot tell one somebody adopted from one git just
+  # made). Without this the very first run would leave the tree on master —
+  # describing whatever upstream had merged since this box was built, which
+  # is the confidently-wrong answer the whole feature exists to prevent.
+  if ! command git -C "$incoming" checkout --quiet --detach "$rev"; then
+    say "cloned, but $rev is not in $url — discarding the partial tree"
+    rm -rf "$incoming"
+    exit 1
+  fi
+  # The publish. A rename within one directory is atomic, which is what
+  # makes the paragraph above true.
+  if mv "$incoming" "$dir"; then
+    say "cloned and parked on $rev"
+  else
+    say "could not move $incoming into place — leaving it for the next run"
+    exit 1
+  fi
+fi
+
+# --- 2. park it on the rev this box runs ------------------------------
+head=$(git rev-parse HEAD 2>/dev/null) || head=""
+if [ -z "$head" ]; then
+  say "$dir has no HEAD to read — leaving it alone"
+  exit 1
+elif [ "$head" = "$rev" ]; then
+  say "$dir is at $rev, the rev this box runs"
+elif [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" != "HEAD" ]; then
+  # A branch is checked out, so somebody adopted this tree as a working
+  # copy. Realigning it would move their branch pointer.
+  say "$dir is on a branch, not the detached rev this script leaves — not touching it" \
+      "(box runs $rev)"
+elif [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  say "$dir has uncommitted changes — not touching it (box runs $rev)"
+else
+  # Clean and detached: the state the bootstrap leaves. Moving it to the
+  # rev the box ALREADY runs changes nothing about what the box runs; it
+  # only stops the tree from describing a different box than this one.
+  say "$dir is at $head but the box runs $rev — realigning"
+  if git fetch --quiet origin && git checkout --quiet --detach "$rev"; then
+    say "realigned to $rev"
+  else
+    say "could not realign (offline, or $rev is not on origin) — the tree still reads $head"
+    rc=1
+  fi
+fi
+
+# --- 3. the fork remote -----------------------------------------------
+# Only when the deployment asked for one. Creating a repository in the
+# operator's GitHub account is an outward-facing act, so it is an option
+# (selfUpdate.checkout.fork) and not a side effect of having a checkout.
+if [ -z "''${AGENT_BOX_CHECKOUT_FORK:-}" ]; then
+  exit "$rc"
+fi
+if git remote get-url fork >/dev/null 2>&1; then
+  exit "$rc"
+fi
+if ! command -v gh >/dev/null 2>&1; then
+  say "gh is not on PATH — no fork remote added"
+  exit "$rc"
+fi
+if ! gh auth status >/dev/null 2>&1; then
+  # The usual first-boot case: the box has a checkout before it has a
+  # token. Nothing is lost — the next supervisor start runs this again,
+  # and by then `agent-box-session env set GH_TOKEN ...` has been done.
+  say "gh is not authenticated (no GH_TOKEN yet?) — no fork remote added; re-run me once there is one"
+  exit "$rc"
+fi
+say "creating the fork remote"
+# --remote-name fork, deliberately: with the default name gh renames the
+# existing origin to `upstream`, and origin is what AGENT_BOX_CHECKOUT_URL
+# and the rev above are about. Fork work is `git push fork ...`; origin
+# stays the thing this box is built from.
+if (cd "$dir" && command gh repo fork --clone=false --remote --remote-name fork >/dev/null 2>&1); then
+  say "fork remote added: $(git remote get-url fork 2>/dev/null)"
+else
+  # Forking your own repo is an error, so is a token without repo scope,
+  # so is a rate limit. None of them are worth failing a boot over.
+  say "gh repo fork did not add a remote (own repo, missing scope, or rate limit) — checkout is still usable"
+fi
+exit "$rc"
+  '';
+
   # Dispatch target for standing watches (local-channels#1): the receiver
   # daemon runs this as LOCAL_WEBHOOK_SPAWN_CMD when a delivery matches a
   # deliver_to:"subagent" subscription. It turns the event batch on stdin into
@@ -5756,6 +6034,275 @@ fi
 # step above returned.
 exit 0
   '');
+
+  # The tree the box is BUILT FROM (issue #242). Backend-neutral like every
+  # other Phase-2 payload — bare git resolved from the unit's PATH,
+  # configuration taken from AGENT_BOX_SRC_* — so nix/runtime.nix ships the
+  # same binary and `agentbox update` drives it with the same three verbs
+  # this module's updater uses. That matters more here than for most
+  # payloads: "what does an update DO" is the one answer the two backends
+  # must not give differently.
+  sourceTree = pkgs.writeShellScriptBin "agent-box-source" ''
+# agent-box-source — the tree the box is BUILT FROM (issue #242).
+#
+# Until this existed, "update the box" meant asking GitHub's API for a rev
+# and fetching a COPY of one generated file by rev + sha256 (the single-file
+# contract, issue #51). The box never held the sources it runs, so the round
+# trip an agent needs to fix its own box — read, edit, rebuild — had no
+# local end. Issue #242 asks for the other shape: "update box should be
+# `git pull` with the box using the checked out files (no copies)".
+#
+# This is that tree. It is ROOT-owned and lives outside every agent's home,
+# because whoever can write the tree decides what root builds: a rebuild
+# from an agent-writable path is root-equivalence for that user (issue
+# #127's users-are-the-trust-boundary doctrine). The maintainer's own
+# ~/agent-box checkout (agent-box-checkout, same issue) is a different tree
+# for a different job — that one is the agent's working copy, and a fix
+# reaches this tree the way any other change does: through the repo.
+#
+# Three verbs, all idempotent, all env-configured:
+#
+#   check   fetch and print the rev the target ref is at. Touches nothing.
+#   pull    fast-forward the tree to that rev and print the new HEAD.
+#   reset   move the tree back to a named rev (what a failed rebuild does).
+#   rev     print the tree's HEAD.
+#
+# The fast-forward guard is `git merge --ff-only` itself, which is stricter
+# than the API compare it replaces and needs no second opinion from a
+# server: a target that is not a descendant of the running rev means
+# upstream history was rewritten or an older, possibly vulnerable rev is
+# being replayed, and both are refused by construction.
+set -u
+
+prog=agent-box-source
+say() { printf '%s: %s\n' "$prog" "$*" >&2; }
+die() { say "$@"; exit 1; }
+
+dir=''${AGENT_BOX_SRC_DIR:-}
+url=''${AGENT_BOX_SRC_URL:-}
+rev=''${AGENT_BOX_SRC_REV:-}
+branch=''${AGENT_BOX_SRC_BRANCH:-}
+# An explicit target ref (a tag, a branch, a commit) instead of the tracked
+# branch's head — `agentbox update --rev`. It is fetched by name and still
+# goes through the fast-forward guard, so "update to this tag" refuses a tag
+# that is behind the running rev exactly as following the branch would.
+ref=''${AGENT_BOX_SRC_REF:-}
+# The one documented way past that guard: a deliberate downgrade
+# (`agentbox update --force`). Non-empty means the target replaces HEAD even
+# when it is not a descendant.
+force=''${AGENT_BOX_SRC_FORCE:-}
+
+[ -n "$dir" ] || die "AGENT_BOX_SRC_DIR is unset — there is no tree to act on"
+case "$dir" in
+  (/*) ;;
+  (*) die "AGENT_BOX_SRC_DIR must be absolute, got '$dir'" ;;
+esac
+[ -n "$url" ] || die "AGENT_BOX_SRC_URL is unset — refusing to guess where $dir comes from"
+
+# Root-owned and world-readable on purpose: `nix` evaluates the module out
+# of this tree, and the settings page and an agent both want to be able to
+# read what the box is running. Nothing but root writes it.
+umask 022
+
+# This runs unattended from a root oneshot. A credential prompt has nobody
+# to answer it and a stalled transfer has no timeout of its own, so both are
+# turned into failures the next trigger can retry — the same guards
+# agent-box-checkout takes, for the same reason.
+export GIT_TERMINAL_PROMPT=0
+unset GIT_ASKPASS SSH_ASKPASS
+export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=60
+
+# Every git below runs AS ROOT in a tree fetched from the network, and
+# `checkout`/`merge` are exactly the commands git runs hooks for. The module
+# already confines the tree to /var/lib so nothing but root can put a hook
+# there; this is the second lock, and it costs one environment variable:
+# core.hooksPath at a path that holds no hooks means no hook is ever found.
+# GIT_CONFIG_* rather than `git -c`, so it covers `git clone` too — which
+# runs before the tree this is protecting even exists.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
+
+git() { command git -C "$dir" "$@"; }
+
+# --- the tree exists --------------------------------------------------
+clone_if_missing() {
+  [ -e "$dir/.git" ] && return 0
+  # Clone into a SIBLING and rename, so $dir is either absent or a finished
+  # tree and never something in between: git writes .git within the first
+  # moments of a clone and cleans it up only when the clone FAILS. A signal
+  # is not a failure, and this runs where a reboot can arrive — cloned
+  # straight into $dir, one unlucky reboot leaves a .git with no HEAD that
+  # every later run would find, skip the clone for, and refuse to touch.
+  # A fixed sibling name rather than mktemp: an interrupted run leaves
+  # exactly one of these and the next one reclaims it.
+  incoming="$dir.incoming"
+  rm -rf "$incoming"
+  say "cloning $url into $dir"
+  mkdir -p "$(dirname "$dir")" || die "cannot create $(dirname "$dir")"
+  # $dir exists but holds no .git — a tmpfiles rule that created the
+  # directory, or an interrupted run that left something behind. `mv` into an
+  # EXISTING directory moves the source INSIDE it, so the publish below would
+  # silently produce $dir/<basename>.incoming instead of $dir: a nested
+  # checkout, a $dir that still has no .git, and a clone attempted again on
+  # every later run. Reclaim it when it is empty, and refuse loudly when it
+  # is not, rather than nesting.
+  if [ -e "$dir" ]; then
+    rmdir "$dir" 2>/dev/null || true
+    [ -e "$dir" ] && die "$dir exists and is not a checkout — move it aside"
+  fi
+  command git clone --quiet "$url" "$incoming" \
+    || { rm -rf "$incoming"; die "clone of $url failed — offline, or the repo is not public"; }
+  mv "$incoming" "$dir" || { rm -rf "$incoming"; die "could not move $incoming into place"; }
+  say "cloned"
+}
+
+# The branch to track. Named explicitly by the host, or read from the
+# remote's own default — never guessed as "master", because a repo that
+# renamed its default branch would then be silently un-updatable.
+resolve_branch() {
+  [ -n "$branch" ] && return 0
+  branch=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || branch=""
+  branch=''${branch#origin/}
+  if [ -z "$branch" ]; then
+    git remote set-head origin --auto >/dev/null 2>&1 || true
+    branch=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || branch=""
+    branch=''${branch#origin/}
+  fi
+  [ -n "$branch" ] || die "cannot tell which branch origin defaults to — set AGENT_BOX_SRC_BRANCH"
+}
+
+fetch() {
+  # The configured URL wins over the one the tree was cloned from. A host
+  # that repoints selfUpdate.repo (a fork, a mirror, a rename) would
+  # otherwise keep fetching the old origin forever, and the box would look
+  # up to date against a repo nobody meant it to follow.
+  have=$(git remote get-url origin 2>/dev/null) || have=""
+  if [ "$have" != "$url" ]; then
+    say "origin is $have, but this box is configured for $url — repointing"
+    git remote set-url origin "$url" || die "could not repoint origin at $url"
+  fi
+  git fetch --quiet --prune origin || die "fetch from $url failed — offline?"
+}
+
+# What rev does the remote have for a ref, asked WITHOUT a tree — no clone,
+# no fetch, no .git touched. This is what makes `check` a question: "is there
+# an update" must not be the thing that creates the checkout, and on a box
+# that has never updated the tree does not exist yet, so the alternative was
+# cloning the whole repo to answer.
+#
+# ls-remote prints "<sha>\t<ref>" per matching ref. An annotated tag matches
+# twice — the tag object, and the commit it peels to as "<ref>^{}" — and the
+# peeled line is the one a caller means by "the rev of v1.2.3".
+remote_rev() {
+  out=$(command git ls-remote "$url" "$@" 2>/dev/null) \
+    || die "cannot reach $url — offline?"
+  [ -n "$out" ] || return 1
+  peeled=$(printf '%s\n' "$out" | grep '\^{}$' | head -n 1 | cut -f1)
+  if [ -n "$peeled" ]; then
+    printf '%s\n' "$peeled"
+  else
+    printf '%s\n' "$out" | head -n 1 | cut -f1
+  fi
+}
+
+# What are we aiming at? Either a named ref, fetched by name, or the head of
+# the tracked branch. Both end as a bare rev, so everything downstream is
+# ref-shaped in exactly one place.
+target_rev() {
+  if [ -n "$ref" ]; then
+    fetch
+    git fetch --quiet origin "$ref" || die "origin has no ref '$ref'"
+    git rev-parse --verify --quiet 'FETCH_HEAD^{commit}' \
+      || die "'$ref' does not name a commit"
+  else
+    fetch
+    resolve_branch
+    git rev-parse --verify --quiet "refs/remotes/origin/$branch^{commit}" \
+      || die "origin has no branch '$branch'"
+  fi
+}
+
+case "''${1:-}" in
+  (check)
+    # Deliberately NOT clone_if_missing/target_rev: see remote_rev above.
+    # With no branch configured the remote's own HEAD is the tracked branch,
+    # which is the same answer resolve_branch reaches through origin/HEAD.
+    if [ -n "$ref" ]; then
+      remote_rev "$ref" || die "origin has no ref '$ref'"
+    elif [ -n "$branch" ]; then
+      remote_rev "refs/heads/$branch" || die "origin has no branch '$branch'"
+    else
+      remote_rev HEAD || die "$url has no HEAD"
+    fi
+    ;;
+
+  (pull)
+    [ -n "$rev" ] || die "AGENT_BOX_SRC_REV is unset — refusing to move a tree with no baseline"
+    clone_if_missing
+    target=$(target_rev) || exit 1
+    resolve_branch
+    head=$(git rev-parse HEAD 2>/dev/null) || die "$dir has no HEAD to read"
+    # Realign to the rev the box RUNS before fast-forwarding. Normally these
+    # are already equal — nothing but this script writes the tree. When they
+    # are not (a fresh clone landed on the branch tip, an operator reset it,
+    # a rebuild rolled the system back but not the tree), the running rev is
+    # the truth and the tree is the copy: moving the tree changes what the
+    # box will BUILD, never what it currently runs, and starting the
+    # fast-forward anywhere else would let the guard below measure ancestry
+    # from a rev this box never ran.
+    if [ "$head" != "$rev" ] || [ "$(git rev-parse --abbrev-ref HEAD)" = "HEAD" ]; then
+      git cat-file -e "$rev^{commit}" 2>/dev/null \
+        || die "the running rev $rev is not in $url — this tree cannot describe this box"
+      [ "$head" = "$rev" ] || say "$dir is at $head but the box runs $rev — realigning before the fast-forward"
+      # -B, not a detached checkout: `git merge` advances a BRANCH, and a
+      # tree left detached (a fresh clone, an operator's inspection) has
+      # nothing for it to advance.
+      git checkout --quiet -B "$branch" "$rev" \
+        || die "could not put $dir on $branch at $rev"
+    fi
+    if [ "$target" = "$rev" ]; then
+      : # nothing to move to; fall through and print the rev we are on
+    elif [ -z "$force" ] && git merge-base --is-ancestor "$target" "$rev"; then
+      # `git merge --ff-only <ancestor>` reports "Already up to date" and
+      # exits 0, so without this an explicit downgrade target (`--rev` at an
+      # older tag) would silently do nothing and be reported as a successful
+      # update. The old GitHub compare refused this as status "behind"; so
+      # does this.
+      die "refusing update: $target is behind the running rev $rev"
+    fi
+    if [ -n "$force" ]; then
+      # The deliberate downgrade. Named, logged, and never the default.
+      say "moving to $target without the fast-forward check (force)"
+      git checkout --quiet -B "$branch" "$target" || die "could not move $dir to $target"
+    elif ! git merge --ff-only --quiet "$target" 2>/dev/null; then
+      # THE guard. --ff-only refuses anything that is not a descendant of
+      # the running rev: a force-push, a rewritten history, a replay of an
+      # older rev. It is also the whole of the merge — the tree carries no
+      # local commits to reconcile, and a tree that somehow does is a tree
+      # nothing here should be resolving conflicts in.
+      die "refusing update: $target is not a fast-forward of the running rev $rev"
+    fi
+    git rev-parse HEAD
+    ;;
+
+  (reset)
+    to=''${2:-}
+    [ -n "$to" ] || die "reset needs a rev"
+    [ -e "$dir/.git" ] || die "$dir is not a checkout — nothing to reset"
+    resolve_branch
+    git checkout --quiet -B "$branch" "$to" \
+      || die "could not move $dir back to $to"
+    say "$dir is back at $to"
+    ;;
+
+  (rev)
+    git rev-parse --verify --quiet HEAD || die "$dir has no HEAD to read"
+    ;;
+
+  (*)
+    die "usage: $prog check|pull|reset REV|rev"
+    ;;
+esac
+  '';
 
   # Binding contract (issue #451, #154 Phase 5): which env vars and Exec
   # directives the agent-box-webhook@ unit gets is data, not a hand-written
@@ -6953,6 +7500,20 @@ exit 0
     }
     mirror_codex_standalone
 
+    # The box's own sources, on the box (issue #242). Backgrounded on purpose:
+    # the first run clones a repository over the network and no session may wait
+    # on that — a box whose egress is broken must still start its agents. Run
+    # through the env-exec wrapper so the fork step sees the user's GH_TOKEN,
+    # which lives in the env store and never in this unit's environment.
+    #
+    # Every start, not just the first: the script is idempotent (a `git
+    # rev-parse` when there is nothing to do) and this is also what re-parks the
+    # tree after an update moved the box past it. A crash-restart loop therefore
+    # costs one local git command per respawn, not a clone.
+    if [ -n "''${AGENT_BOX_CHECKOUT_DIR:-}" ]; then
+      "''${AGENT_BOX_ENV_EXEC:?}" agent-box-checkout &
+    fi
+
     # Deliver-once + resume bookkeeping. A session's kickoff prompt
     # (initialPrompt) must fire on the FIRST spawn only; every later respawn
     # (crash, clean exit, reboot, Spot stop→restart — all of which keep the
@@ -8086,24 +8647,71 @@ in
         `/run/current-system/sw/bin/systemctl start --no-block
         agent-box-update.service` — one command, the same one the shipped
         guide and the settings page's Update button use — a root oneshot
-        that fast-forwards the box to the upstream repo's latest
-        default-branch commit by rewriting `pinFile` (and, when agentNixpkgs
-        is wired, advances `agentPinFile` to the latest nixos-unstable
-        channel release so agent CLIs stay fresh) and running
-        `nixos-rebuild switch`.
+        that fast-forwards the box's own source tree (`srcDir`) to the
+        upstream repo's latest default-branch commit with
+        `git merge --ff-only`, and runs `nixos-rebuild switch` against it
+        (and, when agentNixpkgs is wired, advances `agentPinFile` to the
+        latest nixos-unstable channel release so agent CLIs stay fresh).
+        "Update the box" is `git pull` and a rebuild from the checked-out
+        files (issue #242) — no API query, no fetched copy of the module.
         The privilege boundary is trigger-only: no arguments, environment or
         paths cross sudo; the update source and logic are fixed in the unit.
         NOTE: the rebuild restarts agent services, so running sessions die —
         agents should save their working context before triggering it.
         Release signature verification is future work (tracked upstream);
-        until then the updater trusts the pinned GitHub repo as published,
-        hash-pinning only what it fetched
+        until then the updater trusts the configured GitHub repo as
+        published, and refuses anything that is not a descendant of the rev
+        the box is running
       '';
 
       repo = lib.mkOption {
         type = lib.types.str;
         default = "defangdevs/agent-box";
         description = "GitHub owner/repo the update service pulls from.";
+      };
+
+      srcDir = lib.mkOption {
+        type = lib.types.str;
+        default = "/var/lib/agent-box/src";
+        description = ''
+          The box's own source tree — a git checkout of `repo` that root
+          keeps, and the thing an update MOVES. `sudo systemctl start
+          agent-box-update.service` fast-forwards this tree with
+          `git merge --ff-only` and rebuilds; there is no API query and no
+          fetched copy of the module (issue #242).
+
+          The host configuration must import the module out of this tree
+          when it exists — `imports = [ /var/lib/agent-box/src/modules/agent-box.nix ]`
+          behind the same `builtins.pathExists` dance `pinFile` already uses,
+          see aws/template.yaml for the reference wiring. A host that does
+          not is not broken: the updater still writes `pinFile`, so a
+          configuration.nix from before this existed keeps fetching the same
+          rev the tree was just moved to. It just pays for a download of what
+          is already on its disk.
+
+          ROOT-owned, and outside every agent's home on purpose: whoever can
+          write this tree decides what root builds, so an agent-writable
+          build source would make that user root-equivalent (issue #127 —
+          users are the trust boundary). The maintainer's own working copy is
+          a different tree with a different owner; see `checkout`.
+
+          Asserted, not just documented: the path must be a normalized one
+          under /var/lib. Owning the directory is not enough — a writable
+          ANCESTOR lets the whole thing be swapped for a tree whose git hooks
+          then run as root under the next update. A host that needs the tree
+          on another volume mounts that volume under /var/lib.
+        '';
+      };
+
+      branch = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "master";
+        description = ''
+          Branch of `repo` the source tree follows. Null reads the remote's
+          own default branch rather than assuming one, so a repo that renames
+          its default does not silently become un-updatable.
+        '';
       };
 
       rev = lib.mkOption {
@@ -8122,11 +8730,19 @@ in
         type = lib.types.str;
         default = "/etc/nixos/agent-box-pin.nix";
         description = ''
-          File the updater atomically rewrites with
-          `{ rev = "..."; sha256 = "..."; }`. The host configuration must
-          import the module at exactly this pin when the file exists (see
-          aws/template.yaml for the reference wiring); otherwise the update
-          rebuilds against a stale module and silently no-ops.
+          File the updater atomically rewrites after each fast-forward:
+          `{ rev = "..."; sha256 = "..."; }` — the rev the source tree was
+          moved to, and the flat sha256 of that tree's own
+          `modules/agent-box.nix`.
+
+          Since issue #242 this is the RECORD, not the mechanism: a host
+          wired the current way imports the module out of `srcDir` and never
+          reads the hash. It is still written because a configuration.nix
+          from before that change fetches the module BY this pin, and
+          advancing it is what keeps such a box updating to the same rev the
+          tree just moved to instead of freezing on the last pin it ever
+          saw. Either wiring lands on the same rev; only one of them pays
+          for a download of what is already on the disk.
         '';
       };
 
@@ -8167,6 +8783,107 @@ in
           `{ url = "..."; sha256 = "..."; }` — the latest nixos-unstable
           channel release, feeding agentNixpkgs on the next eval.
         '';
+      };
+
+      # Issue #242: "agent-box should ship with its own fork". The box
+      # fetches one generated file and never saw its own sources, so it
+      # could not answer for itself and an agent could not fix it. The
+      # checkout is the agent's WORKING COPY — the source ships, the agent
+      # edits it, pushes to a fork, opens a PR. It is not the tree the box
+      # BUILDS from: that is `srcDir`, root-owned, and the two are separate
+      # on purpose. A rebuild from an agent-writable path would make that
+      # user root-equivalent (issue #127 — users are the trust boundary), so
+      # a fix reaches the running box the way any other change does: through
+      # the repo, and the next `git pull`.
+      checkout = {
+        enable = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+          example = false;
+          description = ''
+            Ship this box's own sources ON the box: one git checkout of
+            `repo`, parked on the `rev` the box is running, owned by a
+            single maintainer user (see `maintainer`), created on the first
+            supervisor start after the box comes up.
+
+            On by default, because a source tree an operator has to ask for
+            is a source tree nobody reads — and the failure it prevents is
+            an agent answering confidently about a box it cannot see. The
+            cost is one clone of `repo` on the maintainer's home volume.
+
+            Bootstrap, not sync: `agent-box-checkout` moves the tree only
+            between the state it leaves behind (detached HEAD, clean) and
+            the rev the box already runs. A branch, a modified file or a
+            half-finished rebase is somebody's work and is left alone, and
+            nothing here changes what the box RUNS.
+
+            NixOS only for now (issue #242 decision 5(a)): the round trip
+            it exists to serve ends in `nixos-rebuild switch` and a pin
+            file, neither of which a native box has. Declared as a reviewed
+            divergence in scripts/check_backend_parity.py rather than left
+            to be discovered on a Lightsail box; native follows once #451
+            PR 2 makes the two renderers share one binding contract.
+          '';
+        };
+
+        maintainer = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          example = "agent";
+          description = ''
+            Which agent user owns the checkout. Null picks the same user the
+            settings page calls root — `web.user` when that is one of
+            `users`, otherwise the first by name.
+
+            One user, not all of them: N checkouts of one repository are N
+            trees drifting from the running rev on N schedules, and the
+            point of shipping the source is that there is ONE answer to
+            "what is this box". Sibling SESSIONS of the maintainer share the
+            tree, which is why work belongs in `git worktree add --detach`
+            (issue #126) — the same rule the shipped guide already gives.
+          '';
+        };
+
+        path = lib.mkOption {
+          type = lib.types.str;
+          default = "agent-box";
+          example = "src/agent-box";
+          description = ''
+            Where the checkout lands, relative to the maintainer's home —
+            the default is ~/agent-box, and a subdirectory ("src/agent-box")
+            works too.
+
+            Strictly inside that home, and asserted: no leading "/", no ".."
+            or "." component, and no empty one. The agent unit runs
+            ProtectSystem=strict with ReadWritePaths=/home/%i, so a tree
+            outside the home is denied with EROFS, and naming it in
+            ReadWritePaths instead fails the whole namespace with
+            226/NAMESPACE until something else creates it (issue #316). A
+            box that needs more room for it gives the home more room.
+          '';
+        };
+
+        fork = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+          example = false;
+          description = ''
+            Also add a `fork` remote to the checkout, forking `repo` into
+            the account the box's `GH_TOKEN` belongs to, so an agent can
+            push a branch and open a PR without write access upstream.
+
+            Attempted on the first supervisor start that finds a token and
+            no `fork` remote — so a box that gets its token later still
+            gets the remote, and one that never does keeps a usable
+            checkout. `origin` is never renamed: it stays the repo this box
+            is built from, which is what `rev` is a rev OF.
+
+            Set false on a box whose token must not create repositories.
+            Note that pushing to the fork does not make the box run it: the
+            updater fetches from `repo`, chosen at deploy time. A box that
+            should update from its own fork sets `repo` to that fork.
+          '';
+        };
       };
     };
 
@@ -8546,6 +9263,71 @@ in
 
   config = lib.mkIf cfg.enable (lib.mkMerge [{
     assertions = [{
+      # The whole security argument for building from a local tree is that
+      # nothing but root can write it: agent-box-source runs `git checkout`
+      # and `git merge` in that tree AS ROOT, and a tree an agent can
+      # replace is a tree whose .git/hooks run as root the next time the
+      # allowed `systemctl start agent-box-update.service` fires. Ownership
+      # of the directory is not enough — a writable ANCESTOR lets the whole
+      # directory be swapped — so the option is confined to /var/lib, which
+      # is root-managed by systemd convention and is where the default
+      # already lives. A host that needs the tree on another volume mounts
+      # it under /var/lib rather than pointing this at /home.
+      #
+      # This is the option's own guard. modules/src/source-tree.sh also
+      # runs git with core.hooksPath pointed at nothing, so a tree that
+      # somehow does carry hooks cannot run them either way.
+      assertion =
+        let
+          dir = cfg.selfUpdate.srcDir;
+        in
+        lib.hasPrefix "/var/lib/" dir
+        && lib.all (part: part != "" && part != "." && part != "..")
+          (lib.drop 1 (lib.splitString "/" dir));
+      message =
+        "services.agent-box.selfUpdate.srcDir must be an absolute, "
+        + "normalized path under /var/lib — root builds the box from that "
+        + "tree, so an agent-writable ancestor anywhere above it (a home, "
+        + "/tmp) would let an agent choose what root builds and run git "
+        + "hooks as root. Got \"" + cfg.selfUpdate.srcDir + "\".";
+    } {
+      # checkout.path is joined onto /home/<maintainer>, and the agent unit
+      # grants ReadWritePaths=/home/%i and nothing else. So every way of
+      # leaving that directory is refused HERE, at eval — not as EROFS
+      # inside a background job's journal, which is where the first version
+      # of this assertion left "../agent-box" to be discovered. An empty or
+      # "." component is refused for a different reason: it resolves to the
+      # home ITSELF, and a clone straight into $HOME is not something to
+      # find out about afterwards.
+      assertion =
+        let
+          path = cfg.selfUpdate.checkout.path;
+        in
+        !(lib.hasPrefix "/" path)
+        && lib.all (part: part != "" && part != "." && part != "..")
+          (lib.splitString "/" path);
+      message =
+        "services.agent-box.selfUpdate.checkout.path must stay inside the "
+        + "maintainer's home: no leading '/', no '..' or '.' component and "
+        + "no empty one. The agent unit's ProtectSystem=strict grants "
+        + "/home/<maintainer> and nothing else, so anything else is denied "
+        + "with EROFS at the first clone. Got \""
+        + cfg.selfUpdate.checkout.path + "\".";
+    } {
+      # A maintainer nobody defined is worse than an error: checkoutEnabled
+      # goes true, checkoutDir names /home/<nobody>/..., and then no
+      # agent-box@<user> unit matches it — so the variables are never
+      # supplied, nothing is ever cloned, and the box looks like a box whose
+      # checkout simply failed.
+      assertion = cfg.selfUpdate.checkout.maintainer == null
+        || cfg.users ? ${cfg.selfUpdate.checkout.maintainer};
+      message =
+        "services.agent-box.selfUpdate.checkout.maintainer = "
+        + "\"" + (toString cfg.selfUpdate.checkout.maintainer) + "\" but "
+        + "that user isn't defined in services.agent-box.users, so no "
+        + "agent-box@<user> unit would carry the checkout and none would "
+        + "ever be created.";
+    } {
       assertion = cfg.users != { };
       message = "services.agent-box.enable is true but no users are defined in services.agent-box.users.";
     } {
@@ -8816,6 +9598,32 @@ in
             # repo, box-wide — host-level, not per-user.
             AGENT_BOX_WEBHOOK_REPO = cfg.webhook.repo;
           }
+          // lib.optionalAttrs (name == checkoutMaintainer) {
+            # The shipped checkout (issue #242), on the ONE user's unit that
+            # owns it — presence is what tells the supervisor and the CLI
+            # there is a tree to keep, so a non-maintainer's session finds
+            # agent-box-checkout on PATH and is told plainly that it owns no
+            # checkout, instead of quietly cloning a second one.
+            AGENT_BOX_CHECKOUT_DIR = checkoutDir;
+            # https, not ssh: the box authenticates to GitHub through
+            # `gh auth git-credential` (see /etc/gitconfig above), and a
+            # public clone needs no credential at all — which is what makes
+            # a first boot with no token still land a readable tree.
+            AGENT_BOX_CHECKOUT_URL = "https://github.com/${cfg.selfUpdate.repo}.git";
+            # The rev this box RUNS, not the remote's head. A tree parked
+            # somewhere else describes a different box, and #242's own
+            # triage is about what that costs: an agent read a ttyd flag out
+            # of the tree and told its user a gesture worked that did not.
+            AGENT_BOX_CHECKOUT_REV = cfg.selfUpdate.rev;
+          }
+          // lib.optionalAttrs (name == checkoutMaintainer && cfg.selfUpdate.checkout.fork) {
+            # Presence = "fork `repo` into this token's account and add it
+            # as the `fork` remote" (selfUpdate.checkout.fork). Separate
+            # from the three above because creating a repository in the
+            # operator's GitHub account is an outward-facing act, not a
+            # side effect of having a tree to read.
+            AGENT_BOX_CHECKOUT_FORK = "1";
+          }
           // lib.optionalAttrs (webhookEnabled && cfg.webhook.syncSessionPlugin) {
             # Presence = "keep the session's plugin cache off the floor"
             # (webhook.syncSessionPlugin, issue #193): one fetched script,
@@ -8988,35 +9796,48 @@ in
     systemd.services.agent-box-update = {
       description = "Fast-forward agent-box to upstream HEAD and rebuild";
       # No wantedBy — on-demand only, via the agents' sudo rule (or root).
-      path = [ pkgs.curl pkgs.jq pkgs.openssl pkgs.coreutils pkgs.util-linux pkgs.nix ];
+      # No jq any more: the update is a `git merge --ff-only`, not a GitHub
+      # API query, so nothing here parses JSON. curl stays for the one
+      # remaining network call — the nixos-unstable channel redirect.
+      path = [ pkgs.curl pkgs.openssl pkgs.coreutils pkgs.util-linux pkgs.nix pkgs.git sourceTree ];
       environment = {
         REPO = cfg.selfUpdate.repo;
         CURRENT_REV = cfg.selfUpdate.rev;
         PIN_FILE = cfg.selfUpdate.pinFile;
         AGENT_PIN_FILE = cfg.selfUpdate.agentPinFile;
+        # What agent-box-source reads. The rev is the ancestry baseline: the
+        # tree is realigned to the rev the box RUNS before the fast-forward,
+        # so the guard measures from what is actually running and not from
+        # wherever the tree happened to be left.
+        AGENT_BOX_SRC_DIR = cfg.selfUpdate.srcDir;
+        AGENT_BOX_SRC_URL = "https://github.com/${cfg.selfUpdate.repo}.git";
+        AGENT_BOX_SRC_REV = cfg.selfUpdate.rev;
+        # git reads a config file relative to HOME and warns (or, with some
+        # safe.directory setups, refuses) without one. The unit inherits no
+        # HOME of its own.
+        HOME = "/root";
         # nixos-rebuild resolves <nixpkgs> via NIX_PATH, which systemd units
         # don't inherit; point it at root's channel (the NixOS AMI default).
         NIX_PATH = "nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:nixos-config=/etc/nixos/configuration.nix";
+      } // lib.optionalAttrs (cfg.selfUpdate.branch != null) {
+        AGENT_BOX_SRC_BRANCH = cfg.selfUpdate.branch;
       };
       serviceConfig.Type = "oneshot";
       script = ''
         set -euo pipefail
-        api() { curl -fsSL -H 'Accept: application/vnd.github+json' "$1"; }
 
-        # --- what would change? -----------------------------------------
-        target="$(api "https://api.github.com/repos/$REPO/commits/HEAD" | jq -r .sha)"
+        # Update by `git pull` (issue #242). The box holds the tree it is built
+        # from — $AGENT_BOX_SRC_DIR, root-owned, maintained by agent-box-source —
+        # and the host configuration imports the module OUT of that tree, so
+        # fast-forwarding it is the update. There is no API query to make and no
+        # copy to fetch: `git merge --ff-only` inside agent-box-source is the same
+        # refusal the GitHub compare used to spell out (a target that is not
+        # strictly ahead means rewritten history or a replayed older rev), enforced
+        # by git instead of asked of a server.
+        target="$(agent-box-source pull)"
         update_module=1
         if [ "$target" = "$CURRENT_REV" ]; then
           update_module=0
-        else
-          # Fast-forward only: a target that isn't strictly ahead of the
-          # running rev means upstream history was rewritten or an older
-          # (possibly vulnerable) rev is being replayed — refuse both.
-          status="$(api "https://api.github.com/repos/$REPO/compare/$CURRENT_REV...$target" | jq -r .status)"
-          if [ "$status" != "ahead" ]; then
-            echo "refusing update: $target is '$status' of running rev $CURRENT_REV (need fast-forward)" >&2
-            exit 1
-          fi
         fi
 
         # Agent CLI pin: latest nixos-unstable channel release.
@@ -9030,16 +9851,29 @@ in
         fi
 
         if [ "$update_module" = 0 ] && [ "$update_agent" = 0 ]; then
-          echo "already current: module at $target, agent nixpkgs at $release"
+          echo "already current: source tree at $target, agent nixpkgs at $release"
           exit 0
         fi
 
         # --- write the pins (with backups, so failure rolls back exactly
         # what this run changed) ------------------------------------------
         if [ "$update_module" = 1 ]; then
-          module="$(mktemp)"
-          trap 'rm -f "$module"' EXIT
-          curl -fsSL "https://raw.githubusercontent.com/$REPO/$target/modules/agent-box.nix" -o "$module"
+          # The pin file is no longer the mechanism — the tree is — but it is still
+          # written, for two reasons. It is this box's durable record of the rev it
+          # was last moved to, which is what the settings page and the next
+          # evaluation of selfUpdate.rev read. And a host wired the older way (a
+          # configuration.nix that fetches the module by rev + sha256, i.e. every
+          # box deployed before this landed) keeps updating to exactly the rev the
+          # tree just moved to, instead of silently freezing on the last rev its pin
+          # file ever saw. Same file, same contract, same hash: builtins.fetchurl
+          # takes the flat sha256 of the file, which is what this computes locally
+          # rather than over the network.
+          module="$AGENT_BOX_SRC_DIR/modules/agent-box.nix"
+          if [ ! -e "$module" ]; then
+            echo "the source tree at $AGENT_BOX_SRC_DIR has no modules/agent-box.nix — refusing to rebuild from it" >&2
+            agent-box-source reset "$CURRENT_REV" || true
+            exit 1
+          fi
           sha="sha256-$(openssl dgst -sha256 -binary "$module" | base64)"
           if [ -e "$PIN_FILE" ]; then
             cp "$PIN_FILE" "$PIN_FILE.prev"
@@ -9060,13 +9894,25 @@ in
           mv "$AGENT_PIN_FILE.tmp" "$AGENT_PIN_FILE"
         fi
 
-        wall "agent-box: updating (module: $REPO@$target, agent nixpkgs: $release) — agent sessions will restart if their services changed." || true
+        wall "agent-box: updating (source: $REPO@$target, agent nixpkgs: $release) — agent sessions will restart if their services changed." || true
         if /run/current-system/sw/bin/nixos-rebuild switch; then
           wall "agent-box: update to $target applied." || true
         else
-          # Roll back exactly the pins this run touched so the next trigger
-          # retries cleanly instead of believing the failed state is current.
+          # Roll back exactly what this run changed so the next trigger retries
+          # cleanly instead of believing the failed state is current. The tree comes
+          # back too: leaving it ahead of the system would make the NEXT run measure
+          # its fast-forward from a rev this box never ran, and would make an agent
+          # reading the tree describe a box that failed to build.
           if [ "$update_module" = 1 ]; then
+            # `reset` can fail — it resolves the tracked branch, which needs either
+            # AGENT_BOX_SRC_BRANCH or a readable origin/HEAD, and the network is
+            # exactly what a box in this branch may have lost. Say which of the two
+            # happened instead of asserting the good one: the guide tells agents that
+            # the tree names the rev the box runs, so a tree left ahead of a failed
+            # rebuild is a wrong answer somebody will read. The next pull realigns it.
+            tree_state="rolled back"
+            agent-box-source reset "$CURRENT_REV" \
+              || tree_state="NOT rolled back, it still reads past $CURRENT_REV"
             if [ -e "$PIN_FILE.prev" ]; then
               mv "$PIN_FILE.prev" "$PIN_FILE"
             else
@@ -9080,7 +9926,7 @@ in
               rm -f "$AGENT_PIN_FILE"
             fi
           fi
-          wall "agent-box: update to $target FAILED — pins rolled back, system unchanged. See: journalctl -u agent-box-update" || true
+          wall "agent-box: update to $target FAILED — pins rolled back, source tree ''${tree_state:-rolled back}, system unchanged. See: journalctl -u agent-box-update" || true
           exit 1
         fi
       '';

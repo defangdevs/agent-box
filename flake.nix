@@ -785,6 +785,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               check_payload agent-box-mark-stopped mark-stopped.sh
               check_payload agent-box-spot-monitor spot-monitor.sh
               check_payload agent-box-update update.sh
+              check_payload agent-box-source source-tree.sh
               check_payload agent-box-codex-remote-control codex-remote-control.sh
               check_payload agent-box-claude-session-start-hook claude-session-start-hook.sh
               check_payload agent-box-session-bare session-cli.sh
@@ -1307,6 +1308,136 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.jq pkgs.gawk ];
                 script = ./modules/src/webhook-cli.sh;
                 tests = ./tests/test-webhook-claim.sh;
+              } ''
+              bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # Eval regression for selfUpdate.checkout's two assertions
+          # (issue #242, PR #478 review). Both guard a value whose only
+          # other feedback is a background job failing with EROFS in a
+          # journal nobody reads, so what matters is that the REFUSAL
+          # happens at eval — and `..`, `.` and the empty component are
+          # exactly the inputs a first pass at "must be relative" lets
+          # through.
+          #
+          # It reads config.assertions rather than forcing toplevel:
+          # inspecting the list is what says WHICH assertion fired, where
+          # a failed build would only say that something did.
+          checkout-options =
+            let
+              evalWith = extra: (nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: {
+                    imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ];
+                  })
+                  {
+                    services.agent-box = nixpkgs.lib.recursiveUpdate {
+                      enable = true;
+                      users.agent = { };
+                      selfUpdate = {
+                        enable = true;
+                        rev = "0000000000000000000000000000000000000000";
+                      };
+                    } extra;
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              }).config.assertions;
+              failed = extra:
+                builtins.filter (a: !a.assertion) (evalWith extra);
+              # Does SOME assertion fire, and does its message name the
+              # option under test? Keyed on the option path, so a config
+              # rejected for an unrelated reason cannot pass for a hit.
+              rejects = option: extra:
+                builtins.any
+                  (a: nixpkgs.lib.hasInfix option a.message)
+                  (failed extra);
+              path = p: { selfUpdate.checkout.path = p; };
+              srcDir = d: { selfUpdate.srcDir = d; };
+              cases =
+                # srcDir decides what ROOT builds, so its assertion is the
+                # trust boundary and not a convenience: accepted cases must
+                # keep working, and every path with an agent-writable
+                # ancestor must be refused.
+                map (d: { label = "accepts srcDir ${builtins.toJSON d}"; ok = !(rejects "selfUpdate.srcDir" (srcDir d)); })
+                  [ "/var/lib/agent-box/src" "/var/lib/agent-box-src" "/var/lib/a/b/c" ]
+                ++ map (d: { label = "refuses srcDir ${builtins.toJSON d}"; ok = rejects "selfUpdate.srcDir" (srcDir d); })
+                  [ "/home/agent/src" "/home/agent/agent-box" "/tmp/src" "/var/tmp/src"
+                    "/var/lib" "/var/libel/src" "relative/src" ""
+                    "/var/lib/../../home/agent/src" "/var/lib//src" "/var/lib/./src" ]
+                ++
+                # Accepted: a plain name and a subdirectory.
+                map (p: { label = "accepts ${p}"; ok = !(rejects "checkout.path" (path p)); })
+                  [ "agent-box" "src/agent-box" ]
+                # Refused: every way out of /home/<maintainer>.
+                ++ map (p: { label = "refuses ${builtins.toJSON p}"; ok = rejects "checkout.path" (path p); })
+                  [ "/srv/agent-box" "../agent-box" "src/../../agent-box" "." "" "a//b" "agent-box/" ]
+                ++ [
+                  { label = "accepts a maintainer that exists";
+                    ok = !(rejects "checkout.maintainer"
+                      { selfUpdate.checkout.maintainer = "agent"; }); }
+                  { label = "refuses a maintainer that does not";
+                    ok = rejects "checkout.maintainer"
+                      { selfUpdate.checkout.maintainer = "nobody"; }; }
+                  { label = "accepts a null maintainer";
+                    ok = !(rejects "checkout.maintainer"
+                      { selfUpdate.checkout.maintainer = null; }); }
+                ];
+              bad = builtins.filter (c: !c.ok) cases;
+            in
+            assert bad == [ ] || throw ("agent-box: checkout option assertions "
+              + "did not behave as expected: "
+              + builtins.concatStringsSep ", " (map (c: c.label) bad));
+            pkgs.runCommand "agent-box-checkout-options-ok" { } ''
+              printf '%s\n' ${nixpkgs.lib.escapeShellArg
+                (builtins.concatStringsSep "\n" (map (c: "ok   " + c.label) cases))} \
+                | tee "$out"
+            '';
+
+          # Unit test for the shipped source checkout (issue #242). Its
+          # dangerous branches are the ones that do NOTHING: this runs
+          # unattended at every supervisor start, in a tree sibling
+          # sessions work in, so a realign that moved somebody's branch
+          # pointer would destroy work at boot on a box nobody is
+          # watching. `origin` is a local repository and `gh` is a shim,
+          # so there is no network here and it runs natively on every
+          # architecture — which is where the VM tests cannot go.
+          # The box's own source tree (issue #242) — the thing "update the
+          # box" now moves, and the fast-forward guard that replaced a
+          # GitHub API compare. Root runs this unattended and the tree it
+          # leaves behind is what the next rebuild BUILDS, so the refusals
+          # (a rewritten history, a downgrade, a baseline the tree has never
+          # heard of) are worth more assertions than the happy path.
+          # `origin` is a local repository, so there is no network here and
+          # it runs natively on every architecture.
+          source-tree =
+            pkgs.runCommand "agent-box-source-tree"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.git pkgs.gnugrep ];
+                script = ./modules/src/source-tree.sh;
+                tests = ./tests/test-source-tree.sh;
+              } ''
+              bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          checkout-bootstrap =
+            pkgs.runCommand "agent-box-checkout-bootstrap"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.git pkgs.gnugrep ];
+                script = ./modules/src/checkout-cli.sh;
+                tests = ./tests/test-checkout-bootstrap.sh;
               } ''
               bash "$tests" "$script" > log 2>&1 || {
                 cat log

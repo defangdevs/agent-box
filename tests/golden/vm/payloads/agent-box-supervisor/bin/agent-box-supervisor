@@ -643,6 +643,20 @@ mirror_codex_standalone() {
 }
 mirror_codex_standalone
 
+# The box's own sources, on the box (issue #242). Backgrounded on purpose:
+# the first run clones a repository over the network and no session may wait
+# on that — a box whose egress is broken must still start its agents. Run
+# through the env-exec wrapper so the fork step sees the user's GH_TOKEN,
+# which lives in the env store and never in this unit's environment.
+#
+# Every start, not just the first: the script is idempotent (a `git
+# rev-parse` when there is nothing to do) and this is also what re-parks the
+# tree after an update moved the box past it. A crash-restart loop therefore
+# costs one local git command per respawn, not a clone.
+if [ -n "${AGENT_BOX_CHECKOUT_DIR:-}" ]; then
+  "${AGENT_BOX_ENV_EXEC:?}" agent-box-checkout &
+fi
+
 # Deliver-once + resume bookkeeping. A session's kickoff prompt
 # (initialPrompt) must fire on the FIRST spawn only; every later respawn
 # (crash, clean exit, reboot, Spot stop→restart — all of which keep the

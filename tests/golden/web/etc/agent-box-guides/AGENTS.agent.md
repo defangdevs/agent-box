@@ -429,6 +429,47 @@ path is required for the passwordless sudo rule to match, and so is the
 --no-block: sudoers compares the whole command line, so dropping a flag
 makes the rule miss and sudo ask for a password instead.
 
+That is a `git pull`. Root keeps this box's own checkout of the repo at
+`/var/lib/agent-box/src` and rebuilds FROM it, so an update is a
+fast-forward of that tree - which is also why it refuses anything that
+is not a descendant of the rev the box is running. The first update
+clones it (so a box that has never updated does not have it yet); every
+later one moves it. The tree is root-owned and you cannot write it:
+that is deliberate, since whatever writes it decides what root builds.
+Read it freely - `git -C /var/lib/agent-box/src log -1` names the rev
+the box runs. The one exception is an update in flight: the tree moves
+FIRST and the rebuild follows it, so between the two - and after a
+rebuild that failed and could not put the tree back, which the wall
+notice says - it reads ahead of the running system.
+
+## This box ships its own sources
+
+A checkout of the repo this box is BUILT from lives at
+`/home/agent/agent-box`, owned by the user `agent`. Read it
+before you answer a question about how this box works: what the box
+actually does is in that tree, and a general memory of agent-box is
+not the same thing.
+
+It is parked on the exact rev the box runs (detached HEAD - `git -C
+/home/agent/agent-box log -1` names it), so what you read is what is
+installed. `agent-box-checkout` re-creates it if it goes missing and
+re-parks it after a box update; it refuses to touch a tree that is on
+a branch or has uncommitted changes, so your work is never at risk.
+
+The checkout is SHARED by every session of that user, exactly like a
+repo you cloned yourself, so it is what ~/worktrees is for: run
+`git worktree add ~/worktrees/NAME --detach ${AGENT_BOX_CHECKOUT_REV}`
+from the checkout and work there. Never commit in the shared tree.
+
+Changing this box means the same round trip as changing any other
+repo: edit, `nix run .#assemble`, run the checks, push to the `fork`
+remote if you have one, and open a PR. Editing THIS tree changes
+nothing about what the box runs - the box rebuilds from root's own
+checkout (see Updating above), which only ever fast-forwards along the
+repo the deployment points at. So a commit reaches this machine once it
+is merged there and the update above runs; a commit that only exists
+here reaches nothing.
+
 ## This platform has its own upstream repo
 
 The box itself - the terminal, session manager, webhook wiring, this

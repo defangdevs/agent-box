@@ -2,22 +2,19 @@
 set -e
 
 set -euo pipefail
-api() { curl -fsSL -H 'Accept: application/vnd.github+json' "$1"; }
 
-# --- what would change? -----------------------------------------
-target="$(api "https://api.github.com/repos/$REPO/commits/HEAD" | jq -r .sha)"
+# Update by `git pull` (issue #242). The box holds the tree it is built
+# from — $AGENT_BOX_SRC_DIR, root-owned, maintained by agent-box-source —
+# and the host configuration imports the module OUT of that tree, so
+# fast-forwarding it is the update. There is no API query to make and no
+# copy to fetch: `git merge --ff-only` inside agent-box-source is the same
+# refusal the GitHub compare used to spell out (a target that is not
+# strictly ahead means rewritten history or a replayed older rev), enforced
+# by git instead of asked of a server.
+target="$(agent-box-source pull)"
 update_module=1
 if [ "$target" = "$CURRENT_REV" ]; then
   update_module=0
-else
-  # Fast-forward only: a target that isn't strictly ahead of the
-  # running rev means upstream history was rewritten or an older
-  # (possibly vulnerable) rev is being replayed — refuse both.
-  status="$(api "https://api.github.com/repos/$REPO/compare/$CURRENT_REV...$target" | jq -r .status)"
-  if [ "$status" != "ahead" ]; then
-    echo "refusing update: $target is '$status' of running rev $CURRENT_REV (need fast-forward)" >&2
-    exit 1
-  fi
 fi
 
 # Agent CLI pin: latest nixos-unstable channel release.
@@ -31,16 +28,29 @@ if [ -e "$AGENT_PIN_FILE" ] && grep -qF "$tarball" "$AGENT_PIN_FILE"; then
 fi
 
 if [ "$update_module" = 0 ] && [ "$update_agent" = 0 ]; then
-  echo "already current: module at $target, agent nixpkgs at $release"
+  echo "already current: source tree at $target, agent nixpkgs at $release"
   exit 0
 fi
 
 # --- write the pins (with backups, so failure rolls back exactly
 # what this run changed) ------------------------------------------
 if [ "$update_module" = 1 ]; then
-  module="$(mktemp)"
-  trap 'rm -f "$module"' EXIT
-  curl -fsSL "https://raw.githubusercontent.com/$REPO/$target/modules/agent-box.nix" -o "$module"
+  # The pin file is no longer the mechanism — the tree is — but it is still
+  # written, for two reasons. It is this box's durable record of the rev it
+  # was last moved to, which is what the settings page and the next
+  # evaluation of selfUpdate.rev read. And a host wired the older way (a
+  # configuration.nix that fetches the module by rev + sha256, i.e. every
+  # box deployed before this landed) keeps updating to exactly the rev the
+  # tree just moved to, instead of silently freezing on the last rev its pin
+  # file ever saw. Same file, same contract, same hash: builtins.fetchurl
+  # takes the flat sha256 of the file, which is what this computes locally
+  # rather than over the network.
+  module="$AGENT_BOX_SRC_DIR/modules/agent-box.nix"
+  if [ ! -e "$module" ]; then
+    echo "the source tree at $AGENT_BOX_SRC_DIR has no modules/agent-box.nix — refusing to rebuild from it" >&2
+    agent-box-source reset "$CURRENT_REV" || true
+    exit 1
+  fi
   sha="sha256-$(openssl dgst -sha256 -binary "$module" | base64)"
   if [ -e "$PIN_FILE" ]; then
     cp "$PIN_FILE" "$PIN_FILE.prev"
@@ -61,13 +71,25 @@ if [ "$update_agent" = 1 ]; then
   mv "$AGENT_PIN_FILE.tmp" "$AGENT_PIN_FILE"
 fi
 
-wall "agent-box: updating (module: $REPO@$target, agent nixpkgs: $release) — agent sessions will restart if their services changed." || true
+wall "agent-box: updating (source: $REPO@$target, agent nixpkgs: $release) — agent sessions will restart if their services changed." || true
 if /run/current-system/sw/bin/nixos-rebuild switch; then
   wall "agent-box: update to $target applied." || true
 else
-  # Roll back exactly the pins this run touched so the next trigger
-  # retries cleanly instead of believing the failed state is current.
+  # Roll back exactly what this run changed so the next trigger retries
+  # cleanly instead of believing the failed state is current. The tree comes
+  # back too: leaving it ahead of the system would make the NEXT run measure
+  # its fast-forward from a rev this box never ran, and would make an agent
+  # reading the tree describe a box that failed to build.
   if [ "$update_module" = 1 ]; then
+    # `reset` can fail — it resolves the tracked branch, which needs either
+    # AGENT_BOX_SRC_BRANCH or a readable origin/HEAD, and the network is
+    # exactly what a box in this branch may have lost. Say which of the two
+    # happened instead of asserting the good one: the guide tells agents that
+    # the tree names the rev the box runs, so a tree left ahead of a failed
+    # rebuild is a wrong answer somebody will read. The next pull realigns it.
+    tree_state="rolled back"
+    agent-box-source reset "$CURRENT_REV" \
+      || tree_state="NOT rolled back, it still reads past $CURRENT_REV"
     if [ -e "$PIN_FILE.prev" ]; then
       mv "$PIN_FILE.prev" "$PIN_FILE"
     else
@@ -81,7 +103,7 @@ else
       rm -f "$AGENT_PIN_FILE"
     fi
   fi
-  wall "agent-box: update to $target FAILED — pins rolled back, system unchanged. See: journalctl -u agent-box-update" || true
+  wall "agent-box: update to $target FAILED — pins rolled back, source tree ${tree_state:-rolled back}, system unchanged. See: journalctl -u agent-box-update" || true
   exit 1
 fi
 

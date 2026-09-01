@@ -462,15 +462,25 @@ silently falling back to asking for a password.
 Update the box's software with:
 `sudo -n /usr/bin/systemctl start --no-block agent-box-update.service`
 (the full path is required for the passwordless sudo rule to match).
-This box is not NixOS: the update fast-forwards the Nix profile your
-software comes from to the newest commit of the upstream repo, renders
-the host configuration that release describes, and restarts the services
-onto it - your own tmux session included, so save context first.
+That is a `git pull`. Root keeps this box's own checkout of the repo
+at /var/lib/agent-box/src and installs the Nix profile your software comes from
+straight out of it, so an update is a fast-forward of that tree - which
+is also why it refuses anything that is not a descendant of the rev you
+are running. The first update clones it (so a box that has never
+updated does not have it yet); every later one moves it. The tree is
+root-owned and you cannot write it: that is deliberate, since whatever
+writes it decides what root installs. Read it freely - `git -C /var/lib/agent-box/src log -1`
+names the rev the box runs. The one exception is an update in flight: the
+tree moves FIRST and the profile swap follows it, so between the two - and
+after a swap that failed and rolled the profile back - it reads ahead of
+what is installed.
 
-It refuses a target that is not strictly ahead of the rev you are
-running, and if the new release fails to apply it rolls the profile
-back and re-applies the old one. Watch it with `journalctl -fu agent-box-update.service`;
-the box's own rev is on the settings page.
+This box is not NixOS, so what follows the pull is a profile swap and
+not a system rebuild: the release renders the host configuration it
+describes and restarts the services onto it - your own tmux session
+included, so save context first. If the new release fails to apply, the
+profile rolls back and the old one is re-applied. Watch it with `journalctl -fu
+agent-box-update.service`; the box's own rev is on the settings page.
 
 ## This platform has its own upstream repo
 

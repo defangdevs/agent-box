@@ -2146,18 +2146,30 @@ class SelfUpdateLogicTest(unittest.TestCase):
         self.calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    def _api(self, mapping):
-        def call(url, timeout=30):
-            for fragment, payload in mapping.items():
-                if fragment in url:
-                    return payload
-            raise AssertionError(f"unexpected API call: {url}")
-        self.mod.github_json = call
+    def _source(self, target=None, fail=None):
+        """Stand in for agent-box-source, and record how it was driven.
+
+        The tree manager is a shell payload with its own test file
+        (tests/test-source-tree.sh, flake check `source-tree`), which is
+        where the fast-forward guard and the realign are pinned. What
+        belongs HERE is the other half: that cmd_update asks it the right
+        question, and that its refusal reaches the journal as a reason
+        rather than a traceback.
+        """
+        self.source_calls = []
+
+        def call(profile, verb, *rest, **kw):
+            self.source_calls.append((verb, list(rest), kw))
+            if fail:
+                raise self.mod.UpdateError(fail)
+            return target
+        self.mod.source_tree = call
 
     def _args(self, prof, **over):
         import argparse
         base = dict(profile=str(prof), post_switch=False, repo=None, rev=None,
-                    force=False, check=False, config="/etc/agent-box/x.json",
+                    branch=None, src="/var/lib/agent-box/src", force=False,
+                    check=False, config="/etc/agent-box/x.json",
                     no_restart_sessions=False, from_generation=None,
                     from_rev=None)
         base.update(over)
@@ -2175,6 +2187,22 @@ class SelfUpdateLogicTest(unittest.TestCase):
                          ("defangdevs/agent-box", None))
         self.assertEqual(parse("path:/etc/agent-box"), (None, None))
         self.assertEqual(parse(None), (None, None))
+        # A box that has updated at least once is installed from its own
+        # source tree (issue #242). That URL names a rev and no repo — half
+        # the answer, which is why profile_origin asks source_repo for the
+        # other half rather than treating this as "unknown".
+        self.assertEqual(
+            parse(f"git+file:///var/lib/agent-box/src?rev={FAKE_REV}"),
+            (None, FAKE_REV))
+        self.assertEqual(
+            parse(f"git+file:///var/lib/agent-box/src?ref=master&rev={FAKE_REV}"),
+            (None, FAKE_REV))
+        # No rev in the query: nothing to compare a target against, and it
+        # must not be confused for one.
+        self.assertEqual(parse("git+file:///var/lib/agent-box/src"),
+                         (None, None))
+        self.assertEqual(parse("git+file:///var/lib/agent-box/src?ref=master"),
+                         (None, None))
 
     def test_manifest_element_handles_both_nix_shapes(self):
         """nix >= 2.20 keys elements by name; older nix uses a list."""
@@ -2193,22 +2221,27 @@ class SelfUpdateLogicTest(unittest.TestCase):
     def test_already_current_is_not_an_update(self):
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
-            self._api({"/commits/": {"sha": FAKE_REV}})
+            self._source(FAKE_REV)
             with self.quiet():
                 self.assertEqual(self.mod.cmd_update(self._args(prof)), 0)
         self.assertEqual(self.calls, [],
                          "an already-current box must not touch its profile")
+        self.assertEqual(self.source_calls[0][0], "pull")
+        self.assertEqual(self.source_calls[0][2]["rev"], FAKE_REV,
+                         "the running rev is the fast-forward baseline")
 
     def test_non_fast_forward_is_refused(self):
-        """The one part of the NixOS payload worth porting verbatim.
+        """A refusal from the tree manager stops the update, here too.
 
         A target that is not strictly ahead means rewritten history or a
-        replay of an older, possibly vulnerable rev.
+        replay of an older, possibly vulnerable rev. `git merge --ff-only`
+        inside agent-box-source is what says so now (issue #242); what this
+        pins is that its non-zero exit reaches the profile switch as a
+        refusal and not as a rev to install.
         """
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
-            self._api({"/commits/": {"sha": "2" * 40},
-                       "/compare/": {"status": "behind"}})
+            self._source(fail="refusing update: 2222 is not a fast-forward")
             with self.quiet(), self.assertRaises(self.mod.UpdateError) as cm:
                 self.mod.cmd_update(self._args(prof))
         self.assertIn("fast-forward", str(cm.exception))
@@ -2218,17 +2251,28 @@ class SelfUpdateLogicTest(unittest.TestCase):
     def test_force_skips_the_check_but_check_mode_changes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
-            self._api({"/commits/": {"sha": "2" * 40},
-                       "/compare/": {"status": "ahead"}})
+            self._source("2" * 40)
             with self.quiet():
                 self.assertEqual(
                     self.mod.cmd_update(self._args(prof, check=True)), 0)
             self.assertEqual(self.calls, [])
-            # --force reaches the switch without asking about ancestry at
-            # all: the compare endpoint is never called (it would raise).
-            self._api({"/commits/": {"sha": "2" * 40}})
+            # --check asks a question. It must not be the verb that MOVES
+            # the tree, or "is there an update" would half-apply one.
+            self.assertEqual([c[0] for c in self.source_calls], ["check"])
+            # And it must ask about the SAME branch the update would take,
+            # or `--check --branch stable` reports the default branch's tip
+            # and the update that follows moves somewhere else.
+            self._source("2" * 40)
+            with self.quiet():
+                self.mod.cmd_update(
+                    self._args(prof, check=True, branch="stable"))
+            self.assertEqual(self.source_calls[0][2]["branch"], "stable")
+            # --force is carried through to the tree manager, which owns the
+            # guard it skips; the renderer does not second-guess ancestry.
+            self._source("2" * 40)
             with self.quiet(), self.assertRaises(self.mod.UpdateError):
                 self.mod.cmd_update(self._args(prof, force=True))
+            self.assertTrue(self.source_calls[0][2]["force"])
             self.assertTrue(any("build" in c for c in self.calls))
 
     def test_a_no_op_install_is_reported_as_a_failure(self):
@@ -2242,13 +2286,20 @@ class SelfUpdateLogicTest(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)   # manifest keeps saying FAKE_REV
-            self._api({"/commits/": {"sha": "2" * 40},
-                       "/compare/": {"status": "ahead"}})
+            self._source("2" * 40)
             with self.quiet(), self.assertRaises(self.mod.UpdateError) as cm:
                 self.mod.cmd_update(self._args(prof))
         self.assertIn("refusing to call that an update", str(cm.exception))
         installs = [c for c in self.calls if "install" in c]
         removes = [c for c in self.calls if "remove" in c]
+        # The box installs out of its OWN tree, not out of GitHub (issue
+        # #242) — and ?rev= is what makes the profile manifest record which
+        # commit that was, which is how the next run reads its own baseline.
+        self.assertTrue(
+            any("git+file:///var/lib/agent-box/src"
+                f"?rev={'2' * 40}#runtime" in a
+                for c in self.calls for a in c),
+            f"no local-tree flake in {self.calls}")
         self.assertTrue(removes and installs,
                         "the switch is remove-then-install, not a bare "
                         "install")
@@ -2272,8 +2323,7 @@ class SelfUpdateLogicTest(unittest.TestCase):
         self.mod.run = fail_on_build
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
-            self._api({"/commits/": {"sha": "2" * 40},
-                       "/compare/": {"status": "ahead"}})
+            self._source("2" * 40)
             with self.quiet() as out, \
                     self.assertRaises(self.mod.UpdateError) as cm:
                 self.mod.cmd_update(self._args(prof))
@@ -2345,8 +2395,7 @@ class SelfUpdateLogicTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)          # a plain dir, no symlink
             self.assertIsNone(self.mod.profile_generation(prof))
-            self._api({"/commits/": {"sha": target},
-                       "/compare/": {"status": "ahead"}})
+            self._source(target)
 
             def install(cmd, check=True, capture=False):
                 self.calls.append(list(cmd))
@@ -2369,29 +2418,50 @@ class SelfUpdateLogicTest(unittest.TestCase):
         for call in self.calls:
             self.assertNotIn("None", call)
 
-    def test_github_failures_are_reported_not_raised(self):
-        """A rate limit is 60/hour per IP, so the journal must read well.
+    def test_a_stalled_source_tree_is_bounded(self):
+        """The update unit sets TimeoutStartSec=infinity, so nothing else is.
 
-        `main` catches ConfigError and UpdateError; anything else is a
-        traceback in the journal where an operator wanted a reason.
+        A fetch that hangs rather than fails would leave
+        agent-box-update.service active forever and the settings page
+        reporting an update in progress. The bound belongs here, and its
+        expiry has to read like every other refused update.
         """
-        import urllib.error
-        import urllib.request
-
-        def boom(req, timeout=30):
-            raise urllib.error.HTTPError(
-                req.full_url, 403, "rate limit exceeded", {}, None)
-
-        real = urllib.request.urlopen
-        urllib.request.urlopen = boom
-        self.addCleanup(setattr, urllib.request, "urlopen", real)
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
+            self.mod.SOURCE_TIMEOUT = 0.2
+            cli = prof / "bin" / "agent-box-source"
+            cli.write_text("#!/bin/sh\nsleep 30\n")
+            os.chmod(cli, 0o755)
             with self.quiet(), self.assertRaises(self.mod.UpdateError) as cm:
                 self.mod.cmd_update(self._args(prof))
-        self.assertIn("GitHub request failed", str(cm.exception))
+        self.assertIn("timed out", str(cm.exception))
         self.assertEqual(self.calls, [],
-                         "a failed lookup must not touch the profile")
+                         "a stalled pull must not touch the profile")
+
+    def test_a_source_tree_failure_is_reported_not_raised(self):
+        """`main` catches ConfigError and UpdateError — nothing else.
+
+        The real source_tree, against a real (failing) agent-box-source, so
+        this covers the wrapper rather than the stub: a tree that cannot be
+        fetched must read as a reason in the journal, and must not reach the
+        profile switch with an empty rev.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            cli = prof / "bin" / "agent-box-source"
+            cli.write_text("#!/bin/sh\n"
+                           "echo 'agent-box-source: fetch failed' >&2\n"
+                           "exit 1\n")
+            os.chmod(cli, 0o755)
+            err = io.StringIO()
+            with self.quiet(), contextlib.redirect_stderr(err), \
+                    self.assertRaises(self.mod.UpdateError) as cm:
+                self.mod.cmd_update(self._args(prof))
+        self.assertIn("agent-box-source", str(cm.exception))
+        self.assertIn("fetch failed", err.getvalue(),
+                      "the payload's own reason has to reach the journal")
+        self.assertEqual(self.calls, [],
+                         "a failed pull must not touch the profile")
 
 
 def update_fixture():

@@ -128,15 +128,23 @@ first boot.
 
 ### Updating a deployed box (user- or agent-triggered)
 
+Updating is `git pull` (issue #242). The box keeps its own source tree at
+`/var/lib/agent-box/src` — root-owned, a plain checkout of the repo — and the
+generated `/etc/nixos/configuration.nix` imports the module out of that tree
+when it is there. `agent-box-update.service`, a root oneshot enabled via the
+module's `selfUpdate` option, clones the tree on its first run and on every
+run fast-forwards it with `git merge --ff-only` (which is what refuses a
+rewritten history or a replay of an older, possibly vulnerable revision) and
+runs `nixos-rebuild switch`. On rebuild failure the tree moves back to the
+running revision along with the pins, and the running system is unchanged.
+
 The launch-time `AgentBoxRev`/`AgentBoxSha256` parameters pin the module for
-the FIRST boot only. The generated `/etc/nixos/configuration.nix` prefers
-`/etc/nixos/agent-box-pin.nix` when that file exists, and
-`agent-box-update.service` — a root oneshot enabled via the module's
-`selfUpdate` option — owns that file: it resolves upstream master's HEAD,
-verifies it is strictly ahead of the running revision (history rewrites and
-downgrade replays are refused), hash-pins the fetched module, rewrites the pin
-file atomically, and runs `nixos-rebuild switch`. On rebuild failure the pins
-roll back and the running system is unchanged.
+the FIRST boot only — before the first update there is no tree yet, so
+`configuration.nix` falls back to fetching the single generated module file by
+`/etc/nixos/agent-box-pin.nix` when that file exists. The updater keeps that
+pin advanced to the same revision the tree was moved to, so a box deployed
+from an older template — whose `configuration.nix` only knows how to fetch —
+lands on exactly the same module, and only pays for the download.
 
 The same run also advances `/etc/nixos/agent-box-agent-pin.nix` — a second
 pin, holding the latest nixos-unstable channel-release tarball — from which
