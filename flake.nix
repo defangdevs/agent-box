@@ -1316,6 +1316,29 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # Unit test for the shipped source checkout (issue #242). Its
+          # dangerous branches are the ones that do NOTHING: this runs
+          # unattended at every supervisor start, in a tree sibling
+          # sessions work in, so a realign that moved somebody's branch
+          # pointer would destroy work at boot on a box nobody is
+          # watching. `origin` is a local repository and `gh` is a shim,
+          # so there is no network here and it runs natively on every
+          # architecture — which is where the VM tests cannot go.
+          checkout-bootstrap =
+            pkgs.runCommand "agent-box-checkout-bootstrap"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.git pkgs.gnugrep ];
+                script = ./modules/src/checkout-cli.sh;
+                tests = ./tests/test-checkout-bootstrap.sh;
+              } ''
+              bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Issue #425: a box with no webhook panel used to render an
           # empty string, so its operator could not tell a feature that is
           # off from one that is wired up wrong — which is how #425 was

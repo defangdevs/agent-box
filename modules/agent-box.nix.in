@@ -47,6 +47,33 @@ let
       --no-block: sudoers compares the whole command line, so dropping a flag
       makes the rule miss and sudo ask for a password instead.
 
+    '' + lib.optionalString checkoutEnabled ''
+      ## This box ships its own sources
+
+      A checkout of the repo this box is BUILT from lives at
+      `${checkoutDir}`, owned by the user `${checkoutMaintainer}`. Read it
+      before you answer a question about how this box works: what the box
+      actually does is in that tree, and a general memory of agent-box is
+      not the same thing.
+
+      It is parked on the exact rev the box runs (detached HEAD - `git -C
+      ${checkoutDir} log -1` names it), so what you read is what is
+      installed. `agent-box-checkout` re-creates it if it goes missing and
+      re-parks it after a box update; it refuses to touch a tree that is on
+      a branch or has uncommitted changes, so your work is never at risk.
+
+      The checkout is SHARED by every session of that user, exactly like a
+      repo you cloned yourself. Work in `git worktree add --detach` under
+      your own directory and push from there - never commit in the shared
+      tree.
+
+      Changing this box means the same round trip as changing any other
+      repo: edit, `nix run .#assemble`, run the checks, push to the `fork`
+      remote if you have one, and open a PR. What the box RUNS still comes
+      from the repo the deployment pinned, fetched by root as a hash-pinned
+      file - so a commit only reaches this machine after the update above,
+      and only when the deployment points at the repo you pushed to.
+
     '')
       # Which HOST this guide is describing. The two backends install the
       # same guide and are not the same box underneath it: this one is
@@ -166,6 +193,39 @@ let
   # and reads each file through its world-read bit (default 0644). Symlinked
   # into $HOME as ~/downloads so the agent never touches /var/lib directly.
   downloadsDirOf = name: "/var/lib/agent-box-downloads/${name}";
+
+  # The box's own sources, on the box (issue #242). A deployed box fetches
+  # ONE file — the generated modules/agent-box.nix, by rev + sha256 (issue
+  # #51) — so until now it had never seen the tree it is built from, and an
+  # agent asked about its own box answered from a model of agent-box rather
+  # than from this one. PR #293 settled that the source ships with each
+  # operator; these three bindings are where the module says WHOSE it is and
+  # WHERE it lands, and modules/src/checkout-cli.sh is what puts it there.
+  #
+  # ONE maintainer owns it, not every agent user (issue #242 decision 2).
+  # A session is not a security boundary and neither is a home directory
+  # here: N checkouts would be N copies of the same tree, each drifting from
+  # the running rev on its own schedule, and the answer surface would stop
+  # having a single answer. Which user, in the same order the settings
+  # page's rootUser picks: the web user when it is one of ours, else the
+  # first user by name. checkout.maintainer overrides it.
+  checkoutMaintainer =
+    let names = lib.attrNames cfg.users; in
+    if !(cfg.selfUpdate.enable && cfg.selfUpdate.checkout.enable) then null
+    else if cfg.selfUpdate.checkout.maintainer != null then
+      cfg.selfUpdate.checkout.maintainer
+    else if cfg.users ? ${cfg.web.user} then cfg.web.user
+    else if names != [ ] then lib.head names
+    else null;
+  checkoutEnabled = checkoutMaintainer != null;
+  # Relative paths hang off the maintainer's home, which is what almost
+  # every deployment wants (~/agent-box); an absolute one is taken as given
+  # so a host with a bigger volume elsewhere can say so.
+  checkoutDir =
+    if !checkoutEnabled then null
+    else if lib.hasPrefix "/" cfg.selfUpdate.checkout.path then
+      cfg.selfUpdate.checkout.path
+    else "/home/${checkoutMaintainer}/${cfg.selfUpdate.checkout.path}";
 
   # Per-user webhook receiver (local-channels local-webhook plugin, issue #101).
   # One receiver-only daemon per web user owns a UNIX-socket HTTP ingress
@@ -504,6 +564,9 @@ let
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli ]
+    # Same "presence tells an agent the feature is live" reasoning as the
+    # two above: a box with no shipped checkout has no agent-box-checkout.
+    ++ lib.optional checkoutEnabled checkoutCli
     ++ agentBaseTools
     ++ cfg.extraPackages
   );
@@ -643,6 +706,14 @@ let
   # transcript that copied a curl line.
   uploadCli = pkgs.writeShellScriptBin "agent-box-upload" ''
 @@include:src/upload-cli.sh@@
+  '';
+
+  # Bootstraps and re-aligns the shipped checkout (issue #242). On the
+  # agent's PATH as well as the supervisor's, because "my checkout is gone"
+  # and "the box updated past my tree" both want the same idempotent run,
+  # and an agent that can name the repair does not have to reconstruct it.
+  checkoutCli = pkgs.writeShellScriptBin "agent-box-checkout" ''
+@@include:src/checkout-cli.sh@@
   '';
 
   # Dispatch target for standing watches (local-channels#1): the receiver
@@ -1635,6 +1706,99 @@ in
           channel release, feeding agentNixpkgs on the next eval.
         '';
       };
+
+      # Issue #242: "agent-box should ship with its own fork". The box
+      # fetches one generated file and never saw its own sources, so it
+      # could not answer for itself and an agent could not fix it. The
+      # checkout is step 1 of that issue's design B — the source ships, the
+      # agent edits it, pushes to a fork, opens a PR — and it is the whole
+      # of what this option does. It deliberately does NOT make the local
+      # tree a build source: `repo` stays a deploy-time choice and root
+      # still fetches a hash-pinned file from GitHub, so the agent user
+      # gains no privilege (issue #127 — a rebuild from an agent-writable
+      # path is root-equivalence for every user on the box).
+      checkout = {
+        enable = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+          example = false;
+          description = ''
+            Ship this box's own sources ON the box: one git checkout of
+            `repo`, parked on the `rev` the box is running, owned by a
+            single maintainer user (see `maintainer`), created on the first
+            supervisor start after the box comes up.
+
+            On by default, because a source tree an operator has to ask for
+            is a source tree nobody reads — and the failure it prevents is
+            an agent answering confidently about a box it cannot see. The
+            cost is one clone of `repo` on the maintainer's home volume.
+
+            Bootstrap, not sync: `agent-box-checkout` moves the tree only
+            between the state it leaves behind (detached HEAD, clean) and
+            the rev the box already runs. A branch, a modified file or a
+            half-finished rebase is somebody's work and is left alone, and
+            nothing here changes what the box RUNS.
+
+            NixOS only for now (issue #242 decision 5(a)): the round trip
+            it exists to serve ends in `nixos-rebuild switch` and a pin
+            file, neither of which a native box has. Declared as a reviewed
+            divergence in scripts/check_backend_parity.py rather than left
+            to be discovered on a Lightsail box; native follows once #451
+            PR 2 makes the two renderers share one binding contract.
+          '';
+        };
+
+        maintainer = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          example = "agent";
+          description = ''
+            Which agent user owns the checkout. Null picks the same user the
+            settings page calls root — `web.user` when that is one of
+            `users`, otherwise the first by name.
+
+            One user, not all of them: N checkouts of one repository are N
+            trees drifting from the running rev on N schedules, and the
+            point of shipping the source is that there is ONE answer to
+            "what is this box". Sibling SESSIONS of the maintainer share the
+            tree, which is why work belongs in `git worktree add --detach`
+            (issue #126) — the same rule the shipped guide already gives.
+          '';
+        };
+
+        path = lib.mkOption {
+          type = lib.types.str;
+          default = "agent-box";
+          example = "/srv/agent-box";
+          description = ''
+            Where the checkout lands. A relative path hangs off the
+            maintainer's home (the default is ~/agent-box); an absolute one
+            is used as given, for a host that keeps it on another volume.
+          '';
+        };
+
+        fork = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+          example = false;
+          description = ''
+            Also add a `fork` remote to the checkout, forking `repo` into
+            the account the box's `GH_TOKEN` belongs to, so an agent can
+            push a branch and open a PR without write access upstream.
+
+            Attempted on the first supervisor start that finds a token and
+            no `fork` remote — so a box that gets its token later still
+            gets the remote, and one that never does keeps a usable
+            checkout. `origin` is never renamed: it stays the repo this box
+            is built from, which is what `rev` is a rev OF.
+
+            Set false on a box whose token must not create repositories.
+            Note that pushing to the fork does not make the box run it: the
+            updater fetches from `repo`, chosen at deploy time. A box that
+            should update from its own fork sets `repo` to that fork.
+          '';
+        };
+      };
     };
 
     webhook = {
@@ -2282,6 +2446,32 @@ in
             # (per-session LOCAL_WEBHOOK_* env + claude plugin seeding). One
             # repo, box-wide — host-level, not per-user.
             AGENT_BOX_WEBHOOK_REPO = cfg.webhook.repo;
+          }
+          // lib.optionalAttrs (name == checkoutMaintainer) {
+            # The shipped checkout (issue #242), on the ONE user's unit that
+            # owns it — presence is what tells the supervisor and the CLI
+            # there is a tree to keep, so a non-maintainer's session finds
+            # agent-box-checkout on PATH and is told plainly that it owns no
+            # checkout, instead of quietly cloning a second one.
+            AGENT_BOX_CHECKOUT_DIR = checkoutDir;
+            # https, not ssh: the box authenticates to GitHub through
+            # `gh auth git-credential` (see /etc/gitconfig above), and a
+            # public clone needs no credential at all — which is what makes
+            # a first boot with no token still land a readable tree.
+            AGENT_BOX_CHECKOUT_URL = "https://github.com/${cfg.selfUpdate.repo}.git";
+            # The rev this box RUNS, not the remote's head. A tree parked
+            # somewhere else describes a different box, and #242's own
+            # triage is about what that costs: an agent read a ttyd flag out
+            # of the tree and told its user a gesture worked that did not.
+            AGENT_BOX_CHECKOUT_REV = cfg.selfUpdate.rev;
+          }
+          // lib.optionalAttrs (name == checkoutMaintainer && cfg.selfUpdate.checkout.fork) {
+            # Presence = "fork `repo` into this token's account and add it
+            # as the `fork` remote" (selfUpdate.checkout.fork). Separate
+            # from the three above because creating a repository in the
+            # operator's GitHub account is an outward-facing act, not a
+            # side effect of having a tree to read.
+            AGENT_BOX_CHECKOUT_FORK = "1";
           }
           // lib.optionalAttrs (webhookEnabled && cfg.webhook.syncSessionPlugin) {
             # Presence = "keep the session's plugin cache off the floor"

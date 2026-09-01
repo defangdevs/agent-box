@@ -154,10 +154,28 @@ BY_DESIGN = {
                                    "captures the real store-built one",
 }
 
+# One reason, cited by the four entries below, so it has one home rather
+# than four copies to keep in step. Box-wide only: the per-unit pass
+# subtracts everything already declared here, on the reasoning that a
+# one-sided name is one-sided in whatever unit carries it.
+CHECKOUT_GAP = (
+    "#242 decision 5(a): the shipped source checkout is NixOS-only for now, "
+    "and this is the reviewed divergence rather than the discovered one. "
+    "The round trip it serves ends in a pin file and `nixos-rebuild switch` "
+    "(modules/src/update.sh); a native box has neither — `agentbox update` "
+    "takes the profile head, with no rev to fast-forward onto (bin/agentbox, "
+    "issue #358) — so wiring these names there would ship a tree with no way "
+    "to become the running system. Native follows once #451 PR 2 gives both "
+    "renderers one binding contract; delete these entries then")
+
 # Divergences that are BUGS, each owned by an issue. This table must only ever
 # shrink: fixing a gap means deleting its line, and the staleness check below
 # makes that mandatory rather than optional.
 KNOWN_GAPS = {
+    "AGENT_BOX_CHECKOUT_DIR": CHECKOUT_GAP,
+    "AGENT_BOX_CHECKOUT_FORK": CHECKOUT_GAP,
+    "AGENT_BOX_CHECKOUT_REV": CHECKOUT_GAP,
+    "AGENT_BOX_CHECKOUT_URL": CHECKOUT_GAP,
 }
 
 # Units, by family (instance and template spellings normalized away).

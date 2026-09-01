@@ -34,7 +34,9 @@ the user to download?" belongs in the shipped guide. A box that also has a
 clone of this repo ends up with both, discovered at different scopes: the
 shipped guide through the pointer seeded in `$HOME` (and, for claude,
 `~/.claude/CLAUDE.md` -> the `/etc` guide), this file through the checkout it
-sits in. Editing the shipped guide is a module change like any other — run
+sits in — which, since #242, every NixOS box has by default
+(`selfUpdate.checkout`), so "both, at different scopes" is now the
+ordinary case rather than the one our own box happens to be in. Editing the shipped guide is a module change like any other — run
 `nix run .#assemble`, and the golden fixture moves with it.
 
 ## Project Structure & Module Organization
@@ -50,6 +52,7 @@ Keep the module self-contained: deployed boxes fetch `modules/agent-box.nix` as 
 - `nix build -L .#checks.<system>.assemble-module-escaping` runs `tests/test-assemble-module.py`, the unit tests for the assembler's Nix escaping (issue #244). The up-to-date check above cannot catch an escaping bug — it regenerates the file with the same assembler, so the check and the bug agree on the wrong bytes. Runnable without Nix too: `python3 tests/test-assemble-module.py`, or `--nix` to round-trip the corpus through `nix-instantiate` instead of the lexer model.
 - `nix build -L .#checks.<system>.backend-parity` compares what the NixOS module and the native renderer supply to the SAME shared payloads under `modules/src/` — every `AGENT_BOX_*` variable and every rendered service — and fails on a difference not declared in `scripts/check_backend_parity.py`. Runnable without Nix too: `python3 scripts/check_backend_parity.py`. Its two tables are the point: `BY_DESIGN` for a difference that is correct (with the reason), `KNOWN_GAPS` for one that is a bug (with its issue). Both are staleness-checked, so a gap you fix must be deleted from the table in the same change. Issue #392 — the settings page's Connections section, missing from every native box because only the module set `AGENT_BOX_CONNECT_BINS` — is the failure this exists to catch; neither backend's fixture could see it, because each ratifies whatever its own renderer emits.
 - `nix build -L .#checks.<system>.vendor-integrity` verifies every third-party file under `modules/src/vendor/` still hashes to the pin recorded in `modules/src/vendor/vendor.json`. Runnable without Nix too: `python3 scripts/check_vendor.py`. Add `--upstream` (needs network, so it is not in the Nix check) to ask each forge whether a newer release exists — `.github/workflows/vendor-updates.yml` does that weekly and files an issue.
+- `nix build -L .#checks.<system>.checkout-bootstrap` runs `tests/test-checkout-bootstrap.sh` against `modules/src/checkout-cli.sh`, the script that puts this repo ON a deployed box (issue #242). Its assertions are mostly REFUSALS, because that is where the damage would be: it runs unattended at every supervisor start, in a tree sibling sessions are working in, so a realign that moved somebody's branch pointer would destroy work at boot on a box nobody is watching. `origin` is a local repository and `gh` is a shim, so there is no network and it runs natively on every architecture. Runnable without Nix too: `bash tests/test-checkout-bootstrap.sh modules/src/checkout-cli.sh`.
 - `nix flake metadata` validates flake inputs and basic evaluation.
 - `nix build .#packages.x86_64-linux.vm` builds the bootable qcow2 image under `result/`.
 - `nix build -L .#checks.<system>.multi-user` runs the quick module/configuration assertion.

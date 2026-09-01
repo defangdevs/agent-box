@@ -429,6 +429,32 @@ path is required for the passwordless sudo rule to match, and so is the
 --no-block: sudoers compares the whole command line, so dropping a flag
 makes the rule miss and sudo ask for a password instead.
 
+## This box ships its own sources
+
+A checkout of the repo this box is BUILT from lives at
+`/home/agent/agent-box`, owned by the user `agent`. Read it
+before you answer a question about how this box works: what the box
+actually does is in that tree, and a general memory of agent-box is
+not the same thing.
+
+It is parked on the exact rev the box runs (detached HEAD - `git -C
+/home/agent/agent-box log -1` names it), so what you read is what is
+installed. `agent-box-checkout` re-creates it if it goes missing and
+re-parks it after a box update; it refuses to touch a tree that is on
+a branch or has uncommitted changes, so your work is never at risk.
+
+The checkout is SHARED by every session of that user, exactly like a
+repo you cloned yourself. Work in `git worktree add --detach` under
+your own directory and push from there - never commit in the shared
+tree.
+
+Changing this box means the same round trip as changing any other
+repo: edit, `nix run .#assemble`, run the checks, push to the `fork`
+remote if you have one, and open a PR. What the box RUNS still comes
+from the repo the deployment pinned, fetched by root as a hash-pinned
+file - so a commit only reaches this machine after the update above,
+and only when the deployment points at the repo you pushed to.
+
 ## This platform has its own upstream repo
 
 The box itself - the terminal, session manager, webhook wiring, this
