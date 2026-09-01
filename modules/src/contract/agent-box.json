@@ -1,0 +1,14 @@
+{
+  "unit": "agent-box@",
+  "condition": "always",
+  "env": [
+    { "name": "AGENT_BOX_GREP_BIN", "kind": "bin", "program": "grep" },
+    { "name": "AGENT_BOX_FIND_BIN", "kind": "bin", "program": "find" },
+    { "name": "AGENT_BOX_FLOCK_BIN", "kind": "bin", "program": "flock" },
+    { "name": "AGENT_BOX_HOSTNAME_BIN", "kind": "bin", "program": "hostname" },
+    { "name": "AGENT_BOX_ENV_EXEC", "kind": "bin", "program": "agent-box-env-exec" }
+  ],
+  "execStart": [
+    { "kind": "bin", "program": "agent-box-supervisor" }
+  ]
+}

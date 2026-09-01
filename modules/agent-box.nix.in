@@ -720,17 +720,37 @@ let
   webhookContract = builtins.fromJSON ''
 @@include:src/contract/agent-box-webhook.json@@
   '';
+  # modules/src/contract/agent-box.json — the same treatment for the
+  # per-session agent-box@ unit's fixed-program bindings (issue #451, PR 2's
+  # second unit family). The per-instance URL/path/username values on this
+  # unit, and its curated PATH/AGENT_BOX_AGENT_BINS lists, stay hand-written:
+  # they are either per-instance interpolation or a legitimately different
+  # value per backend, not a bare program name a contract entry could name.
+  agentBoxContract = builtins.fromJSON ''
+@@include:src/contract/agent-box.json@@
+  '';
   # A manifest entry only ever names a PROGRAM, never a store path (native's
   # side of the same contract resolves every program to "${self.bin}/name").
   # This is the module's half of that resolution: program name -> the
-  # derivation that provides it. Add an entry here, not a new hand-written
-  # environment/serviceConfig line, when a future contract references a new
-  # program.
+  # COMPLETE resolved path this backend serves it at. Stored fully resolved,
+  # not as a bare derivation, because the writer each program happens to use
+  # decides where its executable lands — writeShellScriptBin puts it at
+  # "${drv}/bin/name", but writeShellScript/writers.writePython3 put the
+  # executable AT "${drv}" itself — so contractBin below does no path
+  # arithmetic of its own, it just looks the program up. Add an entry here,
+  # not a new hand-written environment/serviceConfig line, when a future
+  # contract references a new program.
   contractPrograms = {
-    "agent-box-webhook-spawn" = webhookSpawn;
-    "agent-box-webhook-receiver" = webhookReceiverBin;
-    "agent-box-webhook-policy-apply" = webhookPolicyApply;
-    tmux = pkgs.tmux;
+    "agent-box-webhook-spawn" = "${webhookSpawn}/bin/agent-box-webhook-spawn";
+    "agent-box-webhook-receiver" = "${webhookReceiverBin}/bin/agent-box-webhook-receiver";
+    "agent-box-webhook-policy-apply" = "${webhookPolicyApply}/bin/agent-box-webhook-policy-apply";
+    tmux = "${pkgs.tmux}/bin/tmux";
+    grep = "${pkgs.gnugrep}/bin/grep";
+    find = "${pkgs.findutils}/bin/find";
+    flock = "${pkgs.util-linux}/bin/flock";
+    hostname = "${pkgs.unixtools.hostname}/bin/hostname";
+    "agent-box-env-exec" = "${envExecWrapper}";
+    "agent-box-supervisor" = "${supervisorScript}/bin/agent-box-supervisor";
   };
   # Resolve one manifest entry to the value this backend binds it to. An
   # unknown kind or program is a hard error at eval time (the whole point of
@@ -740,10 +760,8 @@ let
     if entry.kind != "bin" then
       throw "agent-box: contract entry has unknown kind '${entry.kind}'"
     else
-      let
-        drv = contractPrograms.${entry.program} or
-          (throw "agent-box: contract references unknown program '${entry.program}'");
-      in "${drv}/bin/${entry.program}";
+      contractPrograms.${entry.program} or
+        (throw "agent-box: contract references unknown program '${entry.program}'");
 
   # One session = one agent CLI in one tmux session. These options are the
   # FIRST-BOOT SEED only (see users.<name>.sessions); at runtime the same
@@ -2166,20 +2184,19 @@ in
         # each shallow-replace the whole `environment` attrset in turn and
         # silently drop everything set before it.
         environment =
-          ({
+          ((lib.listToAttrs (map
+            (e: lib.nameValuePair e.name (contractBin e))
+            agentBoxContract.env)) // {
             # grep and find are on the agent's own PATH too (agentBaseTools,
             # issue #372), but flock/hostname never are, and the supervisor's
             # transcript lookups, the sessions.json lock (issue #254) and the
             # codex remote-control wrapper's UTS re-exec run outside any
-            # agent session — so all four still get pinned binaries here (the
-            # AGENT_BOX_*_BIN convention) — same store path for every
-            # instance, hence host-level rather than per-user env-file
-            # content.
-            AGENT_BOX_GREP_BIN = "${pkgs.gnugrep}/bin/grep";
-            AGENT_BOX_FIND_BIN = "${pkgs.findutils}/bin/find";
-            AGENT_BOX_FLOCK_BIN = "${pkgs.util-linux}/bin/flock";
-            AGENT_BOX_HOSTNAME_BIN = "${pkgs.unixtools.hostname}/bin/hostname";
-            AGENT_BOX_ENV_EXEC = "${envExecWrapper}";
+            # agent session — so all four (plus env-exec) still get pinned
+            # binaries here (the AGENT_BOX_*_BIN convention), from the
+            # shared binding contract (agentBoxContract, issue #451) rather
+            # than hand-written — same store path for every instance, hence
+            # host-level rather than per-user env-file content.
+            #
             # Lazy harnesses (issue #416): where the supervisor fetches an
             # agent CLI from when a session names one that is not installed.
             # The SAME pinned channel the module resolves an eagerly
@@ -2187,6 +2204,12 @@ in
             # the other lands on one store path per CLI rather than two.
             AGENT_BOX_NIXPKGS = jitNixpkgsRef;
             AGENT_BOX_NIX_BIN = "${config.nix.package}/bin/nix";
+            # NOT in the contract above: unlike grep/find/flock/hostname/
+            # env-exec, native only sets this when "codex" is an installed
+            # agent (bin/agentbox's user_dropins), while the module sets it
+            # unconditionally — a real, pre-existing condition mismatch
+            # (issue #480), not something this refactor should paper over
+            # by silently making native unconditional too.
             AGENT_BOX_CODEX_RC = "${codexRemoteControl}";
             # Hook settings for claude spawns — the segment-rotation record
             # (issue #223) the supervisor follows on respawn.
@@ -2250,7 +2273,7 @@ in
           # unit's own bare `ExecStart=agent-box-supervisor`/
           # `ExecStop=tmux …` entirely, then the real absolute path replaces
           # it, with zero dependency on any search-path resolution at all.
-          ExecStart = [ "" "${supervisorScript}/bin/agent-box-supervisor" ];
+          ExecStart = [ "" (contractBin (lib.elemAt agentBoxContract.execStart 0)) ];
           ExecStop = [ "" "${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} kill-server" ];
           # NOTE: the settings page's user-owned ~/.config/agent-box/env is
           # deliberately NOT listed here (nor in the per-user env file).

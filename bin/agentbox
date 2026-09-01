@@ -1807,17 +1807,25 @@ class Renderer:
         and every drop-in is per instance, matching the NixOS side.
         """
         path = self.host_path(u)
+        # grep/find/flock/hostname/env-exec and the ExecStart binary come
+        # from the shared binding contract (issue #451) instead of being
+        # hand-written here — modules/agent-box.nix.in's contractBin is the
+        # module's half of the same resolution. AGENT_BOX_CODEX_RC stays
+        # hand-written below: unlike these five, it's conditional here on
+        # "codex" being installed while the module sets it unconditionally
+        # (issue #480, a pre-existing mismatch this refactor doesn't paper
+        # over).
+        agent_box_contract = self.load_contract("agent-box")
         lines = [
             f'Environment="PATH={path}"',
             f'Environment="AGENT_BOX_HOST_LABEL={self.spec.host_label}"',
-            f'Environment="AGENT_BOX_ENV_EXEC={self.bin}/agent-box-env-exec"',
-            f'Environment="AGENT_BOX_GREP_BIN={self.bin}/grep"',
-            f'Environment="AGENT_BOX_FIND_BIN={self.bin}/find"',
-            f'Environment="AGENT_BOX_FLOCK_BIN={self.bin}/flock"',
-            f'Environment="AGENT_BOX_HOSTNAME_BIN={self.bin}/hostname"',
+        ] + [
+            f'Environment="{e["name"]}={self.contract_bin(e)}"'
+            for e in agent_box_contract["env"]
+        ] + [
             f'ExecSearchPath={path}',
             "ExecStart=",
-            f"ExecStart={self.bin}/agent-box-supervisor",
+            f"ExecStart={self.contract_bin(agent_box_contract['execStart'][0])}",
             "ExecStop=",
             f"ExecStop={self.bin}/tmux -L agent-box kill-server",
         ]
