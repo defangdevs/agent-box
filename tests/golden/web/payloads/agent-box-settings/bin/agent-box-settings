@@ -3939,12 +3939,12 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     setStatus(el, "checking", "Starting update…");
     (function tick() {
       if (tries++ > MAX) {
-        setStatus(el, "blocked", "Update still running — check again shortly.");
+        setStatus(el, "blocked", "Update still running. Check again shortly.");
         return;
       }
       fetchStatus(url).then(function (s) {
         if (!s || !s.update) {           // daemon switching, or no unit to watch
-          setStatus(el, "checking", "Rebuilding the system…");
+          setStatus(el, "checking", "Applying the update...");
           window.setTimeout(tick, 2500);
           return;
         }
@@ -3956,7 +3956,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
         }
         if (u.since > baseline) {        // a newer run started and is no longer active → done
           if (u.active === "failed" || u.result !== "success") {
-            setStatus(el, "blocked", "Update failed — try again or ask an administrator.");
+            setStatus(el, "blocked", "Update failed. Try again or ask an administrator.");
           } else if (s.rev && rev0 && s.rev !== rev0) {
             var repo = el.getAttribute("data-repo");
             var short = s.rev.slice(0, 12);
@@ -4017,11 +4017,11 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     var el = document.getElementById("reboot-status");
     if (!el) { return; }
     var dipped = false, tries = 0, MAX = 240;   // ~10 min at 2.5s
-    setStatus(el, "checking", "Restarting — this page will come back by itself…");
+    setStatus(el, "checking", "Restarting. This page will come back by itself...");
     (function tick() {
       if (tries++ > MAX) {
         setStatus(el, "blocked",
-                  "Agent-box has not come back — ask an administrator to check it.");
+                  "Agent-box has not come back. Ask an administrator to check it.");
         return;
       }
       fetchStatus(url).then(function (s) {
@@ -4084,7 +4084,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
             ? "https://github.com/" + repoPath + "/compare/" +
               encodeURIComponent(rev) + "..." + encodeURIComponent(head)
             : fallback;
-          show("available", "Agent-box update available — " + commits + ".", "View changes", href);
+          show("available", "Agent-box update available: " + commits + ".", "View changes", href);
           return;
         }
         show("blocked", "Automatic agent-box update unavailable.", "Compare revisions", fallback);
@@ -4535,7 +4535,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     fetchSecret(b.getAttribute("data-secret-url")).then(function (secret) {
       if (!out.isConnected) { return; }
       if (!secret) {
-        b.setAttribute("title", "No secret yet — connect the service first");
+        b.setAttribute("title", "No secret yet. Connect the service first");
         return;
       }
       out.setAttribute("data-mask", out.textContent);

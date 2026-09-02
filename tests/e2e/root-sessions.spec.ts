@@ -260,7 +260,7 @@ test('settings link on the root page reaches the settings page, which manages se
   const page = await authedPage(browser);
   await page.goto('/');
   await page.locator(`#tab-bar a[href="/${USER}/settings/"]`).click();
-  await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
   // The session manager moved here from the old root list page (issue 119).
   await expect(page.locator('#session-editor')).toHaveCount(1);
   await expect(page.getByRole('heading', { name: 'Sessions', exact: true })).toBeVisible();

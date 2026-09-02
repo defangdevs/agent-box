@@ -105,7 +105,7 @@ test('basic auth renders the page and sets the auth cookie; cookie alone then su
   });
   const page = await ctx.newPage();
   await page.goto(SETTINGS_PATH);
-  await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
 
   const cookie = (await ctx.cookies()).find((c) =>
     c.name.startsWith('__Host-agent_box_auth_')
@@ -121,7 +121,7 @@ test('basic auth renders the page and sets the auth cookie; cookie alone then su
   const cookiePage = await cookieCtx.newPage();
   const res = await cookiePage.goto(SETTINGS_PATH);
   expect(res!.status()).toBe(200);
-  await expect(cookiePage.getByRole('heading', { name: 'Settings' })).toBeVisible();
+  await expect(cookiePage.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
 });
 
 test('update status reports available commits and links to the GitHub changes', async ({ browser }) => {
@@ -141,7 +141,7 @@ test('update status reports available commits and links to the GitHub changes', 
   await page.goto(SETTINGS_PATH);
   const status = page.locator('#update-status');
   await expect(status).toHaveAttribute('data-state', 'available');
-  await expect(status).toContainText('agent-box update available — 3 commits.');
+  await expect(status).toContainText('Agent-box update available: 3 commits.');
   const changes = status.getByRole('link', { name: 'View changes' });
   await expect(changes).toHaveAttribute('href', new RegExp(`/compare/.+\\.\\.\\.${head}$`));
 });

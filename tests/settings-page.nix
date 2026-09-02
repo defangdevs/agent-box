@@ -177,7 +177,7 @@
     # curl is still writing the page -> curl exit 23.)
     machine.succeed(
         f"su -s /bin/sh agent -c '{sock_curl} http://localhost/agent/settings/' "
-        "| grep '<h1.*Settings</h1>' >/dev/null"
+        "| grep -E '<h1><span[^>]*>[^<]*</span>Settings</h1>' >/dev/null"
     )
     # ...another local user gets permission denied — cannot list, write, or
     # restart. (Before the fix, all three worked over 127.0.0.1:7781.)
@@ -200,7 +200,7 @@
     # Authenticated GET renders the page.
     client.succeed(
         f"{curl} -u agent:testpassword https://box.test/agent/settings/ "
-        "| grep '<h1.*Settings</h1>' >/dev/null"
+        "| grep -E '<h1><span[^>]*>[^<]*</span>Settings</h1>' >/dev/null"
     )
 
     # No env file exists yet.
@@ -444,7 +444,7 @@
 
     # Maintenance's third row restarts agent-box. A kernel or libc patch
     # installs on disk and only takes effect at a boot, unattended patching
-    # deliberately never reboots, and nothing inside the box could — so
+    # deliberately never reboots, and nothing inside the box could - so
     # without this card such an update never finishes at all.
     assert "Restart agent-box" in page, "Maintenance should offer a restart"
     assert 'id="reboot-status"' in page, "Reboot card should have a status target"
