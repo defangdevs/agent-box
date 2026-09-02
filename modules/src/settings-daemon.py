@@ -3739,6 +3739,7 @@ def render_webhooks(watches):
 
 
 def render_agent_options():
+    """Build the session form options for the available assistants."""
     items = []
     for agent in AGENTS:
         sel = " selected" if agent == DEFAULT_AGENT else ""
