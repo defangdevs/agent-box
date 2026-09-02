@@ -1039,7 +1039,7 @@ note="${LOCAL_WEBHOOK_SPAWN_NOTE:+ (\"$LOCAL_WEBHOOK_SPAWN_NOTE\")}"
 # surface as a visible line rather than as "nobody else is live".
 peers="$("$SESSION_BIN" peers 2>&1)" \
   || peers="Could not ask which sessions are live, so assume one of them owns
-this and check by hand (agent-box-session peers, agent-box-session ls):
+this and check by hand ($SESSION_BIN peers, $SESSION_BIN ls):
 $peers"
 
 preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded" "$peers")"
