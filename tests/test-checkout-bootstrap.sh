@@ -136,6 +136,48 @@ else
   no "an interrupted clone is reclaimed by the next run" "$(cat "$work/out")"
 fi
 
+# --- REFUSAL: $dir already exists ---------------------------------------
+# Plain `mv` into an existing directory moves the source INSIDE it, so the
+# publish would produce $dir/<basename>.incoming: a nested checkout, a $dir
+# with no .git, and a clone repeated on every later run. An operator or an
+# agent running `mkdir -p` on the configured path is all it takes. `mv -T`
+# is what refuses that, in rename(2) rather than in a check that could be
+# raced, so both destination states are pinned here.
+rm -rf "$AGENT_BOX_CHECKOUT_DIR" "$AGENT_BOX_CHECKOUT_DIR.incoming"
+mkdir -p "$AGENT_BOX_CHECKOUT_DIR"                 # empty: reclaim it
+AGENT_BOX_CHECKOUT_REV=$REV_ONE run
+if [ "$(head_of "$AGENT_BOX_CHECKOUT_DIR")" = "$REV_ONE" ] \
+   && [ ! -e "$AGENT_BOX_CHECKOUT_DIR/$(basename "$AGENT_BOX_CHECKOUT_DIR").incoming" ]; then
+  ok "an empty dir is reclaimed, not cloned into"
+else
+  no "an empty dir is reclaimed, not cloned into" "$(cat "$work/out")"
+fi
+
+# Non-empty is somebody's data: refuse, say so, and leave it alone. The
+# clone must not be published anywhere — a nested tree is worse than none,
+# because the next run cannot tell it from a fresh start. "No .git" alone
+# would not catch that: a clone nested at $dir/<basename>.incoming leaves
+# the data intact and $dir/.git absent too, so the nested path is named
+# here explicitly. The SIBLING $dir.incoming is a different matter and is
+# asserted present below — refusing deliberately leaves the staging tree
+# for the next run to reclaim, which the "interrupted clone" case above
+# already relies on.
+rm -rf "$AGENT_BOX_CHECKOUT_DIR" "$AGENT_BOX_CHECKOUT_DIR.incoming"
+mkdir -p "$AGENT_BOX_CHECKOUT_DIR"
+echo mine > "$AGENT_BOX_CHECKOUT_DIR/not-a-checkout"
+AGENT_BOX_CHECKOUT_REV=$REV_ONE run
+nested="$AGENT_BOX_CHECKOUT_DIR/$(basename "$AGENT_BOX_CHECKOUT_DIR").incoming"
+if said "could not publish" \
+   && [ "$(cat "$AGENT_BOX_CHECKOUT_DIR/not-a-checkout")" = mine ] \
+   && [ ! -e "$nested" ] \
+   && [ -e "$AGENT_BOX_CHECKOUT_DIR.incoming" ] \
+   && [ ! -e "$AGENT_BOX_CHECKOUT_DIR/.git" ]; then
+  ok "a non-empty dir is refused, and its contents survive"
+else
+  no "a non-empty dir is refused, and its contents survive" "$(cat "$work/out")"
+fi
+rm -rf "$AGENT_BOX_CHECKOUT_DIR" "$AGENT_BOX_CHECKOUT_DIR.incoming"
+
 # A rev the remote does not have leaves NOTHING behind — publishing a tree
 # parked on the wrong commit is the failure this whole script exists to
 # avoid, so a half-right tree is worse than none.

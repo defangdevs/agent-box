@@ -118,11 +118,26 @@ if [ ! -e "$dir/.git" ]; then
     exit 1
   fi
   # The publish. A rename within one directory is atomic, which is what
-  # makes the paragraph above true.
-  if mv "$incoming" "$dir"; then
+  # makes the paragraph above true — and `-T` is what keeps it atomic when
+  # $dir already EXISTS. Plain `mv` into an existing directory moves the
+  # source INSIDE it, so the publish would quietly produce
+  # $dir/<basename>.incoming: a nested tree, a $dir with still no .git, the
+  # test above still true, and another nested copy on every later run, while
+  # the supervisor's comment promises a restart costs one local git command.
+  # $dir is reachable in that state without anything going wrong —
+  # checkout.path takes a nested value like src/agent-box and the shipped
+  # guide tells the agent to read that tree, so one mkdir -p is enough.
+  #
+  # `-T` names the DESTINATION rather than a directory to move into, so
+  # rename(2) decides: an empty $dir is replaced, a non-empty one is
+  # refused. That is the whole guard, and it is the reason there is no
+  # check above it to race — a concurrent run creating $dir between a check
+  # and this line could only change WHICH branch is taken, never whether
+  # the tree ends up nested.
+  if mv -T "$incoming" "$dir"; then
     say "cloned and parked on $rev"
   else
-    say "could not move $incoming into place — leaving it for the next run"
+    say "could not publish $incoming as $dir — if $dir exists and is not a checkout, move it aside; leaving the tree for the next run"
     exit 1
   fi
 fi
