@@ -1618,6 +1618,17 @@ class RenderTest(unittest.TestCase):
                 # (issue #471 review), not a hard-coded "config.yaml" —
                 # load_config() also accepts JSON and a custom path.
                 self.assertIn(str(custom_config), wrapper)
+                # ...but only the spawn wrapper carries the VALUE. Nothing
+                # in webhook-cli.sh reads AGENT_BOX_HOOK_SESSION_ARGS, and
+                # that CLI never invokes the spawn payload — it delegates to
+                # webhook.py — so the copy this renderer used to put in the
+                # CLI wrapper was read by no one. The module never had it
+                # there either, which made it a divergence in the direction
+                # nothing complains about; rendering both prologues from
+                # modules/src/contract/wrappers.json removed it.
+                if not name.endswith("agent-box-webhook-spawn"):
+                    self.assertNotIn("AGENT_BOX_HOOK_SESSION_ARGS", wrapper)
+                    continue
                 line = [x for x in wrapper.splitlines()
                         if "AGENT_BOX_HOOK_SESSION_ARGS" in x][0]
                 # What the shell would actually assign, per the shell.

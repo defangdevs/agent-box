@@ -334,14 +334,11 @@ UNIT_VARS_KNOWN_GAPS = {
 #
 # Same conventions as the tables above: an entry names the side it excuses,
 # and a name already declared box-wide needs no entry here.
+# Empty since the prologues became data (modules/src/contract/wrappers.json):
+# both backends render the same manifest, so a per-wrapper divergence is no
+# longer something either renderer can express. The comparison stays as the
+# backstop for the wrappers that have not been migrated yet.
 WRAPPER_VARS_BY_DESIGN = {
-    "agent-box-webhook AGENT_BOX_HOOK_ARGS_OPTION_NAME": (
-        "native",
-        "the CLI names the fleet-wide default's home in its own "
-        "diagnostics, and each backend has a different home to name: the "
-        "module bakes the option name into webhookCli at Nix eval time, "
-        "while native has one shared binary and must hand the config file "
-        "path over from the wrapper it generates per box"),
 }
 WRAPPER_VARS_KNOWN_GAPS = {
 }

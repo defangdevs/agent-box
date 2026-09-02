@@ -1,5 +1,13 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+# The pinned webhook.py this box RUNS. The wrapper carries the path
+# so the body stays backend-neutral (issue #154, Phase 2).
 export AGENT_BOX_WEBHOOK_SCRIPT=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-webhook.py
+# Where the fleet-wide default for hook-session args LIVES, named
+# once so the CLI's diagnostics can say it without hard-coding
+# backend prose into the shared script (issue #471 — the same shape
+# #466 fixed for the Caddyfile banner). Exported whether or not the
+# default is currently set to anything: the key exists either way.
+export AGENT_BOX_HOOK_ARGS_OPTION_NAME='the NixOS option services.agent-box.webhook.hookSessionArgs'
 set -eu
 # jq/python3/coreutils resolve from PATH (system packages); the pinned
 # webhook.py store path comes from the env the generated wrapper exports
