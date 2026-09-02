@@ -349,9 +349,11 @@ class ProfileRoutes(ProfileFixture):
         prefer either, is how they drift apart."""
         _, base = self.serve()
         self.post(base, "/profiles/set", name="review", HARNESS="claude")
-        status, _ = self.post(base, "/profiles/setkey", name="review",
-                              key="HARNESS", value="codex")
+        status, body = self.post(base, "/profiles/setkey", name="review",
+                                 key="HARNESS", value="codex")
         self.assertEqual(status, 400)
+        self.assertIn("Assistant is already a profile option", body)
+        self.assertNotIn("HARNESS, MODEL, EFFORT, SYSTEM_PROMPT", body)
 
     def test_a_name_that_is_not_a_profile_name_never_reaches_the_disk(self):
         """One file per profile, so the name is a path component."""
@@ -363,6 +365,7 @@ class ProfileRoutes(ProfileFixture):
         self.assertEqual(os.listdir(self.profiles), [])
 
     def test_an_unknown_harness_is_refused(self):
+        """A profile cannot select an assistant unavailable on this box."""
         _, base = self.serve()
         status, body = self.post(base, "/profiles/set", name="ok",
                                  HARNESS="nosuch")

@@ -452,6 +452,12 @@ PROFILE_BIN = os.environ.get("AGENT_BOX_PROFILE_BIN", "")
 # Same charset and length the CLI's valid_name() enforces (profile-cli.sh):
 # one file per profile, so the name is also a path component.
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+PROFILE_RESERVED_LABELS = {
+    "HARNESS": "Assistant",
+    "MODEL": "Model",
+    "EFFORT": "Reasoning level",
+    "SYSTEM_PROMPT": "Instructions",
+}
 # PROFILE_RESERVED (the launch config) comes from the env store above, which
 # is also what env-exec skips at spawn. Every OTHER key in a profile is
 # session environment, and is listed by NAME only — a profile is exactly
@@ -3665,9 +3671,9 @@ PASSWORD_SECTION = """<section>
 
 UPDATE_ROW = """<li>
         <span class="dz"><strong>Update agent-box</strong>
-        <span class="note">Installs the latest agent-box software and AI
-        tools. This usually takes a few minutes. Sessions may restart if
-        needed.{update_line}</span></span>
+        <span class="note">Updates agent-box and its AI tools, refreshes
+        configuration, and restarts affected services. This usually takes a
+        few minutes, and sessions may restart.{update_line}</span></span>
         <form method="post" action="{base}/update" data-poll="update"
               data-status="{base}/status"
               onsubmit="return confirm('Update agent-box now? Sessions may restart if needed.');">
@@ -5922,6 +5928,8 @@ def render_home(message="", selected=None):
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    """Serve the authenticated settings UI and its actions."""
+
     server_version = "agent-box-settings/1"
 
     def _under_base(self, path):
@@ -6116,10 +6124,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "saved": "Secret saved. Restart sessions to apply it.",
         "deleted": "Secret deleted. Restart sessions to apply the change.",
         "restarted": "Restart of all sessions requested.",
-        "session_added": "Session added — it starts within a few seconds.",
+        "session_added": "Session added \u2014 it starts within a few seconds.",
         "session_deleted": "Session deleted.",
         "session_restarted": "Session restart requested.",
-        "session_started": "Session started — it comes up within a few seconds.",
+        "session_started": "Session started \u2014 it comes up within a few seconds.",
         "update": "Agent-box update started. This page may be briefly unavailable.",
         "rebooting": "Restart requested. Agent-box will be unavailable for "
                      "about a minute; reload this page when it is back.",
@@ -6298,6 +6306,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return SESS_PAGE
 
     def do_POST(self):
+        """Validate and apply a settings-page form submission."""
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
         if not self._same_origin():
@@ -6460,12 +6469,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 value = form.get("value", [""])[0]
                 value = value.replace("\r\n", "\n").replace("\r", "\n")
                 if not KEY_RE.match(key) or key in PROFILE_RESERVED:
-                    self._send_html(
-                        render_page(
+                    if key in PROFILE_RESERVED:
+                        message = (
+                            "%s is already a profile option. Set it in the "
+                            "form above."
+                            % PROFILE_RESERVED_LABELS.get(key, "That name")
+                        )
+                    else:
+                        message = (
                             "Invalid setting name. Use letters, digits and "
-                            "underscores; do not start with a digit. %s are "
-                            "profile options \u2014 set them in the form above."
-                            % ", ".join(PROFILE_RESERVED)),
+                            "underscores; do not start with a digit."
+                        )
+                    self._send_html(
+                        render_page(message),
                         status=400,
                     )
                     return
