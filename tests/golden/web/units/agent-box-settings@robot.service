@@ -4,7 +4,6 @@
 Environment="AGENT_BOX_AGENTS=claude,codex,shell"
 Environment="AGENT_BOX_CONNECT_BINS=github=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gh-2.96.0/bin/gh defang=/var/lib/agent-box-defang-cli/bin/defang"
 Environment="AGENT_BOX_CONNECT_EXPRS=defang=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-defang-cli-expr.nix"
-Environment="AGENT_BOX_DEFAULT_AGENT=claude"
 Environment="AGENT_BOX_HOOK_SPAWN_CMD=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook-spawn/bin/agent-box-webhook-spawn"
 Environment="AGENT_BOX_NIXPKGS=https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz"
 Environment="AGENT_BOX_NIX_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nix-2.34.8/bin/nix"

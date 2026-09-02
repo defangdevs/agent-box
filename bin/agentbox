@@ -2111,8 +2111,6 @@ class Renderer:
                        f'Environment="PATH={self.bin}"',
                        f'Environment="AGENT_BOX_AGENTS='
                        f'{",".join(self.spec.agents + ["shell"])}"',
-                       f'Environment="AGENT_BOX_DEFAULT_AGENT='
-                       f'{self.spec.default_agent}"',
                        f'Environment="AGENT_BOX_REPO={self.spec.repo}"',
                        f'Environment="AGENT_BOX_REV={self.spec.rev}"',
                        f'Environment="AGENT_BOX_SYSTEMCTL={SYSTEMCTL}"',

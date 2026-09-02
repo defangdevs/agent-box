@@ -385,7 +385,6 @@ def dumps(path):
 #   AGENT_BOX_HOME               "1" = also serve the tabbed terminal
 #                                 workspace at / (primary web user)
 #   AGENT_BOX_AGENTS             comma-separated installed agent CLIs
-#   AGENT_BOX_DEFAULT_AGENT      agent preselected in the add form
 #   AGENT_BOX_PASSWORD_CMD       no-argument sudo command that verifies
 #                                 and replaces this user's web password
 #   AGENT_BOX_WEBHOOK_SCRIPT     pinned local-webhook webhook.py (empty =
@@ -493,7 +492,6 @@ WEB_USERS = [x for x in os.environ.get("AGENT_BOX_WEB_USERS", "").split(",") if 
 SESS_BASE = "" if HOME else BASE
 SESS_PAGE = TERM_HOME if HOME else BASE + "/"
 AGENTS = [a for a in os.environ.get("AGENT_BOX_AGENTS", "claude").split(",") if a]
-DEFAULT_AGENT = os.environ.get("AGENT_BOX_DEFAULT_AGENT", "claude")
 # Full sudo command line that triggers the box update (issue 54). Empty
 # when selfUpdate is off, which hides the Update card and 404s the route.
 UPDATE_CMD = os.environ.get("AGENT_BOX_UPDATE_CMD", "")
@@ -3330,8 +3328,7 @@ STYLE = """<style>
 # Shared by the settings-page and workspace add forms so their layout,
 # accessibility, and autocomplete behaviour cannot drift apart.
 NEW_SESSION_FIELDS_TPL = """<div class="row new-session-row">
-  <select name="agent" aria-label="Assistant">{agents}</select>
-  <select id="profile-picker" name="profile" aria-label="Profile"
+  <select id="profile-picker" name="profile" aria-label="Profile" required
           title="Profile: saved assistant, model, reasoning level and instructions">{profiles}</select>
   <span class="cwd-control">
     <label for="new-session-cwd">Starting folder</label>
@@ -3347,9 +3344,9 @@ NEW_SESSION_FIELDS_TPL = """<div class="row new-session-row">
   </span>
   <button type="submit" class="btn">Add session</button>
 </div>
-<p class="note">Choose where the session starts. The default is your home
-folder (<code>~</code>). A profile can also choose the assistant, model and
-instructions.</p>
+<p class="note">The profile decides which assistant runs, and its model,
+reasoning level and instructions. Choose where the session starts too: the
+default is your home folder (<code>~</code>).</p>
 <div class="row prompt-row">
   <textarea name="prompt" rows="2"
             placeholder="starting task (optional) &mdash; what this session should work on first"></textarea>
@@ -4860,26 +4857,52 @@ def render_keys(keys):
     return '<ul class="tbl"><li class="tbl-head">Name</li>' + body + "</ul>"
 
 
-def render_profile_options(profiles):
-    """The session row's profile <select>. "no profile" FIRST and selected,
-    because a session started with no profile is what every session on this
-    box was until now — the picker adds a choice, it does not take the
-    default away.
+# The value the profile picker posts for a bare shell session. A profile
+# NAME can only hold [A-Za-z0-9_-], so a leading ":" cannot collide with a
+# real profile - including one somebody names "shell", which is legal (what
+# #493 refuses is HARNESS=shell, not the name).
+SHELL_PSEUDO_PROFILE = ":shell"
 
-    Offers nothing at all without a resolver. The settings unit is socket
-    activated with stopIfChanged = false, so a daemon that survived an
-    update can still be running on the environment it started with — and on
-    one that predates AGENT_BOX_PROFILE_BIN, every pick would fail. A
-    picker that cannot work is worse than no picker: it sends the operator
-    looking for a deleted profile."""
+
+def render_profile_options(profiles):
+    """The session row's profile <select> - now the ONLY control on it
+    (issue #493).
+
+    It used to sit beside an assistant <select> and override it. That pair
+    could not express what a box actually is any more: a box installs its
+    assistants on demand, so there is no default one for the other select to
+    preselect, and two controls that both name an assistant made "which of
+    these two did I just change" a question the page could not answer.
+
+    So the profile is the whole answer, and every entry here starts a
+    session on its own terms. `shell` is offered as a pseudo-profile rather
+    than a profile file: it is a session KIND with no model, reasoning level
+    or instructions to save, which is the same reason agent-box-profile
+    refuses it as a HARNESS.
+
+    Nothing is preselected. The box no longer has a default assistant, so
+    the page asks rather than guessing - the rule the profile editor's own
+    picker already follows.
+
+    Without a resolver there is no picker at all. The settings unit is
+    socket activated with stopIfChanged = false, so a daemon that survived
+    an update can still be running on the environment it started with - and
+    on one that predates AGENT_BOX_PROFILE_BIN every pick would fail. Such a
+    daemon can still start a shell, which is the one entry needing no
+    resolver, and says why the rest are missing.
+    """
+    shell_opt = ('<option value="%s">shell (no assistant)</option>'
+                 % SHELL_PSEUDO_PROFILE)
     if not PROFILE_BIN:
-        return '<option value="">&mdash; no profile &mdash;</option>'
-    items = ['<option value="">&mdash; no profile &mdash;</option>']
+        return ('<option value="" disabled selected>Restart the settings '
+                'service to list profiles</option>' + shell_opt)
+    items = ['<option value="" disabled selected>Choose a profile</option>']
     for name in sorted(profiles):
         safe = html.escape(name)
         harness = html.escape(profiles[name]["reserved"].get("HARNESS") or "")
         label = f"{safe} ({harness})" if harness else safe
         items.append(f'<option value="{safe}">{label}</option>')
+    items.append(shell_opt)
     return "".join(items)
 
 
@@ -5467,16 +5490,6 @@ def render_webhooks(watches):
             + "".join(rows) + "</ul>")
 
 
-def render_agent_options():
-    """Build the session form options for the available assistants."""
-    items = []
-    for agent in AGENTS:
-        sel = " selected" if agent == DEFAULT_AGENT else ""
-        safe = html.escape(agent)
-        items.append(f'<option value="{safe}"{sel}>{safe}</option>')
-    return "".join(items)
-
-
 def render_reboot_line():
     """Why a reboot is worth pressing, or nothing at all.
 
@@ -5699,7 +5712,6 @@ def render_new_session_fields(profiles=None):
         profiles = read_profiles()
     return NEW_SESSION_FIELDS_TPL.format(
         action_base=html.escape(SESS_BASE),
-        agents=render_agent_options(),
         profiles=render_profile_options(profiles),
     )
 
@@ -6591,21 +6603,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
             back_page = self._sess_page(form)
             # Error pages re-render the page the form came from.
             render = render_home if (HOME and back_page == SESS_PAGE) else render_page
-            agent = (form.get("agent", [""])[0]).strip() or DEFAULT_AGENT
-            if agent not in AGENTS:
+            # The profile is the whole answer now (issue #493): the row has
+            # no assistant <select> beside it any more, and there is no
+            # box-wide default assistant left to fall back to. So the
+            # assistant comes from the profile, and a request naming neither
+            # is refused rather than guessed at.
+            #
+            # The old rule - "the profile's harness WINS over the select on
+            # its left" - existed because a <select> always posts a value,
+            # so the form could not tell "chose claude" from "left it
+            # alone". Deleting the select deletes the ambiguity with it.
+            # `agent-box-session add --profile P --agent H` is still the way
+            # to say the other thing from a shell.
+            profile = (form.get("profile", [""])[0]).strip()
+            agent = (form.get("agent", [""])[0]).strip()
+            if profile == SHELL_PSEUDO_PROFILE:
+                # The one entry that is not a profile file: a bare shell has
+                # no model, reasoning level or instructions to carry.
+                agent, profile = "shell", ""
+            elif profile:
+                agent = ""      # resolved from the profile below
+            elif not agent:
+                # The FORM always sends a profile now, so this is a request
+                # made some other way. It used to fall through to the box
+                # default; there is none, so it is refused rather than
+                # guessed at.
                 self._send_html(
-                    render("Unknown agent. Available: " + ", ".join(AGENTS)),
+                    render("Pick a profile for that session \u2014 it is "
+                           "what decides which assistant runs, and how."),
                     status=400,
                 )
                 return
-            # An agent profile (#321), if one was picked. The profile's
-            # harness WINS over the select on its left, rather than the
-            # CLI's order where an explicit --agent overrides it: a select
-            # always posts a value, so this form cannot tell "chose claude"
-            # from "left it alone", and a rule that depends on a difference
-            # the page cannot see would be a guess. `agent-box-session add
-            # --profile P --agent H` is still the way to say the other thing.
-            profile = (form.get("profile", [""])[0]).strip()
+            # An explicit assistant with no profile is still allowed, which
+            # is what `agent-box-session add --agent H` does from a shell.
+            # The row no longer offers it (issue #493), but the route is not
+            # the row: removing the picker's ambiguity is not a reason to
+            # take a capability away from everything else that posts here.
+            if agent and agent not in AGENTS:
+                self._send_html(
+                    render("Unknown assistant. Available: " + ", ".join(AGENTS)),
+                    status=400,
+                )
+                return
             pargs = []
             if profile and not PROFILE_BIN:
                 # Said plainly, because the two are fixed differently: this
@@ -6626,18 +6665,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # resolved HERE, at create time, so a later edit to the
                 # profile does not change what a running session was started
                 # with (the rule webhook.hookSessionArgs already states).
-                # The row's selection is handed to the RESOLVER when the
-                # profile names no harness of its own — not corrected after
-                # it, because the arguments are harness-specific. Without
-                # this, a profile carrying only MODEL/EFFORT resolved to the
-                # box default and discarded the selection, so neither the
-                # profile nor the operator decided which harness ran. One
-                # file, not read_profiles(): the whole directory is not
-                # needed to answer a question about one profile.
-                own_harness = as_dict(
-                    load(profile_path(profile))).get("HARNESS", "").strip()
-                resolved = profile_launch(profile,
-                                          "" if own_harness else agent)
+                # No override is passed any more (issue #493). There used
+                # to be one: the row's assistant <select> was handed to the
+                # resolver when the profile named no harness of its own,
+                # because otherwise a profile carrying only MODEL/EFFORT
+                # resolved to the box default and neither the profile nor
+                # the operator decided which assistant ran. Both halves of
+                # that are gone - the select, and the box default - and a
+                # profile that names no harness is now refused by the
+                # resolver itself rather than quietly resolved.
+                resolved = profile_launch(profile)
                 if resolved is None:
                     self._send_html(
                         render("Could not load profile '%s'. It may have "
@@ -6645,7 +6682,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         status=400,
                     )
                     return
-                agent = resolved.get("harness") or agent
+                agent = resolved.get("harness") or ""
                 if agent not in AGENTS:
                     self._send_html(
                         render("Profile '%s' uses an assistant that is not "
