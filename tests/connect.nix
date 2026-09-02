@@ -432,7 +432,7 @@ in
     with subtest("a hand-set env key still wins, and the card says so"):
         assert post("/agent/settings/set", "key=GH_TOKEN&value=ghp_manual") == "303"
         body = get("/agent/settings/")
-        assert "is set under Environment secrets" in body
+        assert "is set under API keys and secrets" in body
         assert "ghp_manual" not in body
         # The status probe must see the env STORE, not just the daemon's own
         # environment: that unit never loads the store (the supervisor's

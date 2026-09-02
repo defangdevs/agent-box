@@ -71,8 +71,8 @@ class WebhookPanelState(unittest.TestCase):
     def test_no_webhook_variables_at_all_reads_as_off(self):
         """The box renders no receiver. Nothing is broken; say so."""
         text = daemon_with().webhook_unavailable()
-        self.assertIn("Off on this box", text)
-        self.assertIn("webhook.enable", text)
+        self.assertIn("Automations are not enabled", text)
+        self.assertIn("administrator", text)
 
     def test_state_dir_without_script_names_the_missing_variable(self):
         """Issue #426 exactly: the settings unit got the state dir and the
@@ -83,7 +83,7 @@ class WebhookPanelState(unittest.TestCase):
             AGENT_BOX_WEBHOOK_URL="https://box.example/agent/webhook",
         ).webhook_unavailable()
         self.assertIn("AGENT_BOX_WEBHOOK_SCRIPT", text)
-        self.assertNotIn("Off on this box", text)
+        self.assertNotIn("Automations are not enabled", text)
 
     def test_script_without_state_dir_names_the_missing_variable(self):
         text = daemon_with(
@@ -110,6 +110,13 @@ class WebhookPanelState(unittest.TestCase):
         self.assertIsNone(module.webhook_unavailable())
         self.assertTrue(module.WEBHOOKS)
 
+    def test_event_expiry_labels_explain_their_meaning(self):
+        module = daemon_with()
+        self.assertEqual(module.display_event_expiry("45 minutes"),
+                         "Expires in 45 minutes")
+        self.assertEqual(module.display_event_expiry("never (pinned)"),
+                         "Always active")
+
     def test_no_sender_yet_is_prose_and_not_a_one_row_table(self):
         """The table lists the senders that exist. With none, it is a
         header over a paragraph of documentation — and `.tbl li` is a flex
@@ -121,14 +128,14 @@ class WebhookPanelState(unittest.TestCase):
             AGENT_BOX_WEBHOOK_URL="https://box.example/agent/webhook",
         )
         html = module.render_webhook_endpoint()
-        self.assertNotIn("Payload URL", html)
+        self.assertNotIn("Webhook URL", html)
         self.assertNotIn("<ul", html)
-        self.assertIn("No sender is set up yet", html)
+        self.assertIn("No service is connected yet", html)
         # The command names its source: the panel is not GitHub-only, and
         # `setup` leaning on its default hid the argument entirely.
         self.assertIn("agent-box-webhook setup SOURCE", html)
-        self.assertIn("agent-box-webhook setup github", html)
-        self.assertIn("https://box.example/agent/webhook/&lt;source&gt;", html)
+        self.assertIn("replacing SOURCE", html)
+        self.assertIn("<code>github</code>", html)
 
     def test_a_configured_sender_gets_the_table_back(self):
         """And the same paragraph still says what a webhook is, without
@@ -142,10 +149,10 @@ class WebhookPanelState(unittest.TestCase):
             AGENT_BOX_WEBHOOK_URL="https://box.example/agent/webhook",
         )
         html = module.render_webhook_endpoint()
-        self.assertIn("Payload URL", html)
+        self.assertIn("Webhook URL", html)
         self.assertIn("https://box.example/agent/webhook/stripe", html)
         self.assertNotIn("No sender is set up yet", html)
-        self.assertIn("GitHub is just the usual one", html)
+        self.assertIn("Connect GitHub or another service", html)
 
     def test_the_explanation_is_rendered_as_the_webhook_section(self):
         """Under its own heading, so an operator looking for the panel
@@ -153,8 +160,8 @@ class WebhookPanelState(unittest.TestCase):
         module = daemon_with()
         html = module.WEBHOOK_UNAVAILABLE_TPL.format(
             text=module.webhook_unavailable())
-        self.assertIn("<h2>Webhook</h2>", html)
-        self.assertIn("Off on this box", html)
+        self.assertIn("<h2>Automations</h2>", html)
+        self.assertIn("Automations are not enabled", html)
 
 
 if __name__ == "__main__":

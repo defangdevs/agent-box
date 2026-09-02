@@ -1912,7 +1912,7 @@
         # Until this, both halves were reachable only by running
         # `agent-box-webhook url`/`setup` in a session — a shell the
         # operator reading this page may not have.
-        "Payload URL",
+        "Webhook URL",
         "https://box.test/agent/webhook/github",
         'data-copy="https://box.test/agent/webhook/github"',
         'data-secret-url="/agent/settings/webhooks/secret?source=github"',
@@ -2076,7 +2076,7 @@
     # That was main's last topic, so its row now reads one of the empty
     # states: a filter file that lists nothing.
     page = machine.succeed(f"{settings_curl} {settings_page}")
-    assert "no subscriptions" in page, page
+    assert "event notifications off" in page, page
     assert "Unsubscribed from everything" in page, page
 
     # An empty filter file names no topic, so unsubscribe has nothing to take
@@ -2088,8 +2088,8 @@
     assert settings_post(forget_url, "name=main") == "303"
     machine.fail(f"test -e {main_filter}")
     page = machine.succeed(f"{settings_curl} {settings_page}")
-    assert "never subscribed" in page, page
-    assert "no subscriptions" not in page, page
+    assert "event notifications off" in page, page
+    assert "never subscribed" not in page, page
     # Nothing left to delete: the route says so rather than reporting a
     # success it did not have.
     assert "ok=webhook_kept" in machine.succeed(
