@@ -462,7 +462,7 @@ in
         machine.wait_until_fails(tmux("list-sessions"))
         assert post("/agent/settings/connect/start", "flow=claude") == "409"
         machine.fail(tmux("list-sessions"))
-        assert "nowhere to sign in from" in get("/agent/settings/")
+        assert "before signing in" in get("/agent/settings/")
         assert state("claude")["blocked"] is True
   '';
 }

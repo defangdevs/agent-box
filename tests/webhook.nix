@@ -1904,9 +1904,9 @@
         "github:defangdevs/panel",     # this session's own subscription...
         "shown in the UI",             # ...and the note saying why it exists
         'data-fold="subs-main"',       # folded under the session it delivers to
-        "1 subscription",              # and counted on that session's row
+        "1 event notification",        # and counted on that session's row
         f'data-fold="subs-{hook_name}"',   # a spawned session's seeded topic
-        "Standing watch",              # the shared dispatch list, its own panel
+        "Automatic session rule",      # the shared dispatch list, its own panel
         # The endpoint half of the same panel: what to register in the
         # sender, per configured source, paste-ready with a copy button.
         # Until this, both halves were reachable only by running
