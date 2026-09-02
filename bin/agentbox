@@ -739,6 +739,15 @@ class Renderer:
         """
         if entry["kind"] == "hook-spawn":
             return "/etc/agent-box/bin/agent-box-webhook-spawn"
+        # A GENERATED per-box CLI wrapper, not a plain profile binary. The
+        # profile's flat bin/ holds the payload (agent-box-session-bare);
+        # the wrapper that supplies its environment is the one this renderer
+        # writes to /usr/local/bin. Resolving a "cli" entry through the
+        # self.bin lookup below would name a file that does not exist —
+        # which is the shape of issue #503, where the spawn payload resolved
+        # `agent-box-session` from a PATH holding only the profile.
+        if entry["kind"] == "cli":
+            return f"/usr/local/bin/{entry['program']}"
         if entry["kind"] != "bin":
             raise ValueError(
                 f"agent-box: contract entry has unknown kind {entry['kind']!r}")

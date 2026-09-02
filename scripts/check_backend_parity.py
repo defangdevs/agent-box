@@ -372,6 +372,24 @@ WRAPPERS_BY_DESIGN = {
 WRAPPERS_KNOWN_GAPS = {
 }
 
+# A shared payload that RUNS one of those generated CLIs by bare name, letting
+# PATH decide which file it gets. That is the same divergence as a missing
+# export, one layer down, and it is not something either backend can declare
+# its way out of: the module's receiver unit put the session CLI on PATH, the
+# native one could not — its profile holds the payload (…-bare) and the wrapper
+# lives in /usr/local/bin — so every standing-watch match on a native box died
+# with "exec: agent-box-session: not found" and the batch was dropped (#503).
+#
+# Only the two forms that actually EXECUTE are matched, `exec NAME` and
+# `$(NAME`, because a payload legitimately mentions these CLIs constantly in
+# prompt text and --help output, and a rule that read prose would be worse than
+# no rule. The fix is always the same: pin it through a contract entry of kind
+# "cli" and call "$THAT_BIN".
+BARE_CALLS_BY_DESIGN = {
+}
+BARE_CALLS_KNOWN_GAPS = {
+}
+
 
 def wrapper_files(root):
     """{name: text} for every generated wrapper in one rendered tree.
@@ -388,6 +406,27 @@ def wrapper_files(root):
         if path.parent.name == "bin":
             found.setdefault(path.name, set()).update(
                 m.group(1) for m in EXPORTED.finditer(text))
+    return found
+
+
+def bare_cli_calls(names):
+    """{"<payload> <cli>", ...} for a shared payload that EXECS a generated
+    CLI by bare name.
+
+    Command position only, and only the two spellings that run something:
+    `exec NAME` and `$(NAME`. These CLIs appear all over the payloads' prompt
+    text and help output, so anything looser reports prose.
+    """
+    found = set()
+    pattern = re.compile(
+        r"(?:\bexec\s+|\$\()\s*(" + "|".join(re.escape(n) for n in sorted(names))
+        + r")(?=[\s)]|$)")
+    for path, text in read_files(SHARED):
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            for match in pattern.finditer(line):
+                found.add(f"{path.name} {match.group(1)}")
     return found
 
 
@@ -564,7 +603,8 @@ def ambiguous(kind, by_design, known):
     return dupes
 
 
-def report(kind, only_module, only_native, by_design, known):
+def report(kind, only_module, only_native, by_design, known,
+           where=None, remedy=None):
     """Print one section; return (violations, stale entries).
 
     An entry excuses its name only on the side it was written for. A name
@@ -575,7 +615,11 @@ def report(kind, only_module, only_native, by_design, known):
     violations, stale = [], []
     for name in sorted(only_module | only_native):
         side = "module" if name in only_module else "native"
-        where = f"{side} only"
+        # `where` overrides the side phrasing for a section where "module
+        # only" would be a lie: a bare CLI call sits in a SHARED payload, so
+        # it is not one backend supplying something the other does not — it
+        # is one line hazardous to whichever PATH lacks the CLI.
+        where = where or f"{side} only"
         entry = by_design.get(name) or known.get(name)
         if entry is not None and entry[0] != side:
             violations.append((name, f"{where}, but its entry is written for "
@@ -593,9 +637,9 @@ def report(kind, only_module, only_native, by_design, known):
         print(f"\nFAIL: {len(violations)} undeclared {kind} divergence(s):",
               file=sys.stderr)
         for name, where in violations:
-            print(f"       {name} — supplied {where}.\n"
-                  f"       Supply it from both backends, or declare it in "
-                  f"scripts/check_backend_parity.py with a reason.",
+            print(f"       {name} — {where}.\n"
+                  f"       {remedy or 'Supply it from both backends, or declare it in '
+                             'scripts/check_backend_parity.py with a reason.'}",
                   file=sys.stderr)
     if stale:
         print(f"\nFAIL: {len(stale)} stale {kind} entr(y/ies) — no longer a "
@@ -634,8 +678,10 @@ def main():
                              WRAPPER_VARS_BY_DESIGN, WRAPPER_VARS_KNOWN_GAPS)
     bad_wrapper_set = ambiguous("wrapper",
                                 WRAPPERS_BY_DESIGN, WRAPPERS_KNOWN_GAPS)
+    bad_bare = ambiguous("bare CLI call",
+                         BARE_CALLS_BY_DESIGN, BARE_CALLS_KNOWN_GAPS)
     if (bad_vars or bad_units or bad_pairs or bad_wrappers
-            or bad_wrapper_set):
+            or bad_wrapper_set or bad_bare):
         return 1
     shared_units = names(SHARED_UNITS, SUPPLIED)
     module = names(GOLDEN, SUPPLIED) | shared_units
@@ -727,7 +773,22 @@ def main():
                     carrying(nat_wrappers, set(nat_wrappers) - set(mod_wrappers)),
                     WRAPPERS_BY_DESIGN, WRAPPERS_KNOWN_GAPS)
 
-    if (v1 or v2 or v3 or v4 or v5 or s1 or s2 or s3 or s4 or s5):
+    # ...and a payload that runs one of those wrappers by bare NAME, which
+    # leaves the choice of file to whichever PATH the caller happens to have.
+    # Reported as module-side: the payload is shared, so the call is a hazard
+    # for whichever backend's PATH does not carry the CLI, and naming a side
+    # would be arbitrary.
+    bare = bare_cli_calls(set(mod_wrappers) & set(nat_wrappers))
+    print(f"\nshared payloads running a generated CLI by bare name "
+          f"(PATH decides which file):")
+    v6, s6 = report("bare CLI call", bare, set(),
+                    BARE_CALLS_BY_DESIGN, BARE_CALLS_KNOWN_GAPS,
+                    where="run by bare name, so PATH picks the file",
+                    remedy=("Pin it: give the wrapper a contract entry of "
+                            "kind \"cli\" and call \"$THAT_BIN\" instead."))
+
+    if (v1 or v2 or v3 or v4 or v5 or v6
+            or s1 or s2 or s3 or s4 or s5 or s6):
         return 1
     print("\nOK: every divergence between the two backends is declared.")
     return 0

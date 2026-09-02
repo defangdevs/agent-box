@@ -151,6 +151,16 @@ $6"
 #   hook_args_source  where they came from, for the --preamble report
 hook_args_file="$HOME/.config/agent-box/env"
 ENVSTORE="${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
+# The session CLI this spawn ends by exec'ing into, pinned for the same reason
+# and by the same wrapper. It used to be a bare `agent-box-session`, resolved
+# from the receiver unit's PATH — which works only where that PATH happens to
+# carry the CLI. On a native box it does not: the profile ships the payload as
+# agent-box-session-bare and the usable CLI is the generated wrapper at
+# /usr/local/bin, so every standing-watch match died with
+# "exec: agent-box-session: not found" and the batch was DROPPED (issue #503).
+# Nothing here resolves a generated CLI from PATH any more; the wrapper says
+# where it is, exactly as it does for the env store, jq and flock.
+SESSION_BIN="${AGENT_BOX_SESSION_BIN:?the session CLI is pinned by the generated wrapper; run this through the installed command}"
 hook_args_source=""
 if [ -n "${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   hook_args_source="${AGENT_BOX_HOOK_ARGS_OPTION_NAME:-the fleet-wide default}"
@@ -763,7 +773,7 @@ note="${LOCAL_WEBHOOK_SPAWN_NOTE:+ (\"$LOCAL_WEBHOOK_SPAWN_NOTE\")}"
 # tmux is not on this unit's PATH, which is why the CLI takes the pinned
 # AGENT_BOX_TMUX_BIN this unit exports, and a future PATH regression must
 # surface as a visible line rather than as "nobody else is live".
-peers="$(agent-box-session peers 2>&1)" \
+peers="$("$SESSION_BIN" peers 2>&1)" \
   || peers="Could not ask which sessions are live, so assume one of them owns
 this and check by hand (agent-box-session peers, agent-box-session ls):
 $peers"
@@ -784,10 +794,10 @@ pflag=()
 # post-mortem branch is unaffected: a hook agent that CRASHES is not parked,
 # so it stays attachable for inspection exactly as before.
 if [ "${#extra[@]}" -gt 0 ]; then
-  exec agent-box-session add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral --prompt "$preamble
+  exec "$SESSION_BIN" add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral --prompt "$preamble
 
 $PROMPT" -- "${extra[@]}"
 fi
-exec agent-box-session add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral --prompt "$preamble
+exec "$SESSION_BIN" add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral --prompt "$preamble
 
 $PROMPT"

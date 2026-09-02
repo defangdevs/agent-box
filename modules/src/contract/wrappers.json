@@ -2,7 +2,7 @@
   "//": [
     "Binding contract for generated WRAPPER prologues (issue #451's shape, one",
     "level over). A wrapper is the third place a shared payload's environment",
-    "can come from, after a unit and an env file — and it belongs to no unit:",
+    "can come from, after a unit and an env file \u2014 and it belongs to no unit:",
     "the webhook receiver and the settings daemon both run agent-box-webhook-",
     "spawn, so what it gets is the prologue the renderer writes above the",
     "`exec`, not any unit's Environment=. Both backends used to write those",
@@ -15,9 +15,16 @@
     "So the prologue is data. Each entry is one export, and the reason it",
     "exists is written HERE, once, instead of once per backend.",
     "",
-    "  kind 'bin'     names a PROGRAM, never a path — each backend resolves it",
+    "  kind 'bin'     names a PROGRAM, never a path \u2014 each backend resolves it",
     "                 the way it already resolves a unit contract's programs",
     "                 (contractPrograms here, self.bin/<program> natively).",
+    "  kind 'cli'     names one of the GENERATED per-box CLI wrappers. Same",
+    "                 program-not-a-path rule as 'bin', but the two backends",
+    "                 put a generated wrapper somewhere different from a plain",
+    "                 profile binary: a store path built per box on NixOS,",
+    "                 /usr/local/bin/<program> natively. Needed because the",
+    "                 profile's flat bin/ holds the PAYLOAD (\u2026-bare), not the",
+    "                 wrapper that supplies its environment.",
     "  kind 'config'  names a per-box VALUE by key. The two backends may",
     "                 legitimately resolve one to different text: the box's",
     "                 configuration lives in a NixOS option on one and in",
@@ -46,7 +53,7 @@
           "why": [
             "Where the fleet-wide default for hook-session args LIVES, named",
             "once so the CLI's diagnostics can say it without hard-coding",
-            "backend prose into the shared script (issue #471 — the same shape",
+            "backend prose into the shared script (issue #471 \u2014 the same shape",
             "#466 fixed for the Caddyfile banner). Exported whether or not the",
             "default is currently set to anything: the key exists either way."
           ]
@@ -56,6 +63,20 @@
     {
       "name": "agent-box-webhook-spawn",
       "env": [
+        {
+          "name": "AGENT_BOX_SESSION_BIN",
+          "kind": "cli",
+          "program": "agent-box-session",
+          "why": [
+            "The CLI this spawn ends by exec'ing into, to create the hook session.",
+            "It was a bare `agent-box-session` resolved from the receiver unit's",
+            "PATH, which carried it on NixOS and not natively \u2014 where the profile",
+            "ships agent-box-session-bare and the wrapper lives in /usr/local/bin.",
+            "Every match on a native box died with 'exec: agent-box-session: not",
+            "found' and the batch was dropped (issue #503). Pinned here so no",
+            "backend's PATH decides whether a watch can start anything."
+          ]
+        },
         {
           "name": "AGENT_BOX_FLOCK_BIN",
           "kind": "bin",
@@ -75,7 +96,7 @@
             "--preamble is run by the SETTINGS DAEMON, whose unit forces a PATH",
             "without jq (the receiver unit's PATH has it, but that is the other",
             "caller). Every jq use in this script is guarded, so an unfound",
-            "binary would report the wrong worker rather than fail — pin it."
+            "binary would report the wrong worker rather than fail \u2014 pin it."
           ]
         },
         {
@@ -84,7 +105,7 @@
           "key": "defaultAgent",
           "why": [
             "Which agent a match really starts. The spawn calls",
-            "`agent-box-session add` with no --agent, so it is the box default —",
+            "`agent-box-session add` with no --agent, so it is the box default \u2014",
             "and --preamble has to NAME it, because that is the half of 'what",
             "does this watch launch' the page could not show before (#292)."
           ]
