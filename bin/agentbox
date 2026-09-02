@@ -744,6 +744,69 @@ class Renderer:
                 f"agent-box: contract entry has unknown kind {entry['kind']!r}")
         return f"{self.bin}/{entry['program']}"
 
+    def contract_config(self, key):
+        """Resolve one wrapper-contract config entry to this box's value.
+
+        The other half of a wrapper contract's resolution, beside
+        contract_bin above. A manifest entry names a KEY and never a value
+        precisely because the two backends may resolve one to different
+        text: a diagnostic that says where the fleet-wide default for
+        hook-session args LIVES has to name a NixOS option on that backend
+        and the config file actually in force here (issue #471). An empty
+        string means "not set", which is what omitWhenEmpty keys on.
+        """
+        if key == "defaultAgent":
+            return self.spec.default_agent
+        if key == "webhookScript":
+            return self.spec.webhook_script
+        if key == "hookArgsOptionName":
+            # self.config, not a hard-coded "config.yaml": load_config()
+            # also accepts JSON and a custom --config path, and the
+            # diagnostic has to name the file in force (issue #471 review).
+            return f"webhook.hookSessionArgs in {self.config}"
+        if key == "hookSessionArgs":
+            return (json.dumps(self.spec.hook_session_args)
+                    if self.spec.hook_session_args else "")
+        raise ValueError(
+            f"agent-box: wrapper contract has unknown config key {key!r}")
+
+    def wrapper_env(self, name):
+        """One generated wrapper's prologue, rendered from the manifest.
+
+        A wrapper belongs to no unit — the webhook receiver and the settings
+        daemon both run agent-box-webhook-spawn — so what the payload gets
+        is this block above the `exec`, and both backends used to write it
+        by hand, in two languages. PR #500 is what that cost: this renderer
+        never exported AGENT_BOX_ENVSTORE_BIN, the payload reads it with a
+        ${...:?}, and every standing watch here died at "spawn command
+        exited 1" with the batch dropped. Neither backend writes a prologue
+        any more; both render modules/src/contract/wrappers.json.
+
+        The "why" prose comes from the manifest too, so the reason an export
+        exists is written once for both backends rather than once each.
+        """
+        wrappers = self.load_contract("wrappers")["wrappers"]
+        wrapper = next((w for w in wrappers if w["name"] == name), None)
+        if wrapper is None:
+            raise ValueError(f"agent-box: no wrapper contract named {name!r}")
+        out = ""
+        for entry in wrapper["env"]:
+            if entry["kind"] == "config":
+                value = self.contract_config(entry["key"])
+                # shlex.quote, not hand-written single quotes: these values
+                # come from the box's config, and JSON does not escape an
+                # apostrophe — one `don't` in webhook.hookSessionArgs closed
+                # the quoted string and broke the wrapper (issue #394 review).
+                rendered = shlex.quote(value)
+            else:
+                value = rendered = self.contract_bin(entry)
+            if entry.get("omitWhenEmpty") and not value:
+                continue
+            for line in entry.get("why", []):
+                out += f"# {line}\n"
+            out += f"export {entry['name']}={rendered}\n"
+        return out
+
     def render(self):
         t = Tree()
         self.dirs(t)
@@ -2609,29 +2672,13 @@ class Renderer:
             # also accepts JSON and a custom --config path, and the
             # diagnostic has to name the file actually in force (issue
             # #471 review).
-            hook_args_option_name = \
-                f"webhook.hookSessionArgs in {self.config}"
-            # Exported unconditionally, unlike the value below: the key
-            # exists, and this names it, whether or not it is currently
-            # set to anything.
-            hook_env = (
-                f"export AGENT_BOX_HOOK_ARGS_OPTION_NAME="
-                f"{shlex.quote(hook_args_option_name)}\n"
-                # Unset when the list is empty, so "nothing set" stays
-                # distinguishable from "set to nothing" — matching the
-                # module's `lib.optionalString (hookSessionArgs != [])`
-                # (issue #471). Exporting `[]` unconditionally used to
-                # make webhook-spawn.sh's `[ -n ... ]` check always true
-                # on native.
-                + (f"export AGENT_BOX_HOOK_SESSION_ARGS="
-                   f"{shlex.quote(json.dumps(self.spec.hook_session_args))}\n"
-                   if self.spec.hook_session_args else ""))
+            # Both prologues come from modules/src/contract/wrappers.json,
+            # the same manifest the module renders — see wrapper_env above
+            # for why neither backend writes one by hand any more.
             t.file(self.p("/usr/local/bin/agent-box-webhook"),
                    "#!/bin/sh\n"
                    "# Generated by `agentbox apply` — do not edit.\n"
-                   f"export AGENT_BOX_WEBHOOK_SCRIPT="
-                   f"{shlex.quote(self.spec.webhook_script)}\n"
-                   + hook_env
+                   + self.wrapper_env("agent-box-webhook")
                    + f'exec {self.bin}/agent-box-webhook-bare "$@"\n', 0o755)
             # A second, narrower wrapper around the profile's own spawn
             # binary (issue #471 review): the webhook receiver and the
@@ -2639,57 +2686,11 @@ class Renderer:
             # command directly, never through agent-box-webhook above, so
             # without this the box-wide hookSessionArgs default never
             # reached an automated hook-session spawn on native — only a
-            # hand-run `agent-box-webhook` call saw it. The module has no
-            # equivalent gap: it bakes the same two lines directly into
-            # webhookSpawn's own derivation at Nix eval time, so every
-            # caller of that binary already carries them.
-            # ...and it needs more than the CLI above does. This is the
-            # only wrapper that runs webhook-spawn.sh, and that payload
-            # reads three names the CLI's own payload never does — the
-            # same three the module exports into webhookSpawn's
-            # derivation. AGENT_BOX_ENVSTORE_BIN is the one that bites:
-            # the payload reads it with ${...:?}, so a spawn wrapper
-            # without it EXITS 1 before doing anything, and a standing
-            # watch on a native box silently stops starting sessions
-            # (the receiver logs "spawn command exited 1" and DROPS the
-            # batch — GitHub does not retry it). It only ever appeared to
-            # work because the receiver inherited the variable from the
-            # `agentbox apply` process that started it, until a
-            # socket-activated restart gave it a clean environment.
-            #
-            # Not in hook_env: the CLI wrapper's payload reads none of
-            # them, and exporting a name into a wrapper that does not
-            # need it is the same divergence in the other direction.
-            spawn_env = (
-                # registry.sh takes the hook-session cap lock through
-                # this, and the receiver unit's PATH (jq + coreutils +
-                # the session CLI) has no flock on it.
-                f"export AGENT_BOX_FLOCK_BIN="
-                f"{shlex.quote(f'{self.bin}/flock')}\n"
-                # webhook-spawn.sh reads the dispatch file with jq to find
-                # the watch's own agent profile (issue #321), and its
-                # --preamble caller is the settings daemon, whose PATH does
-                # not carry jq. Every jq use in that script is guarded, so
-                # an unfound binary reports the wrong worker instead of
-                # failing. Pinned here for the same reason the module pins
-                # it into webhookSpawn's own derivation.
-                f"export AGENT_BOX_JQ_BIN={shlex.quote(f'{self.bin}/jq')}\n"
-                # Which agent a match starts, for --preamble's report:
-                # the spawn calls `agent-box-session add` with no
-                # --agent, so it is the box default. Unset, the report
-                # says "<the box default agent>" instead of naming it.
-                f"export AGENT_BOX_DEFAULT_AGENT="
-                f"{shlex.quote(self.spec.default_agent)}\n"
-                # The env store's one parser (issue #212), for the two
-                # keys the spawn reads out of the per-user env file:
-                # AGENT_BOX_HOOK_PROFILE and AGENT_BOX_HOOK_SESSION_ARGS.
-                f"export AGENT_BOX_ENVSTORE_BIN="
-                f"{shlex.quote(f'{self.bin}/agent-box-envstore')}\n"
-                + hook_env)
+            # hand-run `agent-box-webhook` call saw it.
             t.file(self.p("/etc/agent-box/bin/agent-box-webhook-spawn"),
                    "#!/bin/sh\n"
                    "# Generated by `agentbox apply` — do not edit.\n"
-                   + spawn_env
+                   + self.wrapper_env("agent-box-webhook-spawn")
                    + f'exec {self.bin}/agent-box-webhook-spawn "$@"\n', 0o755)
 
 

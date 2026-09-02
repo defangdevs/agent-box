@@ -1,30 +1,29 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
-# Same pin as sessionCli, and for the same reason (issue #254): the
-# receiver unit's PATH is jq + coreutils + the session CLI, so flock
-# (util-linux) is not on it, and the hook-session cap check has to hold
-# the registry lock through the add it decides on.
+# Same pin as the session CLI, and for the same reason (issue #254):
+# the receiver unit's PATH is jq + coreutils + the session CLI, so
+# flock is not on it, and the hook-session cap check has to hold the
+# registry lock through the add it decides on.
 export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock
 # --preamble is run by the SETTINGS DAEMON, whose unit forces a PATH
 # without jq (the receiver unit's PATH has it, but that is the other
-# caller). Every jq use in this script is guarded, so an unfound binary
-# would report the wrong worker rather than fail — pin it like the two
-# above instead.
+# caller). Every jq use in this script is guarded, so an unfound
+# binary would report the wrong worker rather than fail — pin it.
 export AGENT_BOX_JQ_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin/jq
-# Which agent a match really starts. The spawn calls `agent-box-session
-# add` with no --agent, so it is the box default — and --preamble has to
-# NAME it, because that is the half of "what does this watch launch" the
-# page could not show before (issue #292). Same value sessionCli exports.
+# Which agent a match really starts. The spawn calls
+# `agent-box-session add` with no --agent, so it is the box default —
+# and --preamble has to NAME it, because that is the half of 'what
+# does this watch launch' the page could not show before (#292).
 export AGENT_BOX_DEFAULT_AGENT=claude
-# This wrapper reads two keys out of the env store, so it reads them with
-# the store's own parser (issue #212) rather than a fifth copy of the
-# KEY=value loop.
+# This wrapper reads two keys out of the env store, so it reads them
+# with the store's own parser (issue #212) rather than a fifth copy
+# of the KEY=value loop. The payload reads it with ${...:?}: without
+# it the spawn exits 1 before doing anything, and a standing watch
+# silently stops starting sessions (issue #500).
 export AGENT_BOX_ENVSTORE_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-envstore/bin/agent-box-envstore
-# Named once so --preamble's report and the fallback line it prints can
-# say where the fleet-wide default LIVES without hard-coding backend
-# prose into the shared script (issue #471 — the same shape #466 fixed
-# for the Caddyfile banner). Exported unconditionally, unlike the value
-# below: the option exists, and this describes it, whether or not it is
-# currently set to anything.
+# Where the fleet-wide default LIVES, for --preamble's report and
+# the fallback line it prints (issue #471). Exported unconditionally,
+# unlike the value below: the key exists, and this names it, whether
+# or not it is currently set to anything.
 export AGENT_BOX_HOOK_ARGS_OPTION_NAME='the NixOS option services.agent-box.webhook.hookSessionArgs'
 set -eu
 # coreutils/agent-box-session resolve from the webhook daemon unit's PATH

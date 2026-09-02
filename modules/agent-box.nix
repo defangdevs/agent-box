@@ -3580,9 +3580,8 @@ esac
   # dir; no sudo, no rebuild.
   # As with sessionCli: the wrapper pins the fetched webhook.py store path
   # through env, the body is backend-neutral (issue #154, Phase 2).
-  webhookCli = pkgs.writeShellScriptBin "agent-box-webhook" (''
-    export AGENT_BOX_WEBHOOK_SCRIPT=${localWebhookScript}
-  '' + ''
+  webhookCli = pkgs.writeShellScriptBin "agent-box-webhook" (
+    wrapperEnv "agent-box-webhook" + ''
     set -eu
     # jq/python3/coreutils resolve from PATH (system packages); the pinned
     # webhook.py store path comes from the env the generated wrapper exports
@@ -5080,49 +5079,8 @@ exit "$rc"
   # entries the supervisor is about to start), never how many entries the
   # registry accumulated — a finished session must not hold a slot forever
   # (issue #280), which is why the receiver unit below pins AGENT_BOX_TMUX_BIN.
-  webhookSpawn = pkgs.writeShellScriptBin "agent-box-webhook-spawn" (''
-    # Same pin as sessionCli, and for the same reason (issue #254): the
-    # receiver unit's PATH is jq + coreutils + the session CLI, so flock
-    # (util-linux) is not on it, and the hook-session cap check has to hold
-    # the registry lock through the add it decides on.
-    export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
-    # --preamble is run by the SETTINGS DAEMON, whose unit forces a PATH
-    # without jq (the receiver unit's PATH has it, but that is the other
-    # caller). Every jq use in this script is guarded, so an unfound binary
-    # would report the wrong worker rather than fail — pin it like the two
-    # above instead.
-    export AGENT_BOX_JQ_BIN=${pkgs.jq}/bin/jq
-    # Which agent a match really starts. The spawn calls `agent-box-session
-    # add` with no --agent, so it is the box default — and --preamble has to
-    # NAME it, because that is the half of "what does this watch launch" the
-    # page could not show before (issue #292). Same value sessionCli exports.
-    export AGENT_BOX_DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
-    # This wrapper reads two keys out of the env store, so it reads them with
-    # the store's own parser (issue #212) rather than a fifth copy of the
-    # KEY=value loop.
-    export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
-    # Named once so --preamble's report and the fallback line it prints can
-    # say where the fleet-wide default LIVES without hard-coding backend
-    # prose into the shared script (issue #471 — the same shape #466 fixed
-    # for the Caddyfile banner). Exported unconditionally, unlike the value
-    # below: the option exists, and this describes it, whether or not it is
-    # currently set to anything.
-    export AGENT_BOX_HOOK_ARGS_OPTION_NAME=${lib.escapeShellArg "the NixOS option services.agent-box.webhook.hookSessionArgs"}
-  '' + lib.optionalString (cfg.webhook.hookSessionArgs != [ ]) ''
-    # The fleet-wide default for hook-session args (webhook.hookSessionArgs),
-    # JSON so multi-word args survive the round trip; the script decodes it
-    # with jq into the session's extraArgs.
-    #
-    # It belongs HERE and not in the receiver unit's environment, where it
-    # used to live: only the daemon's own child could see it there, so the
-    # settings page and a hand-run --preamble both reported "no extra
-    # arguments" on a box whose NixOS config had set a model (#292). Every
-    # caller now resolves the same default — and the per-user env file still
-    # overrides it, because the script reads that file after this (#290).
-    # Unset when the list is empty, so "nothing set" stays distinguishable
-    # from "set to nothing".
-    export AGENT_BOX_HOOK_SESSION_ARGS=${lib.escapeShellArg (builtins.toJSON cfg.webhook.hookSessionArgs)}
-  '' + ''
+  webhookSpawn = pkgs.writeShellScriptBin "agent-box-webhook-spawn" (
+    wrapperEnv "agent-box-webhook-spawn" + ''
 set -eu
 # coreutils/agent-box-session resolve from the webhook daemon unit's PATH
 # (issue #154, Phase 2) — that unit is what runs this script as its
@@ -6578,6 +6536,151 @@ esac
   ]
 }
   '';
+  # modules/src/contract/wrappers.json — the same treatment for a generated
+  # WRAPPER's prologue, which belongs to no unit: the receiver and the settings
+  # daemon both run agent-box-webhook-spawn, so its environment is the block
+  # above the `exec`, not any unit's Environment=. Both backends used to write
+  # that block by hand in two languages, and PR #500 is what that cost — the
+  # native spawn wrapper never exported AGENT_BOX_ENVSTORE_BIN, which the
+  # payload reads with ''${...:?}, so every standing watch on a native box died
+  # before doing anything. Neither backend writes a prologue any more: both
+  # render this manifest, so the two cannot drift apart.
+  wrapperContract = builtins.fromJSON ''
+{
+  "//": [
+    "Binding contract for generated WRAPPER prologues (issue #451's shape, one",
+    "level over). A wrapper is the third place a shared payload's environment",
+    "can come from, after a unit and an env file — and it belongs to no unit:",
+    "the webhook receiver and the settings daemon both run agent-box-webhook-",
+    "spawn, so what it gets is the prologue the renderer writes above the",
+    "`exec`, not any unit's Environment=. Both backends used to write those",
+    "prologues by hand, in two languages, which is the half of a shared payload",
+    "that deduplicating modules/src/ never deduplicated. PR #500 is what that",
+    "cost: native's spawn wrapper never exported AGENT_BOX_ENVSTORE_BIN, the",
+    "payload reads it with ''${...:?}, and every standing watch on a native box",
+    "died at 'spawn command exited 1' with the batch dropped.",
+    "",
+    "So the prologue is data. Each entry is one export, and the reason it",
+    "exists is written HERE, once, instead of once per backend.",
+    "",
+    "  kind 'bin'     names a PROGRAM, never a path — each backend resolves it",
+    "                 the way it already resolves a unit contract's programs",
+    "                 (contractPrograms here, self.bin/<program> natively).",
+    "  kind 'config'  names a per-box VALUE by key. The two backends may",
+    "                 legitimately resolve one to different text: the box's",
+    "                 configuration lives in a NixOS option on one and in",
+    "                 config.yaml on the other, and a diagnostic that names",
+    "                 where a default lives has to name the real place.",
+    "  omitWhenEmpty  drop the line entirely when the value resolves empty, so",
+    "                 'nothing set' stays distinguishable from 'set to nothing'."
+  ],
+  "wrappers": [
+    {
+      "name": "agent-box-webhook",
+      "env": [
+        {
+          "name": "AGENT_BOX_WEBHOOK_SCRIPT",
+          "kind": "config",
+          "key": "webhookScript",
+          "why": [
+            "The pinned webhook.py this box RUNS. The wrapper carries the path",
+            "so the body stays backend-neutral (issue #154, Phase 2)."
+          ]
+        },
+        {
+          "name": "AGENT_BOX_HOOK_ARGS_OPTION_NAME",
+          "kind": "config",
+          "key": "hookArgsOptionName",
+          "why": [
+            "Where the fleet-wide default for hook-session args LIVES, named",
+            "once so the CLI's diagnostics can say it without hard-coding",
+            "backend prose into the shared script (issue #471 — the same shape",
+            "#466 fixed for the Caddyfile banner). Exported whether or not the",
+            "default is currently set to anything: the key exists either way."
+          ]
+        }
+      ]
+    },
+    {
+      "name": "agent-box-webhook-spawn",
+      "env": [
+        {
+          "name": "AGENT_BOX_FLOCK_BIN",
+          "kind": "bin",
+          "program": "flock",
+          "why": [
+            "Same pin as the session CLI, and for the same reason (issue #254):",
+            "the receiver unit's PATH is jq + coreutils + the session CLI, so",
+            "flock is not on it, and the hook-session cap check has to hold the",
+            "registry lock through the add it decides on."
+          ]
+        },
+        {
+          "name": "AGENT_BOX_JQ_BIN",
+          "kind": "bin",
+          "program": "jq",
+          "why": [
+            "--preamble is run by the SETTINGS DAEMON, whose unit forces a PATH",
+            "without jq (the receiver unit's PATH has it, but that is the other",
+            "caller). Every jq use in this script is guarded, so an unfound",
+            "binary would report the wrong worker rather than fail — pin it."
+          ]
+        },
+        {
+          "name": "AGENT_BOX_DEFAULT_AGENT",
+          "kind": "config",
+          "key": "defaultAgent",
+          "why": [
+            "Which agent a match really starts. The spawn calls",
+            "`agent-box-session add` with no --agent, so it is the box default —",
+            "and --preamble has to NAME it, because that is the half of 'what",
+            "does this watch launch' the page could not show before (#292)."
+          ]
+        },
+        {
+          "name": "AGENT_BOX_ENVSTORE_BIN",
+          "kind": "bin",
+          "program": "agent-box-envstore",
+          "why": [
+            "This wrapper reads two keys out of the env store, so it reads them",
+            "with the store's own parser (issue #212) rather than a fifth copy",
+            "of the KEY=value loop. The payload reads it with ''${...:?}: without",
+            "it the spawn exits 1 before doing anything, and a standing watch",
+            "silently stops starting sessions (issue #500)."
+          ]
+        },
+        {
+          "name": "AGENT_BOX_HOOK_ARGS_OPTION_NAME",
+          "kind": "config",
+          "key": "hookArgsOptionName",
+          "why": [
+            "Where the fleet-wide default LIVES, for --preamble's report and",
+            "the fallback line it prints (issue #471). Exported unconditionally,",
+            "unlike the value below: the key exists, and this names it, whether",
+            "or not it is currently set to anything."
+          ]
+        },
+        {
+          "name": "AGENT_BOX_HOOK_SESSION_ARGS",
+          "kind": "config",
+          "key": "hookSessionArgs",
+          "omitWhenEmpty": true,
+          "why": [
+            "The fleet-wide default for hook-session args, JSON so multi-word",
+            "args survive the round trip; the script decodes it with jq into the",
+            "session's extraArgs. It belongs HERE and not in the receiver unit's",
+            "environment, where it used to live: only the daemon's own child",
+            "could see it there, so the settings page and a hand-run --preamble",
+            "both reported 'no extra arguments' on a box whose configuration had",
+            "set a model (#292). The per-user env file still overrides it,",
+            "because the script reads that file after this (#290)."
+          ]
+        }
+      ]
+    }
+  ]
+}
+  '';
   # A small, deliberately closed vocabulary of conditions a contract entry
   # can be gated on (issue #451) — not a general expression language. Add a
   # name here only when a real THIRD condition shows up, matching whatever
@@ -6628,6 +6731,8 @@ esac
     grep = "${pkgs.gnugrep}/bin/grep";
     find = "${pkgs.findutils}/bin/find";
     flock = "${pkgs.util-linux}/bin/flock";
+    jq = "${pkgs.jq}/bin/jq";
+    "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";
     "agent-box-supervisor" = "${supervisorScript}/bin/agent-box-supervisor";
@@ -6648,6 +6753,47 @@ esac
     else
       contractPrograms.${entry.program} or
         (throw "agent-box: contract references unknown program '${entry.program}'");
+
+  # The other half of a wrapper contract's resolution: a per-box VALUE, named
+  # by key. Unlike a program, the two backends may legitimately resolve one of
+  # these to different text — a diagnostic that says where the fleet-wide
+  # default lives has to name a NixOS option here and config.yaml natively —
+  # which is exactly why the manifest names a KEY and never a value. An empty
+  # result means "not set": an entry marked omitWhenEmpty then renders no line
+  # at all, so "nothing set" stays distinguishable from "set to nothing".
+  contractConfigValue = key:
+    if key == "defaultAgent" then cfg.agent
+    else if key == "webhookScript" then "${localWebhookScript}"
+    else if key == "hookArgsOptionName" then
+      "the NixOS option services.agent-box.webhook.hookSessionArgs"
+    else if key == "hookSessionArgs" then
+      (if cfg.webhook.hookSessionArgs == [ ] then ""
+       else builtins.toJSON cfg.webhook.hookSessionArgs)
+    else throw "agent-box: wrapper contract has unknown config key '${key}'";
+
+  # One generated wrapper's prologue, rendered from the manifest. bin values
+  # are store paths this module already pinned, so they go out bare the way
+  # every hand-written line did; config values are box configuration and are
+  # escaped. The "why" prose rides along from the manifest, so the reason an
+  # export exists is written once for both backends rather than once each.
+  wrapperEnv = name:
+    let
+      wrapper = lib.findFirst (w: w.name == name)
+        (throw "agent-box: no wrapper contract named '${name}'")
+        wrapperContract.wrappers;
+      render = entry:
+        let
+          value =
+            if entry.kind == "config" then contractConfigValue entry.key
+            else contractBin entry;
+          quoted =
+            if entry.kind == "config" then lib.escapeShellArg value else value;
+          why = lib.concatMapStrings (line: "# ${line}\n") (entry.why or [ ]);
+        in
+        if (entry.omitWhenEmpty or false) && value == "" then ""
+        else why + "export ${entry.name}=${quoted}\n";
+    in
+    lib.concatMapStrings render wrapper.env;
 
   # One session = one agent CLI in one tmux session. These options are the
   # FIRST-BOOT SEED only (see users.<name>.sessions); at runtime the same
