@@ -95,6 +95,25 @@ if [ ! -e "$dir/.git" ]; then
   # new partial clone behind on every reboot. Nothing but this script writes
   # that path — $dir comes from the module, not from anything at runtime,
   # and was required to be absolute above.
+  #
+  # The rename also has to land on a path that does not exist. `mv` into an
+  # EXISTING directory moves the source INSIDE it, so a $dir somebody
+  # created first would swallow the clone as $dir/<basename>.incoming: $dir
+  # would still have no .git, the test above would still be true, and every
+  # later run would clone again and leave another nested copy — while the
+  # supervisor's comment promises a restart costs one local git command.
+  # $dir is reachable in that state: checkout.path takes a nested value like
+  # src/agent-box, and the shipped guide tells the agent to read that tree,
+  # so one mkdir -p is enough. Reclaim an empty $dir and refuse a non-empty
+  # one, which is the guard source-tree.sh already applies to the same
+  # rename.
+  if [ -e "$dir" ]; then
+    rmdir "$dir" 2>/dev/null || true
+    if [ -e "$dir" ]; then
+      say "$dir exists and is not a checkout — move it aside, then re-run me"
+      exit 1
+    fi
+  fi
   incoming="$dir.incoming"
   rm -rf "$incoming"
   say "cloning $url into $dir"
