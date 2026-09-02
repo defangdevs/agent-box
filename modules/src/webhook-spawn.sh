@@ -157,7 +157,7 @@ ENVSTORE="${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated
 # carry the CLI. On a native box it does not: the profile ships the payload as
 # agent-box-session-bare and the usable CLI is the generated wrapper at
 # /usr/local/bin, so every standing-watch match died with
-# "exec: agent-box-session: not found" and the batch was DROPPED (issue #503).
+# "exec: agent-box-session: not found" and the batch was DROPPED (PR #503).
 # Nothing here resolves a generated CLI from PATH any more; the wrapper says
 # where it is, exactly as it does for the env store, jq and flock.
 SESSION_BIN="${AGENT_BOX_SESSION_BIN:?the session CLI is pinned by the generated wrapper; run this through the installed command}"

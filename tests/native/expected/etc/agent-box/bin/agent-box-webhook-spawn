@@ -5,7 +5,7 @@
 # PATH, which carried it on NixOS and not natively — where the profile
 # ships agent-box-session-bare and the wrapper lives in /usr/local/bin.
 # Every match on a native box died with 'exec: agent-box-session: not
-# found' and the batch was dropped (issue #503). Pinned here so no
+# found' and the batch was dropped (PR #503). Pinned here so no
 # backend's PATH decides whether a watch can start anything.
 export AGENT_BOX_SESSION_BIN=/usr/local/bin/agent-box-session
 # Same pin as the session CLI, and for the same reason (issue #254):

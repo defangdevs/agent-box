@@ -744,7 +744,7 @@ class Renderer:
         # the wrapper that supplies its environment is the one this renderer
         # writes to /usr/local/bin. Resolving a "cli" entry through the
         # self.bin lookup below would name a file that does not exist —
-        # which is the shape of issue #503, where the spawn payload resolved
+        # which is the shape of PR #503, where the spawn payload resolved
         # `agent-box-session` from a PATH holding only the profile.
         if entry["kind"] == "cli":
             return f"/usr/local/bin/{entry['program']}"
