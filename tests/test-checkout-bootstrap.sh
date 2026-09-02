@@ -137,10 +137,12 @@ else
 fi
 
 # --- REFUSAL: $dir already exists ---------------------------------------
-# `mv` into an existing directory moves the source INSIDE it, so without a
-# guard the publish produces $dir/<basename>.incoming: a nested checkout, a
-# $dir with no .git, and a clone repeated on every later run. An operator or
-# an agent running `mkdir -p` on the configured path is all it takes.
+# Plain `mv` into an existing directory moves the source INSIDE it, so the
+# publish would produce $dir/<basename>.incoming: a nested checkout, a $dir
+# with no .git, and a clone repeated on every later run. An operator or an
+# agent running `mkdir -p` on the configured path is all it takes. `mv -T`
+# is what refuses that, in rename(2) rather than in a check that could be
+# raced, so both destination states are pinned here.
 rm -rf "$AGENT_BOX_CHECKOUT_DIR" "$AGENT_BOX_CHECKOUT_DIR.incoming"
 mkdir -p "$AGENT_BOX_CHECKOUT_DIR"                 # empty: reclaim it
 AGENT_BOX_CHECKOUT_REV=$REV_ONE run
@@ -158,7 +160,7 @@ rm -rf "$AGENT_BOX_CHECKOUT_DIR" "$AGENT_BOX_CHECKOUT_DIR.incoming"
 mkdir -p "$AGENT_BOX_CHECKOUT_DIR"
 echo mine > "$AGENT_BOX_CHECKOUT_DIR/not-a-checkout"
 AGENT_BOX_CHECKOUT_REV=$REV_ONE run
-if said "is not a checkout" \
+if said "could not publish" \
    && [ "$(cat "$AGENT_BOX_CHECKOUT_DIR/not-a-checkout")" = mine ] \
    && [ ! -e "$AGENT_BOX_CHECKOUT_DIR/.git" ]; then
   ok "a non-empty dir is refused, and its contents survive"
