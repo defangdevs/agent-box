@@ -1946,7 +1946,7 @@ in
           the marketplace itself and tracks its default branch — this pin only
           governs the copy the box runs.
 
-          0.25.0 (this pin, issue #321) lets a dispatch entry carry
+          0.25.0 (issue #321) lets a dispatch entry carry
           `spawnConfig`, a flat map of strings the receiver hands to the spawn
           command in `LOCAL_WEBHOOK_SPAWN_CONFIG`. Every other
           `LOCAL_WEBHOOK_SPAWN_*` variable describes the EVENT, so two watches
