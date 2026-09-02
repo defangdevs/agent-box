@@ -1130,6 +1130,48 @@ in
         machine.succeed(as_agent("agent-box-session env rm PLAIN"))
         assert machine.succeed(as_agent("agent-box-session env ls")).split() == []
 
+    # --- prepopulated profiles (issue #493) --------------------------------
+    with subtest("a box arrives with one profile per installed harness"):
+        # "Add session" is profile-first, so a box whose profile list is
+        # empty offers nothing to start. The supervisor seeds one profile
+        # per INSTALLED harness, named after it.
+        pdir = "/home/agent/.config/agent-box/profiles"
+        seeded_ls = machine.succeed(as_agent("agent-box-profile ls"))
+        for harness in ("claude", "codex"):
+            assert re.search(rf"^{harness}\s+{harness}\s", seeded_ls, re.M), seeded_ls
+        # `shell` is not among them: it is a session kind, not a worker.
+        machine.fail(f"test -e {pdir}/shell.env")
+
+        # MODEL and EFFORT are EMPTY on purpose, so the harness applies its
+        # own default. A value baked in at first boot would freeze that
+        # default and go stale the next time a model alias moves.
+        seeded = json.loads(machine.succeed(as_agent("agent-box-profile launch claude")))
+        assert seeded["harness"] == "claude", seeded
+        assert seeded["args"] == [], seeded
+
+        # Deleted stays deleted. The supervisor calls `seed` on EVERY start,
+        # so seeding whenever the file is absent would resurrect a profile
+        # the user removed: nothing should stop somebody deleting the codex
+        # profile if they never use codex. The stamp records the name.
+        machine.succeed(as_agent("agent-box-profile rm codex"))
+        machine.succeed(as_agent("agent-box-profile seed"))
+        machine.fail(f"test -e {pdir}/codex.env")
+        # And an EDIT is never clobbered, for the same reason: the profile is
+        # the user's to change, by hand or by asking an agent to.
+        machine.succeed(as_agent("agent-box-profile set claude MODEL=opus"))
+        machine.succeed(as_agent("agent-box-profile seed"))
+        edited = json.loads(machine.succeed(as_agent("agent-box-profile launch claude")))
+        assert edited["args"] == ["--model", "opus"], edited
+        # Deleting the stamp is the way back to the whole set.
+        machine.succeed(as_agent(f"rm -f {pdir}/.seeded"))
+        machine.succeed(as_agent("agent-box-profile seed"))
+        machine.succeed(f"test -e {pdir}/codex.env")
+        # ...but it still does not overwrite what is already there.
+        again = json.loads(machine.succeed(as_agent("agent-box-profile launch claude")))
+        assert again["args"] == ["--model", "opus"], again
+        machine.succeed(as_agent("agent-box-profile rm claude"))
+        machine.succeed(as_agent("agent-box-profile rm codex"))
+
     # --- agent profiles (issue #321) --------------------------------------
     with subtest("a profile resolves a worker: harness, args and session env"):
         # A profile is the WORKER (harness + model + effort + appended system
@@ -1137,14 +1179,14 @@ in
         # data like the env store: written by the CLI, no rebuild, no root.
         machine.succeed(
             as_agent(
-                "agent-box-profile set triage HARNESS=shell MODEL=sonnet "
+                "agent-box-profile set triage HARNESS=claude MODEL=sonnet "
                 "EFFORT=low PROFILE_TOKEN=sekret"
             )
         )
         pfile = "/home/agent/.config/agent-box/profiles/triage.env"
         machine.succeed(f"stat -c '%a' {pfile} | grep -x 600")
         prof_ls = machine.succeed(as_agent("agent-box-profile ls"))
-        assert re.search(r"^triage\s+shell\s+sonnet\s+low", prof_ls, re.M), prof_ls
+        assert re.search(r"^triage\s+claude\s+sonnet\s+low", prof_ls, re.M), prof_ls
         # show prints the launch config, and the env KEY without its value —
         # the same rule `agent-box-session env ls` holds (a profile is exactly
         # where a token ends up).
@@ -1154,14 +1196,35 @@ in
         # A harness this box does not install is refused at write time, so a
         # profile can never resolve to a session that cannot start.
         machine.fail(as_agent("agent-box-profile set triage HARNESS=nosuch"))
-        # MODEL/EFFORT map to nothing on a shell session, and the CLI says so
+        # And neither is `shell` one (issue #493). It is a session KIND, not
+        # a worker: it has no model, effort or system prompt to configure, so
+        # a profile built around it would configure nothing. The refusal says
+        # which of the two the caller wanted.
+        shell_refusal = machine.fail(
+            as_agent("agent-box-profile set triage HARNESS=shell 2>&1")
+        )
+        assert "session kind, not a worker" in shell_refusal, shell_refusal
+        assert "--agent shell" in shell_refusal, shell_refusal
+        # MODEL/EFFORT still map to nothing when a shell session is started
+        # FROM a profile with `--agent shell`, and the resolver says so
         # rather than inventing flags for it.
-        assert "ignored for the 'shell' harness" in prof_show, prof_show
+        shell_launch = json.loads(
+            machine.succeed(as_agent("agent-box-profile launch triage shell"))
+        )
+        assert shell_launch["args"] == [], shell_launch
+        assert any("ignored for the 'shell' harness" in w
+                   for w in shell_launch["warnings"]), shell_launch
 
         # add --profile: the harness comes from the profile, and the caller's
         # own `--` tail is appended AFTER the profile's args, so an explicit
         # flag still has the last word.
-        machine.succeed(as_agent("agent-box-session add worker --profile triage"))
+        # `--agent shell` overrides the profile's own harness, which is also
+        # what keeps this session cheap: the assertions below are about the
+        # profile's ENVIRONMENT reaching the pane, and a bare shell is the
+        # cheapest pane to read it from.
+        machine.succeed(
+            as_agent("agent-box-session add worker --profile triage --agent shell")
+        )
         machine.succeed(f"jq -e '.sessions.worker.agent == \"shell\"' {sfile}")
         machine.succeed(f"jq -e '.sessions.worker.profile == \"triage\"' {sfile}")
         # The profile's env reaches the session's process environment at spawn

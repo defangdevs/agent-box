@@ -878,6 +878,7 @@ let
     # /usr/local/bin/agent-box-session, the wrapper it generates there.
     "agent-box-session" = "${sessionCli}/bin/agent-box-session";
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
+    "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";
     "agent-box-supervisor" = "${supervisorScript}/bin/agent-box-supervisor";

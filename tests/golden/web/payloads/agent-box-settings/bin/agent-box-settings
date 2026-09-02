@@ -3401,7 +3401,7 @@ PROFILES_SECTION_TPL = """<section>
                  pattern="[A-Za-z0-9_-]{{1,64}}" required autocomplete="off"
                  aria-label="Profile name"
                  title="Letters, digits, underscore and hyphen; at most 64 characters">
-          <select name="HARNESS" aria-label="Assistant">{harnesses}</select>
+          <select name="HARNESS" aria-label="Assistant" required>{harnesses}</select>
           <input type="text" name="MODEL" placeholder="model (optional)"
                  autocomplete="off" aria-label="Model">
           <input type="text" name="EFFORT" placeholder="reasoning level (optional)"
@@ -4883,13 +4883,33 @@ def render_profile_options(profiles):
     return "".join(items)
 
 
+# The harnesses a PROFILE may name: the installed ones, minus "shell"
+# (issue #493). A profile is a worker - a harness plus the model, effort and
+# prompt that tell two workers on it apart - and "shell" has none of those,
+# so a profile built around it configures nothing. It stays in AGENTS,
+# because a shell SESSION is still a session kind; only the profile editor
+# refuses it. agent-box-profile applies the same rule, so the page cannot
+# offer a value the CLI would reject.
+PROFILE_AGENTS = [a for a in AGENTS if a != "shell"]
+
+
 def render_harness_options(selected=""):
-    """The profile editor's harness <select>. Unlike the session row's, this
-    one has a blank entry: HARNESS is optional in a profile file, and a
-    profile that names none resolves to the box default the same way a
-    session with no --agent does."""
-    items = ['<option value="">&mdash; default assistant &mdash;</option>']
-    for agent in AGENTS:
+    """The profile editor's assistant <select>.
+
+    It has a blank entry, but that entry is a PROMPT and not a value: a
+    profile must name its assistant (issue #493). There used to be a
+    "default assistant" option here, resolving through the box-wide default
+    agent the same way a session with no --agent does. A box now starts with
+    no assistant installed and installs them on demand, so "the default one"
+    names nothing anybody chose - and a profile that resolved through it
+    would quietly become a different worker the day the box's configuration
+    changed. So the blank entry is unselectable: the form asks, and the
+    resolver refuses a profile that never answered.
+    """
+    blank_sel = "" if selected else " selected"
+    items = ['<option value="" disabled%s>Choose an assistant</option>'
+             % blank_sel]
+    for agent in PROFILE_AGENTS:
         safe = html.escape(agent)
         sel = " selected" if agent == selected else ""
         items.append(f'<option value="{safe}"{sel}>{safe}</option>')
@@ -4961,7 +4981,7 @@ def render_profiles(profiles):
             f'<form method="post" action="{base}/profiles/set">'
             f'<input type="hidden" name="name" value="{safe}">'
             f'<div class="row">'
-            f'<select name="HARNESS" aria-label="Assistant for {safe}">'
+            f'<select name="HARNESS" aria-label="Assistant for {safe}" required>'
             f'{render_harness_options(res.get("HARNESS") or "")}</select>'
             f'<input type="text" name="MODEL" value="{html.escape(res.get("MODEL") or "")}" '
             f'placeholder="model" autocomplete="off" aria-label="Model for {safe}">'
@@ -6522,10 +6542,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     drop.append(key)
             harness = dict(assignments).get("HARNESS", "")
-            if harness and harness not in AGENTS:
+            # Required, not optional (issue #493): there is no box-wide
+            # default harness left to fall back to, and the resolver refuses
+            # a profile that names none. Caught here so the answer is a
+            # sentence on the page rather than a profile that saves fine and
+            # then fails to start.
+            if not harness:
+                self._send_html(
+                    render_page("Pick an assistant for that profile \u2014 a "
+                                "profile is an assistant plus the settings "
+                                "that go with it, so it needs one. "
+                                "Available: " + ", ".join(PROFILE_AGENTS)),
+                    status=400)
+                return
+            if harness not in PROFILE_AGENTS:
+                # "shell" lands here on purpose: it is a session kind, not a
+                # worker, so it has no model, effort or prompt to configure.
                 self._send_html(
                     render_page("Unknown assistant. Available: "
-                                + ", ".join(AGENTS)),
+                                + ", ".join(PROFILE_AGENTS)),
                     status=400)
                 return
             try:
