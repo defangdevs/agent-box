@@ -13,6 +13,7 @@ Environment="AGENT_BOX_HOSTNAME_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-
 Environment="AGENT_BOX_HOST_LABEL=golden.example.org"
 Environment="AGENT_BOX_NIXPKGS=https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz"
 Environment="AGENT_BOX_NIX_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nix-2.34.8/bin/nix"
+Environment="AGENT_BOX_PROFILE_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-profile/bin/agent-box-profile"
 Environment="AGENT_BOX_WEBHOOK_PINNED_SCRIPT=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-webhook.py"
 Environment="AGENT_BOX_WEBHOOK_REPO=defangdevs/local-channels"
 Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-67/lib/locale/locale-archive"

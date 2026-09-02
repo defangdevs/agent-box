@@ -3328,6 +3328,18 @@ JQ=jq
 # format the settings page and `agent-box-session env` already write.
 DIR="$HOME/.config/agent-box/profiles"
 HARNESSES="''${AGENT_BOX_AGENTS:?}"
+# ...minus `shell`, for a PROFILE (issue #493). A profile is a worker: a
+# harness plus the model, effort and prompt that tell two workers on it
+# apart. `shell` has none of those - it is a bare login shell, and
+# launch_json below already has to warn that all three are ignored for it -
+# so a profile built around it configures nothing. It stays in HARNESSES,
+# because `agent-box-session add --agent shell` is still a session kind;
+# it is only PROFILE_HARNESSES that refuses it.
+PROFILE_HARNESSES=""
+for _h in $HARNESSES; do
+  [ "$_h" = shell ] && continue
+  PROFILE_HARNESSES="''${PROFILE_HARNESSES:+$PROFILE_HARNESSES }$_h"
+done
 # A profile file is the env store in another directory, so it is read and
 # written by the store's one parser (issue #212) — not by a copy of the
 # KEY=value loop that lives here. That is what lets a SYSTEM_PROMPT span
@@ -3345,11 +3357,12 @@ usage() {
   echo "       agent-box-profile set NAME KEY=VALUE..."
   echo "       agent-box-profile rm NAME [KEY...]"
   echo "       agent-box-profile launch NAME [HARNESS]   (JSON, for agent-box-session)"
+  echo "       agent-box-profile seed                    (prepopulate, once per harness)"
   echo "A profile is a worker: a harness plus the knobs that tell two sessions"
   echo "on that harness apart. Start one with:"
   echo "       agent-box-session add [NAME] --profile PROFILE"
   echo "Reserved keys (turned into harness arguments):"
-  echo "  HARNESS        $HARNESSES"
+  echo "  HARNESS        $PROFILE_HARNESSES  (required; 'shell' is a session kind, not a worker)"
   echo "  MODEL          claude: --model VALUE; codex: -m VALUE"
   echo "  EFFORT         claude: --effort VALUE; codex: -c model_reasoning_effort=VALUE"
   echo "  SYSTEM_PROMPT  claude: --append-system-prompt VALUE"
@@ -3430,13 +3443,42 @@ launch_json() {
   # afterwards: the arguments are harness-specific, so a profile resolved for
   # codex and then started on another harness would hand it codex's flags.
   h="''${2:-}"
-  [ -n "$h" ] || h="$res_HARNESS"
-  [ -n "$h" ] || h="''${AGENT_BOX_DEFAULT_AGENT:-}"
+  if [ -n "$h" ]; then
+    # An OVERRIDE may name any session kind, `shell` included: `--profile P
+    # --agent shell` is how a profile's environment reaches a bare shell,
+    # and the caller said which one they meant. It is checked against the
+    # full list.
+    case " $HARNESSES " in
+      (*" $h "*) ;;
+      (*) echo "profile '$1': harness '$h' is not available (available: $HARNESSES)" >&2; return 2 ;;
+    esac
+  else
+    h="$res_HARNESS"
+    # No fall back to a box-wide default harness (issue #493). A box now
+    # starts with no harness installed and installs them on demand, so "the
+    # default one" names nothing a user chose; a profile that resolved
+    # through it would silently become a different worker the day the box's
+    # configuration changed. A profile says which harness it is, or it is
+    # not startable - and says so here rather than at the next spawn.
+    [ -n "$h" ] || { echo "profile '$1': no HARNESS set (agent-box-profile set '$1' HARNESS=<$(printf '%s' "$PROFILE_HARNESSES" | tr ' ' '|')>)" >&2; return 2; }
+    # What the profile itself NAMES is held to the profile list, so `shell`
+    # is refused here too. `set` already refuses to write it, and so does
+    # the settings page - but neither governs a file that predates this
+    # release or was edited by hand, and the profile file is explicitly the
+    # user's to edit. Without this, such a profile would be launchable and
+    # yet unsaveable: opening its row and pressing Save answers 400.
+    case " $PROFILE_HARNESSES " in
+      (*" $h "*) ;;
+      (*)
+        if [ "$h" = shell ]; then
+          echo "profile '$1': HARNESS=shell is a session kind, not a worker. Start a shell with 'agent-box-session add --agent shell', or with '--profile $1 --agent shell' to carry this profile's environment into it." >&2
+        else
+          echo "profile '$1': harness '$h' is not available (available: $PROFILE_HARNESSES)" >&2
+        fi
+        return 2 ;;
+    esac
+  fi
   warn=""
-  case " $HARNESSES " in
-    (*" $h "*) ;;
-    (*) echo "profile '$1': harness '$h' is not available (available: $HARNESSES)" >&2; return 2 ;;
-  esac
   set --
   case "$h" in
     claude)
@@ -3481,7 +3523,7 @@ case "$cmd" in
       n="''${f##*/}"; n="''${n%.env}"
       valid_name "$n" || continue
       read_profile "$n" || continue
-      printf '%-20s %-8s %-18s %s\n' "$n" "''${res_HARNESS:-''${AGENT_BOX_DEFAULT_AGENT:-?}}" \
+      printf '%-20s %-8s %-18s %s\n' "$n" "''${res_HARNESS:-?}" \
         "''${res_MODEL:--}" "''${res_EFFORT:--}"
     done
     ;;
@@ -3521,9 +3563,15 @@ case "$cmd" in
       k="''${a%%=*}"; v="''${a#*=}"
       valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
       if [ "$k" = HARNESS ]; then
-        case " $HARNESSES " in
+        case " $PROFILE_HARNESSES " in
           (*" $v "*) ;;
-          (*) echo "harness '$v' is not available (available: $HARNESSES)" >&2; exit 2 ;;
+          (*)
+            if [ "$v" = shell ]; then
+              echo "'shell' is a session kind, not a worker: it has no model, effort or system prompt to configure, so a profile cannot be built around it. Start one with 'agent-box-session add --agent shell'." >&2
+            else
+              echo "harness '$v' is not available (available: $PROFILE_HARNESSES)" >&2
+            fi
+            exit 2 ;;
         esac
       fi
       assign+=("$a")
@@ -3552,6 +3600,50 @@ case "$cmd" in
       "$ENVSTORE" --profile "$name" unset "$@"
       echo "profile '$name': removed $*"
     fi
+    ;;
+  seed)
+    # Prepopulate one profile per installed harness, named after it (issue
+    # #493). "Add session" is profile-first, so a box with an empty profile
+    # list offers nothing to start; these are what it offers.
+    #
+    # HARNESS only. MODEL and EFFORT are left EMPTY deliberately: launch_json
+    # omits the flag when the value is empty, so the harness applies its own
+    # default (codex reads ~/.codex/config.toml; claude has no on-disk
+    # default on this box at all). A value baked in here would freeze that
+    # default at first boot and go stale the next time a model alias moves.
+    #
+    # Named `claude`, not `claude-default`. The file is the user's to edit -
+    # by hand, from the settings page, or by asking an agent to change it -
+    # and a name carrying "default" is a lie the moment MODEL is set in it.
+    #
+    # ONCE PER NAME, recorded in the stamp. The supervisor calls this on
+    # every start, so seeding whenever the file is absent would resurrect a
+    # profile the user deleted on their next session: nothing should stop
+    # somebody deleting the codex profile if they never use codex. Recording
+    # the name instead of just testing the file also keeps the case that
+    # matters later - a harness added in a FUTURE release is still seeded,
+    # without reviving the ones that were deliberately removed. Delete the
+    # stamp to be offered the whole set again.
+    #
+    # Not shown in usage() as something to run by hand, but harmless to: it
+    # is idempotent, and it is the one way back to a profile you deleted.
+    #
+    # The stamp is read with `case`, not grep: grep is deliberately NOT on
+    # the curated agent PATH (agentBaseTools), so reaching for it here would
+    # mean a new pinned binary in the wrapper contract for a substring test
+    # the shell already does.
+    stamp="$DIR/.seeded"
+    mkdir -p "$DIR" || exit 0
+    seeded=" "
+    [ -f "$stamp" ] && seeded=" $(tr '\n' ' ' < "$stamp") "
+    for h in $PROFILE_HARNESSES; do
+      case "$seeded" in (*" $h "*) continue ;; esac
+      if [ ! -e "$(file_for "$h")" ]; then
+        "$ENVSTORE" --profile "$h" set "HARNESS=$h" >/dev/null || continue
+      fi
+      printf '%s\n' "$h" >> "$stamp"
+      echo "profile '$h' created - 'agent-box-session add --profile $h' starts a session with it"
+    done
     ;;
   launch)
     # The machine-readable half of `show`, for `agent-box-session add
@@ -5478,6 +5570,16 @@ $6"
 #   hook_args_source  where they came from, for the --preamble report
 hook_args_file="$HOME/.config/agent-box/env"
 ENVSTORE="''${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
+# The session CLI this spawn ends by exec'ing into, pinned for the same reason
+# and by the same wrapper. It used to be a bare `agent-box-session`, resolved
+# from the receiver unit's PATH - which works only where that PATH happens to
+# carry the CLI. On a native box it does not: the profile ships the payload as
+# agent-box-session-bare and the usable CLI is the generated wrapper at
+# /usr/local/bin, so every standing-watch match died with
+# "exec: agent-box-session: not found" and the batch was DROPPED (PR #503).
+# Nothing here resolves a generated CLI from PATH any more; the wrapper says
+# where it is, exactly as it does for the env store, jq and flock.
+SESSION_BIN="''${AGENT_BOX_SESSION_BIN:?the session CLI is pinned by the generated wrapper; run this through the installed command}"
 hook_args_source=""
 if [ -n "''${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   hook_args_source="''${AGENT_BOX_HOOK_ARGS_OPTION_NAME:-the fleet-wide default}"
@@ -6090,9 +6192,9 @@ note="''${LOCAL_WEBHOOK_SPAWN_NOTE:+ (\"$LOCAL_WEBHOOK_SPAWN_NOTE\")}"
 # tmux is not on this unit's PATH, which is why the CLI takes the pinned
 # AGENT_BOX_TMUX_BIN this unit exports, and a future PATH regression must
 # surface as a visible line rather than as "nobody else is live".
-peers="$(agent-box-session peers 2>&1)" \
+peers="$("$SESSION_BIN" peers 2>&1)" \
   || peers="Could not ask which sessions are live, so assume one of them owns
-this and check by hand (agent-box-session peers, agent-box-session ls):
+this and check by hand ($SESSION_BIN peers, $SESSION_BIN ls):
 $peers"
 
 preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded" "$peers")"
@@ -6111,11 +6213,11 @@ pflag=()
 # post-mortem branch is unaffected: a hook agent that CRASHES is not parked,
 # so it stays attachable for inspection exactly as before.
 if [ "''${#extra[@]}" -gt 0 ]; then
-  exec agent-box-session add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
+  exec "$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
 
 $PROMPT" -- "''${extra[@]}"
 fi
-exec agent-box-session add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
+exec "$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
 
 $PROMPT"
   '');
@@ -6520,7 +6622,8 @@ esac
     { "name": "AGENT_BOX_FIND_BIN", "kind": "bin", "program": "find" },
     { "name": "AGENT_BOX_FLOCK_BIN", "kind": "bin", "program": "flock" },
     { "name": "AGENT_BOX_HOSTNAME_BIN", "kind": "bin", "program": "hostname" },
-    { "name": "AGENT_BOX_ENV_EXEC", "kind": "bin", "program": "agent-box-env-exec" }
+    { "name": "AGENT_BOX_ENV_EXEC", "kind": "bin", "program": "agent-box-env-exec" },
+    { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" }
   ],
   "execStart": [
     { "kind": "bin", "program": "agent-box-supervisor" }
@@ -6565,7 +6668,7 @@ esac
   "//": [
     "Binding contract for generated WRAPPER prologues (issue #451's shape, one",
     "level over). A wrapper is the third place a shared payload's environment",
-    "can come from, after a unit and an env file — and it belongs to no unit:",
+    "can come from, after a unit and an env file - and it belongs to no unit:",
     "the webhook receiver and the settings daemon both run agent-box-webhook-",
     "spawn, so what it gets is the prologue the renderer writes above the",
     "`exec`, not any unit's Environment=. Both backends used to write those",
@@ -6578,9 +6681,16 @@ esac
     "So the prologue is data. Each entry is one export, and the reason it",
     "exists is written HERE, once, instead of once per backend.",
     "",
-    "  kind 'bin'     names a PROGRAM, never a path — each backend resolves it",
+    "  kind 'bin'     names a PROGRAM, never a path - each backend resolves it",
     "                 the way it already resolves a unit contract's programs",
     "                 (contractPrograms here, self.bin/<program> natively).",
+    "  kind 'cli'     names one of the GENERATED per-box CLI wrappers. Same",
+    "                 program-not-a-path rule as 'bin', but the two backends",
+    "                 put a generated wrapper somewhere different from a plain",
+    "                 profile binary: a store path built per box on NixOS,",
+    "                 /usr/local/bin/<program> natively. Needed because the",
+    "                 profile's flat bin/ holds the PAYLOAD (...-bare), not the",
+    "                 wrapper that supplies its environment.",
     "  kind 'config'  names a per-box VALUE by key. The two backends may",
     "                 legitimately resolve one to different text: the box's",
     "                 configuration lives in a NixOS option on one and in",
@@ -6609,7 +6719,7 @@ esac
           "why": [
             "Where the fleet-wide default for hook-session args LIVES, named",
             "once so the CLI's diagnostics can say it without hard-coding",
-            "backend prose into the shared script (issue #471 — the same shape",
+            "backend prose into the shared script (issue #471 - the same shape",
             "#466 fixed for the Caddyfile banner). Exported whether or not the",
             "default is currently set to anything: the key exists either way."
           ]
@@ -6619,6 +6729,20 @@ esac
     {
       "name": "agent-box-webhook-spawn",
       "env": [
+        {
+          "name": "AGENT_BOX_SESSION_BIN",
+          "kind": "cli",
+          "program": "agent-box-session",
+          "why": [
+            "The CLI this spawn ends by exec'ing into, to create the hook session.",
+            "It was a bare `agent-box-session` resolved from the receiver unit's",
+            "PATH, which carried it on NixOS and not natively - where the profile",
+            "ships agent-box-session-bare and the wrapper lives in /usr/local/bin.",
+            "Every match on a native box died with 'exec: agent-box-session: not",
+            "found' and the batch was dropped (PR #503). Pinned here so no",
+            "backend's PATH decides whether a watch can start anything."
+          ]
+        },
         {
           "name": "AGENT_BOX_FLOCK_BIN",
           "kind": "bin",
@@ -6638,7 +6762,7 @@ esac
             "--preamble is run by the SETTINGS DAEMON, whose unit forces a PATH",
             "without jq (the receiver unit's PATH has it, but that is the other",
             "caller). Every jq use in this script is guarded, so an unfound",
-            "binary would report the wrong worker rather than fail — pin it."
+            "binary would report the wrong worker rather than fail - pin it."
           ]
         },
         {
@@ -6647,7 +6771,7 @@ esac
           "key": "defaultAgent",
           "why": [
             "Which agent a match really starts. The spawn calls",
-            "`agent-box-session add` with no --agent, so it is the box default —",
+            "`agent-box-session add` with no --agent, so it is the box default -",
             "and --preamble has to NAME it, because that is the half of 'what",
             "does this watch launch' the page could not show before (#292)."
           ]
@@ -6747,7 +6871,13 @@ esac
     find = "${pkgs.findutils}/bin/find";
     flock = "${pkgs.util-linux}/bin/flock";
     jq = "${pkgs.jq}/bin/jq";
+    # A generated per-box CLI, not a plain profile binary: kind "cli" in a
+    # wrapper contract. This module builds one derivation per box, so the
+    # store path IS the answer; native's half of the same entry resolves to
+    # /usr/local/bin/agent-box-session, the wrapper it generates there.
+    "agent-box-session" = "${sessionCli}/bin/agent-box-session";
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
+    "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";
     "agent-box-supervisor" = "${supervisorScript}/bin/agent-box-supervisor";
@@ -6763,7 +6893,8 @@ esac
   # gap — a plain self.bin/<program> lookup that carries no such config
   # (issue #471 review). The two kinds only need to differ on that backend.
   contractBin = entry:
-    if entry.kind != "bin" && entry.kind != "hook-spawn" then
+    if entry.kind != "bin" && entry.kind != "hook-spawn"
+       && entry.kind != "cli" then
       throw "agent-box: contract entry has unknown kind '${entry.kind}'"
     else
       contractPrograms.${entry.program} or
@@ -7496,6 +7627,18 @@ esac
     # and a home that predates this release gains it. Best effort — a mkdir that
     # fails must never keep sessions from starting.
     mkdir -p "$HOME"/worktrees 2>/dev/null || :
+
+    # Prepopulated agent profiles (issue #493). "Add session" is profile-first,
+    # so a box whose profile list is empty offers nothing to start with. The
+    # work is `agent-box-profile seed`, not a loop here: that CLI already knows
+    # which harnesses are installed, where a profile file lives and which parser
+    # writes it, and none of those three reach this unit's environment.
+    #
+    # On every start, like the mkdir above - but the CLI seeds each name ONCE and
+    # records it, so a profile the user deleted is not resurrected on their next
+    # session. Best effort: a profile that cannot be written must never keep
+    # sessions from starting.
+    "''${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" seed >/dev/null 2>&1 || :
 
     seed_json() {
       # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
@@ -10775,6 +10918,12 @@ PROFILE_BIN = os.environ.get("AGENT_BOX_PROFILE_BIN", "")
 # Same charset and length the CLI's valid_name() enforces (profile-cli.sh):
 # one file per profile, so the name is also a path component.
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+PROFILE_RESERVED_LABELS = {
+    "HARNESS": "Assistant",
+    "MODEL": "Model",
+    "EFFORT": "Reasoning level",
+    "SYSTEM_PROMPT": "Instructions",
+}
 # PROFILE_RESERVED (the launch config) comes from the env store above, which
 # is also what env-exec skips at spawn. Every OTHER key in a profile is
 # session environment, and is listed by NAME only — a profile is exactly
@@ -10904,28 +11053,24 @@ def webhook_unavailable():
         each button would fail for a reason the page never states.
     """
     if not (WEBHOOK_CONFIGURED or HOOK_SPAWN_CMD):
-        return ("Off on this box &mdash; nothing here receives deliveries, "
-                "so no standing watch can start a session from one. Turn it "
-                "on in the box&rsquo;s configuration "
-                "(<code>webhook.enable</code>) and apply.")
+        return ("Automations are not enabled for this agent-box. An "
+                "administrator can enable webhook support in its "
+                "configuration.")
     missing = [name for name, value in
                (("AGENT_BOX_WEBHOOK_SCRIPT", WEBHOOK_SCRIPT),
                 ("AGENT_BOX_WEBHOOK_STATE_DIR", WEBHOOK_STATE_DIR))
                if not value]
     if missing:
-        return ("Enabled on this box, but this page was given no "
+        return ("Automations are unavailable because setup is incomplete: "
+                "this page was given no "
                 + " and no ".join("<code>%s</code>" % html.escape(name)
                                   for name in missing)
-                + ", so it cannot show or change subscriptions. The receiver "
-                "itself may well be running: <code>agent-box-webhook ls</code> "
-                "in a session still answers. This is a bug in the box, not a "
-                "setting &mdash; report it with this line.")
+                + ". Report this message to the administrator.")
     if not os.path.isfile(WEBHOOK_SCRIPT):
-        return ("Enabled on this box, but the pinned webhook script "
+        return ("Automations are unavailable because a required file "
                 "<code>%s</code> is not there, so nothing on this page can "
-                "run. The receiver runs that same file, which means "
-                "deliveries are not arriving either. This is a bug in the "
-                "box, not a setting &mdash; report it with this line."
+                "run. Events are not arriving either. Report this message "
+                "to the administrator."
                 % html.escape(WEBHOOK_SCRIPT))
     return None
 
@@ -12352,9 +12497,8 @@ CONNECT_DEFS = [
         "binary": "claude",
         "attr": "claude-code",
         "label": "Claude Code",
-        "note": "Runs <code>claude auth login</code> &mdash; your Claude "
-                "subscription or Console account. The CLI stores the "
-                "credential in <code>~/.claude</code>.",
+        "note": "Sign in with your Claude subscription or Anthropic "
+                "Console account.",
         "start": ["auth", "login"],
         "status": ["auth", "status"],
         "parse": "claude",
@@ -12371,9 +12515,8 @@ CONNECT_DEFS = [
         "binary": "codex",
         "attr": "codex",
         "label": "Codex",
-        "note": "Runs <code>codex login --device-auth</code> &mdash; enter "
-                "the code on the page it prints. The CLI stores the "
-                "credential in <code>~/.codex</code>.",
+        "note": "Sign in with your OpenAI account. Follow the link and "
+                "enter the code shown here.",
         "start": ["login", "--device-auth"],
         "status": ["login", "status"],
         "parse": "codex",
@@ -12393,10 +12536,8 @@ CONNECT_DEFS = [
         "binary": "gh",
         "attr": "gh",
         "label": "GitHub",
-        "note": "Runs <code>gh auth login --web</code> &mdash; GitHub's own "
-                "device flow. No app to register, no token to copy, and "
-                "<code>git</code> reads it through gh's credential "
-                "helper.",
+        "note": "Uses GitHub's secure sign-in process. You will not need "
+                "to create an app or paste a token.",
         "start": ["auth", "login", "--hostname", "github.com",
                   "--git-protocol", "https", "--web",
                   "--scopes", "repo,read:org,workflow"],
@@ -12433,9 +12574,7 @@ CONNECT_DEFS = [
         # this card is installable on both backends (issue #461).
         "attr": None,
         "label": "Defang",
-        "note": "Runs <code>defang login</code> &mdash; opens Defang's own "
-                "sign-in page in a browser; the CLI polls for your "
-                "approval itself, so there is no code to copy back.",
+        "note": "Opens Defang's secure sign-in page in your browser.",
         "start": ["login", "--non-interactive=false"],
         "status": ["whoami", "--json"],
         "parse": "defang",
@@ -13657,30 +13796,29 @@ STYLE = """<style>
 # Shared by the settings-page and workspace add forms so their layout,
 # accessibility, and autocomplete behaviour cannot drift apart.
 NEW_SESSION_FIELDS_TPL = """<div class="row new-session-row">
-  <select name="agent" aria-label="Harness">{agents}</select>
-  <select id="profile-picker" name="profile" aria-label="Agent profile"
-          title="Agent profile: a harness plus its model, effort and system prompt">{profiles}</select>
+  <select name="agent" aria-label="Assistant">{agents}</select>
+  <select id="profile-picker" name="profile" aria-label="Profile"
+          title="Profile: saved assistant, model, reasoning level and instructions">{profiles}</select>
   <span class="cwd-control">
-    <label for="new-session-cwd">Working directory</label>
+    <label for="new-session-cwd">Starting folder</label>
     <span class="combo">
       <input id="new-session-cwd" type="text" name="cwd" value="~" class="cwd"
              placeholder="~" autocomplete="off" autocapitalize="off"
              autocorrect="off" spellcheck="false"
              data-dir-input data-dir-base="{action_base}"
-             aria-label="Working directory" aria-autocomplete="list"
-             title="Working directory (starts in your home directory)">
+             aria-label="Starting folder" aria-autocomplete="list"
+             title="Starting folder (defaults to your home folder)">
       <ul class="ac" hidden></ul>
     </span>
   </span>
   <button type="submit" class="btn">Add session</button>
 </div>
-<p class="note">Where the agent starts. Defaults to your home directory
-(<code>~</code>); type to browse folders one level at a time. A profile
-brings its own harness, model and system prompt, so picking one overrides
-the harness on its left.</p>
+<p class="note">Choose where the session starts. The default is your home
+folder (<code>~</code>). A profile can also choose the assistant, model and
+instructions.</p>
 <div class="row prompt-row">
   <textarea name="prompt" rows="2"
-            placeholder="kickoff prompt (optional) &mdash; the task to start on; a respawn resumes it"></textarea>
+            placeholder="starting task (optional) &mdash; what this session should work on first"></textarea>
 </div>"""
 
 # The session manager <section> on the settings page (every user,
@@ -13694,10 +13832,9 @@ SESSIONS_SECTION_TPL = """<section>
       <h2>Sessions</h2>
       <button type="button" class="btn" data-toggle="session-editor">Add session</button>
     </div>
-    <p class="note">Each session is one harness &mdash; the agent CLI
-    itself &mdash; in its own terminal tab. New sessions start within a
-    few seconds &mdash; no rebuild, no sudo. Click a session to open its
-    terminal.</p>
+    <p class="note">Each session opens a separate terminal tab for an AI
+    assistant or shell. New sessions are usually ready within a few seconds.
+    Select one to open it.</p>
     <div id="session-editor" class="editor">
       <form method="post" action="{action_base}/sessions/add">
         <input type="hidden" name="back" value="settings">
@@ -13716,15 +13853,13 @@ SESSIONS_SECTION_TPL = """<section>
 # because the session row now has two controls that both name a harness.
 PROFILES_SECTION_TPL = """<section>
     <div class="sec-head">
-      <h2>Agent profiles</h2>
+      <h2>Profiles</h2>
       <button type="button" class="btn" data-toggle="profile-editor">Add profile</button>
     </div>
-    <p class="note">A profile is a <em>worker</em>: a harness plus the model,
-    effort and system prompt that tell two sessions on one harness apart.
-    Pick one in the session row above, or hand every dispatched webhook
-    session to one with <code>AGENT_BOX_HOOK_PROFILE</code>. Editing a profile
-    changes what starts <em>next</em> &mdash; a running session keeps the
-    arguments it started with.</p>
+    <p class="note">Profiles save how an assistant should start, including
+    its model, reasoning level and extra instructions. Choose one when adding
+    a session or use one for sessions started automatically. Changes apply
+    only to new sessions.</p>
     <div id="profile-editor" class="editor">
       <form method="post" action="{base}/profiles/set">
         <div class="row">
@@ -13732,21 +13867,20 @@ PROFILES_SECTION_TPL = """<section>
                  pattern="[A-Za-z0-9_-]{{1,64}}" required autocomplete="off"
                  aria-label="Profile name"
                  title="Letters, digits, underscore and hyphen; at most 64 characters">
-          <select name="HARNESS" aria-label="Harness">{harnesses}</select>
+          <select name="HARNESS" aria-label="Assistant" required>{harnesses}</select>
           <input type="text" name="MODEL" placeholder="model (optional)"
                  autocomplete="off" aria-label="Model">
-          <input type="text" name="EFFORT" placeholder="effort (optional)"
-                 autocomplete="off" aria-label="Effort">
+          <input type="text" name="EFFORT" placeholder="reasoning level (optional)"
+                 autocomplete="off" aria-label="Reasoning level">
           <button type="submit" class="btn">Save</button>
         </div>
         <div class="row prompt-row">
           <textarea name="SYSTEM_PROMPT" rows="2" spellcheck="false"
-                    placeholder="appended system prompt (optional) &mdash; standing instructions for every session on this profile"></textarea>
+                    placeholder="instructions (optional) &mdash; used for every session with this profile"></textarea>
         </div>
-        <p class="note">Saving an existing name updates it. A blank field
-        clears that key rather than keeping the old value, so this form is
-        the whole launch config &mdash; environment keys are added per
-        profile, on its own row below.</p>
+        <p class="note">Saving a profile with the same name replaces it.
+        Leave an optional field blank to remove its current value. Add API
+        keys or other advanced settings from the profile row below.</p>
       </form>
     </div>
     <div id="profiles-list">{profiles}</div>
@@ -13764,13 +13898,12 @@ PROFILES_SECTION_TPL = """<section>
 # own header still says which of the two it is.
 WEBHOOKS_SECTION_TPL = """<section>
     <div class="sec-head">
-      <h2>Webhook</h2>
+      <h2>Automations</h2>
     </div>
     <div id="webhook-endpoint">{endpoint}</div>
-    <p class="note">A standing watch belongs to no session: a matching
-    event starts a NEW one. Subscriptions that deliver INTO a session are
-    listed under that session above. Deleting either takes effect on the
-    next delivery &mdash; no restart.</p>
+    <p class="note">Automatic session rules start a new session when a
+    matching event arrives. Event notifications sent to existing sessions
+    appear under Sessions above. Changes apply to the next event.</p>
     <div id="webhooks-list">{webhooks}</div>
   </section>"""
 
@@ -13780,7 +13913,7 @@ WEBHOOKS_SECTION_TPL = """<section>
 # is off or the box is wrong. See webhook_unavailable() for the states.
 WEBHOOK_UNAVAILABLE_TPL = """<section>
     <div class="sec-head">
-      <h2>Webhook</h2>
+      <h2>Automations</h2>
     </div>
     <p class="note">{text}</p>
   </section>"""
@@ -13794,23 +13927,18 @@ WEBHOOK_UNAVAILABLE_TPL = """<section>
 # CI system, a payment processor and a home-grown script are all the same
 # kind of sender to this box. Shared by both states below, because the
 # answer must not depend on whether a sender happens to be set up yet.
-WEBHOOK_LEAD = ("Another service can tell this box when something happens "
-                "&mdash; a commit or a review on a repo, a build finishing, "
-                "a payment &mdash; and an agent hears about it instead of "
-                "having to keep checking. Any sender that can sign what it "
-                "sends will do; GitHub is just the usual one.")
+WEBHOOK_LEAD = ("Connect GitHub or another service so agent-box can respond "
+                "when something happens &mdash; for example, when a review "
+                "is submitted or a build finishes.")
 
 # The table is for senders that ARE set up. Everything a reader needs in
 # order to make sense of the rows goes in this paragraph above it, never
 # in a row of its own: `.tbl li` is a flex row, so prose dropped into the
 # list is laid out as though its sentences were columns.
-WEBHOOK_ENDPOINT_TPL = """<p class="note">%s To connect a sender, give it
-    the payload URL for its source together with that source's secret
-    &mdash; the copy buttons hand over both. It needs both: this box
-    rejects anything it cannot verify against the secret, so the URL on
-    its own delivers nothing. On GitHub that is the repo's Settings
-    &rarr; Webhooks &rarr; Add webhook, with content type
-    <code>application/json</code>.</p>
+WEBHOOK_ENDPOINT_TPL = """<p class="note">%s To connect GitHub, copy the
+    webhook URL and secret below into the repository's Settings &rarr;
+    Webhooks &rarr; Add webhook page. Select <code>application/json</code>
+    as the content type. Both values are required.</p>
     {rows}""" % WEBHOOK_LEAD
 
 # No sender configured: no table at all, because an empty one is a header
@@ -13819,13 +13947,10 @@ WEBHOOK_ENDPOINT_TPL = """<p class="note">%s To connect a sender, give it
 # reader connecting Stripe should not have to discover that the argument
 # exists.
 WEBHOOK_ENDPOINT_EMPTY_TPL = """<p class="note">%s</p>
-    <p class="note">No sender is set up yet, so this box rejects every
-    delivery. Run <code>agent-box-webhook setup SOURCE</code> in a
-    session, naming the sender you are connecting &mdash;
-    <code>agent-box-webhook setup github</code> for a GitHub repo,
-    <code>agent-box-webhook setup stripe</code> for Stripe. It mints that
-    source's secret, prints it once, and prints the payload URL to
-    register: <code>{base}/&lt;source&gt;</code>.</p>""" % WEBHOOK_LEAD
+    <p class="note">No service is connected yet. To add one, open a session
+    and run <code>agent-box-webhook setup SOURCE</code>, replacing SOURCE with
+    the service name &mdash; for example, <code>github</code> or
+    <code>stripe</code>.</p>""" % WEBHOOK_LEAD
 
 # Guided sign-in (issues #207, #208, #313). Hidden entirely when the box
 # passed no AGENT_BOX_CONNECT_BINS. data-busy tells the page whether a
@@ -13834,11 +13959,9 @@ CONNECT_SECTION_TPL = """<section>
     <div class="sec-head">
       <h2>Connections</h2>
     </div>
-    <p class="note">Sign in without leaving this page. Each card runs
-    that tool's OWN sign-in command in a terminal you never have to
-    find, and the tool stores its own credential &mdash; this page never
-    sees a token. Setting a key by hand under Environment secrets still
-    works, and still wins.</p>
+    <p class="note">Connect the accounts your assistants can use. Sign-in is
+    handled securely by each provider, and this page does not display your
+    credentials. API keys added manually below take priority.</p>
     <div id="connect-list" data-busy="{busy}">{cards}</div>
   </section>"""
 
@@ -13925,8 +14048,8 @@ BODY = """<main>
     </svg>
     GitHub
   </a>
-  <a class="back" href="{term_home}">&larr; terminal</a>
-  <h1><span class="mark">{mark}</span>Settings for {user}</h1>
+  <a class="back" href="{term_home}">&larr; workspace</a>
+  <h1><span class="mark">{mark}</span>Settings</h1>
   <div id="msg-slot">{message}</div>
   {sessions_section}
   {profiles_section}
@@ -13934,14 +14057,12 @@ BODY = """<main>
   {connect_section}
   <section>
     <div class="sec-head">
-      <h2>Environment secrets</h2>
+      <h2>API keys and secrets</h2>
       <button type="button" class="btn" data-toggle="secret-editor">Add secret</button>
     </div>
-    <p class="note">Secrets are passed to your agent sessions as environment
-    variables (e.g. <code>GH_TOKEN</code>, <code>ANTHROPIC_API_KEY</code>).
-    They are written to a private file only your agent can read &mdash;
-    never shown here, never typed into the chat. Restart sessions to
-    apply changes.</p>
+    <p class="note">Store API keys and other credentials used by your
+    sessions. Values are hidden after you save them. Restart a session before
+    expecting a change to take effect.</p>
     <div id="secret-editor" class="editor">
       <form id="secret-form" method="post" action="{base}/set">
         <div class="row">
@@ -13949,34 +14070,31 @@ BODY = """<main>
                  pattern="[A-Za-z_][A-Za-z0-9_]*" required
                  title="Letters, digits and underscores; must not start with a digit">
           <textarea name="value" class="secret-value" rows="2" spellcheck="false"
-                    placeholder="value (may span lines &mdash; paste a PEM whole)"
+                    placeholder="value"
                     autocomplete="off" required></textarea>
           <button type="submit" class="btn">Save</button>
         </div>
-        <p class="note">The value is write-only &mdash; saving replaces any
-        existing value for that key. This page never displays stored values.
-        A value may span lines, so an x509 key or a PEM can be pasted whole
-        (from a session: <code>agent-box-session env set KEY --stdin</code>).</p>
+        <p class="note">Saving a secret with the same name replaces its
+        current value. Stored values cannot be viewed from this page.
+        Multi-line values are supported.</p>
       </form>
     </div>
     <div id="secrets-list">{keys}</div>
   </section>
   {password_section}
   <section>
-    <h2>Danger zone</h2>
+    <h2>Maintenance</h2>
     <ul class="tbl danger">
       <li>
         <span class="dz"><strong>Restart all sessions</strong>
-        <span class="note">Restarts the whole agent service: every
-        session comes back with the current secrets and token files.
-        Live sessions are killed &mdash; unsaved in-flight work is lost.
-        A stopped session stays stopped, because parking one is
-        deliberate: press Start on its own row to bring it back.
+        <span class="note">Stops and restarts every running session. Any
+        work that has not been saved will be lost. Sessions you stopped
+        manually will remain stopped.
         <span id="restart-status" class="update-state" aria-live="polite"></span></span></span>
         <form method="post" action="{base}/restart" data-poll="restart"
               data-status="{base}/status"
-              onsubmit="return confirm('Restart all sessions now? Live sessions will be killed and any unsaved in-flight work is lost.');">
-          <button type="submit" class="btn danger-btn">Restart all</button>
+              onsubmit="return confirm('Restart all sessions? Any work that has not been saved will be lost.');">
+          <button type="submit" class="btn danger-btn">Restart all sessions</button>
         </form>
       </li>
       {update_row}
@@ -13992,8 +14110,8 @@ PASSWORD_SECTION = """<section>
       <h2>Account</h2>
       <button type="button" class="btn" data-toggle="password-editor">Change password</button>
     </div>
-    <p class="note">Change the password used to sign in to this browser
-    terminal. All signed-in browsers will be logged out.</p>
+    <p class="note">Change the password used to open agent-box. You will be
+    signed out on every device.</p>
     <div id="password-editor" class="editor">
       <form method="post" action="{base}/password" data-native>
         <div class="fields">
@@ -14018,33 +14136,30 @@ PASSWORD_SECTION = """<section>
   </section>"""
 
 UPDATE_ROW = """<li>
-        <span class="dz"><strong>Update box</strong>
-        <span class="note">Fetches the latest agent-box release and agent
-        CLI versions, then rebuilds the system. Takes a few minutes; sessions
-        restart if their software changed.{update_line}</span></span>
+        <span class="dz"><strong>Update agent-box</strong>
+        <span class="note">Updates agent-box and its AI tools, refreshes
+        configuration, and restarts affected services. This usually takes a
+        few minutes, and sessions may restart.{update_line}</span></span>
         <form method="post" action="{base}/update" data-poll="update"
               data-status="{base}/status"
-              onsubmit="return confirm('Update the box now? This rebuilds the system and may restart the agent sessions.');">
-          <button type="submit" class="btn danger-btn">Update box</button>
+              onsubmit="return confirm('Update agent-box now? Sessions may restart if needed.');">
+          <button type="submit" class="btn danger-btn">Update agent-box</button>
         </form>
       </li>"""
 
-# Last in the Danger zone, because it is the widest: the machine, not a
+# Last in Maintenance, because it is the widest: the machine, not a
 # service. The note says what comes back by itself, so the choice is
 # about the minute of downtime rather than about losing the box.
 REBOOT_ROW = """<li>
-        <span class="dz"><strong>Reboot box</strong>
-        <span class="note">Reboots the whole machine. Every session is
-        killed and the box is unreachable for about a minute; the
-        sessions then come back on their own, minus whatever was in
-        flight. This is the only way to finish a kernel or libc update:
-        those install on disk and take effect at a boot, and unattended
-        patching never reboots by itself.{reboot_line}
+        <span class="dz"><strong>Restart agent-box</strong>
+        <span class="note">Makes agent-box unavailable for about a minute.
+        Running sessions will stop, and any work that has not been saved will
+        be lost. Use this when an update says a restart is required.{reboot_line}
         <span id="reboot-status" class="update-state" aria-live="polite"></span></span></span>
         <form method="post" action="{base}/reboot" data-poll="reboot"
               data-status="{base}/status"
-              onsubmit="return confirm('Reboot the box now? Every session is killed and the box is unreachable for about a minute.');">
-          <button type="submit" class="btn danger-btn">Reboot box</button>
+              onsubmit="return confirm('Restart agent-box now? It will be unavailable for about a minute, and unsaved work will be lost.');">
+          <button type="submit" class="btn danger-btn">Restart agent-box</button>
         </form>
       </li>"""
 
@@ -14285,7 +14400,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     }, 150);
   }
 
-  // After "Update box": watch the update oneshot from `baseline` (its
+  // After "Update agent-box": watch the update oneshot from `baseline` (its
   // start time before we triggered) until a strictly newer run
   // finishes. The rebuild may restart this daemon, so a failed fetch is
   // "still rebuilding", not an error.
@@ -14296,12 +14411,12 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     setStatus(el, "checking", "Starting update…");
     (function tick() {
       if (tries++ > MAX) {
-        setStatus(el, "blocked", "Update still running — check the box shortly.");
+        setStatus(el, "blocked", "Update still running. Check again shortly.");
         return;
       }
       fetchStatus(url).then(function (s) {
         if (!s || !s.update) {           // daemon switching, or no unit to watch
-          setStatus(el, "checking", "Rebuilding the system…");
+          setStatus(el, "checking", "Applying the update...");
           window.setTimeout(tick, 2500);
           return;
         }
@@ -14313,7 +14428,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
         }
         if (u.since > baseline) {        // a newer run started and is no longer active → done
           if (u.active === "failed" || u.result !== "success") {
-            setStatus(el, "blocked", "Update failed — check the update service journal.");
+            setStatus(el, "blocked", "Update failed. Try again or ask an administrator.");
           } else if (s.rev && rev0 && s.rev !== rev0) {
             var repo = el.getAttribute("data-repo");
             var short = s.rev.slice(0, 12);
@@ -14374,11 +14489,11 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     var el = document.getElementById("reboot-status");
     if (!el) { return; }
     var dipped = false, tries = 0, MAX = 240;   // ~10 min at 2.5s
-    setStatus(el, "checking", "Rebooting — this page comes back by itself…");
+    setStatus(el, "checking", "Restarting. This page will come back by itself...");
     (function tick() {
       if (tries++ > MAX) {
         setStatus(el, "blocked",
-                  "The box has not come back — check the cloud console.");
+                  "Agent-box has not come back. Ask an administrator to check it.");
         return;
       }
       fetchStatus(url).then(function (s) {
@@ -14430,7 +14545,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       })
       .then(function (result) {
         if (result.status === "identical") {
-          show("current", "No agent-box code update.");
+          show("current", "Agent-box is up to date.");
           return;
         }
         if (result.status === "ahead") {
@@ -14441,7 +14556,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
             ? "https://github.com/" + repoPath + "/compare/" +
               encodeURIComponent(rev) + "..." + encodeURIComponent(head)
             : fallback;
-          show("available", "agent-box update available — " + commits + ".", "View changes", href);
+          show("available", "Agent-box update available: " + commits + ".", "View changes", href);
           return;
         }
         show("blocked", "Automatic agent-box update unavailable.", "Compare revisions", fallback);
@@ -14892,7 +15007,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     fetchSecret(b.getAttribute("data-secret-url")).then(function (secret) {
       if (!out.isConnected) { return; }
       if (!secret) {
-        b.setAttribute("title", "No secret yet — run agent-box-webhook setup");
+        b.setAttribute("title", "No secret yet. Connect the service first");
         return;
       }
       out.setAttribute("data-mask", out.textContent);
@@ -15234,13 +15349,33 @@ def render_profile_options(profiles):
     return "".join(items)
 
 
+# The harnesses a PROFILE may name: the installed ones, minus "shell"
+# (issue #493). A profile is a worker - a harness plus the model, effort and
+# prompt that tell two workers on it apart - and "shell" has none of those,
+# so a profile built around it configures nothing. It stays in AGENTS,
+# because a shell SESSION is still a session kind; only the profile editor
+# refuses it. agent-box-profile applies the same rule, so the page cannot
+# offer a value the CLI would reject.
+PROFILE_AGENTS = [a for a in AGENTS if a != "shell"]
+
+
 def render_harness_options(selected=""):
-    """The profile editor's harness <select>. Unlike the session row's, this
-    one has a blank entry: HARNESS is optional in a profile file, and a
-    profile that names none resolves to the box default the same way a
-    session with no --agent does."""
-    items = ['<option value="">&mdash; box default &mdash;</option>']
-    for agent in AGENTS:
+    """The profile editor's assistant <select>.
+
+    It has a blank entry, but that entry is a PROMPT and not a value: a
+    profile must name its assistant (issue #493). There used to be a
+    "default assistant" option here, resolving through the box-wide default
+    agent the same way a session with no --agent does. A box now starts with
+    no assistant installed and installs them on demand, so "the default one"
+    names nothing anybody chose - and a profile that resolved through it
+    would quietly become a different worker the day the box's configuration
+    changed. So the blank entry is unselectable: the form asks, and the
+    resolver refuses a profile that never answered.
+    """
+    blank_sel = "" if selected else " selected"
+    items = ['<option value="" disabled%s>Choose an assistant</option>'
+             % blank_sel]
+    for agent in PROFILE_AGENTS:
         safe = html.escape(agent)
         sel = " selected" if agent == selected else ""
         items.append(f'<option value="{safe}"{sel}>{safe}</option>')
@@ -15264,10 +15399,11 @@ def render_profiles(profiles):
             if res.get(key):
                 bits.append(html.escape(res[key]))
         if res.get("SYSTEM_PROMPT"):
-            bits.append("system prompt")
+            bits.append("instructions")
         env_keys = profiles[name]["env"]
         if env_keys:
-            bits.append("%d env key%s" % (len(env_keys), "" if len(env_keys) == 1 else "s"))
+            bits.append("%d custom setting%s" % (
+                len(env_keys), "" if len(env_keys) == 1 else "s"))
         # Each bit was escaped as it went in, so the join must NOT be
         # escaped again: a MODEL holding "&" or "<" would render as visible
         # entity text ("&amp;lt;").
@@ -15291,7 +15427,7 @@ def render_profiles(profiles):
                 f'</span></li>'
             )
         env_list = ('<ul class="tbl subs">' + "".join(chips) + "</ul>") if chips else (
-            '<p class="note">No environment keys.</p>')
+            '<p class="note">No custom settings.</p>')
         # Pre-filled edit form: the launch fields come back as they are
         # stored, so an edit is an edit and not a retype. SYSTEM_PROMPT is a
         # textarea for the same reason it is one above — it can span lines.
@@ -15311,36 +15447,36 @@ def render_profiles(profiles):
             f'<form method="post" action="{base}/profiles/set">'
             f'<input type="hidden" name="name" value="{safe}">'
             f'<div class="row">'
-            f'<select name="HARNESS" aria-label="Harness for {safe}">'
+            f'<select name="HARNESS" aria-label="Assistant for {safe}" required>'
             f'{render_harness_options(res.get("HARNESS") or "")}</select>'
             f'<input type="text" name="MODEL" value="{html.escape(res.get("MODEL") or "")}" '
             f'placeholder="model" autocomplete="off" aria-label="Model for {safe}">'
             f'<input type="text" name="EFFORT" value="{html.escape(res.get("EFFORT") or "")}" '
-            f'placeholder="effort" autocomplete="off" aria-label="Effort for {safe}">'
+            f'placeholder="reasoning level" autocomplete="off" '
+            f'aria-label="Reasoning level for {safe}">'
             f'<button type="submit" class="btn">Save</button></div>'
             f'<div class="row prompt-row"><textarea name="SYSTEM_PROMPT" rows="2" '
-            f'spellcheck="false" placeholder="appended system prompt" '
-            f'aria-label="System prompt for {safe}">{prompt_val}</textarea></div>'
+            f'spellcheck="false" placeholder="instructions" '
+            f'aria-label="Instructions for {safe}">{prompt_val}</textarea></div>'
             f'</form>'
-            f'<p class="note">Environment for sessions started with this '
-            f'profile, applied at every spawn on top of your secrets. This is '
-            f'convenience, <strong>not</strong> isolation: sessions of one '
-            f'user are not separated, so a sibling session reads these out of '
-            f'<code>/proc</code>. Values are never shown here.</p>'
+            f'<p class="note">These values are added whenever a session starts '
+            f'with this profile. They are hidden here, but sessions under the '
+            f'same account can access one another&rsquo;s values. Do not use '
+            f'profiles to separate trusted and untrusted work.</p>'
             f'{env_list}'
             f'<form class="row" method="post" action="{base}/profiles/setkey">'
             f'<input type="hidden" name="name" value="{safe}">'
             f'<input type="text" name="key" placeholder="KEY_NAME" required '
             f'pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off" '
-            f'aria-label="Environment key for {safe}">'
+            f'aria-label="Setting name for {safe}">'
             f'<input type="password" name="value" placeholder="value" required '
             f'autocomplete="off" aria-label="Value for that key">'
             f'<button type="submit" class="btn">Add</button></form>'
             f'</div></details></li>'
         )
     body = "".join(rows) if rows else (
-        '<li class="empty">No profiles yet &mdash; every session starts on '
-        'the harness picked above.</li>')
+        '<li class="empty">No profiles yet. New sessions use the assistant '
+        'selected above.</li>')
     return '<ul class="tbl"><li class="tbl-head">Profile</li>' + body + "</ul>"
 
 
@@ -15400,6 +15536,11 @@ def render_sessions(subs=None):
                 state = "stopped"
             else:
                 state = "starting"
+            state_label = {
+                "live": "Running",
+                "starting": "Starting",
+                "stopped": "Stopped",
+            }[state]
             # One route, two verbs: /sessions/restart clears the stopped
             # flag and kills the pane, so on a session that is already down
             # it only STARTS one. Nothing is running to lose there, and
@@ -15409,8 +15550,8 @@ def render_sessions(subs=None):
                 verb, guard = "Start", ""
             else:
                 verb = "Restart"
-                guard = (f' onsubmit="return confirm(\'Restart {safe}? '
-                         f'Unsaved in-flight work is lost.\');"')
+                guard = (f' onsubmit="return confirm(\'Restart {safe}? Any '
+                         f'work that has not been saved will be lost.\');"')
             # Download the session's own transcript (issue #248), when the
             # daemon can find one. A GET on a read-only route, so it is a
             # link and not a form — and no button at all for a session with
@@ -15454,9 +15595,9 @@ def render_sessions(subs=None):
                 f'<a class="sess" href="{term}{safe}/"><code>{safe}</code></a>'
                 f'<span class="meta">{agent}</span>'
                 f'{prof_tag}'
-                f'<span class="meta" title="Working directory"><code>{cwd}</code></span>'
+                f'<span class="meta" title="Starting folder"><code>{cwd}</code></span>'
                 f'{subject}'
-                f'<span class="state" data-state="{state}">{state}</span>'
+                f'<span class="state" data-state="{state}">{state_label}</span>'
                 f'{render_subs_chip(subs, name)}</span>'
                 f'<span class="acts">'
                 f'{download}'
@@ -15466,7 +15607,8 @@ def render_sessions(subs=None):
                 f'<input type="hidden" name="back" value="settings">'
                 f'<button type="submit" class="btn small">{verb}</button></form>'
                 f'<form class="inline" method="post" action="{base}/sessions/delete" '
-                f'onsubmit="return confirm(\'Delete session {safe}? Its live agent is killed.\');">'
+                f'onsubmit="return confirm(\'Delete session {safe}? Its running '
+                f'assistant will stop.\');">'
                 f'<input type="hidden" name="name" value="{safe}">'
                 f'<input type="hidden" name="back" value="settings">'
                 f'<button type="submit" class="icon idanger" aria-label="Delete" '
@@ -15498,15 +15640,22 @@ WEBHOOK_STATES = {
     # None of it names the filter FILE. That a subscription is a line in a
     # JSON file is this daemon's business and webhook.py's; the operator
     # reading the row is being told what the session receives.
-    "listening": ("listening", ""),
-    "empty": ("no subscriptions", "Unsubscribed from everything. Receives nothing."),
-    "absent": ("never subscribed", "Receives nothing until this session "
-                                   "subscribes to something. Nothing to clean up."),
-    "invalid": ("broken", "This session's subscriptions cannot be read, so it "
-                          "receives nothing. Subscribing again rewrites them; "
-                          "Clear removes them."),
-    "off": ("muted", "Delivery is switched off for this session."),
-    "unknown": ("unreadable", "Could not read this session's subscriptions."),
+    "listening": ("receiving events", ""),
+    "empty": (
+        "event notifications off", "This session is not receiving events."),
+    "absent": (
+        "event notifications off",
+        "This session has not been connected to any events."),
+    "invalid": (
+        "event setup error",
+        "This session's event settings cannot be read, so it is not receiving "
+        "events. Subscribe again to replace them, or select Clear to remove "
+        "them."),
+    "off": (
+        "event notifications paused", "Events are paused for this session."),
+    "unknown": (
+        "event status unavailable",
+        "Could not read this session's event settings."),
 }
 
 
@@ -15520,12 +15669,22 @@ def render_subs_chip(subs, name):
         return ""
     count = len(sub["topics"])
     if sub["state"] == "listening":
-        label = "1 subscription" if count == 1 else "%d subscriptions" % count
+        label = "1 event notification" if count == 1 else "%d event notifications" % count
     else:
         # A muted session HAS topics and receives none of them, so the
         # count would be the one thing the row must not say.
         label = WEBHOOK_STATES.get(sub["state"], WEBHOOK_STATES["unknown"])[0]
     return f'<span class="meta subs-chip">{html.escape(label)}</span>'
+
+
+def display_event_expiry(value):
+    """Turn the receiver's terse duration into a self-explanatory label."""
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    if value.lower().startswith("never"):
+        return "Always active"
+    return "Expires in " + value
 
 
 def render_session_subs(sub, name):
@@ -15545,7 +15704,7 @@ def render_session_subs(sub, name):
         if topic:
             rows.append(render_webhook_row(
                 topic,
-                [str(entry.get("expiresIn") or "")],
+                [display_event_expiry(entry.get("expiresIn"))],
                 str(entry.get("note") or ""),
                 sub["key"],
                 dispatch=False,
@@ -15556,12 +15715,12 @@ def render_session_subs(sub, name):
         # without is having a leftover state cleared. Neither says "file".
         count = len(sub["topics"])
         if count:
-            label = "Unsubscribe all"
-            ask = ("Unsubscribe %s from %d topic%s?"
+            label = "Stop all notifications"
+            ask = ("Stop all event notifications for %s? This removes %d rule%s."
                    % (name, count, "" if count == 1 else "s"))
         else:
             label = "Clear"
-            ask = "Clear the leftover subscriptions of %s?" % name
+            ask = "Clear the unreadable event settings for %s?" % name
         forget = (
             f'<form class="inline" method="post" action="{html.escape(BASE)}/webhooks/forget" '
             f'onsubmit="return confirm(\'{html.escape(ask, quote=True)}\');">'
@@ -15596,16 +15755,17 @@ def render_webhook_row(topic, meta, note, key, dispatch, fold=""):
     note_html = (
         f'<span class="note wh-note">{html.escape(note)}</span>' if note else ""
     )
+    item_name = "automatic session rule" if dispatch else "event notification rule"
     row = (
         f'<span class="nm wh"><code>{safe_topic}</code>{bits}{note_html}</span>'
         f'<span class="acts">'
         f'<form class="inline" method="post" action="{base}/webhooks/unsubscribe" '
-        f'onsubmit="return confirm(\'Delete the subscription to {safe_topic}?\');">'
+        f'onsubmit="return confirm(\'Delete the {item_name} for {safe_topic}?\');">'
         f'<input type="hidden" name="topic" value="{safe_topic}">'
         f'<input type="hidden" name="key" value="{html.escape(key)}">'
         f'<input type="hidden" name="dispatch" value="{"1" if dispatch else ""}">'
         f'<button type="submit" class="icon idanger" aria-label="Delete" '
-        f'title="Delete subscription to {safe_topic}">{ICON_TRASH}</button></form>'
+        f'title="Delete {item_name} for {safe_topic}">{ICON_TRASH}</button></form>'
         f'</span>'
     )
     if not fold:
@@ -15616,10 +15776,10 @@ def render_webhook_row(topic, meta, note, key, dispatch, fold=""):
     # read as text the session would really receive.
     return (
         f'<li class="foldrow"><details data-fold="watch-{safe_topic}">'
-        f'<summary title="Show what a match launches">{row}</summary>'
-        f'<div class="wh-prompt"><p class="note">What a matching event starts '
-        f'&mdash; the launch command, then the prompt the new session is given. '
-        f'The &lt;&hellip;&gt; parts come from the event.</p>'
+        f'<summary title="Show what this rule starts">{row}</summary>'
+        f'<div class="wh-prompt"><p class="note">A matching event starts a new '
+        f'session with the setup and instructions shown below. Text in '
+        f'&lt;&hellip;&gt; comes from the event.</p>'
         f'<pre>{html.escape(fold)}</pre></div>'
         f'</details></li>'
     )
@@ -15659,13 +15819,13 @@ def rotate_form(source):
     safe = html.escape(source)
     return (
         '<form class="inline" method="post" action="%s/webhooks/rotate" '
-        'onsubmit="return confirm(\'Rotate the %s secret? Deliveries signed '
-        'with the old secret are rejected until you paste the new one into '
-        'the sender, and GitHub does not retry them.\');">'
+        'onsubmit="return confirm(\'Replace the %s secret? Events will stop '
+        'until you update the connected service, and some missed events may '
+        'not be retried.\');">'
         '<input type="hidden" name="source" value="%s">'
         '<button type="submit" class="icon ismall" '
-        'aria-label="Rotate the %s secret" '
-        'title="Mint a new secret">Rotate</button></form>'
+        'aria-label="Replace the %s secret" '
+        'title="Create a new secret">Replace</button></form>'
         % (html.escape(BASE), safe, safe, safe)
     )
 
@@ -15707,7 +15867,7 @@ def render_webhook_endpoint():
         # Naming the default is not decoration: a URL registered with no
         # source on the end routes to it, so this is the one row that also
         # explains an endpoint someone pasted bare months ago.
-        tag = (" (default &mdash; a URL with no source lands here)"
+        tag = (" &middot; default service"
                if name == default else "")
         rows.append(
             '<li><span class="nm wh"><code>%s/%s</code>'
@@ -15731,7 +15891,7 @@ def render_webhook_endpoint():
         # senders that exist, and there are none to list.
         return WEBHOOK_ENDPOINT_EMPTY_TPL.format(base=base)
     return WEBHOOK_ENDPOINT_TPL.format(
-        rows=('<ul class="tbl"><li class="tbl-head">Payload URL</li>'
+        rows=('<ul class="tbl"><li class="tbl-head">Webhook URL</li>'
               + "".join(rows) + "</ul>")
     )
 
@@ -15758,7 +15918,7 @@ def render_webhooks(watches):
         prompt = hook_preamble(topic, note, stamp)
         rows.append(render_webhook_row(
             topic,
-            [str(entry.get("expiresIn") or "")],
+            [display_event_expiry(entry.get("expiresIn"))],
             # Only when the prompt could not be rendered: then the note is
             # the one thing left that says why this watch exists.
             "" if prompt else note,
@@ -15768,12 +15928,13 @@ def render_webhooks(watches):
             fold=prompt,
         ))
     if not rows:
-        rows.append('<li class="empty">No standing watches.</li>')
-    return ('<ul class="tbl"><li class="tbl-head">Standing watch</li>'
+        rows.append('<li class="empty">No automatic session rules.</li>')
+    return ('<ul class="tbl"><li class="tbl-head">Automatic session rule</li>'
             + "".join(rows) + "</ul>")
 
 
 def render_agent_options():
+    """Build the session form options for the available assistants."""
     items = []
     for agent in AGENTS:
         sel = " selected" if agent == DEFAULT_AGENT else ""
@@ -15796,9 +15957,8 @@ def render_reboot_line():
     reason = ""
     if packages:
         reason = " (" + html.escape(", ".join(packages)) + ")"
-    return ("<br><strong>A reboot is pending</strong>" + reason
-            + " &mdash; patches are installed on disk and take effect at "
-              "the next boot.")
+    return ("<br><strong>A restart is required</strong>" + reason
+            + " &mdash; restart agent-box to finish installing the update.")
 
 
 def render_update_line():
@@ -15815,7 +15975,7 @@ def render_update_line():
     if REPO:
         url = html.escape(f"https://github.com/{REPO}/commit/{REV}")
         label = f'<a href="{url}">{label}</a>'
-    line = " Currently at " + label + "."
+    line = " Installed version: " + label + "."
     if not REPO:
         return line
     repo = html.escape(REPO)
@@ -15892,22 +16052,19 @@ def render_connect_card(state):
     )
     note = state["note"]
     if not state["installed"] and state["installable"]:
-        note += (' This box does not ship it — the button fetches it into '
-                 'your own Nix profile first, which is a one-off of a few '
-                 'minutes.')
+        note += (' The first sign-in also installs this tool and may take a '
+                 'few minutes.')
     step = render_connect_step(state)
     if state["blocked"]:
-        step = ('<div class="conn-step"><p class="note">No terminal session '
-                'is running, so there is nowhere to sign in from. Add a '
-                'session above first.</p></div>')
+        step = ('<div class="conn-step"><p class="note">Add a session above '
+                'before signing in.</p></div>')
     warn = ""
     if state["shadow"]:
         keys = ", ".join("<code>%s</code>" % html.escape(k) for k in state["shadow"])
         warn = (
             f'<div class="conn-step"><p class="note conn-warn">{keys} is set '
-            f'under Environment secrets. These CLIs prefer their environment '
-            f'variable over a stored credential, so the value you set by hand '
-            f'is what your sessions use &mdash; signed in here or not.</p></div>'
+            f'under API keys and secrets. Sessions will use that value instead '
+            f'of the account shown here.</p></div>'
         )
     # Open on anything the operator has to act on or read right now: a flow
     # mid-run, a fresh error, the "no session to sign in from" note, or a
@@ -15941,8 +16098,8 @@ def render_connect_step(state):
         return (f'<div class="conn-step"><p class="note">Starting the '
                 f'sign-in&hellip;</p>{cancel}</div>')
     if state["state"] == "exchanging":
-        return ('<div class="conn-step"><p class="note">The CLI finished '
-                'signing in &mdash; confirming with it now&hellip;</p></div>')
+        return ('<div class="conn-step"><p class="note">Sign-in complete. '
+                'Checking the connection&hellip;</p></div>')
     if state["state"] in ("failed", "expired") and state["error"]:
         return (f'<div class="conn-step"><p class="note conn-error">'
                 f'{html.escape(state["error"])}</p></div>')
@@ -16257,6 +16414,8 @@ def render_home(message="", selected=None):
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    """Serve the authenticated settings UI and its actions."""
+
     server_version = "agent-box-settings/1"
 
     def _under_base(self, path):
@@ -16448,39 +16607,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     OK_MESSAGES = {
-        "saved": "Key saved. Restart the sessions to apply.",
-        "deleted": "Key deleted. Restart the sessions to apply.",
+        "saved": "Secret saved. Restart sessions to apply it.",
+        "deleted": "Secret deleted. Restart sessions to apply the change.",
         "restarted": "Restart of all sessions requested.",
-        "session_added": "Session added — it starts within a few seconds.",
+        "session_added": "Session added \u2014 it starts within a few seconds.",
         "session_deleted": "Session deleted.",
         "session_restarted": "Session restart requested.",
-        "session_started": "Session started — it comes up within a few seconds.",
-        "update": "Box update started — the system rebuilds in the "
-                  "background and this page may briefly go away.",
-        "rebooting": "Reboot requested — the box goes away for about a "
-                     "minute. Reload this page once it is back.",
-        "webhook_rotated": ("Secret rotated. Copy the new one into the sender "
-                            "now — deliveries signed with the old secret are "
-                            "rejected from this moment, and GitHub does not "
-                            "retry them."),
-        "webhook_kept_secret": ("Could not rotate that secret. A source whose "
-                                "secret is written into sources.json by hand "
-                                "is the CLI's to change: run "
-                                "`agent-box-webhook rotate SOURCE` in a "
-                                "session."),
-        "webhook_deleted": "Subscription deleted — it stops at the next delivery.",
-        "webhook_forgotten": "Subscriptions cleared — that session now receives nothing.",
-        "webhook_kept": "Could not delete that subscription. It may already be gone.",
+        "session_started": "Session started \u2014 it comes up within a few seconds.",
+        "update": "Agent-box update started. This page may be briefly unavailable.",
+        "rebooting": "Restart requested. Agent-box will be unavailable for "
+                     "about a minute; reload this page when it is back.",
+        "webhook_rotated": ("Secret replaced. Copy the new secret into the "
+                            "connected service now; events using the old one "
+                            "are no longer accepted."),
+        "webhook_kept_secret": ("Could not replace that secret from this "
+                                "page. Open a session and run "
+                                "`agent-box-webhook rotate SOURCE`."),
+        "webhook_deleted": "Event rule deleted. The change applies to the next event.",
+        "webhook_forgotten": "Event notification rules cleared for this session.",
+        "webhook_kept": "Could not delete that event rule. It may already be gone.",
         "password_changed": "Password changed. Sign in with your new password.",
         "connect_started": "Sign-in started \u2014 follow the steps under Connections.",
         "connect_cancelled": "Sign-in cancelled.",
         "connect_code": "Code sent \u2014 waiting for the sign-in to finish.",
         "profile_saved": "Profile saved. Sessions started from now on use it.",
         "profile_deleted": ("Profile deleted. Sessions already running keep "
-                            "the arguments and environment they started with."),
-        "profile_key_saved": ("Key added to the profile. Sessions on it pick "
+                            "their current settings."),
+        "profile_key_saved": ("Setting added to the profile. Sessions on it pick "
                               "it up at their next start."),
-        "profile_key_deleted": ("Key removed from the profile. Sessions on it "
+        "profile_key_deleted": ("Setting removed from the profile. Sessions on it "
                                 "drop it at their next start."),
     }
 
@@ -16637,6 +16792,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return SESS_PAGE
 
     def do_POST(self):
+        """Validate and apply a settings-page form submission."""
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
         if not self._same_origin():
@@ -16799,12 +16955,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 value = form.get("value", [""])[0]
                 value = value.replace("\r\n", "\n").replace("\r", "\n")
                 if not KEY_RE.match(key) or key in PROFILE_RESERVED:
+                    if key in PROFILE_RESERVED:
+                        message = (
+                            "%s is already a profile option. Set it in the "
+                            "form above."
+                            % PROFILE_RESERVED_LABELS.get(key, "That name")
+                        )
+                    else:
+                        message = (
+                            "Invalid setting name. Use letters, digits and "
+                            "underscores; do not start with a digit."
+                        )
                     self._send_html(
-                        render_page(
-                            "Invalid environment key. Use letters, digits and "
-                            "underscores; do not start with a digit. %s are "
-                            "launch config \u2014 set them in the form above."
-                            % ", ".join(PROFILE_RESERVED)),
+                        render_page(message),
                         status=400,
                     )
                     return
@@ -16845,10 +17008,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     drop.append(key)
             harness = dict(assignments).get("HARNESS", "")
-            if harness and harness not in AGENTS:
+            # Required, not optional (issue #493): there is no box-wide
+            # default harness left to fall back to, and the resolver refuses
+            # a profile that names none. Caught here so the answer is a
+            # sentence on the page rather than a profile that saves fine and
+            # then fails to start.
+            if not harness:
                 self._send_html(
-                    render_page("Unknown harness. Available: "
-                                + ", ".join(AGENTS)),
+                    render_page("Pick an assistant for that profile \u2014 a "
+                                "profile is an assistant plus the settings "
+                                "that go with it, so it needs one. "
+                                "Available: " + ", ".join(PROFILE_AGENTS)),
+                    status=400)
+                return
+            if harness not in PROFILE_AGENTS:
+                # "shell" lands here on purpose: it is a session kind, not a
+                # worker, so it has no model, effort or prompt to configure.
+                self._send_html(
+                    render_page("Unknown assistant. Available: "
+                                + ", ".join(PROFILE_AGENTS)),
                     status=400)
                 return
             try:
@@ -16900,9 +17078,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # one is a restart of the settings daemon, not a hunt for a
                 # profile that is sitting right there in the list.
                 self._send_html(
-                    render("This box has no profile resolver configured, so "
-                           "a session cannot be started from a profile. "
-                           "Restart the settings service and try again."),
+                    render("Profiles are temporarily unavailable. Restart "
+                           "agent-box and try again."),
                     status=503,
                 )
                 return
@@ -16929,7 +17106,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                           "" if own_harness else agent)
                 if resolved is None:
                     self._send_html(
-                        render("Could not resolve profile '%s'. It may have "
+                        render("Could not load profile '%s'. It may have "
                                "just been deleted." % profile),
                         status=400,
                     )
@@ -16937,8 +17114,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 agent = resolved.get("harness") or agent
                 if agent not in AGENTS:
                     self._send_html(
-                        render("Profile '%s' names a harness this box does "
-                               "not have. Available: %s"
+                        render("Profile '%s' uses an assistant that is not "
+                               "available. Choose one of: %s"
                                % (profile, ", ".join(AGENTS))),
                         status=400,
                     )
@@ -18107,7 +18284,14 @@ if __name__ == "__main__":
         environment = (lib.listToAttrs (map
           (e: lib.nameValuePair e.name (contractBin e))
           webhookContract.env)) // {
-          PATH = lib.mkForce (lib.makeBinPath [ pkgs.jq pkgs.coreutils sessionCli ]);
+          # jq and coreutils only. The session CLI used to be on here so the
+          # spawn payload's bare `agent-box-session` would resolve - which is
+          # precisely what native could not reproduce, because its profile
+          # holds the payload rather than the wrapper (issue #503). The
+          # payload now takes AGENT_BOX_SESSION_BIN from the wrapper
+          # contract, so no backend's PATH decides whether a watch can start
+          # a session, and this unit's PATH says what it means again.
+          PATH = lib.mkForce (lib.makeBinPath [ pkgs.jq pkgs.coreutils ]);
         };
         serviceConfig = {
           ExecStartPre = [ "" (contractBin (lib.elemAt webhookContract.execStartPre 0)) ];

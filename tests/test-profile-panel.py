@@ -76,7 +76,12 @@ for line in open(path):
     if line and not line.startswith("#") and "=" in line:
         key, value = line.split("=", 1)
         store[key] = value.strip('"')
-harness = override or store.get("HARNESS") or "claude"  # box default last
+harness = override or store.get("HARNESS")
+if not harness:
+    # No box default left (issue #493): a profile names its harness or it
+    # is not startable, and the real resolver says so here too.
+    sys.stderr.write("no HARNESS set\\n")
+    sys.exit(2)
 args = []
 if store.get("MODEL"):
     args += ["--model", store["MODEL"]]
@@ -349,9 +354,11 @@ class ProfileRoutes(ProfileFixture):
         prefer either, is how they drift apart."""
         _, base = self.serve()
         self.post(base, "/profiles/set", name="review", HARNESS="claude")
-        status, _ = self.post(base, "/profiles/setkey", name="review",
-                              key="HARNESS", value="codex")
+        status, body = self.post(base, "/profiles/setkey", name="review",
+                                 key="HARNESS", value="codex")
         self.assertEqual(status, 400)
+        self.assertIn("Assistant is already a profile option", body)
+        self.assertNotIn("HARNESS, MODEL, EFFORT, SYSTEM_PROMPT", body)
 
     def test_a_name_that_is_not_a_profile_name_never_reaches_the_disk(self):
         """One file per profile, so the name is a path component."""
@@ -363,11 +370,12 @@ class ProfileRoutes(ProfileFixture):
         self.assertEqual(os.listdir(self.profiles), [])
 
     def test_an_unknown_harness_is_refused(self):
+        """A profile cannot select an assistant unavailable on this box."""
         _, base = self.serve()
         status, body = self.post(base, "/profiles/set", name="ok",
                                  HARNESS="nosuch")
         self.assertEqual(status, 400)
-        self.assertIn("Unknown harness", body)
+        self.assertIn("Unknown assistant", body)
 
     def test_an_unknown_verb_is_a_404_not_a_traceback(self):
         _, base = self.serve()
@@ -404,9 +412,11 @@ class ProfileRoutes(ProfileFixture):
 
     def test_a_profile_with_no_harness_uses_the_row_selection(self):
         """Otherwise neither the profile nor the operator decides. The
-        resolver falls back to the box default when a profile names no
-        HARNESS, so passing no override discarded the row's selection and
-        started claude for a profile carrying only a model — while the note
+        The override is what decides here, and it is the only thing that
+        can: since #493 there is no box default left to fall back to, so a
+        profile naming no HARNESS is startable ONLY through the row's own
+        selection. Passing no override used to discard that selection and
+        start claude for a profile carrying only a model - while the note
         under the row said the profile supplies the harness."""
         _, base = self.serve()
         self.write_profile("modelonly", "MODEL=opus\n")
@@ -513,7 +523,7 @@ class ProfileRoutes(ProfileFixture):
                                  agent="claude", profile="triage", cwd="~",
                                  prompt="")
         self.assertEqual(status, 400)
-        self.assertIn("Could not resolve profile", body)
+        self.assertIn("Could not load profile", body)
 
     def test_a_box_with_no_resolver_says_so_rather_than_blaming_the_profile(self):
         """The two are fixed differently: one is a restart of this daemon,
@@ -524,7 +534,7 @@ class ProfileRoutes(ProfileFixture):
                                  agent="claude", profile="triage", cwd="~",
                                  prompt="")
         self.assertEqual(status, 503)
-        self.assertIn("no profile resolver", body)
+        self.assertIn("Profiles are temporarily unavailable", body)
         self.assertNotIn("may have just been deleted", body)
         self.assertEqual(self.read_sessions(), {})
 
@@ -558,7 +568,7 @@ class ProfileRoutes(ProfileFixture):
                                  agent="claude", profile="gone", cwd="~",
                                  prompt="")
         self.assertEqual(status, 400)
-        self.assertIn("Could not resolve profile", body)
+        self.assertIn("Could not load profile", body)
         self.assertEqual(self.read_sessions(), {})
 
     def test_deleting_a_profile_leaves_running_sessions_alone(self):
@@ -576,8 +586,69 @@ class ProfileRoutes(ProfileFixture):
         # And the page still renders, naming the profile the session was
         # started as even though it is gone.
         page = urllib.request.urlopen(base + "/").read().decode()
-        self.assertIn("Agent profiles", page)
+        self.assertIn("<h2>Profiles</h2>", page)
+        self.assertNotIn("harness plus the model", page)
+        self.assertIn("reasoning level", page)
         self.assertIn("prof-tag", page)
+
+
+class ProfilesAreNotBuiltAroundABoxDefault(ProfileFixture):
+    """Issue #493, bullets 2 and 3.
+
+    A profile is a WORKER: a harness plus the model, effort and prompt that
+    tell two workers on that harness apart. Two things follow, and both used
+    to be false.
+
+    `shell` is not one of those harnesses. It has no model, effort or system
+    prompt to configure, so a profile built around it configures nothing --
+    the resolver could only warn that all three were ignored. It stays a
+    session KIND (`--agent shell` still works); it stops being a profile
+    answer.
+
+    And there is no "box default" harness to fall back to. A box now starts
+    with no harness installed and installs them on demand, so the default
+    named nothing anybody chose, and a profile resolving through it would
+    quietly become a different worker the day the box's configuration
+    changed. The picker's blank entry is now a prompt, not a value.
+    """
+
+    # Borrowed, not inherited: subclassing ProfileRoutes would re-run its
+    # own two dozen tests under this class's name for two helpers.
+    serve = ProfileRoutes.serve
+    post = ProfileRoutes.post
+
+    def test_shell_is_not_offered_as_a_profile_harness(self):
+        _, base = self.serve()
+        page = urllib.request.urlopen(base + "/").read().decode()
+        editor = page.split('id="profile-editor"', 1)[1].split("</form>", 1)[0]
+        self.assertIn('<option value="claude"', editor)
+        self.assertNotIn('<option value="shell"', editor)
+
+    def test_shell_is_refused_as_a_profile_harness(self):
+        _, base = self.serve()
+        status, body = self.post(base, "/profiles/set", name="sh",
+                                 HARNESS="shell")
+        self.assertEqual(status, 400)
+        self.assertIn("Unknown assistant", body)
+        self.assertEqual(os.listdir(self.profiles), [])
+
+    def test_the_picker_offers_no_box_default_entry(self):
+        _, base = self.serve()
+        page = urllib.request.urlopen(base + "/").read().decode()
+        self.assertNotIn("default assistant", page)
+        # The blank entry survives as a PROMPT, and cannot be submitted.
+        self.assertIn('<option value="" disabled', page)
+        self.assertIn('name="HARNESS" aria-label="Assistant" required', page)
+
+    def test_a_profile_with_no_harness_is_refused(self):
+        """The form asks; the handler is what actually enforces it, because
+        a POST does not have to come from the form."""
+        _, base = self.serve()
+        status, body = self.post(base, "/profiles/set", name="empty",
+                                 MODEL="opus")
+        self.assertEqual(status, 400)
+        self.assertIn("Pick an assistant", body)
+        self.assertEqual(os.listdir(self.profiles), [])
 
 
 if __name__ == "__main__":

@@ -432,7 +432,7 @@ in
     with subtest("a hand-set env key still wins, and the card says so"):
         assert post("/agent/settings/set", "key=GH_TOKEN&value=ghp_manual") == "303"
         body = get("/agent/settings/")
-        assert "is set under Environment secrets" in body
+        assert "is set under API keys and secrets" in body
         assert "ghp_manual" not in body
         # The status probe must see the env STORE, not just the daemon's own
         # environment: that unit never loads the store (the supervisor's
@@ -462,7 +462,7 @@ in
         machine.wait_until_fails(tmux("list-sessions"))
         assert post("/agent/settings/connect/start", "flow=claude") == "409"
         machine.fail(tmux("list-sessions"))
-        assert "nowhere to sign in from" in get("/agent/settings/")
+        assert "before signing in" in get("/agent/settings/")
         assert state("claude")["blocked"] is True
   '';
 }
