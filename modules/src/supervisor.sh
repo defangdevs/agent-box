@@ -509,7 +509,7 @@ start_session() {
       # claude_transcript_has_work. Run the normal kickoff instead of
       # claiming an interruption nothing backs up.
       prompt="$ip"
-    elif [ -n "''${AGENT_BOX_RESTART_NOTICE:-}" ]; then
+    elif [ "$agent" = claude ] && [ -n "${AGENT_BOX_RESTART_NOTICE:-}" ]; then
       prompt="You were interrupted and automatically restarted (agent-box session $bid). Your previous transcript for this session has been resumed — review what you had already done, verify the current state, and continue from where you left off. If that work was already complete, say so briefly and stop rather than redoing it."
     else
       # Opt-in only (issue #507): --resume already restores the transcript
