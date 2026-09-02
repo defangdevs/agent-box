@@ -127,7 +127,7 @@
     }, 150);
   }
 
-  // After "Update box": watch the update oneshot from `baseline` (its
+  // After "Update agent-box": watch the update oneshot from `baseline` (its
   // start time before we triggered) until a strictly newer run
   // finishes. The rebuild may restart this daemon, so a failed fetch is
   // "still rebuilding", not an error.
@@ -138,7 +138,7 @@
     setStatus(el, "checking", "Starting update…");
     (function tick() {
       if (tries++ > MAX) {
-        setStatus(el, "blocked", "Update still running — check the box shortly.");
+        setStatus(el, "blocked", "Update still running — check again shortly.");
         return;
       }
       fetchStatus(url).then(function (s) {
@@ -155,7 +155,7 @@
         }
         if (u.since > baseline) {        // a newer run started and is no longer active → done
           if (u.active === "failed" || u.result !== "success") {
-            setStatus(el, "blocked", "Update failed — check the update service journal.");
+            setStatus(el, "blocked", "Update failed — try again or ask an administrator.");
           } else if (s.rev && rev0 && s.rev !== rev0) {
             var repo = el.getAttribute("data-repo");
             var short = s.rev.slice(0, 12);
@@ -216,11 +216,11 @@
     var el = document.getElementById("reboot-status");
     if (!el) { return; }
     var dipped = false, tries = 0, MAX = 240;   // ~10 min at 2.5s
-    setStatus(el, "checking", "Rebooting — this page comes back by itself…");
+    setStatus(el, "checking", "Restarting — this page will come back by itself…");
     (function tick() {
       if (tries++ > MAX) {
         setStatus(el, "blocked",
-                  "The box has not come back — check the cloud console.");
+                  "Agent-box has not come back — ask an administrator to check it.");
         return;
       }
       fetchStatus(url).then(function (s) {
@@ -272,7 +272,7 @@
       })
       .then(function (result) {
         if (result.status === "identical") {
-          show("current", "No agent-box code update.");
+          show("current", "Agent-box is up to date.");
           return;
         }
         if (result.status === "ahead") {
@@ -283,7 +283,7 @@
             ? "https://github.com/" + repoPath + "/compare/" +
               encodeURIComponent(rev) + "..." + encodeURIComponent(head)
             : fallback;
-          show("available", "agent-box update available — " + commits + ".", "View changes", href);
+          show("available", "Agent-box update available — " + commits + ".", "View changes", href);
           return;
         }
         show("blocked", "Automatic agent-box update unavailable.", "Compare revisions", fallback);
@@ -734,7 +734,7 @@
     fetchSecret(b.getAttribute("data-secret-url")).then(function (secret) {
       if (!out.isConnected) { return; }
       if (!secret) {
-        b.setAttribute("title", "No secret yet — run agent-box-webhook setup");
+        b.setAttribute("title", "No secret yet — connect the service first");
         return;
       }
       out.setAttribute("data-mask", out.textContent);

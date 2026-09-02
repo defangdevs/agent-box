@@ -50,7 +50,7 @@
         user = "agent";
         fail2ban = false;
       };
-      # Issue 54: the settings page grows an "Update box" button that triggers
+      # Issue 54: the settings page grows an "Update agent-box" button that triggers
       # agent-box-update.service through the allowlisted sudo rule. The VM has
       # no network, so the unit itself will fail after activating — the test
       # only proves the trigger plumbing (button -> daemon -> sudo -> unit).
@@ -177,7 +177,7 @@
     # curl is still writing the page -> curl exit 23.)
     machine.succeed(
         f"su -s /bin/sh agent -c '{sock_curl} http://localhost/agent/settings/' "
-        "| grep 'Settings for agent' >/dev/null"
+        "| grep '<h1.*Settings</h1>' >/dev/null"
     )
     # ...another local user gets permission denied — cannot list, write, or
     # restart. (Before the fix, all three worked over 127.0.0.1:7781.)
@@ -200,7 +200,7 @@
     # Authenticated GET renders the page.
     client.succeed(
         f"{curl} -u agent:testpassword https://box.test/agent/settings/ "
-        "| grep 'Settings for agent' >/dev/null"
+        "| grep '<h1.*Settings</h1>' >/dev/null"
     )
 
     # No env file exists yet.
@@ -386,7 +386,7 @@
         machine.fail("grep -q '^UI_SECRET=' /tmp/agent-env")
 
     # Issue 54: with selfUpdate enabled the page shows the Update card...
-    assert "Update box" in page, "Update box card should be rendered when selfUpdate is on"
+    assert "Update agent-box" in page, "Update card should be rendered when selfUpdate is on"
     # ...including the running rev as a GitHub commit link (selfUpdate.rev +
     # the default repo), so the page answers "what version is this box on".
     assert (
@@ -442,16 +442,16 @@
         f"status should surface the failed update run: {status}"
     )
 
-    # The Danger zone's third row: "Reboot box". A kernel or libc patch
+    # Maintenance's third row restarts agent-box. A kernel or libc patch
     # installs on disk and only takes effect at a boot, unattended patching
     # deliberately never reboots, and nothing inside the box could — so
     # without this card such an update never finishes at all.
-    assert "Reboot box" in page, "Danger zone should offer a reboot"
+    assert "Restart agent-box" in page, "Maintenance should offer a restart"
     assert 'id="reboot-status"' in page, "Reboot card should have a status target"
     # It stays quiet until the distro says a reboot would apply something.
     # NixOS never writes that marker, so this box says nothing until the
     # test writes one itself.
-    assert "A reboot is pending" not in page, (
+    assert "A restart is required" not in page, (
         "the reboot card should be silent with no marker file"
     )
     machine.succeed(
@@ -461,7 +461,7 @@
     pending = client.succeed(
         f"{curl} -u agent:testpassword https://box.test/agent/settings/"
     )
-    assert "A reboot is pending" in pending, (
+    assert "A restart is required" in pending, (
         "the card should report the distro's pending-reboot marker"
     )
     assert "linux-image-6.8.0-test" in pending, (

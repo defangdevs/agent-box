@@ -105,7 +105,7 @@ test('basic auth renders the page and sets the auth cookie; cookie alone then su
   });
   const page = await ctx.newPage();
   await page.goto(SETTINGS_PATH);
-  await expect(page.getByRole('heading', { name: `Settings for ${USER}` })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
 
   const cookie = (await ctx.cookies()).find((c) =>
     c.name.startsWith('__Host-agent_box_auth_')
@@ -121,7 +121,7 @@ test('basic auth renders the page and sets the auth cookie; cookie alone then su
   const cookiePage = await cookieCtx.newPage();
   const res = await cookiePage.goto(SETTINGS_PATH);
   expect(res!.status()).toBe(200);
-  await expect(cookiePage.getByRole('heading', { name: `Settings for ${USER}` })).toBeVisible();
+  await expect(cookiePage.getByRole('heading', { name: 'Settings' })).toBeVisible();
 });
 
 test('update status reports available commits and links to the GitHub changes', async ({ browser }) => {

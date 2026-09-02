@@ -2199,7 +2199,7 @@ class SelfUpdateRenderTest(unittest.TestCase):
         self.assertIn(trigger, guide)
 
     def test_only_the_root_user_may_reboot_the_box(self):
-        """The Danger zone's "Reboot box", and the boundary it respects.
+        """Maintenance's "Restart agent-box", and the boundary it respects.
 
         "Restart all" bounces the caller's OWN unit and needs no sudo at
         all; a reboot takes every user's sessions down with it. So the

@@ -367,7 +367,7 @@ class ProfileRoutes(ProfileFixture):
         status, body = self.post(base, "/profiles/set", name="ok",
                                  HARNESS="nosuch")
         self.assertEqual(status, 400)
-        self.assertIn("Unknown harness", body)
+        self.assertIn("Unknown assistant", body)
 
     def test_an_unknown_verb_is_a_404_not_a_traceback(self):
         _, base = self.serve()
@@ -513,7 +513,7 @@ class ProfileRoutes(ProfileFixture):
                                  agent="claude", profile="triage", cwd="~",
                                  prompt="")
         self.assertEqual(status, 400)
-        self.assertIn("Could not resolve profile", body)
+        self.assertIn("Could not load profile", body)
 
     def test_a_box_with_no_resolver_says_so_rather_than_blaming_the_profile(self):
         """The two are fixed differently: one is a restart of this daemon,
@@ -524,7 +524,7 @@ class ProfileRoutes(ProfileFixture):
                                  agent="claude", profile="triage", cwd="~",
                                  prompt="")
         self.assertEqual(status, 503)
-        self.assertIn("no profile resolver", body)
+        self.assertIn("Profiles are temporarily unavailable", body)
         self.assertNotIn("may have just been deleted", body)
         self.assertEqual(self.read_sessions(), {})
 
@@ -558,7 +558,7 @@ class ProfileRoutes(ProfileFixture):
                                  agent="claude", profile="gone", cwd="~",
                                  prompt="")
         self.assertEqual(status, 400)
-        self.assertIn("Could not resolve profile", body)
+        self.assertIn("Could not load profile", body)
         self.assertEqual(self.read_sessions(), {})
 
     def test_deleting_a_profile_leaves_running_sessions_alone(self):
@@ -576,7 +576,9 @@ class ProfileRoutes(ProfileFixture):
         # And the page still renders, naming the profile the session was
         # started as even though it is gone.
         page = urllib.request.urlopen(base + "/").read().decode()
-        self.assertIn("Agent profiles", page)
+        self.assertIn("<h2>Profiles</h2>", page)
+        self.assertNotIn("harness plus the model", page)
+        self.assertIn("reasoning level", page)
         self.assertIn("prof-tag", page)
 
 
