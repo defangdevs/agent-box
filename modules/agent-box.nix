@@ -5478,6 +5478,16 @@ $6"
 #   hook_args_source  where they came from, for the --preamble report
 hook_args_file="$HOME/.config/agent-box/env"
 ENVSTORE="''${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
+# The session CLI this spawn ends by exec'ing into, pinned for the same reason
+# and by the same wrapper. It used to be a bare `agent-box-session`, resolved
+# from the receiver unit's PATH - which works only where that PATH happens to
+# carry the CLI. On a native box it does not: the profile ships the payload as
+# agent-box-session-bare and the usable CLI is the generated wrapper at
+# /usr/local/bin, so every standing-watch match died with
+# "exec: agent-box-session: not found" and the batch was DROPPED (PR #503).
+# Nothing here resolves a generated CLI from PATH any more; the wrapper says
+# where it is, exactly as it does for the env store, jq and flock.
+SESSION_BIN="''${AGENT_BOX_SESSION_BIN:?the session CLI is pinned by the generated wrapper; run this through the installed command}"
 hook_args_source=""
 if [ -n "''${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   hook_args_source="''${AGENT_BOX_HOOK_ARGS_OPTION_NAME:-the fleet-wide default}"
@@ -6090,9 +6100,9 @@ note="''${LOCAL_WEBHOOK_SPAWN_NOTE:+ (\"$LOCAL_WEBHOOK_SPAWN_NOTE\")}"
 # tmux is not on this unit's PATH, which is why the CLI takes the pinned
 # AGENT_BOX_TMUX_BIN this unit exports, and a future PATH regression must
 # surface as a visible line rather than as "nobody else is live".
-peers="$(agent-box-session peers 2>&1)" \
+peers="$("$SESSION_BIN" peers 2>&1)" \
   || peers="Could not ask which sessions are live, so assume one of them owns
-this and check by hand (agent-box-session peers, agent-box-session ls):
+this and check by hand ($SESSION_BIN peers, $SESSION_BIN ls):
 $peers"
 
 preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded" "$peers")"
@@ -6111,11 +6121,11 @@ pflag=()
 # post-mortem branch is unaffected: a hook agent that CRASHES is not parked,
 # so it stays attachable for inspection exactly as before.
 if [ "''${#extra[@]}" -gt 0 ]; then
-  exec agent-box-session add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
+  exec "$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
 
 $PROMPT" -- "''${extra[@]}"
 fi
-exec agent-box-session add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
+exec "$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
 
 $PROMPT"
   '');
@@ -6565,7 +6575,7 @@ esac
   "//": [
     "Binding contract for generated WRAPPER prologues (issue #451's shape, one",
     "level over). A wrapper is the third place a shared payload's environment",
-    "can come from, after a unit and an env file — and it belongs to no unit:",
+    "can come from, after a unit and an env file - and it belongs to no unit:",
     "the webhook receiver and the settings daemon both run agent-box-webhook-",
     "spawn, so what it gets is the prologue the renderer writes above the",
     "`exec`, not any unit's Environment=. Both backends used to write those",
@@ -6578,9 +6588,16 @@ esac
     "So the prologue is data. Each entry is one export, and the reason it",
     "exists is written HERE, once, instead of once per backend.",
     "",
-    "  kind 'bin'     names a PROGRAM, never a path — each backend resolves it",
+    "  kind 'bin'     names a PROGRAM, never a path - each backend resolves it",
     "                 the way it already resolves a unit contract's programs",
     "                 (contractPrograms here, self.bin/<program> natively).",
+    "  kind 'cli'     names one of the GENERATED per-box CLI wrappers. Same",
+    "                 program-not-a-path rule as 'bin', but the two backends",
+    "                 put a generated wrapper somewhere different from a plain",
+    "                 profile binary: a store path built per box on NixOS,",
+    "                 /usr/local/bin/<program> natively. Needed because the",
+    "                 profile's flat bin/ holds the PAYLOAD (...-bare), not the",
+    "                 wrapper that supplies its environment.",
     "  kind 'config'  names a per-box VALUE by key. The two backends may",
     "                 legitimately resolve one to different text: the box's",
     "                 configuration lives in a NixOS option on one and in",
@@ -6609,7 +6626,7 @@ esac
           "why": [
             "Where the fleet-wide default for hook-session args LIVES, named",
             "once so the CLI's diagnostics can say it without hard-coding",
-            "backend prose into the shared script (issue #471 — the same shape",
+            "backend prose into the shared script (issue #471 - the same shape",
             "#466 fixed for the Caddyfile banner). Exported whether or not the",
             "default is currently set to anything: the key exists either way."
           ]
@@ -6619,6 +6636,20 @@ esac
     {
       "name": "agent-box-webhook-spawn",
       "env": [
+        {
+          "name": "AGENT_BOX_SESSION_BIN",
+          "kind": "cli",
+          "program": "agent-box-session",
+          "why": [
+            "The CLI this spawn ends by exec'ing into, to create the hook session.",
+            "It was a bare `agent-box-session` resolved from the receiver unit's",
+            "PATH, which carried it on NixOS and not natively - where the profile",
+            "ships agent-box-session-bare and the wrapper lives in /usr/local/bin.",
+            "Every match on a native box died with 'exec: agent-box-session: not",
+            "found' and the batch was dropped (PR #503). Pinned here so no",
+            "backend's PATH decides whether a watch can start anything."
+          ]
+        },
         {
           "name": "AGENT_BOX_FLOCK_BIN",
           "kind": "bin",
@@ -6638,7 +6669,7 @@ esac
             "--preamble is run by the SETTINGS DAEMON, whose unit forces a PATH",
             "without jq (the receiver unit's PATH has it, but that is the other",
             "caller). Every jq use in this script is guarded, so an unfound",
-            "binary would report the wrong worker rather than fail — pin it."
+            "binary would report the wrong worker rather than fail - pin it."
           ]
         },
         {
@@ -6647,7 +6678,7 @@ esac
           "key": "defaultAgent",
           "why": [
             "Which agent a match really starts. The spawn calls",
-            "`agent-box-session add` with no --agent, so it is the box default —",
+            "`agent-box-session add` with no --agent, so it is the box default -",
             "and --preamble has to NAME it, because that is the half of 'what",
             "does this watch launch' the page could not show before (#292)."
           ]
@@ -6747,6 +6778,11 @@ esac
     find = "${pkgs.findutils}/bin/find";
     flock = "${pkgs.util-linux}/bin/flock";
     jq = "${pkgs.jq}/bin/jq";
+    # A generated per-box CLI, not a plain profile binary: kind "cli" in a
+    # wrapper contract. This module builds one derivation per box, so the
+    # store path IS the answer; native's half of the same entry resolves to
+    # /usr/local/bin/agent-box-session, the wrapper it generates there.
+    "agent-box-session" = "${sessionCli}/bin/agent-box-session";
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";
@@ -6763,7 +6799,8 @@ esac
   # gap — a plain self.bin/<program> lookup that carries no such config
   # (issue #471 review). The two kinds only need to differ on that backend.
   contractBin = entry:
-    if entry.kind != "bin" && entry.kind != "hook-spawn" then
+    if entry.kind != "bin" && entry.kind != "hook-spawn"
+       && entry.kind != "cli" then
       throw "agent-box: contract entry has unknown kind '${entry.kind}'"
     else
       contractPrograms.${entry.program} or
@@ -18071,7 +18108,14 @@ if __name__ == "__main__":
         environment = (lib.listToAttrs (map
           (e: lib.nameValuePair e.name (contractBin e))
           webhookContract.env)) // {
-          PATH = lib.mkForce (lib.makeBinPath [ pkgs.jq pkgs.coreutils sessionCli ]);
+          # jq and coreutils only. The session CLI used to be on here so the
+          # spawn payload's bare `agent-box-session` would resolve - which is
+          # precisely what native could not reproduce, because its profile
+          # holds the payload rather than the wrapper (issue #503). The
+          # payload now takes AGENT_BOX_SESSION_BIN from the wrapper
+          # contract, so no backend's PATH decides whether a watch can start
+          # a session, and this unit's PATH says what it means again.
+          PATH = lib.mkForce (lib.makeBinPath [ pkgs.jq pkgs.coreutils ]);
         };
         serviceConfig = {
           ExecStartPre = [ "" (contractBin (lib.elemAt webhookContract.execStartPre 0)) ];

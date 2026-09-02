@@ -872,6 +872,11 @@ let
     find = "${pkgs.findutils}/bin/find";
     flock = "${pkgs.util-linux}/bin/flock";
     jq = "${pkgs.jq}/bin/jq";
+    # A generated per-box CLI, not a plain profile binary: kind "cli" in a
+    # wrapper contract. This module builds one derivation per box, so the
+    # store path IS the answer; native's half of the same entry resolves to
+    # /usr/local/bin/agent-box-session, the wrapper it generates there.
+    "agent-box-session" = "${sessionCli}/bin/agent-box-session";
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";
@@ -888,7 +893,8 @@ let
   # gap — a plain self.bin/<program> lookup that carries no such config
   # (issue #471 review). The two kinds only need to differ on that backend.
   contractBin = entry:
-    if entry.kind != "bin" && entry.kind != "hook-spawn" then
+    if entry.kind != "bin" && entry.kind != "hook-spawn"
+       && entry.kind != "cli" then
       throw "agent-box: contract entry has unknown kind '${entry.kind}'"
     else
       contractPrograms.${entry.program} or
@@ -3519,7 +3525,14 @@ in
         environment = (lib.listToAttrs (map
           (e: lib.nameValuePair e.name (contractBin e))
           webhookContract.env)) // {
-          PATH = lib.mkForce (lib.makeBinPath [ pkgs.jq pkgs.coreutils sessionCli ]);
+          # jq and coreutils only. The session CLI used to be on here so the
+          # spawn payload's bare `agent-box-session` would resolve - which is
+          # precisely what native could not reproduce, because its profile
+          # holds the payload rather than the wrapper (issue #503). The
+          # payload now takes AGENT_BOX_SESSION_BIN from the wrapper
+          # contract, so no backend's PATH decides whether a watch can start
+          # a session, and this unit's PATH says what it means again.
+          PATH = lib.mkForce (lib.makeBinPath [ pkgs.jq pkgs.coreutils ]);
         };
         serviceConfig = {
           ExecStartPre = [ "" (contractBin (lib.elemAt webhookContract.execStartPre 0)) ];

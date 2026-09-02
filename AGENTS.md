@@ -137,6 +137,20 @@ The rules, all enforced by `scripts/check_vendor.py`:
 
 Follow existing formatting: two-space indentation for Nix and TypeScript, four spaces for Python, and trailing semicolons in TypeScript. Use kebab-case for Nix check names and filenames, descriptive camelCase for Nix locals, and `UPPER_SNAKE_CASE` for environment variables. Keep comments focused on security constraints or non-obvious deployment behavior. No repository-wide formatter is configured, so match adjacent code.
 
+**Keep it ASCII.** Write `-` and not an em dash, `...` and not an ellipsis,
+straight quotes and not curly ones, `->` and not an arrow. This is about where
+these strings END UP, not about the editor they are written in: comments and
+prose in `modules/src/` are embedded into generated shell wrappers, systemd
+units, journal lines, hook-session prompts and the terminal a user reads over
+ttyd, and one of those consumers is already ASCII-checked outright
+(`scripts/check_azure_template.py` refuses a non-ASCII bootstrap). A JSON
+manifest is the worst case: `\u2014` is invisible in the source and arrives as
+an em dash in every file rendered from it, so a byte scan of the manifest finds
+nothing while the output is full of them.
+
+New and changed lines only - existing prose is not being rewritten, so match
+the file around you for everything else.
+
 ### Icons in the web UI
 
 Every icon on the settings and workspace pages is inline SVG from
