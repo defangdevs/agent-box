@@ -3391,7 +3391,6 @@ in
             # below, while AGENT_BOX_TMUX_BIN's "always" applies
             # unconditionally like it always has.
             AGENT_BOX_AGENTS = lib.concatStringsSep "," (sessionKinds cfg.installAgents);
-            AGENT_BOX_DEFAULT_AGENT = cfg.agent;
             # Guided sign-in (issues #207, #208, #313). The daemon starts
             # these in a tmux session on the AGENT unit's server, so the
             # credential is written in the same namespace a terminal

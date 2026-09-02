@@ -208,14 +208,33 @@ class ProfilePanel(ProfileFixture):
         self.assertIn("GH_TOKEN", html)
         self.assertNotIn("ghp_supersecret", html)
 
-    def test_the_session_row_picker_offers_no_profile_first(self):
-        """The picker adds a choice; it does not take the default away.
-        Every session on this box until now had no profile."""
+    def test_the_session_row_picker_asks_rather_than_defaulting(self):
+        """The picker is the row's ONLY control now (issue #493), so it can
+        no longer lead with a "no profile" value: there is no assistant
+        <select> beside it to fall through to, and no box-wide default
+        assistant behind that. It asks instead, and offers `shell` as the
+        one entry that is not a profile file."""
         self.write_profile("triage", "HARNESS=claude\n")
         module = self.daemon()
         options = module.render_profile_options(module.read_profiles())
-        self.assertTrue(options.startswith('<option value="">'))
+        self.assertTrue(options.startswith('<option value="" disabled selected>'))
+        self.assertIn("Choose a profile", options)
         self.assertIn('<option value="triage">triage (claude)</option>', options)
+        # `shell` is offered, and never as a profile file.
+        self.assertIn('<option value=":shell">', options)
+        # Nothing posts an empty profile any more.
+        self.assertNotIn('<option value="">', options)
+
+    def test_a_profile_may_be_named_shell_without_colliding(self):
+        """A profile NAME of "shell" is legal - what #493 refuses is
+        HARNESS=shell - so the pseudo-entry cannot use the bare word as its
+        value. It uses ":shell", which PROFILE_NAME_RE can never match."""
+        self.write_profile("shell", "HARNESS=claude\n")
+        module = self.daemon()
+        options = module.render_profile_options(module.read_profiles())
+        self.assertIn('<option value="shell">shell (claude)</option>', options)
+        self.assertIn('<option value=":shell">', options)
+        self.assertFalse(module.PROFILE_NAME_RE.match(module.SHELL_PSEUDO_PROFILE))
 
     def test_a_session_started_from_a_profile_says_so(self):
         self.write_sessions({"main": {"agent": "claude", "profile": "triage"},
@@ -410,21 +429,18 @@ class ProfileRoutes(ProfileFixture):
         self.assertEqual(list(self.read_sessions().values())[0]["agent"],
                          "claude")
 
-    def test_a_profile_with_no_harness_uses_the_row_selection(self):
-        """Otherwise neither the profile nor the operator decides. The
-        The override is what decides here, and it is the only thing that
-        can: since #493 there is no box default left to fall back to, so a
-        profile naming no HARNESS is startable ONLY through the row's own
-        selection. Passing no override used to discard that selection and
-        start claude for a profile carrying only a model - while the note
-        under the row said the profile supplies the harness."""
+    def test_a_profile_with_no_harness_is_refused(self):
+        """There is nothing left to rescue it with. The row's assistant
+        <select> used to be handed to the resolver as an override for
+        exactly this case; with the select gone (issue #493) a profile that
+        names no assistant is simply not startable, and the resolver is
+        what says so."""
         _, base = self.serve()
         self.write_profile("modelonly", "MODEL=opus\n")
-        self.post(base, "/sessions/add", back="settings", agent="codex",
-                  profile="modelonly", cwd="~", prompt="")
-        entry = list(self.read_sessions().values())[0]
-        self.assertEqual(entry["agent"], "codex")
-        self.assertEqual(entry["profile"], "modelonly")
+        status, _ = self.post(base, "/sessions/add", back="settings",
+                              profile="modelonly", cwd="~", prompt="")
+        self.assertEqual(status, 400)
+        self.assertEqual(self.read_sessions(), {})
 
     def test_a_profile_that_names_a_harness_still_wins(self):
         """The override is passed ONLY when the profile names none, so the
@@ -499,14 +515,26 @@ class ProfileRoutes(ProfileFixture):
         self.assertEqual([f for f in os.listdir(self.profiles)
                           if f.endswith(".env")], [])
 
-    def test_adding_a_session_with_no_profile_is_unchanged(self):
-        """The picker adds a choice. Everything that worked before it must
-        still work exactly as it did."""
+    def test_adding_a_session_with_no_profile_is_refused(self):
+        """It used to fall through to the row's assistant <select>, and
+        behind that to the box default. Both are gone (issue #493), so a
+        post naming no profile has nothing left to mean - and the page says
+        so rather than picking an assistant on the operator's behalf."""
         _, base = self.serve()
-        self.post(base, "/sessions/add", back="settings", agent="codex",
-                  profile="", cwd="~", prompt="")
+        status, body = self.post(base, "/sessions/add", back="settings",
+                                 profile="", cwd="~", prompt="")
+        self.assertEqual(status, 400)
+        self.assertIn("Pick a profile", body)
+        self.assertEqual(self.read_sessions(), {})
+
+    def test_the_shell_pseudo_profile_starts_a_bare_shell(self):
+        """The one picker entry that is not a profile file: it records no
+        profile name, because there is none to re-read at the next spawn."""
+        _, base = self.serve()
+        self.post(base, "/sessions/add", back="settings", profile=":shell",
+                  cwd="~", prompt="")
         entry = list(self.read_sessions().values())[0]
-        self.assertEqual(entry["agent"], "codex")
+        self.assertEqual(entry["agent"], "shell")
         self.assertIsNone(entry["profile"])
         self.assertEqual(entry["extraArgs"], [])
 
