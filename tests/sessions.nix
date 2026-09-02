@@ -1214,6 +1214,19 @@ in
         assert shell_launch["args"] == [], shell_launch
         assert any("ignored for the 'shell' harness" in w
                    for w in shell_launch["warnings"]), shell_launch
+        # But a profile whose OWN file names shell is refused at launch, not
+        # just at write time. `set` cannot write one and the settings page
+        # cannot save one, yet neither governs a file that predates this
+        # release or was edited by hand - and the profile file is explicitly
+        # the user's to edit. Launchable-but-unsaveable is the state this
+        # closes.
+        legacy = "/home/agent/.config/agent-box/profiles/legacy.env"
+        machine.succeed(as_agent(f"printf 'HARNESS=shell\\n' > {legacy}"))
+        legacy_err = machine.fail(as_agent("agent-box-profile launch legacy 2>&1"))
+        assert "session kind, not a worker" in legacy_err, legacy_err
+        # ...and the override is still the way to start one from it.
+        machine.succeed(as_agent("agent-box-profile launch legacy shell"))
+        machine.succeed(as_agent(f"rm -f {legacy}"))
 
         # add --profile: the harness comes from the profile, and the caller's
         # own `--` tail is appended AFTER the profile's args, so an explicit

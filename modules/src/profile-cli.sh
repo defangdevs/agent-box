@@ -130,19 +130,42 @@ launch_json() {
   # afterwards: the arguments are harness-specific, so a profile resolved for
   # codex and then started on another harness would hand it codex's flags.
   h="${2:-}"
-  [ -n "$h" ] || h="$res_HARNESS"
-  # No fall back to a box-wide default harness (issue #493). A box now
-  # starts with no harness installed and installs them on demand, so "the
-  # default one" names nothing a user chose; a profile that resolved
-  # through it would silently become a different worker the day the box's
-  # configuration changed. A profile says which harness it is, or it is
-  # not startable - and says so here rather than at the next spawn.
-  [ -n "$h" ] || { echo "profile '$1': no HARNESS set (agent-box-profile set '$1' HARNESS=<$(printf '%s' "$PROFILE_HARNESSES" | tr ' ' '|')>)" >&2; return 2; }
+  if [ -n "$h" ]; then
+    # An OVERRIDE may name any session kind, `shell` included: `--profile P
+    # --agent shell` is how a profile's environment reaches a bare shell,
+    # and the caller said which one they meant. It is checked against the
+    # full list.
+    case " $HARNESSES " in
+      (*" $h "*) ;;
+      (*) echo "profile '$1': harness '$h' is not available (available: $HARNESSES)" >&2; return 2 ;;
+    esac
+  else
+    h="$res_HARNESS"
+    # No fall back to a box-wide default harness (issue #493). A box now
+    # starts with no harness installed and installs them on demand, so "the
+    # default one" names nothing a user chose; a profile that resolved
+    # through it would silently become a different worker the day the box's
+    # configuration changed. A profile says which harness it is, or it is
+    # not startable - and says so here rather than at the next spawn.
+    [ -n "$h" ] || { echo "profile '$1': no HARNESS set (agent-box-profile set '$1' HARNESS=<$(printf '%s' "$PROFILE_HARNESSES" | tr ' ' '|')>)" >&2; return 2; }
+    # What the profile itself NAMES is held to the profile list, so `shell`
+    # is refused here too. `set` already refuses to write it, and so does
+    # the settings page - but neither governs a file that predates this
+    # release or was edited by hand, and the profile file is explicitly the
+    # user's to edit. Without this, such a profile would be launchable and
+    # yet unsaveable: opening its row and pressing Save answers 400.
+    case " $PROFILE_HARNESSES " in
+      (*" $h "*) ;;
+      (*)
+        if [ "$h" = shell ]; then
+          echo "profile '$1': HARNESS=shell is a session kind, not a worker. Start a shell with 'agent-box-session add --agent shell', or with '--profile $1 --agent shell' to carry this profile's environment into it." >&2
+        else
+          echo "profile '$1': harness '$h' is not available (available: $PROFILE_HARNESSES)" >&2
+        fi
+        return 2 ;;
+    esac
+  fi
   warn=""
-  case " $HARNESSES " in
-    (*" $h "*) ;;
-    (*) echo "profile '$1': harness '$h' is not available (available: $HARNESSES)" >&2; return 2 ;;
-  esac
   set --
   case "$h" in
     claude)
