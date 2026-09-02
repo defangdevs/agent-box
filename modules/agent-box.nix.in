@@ -753,6 +753,12 @@ let
     # (util-linux) is not on it, and the hook-session cap check has to hold
     # the registry lock through the add it decides on.
     export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
+    # --preamble is run by the SETTINGS DAEMON, whose unit forces a PATH
+    # without jq (the receiver unit's PATH has it, but that is the other
+    # caller). Every jq use in this script is guarded, so an unfound binary
+    # would report the wrong worker rather than fail — pin it like the two
+    # above instead.
+    export AGENT_BOX_JQ_BIN=${pkgs.jq}/bin/jq
     # Which agent a match really starts. The spawn calls `agent-box-session
     # add` with no --agent, so it is the box default — and --preamble has to
     # NAME it, because that is the half of "what does this watch launch" the
@@ -1940,9 +1946,22 @@ in
           the marketplace itself and tracks its default branch — this pin only
           governs the copy the box runs.
 
-          0.23.0 (this pin, issue #380) retired the built-in failures-only CI
+          0.25.0 (issue #321) lets a dispatch entry carry
+          `spawnConfig`, a flat map of strings the receiver hands to the spawn
+          command in `LOCAL_WEBHOOK_SPAWN_CONFIG`. Every other
+          `LOCAL_WEBHOOK_SPAWN_*` variable describes the EVENT, so two watches
+          on one repo used to be indistinguishable to webhook-spawn.sh; this
+          one describes the WATCH, which is what `agent-box-webhook subscribe
+          --profile NAME` writes and what lets a watch name the agent profile
+          its own sessions start on. AGENT_BOX_HOOK_PROFILE stays the box-wide
+          fallback. The same release queues dispatch batches per (key,
+          spawnConfig) rather than per key, so two watches on one repo cannot
+          coalesce into a single spawn that would hand one watch's events to
+          the other's worker.
+
+          0.23.0 (issue #380) retired the built-in failures-only CI
           brake for rule-less dispatch entries: a `--deliver-to subagent`
-          watch now MUST carry its own `when`/`drop` rules or webhook_subscribe
+          watch MUST carry its own `when`/`drop` rules or webhook_subscribe
           refuses to create it. `ignoreSenders` also became a pure sender mute
           with no CI-outcome carve-out. webhook-cli.sh (see subscribeCmd
           below) fills in a default `when` for a rule-less GitHub subagent

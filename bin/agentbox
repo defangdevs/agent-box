@@ -2666,6 +2666,14 @@ class Renderer:
                 # the session CLI) has no flock on it.
                 f"export AGENT_BOX_FLOCK_BIN="
                 f"{shlex.quote(f'{self.bin}/flock')}\n"
+                # webhook-spawn.sh reads the dispatch file with jq to find
+                # the watch's own agent profile (issue #321), and its
+                # --preamble caller is the settings daemon, whose PATH does
+                # not carry jq. Every jq use in that script is guarded, so
+                # an unfound binary reports the wrong worker instead of
+                # failing. Pinned here for the same reason the module pins
+                # it into webhookSpawn's own derivation.
+                f"export AGENT_BOX_JQ_BIN={shlex.quote(f'{self.bin}/jq')}\n"
                 # Which agent a match starts, for --preamble's report:
                 # the spawn calls `agent-box-session add` with no
                 # --agent, so it is the box default. Unset, the report

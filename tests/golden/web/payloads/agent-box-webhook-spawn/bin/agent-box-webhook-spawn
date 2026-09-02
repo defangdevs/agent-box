@@ -4,6 +4,12 @@
 # (util-linux) is not on it, and the hook-session cap check has to hold
 # the registry lock through the add it decides on.
 export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock
+# --preamble is run by the SETTINGS DAEMON, whose unit forces a PATH
+# without jq (the receiver unit's PATH has it, but that is the other
+# caller). Every jq use in this script is guarded, so an unfound binary
+# would report the wrong worker rather than fail — pin it like the two
+# above instead.
+export AGENT_BOX_JQ_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin/jq
 # Which agent a match really starts. The spawn calls `agent-box-session
 # add` with no --agent, so it is the box default — and --preamble has to
 # NAME it, because that is the half of "what does this watch launch" the
@@ -21,10 +27,18 @@ export AGENT_BOX_ENVSTORE_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-
 # currently set to anything.
 export AGENT_BOX_HOOK_ARGS_OPTION_NAME='the NixOS option services.agent-box.webhook.hookSessionArgs'
 set -eu
-# jq/coreutils/agent-box-session resolve from the webhook daemon unit's
-# PATH (issue #154, Phase 2) — this script only ever runs as that unit's
+# coreutils/agent-box-session resolve from the webhook daemon unit's PATH
+# (issue #154, Phase 2) — that unit is what runs this script as its
 # LOCAL_WEBHOOK_SPAWN_CMD child.
-JQ=jq
+#
+# jq is pinned instead, the AGENT_BOX_*_BIN way the flock and env-store
+# dependencies already are, because --preamble has a SECOND caller with a
+# different PATH: the settings daemon, whose unit forces a PATH of the daemon
+# itself plus coreutils/findutils/gnugrep/gnused/systemd. A bare `jq` there is
+# not found, and every use of it in this script is guarded (`|| …`, or an
+# `if`), so the failure would be silent — the watch panel would quietly report
+# the wrong worker and the wrong arguments.
+JQ="${AGENT_BOX_JQ_BIN:-jq}"
 # The session registry — where it lives, how it is locked and how it is
 # rewritten — is one file every shell writer splices in (issue #254). This one
 # only LOCKS: the write is done by the `agent-box-session add` it execs into,
@@ -411,16 +425,16 @@ fi
 # could name a profile that does not exist on the box. An unusable value is
 # reported and IGNORED below rather than failing the spawn — a webhook
 # delivery must never be dropped because a profile was renamed.
-hook_profile="${AGENT_BOX_HOOK_PROFILE:-}"
-hook_profile_source=""
+box_profile="${AGENT_BOX_HOOK_PROFILE:-}"
+box_profile_source=""
 # Read with the env store's own parser (issue #212), never a fifth copy of the
 # KEY=value loop: the file may hold a multi-line value now, and only the one
 # parser knows where such an entry ends. Only these two keys are read, so
 # nothing else in the file reaches this process.
 if [ -r "$hook_args_file" ]; then
   if val=$("$ENVSTORE" --file "$hook_args_file" get AGENT_BOX_HOOK_PROFILE); then
-    hook_profile=$val
-    hook_profile_source="AGENT_BOX_HOOK_PROFILE in $hook_args_file"
+    box_profile=$val
+    box_profile_source="AGENT_BOX_HOOK_PROFILE in $hook_args_file"
   fi
   if val=$("$ENVSTORE" --file "$hook_args_file" get AGENT_BOX_HOOK_SESSION_ARGS); then
     AGENT_BOX_HOOK_SESSION_ARGS=$val
@@ -430,28 +444,89 @@ fi
 # A value that did not come from the env file was exported into this process
 # (a hand-run script, or a unit environment): say so rather than reporting a
 # source of "".
-[ -z "$hook_profile" ] || [ -n "$hook_profile_source" ] \
-  || hook_profile_source="the AGENT_BOX_HOOK_PROFILE environment variable"
-if [ -n "$hook_profile" ]; then
-  # Checked HERE, not left to `agent-box-session add --profile`, which exits 2
-  # on an unknown profile: that exit would drop the batch, and the events do
-  # not come back. Name charset first (it reaches a file path), then the file.
-  case "$hook_profile" in
-    (*[!A-Za-z0-9_-]*)
-      echo "agent-box-webhook-spawn: AGENT_BOX_HOOK_PROFILE '$hook_profile' is not a" \
-           "valid profile name; starting this session on the box default" >&2
-      hook_profile_source="$hook_profile_source — IGNORED, not a valid profile name"
-      hook_profile=""
-      ;;
-    (*)
-      if [ ! -r "$HOME/.config/agent-box/profiles/$hook_profile.env" ]; then
-        echo "agent-box-webhook-spawn: no such profile '$hook_profile'" \
-             "(agent-box-profile ls); starting this session on the box default" >&2
-        hook_profile_source="$hook_profile_source — IGNORED, no such profile"
-        hook_profile=""
-      fi
-      ;;
+[ -z "$box_profile" ] || [ -n "$box_profile_source" ] \
+  || box_profile_source="the AGENT_BOX_HOOK_PROFILE environment variable"
+
+# The WATCH's own answer, which beats both box-wide settings above — the last
+# step of issue #321. AGENT_BOX_HOOK_PROFILE names ONE worker for every
+# dispatched session on the box; a watch carrying spawnConfig.profile is naming
+# the worker for its own events only, and the narrower answer is the one whoever
+# wrote it meant. That is what lets cheap triage handle new issues while a red
+# build starts something that can actually fix it.
+#
+# It arrives in LOCAL_WEBHOOK_SPAWN_CONFIG (local-channels 0.25.0), the one
+# variable the dispatcher fills from the matched subscription rather than from
+# the event. Older receivers set nothing, and an entry with no config sets `{}`,
+# so both read as "no watch-level answer" and the box-wide setting stands.
+#
+# --preamble has no delivery and so no variable: the settings page asks what a
+# named TOPIC would start, so that mode reads the watch straight out of the
+# dispatch file. Same precedence either way, because the page must not advertise
+# a worker the spawn would not use.
+watch_profile=""
+watch_config=""
+if [ -n "${LOCAL_WEBHOOK_SPAWN_CONFIG:-}" ]; then
+  watch_config="$LOCAL_WEBHOOK_SPAWN_CONFIG"
+elif [ "${1:-}" = "--preamble" ] && [ -n "${2:-}" ] && [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ]; then
+  # Best effort, like every other read here: no file, bad JSON or no such topic
+  # all mean "this watch names no profile", never a failed render.
+  watch_config=$("$JQ" -r --arg t "$2" \
+    '[(.topics // [])[] | select(type == "object" and (.topic // "") == $t)][0]
+     | (if type == "object" then (.spawnConfig // {}) else {} end) | tojson' \
+    "$LOCAL_WEBHOOK_STATE_DIR/filter.dispatch.json" 2>/dev/null) || watch_config=""
+fi
+if [ -n "$watch_config" ]; then
+  # `.profile` must be a STRING. webhook.py drops a non-string value when it
+  # reads the filter file, so a delivery never carries one — but --preamble
+  # reads that file directly, and the file is documented as hand-editable, so
+  # `{"profile": 5}` would otherwise render as the profile "5".
+  watch_profile=$("$JQ" -r \
+    'if type == "object" and (.profile | type) == "string" then .profile else empty end' \
+    <<<"$watch_config" 2>/dev/null) || watch_profile=""
+fi
+
+# '' when NAME can be launched, else why not. Checked HERE, not left to
+# `agent-box-session add --profile`, which exits 2 on an unknown profile: that
+# exit would drop the batch, and the events do not come back. Charset first,
+# because the name reaches a file path.
+profile_problem() {
+  case "$1" in
+    (*[!A-Za-z0-9_-]*) printf 'not a valid profile name'; return 0 ;;
   esac
+  [ -r "$HOME/.config/agent-box/profiles/$1.env" ] || printf 'no such profile'
+}
+
+# Most specific first, and each candidate is validated BEFORE it is allowed to
+# displace the next one. An unusable watch profile must not cost the box-wide
+# one: that would make naming a profile on one watch quietly downgrade every
+# event it matches from the operator's chosen worker to the raw box default,
+# for a typo in a field the box-wide setting has nothing to do with.
+hook_profile=""
+hook_profile_source=""
+hook_profile_ignored=""
+try_profile() {
+  [ -n "$1" ] || return 0
+  [ -z "$hook_profile" ] || return 0
+  why=$(profile_problem "$1")
+  if [ -z "$why" ]; then
+    hook_profile="$1"
+    hook_profile_source="$2"
+    return 0
+  fi
+  echo "agent-box-webhook-spawn: ignoring profile '$1' from $2 — $why" >&2
+  hook_profile_ignored="${hook_profile_ignored:+$hook_profile_ignored; }$2 — IGNORED, $why"
+}
+
+try_profile "$watch_profile" "this watch's own spawnConfig.profile"
+try_profile "$box_profile" "$box_profile_source"
+if [ -n "$hook_profile" ]; then
+  [ -z "$hook_profile_ignored" ] \
+    || echo "agent-box-webhook-spawn: starting this session on profile" \
+            "'$hook_profile' ($hook_profile_source) instead" >&2
+else
+  hook_profile_source="$hook_profile_ignored"
+  [ -z "$hook_profile_ignored" ] \
+    || echo "agent-box-webhook-spawn: starting this session on the box default" >&2
 fi
 
 extra=()
@@ -516,7 +591,8 @@ environment come from that profile ($hook_profile_source) — read it back with 
     printf '%s\n' "No agent profile is set, so a match starts the box default \
 harness. Pick a worker for every LATER hook session with: agent-box-profile \
 set triage HARNESS=claude MODEL=sonnet EFFORT=low && agent-box-session env set \
-AGENT_BOX_HOOK_PROFILE triage"
+AGENT_BOX_HOOK_PROFILE triage — or for THIS watch alone, re-subscribe it with \
+'agent-box-webhook subscribe TOPIC --deliver-to subagent --profile triage'."
   fi
   if [ -n "$hook_args_source" ]; then
     printf 'The arguments after the agent come from %s.\n' "$hook_args_source"

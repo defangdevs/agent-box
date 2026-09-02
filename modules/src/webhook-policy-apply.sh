@@ -15,8 +15,15 @@ fi
 # For every entry whose topic is declared: the declaration REPLACES the
 # managed fields (the payload predicates, ignoreSenders, note) wholesale —
 # partial merges would let config and state drift apart. Runtime fields
-# (ttlHours, renewOnEvent, timestamps) stay the entry's own. Bare-string
-# topics normalize to the object form webhook.py itself writes.
+# (ttlHours, renewOnEvent, spawnConfig, timestamps) stay the entry's own.
+# Bare-string topics normalize to the object form webhook.py itself writes.
+#
+# spawnConfig is on that list deliberately (issue #321): it names an agent
+# PROFILE, and a profile is runtime data a user creates with
+# agent-box-profile — a declared value could name one that does not exist on
+# the box, which is the same reason AGENT_BOX_HOOK_PROFILE has no NixOS option
+# beside it. So `agent-box-webhook subscribe --profile` survives a receiver
+# restart on a governed watch, rather than being reverted by a rebuild.
 #
 # local-webhook 0.19.0 renamed the two predicates when -> include and
 # drop -> exclude (local-channels#294). It still ACCEPTS the old names on

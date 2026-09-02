@@ -1657,7 +1657,8 @@ def webhook_unsubscribe(key, topic, dispatch):
 
 
 def hook_args_stamp():
-    """(mtime_ns, size) of the env file and of the profiles directory.
+    """(mtime_ns, size) of the env file, the profiles directory and the
+    dispatch filter file.
 
     Part of hook_preamble's cache key. The dispatch script reports the
     hook-session arguments that file can override (#292), so its output is
@@ -1671,9 +1672,14 @@ def hook_args_stamp():
     profile still exists decides whether the watch uses it at all. Creating
     or removing one does not touch the env file, and every write goes through
     a rename inside this directory, so its mtime moves on both.
+
+    The dispatch filter file joins them because a watch can now name its own
+    profile (spawnConfig.profile, issue #321): the report reads that file, so
+    re-subscribing a watch with a different --profile has to re-render. Every
+    write to it is an atomic rename, so the mtime moves.
     """
     stamps = []
-    for path in (ENV_FILE, PROFILES_DIR):
+    for path in (ENV_FILE, PROFILES_DIR, os.path.join(webhook_state_dir(), "filter.dispatch.json")):
         try:
             info = os.stat(path)
         except OSError:
@@ -1705,6 +1711,10 @@ def hook_preamble(topic, note, stamp):
     try:
         proc = subprocess.run(
             [HOOK_SPAWN_CMD, "--preamble", topic, note],
+            # The script reads the dispatch file to find THIS watch's own
+            # profile (#321); under socket activation nothing else puts the
+            # state dir in this daemon's environment.
+            env=dict(os.environ, LOCAL_WEBHOOK_STATE_DIR=webhook_state_dir()),
             check=False,
             capture_output=True,
             text=True,

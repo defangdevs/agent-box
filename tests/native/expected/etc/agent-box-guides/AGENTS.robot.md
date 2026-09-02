@@ -160,7 +160,11 @@ plainly rather than handing it back.
   profile. Profile env is convenience, not isolation: every session of this
   user can read it out of /proc. A standing webhook watch hands its work to
   a profile through `agent-box-session env set AGENT_BOX_HOOK_PROFILE NAME`,
-  which is the only way to pick the harness a dispatched hook-* session runs.
+  which is how the harness a dispatched hook-* session runs gets picked at
+  all. That setting is box-wide; one watch picks its OWN worker with
+  `agent-box-webhook subscribe TOPIC --deliver-to subagent --profile NAME`,
+  which beats it. So cheap triage can take new issues while a red build
+  starts something that can fix it.
 
 ## Slash commands: type them into your own pane
 
