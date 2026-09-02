@@ -10398,6 +10398,23 @@ in
       } // lib.optionalAttrs (cfg.selfUpdate.branch != null) {
         AGENT_BOX_SRC_BRANCH = cfg.selfUpdate.branch;
       };
+      # This unit's own definition changes on every non-noop run: CURRENT_REV
+      # above is baked in from cfg.selfUpdate.rev, which the script itself
+      # just advanced. So the `nixos-rebuild switch` this script runs is
+      # switch-to-configuration diffing THIS unit against its predecessor and
+      # finding it changed — and by default that means restart-on-activation,
+      # which sends the stop signal to the cgroup the still-running script is
+      # sitting in. The rebuild has already reached the point where the new
+      # generation is symlinked and active, so the "failure" this produces is
+      # a false negative — Main process exited, code=killed, status=15/TERM,
+      # logged and reported as if the update failed when it fully applied.
+      # Same mechanism as the amazon-init false negatives in agent-box#186,
+      # here hitting the update service's own reporting instead of a test
+      # assertion. restartIfChanged/stopIfChanged=false leaves this run
+      # alone; the NEXT trigger starts fresh from the new unit file anyway,
+      # so there is nothing to gain from restarting a run already in flight.
+      restartIfChanged = false;
+      stopIfChanged = false;
       serviceConfig.Type = "oneshot";
       script = ''
         set -euo pipefail
