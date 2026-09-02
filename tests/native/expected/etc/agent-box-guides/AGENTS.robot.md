@@ -90,7 +90,7 @@ plainly rather than handing it back.
   the box tells you one is waiting by creating /var/run/reboot-required
   (`cat /var/run/reboot-required.pkgs` names what asked). Say so to the
   person you are working with when you see it. There IS a way to finish
-  it - "Reboot box" in the settings page's Danger zone, and the same
+  it - "Restart agent-box" in the settings page's Maintenance section, and the same
   command as a sudo grant if `sudo -ln` lists `systemctl reboot` for you
   - but a reboot kills every session on this box, yours included, so it
   is a thing to be asked for rather than a thing to decide. Ask, unless
