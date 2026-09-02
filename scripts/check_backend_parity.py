@@ -47,6 +47,16 @@ Box-wide, both backends supplied the name, so the comparison above saw nothing
 at all. Supplying a variable somewhere is not supplying it to the payload that
 reads it.
 
+A FOURTH time, keyed by (wrapper, variable), over the generated wrappers both
+backends render. A wrapper belongs to no unit — the receiver and the settings
+daemon both run the spawn wrapper — so its environment comes from the prologue
+each renderer writes above the `exec`, and those prologues are the half of a
+shared payload that deduplicating modules/src/ left in two places. That is how
+a native box came to run agent-box-webhook-spawn without AGENT_BOX_ENVSTORE_BIN,
+which the payload reads with ${...:?}: the standing watch exited 1 on every
+match and dropped the batch, while box-wide and per-unit both looked clean
+because the session and profile CLIs export the same name.
+
 Run it directly (`python3 scripts/check_backend_parity.py`), or through the
 `backend-parity` flake check.
 """
@@ -83,6 +93,11 @@ SUPPLIED = re.compile(
 # than detected, because "a payload assigns it" is also true of a name a
 # payload merely defaults (AGENT_BOX_HOOK_SESSION_ARGS), and dropping those
 # would hide exactly the divergences this check exists to find.
+# An `export NAME=` line in a generated wrapper. Anchored at the start of a
+# line, unlike SUPPLIED above: a wrapper is a script, and a payload that
+# MENTIONS a name in a comment or reads it is not supplying it.
+EXPORTED = re.compile(r"^\s*export (AGENT_BOX_[A-Z0-9_]+)=", re.MULTILINE)
+
 INTERNAL = {
     "AGENT_BOX_SESSION_ID": "supervisor tells the session's own hook which "
                             "session it is in",
@@ -301,6 +316,69 @@ UNIT_VARS_BY_DESIGN = {
 }
 UNIT_VARS_KNOWN_GAPS = {
 }
+
+# Per (wrapper, variable). A generated WRAPPER is the third place a payload's
+# environment can come from, and it belongs to no unit: /etc/agent-box/bin/
+# agent-box-webhook-spawn is run by the webhook receiver AND by the settings
+# daemon, so neither unit's environment is where its variables live — the
+# prologue the renderer writes above the `exec` is. Both backends write those
+# prologues by hand, in two languages, which is the one part of a shared
+# payload that the modules/src/ deduplication never deduplicated.
+#
+# What it costs, and why the box-wide comparison cannot see it: the spawn
+# wrapper reads AGENT_BOX_ENVSTORE_BIN with ${...:?}, the module exported it
+# and the native renderer did not, so every native box's standing watch died
+# at "spawn command exited 1" and dropped the batch. Box-wide the name looked
+# supplied by both, because the native session and profile CLIs export it —
+# just not the wrapper that reads it. Same shape as issue #426 one level over.
+#
+# Same conventions as the tables above: an entry names the side it excuses,
+# and a name already declared box-wide needs no entry here.
+WRAPPER_VARS_BY_DESIGN = {
+    "agent-box-webhook AGENT_BOX_HOOK_ARGS_OPTION_NAME": (
+        "native",
+        "the CLI names the fleet-wide default's home in its own "
+        "diagnostics, and each backend has a different home to name: the "
+        "module bakes the option name into webhookCli at Nix eval time, "
+        "while native has one shared binary and must hand the config file "
+        "path over from the wrapper it generates per box"),
+}
+WRAPPER_VARS_KNOWN_GAPS = {
+}
+
+
+def wrapper_files(root):
+    """{name: text} for every generated wrapper in one rendered tree.
+
+    A wrapper is a script in a bin/ directory, named for the payload it
+    runs: tests/golden/web/payloads/<name>/bin/<name> on the module side,
+    /usr/local/bin/<name> and /etc/agent-box/bin/<name> on the native one.
+    Keying on the basename is what lets the two be compared at all — the
+    paths have nothing else in common, and the name is what both renderers
+    agree on.
+    """
+    found = {}
+    for path, text in read_files(root):
+        if path.parent.name == "bin":
+            found.setdefault(path.name, set()).update(
+                m.group(1) for m in EXPORTED.finditer(text))
+    return found
+
+
+def payload_self_exports():
+    """Names a shared payload exports for ITSELF.
+
+    The module's wrapper is the prologue plus the payload inlined; the
+    native one is the prologue plus an exec. So a payload that exports a
+    name of its own (AGENT_BOX_REGISTRY_LOCK_FD, handed to a subprocess
+    through an open fd) shows up on the module side only — an artefact of
+    how each backend packages the same bytes, not a divergence. Read out
+    of the payloads rather than listed here, so a new one needs no edit.
+    """
+    found = set()
+    for _, text in read_files(SHARED):
+        found.update(m.group(1) for m in EXPORTED.finditer(text))
+    return found
 
 
 def read_files(root):
@@ -526,7 +604,9 @@ def main():
     bad_units = ambiguous("unit", UNITS_BY_DESIGN, UNITS_KNOWN_GAPS)
     bad_pairs = ambiguous("per-unit variable",
                           UNIT_VARS_BY_DESIGN, UNIT_VARS_KNOWN_GAPS)
-    if bad_vars or bad_units or bad_pairs:
+    bad_wrappers = ambiguous("per-wrapper variable",
+                             WRAPPER_VARS_BY_DESIGN, WRAPPER_VARS_KNOWN_GAPS)
+    if bad_vars or bad_units or bad_pairs or bad_wrappers:
         return 1
     shared_units = names(SHARED_UNITS, SUPPLIED)
     module = names(GOLDEN, SUPPLIED) | shared_units
@@ -582,7 +662,30 @@ def main():
     v3, s3 = report("per-unit variable", pair_module, pair_native,
                     UNIT_VARS_BY_DESIGN, UNIT_VARS_KNOWN_GAPS)
 
-    if v1 or v2 or v3 or s1 or s2 or s3:
+    # Per (wrapper, variable), over the wrappers BOTH backends render.
+    # Payload self-exports are dropped: they are inside the module's
+    # inlined copy and inside the binary the native wrapper execs, so
+    # counting them would report every one of them as module-only.
+    self_exported = payload_self_exports()
+    mod_wrappers = wrapper_files(GOLDEN)
+    nat_wrappers = wrapper_files(NATIVE)
+    wrap_module, wrap_native = set(), set()
+    both = sorted(set(mod_wrappers) & set(nat_wrappers))
+    for name in both:
+        supplies = (mod_wrappers[name] - self_exported,
+                    nat_wrappers[name] - self_exported)
+        for side, one_sided in zip((wrap_module, wrap_native),
+                                   (supplies[0] - supplies[1],
+                                    supplies[1] - supplies[0])):
+            side.update(f"{name} {var}"
+                        for var in (one_sided & contract) - declared)
+
+    print(f"\nper-wrapper variables, over the {len(both)} generated "
+          f"wrapper(s) both backends render:")
+    v4, s4 = report("per-wrapper variable", wrap_module, wrap_native,
+                    WRAPPER_VARS_BY_DESIGN, WRAPPER_VARS_KNOWN_GAPS)
+
+    if v1 or v2 or v3 or v4 or s1 or s2 or s3 or s4:
         return 1
     print("\nOK: every divergence between the two backends is declared.")
     return 0
