@@ -172,13 +172,14 @@
 
     sock_curl = "curl -s --max-time 10 --unix-socket /run/agent-box-settings/agent.sock"
 
-    # The owning user can talk to its own daemon over the socket...
-    # (grep without -q: -q exits on first match and closes the pipe while
-    # curl is still writing the page -> curl exit 23.)
-    machine.succeed(
-        f"su -s /bin/sh agent -c '{sock_curl} http://localhost/agent/settings/' "
-        "| grep -F 'Settings</h1>' >/dev/null"
+    # The owning user can talk to its own daemon over the socket, and gets
+    # the rendered page back (heading plus its icon span; a single-line
+    # regex can't pin both at once since {mark} is a multi-line inline SVG).
+    sock_page = machine.succeed(
+        f"su -s /bin/sh agent -c '{sock_curl} http://localhost/agent/settings/'"
     )
+    assert '<span class="mark">' in sock_page
+    assert "Settings</h1>" in sock_page
     # ...another local user gets permission denied — cannot list, write, or
     # restart. (Before the fix, all three worked over 127.0.0.1:7781.)
     machine.fail(
@@ -198,10 +199,11 @@
     )
 
     # Authenticated GET renders the page.
-    client.succeed(
-        f"{curl} -u agent:testpassword https://box.test/agent/settings/ "
-        "| grep -F 'Settings</h1>' >/dev/null"
+    auth_page = client.succeed(
+        f"{curl} -u agent:testpassword https://box.test/agent/settings/"
     )
+    assert '<span class="mark">' in auth_page
+    assert "Settings</h1>" in auth_page
 
     # No env file exists yet.
     machine.fail("test -e /home/agent/.config/agent-box/env")
