@@ -2077,7 +2077,7 @@
     # states: a filter file that lists nothing.
     page = machine.succeed(f"{settings_curl} {settings_page}")
     assert "event notifications off" in page, page
-    assert "Unsubscribed from everything" in page, page
+    assert "This session is not receiving events." in page, page
 
     # An empty filter file names no topic, so unsubscribe has nothing to take
     # hold of: deleting the FILE is the only cleanup left, and the page can do
