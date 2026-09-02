@@ -170,7 +170,7 @@ in
         # /agent/settings/ is a page, so a session called "settings" could
         # never be routed to a terminal — the CLI refuses the name outright.
         for name in ["settings", "downloads", "webhook", "sessions", "token", "ws"]:
-            machine.fail(as_agent(f"agent-box-session add {name} --agent shell"))
+            machine.fail(as_agent(f"agent-box-session add {name} --harness shell"))
         machine.succeed(
             "jq -e '.sessions | has(\"settings\") | not'"
             " /home/agent/.config/agent-box/sessions.json"
@@ -183,7 +183,7 @@ in
         machine.succeed(as_agent("mkdir -p /home/agent/ws"))
         for _ in range(2):
             machine.succeed(
-                as_agent("agent-box-session add --cwd /home/agent/ws --agent shell")
+                as_agent("agent-box-session add --cwd /home/agent/ws --harness shell")
             )
         machine.succeed(
             "jq -e '.sessions | has(\"ws\") | not'"
@@ -207,7 +207,7 @@ in
     # CSS, with the full name as the tab's tooltip.
     long_name = "hook-defangdevs-local-channels-de2d"
     machine.succeed(
-        f"su -s /bin/sh agent -c 'agent-box-session add {long_name} --agent shell'"
+        f"su -s /bin/sh agent -c 'agent-box-session add {long_name} --harness shell'"
     )
     long_page = client.succeed(
         f"{curl} -u agent:testpassword https://box.test/agent/"
@@ -401,7 +401,7 @@ in
     # Bounded by `timeout`, because past the offer this wrapper is meant not
     # to return: it BECOMES the terminal.
     with subtest("a stopped session starts from its own pane"):
-        machine.succeed(as_agent("agent-box-session add pane --agent shell"))
+        machine.succeed(as_agent("agent-box-session add pane --harness shell"))
         machine.wait_until_succeeds(tmux("has-session -t =pane"), timeout=60)
         machine.succeed(as_agent("agent-box-session stop pane"))
         machine.wait_until_fails(tmux("has-session -t =pane"), timeout=60)
@@ -533,7 +533,7 @@ in
             "/home/agent/.config/agent-box/sessions.json"
         )
         machine.succeed(as_agent(
-            "agent-box-session add --agent claude --cwd /home/agent/work/repo"
+            "agent-box-session add --harness claude --cwd /home/agent/work/repo"
         ))
         machine.succeed(
             "jq -e '.sessions | has(\"repo-2\")' "
@@ -541,7 +541,7 @@ in
         )
         # A session in HOME keeps the random suffix: home's basename is the
         # user's own name, which says nothing about the work.
-        machine.succeed(as_agent("agent-box-session add --agent claude"))
+        machine.succeed(as_agent("agent-box-session add --harness claude"))
         machine.succeed(
             "jq -e '[.sessions | keys[] | select(startswith(\"claude-\"))] "
             "| length == 1' /home/agent/.config/agent-box/sessions.json"
@@ -601,7 +601,7 @@ in
 
         # Create a session the way everything outside the browser does.
         machine.succeed(
-            "su -s /bin/sh agent -c 'agent-box-session add feedtest --agent claude'"
+            "su -s /bin/sh agent -c 'agent-box-session add feedtest --harness claude'"
         )
         client.wait_until_succeeds(
             f"grep '^data:' /tmp/feed.txt | grep -v {baseline} >/dev/null", timeout=60
@@ -713,7 +713,7 @@ in
         # A session with no conversation to hand over (here a shell session,
         # but equally a codex session started with no prompt to stamp) gets
         # no button at all rather than one that 404s.
-        machine.succeed(as_agent("agent-box-session add shelltest --agent shell"))
+        machine.succeed(as_agent("agent-box-session add shelltest --harness shell"))
         client.wait_until_succeeds(
             f"{curl} -u agent:testpassword https://box.test/agent/settings/ "
             "| grep 'value=\"shelltest\"' >/dev/null",

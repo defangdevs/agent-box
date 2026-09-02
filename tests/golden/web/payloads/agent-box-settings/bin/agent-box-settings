@@ -4899,7 +4899,7 @@ def render_harness_options(selected=""):
     It has a blank entry, but that entry is a PROMPT and not a value: a
     profile must name its assistant (issue #493). There used to be a
     "default assistant" option here, resolving through the box-wide default
-    agent the same way a session with no --agent does. A box now starts with
+    agent the same way a session with no --harness does. A box now starts with
     no assistant installed and installs them on demand, so "the default one"
     names nothing anybody chose - and a profile that resolved through it
     would quietly become a different worker the day the box's configuration
@@ -6600,11 +6600,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             # An agent profile (#321), if one was picked. The profile's
             # harness WINS over the select on its left, rather than the
-            # CLI's order where an explicit --agent overrides it: a select
+            # CLI's order where an explicit --harness overrides it: a select
             # always posts a value, so this form cannot tell "chose claude"
             # from "left it alone", and a rule that depends on a difference
             # the page cannot see would be a guess. `agent-box-session add
-            # --profile P --agent H` is still the way to say the other thing.
+            # --profile P --harness H` is still the way to say the other thing.
             profile = (form.get("profile", [""])[0]).strip()
             pargs = []
             if profile and not PROFILE_BIN:

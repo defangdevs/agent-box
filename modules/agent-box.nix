@@ -434,7 +434,7 @@ let
       ever hand-edit the file.
     - Manage your own sessions without a rebuild:
       `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
-      plus `--agent claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
+      plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
       use it to fan out work, add a reviewer agent, or open a plain shell. The
       kickoff prompt fires once: a later respawn (crash, reboot, Spot restart)
       resumes that session's transcript instead of redoing the work. An agent
@@ -451,9 +451,13 @@ let
       unavailable. The same is true of any other CLI: `nix profile add
       nixpkgs#<pkg>` puts it in `~/.nix-profile/bin`, which is FIRST on your
       PATH, so an install is visible to a pane that is already running.
-    - `--agent` picks the HARNESS (the CLI program). An agent PROFILE is the
-      worker: a harness plus a model, an effort level, an appended system prompt
-      and environment. Make one with `agent-box-profile set NAME
+    - `--harness` picks the CLI PROGRAM (claude, codex, shell). An agent PROFILE
+      is the worker: a harness plus a model, an effort level, an appended system
+      prompt and environment. Keep the two words apart, because the harnesses
+      themselves do not: `claude --agent` and `opencode --agent` both name a
+      WORKER, which here is `--profile`. Our own `--agent` was the old spelling
+      of `--harness`; it still works and prints a deprecation line. Make a
+      profile with `agent-box-profile set NAME
       HARNESS=claude MODEL=sonnet EFFORT=low KEY=value`, read it back with
       `agent-box-profile show NAME`, and start it with `agent-box-session add
       [NAME] --profile PROFILE`. A `-- EXTRA_ARGS` tail still wins over the
@@ -497,7 +501,7 @@ let
 
     The name belongs to the harness, not to agent-box, so a respawn loses it:
     set it again, or make it permanent at creation with
-    `agent-box-session add work --agent claude -- -n "claude: PR 42"`.
+    `agent-box-session add work --harness claude -- -n "claude: PR 42"`.
 
     @WEBHOOK_SECTION@## Handing a file to the user
 
@@ -2726,7 +2730,8 @@ kill_session() {
 usage() {
   echo "usage: agent-box-session ls"
   echo "       agent-box-session peers"
-  echo "       agent-box-session add [NAME] [--agent AGENT] [--profile PROFILE] [--cwd DIR]"
+  echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
+  echo "                             [--cwd DIR]"
   echo "                             [--prompt TEXT] [--resume-prompt TEXT] [--ephemeral]"
   echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
@@ -2738,10 +2743,13 @@ usage() {
   echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters, and"
   echo "not one of: $RESERVED_NAMES (each is already a path under /<user>/). (a"
   echo "longer name would be invisible in the web UI)."
-  echo "agents: $AGENTS (default: $DEFAULT_AGENT) — the HARNESS to run."
+  echo "harnesses: $AGENTS (default: $DEFAULT_AGENT) — the CLI PROGRAM to run."
   echo "--profile names an agent profile (agent-box-profile ls): a harness plus"
   echo "a model, an effort level, an appended system prompt and session env."
-  echo "--agent and a '-- EXTRA_ARGS' tail override what the profile resolved."
+  echo "--harness and a '-- EXTRA_ARGS' tail override what the profile resolved."
+  echo "(--agent is the old name for --harness and still works. It is"
+  echo "deprecated: claude and opencode both spell --agent for the PROFILE,"
+  echo "which is this box's --profile, so the two meanings collided.)"
   echo '--cwd is where the session starts (default $HOME, shared by every'
   echo "session). To work a repo another session is already in, give this one"
   echo "a checkout of its own: git worktree add ~/worktrees/NAME -b BRANCH."
@@ -2846,9 +2854,9 @@ mintable() {
   ! reserved_name "$1" && ! taken "$1"
 }
 gen_name() {
-  # gen_name AGENT [CWD] — echo a unique session name derived from AGENT: the
-  # bare name when free ("claude"), else the working directory's own name
-  # ("portal", then "portal-2"). Callers pass a validated agent, itself a
+  # gen_name HARNESS [CWD] — echo a unique session name derived from HARNESS:
+  # the bare name when free ("claude"), else the working directory's own name
+  # ("portal", then "portal-2"). Callers pass a validated harness, itself a
   # valid name; CWD is whatever the caller will store, so it is untrusted
   # text and gets folded into the name charset here.
   #
@@ -2889,7 +2897,7 @@ cmd="''${1:-}"; shift || true
 case "$cmd" in
   ls)
     live="$(t list-sessions -F '#S' 2>/dev/null || true)"
-    printf '%-24s %-8s %s\n' NAME AGENT STATE
+    printf '%-24s %-8s %s\n' NAME HARNESS STATE
     if [ -s "$REGISTRY_FILE" ]; then
       "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$REGISTRY_FILE" \
       | while IFS="$(printf '\t')" read -r n a state; do
@@ -2977,7 +2985,7 @@ case "$cmd" in
       [ -n "$n" ] || continue
       [ "$n" != "$me" ] || continue
       peers=$((peers + 1))
-      agent="-"; cwd="-"; unmanaged=""
+      harness="-"; cwd="-"; unmanaged=""
       if [ -s "$REGISTRY_FILE" ]; then
         # One read per session, and a session tmux knows but the registry
         # does not is reported as `unmanaged` rather than skipped: it is
@@ -2987,8 +2995,8 @@ case "$cmd" in
             [(.sessions[$n].agent // "-"),
              (.sessions[$n].workingDirectory // "-")] | @tsv
           else "-\t-\tunmanaged" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
-        IFS="$(printf '\t')" read -r agent cwd unmanaged <<<"$meta"
-        [ -n "$agent" ] || agent="-"
+        IFS="$(printf '\t')" read -r harness cwd unmanaged <<<"$meta"
+        [ -n "$harness" ] || harness="-"
         [ -n "$cwd" ] || cwd="-"
         # No recorded working directory means the supervisor starts it in
         # $HOME — say that, rather than a dash a reader has to interpret. It
@@ -3001,11 +3009,11 @@ case "$cmd" in
       # an event, an interactive one by a person or by the box's own config.
       # A session tmux knows and the registry does not keeps BOTH facts: it
       # is running whoever started it, so it can be in your files.
-      [ "$agent" != "-" ] || agent="agent unknown"
+      [ "$harness" != "-" ] || harness="harness unknown"
       kind="interactive"
       case "$n" in (hook-*) kind="dispatched (hook session)" ;; esac
       [ -z "$unmanaged" ] || kind="$kind, not in the registry"
-      out="$out$(printf '%s — %s, %s, cwd %s' "$n" "$agent" "$kind" "$cwd")"$'\n'
+      out="$out$(printf '%s — %s, %s, cwd %s' "$n" "$harness" "$kind" "$cwd")"$'\n'
       ff="$sd/filter.$user-$n.json"
       claims=""
       if [ -s "$ff" ]; then
@@ -3053,11 +3061,21 @@ case "$cmd" in
       ""|-*) ;;
       *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
-    agent="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
-    profile=""; has_agent=0; ephemeral=0
+    harness="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
+    profile=""; has_harness=0; ephemeral=0
     while [ $# -gt 0 ]; do
       case "$1" in
-        --agent) agent="''${2:?--agent needs a value}"; has_agent=1; shift 2 ;;
+        --harness) harness="''${2:?--harness needs a value}"; has_harness=1; shift 2 ;;
+        # `--agent` is what this flag was called until the harnesses took the
+        # word for something else: `claude --agent` and `opencode --agent` both
+        # name a WORKER — a prompt, a model, an effort level — which is this
+        # box's `--profile`. Kept working, because it is written down in every
+        # note, transcript and README a box has; deprecated, because a reader
+        # who knows one of those CLIs reads it as the other thing.
+        --agent)
+          harness="''${2:?--agent needs a value}"; has_harness=1; shift 2
+          echo "agent-box-session: --agent is deprecated, use --harness (it picks the CLI program; --profile picks the worker)" >&2
+          ;;
         --profile) profile="''${2:?--profile needs a value}"; shift 2 ;;
         --cwd) cwd="''${2:?--cwd needs a value}"; shift 2 ;;
         --prompt) prompt="''${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
@@ -3082,15 +3100,15 @@ case "$cmd" in
     # jq, coreutils and this script and nothing else.
     pargs=()
     if [ -n "$profile" ]; then
-      # --agent on the command line wins over the profile's harness, the same
+      # --harness on the command line wins over the profile's harness, the same
       # override order the env file has over the NixOS option elsewhere here —
       # and it is passed INTO the resolver, because the arguments a profile
       # resolves to are harness-specific (`--model` for claude, `-m` for
       # codex, none at all for a shell session).
       povr=""
-      [ "$has_agent" = 1 ] && povr="$agent"
+      [ "$has_harness" = 1 ] && povr="$harness"
       pjson="$("''${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" launch "$profile" "$povr")" || exit 2
-      agent="$("$JQ" -r '.harness' <<<"$pjson")"
+      harness="$("$JQ" -r '.harness' <<<"$pjson")"
       "$JQ" -r --arg p "$profile" \
         '.warnings[] | "agent-box-session: profile \($p): " + .' <<<"$pjson" >&2
       # Profile args go FIRST so an explicit `-- EXTRA_ARGS` tail still has the
@@ -3108,8 +3126,8 @@ case "$cmd" in
       done < <("$JQ" -j '.args[] + "\u0000"' <<<"$pjson")
     fi
     case " $AGENTS " in
-      (*" $agent "*) ;;
-      (*) echo "agent '$agent' is not available (available: $AGENTS)" >&2; exit 2 ;;
+      (*" $harness "*) ;;
+      (*) echo "harness '$harness' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
     registry_ensure
     # Name choice and write are one critical section (issue #254): gen_name
@@ -3117,7 +3135,7 @@ case "$cmd" in
     # could pick the same free name and the second rename would drop the first
     # session outright.
     registry_lock
-    [ -n "$name" ] || name="$(gen_name "$agent" "$cwd")"
+    [ -n "$name" ] || name="$(gen_name "$harness" "$cwd")"
     if taken "$name"; then
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
@@ -3136,7 +3154,7 @@ case "$cmd" in
     # One argument vector: the profile's args first, the caller's own `--`
     # tail after them, so an explicit flag still has the last word.
     sargs=("''${pargs[@]}" "$@")
-    registry_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
+    registry_edit --arg n "$name" --arg a "$harness" --arg c "$cwd" \
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
       --arg prof "$profile" --arg eph "$ephemeral" \
@@ -3161,8 +3179,8 @@ case "$cmd" in
         "   .-~~-." \
         "  ( (o) )" \
         "   \`-~~-'"
-    what="$agent"
-    [ -n "$profile" ] && what="$agent, profile $profile"
+    what="$harness"
+    [ -n "$profile" ] && what="$harness, profile $profile"
     if [ "$has_prompt" = 1 ]; then
       echo "session '$name' ($what) added with a kickoff prompt — the supervisor starts it within ~2s"
     else
@@ -3295,7 +3313,7 @@ esac
   '');
 
   # Agent profiles (issue #321): the WORKER, as opposed to the harness that
-  # `--agent` selects — a harness plus the model, effort, appended system
+  # `--harness` selects — a harness plus the model, effort, appended system
   # prompt and environment that tell two sessions on one harness apart.
   #
   # Deliberately NOT a services.agent-box.* option: a profile is per-user
@@ -3317,7 +3335,7 @@ set -eu
 # exports, exactly as src/session-cli.sh does (issue #154, Phase 2).
 JQ=jq
 # An agent PROFILE (issue #321): the concrete worker, as opposed to the
-# HARNESS (claude/codex/shell) that `agent-box-session --agent` selects. A
+# HARNESS (claude/codex/shell) that `agent-box-session --harness` selects. A
 # profile names a harness plus the knobs that make two sessions on the same
 # harness different workers — model, effort, an appended system prompt, and
 # environment for the session.
@@ -3333,7 +3351,7 @@ HARNESSES="''${AGENT_BOX_AGENTS:?}"
 # apart. `shell` has none of those - it is a bare login shell, and
 # launch_json below already has to warn that all three are ignored for it -
 # so a profile built around it configures nothing. It stays in HARNESSES,
-# because `agent-box-session add --agent shell` is still a session kind;
+# because `agent-box-session add --harness shell` is still a session kind;
 # it is only PROFILE_HARNESSES that refuses it.
 PROFILE_HARNESSES=""
 for _h in $HARNESSES; do
@@ -3439,13 +3457,13 @@ read_profile() {
 launch_json() {
   read_profile "$1" || { echo "no such profile: '$1' (see agent-box-profile ls)" >&2; return 2; }
   # $2 = a harness that overrides the profile's own (agent-box-session add
-  # --profile P --agent H). It has to be resolved HERE and not corrected
+  # --profile P --harness H). It has to be resolved HERE and not corrected
   # afterwards: the arguments are harness-specific, so a profile resolved for
   # codex and then started on another harness would hand it codex's flags.
   h="''${2:-}"
   if [ -n "$h" ]; then
     # An OVERRIDE may name any session kind, `shell` included: `--profile P
-    # --agent shell` is how a profile's environment reaches a bare shell,
+    # --harness shell` is how a profile's environment reaches a bare shell,
     # and the caller said which one they meant. It is checked against the
     # full list.
     case " $HARNESSES " in
@@ -3471,7 +3489,7 @@ launch_json() {
       (*" $h "*) ;;
       (*)
         if [ "$h" = shell ]; then
-          echo "profile '$1': HARNESS=shell is a session kind, not a worker. Start a shell with 'agent-box-session add --agent shell', or with '--profile $1 --agent shell' to carry this profile's environment into it." >&2
+          echo "profile '$1': HARNESS=shell is a session kind, not a worker. Start a shell with 'agent-box-session add --harness shell', or with '--profile $1 --harness shell' to carry this profile's environment into it." >&2
         else
           echo "profile '$1': harness '$h' is not available (available: $PROFILE_HARNESSES)" >&2
         fi
@@ -3567,7 +3585,7 @@ case "$cmd" in
           (*" $v "*) ;;
           (*)
             if [ "$v" = shell ]; then
-              echo "'shell' is a session kind, not a worker: it has no model, effort or system prompt to configure, so a profile cannot be built around it. Start one with 'agent-box-session add --agent shell'." >&2
+              echo "'shell' is a session kind, not a worker: it has no model, effort or system prompt to configure, so a profile cannot be built around it. Start one with 'agent-box-session add --harness shell'." >&2
             else
               echo "harness '$v' is not available (available: $PROFILE_HARNESSES)" >&2
             fi
@@ -3649,7 +3667,7 @@ case "$cmd" in
     # The machine-readable half of `show`, for `agent-box-session add
     # --profile`. Warnings go to stderr there too, so the operator sees them
     # once, on the CLI they ran. The optional second argument is the harness
-    # the caller settled on (`add --profile P --agent H`), which decides the
+    # the caller settled on (`add --profile P --harness H`), which decides the
     # argument mapping.
     name="''${1:-}"; shift || true
     valid_name "$name" || { usage >&2; exit 2; }
@@ -5738,7 +5756,7 @@ fi
 # keeping a copy that would drift.
 #
 # The agent is never chosen here — the spawn calls `agent-box-session add`
-# with no --agent — so the box default is what a match really starts. The
+# with no --harness — so the box default is what a match really starts. The
 # wrapper exports it for exactly this line; unset only in a hand-run script.
 render_launch() {
   # The example is a variable so the copy-paste line keeps the shell quoting
@@ -6771,7 +6789,7 @@ esac
           "key": "defaultAgent",
           "why": [
             "Which agent a match really starts. The spawn calls",
-            "`agent-box-session add` with no --agent, so it is the box default -",
+            "`agent-box-session add` with no --harness, so it is the box default -",
             "and --preamble has to NAME it, because that is the half of 'what",
             "does this watch launch' the page could not show before (#292)."
           ]
@@ -8948,7 +8966,7 @@ in
       description = ''
         Agent CLIs this box may run — the ALLOW-list a session's `agent` is
         validated against, independently of what any session currently runs,
-        so a runtime `agent-box-session add --agent codex` needs no rebuild.
+        so a runtime `agent-box-session add --harness codex` needs no rebuild.
         Default: all supported agents.
 
         Since issue #416 this no longer means "built into the system
@@ -15329,7 +15347,7 @@ def render_harness_options(selected=""):
     It has a blank entry, but that entry is a PROMPT and not a value: a
     profile must name its assistant (issue #493). There used to be a
     "default assistant" option here, resolving through the box-wide default
-    agent the same way a session with no --agent does. A box now starts with
+    agent the same way a session with no --harness does. A box now starts with
     no assistant installed and installs them on demand, so "the default one"
     names nothing anybody chose - and a profile that resolved through it
     would quietly become a different worker the day the box's configuration
@@ -17030,11 +17048,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             # An agent profile (#321), if one was picked. The profile's
             # harness WINS over the select on its left, rather than the
-            # CLI's order where an explicit --agent overrides it: a select
+            # CLI's order where an explicit --harness overrides it: a select
             # always posts a value, so this form cannot tell "chose claude"
             # from "left it alone", and a rule that depends on a difference
             # the page cannot see would be a guess. `agent-box-session add
-            # --profile P --agent H` is still the way to say the other thing.
+            # --profile P --harness H` is still the way to say the other thing.
             profile = (form.get("profile", [""])[0]).strip()
             pargs = []
             if profile and not PROFILE_BIN:

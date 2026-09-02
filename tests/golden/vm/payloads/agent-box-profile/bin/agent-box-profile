@@ -10,7 +10,7 @@ set -eu
 # exports, exactly as src/session-cli.sh does (issue #154, Phase 2).
 JQ=jq
 # An agent PROFILE (issue #321): the concrete worker, as opposed to the
-# HARNESS (claude/codex/shell) that `agent-box-session --agent` selects. A
+# HARNESS (claude/codex/shell) that `agent-box-session --harness` selects. A
 # profile names a harness plus the knobs that make two sessions on the same
 # harness different workers — model, effort, an appended system prompt, and
 # environment for the session.
@@ -26,7 +26,7 @@ HARNESSES="${AGENT_BOX_AGENTS:?}"
 # apart. `shell` has none of those - it is a bare login shell, and
 # launch_json below already has to warn that all three are ignored for it -
 # so a profile built around it configures nothing. It stays in HARNESSES,
-# because `agent-box-session add --agent shell` is still a session kind;
+# because `agent-box-session add --harness shell` is still a session kind;
 # it is only PROFILE_HARNESSES that refuses it.
 PROFILE_HARNESSES=""
 for _h in $HARNESSES; do
@@ -132,13 +132,13 @@ read_profile() {
 launch_json() {
   read_profile "$1" || { echo "no such profile: '$1' (see agent-box-profile ls)" >&2; return 2; }
   # $2 = a harness that overrides the profile's own (agent-box-session add
-  # --profile P --agent H). It has to be resolved HERE and not corrected
+  # --profile P --harness H). It has to be resolved HERE and not corrected
   # afterwards: the arguments are harness-specific, so a profile resolved for
   # codex and then started on another harness would hand it codex's flags.
   h="${2:-}"
   if [ -n "$h" ]; then
     # An OVERRIDE may name any session kind, `shell` included: `--profile P
-    # --agent shell` is how a profile's environment reaches a bare shell,
+    # --harness shell` is how a profile's environment reaches a bare shell,
     # and the caller said which one they meant. It is checked against the
     # full list.
     case " $HARNESSES " in
@@ -164,7 +164,7 @@ launch_json() {
       (*" $h "*) ;;
       (*)
         if [ "$h" = shell ]; then
-          echo "profile '$1': HARNESS=shell is a session kind, not a worker. Start a shell with 'agent-box-session add --agent shell', or with '--profile $1 --agent shell' to carry this profile's environment into it." >&2
+          echo "profile '$1': HARNESS=shell is a session kind, not a worker. Start a shell with 'agent-box-session add --harness shell', or with '--profile $1 --harness shell' to carry this profile's environment into it." >&2
         else
           echo "profile '$1': harness '$h' is not available (available: $PROFILE_HARNESSES)" >&2
         fi
@@ -260,7 +260,7 @@ case "$cmd" in
           (*" $v "*) ;;
           (*)
             if [ "$v" = shell ]; then
-              echo "'shell' is a session kind, not a worker: it has no model, effort or system prompt to configure, so a profile cannot be built around it. Start one with 'agent-box-session add --agent shell'." >&2
+              echo "'shell' is a session kind, not a worker: it has no model, effort or system prompt to configure, so a profile cannot be built around it. Start one with 'agent-box-session add --harness shell'." >&2
             else
               echo "harness '$v' is not available (available: $PROFILE_HARNESSES)" >&2
             fi
@@ -342,7 +342,7 @@ case "$cmd" in
     # The machine-readable half of `show`, for `agent-box-session add
     # --profile`. Warnings go to stderr there too, so the operator sees them
     # once, on the CLI they ran. The optional second argument is the harness
-    # the caller settled on (`add --profile P --agent H`), which decides the
+    # the caller settled on (`add --profile P --harness H`), which decides the
     # argument mapping.
     name="${1:-}"; shift || true
     valid_name "$name" || { usage >&2; exit 2; }

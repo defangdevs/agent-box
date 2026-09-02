@@ -97,7 +97,7 @@ plainly rather than handing it back.
   ever hand-edit the file.
 - Manage your own sessions without a rebuild:
   `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
-  plus `--agent claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
+  plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
   use it to fan out work, add a reviewer agent, or open a plain shell. The
   kickoff prompt fires once: a later respawn (crash, reboot, Spot restart)
   resumes that session's transcript instead of redoing the work. An agent
@@ -114,9 +114,13 @@ plainly rather than handing it back.
   unavailable. The same is true of any other CLI: `nix profile add
   nixpkgs#<pkg>` puts it in `~/.nix-profile/bin`, which is FIRST on your
   PATH, so an install is visible to a pane that is already running.
-- `--agent` picks the HARNESS (the CLI program). An agent PROFILE is the
-  worker: a harness plus a model, an effort level, an appended system prompt
-  and environment. Make one with `agent-box-profile set NAME
+- `--harness` picks the CLI PROGRAM (claude, codex, shell). An agent PROFILE
+  is the worker: a harness plus a model, an effort level, an appended system
+  prompt and environment. Keep the two words apart, because the harnesses
+  themselves do not: `claude --agent` and `opencode --agent` both name a
+  WORKER, which here is `--profile`. Our own `--agent` was the old spelling
+  of `--harness`; it still works and prints a deprecation line. Make a
+  profile with `agent-box-profile set NAME
   HARNESS=claude MODEL=sonnet EFFORT=low KEY=value`, read it back with
   `agent-box-profile show NAME`, and start it with `agent-box-session add
   [NAME] --profile PROFILE`. A `-- EXTRA_ARGS` tail still wins over the
@@ -160,7 +164,7 @@ commands, or read `--help` for a start-time flag (Claude Code: `-n, --name`).
 
 The name belongs to the harness, not to agent-box, so a respawn loses it:
 set it again, or make it permanent at creation with
-`agent-box-session add work --agent claude -- -n "claude: PR 42"`.
+`agent-box-session add work --harness claude -- -n "claude: PR 42"`.
 
 ## Getting told, instead of polling (webhooks)
 

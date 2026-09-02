@@ -298,7 +298,8 @@ kill_session() {
 usage() {
   echo "usage: agent-box-session ls"
   echo "       agent-box-session peers"
-  echo "       agent-box-session add [NAME] [--agent AGENT] [--profile PROFILE] [--cwd DIR]"
+  echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
+  echo "                             [--cwd DIR]"
   echo "                             [--prompt TEXT] [--resume-prompt TEXT] [--ephemeral]"
   echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
@@ -310,10 +311,13 @@ usage() {
   echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters, and"
   echo "not one of: $RESERVED_NAMES (each is already a path under /<user>/). (a"
   echo "longer name would be invisible in the web UI)."
-  echo "agents: $AGENTS (default: $DEFAULT_AGENT) — the HARNESS to run."
+  echo "harnesses: $AGENTS (default: $DEFAULT_AGENT) — the CLI PROGRAM to run."
   echo "--profile names an agent profile (agent-box-profile ls): a harness plus"
   echo "a model, an effort level, an appended system prompt and session env."
-  echo "--agent and a '-- EXTRA_ARGS' tail override what the profile resolved."
+  echo "--harness and a '-- EXTRA_ARGS' tail override what the profile resolved."
+  echo "(--agent is the old name for --harness and still works. It is"
+  echo "deprecated: claude and opencode both spell --agent for the PROFILE,"
+  echo "which is this box's --profile, so the two meanings collided.)"
   echo '--cwd is where the session starts (default $HOME, shared by every'
   echo "session). To work a repo another session is already in, give this one"
   echo "a checkout of its own: git worktree add ~/worktrees/NAME -b BRANCH."
@@ -418,9 +422,9 @@ mintable() {
   ! reserved_name "$1" && ! taken "$1"
 }
 gen_name() {
-  # gen_name AGENT [CWD] — echo a unique session name derived from AGENT: the
-  # bare name when free ("claude"), else the working directory's own name
-  # ("portal", then "portal-2"). Callers pass a validated agent, itself a
+  # gen_name HARNESS [CWD] — echo a unique session name derived from HARNESS:
+  # the bare name when free ("claude"), else the working directory's own name
+  # ("portal", then "portal-2"). Callers pass a validated harness, itself a
   # valid name; CWD is whatever the caller will store, so it is untrusted
   # text and gets folded into the name charset here.
   #
@@ -461,7 +465,7 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   ls)
     live="$(t list-sessions -F '#S' 2>/dev/null || true)"
-    printf '%-24s %-8s %s\n' NAME AGENT STATE
+    printf '%-24s %-8s %s\n' NAME HARNESS STATE
     if [ -s "$REGISTRY_FILE" ]; then
       "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$REGISTRY_FILE" \
       | while IFS="$(printf '\t')" read -r n a state; do
@@ -549,7 +553,7 @@ case "$cmd" in
       [ -n "$n" ] || continue
       [ "$n" != "$me" ] || continue
       peers=$((peers + 1))
-      agent="-"; cwd="-"; unmanaged=""
+      harness="-"; cwd="-"; unmanaged=""
       if [ -s "$REGISTRY_FILE" ]; then
         # One read per session, and a session tmux knows but the registry
         # does not is reported as `unmanaged` rather than skipped: it is
@@ -559,8 +563,8 @@ case "$cmd" in
             [(.sessions[$n].agent // "-"),
              (.sessions[$n].workingDirectory // "-")] | @tsv
           else "-\t-\tunmanaged" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
-        IFS="$(printf '\t')" read -r agent cwd unmanaged <<<"$meta"
-        [ -n "$agent" ] || agent="-"
+        IFS="$(printf '\t')" read -r harness cwd unmanaged <<<"$meta"
+        [ -n "$harness" ] || harness="-"
         [ -n "$cwd" ] || cwd="-"
         # No recorded working directory means the supervisor starts it in
         # $HOME — say that, rather than a dash a reader has to interpret. It
@@ -573,11 +577,11 @@ case "$cmd" in
       # an event, an interactive one by a person or by the box's own config.
       # A session tmux knows and the registry does not keeps BOTH facts: it
       # is running whoever started it, so it can be in your files.
-      [ "$agent" != "-" ] || agent="agent unknown"
+      [ "$harness" != "-" ] || harness="harness unknown"
       kind="interactive"
       case "$n" in (hook-*) kind="dispatched (hook session)" ;; esac
       [ -z "$unmanaged" ] || kind="$kind, not in the registry"
-      out="$out$(printf '%s — %s, %s, cwd %s' "$n" "$agent" "$kind" "$cwd")"$'\n'
+      out="$out$(printf '%s — %s, %s, cwd %s' "$n" "$harness" "$kind" "$cwd")"$'\n'
       ff="$sd/filter.$user-$n.json"
       claims=""
       if [ -s "$ff" ]; then
@@ -625,11 +629,21 @@ case "$cmd" in
       ""|-*) ;;
       *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
-    agent="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
-    profile=""; has_agent=0; ephemeral=0
+    harness="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
+    profile=""; has_harness=0; ephemeral=0
     while [ $# -gt 0 ]; do
       case "$1" in
-        --agent) agent="${2:?--agent needs a value}"; has_agent=1; shift 2 ;;
+        --harness) harness="${2:?--harness needs a value}"; has_harness=1; shift 2 ;;
+        # `--agent` is what this flag was called until the harnesses took the
+        # word for something else: `claude --agent` and `opencode --agent` both
+        # name a WORKER — a prompt, a model, an effort level — which is this
+        # box's `--profile`. Kept working, because it is written down in every
+        # note, transcript and README a box has; deprecated, because a reader
+        # who knows one of those CLIs reads it as the other thing.
+        --agent)
+          harness="${2:?--agent needs a value}"; has_harness=1; shift 2
+          echo "agent-box-session: --agent is deprecated, use --harness (it picks the CLI program; --profile picks the worker)" >&2
+          ;;
         --profile) profile="${2:?--profile needs a value}"; shift 2 ;;
         --cwd) cwd="${2:?--cwd needs a value}"; shift 2 ;;
         --prompt) prompt="${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
@@ -654,15 +668,15 @@ case "$cmd" in
     # jq, coreutils and this script and nothing else.
     pargs=()
     if [ -n "$profile" ]; then
-      # --agent on the command line wins over the profile's harness, the same
+      # --harness on the command line wins over the profile's harness, the same
       # override order the env file has over the NixOS option elsewhere here —
       # and it is passed INTO the resolver, because the arguments a profile
       # resolves to are harness-specific (`--model` for claude, `-m` for
       # codex, none at all for a shell session).
       povr=""
-      [ "$has_agent" = 1 ] && povr="$agent"
+      [ "$has_harness" = 1 ] && povr="$harness"
       pjson="$("${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" launch "$profile" "$povr")" || exit 2
-      agent="$("$JQ" -r '.harness' <<<"$pjson")"
+      harness="$("$JQ" -r '.harness' <<<"$pjson")"
       "$JQ" -r --arg p "$profile" \
         '.warnings[] | "agent-box-session: profile \($p): " + .' <<<"$pjson" >&2
       # Profile args go FIRST so an explicit `-- EXTRA_ARGS` tail still has the
@@ -680,8 +694,8 @@ case "$cmd" in
       done < <("$JQ" -j '.args[] + "\u0000"' <<<"$pjson")
     fi
     case " $AGENTS " in
-      (*" $agent "*) ;;
-      (*) echo "agent '$agent' is not available (available: $AGENTS)" >&2; exit 2 ;;
+      (*" $harness "*) ;;
+      (*) echo "harness '$harness' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
     registry_ensure
     # Name choice and write are one critical section (issue #254): gen_name
@@ -689,7 +703,7 @@ case "$cmd" in
     # could pick the same free name and the second rename would drop the first
     # session outright.
     registry_lock
-    [ -n "$name" ] || name="$(gen_name "$agent" "$cwd")"
+    [ -n "$name" ] || name="$(gen_name "$harness" "$cwd")"
     if taken "$name"; then
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
@@ -708,7 +722,7 @@ case "$cmd" in
     # One argument vector: the profile's args first, the caller's own `--`
     # tail after them, so an explicit flag still has the last word.
     sargs=("${pargs[@]}" "$@")
-    registry_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
+    registry_edit --arg n "$name" --arg a "$harness" --arg c "$cwd" \
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
       --arg prof "$profile" --arg eph "$ephemeral" \
@@ -733,8 +747,8 @@ case "$cmd" in
         "   .-~~-." \
         "  ( (o) )" \
         "   \`-~~-'"
-    what="$agent"
-    [ -n "$profile" ] && what="$agent, profile $profile"
+    what="$harness"
+    [ -n "$profile" ] && what="$harness, profile $profile"
     if [ "$has_prompt" = 1 ]; then
       echo "session '$name' ($what) added with a kickoff prompt — the supervisor starts it within ~2s"
     else

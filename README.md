@@ -380,13 +380,13 @@ authoritative and a rebuild never clobbers runtime changes. Create and
 destroy sessions as the user — no sudo, no `nixos-rebuild`:
 
 ```bash
-agent-box-session ls                        # NAME AGENT STATE
+agent-box-session ls                        # NAME HARNESS STATE
 agent-box-session peers                     # the OTHER live sessions: where each
                                             # one works and what it claims
-agent-box-session add --agent codex         # auto-named "codex" (or "codex-XXXX")
-agent-box-session add review --agent codex  # or name it yourself; starts within ~2s
+agent-box-session add --harness codex       # auto-named "codex" (or "codex-XXXX")
+agent-box-session add review --harness codex  # or name it yourself; starts in ~2s
 agent-box-session add scratch --cwd ~/proj -- --model opus
-agent-box-session add tidy --agent shell    # plain login shell, the pseudo-harness
+agent-box-session add tidy --harness shell  # plain login shell, the pseudo-harness
 agent-box-session restart review
 agent-box-session rm review                 # delist + kill
 ```
@@ -442,11 +442,14 @@ them). Killed-on-error sessions keep a
 post-mortem shell open instead of being respawned over; delisted sessions
 stay gone.
 
-**Harness or agent profile?** `--agent` selects the **harness** — the CLI
+**Harness or agent profile?** `--harness` selects the **harness** — the CLI
 program (`claude`, `codex`, or the `shell` pseudo-harness). An **agent
 profile** is the *worker*: a harness plus the model, the effort level, an
 appended system prompt and the environment that tell two sessions on the
-same harness apart. Profiles are per-user runtime data too, in
+same harness apart. The word *agent* is deliberately not used for either:
+`claude --agent` and `opencode --agent` both name a worker, so this box
+spells that `--profile`. `--agent` remains as a deprecated alias of
+`--harness` and prints a line saying so. Profiles are per-user runtime data too, in
 `~/.config/agent-box/profiles/<name>.env`:
 
 ```bash

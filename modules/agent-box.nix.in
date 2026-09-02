@@ -674,7 +674,7 @@ let
   '');
 
   # Agent profiles (issue #321): the WORKER, as opposed to the harness that
-  # `--agent` selects — a harness plus the model, effort, appended system
+  # `--harness` selects — a harness plus the model, effort, appended system
   # prompt and environment that tell two sessions on one harness apart.
   #
   # Deliberately NOT a services.agent-box.* option: a profile is per-user
@@ -1428,7 +1428,7 @@ in
       description = ''
         Agent CLIs this box may run — the ALLOW-list a session's `agent` is
         validated against, independently of what any session currently runs,
-        so a runtime `agent-box-session add --agent codex` needs no rebuild.
+        so a runtime `agent-box-session add --harness codex` needs no rebuild.
         Default: all supported agents.
 
         Since issue #416 this no longer means "built into the system
