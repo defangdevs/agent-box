@@ -508,6 +508,17 @@ class Spec:
                 f"{codex_full_access!r}")
         self.codex_full_access = (
             bool(codex_full_access) and "codex" in self.agents)
+        # Opt-in built-in restart notice for claude respawns (issue #507),
+        # off by default like the module's restartNotice option — same
+        # "quoted false is still truthy" trap as codexFullAccess above, so
+        # the same type check.
+        restart_notice = data.get("restartNotice", False)
+        if restart_notice is not None and not isinstance(
+                restart_notice, bool):
+            raise ConfigError(
+                "restartNotice must be true, false or null, got "
+                f"{restart_notice!r}")
+        self.restart_notice = bool(restart_notice)
         self.sudo_allowlist = list(data.get("sudoAllowlist") or [])
         # Where a lazily installed harness comes from (issue #416). The
         # NixOS module reuses selfUpdate.agentNixpkgs — the pin its update
@@ -1886,6 +1897,11 @@ class Renderer:
             # restricted values back. Exporting it without the file would
             # make that opt-out fight a default nobody wrote.
             pairs.append(("AGENT_BOX_CODEX_FULL_ACCESS", "1"))
+        if self.spec.restart_notice:
+            # Set ONLY when true: supervisor.sh reads presence, not value,
+            # so exporting it unconditionally would make the off-by-default
+            # this option promises (issue #507) impossible to reach.
+            pairs.append(("AGENT_BOX_RESTART_NOTICE", "1"))
         if self.spec.web_enable:
             pairs.append(("AGENT_BOX_URL", u.url))
             if self.spec.webhook_enable:

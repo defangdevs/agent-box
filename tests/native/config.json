@@ -8,6 +8,7 @@
   "domain": "golden.example.org",
   "protectMemory": true,
   "repo": "defangdevs/agent-box",
+  "restartNotice": false,
   "rev": "0000000000000000000000000000000000000000",
   "sudoAllowlist": [
     "/run/current-system/sw/bin/systemctl reload caddy.service"
