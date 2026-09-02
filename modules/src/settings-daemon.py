@@ -3329,8 +3329,8 @@ def render_profiles(profiles):
             f'</div></details></li>'
         )
     body = "".join(rows) if rows else (
-        '<li class="empty">No profiles yet. New sessions use the assistant '
-        'selected above.</li>')
+        '<li class="empty">No profiles yet. Add one, or start a session '
+        'with &quot;shell (no assistant)&quot;.</li>')
     return '<ul class="tbl"><li class="tbl-head">Profile</li>' + body + "</ul>"
 
 
