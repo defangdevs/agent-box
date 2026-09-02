@@ -3328,6 +3328,18 @@ JQ=jq
 # format the settings page and `agent-box-session env` already write.
 DIR="$HOME/.config/agent-box/profiles"
 HARNESSES="''${AGENT_BOX_AGENTS:?}"
+# ...minus `shell`, for a PROFILE (issue #493). A profile is a worker: a
+# harness plus the model, effort and prompt that tell two workers on it
+# apart. `shell` has none of those - it is a bare login shell, and
+# launch_json below already has to warn that all three are ignored for it -
+# so a profile built around it configures nothing. It stays in HARNESSES,
+# because `agent-box-session add --agent shell` is still a session kind;
+# it is only PROFILE_HARNESSES that refuses it.
+PROFILE_HARNESSES=""
+for _h in $HARNESSES; do
+  [ "$_h" = shell ] && continue
+  PROFILE_HARNESSES="''${PROFILE_HARNESSES:+$PROFILE_HARNESSES }$_h"
+done
 # A profile file is the env store in another directory, so it is read and
 # written by the store's one parser (issue #212) — not by a copy of the
 # KEY=value loop that lives here. That is what lets a SYSTEM_PROMPT span
@@ -3345,11 +3357,12 @@ usage() {
   echo "       agent-box-profile set NAME KEY=VALUE..."
   echo "       agent-box-profile rm NAME [KEY...]"
   echo "       agent-box-profile launch NAME [HARNESS]   (JSON, for agent-box-session)"
+  echo "       agent-box-profile seed                    (prepopulate, once per harness)"
   echo "A profile is a worker: a harness plus the knobs that tell two sessions"
   echo "on that harness apart. Start one with:"
   echo "       agent-box-session add [NAME] --profile PROFILE"
   echo "Reserved keys (turned into harness arguments):"
-  echo "  HARNESS        $HARNESSES"
+  echo "  HARNESS        $PROFILE_HARNESSES  (required; 'shell' is a session kind, not a worker)"
   echo "  MODEL          claude: --model VALUE; codex: -m VALUE"
   echo "  EFFORT         claude: --effort VALUE; codex: -c model_reasoning_effort=VALUE"
   echo "  SYSTEM_PROMPT  claude: --append-system-prompt VALUE"
@@ -3430,13 +3443,42 @@ launch_json() {
   # afterwards: the arguments are harness-specific, so a profile resolved for
   # codex and then started on another harness would hand it codex's flags.
   h="''${2:-}"
-  [ -n "$h" ] || h="$res_HARNESS"
-  [ -n "$h" ] || h="''${AGENT_BOX_DEFAULT_AGENT:-}"
+  if [ -n "$h" ]; then
+    # An OVERRIDE may name any session kind, `shell` included: `--profile P
+    # --agent shell` is how a profile's environment reaches a bare shell,
+    # and the caller said which one they meant. It is checked against the
+    # full list.
+    case " $HARNESSES " in
+      (*" $h "*) ;;
+      (*) echo "profile '$1': harness '$h' is not available (available: $HARNESSES)" >&2; return 2 ;;
+    esac
+  else
+    h="$res_HARNESS"
+    # No fall back to a box-wide default harness (issue #493). A box now
+    # starts with no harness installed and installs them on demand, so "the
+    # default one" names nothing a user chose; a profile that resolved
+    # through it would silently become a different worker the day the box's
+    # configuration changed. A profile says which harness it is, or it is
+    # not startable - and says so here rather than at the next spawn.
+    [ -n "$h" ] || { echo "profile '$1': no HARNESS set (agent-box-profile set '$1' HARNESS=<$(printf '%s' "$PROFILE_HARNESSES" | tr ' ' '|')>)" >&2; return 2; }
+    # What the profile itself NAMES is held to the profile list, so `shell`
+    # is refused here too. `set` already refuses to write it, and so does
+    # the settings page - but neither governs a file that predates this
+    # release or was edited by hand, and the profile file is explicitly the
+    # user's to edit. Without this, such a profile would be launchable and
+    # yet unsaveable: opening its row and pressing Save answers 400.
+    case " $PROFILE_HARNESSES " in
+      (*" $h "*) ;;
+      (*)
+        if [ "$h" = shell ]; then
+          echo "profile '$1': HARNESS=shell is a session kind, not a worker. Start a shell with 'agent-box-session add --agent shell', or with '--profile $1 --agent shell' to carry this profile's environment into it." >&2
+        else
+          echo "profile '$1': harness '$h' is not available (available: $PROFILE_HARNESSES)" >&2
+        fi
+        return 2 ;;
+    esac
+  fi
   warn=""
-  case " $HARNESSES " in
-    (*" $h "*) ;;
-    (*) echo "profile '$1': harness '$h' is not available (available: $HARNESSES)" >&2; return 2 ;;
-  esac
   set --
   case "$h" in
     claude)
@@ -3481,7 +3523,7 @@ case "$cmd" in
       n="''${f##*/}"; n="''${n%.env}"
       valid_name "$n" || continue
       read_profile "$n" || continue
-      printf '%-20s %-8s %-18s %s\n' "$n" "''${res_HARNESS:-''${AGENT_BOX_DEFAULT_AGENT:-?}}" \
+      printf '%-20s %-8s %-18s %s\n' "$n" "''${res_HARNESS:-?}" \
         "''${res_MODEL:--}" "''${res_EFFORT:--}"
     done
     ;;
@@ -3521,9 +3563,15 @@ case "$cmd" in
       k="''${a%%=*}"; v="''${a#*=}"
       valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
       if [ "$k" = HARNESS ]; then
-        case " $HARNESSES " in
+        case " $PROFILE_HARNESSES " in
           (*" $v "*) ;;
-          (*) echo "harness '$v' is not available (available: $HARNESSES)" >&2; exit 2 ;;
+          (*)
+            if [ "$v" = shell ]; then
+              echo "'shell' is a session kind, not a worker: it has no model, effort or system prompt to configure, so a profile cannot be built around it. Start one with 'agent-box-session add --agent shell'." >&2
+            else
+              echo "harness '$v' is not available (available: $PROFILE_HARNESSES)" >&2
+            fi
+            exit 2 ;;
         esac
       fi
       assign+=("$a")
@@ -3552,6 +3600,50 @@ case "$cmd" in
       "$ENVSTORE" --profile "$name" unset "$@"
       echo "profile '$name': removed $*"
     fi
+    ;;
+  seed)
+    # Prepopulate one profile per installed harness, named after it (issue
+    # #493). "Add session" is profile-first, so a box with an empty profile
+    # list offers nothing to start; these are what it offers.
+    #
+    # HARNESS only. MODEL and EFFORT are left EMPTY deliberately: launch_json
+    # omits the flag when the value is empty, so the harness applies its own
+    # default (codex reads ~/.codex/config.toml; claude has no on-disk
+    # default on this box at all). A value baked in here would freeze that
+    # default at first boot and go stale the next time a model alias moves.
+    #
+    # Named `claude`, not `claude-default`. The file is the user's to edit -
+    # by hand, from the settings page, or by asking an agent to change it -
+    # and a name carrying "default" is a lie the moment MODEL is set in it.
+    #
+    # ONCE PER NAME, recorded in the stamp. The supervisor calls this on
+    # every start, so seeding whenever the file is absent would resurrect a
+    # profile the user deleted on their next session: nothing should stop
+    # somebody deleting the codex profile if they never use codex. Recording
+    # the name instead of just testing the file also keeps the case that
+    # matters later - a harness added in a FUTURE release is still seeded,
+    # without reviving the ones that were deliberately removed. Delete the
+    # stamp to be offered the whole set again.
+    #
+    # Not shown in usage() as something to run by hand, but harmless to: it
+    # is idempotent, and it is the one way back to a profile you deleted.
+    #
+    # The stamp is read with `case`, not grep: grep is deliberately NOT on
+    # the curated agent PATH (agentBaseTools), so reaching for it here would
+    # mean a new pinned binary in the wrapper contract for a substring test
+    # the shell already does.
+    stamp="$DIR/.seeded"
+    mkdir -p "$DIR" || exit 0
+    seeded=" "
+    [ -f "$stamp" ] && seeded=" $(tr '\n' ' ' < "$stamp") "
+    for h in $PROFILE_HARNESSES; do
+      case "$seeded" in (*" $h "*) continue ;; esac
+      if [ ! -e "$(file_for "$h")" ]; then
+        "$ENVSTORE" --profile "$h" set "HARNESS=$h" >/dev/null || continue
+      fi
+      printf '%s\n' "$h" >> "$stamp"
+      echo "profile '$h' created - 'agent-box-session add --profile $h' starts a session with it"
+    done
     ;;
   launch)
     # The machine-readable half of `show`, for `agent-box-session add
@@ -6530,7 +6622,8 @@ esac
     { "name": "AGENT_BOX_FIND_BIN", "kind": "bin", "program": "find" },
     { "name": "AGENT_BOX_FLOCK_BIN", "kind": "bin", "program": "flock" },
     { "name": "AGENT_BOX_HOSTNAME_BIN", "kind": "bin", "program": "hostname" },
-    { "name": "AGENT_BOX_ENV_EXEC", "kind": "bin", "program": "agent-box-env-exec" }
+    { "name": "AGENT_BOX_ENV_EXEC", "kind": "bin", "program": "agent-box-env-exec" },
+    { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" }
   ],
   "execStart": [
     { "kind": "bin", "program": "agent-box-supervisor" }
@@ -6784,6 +6877,7 @@ esac
     # /usr/local/bin/agent-box-session, the wrapper it generates there.
     "agent-box-session" = "${sessionCli}/bin/agent-box-session";
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
+    "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";
     "agent-box-supervisor" = "${supervisorScript}/bin/agent-box-supervisor";
@@ -7533,6 +7627,18 @@ esac
     # and a home that predates this release gains it. Best effort — a mkdir that
     # fails must never keep sessions from starting.
     mkdir -p "$HOME"/worktrees 2>/dev/null || :
+
+    # Prepopulated agent profiles (issue #493). "Add session" is profile-first,
+    # so a box whose profile list is empty offers nothing to start with. The
+    # work is `agent-box-profile seed`, not a loop here: that CLI already knows
+    # which harnesses are installed, where a profile file lives and which parser
+    # writes it, and none of those three reach this unit's environment.
+    #
+    # On every start, like the mkdir above - but the CLI seeds each name ONCE and
+    # records it, so a profile the user deleted is not resurrected on their next
+    # session. Best effort: a profile that cannot be written must never keep
+    # sessions from starting.
+    "''${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" seed >/dev/null 2>&1 || :
 
     seed_json() {
       # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
@@ -13725,7 +13831,7 @@ PROFILES_SECTION_TPL = """<section>
                  pattern="[A-Za-z0-9_-]{{1,64}}" required autocomplete="off"
                  aria-label="Profile name"
                  title="Letters, digits, underscore and hyphen; at most 64 characters">
-          <select name="HARNESS" aria-label="Assistant">{harnesses}</select>
+          <select name="HARNESS" aria-label="Assistant" required>{harnesses}</select>
           <input type="text" name="MODEL" placeholder="model (optional)"
                  autocomplete="off" aria-label="Model">
           <input type="text" name="EFFORT" placeholder="reasoning level (optional)"
@@ -15207,13 +15313,33 @@ def render_profile_options(profiles):
     return "".join(items)
 
 
+# The harnesses a PROFILE may name: the installed ones, minus "shell"
+# (issue #493). A profile is a worker - a harness plus the model, effort and
+# prompt that tell two workers on it apart - and "shell" has none of those,
+# so a profile built around it configures nothing. It stays in AGENTS,
+# because a shell SESSION is still a session kind; only the profile editor
+# refuses it. agent-box-profile applies the same rule, so the page cannot
+# offer a value the CLI would reject.
+PROFILE_AGENTS = [a for a in AGENTS if a != "shell"]
+
+
 def render_harness_options(selected=""):
-    """The profile editor's harness <select>. Unlike the session row's, this
-    one has a blank entry: HARNESS is optional in a profile file, and a
-    profile that names none resolves to the box default the same way a
-    session with no --agent does."""
-    items = ['<option value="">&mdash; default assistant &mdash;</option>']
-    for agent in AGENTS:
+    """The profile editor's assistant <select>.
+
+    It has a blank entry, but that entry is a PROMPT and not a value: a
+    profile must name its assistant (issue #493). There used to be a
+    "default assistant" option here, resolving through the box-wide default
+    agent the same way a session with no --agent does. A box now starts with
+    no assistant installed and installs them on demand, so "the default one"
+    names nothing anybody chose - and a profile that resolved through it
+    would quietly become a different worker the day the box's configuration
+    changed. So the blank entry is unselectable: the form asks, and the
+    resolver refuses a profile that never answered.
+    """
+    blank_sel = "" if selected else " selected"
+    items = ['<option value="" disabled%s>Choose an assistant</option>'
+             % blank_sel]
+    for agent in PROFILE_AGENTS:
         safe = html.escape(agent)
         sel = " selected" if agent == selected else ""
         items.append(f'<option value="{safe}"{sel}>{safe}</option>')
@@ -15285,7 +15411,7 @@ def render_profiles(profiles):
             f'<form method="post" action="{base}/profiles/set">'
             f'<input type="hidden" name="name" value="{safe}">'
             f'<div class="row">'
-            f'<select name="HARNESS" aria-label="Assistant for {safe}">'
+            f'<select name="HARNESS" aria-label="Assistant for {safe}" required>'
             f'{render_harness_options(res.get("HARNESS") or "")}</select>'
             f'<input type="text" name="MODEL" value="{html.escape(res.get("MODEL") or "")}" '
             f'placeholder="model" autocomplete="off" aria-label="Model for {safe}">'
@@ -16846,10 +16972,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     drop.append(key)
             harness = dict(assignments).get("HARNESS", "")
-            if harness and harness not in AGENTS:
+            # Required, not optional (issue #493): there is no box-wide
+            # default harness left to fall back to, and the resolver refuses
+            # a profile that names none. Caught here so the answer is a
+            # sentence on the page rather than a profile that saves fine and
+            # then fails to start.
+            if not harness:
+                self._send_html(
+                    render_page("Pick an assistant for that profile \u2014 a "
+                                "profile is an assistant plus the settings "
+                                "that go with it, so it needs one. "
+                                "Available: " + ", ".join(PROFILE_AGENTS)),
+                    status=400)
+                return
+            if harness not in PROFILE_AGENTS:
+                # "shell" lands here on purpose: it is a session kind, not a
+                # worker, so it has no model, effort or prompt to configure.
                 self._send_html(
                     render_page("Unknown assistant. Available: "
-                                + ", ".join(AGENTS)),
+                                + ", ".join(PROFILE_AGENTS)),
                     status=400)
                 return
             try:

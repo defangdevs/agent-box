@@ -44,6 +44,18 @@ registry_ensure "${AGENT_BOX_SESSIONS_SEED:?}"
 # fails must never keep sessions from starting.
 mkdir -p "$HOME"/worktrees 2>/dev/null || :
 
+# Prepopulated agent profiles (issue #493). "Add session" is profile-first,
+# so a box whose profile list is empty offers nothing to start with. The
+# work is `agent-box-profile seed`, not a loop here: that CLI already knows
+# which harnesses are installed, where a profile file lives and which parser
+# writes it, and none of those three reach this unit's environment.
+#
+# On every start, like the mkdir above - but the CLI seeds each name ONCE and
+# records it, so a profile the user deleted is not resurrected on their next
+# session. Best effort: a profile that cannot be written must never keep
+# sessions from starting.
+"${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" seed >/dev/null 2>&1 || :
+
 seed_json() {
   # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
   # if missing. A file jq can't parse is left untouched: the dialog
