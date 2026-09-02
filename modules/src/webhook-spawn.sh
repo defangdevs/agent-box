@@ -153,7 +153,7 @@ hook_args_file="$HOME/.config/agent-box/env"
 ENVSTORE="${AGENT_BOX_ENVSTORE_BIN:?the env-store CLI is pinned by the generated wrapper; run this through the installed command}"
 # The session CLI this spawn ends by exec'ing into, pinned for the same reason
 # and by the same wrapper. It used to be a bare `agent-box-session`, resolved
-# from the receiver unit's PATH — which works only where that PATH happens to
+# from the receiver unit's PATH - which works only where that PATH happens to
 # carry the CLI. On a native box it does not: the profile ships the payload as
 # agent-box-session-bare and the usable CLI is the generated wrapper at
 # /usr/local/bin, so every standing-watch match died with

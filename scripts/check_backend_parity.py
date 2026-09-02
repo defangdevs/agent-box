@@ -376,8 +376,8 @@ WRAPPERS_KNOWN_GAPS = {
 # PATH decide which file it gets. That is the same divergence as a missing
 # export, one layer down, and it is not something either backend can declare
 # its way out of: the module's receiver unit put the session CLI on PATH, the
-# native one could not — its profile holds the payload (…-bare) and the wrapper
-# lives in /usr/local/bin — so every standing-watch match on a native box died
+# native one could not - its profile holds the payload (...-bare) and the wrapper
+# lives in /usr/local/bin - so every standing-watch match on a native box died
 # with "exec: agent-box-session: not found" and the batch was dropped (#503).
 #
 # Only the two forms that actually EXECUTE are matched, `exec NAME` and
@@ -617,7 +617,7 @@ def report(kind, only_module, only_native, by_design, known,
         side = "module" if name in only_module else "native"
         # `where` overrides the side phrasing for a section where "module
         # only" would be a lie: a bare CLI call sits in a SHARED payload, so
-        # it is not one backend supplying something the other does not — it
+        # it is not one backend supplying something the other does not - it
         # is one line hazardous to whichever PATH lacks the CLI.
         where = where or f"{side} only"
         entry = by_design.get(name) or known.get(name)
@@ -637,7 +637,7 @@ def report(kind, only_module, only_native, by_design, known,
         print(f"\nFAIL: {len(violations)} undeclared {kind} divergence(s):",
               file=sys.stderr)
         for name, where in violations:
-            print(f"       {name} — {where}.\n"
+            print(f"       {name} - {where}.\n"
                   f"       {remedy or 'Supply it from both backends, or declare it in '
                              'scripts/check_backend_parity.py with a reason.'}",
                   file=sys.stderr)
