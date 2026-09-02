@@ -155,13 +155,22 @@ fi
 
 # Non-empty is somebody's data: refuse, say so, and leave it alone. The
 # clone must not be published anywhere — a nested tree is worse than none,
-# because the next run cannot tell it from a fresh start.
+# because the next run cannot tell it from a fresh start. "No .git" alone
+# would not catch that: a clone nested at $dir/<basename>.incoming leaves
+# the data intact and $dir/.git absent too, so the nested path is named
+# here explicitly. The SIBLING $dir.incoming is a different matter and is
+# asserted present below — refusing deliberately leaves the staging tree
+# for the next run to reclaim, which the "interrupted clone" case above
+# already relies on.
 rm -rf "$AGENT_BOX_CHECKOUT_DIR" "$AGENT_BOX_CHECKOUT_DIR.incoming"
 mkdir -p "$AGENT_BOX_CHECKOUT_DIR"
 echo mine > "$AGENT_BOX_CHECKOUT_DIR/not-a-checkout"
 AGENT_BOX_CHECKOUT_REV=$REV_ONE run
+nested="$AGENT_BOX_CHECKOUT_DIR/$(basename "$AGENT_BOX_CHECKOUT_DIR").incoming"
 if said "could not publish" \
    && [ "$(cat "$AGENT_BOX_CHECKOUT_DIR/not-a-checkout")" = mine ] \
+   && [ ! -e "$nested" ] \
+   && [ -e "$AGENT_BOX_CHECKOUT_DIR.incoming" ] \
    && [ ! -e "$AGENT_BOX_CHECKOUT_DIR/.git" ]; then
   ok "a non-empty dir is refused, and its contents survive"
 else
