@@ -79,7 +79,6 @@ HOSTILE_PASSWORD = "p'; touch /tmp/pwned; '$x `id` \"q\""
 SAMPLE = {
     "@@NIXINSTALLER@@": "https://install.determinate.systems/nix",
     "@@FLAKEREF@@": "github:defangdevs/agent-box/0123456789abcdef",
-    "@@AGENT@@": "claude",
     "@@USER@@": "agent",
     "@@AGENTSMD@@": "## This box\n\n- A line with 'quotes' and $dollars.\n",
     "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
@@ -93,7 +92,6 @@ SAMPLE = {
 DEFAULT_OF = {
     "@@NIXINSTALLER@@": "nixInstallerUrl",
     "@@FLAKEREF@@": "agentBoxFlakeRef",
-    "@@AGENT@@": "agent",
     "@@USER@@": "userName",
     "@@AGENTSMD@@": "agentsMd",
 }

@@ -125,15 +125,15 @@ az group create -n agent-box -l westus3
 az deployment group create -g agent-box \
   --template-file azure/agent-box.json \
   --parameters webPassword='<16-64 chars>' \
-               adminPasswordOrKey="$(cat ~/.ssh/id_ed25519.pub)" \
-               agent=claude
+               adminPasswordOrKey="$(cat ~/.ssh/id_ed25519.pub)"
 ```
 
 The deployment finishes when the box is actually configured — a few minutes:
 installing Nix, substituting the profile, and Caddy issuing a Let's Encrypt
 certificate against `<addr>.sslip.io`. There is no closure to build and no
-reboot. Read the URL, the address and the Remote Control session name from
-`properties.outputs`.
+reboot. Read the URL and the address from `properties.outputs`; its
+`remoteControlSession` is only meaningful once you have started a claude
+session from the settings page's install+sign-in cards.
 
 `webPassword` is 16-64 characters, and any character is safe. Bicep has no
 `AllowedPattern` equivalent — a parameter can be constrained by length and by a
