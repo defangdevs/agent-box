@@ -217,3 +217,24 @@ File it in the repo that owns the fix, not the one you happen to be sitting in (
 History uses concise imperative subjects and scoped Conventional Commit forms such as `feat(web): ...`, `fix(sessions): ...`, and `docs(agents-md): ...`. Reference issues when applicable. Pull requests should explain motivation, summarize user-visible and security effects, list exact checks run, and link the issue. Include screenshots for changes to the workspace or settings UI, and call out AWS cost, IAM, networking, or migration impacts.
 
 Attach those screenshots with `agent-box-upload FILE --repo defangdevs/agent-box`, which prints the markdown to paste — the same store the browser's paste uses, so no binary lands in the diff. Do **not** add another `assets/*` branch: PRs #210, #228 and #243 each parked PNGs on one to keep the diff clean, each said "delete after merge", and all four branches (`assets/175-new-session-ui`, `assets/227-webhook-subscriptions-panel`, `assets/236-long-session-names`, `assets/241-stopped-session-ui`) are still here. Leave them, and leave the `defangdevs/assets` repo — closed PRs #133 and #209 embed images from them, and deleting either breaks that history — but do not add to either.
+
+### Finishing a CodeRabbit review
+
+CodeRabbit reviews every PR in this repo, and pushing the fix does not clear the review it left. Two things stay behind, and each one keeps the PR red on its own — `gh pr merge --auto` then waits forever, because the branch ruleset gates on resolved conversations. Close both by hand, in this order, as the last step of addressing a review:
+
+1. **Resolve every thread you addressed.** Re-read the thread first: a finding can be argued down and withdrawn between the moment you read it and the moment you push, and resolving is the wrong answer to a comment you decided not to act on — reply there instead. Collect the ids and resolve them:
+
+   ```bash
+   gh api graphql -f query='{repository(owner:"defangdevs",name:"agent-box"){
+     pullRequest(number:NNN){reviewThreads(first:100){nodes{id isResolved path line}}}}}'
+   gh api graphql -f query='mutation{resolveReviewThread(input:{threadId:"THREAD_ID"}){thread{isResolved}}}'
+   ```
+
+2. **Dismiss the review itself.** A `CHANGES_REQUESTED` verdict outlives both the resolved threads and the new commits, so the PR keeps showing changes requested until the review is dismissed:
+
+   ```bash
+   gh api -X PUT repos/defangdevs/agent-box/pulls/NNN/reviews/REVIEW_ID/dismissals \
+     -f event=DISMISS -f message='addressed in <sha>'
+   ```
+
+   `gh pr view NNN --json reviews` has the review ids and their states. Only a review carrying a verdict can be dismissed — a plain `COMMENTED` review has nothing to clear, and asking for a fresh pass with an `@coderabbitai review` comment gets the same result the slow way.
