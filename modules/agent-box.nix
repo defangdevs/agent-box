@@ -1563,6 +1563,7 @@ if __name__ == "__main__":
     REGISTRY_FLOCK=${pkgs.util-linux}/bin/flock
     REGISTRY_PROG=agent-box-mark-stopped
     LEASE_JQ=${pkgs.jq}/bin/jq
+    LEASE_DIR=${lib.escapeShellArg "/home/${name}/.local/state/agent-box/lease"}
   '' + ''
     # Pane epilogue: how the agent's pane ENDED, recorded on this session's
     # sessions.json entry. $1 = session name, $2 = the agent's exit status

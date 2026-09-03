@@ -11,6 +11,7 @@ REGISTRY_JQ=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin/jq
 REGISTRY_FLOCK=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock
 REGISTRY_PROG=agent-box-mark-stopped
 LEASE_JQ=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin/jq
+LEASE_DIR=/home/agent/.local/state/agent-box/lease
 # Pane epilogue: how the agent's pane ENDED, recorded on this session's
 # sessions.json entry. $1 = session name, $2 = the agent's exit status
 # (absent, or 0, means a clean exit — a box that predates the second
