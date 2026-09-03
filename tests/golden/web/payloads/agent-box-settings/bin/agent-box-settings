@@ -5970,11 +5970,12 @@ def render_msg(message, page, kind="ok"):
     the page lurching on its own.
 
     `kind` ("ok" / "warn" / "error") picks the CSS palette via
-    data-kind — a failure used to render in the same green as a
+    data-kind - a failure used to render in the same green as a
     success, indistinguishable at a glance (issue #549). An error
     also gets role="alert" (assertive) instead of role="status"
-    (polite), and a copy button, since the operator has no shell here
-    to select the text from and may need to paste it elsewhere."""
+    (polite). Every kind gets a copy button, since the operator has
+    no shell here to select the banner text from and may need to
+    paste it elsewhere, whichever kind it is."""
     if not message:
         return ""
     role = "alert" if kind == "error" else "status"
@@ -6366,60 +6367,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    # Each value is (text, kind). The ok= channel's name describes the
+    # MECHANISM (a message queued across a redirect), not that the news
+    # is good - a handful of entries are failures carried on it because
+    # the banner is the only page-level feedback there is after a
+    # redirect, session_registry_unreadable being the original case
+    # (issue #279). Carrying the kind right on the entry, rather than in
+    # a side-table of the keys that are secretly errors, makes a future
+    # failure-shaped entry that forgets its kind default to rendering
+    # green (issue #549) structurally impossible rather than easy to miss.
     OK_MESSAGES = {
-        "saved": "Secret saved. Restart sessions to apply it.",
-        "deleted": "Secret deleted. Restart sessions to apply the change.",
-        "restarted": "Restart of all sessions requested.",
-        "session_added": "Session added \u2014 it starts within a few seconds.",
-        "session_deleted": "Session deleted.",
-        "session_restarted": "Session restart requested.",
-        "session_started": "Session started \u2014 it comes up within a few seconds.",
-        # A failure carried on the ok= channel, like webhook_kept below: the
-        # banner is the only page-level feedback there is, and an operator
-        # with no shell has to be told that nothing was changed AND that the
-        # box repairs itself, or the natural next move is to press the button
-        # again (issue #279).
-        "session_registry_unreadable":
+        "saved": ("Secret saved. Restart sessions to apply it.", "ok"),
+        "deleted": ("Secret deleted. Restart sessions to apply the change.", "ok"),
+        "restarted": ("Restart of all sessions requested.", "ok"),
+        "session_added": ("Session added \u2014 it starts within a few seconds.", "ok"),
+        "session_deleted": ("Session deleted.", "ok"),
+        "session_restarted": ("Session restart requested.", "ok"),
+        "session_started": ("Session started \u2014 it comes up within a few seconds.", "ok"),
+        "session_registry_unreadable": (
             "The session list could not be read, so nothing was changed. "
             "The box moves the unreadable file aside and rebuilds the list "
             "within a few seconds \u2014 reload this page and try again.",
-        "update": "Agent-box update started. This page may be briefly unavailable.",
-        "rebooting": "Restart requested. Agent-box will be unavailable for "
-                     "about a minute; reload this page when it is back.",
-        "webhook_rotated": ("Secret replaced. Copy the new secret into the "
-                            "connected service now; events using the old one "
-                            "are no longer accepted."),
-        "webhook_kept_secret": ("Could not replace that secret from this "
-                                "page. Open a session and run "
-                                "`agent-box-webhook rotate SOURCE`."),
-        "webhook_deleted": "Event rule deleted. The change applies to the next event.",
-        "webhook_forgotten": "Event notification rules cleared for this session.",
-        "webhook_kept": "Could not delete that event rule. It may already be gone.",
-        "password_changed": "Password changed. Sign in with your new password.",
-        "connect_started": "Sign-in started \u2014 follow the steps under Connections.",
-        "connect_cancelled": "Sign-in cancelled.",
-        "connect_code": "Code sent \u2014 waiting for the sign-in to finish.",
-        "profile_saved": "Profile saved. Sessions started from now on use it.",
-        "profile_deleted": ("Profile deleted. Sessions already running keep "
-                            "their current settings."),
-        "profile_key_saved": ("Setting added to the profile. Sessions on it pick "
-                              "it up at their next start."),
-        "profile_key_deleted": ("Setting removed from the profile. Sessions on it "
-                                "drop it at their next start."),
+            "error",
+        ),
+        "update": ("Agent-box update started. This page may be briefly unavailable.", "ok"),
+        "rebooting": (("Restart requested. Agent-box will be unavailable for "
+                       "about a minute; reload this page when it is back."), "ok"),
+        "webhook_rotated": (("Secret replaced. Copy the new secret into the "
+                             "connected service now; events using the old one "
+                             "are no longer accepted."), "ok"),
+        "webhook_kept_secret": (("Could not replace that secret from this "
+                                 "page. Open a session and run "
+                                 "`agent-box-webhook rotate SOURCE`."), "error"),
+        "webhook_deleted": ("Event rule deleted. The change applies to the next event.", "ok"),
+        "webhook_forgotten": ("Event notification rules cleared for this session.", "ok"),
+        "webhook_kept": ("Could not delete that event rule. It may already be gone.", "error"),
+        "password_changed": ("Password changed. Sign in with your new password.", "ok"),
+        "connect_started": ("Sign-in started \u2014 follow the steps under Connections.", "ok"),
+        "connect_cancelled": ("Sign-in cancelled.", "ok"),
+        "connect_code": ("Code sent \u2014 waiting for the sign-in to finish.", "ok"),
+        "profile_saved": ("Profile saved. Sessions started from now on use it.", "ok"),
+        "profile_deleted": (("Profile deleted. Sessions already running keep "
+                             "their current settings."), "ok"),
+        "profile_key_saved": (("Setting added to the profile. Sessions on it pick "
+                               "it up at their next start."), "ok"),
+        "profile_key_deleted": (("Setting removed from the profile. Sessions on it "
+                                 "drop it at their next start."), "ok"),
     }
-
-    # A handful of OK_MESSAGES entries are failures carried on the ok=
-    # channel rather than a 4xx/5xx response — issue #279's
-    # session_registry_unreadable being the original case — because the
-    # banner is the only page-level feedback there is after a redirect.
-    # Without this they rendered in the same green as "Session added"
-    # (issue #549): the ok= channel's name describes the MECHANISM
-    # (a message queued across a redirect), not that the news is good.
-    OK_MESSAGES_ERROR = frozenset((
-        "session_registry_unreadable",
-        "webhook_kept_secret",
-        "webhook_kept",
-    ))
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -6459,9 +6453,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         message = ""
         kind = "ok"
         if "ok" in params:
-            ok_key = params["ok"][0]
-            message = self.OK_MESSAGES.get(ok_key, "")
-            kind = "error" if ok_key in self.OK_MESSAGES_ERROR else "ok"
+            message, kind = self.OK_MESSAGES.get(params["ok"][0], ("", "ok"))
         if HOME and parsed.path == "/":
             # The vhost root picks a USER. With one terminal user — the norm
             # — there is nothing to pick, so it lands in that user's space,
