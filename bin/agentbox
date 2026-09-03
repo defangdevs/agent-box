@@ -192,17 +192,30 @@ def load_config(path):
     """
     text = Path(path).read_text()
     if path.endswith(".json"):
-        return json.loads(text)
-    try:
-        import yaml
-    except ImportError:
-        raise ConfigError(
-            f"{path} is YAML but PyYAML is not importable. Install the "
-            "runtime profile (which ships it), or use a .json config."
-        )
-    data = yaml.safe_load(text)
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            # A ConfigError, not a traceback: a syntax error in the file the
+            # operator just wrote is the most ordinary boundary failure there
+            # is (issue #525).
+            raise ConfigError(f"{path} is not valid JSON: {e}")
+    else:
+        try:
+            import yaml
+        except ImportError:
+            raise ConfigError(
+                f"{path} is YAML but PyYAML is not importable. Install the "
+                "runtime profile (which ships it), or use a .json config."
+            )
+        try:
+            data = yaml.safe_load(text)
+        except Exception as e:
+            raise ConfigError(f"{path} is not valid YAML: {e}")
+    # Checked here as well as in BOX_SCHEMA so the message can name the FILE
+    # the operator has to open; the schema only ever sees the parsed value.
     if not isinstance(data, dict):
-        raise ConfigError(f"{path}: top level must be a mapping")
+        raise ConfigError(f"{path}: top level must be a mapping, got "
+                          f"{data!r}")
     return data
 
 
@@ -361,10 +374,226 @@ def profile_origin(profile):
     return repo, rev
 
 
+# --------------------------------------------------------------------------
+# The configuration schema (issue #525)
+# --------------------------------------------------------------------------
+#
+# config.yaml is a trust boundary: an operator writes it by hand, or a launch
+# template renders it, and what comes out is the whole description of a box
+# that runs agents with sudo grants. Until this schema existed the boundary
+# did not VALIDATE, it COERCED, and the two differ exactly where it matters:
+#
+#   * `bool("false")` is True, so `protectMemory: "false"` turned memory
+#     protection ON and `users.agent.root: "false"` made a user root-capable
+#     - the config reversing the operator's explicit intent.
+#   * `list("claude")` is six one-character agents, and a string
+#     `sudoAllowlist` became a list of characters the same way.
+#   * An unknown key was silently ignored, so a misspelled knob was
+#     indistinguishable from one left at its default.
+#   * A wrong type that did NOT coerce escaped as a bare AttributeError or
+#     ValueError traceback, naming neither the field nor its path.
+#
+# So every documented field is declared here, once, and a value is CHECKED
+# against its declared shape rather than passed through a constructor. Three
+# rules the nodes below all follow:
+#
+#   * null is accepted wherever a value is, and means "not written": the
+#     defaulting in Spec reads it the way it reads an absent key, except for
+#     the booleans, where an explicit null has always meant off (bool(None)).
+#   * An unknown key is an error at EVERY object, and the message names the
+#     keys that do exist. A typo must not read as a default.
+#   * Every message carries the full path (users.robot.environment.PORT),
+#     because a config that is 60 lines of nested mappings has no other
+#     landmark to hand the operator.
+#
+# Deliberately not a general-purpose validator: it is a closed description of
+# the fields this file documents, small enough to read beside the Spec that
+# consumes it.
+
+# Bumped only for a config change the CURRENT reader cannot make sense of, so
+# a box tells the operator "this config is newer than this agentbox" instead
+# of rendering half of what they wrote. Absent means 1: no config in the
+# field carries the key, and every one of them is a version-1 config.
+CONFIG_SCHEMA_VERSION = 1
+
+
+def _field(prefix, key):
+    return f"{prefix}.{key}" if prefix else str(key)
+
+
+class _Scalar:
+    """A leaf: one predicate, plus the phrase its error message uses."""
+
+    def __init__(self, phrase, ok):
+        self.phrase = phrase
+        self.ok = ok
+
+    def check(self, value, path):
+        if value is None or self.ok(value):
+            return
+        raise ConfigError(f"{path} must be {self.phrase}, got {value!r}")
+
+
+def _is_str(v):
+    return isinstance(v, str)
+
+
+def _is_port(v):
+    # bool is an int in Python, and `ttydPort: true` is not a port.
+    return isinstance(v, int) and not isinstance(v, bool) and 0 < v < 65536
+
+
+BOOL = _Scalar("true, false or null", lambda v: isinstance(v, bool))
+STR = _Scalar("a string", _is_str)
+PORT = _Scalar("a TCP port (1-65535)", _is_port)
+STR_LIST = _Scalar("a list of strings",
+                   lambda v: isinstance(v, list) and all(map(_is_str, v)))
+# osUpdates.automaticReboot is `false` or an "HH:MM" time. WHICH strings are
+# times - and why `true` alone is refused - is Spec's business; the shape only
+# rules out the types that could never be either.
+REBOOT_TIME = _Scalar('false or an "HH:MM" time',
+                      lambda v: isinstance(v, (bool, str)))
+# An integer, and only this one: `v == 1` alone is also True for `True` and
+# for `1.0`, neither of which is a schema version anybody wrote on purpose.
+SCHEMA_VERSION = _Scalar(
+    f"{CONFIG_SCHEMA_VERSION} (the only schema version this agentbox reads)",
+    lambda v: (isinstance(v, int) and not isinstance(v, bool)
+               and v == CONFIG_SCHEMA_VERSION))
+
+
+class _Obj:
+    """A mapping whose keys are fixed by this schema, and closed."""
+
+    def __init__(self, fields, hint=""):
+        self.fields = fields
+        self.hint = hint
+
+    def check(self, value, path):
+        if value is None:
+            return
+        if not isinstance(value, dict):
+            what = f"{path} must be an object" if path else (
+                "the top level must be an object")
+            raise ConfigError(f"{what}, got {value!r}{self.hint}")
+        for key, sub in value.items():
+            if key not in self.fields:
+                where = f"{path}: unknown key" if path else (
+                    "unknown top-level key")
+                raise ConfigError(
+                    f"{where} {key!r} (known keys: "
+                    + ", ".join(sorted(self.fields)) + ")")
+            self.fields[key].check(sub, _field(path, key))
+
+
+class _Map:
+    """A mapping whose keys are names the OPERATOR chose, not this schema.
+
+    Users, sessions and environment variables: open in the keys, closed in
+    the value shape. A non-string key is refused rather than coerced - the
+    renderer sorts these names, builds file names out of them and matches
+    them against USER_RE, none of which a YAML integer key survives.
+    """
+
+    def __init__(self, noun, value):
+        self.noun = noun
+        self.value = value
+
+    def check(self, value, path):
+        if value is None:
+            return
+        if not isinstance(value, dict):
+            raise ConfigError(
+                f"{path} must be an object of {self.noun}s, got {value!r}")
+        for key, sub in value.items():
+            if not _is_str(key):
+                raise ConfigError(
+                    f"{path}: {self.noun} name must be a string, "
+                    f"got {key!r}")
+            self.value.check(sub, _field(path, key))
+
+
+# A declared session. `cwd`/`prompt` are what a hand-written config.yaml
+# says; `workingDirectory`/`initialPrompt` are the module's own option names,
+# which tests/spec.nix emits - user_seed reads either spelling, so both are
+# part of the schema.
+SESSION_SCHEMA = _Obj({
+    "agent": STR,
+    "skipPermissions": BOOL,
+    "remoteControl": BOOL,
+    "remoteControlName": STR,
+    "extraArgs": STR_LIST,
+    "cwd": STR,
+    "workingDirectory": STR,
+    "prompt": STR,
+    "initialPrompt": STR,
+    "resumePrompt": STR,
+})
+
+USER_SCHEMA = _Obj({
+    "home": STR,
+    "agent": STR,
+    "ttydPort": PORT,
+    "root": BOOL,
+    # attrsOf str in the module's option, so string values here too: an
+    # unquoted YAML number is a config the other backend would reject.
+    "environment": _Map("environment variable", STR),
+    "environmentFiles": STR_LIST,
+    "seedMainSession": BOOL,
+    "sessions": _Map("session", SESSION_SCHEMA),
+})
+
+BOX_SCHEMA = _Obj({
+    "schemaVersion": SCHEMA_VERSION,
+    "domain": STR,
+    "hostLabel": STR,
+    "agents": STR_LIST,
+    "defaultAgent": STR,
+    "repo": STR,
+    "rev": STR,
+    "protectMemory": BOOL,
+    "codexFullAccess": BOOL,
+    "restartNotice": BOOL,
+    "sudoAllowlist": STR_LIST,
+    "jitNixpkgs": STR,
+    "web": _Obj({"enable": BOOL, "rebootButton": BOOL}),
+    "webhook": _Obj({
+        "enable": BOOL,
+        "repo": STR,
+        "script": STR,
+        "hookSessionArgs": STR_LIST,
+    }),
+    # The hint is the whole reason a falsy non-mapping is refused instead of
+    # folded into `{}`: `osUpdates: false` is the obvious way to write "off",
+    # and an empty mapping defaults `enable` back to TRUE - the one spelling
+    # meaning "leave my box's patching alone" turning it on (CodeRabbit on
+    # PR #453).
+    "osUpdates": _Obj(
+        {"enable": BOOL, "automaticReboot": REBOOT_TIME},
+        hint=" - to turn base-OS patch policy off, write "
+             "`osUpdates: {enable: false}`"),
+    "users": _Map("user", USER_SCHEMA),
+})
+
+
+def validate_config(data):
+    """Type-check the whole config before any value is read out of it.
+
+    Called from Spec, which every entry point builds before it renders, so a
+    malformed config is a one-line ConfigError and exit 2 - raised before
+    apply has written a file, created a user or touched a unit.
+    """
+    BOX_SCHEMA.check(data, "")
+    return data
+
+
 class Spec:
     """The validated, defaulted view of config.yaml the renderer reads."""
 
     def __init__(self, data, profile):
+        # Every field below is typed by BOX_SCHEMA first (issue #525), so
+        # what follows reads values and applies defaults - it never has to
+        # guess what an operator meant by a value of the wrong type.
+        validate_config(data)
         self.profile = profile
         self.domain = data.get("domain") or ""
         self.host_label = data.get("hostLabel") or self.domain or "agent-box"
@@ -396,41 +625,28 @@ class Spec:
         # older profile with no asset leaves the script empty, and webhooks
         # stay off rather than rendering units around a missing file.
         wh = data.get("webhook") or {}
+        # A quoted "false" would pass bool()'s truthiness check and enable
+        # webhooks anyway, so the schema refuses one (issue #404 review).
+        # An explicit null still means off, same as bool(None).
         webhook_enable = wh.get("enable", True)
-        # A quoted "false" would otherwise pass bool()'s truthiness check
-        # and enable webhooks anyway — same trap as codexFullAccess above
-        # (issue #404 review). null still means off, same as bool(None).
-        if webhook_enable is not None and not isinstance(
-                webhook_enable, bool):
-            raise ConfigError(
-                "webhook.enable must be true, false or null, got "
-                f"{webhook_enable!r}")
         pin = profile_webhook_pin(profile)
         self.webhook_repo = wh.get("repo") or pin.get("repo") or ""
         self.webhook_script = (wh.get("script")
                                or profile_webhook_script(profile) or "")
         self._webhook_enable = bool(webhook_enable)
         web = data.get("web") or {}
-        web_enable = web.get("enable", True)
-        # Same trap, same fix (CodeRabbit finding on PR #431): web.enable
-        # now gates webhook_enable too, so a quoted "false" here would
-        # silently turn webhooks loose as well. null still means off.
-        if web_enable is not None and not isinstance(web_enable, bool):
-            raise ConfigError(
-                f"web.enable must be true, false or null, got {web_enable!r}")
-        self.web_enable = bool(web_enable)
+        # Same trap, and it reaches further (CodeRabbit finding on PR #431):
+        # web.enable gates webhook_enable too, so a quoted "false" here
+        # would turn webhooks loose as well. null still means off.
+        self.web_enable = bool(web.get("enable", True))
         # "Reboot box" in the settings page's Danger zone (the module's
         # web.rebootButton). Default on: a kernel or libc patch installs on
         # disk and takes effect at a boot, unattended patching deliberately
         # never reboots (see APT_CONF), and nobody inside the box can — so
-        # without the button such an update never finishes at all. Same
-        # quoted-"false" guard as web.enable above; null still means off.
-        reboot_button = web.get("rebootButton", True)
-        if reboot_button is not None and not isinstance(reboot_button, bool):
-            raise ConfigError(
-                "web.rebootButton must be true, false or null, got "
-                f"{reboot_button!r}")
-        self.reboot_button = bool(reboot_button) and self.web_enable
+        # without the button such an update never finishes at all. Typed
+        # like web.enable above; null still means off.
+        self.reboot_button = (bool(web.get("rebootButton", True))
+                              and self.web_enable)
         self.protect_memory = bool(data.get("protectMemory", True))
         # Base-OS patching (see APT_CONF). Default on, because the failure
         # it prevents is silent: an unattended patch run that installs a
@@ -438,30 +654,14 @@ class Spec:
         # Written as apt + needrestart policy, so a host whose package
         # manager is neither (RHEL, and its own dnf-automatic) should set
         # `osUpdates: {enable: false}` rather than collect two inert files.
-        # `or {}` would be the trap in its most direct form: it folds
-        # `osUpdates: false` — the obvious way to write "off" — into an
-        # empty mapping, whose `enable` then defaults to TRUE, so the one
-        # spelling that means "do not touch my box's patching" is the one
-        # that turns it on (CodeRabbit on PR #453). Only an absent key is
-        # absent; anything else has to be a mapping, and the message names
-        # the spelling that works.
-        os_updates = data.get("osUpdates")
-        if os_updates is None:
-            os_updates = {}
-        if not isinstance(os_updates, dict):
-            raise ConfigError(
-                f"osUpdates must be a mapping, got {os_updates!r} — to turn "
-                "base-OS patch policy off, write `osUpdates: {enable: false}`")
-        os_updates_enable = os_updates.get("enable", True)
-        # The quoted-"false" trap the other booleans here already guard
-        # against (issue #404 review): a string is truthy, so `enable:
-        # "false"` would turn the thing ON. null still means off.
-        if os_updates_enable is not None and not isinstance(
-                os_updates_enable, bool):
-            raise ConfigError(
-                "osUpdates.enable must be true, false or null, got "
-                f"{os_updates_enable!r}")
-        self.os_updates_enable = bool(os_updates_enable)
+        # `or {}` here folds ONLY an absent key or an explicit null: the
+        # schema refuses every other non-mapping, because folding
+        # `osUpdates: false` - the obvious way to write "off" - into an
+        # empty mapping defaults `enable` back to TRUE (CodeRabbit on
+        # PR #453). `enable` itself is typed, so a truthy `"false"` cannot
+        # turn the policy on either (issue #404 review); null means off.
+        os_updates = data.get("osUpdates") or {}
+        self.os_updates_enable = bool(os_updates.get("enable", True))
         # Off by default: nobody on this box can perform a reboot, but a
         # box that reboots ITSELF at an arbitrary moment is worse — it
         # takes every live agent session with it. A deployment that would
@@ -487,45 +687,23 @@ class Spec:
         # watch spawns — the classic use is a cheaper model for triage
         # (issue #216). Same shape as the module's option: a list of
         # strings, exported as JSON because webhook-spawn.sh parses it with
-        # jq and a value may contain spaces.
-        webhook_cfg = data.get("webhook") or {}
-        hook_session_args = webhook_cfg.get("hookSessionArgs")
-        # A string here would otherwise pass straight through list() as
-        # one character per element — jq would parse each as its own
-        # argument, silently garbling the hook session's command line
-        # (issue #404 review).
-        if hook_session_args is not None and not (
-                isinstance(hook_session_args, list)
-                and all(isinstance(a, str) for a in hook_session_args)):
-            raise ConfigError(
-                "webhook.hookSessionArgs must be a list of strings, got "
-                f"{hook_session_args!r}")
-        self.hook_session_args = list(hook_session_args or [])
-        codex_full_access = data.get("codexFullAccess", True)
-        # A quoted "false" would otherwise pass bool()'s truthiness check
-        # and turn codex loose with danger-full-access — a string typo
-        # silently granting the one thing this knob exists to gate
-        # (issue #404 review). null still means off, same as bool(None):
-        # only a type this config format has no business carrying is
-        # rejected.
-        if codex_full_access is not None and not isinstance(
-                codex_full_access, bool):
-            raise ConfigError(
-                "codexFullAccess must be true, false or null, got "
-                f"{codex_full_access!r}")
+        # jq and a value may contain spaces. A bare string would pass
+        # through list() as one character per element, and jq would read
+        # each as its own argument (issue #404 review), so the schema types
+        # it as a list.
+        self.hook_session_args = list(wh.get("hookSessionArgs") or [])
+        # A quoted "false" would pass bool()'s truthiness check and turn
+        # codex loose with danger-full-access - a string typo granting the
+        # one thing this knob exists to gate (issue #404 review). null still
+        # means off, same as bool(None).
         self.codex_full_access = (
-            bool(codex_full_access) and "codex" in self.agents)
+            bool(data.get("codexFullAccess", True))
+            and "codex" in self.agents)
         # Opt-in built-in restart notice for claude respawns (issue #507),
         # off by default like the module's restartNotice option — same
         # "quoted false is still truthy" trap as codexFullAccess above, so
-        # the same type check.
-        restart_notice = data.get("restartNotice", False)
-        if restart_notice is not None and not isinstance(
-                restart_notice, bool):
-            raise ConfigError(
-                "restartNotice must be true, false or null, got "
-                f"{restart_notice!r}")
-        self.restart_notice = bool(restart_notice)
+        # the schema types it the same way.
+        self.restart_notice = bool(data.get("restartNotice", False))
         self.sudo_allowlist = list(data.get("sudoAllowlist") or [])
         # Where a lazily installed harness comes from (issue #416). The
         # NixOS module reuses selfUpdate.agentNixpkgs — the pin its update
@@ -579,6 +757,10 @@ class User:
         self.home = data.get("home") or f"/home/{name}"
         self.agent = data.get("agent") or spec.default_agent
         self.ttyd_port = data.get("ttydPort")
+        # Typed by USER_SCHEMA (issue #525): `root: "false"` used to pass
+        # bool()'s truthiness check and hand this user the settings page and
+        # the root vhost - the config reversing what the operator wrote, for
+        # the one field where that matters most.
         self.want_root = bool(data.get("root"))
         self.environment = dict(data.get("environment") or {})
         self.environment_files = list(data.get("environmentFiles") or [])
@@ -594,10 +776,6 @@ class User:
             # Mirrors seedMain in modules/agent-box.nix.in — the two
             # backends must answer this the same way.
             seed_main = data.get("seedMainSession")
-            if seed_main is not None and not isinstance(seed_main, bool):
-                raise ConfigError(
-                    "seedMainSession must be true, false or null, got "
-                    f"{seed_main!r}")
             if seed_main is None:
                 # spec.web_enable alone IS the native equivalent of the
                 # module's `cfg.web.enable && u.web.passwordHashFile != null`.

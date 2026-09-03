@@ -15,6 +15,7 @@ no network. Regenerate the fixture after an intended change with:
     python3 tests/test_agentbox.py --update
 """
 
+import ast
 import contextlib
 import importlib.util
 import io
@@ -2140,6 +2141,275 @@ class RenderTest(unittest.TestCase):
                 literal, {n: v for n, v in got if n in literal},
                 f"agent-web-terminal@{user} changes the VALUE of a ttyd "
                 f"option the shared template pins")
+
+
+class ConfigSchemaTest(unittest.TestCase):
+    """The typed config boundary (issue #525).
+
+    Every field of config.yaml is declared in BOX_SCHEMA and checked before
+    Spec reads a value out of it. What is under test here is the REFUSALS:
+    the boundary used to coerce instead of validate, and the coercions ran
+    the wrong way round on precisely the fields where that is dangerous -
+    `protectMemory: "false"` turned the protection on, `root: "false"` made
+    a user root-capable. A test that only proved valid configs still work
+    would not have caught any of that.
+    """
+
+    def setUp(self):
+        self.mod = load_agentbox()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.prof = build_fake_profile(self.tmp.name)
+
+    def spec(self, mutate):
+        """Build a Spec from the golden config with one thing changed."""
+        config = json.loads(CONFIG_JSON.read_text())
+        mutate(config)
+        return self.mod.Spec(config, self.prof)
+
+    def refused(self, mutate):
+        """The ConfigError text a mutated golden config is refused with."""
+        with self.assertRaises(self.mod.ConfigError) as caught:
+            self.spec(mutate)
+        return str(caught.exception)
+
+    def test_the_reported_coercions_are_refused_with_the_field_named(self):
+        """Every example from issue #525, each with the path in the message.
+
+        The first two are the reason this is a P1: `bool("false")` is True,
+        so a config saying "off" configured a box that was on - and for
+        `root` that is the account the settings page and the root vhost
+        belong to. The next two are `list("claude")`, which is six
+        one-character agents rather than one agent named claude.
+        """
+        for message, mutate in [
+            ("protectMemory must be true, false or null, got 'false'",
+             lambda c: c.update(protectMemory="false")),
+            ("users.agent.root must be true, false or null, got 'false'",
+             lambda c: c["users"]["agent"].update(root="false")),
+            ("agents must be a list of strings, got 'claude'",
+             lambda c: c.update(agents="claude")),
+            ("sudoAllowlist must be a list of strings, got '/bin/true'",
+             lambda c: c.update(sudoAllowlist="/bin/true")),
+            ("unknown top-level key 'protectMemry'",
+             lambda c: c.update(protectMemry=False)),
+        ]:
+            self.assertIn(message, self.refused(mutate))
+
+    def test_a_bad_value_never_reads_as_its_default(self):
+        """The refusal is the point, not a fallback.
+
+        Falling back to the default on a bad value would leave the box
+        running the setting the operator was trying to change, which is the
+        failure this issue is about wearing a different hat.
+        """
+        self.assertTrue(self.spec(lambda c: None).protect_memory)
+        self.assertIn("protectMemory must be",
+                      self.refused(lambda c: c.update(protectMemory=0)))
+        self.assertIn("protectMemory must be",
+                      self.refused(lambda c: c.update(protectMemory=[])))
+
+    def test_unknown_keys_are_refused_at_every_object(self):
+        """A typo must not read as a default, however deep it is.
+
+        The message lists the keys that DO exist, because "unknown key
+        'sesions'" on its own leaves the operator guessing at the spelling.
+        """
+        for path, mutate in [
+            ("unknown top-level key 'webhoook'",
+             lambda c: c.update(webhoook={})),
+            ("web: unknown key 'rebootbutton'",
+             lambda c: c["web"].update(rebootbutton=True)),
+            ("webhook: unknown key 'sript'",
+             lambda c: c["webhook"].update(sript="/etc/x.py")),
+            ("osUpdates: unknown key 'reboot'",
+             lambda c: c.update(osUpdates={"reboot": "03:00"})),
+            ("users.robot: unknown key 'agnet'",
+             lambda c: c["users"]["robot"].update(agnet="codex")),
+            ("users.robot.sessions.main: unknown key 'cwdd'",
+             lambda c: c["users"]["robot"]["sessions"]["main"].update(
+                 cwdd="/tmp")),
+        ]:
+            text = self.refused(mutate)
+            self.assertIn(path, text)
+            self.assertIn("known keys:", text)
+
+    def test_a_malformed_nesting_is_a_config_error_not_a_traceback(self):
+        """These used to escape as AttributeError / TypeError / ValueError.
+
+        `assertRaises(ConfigError)` is the assertion, and it is a narrow
+        one on purpose: those three are what a `.get()`, a `dict()` and an
+        `items()` on the wrong type raise, and each of them reached the
+        operator as a traceback with no field name anywhere in it.
+        """
+        for message, mutate in [
+            ("users must be an object of users",
+             lambda c: c.update(users=["agent"])),
+            ("users: user name must be a string, got 7",
+             lambda c: c["users"].update({7: {}})),
+            ("users.robot.sessions must be an object of sessions",
+             lambda c: c["users"]["robot"].update(sessions=["main"])),
+            ("users.robot.sessions.main must be an object",
+             lambda c: c["users"]["robot"]["sessions"].update(main="codex")),
+            ("users.robot.environment must be an object of environment "
+             "variables",
+             lambda c: c["users"]["robot"].update(environment="A=1")),
+            ("users.robot.environment.PORT must be a string, got 8080",
+             lambda c: c["users"]["robot"]["environment"].update(PORT=8080)),
+            ("users.robot.environmentFiles must be a list of strings",
+             lambda c: c["users"]["robot"].update(environmentFiles="/x.env")),
+            ("users.robot.ttydPort must be a TCP port (1-65535)",
+             lambda c: c["users"]["robot"].update(ttydPort="7681")),
+            ("web must be an object",
+             lambda c: c.update(web=["enable"])),
+            ("webhook must be an object",
+             lambda c: c.update(webhook="on")),
+            ("webhook.hookSessionArgs must be a list of strings",
+             lambda c: c["webhook"].update(hookSessionArgs="--model sonnet")),
+        ]:
+            self.assertIn(message, self.refused(mutate))
+
+    def test_os_updates_still_names_the_spelling_that_turns_it_off(self):
+        """`osUpdates: false` is the obvious way to write "off", and
+        folding it into `{}` defaults `enable` back to true (CodeRabbit on
+        PR #453). Refusing it is only half an answer without the hint."""
+        text = self.refused(lambda c: c.update(osUpdates=False))
+        self.assertIn("osUpdates must be an object, got False", text)
+        self.assertIn("`osUpdates: {enable: false}`", text)
+
+    def test_null_still_means_written_down_as_nothing(self):
+        """An explicit null is not a type error - every backend that
+        renders this config writes one for an unset value, and for the
+        booleans it has always meant off (bool(None)). Changing that with
+        the schema would have turned working configs into failures."""
+        spec = self.spec(lambda c: c.update(
+            hostLabel=None, sudoAllowlist=None, osUpdates=None,
+            web={"enable": None}, webhook={"enable": None}))
+        self.assertFalse(spec.web_enable)
+        self.assertFalse(spec.webhook_enable)
+        self.assertEqual([], spec.sudo_allowlist)
+        self.assertTrue(spec.os_updates_enable)
+        for user in ("agent", "robot"):
+            spec = self.spec(
+                lambda c, u=user: c["users"][u].update(
+                    home=None, agent=None, ttydPort=None, root=None,
+                    environment=None, environmentFiles=None, sessions=None))
+            self.assertTrue(spec.users)
+
+    def test_the_schema_version_is_optional_and_pinned(self):
+        """No config in the field carries the key, so absent means 1. A
+        version this agentbox has never heard of is refused rather than
+        half-rendered - which is the whole point of having the field
+        before an incompatible change needs it."""
+        self.assertEqual(1, self.mod.CONFIG_SCHEMA_VERSION)
+        self.spec(lambda c: c.update(schemaVersion=1))  # must not raise
+        for bad in (2, 0, "1", True, 1.0):
+            self.assertIn("schemaVersion must be 1",
+                          self.refused(lambda c, b=bad: c.update(
+                              schemaVersion=b)))
+
+    def test_a_file_that_is_not_a_mapping_names_the_file(self):
+        """The schema only ever sees a parsed value, so load_config keeps
+        its own check: the operator needs the path of the file to open."""
+        for text in ("[]", '"just a string"', ""):
+            path = Path(self.tmp.name) / "bad.json"
+            path.write_text(text)
+            with self.assertRaises(self.mod.ConfigError) as caught:
+                self.mod.load_config(str(path))
+            self.assertIn(str(path), str(caught.exception))
+
+    def test_nothing_is_written_when_the_config_is_refused(self):
+        """The acceptance criterion that cannot be tested from Spec alone:
+        validation happens before apply creates a directory, writes a file,
+        adds a user or touches a unit. Rendering under `--root` is the only
+        one of those a test may exercise, so it stands in for all of them -
+        and the render root not existing afterwards is the assertion.
+        """
+        config = json.loads(CONFIG_JSON.read_text())
+        config["users"]["agent"]["root"] = "false"
+        cfg = Path(self.tmp.name) / "bad-root.json"
+        cfg.write_text(json.dumps(config))
+        out = Path(self.tmp.name) / "never-rendered"
+        proc = subprocess.run(
+            [sys.executable, str(AGENTBOX), "apply", "--config", str(cfg),
+             "--profile", str(self.prof), "--root", str(out)],
+            capture_output=True, text=True)
+        self.assertEqual(2, proc.returncode, proc.stderr)
+        self.assertEqual(
+            ["agentbox: users.agent.root must be true, false or null, "
+             "got 'false'"],
+            proc.stderr.splitlines(),
+            "a config error must be one line, not a traceback")
+        self.assertFalse(out.exists(),
+                         "apply rendered into the tree after refusing the "
+                         "config")
+
+    def test_every_config_field_the_code_reads_is_declared(self):
+        """The drift guard: an undeclared field is a REFUSED config.
+
+        Adding `data.get("newKnob")` to Spec without declaring newKnob in
+        the schema does not quietly ignore it any more - the schema rejects
+        every config that sets it, so the knob is unusable and every box
+        configured with it fails to apply. Read out of the source rather
+        than listed here, for the reason profile_payload_names is: a
+        hand-copied list of a list that already exists drifts.
+
+        The receiver table is deliberately exhaustive - a `.get()` on a
+        local this test has never seen fails it, so a new one has to be
+        classified as config (which schema?) or not.
+        """
+        mod = self.mod
+        webhook = mod.BOX_SCHEMA.fields["webhook"]
+        table = {
+            ("Spec", "__init__"): {
+                "data": mod.BOX_SCHEMA,
+                "wh": webhook,
+                "web": mod.BOX_SCHEMA.fields["web"],
+                "os_updates": mod.BOX_SCHEMA.fields["osUpdates"],
+                # Not config: the webhook pin shipped beside the profile's
+                # own webhook.py, read from the profile's asset directory.
+                "pin": None,
+            },
+            ("User", "__init__"): {
+                "data": mod.USER_SCHEMA,
+                "s or {}": mod.SESSION_SCHEMA,
+            },
+            ("Renderer", "user_seed"): {"s": mod.SESSION_SCHEMA},
+        }
+        tree = ast.parse(AGENTBOX.read_text())
+        seen = set()
+        for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+            for fn in [n for n in cls.body
+                       if isinstance(n, ast.FunctionDef)]:
+                where = (cls.name, fn.name)
+                if where not in table:
+                    continue
+                for node in ast.walk(fn):
+                    if not (isinstance(node, ast.Call)
+                            and isinstance(node.func, ast.Attribute)
+                            and node.func.attr == "get"
+                            and node.args
+                            and isinstance(node.args[0], ast.Constant)
+                            and isinstance(node.args[0].value, str)):
+                        continue
+                    who = ast.unparse(node.func.value)
+                    self.assertIn(
+                        who, table[where],
+                        f"{cls.name}.{fn.name} reads {node.args[0].value!r} "
+                        f"off {who}, which this test cannot classify - is it "
+                        "config? then say which schema declares it")
+                    seen.add((where, who))
+                    schema = table[where][who]
+                    if schema is None:
+                        continue
+                    self.assertIn(
+                        node.args[0].value, schema.fields,
+                        f"{cls.name}.{fn.name} reads config field "
+                        f"{node.args[0].value!r}, which no schema declares - "
+                        "every config that sets it would be refused")
+        self.assertEqual(
+            {(w, who) for w, r in table.items() for who in r}, seen,
+            "the receiver table names a local that no longer exists")
 
 
 class SelfUpdateRenderTest(unittest.TestCase):
