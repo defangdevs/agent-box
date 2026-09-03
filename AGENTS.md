@@ -96,6 +96,42 @@ definition is a function of what its own script just wrote (a rev, a
 generated pin, a computed hash) needs the same two lines, for the same
 reason.
 
+## Every host command `agentbox apply` runs is required or advisory
+
+`cmd_apply` is five phases -- render, validate, commit, activate, verify -- and
+the activation phase runs nothing directly. It goes through `Activation`, which
+takes each command as either `require()` or `optional()`:
+
+- **`require()`** is a capability the config asked for: the units the render
+  declares, the tmpfiles the box's runtime directories come from, the Caddy
+  reload after `web.enable`. A failure is collected, printed, and makes
+  `agentbox apply` exit non-zero -- with no "apply complete" line over it.
+- **`optional()`** is cleanup, or a capability the box may legitimately not
+  have: disabling a unit the config dropped, stopping an instance for a user
+  that was removed, taking `systemd-oomd` out of earlyoom's way on a distro
+  that ships none, `sysctl --system` (whose exit status is a statement about
+  every other file in `/etc/sysctl.d` as much as about ours). A failure is a
+  visible note and nothing more.
+
+So a new host command in `activate()` has to be classified, and `check=False`
+is no longer a way to avoid the question -- it was exactly how issue #526
+happened: a first boot could signal CloudFormation success for a box whose
+caddy never came up. Two callers depend on that exit status and neither can
+recover a signal it did not get: the Lightsail/EC2 bootstrap signals its
+WaitCondition only after apply returns 0, and `agentbox update`'s phase two
+rolls the profile back to the previous release on a non-zero apply.
+
+The verify phase asks systemd what actually became of each required unit,
+because `systemctl start` reports on the START -- a `Type=simple` service is
+"started" the moment it forks. A unit `systemctl show` reports as not loaded,
+or as anything other than active/activating/reloading (a oneshot with
+`RemainAfterExit=no` excepted, which is inactive when it succeeds), is a
+required failure.
+
+Units are required by default. `advisory_units()` is the one exception and
+carries its reason: `agent-box-zram.service` on a kernel that can be SHOWN to
+have no zram module (issue #435), where apply already prints the diagnosis.
+
 ## Trying a terminal option without a rebuild
 
 ttyd's client merges URL query parameters into its client options on every

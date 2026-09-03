@@ -15,6 +15,7 @@ no network. Regenerate the fixture after an intended change with:
     python3 tests/test_agentbox.py --update
 """
 
+import argparse
 import ast
 import contextlib
 import importlib.util
@@ -2908,6 +2909,430 @@ class SelfUpdateLogicTest(unittest.TestCase):
                       "the payload's own reason has to reach the journal")
         self.assertEqual(self.calls, [],
                          "a failed pull must not touch the profile")
+
+
+class ApplyActivationTest(unittest.TestCase):
+    """What `agentbox apply` does when a host command says no (issue #526).
+
+    Applying used to run its systemctl calls with `check=False` and then
+    print "apply complete" over whatever they had said, so a first boot, an
+    update or an operator at a prompt got a green line for a box whose
+    caddy never came up. These tests inject a failure at each phase and
+    assert both halves of the fix: the exit status, and that the reason
+    survives into the output instead of being swallowed.
+
+    Nothing here touches the host. The live path writes to absolute paths
+    under /etc, so the render's file, link and removal lists are emptied
+    before `cmd_apply` sees them (`extra_files` is how a test puts one
+    back, for the validation phase) and every command is answered from a
+    table rather than run.
+    """
+
+    # What `systemctl show` says about a unit that is doing its job.
+    LIVE = ("LoadState=loaded\nActiveState=active\nSubState=running\n"
+            "Type=simple\nRemainAfterExit=no\n")
+
+    def setUp(self):
+        self.mod = load_agentbox()
+        self.calls = []
+        self.fail_when = []      # substrings of a command line that fails
+        self.raise_when = []     # ... and of one whose binary is missing
+        self.unit_show = {}      # unit -> `systemctl show` output
+        self.stale = []          # what systemd_units_live reports
+        self.extra_files = {}    # path -> text, the only files rendered
+        self.caddy_stub = None   # shell body for the profile's caddy
+        self.mod.run = self._run
+        self.mod.write_if_changed = lambda *a, **k: False
+        self.mod.remove_if_ours = lambda *a, **k: False
+        self.mod.link_if_changed = lambda *a, **k: False
+        # Two questions about the box this test is running on, pinned so
+        # the answers are the test's own: whether the kernel has a zram
+        # module, and whether the web secrets have been projected into
+        # /run yet. A real /run/agent-box-web/env would also drag a live
+        # box's password hash into the test environment.
+        self.mod.zram_module_available = lambda: True
+        self.mod.AUTH_ENV_FILE = "/nonexistent/agent-box-web/env"
+        real_render = self.mod.Renderer.render
+        extra = self.extra_files
+
+        def render_into_memory(rend):
+            tree = real_render(rend)
+            tree.files.clear()
+            tree.dirs.clear()
+            tree.links.clear()
+            tree.remove.clear()
+            for path, text in extra.items():
+                tree.files[path] = (text, 0o440)
+            return tree
+
+        self.mod.Renderer.render = render_into_memory
+
+    def _run(self, cmd, check=True, capture=False):
+        cmd = [str(c) for c in cmd]
+        self.calls.append(cmd)
+        text = " ".join(cmd)
+        if cmd[0] == "visudo":
+            # Really run: the point of the validation tests is what visudo
+            # itself makes of the rendered file, so this one command is not
+            # answered from the table.
+            return subprocess.run(cmd, text=True, capture_output=True)
+        if cmd[:2] == ["systemctl", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, self.unit_show.get(cmd[2], self.LIVE), "")
+        if cmd[:2] == ["systemctl", "list-unit-files"]:
+            prefix = cmd[-1].rstrip("*")
+            return subprocess.CompletedProcess(
+                cmd, 0, "".join(f"{u} enabled\n" for u in self.stale
+                                if u.startswith(prefix)), "")
+        for pattern in self.raise_when:
+            if pattern in text:
+                raise FileNotFoundError(2, "No such file or directory",
+                                        cmd[0])
+        for pattern in self.fail_when:
+            if pattern in text:
+                if check:
+                    raise subprocess.CalledProcessError(1, cmd)
+                return subprocess.CompletedProcess(
+                    cmd, 1, "", f"{cmd[0]}: it did not work\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def apply(self, **over):
+        """Run the live apply and return (rc, stdout, stderr)."""
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            if self.caddy_stub is not None:
+                (prof / "bin" / "caddy").write_text(self.caddy_stub)
+                os.chmod(prof / "bin" / "caddy", 0o755)
+            args = argparse.Namespace(
+                config=str(CONFIG_JSON), profile=str(prof), root=None,
+                dry_run=False, first_boot=False, settle_delay=0)
+            for key, value in over.items():
+                setattr(args, key, value)
+            # Every login reads as missing, so `useradd` is classified on
+            # every run rather than only on a box that lacks these users.
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err), \
+                    mock.patch("pwd.getpwnam", side_effect=KeyError):
+                rc = self.mod.cmd_apply(args)
+        return rc, out.getvalue(), err.getvalue()
+
+    def assertFailed(self, rc, out, err, *expected):
+        self.assertEqual(rc, 1, f"apply should have failed\n{out}\n{err}")
+        self.assertNotIn("apply complete", out,
+                         "the success line must never be printed over a "
+                         "required failure")
+        self.assertIn("apply FAILED", err)
+        for text in expected:
+            self.assertIn(text, err)
+
+    def systemctl_calls(self):
+        return [c for c in self.calls if c[0] == "systemctl"]
+
+    # -- the baseline --------------------------------------------------------
+
+    def test_a_clean_apply_still_reports_complete(self):
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("apply complete", out)
+        self.assertNotIn("apply FAILED", err)
+
+    # -- phase 4: activation -------------------------------------------------
+
+    def test_a_required_unit_that_will_not_start_fails_apply(self):
+        self.fail_when = ["enable --now caddy.service"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "start caddy.service",
+                          "it did not work")
+
+    def test_a_session_instance_that_will_not_start_fails_apply(self):
+        """A %i instance is started, never enabled - same requirement."""
+        self.fail_when = ["start agent-box@agent.service"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "start agent-box@agent.service")
+
+    def test_a_failed_caddy_reload_fails_apply(self):
+        self.fail_when = ["reload-or-restart caddy.service"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "reload caddy.service")
+
+    def test_failed_tmpfiles_fails_apply(self):
+        """The runtime dirs, ~/sites and the downloads tree come from it."""
+        self.fail_when = ["systemd-tmpfiles"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "systemd-tmpfiles")
+
+    def test_failed_daemon_reload_fails_apply_without_a_traceback(self):
+        """It used to raise: check=True, with nothing catching it."""
+        self.fail_when = ["daemon-reload"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "systemctl daemon-reload")
+        self.assertNotIn("Traceback", err)
+
+    def test_failed_useradd_fails_apply(self):
+        self.fail_when = ["useradd --create-home"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "create user agent")
+        self.assertNotIn("created user agent", out,
+                         "a useradd that failed must not report a user")
+
+    def test_a_missing_systemctl_is_a_failure_not_a_traceback(self):
+        self.raise_when = ["systemctl enable --now caddy.service"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "start caddy.service")
+        self.assertNotIn("Traceback", err)
+
+    # -- phase 4: what stays best-effort -------------------------------------
+
+    def test_cleanup_failures_are_notes_not_failures(self):
+        """Stopping a dropped instance, and taking systemd-oomd away.
+
+        Neither is a capability the config asked for: the first is the
+        config no longer asking for something, and the second is a distro
+        daemon this box may not have at all.
+        """
+        self.stale = ["agent-box@ghost.service"]
+        self.fail_when = ["stop agent-box@ghost.service",
+                          "disable --now systemd-oomd.service"]
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("apply complete", out)
+        self.assertIn("note: stop agent-box@ghost.service", out)
+        self.assertIn("note: disable systemd-oomd.service", out)
+        self.assertIn("best effort", out)
+
+    def test_sysctl_failure_is_a_note(self):
+        """`sysctl --system` applies every OTHER file in sysctl.d too."""
+        self.fail_when = ["sysctl --system"]
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("note: sysctl --system", out)
+
+    def test_zram_is_advisory_only_on_a_kernel_without_the_module(self):
+        """Issue #435: linux-azure images ship no zram module.
+
+        That is a diagnosis apply already prints, not a box that was
+        misconfigured - but on a kernel that HAS the module, a zram unit
+        that will not start is a required failure like any other.
+        """
+        self.fail_when = ["enable --now agent-box-zram.service"]
+        self.mod.zram_module_available = lambda: False
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("note: start agent-box-zram.service", out)
+        self.assertIn("zram unavailable on this kernel", out)
+
+        self.mod.zram_module_available = lambda: True
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "start agent-box-zram.service")
+
+    # -- phase 5: verification -----------------------------------------------
+
+    def test_a_unit_that_started_and_then_died_fails_apply(self):
+        """`systemctl start` reports on the start, not on the outcome."""
+        self.unit_show["caddy.service"] = (
+            "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+            "Type=notify\nRemainAfterExit=no\n")
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "caddy.service", "is failed")
+
+    def test_a_unit_systemd_never_loaded_fails_apply(self):
+        self.unit_show["agent-box-settings@agent.socket"] = (
+            "LoadState=not-found\nActiveState=inactive\nSubState=dead\n")
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "agent-box-settings@agent.socket",
+                          "not loaded")
+
+    def test_a_oneshot_that_ran_and_exited_is_not_a_failure(self):
+        """systemd reports it inactive; for a oneshot that IS success."""
+        self.unit_show["agent-web-auth-secrets.service"] = (
+            "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+            "Type=oneshot\nRemainAfterExit=no\n")
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+
+    def test_one_fault_is_reported_once(self):
+        """Its start already failed; asking systemd adds no second line."""
+        self.fail_when = ["enable --now caddy.service"]
+        self.unit_show["caddy.service"] = (
+            "LoadState=loaded\nActiveState=failed\nSubState=failed\n")
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 1)
+        self.assertNotIn("is failed", err)
+        self.assertNotIn(["systemctl", "show", "caddy.service",
+                          "--property=LoadState", "--property=ActiveState",
+                          "--property=SubState", "--property=Type",
+                          "--property=RemainAfterExit"],
+                         self.calls)
+
+    # -- phase 2: validation, before anything is committed -------------------
+
+    def test_a_sudoers_drop_in_visudo_rejects_stops_the_apply(self):
+        """And stops it while the box is still running what it was.
+
+        A malformed sudoers file can lock an administrator out of sudo, so
+        this is the one that must never reach disk.
+        """
+        if not shutil.which("visudo"):
+            self.skipTest("no visudo on this box")
+        self.extra_files["/etc/sudoers.d/agent-box"] = "not ( sudoers\n"
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "validate /etc/sudoers.d/agent-box")
+        self.assertEqual(self.systemctl_calls(), [],
+                         "a refused render must not have been activated")
+
+    def test_a_valid_sudoers_drop_in_passes(self):
+        if not shutil.which("visudo"):
+            self.skipTest("no visudo on this box")
+        self.extra_files["/etc/sudoers.d/agent-box"] = (
+            "agent ALL=(root) NOPASSWD: /usr/bin/systemctl reload "
+            "caddy.service\n")
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+
+    def test_the_rendered_sudoers_drop_in_is_one_visudo_accepts(self):
+        """The real thing, not an injected sample.
+
+        The fixture keeps @PROFILE@ where a store path would be, which is
+        a perfectly ordinary command path as far as sudoers grammar goes.
+        """
+        if not shutil.which("visudo"):
+            self.skipTest("no visudo on this box")
+        rendered = FIXTURE / "etc/sudoers.d/agent-box"
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate = Path(tmp) / "sudoers"
+            candidate.write_text(rendered.read_text())
+            os.chmod(candidate, 0o440)
+            out = subprocess.run(["visudo", "-c", "-f", str(candidate)],
+                                 capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_a_caddyfile_caddy_refuses_stops_the_apply(self):
+        """The profile's own caddy is the judge, and it said no."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / "env"
+            env.write_text("WEB_PASSWORD_HASH_AGENT=$argon2id$v=19$x\n")
+            self.mod.AUTH_ENV_FILE = str(env)
+            self.extra_files[self.mod.CADDYFILE] = "whatever the render said\n"
+            self.caddy_stub = (
+                "#!/bin/sh\n"
+                'echo "Error: adapting config using caddyfile: '
+                'unrecognized hash algorithm: agent" >&2\n'
+                "exit 1\n")
+            rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "validate " + self.mod.CADDYFILE,
+                          "unrecognized hash algorithm")
+        self.assertEqual(self.systemctl_calls(), [],
+                         "a refused render must not have been activated")
+
+    def test_the_caddyfile_check_gets_the_units_own_environment(self):
+        """Because the rendered file is a template over it.
+
+        The per-user hash and cookie secret reach caddy through
+        EnvironmentFile=/run/agent-box-web/env, so a validate run without
+        them fails on its own missing inputs. HOME and the XDG variables
+        are the unit's too, so certmagic does not scatter a certificate
+        directory into root's home.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / "env"
+            env.write_text("WEB_PASSWORD_HASH_AGENT=hashed\n"
+                           "WEB_COOKIE_SECRET_AGENT=deadbeef\n")
+            self.mod.AUTH_ENV_FILE = str(env)
+            self.extra_files[self.mod.CADDYFILE] = "irrelevant\n"
+            seen = Path(tmp) / "seen"
+            self.caddy_stub = (
+                "#!/bin/sh\n"
+                f'env > {seen}\n'
+                "exit 0\n")
+            rc, out, err = self.apply()
+            passed = dict(
+                line.split("=", 1) for line in
+                seen.read_text().splitlines() if "=" in line)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(passed.get("WEB_PASSWORD_HASH_AGENT"), "hashed")
+        self.assertEqual(passed.get("WEB_COOKIE_SECRET_AGENT"), "deadbeef")
+        self.assertEqual(passed.get("XDG_DATA_HOME"), "/var/lib")
+        self.assertEqual(passed.get("HOME"), "/var/lib/caddy")
+        self.assertNotIn("written unchecked", out)
+
+    def test_the_caddyfile_check_is_skipped_when_the_secrets_are_absent(self):
+        """Skipped with a note, never silently treated as a pass."""
+        self.extra_files[self.mod.CADDYFILE] = "irrelevant\n"
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("written unchecked", out)
+
+    def test_a_caddy_that_will_not_run_is_a_skip_not_a_failure(self):
+        """The CHECK's input is missing, which is not a bad config.
+
+        And the same box points caddy.service at that binary, so the front
+        door not coming up is reported as the required failure it is,
+        against the unit that needs it (CodeRabbit, PR #539).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / "env"
+            env.write_text("WEB_PASSWORD_HASH_AGENT=hashed\n")
+            self.mod.AUTH_ENV_FILE = str(env)
+            self.extra_files[self.mod.CADDYFILE] = "irrelevant\n"
+            self.caddy_stub = "#!/nonexistent/sh\n"      # ENOENT on exec
+            rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("written unchecked", out)
+        self.assertNotIn("apply FAILED", err)
+
+
+class PostSwitchFailureTest(unittest.TestCase):
+    """An update whose apply fails puts the profile back (issue #526).
+
+    `post_switch` already rolled back on a non-zero apply; what changed is
+    that a partially-activated box now RETURNS non-zero. These pin the two
+    halves together, because the rollback is what that exit status is for.
+    """
+
+    def setUp(self):
+        self.mod = load_agentbox()
+        self.calls = []
+        self.rolled_back = []
+        self.mod.run = self._record
+        self.mod.restart_units = lambda restart_sessions=True: []
+        self.mod.wall = lambda message: None
+        self.mod.rollback_to = self._rollback
+
+    def _record(self, cmd, check=True, capture=False):
+        self.calls.append([str(c) for c in cmd])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def _rollback(self, profile, generation):
+        self.rolled_back.append(generation)
+        return True
+
+    def _post_switch(self, rc):
+        self.mod.cmd_apply = lambda args: rc
+        args = argparse.Namespace(
+            config="/etc/agent-box/config.json", no_restart_sessions=False,
+            from_generation="7", from_rev="a" * 40)
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                got = self.mod.post_switch(args, prof)
+        return got, err.getvalue()
+
+    def test_a_failed_apply_rolls_the_profile_back(self):
+        got, err = self._post_switch(1)
+        self.assertEqual(got, 1)
+        self.assertEqual(self.rolled_back, [7])
+        self.assertIn("exited 1", err)
+        self.assertIn([str(Path("bin/agentbox").name)],
+                      [[Path(c[0]).name] for c in self.calls],
+                      "the rolled-back release has to re-apply")
+
+    def test_a_clean_apply_keeps_the_new_release(self):
+        got, _ = self._post_switch(0)
+        self.assertEqual(got, 0)
+        self.assertEqual(self.rolled_back, [])
 
 
 def update_fixture():
