@@ -75,11 +75,11 @@ Prefer targeted checks over `nix flake check`; the intentionally filesystem-free
 (`cfg.selfUpdate.rev`), which the unit's own script advances before calling
 `nixos-rebuild switch`. So on every non-noop run, this unit's definition
 necessarily differs from the one `switch-to-configuration` is activating
-FROM — and by NixOS's default `restartIfChanged = true`, activation sends
+FROM -- and by NixOS's default `restartIfChanged = true`, activation sends
 the stop signal to the cgroup the still-running script sits in, right as the
 new generation finishes coming up. The rebuild has already succeeded by
 then; only the unit's own exit status is a casualty (`Main process exited,
-code=killed, status=15/TERM`, `Failed with result 'signal'`) — a box that
+code=killed, status=15/TERM`, `Failed with result 'signal'`) -- a box that
 just updated cleanly reports "Update failed" on the settings page. Same
 false-negative mechanism as the amazon-init reports in #186 ("the switch
 masked the unit that was performing the switch"), here landing on this
@@ -89,7 +89,7 @@ unit's own reporting instead of a boot-time test assertion. Confirm a given
 generation landed at the exact failure timestamp, the update applied.
 
 Fixed in #514 with `restartIfChanged = false; stopIfChanged = false;` on the
-unit — an in-flight run is left alone, and the next trigger picks up the new
+unit -- an in-flight run is left alone, and the next trigger picks up the new
 unit definition from the activated system regardless, so there is nothing to
 gain from restarting a run already in progress. Any other unit whose own
 definition is a function of what its own script just wrote (a rev, a
