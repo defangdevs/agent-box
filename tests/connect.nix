@@ -161,22 +161,20 @@ in
         enable = true;
         agent = "claude";
         installAgents = [ "claude" ];
-        # claude eagerly, because the seeded "main" below has to bring a
-        # tmux server up and a VM test cannot fetch a harness. codex is
+        # claude eagerly, because a VM test cannot fetch a harness. codex is
         # deliberately left out of BOTH lists, which is what makes the
         # "not installed, offers to fetch it" card below a real case.
         eagerAgents = [ "claude" ];
         users.agent = {
           web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
-          # This test predates the front door (issue #416): its sign-in
-          # panes are children of the agent unit's tmux server, and
-          # connect_start REFUSES to create that server itself (it would
-          # reparent every later session into the settings daemon's
-          # cgroup). So it needs the seeded "main" a web box no longer
-          # gets by default — including for the subtest below that KILLS
-          # every session to prove the card reports "blocked" rather than
-          # offering a dead button.
-          seedMainSession = true;
+          # Left at the default (false, since this user has a web front
+          # door): the whole point of the subtest below is that the cards
+          # work with ZERO sessions ever seeded, on a box exactly like a
+          # real deployment's (issue #544). The supervisor itself brings
+          # the tmux server up unconditionally now, so the connect cards'
+          # sign-in panes — still refusing to create that server themselves
+          # (see tmux_server_up() in settings-daemon.py) — have one to
+          # attach to regardless.
         };
         web = {
           enable = true;
@@ -279,6 +277,20 @@ in
             machine.sleep(1)
         raise Exception(f"{flow} stuck in {state(flow)['state']}, wanted {want}")
 
+
+    with subtest("the front door works before any session is ever added (issue #544)"):
+        # No session was ever seeded (users.agent.sessions is empty, and
+        # seedMainSession defaults to false for a user with a web front
+        # door) — a fresh deployment exactly as issue #544 hit it. Before
+        # this fix nothing had ever called tmux new-session, so no tmux
+        # server existed either, and connect_state's "blocked" check kept
+        # every card behind an "Add a session above before signing in."
+        # dead end — defeating the one thing a front door is for: signing
+        # in BEFORE adding a session, not after. The supervisor now brings
+        # the server up on its own, so the card already works here.
+        assert state("claude")["blocked"] is False
+        body = get("/agent/settings/")
+        assert "before signing in" not in body, body[:800]
 
     with subtest("every card renders, installed or not"):
         body = get("/agent/settings/")

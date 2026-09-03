@@ -24,6 +24,26 @@ REGISTRY_PROG=supervisor
 WEBHOOK_MARKETPLACE=local-channels
 WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
 
+# Bring the tmux server up, unconditionally, before anything below decides
+# whether there is even a session to create (issue #544). A web user's
+# default (seedMainSession) seeds NO session at all, on the reasoning that
+# the settings page is the front door instead -- but the settings page's own
+# sign-in cards (issue #416) refuse to start a pane without an already-
+# running server (see tmux_server_up() in settings-daemon.py: a server THEY
+# started would fork under the settings daemon's cgroup, not this hardened
+# unit's, and drag every later session into it). With no session ever added
+# and no server either, every card was permanently "blocked" -- "Add a
+# session above before signing in" -- which defeats the one thing the front
+# door was supposed to let a brand-new box do: sign in before adding a
+# session, not after.
+#
+# `exit-empty` (tmux's own default) kills a server the moment its last
+# client disconnects with zero sessions left, which is exactly the state
+# right after a bare `start-server`'s own client goes away -- so it has to be
+# turned off in the SAME client round-trip (chained with `\;`), or the
+# server is already gone before a second command could reach it.
+$TMUX start-server \; set-option -g exit-empty off 2>/dev/null || :
+
 # First boot only: seed the Nix-declared sessions. The file is RUNTIME
 # data afterwards — a rebuild must never clobber sessions the user
 # added or removed while the box was live. Under the registry lock, because
