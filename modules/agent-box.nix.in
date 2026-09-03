@@ -1989,7 +1989,7 @@ in
           watchPolicy is unaffected in shape and, since 0.23.0, is the ONLY
           thing that still makes the box's own standing watch selective.
 
-          0.26.0 (this pin) adds delivery INTO a codex session, which until now
+          0.26.0 adds delivery INTO a codex session, which until then
           could only MANAGE subscriptions: `subscribe` run inside one starts a
           detached peer that hands each event to `codex queue`, landing it as a
           message at that session's next turn boundary. The module needs
@@ -1998,6 +1998,15 @@ in
           guide's webhook section now says so. Two versions came between:
           0.24.0 stopped dressing a foreign sender in GitHub's shape, and
           0.25.0 lets a watch carry a `spawnConfig` for its spawn command.
+
+          0.27.0 (this pin) puts the COMMIT a CI event reports on in the spawn
+          meta, as `sha` (plus `branch` where the payload has one). One failing
+          run reaches a watch as up to six event shapes and the sha is the only
+          field all six carry, so it is what tells a spawn command they are one
+          run. webhook-spawn.sh seeds the narrower claim from it (issues #510
+          and #511, where one red master spawned two sessions 63s apart and
+          both filed the same diagnosis); the branch-shaped claim below it
+          stays as the fallback for a payload that carries no sha.
         '';
       };
       sha256 = lib.mkOption {
