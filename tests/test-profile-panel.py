@@ -417,6 +417,21 @@ class ProfileRoutes(ProfileFixture):
         self.assertEqual(entries[0]["profile"], "triage")
         self.assertEqual(entries[0]["extraArgs"], ["--model", "sonnet"])
 
+    def test_the_auto_name_comes_from_the_profile_not_the_harness(self):
+        """Two profiles on the same harness ("triage" and "reviewer", both
+        claude) used to both mint from "claude" ("claude", then "claude-2")
+        — indistinguishable in the row, for the same reason issue #277
+        named. The profile is the more specific worker identity, so it is
+        the name gen_session_name mints from."""
+        _, base = self.serve()
+        self.write_profile("triage", "HARNESS=claude\n")
+        self.write_profile("reviewer", "HARNESS=claude\n")
+        self.post(base, "/sessions/add", back="settings",
+                  profile="triage", cwd="~", prompt="")
+        self.post(base, "/sessions/add", back="settings",
+                  profile="reviewer", cwd="~", prompt="")
+        self.assertEqual(set(self.read_sessions()), {"triage", "reviewer"})
+
     def test_the_profiles_harness_wins_over_the_select_beside_it(self):
         """A <select> always posts a value, so this form cannot tell
         "chose claude" from "left it alone" — and a rule that turned on a

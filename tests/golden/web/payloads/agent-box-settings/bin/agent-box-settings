@@ -930,30 +930,37 @@ def read_sessions():
     return result
 
 
-def gen_session_name(agent, sessions, cwd=None):
-    """Auto-generate a unique session name from the agent and its directory.
+def gen_session_name(base_name, sessions, cwd=None):
+    """Auto-generate a unique session name from base_name and the directory.
 
-    The first session for an agent gets the bare name ("claude"); a later one
-    that would collide is named after the directory it works in ("portal",
-    then "portal-2"). Users rarely care what a session is called (rename at
-    runtime via /rename), so this spares them inventing one — but the name is
-    also all a row shows about WHICH session it is, and a random "claude-a3f9"
-    said nothing, so two auto-named sessions under one project tree were
-    indistinguishable and the wrong transcript got downloaded (issue #277).
+    The first session for base_name gets the bare name ("claude"); a later
+    one that would collide is named after the directory it works in
+    ("portal", then "portal-2"). Users rarely care what a session is called
+    (rename at runtime via /rename), so this spares them inventing one — but
+    the name is also all a row shows about WHICH session it is, and a random
+    "claude-a3f9" said nothing, so two auto-named sessions under one project
+    tree were indistinguishable and the wrong transcript got downloaded
+    (issue #277).
 
-    `agent` is always one of AGENTS (or "shell"), so it already matches
-    SESSION_RE; `cwd` is None for home (whose basename is the user's own name
-    and names nothing) or an absolute path this daemon has resolved. Keeping
-    the mirror in session-cli.sh's gen_name in step is deliberate: both
-    creation paths must name a session the same way.
+    `base_name` is the profile name when the session was started with one,
+    else the agent — the caller (the /sessions/add handler) resolves that,
+    since only it knows whether a profile was given. Either way it is
+    already one of AGENTS/"shell" or a name PROFILE_NAME_RE has passed, so
+    it already matches SESSION_RE; `cwd` is None for home (whose basename is
+    the user's own name and names nothing) or an absolute path this daemon
+    has resolved. Keeping the mirror in session-cli.sh's gen_name in step is
+    deliberate: both creation paths must name a session the same way,
+    profile included — two profiles on the same harness ("triage" and
+    "reviewer", both claude) used to mint "claude" and "claude-2",
+    indistinguishable for the reason issue #277 named in the first place.
 
     RESERVED_NAMES count as taken: the directory branch below would happily
     name a session after ~/settings or ~/ws, and that is precisely the name
     the vhost cannot route to a terminal.
     """
     taken = set(sessions) | RESERVED_NAMES
-    if agent not in taken:
-        return agent
+    if base_name not in taken:
+        return base_name
     base = re.sub(r"[^A-Za-z0-9_-]", "-", os.path.basename((cwd or "").rstrip("/")))
     base = base.strip("-")
     if base and len(base) <= NAME_MAX - 2:
@@ -966,11 +973,11 @@ def gen_session_name(agent, sessions, cwd=None):
     # No usable directory name, or nine sessions already work in that one:
     # random cannot collide the way a tenth "-N" guess would.
     for _ in range(1000):
-        candidate = "%s-%s" % (agent, secrets.token_hex(2))
+        candidate = "%s-%s" % (base_name, secrets.token_hex(2))
         if candidate not in taken:
             return candidate
     # Astronomically unlikely fallback: a longer token can't be taken.
-    return ("%s-%s" % (agent, secrets.token_hex(8)))[:NAME_MAX]
+    return ("%s-%s" % (base_name, secrets.token_hex(8)))[:NAME_MAX]
 
 
 def write_sessions(sessions):
@@ -6718,12 +6725,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # the later rename would drop the earlier session outright.
             with sessions_lock():
                 sessions = read_sessions()
-                # The name is always auto-derived from the agent — there is no
-                # name field in the form. Users rarely care what a session is
-                # called (rename at runtime via /rename), so autogen spares
-                # them inventing one AND guarantees a unique key, so no
-                # collision or accidental-overwrite (issue 100) is possible.
-                name = gen_session_name(agent, sessions, cwd)
+                # The name is always auto-derived — there is no name field in
+                # the form — from the PROFILE when one was given (it is the
+                # more specific worker identity; see gen_session_name), else
+                # the agent. Users rarely care what a session is called
+                # (rename at runtime via /rename), so autogen spares them
+                # inventing one AND guarantees a unique key, so no collision
+                # or accidental-overwrite (issue 100) is possible.
+                name = gen_session_name(profile or agent, sessions, cwd)
                 sessions[name] = {
                     "agent": agent,
                     "skipPermissions": True,

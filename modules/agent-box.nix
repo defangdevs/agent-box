@@ -2856,17 +2856,23 @@ mintable() {
   ! reserved_name "$1" && ! taken "$1"
 }
 gen_name() {
-  # gen_name HARNESS [CWD] — echo a unique session name derived from HARNESS:
-  # the bare name when free ("claude"), else the working directory's own name
-  # ("portal", then "portal-2"). Callers pass a validated harness, itself a
-  # valid name; CWD is whatever the caller will store, so it is untrusted
-  # text and gets folded into the name charset here.
+  # gen_name BASE [CWD] — echo a unique session name derived from BASE: the
+  # bare name when free ("claude"), else the working directory's own name
+  # ("portal", then "portal-2"). BASE is the profile name when the session
+  # was started with one, else the harness — a validated name either way, so
+  # this takes it as given; CWD is whatever the caller will store, so it is
+  # untrusted text and gets folded into the name charset here.
   #
   # A random "claude-a3f9" named nothing an operator could recognise, and the
   # web UI's row shows only name, agent, cwd and state — so two auto-named
   # claude sessions under one project tree were indistinguishable and the
-  # wrong transcript got downloaded (issue #277). The directory name is the
-  # one fact that says WHERE this session works.
+  # wrong transcript got downloaded (issue #277). Naming from the PROFILE
+  # rather than the harness is the same fix applied one layer up: with
+  # "Add session" profile-first (issue #493), two profiles on the same
+  # harness ("triage" and "reviewer", both claude) used to mint "claude" and
+  # "claude-2" — indistinguishable again, and for the same reason issue #277
+  # named. The directory name is the next-best fact when BASE collides, since
+  # it says WHERE this session works.
   a="$1"
   mintable "$a" && { printf '%s' "$a"; return; }
   # HOME is deliberately not used: its basename is the user's own name, which
@@ -3137,7 +3143,10 @@ case "$cmd" in
     # could pick the same free name and the second rename would drop the first
     # session outright.
     registry_lock
-    [ -n "$name" ] || name="$(gen_name "$harness" "$cwd")"
+    # The profile is the more specific name when there is one (see gen_name):
+    # two profiles on the same harness should mint two different names, not
+    # "claude" and "claude-2" for workers nobody would call the same thing.
+    [ -n "$name" ] || name="$(gen_name "''${profile:-$harness}" "$cwd")"
     if taken "$name"; then
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
@@ -11493,30 +11502,37 @@ def read_sessions():
     return result
 
 
-def gen_session_name(agent, sessions, cwd=None):
-    """Auto-generate a unique session name from the agent and its directory.
+def gen_session_name(base_name, sessions, cwd=None):
+    """Auto-generate a unique session name from base_name and the directory.
 
-    The first session for an agent gets the bare name ("claude"); a later one
-    that would collide is named after the directory it works in ("portal",
-    then "portal-2"). Users rarely care what a session is called (rename at
-    runtime via /rename), so this spares them inventing one — but the name is
-    also all a row shows about WHICH session it is, and a random "claude-a3f9"
-    said nothing, so two auto-named sessions under one project tree were
-    indistinguishable and the wrong transcript got downloaded (issue #277).
+    The first session for base_name gets the bare name ("claude"); a later
+    one that would collide is named after the directory it works in
+    ("portal", then "portal-2"). Users rarely care what a session is called
+    (rename at runtime via /rename), so this spares them inventing one — but
+    the name is also all a row shows about WHICH session it is, and a random
+    "claude-a3f9" said nothing, so two auto-named sessions under one project
+    tree were indistinguishable and the wrong transcript got downloaded
+    (issue #277).
 
-    `agent` is always one of AGENTS (or "shell"), so it already matches
-    SESSION_RE; `cwd` is None for home (whose basename is the user's own name
-    and names nothing) or an absolute path this daemon has resolved. Keeping
-    the mirror in session-cli.sh's gen_name in step is deliberate: both
-    creation paths must name a session the same way.
+    `base_name` is the profile name when the session was started with one,
+    else the agent — the caller (the /sessions/add handler) resolves that,
+    since only it knows whether a profile was given. Either way it is
+    already one of AGENTS/"shell" or a name PROFILE_NAME_RE has passed, so
+    it already matches SESSION_RE; `cwd` is None for home (whose basename is
+    the user's own name and names nothing) or an absolute path this daemon
+    has resolved. Keeping the mirror in session-cli.sh's gen_name in step is
+    deliberate: both creation paths must name a session the same way,
+    profile included — two profiles on the same harness ("triage" and
+    "reviewer", both claude) used to mint "claude" and "claude-2",
+    indistinguishable for the reason issue #277 named in the first place.
 
     RESERVED_NAMES count as taken: the directory branch below would happily
     name a session after ~/settings or ~/ws, and that is precisely the name
     the vhost cannot route to a terminal.
     """
     taken = set(sessions) | RESERVED_NAMES
-    if agent not in taken:
-        return agent
+    if base_name not in taken:
+        return base_name
     base = re.sub(r"[^A-Za-z0-9_-]", "-", os.path.basename((cwd or "").rstrip("/")))
     base = base.strip("-")
     if base and len(base) <= NAME_MAX - 2:
@@ -11529,11 +11545,11 @@ def gen_session_name(agent, sessions, cwd=None):
     # No usable directory name, or nine sessions already work in that one:
     # random cannot collide the way a tenth "-N" guess would.
     for _ in range(1000):
-        candidate = "%s-%s" % (agent, secrets.token_hex(2))
+        candidate = "%s-%s" % (base_name, secrets.token_hex(2))
         if candidate not in taken:
             return candidate
     # Astronomically unlikely fallback: a longer token can't be taken.
-    return ("%s-%s" % (agent, secrets.token_hex(8)))[:NAME_MAX]
+    return ("%s-%s" % (base_name, secrets.token_hex(8)))[:NAME_MAX]
 
 
 def write_sessions(sessions):
@@ -17281,12 +17297,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # the later rename would drop the earlier session outright.
             with sessions_lock():
                 sessions = read_sessions()
-                # The name is always auto-derived from the agent — there is no
-                # name field in the form. Users rarely care what a session is
-                # called (rename at runtime via /rename), so autogen spares
-                # them inventing one AND guarantees a unique key, so no
-                # collision or accidental-overwrite (issue 100) is possible.
-                name = gen_session_name(agent, sessions, cwd)
+                # The name is always auto-derived — there is no name field in
+                # the form — from the PROFILE when one was given (it is the
+                # more specific worker identity; see gen_session_name), else
+                # the agent. Users rarely care what a session is called
+                # (rename at runtime via /rename), so autogen spares them
+                # inventing one AND guarantees a unique key, so no collision
+                # or accidental-overwrite (issue 100) is possible.
+                name = gen_session_name(profile or agent, sessions, cwd)
                 sessions[name] = {
                     "agent": agent,
                     "skipPermissions": True,
