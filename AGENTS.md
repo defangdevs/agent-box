@@ -74,7 +74,7 @@ Keep the module self-contained: deployed boxes fetch `modules/agent-box.nix` as 
 
 The eval-level checks (`multi-user`, `module-single-file`, `download-route`, `webhook-route`, `module-generated-up-to-date`, `assemble-module-escaping`) and `nix run .#assemble` are exposed for both `x86_64-linux` and `aarch64-linux`, so they run natively on a Graviton box like the deployed fleet. The qcow2 image and the interactive `runNixOSTest` checks are `x86_64-linux`-only: a NixOS test needs a same-arch KVM guest, so building them from another arch would fall back to unusably slow TCG. Widen `vmSystems` in `flake.nix` to offer them elsewhere.
 
-Run the whole native set rather than a hand-picked subset - it is a few minutes, and there is no reliable way to guess which checks a change touches. Enumerate them from `nix flake show --json` and build each one. Editing anything under `modules/src/` is the case that punishes guessing: it breaks TWO committed fixtures plus the generated module, and each is a separate command (`python3 tests/test_agentbox.py --update`, `nix run .#update-golden`, `nix run .#assemble`). Discovering them one at a time costs a red CI round each; PR #472 spent two that way. Pass `--keep-going`, or `nix build` lists every not-yet-built check beside the one that really failed and those have no build log.
+Run the whole native set rather than a hand-picked subset - it is a few minutes, and there is no reliable way to guess which checks a change touches. Enumerate them from `nix flake show --json` and build each one. Editing anything under `modules/src/` is the case that punishes guessing, because which committed artefact moves depends on which payload you touched. The generated module always does (`nix run .#assemble`). A payload both backends render - a guide, a CLI wrapper - also moves `tests/native/expected/` (`python3 tests/test_agentbox.py --update`) AND `tests/golden/` (`nix run .#update-golden`), which is what caught PR #472 out for two red rounds. A web-only payload such as `settings.js` moves the golden tree alone, since the native expected tree carries no web payloads at all. Three artefacts, three separate commands, and no way to reason your way to the right subset faster than the checks will tell you. Pass `--keep-going`, or `nix build` lists every not-yet-built check beside the one that really failed and those have no build log.
 - `cfn-lint aws/template.yaml aws/lightsail-template.yaml` validates the CloudFormation templates.
 - `python3 scripts/check_azure_template.py` validates the Azure deployment: that `azure/agent-box.json` still matches a fresh `bicep build` of `azure/agent-box.bicep` (the JSON is a build artifact and is what the README's Deploy button serves, so an edit that never reached it ships nothing), that the bootstrap the template carries renders with no placeholder left, stays ASCII and parses under `bash -n`, and that the web password never leaves the extension's `protectedSettings` for the API-readable `settings`. Pass `--no-build` to skip the recompile on a machine with no Bicep CLI. Recompile with `cd azure && az bicep build --file agent-box.bicep`.
 
@@ -347,10 +347,12 @@ one here has already cost at least one.
   rejects `NotAllowedError` for want of transient activation, and
   `Browser.grantPermissions` with `clipboardReadWrite` is what lets you read
   back what the button copied (PR #421). For a SCREENSHOT, never point
-  chromium at the live page or the rig: the page opens an SSE stream that
-  never ends, so headless chromium never fires load and hangs past any
-  timeout. Curl the page to a file and shoot `file://`, where the inline CSS
-  and JS still render and only the SSE fails fast.
+  chromium at the live page or the rig: the page holds a persistent event
+  stream open and schedules polling on top of it, so a headless run that waits
+  for the network to settle never returns and dies on its timeout instead.
+  Curl the page to a file and shoot `file://` as a static-render workaround -
+  the CSS and JS are inline, so the initial paint is faithful, while the
+  page's own relative event and polling requests simply fail there.
 - **Never read a status through a pipe.** `cmd 2>&1 | tail -N; echo $?`
   reports `tail`'s status, which is almost always 0 - and nix prints
   `building '...drv'` lines whether or not the build succeeded, with the
