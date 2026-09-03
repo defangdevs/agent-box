@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 export AGENT_BOX_WEBHOOK_POLICY_FILE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook-watch-policy.json
 set -eu
 # jq/coreutils resolve from the webhook daemon unit's PATH (issue #154,

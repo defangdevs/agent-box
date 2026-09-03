@@ -1,0 +1,11 @@
+[Unit]
+
+[Socket]
+
+
+
+
+[Install]
+WantedBy=sockets.target fail2ban.service
+
+# X-Golden-wantedBy: fail2ban.service sockets.target

@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 # This runs as the last command in an agent's pane, so it inherits that
 # agent's PATH — which may be anything at all. Everything it needs is
 # pinned here instead: coreutils on a PATH of its own, jq and the registry

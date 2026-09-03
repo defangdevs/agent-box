@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 export AGENT_BOX_SESSION_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-session/bin/agent-box-session
 set -u
 # tmux, jq and head resolve from the web-terminal unit's PATH; the socket

@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 # Resolve the GitHub login this box ACTS AS and cache it, for local-webhook's
 # "@self" sender mute (issue #261). Prints the login on stdout; prints nothing
 # and exits 1 when it cannot be resolved.

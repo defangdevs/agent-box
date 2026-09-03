@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 # The pid-managed daemon backend records and probes its app-server child by
 # shelling out to a bare `ps` — procps sits on the agent unit's PATH
 # (agentBaseTools), which every session inherits. Without it every start

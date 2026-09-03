@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 export AGENT_BOX_AGENTS='claude codex shell'
 export AGENT_BOX_DEFAULT_AGENT=claude
 # A profile file is the env store in another directory, so it has the same
