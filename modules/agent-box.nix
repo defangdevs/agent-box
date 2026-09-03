@@ -4728,7 +4728,7 @@ esac
         ensure_state
         if [ "''${1:-}" != "-h" ] && [ "''${1:-}" != "--help" ]; then
           deliver_to=session; have_when=0; have_drop=0; topic=""; want=""
-          have_include=0; claims=""; profile=""; have_profile=0
+          have_include=0; have_exclude=0; claims=""; profile=""; have_profile=0
           # Filter --claim out of the argument list as we scan it: webhook.py has
           # never heard of that flag, so it is translated to --include below and
           # must not survive into the exec. Rotate idiom — take from the front,
@@ -4764,6 +4764,7 @@ esac
               --when|--when=*) have_when=1 ;;
               --drop|--drop=*) have_drop=1 ;;
               --include|--include=*) have_include=1 ;;
+              --exclude|--exclude=*) have_exclude=1 ;;
               --claim) want=claim; continue ;;
               --claim=*)
                 if [ -z "''${a#--claim=}" ]; then
@@ -4841,7 +4842,8 @@ esac
             fi
             set -- "$@" --include "$("$JQ" -nc --argjson any "$all" '{any:$any}')"
           fi
-          if [ "$deliver_to" = subagent ] && [ "$have_when" = 0 ] && [ "$have_drop" = 0 ]; then
+          if [ "$deliver_to" = subagent ] && [ "$have_when" = 0 ] && [ "$have_drop" = 0 ] \
+             && [ "$have_include" = 0 ] && [ "$have_exclude" = 0 ]; then
             # A bare "owner/repo" (no "source:" prefix at all) is the github
             # shorthand; anything with its OWN "source:" prefix — including a
             # non-github one whose key happens to contain a "/", e.g.
