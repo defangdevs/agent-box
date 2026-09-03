@@ -4069,6 +4069,23 @@ def render_new_session_fields(profiles=None):
     )
 
 
+def pane_state(name, live, stopped):
+    """Which of the three panes a session gets — the ONE derivation, read
+    by the tab bar and by render_pane alike, and stamped into the markup
+    so SCRIPT never has to re-derive it.
+
+    It answers "is the pane attachable", which is not the question the
+    tab's coloured dot answers. A session whose AGENT crashed still has a
+    live tmux session holding the post-mortem shell, so its dot says
+    `died` while its pane is `live` (issue #516). The client used to infer
+    the pane from the dot and so tore that shell out on the next live-feed
+    refresh, replacing the one surface that says WHY the agent died with a
+    "starting…" placeholder (CodeRabbit on PR #522)."""
+    if name in live:
+        return "live"
+    return "stopped" if name in stopped else "starting"
+
+
 def render_tabs(names, live, stopped, died, selected):
     """The workspace tab bar. File order, not sorted: sessions.json
     preserves insertion order, so a new session appears as the
@@ -4107,9 +4124,14 @@ def render_tabs(names, live, stopped, died, selected):
         # other place that says it, and neither is where the operator is
         # looking when a session dies under them.
         tip = (safe + " &mdash; the agent died") if state == "died" else safe
+        # The dot's state and the PANE's state are different questions, so
+        # the tab carries both: SCRIPT reads data-pane-state and never has
+        # to guess the second from the first (issue #516).
+        ps = pane_state(name, live, stopped)
         items.append(
             f'<span class="tab-wrap">'
-            f'<a class="tab" data-tab="{safe}" href="{home}?tab={safe}"{cur}'
+            f'<a class="tab" data-tab="{safe}" data-pane-state="{ps}"'
+            f' href="{home}?tab={safe}"{cur}'
             f' title="{tip}">'
             f'<span class="state" data-state="{state}"></span>'
             f'<span class="tab-name">{safe}</span></a>'
@@ -4164,7 +4186,8 @@ def render_pane(selected, live, stopped):
     if selected is None:
         return '<div class="pane placeholder active">No session selected.</div>'
     safe = html.escape(selected)
-    if selected in stopped and selected not in live:
+    state = pane_state(selected, live, stopped)
+    if state == "stopped":
         # The Start button lives HERE, not only in the settings page's session
         # row: this pane is what the operator is looking at when they find out
         # the session is down, and sending them to another page to press a
@@ -4184,7 +4207,7 @@ def render_pane(selected, live, stopped):
                 f'<input type="hidden" name="back" value="workspace">'
                 f'<button type="submit" class="btn small">Start</button>'
                 f'</form></div>')
-    if selected not in live:
+    if state == "starting":
         return (f'<div class="pane placeholder active" data-pane="{safe}" '
                 f'data-ph="starting">{safe} is starting&hellip; '
                 f'reload in a few seconds.</div>')

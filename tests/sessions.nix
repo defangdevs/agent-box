@@ -1473,9 +1473,18 @@ in
         # can never show the clear.
         machine.succeed(as_agent("agent-box-session add revived"))
         machine.wait_until_succeeds(tmux("has-session -t =revived"), timeout=120)
+        # Under the registry lock, the same one every writer in the box
+        # takes: has-session only proves tmux created the session, and the
+        # supervisor can still be inside its own mark_started read-modify-
+        # write. An unlocked jq-and-mv here would publish a document read
+        # before that update and lose one of the two writes -- either the
+        # seeded died=99 or the supervisor's (CodeRabbit on PR #522).
         machine.succeed(as_agent(
-            f"jq '.sessions.revived.died = 99' {sfile} > {sfile}.t "
-            f"&& mv {sfile}.t {sfile}"
+            f"flock {sfile}.lock sh -c "
+            + shlex.quote(
+                f"jq '.sessions.revived.died = 99' {sfile} > {sfile}.t "
+                f"&& mv {sfile}.t {sfile}"
+            )
         ))
         machine.succeed(f"jq -e '.sessions.revived.died == 99' {sfile}")
         machine.succeed(as_agent("agent-box-session restart revived"))

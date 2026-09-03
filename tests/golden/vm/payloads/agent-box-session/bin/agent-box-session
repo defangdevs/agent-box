@@ -563,7 +563,7 @@ case "$cmd" in
       [ -n "$n" ] || continue
       [ "$n" != "$me" ] || continue
       peers=$((peers + 1))
-      harness="-"; cwd="-"; unmanaged=""; dead=""
+      harness="-"; cwd="-"; unmanaged="managed"; dead="-"
       if [ -s "$REGISTRY_FILE" ]; then
         # One read per session, and a session tmux knows but the registry
         # does not is reported as `unmanaged` rather than skipped: it is
@@ -572,12 +572,23 @@ case "$cmd" in
           if (.sessions | has($n)) then
             [(.sessions[$n].agent // "-"),
              (.sessions[$n].workingDirectory // "-"),
-             "",
-             (.sessions[$n].died // "" | tostring)] | @tsv
-          else "-\t-\tunmanaged\t" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
+             "managed",
+             (.sessions[$n].died // "-" | tostring)] | @tsv
+          else "-\t-\tunmanaged\t-" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
+        # EVERY field carries a non-empty sentinel, and that is load-bearing
+        # rather than tidy: tab is an IFS WHITESPACE character, so bash `read`
+        # folds a run of them into one delimiter and an empty field simply
+        # vanishes. A live session (died unset) used to emit `agent<TAB>cwd
+        # <TAB><TAB>`, whose empty third field collapsed — `unmanaged` took
+        # the fourth, so every registered session read as "not in the
+        # registry" and a crash never reported DIED (CodeRabbit on PR #522).
         IFS="$(printf '\t')" read -r harness cwd unmanaged dead <<<"$meta"
+        # A jq that failed leaves all four empty; put the sentinels back, or
+        # an unreadable registry reads as a corpse with no exit status.
         [ -n "$harness" ] || harness="-"
         [ -n "$cwd" ] || cwd="-"
+        [ -n "$unmanaged" ] || unmanaged="managed"
+        [ -n "$dead" ] || dead="-"
         # No recorded working directory means the supervisor starts it in
         # $HOME — say that, rather than a dash a reader has to interpret. It
         # is where the session STARTED either way: an agent can cd anywhere,
@@ -592,12 +603,12 @@ case "$cmd" in
       [ "$harness" != "-" ] || harness="harness unknown"
       kind="interactive"
       case "$n" in (hook-*) kind="dispatched (hook session)" ;; esac
-      [ -z "$unmanaged" ] || kind="$kind, not in the registry"
+      [ "$unmanaged" = "managed" ] || kind="$kind, not in the registry"
       # A session whose agent CRASHED is still a live tmux session, because
       # the pane it left behind is a post-mortem shell (issue #516). Nobody
       # is working in it, so it is not a peer to yield to — and yielding to
       # one is exactly what this command exists to prevent.
-      [ -z "$dead" ] \
+      [ "$dead" = "-" ] \
         || kind="$kind, DIED (exit $dead) — its pane is a post-mortem shell, so nobody is working in it"
       out="$out$(printf '%s — %s, %s, cwd %s' "$n" "$harness" "$kind" "$cwd")"$'\n'
       ff="$sd/filter.$user-$n.json"

@@ -3033,7 +3033,7 @@ case "$cmd" in
       [ -n "$n" ] || continue
       [ "$n" != "$me" ] || continue
       peers=$((peers + 1))
-      harness="-"; cwd="-"; unmanaged=""; dead=""
+      harness="-"; cwd="-"; unmanaged="managed"; dead="-"
       if [ -s "$REGISTRY_FILE" ]; then
         # One read per session, and a session tmux knows but the registry
         # does not is reported as `unmanaged` rather than skipped: it is
@@ -3042,12 +3042,23 @@ case "$cmd" in
           if (.sessions | has($n)) then
             [(.sessions[$n].agent // "-"),
              (.sessions[$n].workingDirectory // "-"),
-             "",
-             (.sessions[$n].died // "" | tostring)] | @tsv
-          else "-\t-\tunmanaged\t" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
+             "managed",
+             (.sessions[$n].died // "-" | tostring)] | @tsv
+          else "-\t-\tunmanaged\t-" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
+        # EVERY field carries a non-empty sentinel, and that is load-bearing
+        # rather than tidy: tab is an IFS WHITESPACE character, so bash `read`
+        # folds a run of them into one delimiter and an empty field simply
+        # vanishes. A live session (died unset) used to emit `agent<TAB>cwd
+        # <TAB><TAB>`, whose empty third field collapsed — `unmanaged` took
+        # the fourth, so every registered session read as "not in the
+        # registry" and a crash never reported DIED (CodeRabbit on PR #522).
         IFS="$(printf '\t')" read -r harness cwd unmanaged dead <<<"$meta"
+        # A jq that failed leaves all four empty; put the sentinels back, or
+        # an unreadable registry reads as a corpse with no exit status.
         [ -n "$harness" ] || harness="-"
         [ -n "$cwd" ] || cwd="-"
+        [ -n "$unmanaged" ] || unmanaged="managed"
+        [ -n "$dead" ] || dead="-"
         # No recorded working directory means the supervisor starts it in
         # $HOME — say that, rather than a dash a reader has to interpret. It
         # is where the session STARTED either way: an agent can cd anywhere,
@@ -3062,12 +3073,12 @@ case "$cmd" in
       [ "$harness" != "-" ] || harness="harness unknown"
       kind="interactive"
       case "$n" in (hook-*) kind="dispatched (hook session)" ;; esac
-      [ -z "$unmanaged" ] || kind="$kind, not in the registry"
+      [ "$unmanaged" = "managed" ] || kind="$kind, not in the registry"
       # A session whose agent CRASHED is still a live tmux session, because
       # the pane it left behind is a post-mortem shell (issue #516). Nobody
       # is working in it, so it is not a peer to yield to — and yielding to
       # one is exactly what this command exists to prevent.
-      [ -z "$dead" ] \
+      [ "$dead" = "-" ] \
         || kind="$kind, DIED (exit $dead) — its pane is a post-mortem shell, so nobody is working in it"
       out="$out$(printf '%s — %s, %s, cwd %s' "$n" "$harness" "$kind" "$cwd")"$'\n'
       ff="$sd/filter.$user-$n.json"
@@ -14879,11 +14890,10 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     var s = t ? t.querySelector("[data-state]") : null;
     return s ? s.getAttribute("data-state") : "";
   }
-  function tabLive(name) { return tabState(name) === "live"; }
   function placeholderText(name) {
     // Mirrors render_pane: a stopped session is not coming up on its
     // own, so don't promise that it is starting.
-    return tabState(name) === "stopped"
+    return paneState(name) === "stopped"
       ? name + " is stopped — nothing starts it on its own."
       : name + " is starting…";
   }
@@ -14922,8 +14932,23 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   function paneState(name) {
     // The three states a pane is built for; data-ph records which one the
     // mounted pane belongs to, on the iframe as much as on a placeholder.
-    if (tabLive(name)) { return "live"; }
-    return tabState(name) === "stopped" ? "stopped" : "starting";
+    //
+    // The SERVER decides it (pane_state in the daemon) and stamps it on the
+    // tab, because "is the pane attachable" is not the question the tab's
+    // coloured dot answers: a session whose agent crashed keeps a live tmux
+    // session holding the post-mortem shell, so its dot reads `died` while
+    // its pane is `live` (issue #516). Deriving the pane from the dot here
+    // put the two sides out of step — the first live-feed refresh replaced
+    // that shell with a "starting…" placeholder and threw away the one
+    // surface that says WHY (CodeRabbit on PR #522).
+    var t = tabEl(name);
+    var ps = t ? t.getAttribute("data-pane-state") : null;
+    if (ps) { return ps; }
+    // Markup rendered before that stamp existed: fall back to the dot,
+    // which agrees with the server for every state except `died`.
+    var st = tabState(name);
+    if (st === "live" || st === "died") { return "live"; }
+    return st === "stopped" ? "stopped" : "starting";
   }
   function ensurePane(name) {
     var cur = document.querySelector('#panes .pane[data-pane="' + name + '"]');
@@ -14938,7 +14963,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     // Panes rendered before this stamp existed are server-rendered iframes.
     if (cur && (cur.getAttribute("data-ph") || "live") === want) { return cur; }
     var el;
-    if (tabLive(name)) {
+    if (want === "live") {
       el = document.createElement("iframe");
       // data-term-base is this user's own path with its trailing slash;
       // a session hangs off it as a path segment, not a query.
@@ -16372,6 +16397,23 @@ def render_new_session_fields(profiles=None):
     )
 
 
+def pane_state(name, live, stopped):
+    """Which of the three panes a session gets — the ONE derivation, read
+    by the tab bar and by render_pane alike, and stamped into the markup
+    so SCRIPT never has to re-derive it.
+
+    It answers "is the pane attachable", which is not the question the
+    tab's coloured dot answers. A session whose AGENT crashed still has a
+    live tmux session holding the post-mortem shell, so its dot says
+    `died` while its pane is `live` (issue #516). The client used to infer
+    the pane from the dot and so tore that shell out on the next live-feed
+    refresh, replacing the one surface that says WHY the agent died with a
+    "starting…" placeholder (CodeRabbit on PR #522)."""
+    if name in live:
+        return "live"
+    return "stopped" if name in stopped else "starting"
+
+
 def render_tabs(names, live, stopped, died, selected):
     """The workspace tab bar. File order, not sorted: sessions.json
     preserves insertion order, so a new session appears as the
@@ -16410,9 +16452,14 @@ def render_tabs(names, live, stopped, died, selected):
         # other place that says it, and neither is where the operator is
         # looking when a session dies under them.
         tip = (safe + " &mdash; the agent died") if state == "died" else safe
+        # The dot's state and the PANE's state are different questions, so
+        # the tab carries both: SCRIPT reads data-pane-state and never has
+        # to guess the second from the first (issue #516).
+        ps = pane_state(name, live, stopped)
         items.append(
             f'<span class="tab-wrap">'
-            f'<a class="tab" data-tab="{safe}" href="{home}?tab={safe}"{cur}'
+            f'<a class="tab" data-tab="{safe}" data-pane-state="{ps}"'
+            f' href="{home}?tab={safe}"{cur}'
             f' title="{tip}">'
             f'<span class="state" data-state="{state}"></span>'
             f'<span class="tab-name">{safe}</span></a>'
@@ -16467,7 +16514,8 @@ def render_pane(selected, live, stopped):
     if selected is None:
         return '<div class="pane placeholder active">No session selected.</div>'
     safe = html.escape(selected)
-    if selected in stopped and selected not in live:
+    state = pane_state(selected, live, stopped)
+    if state == "stopped":
         # The Start button lives HERE, not only in the settings page's session
         # row: this pane is what the operator is looking at when they find out
         # the session is down, and sending them to another page to press a
@@ -16487,7 +16535,7 @@ def render_pane(selected, live, stopped):
                 f'<input type="hidden" name="back" value="workspace">'
                 f'<button type="submit" class="btn small">Start</button>'
                 f'</form></div>')
-    if selected not in live:
+    if state == "starting":
         return (f'<div class="pane placeholder active" data-pane="{safe}" '
                 f'data-ph="starting">{safe} is starting&hellip; '
                 f'reload in a few seconds.</div>')

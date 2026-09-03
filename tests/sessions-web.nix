@@ -427,10 +427,22 @@ in
         tab = tab[:tab.index("</a>")]
         assert 'data-state="died"' in tab, tab
         assert "the agent died" in tab, tab
+        # The dot says the AGENT died; the pane state says the tmux session
+        # is still attachable, and the tab carries both. SCRIPT reads this
+        # one rather than deriving it from the dot -- deriving it is what
+        # made the client tear the post-mortem shell out on the next
+        # live-feed refresh (CodeRabbit on PR #522).
+        assert 'data-pane-state="live"' in tab, tab
         # The pane still attaches: the post-mortem shell holds the error the
         # operator came to read, and hiding it behind a placeholder would
         # throw away the one thing that says WHY.
-        assert 'data-ph="live"' in died_ws, died_ws
+        #
+        # Scoped to THIS session's pane, never the whole page: `main` is live
+        # in the same workspace, so a page-wide search for data-ph="live"
+        # passes on main's iframe even when `crashed` got a placeholder.
+        crashed_pane = died_ws[died_ws.index('data-pane="crashed"'):]
+        crashed_pane = crashed_pane[:crashed_pane.index(">") + 1]
+        assert 'data-ph="live"' in crashed_pane, crashed_pane
 
         machine.succeed(as_agent("agent-box-session rm crashed"))
 
