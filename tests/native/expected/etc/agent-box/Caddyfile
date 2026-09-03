@@ -3,7 +3,13 @@
 # the next agentbox apply. To add your own virtual host,
 # drop a *.caddy snippet into ~/sites/ (which is a symlink into
 # /var/lib/agent-box-sites/<you>/, a caddy-readable location) and
-# reload with: sudo systemctl reload caddy.service
+# reload caddy with:
+#
+#     sudo /usr/bin/systemctl reload caddy.service
+#
+# spelled with the full path, because sudoers matches the command path
+# exactly and a bare `systemctl` can resolve through PATH to one it will
+# not match — which asks for a password the agent does not have.
 #
 # Recommended snippet shape — reverse-proxy to a localhost port your
 # agent runs, NOT `file_server /home/<you>/...`. caddy.service has
@@ -303,3 +309,14 @@ handle {
 }
 
 }
+
+# Per-user snippet directories. Each agent user's ~/sites/ symlinks
+# here. Add a file below and reload caddy — that is the whole
+# workflow, no agentbox apply required:
+#
+#     sudo /usr/bin/systemctl reload caddy.service
+#
+# One import per user: Caddyfile's `import` directive only accepts a
+# single `*` per pattern, so we can't collapse this to `*/*.caddy`.
+import /var/lib/agent-box-sites/agent/*.caddy
+import /var/lib/agent-box-sites/robot/*.caddy

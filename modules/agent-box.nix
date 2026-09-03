@@ -18632,13 +18632,20 @@ if __name__ == "__main__":
       # can't read /home. See the comment block at the top of the rendered
       # file below (agents will read that from the running box).
       managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
-      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" ]
-        [ cfg.web.domain "services.agent-box" "nixos-rebuild switch" ] ''
+      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" ]
+        [ cfg.web.domain "services.agent-box" "nixos-rebuild switch"
+          caddyReloadCmd ] ''
         # This file is managed by @MANAGED_BY@ — edits here get OVERWRITTEN on
         # the next @APPLY_CMD@. To add your own virtual host,
         # drop a *.caddy snippet into ~/sites/ (which is a symlink into
         # /var/lib/agent-box-sites/<you>/, a caddy-readable location) and
-        # reload with: sudo systemctl reload caddy.service
+        # reload caddy with:
+        #
+        #     sudo @RELOAD_CMD@
+        #
+        # spelled with the full path, because sudoers matches the command path
+        # exactly and a bare `systemctl` can resolve through PATH to one it will
+        # not match — which asks for a password the agent does not have.
         #
         # Recommended snippet shape — reverse-proxy to a localhost port your
         # agent runs, NOT `file_server /home/<you>/...`. caddy.service has
@@ -18679,10 +18686,16 @@ if __name__ == "__main__":
       + "\n"
       + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
       + "}\n\n"
-      + ''
+      # The same fragment the native renderer binds (issue #154 Phase 2), so
+      # both backends document — and wire — this extension point identically.
+      + lib.replaceStrings [ "@APPLY_CMD@" "@RELOAD_CMD@" ]
+          [ "nixos-rebuild switch" caddyReloadCmd ] ''
         # Per-user snippet directories. Each agent user's ~/sites/ symlinks
-        # here. Adding a file below and running `sudo systemctl reload
-        # caddy.service` is the whole workflow — no nixos-rebuild required.
+        # here. Add a file below and reload caddy — that is the whole
+        # workflow, no @APPLY_CMD@ required:
+        #
+        #     sudo @RELOAD_CMD@
+        #
         # One import per user: Caddyfile's `import` directive only accepts a
         # single `*` per pattern, so we can't collapse this to `*/*.caddy`.
       ''
