@@ -1834,9 +1834,19 @@ if __name__ == "__main__":
           return 1
         fi
       fi
-      registry_unlock
       _registry_heal_warned=0
+      # STILL HOLDING THE LOCK: moving the bad file aside and re-seeding are one
+      # step. Release between them and `agent-box-session add` can create the
+      # registry in the gap — registry_ensure never clobbers a file that exists,
+      # so the declared sessions would stay unseeded on that boot and every later
+      # one, which is the outcome this whole function exists to avoid. Same
+      # reasoning as issue #289, which put creation inside the protocol in the
+      # first place. registry_ensure takes the lock again and the lock nests, so
+      # this does not deadlock against itself.
       registry_ensure "''${1:-}"
+      _registry_heal_rc=$?
+      registry_unlock
+      return "$_registry_heal_rc"
     }
 
     registry_ensure() {
@@ -2824,9 +2834,19 @@ registry_selfheal() {
       return 1
     fi
   fi
-  registry_unlock
   _registry_heal_warned=0
+  # STILL HOLDING THE LOCK: moving the bad file aside and re-seeding are one
+  # step. Release between them and `agent-box-session add` can create the
+  # registry in the gap — registry_ensure never clobbers a file that exists,
+  # so the declared sessions would stay unseeded on that boot and every later
+  # one, which is the outcome this whole function exists to avoid. Same
+  # reasoning as issue #289, which put creation inside the protocol in the
+  # first place. registry_ensure takes the lock again and the lock nests, so
+  # this does not deadlock against itself.
   registry_ensure "''${1:-}"
+  _registry_heal_rc=$?
+  registry_unlock
+  return "$_registry_heal_rc"
 }
 
 registry_ensure() {
@@ -5703,9 +5723,19 @@ registry_selfheal() {
       return 1
     fi
   fi
-  registry_unlock
   _registry_heal_warned=0
+  # STILL HOLDING THE LOCK: moving the bad file aside and re-seeding are one
+  # step. Release between them and `agent-box-session add` can create the
+  # registry in the gap — registry_ensure never clobbers a file that exists,
+  # so the declared sessions would stay unseeded on that boot and every later
+  # one, which is the outcome this whole function exists to avoid. Same
+  # reasoning as issue #289, which put creation inside the protocol in the
+  # first place. registry_ensure takes the lock again and the lock nests, so
+  # this does not deadlock against itself.
   registry_ensure "''${1:-}"
+  _registry_heal_rc=$?
+  registry_unlock
+  return "$_registry_heal_rc"
 }
 
 registry_ensure() {
@@ -8001,9 +8031,19 @@ esac
           return 1
         fi
       fi
-      registry_unlock
       _registry_heal_warned=0
+      # STILL HOLDING THE LOCK: moving the bad file aside and re-seeding are one
+      # step. Release between them and `agent-box-session add` can create the
+      # registry in the gap — registry_ensure never clobbers a file that exists,
+      # so the declared sessions would stay unseeded on that boot and every later
+      # one, which is the outcome this whole function exists to avoid. Same
+      # reasoning as issue #289, which put creation inside the protocol in the
+      # first place. registry_ensure takes the lock again and the lock nests, so
+      # this does not deadlock against itself.
       registry_ensure "''${1:-}"
+      _registry_heal_rc=$?
+      registry_unlock
+      return "$_registry_heal_rc"
     }
 
     registry_ensure() {

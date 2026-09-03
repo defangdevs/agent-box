@@ -599,6 +599,28 @@ class SelfHeal(RegistryCase):
         self.assertEqual(self.corrupt_files(), [])
         self.assertEqual(done.stderr.count("could not be"), 1, done.stderr)
 
+    def test_quarantine_and_re_seed_are_one_critical_section(self):
+        """The gap that would cost the declared sessions: release the lock
+        between moving the bad file aside and re-seeding, and an
+        `agent-box-session add` can create the registry in it. registry_ensure
+        never clobbers a file that exists, so the seed would be skipped on
+        that boot and every later one.
+
+        Asked of the library directly, by standing in for registry_ensure:
+        timing a window this small from outside would prove nothing on a
+        loaded runner.
+        """
+        self.file.write_text("not json\n")
+        done = self.run_writer(
+            'registry_ensure() { '
+            'echo "ensure held=$REGISTRY_HELD depth=$_registry_depth" >&2; }\n'
+            + self.HEAL, args=[str(self.seed_file)])
+        # The section is still open whether or not this box has flock; with
+        # flock the lock is genuinely held as well.
+        self.assertIn("depth=1", done.stderr)
+        if FLOCK:
+            self.assertIn("held=1", done.stderr)
+
     def test_healing_waits_for_a_writer_that_holds_the_lock(self):
         # The one that would cost data: a writer mid read-modify-write has
         # already read the good document and is about to rename it into

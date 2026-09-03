@@ -1724,7 +1724,11 @@ in
         machine.succeed(as_agent(
             f"printf 'not json\\n' > {sfile}; "
             "env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box "
-            "kill-session -t =main"
+            # `|| true`: main may be the only session left by this point in
+            # the file, and killing the last one ends the tmux server, which
+            # tmux can report back as a failure. What matters is that the
+            # pane is gone.
+            "kill-session -t =main || true"
         ))
         # The box comes back on its own, with no operator and no restart.
         machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=120)
@@ -1734,13 +1738,15 @@ in
         kept = machine.succeed(as_agent(f"ls {sfile}.corrupt-*")).split()[0]
         assert "not json" in machine.succeed(as_agent(f"cat {kept}")), kept
         # And the journal names it, which is all an operator staring at an
-        # idle box has to go on.
-        log = machine.succeed(
+        # idle box has to go on. NOT called `log`: the test driver already
+        # binds that name to its own AbstractLogger, and the driver's type
+        # check refuses the shadowing at BUILD time, before any VM boots.
+        journal = machine.succeed(
             "journalctl -u agent-box@agent.service --no-pager "
             f"--since '{since}'"
         )
-        assert sfile in log, log
-        assert "does not parse" in log, log
+        assert sfile in journal, journal
+        assert "does not parse" in journal, journal
         machine.succeed(as_agent(f"rm -f {sfile}.corrupt-*"))
 
   '';
