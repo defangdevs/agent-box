@@ -422,17 +422,23 @@ mintable() {
   ! reserved_name "$1" && ! taken "$1"
 }
 gen_name() {
-  # gen_name HARNESS [CWD] — echo a unique session name derived from HARNESS:
-  # the bare name when free ("claude"), else the working directory's own name
-  # ("portal", then "portal-2"). Callers pass a validated harness, itself a
-  # valid name; CWD is whatever the caller will store, so it is untrusted
-  # text and gets folded into the name charset here.
+  # gen_name BASE [CWD] — echo a unique session name derived from BASE: the
+  # bare name when free ("claude"), else the working directory's own name
+  # ("portal", then "portal-2"). BASE is the profile name when the session
+  # was started with one, else the harness — a validated name either way, so
+  # this takes it as given; CWD is whatever the caller will store, so it is
+  # untrusted text and gets folded into the name charset here.
   #
   # A random "claude-a3f9" named nothing an operator could recognise, and the
   # web UI's row shows only name, agent, cwd and state — so two auto-named
   # claude sessions under one project tree were indistinguishable and the
-  # wrong transcript got downloaded (issue #277). The directory name is the
-  # one fact that says WHERE this session works.
+  # wrong transcript got downloaded (issue #277). Naming from the PROFILE
+  # rather than the harness is the same fix applied one layer up: with
+  # "Add session" profile-first (issue #493), two profiles on the same
+  # harness ("triage" and "reviewer", both claude) used to mint "claude" and
+  # "claude-2" — indistinguishable again, and for the same reason issue #277
+  # named. The directory name is the next-best fact when BASE collides, since
+  # it says WHERE this session works.
   a="$1"
   mintable "$a" && { printf '%s' "$a"; return; }
   # HOME is deliberately not used: its basename is the user's own name, which
@@ -703,7 +709,10 @@ case "$cmd" in
     # could pick the same free name and the second rename would drop the first
     # session outright.
     registry_lock
-    [ -n "$name" ] || name="$(gen_name "$harness" "$cwd")"
+    # The profile is the more specific name when there is one (see gen_name):
+    # two profiles on the same harness should mint two different names, not
+    # "claude" and "claude-2" for workers nobody would call the same thing.
+    [ -n "$name" ] || name="$(gen_name "${profile:-$harness}" "$cwd")"
     if taken "$name"; then
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
