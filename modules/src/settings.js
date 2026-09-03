@@ -763,7 +763,7 @@
 
   // The editors render expanded (no-JS fallback); collapse them once
   // JS is live so the page opens in list-only, GitHub-style form.
-  ["secret-editor", "session-editor", "password-editor"].forEach(function (id) {
+  ["secret-editor", "session-editor", "password-editor", "profile-editor"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) { el.hidden = true; }
   });
