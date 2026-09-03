@@ -497,7 +497,8 @@
     // that shell with a "starting…" placeholder and threw away the one
     // surface that says WHY (CodeRabbit on PR #522).
     var t = tabEl(name);
-    var ps = t ? t.getAttribute("data-pane-state") : null;
+    var el = t ? t.querySelector("[data-pane-state]") : null;
+    var ps = el ? el.getAttribute("data-pane-state") : null;
     if (ps) { return ps; }
     // Markup rendered before that stamp existed: fall back to the dot,
     // which agrees with the server for every state except `died`.

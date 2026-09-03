@@ -4124,16 +4124,19 @@ def render_tabs(names, live, stopped, died, selected):
         # other place that says it, and neither is where the operator is
         # looking when a session dies under them.
         tip = (safe + " &mdash; the agent died") if state == "died" else safe
-        # The dot's state and the PANE's state are different questions, so
-        # the tab carries both: SCRIPT reads data-pane-state and never has
-        # to guess the second from the first (issue #516).
+        # The dot's state and the PANE's state are different questions, and
+        # the dot carries both answers side by side: `died` says the agent
+        # is gone, `live` says its tmux session is still attachable. SCRIPT
+        # reads data-pane-state and never guesses the second from the first
+        # (issue #516). It rides on this span rather than on the <a> so that
+        # the tab's own attribute order stays as it was.
         ps = pane_state(name, live, stopped)
         items.append(
             f'<span class="tab-wrap">'
-            f'<a class="tab" data-tab="{safe}" data-pane-state="{ps}"'
-            f' href="{home}?tab={safe}"{cur}'
+            f'<a class="tab" data-tab="{safe}" href="{home}?tab={safe}"{cur}'
             f' title="{tip}">'
-            f'<span class="state" data-state="{state}"></span>'
+            f'<span class="state" data-state="{state}"'
+            f' data-pane-state="{ps}"></span>'
             f'<span class="tab-name">{safe}</span></a>'
             f'<form class="tab-close" method="post" action="{base}/sessions/delete">'
             f'<input type="hidden" name="name" value="{safe}">'
