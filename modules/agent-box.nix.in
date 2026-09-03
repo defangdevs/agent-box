@@ -3527,6 +3527,14 @@ in
               pkgs.gnugrep
               pkgs.gnused
               pkgs.systemd
+              # agent-box-profile (AGENT_BOX_PROFILE_BIN, invoked by this
+              # daemon for /sessions/add and /profiles/set) shells out to
+              # jq from PATH rather than a pinned store path — same as the
+              # agent-box-session and tmux-attach units below, which both
+              # already carry it. Without it here, profile resolution
+              # fails silently (jq: command not found) and the daemon
+              # reports an intact profile as possibly deleted.
+              pkgs.jq
             ]);
           };
         serviceConfig.ExecStart = [ "" (settingsContractBin (lib.elemAt settingsContract.execStart 0)) ];
