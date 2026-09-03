@@ -1497,6 +1497,108 @@ in
         assert re.search(r"^revived\s+claude\s+live", ls_out, re.M), ls_out
         machine.succeed(as_agent("agent-box-session rm revived"))
 
+    # --- a lease records how an accepted assignment ended (issue #535) ----
+    #
+    # webhook-spawn.sh's lease_create writes one at spawn (asserted against
+    # a REAL dispatch in tests/webhook.nix); what happens to it after —
+    # died, vanished, or resolved by a clean exit — is the mark-stopped.sh /
+    # supervisor.sh wiring under test here, and none of that needs a real
+    # dispatch. Seeded by hand, the same way "a spawn clears a stale died
+    # flag" above seeds died=99, so this exercises the OUTCOME half in
+    # isolation with the fake-agent harness already proven reliable for
+    # died/stopped.
+    machine.succeed(as_agent("mkdir -p /home/agent/.local/state/agent-box/lease"))
+
+    def seed_lease(name):
+        machine.succeed(as_agent(
+            "printf '%s' "
+            + shlex.quote(
+                '{"topic":"github:defangdevs/agent-box","object":"1",'
+                '"claimedAt":"2026-01-01T00:00:00Z","outcome":null}'
+            )
+            + " > " + lease_file(name)
+        ))
+
+    def lease_outcome(name):
+        return machine.succeed(
+            f"jq -r '.outcome // \"null\"' {lease_file(name)}"
+        ).strip()
+
+    with subtest("a crash records died:<status> on an open lease"):
+        # Seeded BEFORE the add: `--not-a-real-flag` can crash the pane
+        # before a lease seeded afterwards would exist, and lease_mark_outcome
+        # is a no-op with no lease file to write into.
+        seed_lease("hook-lease-crash")
+        machine.succeed(
+            as_agent("agent-box-session add hook-lease-crash -- --not-a-real-flag"))
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions[\"hook-lease-crash\"].died == 1' {sfile}", timeout=120
+        )
+        assert lease_outcome("hook-lease-crash") == "died:1", lease_outcome("hook-lease-crash")
+        ls_out = machine.succeed(as_agent("agent-box-session ls"))
+        assert re.search(
+            r"^hook-lease-crash\s+claude\s+died\(1\), UNRESOLVED ASSIGNMENT \(died:1\)",
+            ls_out, re.M), ls_out
+        machine.succeed(as_agent("agent-box-session rm hook-lease-crash"))
+        # rm's own cleanup (lease_clear) leaves nothing behind either.
+        machine.fail(f"test -e {lease_file('hook-lease-crash')}")
+
+    with subtest("a respawn with no epilogue at all is recorded as vanished"):
+        # kill-session (like a reboot, or the OOM-kill that stranded #279)
+        # ends a pane with NO epilogue — mark-stopped.sh never runs, so
+        # nothing sets `died`, and the reconcile loop just respawns. That
+        # silent case is what start_session's own launched-and-not-died
+        # check (supervisor.sh) is for.
+        machine.succeed(as_agent("agent-box-session add hook-lease-vanish"))
+        machine.wait_until_succeeds(tmux("has-session -t =hook-lease-vanish"), timeout=120)
+        seed_lease("hook-lease-vanish")
+        machine.succeed(tmux("kill-session -t =hook-lease-vanish"))
+        machine.wait_until_succeeds(tmux("has-session -t =hook-lease-vanish"), timeout=60)
+        assert lease_outcome("hook-lease-vanish") == "vanished", lease_outcome("hook-lease-vanish")
+        ls_out = machine.succeed(as_agent("agent-box-session ls"))
+        assert "UNRESOLVED ASSIGNMENT (vanished)" in ls_out, ls_out
+        # `peers` is what a sibling session reads before deciding whether an
+        # object is already owned — the same surface a hook session's own
+        # yield-rule preamble carries. It has to say the same thing.
+        peers = machine.succeed(as_agent("agent-box-session peers"))
+        assert "hook-lease-vanish —" in peers, peers
+        assert "UNRESOLVED ASSIGNMENT (vanished)" in peers, peers
+
+        # A later clean exit resolves it -- whatever the earlier respawn's
+        # lease said no longer applies once the session gets the chance to
+        # say it is done. Flip its args to the clean-exit shape and restart,
+        # the same way "a spawn clears a stale died flag" revives `revived`.
+        machine.succeed(as_agent(
+            f"flock {sfile}.lock sh -c "
+            + shlex.quote(
+                f'jq \'.sessions["hook-lease-vanish"].extraArgs = ["--help"]\' {sfile}'
+                f" > {sfile}.t && mv {sfile}.t {sfile}"
+            )
+        ))
+        machine.succeed(as_agent("agent-box-session restart hook-lease-vanish"))
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions[\"hook-lease-vanish\"].stopped == true' {sfile}",
+            timeout=120,
+        )
+        machine.fail(f"test -e {lease_file('hook-lease-vanish')}")
+        machine.succeed(as_agent("agent-box-session rm hook-lease-vanish"))
+
+    with subtest("an ordinary session is never flagged"):
+        # No lease is ever created for a session started directly (only
+        # webhook-spawn.sh calls lease_create), so a crash here must read
+        # exactly as it did before issue #535 — lease_outcome's own `-s`
+        # guard is what keeps ls/peers silent rather than erroring on a
+        # session that was never leased.
+        machine.succeed(
+            as_agent("agent-box-session add ordinary-crash -- --not-a-real-flag"))
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions[\"ordinary-crash\"].died == 1' {sfile}", timeout=120
+        )
+        ls_out = machine.succeed(as_agent("agent-box-session ls"))
+        assert re.search(r"^ordinary-crash\s+claude\s+died\(1\)\s*$", ls_out, re.M), ls_out
+        assert "UNRESOLVED ASSIGNMENT" not in ls_out, ls_out
+        machine.succeed(as_agent("agent-box-session rm ordinary-crash"))
+
     with subtest("a one-shot session is delisted, not parked"):
         # A hook-* session's shape: spawned --ephemeral because nobody will
         # ever resume it. Both ways of parking one must end in a DELIST, so

@@ -948,6 +948,17 @@
         f" /home/agent/.local/state/local-webhook/filter.agent-{other}.json"
     )
 
+    # lease_create's own file (issue #535) is a durable audit record of the
+    # same spawn, independent of the filter file above (which EXPIRES). Its
+    # shape is asserted against a REAL run of this script in the
+    # `webhook-spawn-claim` native check instead of here: this test's own
+    # testScript sits within ~1.5 KiB of the 128 KiB driver limit
+    # (testscript-fits), and lease_create is a pure function of the same
+    # LOCAL_WEBHOOK_SPAWN_META that check already drives this wrapper with.
+    # What only a VM can show — the outcome wiring on a crash, a silent
+    # death with no epilogue, or a clean exit — is tested with the
+    # fake-agent harness in tests/sessions.nix instead.
+
     # What a claim looks like for a numbered object, for a commit, and for a
     # meta the wrapper cannot parse is asserted in the `webhook-spawn-claim`
     # check instead. Those are pure functions of LOCAL_WEBHOOK_SPAWN_META, so

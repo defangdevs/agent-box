@@ -362,6 +362,8 @@ let
     REGISTRY_JQ=${pkgs.jq}/bin/jq
     REGISTRY_FLOCK=${pkgs.util-linux}/bin/flock
     REGISTRY_PROG=agent-box-mark-stopped
+    LEASE_JQ=${pkgs.jq}/bin/jq
+    LEASE_DIR=${lib.escapeShellArg "/home/${name}/.local/state/agent-box/lease"}
   '' + ''
     @@include:src/mark-stopped.sh@@
   '');

@@ -96,6 +96,21 @@ check() {
   fi
 }
 
+# The lease file (issue #535), keyed by session name — resolved by NAME
+# rather than a fixed glob, since the wrapper mints a random suffix. Exact
+# prefix strip (not a wildcard) so a hyphenated build-sandbox username (or
+# hyphenated session name, which every spawn() call here has) never confuses
+# the two. $1 the lease's expected topic, $2 its expected object (jq value,
+# e.g. '"4242"' or 'null'), $3 the filter file `spawn` returned (its own name
+# carries the session name spawn() minted).
+SPAWN_USER=$(id -un)
+check_lease() {
+  ses=$(basename "$3" .json); ses=${ses#filter."$SPAWN_USER"-}
+  lf="$HOME/.local/state/agent-box/lease/$ses.json"
+  check "$4" "$lf" \
+    "(.topic == $1) and (.object == $2) and (.outcome == null) and (.claimedAt != null)"
+}
+
 # --- a numbered object: exactly that issue or PR, and never the repo's CI ---
 #
 # Not workflow_run.pull_requests.0.number either, which reads well and never
@@ -110,6 +125,11 @@ check "a numbered spawn claims both number paths, and no CI path" "$f" \
 # across every hook session on the box (#251).
 check "the note names the object it claims" "$f" \
   '.topics[0].note | contains("defangdevs/numbered#4242") and contains("issues.assigned")'
+# The durable lease agrees with the claim on the SAME object -- both are
+# derived from the same $meta.number, so a numbered claim never sits beside
+# an object-less lease or vice versa.
+check_lease '"github:defangdevs/numbered"' '"4242"' "$f" \
+  "a numbered spawn's lease names the same object as its claim"
 
 # --- a `number` that is not a number ---
 #
@@ -122,6 +142,10 @@ check "a non-numeric number falls back to the branch claim" "$f" \
    and ([.topics[0].include.all[].any[]?.path] | index("workflow_run")) != null'
 check "and the note falls back with it" "$f" \
   '.topics[0].note | contains("TOPIC BRANCHES") and (contains("#") | not)'
+# A non-numeric number is exactly the case object extraction must also
+# reject: a lease naming "n/a" would be worse than one naming nothing.
+check_lease '"github:defangdevs/unnumbered"' 'null' "$f" \
+  "a non-numeric number leaves the lease's object null, not \"n/a\""
 
 # --- a CI outcome that names its commit (#510, #511) ---
 #

@@ -14,6 +14,7 @@ FIND="${AGENT_BOX_FIND_BIN:-find}"
 # the same protocol as writing it (issue #289).
 REGISTRY_PROG=supervisor
 @@include:lib/registry.sh@@
+@@include:lib/lease.sh@@
 # The webhook channel plugin, spelled once (issue #257): three places have to
 # agree on it — the settings seed (an enabledPlugins key), the plugin-cache
 # sync, and claude's --channels tag. The marketplace NAME comes from the
@@ -458,6 +459,19 @@ start_session() {
     if [ "$($JQ -r 'if .hasRun == true then "true" else "false" end' <<<"$sjson")" = true ]; then
       launched=true
     fi
+  fi
+  # A respawn ($launched) this reconcile loop is doing for a session that
+  # was neither flagged `died` (mark-stopped.sh's crash branch) nor filtered
+  # out as `stopped` (the loop's own select(), above) means its last pane
+  # ended with NO epilogue at all -- kill-session, a reboot, an OOM-kill of
+  # the tmux server (issue #535's incident: five sessions lost within one
+  # second to a box update). $died is read from THIS call's own snapshot,
+  # before the "answer to a prior crash" clear further down, so it names
+  # what was true when the respawn was decided, not what this spawn is
+  # about to make true. A no-op for every session with no open lease --
+  # which is every session except a dispatched hook-* one.
+  if [ "$launched" = true ] && [ -z "$died" ]; then
+    lease_mark_outcome "$sname" vanished
   fi
   # Mint the launch id on the first spawn if nothing carries one yet
   # (legacy/seed sessions, hand-edited files). /proc/.../uuid is the
@@ -977,6 +991,35 @@ sweep_session_state() {
   done
 }
 
+# Same backstop as sweep_session_state, for a lease (issue #535) left behind
+# by a session `agent-box-session rm`'s own prune (or a hand-edited registry)
+# never reached. A leftover lease is not just litter: a name is re-usable, and
+# a stale "vanished"/"died:N" would hand a NEW session at that name somebody
+# else's unresolved outcome the moment it is looked up.
+#
+# A GRACE PERIOD, not an immediate delete on a registry miss: webhook-spawn.sh
+# writes the lease (lease_create) and only THEN execs into `agent-box-session
+# add`, which is what actually creates the registry entry — so a lease can
+# legitimately exist for a few moments before its session does. A sweep
+# landing in that window would delete a lease the spawn had not even finished
+# writing yet. 30s is generous next to the ~2s reconcile tick and the
+# millisecond-scale gap the exec actually takes; it costs nothing but a
+# slightly later cleanup for the genuinely-orphaned case this backstop exists
+# for.
+sweep_lease_state() {
+  _listed="$($JQ -r '.sessions | keys[]' "$REGISTRY_FILE" 2>/dev/null)" || return 0
+  _now="$(date +%s)" || return 0
+  for _f in "$LEASE_DIR"/*.json; do
+    _n=${_f##*/}; _n=${_n%.json}
+    case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
+    case "$NL$_listed$NL" in (*"$NL$_n$NL"*) continue ;; esac
+    _mtime="$(stat -c %Y "$_f" 2>/dev/null)" || continue
+    case "$_mtime" in (*[!0-9]*|"") continue ;; esac
+    [ "$((_now - _mtime))" -ge 30 ] || continue
+    rm -f "$_f"
+  done
+}
+
 # Delist ONE-SHOT sessions that have been parked (--ephemeral, issue #167's
 # other half).
 #
@@ -1049,6 +1092,7 @@ while true; do
   registry_selfheal "${AGENT_BOX_SESSIONS_SEED:-}"
   reap_ephemeral
   sweep_session_state
+  sweep_lease_state
   while IFS= read -r sname; do
     case "$sname" in
       (*[!A-Za-z0-9_-]*|"") continue ;;

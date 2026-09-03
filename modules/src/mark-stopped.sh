@@ -25,6 +25,7 @@
 # hands it a PATH, the two binaries the protocol needs, and the registry of the
 # user it was generated for.
 @@include:lib/registry.sh@@
+@@include:lib/lease.sh@@
 [ -n "${1:-}" ] && [ -s "$REGISTRY_FILE" ] || exit 0
 # The status arrives from the pane's own shell as `$?`, so it is a small
 # non-negative integer or nothing. Anything else is still an ending that was
@@ -35,6 +36,12 @@ case "$_status" in (""|*[!0-9]*) _status=1 ;; esac
 if [ "$_status" -eq 0 ]; then
   _edit='if .sessions | has($s) then .sessions[$s].stopped = true else . end'
   _check='(.sessions | has($s) | not) or (.sessions[$s].stopped == true)'
+  # This pane got the chance to say it was blocked or finished and chose to
+  # stop, so any lease it holds (issue #535) is resolved -- whatever an
+  # earlier respawn's lease recorded (including "vanished") no longer
+  # applies. Independent of the registry write above and its retry loop:
+  # a lease has one writer at a time, so there is nothing here to race.
+  lease_clear "$1"
 else
   # Recorded as the STATUS, not a bare true: it is the only thing anyone
   # knows about the crash without attaching to the post-mortem pane, and it
@@ -42,6 +49,7 @@ else
   # session that comes back is never left looking dead.
   _edit='if .sessions | has($s) then .sessions[$s].died = $st else . end'
   _check='(.sessions | has($s) | not) or (.sessions[$s].died == $st)'
+  lease_mark_outcome "$1" "died:$_status"
 fi
 # Verified write, retried: on an agent that exits within its first
 # seconds, the supervisor's mark_started rewrite can race this one
