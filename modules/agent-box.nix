@@ -1761,6 +1761,94 @@ if __name__ == "__main__":
       return 1
     }
 
+    registry_valid() {
+      # 0 when the registry is usable: ONE JSON document, an object, with a
+      # `sessions` OBJECT in it — the shape every reader here indexes by session
+      # name.
+      #
+      # `-s` is what makes this agree with the settings daemon's json.load().
+      # jq on its own reads a STREAM of values, so a registry with garbage
+      # appended parses far enough to yield the first document's session names
+      # and only then fails (measured: the reconcile loop printed "claude" and
+      # exited 5), while python refuses the same file outright. Slurping makes
+      # both sides call that same file corrupt, which matters because the
+      # daemon refuses to WRITE a file this says is fine.
+      "$REGISTRY_JQ" -s -e \
+        'length == 1 and (.[0] | type == "object")
+         and (.[0].sessions | type == "object")' \
+        "$REGISTRY_FILE" >/dev/null 2>&1
+    }
+
+    # 1 once the "could not move it aside" warning below has been printed, so a
+    # loop that calls this every couple of seconds says it once per transition
+    # rather than forever.
+    _registry_heal_warned=0
+
+    registry_selfheal() {
+      # registry_selfheal [SEED] — a registry that does not PARSE is not an empty
+      # registry (issue #279). Both halves of the box used to read it as one:
+      # the reconcile loop sent jq's error to /dev/null and iterated over
+      # nothing, so no session started, nothing was logged and the unit stayed
+      # `active (running)` — a box that looks idle. And the seed could not
+      # repair it, because registry_ensure re-seeds only when the file is
+      # MISSING OR EMPTY, and a corrupt one is neither.
+      #
+      # So the bad file is moved aside — kept, never deleted: it is the only
+      # record of what the operator had asked this box to run, and reading it
+      # back by hand is the one way to restore a session that is not in the
+      # seed — and the registry is re-created from the seed. Losing the
+      # declared sessions to a fresh start is a worse outcome than losing none,
+      # but both are better than a box that silently runs nothing.
+      #
+      # Only for the SUPERVISOR to call. The other writers reach the registry
+      # through registry_edit, which fails closed on a document jq cannot read
+      # and leaves the file exactly as it was; healing is the job of the one
+      # program that is already looping.
+      registry_valid && { _registry_heal_warned=0; return 0; }
+      registry_lock
+      # Re-check under the lock: every writer publishes by rename, so a document
+      # that landed between the check above and this line is WHOLE. Quarantining
+      # it would throw away a perfectly good registry.
+      if registry_valid; then
+        registry_unlock
+        _registry_heal_warned=0
+        return 0
+      fi
+      # A file that is not there at all is a first boot or a deleted registry,
+      # not corruption: there is nothing to keep, and registry_ensure below
+      # creates it.
+      if [ -e "$REGISTRY_FILE" ]; then
+        _registry_bad="$REGISTRY_FILE.corrupt-$(date +%Y%m%d-%H%M%S)"
+        if mv -f "$REGISTRY_FILE" "$_registry_bad" 2>/dev/null; then
+          echo "$REGISTRY_PROG: $REGISTRY_FILE does not parse;" \
+               "moved it to $_registry_bad and re-seeding (issue #279)" >&2
+        else
+          # A read-only home or a full disk. Say so ONCE — the alternative is
+          # this line every two seconds for as long as the box is up — and
+          # leave the file alone rather than pretending it was handled.
+          [ "$_registry_heal_warned" = 1 ] || \
+            echo "$REGISTRY_PROG: $REGISTRY_FILE does not parse and could not be" \
+                 "moved aside; no session can start (issue #279)" >&2
+          _registry_heal_warned=1
+          registry_unlock
+          return 1
+        fi
+      fi
+      _registry_heal_warned=0
+      # STILL HOLDING THE LOCK: moving the bad file aside and re-seeding are one
+      # step. Release between them and `agent-box-session add` can create the
+      # registry in the gap — registry_ensure never clobbers a file that exists,
+      # so the declared sessions would stay unseeded on that boot and every later
+      # one, which is the outcome this whole function exists to avoid. Same
+      # reasoning as issue #289, which put creation inside the protocol in the
+      # first place. registry_ensure takes the lock again and the lock nests, so
+      # this does not deadlock against itself.
+      registry_ensure "''${1:-}"
+      _registry_heal_rc=$?
+      registry_unlock
+      return "$_registry_heal_rc"
+    }
+
     registry_ensure() {
       # registry_ensure [SEED] — make sure the registry EXISTS, inside the same
       # critical section as everything that writes it (issue #289).
@@ -2671,6 +2759,94 @@ registry_edit() {
   rm -f "$_registry_tmp"
   registry_unlock
   return 1
+}
+
+registry_valid() {
+  # 0 when the registry is usable: ONE JSON document, an object, with a
+  # `sessions` OBJECT in it — the shape every reader here indexes by session
+  # name.
+  #
+  # `-s` is what makes this agree with the settings daemon's json.load().
+  # jq on its own reads a STREAM of values, so a registry with garbage
+  # appended parses far enough to yield the first document's session names
+  # and only then fails (measured: the reconcile loop printed "claude" and
+  # exited 5), while python refuses the same file outright. Slurping makes
+  # both sides call that same file corrupt, which matters because the
+  # daemon refuses to WRITE a file this says is fine.
+  "$REGISTRY_JQ" -s -e \
+    'length == 1 and (.[0] | type == "object")
+     and (.[0].sessions | type == "object")' \
+    "$REGISTRY_FILE" >/dev/null 2>&1
+}
+
+# 1 once the "could not move it aside" warning below has been printed, so a
+# loop that calls this every couple of seconds says it once per transition
+# rather than forever.
+_registry_heal_warned=0
+
+registry_selfheal() {
+  # registry_selfheal [SEED] — a registry that does not PARSE is not an empty
+  # registry (issue #279). Both halves of the box used to read it as one:
+  # the reconcile loop sent jq's error to /dev/null and iterated over
+  # nothing, so no session started, nothing was logged and the unit stayed
+  # `active (running)` — a box that looks idle. And the seed could not
+  # repair it, because registry_ensure re-seeds only when the file is
+  # MISSING OR EMPTY, and a corrupt one is neither.
+  #
+  # So the bad file is moved aside — kept, never deleted: it is the only
+  # record of what the operator had asked this box to run, and reading it
+  # back by hand is the one way to restore a session that is not in the
+  # seed — and the registry is re-created from the seed. Losing the
+  # declared sessions to a fresh start is a worse outcome than losing none,
+  # but both are better than a box that silently runs nothing.
+  #
+  # Only for the SUPERVISOR to call. The other writers reach the registry
+  # through registry_edit, which fails closed on a document jq cannot read
+  # and leaves the file exactly as it was; healing is the job of the one
+  # program that is already looping.
+  registry_valid && { _registry_heal_warned=0; return 0; }
+  registry_lock
+  # Re-check under the lock: every writer publishes by rename, so a document
+  # that landed between the check above and this line is WHOLE. Quarantining
+  # it would throw away a perfectly good registry.
+  if registry_valid; then
+    registry_unlock
+    _registry_heal_warned=0
+    return 0
+  fi
+  # A file that is not there at all is a first boot or a deleted registry,
+  # not corruption: there is nothing to keep, and registry_ensure below
+  # creates it.
+  if [ -e "$REGISTRY_FILE" ]; then
+    _registry_bad="$REGISTRY_FILE.corrupt-$(date +%Y%m%d-%H%M%S)"
+    if mv -f "$REGISTRY_FILE" "$_registry_bad" 2>/dev/null; then
+      echo "$REGISTRY_PROG: $REGISTRY_FILE does not parse;" \
+           "moved it to $_registry_bad and re-seeding (issue #279)" >&2
+    else
+      # A read-only home or a full disk. Say so ONCE — the alternative is
+      # this line every two seconds for as long as the box is up — and
+      # leave the file alone rather than pretending it was handled.
+      [ "$_registry_heal_warned" = 1 ] || \
+        echo "$REGISTRY_PROG: $REGISTRY_FILE does not parse and could not be" \
+             "moved aside; no session can start (issue #279)" >&2
+      _registry_heal_warned=1
+      registry_unlock
+      return 1
+    fi
+  fi
+  _registry_heal_warned=0
+  # STILL HOLDING THE LOCK: moving the bad file aside and re-seeding are one
+  # step. Release between them and `agent-box-session add` can create the
+  # registry in the gap — registry_ensure never clobbers a file that exists,
+  # so the declared sessions would stay unseeded on that boot and every later
+  # one, which is the outcome this whole function exists to avoid. Same
+  # reasoning as issue #289, which put creation inside the protocol in the
+  # first place. registry_ensure takes the lock again and the lock nests, so
+  # this does not deadlock against itself.
+  registry_ensure "''${1:-}"
+  _registry_heal_rc=$?
+  registry_unlock
+  return "$_registry_heal_rc"
 }
 
 registry_ensure() {
@@ -5474,6 +5650,94 @@ registry_edit() {
   return 1
 }
 
+registry_valid() {
+  # 0 when the registry is usable: ONE JSON document, an object, with a
+  # `sessions` OBJECT in it — the shape every reader here indexes by session
+  # name.
+  #
+  # `-s` is what makes this agree with the settings daemon's json.load().
+  # jq on its own reads a STREAM of values, so a registry with garbage
+  # appended parses far enough to yield the first document's session names
+  # and only then fails (measured: the reconcile loop printed "claude" and
+  # exited 5), while python refuses the same file outright. Slurping makes
+  # both sides call that same file corrupt, which matters because the
+  # daemon refuses to WRITE a file this says is fine.
+  "$REGISTRY_JQ" -s -e \
+    'length == 1 and (.[0] | type == "object")
+     and (.[0].sessions | type == "object")' \
+    "$REGISTRY_FILE" >/dev/null 2>&1
+}
+
+# 1 once the "could not move it aside" warning below has been printed, so a
+# loop that calls this every couple of seconds says it once per transition
+# rather than forever.
+_registry_heal_warned=0
+
+registry_selfheal() {
+  # registry_selfheal [SEED] — a registry that does not PARSE is not an empty
+  # registry (issue #279). Both halves of the box used to read it as one:
+  # the reconcile loop sent jq's error to /dev/null and iterated over
+  # nothing, so no session started, nothing was logged and the unit stayed
+  # `active (running)` — a box that looks idle. And the seed could not
+  # repair it, because registry_ensure re-seeds only when the file is
+  # MISSING OR EMPTY, and a corrupt one is neither.
+  #
+  # So the bad file is moved aside — kept, never deleted: it is the only
+  # record of what the operator had asked this box to run, and reading it
+  # back by hand is the one way to restore a session that is not in the
+  # seed — and the registry is re-created from the seed. Losing the
+  # declared sessions to a fresh start is a worse outcome than losing none,
+  # but both are better than a box that silently runs nothing.
+  #
+  # Only for the SUPERVISOR to call. The other writers reach the registry
+  # through registry_edit, which fails closed on a document jq cannot read
+  # and leaves the file exactly as it was; healing is the job of the one
+  # program that is already looping.
+  registry_valid && { _registry_heal_warned=0; return 0; }
+  registry_lock
+  # Re-check under the lock: every writer publishes by rename, so a document
+  # that landed between the check above and this line is WHOLE. Quarantining
+  # it would throw away a perfectly good registry.
+  if registry_valid; then
+    registry_unlock
+    _registry_heal_warned=0
+    return 0
+  fi
+  # A file that is not there at all is a first boot or a deleted registry,
+  # not corruption: there is nothing to keep, and registry_ensure below
+  # creates it.
+  if [ -e "$REGISTRY_FILE" ]; then
+    _registry_bad="$REGISTRY_FILE.corrupt-$(date +%Y%m%d-%H%M%S)"
+    if mv -f "$REGISTRY_FILE" "$_registry_bad" 2>/dev/null; then
+      echo "$REGISTRY_PROG: $REGISTRY_FILE does not parse;" \
+           "moved it to $_registry_bad and re-seeding (issue #279)" >&2
+    else
+      # A read-only home or a full disk. Say so ONCE — the alternative is
+      # this line every two seconds for as long as the box is up — and
+      # leave the file alone rather than pretending it was handled.
+      [ "$_registry_heal_warned" = 1 ] || \
+        echo "$REGISTRY_PROG: $REGISTRY_FILE does not parse and could not be" \
+             "moved aside; no session can start (issue #279)" >&2
+      _registry_heal_warned=1
+      registry_unlock
+      return 1
+    fi
+  fi
+  _registry_heal_warned=0
+  # STILL HOLDING THE LOCK: moving the bad file aside and re-seeding are one
+  # step. Release between them and `agent-box-session add` can create the
+  # registry in the gap — registry_ensure never clobbers a file that exists,
+  # so the declared sessions would stay unseeded on that boot and every later
+  # one, which is the outcome this whole function exists to avoid. Same
+  # reasoning as issue #289, which put creation inside the protocol in the
+  # first place. registry_ensure takes the lock again and the lock nests, so
+  # this does not deadlock against itself.
+  registry_ensure "''${1:-}"
+  _registry_heal_rc=$?
+  registry_unlock
+  return "$_registry_heal_rc"
+}
+
 registry_ensure() {
   # registry_ensure [SEED] — make sure the registry EXISTS, inside the same
   # critical section as everything that writes it (issue #289).
@@ -7694,6 +7958,94 @@ esac
       return 1
     }
 
+    registry_valid() {
+      # 0 when the registry is usable: ONE JSON document, an object, with a
+      # `sessions` OBJECT in it — the shape every reader here indexes by session
+      # name.
+      #
+      # `-s` is what makes this agree with the settings daemon's json.load().
+      # jq on its own reads a STREAM of values, so a registry with garbage
+      # appended parses far enough to yield the first document's session names
+      # and only then fails (measured: the reconcile loop printed "claude" and
+      # exited 5), while python refuses the same file outright. Slurping makes
+      # both sides call that same file corrupt, which matters because the
+      # daemon refuses to WRITE a file this says is fine.
+      "$REGISTRY_JQ" -s -e \
+        'length == 1 and (.[0] | type == "object")
+         and (.[0].sessions | type == "object")' \
+        "$REGISTRY_FILE" >/dev/null 2>&1
+    }
+
+    # 1 once the "could not move it aside" warning below has been printed, so a
+    # loop that calls this every couple of seconds says it once per transition
+    # rather than forever.
+    _registry_heal_warned=0
+
+    registry_selfheal() {
+      # registry_selfheal [SEED] — a registry that does not PARSE is not an empty
+      # registry (issue #279). Both halves of the box used to read it as one:
+      # the reconcile loop sent jq's error to /dev/null and iterated over
+      # nothing, so no session started, nothing was logged and the unit stayed
+      # `active (running)` — a box that looks idle. And the seed could not
+      # repair it, because registry_ensure re-seeds only when the file is
+      # MISSING OR EMPTY, and a corrupt one is neither.
+      #
+      # So the bad file is moved aside — kept, never deleted: it is the only
+      # record of what the operator had asked this box to run, and reading it
+      # back by hand is the one way to restore a session that is not in the
+      # seed — and the registry is re-created from the seed. Losing the
+      # declared sessions to a fresh start is a worse outcome than losing none,
+      # but both are better than a box that silently runs nothing.
+      #
+      # Only for the SUPERVISOR to call. The other writers reach the registry
+      # through registry_edit, which fails closed on a document jq cannot read
+      # and leaves the file exactly as it was; healing is the job of the one
+      # program that is already looping.
+      registry_valid && { _registry_heal_warned=0; return 0; }
+      registry_lock
+      # Re-check under the lock: every writer publishes by rename, so a document
+      # that landed between the check above and this line is WHOLE. Quarantining
+      # it would throw away a perfectly good registry.
+      if registry_valid; then
+        registry_unlock
+        _registry_heal_warned=0
+        return 0
+      fi
+      # A file that is not there at all is a first boot or a deleted registry,
+      # not corruption: there is nothing to keep, and registry_ensure below
+      # creates it.
+      if [ -e "$REGISTRY_FILE" ]; then
+        _registry_bad="$REGISTRY_FILE.corrupt-$(date +%Y%m%d-%H%M%S)"
+        if mv -f "$REGISTRY_FILE" "$_registry_bad" 2>/dev/null; then
+          echo "$REGISTRY_PROG: $REGISTRY_FILE does not parse;" \
+               "moved it to $_registry_bad and re-seeding (issue #279)" >&2
+        else
+          # A read-only home or a full disk. Say so ONCE — the alternative is
+          # this line every two seconds for as long as the box is up — and
+          # leave the file alone rather than pretending it was handled.
+          [ "$_registry_heal_warned" = 1 ] || \
+            echo "$REGISTRY_PROG: $REGISTRY_FILE does not parse and could not be" \
+                 "moved aside; no session can start (issue #279)" >&2
+          _registry_heal_warned=1
+          registry_unlock
+          return 1
+        fi
+      fi
+      _registry_heal_warned=0
+      # STILL HOLDING THE LOCK: moving the bad file aside and re-seeding are one
+      # step. Release between them and `agent-box-session add` can create the
+      # registry in the gap — registry_ensure never clobbers a file that exists,
+      # so the declared sessions would stay unseeded on that boot and every later
+      # one, which is the outcome this whole function exists to avoid. Same
+      # reasoning as issue #289, which put creation inside the protocol in the
+      # first place. registry_ensure takes the lock again and the lock nests, so
+      # this does not deadlock against itself.
+      registry_ensure "''${1:-}"
+      _registry_heal_rc=$?
+      registry_unlock
+      return "$_registry_heal_rc"
+    }
+
     registry_ensure() {
       # registry_ensure [SEED] — make sure the registry EXISTS, inside the same
       # critical section as everything that writes it (issue #289).
@@ -7772,7 +8124,13 @@ esac
     # this unit and a session being added start in parallel on a first boot, and
     # "the file was empty when I looked" must not survive another writer's
     # decision (issue #289).
-    registry_ensure "''${AGENT_BOX_SESSIONS_SEED:?}"
+    #
+    # registry_selfheal rather than registry_ensure, because creation is only one
+    # of the two ways this unit can find itself with no usable registry: a file
+    # that does not PARSE is the other, and registry_ensure re-seeds only a
+    # missing or empty one (issue #279). On the ordinary boot — a registry that
+    # is already there and readable — the two are the same call plus one jq.
+    registry_selfheal "''${AGENT_BOX_SESSIONS_SEED:?}"
 
     # Ship ~/worktrees, empty (issue #126). $HOME is shared by every session of
     # this user, so two of them in one clone edit the same files, and the fix is
@@ -9015,6 +9373,14 @@ esac
     # stop) stay listed but are left down until a restart clears the flag —
     # except the one-shot ones, which reap_ephemeral delists instead.
     while true; do
+      # First, because everything below reads the registry and every one of those
+      # reads answers "no sessions" to a document jq cannot parse (issue #279).
+      # Corruption can arrive while the box is UP — a hand edit, a truncating
+      # crash, a full disk caught mid-write by a writer that predates the atomic
+      # rename — so this belongs on the tick and not only at startup, which is
+      # also what makes the box come back on its own instead of waiting for
+      # somebody to notice it is running nothing.
+      registry_selfheal "''${AGENT_BOX_SESSIONS_SEED:-}"
       reap_ephemeral
       sweep_session_state
       while IFS= read -r sname; do
@@ -11585,25 +11951,80 @@ def sessions_lock():
             lock.close()
 
 
-def read_sessions():
-    """Return the raw sessions dict from SESSIONS_FILE ({} on any problem).
+# What write_sessions stamps on a registry that carries no version of its
+# own. It never OVERWRITES one it read: see write_sessions.
+REGISTRY_VERSION = 1
 
-    Values are kept as-is for read-modify-write; callers that render or
-    publish names filter through SESSION_RE themselves.
+
+class RegistryUnreadable(Exception):
+    """SESSIONS_FILE is there but is not a session registry (issue #279).
+
+    Raised by load_sessions so a read-modify-write can refuse. It is a
+    distinct answer from "there are no sessions", and conflating the two was
+    the bug: every mutation route wrote {} back plus its own edit, so ONE
+    click on Add session republished the registry with a single entry and
+    delisted every other session for good -- hasRun, boxSessionId and stopped
+    gone with them. Running panes survived as unmanaged tmux sessions that
+    nothing respawns, and re-adding a name started a fresh conversation.
+    """
+
+
+def load_sessions():
+    """Read SESSIONS_FILE as (sessions, version), for a read-modify-write.
+
+    Raises RegistryUnreadable when the file exists but cannot be trusted:
+    unreadable, not JSON, or a document whose top level or `.sessions` is
+    not an object. A MISSING file is not an error -- that is a first boot,
+    and creating the registry is exactly what an add does.
+
+    Entries are returned VERBATIM, including any whose value is not a dict.
+    read_sessions drops those for display, but dropping them here would make
+    the next write delete them, which is the same data loss in a smaller
+    place; and refusing the whole write over one odd entry would leave the
+    web UI permanently unable to add or delete a session, with no repair
+    path that does not need a shell.
+
+    `version` is whatever the file carried, so write_sessions can put the
+    same value back instead of stamping v1 over a document a newer box
+    wrote.
     """
     try:
         with open(SESSIONS_FILE, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return {}, REGISTRY_VERSION
+    except OSError as exc:
+        raise RegistryUnreadable(
+            "cannot read %s: %s" % (SESSIONS_FILE, exc.strerror or exc))
+    except ValueError as exc:
+        raise RegistryUnreadable(
+            "%s is not valid JSON: %s" % (SESSIONS_FILE, exc))
+    if not isinstance(data, dict) or not isinstance(data.get("sessions"), dict):
+        raise RegistryUnreadable(
+            '%s carries no {"sessions": {...}} object' % SESSIONS_FILE)
+    return dict(data["sessions"]), data.get("version", REGISTRY_VERSION)
+
+
+def read_sessions():
+    """Return the sessions dict from SESSIONS_FILE for DISPLAY ({} on any
+    problem), with entries that are not objects dropped.
+
+    Here "the registry does not parse" and "there are no sessions" really
+    are the same answer, and deliberately so: a page that renders an empty
+    list beats a 500 on every route that merely mentions a session, and the
+    supervisor moves a corrupt registry aside within a tick or two, so the
+    empty list is transient. A route that WRITES must use load_sessions
+    instead (issue #279) -- publishing this answer back is what deleted the
+    other sessions.
+
+    Callers that render or publish names filter through SESSION_RE
+    themselves.
+    """
+    try:
+        sessions, _ = load_sessions()
+    except RegistryUnreadable:
         return {}
-    sessions = data.get("sessions") if isinstance(data, dict) else None
-    if not isinstance(sessions, dict):
-        return {}
-    result = {}
-    for k, v in sessions.items():
-        if isinstance(k, str) and isinstance(v, dict):
-            result[k] = v
-    return result
+    return {k: v for k, v in sessions.items() if isinstance(v, dict)}
 
 
 def gen_session_name(base_name, sessions, cwd=None):
@@ -11656,11 +12077,17 @@ def gen_session_name(base_name, sessions, cwd=None):
     return ("%s-%s" % (base_name, secrets.token_hex(8)))[:NAME_MAX]
 
 
-def write_sessions(sessions):
+def write_sessions(sessions, version=REGISTRY_VERSION):
     """Atomically rewrite SESSIONS_FILE (0600) with the given dict.
 
     Same tempfile-in-directory + os.replace dance as envstore.save. The
     supervisor in the agent unit picks the change up within ~2s.
+
+    `version` is the one load_sessions read back, so a document written by a
+    newer box keeps its own version rather than being silently downgraded to
+    1 by whichever route the operator happened to press first (issue #279).
+    This daemon does not understand a v2 registry, but stamping v1 on it
+    tells every other reader that it does.
     """
     directory = os.path.dirname(SESSIONS_FILE) or "."
     os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -11668,7 +12095,7 @@ def write_sessions(sessions):
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"version": 1, "sessions": sessions}, fh, indent=2)
+            json.dump({"version": version, "sessions": sessions}, fh, indent=2)
             fh.write("\n")
         os.replace(tmp, SESSIONS_FILE)
     except BaseException:
@@ -16938,6 +17365,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             WATCHER.release()
 
+    def _registry_refusal(self, verb, exc, page):
+        """Answer a mutation route that could not read the registry
+        (issue #279): say so in the journal, where the detail belongs, and
+        put a banner in front of the operator, who has no shell here.
+
+        The banner is the visible part of the fix. Silence was the bug: the
+        route returned its usual "Session added" while the registry it had
+        just republished no longer mentioned any of the other sessions.
+        """
+        sys.stderr.write("sessions/%s refused: %s\n" % (verb, exc))
+        self._redirect("ok=session_registry_unreadable", page)
+
     def _redirect(self, query="", page=None):
         target = (page or BASE + "/") + (("?" + query) if query else "")
         self.send_response(303)
@@ -16953,6 +17392,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "session_deleted": "Session deleted.",
         "session_restarted": "Session restart requested.",
         "session_started": "Session started \u2014 it comes up within a few seconds.",
+        # A failure carried on the ok= channel, like webhook_kept below: the
+        # banner is the only page-level feedback there is, and an operator
+        # with no shell has to be told that nothing was changed AND that the
+        # box repairs itself, or the natural next move is to press the button
+        # again (issue #279).
+        "session_registry_unreadable":
+            "The session list could not be read, so nothing was changed. "
+            "The box moves the unreadable file aside and rebuilds the list "
+            "within a few seconds \u2014 reload this page and try again.",
         "update": "Agent-box update started. This page may be briefly unavailable.",
         "rebooting": "Restart requested. Agent-box will be unavailable for "
                      "about a minute; reload this page when it is back.",
@@ -17509,35 +17957,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # a concurrent add — from another browser tab, this daemon's own
             # second thread, or the CLI — could pick the same free name, and
             # the later rename would drop the earlier session outright.
-            with sessions_lock():
-                sessions = read_sessions()
-                # The name is always auto-derived — there is no name field in
-                # the form — from the PROFILE when one was given (it is the
-                # more specific worker identity; see gen_session_name), else
-                # the agent. Users rarely care what a session is called
-                # (rename at runtime via /rename), so autogen spares them
-                # inventing one AND guarantees a unique key, so no collision
-                # or accidental-overwrite (issue 100) is possible.
-                name = gen_session_name(profile or agent, sessions, cwd)
-                sessions[name] = {
-                    "agent": agent,
-                    "skipPermissions": True,
-                    "remoteControl": True,
-                    "remoteControlName": None,
-                    "workingDirectory": cwd,
-                    "extraArgs": pargs,
-                    # The NAME, not just the resolved arguments: the spawn
-                    # wrapper re-reads it at every start to apply the
-                    # profile's environment, so a rotated token in a profile
-                    # reaches this session on its next restart while the
-                    # arguments above stay as they were created.
-                    "profile": profile or None,
-                    "initialPrompt": prompt or None,
-                    "resumePrompt": None,
-                    "boxSessionId": None,
-                    "hasRun": False,
-                }
-                write_sessions(sessions)
+            try:
+                with sessions_lock():
+                    sessions, version = load_sessions()
+                    # The name is always auto-derived: there is no name field
+                    # in the form. From the PROFILE when one was given (it is the
+                    # more specific worker identity; see gen_session_name), else
+                    # the agent. Users rarely care what a session is called
+                    # (rename at runtime via /rename), so autogen spares them
+                    # inventing one AND guarantees a unique key, so no collision
+                    # or accidental-overwrite (issue 100) is possible.
+                    name = gen_session_name(profile or agent, sessions, cwd)
+                    sessions[name] = {
+                        "agent": agent,
+                        "skipPermissions": True,
+                        "remoteControl": True,
+                        "remoteControlName": None,
+                        "workingDirectory": cwd,
+                        "extraArgs": pargs,
+                        # The NAME, not just the resolved arguments: the spawn
+                        # wrapper re-reads it at every start to apply the
+                        # profile's environment, so a rotated token in a profile
+                        # reaches this session on its next restart while the
+                        # arguments above stay as they were created.
+                        "profile": profile or None,
+                        "initialPrompt": prompt or None,
+                        "resumePrompt": None,
+                        "boxSessionId": None,
+                        "hasRun": False,
+                    }
+                    write_sessions(sessions, version)
+            except RegistryUnreadable as exc:
+                # Refuse rather than republish (issue #279). Without this the
+                # write below carried the empty dict read_sessions used to
+                # return for a corrupt file, so adding one session deleted
+                # every other one. The supervisor moves the bad file aside
+                # within a tick or two, so the answer is "try again", not
+                # "open a shell".
+                self._registry_refusal("add", exc, back_page)
+                return
             # On the workspace, land on the new session's tab (gen_session_name
             # returns a SESSION_RE-shaped name, so it is URL-safe as-is).
             query = "ok=session_added"
@@ -17552,10 +18010,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # resurrected entry is a session the supervisor starts and no
                 # delete path knows about. The kill stays OUTSIDE: tmux is not
                 # this file, and nothing may hold the lock across a subprocess.
-                with sessions_lock():
-                    sessions = read_sessions()
-                    sessions.pop(name, None)
-                    write_sessions(sessions)
+                try:
+                    with sessions_lock():
+                        sessions, version = load_sessions()
+                        sessions.pop(name, None)
+                        write_sessions(sessions, version)
+                except RegistryUnreadable as exc:
+                    # A delete against a registry we could not read used to
+                    # publish an empty one: the named session went, and so did
+                    # every other (issue #279).
+                    self._registry_refusal("delete", exc, self._sess_page(form))
+                    return
                 kill_session(name)
                 # Delisted and killed, so its filter file routes nothing —
                 # but it would go on claiming its topics against the standing
@@ -17591,12 +18056,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # back that session's hasRun=false and its already-consumed
                 # initialPrompt, and the supervisor then re-fired the kickoff
                 # prompt under a new id the next time that session died.
-                with sessions_lock():
-                    sessions = read_sessions()
-                    entry = sessions.get(name)
-                    if entry is not None and entry.pop("stopped", None) is not None:
-                        write_sessions(sessions)
-                        ok = "ok=session_started"
+                try:
+                    with sessions_lock():
+                        sessions, version = load_sessions()
+                        entry = sessions.get(name)
+                        # isinstance, not `is not None`: load_sessions keeps an
+                        # entry whose value is not an object rather than
+                        # dropping it (see its docstring), so the .pop below
+                        # has to ask rather than assume.
+                        if isinstance(entry, dict) and entry.pop("stopped", None) is not None:
+                            write_sessions(sessions, version)
+                            ok = "ok=session_started"
+                except RegistryUnreadable as exc:
+                    # Start is the button an operator presses when the box
+                    # looks wrong, which is exactly when the registry might
+                    # be the thing that is wrong (issue #279). Do not answer
+                    # it by deleting the rest of the list.
+                    self._registry_refusal("restart", exc, self._sess_page(form))
+                    return
                 kill_session(name)
             back_page = self._sess_page(form)
             # On the workspace, land on the tab of the session just started —
