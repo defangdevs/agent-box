@@ -19,7 +19,7 @@ export AGENT_BOX_FLOCK_BIN=@PROFILE@/bin/flock
 # binary would report the wrong worker rather than fail - pin it.
 export AGENT_BOX_JQ_BIN=@PROFILE@/bin/jq
 # Which agent a match really starts. The spawn calls
-# `agent-box-session add` with no --agent, so it is the box default -
+# `agent-box-session add` with no --harness, so it is the box default -
 # and --preamble has to NAME it, because that is the half of 'what
 # does this watch launch' the page could not show before (#292).
 export AGENT_BOX_DEFAULT_AGENT=claude

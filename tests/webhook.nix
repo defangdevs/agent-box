@@ -1146,7 +1146,7 @@
         "sudo -u agent env HOME=/home/agent"
         f" {spawn_cmd} --preamble 'github:defangdevs/*' 'why this watch exists'"
     )
-    # The agent is named, not implied: the spawn passes no --agent, so a match
+    # The agent is named, not implied: the spawn passes no --harness, so a match
     # starts the box default, and "which model does the watch use" is not
     # answerable from the prompt alone.
     assert "claude --model haiku" in launch, launch
@@ -1179,7 +1179,7 @@
             "services.agent-box.webhook.hookSessionArgs") in launch, launch
 
     # --- issue #321: a standing watch hands work to an agent PROFILE --------
-    # The gap a profile closes here: the spawn passes no --agent, so a match
+    # The gap a profile closes here: the spawn passes no --harness, so a match
     # always started the box default harness, and hookSessionArgs could only
     # append flags to it. A profile picks the harness, the model, the effort,
     # an appended system prompt and the session's environment, under one name.

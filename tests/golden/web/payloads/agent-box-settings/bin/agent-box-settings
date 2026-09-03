@@ -4922,7 +4922,7 @@ def render_harness_options(selected=""):
     It has a blank entry, but that entry is a PROMPT and not a value: a
     profile must name its assistant (issue #493). There used to be a
     "default assistant" option here, resolving through the box-wide default
-    agent the same way a session with no --agent does. A box now starts with
+    agent the same way a session with no --harness does. A box now starts with
     no assistant installed and installs them on demand, so "the default one"
     names nothing anybody chose - and a profile that resolved through it
     would quietly become a different worker the day the box's configuration
@@ -6613,7 +6613,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # its left" - existed because a <select> always posts a value,
             # so the form could not tell "chose claude" from "left it
             # alone". Deleting the select deletes the ambiguity with it.
-            # `agent-box-session add --profile P --agent H` is still the way
+            # `agent-box-session add --profile P --harness H` is still the way
             # to say the other thing from a shell.
             profile = (form.get("profile", [""])[0]).strip()
             agent = (form.get("agent", [""])[0]).strip()
@@ -6635,7 +6635,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             # An explicit assistant with no profile is still allowed, which
-            # is what `agent-box-session add --agent H` does from a shell.
+            # is what `agent-box-session add --harness H` does from a shell.
             # The row no longer offers it (issue #493), but the route is not
             # the row: removing the picker's ambiguity is not a reason to
             # take a capability away from everything else that posts here.

@@ -218,7 +218,7 @@ in
         machine.succeed(as_agent("echo MINE-AGENTS > /home/agent/keep/AGENTS.md"))
         machine.succeed(as_agent("echo MINE-CLAUDE > /home/agent/keep/CLAUDE.md"))
         machine.succeed(as_agent(
-            "agent-box-session add keeper --agent claude --cwd /home/agent/keep"
+            "agent-box-session add keeper --harness claude --cwd /home/agent/keep"
         ))
         machine.wait_until_succeeds(tmux("has-session -t =keeper"), timeout=60)
         machine.succeed("grep -Fx MINE-AGENTS /home/agent/keep/AGENTS.md >/dev/null")
@@ -231,7 +231,7 @@ in
         machine.fail("test -e /home/agent/.codex/AGENTS.md")
         machine.succeed(as_agent("mkdir -p /home/agent/cxdir"))
         machine.succeed(as_agent(
-            "agent-box-session add cx --agent codex --cwd /home/agent/cxdir"
+            "agent-box-session add cx --harness codex --cwd /home/agent/cxdir"
         ))
         machine.wait_until_succeeds("test -f /home/agent/cxdir/AGENTS.md", timeout=60)
         machine.fail("test -e /home/agent/cxdir/CLAUDE.md")
@@ -252,7 +252,7 @@ in
         # A shell session gets neither: no agent there reads them.
         machine.succeed(as_agent("mkdir -p /home/agent/shdir"))
         machine.succeed(as_agent(
-            "agent-box-session add sh --agent shell --cwd /home/agent/shdir"
+            "agent-box-session add sh --harness shell --cwd /home/agent/shdir"
         ))
         machine.wait_until_succeeds(tmux("has-session -t =sh"), timeout=60)
         machine.fail("test -e /home/agent/shdir/AGENTS.md")
@@ -299,7 +299,7 @@ in
             " > /home/agent/s.tmp && mv /home/agent/s.tmp"
             " /home/agent/.claude/settings.json"
         ))
-        machine.succeed(as_agent("agent-box-session add themed --agent claude"))
+        machine.succeed(as_agent("agent-box-session add themed --harness claude"))
         machine.wait_until_succeeds(tmux("has-session -t =themed"), timeout=60)
         machine.succeed(
             "jq -e '.theme == \"light\"' /home/agent/.claude/settings.json"
@@ -308,7 +308,7 @@ in
 
     # --- runtime add: no sudo, no rebuild ---------------------------------
     machine.succeed(
-        "su -s /bin/sh agent -c 'agent-box-session add helper --agent codex'"
+        "su -s /bin/sh agent -c 'agent-box-session add helper --harness codex'"
     )
     machine.wait_until_succeeds(tmux("has-session -t =helper"), timeout=60)
     machine.succeed(
@@ -399,7 +399,7 @@ in
     # Regression guard on the old onboarding: no copy-paste command list, and no
     # instruction to open a shell session to run it.
     full_pane = machine.succeed(tmux('capture-pane -p -S -50 -t "=helper:"'))
-    assert "--agent shell" not in full_pane, full_pane
+    assert "--harness shell" not in full_pane, full_pane
     assert "codex login --device-auth" not in full_pane, full_pane
 
     # --- rejected credentials re-authenticate with no keystroke (issue 187) ---
@@ -508,7 +508,7 @@ in
     # Re-adding an existing name errors out and must not clobber the stored
     # config (issue 100): helper keeps its codex agent.
     machine.fail(
-        "su -s /bin/sh agent -c 'agent-box-session add helper --agent claude'"
+        "su -s /bin/sh agent -c 'agent-box-session add helper --harness claude'"
     )
     machine.succeed(
         "jq -e '.sessions.helper.agent == \"codex\"' "
@@ -588,7 +588,7 @@ in
     # from a session a person or the config started — a dispatched session
     # defers to the second and merely hands off to the first. A `shell`
     # session, because it stays up for the length of the assertion.
-    machine.succeed(as_agent("agent-box-session add hook-rank-probe --agent shell"))
+    machine.succeed(as_agent("agent-box-session add hook-rank-probe --harness shell"))
     machine.wait_until_succeeds(tmux("has-session -t =hook-rank-probe"), timeout=60)
     ranks = machine.succeed(as_agent("agent-box-session peers"))
     assert re.search(r"^hook-rank-probe .*dispatched \(hook session\)",
@@ -596,10 +596,10 @@ in
     assert re.search(r"^main .*interactive", ranks, re.M), ranks
     machine.succeed(as_agent("agent-box-session rm hook-rank-probe"))
 
-    # --- auto-named add: no NAME → derived from the agent -----------------
-    # First codex-derived name is the bare agent name (no session is literally
-    # "codex" yet — "helper" runs codex but under its own name).
-    machine.succeed("su -s /bin/sh agent -c 'agent-box-session add --agent codex'")
+    # --- auto-named add: no NAME → derived from the harness ---------------
+    # First codex-derived name is the bare harness name (no session is
+    # literally "codex" yet — "helper" runs codex but under its own name).
+    machine.succeed("su -s /bin/sh agent -c 'agent-box-session add --harness codex'")
     machine.wait_until_succeeds(tmux("has-session -t =codex"), timeout=60)
     machine.succeed(
         "jq -e '.sessions.codex.agent == \"codex\"' "
@@ -607,7 +607,7 @@ in
     )
     # A second codex-derived name collides with "codex", so it gets a short
     # random suffix ("codex-XXXX") — a distinct, valid session name.
-    machine.succeed("su -s /bin/sh agent -c 'agent-box-session add --agent codex'")
+    machine.succeed("su -s /bin/sh agent -c 'agent-box-session add --harness codex'")
     machine.succeed(
         "jq -e '[.sessions | keys[] | select(test(\"^codex-[0-9a-f]+$\"))] | length == 1' "
         "/home/agent/.config/agent-box/sessions.json"
@@ -619,6 +619,33 @@ in
     machine.wait_until_succeeds(tmux(f'has-session -t "={suffixed}"'), timeout=60)
     machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm codex'")
     machine.succeed(f"su -s /bin/sh agent -c 'agent-box-session rm {suffixed}'")
+
+    # --- `--agent` is the deprecated spelling of `--harness` --------------
+    # The flag was renamed because the harnesses took the word: `claude
+    # --agent` and `opencode --agent` both name a WORKER, which on this box
+    # is `--profile`. The old spelling keeps working — it is written into
+    # every note, README and transcript a deployed box already carries — and
+    # says on stderr that it is old. Both halves are the assertion: a warning
+    # that dropped the session would break running boxes, and a silent alias
+    # would leave the collision in place.
+    deprecated = machine.succeed(
+        "su -s /bin/sh agent -c "
+        "'agent-box-session add legacyflag --agent shell 2>&1'"
+    )
+    assert "--agent is deprecated" in deprecated, deprecated
+    assert "--harness" in deprecated, deprecated
+    machine.succeed(
+        "jq -e '.sessions.legacyflag.agent == \"shell\"' "
+        "/home/agent/.config/agent-box/sessions.json"
+    )
+    # ...and the new spelling says nothing at all.
+    quiet = machine.succeed(
+        "su -s /bin/sh agent -c "
+        "'agent-box-session add newflag --harness shell 2>&1'"
+    )
+    assert "deprecated" not in quiet, quiet
+    machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm legacyflag'")
+    machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm newflag'")
 
     # --- a hostile TMUX_TMPDIR must not disarm the CLI (issue #268) --------
     # The CLI used to defer to an inherited TMUX_TMPDIR, so any system-wide
@@ -686,7 +713,7 @@ in
 
     # --- shell pseudo-agent (issue 113): supervised plain login shell ------
     machine.succeed(
-        "su -s /bin/sh agent -c 'agent-box-session add scratch --agent shell'"
+        "su -s /bin/sh agent -c 'agent-box-session add scratch --harness shell'"
     )
     machine.wait_until_succeeds(tmux("has-session -t =scratch"), timeout=60)
     machine.succeed(
@@ -739,7 +766,7 @@ in
     with subtest("kickoff prompt is delivered once and consumed"):
         machine.succeed(
             "su -s /bin/sh agent -c "
-            + shlex.quote("agent-box-session add task1 --agent codex --prompt 'do the thing'")
+            + shlex.quote("agent-box-session add task1 --harness codex --prompt 'do the thing'")
         )
         # Stored as initialPrompt with an id minted up front; not yet run.
         machine.succeed(
@@ -798,7 +825,7 @@ in
         # A LISTED session's state is never swept — it is that session's
         # conversation, and being merely down (stopped, or between respawns)
         # is not being gone.
-        machine.succeed(as_agent("agent-box-session add kept --agent shell"))
+        machine.succeed(as_agent("agent-box-session add kept --harness shell"))
         machine.wait_until_succeeds(tmux("has-session -t =kept"), timeout=60)
         machine.wait_until_succeeds(f"test -e {state_file('kept')}", timeout=60)
         machine.succeed(as_agent("agent-box-session stop kept"))
@@ -820,7 +847,7 @@ in
         # plugin marketplace in the VM.
         machine.succeed(
             as_agent(
-                "agent-box-session add variadic --agent claude "
+                "agent-box-session add variadic --harness claude "
                 "--prompt 'do the variadic thing' -- --add-dir /home/agent"
             )
         )
@@ -919,7 +946,7 @@ in
         rot_state = state_file("rot")
         machine.succeed(
             as_agent(
-                "agent-box-session add rot --agent claude --prompt 'do the rotation thing'"
+                "agent-box-session add rot --harness claude --prompt 'do the rotation thing'"
             )
         )
         machine.wait_until_succeeds(tmux("has-session -t =rot"), timeout=60)
@@ -1090,7 +1117,7 @@ in
         # And the whole value reaches a session's environment at spawn, which
         # is the end of the path the settings page starts (issue 89): the
         # env-exec wrapper reads this file with the same parser that wrote it.
-        machine.succeed(as_agent("agent-box-session add pemsess --agent shell"))
+        machine.succeed(as_agent("agent-box-session add pemsess --harness shell"))
         machine.wait_until_succeeds(tmux("has-session -t =pemsess"), timeout=60)
         # /proc/<pid>/environ is an EXEC-TIME snapshot, and the pane command is
         # `<env-exec wrapper> <shell>` run by tmux through sh: whether the
@@ -1175,7 +1202,7 @@ in
     # --- agent profiles (issue #321) --------------------------------------
     with subtest("a profile resolves a worker: harness, args and session env"):
         # A profile is the WORKER (harness + model + effort + appended system
-        # prompt + env), as opposed to the harness `--agent` picks. Runtime
+        # prompt + env), as opposed to the harness `--harness` picks. Runtime
         # data like the env store: written by the CLI, no rebuild, no root.
         machine.succeed(
             as_agent(
@@ -1204,9 +1231,9 @@ in
             as_agent("agent-box-profile set triage HARNESS=shell 2>&1")
         )
         assert "session kind, not a worker" in shell_refusal, shell_refusal
-        assert "--agent shell" in shell_refusal, shell_refusal
+        assert "--harness shell" in shell_refusal, shell_refusal
         # MODEL/EFFORT still map to nothing when a shell session is started
-        # FROM a profile with `--agent shell`, and the resolver says so
+        # FROM a profile with `--harness shell`, and the resolver says so
         # rather than inventing flags for it.
         shell_launch = json.loads(
             machine.succeed(as_agent("agent-box-profile launch triage shell"))
@@ -1231,12 +1258,12 @@ in
         # add --profile: the harness comes from the profile, and the caller's
         # own `--` tail is appended AFTER the profile's args, so an explicit
         # flag still has the last word.
-        # `--agent shell` overrides the profile's own harness, which is also
+        # `--harness shell` overrides the profile's own harness, which is also
         # what keeps this session cheap: the assertions below are about the
         # profile's ENVIRONMENT reaching the pane, and a bare shell is the
         # cheapest pane to read it from.
         machine.succeed(
-            as_agent("agent-box-session add worker --profile triage --agent shell")
+            as_agent("agent-box-session add worker --profile triage --harness shell")
         )
         machine.succeed(f"jq -e '.sessions.worker.agent == \"shell\"' {sfile}")
         machine.succeed(f"jq -e '.sessions.worker.profile == \"triage\"' {sfile}")
@@ -1276,7 +1303,7 @@ in
         assert "MODEL=sonnet" not in environ, environ
 
         # A claude profile maps the same keys onto claude's own flags, and the
-        # override order holds: --agent wins over the profile's harness, and
+        # override order holds: --harness wins over the profile's harness, and
         # the args follow the harness that actually runs.
         machine.succeed(
             as_agent(
@@ -1460,7 +1487,7 @@ in
         sfile=/home/agent/.config/agent-box/sessions.json
         export TMUX_TMPDIR=/run/agent-box-agent
         for i in $(seq 1 20); do
-          agent-box-session add racer --agent shell --prompt 'race me' >/dev/null \
+          agent-box-session add racer --harness shell --prompt 'race me' >/dev/null \
             || { echo "iteration $i: add failed (a lost update dropped it?)" >&2; exit 1; }
           # Busy-wait, no sleep: the window opens when the pane appears and is
           # a few milliseconds wide, so the delete has to leave immediately.
@@ -1521,7 +1548,7 @@ in
         # without it), so every worker re-parks the session first — which makes
         # the storm the two real user actions it imitates: Start in the browser
         # and `agent-box-session stop` in a terminal.
-        machine.succeed(as_agent("agent-box-session add parked --agent shell"))
+        machine.succeed(as_agent("agent-box-session add parked --harness shell"))
         machine.wait_until_succeeds(tmux("has-session -t =parked"), timeout=60)
         machine.succeed(as_agent("agent-box-session stop parked"))
         lost_update_script = r"""
@@ -1543,7 +1570,7 @@ in
               done ) &
           done
           for n in $names; do
-            agent-box-session add $n --agent shell --prompt "kickoff $n" >/dev/null \
+            agent-box-session add $n --harness shell --prompt "kickoff $n" >/dev/null \
               || { echo "round $round: add $n failed (a lost update dropped it?)" >&2; exit 1; }
           done
           for n in $names; do

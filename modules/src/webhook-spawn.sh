@@ -319,7 +319,7 @@ fi
 # keeping a copy that would drift.
 #
 # The agent is never chosen here — the spawn calls `agent-box-session add`
-# with no --agent — so the box default is what a match really starts. The
+# with no --harness — so the box default is what a match really starts. The
 # wrapper exports it for exactly this line; unset only in a hand-run script.
 render_launch() {
   # The example is a variable so the copy-paste line keeps the shell quoting

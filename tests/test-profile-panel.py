@@ -421,7 +421,7 @@ class ProfileRoutes(ProfileFixture):
         """A <select> always posts a value, so this form cannot tell
         "chose claude" from "left it alone" — and a rule that turned on a
         difference the page cannot see would be a guess. The CLI's
-        `--profile P --agent H` is still the way to say the other thing."""
+        `--profile P --harness H` is still the way to say the other thing."""
         _, base = self.serve()
         self.write_profile("triage", "HARNESS=claude\n")
         self.post(base, "/sessions/add", back="settings", agent="shell",
@@ -630,7 +630,7 @@ class ProfilesAreNotBuiltAroundABoxDefault(ProfileFixture):
     `shell` is not one of those harnesses. It has no model, effort or system
     prompt to configure, so a profile built around it configures nothing --
     the resolver could only warn that all three were ignored. It stays a
-    session KIND (`--agent shell` still works); it stops being a profile
+    session KIND (`--harness shell` still works); it stops being a profile
     answer.
 
     And there is no "box default" harness to fall back to. A box now starts

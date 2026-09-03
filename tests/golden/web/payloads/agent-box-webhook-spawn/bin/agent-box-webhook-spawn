@@ -18,7 +18,7 @@ export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linu
 # binary would report the wrong worker rather than fail - pin it.
 export AGENT_BOX_JQ_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin/jq
 # Which agent a match really starts. The spawn calls
-# `agent-box-session add` with no --agent, so it is the box default -
+# `agent-box-session add` with no --harness, so it is the box default -
 # and --preamble has to NAME it, because that is the half of 'what
 # does this watch launch' the page could not show before (#292).
 export AGENT_BOX_DEFAULT_AGENT=claude
@@ -583,7 +583,7 @@ fi
 # keeping a copy that would drift.
 #
 # The agent is never chosen here — the spawn calls `agent-box-session add`
-# with no --agent — so the box default is what a match really starts. The
+# with no --harness — so the box default is what a match really starts. The
 # wrapper exports it for exactly this line; unset only in a hand-run script.
 render_launch() {
   # The example is a variable so the copy-paste line keeps the shell quoting
