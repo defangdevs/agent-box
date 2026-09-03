@@ -3988,7 +3988,7 @@ def render_connect_card(state):
         # here; the distinction matters because the fix is different (wait
         # for a download, not go through an OAuth flow).
         pill = ("stopped", "Not installed")
-    if state["state"] in ("waiting", "starting", "checking", "exchanging"):
+    if state["state"] in ("waiting", "starting", "exchanging"):
         label, confirm = None, False
     elif state["blocked"]:
         label, confirm = None, False
@@ -4001,7 +4001,22 @@ def render_connect_card(state):
         label, confirm = ("Install & sign in", False) if state["installable"] \
             else (None, False)
     else:
-        label, confirm = "Sign in", False
+        # "checking" falls in here too, on purpose. connect_status() never
+        # blocks the render (a slow or unreachable network must not hold
+        # the whole settings page hostage for a status pill), so EVERY
+        # card starts "checking" on a cold cache and reverts to it whenever
+        # CONNECT_STATUS_TTL lapses between renders — which is often, since
+        # a probe is only as fresh as the last page load. The button used
+        # to disappear for that whole window: nothing to click, no error,
+        # no request, until the poll a beat later swapped the real button
+        # back in. A quick operator hits that gap on nearly every reload,
+        # and unevenly — gh's probe answers faster than claude's or
+        # codex's, which is why only the GitHub card ever seemed to work.
+        # connect_start() does not read this cache either way, so offering
+        # the button is safe; the one thing it must not do is skip a
+        # destructive flow's confirmation on the strength of a guess, so
+        # that guard stays armed until the probe actually clears it.
+        label, confirm = "Sign in", (state["state"] == "checking" and state["destructive"])
     action = ""
     if label:
         guard = ""
