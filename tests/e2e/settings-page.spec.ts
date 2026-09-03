@@ -124,6 +124,25 @@ test('basic auth renders the page and sets the auth cookie; cookie alone then su
   await expect(cookiePage.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
 });
 
+// Regression for the bug where settings.js's init-time collapse list
+// omitted "profile-editor": the form rendered expanded (the no-JS
+// fallback) instead of behind the "Add profile" button, and a first click
+// on the button then hid it instead of revealing it.
+test('session, profile and secret editors all collapse on load and open on click', async ({ browser }) => {
+  const page = await authedPage(browser);
+  await page.goto(SETTINGS_PATH);
+
+  await expect(page.locator('#session-editor')).toBeHidden();
+  await expect(page.locator('#profile-editor')).toBeHidden();
+  await expect(page.locator('#secret-editor')).toBeHidden();
+
+  await page.getByRole('button', { name: 'Add session' }).click();
+  await expect(page.locator('#session-editor')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Add profile' }).click();
+  await expect(page.locator('#profile-editor')).toBeVisible();
+});
+
 test('update status reports available commits and links to the GitHub changes', async ({ browser }) => {
   const page = await authedPage(browser);
   const head = '1111111111111111111111111111111111111111';
