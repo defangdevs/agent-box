@@ -387,6 +387,65 @@ in
         )
         assert 'data-ph="live"' in live_ws, live_ws
 
+    # --- what the web surface says about a session that DIED (issue #516) -
+    # A crash is the one ending that leaves the tmux session UP: the pane
+    # becomes a post-mortem shell, deliberately (#167), so it can be read.
+    # Every surface here was built on tmux liveness alone and therefore
+    # called that pane Running -- which is how a codex Remote Control daemon
+    # died on the deployed box under a green dot, and nobody noticed until
+    # the phone app stopped answering.
+    with subtest("a crashed session is described as died, not as running"):
+        machine.succeed(
+            as_agent("agent-box-session add crashed -- --not-a-real-flag"))
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions.crashed.died == 1' {sfile}", timeout=120
+        )
+        machine.succeed(tmux("has-session -t =crashed"))
+
+        died_page = client.succeed(
+            f"{curl} -u agent:testpassword https://box.test/agent/settings/"
+        )
+        row = died_page[died_page.index('href="/agent/crashed/"'):]
+        row = row[:row.index("/sessions/delete")]
+        assert 'data-state="died"' in row, row
+        assert ">Died</span>" in row, row
+        # The exit status is the whole of what anyone knows about the crash
+        # without attaching to the pane, so the row carries it.
+        assert "exited with status 1" in row, row
+        # Restart, and no "unsaved work is lost" confirm: same reasoning as
+        # the stopped row (#241) -- there is no running agent to lose.
+        assert ">Restart</button>" in row, row
+        assert "confirm(" not in row, row
+
+        # The workspace tab is the surface the operator is actually looking
+        # at, and the dot is all it has room for, so the words go in the
+        # tooltip.
+        died_ws = client.succeed(
+            f"{curl} -u agent:testpassword 'https://box.test/agent/?tab=crashed'"
+        )
+        tab = died_ws[died_ws.index('data-tab="crashed"'):]
+        tab = tab[:tab.index("</a>")]
+        assert 'data-state="died"' in tab, tab
+        assert "the agent died" in tab, tab
+        # The dot says the AGENT died; the pane state says the tmux session
+        # is still attachable, and the tab carries both. SCRIPT reads this
+        # one rather than deriving it from the dot -- deriving it is what
+        # made the client tear the post-mortem shell out on the next
+        # live-feed refresh (CodeRabbit on PR #522).
+        assert 'data-pane-state="live"' in tab, tab
+        # The pane still attaches: the post-mortem shell holds the error the
+        # operator came to read, and hiding it behind a placeholder would
+        # throw away the one thing that says WHY.
+        #
+        # Scoped to THIS session's pane, never the whole page: `main` is live
+        # in the same workspace, so a page-wide search for data-ph="live"
+        # passes on main's iframe even when `crashed` got a placeholder.
+        crashed_pane = died_ws[died_ws.index('data-pane="crashed"'):]
+        crashed_pane = crashed_pane[:crashed_pane.index(">") + 1]
+        assert 'data-ph="live"' in crashed_pane, crashed_pane
+
+        machine.succeed(as_agent("agent-box-session rm crashed"))
+
     # The terminal pane is the other surface that could only send the
     # operator elsewhere, and it is the one they are looking at when they
     # find out the session is down. Given a terminal on the other end it

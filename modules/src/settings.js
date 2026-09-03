@@ -445,11 +445,10 @@
     var s = t ? t.querySelector("[data-state]") : null;
     return s ? s.getAttribute("data-state") : "";
   }
-  function tabLive(name) { return tabState(name) === "live"; }
   function placeholderText(name) {
     // Mirrors render_pane: a stopped session is not coming up on its
     // own, so don't promise that it is starting.
-    return tabState(name) === "stopped"
+    return paneState(name) === "stopped"
       ? name + " is stopped — nothing starts it on its own."
       : name + " is starting…";
   }
@@ -488,8 +487,24 @@
   function paneState(name) {
     // The three states a pane is built for; data-ph records which one the
     // mounted pane belongs to, on the iframe as much as on a placeholder.
-    if (tabLive(name)) { return "live"; }
-    return tabState(name) === "stopped" ? "stopped" : "starting";
+    //
+    // The SERVER decides it (pane_state in the daemon) and stamps it on the
+    // tab, because "is the pane attachable" is not the question the tab's
+    // coloured dot answers: a session whose agent crashed keeps a live tmux
+    // session holding the post-mortem shell, so its dot reads `died` while
+    // its pane is `live` (issue #516). Deriving the pane from the dot here
+    // put the two sides out of step — the first live-feed refresh replaced
+    // that shell with a "starting…" placeholder and threw away the one
+    // surface that says WHY (CodeRabbit on PR #522).
+    var t = tabEl(name);
+    var el = t ? t.querySelector("[data-pane-state]") : null;
+    var ps = el ? el.getAttribute("data-pane-state") : null;
+    if (ps) { return ps; }
+    // Markup rendered before that stamp existed: fall back to the dot,
+    // which agrees with the server for every state except `died`.
+    var st = tabState(name);
+    if (st === "live" || st === "died") { return "live"; }
+    return st === "stopped" ? "stopped" : "starting";
   }
   function ensurePane(name) {
     var cur = document.querySelector('#panes .pane[data-pane="' + name + '"]');
@@ -504,7 +519,7 @@
     // Panes rendered before this stamp existed are server-rendered iframes.
     if (cur && (cur.getAttribute("data-ph") || "live") === want) { return cur; }
     var el;
-    if (tabLive(name)) {
+    if (want === "live") {
       el = document.createElement("iframe");
       // data-term-base is this user's own path with its trailing slash;
       // a session hangs off it as a path segment, not a query.
