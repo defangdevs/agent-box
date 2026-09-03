@@ -18679,10 +18679,12 @@ if __name__ == "__main__":
       + "\n"
       + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
       + "}\n\n"
-      + ''
+      # The same fragment the native renderer binds (issue #154 Phase 2), so
+      # both backends document — and wire — this extension point identically.
+      + lib.replaceStrings [ "@APPLY_CMD@" ] [ "nixos-rebuild switch" ] ''
         # Per-user snippet directories. Each agent user's ~/sites/ symlinks
         # here. Adding a file below and running `sudo systemctl reload
-        # caddy.service` is the whole workflow — no nixos-rebuild required.
+        # caddy.service` is the whole workflow — no @APPLY_CMD@ required.
         # One import per user: Caddyfile's `import` directive only accepts a
         # single `*` per pattern, so we can't collapse this to `*/*.caddy`.
       ''

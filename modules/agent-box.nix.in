@@ -3135,12 +3135,10 @@ in
       + "\n"
       + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
       + "}\n\n"
-      + ''
-        # Per-user snippet directories. Each agent user's ~/sites/ symlinks
-        # here. Adding a file below and running `sudo systemctl reload
-        # caddy.service` is the whole workflow — no nixos-rebuild required.
-        # One import per user: Caddyfile's `import` directive only accepts a
-        # single `*` per pattern, so we can't collapse this to `*/*.caddy`.
+      # The same fragment the native renderer binds (issue #154 Phase 2), so
+      # both backends document — and wire — this extension point identically.
+      + lib.replaceStrings [ "@APPLY_CMD@" ] [ "nixos-rebuild switch" ] ''
+        @@include:src/caddyfile-sites.caddy@@
       ''
       + lib.concatMapStringsSep "" (name: "import /var/lib/agent-box-sites/${name}/*.caddy\n") (lib.attrNames cfg.users));
 

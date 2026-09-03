@@ -303,3 +303,11 @@ handle {
 }
 
 }
+
+# Per-user snippet directories. Each agent user's ~/sites/ symlinks
+# here. Adding a file below and running `sudo systemctl reload
+# caddy.service` is the whole workflow — no agentbox apply required.
+# One import per user: Caddyfile's `import` directive only accepts a
+# single `*` per pattern, so we can't collapse this to `*/*.caddy`.
+import /var/lib/agent-box-sites/agent/*.caddy
+import /var/lib/agent-box-sites/robot/*.caddy

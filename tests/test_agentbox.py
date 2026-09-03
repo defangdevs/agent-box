@@ -1110,6 +1110,44 @@ class RenderTest(unittest.TestCase):
                 / "agent-box-fail2ban.service").read_text()
         self.assertIn("-c /etc/agent-box/fail2ban", unit)
 
+    def test_a_snippet_in_sites_is_actually_served(self):
+        """The ~/sites extension point (issue #40) is four pieces: the
+        caddy-readable snippet dir, the symlink into $HOME, the sudo grant
+        to reload caddy — and the `import` that makes caddy read the
+        snippet. The native backend rendered the first three and not the
+        fourth, which is the failure that looks like success: the dir is
+        there, the reload exits 0, and the agent's vhost is never served
+        (caddy answers the TLS handshake for that hostname with an
+        internal error, since no such site exists).
+
+        One `import` per user, because a Caddyfile glob takes a single
+        `*`, and at the TOP level — an import inside the front-door block
+        would be a snippet spliced into that vhost instead of a vhost of
+        its own.
+        """
+        caddyfile = (FIXTURE / "etc/agent-box/Caddyfile").read_text()
+        tmpfiles = (FIXTURE / "etc/tmpfiles.d/agent-box.conf").read_text()
+        config = json.loads(CONFIG_JSON.read_text())
+        closing = caddyfile.rindex("\n}\n")
+        for user in config["users"]:
+            line = f"import /var/lib/agent-box-sites/{user}/*.caddy"
+            self.assertIn(line, caddyfile,
+                          f"{user}'s ~/sites snippets are never imported, "
+                          f"so their vhost is never served")
+            self.assertGreater(caddyfile.index(line), closing,
+                               "the snippet import is nested inside the "
+                               "front-door block")
+            # The glob names the directory tmpfiles actually creates, not
+            # a near-miss path that would silently match nothing.
+            self.assertIn(f"d /var/lib/agent-box-sites/{user} 0750 {user} "
+                          "caddy", tmpfiles)
+        # The rendered file promises this workflow to every agent that
+        # reads it, and both backends bind the same fragment for the
+        # comment AND the imports, so promise and wiring cannot drift.
+        self.assertIn("drop a *.caddy snippet into ~/sites/", caddyfile)
+        module = (REPO / "modules/agent-box.nix.in").read_text()
+        self.assertIn("@@include:src/caddyfile-sites.caddy@@", module)
+
     def test_the_guide_promises_only_commands_this_box_has(self):
         """The guide is shipped to every box and names commands by hand.
 

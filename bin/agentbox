@@ -2832,6 +2832,20 @@ class Renderer:
             parts.append(bind("terminal", u))
         parts.append(bind("root", root_user))
         parts.append("}\n")
+        # The self-serve extension point the header fragment documents, and
+        # the reason the sudo allowlist carries `systemctl reload
+        # caddy.service`: one `import` per user, since Caddyfile's `import`
+        # accepts a single `*` per pattern. Without these lines a native box
+        # has the whole mechanism — the caddy-readable dir, the ~/sites
+        # symlink, the reload grant, the instructions at the top of this
+        # very file — and nothing that ever reads a snippet, so an agent's
+        # virtual host is silently never served: caddy reloads happily
+        # and answers the TLS handshake for that hostname with an
+        # internal_error, because no vhost by that name exists.
+        parts.append(
+            bind("sites")
+            + "".join(f"import /var/lib/agent-box-sites/{u.name}/*.caddy\n"
+                      for u in self.spec.users))
         # GENERATED_HEADER first: the fragment's own banner is shared with
         # the module and speaks NixOS ("the next nixos-rebuild"), so it is
         # not a marker of who wrote THIS file. Without a header of ours,
