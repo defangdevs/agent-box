@@ -14,5 +14,7 @@ Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-curl-8.21.0-bin/bi
 Environment="PIN_FILE=/etc/nixos/agent-box-pin.nix"
 Environment="REPO=defangdevs/agent-box"
 Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026b/share/zoneinfo"
+X-RestartIfChanged=false
+X-StopIfChanged=false
 ExecStart=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-unit-script-agent-box-update-start/bin/agent-box-update-start 
 Type=oneshot
