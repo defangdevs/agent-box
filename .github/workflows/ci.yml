@@ -226,17 +226,16 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      # The interactive VM tests, in one nix invocation so independent
-      # derivations build CONCURRENTLY (as separate steps they serialize
-      # twice over: per-step, and via nix's default max-jobs=1). Ran
-      # back-to-back they took ~8 min of the job's ~10; concurrently they
-      # bound the job at roughly the slowest wave (~3-4 min).
-      #   --max-jobs 3: ubuntu-latest has 4 vCPUs / 16 GiB and web-surface
-      #     boots TWO qemu nodes — all 7 at once would thrash and trade the
-      #     saved minutes back as flaky timeouts. Splitting `sessions` (issue
-      #     #312) does not by itself stop it holding the wave open, which is
-      #     why the long check is started first below; the bound is then the
-      #     greater of its length and the rest of the work over two slots.
+      # The interactive VM tests, split across three nix invocations (see
+      # the lane comment below) so independent derivations build
+      # CONCURRENTLY instead of serializing per-step and via nix's default
+      # max-jobs=1. Ran back-to-back they'd take ~17 min; laned, they bound
+      # the job at roughly the slowest lane.
+      #   ubuntu-latest has 4 vCPUs / 16 GiB, and web-surface/sessions/
+      #     sessions-web/settings-page/webhook each boot TWO qemu nodes — all
+      #     7 checks at once would thrash and trade the saved minutes back
+      #     as flaky timeouts, which is why the two longest each get an
+      #     isolated lane instead (issues #312, #519).
       #   --keep-going: one red test doesn't hide the others' results (the
       #     failing drv is still named in the log).
       # What each check covers:
@@ -287,31 +286,43 @@ jobs:
         # over the same eight runs).
         timeout-minutes: 18
         run: |
-          # `sessions` is the longest check, so it has to START FIRST. With
-          # three slots the window is its own length only while it begins at
-          # t=0, and nix picks the order itself: measured on run 32649965071,
-          # it landed in the SECOND wave, began 86s in, finished last, and the
-          # window was 86+270=357s while the check itself was only 270s. The
-          # five short checks had already filled the slots.
+          # `sessions` is the longest check, so it gets its own lane and
+          # starts first, same as before (#312). But splitting `sessions`
+          # didn't stop the wave being held open by whichever check nix
+          # schedules last inside the shared "rest" bucket: measured on a
+          # green master run (32651927723, right after #344 merged),
+          # `webhook` started at +224s and closed the step at +323s even
+          # though it's shorter than `sessions` — the six-item bucket just
+          # packs in whatever order nix's own scheduler picks, not by size.
           #
-          # Two invocations pin the packing instead of hoping for it: the long
-          # check alone, the other six sharing the remaining two slots. Still
-          # three VM guests at once, so the memory budget below is unchanged
-          # (the long invocation holds ONE test, so its second slot only ever
-          # builds a dependency).
-          nix build -L --max-jobs 2 .#checks.x86_64-linux.sessions &
-          long=$!
+          # `webhook.nix` has grown since: on run 33697007598 it took
+          # 223.84s (`sessions` 333.33s) and STILL started last, at +371s,
+          # holding the step open to 597s. Giving it its own lane too fixes
+          # the same flaw one level down, the way `sessions` already got
+          # fixed: three lanes now, sized so `sessions` alone bounds the
+          # window again.
+          #
+          # Total configured --max-jobs across the three lanes is 4, same
+          # as the two-lane split's 2+2 — this repartitions which checks
+          # get isolated, it doesn't raise the memory budget (still three
+          # VM guests at once in the worst case: one from each of the
+          # `sessions`/`webhook` lanes, one from whichever pair is
+          # concurrently building in the five-check lane).
+          nix build -L --max-jobs 1 .#checks.x86_64-linux.sessions &
+          sessions=$!
+          nix build -L --max-jobs 1 .#checks.x86_64-linux.webhook &
+          webhook=$!
           nix build -L --keep-going --max-jobs 2 \
             .#checks.x86_64-linux.web-surface \
             .#checks.x86_64-linux.settings-page \
             .#checks.x86_64-linux.memory-protection \
             .#checks.x86_64-linux.sessions-web \
-            .#checks.x86_64-linux.connect \
-            .#checks.x86_64-linux.webhook &
+            .#checks.x86_64-linux.connect &
           rest=$!
-          # Both are waited on before the step decides, so --keep-going's
-          # promise still holds across the pair: every result reaches the log,
-          # and one red check cannot hide another's.
-          long_status=0; wait "$long" || long_status=$?
+          # All three are waited on before the step decides, so
+          # --keep-going's promise still holds across the set: every result
+          # reaches the log, and one red check cannot hide another's.
+          sessions_status=0; wait "$sessions" || sessions_status=$?
+          webhook_status=0; wait "$webhook" || webhook_status=$?
           rest_status=0; wait "$rest" || rest_status=$?
-          [ "$long_status" -eq 0 ] && [ "$rest_status" -eq 0 ]
+          [ "$sessions_status" -eq 0 ] && [ "$webhook_status" -eq 0 ] && [ "$rest_status" -eq 0 ]
