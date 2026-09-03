@@ -125,8 +125,7 @@ az group create -n agent-box -l westus3
 az deployment group create -g agent-box \
   --template-file azure/agent-box.json \
   --parameters webPassword='<16-64 chars>' \
-               adminPasswordOrKey="$(cat ~/.ssh/id_ed25519.pub)" \
-               agent=claude
+               adminPasswordOrKey="$(cat ~/.ssh/id_ed25519.pub)"
 ```
 
 The deployment finishes when the box is actually configured — a few minutes:

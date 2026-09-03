@@ -40,13 +40,6 @@ param userName string = 'agent'
 @maxLength(64)
 param webPassword string
 
-@description('Which agent CLI the box\'s initial session runs.')
-@allowed([
-  'claude'
-  'codex'
-])
-param agent string = 'claude'
-
 // The picker annotates each value with vCPU/RAM/price because the portal's
 // generated form renders allowed values verbatim - there is no separate label
 // field, exactly as with the Lightsail template's BundleId. Only the first
@@ -294,12 +287,15 @@ AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
 # on the settings page instead of a started agent session. No opt-in back to
 # the pre-#416 behaviour: a session seeded before the box's first sign-in
 # cannot do anything anyway, since its agent CLI still has to authenticate
-# first (issue #469).
+# first (issue #469). No `defaultAgent` either, for the same reason a
+# deploy-time agent parameter was dropped (issue #552): which CLI to run is
+# a choice the settings page's install+sign-in cards make per session, not
+# one this box needs to have made for it before it ever boots. `agentbox`
+# falls back to the first entry of `agents` on its own.
 install -d -m 0755 /etc/agent-box
 cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
 domain: auto
 agents: [claude, codex]
-defaultAgent: @@AGENT@@
 web:
   enable: true
 users:
@@ -341,11 +337,10 @@ set -x
 echo "agent-box bootstrap complete"
 '''
 
-var bootstrap = replace(replace(replace(replace(replace(replace(
+var bootstrap = replace(replace(replace(replace(replace(
   bootstrapTemplate,
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
-  '@@AGENT@@', agent),
   '@@USER@@', userName),
   '@@AGENTSMD@@', agentsMd),
   // base64, not the plaintext: see the comment above the apply, and
@@ -496,7 +491,7 @@ var host = '${replace(publicIp.properties.ipAddress, '.', '-')}.sslip.io'
 @description('Browser terminal. Sign in with the userName and the webPassword chosen at deployment time. The first load waits on Caddy\'s ACME certificate. (The URL deliberately carries no user@ prefix: Chrome answers the auth challenge with URL userinfo plus an EMPTY password, and credentials typed into the prompt cannot override the URL-embedded identity.)')
 output webUrl string = 'https://${host}/${userName}/'
 
-@description('Claude Remote Control session name. After finishing `claude login` once in the browser terminal, the Claude desktop and mobile apps can drive this session. Only meaningful when agent=claude.')
+@description('Claude Remote Control session name. Only meaningful if the session started from the settings page\'s install+sign-in cards is a claude one: after finishing `claude login` once in the browser terminal, the Claude desktop and mobile apps can drive it.')
 output remoteControlSession string = '${userName}-main@${host}'
 
 @description('Static public IPv4 address.')
