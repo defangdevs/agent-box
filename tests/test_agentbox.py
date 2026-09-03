@@ -154,6 +154,13 @@ def build_fake_profile(root):
     (prof / "libexec" / "agent-box").mkdir(parents=True)
     shutil.copy(SRC / "password-helper.py",
                 prof / "libexec" / "agent-box" / "password-helper.py")
+    # agent-box-candidate's body, rendered per box with its constants
+    # prepended (see Renderer's candidate block). Copied here for the same
+    # reason the password helper is: without it the renderer's `is_file()`
+    # guard skips the wrapper, and the expected tree would ratify its
+    # ABSENCE instead of its content.
+    shutil.copy(SRC / "candidate.sh",
+                prof / "libexec" / "agent-box" / "candidate.sh")
     return prof
 
 

@@ -87,6 +87,18 @@ UPDATE_TRIGGER = f"{SYSTEMCTL} start --no-block {UPDATE_UNIT}"
 # daemon's HTTP answer is already on the wire when systemd starts stopping
 # units, this daemon among them.
 REBOOT_TRIGGER = f"{SYSTEMCTL} reboot --no-block"
+# Candidate releases (this box before the fleet). The wrapper is rendered
+# rather than shipped as a profile payload because it runs under sudo, whose
+# env_reset means it can carry no environment: its repo, tree and trigger are
+# baked in by the renderer, so a caller cannot point root at another repo.
+# Spelled once for the same #353 reason as the three above — the sudoers line
+# and the path the guide tells the agent to run must agree byte for byte.
+CANDIDATE_HELPER = "/etc/agent-box/bin/agent-box-candidate"
+CANDIDATE_TRIGGER = f"{CANDIDATE_HELPER} *"
+# Where that wrapper queues the branch it wants, and where agent-box-source
+# consumes it. One update reads it and deletes it: a candidate lasts until
+# the next update and never pins the box.
+CANDIDATE_FILE = "/var/lib/agent-box/candidate"
 # Store housekeeping (issue #394). A full root wedges the whole box —
 # no journal, no profile swap, and an agent that cannot write — and on a
 # native box nobody is around to run `nix-collect-garbage` by hand. The
@@ -2628,6 +2640,15 @@ class Renderer:
             # per-user password grant above exists to avoid.
             if self.spec.reboot_button and u is self.spec.root_user:
                 cmds.append(REBOOT_TRIGGER)
+            # Installing a candidate release goes to the ROOT user alone,
+            # for the same reason the reboot does: it takes every user's
+            # sessions down with it, and one user's power over another's
+            # work is what the per-user grants exist to avoid. `*` allows
+            # exactly one argument of anything, which is all the wrapper
+            # accepts — and the wrapper, not sudoers, is what decides
+            # whether that argument names an installable branch.
+            if u is self.spec.root_user:
+                cmds.append(CANDIDATE_TRIGGER)
             cmds += self.spec.sudo_allowlist
             lines.append(f"{u.name} ALL=(root) NOPASSWD: " + ", ".join(cmds))
         t.file(self.p(SUDOERS_DIR, "agent-box"),
@@ -2894,6 +2915,39 @@ class Renderer:
                               f"agent-box-password-{u.name}"),
                        f"#!{self.bin}/agent-box-python\n" + body + tail,
                        0o755)
+
+        # agent-box-candidate: install a branch on THIS box before it is
+        # merged and the fleet takes it (see modules/src/candidate.sh for
+        # what it refuses). Constants are PREPENDED, not appended: this is
+        # shell, where the body's `case` runs the moment it is reached, so a
+        # tail would assign after the code that reads it. Compiled in for
+        # the same sudo reason as the password helper — env_reset means the
+        # wrapper carries no environment, and a caller-supplied repo URL
+        # would be root building code from anywhere.
+        candidate_src = self.profile / "libexec" / "agent-box" / \
+            "candidate.sh"
+        if candidate_src.is_file():
+            # spec.repo, which prefers the PROFILE's manifest over the
+            # config key: the manifest cannot disagree with what is
+            # installed, and this wrapper must fetch from the repo the box
+            # actually came from. No branch key exists natively — an empty
+            # SRC_BRANCH is what tells the wrapper and agent-box-source to
+            # follow the remote's own default, rather than guessing
+            # "master" at a repo that may have renamed it.
+            url = f"https://github.com/{self.spec.repo}.git"
+            head = (
+                "# Box constants, prepended by `agentbox apply`.\n"
+                f"CANDIDATE_FILE={shlex.quote(CANDIDATE_FILE)}\n"
+                f"SRC_DIR={shlex.quote(SRC_DIR)}\n"
+                f"SRC_URL={shlex.quote(url)}\n"
+                "SRC_BRANCH=''\n"
+                f"SYSTEMCTL={shlex.quote(SYSTEMCTL)}\n"
+                f"UPDATE_TRIGGER={shlex.quote(UPDATE_TRIGGER)}\n"
+                "\n"
+            )
+            t.file(self.p(CANDIDATE_HELPER),
+                   "#!/bin/sh\n" + head + candidate_src.read_text(),
+                   0o755)
 
         # Interactive CLIs beyond agent-box-session/agent-box-profile
         # (interactive_clis, called unconditionally from render()):
@@ -3840,7 +3894,8 @@ def source_tree(profile, verb, *rest, src=SRC_DIR, url=None, rev=None,
     the two backends cannot drift on what "fast-forward the box" means —
     only on what they do with the rev it returns.
     """
-    env = dict(os.environ, AGENT_BOX_SRC_DIR=src)
+    env = dict(os.environ, AGENT_BOX_SRC_DIR=src,
+               AGENT_BOX_CANDIDATE_FILE=CANDIDATE_FILE)
     if url:
         env["AGENT_BOX_SRC_URL"] = url
     if rev:

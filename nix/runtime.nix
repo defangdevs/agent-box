@@ -339,6 +339,10 @@ let
     # crosses sudo, so its paths must not come from env); the template it
     # renders from lives here.
     install -m444 ${src}/password-helper.py $out/libexec/agent-box/
+    # agent-box-candidate, same story: `agentbox apply` renders it per box
+    # with the repo, tree and trigger compiled in, because it crosses sudo
+    # and sudo carries no environment. The module embeds this same file.
+    install -m444 ${src}/candidate.sh $out/libexec/agent-box/
   '';
 in
 pkgs.buildEnv {

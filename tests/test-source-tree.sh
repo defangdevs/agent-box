@@ -324,6 +324,148 @@ AGENT_BOX_SRC_BRANCH=no-such-branch run check
   && ok "a failed check prints no rev at all" \
   || no "a failed check prints no rev at all" "rc=$rc out=$(out)"
 
+# --- a queued candidate (agent-box-candidate) ---------------------------
+#
+# The other half of "try a fix on this box before the fleet takes it": the
+# wrapper queues a branch, and THIS script is what consumes it. Three
+# properties are load-bearing, and each one is the difference between a
+# candidate and a pin:
+#
+#   - it is consumed, once. A candidate that survived its own update would
+#     be reinstalled by every later trigger, and a box that failed to build
+#     it would retry forever.
+#   - coming home does not need the operator. A candidate is squash-merged,
+#     so its head is never an ancestor of the tracked branch and --ff-only
+#     refuses the way back — the box would be stuck off-branch, which is the
+#     exact permanent divergence the feature promises not to create.
+#   - an explicit --rev keeps the strict guard. The relaxation is for the
+#     queue and for the way home, not a general-purpose force.
+candidate_file="$work/candidate"
+export AGENT_BOX_CANDIDATE_FILE="$candidate_file"
+
+# A branch off the tracked branch's tip, which is what a rebased candidate
+# looks like. REV_THREE is master's head throughout.
+git -C "$upstream" branch --quiet cand "$REV_THREE" 2>/dev/null || \
+  git -C "$upstream" branch -f cand "$REV_THREE"
+git -C "$upstream" checkout --quiet cand
+echo four > "$upstream/file"
+git -C "$upstream" commit --quiet -am four
+REV_CAND=$(git -C "$upstream" rev-parse HEAD)
+git -C "$upstream" checkout --quiet master
+
+at "$REV_THREE"
+export AGENT_BOX_SRC_REV="$REV_THREE"
+printf 'want=refs/heads/cand\n' > "$candidate_file"
+run pull
+[ "$rc" = 0 ] && [ "$(out)" = "$REV_CAND" ] \
+  && ok "a queued candidate is what the tree moves to" \
+  || no "a queued candidate is what the tree moves to" "rc=$rc out=$(out) want=$REV_CAND"
+said "installing candidate refs/heads/cand" \
+  && ok "and it says so, naming the branch" \
+  || no "and it says so, naming the branch" "$(cat "$work/err")"
+grep -q "^want=" "$candidate_file" 2>/dev/null \
+  && no "the queued candidate is consumed" "want= survived the pull" \
+  || ok "the queued candidate is consumed, so no later update reinstalls it"
+[ "$(sed -n 's/^on=//p' "$candidate_file")" = "$REV_CAND" ] \
+  && ok "and the box records WHICH candidate it now runs" \
+  || no "and the box records which candidate it now runs" "$(cat "$candidate_file" 2>/dev/null)"
+
+# A candidate that is NOT ahead of the tracked branch is refused here,
+# whatever wrote the marker. This is what keeps "candidate" from being a way
+# to replay an older rev, and it has to live on this side: the force path
+# below is taken by any box already off the branch, so a candidate accepted
+# without this check would be installed with no ancestry guard at all.
+git -C "$upstream" branch --quiet stale "$REV_ONE" 2>/dev/null || \
+  git -C "$upstream" branch -f stale "$REV_ONE"
+at "$REV_THREE"
+printf 'want=refs/heads/stale\n' > "$candidate_file"
+AGENT_BOX_SRC_REV="$REV_THREE" run pull
+[ "$rc" != 0 ] && said "is not ahead of master" \
+  && ok "a candidate behind the tracked branch is refused" \
+  || no "a candidate behind the tracked branch is refused" "rc=$rc out=$(out)"
+[ "$(head_of "$dir")" = "$REV_THREE" ] \
+  && ok "and the tree does not move for it" \
+  || no "and the tree does not move for it" "$(head_of "$dir")"
+
+# Same refusal on a box that is already off the branch, which is the case
+# that matters: there the guard would otherwise be forced past.
+at "$REV_CAND"
+printf 'want=refs/heads/stale\non=%s\n' "$REV_CAND" > "$candidate_file"
+AGENT_BOX_SRC_REV="$REV_CAND" run pull
+[ "$rc" != 0 ] && said "is not ahead of master" \
+  && ok "and refused on a candidate box too, where force would apply" \
+  || no "and refused on a candidate box too" "rc=$rc out=$(out)"
+
+# Now the box RUNS the candidate, and the branch has been squash-merged:
+# master has a new commit that is not the candidate's parent, so the
+# candidate is not an ancestor of master and --ff-only cannot get home.
+echo five > "$upstream/file"
+git -C "$upstream" commit --quiet -am "squash of cand"
+REV_MERGED=$(git -C "$upstream" rev-parse HEAD)
+at "$REV_CAND"
+printf 'on=%s\n' "$REV_CAND" > "$candidate_file"
+AGENT_BOX_SRC_REV="$REV_CAND" run pull
+[ "$rc" = 0 ] && [ "$(out)" = "$REV_MERGED" ] \
+  && ok "a plain update brings a candidate box home to the tracked branch" \
+  || no "a plain update brings a candidate box home" "rc=$rc out=$(out) want=$REV_MERGED"
+said "runs candidate" \
+  && ok "and names why the fast-forward check was skipped" \
+  || no "and names why the fast-forward check was skipped" "$(cat "$work/err")"
+[ ! -e "$candidate_file" ] \
+  && ok "and clears the marker, so nothing stays forced once it is home" \
+  || no "and clears the marker once home" "$(cat "$candidate_file" 2>/dev/null)"
+
+# THE safety property. "Off the tracked branch" is not the signal — a
+# rewritten upstream history looks identical from the ancestry side, and
+# that is the one thing --ff-only exists to refuse. Without a marker
+# claiming a candidate, an off-branch box keeps the strict guard.
+at "$REV_CAND"
+rm -f "$candidate_file"
+AGENT_BOX_SRC_REV="$REV_CAND" AGENT_BOX_SRC_REF="$REV_ONE" run pull
+[ "$rc" != 0 ] && said "refusing update" \
+  && ok "an off-branch box with no candidate marker is still guarded" \
+  || no "an off-branch box with no candidate marker is still guarded" "rc=$rc out=$(out)"
+
+# And a marker whose claim does not match the rev the box runs is stale —
+# a rebuild that failed and rolled the tree back leaves exactly that — so
+# it is ignored rather than trusted into a force.
+at "$REV_CAND"
+printf 'on=%s\n' "$REV_ONE" > "$candidate_file"
+AGENT_BOX_SRC_REV="$REV_CAND" AGENT_BOX_SRC_REF="$REV_ONE" run pull
+[ "$rc" != 0 ] && said "ignoring it" \
+  && ok "a stale candidate marker is ignored, not trusted" \
+  || no "a stale candidate marker is ignored, not trusted" "rc=$rc out=$(out)"
+
+# The relaxation is scoped to the way home. An operator naming an OLDER rev
+# explicitly is refused even on a genuine candidate box, so "I once tried a
+# candidate" never becomes "this box accepts downgrades".
+at "$REV_CAND"
+printf 'on=%s\n' "$REV_CAND" > "$candidate_file"
+AGENT_BOX_SRC_REV="$REV_CAND" AGENT_BOX_SRC_REF="$REV_ONE" run pull
+[ "$rc" != 0 ] && said "refusing update" \
+  && ok "an explicit older --rev is still refused on a candidate box" \
+  || no "an explicit older --rev is still refused on a candidate box" "rc=$rc out=$(out)"
+
+# And the queue does not override an operator who named a ref.
+at "$REV_TWO"
+printf 'want=refs/heads/cand\n' > "$candidate_file"
+AGENT_BOX_SRC_REV="$REV_TWO" AGENT_BOX_SRC_REF="$REV_THREE" run pull
+[ "$rc" = 0 ] && [ "$(out)" = "$REV_THREE" ] \
+  && ok "an explicit --rev wins over a queued candidate" \
+  || no "an explicit --rev wins over a queued candidate" "rc=$rc out=$(out)"
+grep -q "^want=" "$candidate_file" 2>/dev/null \
+  && ok "and leaves the queue alone, so the next plain update still sees it" \
+  || no "and leaves the queue alone" "marker was consumed by a --rev run"
+rm -f "$candidate_file"
+
+# A box with the feature unwired behaves exactly as it did before it
+# existed: no marker path, no candidate, no change in the guard.
+at "$REV_ONE"
+AGENT_BOX_CANDIDATE_FILE= AGENT_BOX_SRC_REV="$REV_ONE" run pull
+[ "$rc" = 0 ] && [ "$(out)" = "$REV_MERGED" ] \
+  && ok "with no marker path wired, a pull is an ordinary fast-forward" \
+  || no "with no marker path wired, a pull is an ordinary fast-forward" "rc=$rc out=$(out)"
+
 # --- a clone that cannot happen -----------------------------------------
 # Offline, or a repo this box's token cannot read. It must fail loudly and
 # leave nothing behind: a half-clone at $dir would be skipped by every later

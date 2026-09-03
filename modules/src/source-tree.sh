@@ -46,6 +46,13 @@ ref=${AGENT_BOX_SRC_REF:-}
 # (`agentbox update --force`). Non-empty means the target replaces HEAD even
 # when it is not a descendant.
 force=${AGENT_BOX_SRC_FORCE:-}
+# Where agent-box-candidate leaves the branch it wants tried on this box
+# before it is merged. Read by `pull` and CONSUMED there — it is intent, not
+# state: what this box runs is the tree's own HEAD, and a marker that
+# outlived its update would be a second answer able to disagree with it.
+# Empty (no such wiring) is a box with the feature off, which behaves
+# exactly as it did before it existed.
+candidate_file=${AGENT_BOX_CANDIDATE_FILE:-}
 
 [ -n "$dir" ] || die "AGENT_BOX_SRC_DIR is unset — there is no tree to act on"
 case "$dir" in
@@ -192,6 +199,56 @@ case "${1:-}" in
 
   (pull)
     [ -n "$rev" ] || die "AGENT_BOX_SRC_REV is unset — refusing to move a tree with no baseline"
+    # A queued candidate (agent-box-candidate BRANCH) is the target for
+    # exactly one update. Consumed BEFORE anything can fail, so a candidate
+    # that does not build is not retried on every later trigger — the next
+    # one goes back to the tracked branch, which is the whole of the
+    # "nothing here pins this box" promise. An explicit --rev wins: an
+    # operator naming a ref is not asking about the queue.
+    # Whether the TARGET was named by the caller, which decides below
+    # whether the fast-forward guard may relax itself. Recorded before the
+    # queue can overwrite $ref.
+    explicit_ref=$ref
+    # The candidate marker carries two fields, and the difference between
+    # them is the difference between a request and a fact:
+    #
+    #   want=REF  agent-box-candidate asks for REF on the next update.
+    #   on=REV    this box IS running the candidate at REV.
+    #
+    # `on` is checked against the rev the box actually runs before it is
+    # believed, and that check is what makes it safe to relax the
+    # fast-forward guard. "The running rev is not an ancestor of the tracked
+    # branch" is NOT a usable signal on its own: a squash-merged candidate
+    # and a rewritten upstream history look identical from here, and the
+    # second is the exact attack --ff-only exists to refuse. So a stale `on`
+    # (a rebuild that failed and rolled the tree back, an operator moving
+    # the tree by hand) is ignored rather than trusted, and the strict guard
+    # comes straight back.
+    candidate=""
+    on_rev=""
+    if [ -n "$candidate_file" ] && [ -e "$candidate_file" ]; then
+      on_rev=$(sed -n 's/^on=//p' "$candidate_file" 2>/dev/null | head -n 1)
+      if [ -z "$ref" ]; then
+        candidate=$(sed -n 's/^want=//p' "$candidate_file" 2>/dev/null | head -n 1)
+      fi
+      if [ -n "$candidate" ]; then
+        # Consumed BEFORE anything can fail, so a candidate that does not
+        # build is not reinstalled by every later trigger. What survives is
+        # only the `on` fact, which the next run re-verifies.
+        if [ -n "$on_rev" ]; then
+          printf 'on=%s\n' "$on_rev" > "$candidate_file.tmp" \
+            && mv "$candidate_file.tmp" "$candidate_file"
+        else
+          rm -f "$candidate_file"
+        fi
+        say "installing candidate $candidate (queued on this box, not merged)"
+        ref=$candidate
+      fi
+    fi
+    if [ -n "$on_rev" ] && [ "$on_rev" != "$rev" ]; then
+      say "candidate marker names $on_rev but the box runs $rev — ignoring it"
+      on_rev=""
+    fi
     clone_if_missing
     target=$(target_rev) || exit 1
     resolve_branch
@@ -214,6 +271,36 @@ case "${1:-}" in
       git checkout --quiet -B "$branch" "$rev" \
         || die "could not put $dir on $branch at $rev"
     fi
+    # A candidate must be strictly AHEAD of the tracked branch, and this is
+    # where that is settled: the fetch above already brought both objects
+    # in, so it costs one ancestry query, and it holds however the marker
+    # came to be written. It is what keeps "candidate" from becoming a way
+    # to replay an older, possibly vulnerable rev — the exact thing
+    # --ff-only refuses and the exact thing the force below would otherwise
+    # reopen, since a box already off the branch takes that force path.
+    if [ -n "$candidate" ]; then
+      if ! git merge-base --is-ancestor "refs/remotes/origin/$branch" \
+           "$target" 2>/dev/null; then
+        die "refusing candidate $candidate: $target is not ahead of $branch — rebase it, so what is tested here is what will land"
+      fi
+    fi
+    # Coming BACK from a candidate needs the guard relaxed, and only that.
+    # A candidate is squash-merged, so its head is never an ancestor of the
+    # tracked branch: once this box has taken one, --ff-only refuses the way
+    # home and the box would be stuck off-branch — the exact permanent
+    # divergence the feature promises not to create.
+    #
+    # Narrow on purpose. It needs the marker to say this box is running a
+    # candidate AND that claim to match the rev it actually runs (checked
+    # above), so a rewritten upstream history — which looks the same from
+    # the ancestry side — is still refused. The target is then either the
+    # tracked branch's own head or a branch agent-box-candidate already
+    # proved is ahead of it, so neither can be a downgrade. An explicit
+    # --rev keeps the strict guard and still has --force of its own.
+    if [ -z "$force" ] && [ -z "$explicit_ref" ] && [ -n "$on_rev" ]; then
+      say "the box runs candidate $rev — moving to $target without the fast-forward check"
+      force=1
+    fi
     if [ "$target" = "$rev" ]; then
       : # nothing to move to; fall through and print the rev we are on
     elif [ -z "$force" ] && git merge-base --is-ancestor "$target" "$rev"; then
@@ -235,6 +322,17 @@ case "${1:-}" in
       # local commits to reconcile, and a tree that somehow does is a tree
       # nothing here should be resolving conflicts in.
       die "refusing update: $target is not a fast-forward of the running rev $rev"
+    fi
+    # Record what the box is now running, so the NEXT plain update knows it
+    # has a way home to relax the guard for — and stop recording it once it
+    # is home, so nothing is left pinned or forced afterwards.
+    if [ -n "$candidate_file" ]; then
+      if [ -n "$candidate" ]; then
+        printf 'on=%s\n' "$(git rev-parse HEAD)" > "$candidate_file.tmp" \
+          && mv "$candidate_file.tmp" "$candidate_file"
+      elif [ -n "$on_rev" ]; then
+        rm -f "$candidate_file"
+      fi
     fi
     git rev-parse HEAD
     ;;

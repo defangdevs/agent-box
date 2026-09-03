@@ -299,6 +299,34 @@ let
       rebuild that failed and could not put the tree back, which the wall
       notice says - it reads ahead of the running system.
 
+    '' + lib.optionalString candidateEnabled ''
+      ## Trying YOUR fix on this box, before every other box takes it
+
+      An update follows the tracked branch, so a fix used to have to be
+      merged before this box could run it - which made the whole fleet the
+      canary for its own tooling. Push the branch and try it here first:
+
+          sudo ${candidateHelper} BRANCH   # install it, then re-apply
+          sudo ${candidateHelper} --status # what is this box running?
+          sudo ${candidateHelper} --reset  # go back to the tracked branch
+
+      Same restart as an ordinary update, so save context first. Then merge
+      once you have SEEN it work, and the fleet takes a change that has run
+      somewhere.
+
+      Three things it refuses, all deliberately. Only a BRANCH on this
+      box's own origin - not a tag, not a sha, and not `refs/pull/N/head`,
+      because a public repo takes pull requests from anyone and that would
+      be a stranger's unreviewed code built as root. Only a branch strictly
+      AHEAD of the tracked branch, so "candidate" can never become a way to
+      replay an older rev - rebase yours, which is also the only way what
+      you test here is what will land. And it never pins this box: the next
+      update returns to the tracked branch and says so, so a candidate you
+      forget converges back on the fleet instead of drifting from it. That
+      return needs no flag from you, and is the one case where the
+      fast-forward guard steps aside - a squash-merged branch is never an
+      ancestor of the branch it landed on, so nothing else could get home.
+
     '' + lib.optionalString checkoutEnabled ''
       ## This box ships its own sources
 
@@ -830,6 +858,315 @@ let
     else if names != [ ] then lib.head names
     else null;
   checkoutEnabled = checkoutMaintainer != null;
+  # Candidate releases: install a branch on THIS box before it is merged and
+  # every other box takes it. Same user the maintainer checkout goes to, and
+  # picked the same way, because it is the same job seen from the other end —
+  # that user holds the tree a fix is written in, and this is how the fix gets
+  # tried here first. ONE user, never all of them: an update takes every
+  # user's sessions down with it, which is exactly what the per-user password
+  # helper and the reboot grant exist to keep out of one agent's hands.
+  # Gated on selfUpdate.enable alone and NOT on web.enable — a box with no
+  # terminal still updates, and its agent still has a fix to try (the trap
+  # tests/memory-protection.nix exists to catch).
+  candidateUser =
+    let names = lib.attrNames cfg.users; in
+    if !cfg.selfUpdate.enable then null
+    else if cfg.users ? ${cfg.web.user} then cfg.web.user
+    else if names != [ ] then lib.head names
+    else null;
+  candidateEnabled = candidateUser != null;
+  # Beside the tree, not inside it: the tree is a checkout git rewrites, and
+  # a marker within it would be one `git clean` from vanishing. srcDir's own
+  # parent is created by agent-box-source before it clones, so this always
+  # lands in a directory that exists by the time anything writes it.
+  candidateFile = "${cfg.selfUpdate.srcDir}.candidate";
+  # The wrapper an agent reaches through sudo. Constants are PREPENDED, not
+  # appended: this is shell, and the body acts the moment it is read. They are
+  # compiled into the store script rather than read from the environment
+  # because sudo's env_reset carries none — and a caller-supplied repo URL
+  # would be root building code from anywhere (issue #154 Phase 2's rule).
+  candidateHelper = pkgs.writeShellScript "agent-box-candidate" ''
+    # Box constants, prepended by the module.
+    CANDIDATE_FILE=${lib.escapeShellArg candidateFile}
+    SRC_DIR=${lib.escapeShellArg cfg.selfUpdate.srcDir}
+    SRC_URL=${lib.escapeShellArg "https://github.com/${cfg.selfUpdate.repo}.git"}
+    SRC_BRANCH=${lib.escapeShellArg (if cfg.selfUpdate.branch != null then cfg.selfUpdate.branch else "")}
+    SYSTEMCTL=/run/current-system/sw/bin/systemctl
+    UPDATE_TRIGGER=${lib.escapeShellArg updateStartCmd}
+    PATH=${lib.makeBinPath [ pkgs.git pkgs.coreutils pkgs.gnused pkgs.systemd ]}:$PATH
+    export PATH
+
+    # agent-box-candidate — install a candidate release on THIS box, before it
+    # is merged and every other box gets it.
+    #
+    # The box's own fix used to have to land on master first. The only
+    # root-capable path an agent has is the update trigger, whose unit follows
+    # the tracked branch, and `git merge --ff-only` refuses everything else by
+    # construction — so "test it here, then merge" was not expressible and the
+    # fleet was the canary for its own tooling. This is the missing verb.
+    #
+    # It is a ROOT wrapper for the same reason the password helper is one: what
+    # writes the source tree decides what root builds, so the tree stays
+    # root-owned (issue #242) and an agent reaches it only through a command
+    # that can refuse. Every constant below is baked in by the renderer rather
+    # than read from the environment, because sudo scrubs the environment
+    # (env_reset) and a wrapper that took its target repo from the caller would
+    # hand root an arbitrary URL to build from.
+    #
+    # Three things it will not do, which is most of the point:
+    #
+    #   * Anything but a BRANCH on this box's own configured origin. Not a
+    #     tag, not a sha, and above all not refs/pull/N/head: on a public repo
+    #     anyone can open a pull request, and a fetchable PR ref would mean a
+    #     stranger's unreviewed code built as root. A branch needs push access
+    #     to the source repo, and whoever has that can already merge.
+    #   * A candidate that is not strictly ahead of the tracked branch. That is
+    #     what stops an old, possibly vulnerable rev being replayed as a
+    #     "candidate", which is the one attack the fast-forward guard exists to
+    #     refuse and which the force this feature needs would otherwise reopen.
+    #     The rev-equality half is here; ANCESTRY is agent-box-source's, at the
+    #     moment of the move, because that is where the objects are and a
+    #     question must not fetch into the tree to answer itself.
+    #   * A permanent divergence. Nothing here pins the box: the marker it
+    #     writes is consumed by the very next update, and an update with no
+    #     marker always heads for the tracked branch (forcing only when the box
+    #     is off it, since a squash-merged candidate is never an ancestor of
+    #     master). So a candidate survives exactly until the next update, and a
+    #     box that is forgotten converges on the fleet instead of drifting from
+    #     it.
+    #
+    # Usage, all idempotent:
+    #
+    #   agent-box-candidate BRANCH   install that branch and re-apply
+    #   agent-box-candidate --reset  go back to the tracked branch now
+    #   agent-box-candidate --status what the box is running, and off what
+    #
+    # The renderer prepends: CANDIDATE_FILE, SRC_DIR, SRC_URL, SRC_BRANCH,
+    # UPDATE_TRIGGER, SYSTEMCTL.
+    set -u
+
+    prog=agent-box-candidate
+    say() { printf '%s: %s\n' "$prog" "$*" >&2; }
+    die() { say "$@"; exit 1; }
+
+    # Same hardening as agent-box-source, and for the same reason: every git
+    # below runs as root against a tree fetched from the network, and a
+    # credential prompt has nobody to answer it.
+    export GIT_TERMINAL_PROMPT=0
+    unset GIT_ASKPASS SSH_ASKPASS
+    export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=60
+    export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
+
+    usage() {
+      cat >&2 <<USAGE
+    usage: $prog BRANCH | --reset | --status
+
+      BRANCH     install that branch of $SRC_URL on this box and re-apply.
+                 It must exist as refs/heads/BRANCH and be strictly ahead of
+                 the tracked branch (''${SRC_BRANCH:-the remote's default}).
+      --reset    return to the tracked branch on the next update, now.
+      --status   print the rev this box runs and whether it is a candidate.
+
+    A candidate lasts until the next update, which always returns to the
+    tracked branch. Nothing here pins this box.
+    USAGE
+    }
+
+    # The tracked branch's head, as a rev. Asked of the remote WITHOUT touching
+    # the tree: --status and the validation below are questions, and a question
+    # must not be the thing that moves what the box builds.
+    tracked_head() {
+      b=''${SRC_BRANCH:-}
+      if [ -n "$b" ]; then
+        out=$(command git ls-remote "$SRC_URL" "refs/heads/$b" 2>/dev/null) \
+          || die "cannot reach $SRC_URL — offline?"
+        [ -n "$out" ] || die "origin has no branch '$b'"
+      else
+        out=$(command git ls-remote "$SRC_URL" HEAD 2>/dev/null) \
+          || die "cannot reach $SRC_URL — offline?"
+        [ -n "$out" ] || die "$SRC_URL has no HEAD"
+      fi
+      printf '%s\n' "$out" | head -n 1 | cut -f1
+    }
+
+    running_rev() {
+      # The tree names the rev the box runs (the guide says so, so it has to be
+      # true here too). A box that has never updated has no tree yet, which is
+      # not an error for --status.
+      [ -e "$SRC_DIR/.git" ] || return 1
+      command git -C "$SRC_DIR" rev-parse --verify --quiet HEAD 2>/dev/null
+    }
+
+    case "''${1:-}" in
+      (-h|--help)
+        usage
+        exit 0
+        ;;
+
+      (--status)
+        rev=$(running_rev) || die "$SRC_DIR is not a checkout yet — this box has never updated"
+        head=$(tracked_head)
+        printf 'rev:     %s\n' "$rev"
+        printf 'tracked: %s at %s\n' "''${SRC_BRANCH:-origin/HEAD}" "$head"
+        # The marker's own claim, believed only when it matches the rev the box
+        # actually runs — the same check agent-box-source makes before it
+        # relaxes the fast-forward guard, and for the same reason: a rebuild
+        # that failed and rolled back leaves a claim that is no longer true.
+        on=""
+        [ -e "$CANDIDATE_FILE" ] \
+          && on=$(sed -n 's/^on=//p' "$CANDIDATE_FILE" 2>/dev/null | head -n 1)
+        if [ -n "$on" ] && [ "$on" = "$rev" ]; then
+          printf 'state:   CANDIDATE — the next update returns to %s\n' \
+            "''${SRC_BRANCH:-the tracked branch}"
+        elif [ "$rev" = "$head" ]; then
+          printf 'state:   on the tracked branch\n'
+        elif command git -C "$SRC_DIR" merge-base --is-ancestor "$rev" "$head" 2>/dev/null; then
+          printf 'state:   behind the tracked branch — an update is available\n'
+        else
+          # Off the branch with nothing claiming a candidate: a rewritten
+          # upstream history, or a tree somebody moved by hand. NOT reported as
+          # a candidate, because agent-box-source will not force out of it
+          # either — it is the case --ff-only exists to refuse.
+          printf 'state:   off %s, and not as a candidate — the fast-forward guard applies\n' \
+            "''${SRC_BRANCH:-the tracked branch}"
+        fi
+        want=""
+        [ -e "$CANDIDATE_FILE" ] \
+          && want=$(sed -n 's/^want=//p' "$CANDIDATE_FILE" 2>/dev/null | head -n 1)
+        [ -n "$want" ] && printf 'pending: %s\n' "$want"
+        exit 0
+        ;;
+
+      (--reset)
+        # An update with no QUEUED candidate already heads for the tracked
+        # branch, so "reset" is the ordinary update — the only work here is
+        # dropping a `want` that has not been consumed yet. The `on` fact must
+        # survive: it is what tells agent-box-source this box has a way home to
+        # relax the guard for, and deleting it would strand the box exactly
+        # where the reset was meant to rescue it from.
+        if [ -e "$CANDIDATE_FILE" ]; then
+          on=$(sed -n 's/^on=//p' "$CANDIDATE_FILE" 2>/dev/null | head -n 1)
+          if [ -n "$on" ]; then
+            printf 'on=%s\n' "$on" > "$CANDIDATE_FILE.tmp" \
+              && mv "$CANDIDATE_FILE.tmp" "$CANDIDATE_FILE"
+          else
+            rm -f "$CANDIDATE_FILE"
+          fi
+        fi
+        say "returning to ''${SRC_BRANCH:-the tracked branch} — triggering an update"
+        exec $UPDATE_TRIGGER
+        ;;
+
+      ("")
+        usage
+        exit 1
+        ;;
+
+      (-*)
+        say "unknown option '$1'"
+        usage
+        exit 1
+        ;;
+    esac
+
+    branch=$1
+    shift
+    [ $# -eq 0 ] || die "one branch at a time (got extra: $*)"
+
+    # --- validate the name ------------------------------------------------
+    #
+    # The name reaches git and reaches a file, so it is checked before either.
+    # Deliberately narrower than git's own refname rules: this is an allowlist
+    # of what a branch in this repo actually looks like, not an attempt to
+    # re-implement git-check-ref-format.
+    case $branch in
+      (refs/heads/*)
+        die "name the branch itself: ''\'''${branch#refs/heads/}' rather than '$branch'"
+        ;;
+      (refs/*)
+        # refs/pull/N/head lands here, which is the whole reason this arm is
+        # separate: there is no branch to suggest, and suggesting one by
+        # stripping refs/heads/ off a path that has no such prefix printed the
+        # input back as its own correction.
+        die "'$branch' is a ref path, not a branch — only a branch of $SRC_URL can be installed"
+        ;;
+      (*..*)
+        die "'$branch' contains '..'"
+        ;;
+      (/*|*/)
+        die "'$branch' starts or ends with '/'"
+        ;;
+      (*//*)
+        die "'$branch' contains '//'"
+        ;;
+      (*[!A-Za-z0-9._/-]*)
+        die "'$branch' has characters outside A-Za-z0-9._/- — refusing"
+        ;;
+      ([!A-Za-z0-9]*)
+        die "'$branch' does not start with a letter or digit"
+        ;;
+    esac
+    [ ''${#branch} -le 200 ] || die "branch name is ''${#branch} characters — refusing"
+
+    # --- it must be a branch on OUR origin --------------------------------
+    #
+    # ls-remote --heads, so only refs/heads/* can match. This is the line that
+    # keeps refs/pull/N/head — a stranger's unreviewed pull request on a public
+    # repo — from ever being installed as root.
+    out=$(command git ls-remote --heads "$SRC_URL" "refs/heads/$branch" 2>/dev/null) \
+      || die "cannot reach $SRC_URL — offline?"
+    [ -n "$out" ] || die "$SRC_URL has no branch '$branch' (a tag, a sha or a pull-request ref will not do)"
+    want=$(printf '%s\n' "$out" | head -n 1 | cut -f1)
+
+    # --- and not the tracked branch's own head ----------------------------
+    #
+    # The cheap half of "strictly ahead", and the only half that can be settled
+    # from ls-remote. ANCESTRY is checked by agent-box-source at the moment of
+    # the move, where the objects already are: asking here would mean fetching
+    # them, and a fetch is not something a refused candidate — or a mistyped
+    # branch name — should leave behind in the tree that decides what root
+    # builds. That check is also the better home for it on its own merits, since
+    # it then holds however the marker was written.
+    head=$(tracked_head)
+    if [ "$want" = "$head" ]; then
+      die "'$branch' is at ''${head} — the same rev as ''${SRC_BRANCH:-the tracked branch}, so there is nothing to try"
+    fi
+
+    # --- record the intent and let the update do the work -----------------
+    #
+    # The marker is intent, never state: the updater consumes it as it starts,
+    # so a candidate that fails to build is not retried forever, and "what is
+    # this box running" stays a question answered by the tree rather than by a
+    # file that can disagree with it.
+    umask 022
+    # A box that has never updated has no tree and may have no state dir either,
+    # and the marker's parent is that dir. Create it rather than failing: the
+    # update this queues would create it anyway when it clones.
+    mkdir -p "$(dirname "$CANDIDATE_FILE")" \
+      || die "could not create $(dirname "$CANDIDATE_FILE")"
+    # An existing `on` fact is carried over, not dropped: a box already running
+    # a candidate is off the tracked branch, so moving it to ANOTHER candidate
+    # needs the same relaxation coming home does. agent-box-source re-verifies
+    # the fact against the running rev before it believes it either way.
+    on=""
+    [ -e "$CANDIDATE_FILE" ] \
+      && on=$(sed -n 's/^on=//p' "$CANDIDATE_FILE" 2>/dev/null | head -n 1)
+    # A `[ ... ] && printf` as the LAST command in the group would make the
+    # group's status that test's — 1 whenever there is no fact to carry — and
+    # the `|| die` below would then report a failure on a write that worked.
+    if [ -n "$on" ]; then
+      printf 'want=refs/heads/%s\non=%s\n' "$branch" "$on" > "$CANDIDATE_FILE.tmp" \
+        || die "could not write $CANDIDATE_FILE.tmp"
+    else
+      printf 'want=refs/heads/%s\n' "$branch" > "$CANDIDATE_FILE.tmp" \
+        || die "could not write $CANDIDATE_FILE.tmp"
+    fi
+    mv "$CANDIDATE_FILE.tmp" "$CANDIDATE_FILE" \
+      || die "could not put $CANDIDATE_FILE in place"
+    say "candidate $branch ($(printf '%.12s' "$want")) queued — triggering an update"
+    say "this box will be off ''${SRC_BRANCH:-the tracked branch}; the next update returns to it"
+    exec $UPDATE_TRIGGER
+  '';
   # Always under the maintainer's home, and the assertion below enforces it.
   # The agent unit runs ProtectSystem=strict with ReadWritePaths=/home/%i,
   # so a tree anywhere else is denied with EROFS — and the obvious repair,
@@ -7216,6 +7553,13 @@ ref=''${AGENT_BOX_SRC_REF:-}
 # (`agentbox update --force`). Non-empty means the target replaces HEAD even
 # when it is not a descendant.
 force=''${AGENT_BOX_SRC_FORCE:-}
+# Where agent-box-candidate leaves the branch it wants tried on this box
+# before it is merged. Read by `pull` and CONSUMED there — it is intent, not
+# state: what this box runs is the tree's own HEAD, and a marker that
+# outlived its update would be a second answer able to disagree with it.
+# Empty (no such wiring) is a box with the feature off, which behaves
+# exactly as it did before it existed.
+candidate_file=''${AGENT_BOX_CANDIDATE_FILE:-}
 
 [ -n "$dir" ] || die "AGENT_BOX_SRC_DIR is unset — there is no tree to act on"
 case "$dir" in
@@ -7362,6 +7706,56 @@ case "''${1:-}" in
 
   (pull)
     [ -n "$rev" ] || die "AGENT_BOX_SRC_REV is unset — refusing to move a tree with no baseline"
+    # A queued candidate (agent-box-candidate BRANCH) is the target for
+    # exactly one update. Consumed BEFORE anything can fail, so a candidate
+    # that does not build is not retried on every later trigger — the next
+    # one goes back to the tracked branch, which is the whole of the
+    # "nothing here pins this box" promise. An explicit --rev wins: an
+    # operator naming a ref is not asking about the queue.
+    # Whether the TARGET was named by the caller, which decides below
+    # whether the fast-forward guard may relax itself. Recorded before the
+    # queue can overwrite $ref.
+    explicit_ref=$ref
+    # The candidate marker carries two fields, and the difference between
+    # them is the difference between a request and a fact:
+    #
+    #   want=REF  agent-box-candidate asks for REF on the next update.
+    #   on=REV    this box IS running the candidate at REV.
+    #
+    # `on` is checked against the rev the box actually runs before it is
+    # believed, and that check is what makes it safe to relax the
+    # fast-forward guard. "The running rev is not an ancestor of the tracked
+    # branch" is NOT a usable signal on its own: a squash-merged candidate
+    # and a rewritten upstream history look identical from here, and the
+    # second is the exact attack --ff-only exists to refuse. So a stale `on`
+    # (a rebuild that failed and rolled the tree back, an operator moving
+    # the tree by hand) is ignored rather than trusted, and the strict guard
+    # comes straight back.
+    candidate=""
+    on_rev=""
+    if [ -n "$candidate_file" ] && [ -e "$candidate_file" ]; then
+      on_rev=$(sed -n 's/^on=//p' "$candidate_file" 2>/dev/null | head -n 1)
+      if [ -z "$ref" ]; then
+        candidate=$(sed -n 's/^want=//p' "$candidate_file" 2>/dev/null | head -n 1)
+      fi
+      if [ -n "$candidate" ]; then
+        # Consumed BEFORE anything can fail, so a candidate that does not
+        # build is not reinstalled by every later trigger. What survives is
+        # only the `on` fact, which the next run re-verifies.
+        if [ -n "$on_rev" ]; then
+          printf 'on=%s\n' "$on_rev" > "$candidate_file.tmp" \
+            && mv "$candidate_file.tmp" "$candidate_file"
+        else
+          rm -f "$candidate_file"
+        fi
+        say "installing candidate $candidate (queued on this box, not merged)"
+        ref=$candidate
+      fi
+    fi
+    if [ -n "$on_rev" ] && [ "$on_rev" != "$rev" ]; then
+      say "candidate marker names $on_rev but the box runs $rev — ignoring it"
+      on_rev=""
+    fi
     clone_if_missing
     target=$(target_rev) || exit 1
     resolve_branch
@@ -7384,6 +7778,36 @@ case "''${1:-}" in
       git checkout --quiet -B "$branch" "$rev" \
         || die "could not put $dir on $branch at $rev"
     fi
+    # A candidate must be strictly AHEAD of the tracked branch, and this is
+    # where that is settled: the fetch above already brought both objects
+    # in, so it costs one ancestry query, and it holds however the marker
+    # came to be written. It is what keeps "candidate" from becoming a way
+    # to replay an older, possibly vulnerable rev — the exact thing
+    # --ff-only refuses and the exact thing the force below would otherwise
+    # reopen, since a box already off the branch takes that force path.
+    if [ -n "$candidate" ]; then
+      if ! git merge-base --is-ancestor "refs/remotes/origin/$branch" \
+           "$target" 2>/dev/null; then
+        die "refusing candidate $candidate: $target is not ahead of $branch — rebase it, so what is tested here is what will land"
+      fi
+    fi
+    # Coming BACK from a candidate needs the guard relaxed, and only that.
+    # A candidate is squash-merged, so its head is never an ancestor of the
+    # tracked branch: once this box has taken one, --ff-only refuses the way
+    # home and the box would be stuck off-branch — the exact permanent
+    # divergence the feature promises not to create.
+    #
+    # Narrow on purpose. It needs the marker to say this box is running a
+    # candidate AND that claim to match the rev it actually runs (checked
+    # above), so a rewritten upstream history — which looks the same from
+    # the ancestry side — is still refused. The target is then either the
+    # tracked branch's own head or a branch agent-box-candidate already
+    # proved is ahead of it, so neither can be a downgrade. An explicit
+    # --rev keeps the strict guard and still has --force of its own.
+    if [ -z "$force" ] && [ -z "$explicit_ref" ] && [ -n "$on_rev" ]; then
+      say "the box runs candidate $rev — moving to $target without the fast-forward check"
+      force=1
+    fi
     if [ "$target" = "$rev" ]; then
       : # nothing to move to; fall through and print the rev we are on
     elif [ -z "$force" ] && git merge-base --is-ancestor "$target" "$rev"; then
@@ -7405,6 +7829,17 @@ case "''${1:-}" in
       # local commits to reconcile, and a tree that somehow does is a tree
       # nothing here should be resolving conflicts in.
       die "refusing update: $target is not a fast-forward of the running rev $rev"
+    fi
+    # Record what the box is now running, so the NEXT plain update knows it
+    # has a way home to relax the guard for — and stop recording it once it
+    # is home, so nothing is left pinned or forced afterwards.
+    if [ -n "$candidate_file" ]; then
+      if [ -n "$candidate" ]; then
+        printf 'on=%s\n' "$(git rev-parse HEAD)" > "$candidate_file.tmp" \
+          && mv "$candidate_file.tmp" "$candidate_file"
+      elif [ -n "$on_rev" ]; then
+        rm -f "$candidate_file"
+      fi
     fi
     git rev-parse HEAD
     ;;
@@ -11612,6 +12047,24 @@ in
     # in the store. Verifying releases against an offline signing key is
     # tracked upstream (defangdevs/agent-box issue 46); until then this
     # trusts the pinned repo as GitHub serves it.
+    # One user may install a candidate release (see candidateHelper). Its own
+    # rule rather than a line in effectiveSudoAllowlist, for the reason the
+    # password helper and the reboot grant are also their own: that list is
+    # box-wide, and this must not become every agent user's power to restart
+    # every other user's sessions onto a branch of their choosing.
+    #
+    # `*` allows exactly one argument of anything, which is all the wrapper
+    # takes. sudoers is not the validator here and should not try to be — the
+    # wrapper is, and it refuses everything that is not a branch on this box's
+    # own origin, strictly ahead of the tracked branch.
+    security.sudo.extraRules = lib.optional candidateEnabled {
+      users = [ candidateUser ];
+      commands = [{
+        command = "${candidateHelper} *";
+        options = [ "NOPASSWD" ];
+      }];
+    };
+
     systemd.services.agent-box-update = {
       description = "Fast-forward agent-box to upstream HEAD and rebuild";
       # No wantedBy — on-demand only, via the agents' sudo rule (or root).
@@ -11631,6 +12084,10 @@ in
         AGENT_BOX_SRC_DIR = cfg.selfUpdate.srcDir;
         AGENT_BOX_SRC_URL = "https://github.com/${cfg.selfUpdate.repo}.git";
         AGENT_BOX_SRC_REV = cfg.selfUpdate.rev;
+        # A candidate agent-box-candidate queued, if any. agent-box-source
+        # CONSUMES it: this update installs it, and the next one goes back to
+        # the tracked branch, so a candidate never becomes a pin.
+        AGENT_BOX_CANDIDATE_FILE = candidateFile;
         # git reads a config file relative to HOME and warns (or, with some
         # safe.directory setups, refuses) without one. The unit inherits no
         # HOME of its own.

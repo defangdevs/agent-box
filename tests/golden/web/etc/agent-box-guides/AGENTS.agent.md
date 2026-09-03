@@ -473,6 +473,33 @@ FIRST and the rebuild follows it, so between the two - and after a
 rebuild that failed and could not put the tree back, which the wall
 notice says - it reads ahead of the running system.
 
+## Trying YOUR fix on this box, before every other box takes it
+
+An update follows the tracked branch, so a fix used to have to be
+merged before this box could run it - which made the whole fleet the
+canary for its own tooling. Push the branch and try it here first:
+
+    sudo /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-candidate BRANCH   # install it, then re-apply
+    sudo /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-candidate --status # what is this box running?
+    sudo /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-candidate --reset  # go back to the tracked branch
+
+Same restart as an ordinary update, so save context first. Then merge
+once you have SEEN it work, and the fleet takes a change that has run
+somewhere.
+
+Three things it refuses, all deliberately. Only a BRANCH on this
+box's own origin - not a tag, not a sha, and not `refs/pull/N/head`,
+because a public repo takes pull requests from anyone and that would
+be a stranger's unreviewed code built as root. Only a branch strictly
+AHEAD of the tracked branch, so "candidate" can never become a way to
+replay an older rev - rebase yours, which is also the only way what
+you test here is what will land. And it never pins this box: the next
+update returns to the tracked branch and says so, so a candidate you
+forget converges back on the fleet instead of drifting from it. That
+return needs no flag from you, and is the one case where the
+fast-forward guard steps aside - a squash-merged branch is never an
+ancestor of the branch it landed on, so nothing else could get home.
+
 ## This box ships its own sources
 
 A checkout of the repo this box is BUILT from lives at

@@ -60,6 +60,34 @@ let
       rebuild that failed and could not put the tree back, which the wall
       notice says - it reads ahead of the running system.
 
+    '' + lib.optionalString candidateEnabled ''
+      ## Trying YOUR fix on this box, before every other box takes it
+
+      An update follows the tracked branch, so a fix used to have to be
+      merged before this box could run it - which made the whole fleet the
+      canary for its own tooling. Push the branch and try it here first:
+
+          sudo ${candidateHelper} BRANCH   # install it, then re-apply
+          sudo ${candidateHelper} --status # what is this box running?
+          sudo ${candidateHelper} --reset  # go back to the tracked branch
+
+      Same restart as an ordinary update, so save context first. Then merge
+      once you have SEEN it work, and the fleet takes a change that has run
+      somewhere.
+
+      Three things it refuses, all deliberately. Only a BRANCH on this
+      box's own origin - not a tag, not a sha, and not `refs/pull/N/head`,
+      because a public repo takes pull requests from anyone and that would
+      be a stranger's unreviewed code built as root. Only a branch strictly
+      AHEAD of the tracked branch, so "candidate" can never become a way to
+      replay an older rev - rebase yours, which is also the only way what
+      you test here is what will land. And it never pins this box: the next
+      update returns to the tracked branch and says so, so a candidate you
+      forget converges back on the fleet instead of drifting from it. That
+      return needs no flag from you, and is the one case where the
+      fast-forward guard steps aside - a squash-merged branch is never an
+      ancestor of the branch it landed on, so nothing else could get home.
+
     '' + lib.optionalString checkoutEnabled ''
       ## This box ships its own sources
 
@@ -233,6 +261,46 @@ let
     else if names != [ ] then lib.head names
     else null;
   checkoutEnabled = checkoutMaintainer != null;
+  # Candidate releases: install a branch on THIS box before it is merged and
+  # every other box takes it. Same user the maintainer checkout goes to, and
+  # picked the same way, because it is the same job seen from the other end —
+  # that user holds the tree a fix is written in, and this is how the fix gets
+  # tried here first. ONE user, never all of them: an update takes every
+  # user's sessions down with it, which is exactly what the per-user password
+  # helper and the reboot grant exist to keep out of one agent's hands.
+  # Gated on selfUpdate.enable alone and NOT on web.enable — a box with no
+  # terminal still updates, and its agent still has a fix to try (the trap
+  # tests/memory-protection.nix exists to catch).
+  candidateUser =
+    let names = lib.attrNames cfg.users; in
+    if !cfg.selfUpdate.enable then null
+    else if cfg.users ? ${cfg.web.user} then cfg.web.user
+    else if names != [ ] then lib.head names
+    else null;
+  candidateEnabled = candidateUser != null;
+  # Beside the tree, not inside it: the tree is a checkout git rewrites, and
+  # a marker within it would be one `git clean` from vanishing. srcDir's own
+  # parent is created by agent-box-source before it clones, so this always
+  # lands in a directory that exists by the time anything writes it.
+  candidateFile = "${cfg.selfUpdate.srcDir}.candidate";
+  # The wrapper an agent reaches through sudo. Constants are PREPENDED, not
+  # appended: this is shell, and the body acts the moment it is read. They are
+  # compiled into the store script rather than read from the environment
+  # because sudo's env_reset carries none — and a caller-supplied repo URL
+  # would be root building code from anywhere (issue #154 Phase 2's rule).
+  candidateHelper = pkgs.writeShellScript "agent-box-candidate" ''
+    # Box constants, prepended by the module.
+    CANDIDATE_FILE=${lib.escapeShellArg candidateFile}
+    SRC_DIR=${lib.escapeShellArg cfg.selfUpdate.srcDir}
+    SRC_URL=${lib.escapeShellArg "https://github.com/${cfg.selfUpdate.repo}.git"}
+    SRC_BRANCH=${lib.escapeShellArg (if cfg.selfUpdate.branch != null then cfg.selfUpdate.branch else "")}
+    SYSTEMCTL=/run/current-system/sw/bin/systemctl
+    UPDATE_TRIGGER=${lib.escapeShellArg updateStartCmd}
+    PATH=${lib.makeBinPath [ pkgs.git pkgs.coreutils pkgs.gnused pkgs.systemd ]}:$PATH
+    export PATH
+
+    @@include:src/candidate.sh@@
+  '';
   # Always under the maintainer's home, and the assertion below enforces it.
   # The agent unit runs ProtectSystem=strict with ReadWritePaths=/home/%i,
   # so a tree anywhere else is denied with EROFS — and the obvious repair,
@@ -2891,6 +2959,24 @@ in
     # in the store. Verifying releases against an offline signing key is
     # tracked upstream (defangdevs/agent-box issue 46); until then this
     # trusts the pinned repo as GitHub serves it.
+    # One user may install a candidate release (see candidateHelper). Its own
+    # rule rather than a line in effectiveSudoAllowlist, for the reason the
+    # password helper and the reboot grant are also their own: that list is
+    # box-wide, and this must not become every agent user's power to restart
+    # every other user's sessions onto a branch of their choosing.
+    #
+    # `*` allows exactly one argument of anything, which is all the wrapper
+    # takes. sudoers is not the validator here and should not try to be — the
+    # wrapper is, and it refuses everything that is not a branch on this box's
+    # own origin, strictly ahead of the tracked branch.
+    security.sudo.extraRules = lib.optional candidateEnabled {
+      users = [ candidateUser ];
+      commands = [{
+        command = "${candidateHelper} *";
+        options = [ "NOPASSWD" ];
+      }];
+    };
+
     systemd.services.agent-box-update = {
       description = "Fast-forward agent-box to upstream HEAD and rebuild";
       # No wantedBy — on-demand only, via the agents' sudo rule (or root).
@@ -2910,6 +2996,10 @@ in
         AGENT_BOX_SRC_DIR = cfg.selfUpdate.srcDir;
         AGENT_BOX_SRC_URL = "https://github.com/${cfg.selfUpdate.repo}.git";
         AGENT_BOX_SRC_REV = cfg.selfUpdate.rev;
+        # A candidate agent-box-candidate queued, if any. agent-box-source
+        # CONSUMES it: this update installs it, and the next one goes back to
+        # the tracked branch, so a candidate never becomes a pin.
+        AGENT_BOX_CANDIDATE_FILE = candidateFile;
         # git reads a config file relative to HOME and warns (or, with some
         # safe.directory setups, refuses) without one. The unit inherits no
         # HOME of its own.

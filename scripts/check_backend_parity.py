@@ -214,6 +214,11 @@ BY_DESIGN = {
     "AGENT_BOX_SRC_DIR": ("module", SRC_TREE_BINDING),
     "AGENT_BOX_SRC_URL": ("module", SRC_TREE_BINDING),
     "AGENT_BOX_SRC_REV": ("module", SRC_TREE_BINDING),
+    # The candidate marker, consumed by that same payload and bound the same
+    # way for the same reason. Both backends DO supply it — native in
+    # source_tree()'s in-process env, beside the AGENT_BOX_SRC_* names above
+    # — so this is a unit-line divergence and not a missing capability.
+    "AGENT_BOX_CANDIDATE_FILE": ("module", SRC_TREE_BINDING),
 }
 
 # One reason, cited by the four entries below, so it has one home rather

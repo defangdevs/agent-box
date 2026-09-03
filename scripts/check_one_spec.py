@@ -61,6 +61,14 @@ SUBSTRATE = [
     (re.compile(r"(/nix/store/e+-agent-box-password-(\w+)/bin/|"
                 r"/etc/agent-box/bin/)agent-box-password-"),
      "agent-box-password-"),
+    # agent-box-candidate, same story: the module grants its store script
+    # (writeShellScript, so a file and not a dir with bin/), native grants
+    # the copy `agentbox apply` renders into /etc. Both are the SAME grant
+    # of the same one-argument wrapper — a substrate spelling, not a
+    # difference in what the box allows.
+    (re.compile(r"/nix/store/e+-agent-box-candidate|"
+                r"/etc/agent-box/bin/agent-box-candidate"),
+     "agent-box-candidate"),
 ]
 
 # Divergences that are CORRECT. Each needs a reason a reader can check.

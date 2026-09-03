@@ -1526,6 +1526,26 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # agent-box-candidate (this box before the fleet): the validator
+          # standing between an agent's sudo grant and what root builds.
+          # Same shape and same reasoning as source-tree above -- weighted
+          # at the refusals, `origin` a local repository so there is no
+          # network, and natively runnable on every architecture.
+          candidate =
+            pkgs.runCommand "agent-box-candidate-check"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.git pkgs.gnugrep pkgs.gnused ];
+                script = ./modules/src/candidate.sh;
+                tests = ./tests/test-candidate.sh;
+              } ''
+              bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Issue #425: a box with no webhook panel used to render an
           # empty string, so its operator could not tell a feature that is
           # off from one that is wired up wrong — which is how #425 was

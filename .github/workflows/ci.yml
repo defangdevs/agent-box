@@ -195,6 +195,17 @@ jobs:
       - name: Check connect card checking state
         run: nix build -L .#checks.x86_64-linux.connect-card && cat result
 
+      # Candidate releases: the validator between an agent's sudo grant and
+      # what root builds, plus agent-box-source's half (the marker it
+      # consumes, and the one narrow case where the fast-forward guard
+      # relaxes). Both are seconds, and there is no VM test that can price
+      # a refusal.
+      - name: Check candidate release validator
+        run: nix build -L .#checks.x86_64-linux.candidate && cat result
+
+      - name: Check source tree manager
+        run: nix build -L .#checks.x86_64-linux.source-tree && cat result
+
       # Issue #374: the native backend's two flake checks, which nothing
       # ran until that bug was found by hand. `runtime-profile` builds
       # packages.<system>.runtime — the profile a native box installs at

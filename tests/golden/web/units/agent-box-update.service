@@ -2,6 +2,7 @@
 Description=Fast-forward agent-box to upstream HEAD and rebuild
 
 [Service]
+Environment="AGENT_BOX_CANDIDATE_FILE=/var/lib/agent-box/src.candidate"
 Environment="AGENT_BOX_SRC_DIR=/var/lib/agent-box/src"
 Environment="AGENT_BOX_SRC_REV=0000000000000000000000000000000000000000"
 Environment="AGENT_BOX_SRC_URL=https://github.com/defangdevs/agent-box.git"
