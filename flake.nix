@@ -1317,6 +1317,55 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # Unit test for the claim a DISPATCHED session is seeded with
+          # (issues #251, #510, #511). Same reasoning as the check above —
+          # a claim's failure mode is silent, so its payload paths are
+          # pinned byte for byte — but for the other half of the mechanism:
+          # webhook-cli.sh writes the claim a session asks for, and
+          # webhook-spawn.sh writes the one a hook session is BORN with.
+          #
+          # It drives the spawn wrapper with a shimmed session CLI and env
+          # store, then hands the claim it wrote to the REAL pinned
+          # webhook.py: shape is half the promise, and the matcher agreeing
+          # is the other half. These assertions used to live in the webhook
+          # VM test, where a pure function of LOCAL_WEBHOOK_SPAWN_META cost
+          # a VM boot — and where they eventually cost the test itself,
+          # since nixpkgs passes testScript to the driver build as one
+          # environment variable and Linux caps that at 128 KiB
+          # (MAX_ARG_STRLEN): the driver stopped building with "Argument
+          # list too long" before any VM booted.
+          webhook-spawn-claim =
+            pkgs.runCommand "agent-box-webhook-spawn-claim"
+              {
+                nativeBuildInputs = [
+                  pkgs.bash
+                  pkgs.coreutils
+                  pkgs.jq
+                  pkgs.python3
+                ];
+                # The whole directory, not the one file: the source form
+                # carries @@include markers and the test resolves them
+                # against its siblings, exactly as the assembler does.
+                src = ./modules/src;
+                tests = ./tests/test-webhook-spawn-claim.sh;
+                # The same pin the module and #runtime read, fetched the
+                # same way (nix/webhook-pin.nix).
+                webhookPy =
+                  let pin = import ./nix/webhook-pin.nix; in
+                  builtins.fetchurl {
+                    url = "https://raw.githubusercontent.com/${pin.repo}/${pin.rev}"
+                          + "/local-webhook/webhook.py";
+                    sha256 = pin.sha256;
+                  };
+              } ''
+              bash "$tests" "$src/webhook-spawn.sh" "$webhookPy" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Eval regression for selfUpdate.checkout's two assertions
           # (issue #242, PR #478 review). Both guard a value whose only
           # other feedback is a background job failing with EROFS in a
@@ -1625,6 +1674,65 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # claude plugin settings).
           webhook = pkgs.testers.runNixOSTest
             (import ./tests/webhook.nix { agent-box = self.nixosModules.agent-box; });
+
+          # The cliff every VM test in this directory is walking toward, and
+          # the one failure that says nothing useful when you reach it.
+          #
+          # nixpkgs hands the driver build its whole test script in ONE
+          # environment variable (`testScript = config.testScriptString` in
+          # nixos/lib/testing/driver.nix). Linux caps a single environment
+          # string at MAX_ARG_STRLEN — 32 pages, 128 KiB — so the FIRST thing
+          # that happens past that is execve failing for the builder's shell:
+          #
+          #   nixos-test-driver-agent-box-webhook> error: executing
+          #     '…/bin/bash': Argument list too long
+          #
+          # No VM boots, nothing names the test script, and the size of a
+          # comment is not where anyone looks. tests/webhook.nix hit it in
+          # PR #518 at 133 KiB, after a 155-line addition.
+          #
+          # So the limit is asserted with a page to spare and a cure attached.
+          # The cure is not "write less": it is to move assertions that do not
+          # need a VM into a native check (`webhook-spawn-claim` is one such
+          # move), or to split the test the way tests/sessions-common.nix
+          # split the session tests in issue #312.
+          testscript-fits =
+            let
+              # 128 KiB is the kernel's; one page under it is ours, so the
+              # guard fires before the unreadable failure does.
+              limit = 131072 - 4096;
+              # Every VM test in the check set, found by the passthru only
+              # runNixOSTest has. removeAttrs first: filterAttrs would force
+              # this attribute's own value and recurse forever.
+              vmTests = nixpkgs.lib.filterAttrs (_: t: t ? driver)
+                (builtins.removeAttrs self.checks.${system} [ "testscript-fits" ]);
+              sizes = nixpkgs.lib.mapAttrs
+                (_: t: builtins.stringLength t.driver.drvAttrs.testScript) vmTests;
+              over = nixpkgs.lib.filterAttrs (_: n: n > limit) sizes;
+              report = nixpkgs.lib.concatStringsSep "\n" (nixpkgs.lib.mapAttrsToList
+                (name: n: "  ${name}: ${toString n} bytes (${toString (n - limit)} over)")
+                over);
+            in
+            if over == { } then
+              pkgs.runCommand "agent-box-testscript-fits" { } ''
+                ${nixpkgs.lib.concatStringsSep "\n" (nixpkgs.lib.mapAttrsToList
+                  (name: n: "echo '${name}: ${toString n} bytes'") sizes)}
+                touch "$out"
+              ''
+            else
+              throw ''
+                VM test script over the ${toString limit}-byte limit:
+                ${report}
+
+                nixpkgs passes testScript to the driver build as one environment
+                variable, and Linux caps that at 128 KiB (MAX_ARG_STRLEN). Past
+                it the driver fails to build with "Argument list too long" and
+                no VM boots.
+
+                Move assertions that do not need a VM into a native check (see
+                `webhook-spawn-claim`), or split the test the way
+                tests/sessions-common.nix split the session tests (issue #312).
+              '';
         });
     };
 }

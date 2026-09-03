@@ -145,12 +145,14 @@ let
       review on your own PR to spawn a sibling that starts working it (that is
       exactly what happened twice in one hour before local-webhook 0.19.0). A
       dispatched session is subscribed to the event's own repo at spawn, so its red
-      CI spawns no sibling - but that seeded claim stops at TOPIC BRANCHES: a failing
-      run on a shared ref (`master`, `main`, a release tag like `v1.2.3`) is claimed
-      by no session, because a red trunk has to reach somebody. No live session
-      silences it, so the watch spawns for it however many sessions are running - the
-      ceiling below is the one thing left that can refuse the batch. Name that ref in
-      your own `--include` when you pick such a run up.
+      CI spawns no sibling. A session started for a CI outcome claims that COMMIT's
+      CI - every event shape the same run reports under, `master` and tags included -
+      so the six shapes of one failure reach one session instead of starting up to
+      six. It stops at that commit: a LATER failure on the same ref is a different
+      sha and gets a session of its own, because a red trunk has to reach somebody
+      whatever else is alive. Before local-webhook 0.27.0 the claim was branch-shaped
+      and a shared ref was excluded outright, so one red `master` spawned two
+      sessions 63s apart and both filed the same diagnosis (agent-box#510, #511).
 
       None of that is watertight, so a `hook-*` session has one more rule: it YIELDS
       to any INTERACTIVE session - one a person or this box's own configuration
@@ -885,8 +887,8 @@ let
 # module-generated-up-to-date check fails until it matches.
 {
   repo = "defangdevs/local-channels";
-  rev = "789b374020842715cda66105fbbebf3267148e3f";
-  sha256 = "sha256-cEvfs1jiMpY+uyhdJH/zSTypNUsZ1FbFALE6KYfN/UM=";
+  rev = "e26aac87ddca1b325290ece457ea657d40bed171";
+  sha256 = "sha256-AX0jhoY+SSZg7cHQytUq8/oF9cYvFDlwIFQSeaKIqow=";
 }
   ;
   localWebhookScript = builtins.fetchurl {
@@ -5555,11 +5557,13 @@ What you own is the OBJECT you were started for, not \
 the whole repository (agent-box#251), so when you open a PR or push a branch, \
 subscribe again naming it — agent-box-webhook subscribe REPO --include with \
 pull_request.number and workflow_run.head_branch — and its CI then reaches you \
-instead of starting a second agent on your work. A failing run on a SHARED ref \
-— master, main, a release tag — is claimed by no session, because a red trunk \
-has to reach somebody whatever else is running, so if that is what started \
-you, name that ref the same way or the next event from the same run can start \
-a second agent beside you.}
+instead of starting a second agent on your work. If a CI outcome started you, \
+your seeded claim is the CI of that one COMMIT — every shape the same run \
+reports under, and nothing else — so the run in front of you reaches you \
+rather than a sibling, on master and on a tag exactly as on a topic branch. \
+What it does NOT cover is the next run: a later failure on the same ref is a \
+different commit and gets a session of its own, which is deliberate, because a \
+red trunk has to reach somebody whatever else is running.}
 
 $(yield_text "$4")
 
@@ -6091,11 +6095,38 @@ fi
 #     which is why the presence leaves above stay as the first half of the
 #     claim rather than being replaced by these.
 #
-#     Cost accepted with it: a session spawned FOR a red trunk claims nothing,
-#     so the second event of that same run can start a twin beside it. The
-#     preamble asks that session to claim the ref by name, which it can read
-#     off its own event text; the exact-run claim this script cannot write is
-#     local-channels#46 again.
+#     Cost accepted with it: a session spawned FOR a red trunk claimed
+#     nothing, so the second event of that same run started a twin beside it.
+#     Measured, 2026-09-02: the master Deploy test went red, `workflow_run`
+#     spawned one session and `check_run` for the SAME run arrived 63s later —
+#     past the coalescing window — and spawned another. Both investigated it,
+#     neither saw the other, and the same diagnosis was filed twice as #510 and
+#     #511. The preamble asks a shared-ref session to claim the ref by name,
+#     which is a request to a model inside the 63 seconds it has to act, not a
+#     mechanism.
+#
+#     So the branch qualifier above is now the FALLBACK, not the answer. When
+#     the meta names the COMMIT the event reports on (local-channels 0.27.0,
+#     that repo's #54), the claim is that commit's CI and nothing else — which
+#     is the right width in both directions and needs no shared-ref carve-out
+#     at all:
+#
+#       * every CI event shape carries the sha, at a path of its own, so the
+#         second shape of the SAME run reaches the session already on it. That
+#         includes a bare commit `status`, whose only branch field is a LIST
+#         the predicate walker cannot index — the one shape `--claim branch:`
+#         can never cover, claimable here for free.
+#       * a LATER red master is a DIFFERENT commit, so it still gets a session
+#         of its own. That is #384's guarantee, kept by the shape of the key
+#         rather than by excluding refs from it.
+#
+#     Not the run id: check_run, check_suite and status do not carry one, so it
+#     cannot link the shapes. Not the branch: two runs on one branch are two
+#     runs, which is exactly how #384 happened.
+#
+#     The fallback stays for a box whose pin predates that meta — an older
+#     receiver sends no sha, and a claim built on an absent value would match
+#     every payload that also lacks it.
 #
 # A numbered claim deliberately does NOT cover that object's CI. A session that
 # opens a PR learns its own branch, and the preamble tells it to re-subscribe
@@ -6109,9 +6140,21 @@ claim_include() {
   "$JQ" -n --argjson meta "''${LOCAL_WEBHOOK_SPAWN_META:-{\}}" '
     (($meta.number // "" | tostring)
      | if test("^[0-9]+$") then tonumber else null end) as $n
+    # A hex sha and nothing else. The meta is payload-derived, so an empty or
+    # malformed value must fall through to the branch rule rather than become
+    # a predicate that matches whatever else is missing that path.
+    | (($meta.sha // "" | tostring)
+       | if test("^[0-9a-f]{7,40}$") then . else null end) as $sha
     | if $n != null then
         {any: [{path: "issue.number", in: [$n]},
                {path: "pull_request.number", in: [$n]}]}
+      elif $sha != null then
+        {any: [{path: "workflow_run.head_sha", in: [$sha]},
+               {path: "workflow_job.head_sha", in: [$sha]},
+               {path: "check_run.head_sha", in: [$sha]},
+               {path: "check_suite.head_sha", in: [$sha]},
+               {path: "deployment.sha", in: [$sha]},
+               {path: "sha", in: [$sha]}]}
       else
         {all: [{any: [{path: "workflow_run", notIn: [null]},
                       {path: "check_run", notIn: [null]},
@@ -6134,11 +6177,20 @@ claim_note() {
     # otherwise be described as "#n/a" while the include claimed CI outcomes.
     (($meta.number // "" | tostring)
      | if test("^[0-9]+$") then . else "" end) as $n
+    | (($meta.sha // "" | tostring)
+       | if test("^[0-9a-f]{7,40}$") then . else "" end) as $sha
+    | ($meta.branch // "" | tostring) as $branch
     | ($meta.event // "") as $e
     | ($meta.action // "") as $a
     | (if $e == "" then "" else " (" + $e + (if $a == "" then "" else "." + $a end) + ")" end) as $what
+    # The ref is said out loud because it is what a reader recognises — but the
+    # sha is what the claim is keyed on, so name both rather than let "master"
+    # read as "every run on master".
+    | (if $branch == "" then "" else " on " + $branch end) as $where
     | if $n != "" then
         "seeded at spawn: this session was started for \($key)#\($n)\($what) and claims that object'"'"'s events while it lives"
+      elif $sha != "" then
+        "seeded at spawn: this session was started for \($key)@\($sha[0:8])\($where)\($what) and claims every CI outcome reporting on THAT COMMIT while it lives (a later run on a different commit still gets a session of its own)"
       else
         "seeded at spawn: this session was started for \($key)\($what) and claims this repo'"'"'s CI outcomes on TOPIC BRANCHES while it lives (never master or a tag: a shared ref always gets a session of its own)"
       end' 2>/dev/null
@@ -9557,7 +9609,7 @@ in
           watchPolicy is unaffected in shape and, since 0.23.0, is the ONLY
           thing that still makes the box's own standing watch selective.
 
-          0.26.0 (this pin) adds delivery INTO a codex session, which until now
+          0.26.0 adds delivery INTO a codex session, which until then
           could only MANAGE subscriptions: `subscribe` run inside one starts a
           detached peer that hands each event to `codex queue`, landing it as a
           message at that session's next turn boundary. The module needs
@@ -9566,6 +9618,15 @@ in
           guide's webhook section now says so. Two versions came between:
           0.24.0 stopped dressing a foreign sender in GitHub's shape, and
           0.25.0 lets a watch carry a `spawnConfig` for its spawn command.
+
+          0.27.0 (this pin) puts the COMMIT a CI event reports on in the spawn
+          meta, as `sha` (plus `branch` where the payload has one). One failing
+          run reaches a watch as up to six event shapes and the sha is the only
+          field all six carry, so it is what tells a spawn command they are one
+          run. webhook-spawn.sh seeds the narrower claim from it (issues #510
+          and #511, where one red master spawned two sessions 63s apart and
+          both filed the same diagnosis); the branch-shaped claim below it
+          stays as the fallback for a payload that carries no sha.
         '';
       };
       sha256 = lib.mkOption {

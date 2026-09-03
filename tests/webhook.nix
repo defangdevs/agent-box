@@ -483,7 +483,8 @@
     client.succeed(
         "cat > /tmp/body.json <<'EOF'\n"
         '{"action":"completed","workflow_run":{"name":"CI","conclusion":"failure",'
-        '"head_branch":"feat/issue-101","html_url":"https://box.test/run/1"},'
+        '"head_branch":"feat/issue-101","head_sha":"1111111111111111111111111111111111111111",'
+        '"html_url":"https://box.test/run/1"},'
         '"repository":{"full_name":"defangdevs/agent-box"},"sender":{"login":"someone"}}\n'
         "EOF"
     )
@@ -740,29 +741,17 @@
     )
     # The topic says what it LISTENS to; the include says what it CLAIMS, and a
     # claim is what silences the standing watch (issue #251). This session was
-    # spawned for a CI outcome, so it claims CI outcomes — enough to swallow
-    # the second event of the same failing run, and no more. A rule-less entry
-    # here claimed every event on the repo: on 2026-08-24 a session spawned for
-    # one issue silenced the master Deploy test failure four seconds later.
+    # spawned for a CI outcome, so it claims the CI of the COMMIT that outcome
+    # reported on — enough to swallow every other shape of the SAME run, and no
+    # more. A rule-less entry here claimed every event on the repo: on
+    # 2026-08-24 a session spawned for one issue silenced the master Deploy
+    # test failure four seconds later.
     machine.succeed(
-        "jq -e '(.topics[0].include.all[0].any | map(.path))"
-        " == [\"workflow_run\", \"check_run\", \"check_suite\", \"workflow_job\"]"
-        " and (.topics[0].include.all[0].any | all(.notIn == [null]))'"
-        f" {hook_filter}"
-    )
-    # ...and only on a TOPIC BRANCH (#384). A run on a SHARED ref — master, main,
-    # a release tag — is nobody's object: the trunk everyone pushes to, or a
-    # release nobody holds, and a red one has to reach a fresh session whatever
-    # else is live. On 2026-08-26 17:56 UTC it did not: a hook session started
-    # minutes earlier for a PR-branch failure claimed every CI outcome in the
-    # repo, so the master Deploy test failure was logged as claimed and nothing
-    # triaged it. There is no glob or prefix leaf to ask for `v*` with, so
-    # "has a slash in it" is the test, at the four paths a head ref arrives on.
-    machine.succeed(
-        "jq -e '(.topics[0].include.all[1].any | map(.path))"
-        " == [\"workflow_run.head_branch\", \"workflow_job.head_branch\","
-        " \"check_suite.head_branch\", \"check_run.check_suite.head_branch\"]"
-        " and (.topics[0].include.all[1].any | all(.contains == [\"/\"]))'"
+        "jq -e '(.topics[0].include.any | map(.path)) == ["
+        "\"workflow_run.head_sha\", \"workflow_job.head_sha\","
+        " \"check_run.head_sha\", \"check_suite.head_sha\","
+        " \"deployment.sha\", \"sha\"]"
+        " and (.topics[0].include.any | all(.in == [\"1111111111111111111111111111111111111111\"]))'"
         f" {hook_filter}"
     )
     # The shape above is only half the promise: what decides a spawn is the
@@ -771,6 +760,11 @@
     # tell a claim that reads right from one that matches nothing (the first
     # version of this claim named .id, which every real delivery carries and
     # the fixtures here do not, so it silently never matched).
+    #
+    # Both directions, because the claim has to be narrow as well as wide: the
+    # other shapes of THIS run are swallowed, and a run on a different commit
+    # is not — which is how a red trunk still reaches somebody (#384) now that
+    # the claim names no ref at all.
     machine.succeed(
         "cat > /tmp/claimcheck.py <<'PYEOF'\n"
         "import importlib.util, json, sys\n"
@@ -779,11 +773,18 @@
         "spec.loader.exec_module(m)\n"
         "claim = json.load(open(sys.argv[2]))['topics'][0]['include']\n"
         "assert m.predicate_error(claim) is None, m.predicate_error(claim)\n"
-        "def wf(b): return {'workflow_run': {'head_branch': b, 'conclusion': 'failure'}}\n"
-        "def cr(b): return {'check_run': {'check_suite': {'head_branch': b}}}\n"
-        "for p in (wf('feat/issue-101'), cr('fix/1-thing')):\n"
+        "MINE = '1111111111111111111111111111111111111111'\n"
+        "OTHER = '2' * 40\n"
+        "def shapes(sha):\n"
+        "    return [{'workflow_run': {'head_sha': sha, 'conclusion': 'failure'}},\n"
+        "            {'workflow_job': {'head_sha': sha}},\n"
+        "            {'check_run': {'head_sha': sha}},\n"
+        "            {'check_suite': {'head_sha': sha}},\n"
+        "            {'deployment': {'sha': sha}},\n"
+        "            {'sha': sha, 'state': 'failure'}]\n"
+        "for p in shapes(MINE):\n"
         "    assert m.match_predicate(claim, p), p\n"
-        "for p in (wf('master'), wf('main'), wf('v3.14.1'), cr('master'), cr('v3.14.1')):\n"
+        "for p in shapes(OTHER):\n"
         "    assert not m.match_predicate(claim, p), p\n"
         "print('claim ok')\n"
         "PYEOF"
@@ -855,15 +856,17 @@
     )
     machine.succeed("grep -q 'seeded at spawn' /tmp/hook-peer.log")
 
-    # The other half of the same brake: a SHARED ref is out of its reach. That
-    # peer is still live and still claiming this repo's topic-branch CI, and a
-    # failing run on `master` gets its own session anyway — the delivery the
-    # 2026-08-26 incident lost.
+    # The other half of the same brake: the NEXT run is out of its reach. That
+    # peer is still live and still claiming its own commit's CI, and a failing
+    # run on `master` at a DIFFERENT commit gets its own session anyway — the
+    # delivery the 2026-08-26 incident lost. The claim names no ref, so this is
+    # the whole of #384's guarantee now: a red trunk reaches somebody because
+    # it is a different sha, not because master was carved out by name.
     client.succeed(
         "cat > /tmp/trunk.json <<'EOF'\n"
         '{"action":"completed","workflow_run":{"name":"Deploy test",'
         '"conclusion":"failure","head_branch":"master",'
-        '"html_url":"https://box.test/run/3"},'
+        '"head_sha":"2222222222222222222222222222222222222222","html_url":"https://box.test/run/3"},'
         '"repository":{"full_name":"defangdevs/agent-box"},'
         '"sender":{"login":"someone"}}\n'
         "EOF"
@@ -945,78 +948,16 @@
         f" /home/agent/.local/state/local-webhook/filter.agent-{other}.json"
     )
 
-    # A spawn for a numbered object claims exactly that object (issue #251).
-    # The number comes from LOCAL_WEBHOOK_SPAWN_META, the dispatcher's own
-    # summary of the batch, so this drives the wrapper with the meta the
-    # daemon would export for `issues.assigned` on #4242.
-    machine.succeed(
-        "sudo -u agent env HOME=/home/agent"
-        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
-        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/numbered"
-        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
-        " LOCAL_WEBHOOK_SPAWN_EVENT=issues"
-        """ LOCAL_WEBHOOK_SPAWN_META='{"event":"issues","action":"assigned","number":"4242"}'"""
-        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
-    )
-    numbered = machine.succeed(
-        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-numbered-\"))'"
-        " /home/agent/.config/agent-box/sessions.json"
-    ).strip()
-    numbered_filter = (
-        f"/home/agent/.local/state/local-webhook/filter.agent-{numbered}.json"
-    )
-    # Both paths a number can arrive on, and NOT the CI paths: a session
-    # working one issue must not own the repo's CI. Not
-    # workflow_run.pull_requests.0.number either, which reads well and never
-    # matches — the predicate walker steps through dicts only, so a list index
-    # ends the walk (local-channels#46).
-    machine.succeed(
-        "jq -e '(.topics[0].include.any | map(.path)) =="
-        " [\"issue.number\", \"pull_request.number\"]"
-        " and (.topics[0].include.any | all(.in == [4242]))'"
-        f" {numbered_filter}"
-    )
-    # The note names the object, because it is echoed under every delivery and
-    # a fresh-context session reads it to learn why the event matters. It used
-    # to be one fixed sentence, byte-identical across every hook session.
-    machine.succeed(
-        "jq -e '.topics[0].note | contains(\"defangdevs/numbered#4242\")"
-        " and contains(\"issues.assigned\")'"
-        f" {numbered_filter}"
-    )
-    machine.succeed(
-        f"sudo -u agent env HOME=/home/agent agent-box-session rm {numbered}"
-    )
-
-    # A `number` that is not a number falls back to the CI claim, and the NOTE
-    # falls back with it. The two used to test the value differently, so a meta
-    # like {"number":"n/a"} produced a note saying the session owned KEY#n/a
-    # while the claim covered CI outcomes — a note that describes a claim
-    # nobody holds is worse than no note.
-    machine.succeed(
-        "sudo -u agent env HOME=/home/agent"
-        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
-        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/unnumbered"
-        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
-        " LOCAL_WEBHOOK_SPAWN_EVENT=issues"
-        """ LOCAL_WEBHOOK_SPAWN_META='{"event":"issues","action":"opened","number":"n/a"}'"""
-        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
-    )
-    unnumbered = machine.succeed(
-        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-unnumbered-\"))'"
-        " /home/agent/.config/agent-box/sessions.json"
-    ).strip()
-    machine.succeed(
-        "jq -e '(.topics[0].include.all[0].any | map(.path) | index(\"workflow_run\"))"
-        " != null"
-        " and (.topics[0].include.all[1].any | map(.path)"
-        " | index(\"workflow_run.head_branch\")) != null"
-        " and (.topics[0].note | contains(\"#\") | not)'"
-        f" /home/agent/.local/state/local-webhook/filter.agent-{unnumbered}.json"
-    )
-    machine.succeed(
-        f"sudo -u agent env HOME=/home/agent agent-box-session rm {unnumbered}"
-    )
+    # What a claim looks like for a numbered object, for a commit, and for a
+    # meta the wrapper cannot parse is asserted in the `webhook-spawn-claim`
+    # check instead. Those are pure functions of LOCAL_WEBHOOK_SPAWN_META, so
+    # they cost a VM boot here and nothing there — and they cost this test
+    # itself once: nixpkgs hands the driver build its testScript in ONE
+    # environment variable, Linux caps a variable at 128 KiB (MAX_ARG_STRLEN),
+    # and the driver stopped building with "Argument list too long" before any
+    # VM booted. What stays here is the wiring above, which the unit test
+    # cannot see: a signed delivery reaching the watch, spawning a session,
+    # and that session landing with the seeded claim already in place.
 
     # A long key keeps its WHOLE name (issue #236). The key used to be cut at
     # 24 sanitized characters, which overran the 32 the daemon renders —

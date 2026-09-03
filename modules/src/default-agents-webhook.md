@@ -105,12 +105,14 @@ the repo. So scope the subscription when you pick up an object, or expect a
 review on your own PR to spawn a sibling that starts working it (that is
 exactly what happened twice in one hour before local-webhook 0.19.0). A
 dispatched session is subscribed to the event's own repo at spawn, so its red
-CI spawns no sibling - but that seeded claim stops at TOPIC BRANCHES: a failing
-run on a shared ref (`master`, `main`, a release tag like `v1.2.3`) is claimed
-by no session, because a red trunk has to reach somebody. No live session
-silences it, so the watch spawns for it however many sessions are running - the
-ceiling below is the one thing left that can refuse the batch. Name that ref in
-your own `--include` when you pick such a run up.
+CI spawns no sibling. A session started for a CI outcome claims that COMMIT's
+CI - every event shape the same run reports under, `master` and tags included -
+so the six shapes of one failure reach one session instead of starting up to
+six. It stops at that commit: a LATER failure on the same ref is a different
+sha and gets a session of its own, because a red trunk has to reach somebody
+whatever else is alive. Before local-webhook 0.27.0 the claim was branch-shaped
+and a shared ref was excluded outright, so one red `master` spawned two
+sessions 63s apart and both filed the same diagnosis (agent-box#510, #511).
 
 None of that is watertight, so a `hook-*` session has one more rule: it YIELDS
 to any INTERACTIVE session - one a person or this box's own configuration
