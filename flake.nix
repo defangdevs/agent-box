@@ -925,6 +925,13 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 nativeBuildInputs = [
                   (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
                   pkgs.caddy
+                  # visudo, for the sudoers half of what `agentbox apply`
+                  # now validates before it commits a render (issue #526).
+                  # Without it here the test that puts the rendered
+                  # drop-in through visudo skips, and a sudoers file that
+                  # can lock an administrator out of sudo reaches a box
+                  # unchecked.
+                  pkgs.sudo
                   # The two config formats this render does NOT own: apt
                   # reads back the unattended-upgrade policy (dpkg only so
                   # apt agrees it has a packaging system at all), perl
