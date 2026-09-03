@@ -3285,9 +3285,9 @@ def validate_caddyfile(text, act, profile):
     validate run must not scatter a certificate directory into root's home.
     """
     caddy = Path(profile) / "bin" / "caddy"
-    if not caddy.is_file():
-        act.notes.append(f"{caddy}: not in the profile - the Caddyfile was "
-                         "written unchecked")
+    if not (caddy.is_file() and os.access(caddy, os.X_OK)):
+        act.notes.append(f"{caddy}: missing or not executable - the "
+                         "Caddyfile was written unchecked")
         return
     try:
         secrets = Path(AUTH_ENV_FILE).read_text()
@@ -3314,7 +3314,14 @@ def validate_caddyfile(text, act, profile):
                  "--config", str(candidate)],
                 text=True, capture_output=True, env=env)
         except OSError as e:
-            act.failed(f"validate {CADDYFILE}", str(e))
+            # A note, not a failure: a caddy that will not exec is this
+            # CHECK's input missing, which the guard above catches in every
+            # case but a race - and the same box has caddy.service pointed
+            # at that binary, so the front door not coming up is reported
+            # as the required failure it is, against the unit that needs
+            # it (CodeRabbit, PR #539).
+            act.notes.append(f"{caddy}: {e.strerror or e} - the Caddyfile "
+                             "was written unchecked")
             return
     if out.returncode == 0:
         print(f"validated {CADDYFILE}")

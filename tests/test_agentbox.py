@@ -3263,6 +3263,24 @@ class ApplyActivationTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertIn("written unchecked", out)
 
+    def test_a_caddy_that_will_not_run_is_a_skip_not_a_failure(self):
+        """The CHECK's input is missing, which is not a bad config.
+
+        And the same box points caddy.service at that binary, so the front
+        door not coming up is reported as the required failure it is,
+        against the unit that needs it (CodeRabbit, PR #539).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / "env"
+            env.write_text("WEB_PASSWORD_HASH_AGENT=hashed\n")
+            self.mod.AUTH_ENV_FILE = str(env)
+            self.extra_files[self.mod.CADDYFILE] = "irrelevant\n"
+            self.caddy_stub = "#!/nonexistent/sh\n"      # ENOENT on exec
+            rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("written unchecked", out)
+        self.assertNotIn("apply FAILED", err)
+
 
 class PostSwitchFailureTest(unittest.TestCase):
     """An update whose apply fails puts the profile back (issue #526).
