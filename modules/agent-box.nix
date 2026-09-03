@@ -7010,9 +7010,10 @@ esac
         default = null;
         description = ''
           Prompt used when the supervisor RESUMES this session after any
-          respawn (crash, reboot, Spot stop→restart). Null uses a built-in
-          steer that continues unfinished work or stops if it was already
-          done. Ignored for shell sessions.
+          respawn (crash, reboot, Spot stop→restart). A non-null value
+          overrides the built-in restart notice. When null, the notice is
+          used only if services.agent-box.restartNotice is enabled;
+          otherwise no prompt is injected. Ignored for shell sessions.
         '';
       };
     };
