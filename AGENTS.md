@@ -220,21 +220,26 @@ Attach those screenshots with `agent-box-upload FILE --repo defangdevs/agent-box
 
 ### Finishing a CodeRabbit review
 
-CodeRabbit reviews every PR in this repo, and pushing the fix does not clear the review it left. Two things stay behind, and each one keeps the PR red on its own — `gh pr merge --auto` then waits forever, because the branch ruleset gates on resolved conversations. Close both by hand, in this order, as the last step of addressing a review:
+CodeRabbit reviews every PR in this repo, and pushing the fix does not clear the review it left. Two things stay behind, and each one keeps the PR red on its own - `gh pr merge --auto` then waits forever, because the branch ruleset gates on resolved conversations. Close both by hand, in this order, as the last step of addressing a review:
 
-1. **Resolve every thread you addressed.** Re-read the thread first: a finding can be argued down and withdrawn between the moment you read it and the moment you push, and resolving is the wrong answer to a comment you decided not to act on — reply there instead. Collect the ids and resolve them:
+1. **Resolve every thread you addressed.** Re-read the thread first: a finding can be argued down and withdrawn between the moment you read it and the moment you push, and resolving is the wrong answer to a comment you decided not to act on - reply there instead. Collect the ids and resolve them, paginating past the first 100 threads:
 
-   ```bash
-   gh api graphql -f query='{repository(owner:"defangdevs",name:"agent-box"){
-     pullRequest(number:NNN){reviewThreads(first:100){nodes{id isResolved path line}}}}}'
-   gh api graphql -f query='mutation{resolveReviewThread(input:{threadId:"THREAD_ID"}){thread{isResolved}}}'
-   ```
+       gh api graphql --paginate --slurp -f query='
+         query($endCursor: String) {
+           repository(owner:"defangdevs", name:"agent-box") {
+             pullRequest(number: NNN) {
+               reviewThreads(first: 100, after: $endCursor) {
+                 nodes { id isResolved path line }
+                 pageInfo { hasNextPage endCursor }
+               }
+             }
+           }
+         }' | jq -r '.[].data.repository.pullRequest.reviewThreads.nodes[].id'
+       gh api graphql -f query='mutation{resolveReviewThread(input:{threadId:"THREAD_ID"}){thread{isResolved}}}'
 
 2. **Dismiss the review itself.** A `CHANGES_REQUESTED` verdict outlives both the resolved threads and the new commits, so the PR keeps showing changes requested until the review is dismissed:
 
-   ```bash
-   gh api -X PUT repos/defangdevs/agent-box/pulls/NNN/reviews/REVIEW_ID/dismissals \
-     -f event=DISMISS -f message='addressed in <sha>'
-   ```
+       gh api -X PUT repos/defangdevs/agent-box/pulls/NNN/reviews/REVIEW_ID/dismissals \
+         -f event=DISMISS -f message='addressed in <sha>'
 
-   `gh pr view NNN --json reviews` has the review ids and their states. Only a review carrying a verdict can be dismissed — a plain `COMMENTED` review has nothing to clear, and asking for a fresh pass with an `@coderabbitai review` comment gets the same result the slow way.
+   `gh pr view NNN --json reviews` has the review ids and their states. A plain `COMMENTED` review carries no merge-blocking verdict, so there is nothing here to clear - asking for a fresh pass with an `@coderabbitai review` comment gets the same result the slow way.
