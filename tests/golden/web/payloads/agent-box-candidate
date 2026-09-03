@@ -88,6 +88,13 @@ USAGE
 # The tracked branch's head, as a rev. Asked of the remote WITHOUT touching
 # the tree: --status and the validation below are questions, and a question
 # must not be the thing that moves what the box builds.
+#
+# Its `die` only exits the COMMAND SUBSTITUTION it runs in, so both callers
+# must check the status: with `set -u` alone (and no `set -e`, deliberately
+# — every refusal here is a `die` with a reason, not a bare non-zero), an
+# unchecked `head=$(tracked_head)` would carry on with head='', print an
+# empty tracked rev from --status, and let the "is it the tracked head
+# already" test below pass by comparing against nothing.
 tracked_head() {
   b=${SRC_BRANCH:-}
   if [ -n "$b" ]; then
@@ -118,7 +125,7 @@ case "${1:-}" in
 
   (--status)
     rev=$(running_rev) || die "$SRC_DIR is not a checkout yet — this box has never updated"
-    head=$(tracked_head)
+    head=$(tracked_head) || exit 1
     printf 'rev:     %s\n' "$rev"
     printf 'tracked: %s at %s\n' "${SRC_BRANCH:-origin/HEAD}" "$head"
     # The marker's own claim, believed only when it matches the rev the box
@@ -133,6 +140,15 @@ case "${1:-}" in
         "${SRC_BRANCH:-the tracked branch}"
     elif [ "$rev" = "$head" ]; then
       printf 'state:   on the tracked branch\n'
+    elif ! command git -C "$SRC_DIR" cat-file -e "$head^{commit}" 2>/dev/null; then
+      # The remote has moved on and the tree has not fetched it yet, which is
+      # the ordinary state of a box between updates. merge-base would exit
+      # 128 on the missing object and fall through to the warning below,
+      # reporting a perfectly normal box as one the guard has a problem with.
+      # Say what is actually known instead: there is a newer rev, and this
+      # tree cannot place itself against it without a fetch — which --status,
+      # being a question, will not do.
+      printf 'state:   an update is available (%.12s); this tree has not fetched it, so it cannot say more\n' "$head"
     elif command git -C "$SRC_DIR" merge-base --is-ancestor "$rev" "$head" 2>/dev/null; then
       printf 'state:   behind the tracked branch — an update is available\n'
     else
@@ -240,7 +256,7 @@ want=$(printf '%s\n' "$out" | head -n 1 | cut -f1)
 # branch name — should leave behind in the tree that decides what root
 # builds. That check is also the better home for it on its own merits, since
 # it then holds however the marker was written.
-head=$(tracked_head)
+head=$(tracked_head) || exit 1
 if [ "$want" = "$head" ]; then
   die "'$branch' is at ${head} — the same rev as ${SRC_BRANCH:-the tracked branch}, so there is nothing to try"
 fi

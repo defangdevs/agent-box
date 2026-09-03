@@ -1240,6 +1240,41 @@ class RenderTest(unittest.TestCase):
             profile = (out / "usr/local/bin/agent-box-profile").read_text()
             self.assertIn("AGENT_BOX_ENVSTORE_BIN=", profile)
 
+    def test_candidate_helper_generated_without_web(self):
+        """agent-box-candidate must exist on a web-disabled box, because the
+        GRANT for it does. sudoers() adds it from implied_sudo_commands(),
+        which is not gated on web.enable -- native has no selfUpdate.enable
+        to gate the update trigger on either -- so a box that renders the
+        rule and not the file leaves sudo finding a command that is not
+        there: exec fails with a bare "No such file or directory" and
+        nothing says the box was built without it.
+
+        Exactly the trap `test_wrappers_generated_without_web` above was
+        written for on #403, and it caught this one too (CodeRabbit finding
+        on the candidate-release PR): the wrapper was first rendered from
+        inside self.caddy(), which a web-disabled box never calls. The pair
+        is what matters, so this asserts BOTH halves together."""
+        data = json.loads(CONFIG_JSON.read_text())
+        data["web"] = {"enable": False}
+        del data["webhook"]
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "no-web.json"
+            cfg.write_text(json.dumps(data))
+            out = render(tmp, cfg)
+            helper = out / "etc/agent-box/bin/agent-box-candidate"
+            self.assertTrue(
+                helper.exists(),
+                "web.enable: false rendered no agent-box-candidate, but "
+                "sudoers still grants it")
+            # And it is the wrapper, with its constants compiled in rather
+            # than left to an environment sudo will not carry.
+            body = helper.read_text()
+            self.assertIn("CANDIDATE_FILE=", body)
+            self.assertIn("SRC_URL=", body)
+            self.assertIn("UPDATE_TRIGGER=", body)
+            sudoers = (out / "etc/sudoers.d/agent-box").read_text()
+            self.assertIn("/etc/agent-box/bin/agent-box-candidate *", sudoers)
+
     def test_every_user_gets_their_own_canonical_guide(self):
         """Issue #394. Two things were wrong at once here.
 
