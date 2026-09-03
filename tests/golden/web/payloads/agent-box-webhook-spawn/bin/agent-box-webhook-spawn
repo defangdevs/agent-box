@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 # The CLI this spawn ends by exec'ing into, to create the hook session.
 # It was a bare `agent-box-session` resolved from the receiver unit's
 # PATH, which carried it on NixOS and not natively - where the profile

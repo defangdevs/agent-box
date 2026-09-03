@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 set -u
 # SessionStart hook for supervisor-spawned claude sessions (issue #223).
 # A clear, a compact or a resume rotates claude's live session id

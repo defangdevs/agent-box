@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 # Put a local file into GitHub's attachment store and print the markdown that
 # embeds it — the same store a human's drag-and-drop uses, so the result is a
 # github.com/user-attachments/assets/<uuid> URL and NOT a file committed to the

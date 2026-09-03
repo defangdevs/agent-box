@@ -2,7 +2,7 @@
 
 [Service]
 Environment="AGENT_BOX_AGENTS=claude,codex,shell"
-Environment="AGENT_BOX_CONNECT_BINS=github=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gh-2.96.0/bin/gh defang=/var/lib/agent-box-defang-cli/bin/defang"
+Environment="AGENT_BOX_CONNECT_BINS=github=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gh-2.98.0/bin/gh defang=/var/lib/agent-box-defang-cli/bin/defang"
 Environment="AGENT_BOX_CONNECT_EXPRS=defang=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-defang-cli-expr.nix"
 Environment="AGENT_BOX_HOOK_SPAWN_CMD=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook-spawn/bin/agent-box-webhook-spawn"
 Environment="AGENT_BOX_NIXPKGS=https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz"
@@ -11,14 +11,14 @@ Environment="AGENT_BOX_PROFILE_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-a
 Environment="AGENT_BOX_REPO=defangdevs/agent-box"
 Environment="AGENT_BOX_REV=0000000000000000000000000000000000000000"
 Environment="AGENT_BOX_SYSTEMCTL=/run/current-system/sw/bin/systemctl"
-Environment="AGENT_BOX_TMUX_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7b/bin/tmux"
+Environment="AGENT_BOX_TMUX_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7c/bin/tmux"
 Environment="AGENT_BOX_UPDATE_CMD=/run/wrappers/bin/sudo -n /run/current-system/sw/bin/systemctl start --no-block agent-box-update.service"
 Environment="AGENT_BOX_UPDATE_UNIT=agent-box-update.service"
-Environment="AGENT_BOX_WEBHOOK_PYTHON=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.6/bin/python3"
+Environment="AGENT_BOX_WEBHOOK_PYTHON=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.7/bin/python3"
 Environment="AGENT_BOX_WEBHOOK_SCRIPT=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-webhook.py"
-Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-67/lib/locale/locale-archive"
-Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-settings/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.10.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin"
-Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026b/share/zoneinfo"
+Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-84/lib/locale/locale-archive"
+Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-settings/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.11.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261.2/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin"
+Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026c/share/zoneinfo"
 X-StopIfChanged=false
 ExecStart=
 ExecStart=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-settings/bin/agent-box-settings

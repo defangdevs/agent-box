@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 # agent-box-source — the tree the box is BUILT FROM (issue #242).
 #
 # Until this existed, "update the box" meant asking GitHub's API for a rev

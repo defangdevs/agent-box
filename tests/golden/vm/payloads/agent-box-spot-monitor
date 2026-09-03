@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p9/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 set -u
 # Binaries resolve from the unit's PATH; who to notify and how long to
 # wait come from the AGENT_BOX_* env the unit sets (issue #154, Phase 2).
