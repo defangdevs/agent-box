@@ -1602,6 +1602,29 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # connect_start()'s install half: resolving nix at use, and
+          # letting a failed install reach the exit marker (issue #544).
+          # Same shape and same subject as connect-card above - the GOLDEN
+          # PAYLOAD, the daemon as it actually ships.
+          connect-install =
+            pkgs.runCommand "agent-box-connect-install"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-connect-install.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-connect-install.py
+              python3 repo/tests/test-connect-install.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # The settings daemon's session routes against a registry that
           # does not parse (issue #279). Same shape and same subject as the
           # two above: the GOLDEN PAYLOAD, the daemon as it actually ships.

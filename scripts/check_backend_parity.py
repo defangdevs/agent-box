@@ -160,9 +160,13 @@ BY_DESIGN = {
         "the BUILDING host's store path into a generated "
         "file and break on the next nix upgrade - so "
         "lib/agents.sh resolves it at USE from PATH and "
-        "the two standard install layouts. Both backends "
-        "reach the same binary; only one can name it "
-        "ahead of time"),
+        "the two standard install layouts, as does the "
+        "settings daemon's connect_nix_bin() for the "
+        "sign-in cards (issue #544 - it used to leave a "
+        "bare `nix` for the pane's shell, which on a "
+        "native box resolves against a PATH that carries "
+        "none). Both backends reach the same binary; only "
+        "one can name it ahead of time"),
     "AGENT_BOX_WEBHOOK_POLICY_FILE": (
         "module",
         "issue #457: both backends bake this "
