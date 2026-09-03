@@ -413,11 +413,20 @@ lease_create() {
   mkdir -p "$LEASE_DIR" 2>/dev/null || return 0
   _lf="$(lease_file "$1")"
   _lt="$(mktemp "$_lf.XXXXXX" 2>/dev/null)" || return 0
-  if "$LEASE_JQ" -n --arg topic "$2" --arg object "$3" \
+  # gen identifies THIS lease instance, distinct from any earlier or later
+  # one at the same NAME -- session names are reusable (a delist-then-add
+  # can reuse one), so lease_mark_outcome checks this back before writing
+  # an outcome, and a stale write from a session that no longer holds this
+  # instance never lands on the lease that replaced it. A fresh random
+  # value rather than a timestamp: two creates within the same wall-clock
+  # second would otherwise mint the same "generation".
+  _gen=""
+  [ -r /proc/sys/kernel/random/uuid ] && read -r _gen < /proc/sys/kernel/random/uuid
+  if "$LEASE_JQ" -n --arg topic "$2" --arg object "$3" --arg gen "$_gen" \
       --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-      '{"//": "Durable claim record for a hook-* session (agent-box#535). Written once at spawn; outcome is set on a crash (mark-stopped.sh) or a silent, epilogue-skipped death (supervisor.sh start_session). Deleted on a clean exit -- absence means never leased, or resolved.",
+      '{"//": "Durable claim record for a hook-* session (agent-box#535). Written once at spawn; outcome is set on a crash (mark-stopped.sh) or a silent, epilogue-skipped death (supervisor.sh start_session). Deleted on a clean exit -- absence means never leased, or resolved. gen identifies this instance across a name reuse; a writer that read a different gen must not apply its outcome here.",
         topic: $topic, object: (if $object == "" then null else $object end),
-        claimedAt: $at, outcome: null}' \
+        claimedAt: $at, gen: (if $gen == "" then null else $gen end), outcome: null}' \
       > "$_lt" 2>/dev/null; then
     mv -f "$_lt" "$_lf" 2>/dev/null || rm -f "$_lt"
   else
@@ -439,23 +448,35 @@ lease_mark_outcome() {
   # most recent one.
   #
   # A resolve (lease_clear, called from rm/reap_ephemeral or a clean exit)
-  # can only race THIS call if something else deletes the same session's
-  # lease concurrently -- e.g. an operator running `rm` at the exact moment
-  # its pane is also crashing. `mv -f` onto a path that no longer exists
-  # CREATES it, so an unguarded rename here would resurrect a lease
-  # lease_clear just deleted. Re-checking existence immediately before the
-  # rename (rather than only once, before the jq call) shrinks that window
-  # to the width of two syscalls; sweep_lease_state is the backstop for
-  # what a shell script cannot make fully atomic without a lock this
-  # single-writer-per-file design deliberately avoids -- a lease resurrected
-  # in that narrow gap outlives no more than the next reconcile tick, since
-  # its session is by then not in the registry either.
+  # can race this call if something else deletes -- and, since a session
+  # NAME is reusable, potentially re-creates -- the same NAME's lease
+  # concurrently: an operator running `rm` then `add` at the exact moment
+  # this pane is also crashing. Existence alone does not catch that: `mv -f`
+  # only needs a path to exist, not that it still holds the SAME lease this
+  # call read, so a plain existence re-check would let this write land on a
+  # brand new lease that reused the name.
+  #
+  # gen (lease_create) is the guard: captured before the edit, re-read
+  # immediately before the rename, and the write is dropped on ANY
+  # mismatch. `[ -e "$_lf" ]` is checked separately from the gen compare
+  # rather than folded into it, so a file that vanished entirely is always
+  # rejected even for a legacy lease minted before this field existed
+  # (empty gen on both sides would otherwise compare equal). What is left
+  # is the width of the read-compare-rename sequence itself, which no
+  # shell script makes fully atomic without a lock this
+  # single-writer-per-file design deliberately avoids; the only way to
+  # land in it is a NEW lease minted for the exact reused name inside that
+  # handful of syscalls, and sweep_lease_state's 30s grace window is the
+  # backstop if it ever does.
   _lf="$(lease_file "$1")"
   [ -s "$_lf" ] || return 0
+  _gen="$("$LEASE_JQ" -r '.gen // empty' "$_lf" 2>/dev/null)" || _gen=""
   _lt="$(mktemp "$_lf.XXXXXX" 2>/dev/null)" || return 0
   if "$LEASE_JQ" --arg outcome "$2" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
       'if .outcome == null then .outcome = $outcome | .endedAt = $at else . end' \
-      "$_lf" > "$_lt" 2>/dev/null && [ -e "$_lf" ]; then
+      "$_lf" > "$_lt" 2>/dev/null \
+      && [ -e "$_lf" ] \
+      && [ "$("$LEASE_JQ" -r '.gen // empty' "$_lf" 2>/dev/null)" = "$_gen" ]; then
     mv -f "$_lt" "$_lf" 2>/dev/null || rm -f "$_lt"
   else
     rm -f "$_lt"

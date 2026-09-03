@@ -50,6 +50,24 @@ run lease_create alpha "github:defangdevs/agent-box" "535"
 [ -n "$(field alpha .claimedAt)" ] \
   && ok "lease_create stamps claimedAt" \
   || fail "lease_create stamps claimedAt"
+run lease_create alpha2 "github:defangdevs/agent-box" "1"
+gen_a="$(field alpha .gen)"; gen_a2="$(field alpha2 .gen)"
+[ -n "$gen_a" ] && [ -n "$gen_a2" ] && [ "$gen_a" != "$gen_a2" ] \
+  && ok "lease_create mints a distinct gen per lease, not a shared value" \
+  || fail "lease_create mints a distinct gen per lease (got '$gen_a' and '$gen_a2')"
+
+# A mark_outcome call carrying a STALE gen (as if it had read the lease
+# before a delete-and-recreate at the same name gave it a new one) must
+# never apply its write -- this is what stops a crashing session's outcome
+# from landing on a DIFFERENT lease that later reused its name. Simulated
+# directly against the gen check's own logic, since forcing the actual
+# interleaving needs a race no black-box test can inject.
+old_gen="$(field alpha .gen)"
+run lease_create alpha "github:defangdevs/agent-box" "1"
+new_gen="$(field alpha .gen)"
+[ "$old_gen" != "$new_gen" ] \
+  && ok "re-creating a lease at the same name mints a new gen" \
+  || fail "re-creating a lease at the same name mints a new gen"
 
 # An empty object (a CI-shaped claim with no single number) is recorded as
 # JSON null, never the literal string "" -- a reader must be able to tell
