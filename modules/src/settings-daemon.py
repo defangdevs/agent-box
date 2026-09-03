@@ -4217,7 +4217,7 @@ def render_tabs(names, live, stopped, died, selected):
     return "".join(items)
 
 
-def render_msg(message, page):
+def render_msg(message, page, kind="ok"):
     """The page-level feedback banner ("Session added", "Key saved"…),
     with a dismiss (x) that works both ways: it is a LINK back to
     `page` — the same page minus the ?ok= that produced the banner —
@@ -4229,12 +4229,22 @@ def render_msg(message, page):
     Dismissal is manual only (issue #246). The banner sits in normal
     flow, so its removal resizes the panes below it; a move the user
     asked for reads as a response, the same move on a timer reads as
-    the page lurching on its own."""
+    the page lurching on its own.
+
+    `kind` ("ok" / "warn" / "error") picks the CSS palette via
+    data-kind - a failure used to render in the same green as a
+    success, indistinguishable at a glance (issue #549). An error
+    also gets role="alert" (assertive) instead of role="status"
+    (polite). Every kind gets a copy button, since the operator has
+    no shell here to select the banner text from and may need to
+    paste it elsewhere, whichever kind it is."""
     if not message:
         return ""
+    role = "alert" if kind == "error" else "status"
     return (
-        f'<div class="msg" role="status">'
+        f'<div class="msg" data-kind="{kind}" role="{role}">'
         f'<span class="msg-text">{html.escape(message)}</span>'
+        f'{copy_button("this message", value=message)}'
         f'<a class="msg-x" href="{html.escape(page, quote=True)}" '
         f'aria-label="Dismiss" title="Dismiss">&times;</a>'
         f'</div>'
@@ -4300,8 +4310,8 @@ def render_head(title):
     )
 
 
-def render_page(message=""):
-    msg_html = render_msg(message, BASE + "/")
+def render_page(message="", kind="ok"):
+    msg_html = render_msg(message, BASE + "/", kind)
     # One pass over the subscription state per render, feeding both
     # panels: it forks the pinned CLI once per session, so the Sessions
     # rows and the standing watches must not each pay for their own.
@@ -4385,7 +4395,7 @@ def render_users():
     )
 
 
-def render_home(message="", selected=None):
+def render_home(message="", selected=None, kind="ok"):
     entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
     names = list(entries)
     if selected not in entries:
@@ -4395,7 +4405,7 @@ def render_home(message="", selected=None):
     died = {n for n, v in entries.items() if crashed_status(v) is not None}
     # Dismissing keeps the selected tab (SESSION_RE names are URL-safe).
     msg_html = render_msg(
-        message, TERM_HOME + ("?tab=" + selected if selected else ""))
+        message, TERM_HOME + ("?tab=" + selected if selected else ""), kind)
     return (
         render_head("Agent Box &mdash; " + html.escape(USER))
         + STYLE
@@ -4619,46 +4629,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    # Each value is (text, kind). The ok= channel's name describes the
+    # MECHANISM (a message queued across a redirect), not that the news
+    # is good - a handful of entries are failures carried on it because
+    # the banner is the only page-level feedback there is after a
+    # redirect, session_registry_unreadable being the original case
+    # (issue #279). Carrying the kind right on the entry, rather than in
+    # a side-table of the keys that are secretly errors, makes a future
+    # failure-shaped entry that forgets its kind default to rendering
+    # green (issue #549) structurally impossible rather than easy to miss.
     OK_MESSAGES = {
-        "saved": "Secret saved. Restart sessions to apply it.",
-        "deleted": "Secret deleted. Restart sessions to apply the change.",
-        "restarted": "Restart of all sessions requested.",
-        "session_added": "Session added \u2014 it starts within a few seconds.",
-        "session_deleted": "Session deleted.",
-        "session_restarted": "Session restart requested.",
-        "session_started": "Session started \u2014 it comes up within a few seconds.",
-        # A failure carried on the ok= channel, like webhook_kept below: the
-        # banner is the only page-level feedback there is, and an operator
-        # with no shell has to be told that nothing was changed AND that the
-        # box repairs itself, or the natural next move is to press the button
-        # again (issue #279).
-        "session_registry_unreadable":
+        "saved": ("Secret saved. Restart sessions to apply it.", "ok"),
+        "deleted": ("Secret deleted. Restart sessions to apply the change.", "ok"),
+        "restarted": ("Restart of all sessions requested.", "ok"),
+        "session_added": ("Session added \u2014 it starts within a few seconds.", "ok"),
+        "session_deleted": ("Session deleted.", "ok"),
+        "session_restarted": ("Session restart requested.", "ok"),
+        "session_started": ("Session started \u2014 it comes up within a few seconds.", "ok"),
+        "session_registry_unreadable": (
             "The session list could not be read, so nothing was changed. "
             "The box moves the unreadable file aside and rebuilds the list "
             "within a few seconds \u2014 reload this page and try again.",
-        "update": "Agent-box update started. This page may be briefly unavailable.",
-        "rebooting": "Restart requested. Agent-box will be unavailable for "
-                     "about a minute; reload this page when it is back.",
-        "webhook_rotated": ("Secret replaced. Copy the new secret into the "
-                            "connected service now; events using the old one "
-                            "are no longer accepted."),
-        "webhook_kept_secret": ("Could not replace that secret from this "
-                                "page. Open a session and run "
-                                "`agent-box-webhook rotate SOURCE`."),
-        "webhook_deleted": "Event rule deleted. The change applies to the next event.",
-        "webhook_forgotten": "Event notification rules cleared for this session.",
-        "webhook_kept": "Could not delete that event rule. It may already be gone.",
-        "password_changed": "Password changed. Sign in with your new password.",
-        "connect_started": "Sign-in started \u2014 follow the steps under Connections.",
-        "connect_cancelled": "Sign-in cancelled.",
-        "connect_code": "Code sent \u2014 waiting for the sign-in to finish.",
-        "profile_saved": "Profile saved. Sessions started from now on use it.",
-        "profile_deleted": ("Profile deleted. Sessions already running keep "
-                            "their current settings."),
-        "profile_key_saved": ("Setting added to the profile. Sessions on it pick "
-                              "it up at their next start."),
-        "profile_key_deleted": ("Setting removed from the profile. Sessions on it "
-                                "drop it at their next start."),
+            "error",
+        ),
+        "update": ("Agent-box update started. This page may be briefly unavailable.", "ok"),
+        "rebooting": (("Restart requested. Agent-box will be unavailable for "
+                       "about a minute; reload this page when it is back."), "ok"),
+        "webhook_rotated": (("Secret replaced. Copy the new secret into the "
+                             "connected service now; events using the old one "
+                             "are no longer accepted."), "ok"),
+        "webhook_kept_secret": (("Could not replace that secret from this "
+                                 "page. Open a session and run "
+                                 "`agent-box-webhook rotate SOURCE`."), "error"),
+        "webhook_deleted": ("Event rule deleted. The change applies to the next event.", "ok"),
+        "webhook_forgotten": ("Event notification rules cleared for this session.", "ok"),
+        "webhook_kept": ("Could not delete that event rule. It may already be gone.", "error"),
+        "password_changed": ("Password changed. Sign in with your new password.", "ok"),
+        "connect_started": ("Sign-in started \u2014 follow the steps under Connections.", "ok"),
+        "connect_cancelled": ("Sign-in cancelled.", "ok"),
+        "connect_code": ("Code sent \u2014 waiting for the sign-in to finish.", "ok"),
+        "profile_saved": ("Profile saved. Sessions started from now on use it.", "ok"),
+        "profile_deleted": (("Profile deleted. Sessions already running keep "
+                             "their current settings."), "ok"),
+        "profile_key_saved": (("Setting added to the profile. Sessions on it pick "
+                               "it up at their next start."), "ok"),
+        "profile_key_deleted": (("Setting removed from the profile. Sessions on it "
+                                 "drop it at their next start."), "ok"),
     }
 
     def do_GET(self):
@@ -4697,8 +4713,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_events()
             return
         message = ""
+        kind = "ok"
         if "ok" in params:
-            message = self.OK_MESSAGES.get(params["ok"][0], "")
+            message, kind = self.OK_MESSAGES.get(params["ok"][0], ("", "ok"))
         if HOME and parsed.path == "/":
             # The vhost root picks a USER. With one terminal user — the norm
             # — there is nothing to pick, so it lands in that user's space,
@@ -4727,7 +4744,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # switching mechanism); anything invalid falls back to the
             # default selection inside render_home.
             tab = (params.get("tab", [""])[0]).strip()
-            self._send_html(render_home(message, tab if SESSION_RE.match(tab) else None))
+            self._send_html(render_home(
+                message, tab if SESSION_RE.match(tab) else None, kind))
             return
         if not self._under_base(parsed.path):
             self._send_html("<h1>404</h1>", status=404)
@@ -4762,7 +4780,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self._send_json({"ok": True, "flow": connect_state(flow)})
             return
-        self._send_html(render_page(message))
+        self._send_html(render_page(message, kind))
 
     def _read_form(self):
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -4836,33 +4854,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
             confirm = form.get("confirm_password", [""])[0]
             if new != confirm:
                 self._send_html(
-                    render_page("New password and confirmation do not match."),
+                    render_page("New password and confirmation do not match.",
+                                kind="error"),
                     status=400,
                 )
                 return
             if not valid_password(new):
                 self._send_html(
                     render_page("New password must be 16–64 characters and "
-                                "cannot contain a line break."),
+                                "cannot contain a line break.", kind="error"),
                     status=400,
                 )
                 return
             if new == previous:
                 self._send_html(
-                    render_page("New password must differ from the current password."),
+                    render_page("New password must differ from the current password.",
+                                kind="error"),
                     status=400,
                 )
                 return
             result = change_password(previous, new)
             if result == 2:
                 self._send_html(
-                    render_page("Current password is incorrect."), status=403
+                    render_page("Current password is incorrect.", kind="error"),
+                    status=403,
                 )
                 return
             if result != 0:
                 self._send_html(
                     render_page("Could not update the password. Try again or "
-                                "check the settings service journal."),
+                                "check the settings service journal.", kind="error"),
                     status=500,
                 )
                 return
@@ -4876,7 +4897,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not KEY_RE.match(key):
                 self._send_html(
                     render_page("Invalid key name. Use letters, digits and "
-                                "underscores; do not start with a digit."),
+                                "underscores; do not start with a digit.", kind="error"),
                     status=400,
                 )
                 return
@@ -4889,7 +4910,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 set_key(key, value)
             except EnvStoreError as exc:
                 self._send_html(
-                    render_page("Could not save that secret — %s." % exc),
+                    render_page("Could not save that secret — %s." % exc, kind="error"),
                     status=400,
                 )
                 return
@@ -4912,7 +4933,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # say it here rather than redirecting into a page that no
                 # longer remembers the attempt.
                 if result["state"] == "failed" and result["error"]:
-                    self._send_html(render_page(result["error"]), status=409)
+                    self._send_html(
+                        render_page(result["error"], kind="error"), status=409)
                     return
                 self._redirect("ok=connect_started")
             elif action == "cancel":
@@ -4924,7 +4946,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._send_html(
                         render_page("That does not look like a sign-in code. "
                                     "Copy the whole value the sign-in page "
-                                    "shows, with no spaces."),
+                                    "shows, with no spaces.", kind="error"),
                         status=400,
                     )
                     return
@@ -4942,7 +4964,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not PROFILE_NAME_RE.match(name):
                 self._send_html(
                     render_page("Invalid profile name. Use letters, digits, "
-                                "'_' and '-', at most 64 characters."),
+                                "'_' and '-', at most 64 characters.", kind="error"),
                     status=400,
                 )
                 return
@@ -4989,7 +5011,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "underscores; do not start with a digit."
                         )
                     self._send_html(
-                        render_page(message),
+                        render_page(message, kind="error"),
                         status=400,
                     )
                     return
@@ -5005,13 +5027,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                             must_exist=True)
                 except EnvStoreError as exc:
                     self._send_html(
-                        render_page("Could not save that key \u2014 %s." % exc),
+                        render_page("Could not save that key \u2014 %s." % exc,
+                                    kind="error"),
                         status=400)
                     return
                 if not written:
                     self._send_html(
                         render_page("No profile named '%s' — it may have "
-                                    "just been deleted." % name),
+                                    "just been deleted." % name, kind="error"),
                         status=404)
                     return
                 self._redirect("ok=profile_key_saved")
@@ -5040,7 +5063,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     render_page("Pick an assistant for that profile \u2014 a "
                                 "profile is an assistant plus the settings "
                                 "that go with it, so it needs one. "
-                                "Available: " + ", ".join(PROFILE_AGENTS)),
+                                "Available: " + ", ".join(PROFILE_AGENTS),
+                                kind="error"),
                     status=400)
                 return
             if harness not in PROFILE_AGENTS:
@@ -5048,14 +5072,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # worker, so it has no model, effort or prompt to configure.
                 self._send_html(
                     render_page("Unknown assistant. Available: "
-                                + ", ".join(PROFILE_AGENTS)),
+                                + ", ".join(PROFILE_AGENTS), kind="error"),
                     status=400)
                 return
             try:
                 profile_write(name, assignments, drop=drop)
             except EnvStoreError as exc:
                 self._send_html(
-                    render_page("Could not save that profile \u2014 %s." % exc),
+                    render_page("Could not save that profile \u2014 %s." % exc,
+                                kind="error"),
                     status=400)
                 return
             # The resolver has the last word on what this profile actually
@@ -5067,7 +5092,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # render_msg escapes the banner text itself, so this stays
                 # plain: escaping here would show the entities.
                 self._send_html(render_page(
-                    "Profile saved, with a warning: " + " ".join(warnings)))
+                    "Profile saved, with a warning: " + " ".join(warnings),
+                    kind="warn"))
                 return
             self._redirect("ok=profile_saved")
         elif path == BASE + "/delete":
@@ -5106,7 +5132,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # guessed at.
                 self._send_html(
                     render("Pick a profile for that session \u2014 it is "
-                           "what decides which assistant runs, and how."),
+                           "what decides which assistant runs, and how.",
+                           kind="error"),
                     status=400,
                 )
                 return
@@ -5117,7 +5144,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # take a capability away from everything else that posts here.
             if agent and agent not in AGENTS:
                 self._send_html(
-                    render("Unknown assistant. Available: " + ", ".join(AGENTS)),
+                    render("Unknown assistant. Available: " + ", ".join(AGENTS),
+                           kind="error"),
                     status=400,
                 )
                 return
@@ -5128,13 +5156,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # profile that is sitting right there in the list.
                 self._send_html(
                     render("Profiles are temporarily unavailable. Restart "
-                           "agent-box and try again."),
+                           "agent-box and try again.", kind="error"),
                     status=503,
                 )
                 return
             if profile:
                 if not PROFILE_NAME_RE.match(profile):
-                    self._send_html(render("Invalid profile name."), status=400)
+                    self._send_html(
+                        render("Invalid profile name.", kind="error"), status=400)
                     return
                 # Resolved by agent-box-profile, the one place the mapping
                 # from profile keys to harness arguments lives (#337) — and
@@ -5154,7 +5183,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if resolved is None:
                     self._send_html(
                         render("Could not load profile '%s'. It may have "
-                               "just been deleted." % profile),
+                               "just been deleted." % profile, kind="error"),
                         status=400,
                     )
                     return
@@ -5163,7 +5192,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._send_html(
                         render("Profile '%s' uses an assistant that is not "
                                "available. Choose one of: %s"
-                               % (profile, ", ".join(AGENTS))),
+                               % (profile, ", ".join(AGENTS)), kind="error"),
                         status=400,
                     )
                     return
@@ -5175,7 +5204,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 cwd = resolve_session_cwd(form.get("cwd", [""])[0])
             except ValueError as exc:
-                self._send_html(render(str(exc)), status=400)
+                self._send_html(render(str(exc), kind="error"), status=400)
                 return
             # Optional kickoff prompt (first spawn only; the supervisor
             # clears it and resumes on later respawns). boxSessionId is

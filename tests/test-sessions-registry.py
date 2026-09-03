@@ -205,6 +205,22 @@ class SessionRoutes(unittest.TestCase):
         page = self.get("/?" + location.split("?", 1)[1])
         self.assertIn("could not be read", page)
         self.assertIn("nothing was changed", page)
+        # Issue #549: this refusal rides the ok= redirect channel (its
+        # name describes the mechanism, not that the news is good), and
+        # used to render in the exact same green as "Session added".
+        self.assertIn('data-kind="error"', page)
+        self.assertIn('role="alert"', page)
+
+    def test_a_successful_add_is_a_banner_the_operator_can_trust(self):
+        """The other half of #549: a REAL success must stay green, not just
+        a failure turn red. Same route, an intact registry this time."""
+        self.serve()
+        _, location = self.post("/sessions/add", back="settings",
+                                agent="shell", cwd="~", prompt="")
+        page = self.get("/?" + location.split("?", 1)[1])
+        self.assertIn("Session added", page)
+        self.assertIn('data-kind="ok"', page)
+        self.assertIn('role="status"', page)
 
     def test_a_corrupt_registry_renders_as_no_sessions_rather_than_a_500(self):
         """The READ paths keep answering {}. A page that renders an empty

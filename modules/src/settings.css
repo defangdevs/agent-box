@@ -217,17 +217,32 @@ input.cwd { width: 260px; max-width: 100%;
 form.inline { display: inline; }
 .msg { display: flex; align-items: center; gap: 10px;
        padding: 10px 14px; border-radius: 8px; margin: 12px 0;
-       border: 1px solid rgba(63,185,80,.4); background: #10251a;
-       color: #7ee787; font-size: 13px; }
+       font-size: 13px; }
+/* Color by kind (issue #549): a failure used to render in the same
+   green as "Session added", indistinguishable at a glance. The
+   palettes are not new — red already marks destructive actions
+   (.danger-btn) and amber already marks a soft warning (.conn-warn);
+   this just gives the banner the same three colors. */
+.msg[data-kind="ok"] { border: 1px solid rgba(63,185,80,.4); background: #10251a;
+                        color: #7ee787; }
+.msg[data-kind="warn"] { border: 1px solid rgba(210,153,34,.4); background: #271b06;
+                          color: #d29922; }
+.msg[data-kind="error"] { border: 1px solid rgba(248,81,73,.4); background: #2b1315;
+                           color: #f85149; }
 .msg-text { flex: 1; }
 /* Dismiss (x), issue #246. A link, so it also works without JS (see
    render_msg); styled as a quiet button that only lights up on hover,
-   like the tab's own close control. */
+   like the tab's own close control. color: inherit rides on the
+   banner's own kind color rather than picking one of its own. */
 .msg-x { flex: none; display: flex; align-items: center; justify-content: center;
          width: 20px; height: 20px; margin: -2px -4px -2px 0;
-         border-radius: 5px; color: #7ee787; opacity: .65;
+         border-radius: 5px; color: inherit; opacity: .65;
          font-size: 15px; line-height: 1; text-decoration: none; }
-.msg-x:hover { opacity: 1; background: rgba(63,185,80,.18); }
+.msg-x:hover { opacity: 1; background: rgba(255,255,255,.12); }
+/* The copy button (issue #549) sits in the same neutral palette as
+   every other .icopy — it is not part of the banner's own color, and
+   the dark kind backgrounds all give it enough contrast. */
+.msg .icopy { flex: none; }
 /* Tabbed terminal workspace (the HOME root page, issue #119). The
    page is a fixed-viewport column: tab bar on top, terminal panes
    filling the rest. Panes are stacked and toggled with visibility

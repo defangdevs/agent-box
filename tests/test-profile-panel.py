@@ -567,6 +567,10 @@ class ProfileRoutes(ProfileFixture):
                                  prompt="")
         self.assertEqual(status, 400)
         self.assertIn("Could not load profile", body)
+        # Issue #549: this used to render in the same green as "Session
+        # added" — indistinguishable from a success at a glance.
+        self.assertIn('data-kind="error"', body)
+        self.assertIn('role="alert"', body)
 
     def test_a_box_with_no_resolver_says_so_rather_than_blaming_the_profile(self):
         """The two are fixed differently: one is a restart of this daemon,
@@ -579,6 +583,7 @@ class ProfileRoutes(ProfileFixture):
         self.assertEqual(status, 503)
         self.assertIn("Profiles are temporarily unavailable", body)
         self.assertNotIn("may have just been deleted", body)
+        self.assertIn('data-kind="error"', body)
         self.assertEqual(self.read_sessions(), {})
 
     def test_deleting_a_profile_waits_for_a_write_in_flight(self):
@@ -612,6 +617,7 @@ class ProfileRoutes(ProfileFixture):
                                  prompt="")
         self.assertEqual(status, 400)
         self.assertIn("Could not load profile", body)
+        self.assertIn('data-kind="error"', body)
         self.assertEqual(self.read_sessions(), {})
 
     def test_deleting_a_profile_leaves_running_sessions_alone(self):
