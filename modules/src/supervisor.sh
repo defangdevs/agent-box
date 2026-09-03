@@ -996,12 +996,26 @@ sweep_session_state() {
 # never reached. A leftover lease is not just litter: a name is re-usable, and
 # a stale "vanished"/"died:N" would hand a NEW session at that name somebody
 # else's unresolved outcome the moment it is looked up.
+#
+# A GRACE PERIOD, not an immediate delete on a registry miss: webhook-spawn.sh
+# writes the lease (lease_create) and only THEN execs into `agent-box-session
+# add`, which is what actually creates the registry entry — so a lease can
+# legitimately exist for a few moments before its session does. A sweep
+# landing in that window would delete a lease the spawn had not even finished
+# writing yet. 30s is generous next to the ~2s reconcile tick and the
+# millisecond-scale gap the exec actually takes; it costs nothing but a
+# slightly later cleanup for the genuinely-orphaned case this backstop exists
+# for.
 sweep_lease_state() {
   _listed="$($JQ -r '.sessions | keys[]' "$REGISTRY_FILE" 2>/dev/null)" || return 0
+  _now="$(date +%s)" || return 0
   for _f in "$LEASE_DIR"/*.json; do
     _n=${_f##*/}; _n=${_n%.json}
     case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
     case "$NL$_listed$NL" in (*"$NL$_n$NL"*) continue ;; esac
+    _mtime="$(stat -c %Y "$_f" 2>/dev/null)" || continue
+    case "$_mtime" in (*[!0-9]*|"") continue ;; esac
+    [ "$((_now - _mtime))" -ge 30 ] || continue
     rm -f "$_f"
   done
 }

@@ -61,12 +61,25 @@ lease_mark_outcome() {
   # must not be replaced by a later crash of that same never-resumed work,
   # and the first hard fact recorded is what an operator needs -- not the
   # most recent one.
+  #
+  # A resolve (lease_clear, called from rm/reap_ephemeral or a clean exit)
+  # can only race THIS call if something else deletes the same session's
+  # lease concurrently -- e.g. an operator running `rm` at the exact moment
+  # its pane is also crashing. `mv -f` onto a path that no longer exists
+  # CREATES it, so an unguarded rename here would resurrect a lease
+  # lease_clear just deleted. Re-checking existence immediately before the
+  # rename (rather than only once, before the jq call) shrinks that window
+  # to the width of two syscalls; sweep_lease_state is the backstop for
+  # what a shell script cannot make fully atomic without a lock this
+  # single-writer-per-file design deliberately avoids -- a lease resurrected
+  # in that narrow gap outlives no more than the next reconcile tick, since
+  # its session is by then not in the registry either.
   _lf="$(lease_file "$1")"
   [ -s "$_lf" ] || return 0
   _lt="$(mktemp "$_lf.XXXXXX" 2>/dev/null)" || return 0
   if "$LEASE_JQ" --arg outcome "$2" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
       'if .outcome == null then .outcome = $outcome | .endedAt = $at else . end' \
-      "$_lf" > "$_lt" 2>/dev/null; then
+      "$_lf" > "$_lt" 2>/dev/null && [ -e "$_lf" ]; then
     mv -f "$_lt" "$_lf" 2>/dev/null || rm -f "$_lt"
   else
     rm -f "$_lt"
