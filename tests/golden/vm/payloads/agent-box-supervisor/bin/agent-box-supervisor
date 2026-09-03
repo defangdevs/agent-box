@@ -483,6 +483,12 @@ WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
 # rest of the unit's life. So this call is only the FIRST attempt; the real
 # guarantee is the copy inside the reconcile loop, which runs every tick like
 # every other self-healing step there (registry_selfheal, the lease sweeps).
+#
+# 1 once the "could not bring it up" warning below has been printed, so a
+# loop calling this every couple of seconds says it once per failure streak
+# rather than forever (same latch shape as registry_selfheal's own).
+_tmux_boot_warned=0
+
 ensure_tmux_server() {
   # Bring the tmux server up before anything decides whether there is even a
   # session to create (issue #544). A web user's default (seedMainSession)
@@ -502,7 +508,17 @@ ensure_tmux_server() {
   # right after a bare `start-server`'s own client goes away -- so it has to
   # be turned off in the SAME client round-trip (chained with `\;`), or the
   # server is already gone before a second command could reach it.
-  $TMUX start-server \; set-option -g exit-empty off 2>/dev/null || :
+  if $TMUX start-server \; set-option -g exit-empty off 2>/dev/null; then
+    _tmux_boot_warned=0
+  elif [ "$_tmux_boot_warned" != 1 ]; then
+    # A retry forever with zero signal would recreate the exact symptom
+    # this fix exists to remove (silently blocked connect cards) with no
+    # clue pointing at the cause, so say it once per streak rather than
+    # trusting the retry alone.
+    echo "supervisor: could not bring up the tmux server; connect cards" \
+         "stay blocked until this recovers, retrying every tick" >&2
+    _tmux_boot_warned=1
+  fi
 }
 ensure_tmux_server
 
