@@ -64,6 +64,7 @@ in
   rev = cfg.selfUpdate.rev;
   protectMemory = cfg.protectMemory;
   codexFullAccess = cfg.codexFullAccess;
+  restartNotice = cfg.restartNotice;
   # Verbatim: these are operator-written sudoers command lines, and a fixture
   # generator has no business rewriting one. They ARE substrate-specific —
   # this configuration's entry names /run/current-system/sw/bin/systemctl,

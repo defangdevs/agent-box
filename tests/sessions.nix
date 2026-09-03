@@ -1067,6 +1067,48 @@ in
         machine.succeed(as_agent("agent-box-session rm rot"))
         machine.fail(f"test -e {rot_state}")
 
+    # --- restart notice is opt-in, off on this host (#507) -----------------
+    with subtest("claude: no injected prompt on respawn when restartNotice is off"):
+        # This host leaves services.agent-box.restartNotice at its default
+        # (false, issue #507): `--resume` already restores the transcript on
+        # its own, so a respawn whose transcript holds REAL work (unlike the
+        # empty stand-in the segment-rotation subtest above uses, which hits
+        # the earlier claude_transcript_has_work branch) must get no
+        # injected prompt at all — not the built-in "you were interrupted"
+        # text this option used to always stamp on.
+        notice_state = state_file("notice")
+        machine.succeed(
+            as_agent(
+                "agent-box-session add notice --agent claude "
+                "--prompt 'do the notice thing'"
+            )
+        )
+        machine.wait_until_succeeds(tmux("has-session -t =notice"), timeout=60)
+        machine.wait_until_succeeds(
+            f"jq -e '.launchSessionId | test(\"^[0-9a-f-]{{36}}$\")' {notice_state}",
+            timeout=60,
+        )
+        notice_bid = machine.succeed(f"jq -r '.launchSessionId' {notice_state}").strip()
+        # No "model":"<synthetic>" is what claude_transcript_has_work treats
+        # as a real assistant turn, unlike the empty stand-in above.
+        machine.succeed(
+            "install -D -o agent /dev/null "
+            f"/home/agent/.claude/projects/-home-agent/{notice_bid}.jsonl"
+        )
+        machine.succeed(
+            "printf %s " + shlex.quote('{"type":"assistant","model":"claude-x"}')
+            + " > /home/agent/.claude/projects/-home-agent/"
+            f"{notice_bid}.jsonl"
+        )
+        machine.succeed(tmux("kill-session -t =notice"))
+        notice_cmd = machine.wait_until_succeeds(
+            tmux('list-panes -t "=notice" -F "#{pane_start_command}"'), timeout=60
+        )
+        unescaped_notice = notice_cmd.replace("\\", "")
+        assert f"--resume {notice_bid}" in unescaped_notice, notice_cmd
+        assert "You were interrupted" not in unescaped_notice, notice_cmd
+        machine.succeed(as_agent("agent-box-session rm notice"))
+
     # --- env CLI writes the same file the settings page + wrapper use -----
     with subtest("env set/ls/rm on ~/.config/agent-box/env"):
         machine.succeed("su -s /bin/sh agent -c 'agent-box-session env set MY_TOKEN sekret'")

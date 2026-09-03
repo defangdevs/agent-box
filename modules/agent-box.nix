@@ -7028,9 +7028,10 @@ esac
         default = null;
         description = ''
           Prompt used when the supervisor RESUMES this session after any
-          respawn (crash, reboot, Spot stop→restart). Null uses a built-in
-          steer that continues unfinished work or stops if it was already
-          done. Ignored for shell sessions.
+          respawn (crash, reboot, Spot stop→restart). A non-null value
+          overrides the built-in restart notice. When null, the notice is
+          used only if services.agent-box.restartNotice is enabled;
+          otherwise no prompt is injected. Ignored for shell sessions.
         '';
       };
     };
@@ -8362,8 +8363,14 @@ esac
           # claude_transcript_has_work. Run the normal kickoff instead of
           # claiming an interruption nothing backs up.
           prompt="$ip"
-        else
+        elif [ "$agent" = claude ] && [ -n "''${AGENT_BOX_RESTART_NOTICE:-}" ]; then
           prompt="You were interrupted and automatically restarted (agent-box session $bid). Your previous transcript for this session has been resumed — review what you had already done, verify the current state, and continue from where you left off. If that work was already complete, say so briefly and stop rather than redoing it."
+        else
+          # Opt-in only (issue #507): --resume already restores the transcript
+          # on its own, so the default is no injected prompt at all — the agent
+          # wakes up mid-transcript exactly as `claude --resume` would outside
+          # agent-box, with nothing here claiming an interruption for it.
+          prompt=""
         fi
       fi
 
@@ -9049,6 +9056,29 @@ in
         USER, shared by every remote thread, so there is nothing per-session
         to override. The codex TUI arms do honour it — the supervisor pins
         the restricted values back on the command line.
+      '';
+    };
+
+    restartNotice = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Stamp the built-in "You were interrupted and automatically
+        restarted..." text onto a claude session's resume prompt after a
+        respawn (crash, reboot, Spot stop→restart) whose transcript already
+        holds real work. Off by default (issue #507): `--resume` reliably
+        restores the transcript on its own, so a respawn with no
+        resumePrompt set now hands the agent no injected prompt at all
+        rather than this notice — same as passing an empty resumePrompt
+        would today.
+
+        A per-session resumePrompt still overrides either way. There is no
+        equivalent for codex or a remote-controlled session: codex's own
+        resume arm stamps the box/session id into its resumed prompt
+        regardless (there is no built-in text to gate), and a
+        remote-controlled codex session is served by a per-user daemon that
+        never restarts with the box's sessions — see codexFullAccess above
+        for why that path has no launch-time injection point at all.
       '';
     };
 
@@ -10185,6 +10215,13 @@ in
             # 234); this env var lets a session with skipPermissions = false
             # pin the restricted values back. Same for every instance.
             AGENT_BOX_CODEX_FULL_ACCESS = "1";
+          }
+          // lib.optionalAttrs cfg.restartNotice {
+            # Opt-in built-in restart notice for claude respawns (issue
+            # #507). Set ONLY when true: supervisor.sh reads its presence,
+            # not its value, so exporting it unconditionally would make the
+            # off-by-default the option promises impossible to reach.
+            AGENT_BOX_RESTART_NOTICE = "1";
           }
           // lib.optionalAttrs webhookEnabled {
             # Doubles as the supervisor's "webhook receiver is live" flag
