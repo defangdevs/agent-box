@@ -199,10 +199,10 @@ fi
 
 custom_exclude='{"path":"workflow_run.event","in":["dynamic"]}'
 out=$(run defangdevs/agent-box --deliver-to subagent --exclude "$custom_exclude")
-if printf '%s\n' "$out" | grep -qxF -- '--exclude'; then
-  ok "--exclude is forwarded (#562)"
+if printf '%s\n' "$out" | grep -qxF "$custom_exclude"; then
+  ok "--exclude is forwarded verbatim (#562)"
 else
-  no "--exclude is forwarded (#562)" "argv: $out"
+  no "--exclude is forwarded verbatim (#562)" "argv: $out"
 fi
 if printf '%s\n' "$out" | grep -qx -- '--when'; then
   no "--exclude suppresses the wrapper's default --when (#562)" "argv: $out"
@@ -214,6 +214,20 @@ if grep -q "no --when/--drop given" "$work/err"; then
      "$(cat "$work/err")"
 else
   ok "--exclude gets no false 'no --when/--drop given' warning (#562)"
+fi
+
+# The parser accepts --exclude=VALUE too (like --include=VALUE); pin that
+# form separately rather than assuming it behaves like the two-argument one.
+out=$(run defangdevs/agent-box --deliver-to subagent --exclude="$custom_exclude")
+if printf '%s\n' "$out" | grep -qxF -- "--exclude=$custom_exclude"; then
+  ok "--exclude=VALUE is forwarded verbatim (#562)"
+else
+  no "--exclude=VALUE is forwarded verbatim (#562)" "argv: $out"
+fi
+if printf '%s\n' "$out" | grep -qx -- '--when'; then
+  no "--exclude=VALUE suppresses the wrapper's default --when (#562)" "argv: $out"
+else
+  ok "--exclude=VALUE suppresses the wrapper's default --when (#562)"
 fi
 
 # Sanity: with truly no rules at all, the default --when is still appended —
