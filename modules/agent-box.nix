@@ -1912,6 +1912,102 @@ if __name__ == "__main__":
       fi
       registry_unlock
     }
+    # A durable audit record for a hook-* session's GitHub claim, so an
+    # assignment this box accepted is never silently lost when its worker dies
+    # before saying so (issue #535).
+    #
+    # lib/registry.sh's own header already measures what SHARED, multi-writer
+    # state costs (issue #254) -- a lease avoids that entirely by giving each
+    # session its own file, written by exactly one program at a time:
+    # agent-box-webhook-spawn creates it, and whichever of mark-stopped.sh (the
+    # pane epilogue) or the supervisor's reconcile loop sees how that spawn ended
+    # writes the outcome. No lock: a session has one pane at a time, so only
+    # that pane's ending ever writes here, and the next spawn's own ending is a
+    # later write to the same file, never a concurrent one.
+    #
+    # Presence, not a status enum, is what a reader acts on:
+    #   no file                        -- never leased, or resolved (lease_clear)
+    #   outcome: null                  -- spawned, not yet accounted for
+    #   outcome: "died:N" / "vanished" -- accepted work this box cannot say
+    #     finished; agent-box-session ls/peers surface it for an operator or a
+    #     sibling session to act on.
+    LEASE_DIR="''${LEASE_DIR:-$HOME/.local/state/agent-box/lease}"
+    LEASE_JQ="''${LEASE_JQ:-''${AGENT_BOX_JQ_BIN:-jq}}"
+
+    lease_file() {
+      # lease_file NAME -- the one place this path is spelled, mirroring
+      # session_state_file (src/supervisor.sh, issue #282/#284's convention for a
+      # supervisor-owned per-session side file).
+      printf '%s/%s.json\n' "$LEASE_DIR" "$1"
+    }
+
+    lease_create() {
+      # lease_create NAME TOPIC OBJECT -- called once, at spawn, by
+      # agent-box-webhook-spawn. TOPIC is "source:key" (e.g.
+      # github:defangdevs/agent-box); OBJECT is the numbered issue/PR this
+      # session claims, or empty for a CI-shaped claim with no single number.
+      # Best effort throughout, like every other write in this file: a session
+      # must spawn whether or not this write lands.
+      mkdir -p "$LEASE_DIR" 2>/dev/null || return 0
+      _lf="$(lease_file "$1")"
+      _lt="$(mktemp "$_lf.XXXXXX" 2>/dev/null)" || return 0
+      if "$LEASE_JQ" -n --arg topic "$2" --arg object "$3" \
+          --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+          '{"//": "Durable claim record for a hook-* session (agent-box#535). Written once at spawn; outcome is set on a crash (mark-stopped.sh) or a silent, epilogue-skipped death (supervisor.sh start_session). Deleted on a clean exit -- absence means never leased, or resolved.",
+            topic: $topic, object: (if $object == "" then null else $object end),
+            claimedAt: $at, outcome: null}' \
+          > "$_lt" 2>/dev/null; then
+        mv -f "$_lt" "$_lf" 2>/dev/null || rm -f "$_lt"
+      else
+        rm -f "$_lt"
+      fi
+    }
+
+    lease_mark_outcome() {
+      # lease_mark_outcome NAME OUTCOME -- record how an unresolved lease ended.
+      # A no-op when NAME never had one open (every non-hook session, a hook
+      # session whose spawn-time write failed, or one already resolved) --
+      # silently: the caller (the pane epilogue, the supervisor's reconcile
+      # loop) must never fail or warn over a session that carries no lease.
+      #
+      # Overwrites only a NULL outcome. A lease that already names one ending
+      # keeps it: "vanished", recorded when a respawn found no epilogue ran,
+      # must not be replaced by a later crash of that same never-resumed work,
+      # and the first hard fact recorded is what an operator needs -- not the
+      # most recent one.
+      _lf="$(lease_file "$1")"
+      [ -s "$_lf" ] || return 0
+      _lt="$(mktemp "$_lf.XXXXXX" 2>/dev/null)" || return 0
+      if "$LEASE_JQ" --arg outcome "$2" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+          'if .outcome == null then .outcome = $outcome | .endedAt = $at else . end' \
+          "$_lf" > "$_lt" 2>/dev/null; then
+        mv -f "$_lt" "$_lf" 2>/dev/null || rm -f "$_lt"
+      else
+        rm -f "$_lt"
+      fi
+    }
+
+    lease_clear() {
+      # lease_clear NAME -- called on a clean exit (mark-stopped.sh's status-0
+      # branch) and on delist (agent-box-session rm, reap_ephemeral): the
+      # session either got the chance to say it was blocked or finished and
+      # chose to stop, or the entry is gone outright, so whatever an earlier
+      # respawn's lease recorded (including "vanished") is resolved. Deleting
+      # the file, not blanking it, is what makes every reader's check a single
+      # `-s` test and keeps a resolved lease from being misread as unresolved.
+      rm -f "$(lease_file "$1")" 2>/dev/null || true
+    }
+
+    lease_outcome() {
+      # lease_outcome NAME -- the recorded outcome, or nothing when there is no
+      # lease or it is not yet resolved. Read-only, so it takes no lock and
+      # tolerates a lease file mid-write elsewhere: a jq failure on a half
+      # written file answers empty, the same as "no lease", rather than erroring
+      # a caller (ls, peers) that must never fail over this.
+      _lf="$(lease_file "$1")"
+      [ -s "$_lf" ] || return 0
+      "$LEASE_JQ" -r '.outcome // empty' "$_lf" 2>/dev/null || true
+    }
     [ -n "''${1:-}" ] && [ -s "$REGISTRY_FILE" ] || exit 0
     # The status arrives from the pane's own shell as `$?`, so it is a small
     # non-negative integer or nothing. Anything else is still an ending that was
@@ -1922,6 +2018,12 @@ if __name__ == "__main__":
     if [ "$_status" -eq 0 ]; then
       _edit='if .sessions | has($s) then .sessions[$s].stopped = true else . end'
       _check='(.sessions | has($s) | not) or (.sessions[$s].stopped == true)'
+      # This pane got the chance to say it was blocked or finished and chose to
+      # stop, so any lease it holds (issue #535) is resolved -- whatever an
+      # earlier respawn's lease recorded (including "vanished") no longer
+      # applies. Independent of the registry write above and its retry loop:
+      # a lease has one writer at a time, so there is nothing here to race.
+      lease_clear "$1"
     else
       # Recorded as the STATUS, not a bare true: it is the only thing anyone
       # knows about the crash without attaching to the post-mortem pane, and it
@@ -1929,6 +2031,7 @@ if __name__ == "__main__":
       # session that comes back is never left looking dead.
       _edit='if .sessions | has($s) then .sessions[$s].died = $st else . end'
       _check='(.sessions | has($s) | not) or (.sessions[$s].died == $st)'
+      lease_mark_outcome "$1" "died:$_status"
     fi
     # Verified write, retried: on an agent that exits within its first
     # seconds, the supervisor's mark_started rewrite can race this one
@@ -2912,6 +3015,102 @@ registry_ensure() {
   fi
   registry_unlock
 }
+# A durable audit record for a hook-* session's GitHub claim, so an
+# assignment this box accepted is never silently lost when its worker dies
+# before saying so (issue #535).
+#
+# lib/registry.sh's own header already measures what SHARED, multi-writer
+# state costs (issue #254) -- a lease avoids that entirely by giving each
+# session its own file, written by exactly one program at a time:
+# agent-box-webhook-spawn creates it, and whichever of mark-stopped.sh (the
+# pane epilogue) or the supervisor's reconcile loop sees how that spawn ended
+# writes the outcome. No lock: a session has one pane at a time, so only
+# that pane's ending ever writes here, and the next spawn's own ending is a
+# later write to the same file, never a concurrent one.
+#
+# Presence, not a status enum, is what a reader acts on:
+#   no file                        -- never leased, or resolved (lease_clear)
+#   outcome: null                  -- spawned, not yet accounted for
+#   outcome: "died:N" / "vanished" -- accepted work this box cannot say
+#     finished; agent-box-session ls/peers surface it for an operator or a
+#     sibling session to act on.
+LEASE_DIR="''${LEASE_DIR:-$HOME/.local/state/agent-box/lease}"
+LEASE_JQ="''${LEASE_JQ:-''${AGENT_BOX_JQ_BIN:-jq}}"
+
+lease_file() {
+  # lease_file NAME -- the one place this path is spelled, mirroring
+  # session_state_file (src/supervisor.sh, issue #282/#284's convention for a
+  # supervisor-owned per-session side file).
+  printf '%s/%s.json\n' "$LEASE_DIR" "$1"
+}
+
+lease_create() {
+  # lease_create NAME TOPIC OBJECT -- called once, at spawn, by
+  # agent-box-webhook-spawn. TOPIC is "source:key" (e.g.
+  # github:defangdevs/agent-box); OBJECT is the numbered issue/PR this
+  # session claims, or empty for a CI-shaped claim with no single number.
+  # Best effort throughout, like every other write in this file: a session
+  # must spawn whether or not this write lands.
+  mkdir -p "$LEASE_DIR" 2>/dev/null || return 0
+  _lf="$(lease_file "$1")"
+  _lt="$(mktemp "$_lf.XXXXXX" 2>/dev/null)" || return 0
+  if "$LEASE_JQ" -n --arg topic "$2" --arg object "$3" \
+      --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      '{"//": "Durable claim record for a hook-* session (agent-box#535). Written once at spawn; outcome is set on a crash (mark-stopped.sh) or a silent, epilogue-skipped death (supervisor.sh start_session). Deleted on a clean exit -- absence means never leased, or resolved.",
+        topic: $topic, object: (if $object == "" then null else $object end),
+        claimedAt: $at, outcome: null}' \
+      > "$_lt" 2>/dev/null; then
+    mv -f "$_lt" "$_lf" 2>/dev/null || rm -f "$_lt"
+  else
+    rm -f "$_lt"
+  fi
+}
+
+lease_mark_outcome() {
+  # lease_mark_outcome NAME OUTCOME -- record how an unresolved lease ended.
+  # A no-op when NAME never had one open (every non-hook session, a hook
+  # session whose spawn-time write failed, or one already resolved) --
+  # silently: the caller (the pane epilogue, the supervisor's reconcile
+  # loop) must never fail or warn over a session that carries no lease.
+  #
+  # Overwrites only a NULL outcome. A lease that already names one ending
+  # keeps it: "vanished", recorded when a respawn found no epilogue ran,
+  # must not be replaced by a later crash of that same never-resumed work,
+  # and the first hard fact recorded is what an operator needs -- not the
+  # most recent one.
+  _lf="$(lease_file "$1")"
+  [ -s "$_lf" ] || return 0
+  _lt="$(mktemp "$_lf.XXXXXX" 2>/dev/null)" || return 0
+  if "$LEASE_JQ" --arg outcome "$2" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      'if .outcome == null then .outcome = $outcome | .endedAt = $at else . end' \
+      "$_lf" > "$_lt" 2>/dev/null; then
+    mv -f "$_lt" "$_lf" 2>/dev/null || rm -f "$_lt"
+  else
+    rm -f "$_lt"
+  fi
+}
+
+lease_clear() {
+  # lease_clear NAME -- called on a clean exit (mark-stopped.sh's status-0
+  # branch) and on delist (agent-box-session rm, reap_ephemeral): the
+  # session either got the chance to say it was blocked or finished and
+  # chose to stop, or the entry is gone outright, so whatever an earlier
+  # respawn's lease recorded (including "vanished") is resolved. Deleting
+  # the file, not blanking it, is what makes every reader's check a single
+  # `-s` test and keeps a resolved lease from being misread as unresolved.
+  rm -f "$(lease_file "$1")" 2>/dev/null || true
+}
+
+lease_outcome() {
+  # lease_outcome NAME -- the recorded outcome, or nothing when there is no
+  # lease or it is not yet resolved. Read-only, so it takes no lock and
+  # tolerates a lease file mid-write elsewhere: a jq failure on a half
+  # written file answers empty, the same as "no lease", rather than erroring
+  # a caller (ls, peers) that must never fail over this.
+  _lf="$(lease_file "$1")"
+  [ -s "$_lf" ] || return 0
+  "$LEASE_JQ" -r '.outcome // empty' "$_lf" 2>/dev/null || true
+}
 AGENTS="''${AGENT_BOX_AGENTS:?}"
 DEFAULT_AGENT="''${AGENT_BOX_DEFAULT_AGENT:?}"
 # NOT ''${TMUX_TMPDIR:-...}: the socket dir is the agent unit's
@@ -2984,6 +3183,9 @@ usage() {
   echo "peers: the OTHER live sessions, where each one works and what it claims"
   echo "(its webhook subscriptions) — ask before you touch a worktree, a branch"
   echo "or an issue somebody else may already have."
+  echo "ls/peers flag 'UNRESOLVED ASSIGNMENT' when a hook-* session's worker"
+  echo "died or vanished (crash, reboot, OOM-kill) before saying it was done —"
+  echo "check its pane or worktree; nothing here retries the work for you."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
   echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
@@ -3136,6 +3338,12 @@ case "$cmd" in
           *$'\n'"$n"$'\n'*)
             if [ -n "$dead" ]; then state="died($dead)"; else state=live; fi ;;
         esac
+        # A hook session's accepted assignment this box cannot say finished
+        # (issue #535) — looked up by NAME, never folded into the @tsv
+        # above: a lease has its own file, so there is no shared-column
+        # empty-field collapse to worry about here.
+        outcome="$(lease_outcome "$n")" || outcome=""
+        [ -z "$outcome" ] || state="$state, UNRESOLVED ASSIGNMENT ($outcome)"
         printf '%-24s %-8s %s\n' "$n" "$a" "$state"
       done
     fi
@@ -3264,6 +3472,14 @@ case "$cmd" in
       # one is exactly what this command exists to prevent.
       [ "$dead" = "-" ] \
         || kind="$kind, DIED (exit $dead) — its pane is a post-mortem shell, so nobody is working in it"
+      # A lease (issue #535) outlives the respawn that resolved it or not: a
+      # session live right now can still carry "vanished" from an EARLIER
+      # pane that ended with no epilogue at all, which is exactly the peer
+      # worth telling a sibling about — it may not know its own assignment
+      # was interrupted once already.
+      outcome="$(lease_outcome "$n")" || outcome=""
+      [ -z "$outcome" ] \
+        || kind="$kind, UNRESOLVED ASSIGNMENT ($outcome) — this box accepted work it cannot say finished"
       out="$out$(printf '%s — %s, %s, cwd %s' "$n" "$harness" "$kind" "$cwd")"$'\n'
       ff="$sd/filter.$user-$n.json"
       claims=""
@@ -3449,6 +3665,7 @@ case "$cmd" in
     kill_session "$name" || exit 1
     prune_filter "$name"
     prune_session_state "$name"
+    lease_clear "$name"
     echo "session '$name' removed"
     ;;
   stop)
@@ -5801,6 +6018,102 @@ registry_ensure() {
   fi
   registry_unlock
 }
+# A durable audit record for a hook-* session's GitHub claim, so an
+# assignment this box accepted is never silently lost when its worker dies
+# before saying so (issue #535).
+#
+# lib/registry.sh's own header already measures what SHARED, multi-writer
+# state costs (issue #254) -- a lease avoids that entirely by giving each
+# session its own file, written by exactly one program at a time:
+# agent-box-webhook-spawn creates it, and whichever of mark-stopped.sh (the
+# pane epilogue) or the supervisor's reconcile loop sees how that spawn ended
+# writes the outcome. No lock: a session has one pane at a time, so only
+# that pane's ending ever writes here, and the next spawn's own ending is a
+# later write to the same file, never a concurrent one.
+#
+# Presence, not a status enum, is what a reader acts on:
+#   no file                        -- never leased, or resolved (lease_clear)
+#   outcome: null                  -- spawned, not yet accounted for
+#   outcome: "died:N" / "vanished" -- accepted work this box cannot say
+#     finished; agent-box-session ls/peers surface it for an operator or a
+#     sibling session to act on.
+LEASE_DIR="''${LEASE_DIR:-$HOME/.local/state/agent-box/lease}"
+LEASE_JQ="''${LEASE_JQ:-''${AGENT_BOX_JQ_BIN:-jq}}"
+
+lease_file() {
+  # lease_file NAME -- the one place this path is spelled, mirroring
+  # session_state_file (src/supervisor.sh, issue #282/#284's convention for a
+  # supervisor-owned per-session side file).
+  printf '%s/%s.json\n' "$LEASE_DIR" "$1"
+}
+
+lease_create() {
+  # lease_create NAME TOPIC OBJECT -- called once, at spawn, by
+  # agent-box-webhook-spawn. TOPIC is "source:key" (e.g.
+  # github:defangdevs/agent-box); OBJECT is the numbered issue/PR this
+  # session claims, or empty for a CI-shaped claim with no single number.
+  # Best effort throughout, like every other write in this file: a session
+  # must spawn whether or not this write lands.
+  mkdir -p "$LEASE_DIR" 2>/dev/null || return 0
+  _lf="$(lease_file "$1")"
+  _lt="$(mktemp "$_lf.XXXXXX" 2>/dev/null)" || return 0
+  if "$LEASE_JQ" -n --arg topic "$2" --arg object "$3" \
+      --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      '{"//": "Durable claim record for a hook-* session (agent-box#535). Written once at spawn; outcome is set on a crash (mark-stopped.sh) or a silent, epilogue-skipped death (supervisor.sh start_session). Deleted on a clean exit -- absence means never leased, or resolved.",
+        topic: $topic, object: (if $object == "" then null else $object end),
+        claimedAt: $at, outcome: null}' \
+      > "$_lt" 2>/dev/null; then
+    mv -f "$_lt" "$_lf" 2>/dev/null || rm -f "$_lt"
+  else
+    rm -f "$_lt"
+  fi
+}
+
+lease_mark_outcome() {
+  # lease_mark_outcome NAME OUTCOME -- record how an unresolved lease ended.
+  # A no-op when NAME never had one open (every non-hook session, a hook
+  # session whose spawn-time write failed, or one already resolved) --
+  # silently: the caller (the pane epilogue, the supervisor's reconcile
+  # loop) must never fail or warn over a session that carries no lease.
+  #
+  # Overwrites only a NULL outcome. A lease that already names one ending
+  # keeps it: "vanished", recorded when a respawn found no epilogue ran,
+  # must not be replaced by a later crash of that same never-resumed work,
+  # and the first hard fact recorded is what an operator needs -- not the
+  # most recent one.
+  _lf="$(lease_file "$1")"
+  [ -s "$_lf" ] || return 0
+  _lt="$(mktemp "$_lf.XXXXXX" 2>/dev/null)" || return 0
+  if "$LEASE_JQ" --arg outcome "$2" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      'if .outcome == null then .outcome = $outcome | .endedAt = $at else . end' \
+      "$_lf" > "$_lt" 2>/dev/null; then
+    mv -f "$_lt" "$_lf" 2>/dev/null || rm -f "$_lt"
+  else
+    rm -f "$_lt"
+  fi
+}
+
+lease_clear() {
+  # lease_clear NAME -- called on a clean exit (mark-stopped.sh's status-0
+  # branch) and on delist (agent-box-session rm, reap_ephemeral): the
+  # session either got the chance to say it was blocked or finished and
+  # chose to stop, or the entry is gone outright, so whatever an earlier
+  # respawn's lease recorded (including "vanished") is resolved. Deleting
+  # the file, not blanking it, is what makes every reader's check a single
+  # `-s` test and keeps a resolved lease from being misread as unresolved.
+  rm -f "$(lease_file "$1")" 2>/dev/null || true
+}
+
+lease_outcome() {
+  # lease_outcome NAME -- the recorded outcome, or nothing when there is no
+  # lease or it is not yet resolved. Read-only, so it takes no lock and
+  # tolerates a lease file mid-write elsewhere: a jq failure on a half
+  # written file answers empty, the same as "no lease", rather than erroring
+  # a caller (ls, peers) that must never fail over this.
+  _lf="$(lease_file "$1")"
+  [ -s "$_lf" ] || return 0
+  "$LEASE_JQ" -r '.outcome // empty' "$_lf" 2>/dev/null || true
+}
 
 # The assignment sentence (#253) and the preamble below are written once and
 # read twice: the receiver builds a prompt with them, and the settings page
@@ -6564,6 +6877,17 @@ if [ -n "''${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "''${LOCAL_WEBHOOK_SPAWN_KEY:
     echo "agent-box-webhook-spawn: could not seed $ff;" \
          "$name starts unsubscribed and its CI may spawn a duplicate" >&2
   fi
+  # A durable audit record of what this session was spawned for (issue
+  # #535), independent of the filter file above: that file EXPIRES
+  # (ttlHours) and is read only by the dispatcher, so it cannot answer "did
+  # this accepted assignment ever finish" once the session that owned it is
+  # gone. $n is the same numbered-object extraction claim_include already
+  # made, so the lease and the claim always agree on which object this
+  # session was spawned for.
+  lease_object="$("$JQ" -rn --argjson meta "''${LOCAL_WEBHOOK_SPAWN_META:-{\}}" \
+    '(($meta.number // "" | tostring) | if test("^[0-9]+$") then . else "" end)' \
+    2>/dev/null)" || lease_object=""
+  lease_create "$name" "$own" "$lease_object"
 fi
 
 # An assignment is a work request, not a triage request (#253), and the
@@ -8109,6 +8433,102 @@ esac
       fi
       registry_unlock
     }
+    # A durable audit record for a hook-* session's GitHub claim, so an
+    # assignment this box accepted is never silently lost when its worker dies
+    # before saying so (issue #535).
+    #
+    # lib/registry.sh's own header already measures what SHARED, multi-writer
+    # state costs (issue #254) -- a lease avoids that entirely by giving each
+    # session its own file, written by exactly one program at a time:
+    # agent-box-webhook-spawn creates it, and whichever of mark-stopped.sh (the
+    # pane epilogue) or the supervisor's reconcile loop sees how that spawn ended
+    # writes the outcome. No lock: a session has one pane at a time, so only
+    # that pane's ending ever writes here, and the next spawn's own ending is a
+    # later write to the same file, never a concurrent one.
+    #
+    # Presence, not a status enum, is what a reader acts on:
+    #   no file                        -- never leased, or resolved (lease_clear)
+    #   outcome: null                  -- spawned, not yet accounted for
+    #   outcome: "died:N" / "vanished" -- accepted work this box cannot say
+    #     finished; agent-box-session ls/peers surface it for an operator or a
+    #     sibling session to act on.
+    LEASE_DIR="''${LEASE_DIR:-$HOME/.local/state/agent-box/lease}"
+    LEASE_JQ="''${LEASE_JQ:-''${AGENT_BOX_JQ_BIN:-jq}}"
+
+    lease_file() {
+      # lease_file NAME -- the one place this path is spelled, mirroring
+      # session_state_file (src/supervisor.sh, issue #282/#284's convention for a
+      # supervisor-owned per-session side file).
+      printf '%s/%s.json\n' "$LEASE_DIR" "$1"
+    }
+
+    lease_create() {
+      # lease_create NAME TOPIC OBJECT -- called once, at spawn, by
+      # agent-box-webhook-spawn. TOPIC is "source:key" (e.g.
+      # github:defangdevs/agent-box); OBJECT is the numbered issue/PR this
+      # session claims, or empty for a CI-shaped claim with no single number.
+      # Best effort throughout, like every other write in this file: a session
+      # must spawn whether or not this write lands.
+      mkdir -p "$LEASE_DIR" 2>/dev/null || return 0
+      _lf="$(lease_file "$1")"
+      _lt="$(mktemp "$_lf.XXXXXX" 2>/dev/null)" || return 0
+      if "$LEASE_JQ" -n --arg topic "$2" --arg object "$3" \
+          --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+          '{"//": "Durable claim record for a hook-* session (agent-box#535). Written once at spawn; outcome is set on a crash (mark-stopped.sh) or a silent, epilogue-skipped death (supervisor.sh start_session). Deleted on a clean exit -- absence means never leased, or resolved.",
+            topic: $topic, object: (if $object == "" then null else $object end),
+            claimedAt: $at, outcome: null}' \
+          > "$_lt" 2>/dev/null; then
+        mv -f "$_lt" "$_lf" 2>/dev/null || rm -f "$_lt"
+      else
+        rm -f "$_lt"
+      fi
+    }
+
+    lease_mark_outcome() {
+      # lease_mark_outcome NAME OUTCOME -- record how an unresolved lease ended.
+      # A no-op when NAME never had one open (every non-hook session, a hook
+      # session whose spawn-time write failed, or one already resolved) --
+      # silently: the caller (the pane epilogue, the supervisor's reconcile
+      # loop) must never fail or warn over a session that carries no lease.
+      #
+      # Overwrites only a NULL outcome. A lease that already names one ending
+      # keeps it: "vanished", recorded when a respawn found no epilogue ran,
+      # must not be replaced by a later crash of that same never-resumed work,
+      # and the first hard fact recorded is what an operator needs -- not the
+      # most recent one.
+      _lf="$(lease_file "$1")"
+      [ -s "$_lf" ] || return 0
+      _lt="$(mktemp "$_lf.XXXXXX" 2>/dev/null)" || return 0
+      if "$LEASE_JQ" --arg outcome "$2" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+          'if .outcome == null then .outcome = $outcome | .endedAt = $at else . end' \
+          "$_lf" > "$_lt" 2>/dev/null; then
+        mv -f "$_lt" "$_lf" 2>/dev/null || rm -f "$_lt"
+      else
+        rm -f "$_lt"
+      fi
+    }
+
+    lease_clear() {
+      # lease_clear NAME -- called on a clean exit (mark-stopped.sh's status-0
+      # branch) and on delist (agent-box-session rm, reap_ephemeral): the
+      # session either got the chance to say it was blocked or finished and
+      # chose to stop, or the entry is gone outright, so whatever an earlier
+      # respawn's lease recorded (including "vanished") is resolved. Deleting
+      # the file, not blanking it, is what makes every reader's check a single
+      # `-s` test and keeps a resolved lease from being misread as unresolved.
+      rm -f "$(lease_file "$1")" 2>/dev/null || true
+    }
+
+    lease_outcome() {
+      # lease_outcome NAME -- the recorded outcome, or nothing when there is no
+      # lease or it is not yet resolved. Read-only, so it takes no lock and
+      # tolerates a lease file mid-write elsewhere: a jq failure on a half
+      # written file answers empty, the same as "no lease", rather than erroring
+      # a caller (ls, peers) that must never fail over this.
+      _lf="$(lease_file "$1")"
+      [ -s "$_lf" ] || return 0
+      "$LEASE_JQ" -r '.outcome // empty' "$_lf" 2>/dev/null || true
+    }
     # The webhook channel plugin, spelled once (issue #257): three places have to
     # agree on it — the settings seed (an enabledPlugins key), the plugin-cache
     # sync, and claude's --channels tag. The marketplace NAME comes from the
@@ -8793,6 +9213,19 @@ esac
           launched=true
         fi
       fi
+      # A respawn ($launched) this reconcile loop is doing for a session that
+      # was neither flagged `died` (mark-stopped.sh's crash branch) nor filtered
+      # out as `stopped` (the loop's own select(), above) means its last pane
+      # ended with NO epilogue at all -- kill-session, a reboot, an OOM-kill of
+      # the tmux server (issue #535's incident: five sessions lost within one
+      # second to a box update). $died is read from THIS call's own snapshot,
+      # before the "answer to a prior crash" clear further down, so it names
+      # what was true when the respawn was decided, not what this spawn is
+      # about to make true. A no-op for every session with no open lease --
+      # which is every session except a dispatched hook-* one.
+      if [ "$launched" = true ] && [ -z "$died" ]; then
+        lease_mark_outcome "$sname" vanished
+      fi
       # Mint the launch id on the first spawn if nothing carries one yet
       # (legacy/seed sessions, hand-edited files). /proc/.../uuid is the
       # kernel's UUID source — a bash `read`, so nothing on PATH is needed
@@ -9311,6 +9744,21 @@ esac
       done
     }
 
+    # Same backstop as sweep_session_state, for a lease (issue #535) left behind
+    # by a session `agent-box-session rm`'s own prune (or a hand-edited registry)
+    # never reached. A leftover lease is not just litter: a name is re-usable, and
+    # a stale "vanished"/"died:N" would hand a NEW session at that name somebody
+    # else's unresolved outcome the moment it is looked up.
+    sweep_lease_state() {
+      _listed="$($JQ -r '.sessions | keys[]' "$REGISTRY_FILE" 2>/dev/null)" || return 0
+      for _f in "$LEASE_DIR"/*.json; do
+        _n=''${_f##*/}; _n=''${_n%.json}
+        case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
+        case "$NL$_listed$NL" in (*"$NL$_n$NL"*) continue ;; esac
+        rm -f "$_f"
+      done
+    }
+
     # Delist ONE-SHOT sessions that have been parked (--ephemeral, issue #167's
     # other half).
     #
@@ -9383,6 +9831,7 @@ esac
       registry_selfheal "''${AGENT_BOX_SESSIONS_SEED:-}"
       reap_ephemeral
       sweep_session_state
+      sweep_lease_state
       while IFS= read -r sname; do
         case "$sname" in
           (*[!A-Za-z0-9_-]*|"") continue ;;

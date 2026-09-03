@@ -124,6 +124,11 @@
         stays a small change."""
         return f"/home/agent/.local/state/agent-box/session/{name}.json"
 
+    def lease_file(name):
+        """A hook-* session's durable claim record (issue #535), spelled the
+        way modules/src/lib/lease.sh's lease_file spells it."""
+        return f"/home/agent/.local/state/agent-box/lease/{name}.json"
+
     # Every assertion that something did NOT come back has to outlast a whole
     # pass of the supervisor's reconcile loop, which sweeps the state files of
     # delisted sessions and then starts every listed session that has no tmux

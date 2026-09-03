@@ -10,6 +10,7 @@ JQ=jq
 # take, or it is not a lock.
 REGISTRY_PROG=agent-box-session
 @@include:lib/registry.sh@@
+@@include:lib/lease.sh@@
 AGENTS="${AGENT_BOX_AGENTS:?}"
 DEFAULT_AGENT="${AGENT_BOX_DEFAULT_AGENT:?}"
 # NOT ${TMUX_TMPDIR:-...}: the socket dir is the agent unit's
@@ -82,6 +83,9 @@ usage() {
   echo "peers: the OTHER live sessions, where each one works and what it claims"
   echo "(its webhook subscriptions) — ask before you touch a worktree, a branch"
   echo "or an issue somebody else may already have."
+  echo "ls/peers flag 'UNRESOLVED ASSIGNMENT' when a hook-* session's worker"
+  echo "died or vanished (crash, reboot, OOM-kill) before saying it was done —"
+  echo "check its pane or worktree; nothing here retries the work for you."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
   echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
@@ -234,6 +238,12 @@ case "$cmd" in
           *$'\n'"$n"$'\n'*)
             if [ -n "$dead" ]; then state="died($dead)"; else state=live; fi ;;
         esac
+        # A hook session's accepted assignment this box cannot say finished
+        # (issue #535) — looked up by NAME, never folded into the @tsv
+        # above: a lease has its own file, so there is no shared-column
+        # empty-field collapse to worry about here.
+        outcome="$(lease_outcome "$n")" || outcome=""
+        [ -z "$outcome" ] || state="$state, UNRESOLVED ASSIGNMENT ($outcome)"
         printf '%-24s %-8s %s\n' "$n" "$a" "$state"
       done
     fi
@@ -362,6 +372,14 @@ case "$cmd" in
       # one is exactly what this command exists to prevent.
       [ "$dead" = "-" ] \
         || kind="$kind, DIED (exit $dead) — its pane is a post-mortem shell, so nobody is working in it"
+      # A lease (issue #535) outlives the respawn that resolved it or not: a
+      # session live right now can still carry "vanished" from an EARLIER
+      # pane that ended with no epilogue at all, which is exactly the peer
+      # worth telling a sibling about — it may not know its own assignment
+      # was interrupted once already.
+      outcome="$(lease_outcome "$n")" || outcome=""
+      [ -z "$outcome" ] \
+        || kind="$kind, UNRESOLVED ASSIGNMENT ($outcome) — this box accepted work it cannot say finished"
       out="$out$(printf '%s — %s, %s, cwd %s' "$n" "$harness" "$kind" "$cwd")"$'\n'
       ff="$sd/filter.$user-$n.json"
       claims=""
@@ -547,6 +565,7 @@ case "$cmd" in
     kill_session "$name" || exit 1
     prune_filter "$name"
     prune_session_state "$name"
+    lease_clear "$name"
     echo "session '$name' removed"
     ;;
   stop)

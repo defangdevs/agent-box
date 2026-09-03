@@ -1373,6 +1373,29 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # Unit tests for the durable per-session lease (issue #535):
+          # outcome precedence (first ending wins, never the most recent),
+          # clear's delete-not-blank resolution, and the read-only accessor
+          # ls/peers call. Pure functions of a JSON file on disk, so this
+          # runs in about a second natively rather than costing a VM boot —
+          # what needs the VM instead is the WIRING (mark-stopped.sh and
+          # supervisor.sh actually calling these at the right moment),
+          # which tests/sessions.nix covers with the fake-agent harness.
+          lease-protocol =
+            pkgs.runCommand "agent-box-lease-protocol"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.jq ];
+                lease = ./modules/src/lib/lease.sh;
+                tests = ./tests/test-lease.sh;
+              } ''
+              bash "$tests" "$lease" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Eval regression for selfUpdate.checkout's two assertions
           # (issue #242, PR #478 review). Both guard a value whose only
           # other feedback is a background job failing with EROFS in a

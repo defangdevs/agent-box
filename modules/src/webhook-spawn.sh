@@ -17,6 +17,7 @@ JQ="${AGENT_BOX_JQ_BIN:-jq}"
 # which inherits the lock (see below).
 REGISTRY_PROG=agent-box-webhook-spawn
 @@include:lib/registry.sh@@
+@@include:lib/lease.sh@@
 
 # The assignment sentence (#253) and the preamble below are written once and
 # read twice: the receiver builds a prompt with them, and the settings page
@@ -780,6 +781,17 @@ if [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "${LOCAL_WEBHOOK_SPAWN_KEY:-}" 
     echo "agent-box-webhook-spawn: could not seed $ff;" \
          "$name starts unsubscribed and its CI may spawn a duplicate" >&2
   fi
+  # A durable audit record of what this session was spawned for (issue
+  # #535), independent of the filter file above: that file EXPIRES
+  # (ttlHours) and is read only by the dispatcher, so it cannot answer "did
+  # this accepted assignment ever finish" once the session that owned it is
+  # gone. $n is the same numbered-object extraction claim_include already
+  # made, so the lease and the claim always agree on which object this
+  # session was spawned for.
+  lease_object="$("$JQ" -rn --argjson meta "${LOCAL_WEBHOOK_SPAWN_META:-{\}}" \
+    '(($meta.number // "" | tostring) | if test("^[0-9]+$") then . else "" end)' \
+    2>/dev/null)" || lease_object=""
+  lease_create "$name" "$own" "$lease_object"
 fi
 
 # An assignment is a work request, not a triage request (#253), and the
