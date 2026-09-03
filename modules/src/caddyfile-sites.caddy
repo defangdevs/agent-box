@@ -1,5 +1,8 @@
 # Per-user snippet directories. Each agent user's ~/sites/ symlinks
-# here. Adding a file below and running `sudo systemctl reload
-# caddy.service` is the whole workflow — no @APPLY_CMD@ required.
+# here. Add a file below and reload caddy — that is the whole
+# workflow, no @APPLY_CMD@ required:
+#
+#     sudo @RELOAD_CMD@
+#
 # One import per user: Caddyfile's `import` directive only accepts a
 # single `*` per pattern, so we can't collapse this to `*/*.caddy`.

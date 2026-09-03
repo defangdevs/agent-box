@@ -1110,6 +1110,34 @@ class RenderTest(unittest.TestCase):
                 / "agent-box-fail2ban.service").read_text()
         self.assertIn("-c /etc/agent-box/fail2ban", unit)
 
+    def test_the_reload_the_caddyfile_documents_is_the_one_sudo_grants(self):
+        """The rendered Caddyfile tells the agent, twice, how to reload the
+        front door after adding a snippet. sudoers matches argv exactly, so
+        that sentence is part of the sudo contract: a documented command
+        that misses the grant by a path silently falls back to asking for a
+        password the agent does not have.
+
+        Both fragments carried a bare `sudo systemctl reload
+        caddy.service`, which resolves through PATH — fine here, where the
+        grant IS /usr/bin/systemctl, and wrong on NixOS, where the grant is
+        /run/current-system/sw/bin/systemctl (CodeRabbit, PR #545). The
+        token is bound per backend now; this asserts the two agree.
+        """
+        caddyfile = (FIXTURE / "etc/agent-box/Caddyfile").read_text()
+        sudoers = (FIXTURE / "etc/sudoers.d/agent-box").read_text()
+        documented = re.findall(r"sudo (\S*systemctl reload caddy\.service)",
+                                caddyfile)
+        self.assertTrue(documented,
+                        "the rendered Caddyfile documents no reload command")
+        for cmd in set(documented):
+            self.assertIn(cmd, sudoers,
+                          f"the Caddyfile tells the agent to run `sudo {cmd}`, "
+                          f"which sudoers does not grant")
+            self.assertTrue(cmd.startswith("/"),
+                            f"`{cmd}` is a bare command name: sudoers matches "
+                            f"the path, so PATH decides whether the grant "
+                            f"applies")
+
     def test_a_snippet_in_sites_is_actually_served(self):
         """The ~/sites extension point (issue #40) is four pieces: the
         caddy-readable snippet dir, the symlink into $HOME, the sudo grant

@@ -73,6 +73,12 @@ DEFAULT_CONFIG = "/etc/agent-box/config.yaml"
 # that does not match the command asks for a password instead).
 UPDATE_UNIT = "agent-box-update.service"
 SYSTEMCTL = "/usr/bin/systemctl"
+# The web front door reload, spelled once for the same reason as the two
+# above: the sudo grant and the command the rendered Caddyfile tells the
+# agent to run have to be the same string. A documented command that
+# misses the grant by a path asks for a password the agent does not have,
+# which is how the header promised a reload NixOS agents could not run.
+CADDY_RELOAD_CMD = f"{SYSTEMCTL} reload caddy.service"
 UPDATE_TRIGGER = f"{SYSTEMCTL} start --no-block {UPDATE_UNIT}"
 # The settings page's "Reboot box" button. Spelled once for the same reason
 # UPDATE_TRIGGER is — the sudoers line and the AGENT_BOX_REBOOT_CMD the
@@ -2587,7 +2593,7 @@ class Renderer:
         """
         cmds = []
         if self.spec.web_enable:
-            cmds.append("/usr/bin/systemctl reload caddy.service")
+            cmds.append(CADDY_RELOAD_CMD)
         cmds.append(UPDATE_TRIGGER)
         return cmds
 
@@ -2795,6 +2801,7 @@ class Renderer:
             text = text.replace("@DOMAIN@", self.spec.domain)
             text = text.replace("@MANAGED_BY@", "agentbox apply")
             text = text.replace("@APPLY_CMD@", "agentbox apply")
+            text = text.replace("@RELOAD_CMD@", CADDY_RELOAD_CMD)
             if user is not None:
                 # Bind every token the fragments carry. The values mirror the
                 # module's helpers one for one (settingsSocketOf,

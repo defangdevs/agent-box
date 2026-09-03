@@ -3126,8 +3126,9 @@ in
       # can't read /home. See the comment block at the top of the rendered
       # file below (agents will read that from the running box).
       managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
-      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" ]
-        [ cfg.web.domain "services.agent-box" "nixos-rebuild switch" ] ''
+      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" ]
+        [ cfg.web.domain "services.agent-box" "nixos-rebuild switch"
+          caddyReloadCmd ] ''
         @@include:src/caddyfile-header.caddy@@
       ''
       + lib.concatMapStringsSep "\n"
@@ -3137,7 +3138,8 @@ in
       + "}\n\n"
       # The same fragment the native renderer binds (issue #154 Phase 2), so
       # both backends document — and wire — this extension point identically.
-      + lib.replaceStrings [ "@APPLY_CMD@" ] [ "nixos-rebuild switch" ] ''
+      + lib.replaceStrings [ "@APPLY_CMD@" "@RELOAD_CMD@" ]
+          [ "nixos-rebuild switch" caddyReloadCmd ] ''
         @@include:src/caddyfile-sites.caddy@@
       ''
       + lib.concatMapStringsSep "" (name: "import /var/lib/agent-box-sites/${name}/*.caddy\n") (lib.attrNames cfg.users));
