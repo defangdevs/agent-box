@@ -91,6 +91,16 @@ class ConnectCardCheckingTest(unittest.TestCase):
         self.assertIn('<button type="submit"', html)
         self.assertIn('onsubmit="return confirm(', html)
 
+    def test_checking_destructive_confirms_when_not_installed_too(self):
+        # A harness is fetched on demand, so a missing binary says nothing
+        # about a stored credential: "Install & sign in" on a destructive
+        # flow mid-probe must still confirm.
+        html = self.daemon.render_connect_card(
+            base_state(id="codex", state="checking", destructive=True,
+                       installed=False, installable=True))
+        self.assertIn("Install & sign in", html)
+        self.assertIn('onsubmit="return confirm(', html)
+
     def test_a_flow_actually_in_flight_still_offers_no_button(self):
         for state in ("waiting", "starting", "exchanging"):
             html = self.daemon.render_connect_card(

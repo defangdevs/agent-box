@@ -17410,8 +17410,14 @@ def render_connect_card(state):
         # The CLI is not on this box yet (issue #416). Same button, same
         # pane — it just fetches first, and the label says so rather than
         # letting a several-minute download look like a hung sign-in.
-        label, confirm = ("Install & sign in", False) if state["installable"] \
-            else (None, False)
+        # A missing CLI is not a missing credential: a harness is fetched
+        # on demand and its stored token outlives the binary, so a
+        # destructive flow mid-probe keeps its guard here for the same
+        # reason it does below — an unanswered probe is a guess, and a
+        # guess must not be what skips the confirmation.
+        label, confirm = ("Install & sign in",
+                          state["state"] == "checking" and state["destructive"]) \
+            if state["installable"] else (None, False)
     else:
         # "checking" falls in here too, on purpose. connect_status() never
         # blocks the render (a slow or unreachable network must not hold
