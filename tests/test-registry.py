@@ -489,5 +489,135 @@ class Creation(RegistryCase):
         self.assertTrue(elsewhere.with_suffix(".json.lock").exists())
 
 
+class SelfHeal(RegistryCase):
+    """A registry that does not PARSE is not an empty registry (#279).
+
+    The supervisor used to send jq's error to /dev/null and iterate over
+    nothing: no session started, nothing was logged, and the unit stayed
+    `active (running)` -- a box that looks idle. registry_ensure could not
+    repair it either, because it re-seeds only a MISSING OR EMPTY file, and a
+    corrupt one is neither.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.seed_file = self.home / "seed.json"
+        self.seed_file.write_text(
+            json.dumps({"version": 1, "sessions": {"main": {"agent": "claude"}}}))
+
+    HEAL = 'registry_selfheal "$1"\n'
+
+    def heal(self, **kw):
+        return self.run_writer(self.HEAL, args=[str(self.seed_file)], **kw)
+
+    def corrupt_files(self):
+        return sorted(p.name for p in self.file.parent.glob("sessions.json.corrupt-*"))
+
+    def test_an_unparseable_registry_is_moved_aside_and_re_seeded(self):
+        self.file.write_text("not json\n")
+        done = self.heal()
+        self.assertEqual(self.sessions(), {"main": {"agent": "claude"}})
+        kept = self.corrupt_files()
+        self.assertEqual(len(kept), 1, done.stderr)
+        self.assertEqual((self.file.parent / kept[0]).read_text(), "not json\n")
+        # The journal line names the file, because that is all an operator
+        # reading `journalctl -u` has to go on.
+        self.assertIn(str(self.file), done.stderr)
+        self.assertIn(kept[0], done.stderr)
+
+    def test_trailing_garbage_is_corruption_too(self):
+        # The shape that made this hard to see: jq reads a STREAM of values,
+        # so the reconcile loop's filter printed the first document's session
+        # names and only THEN failed, while the settings daemon's json.load
+        # refused the same file outright. Slurping is what makes the two
+        # agree, and this is the case that pins it.
+        self.seed({"live": {"agent": "claude"}})
+        self.file.write_text(self.file.read_text() + "\nnot json\n")
+        self.heal()
+        self.assertEqual(self.sessions(), {"main": {"agent": "claude"}})
+        self.assertEqual(len(self.corrupt_files()), 1)
+
+    def test_two_documents_are_corruption_too(self):
+        # Valid to jq, fatal to python: without this the daemon would refuse
+        # every write while the supervisor called the file fine, and nothing
+        # would ever heal it.
+        self.file.write_text('{"version":1,"sessions":{}}\n'
+                             '{"version":1,"sessions":{}}\n')
+        self.heal()
+        self.assertEqual(self.sessions(), {"main": {"agent": "claude"}})
+        self.assertEqual(len(self.corrupt_files()), 1)
+
+    def test_the_shape_the_native_backend_got_wrong_is_healed(self):
+        # .sessions as a list (#356). registry_ensure already refuses to
+        # INSTALL that from a seed; a file that is already on disk in that
+        # shape is the same unusable registry and is healed the same way.
+        self.file.write_text(json.dumps({"version": 1, "sessions": [{"name": "main"}]}))
+        self.heal()
+        self.assertEqual(self.sessions(), {"main": {"agent": "claude"}})
+
+    def test_a_healthy_registry_is_left_exactly_as_it_is(self):
+        # This runs every couple of seconds on every box: the ordinary tick
+        # must touch nothing, and above all must not re-seed over sessions
+        # the operator added at runtime (#59).
+        self.seed({"added-at-runtime": {"agent": "codex"}})
+        before = self.file.read_text()
+        done = self.heal()
+        self.assertEqual(self.file.read_text(), before)
+        self.assertEqual(self.corrupt_files(), [])
+        self.assertEqual(done.stderr, "")
+
+    def test_a_missing_registry_is_created_not_quarantined(self):
+        # A first boot, or a deleted registry: there is nothing to keep.
+        self.heal()
+        self.assertEqual(self.sessions(), {"main": {"agent": "claude"}})
+        self.assertEqual(self.corrupt_files(), [])
+
+    def test_a_first_boot_with_no_directory_yet_is_healed_too(self):
+        # This is the supervisor's very first statement, and on a fresh disk
+        # ~/.config does not exist yet (issue #78). Nothing to quarantine and
+        # nothing to warn about: just the registry, created.
+        elsewhere = self.home / "fresh" / "agent-box" / "sessions.json"
+        done = self.run_writer(self.HEAL, args=[str(self.seed_file)],
+                               file=elsewhere)
+        self.assertEqual(json.loads(elsewhere.read_text())["sessions"],
+                         {"main": {"agent": "claude"}})
+        self.assertEqual(done.stderr, "")
+
+    def test_an_unwritable_directory_says_so_once_and_keeps_the_file(self):
+        # A read-only home or a full disk. The bad file must stay put rather
+        # than be reported as handled, and the warning must not repeat every
+        # tick for as long as the box is up.
+        self.file.write_text("not json\n")
+        self.file.parent.chmod(0o500)
+        self.addCleanup(self.file.parent.chmod, 0o700)
+        # check=False: the writer's exit status is registry_selfheal's own,
+        # and a heal that could not happen reports 1 -- which is the point.
+        done = self.run_writer(self.HEAL * 3, args=[str(self.seed_file)],
+                               check=False)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(self.file.read_text(), "not json\n")
+        self.assertEqual(self.corrupt_files(), [])
+        self.assertEqual(done.stderr.count("could not be"), 1, done.stderr)
+
+    def test_healing_waits_for_a_writer_that_holds_the_lock(self):
+        # The one that would cost data: a writer mid read-modify-write has
+        # already read the good document and is about to rename it into
+        # place. Quarantining under it would throw that away.
+        self.file.write_text("not json\n")
+        holder = self.hold_lock_as_the_daemon_does()
+        proc = self.start_writer(self.HEAL, args=[str(self.seed_file)])
+        time.sleep(BLOCKED_FOR)
+        self.assertEqual(self.file.read_text(), "not json\n",
+                         "quarantined while another writer held the lock")
+        # What that writer was doing all along: publishing a whole document
+        # by rename, which the re-check under the lock has to see.
+        self.seed({"rescued": {"agent": "claude"}})
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        _, err = proc.communicate(timeout=TIMEOUT)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(self.sessions(), {"rescued": {"agent": "claude"}})
+        self.assertEqual(self.corrupt_files(), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

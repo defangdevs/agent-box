@@ -1707,5 +1707,41 @@ in
         assert "no lost update" in machine.succeed(as_agent(lost_update_script))
         machine.succeed(as_agent("agent-box-session rm parked"))
 
+    # --- a registry that does not parse heals itself (issue #279) ----------
+    # Both halves of the box used to read "cannot parse" as "there are no
+    # sessions". The reconcile loop sent jq's error to /dev/null, so it
+    # iterated over nothing, logged nothing and left the unit `active
+    # (running)`: no session started and the box looked idle. The seed could
+    # not repair it either, because it re-seeds only a MISSING OR EMPTY file.
+    #
+    # LAST in this file, deliberately: healing re-seeds the DECLARED set, so
+    # anything added at runtime above would go with it.
+    with subtest("an unreadable sessions.json is moved aside and rebuilt"):
+        since = machine.succeed("date '+%Y-%m-%d %H:%M:%S'").strip()
+        # Corrupt it and end the pane in one step, with the unit left
+        # RUNNING: what is under test is the reconcile loop, not the startup
+        # path, because corruption arrives while a box is up.
+        machine.succeed(as_agent(
+            f"printf 'not json\\n' > {sfile}; "
+            "env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box "
+            "kill-session -t =main"
+        ))
+        # The box comes back on its own, with no operator and no restart.
+        machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=120)
+        machine.succeed(f"jq -e '.sessions.main' {sfile} >/dev/null")
+        # The bad file is KEPT, never deleted: it is the only record of what
+        # the operator had asked this box to run.
+        kept = machine.succeed(as_agent(f"ls {sfile}.corrupt-*")).split()[0]
+        assert "not json" in machine.succeed(as_agent(f"cat {kept}")), kept
+        # And the journal names it, which is all an operator staring at an
+        # idle box has to go on.
+        log = machine.succeed(
+            "journalctl -u agent-box@agent.service --no-pager "
+            f"--since '{since}'"
+        )
+        assert sfile in log, log
+        assert "does not parse" in log, log
+        machine.succeed(as_agent(f"rm -f {sfile}.corrupt-*"))
+
   '';
 }

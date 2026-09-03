@@ -1547,6 +1547,32 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The settings daemon's session routes against a registry that
+          # does not parse (issue #279). Same shape and same subject as the
+          # two above: the GOLDEN PAYLOAD, the daemon as it actually ships.
+          # The VM half of #279 (the supervisor moving the bad file aside)
+          # rides in tests/sessions.nix and the registry-protocol check
+          # below; what only this can price is the three mutation ROUTES,
+          # each against five ways the file can be broken, in seconds.
+          sessions-registry =
+            pkgs.runCommand "agent-box-sessions-registry"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-sessions-registry.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-sessions-registry.py
+              python3 repo/tests/test-sessions-registry.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Unit test for the env store's format (issue #212). The VM tests
           # prove one PEM survives one caller at 300+ seconds a run; this
           # pins the format itself — round trip, no key injection, and the

@@ -29,7 +29,13 @@ WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
 # this unit and a session being added start in parallel on a first boot, and
 # "the file was empty when I looked" must not survive another writer's
 # decision (issue #289).
-registry_ensure "${AGENT_BOX_SESSIONS_SEED:?}"
+#
+# registry_selfheal rather than registry_ensure, because creation is only one
+# of the two ways this unit can find itself with no usable registry: a file
+# that does not PARSE is the other, and registry_ensure re-seeds only a
+# missing or empty one (issue #279). On the ordinary boot — a registry that
+# is already there and readable — the two are the same call plus one jq.
+registry_selfheal "${AGENT_BOX_SESSIONS_SEED:?}"
 
 # Ship ~/worktrees, empty (issue #126). $HOME is shared by every session of
 # this user, so two of them in one clone edit the same files, and the fix is
@@ -1033,6 +1039,14 @@ reap_ephemeral() {
 # stop) stay listed but are left down until a restart clears the flag —
 # except the one-shot ones, which reap_ephemeral delists instead.
 while true; do
+  # First, because everything below reads the registry and every one of those
+  # reads answers "no sessions" to a document jq cannot parse (issue #279).
+  # Corruption can arrive while the box is UP — a hand edit, a truncating
+  # crash, a full disk caught mid-write by a writer that predates the atomic
+  # rename — so this belongs on the tick and not only at startup, which is
+  # also what makes the box come back on its own instead of waiting for
+  # somebody to notice it is running nothing.
+  registry_selfheal "${AGENT_BOX_SESSIONS_SEED:-}"
   reap_ephemeral
   sweep_session_state
   while IFS= read -r sname; do

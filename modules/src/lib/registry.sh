@@ -170,6 +170,84 @@ registry_edit() {
   return 1
 }
 
+registry_valid() {
+  # 0 when the registry is usable: ONE JSON document, an object, with a
+  # `sessions` OBJECT in it — the shape every reader here indexes by session
+  # name.
+  #
+  # `-s` is what makes this agree with the settings daemon's json.load().
+  # jq on its own reads a STREAM of values, so a registry with garbage
+  # appended parses far enough to yield the first document's session names
+  # and only then fails (measured: the reconcile loop printed "claude" and
+  # exited 5), while python refuses the same file outright. Slurping makes
+  # both sides call that same file corrupt, which matters because the
+  # daemon refuses to WRITE a file this says is fine.
+  "$REGISTRY_JQ" -s -e \
+    'length == 1 and (.[0] | type == "object")
+     and (.[0].sessions | type == "object")' \
+    "$REGISTRY_FILE" >/dev/null 2>&1
+}
+
+# 1 once the "could not move it aside" warning below has been printed, so a
+# loop that calls this every couple of seconds says it once per transition
+# rather than forever.
+_registry_heal_warned=0
+
+registry_selfheal() {
+  # registry_selfheal [SEED] — a registry that does not PARSE is not an empty
+  # registry (issue #279). Both halves of the box used to read it as one:
+  # the reconcile loop sent jq's error to /dev/null and iterated over
+  # nothing, so no session started, nothing was logged and the unit stayed
+  # `active (running)` — a box that looks idle. And the seed could not
+  # repair it, because registry_ensure re-seeds only when the file is
+  # MISSING OR EMPTY, and a corrupt one is neither.
+  #
+  # So the bad file is moved aside — kept, never deleted: it is the only
+  # record of what the operator had asked this box to run, and reading it
+  # back by hand is the one way to restore a session that is not in the
+  # seed — and the registry is re-created from the seed. Losing the
+  # declared sessions to a fresh start is a worse outcome than losing none,
+  # but both are better than a box that silently runs nothing.
+  #
+  # Only for the SUPERVISOR to call. The other writers reach the registry
+  # through registry_edit, which fails closed on a document jq cannot read
+  # and leaves the file exactly as it was; healing is the job of the one
+  # program that is already looping.
+  registry_valid && { _registry_heal_warned=0; return 0; }
+  registry_lock
+  # Re-check under the lock: every writer publishes by rename, so a document
+  # that landed between the check above and this line is WHOLE. Quarantining
+  # it would throw away a perfectly good registry.
+  if registry_valid; then
+    registry_unlock
+    _registry_heal_warned=0
+    return 0
+  fi
+  # A file that is not there at all is a first boot or a deleted registry,
+  # not corruption: there is nothing to keep, and registry_ensure below
+  # creates it.
+  if [ -e "$REGISTRY_FILE" ]; then
+    _registry_bad="$REGISTRY_FILE.corrupt-$(date +%Y%m%d-%H%M%S)"
+    if mv -f "$REGISTRY_FILE" "$_registry_bad" 2>/dev/null; then
+      echo "$REGISTRY_PROG: $REGISTRY_FILE does not parse;" \
+           "moved it to $_registry_bad and re-seeding (issue #279)" >&2
+    else
+      # A read-only home or a full disk. Say so ONCE — the alternative is
+      # this line every two seconds for as long as the box is up — and
+      # leave the file alone rather than pretending it was handled.
+      [ "$_registry_heal_warned" = 1 ] || \
+        echo "$REGISTRY_PROG: $REGISTRY_FILE does not parse and could not be" \
+             "moved aside; no session can start (issue #279)" >&2
+      _registry_heal_warned=1
+      registry_unlock
+      return 1
+    fi
+  fi
+  registry_unlock
+  _registry_heal_warned=0
+  registry_ensure "${1:-}"
+}
+
 registry_ensure() {
   # registry_ensure [SEED] — make sure the registry EXISTS, inside the same
   # critical section as everything that writes it (issue #289).
