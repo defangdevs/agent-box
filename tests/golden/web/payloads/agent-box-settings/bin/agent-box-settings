@@ -2601,11 +2601,19 @@ def connect_nix_bin(server_path=None):
     standard install layouts. Returning None is a real answer — the caller
     fails the card with something the operator can read, rather than
     emitting a script that cannot work.
+
+    The pin is preferred but not TRUSTED - it goes through the same
+    executable check as every other candidate, so a store path the garbage
+    collector has since taken falls through to a nix that is really there
+    rather than pinning the card to a script that cannot run. This is one
+    place stricter than agents.sh, which takes its pin on faith: the shell
+    has no cheap way to say "checked, and missing" other than the error it
+    would print anyway, and this resolver does, so the operator gets "no
+    nix on this box" instead of "nix: not found" from inside a pane.
     """
-    if CONNECT_NIX_PIN:
-        return CONNECT_NIX_PIN
-    candidates = [os.path.join(entry, "nix")
-                  for entry in (server_path or "").split(os.pathsep) if entry]
+    candidates = [CONNECT_NIX_PIN] if CONNECT_NIX_PIN else []
+    candidates += [os.path.join(entry, "nix")
+                   for entry in (server_path or "").split(os.pathsep) if entry]
     found = shutil.which("nix")
     if found:
         candidates.append(found)

@@ -98,7 +98,12 @@ class HermeticHome(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.home = os.path.join(self.tmp.name, "home")
         os.makedirs(self.home)
-        patch = unittest.mock.patch.dict(os.environ, {"HOME": self.home})
+        # PATH as well as HOME, and for the whole test rather than only
+        # the load: connect_nix_bin() calls shutil.which("nix") at CALL
+        # time, so a host nix on the developer's PATH would satisfy the
+        # tests that assert nothing is findable.
+        patch = unittest.mock.patch.dict(
+            os.environ, {"HOME": self.home, "PATH": "/nonexistent-for-tests"})
         patch.start()
         self.addCleanup(patch.stop)
         self.daemon = load_daemon({"HOME": self.home})
@@ -107,11 +112,34 @@ class HermeticHome(unittest.TestCase):
 class ConnectNixBinTest(HermeticHome):
 
     def test_a_pinned_nix_wins(self):
-        """The NixOS module's store path is used verbatim when present."""
-        daemon = load_daemon({"AGENT_BOX_NIX_BIN": "/nix/store/xyz/bin/nix",
+        """The NixOS module's store path beats every other candidate."""
+        pinned = fake_nix(self.tmp.name)
+        other = os.path.join(self.tmp.name, "other")
+        os.makedirs(other)
+        daemon = load_daemon({"AGENT_BOX_NIX_BIN": pinned,
                               "HOME": self.home})
-        self.assertEqual(daemon.connect_nix_bin(NATIVE_PANE_PATH),
-                         "/nix/store/xyz/bin/nix")
+        daemon.CONNECT_NIX_FALLBACKS = (fake_nix(other),)
+        self.assertEqual(daemon.connect_nix_bin(other), pinned)
+
+    def test_a_stale_pin_falls_through_to_a_real_nix(self):
+        """A pin is preferred, not trusted: the store path may be gone.
+
+        Returning it unchecked pinned the card to a script that could not
+        run, while a perfectly good nix sat in the default profile.
+        """
+        gone = os.path.join(self.tmp.name, "collected", "bin", "nix")
+        real = fake_nix(self.tmp.name)
+        daemon = load_daemon({"AGENT_BOX_NIX_BIN": gone, "HOME": self.home})
+        daemon.CONNECT_NIX_FALLBACKS = (real,)
+        self.assertEqual(daemon.connect_nix_bin(NATIVE_PANE_PATH), real)
+
+    def test_a_stale_pin_with_no_other_nix_is_reported(self):
+        """...and when there is no other nix, it is named as missing."""
+        gone = os.path.join(self.tmp.name, "collected", "bin", "nix")
+        daemon = load_daemon({"AGENT_BOX_NIX_BIN": gone, "HOME": self.home})
+        daemon.CONNECT_NIX_FALLBACKS = (
+            os.path.join(self.tmp.name, "absent", "nix"),)
+        self.assertIsNone(daemon.connect_nix_bin(NATIVE_PANE_PATH))
 
     def test_the_pane_path_is_searched(self):
         """A single-user install lands in the profile the pane PATH names."""
