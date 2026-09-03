@@ -1867,7 +1867,7 @@ CONNECT_DEFS = [
         # a pinned expression instead, named by AGENT_BOX_CONNECT_EXPRS, so
         # this card is installable on both backends (issue #461).
         "attr": None,
-        "label": "Defang",
+        "label": "Defang Deploy",
         "note": "Opens Defang's secure sign-in page in your browser.",
         "start": ["login", "--non-interactive=false"],
         "status": ["whoami", "--json"],
