@@ -53,6 +53,13 @@ plainly rather than handing it back.
 - Sessions live in RAM: a reboot loses them, so persist anything worth
   keeping to disk under $HOME. An agent that exits with an error drops you
   into a shell for inspection; a clean exit is respawned within ~2s.
+  That post-mortem shell keeps the tmux session ALIVE with no agent in it,
+  so nothing restarts it and nothing is reading events for it. Every
+  surface says which one it is: `agent-box-session ls` prints
+  `died(<status>)`, `peers` marks it DIED (a session that died is not an
+  owner to yield to), and the settings page and workspace tab show it in
+  red. Restart it from that page, or with
+  `agent-box-session restart NAME`, once you know why it went.
 - A respawn or reboot starts a fresh context, but transcripts stay on disk -
   Claude Code under ~/.claude/projects/ (plus ~/.claude/history.jsonl),
   Codex under ~/.codex/sessions/. After a respawn, or when you take over

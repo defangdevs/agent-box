@@ -218,10 +218,15 @@ case "$cmd" in
     live="$(t list-sessions -F '#S' 2>/dev/null || true)"
     printf '%-24s %-8s %s\n' NAME HARNESS STATE
     if [ -s "$REGISTRY_FILE" ]; then
-      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$REGISTRY_FILE" \
-      | while IFS="$(printf '\t')" read -r n a state; do
+      # A fourth column the state needs but nobody prints: the exit status a
+      # crashed pane recorded (issue #516). tmux says a post-mortem bash pane
+      # is alive, so liveness alone cannot tell a dead agent from a running
+      # one, and this used to report the crash as `live`.
+      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end), (.value.died // "" | tostring)] | @tsv' "$REGISTRY_FILE" \
+      | while IFS="$(printf '\t')" read -r n a state dead; do
         case $'\n'"$live"$'\n' in
-          *$'\n'"$n"$'\n'*) state=live ;;
+          *$'\n'"$n"$'\n'*)
+            if [ -n "$dead" ]; then state="died($dead)"; else state=live; fi ;;
         esac
         printf '%-24s %-8s %s\n' "$n" "$a" "$state"
       done
@@ -304,7 +309,7 @@ case "$cmd" in
       [ -n "$n" ] || continue
       [ "$n" != "$me" ] || continue
       peers=$((peers + 1))
-      harness="-"; cwd="-"; unmanaged=""
+      harness="-"; cwd="-"; unmanaged=""; dead=""
       if [ -s "$REGISTRY_FILE" ]; then
         # One read per session, and a session tmux knows but the registry
         # does not is reported as `unmanaged` rather than skipped: it is
@@ -312,9 +317,11 @@ case "$cmd" in
         meta="$("$JQ" -r --arg n "$n" '
           if (.sessions | has($n)) then
             [(.sessions[$n].agent // "-"),
-             (.sessions[$n].workingDirectory // "-")] | @tsv
-          else "-\t-\tunmanaged" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
-        IFS="$(printf '\t')" read -r harness cwd unmanaged <<<"$meta"
+             (.sessions[$n].workingDirectory // "-"),
+             "",
+             (.sessions[$n].died // "" | tostring)] | @tsv
+          else "-\t-\tunmanaged\t" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
+        IFS="$(printf '\t')" read -r harness cwd unmanaged dead <<<"$meta"
         [ -n "$harness" ] || harness="-"
         [ -n "$cwd" ] || cwd="-"
         # No recorded working directory means the supervisor starts it in
@@ -332,6 +339,12 @@ case "$cmd" in
       kind="interactive"
       case "$n" in (hook-*) kind="dispatched (hook session)" ;; esac
       [ -z "$unmanaged" ] || kind="$kind, not in the registry"
+      # A session whose agent CRASHED is still a live tmux session, because
+      # the pane it left behind is a post-mortem shell (issue #516). Nobody
+      # is working in it, so it is not a peer to yield to — and yielding to
+      # one is exactly what this command exists to prevent.
+      [ -z "$dead" ] \
+        || kind="$kind, DIED (exit $dead) — its pane is a post-mortem shell, so nobody is working in it"
       out="$out$(printf '%s — %s, %s, cwd %s' "$n" "$harness" "$kind" "$cwd")"$'\n'
       ff="$sd/filter.$user-$n.json"
       claims=""

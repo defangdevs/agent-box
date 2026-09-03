@@ -115,6 +115,11 @@ ul.tbl.subs li { padding-left: 40px; }
 .state[data-state=starting] { color: #d29922; }
 /* stopped = parked on purpose (clean agent exit / stop), not pending */
 .state[data-state=stopped] { color: #8b949e; }
+/* died = the agent crashed and its pane is a post-mortem shell (issue #516).
+   Red, and deliberately the same red as a failed sign-in: the session looks
+   alive to tmux and is not, which is the one session state that needs
+   somebody to do something. */
+.state[data-state=died] { color: #f85149; }
 .state[data-state=failed] { color: #f85149; }
 /* Guided sign-in cards (issues #207, #208, #313): a wizard step is a
    full-width block under the flow it belongs to, so the steps read in

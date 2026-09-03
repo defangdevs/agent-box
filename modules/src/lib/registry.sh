@@ -1,7 +1,12 @@
 # The session registry's write protocol, spelled once (issue #254).
 #
 # ~/.config/agent-box/sessions.json is INTENT: what the operator asked this box
-# to run — name, agent, working directory, prompts, stopped. FIVE programs
+# to run — name, agent, working directory, prompts, stopped. The one field
+# that is an OBSERVATION rather than intent is `died` (issue #516), and it is
+# here because it is the other half of what the pane epilogue already records
+# next to `stopped`: the same writer, the same ending, one of two branches. A
+# lost update on it costs the pre-#516 reading — a dead session shown as
+# running — never a worse one. FIVE programs
 # write it (the session CLI, the supervisor's reconcile loop, the mark-stopped
 # pane epilogue, the webhook spawn wrapper, the settings daemon's three
 # routes), and every one of them replaces the file by rename. That buys exactly

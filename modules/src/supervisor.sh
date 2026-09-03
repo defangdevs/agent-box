@@ -425,6 +425,10 @@ start_session() {
   # next restart, while the arguments it started with stay put.
   sprofile="$($JQ -r '.profile // ""' <<<"$sjson")"
   case "$sprofile" in (*[!A-Za-z0-9_-]*) sprofile="" ;; esac
+  # Did this session's LAST pane end in a crash? The flag is what makes a
+  # post-mortem bash pane legible to every reader (issue #516); read here
+  # only so the spawn below can clear the one it is answering.
+  died="$($JQ -r '.died // empty' <<<"$sjson")"
   ip="$($JQ -r '.initialPrompt // ""' <<<"$sjson")"
   rp="$($JQ -r '.resumePrompt // ""' <<<"$sjson")"
   # The id this session was last LAUNCHED with (issue #282). Note what that
@@ -793,8 +797,18 @@ start_session() {
   #     fresh one (via the reconcile loop), not a nested inspection
   #     bash or a parked session; leave one closed with detach or
   #     `agent-box-session stop`.
-  epilogue=" && ${AGENT_BOX_MARK_STOPPED:?} $(printf '%q' "$sname") || exec bash"
-  [ "$agent" = codex ] && [ "$rc" = true ] && epilogue=" || exec bash"
+  # Both branches call the epilogue, and the crash branch hands it the
+  # agent's own exit status: `$?` inside the group is the status of whichever
+  # command in the && list failed, which is the agent (the epilogue itself
+  # always exits 0). Escaped, because this string is expanded by the pane's
+  # shell and not by this one. Recording the crash is what lets every reader
+  # tell a post-mortem bash pane from a running agent (issue #516) — tmux
+  # only ever says the pane is alive.
+  _mark="${AGENT_BOX_MARK_STOPPED:?}"
+  _qname="$(printf '%q' "$sname")"
+  epilogue=" && $_mark $_qname 0 || { $_mark $_qname \$?; exec bash; }"
+  [ "$agent" = codex ] && [ "$rc" = true ] \
+    && epilogue=" || { $_mark $_qname \$?; exec bash; }"
   [ "$agent" = shell ] && epilogue=""
   # A delete (settings page / agent-box-session rm: delist THEN kill) or
   # a stop (agent-box-session stop: flag THEN kill) can land while this
@@ -876,6 +890,16 @@ start_session() {
     fi
     if [ "$launched" != true ] || [ "$rotated" = true ]; then
       mark_started "$sname" "$bid"
+    fi
+    # A crash recorded died=<status> (src/mark-stopped.sh) and left a
+    # post-mortem pane behind. THIS spawn is the answer to it, so the flag
+    # goes: a stale one would leave every reader calling a healthy session
+    # dead, which is issue #516 with the sign flipped. Guarded on the flag
+    # being there, so an ordinary respawn still rewrites nothing.
+    if [ -n "$died" ]; then
+      registry_edit --arg s "$sname" \
+        'if .sessions | has($s) then del(.sessions[$s].died) else . end' \
+        2>/dev/null || true
     fi
   fi
   registry_unlock
@@ -960,9 +984,10 @@ sweep_session_state() {
 # exit without it, and a session parked by `agent-box-session stop` never had
 # an agent to ask.
 #
-# Only the parked ones. A CRASH takes the post-mortem branch and is never
-# flagged, so a hook session that died stays listed and attachable for
-# inspection, exactly as before.
+# Only the parked ones. A CRASH is flagged `died`, not `stopped` (issue
+# #516), and only `stopped` is a reap candidate — so a hook session that died
+# stays listed and attachable for inspection, exactly as before, and now says
+# on every surface that that is what it is.
 #
 # The transcript is untouched — it lives under the harness's own state dir and
 # outlives every registry entry. What goes is the name->conversation mapping,

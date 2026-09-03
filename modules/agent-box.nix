@@ -405,6 +405,13 @@ let
     - Sessions live in RAM: a reboot loses them, so persist anything worth
       keeping to disk under $HOME. An agent that exits with an error drops you
       into a shell for inspection; a clean exit is respawned within ~2s.
+      That post-mortem shell keeps the tmux session ALIVE with no agent in it,
+      so nothing restarts it and nothing is reading events for it. Every
+      surface says which one it is: `agent-box-session ls` prints
+      `died(<status>)`, `peers` marks it DIED (a session that died is not an
+      owner to yield to), and the settings page and workspace tab show it in
+      red. Restart it from that page, or with
+      `agent-box-session restart NAME`, once you know why it went.
     - A respawn or reboot starts a fresh context, but transcripts stay on disk -
       Claude Code under ~/.claude/projects/ (plus ~/.claude/history.jsonl),
       Codex under ~/.codex/sessions/. After a respawn, or when you take over
@@ -1554,13 +1561,25 @@ if __name__ == "__main__":
     REGISTRY_FLOCK=${pkgs.util-linux}/bin/flock
     REGISTRY_PROG=agent-box-mark-stopped
   '' + ''
-    # Pane epilogue for a CLEAN agent exit (status 0 — /quit, Ctrl+D: an
-    # exit somebody asked for). Records stopped=true on this session's
-    # sessions.json entry so the supervisor's reconcile loop leaves the
-    # session down instead of respawning-and-resuming it (issue #167).
-    # Crashes never reach this (non-zero exit takes the post-mortem bash
-    # branch), and kill-session / reboot / Spot stop end the pane without
-    # running any epilogue — those still respawn. $1 = session name.
+    # Pane epilogue: how the agent's pane ENDED, recorded on this session's
+    # sessions.json entry. $1 = session name, $2 = the agent's exit status
+    # (absent, or 0, means a clean exit — a box that predates the second
+    # argument passes none).
+    #
+    #   status 0 — an exit somebody ASKED for (/quit, Ctrl+D): stopped=true, so
+    #     the supervisor's reconcile loop leaves the session down instead of
+    #     respawning-and-resuming it (issue #167).
+    #   non-zero — a CRASH, whose pane is a post-mortem shell the supervisor
+    #     deliberately does not respawn over: died=<status>. Nothing about the
+    #     respawn changes (the live pane is what suppresses it) — what changes
+    #     is that every reader can now SAY so. The pane is bash, so tmux reports
+    #     the session as live and the settings page, the workspace tab and
+    #     `agent-box-session ls` all called a dead agent "Running": a codex
+    #     Remote Control daemon died on the deployed box and nothing anywhere
+    #     said it had (issue #516).
+    #
+    # kill-session / reboot / Spot stop end the pane without running any
+    # epilogue at all — those still respawn.
     #
     # The session registry — where it lives, how it is locked and how it is
     # rewritten — is one file every shell writer splices in (issue #254). This is
@@ -1571,7 +1590,12 @@ if __name__ == "__main__":
     # The session registry's write protocol, spelled once (issue #254).
     #
     # ~/.config/agent-box/sessions.json is INTENT: what the operator asked this box
-    # to run — name, agent, working directory, prompts, stopped. FIVE programs
+    # to run — name, agent, working directory, prompts, stopped. The one field
+    # that is an OBSERVATION rather than intent is `died` (issue #516), and it is
+    # here because it is the other half of what the pane epilogue already records
+    # next to `stopped`: the same writer, the same ending, one of two branches. A
+    # lost update on it costs the pre-#516 reading — a dead session shown as
+    # running — never a worse one. FIVE programs
     # write it (the session CLI, the supervisor's reconcile loop, the mark-stopped
     # pane epilogue, the webhook spawn wrapper, the settings daemon's three
     # routes), and every one of them replaces the file by rename. That buys exactly
@@ -1799,6 +1823,23 @@ if __name__ == "__main__":
       registry_unlock
     }
     [ -n "''${1:-}" ] && [ -s "$REGISTRY_FILE" ] || exit 0
+    # The status arrives from the pane's own shell as `$?`, so it is a small
+    # non-negative integer or nothing. Anything else is still an ending that was
+    # not a clean exit, and counts as a crash rather than being dropped: a
+    # malformed status must never be read as "the operator asked for this".
+    _status="''${2:-0}"
+    case "$_status" in (""|*[!0-9]*) _status=1 ;; esac
+    if [ "$_status" -eq 0 ]; then
+      _edit='if .sessions | has($s) then .sessions[$s].stopped = true else . end'
+      _check='(.sessions | has($s) | not) or (.sessions[$s].stopped == true)'
+    else
+      # Recorded as the STATUS, not a bare true: it is the only thing anyone
+      # knows about the crash without attaching to the post-mortem pane, and it
+      # costs the same field. Cleared by the next spawn (src/supervisor.sh), so a
+      # session that comes back is never left looking dead.
+      _edit='if .sessions | has($s) then .sessions[$s].died = $st else . end'
+      _check='(.sessions | has($s) | not) or (.sessions[$s].died == $st)'
+    fi
     # Verified write, retried: on an agent that exits within its first
     # seconds, the supervisor's mark_started rewrite can race this one
     # (both are tmp+mv, last writer wins). The sidecar lock below makes each
@@ -1817,12 +1858,9 @@ if __name__ == "__main__":
       # pass (`flock -w` itself printed nothing before this), and an unparseable
       # registry is the supervisor's news to report, not this script's.
       registry_lock 2>/dev/null
-      registry_edit --arg s "$1" \
-        'if .sessions | has($s) then .sessions[$s].stopped = true else . end' \
-        2>/dev/null
-      "$REGISTRY_JQ" -e --arg s "$1" \
-        '(.sessions | has($s) | not) or (.sessions[$s].stopped == true)' \
-        "$REGISTRY_FILE" >/dev/null 2>&1 && exit 0
+      registry_edit --arg s "$1" --argjson st "$_status" "$_edit" 2>/dev/null
+      "$REGISTRY_JQ" -e --arg s "$1" --argjson st "$_status" \
+        "$_check" "$REGISTRY_FILE" >/dev/null 2>&1 && exit 0
       registry_unlock
       sleep 1
     done
@@ -2464,7 +2502,12 @@ REGISTRY_PROG=agent-box-session
 # The session registry's write protocol, spelled once (issue #254).
 #
 # ~/.config/agent-box/sessions.json is INTENT: what the operator asked this box
-# to run — name, agent, working directory, prompts, stopped. FIVE programs
+# to run — name, agent, working directory, prompts, stopped. The one field
+# that is an OBSERVATION rather than intent is `died` (issue #516), and it is
+# here because it is the other half of what the pane epilogue already records
+# next to `stopped`: the same writer, the same ending, one of two branches. A
+# lost update on it costs the pre-#516 reading — a dead session shown as
+# running — never a worse one. FIVE programs
 # write it (the session CLI, the supervisor's reconcile loop, the mark-stopped
 # pane epilogue, the webhook spawn wrapper, the settings daemon's three
 # routes), and every one of them replaces the file by rename. That buys exactly
@@ -2899,10 +2942,15 @@ case "$cmd" in
     live="$(t list-sessions -F '#S' 2>/dev/null || true)"
     printf '%-24s %-8s %s\n' NAME HARNESS STATE
     if [ -s "$REGISTRY_FILE" ]; then
-      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end)] | @tsv' "$REGISTRY_FILE" \
-      | while IFS="$(printf '\t')" read -r n a state; do
+      # A fourth column the state needs but nobody prints: the exit status a
+      # crashed pane recorded (issue #516). tmux says a post-mortem bash pane
+      # is alive, so liveness alone cannot tell a dead agent from a running
+      # one, and this used to report the crash as `live`.
+      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end), (.value.died // "" | tostring)] | @tsv' "$REGISTRY_FILE" \
+      | while IFS="$(printf '\t')" read -r n a state dead; do
         case $'\n'"$live"$'\n' in
-          *$'\n'"$n"$'\n'*) state=live ;;
+          *$'\n'"$n"$'\n'*)
+            if [ -n "$dead" ]; then state="died($dead)"; else state=live; fi ;;
         esac
         printf '%-24s %-8s %s\n' "$n" "$a" "$state"
       done
@@ -2985,7 +3033,7 @@ case "$cmd" in
       [ -n "$n" ] || continue
       [ "$n" != "$me" ] || continue
       peers=$((peers + 1))
-      harness="-"; cwd="-"; unmanaged=""
+      harness="-"; cwd="-"; unmanaged=""; dead=""
       if [ -s "$REGISTRY_FILE" ]; then
         # One read per session, and a session tmux knows but the registry
         # does not is reported as `unmanaged` rather than skipped: it is
@@ -2993,9 +3041,11 @@ case "$cmd" in
         meta="$("$JQ" -r --arg n "$n" '
           if (.sessions | has($n)) then
             [(.sessions[$n].agent // "-"),
-             (.sessions[$n].workingDirectory // "-")] | @tsv
-          else "-\t-\tunmanaged" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
-        IFS="$(printf '\t')" read -r harness cwd unmanaged <<<"$meta"
+             (.sessions[$n].workingDirectory // "-"),
+             "",
+             (.sessions[$n].died // "" | tostring)] | @tsv
+          else "-\t-\tunmanaged\t" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
+        IFS="$(printf '\t')" read -r harness cwd unmanaged dead <<<"$meta"
         [ -n "$harness" ] || harness="-"
         [ -n "$cwd" ] || cwd="-"
         # No recorded working directory means the supervisor starts it in
@@ -3013,6 +3063,12 @@ case "$cmd" in
       kind="interactive"
       case "$n" in (hook-*) kind="dispatched (hook session)" ;; esac
       [ -z "$unmanaged" ] || kind="$kind, not in the registry"
+      # A session whose agent CRASHED is still a live tmux session, because
+      # the pane it left behind is a post-mortem shell (issue #516). Nobody
+      # is working in it, so it is not a peer to yield to — and yielding to
+      # one is exactly what this command exists to prevent.
+      [ -z "$dead" ] \
+        || kind="$kind, DIED (exit $dead) — its pane is a post-mortem shell, so nobody is working in it"
       out="$out$(printf '%s — %s, %s, cwd %s' "$n" "$harness" "$kind" "$cwd")"$'\n'
       ff="$sd/filter.$user-$n.json"
       claims=""
@@ -5227,7 +5283,12 @@ REGISTRY_PROG=agent-box-webhook-spawn
 # The session registry's write protocol, spelled once (issue #254).
 #
 # ~/.config/agent-box/sessions.json is INTENT: what the operator asked this box
-# to run — name, agent, working directory, prompts, stopped. FIVE programs
+# to run — name, agent, working directory, prompts, stopped. The one field
+# that is an OBSERVATION rather than intent is `died` (issue #516), and it is
+# here because it is the other half of what the pane epilogue already records
+# next to `stopped`: the same writer, the same ending, one of two branches. A
+# lost update on it costs the pre-#516 reading — a dead session shown as
+# running — never a worse one. FIVE programs
 # write it (the session CLI, the supervisor's reconcile loop, the mark-stopped
 # pane epilogue, the webhook spawn wrapper, the settings daemon's three
 # routes), and every one of them replaces the file by rename. That buys exactly
@@ -6228,8 +6289,10 @@ pflag=()
 # so it stays listed for good — the preamble asks the agent to
 # `agent-box-session rm` itself, but that is a request to a model, not a
 # guarantee, and `/quit` reaches the same clean exit without it. The
-# post-mortem branch is unaffected: a hook agent that CRASHES is not parked,
-# so it stays attachable for inspection exactly as before.
+# post-mortem branch is unaffected: a hook agent that CRASHES is flagged
+# `died` rather than parked (issue #516), so it stays listed and attachable
+# for inspection exactly as before -- and every surface now says the agent
+# is gone instead of reporting the post-mortem shell as a running session.
 if [ "''${#extra[@]}" -gt 0 ]; then
   exec "$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
 
@@ -7390,7 +7453,12 @@ esac
     # The session registry's write protocol, spelled once (issue #254).
     #
     # ~/.config/agent-box/sessions.json is INTENT: what the operator asked this box
-    # to run — name, agent, working directory, prompts, stopped. FIVE programs
+    # to run — name, agent, working directory, prompts, stopped. The one field
+    # that is an OBSERVATION rather than intent is `died` (issue #516), and it is
+    # here because it is the other half of what the pane epilogue already records
+    # next to `stopped`: the same writer, the same ending, one of two branches. A
+    # lost update on it costs the pre-#516 reading — a dead session shown as
+    # running — never a worse one. FIVE programs
     # write it (the session CLI, the supervisor's reconcile loop, the mark-stopped
     # pane epilogue, the webhook spawn wrapper, the settings daemon's three
     # routes), and every one of them replaces the file by rename. That buys exactly
@@ -8267,6 +8335,10 @@ esac
       # next restart, while the arguments it started with stay put.
       sprofile="$($JQ -r '.profile // ""' <<<"$sjson")"
       case "$sprofile" in (*[!A-Za-z0-9_-]*) sprofile="" ;; esac
+      # Did this session's LAST pane end in a crash? The flag is what makes a
+      # post-mortem bash pane legible to every reader (issue #516); read here
+      # only so the spawn below can clear the one it is answering.
+      died="$($JQ -r '.died // empty' <<<"$sjson")"
       ip="$($JQ -r '.initialPrompt // ""' <<<"$sjson")"
       rp="$($JQ -r '.resumePrompt // ""' <<<"$sjson")"
       # The id this session was last LAUNCHED with (issue #282). Note what that
@@ -8635,8 +8707,18 @@ esac
       #     fresh one (via the reconcile loop), not a nested inspection
       #     bash or a parked session; leave one closed with detach or
       #     `agent-box-session stop`.
-      epilogue=" && ''${AGENT_BOX_MARK_STOPPED:?} $(printf '%q' "$sname") || exec bash"
-      [ "$agent" = codex ] && [ "$rc" = true ] && epilogue=" || exec bash"
+      # Both branches call the epilogue, and the crash branch hands it the
+      # agent's own exit status: `$?` inside the group is the status of whichever
+      # command in the && list failed, which is the agent (the epilogue itself
+      # always exits 0). Escaped, because this string is expanded by the pane's
+      # shell and not by this one. Recording the crash is what lets every reader
+      # tell a post-mortem bash pane from a running agent (issue #516) — tmux
+      # only ever says the pane is alive.
+      _mark="''${AGENT_BOX_MARK_STOPPED:?}"
+      _qname="$(printf '%q' "$sname")"
+      epilogue=" && $_mark $_qname 0 || { $_mark $_qname \$?; exec bash; }"
+      [ "$agent" = codex ] && [ "$rc" = true ] \
+        && epilogue=" || { $_mark $_qname \$?; exec bash; }"
       [ "$agent" = shell ] && epilogue=""
       # A delete (settings page / agent-box-session rm: delist THEN kill) or
       # a stop (agent-box-session stop: flag THEN kill) can land while this
@@ -8718,6 +8800,16 @@ esac
         fi
         if [ "$launched" != true ] || [ "$rotated" = true ]; then
           mark_started "$sname" "$bid"
+        fi
+        # A crash recorded died=<status> (src/mark-stopped.sh) and left a
+        # post-mortem pane behind. THIS spawn is the answer to it, so the flag
+        # goes: a stale one would leave every reader calling a healthy session
+        # dead, which is issue #516 with the sign flipped. Guarded on the flag
+        # being there, so an ordinary respawn still rewrites nothing.
+        if [ -n "$died" ]; then
+          registry_edit --arg s "$sname" \
+            'if .sessions | has($s) then del(.sessions[$s].died) else . end' \
+            2>/dev/null || true
         fi
       fi
       registry_unlock
@@ -8802,9 +8894,10 @@ esac
     # exit without it, and a session parked by `agent-box-session stop` never had
     # an agent to ask.
     #
-    # Only the parked ones. A CRASH takes the post-mortem branch and is never
-    # flagged, so a hook session that died stays listed and attachable for
-    # inspection, exactly as before.
+    # Only the parked ones. A CRASH is flagged `died`, not `stopped` (issue
+    # #516), and only `stopped` is a reap candidate — so a hook session that died
+    # stays listed and attachable for inspection, exactly as before, and now says
+    # on every surface that that is what it is.
     #
     # The transcript is untouched — it lives under the harness's own state dir and
     # outlives every registry entry. What goes is the name->conversation mapping,
@@ -11534,6 +11627,32 @@ def live_sessions():
     return {line for line in proc.stdout.splitlines() if line}
 
 
+def crashed_status(entry):
+    """The exit status a crashed agent left on its registry entry, or None
+    when the last pane did not crash.
+
+    `died` is written by the pane epilogue (src/mark-stopped.sh) on a
+    non-zero agent exit and cleared by the next spawn, so it describes the
+    pane that is up NOW. It matters because tmux cannot: the crash branch
+    leaves a post-mortem bash shell in the pane, which `tmux list-sessions`
+    reports exactly like a running agent, and so did every surface built on
+    it (issue #516).
+
+    Read defensively -- the registry is edited by five programs in three
+    languages, and a field this daemon only DISPLAYS must never be able to
+    500 the page. A bool True is honoured as 0, this function's "crashed,
+    status not recorded" -- the writer never records a 0, because a 0 exit
+    is the clean one and takes the other branch -- so an entry written by
+    hand still reads as dead rather than as healthy.
+    """
+    value = entry.get("died")
+    if value is True:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def kill_session(name):
     """Kill one tmux session. The supervisor recreates it if it is still
     listed in sessions.json (= restart); delisting first makes it stay
@@ -13330,7 +13449,7 @@ EVENTS_MAX_STREAMS = 8    # a stream costs a thread; past this, clients poll
 
 def session_view():
     """The session state the pages actually render: order, name, agent,
-    working directory, live-or-starting, stopped.
+    working directory, live-or-starting, stopped, died.
 
     Deliberately not the whole of sessions.json — the supervisor still
     mirrors its bookkeeping into that file for one release (hasRun,
@@ -13346,6 +13465,10 @@ def session_view():
             str(entries[name].get("workingDirectory") or ""),
             name in live,
             bool(entries[name].get("stopped")),
+            # A crash changes no other field here -- the pane stays live and
+            # nothing is stopped -- so without this the feed would never push
+            # the frame that repaints the row as Died (issue #516).
+            crashed_status(entries[name]),
         ]
         for name in entries
     ]
@@ -13619,6 +13742,11 @@ STYLE = """<style>
   .state[data-state=starting] { color: #d29922; }
   /* stopped = parked on purpose (clean agent exit / stop), not pending */
   .state[data-state=stopped] { color: #8b949e; }
+  /* died = the agent crashed and its pane is a post-mortem shell (issue #516).
+     Red, and deliberately the same red as a failed sign-in: the session looks
+     alive to tmux and is not, which is the one session state that needs
+     somebody to do something. */
+  .state[data-state=died] { color: #f85149; }
   .state[data-state=failed] { color: #f85149; }
   /* Guided sign-in cards (issues #207, #208, #313): a wizard step is a
      full-width block under the flow it belongs to, so the steps read in
@@ -15589,8 +15717,18 @@ def render_sessions(subs=None):
             cwd = html.escape(display_cwd(entries[name].get("workingDirectory")))
             # stopped = listed but deliberately down (clean agent exit or
             # agent-box-session stop); the same route revives it.
+            #
+            # died = the agent CRASHED and the pane it left behind is a
+            # post-mortem shell (issue #516). tmux reports that pane as a
+            # live session, so liveness alone said "Running" about a session
+            # with no agent in it at all -- which is how a codex Remote
+            # Control daemon died on the deployed box with every surface
+            # still claiming it was up. Only meaningful while the session IS
+            # live: once the pane goes, the supervisor is bringing it back
+            # and "Starting" is the true answer.
+            dead = crashed_status(entries[name])
             if name in live:
-                state = "live"
+                state = "died" if dead is not None else "live"
             elif entries[name].get("stopped"):
                 state = "stopped"
             else:
@@ -15599,7 +15737,17 @@ def render_sessions(subs=None):
                 "live": "Running",
                 "starting": "Starting",
                 "stopped": "Stopped",
+                "died": "Died",
             }[state]
+            # The exit status is all anyone knows about the crash without
+            # attaching to the pane, so it goes where the state is read.
+            state_tip = ""
+            if state == "died":
+                how = ("with status %d" % dead) if dead else "with an error"
+                state_tip = (
+                    ' title="The agent exited %s. The pane is a post-mortem '
+                    'shell &mdash; restart it to bring the agent back."' % how
+                )
             # One route, two verbs: /sessions/restart clears the stopped
             # flag and kills the pane, so on a session that is already down
             # it only STARTS one. Nothing is running to lose there, and
@@ -15607,6 +15755,12 @@ def render_sessions(subs=None):
             # the operator to accept a risk that does not exist (#241).
             if state == "stopped":
                 verb, guard = "Start", ""
+            elif state == "died":
+                # Same reasoning as the stopped row (#241): the confirm asks
+                # the operator to accept losing work that is not there. The
+                # verb stays Restart, because the pane IS there and this
+                # replaces it.
+                verb, guard = "Restart", ""
             else:
                 verb = "Restart"
                 guard = (f' onsubmit="return confirm(\'Restart {safe}? Any '
@@ -15656,7 +15810,7 @@ def render_sessions(subs=None):
                 f'{prof_tag}'
                 f'<span class="meta" title="Starting folder"><code>{cwd}</code></span>'
                 f'{subject}'
-                f'<span class="state" data-state="{state}">{state_label}</span>'
+                f'<span class="state" data-state="{state}"{state_tip}>{state_label}</span>'
                 f'{render_subs_chip(subs, name)}</span>'
                 f'<span class="acts">'
                 f'{download}'
@@ -16218,7 +16372,7 @@ def render_new_session_fields(profiles=None):
     )
 
 
-def render_tabs(names, live, stopped, selected):
+def render_tabs(names, live, stopped, died, selected):
     """The workspace tab bar. File order, not sorted: sessions.json
     preserves insertion order, so a new session appears as the
     rightmost tab, like any terminal app. The dot-only .state span
@@ -16244,15 +16398,22 @@ def render_tabs(names, live, stopped, selected):
         safe = html.escape(name)
         cur = ' aria-current="page"' if name == selected else ""
         if name in live:
-            state = "live"
+            # The pane is up either way; whether an AGENT is in it is what
+            # the dot has to say (issue #516).
+            state = "died" if name in died else "live"
         elif name in stopped:
             state = "stopped"
         else:
             state = "starting"
+        # The dot is the only cue this bar has room for, so a died session
+        # gets the words in the tooltip: the row on the settings page is the
+        # other place that says it, and neither is where the operator is
+        # looking when a session dies under them.
+        tip = (safe + " &mdash; the agent died") if state == "died" else safe
         items.append(
             f'<span class="tab-wrap">'
             f'<a class="tab" data-tab="{safe}" href="{home}?tab={safe}"{cur}'
-            f' title="{safe}">'
+            f' title="{tip}">'
             f'<span class="state" data-state="{state}"></span>'
             f'<span class="tab-name">{safe}</span></a>'
             f'<form class="tab-close" method="post" action="{base}/sessions/delete">'
@@ -16440,6 +16601,7 @@ def render_home(message="", selected=None):
         selected = "main" if "main" in entries else (names[0] if names else None)
     live = live_sessions()
     stopped = {n for n, v in entries.items() if v.get("stopped")}
+    died = {n for n, v in entries.items() if crashed_status(v) is not None}
     # Dismissing keeps the selected tab (SESSION_RE names are URL-safe).
     msg_html = render_msg(
         message, TERM_HOME + ("?tab=" + selected if selected else ""))
@@ -16450,7 +16612,7 @@ def render_home(message="", selected=None):
             base=html.escape(BASE),
             action_base=html.escape(SESS_BASE),
             term_base=html.escape(TERM_HOME),
-            tabs=render_tabs(names, live, stopped, selected),
+            tabs=render_tabs(names, live, stopped, died, selected),
             pane=render_pane(selected, live, stopped),
             new_session_fields=render_new_session_fields(),
             message=msg_html,

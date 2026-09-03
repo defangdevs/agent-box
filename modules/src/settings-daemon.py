@@ -700,6 +700,32 @@ def live_sessions():
     return {line for line in proc.stdout.splitlines() if line}
 
 
+def crashed_status(entry):
+    """The exit status a crashed agent left on its registry entry, or None
+    when the last pane did not crash.
+
+    `died` is written by the pane epilogue (src/mark-stopped.sh) on a
+    non-zero agent exit and cleared by the next spawn, so it describes the
+    pane that is up NOW. It matters because tmux cannot: the crash branch
+    leaves a post-mortem bash shell in the pane, which `tmux list-sessions`
+    reports exactly like a running agent, and so did every surface built on
+    it (issue #516).
+
+    Read defensively -- the registry is edited by five programs in three
+    languages, and a field this daemon only DISPLAYS must never be able to
+    500 the page. A bool True is honoured as 0, this function's "crashed,
+    status not recorded" -- the writer never records a 0, because a 0 exit
+    is the clean one and takes the other branch -- so an entry written by
+    hand still reads as dead rather than as healthy.
+    """
+    value = entry.get("died")
+    if value is True:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def kill_session(name):
     """Kill one tmux session. The supervisor recreates it if it is still
     listed in sessions.json (= restart); delisting first makes it stay
@@ -2496,7 +2522,7 @@ EVENTS_MAX_STREAMS = 8    # a stream costs a thread; past this, clients poll
 
 def session_view():
     """The session state the pages actually render: order, name, agent,
-    working directory, live-or-starting, stopped.
+    working directory, live-or-starting, stopped, died.
 
     Deliberately not the whole of sessions.json — the supervisor still
     mirrors its bookkeeping into that file for one release (hasRun,
@@ -2512,6 +2538,10 @@ def session_view():
             str(entries[name].get("workingDirectory") or ""),
             name in live,
             bool(entries[name].get("stopped")),
+            # A crash changes no other field here -- the pane stays live and
+            # nothing is stopped -- so without this the feed would never push
+            # the frame that repaints the row as Died (issue #516).
+            crashed_status(entries[name]),
         ]
         for name in entries
     ]
@@ -3384,8 +3414,18 @@ def render_sessions(subs=None):
             cwd = html.escape(display_cwd(entries[name].get("workingDirectory")))
             # stopped = listed but deliberately down (clean agent exit or
             # agent-box-session stop); the same route revives it.
+            #
+            # died = the agent CRASHED and the pane it left behind is a
+            # post-mortem shell (issue #516). tmux reports that pane as a
+            # live session, so liveness alone said "Running" about a session
+            # with no agent in it at all -- which is how a codex Remote
+            # Control daemon died on the deployed box with every surface
+            # still claiming it was up. Only meaningful while the session IS
+            # live: once the pane goes, the supervisor is bringing it back
+            # and "Starting" is the true answer.
+            dead = crashed_status(entries[name])
             if name in live:
-                state = "live"
+                state = "died" if dead is not None else "live"
             elif entries[name].get("stopped"):
                 state = "stopped"
             else:
@@ -3394,7 +3434,17 @@ def render_sessions(subs=None):
                 "live": "Running",
                 "starting": "Starting",
                 "stopped": "Stopped",
+                "died": "Died",
             }[state]
+            # The exit status is all anyone knows about the crash without
+            # attaching to the pane, so it goes where the state is read.
+            state_tip = ""
+            if state == "died":
+                how = ("with status %d" % dead) if dead else "with an error"
+                state_tip = (
+                    ' title="The agent exited %s. The pane is a post-mortem '
+                    'shell &mdash; restart it to bring the agent back."' % how
+                )
             # One route, two verbs: /sessions/restart clears the stopped
             # flag and kills the pane, so on a session that is already down
             # it only STARTS one. Nothing is running to lose there, and
@@ -3402,6 +3452,12 @@ def render_sessions(subs=None):
             # the operator to accept a risk that does not exist (#241).
             if state == "stopped":
                 verb, guard = "Start", ""
+            elif state == "died":
+                # Same reasoning as the stopped row (#241): the confirm asks
+                # the operator to accept losing work that is not there. The
+                # verb stays Restart, because the pane IS there and this
+                # replaces it.
+                verb, guard = "Restart", ""
             else:
                 verb = "Restart"
                 guard = (f' onsubmit="return confirm(\'Restart {safe}? Any '
@@ -3451,7 +3507,7 @@ def render_sessions(subs=None):
                 f'{prof_tag}'
                 f'<span class="meta" title="Starting folder"><code>{cwd}</code></span>'
                 f'{subject}'
-                f'<span class="state" data-state="{state}">{state_label}</span>'
+                f'<span class="state" data-state="{state}"{state_tip}>{state_label}</span>'
                 f'{render_subs_chip(subs, name)}</span>'
                 f'<span class="acts">'
                 f'{download}'
@@ -4013,7 +4069,7 @@ def render_new_session_fields(profiles=None):
     )
 
 
-def render_tabs(names, live, stopped, selected):
+def render_tabs(names, live, stopped, died, selected):
     """The workspace tab bar. File order, not sorted: sessions.json
     preserves insertion order, so a new session appears as the
     rightmost tab, like any terminal app. The dot-only .state span
@@ -4039,15 +4095,22 @@ def render_tabs(names, live, stopped, selected):
         safe = html.escape(name)
         cur = ' aria-current="page"' if name == selected else ""
         if name in live:
-            state = "live"
+            # The pane is up either way; whether an AGENT is in it is what
+            # the dot has to say (issue #516).
+            state = "died" if name in died else "live"
         elif name in stopped:
             state = "stopped"
         else:
             state = "starting"
+        # The dot is the only cue this bar has room for, so a died session
+        # gets the words in the tooltip: the row on the settings page is the
+        # other place that says it, and neither is where the operator is
+        # looking when a session dies under them.
+        tip = (safe + " &mdash; the agent died") if state == "died" else safe
         items.append(
             f'<span class="tab-wrap">'
             f'<a class="tab" data-tab="{safe}" href="{home}?tab={safe}"{cur}'
-            f' title="{safe}">'
+            f' title="{tip}">'
             f'<span class="state" data-state="{state}"></span>'
             f'<span class="tab-name">{safe}</span></a>'
             f'<form class="tab-close" method="post" action="{base}/sessions/delete">'
@@ -4235,6 +4298,7 @@ def render_home(message="", selected=None):
         selected = "main" if "main" in entries else (names[0] if names else None)
     live = live_sessions()
     stopped = {n for n, v in entries.items() if v.get("stopped")}
+    died = {n for n, v in entries.items() if crashed_status(v) is not None}
     # Dismissing keeps the selected tab (SESSION_RE names are URL-safe).
     msg_html = render_msg(
         message, TERM_HOME + ("?tab=" + selected if selected else ""))
@@ -4245,7 +4309,7 @@ def render_home(message="", selected=None):
             base=html.escape(BASE),
             action_base=html.escape(SESS_BASE),
             term_base=html.escape(TERM_HOME),
-            tabs=render_tabs(names, live, stopped, selected),
+            tabs=render_tabs(names, live, stopped, died, selected),
             pane=render_pane(selected, live, stopped),
             new_session_fields=render_new_session_fields(),
             message=msg_html,

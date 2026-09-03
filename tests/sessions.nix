@@ -1436,6 +1436,58 @@ in
         assert re.search(r"^quitter\s+claude\s+stopped", ls_out, re.M), ls_out
         machine.succeed(as_agent("agent-box-session rm quitter"))
 
+    # --- crash semantics (issue #516): a live pane with no agent in it ----
+    with subtest("a crashed agent is reported as died, never as running"):
+        # `claude --<unknown flag>` exits 1 — the same non-zero exit a crash
+        # produces, minus the crash. What the epilogue records then is the
+        # STATUS, and it must not park the session: `stopped` is the flag
+        # that means somebody asked for this, and nobody did.
+        machine.succeed(
+            as_agent("agent-box-session add crasher -- --not-a-real-flag"))
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions.crasher.died == 1' {sfile}", timeout=120
+        )
+        machine.succeed(f"jq -e '.sessions.crasher | has(\"stopped\") | not' {sfile}")
+        # The pane survives, and keeping it is deliberate (#167): it is the
+        # post-mortem shell. That is also exactly why every reader needed
+        # telling — tmux reports this session as live, so `ls` called a dead
+        # agent `live` and the settings page called it Running, which is how
+        # a codex Remote Control daemon died on the deployed box with no
+        # surface anywhere saying so.
+        settle()
+        machine.succeed(tmux("has-session -t =crasher"))
+        ls_out = machine.succeed(as_agent("agent-box-session ls"))
+        assert re.search(r"^crasher\s+claude\s+died\(1\)", ls_out, re.M), ls_out
+        # `peers` is the surface a dispatched session reads before deciding
+        # whether the work is taken, and a corpse must not read as an owner.
+        peers = machine.succeed(as_agent("agent-box-session peers"))
+        assert "crasher" in peers, peers
+        assert "DIED (exit 1)" in peers, peers
+        machine.succeed(as_agent("agent-box-session rm crasher"))
+
+    with subtest("a spawn clears a stale died flag"):
+        # The flag describes the pane that is up NOW, so a spawn must drop
+        # the one it is answering — a stale flag would call a healthy session
+        # dead, which is #516 with the sign flipped. Seeded by hand on a
+        # session that is running fine, because an agent that keeps crashing
+        # can never show the clear.
+        machine.succeed(as_agent("agent-box-session add revived"))
+        machine.wait_until_succeeds(tmux("has-session -t =revived"), timeout=120)
+        machine.succeed(as_agent(
+            f"jq '.sessions.revived.died = 99' {sfile} > {sfile}.t "
+            f"&& mv {sfile}.t {sfile}"
+        ))
+        machine.succeed(f"jq -e '.sessions.revived.died == 99' {sfile}")
+        machine.succeed(as_agent("agent-box-session restart revived"))
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions.revived | has(\"died\") | not' {sfile}",
+            timeout=120,
+        )
+        machine.wait_until_succeeds(tmux("has-session -t =revived"), timeout=60)
+        ls_out = machine.succeed(as_agent("agent-box-session ls"))
+        assert re.search(r"^revived\s+claude\s+live", ls_out, re.M), ls_out
+        machine.succeed(as_agent("agent-box-session rm revived"))
+
     with subtest("a one-shot session is delisted, not parked"):
         # A hook-* session's shape: spawned --ephemeral because nobody will
         # ever resume it. Both ways of parking one must end in a DELIST, so

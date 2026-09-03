@@ -791,8 +791,10 @@ pflag=()
 # so it stays listed for good — the preamble asks the agent to
 # `agent-box-session rm` itself, but that is a request to a model, not a
 # guarantee, and `/quit` reaches the same clean exit without it. The
-# post-mortem branch is unaffected: a hook agent that CRASHES is not parked,
-# so it stays attachable for inspection exactly as before.
+# post-mortem branch is unaffected: a hook agent that CRASHES is flagged
+# `died` rather than parked (issue #516), so it stays listed and attachable
+# for inspection exactly as before -- and every surface now says the agent
+# is gone instead of reporting the post-mortem shell as a running session.
 if [ "${#extra[@]}" -gt 0 ]; then
   exec "$SESSION_BIN" add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral --prompt "$preamble
 
