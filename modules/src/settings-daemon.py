@@ -4103,7 +4103,8 @@ def render_connect_step(state):
     if state["code"]:
         parts.append(
             f'<p class="note"><strong>2.</strong> Enter this code on that '
-            f'page: <code class="conn-code">{html.escape(state["code"])}</code></p>'
+            f'page: <code class="conn-code">{html.escape(state["code"])}</code>'
+            f'{copy_button("the pairing code", value=state["code"])}</p>'
         )
     if state["needs_code"]:
         step = "3" if state["code"] else "2"
