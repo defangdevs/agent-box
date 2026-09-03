@@ -186,6 +186,15 @@ jobs:
       - name: Check webhook route in generated Caddyfile
         run: nix build -L .#checks.x86_64-linux.webhook-route && cat result
 
+      # The connect cards' "checking" window (PR #557): the status probe
+      # never blocks a render, so the Sign-in button must exist while the
+      # pill still says "Checking" — and a destructive flow's confirm()
+      # must stay armed until that probe actually clears it. Seconds, and
+      # the connect VM test's stubs answer instantly, so nothing else
+      # prices this.
+      - name: Check connect card checking state
+        run: nix build -L .#checks.x86_64-linux.connect-card && cat result
+
       # Issue #374: the native backend's two flake checks, which nothing
       # ran until that bug was found by hand. `runtime-profile` builds
       # packages.<system>.runtime — the profile a native box installs at

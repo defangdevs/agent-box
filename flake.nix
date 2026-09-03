@@ -1577,6 +1577,31 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # render_connect_card()'s "checking" window: the status probe
+          # never blocks a render, so every card starts "checking" on a
+          # cold cache and the Sign-in button must exist there — while a
+          # destructive flow's confirmation must stay armed until the
+          # probe actually clears it. Same shape and same subject as the
+          # two above: the GOLDEN PAYLOAD, the daemon as it actually ships.
+          connect-card =
+            pkgs.runCommand "agent-box-connect-card"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-connect-card.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-connect-card.py
+              python3 repo/tests/test-connect-card.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # The settings daemon's session routes against a registry that
           # does not parse (issue #279). Same shape and same subject as the
           # two above: the GOLDEN PAYLOAD, the daemon as it actually ships.
