@@ -780,10 +780,14 @@ def ensure_harness_session(agent, remote_control):
                 "hasRun": False,
             }
             write_sessions(sessions, version)
-    except RegistryUnreadable:
-        # Not the connect card's place to surface a broken registry -- the
-        # session list already does that loudly (issue #279), and sign-in
-        # itself still succeeded.
+    except (RegistryUnreadable, OSError):
+        # Not the connect card's place to surface a broken registry, or a
+        # write that failed outright (disk full, a permission problem) --
+        # the session list already reports the former loudly (issue #279),
+        # and sign-in itself still succeeded either way. The pane is
+        # already reaped by the time this runs, so there is no in-flight
+        # request to retry against; the next full sign-in cycle tries
+        # again the same way a first one would.
         pass
 
 
