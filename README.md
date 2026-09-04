@@ -410,7 +410,13 @@ settings page, where a sign-in and a first session are what is actually
 needed. On a box with several terminal users the root lists them instead,
 each behind their own login (add and close sessions from the tab bar — the tab's `×` arms on
 the first click and only closes on the second; restart/delete also on the
-settings page) — and agents can spawn sibling sessions themselves (it's just
+settings page). The grid button at the end of the tab bar lays **every**
+session out at once, each tile a live terminal with the session's name above
+it, which is what you want when four agents are working and one of them is
+waiting on you; press a tile's name (or its tab) to go back to one terminal
+filling the page. It is a URL too (`?view=grid`), so it survives a reload and
+can be bookmarked, and a session added while it is open takes its place on the
+grid without one — and agents can spawn sibling sessions themselves (it's just
 a file edit on their own account — handy for "have Codex cross-check this").
 Open pages follow along live: a session added or removed anywhere — the CLI,
 an agent, a second browser tab — appears or disappears in the tab bar (and in

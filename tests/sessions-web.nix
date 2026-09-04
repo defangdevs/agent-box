@@ -1,7 +1,8 @@
 # VM test for the browser surface over one agent-box user's sessions: the
 # tabbed terminal workspace at /<user>/ (the settings daemon in
 # AGENT_BOX_HOME mode; issue 119) — one tab per session, panes iframing each
-# session's own path, server-side ?tab= selection — the vhost root
+# session's own path, server-side ?tab= selection and the ?view=grid layout
+# that lays every session out at once — the vhost root
 # redirecting into it, and its /sessions/* CRUD routes, all behind auth.
 # Nothing on the vhost is served unauthenticated (the old picker and its
 # public sessions.json are gone). Exercises:
@@ -165,6 +166,53 @@ in
     assert 'src="/agent/claude/"' in tab_page, tab_page
     # main is still a tab, just not the current one.
     assert 'data-tab="main" href="/agent/?tab=main" title="main">' in tab_page, tab_page
+
+    with subtest("the grid lays every session out at once"):
+        # The tab layout mounts ONE terminal: the others are the tab bar's
+        # job until they are shown. Counted on the rendered element and not
+        # on `data-cell=`, which SCRIPT also spells in a selector of its own.
+        assert tab_page.count('<div class="cell') == 1, tab_page
+        # Each pane's caption names the session and links to its own tab,
+        # which is how a grid tile is opened full size. Rendered in both
+        # layouts (CSS hides it in this one), so the grid can re-lay the
+        # panes that are already mounted instead of building a second set.
+        assert ('<a class="cell-head" data-open="claude" '
+                'href="/agent/?tab=claude" title="Open claude full size"'
+                in tab_page), tab_page
+        # The tab bar's layout switch, offering the grid.
+        assert ('<a class="viewtog" data-view-to="grid" '
+                'href="/agent/?tab=claude&amp;view=grid" '
+                'title="Grid: every session at once"' in tab_page), tab_page
+
+        # ?view=grid is the layout AND the no-JS way to reach it: the server
+        # renders a cell per session, each with its own terminal, so a
+        # scriptless browser gets the whole grid.
+        grid_page = client.succeed(
+            f"{curl} -u agent:testpassword "
+            "'https://box.test/agent/?tab=claude&view=grid'"
+        )
+        assert '<body class="ws" data-view="grid">' in grid_page, grid_page
+        assert grid_page.count('<div class="cell') == 2, grid_page
+        for name in ("main", "claude"):
+            assert f'data-cell="{name}"' in grid_page, grid_page
+            assert f'src="/agent/{name}/"' in grid_page, grid_page
+        # The selected session is the tile the grid outlines, and the one
+        # leaving the grid lands on.
+        assert '<div class="cell active" data-cell="claude">' in grid_page, grid_page
+        assert ('<a class="viewtog" data-view-to="tabs" '
+                'href="/agent/?tab=claude" title="Single pane"'
+                in grid_page), grid_page
+        # The tab strip is still in the markup, hidden by CSS: the grid
+        # REPLACES it rather than sitting under it, and keeping the markup is
+        # what lets toggling back restore the strip with no re-render. Its
+        # hrefs carry no layout either way.
+        assert 'data-tab="main" href="/agent/?tab=main"' in grid_page, grid_page
+        # Anything else is the tab layout, so a hand-typed or stale value
+        # degrades to the default rather than to an error page.
+        odd = client.succeed(
+            f"{curl} -u agent:testpassword 'https://box.test/agent/?view=nonsense'"
+        )
+        assert '<body class="ws" data-view="tabs">' in odd, odd
 
     with subtest("a name the vhost already owns is refused"):
         # /agent/settings/ is a page, so a session called "settings" could

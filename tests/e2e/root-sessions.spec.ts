@@ -15,7 +15,9 @@
 //   - dismissing the feedback banner without reloading the workspace,
 //   - session restart/delete on the settings page, incl. the confirm() guard,
 //   - the live feed: sessions created or deleted elsewhere show up in an
-//     already-open page without a reload.
+//     already-open page without a reload,
+//   - the grid layout: every session's terminal at once, reached and left
+//     without a page load (PR #580).
 //
 // See playwright.config.ts for the E2E_* environment contract.
 
@@ -41,6 +43,26 @@ async function authedPage(browser: Browser): Promise<Page> {
     httpCredentials: { username: USER, password: PASSWORD },
   });
   return ctx.newPage();
+}
+
+// Did the page RELOAD? Counted from the request that would fetch the new
+// document, and not from performance.getEntriesByType('navigation').length,
+// which cannot answer it: a navigation replaces the document and its
+// performance timeline together, so the fresh timeline reports exactly one
+// navigation entry whether the page reloaded or not, and the assertion
+// could never fail (CodeRabbit on PR #580).
+//
+// A request is the right signal for the two things these tests care about.
+// A same-document history.replaceState - which selecting a session does on
+// every click - issues none, so it is correctly not a load; nor is an
+// iframe fetching its own terminal, which the mainFrame check drops.
+// Register it AFTER the first goto, so that navigation is not counted.
+function pageLoads(page: Page): () => number {
+  let loads = 0;
+  page.on('request', (req) => {
+    if (req.isNavigationRequest() && req.frame() === page.mainFrame()) loads += 1;
+  });
+  return () => loads;
 }
 
 // The session editor collapses on load when JS is live; a toggle button
@@ -82,6 +104,66 @@ test('?tab= selects a tab server-side (the no-JS switching path)', async ({ brow
   const page = await authedPage(browser);
   await page.goto('/?tab=main');
   await expect(page.locator('#tab-bar .tab[data-tab="main"]')).toHaveAttribute('aria-current', 'page');
+});
+
+test('the grid layout shows every session at once, and switching does not navigate', async ({ browser }) => {
+  const page = await authedPage(browser);
+  await page.goto('/');
+  const loads = pageLoads(page);
+  const names = await tabNames(page);
+  expect(names.length).toBeGreaterThan(0);
+  const current = await page.locator('#tab-bar .tab[aria-current]').getAttribute('data-tab');
+
+  // The tab layout mounts the selected session only; the grid mounts them
+  // all. Neither may NAVIGATE, because that would tear down every attached
+  // terminal on the page and re-attach it a moment later.
+  await expect(page.locator('#panes .cell')).toHaveCount(1);
+  await page.locator('#tab-bar a.viewtog[data-view-to="grid"]').click();
+  await expect(page.locator('body')).toHaveAttribute('data-view', 'grid');
+  await expect(page.locator('#panes .cell')).toHaveCount(names.length);
+  for (const name of names) {
+    await expect(page.locator(`#panes .cell[data-cell="${name}"]`)).toBeVisible();
+  }
+  // Tiles read in tab order however they were mounted (CSS `order`: moving
+  // an iframe in the DOM would reload it).
+  const order = await page.locator('#panes .cell[data-cell]')
+    .evaluateAll((els) => els
+      .map((e) => ({ n: e.getAttribute('data-cell'), o: Number((e as HTMLElement).style.order) }))
+      .sort((a, b) => a.o - b.o)
+      .map((x) => x.n));
+  expect(order).toEqual(names);
+  expect(new URL(page.url()).searchParams.get('view')).toBe('grid');
+
+  // A tile's caption opens that session full size, and every pane stays
+  // mounted behind it.
+  const other = names.find((n) => n !== current) || names[0];
+  await page.locator(`#panes .cell[data-cell="${other}"] .cell-head`).click();
+  await expect(page.locator('body')).toHaveAttribute('data-view', 'tabs');
+  await expect(page.locator(`#tab-bar .tab[data-tab="${other}"]`)).toHaveAttribute('aria-current', 'page');
+  await expect(page.locator('#panes .cell')).toHaveCount(names.length);
+  expect(new URL(page.url()).searchParams.get('view')).toBeNull();
+
+  // ...and none of it was a page load, which is the whole point: following
+  // either href for real would tear down every attached terminal.
+  expect(loads()).toBe(0);
+});
+
+test('?view=grid renders the whole grid server-side (the no-JS path)', async ({ browser }) => {
+  // JavaScript OFF, or this proves nothing the scripted path would not also
+  // pass - the point is that the SERVER renders every tile (CodeRabbit on
+  // PR #580). Locators still work with page scripts disabled: they are an
+  // injected evaluation, which Chromium's script-execution switch does not
+  // block.
+  const ctx = await browser.newContext({
+    httpCredentials: { username: USER, password: PASSWORD },
+    javaScriptEnabled: false,
+  });
+  const page = await ctx.newPage();
+  await page.goto('/?view=grid');
+  const names = await tabNames(page);
+  await expect(page.locator('#panes .cell')).toHaveCount(names.length);
+  await expect(page.locator('#tab-bar a.viewtog[data-view-to="tabs"]')).toBeVisible();
+  await ctx.close();
 });
 
 test('no root-page href embeds URL userinfo (user@host)', async ({ browser }) => {
@@ -147,6 +229,7 @@ test('add a session from the tab bar, switch tabs, delete it on the settings pag
 test('the feedback banner can be dismissed without reloading the workspace', async ({ browser }) => {
   const page = await authedPage(browser);
   await page.goto('/');
+  const loads = pageLoads(page);
   await expect(page.locator(`#panes iframe[src="/${USER}/main/"]`))
     .toBeVisible({ timeout: 30_000 });
 
@@ -161,7 +244,7 @@ test('the feedback banner can be dismissed without reloading the workspace', asy
   await msg.locator('.msg-x').click();
   await expect(msg).toHaveCount(0);
   // No second navigation, so the panes were never torn down...
-  expect(await page.evaluate(() => performance.getEntriesByType('navigation').length)).toBe(1);
+  expect(loads()).toBe(0);
   await expect(page.locator(`#panes .pane[data-pane="main"]`)).toHaveCount(1);
   // ...and the ?ok= is gone, so a later reload does not raise it again while
   // the selected tab survives.
@@ -278,6 +361,7 @@ test('a session created and deleted elsewhere appears and goes without a reload'
   });
   const page = await ctx.newPage();
   await page.goto('/');
+  const loads = pageLoads(page);
   await expect(page.locator('#tab-bar .tab[data-tab="main"]')).toBeVisible();
 
   // Created without touching the open page at all. The name is auto-derived,
@@ -314,7 +398,7 @@ test('a session created and deleted elsewhere appears and goes without a reload'
   await expect(row).toHaveCount(0, { timeout: 15_000 });
 
   // None of that was a page load: the workspace patched itself in place.
-  expect(await page.evaluate(() => performance.getEntriesByType('navigation').length)).toBe(1);
+  expect(loads()).toBe(0);
   await ctx.close();
 });
 

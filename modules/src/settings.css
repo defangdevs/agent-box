@@ -303,25 +303,110 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
    U+2699 GEAR is an Emoji_Presentation code point, so a phone swapped in
    its colour emoji font and drew a shaded 3D gear beside a flat (i) —
    see the note on HOME_BODY. So size the BOX here, once, for both. */
-.tabs .hint, .tabs a.gear { display: flex; color: #8b949e;
-                            padding: 0 7px 9px; }
+.tabs .hint, .tabs a.gear,
+.tabs a.viewtog { display: flex; color: #8b949e; padding: 0 7px 9px; }
 .tabs .hint { cursor: help; }
-.tabs a.gear { text-decoration: none; }
-.tabs .hint svg, .tabs a.gear svg { width: 18px; height: 18px;
-                                    display: block; }
+.tabs a.gear, .tabs a.viewtog { text-decoration: none; }
+.tabs .hint svg, .tabs a.gear svg,
+.tabs a.viewtog svg { width: 18px; height: 18px; display: block; }
+/* The layout switch carries both icons and CSS picks the one the current
+   layout is NOT, which is the layout the button goes to. Doing it here
+   rather than in SCRIPT is what lets a client-side flip leave this control
+   correct: rewriting an href is easy, minting the other inline SVG is not
+   (it would be a second copy of one that lives in the daemon). */
+.ws:not([data-view=grid]) .viewtog .i-single,
+.ws[data-view=grid] .viewtog .i-grid { display: none; }
 .tabs .hint:hover, .tabs .hint:focus-visible,
-.tabs a.gear:hover, .tabs a.gear:focus-visible { color: #e6edf3; }
+.tabs a.gear:hover, .tabs a.gear:focus-visible,
+.tabs a.viewtog:hover,
+.tabs a.viewtog:focus-visible { color: #e6edf3; }
 .ws .editor, .ws .msg { margin: 8px; flex: none; }
 .panes { position: relative; flex: 1; min-height: 0; }
+/* A cell is a pane plus the caption naming it. Stacked and toggled the
+   same way the panes themselves used to be, and for the same reason: a
+   hidden terminal must keep its layout SIZE, or xterm re-measures a 0x0
+   box every time the tab changes. The caption is the grid's; here the
+   tab bar one row up already says the name, so it is display:none and
+   the pane covers the whole cell. */
+.cell { position: absolute; inset: 0; visibility: hidden; }
+.cell.active { visibility: visible; }
+.cell-head { display: none; }
 .pane { position: absolute; inset: 0; width: 100%; height: 100%;
-        border: 0; visibility: hidden; }
+        border: 0; }
+/* The one pane that is not in a cell: "No session selected". */
 .pane.active { visibility: visible; }
+/* align-content as well as align-items: in a grid tile the message and
+   the Start button wrap onto two lines, and without it the wrapped lines
+   are spread to the full height of the tile with the button stranded near
+   the bottom edge. */
 .pane.placeholder { display: flex; align-items: center;
+                    align-content: center;
                     justify-content: center; gap: 10px;
                     flex-wrap: wrap; color: #8b949e; }
 /* The pane's own Start button (a stopped session): the message keeps the
    muted placeholder colour, the button is a button. */
 .pane.placeholder .ph-msg { color: inherit; }
+/* The grid layout: every session's terminal at once (data-view="grid" on
+   the body, set by ?view=grid and by the tab bar's toggle). It RE-LAYS
+   the cells that are already mounted rather than mounting a second set:
+   tmux sizes a session to its most recently used client, so attaching one
+   session twice would leave the two attachments fighting over its size.
+   auto-fit rather than a fixed column count: two sessions get half the
+   page each, eight get a scrolling grid of readable terminals, and a
+   phone gets one column without a media query.
+
+   The track floor is min(320px, 100%) and not a bare 320px: a bare one
+   cannot shrink, so on a 320px-wide phone the 8px padding either side
+   left 304px for a track that insisted on 320 and this container
+   scrolled SIDEWAYS - one column, and still not all of it on screen
+   (CodeRabbit on PR #580). 100% is the free space, so the floor gives
+   way exactly when there is less room than a tile wants. */
+/* The grid REPLACES the tab strip rather than sitting under it: the two are
+   alternative views of the same list, so showing both reads as a grid
+   inside tabs, and the strip is a horizontal scroller (overflow-x on
+   .tabs above) - which on a phone means the page scrolls vertically while
+   the strip scrolls sideways, two axes where the layout promises one. At
+   390px the bar measured 737px of tabs in a 390px viewport. The bar's
+   GLOBAL controls stay: the + that adds a session, the switch back to a
+   single pane, the mouse hint and the gear. Selecting a session is what
+   the tiles are for.
+
+   Hidden in CSS rather than dropped from the markup, so toggling back
+   restores the strip with no re-render and the tab bar stays the one
+   place the layout is derived from. */
+.ws[data-view=grid] .tabs .tab-wrap,
+.ws[data-view=grid] .tabs .tab-empty { display: none; }
+.ws[data-view=grid] .panes { position: static; display: grid; gap: 8px;
+                             padding: 8px; overflow: auto;
+                             grid-template-columns:
+                               repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+                             grid-auto-rows: minmax(240px, 1fr); }
+.ws[data-view=grid] .cell { position: relative; inset: auto;
+                            visibility: visible; display: flex;
+                            flex-direction: column; min-height: 0;
+                            overflow: hidden; border: 1px solid #30363d;
+                            border-radius: 8px; background: #0d1117; }
+/* Which tile leaving the grid will open, and which tab is current: the
+   same answer, so it gets the same accent the current tab has. */
+.ws[data-view=grid] .cell.active { border-color: #58a6ff; }
+.ws[data-view=grid] .cell-head { display: flex; align-items: center;
+                                 gap: 8px; flex: none; padding: 5px 8px;
+                                 font-size: 12px; color: #8b949e;
+                                 text-decoration: none; background: #010409;
+                                 border-bottom: 1px solid #21262d; }
+.ws[data-view=grid] .cell-head:hover,
+.ws[data-view=grid] .cell-head:focus-visible { color: #e6edf3; }
+/* Same treatment a long tab name gets: the label ellipsizes rather than
+   pushing the expand icon out of the tile (issue #236 names run to 150
+   characters), with the full name in the caption's tooltip. */
+.cell-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+             flex: 1; }
+.cell-open { display: flex; flex: none; }
+.cell-open svg { width: 14px; height: 14px; display: block; }
+/* The pane is the rest of the tile, and a flex child rather than an
+   absolute fill: the caption above it is part of the box now. */
+.ws[data-view=grid] .pane { position: static; inset: auto; flex: 1;
+                            min-height: 0; }
 /* Agent profiles (issue #321, step 5). The row folds like a session row —
    .tbl li.foldrow above already gives the <li> and its <summary> their
    layout, caret and hover — so this only styles what is INSIDE the fold,

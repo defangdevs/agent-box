@@ -3550,25 +3550,110 @@ STYLE = """<style>
      U+2699 GEAR is an Emoji_Presentation code point, so a phone swapped in
      its colour emoji font and drew a shaded 3D gear beside a flat (i) —
      see the note on HOME_BODY. So size the BOX here, once, for both. */
-  .tabs .hint, .tabs a.gear { display: flex; color: #8b949e;
-                              padding: 0 7px 9px; }
+  .tabs .hint, .tabs a.gear,
+  .tabs a.viewtog { display: flex; color: #8b949e; padding: 0 7px 9px; }
   .tabs .hint { cursor: help; }
-  .tabs a.gear { text-decoration: none; }
-  .tabs .hint svg, .tabs a.gear svg { width: 18px; height: 18px;
-                                      display: block; }
+  .tabs a.gear, .tabs a.viewtog { text-decoration: none; }
+  .tabs .hint svg, .tabs a.gear svg,
+  .tabs a.viewtog svg { width: 18px; height: 18px; display: block; }
+  /* The layout switch carries both icons and CSS picks the one the current
+     layout is NOT, which is the layout the button goes to. Doing it here
+     rather than in SCRIPT is what lets a client-side flip leave this control
+     correct: rewriting an href is easy, minting the other inline SVG is not
+     (it would be a second copy of one that lives in the daemon). */
+  .ws:not([data-view=grid]) .viewtog .i-single,
+  .ws[data-view=grid] .viewtog .i-grid { display: none; }
   .tabs .hint:hover, .tabs .hint:focus-visible,
-  .tabs a.gear:hover, .tabs a.gear:focus-visible { color: #e6edf3; }
+  .tabs a.gear:hover, .tabs a.gear:focus-visible,
+  .tabs a.viewtog:hover,
+  .tabs a.viewtog:focus-visible { color: #e6edf3; }
   .ws .editor, .ws .msg { margin: 8px; flex: none; }
   .panes { position: relative; flex: 1; min-height: 0; }
+  /* A cell is a pane plus the caption naming it. Stacked and toggled the
+     same way the panes themselves used to be, and for the same reason: a
+     hidden terminal must keep its layout SIZE, or xterm re-measures a 0x0
+     box every time the tab changes. The caption is the grid's; here the
+     tab bar one row up already says the name, so it is display:none and
+     the pane covers the whole cell. */
+  .cell { position: absolute; inset: 0; visibility: hidden; }
+  .cell.active { visibility: visible; }
+  .cell-head { display: none; }
   .pane { position: absolute; inset: 0; width: 100%; height: 100%;
-          border: 0; visibility: hidden; }
+          border: 0; }
+  /* The one pane that is not in a cell: "No session selected". */
   .pane.active { visibility: visible; }
+  /* align-content as well as align-items: in a grid tile the message and
+     the Start button wrap onto two lines, and without it the wrapped lines
+     are spread to the full height of the tile with the button stranded near
+     the bottom edge. */
   .pane.placeholder { display: flex; align-items: center;
+                      align-content: center;
                       justify-content: center; gap: 10px;
                       flex-wrap: wrap; color: #8b949e; }
   /* The pane's own Start button (a stopped session): the message keeps the
      muted placeholder colour, the button is a button. */
   .pane.placeholder .ph-msg { color: inherit; }
+  /* The grid layout: every session's terminal at once (data-view="grid" on
+     the body, set by ?view=grid and by the tab bar's toggle). It RE-LAYS
+     the cells that are already mounted rather than mounting a second set:
+     tmux sizes a session to its most recently used client, so attaching one
+     session twice would leave the two attachments fighting over its size.
+     auto-fit rather than a fixed column count: two sessions get half the
+     page each, eight get a scrolling grid of readable terminals, and a
+     phone gets one column without a media query.
+
+     The track floor is min(320px, 100%) and not a bare 320px: a bare one
+     cannot shrink, so on a 320px-wide phone the 8px padding either side
+     left 304px for a track that insisted on 320 and this container
+     scrolled SIDEWAYS - one column, and still not all of it on screen
+     (CodeRabbit on PR #580). 100% is the free space, so the floor gives
+     way exactly when there is less room than a tile wants. */
+  /* The grid REPLACES the tab strip rather than sitting under it: the two are
+     alternative views of the same list, so showing both reads as a grid
+     inside tabs, and the strip is a horizontal scroller (overflow-x on
+     .tabs above) - which on a phone means the page scrolls vertically while
+     the strip scrolls sideways, two axes where the layout promises one. At
+     390px the bar measured 737px of tabs in a 390px viewport. The bar's
+     GLOBAL controls stay: the + that adds a session, the switch back to a
+     single pane, the mouse hint and the gear. Selecting a session is what
+     the tiles are for.
+
+     Hidden in CSS rather than dropped from the markup, so toggling back
+     restores the strip with no re-render and the tab bar stays the one
+     place the layout is derived from. */
+  .ws[data-view=grid] .tabs .tab-wrap,
+  .ws[data-view=grid] .tabs .tab-empty { display: none; }
+  .ws[data-view=grid] .panes { position: static; display: grid; gap: 8px;
+                               padding: 8px; overflow: auto;
+                               grid-template-columns:
+                                 repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+                               grid-auto-rows: minmax(240px, 1fr); }
+  .ws[data-view=grid] .cell { position: relative; inset: auto;
+                              visibility: visible; display: flex;
+                              flex-direction: column; min-height: 0;
+                              overflow: hidden; border: 1px solid #30363d;
+                              border-radius: 8px; background: #0d1117; }
+  /* Which tile leaving the grid will open, and which tab is current: the
+     same answer, so it gets the same accent the current tab has. */
+  .ws[data-view=grid] .cell.active { border-color: #58a6ff; }
+  .ws[data-view=grid] .cell-head { display: flex; align-items: center;
+                                   gap: 8px; flex: none; padding: 5px 8px;
+                                   font-size: 12px; color: #8b949e;
+                                   text-decoration: none; background: #010409;
+                                   border-bottom: 1px solid #21262d; }
+  .ws[data-view=grid] .cell-head:hover,
+  .ws[data-view=grid] .cell-head:focus-visible { color: #e6edf3; }
+  /* Same treatment a long tab name gets: the label ellipsizes rather than
+     pushing the expand icon out of the tile (issue #236 names run to 150
+     characters), with the full name in the caption's tooltip. */
+  .cell-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+               flex: 1; }
+  .cell-open { display: flex; flex: none; }
+  .cell-open svg { width: 14px; height: 14px; display: block; }
+  /* The pane is the rest of the tile, and a flex child rather than an
+     absolute fill: the caption above it is part of the box now. */
+  .ws[data-view=grid] .pane { position: static; inset: auto; flex: 1;
+                              min-height: 0; }
   /* Agent profiles (issue #321, step 5). The row folds like a session row —
      .tbl li.foldrow above already gives the <li> and its <summary> their
      layout, caret and hover — so this only styles what is INSIDE the fold,
@@ -3836,7 +3921,23 @@ CONNECT_SECTION_TPL = """<section>
 # font hands back is not ours to pick. Sized in px as SVG, the pair is
 # the same 18px box everywhere and inherits currentColor like every
 # other icon on the page.
-HOME_BODY = """<body class="ws">
+#
+# data-view on the <body> is the workspace's LAYOUT: `tabs`, one terminal
+# filling the page, and `grid`, every session's terminal side by side at
+# once (an operator running four agents wants to see all four working, not
+# to click through them). It is one attribute and one set of panes for
+# both, deliberately: a session's terminal is a live tmux client, and tmux
+# sizes a window to its most recently used client, so a second attachment
+# of the same session in a second layout would resize the session out from
+# under the first. So the grid RE-LAYS the panes that are already there
+# rather than mounting a set of its own, and no session is ever attached
+# twice.
+#
+# The layout is a URL parameter (?view=grid), which is what makes it work
+# with scripting off; SCRIPT intercepts the toggle so that flipping the
+# layout does not navigate, since a navigation would tear down every
+# attached terminal on the page.
+HOME_BODY = """<body class="ws" data-view="{view}">
 <div id="msg-slot">{message}</div>
 <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}"
      data-sess-base="{action_base}">
@@ -3844,6 +3945,7 @@ HOME_BODY = """<body class="ws">
   <button type="button" class="btn add" data-toggle="session-editor"
           title="New session" aria-label="New session">+</button>
   <span class="spacer"></span>
+  {view_toggle}
   <span class="hint" tabindex="0"
         aria-label="Terminal mouse tip. Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text."
         title="Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text.">{icon_info}</span>
@@ -3855,7 +3957,7 @@ HOME_BODY = """<body class="ws">
     {new_session_fields}
   </form>
 </div>
-<div class="panes" id="panes">{pane}</div>
+<div class="panes" id="panes">{panes}</div>
 </body>
 </html>
 """
@@ -4026,6 +4128,39 @@ ICON_GEAR = (
     '-.501-.29c-.447-.222-.85-.629-.997-1.189l-.289-1.105c-.029-.11-.101-.143-.137-.146a6.6 6.6 '
     '0 0 0-1.142 0ZM11 8a3 3 0 1 1-6 0 3 3 0 0 1 6 0ZM9.5 8a1.5 1.5 0 1 0-3.001.001A1.5 1.5 0 0 '
     '0 9.5 8Z"/></svg>'
+)
+# The workspace's view switch and the grid tile's own "open this one full
+# size" control. Octicons apps-16, square-16 and screen-full-16: four
+# squares for the grid, one square for the single-pane view it toggles
+# back to, and the outward arrows for a tile that wants the whole page.
+ICON_GRID = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M1.5 3.25c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5A1.75 1.75 0 '
+    '0 1 5.75 7.5h-2.5A1.75 1.75 0 0 1 1.5 5.75Zm7 0c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75'
+    '.784 1.75 1.75v2.5a1.75 1.75 0 0 1-1.75 1.75h-2.5A1.75 1.75 0 0 1 8.5 5.75Zm-7 7c0-.966'
+    '.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a1.75 1.75 0 0 1-1.75 1.75h-2.5a1.75 '
+    '1.75 0 0 1-1.75-1.75Zm7 0c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a1.75 '
+    '1.75 0 0 1-1.75 1.75h-2.5a1.75 1.75 0 0 1-1.75-1.75ZM3.25 3a.25.25 0 0 0-.25.25v2.5c0 .138'
+    '.112.25.25.25h2.5A.25.25 0 0 0 6 5.75v-2.5A.25.25 0 0 0 5.75 3Zm7 0a.25.25 0 0 0-.25.25v2.5'
+    'c0 .138.112.25.25.25h2.5a.25.25 0 0 0 .25-.25v-2.5a.25.25 0 0 0-.25-.25Zm-7 7a.25.25 0 0 0'
+    '-.25.25v2.5c0 .138.112.25.25.25h2.5a.25.25 0 0 0 .25-.25v-2.5a.25.25 0 0 0-.25-.25Zm7 0a.25'
+    '.25 0 0 0-.25.25v2.5c0 .138.112.25.25.25h2.5a.25.25 0 0 0 .25-.25v-2.5a.25.25 0 0 0-.25'
+    '-.25Z"/></svg>'
+)
+ICON_SINGLE = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M4 5.75C4 4.784 4.784 4 5.75 4h4.5c.966 0 1.75.784 1.75 1.75v4.5A1.75 1.75 0 0 1 '
+    '10.25 12h-4.5A1.75 1.75 0 0 1 4 10.25Zm1.75-.25a.25.25 0 0 0-.25.25v4.5c0 .138.112.25.25'
+    '.25h4.5a.25.25 0 0 0 .25-.25v-4.5a.25.25 0 0 0-.25-.25Z"/></svg>'
+)
+ICON_EXPAND = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M1.75 10a.75.75 0 0 1 .75.75v2.5c0 .138.112.25.25.25h2.5a.75.75 0 0 1 0 1.5h-2.5A'
+    '1.75 1.75 0 0 1 1 13.25v-2.5a.75.75 0 0 1 .75-.75Zm12.5 0a.75.75 0 0 1 .75.75v2.5A1.75 1.75 '
+    '0 0 1 13.25 15h-2.5a.75.75 0 0 1 0-1.5h2.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 .75-.75Z'
+    'M2.75 2.5a.25.25 0 0 0-.25.25v2.5a.75.75 0 0 1-1.5 0v-2.5C1 1.784 1.784 1 2.75 1h2.5a.75.75 '
+    '0 0 1 0 1.5ZM10 1.75a.75.75 0 0 1 .75-.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a.75.75 0 0 1'
+    '-1.5 0v-2.5a.25.25 0 0 0-.25-.25h-2.5a.75.75 0 0 1-.75-.75Z"/></svg>'
 )
 ICON_LOCK = (
     '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
@@ -4622,8 +4757,81 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     if (st === "live" || st === "died") { return "live"; }
     return st === "stopped" ? "stopped" : "starting";
   }
+  // Which layout the page is in, and the URL that says so. `tabs` is the
+  // absence of the parameter (see view_href in the daemon), so a tab's own
+  // href keeps the shape it has always had.
+  function wsView() {
+    return document.body.getAttribute("data-view") === "grid" ? "grid" : "tabs";
+  }
+  function wsUrl(name, view) {
+    var q = name ? "?tab=" + encodeURIComponent(name) : "";
+    if (view === "grid") { q = (q ? q + "&" : "?") + "view=grid"; }
+    return tabBar().getAttribute("data-term-base") + q;
+  }
+  // The box around a pane, carrying the caption that names it. One cell
+  // shape for both layouts: the grid re-lays the cells that are already
+  // mounted instead of mounting a set of its own, because a session is a
+  // live tmux client and tmux sizes a window to its most recently used
+  // client: two attachments of one session would fight over its size.
+  function ensureCell(name) {
+    var cell = document.querySelector('#panes .cell[data-cell="' + name + '"]');
+    if (!cell) {
+      cell = document.createElement("div");
+      cell.className = "cell";
+      cell.setAttribute("data-cell", name);
+      // CLONED from a caption already on the page rather than built from
+      // scratch: the server renders one cell on every load, so there is
+      // always one to copy, and copying is what keeps the expand icon in
+      // the daemon instead of in a second copy here.
+      var tpl = document.querySelector("#panes .cell-head");
+      var head;
+      if (tpl) {
+        head = tpl.cloneNode(true);
+      } else {
+        head = document.createElement("a");
+        head.className = "cell-head";
+        var dotEl = document.createElement("span");
+        dotEl.className = "state";
+        var nameEl = document.createElement("span");
+        nameEl.className = "cell-name";
+        head.appendChild(dotEl);
+        head.appendChild(nameEl);
+      }
+      var label = "Open " + name + " full size";
+      head.setAttribute("data-open", name);
+      head.href = wsUrl(name, "tabs");
+      head.title = label;
+      head.setAttribute("aria-label", label);
+      head.querySelector(".cell-name").textContent = name;
+      cell.appendChild(head);
+      document.getElementById("panes").appendChild(cell);
+    }
+    // The dot is the tab's, read back on every sync: the live feed morphs
+    // the tab bar and never touches #panes, so this is where a session
+    // that has since died or stopped reaches its caption.
+    var dot = cell.querySelector(".cell-head .state");
+    if (dot) { dot.setAttribute("data-state", tabState(name) || "starting"); }
+    return cell;
+  }
+  // Tiles read in tab order however they were mounted: the server renders
+  // the selected session's cell and this script appends the rest as they
+  // are first shown, so DOM order is arrival order. Done with CSS `order`
+  // and never by moving the element. Re-inserting an iframe RELOADS it,
+  // which would drop the terminal inside.
+  //
+  // EVERY cell, every time, or the pass makes things worse than it found
+  // them: a cell left without an `order` keeps the initial value 0 and so
+  // sorts ahead of the ones that were given theirs.
+  function wsOrder() {
+    var names = tabNames();
+    document.querySelectorAll("#panes .cell[data-cell]").forEach(function (c) {
+      var i = names.indexOf(c.getAttribute("data-cell"));
+      c.style.order = String(i < 0 ? names.length : i);
+    });
+  }
   function ensurePane(name) {
-    var cur = document.querySelector('#panes .pane[data-pane="' + name + '"]');
+    var cell = ensureCell(name);
+    var cur = cell.querySelector('.pane[data-pane="' + name + '"]');
     // Keep a pane only while the state it was built for still holds. An
     // iframe used to be exempt from that, so it outlived the session
     // inside it: once a live session stopped (clean exit, or a stop from
@@ -4655,12 +4863,9 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     }
     el.setAttribute("data-ph", want);
     el.setAttribute("data-pane", name);
-    if (cur) {
-      if (cur.classList.contains("active")) { el.classList.add("active"); }
-      cur.replaceWith(el);
-    } else {
-      document.getElementById("panes").appendChild(el);
-    }
+    // `active` is the CELL's, so a pane swapped in here carries no state
+    // of its own and cannot disagree with the cell it lands in.
+    if (cur) { cur.replaceWith(el); } else { cell.appendChild(el); }
     return el;
   }
   function wsSelect(name, focus) {
@@ -4671,14 +4876,45 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       else { t.removeAttribute("aria-current"); }
     });
     var pane = ensurePane(name);
-    document.querySelectorAll("#panes .pane").forEach(function (p) {
-      p.classList.toggle("active", p === pane);
+    var cell = pane.parentNode;
+    document.querySelectorAll("#panes .cell").forEach(function (c) {
+      c.classList.toggle("active", c === cell);
     });
-    history.replaceState(null, "", bar.getAttribute("data-term-base") +
-                         "?tab=" + encodeURIComponent(name));
+    history.replaceState(null, "", wsUrl(name, wsView()));
     if (focus && pane.tagName === "IFRAME") {
       try { pane.contentWindow.focus(); } catch (err) { /* cross-origin never happens; be safe */ }
     }
+  }
+  // Switch layout and/or selected session in one move, without navigating:
+  // following the toggle's href for real would tear down every attached
+  // terminal on the page and re-attach it a moment later.
+  // The layout switch, after a flip this script made: the icon follows
+  // data-view in CSS, but the href and the accessible name are attributes
+  // only the server would otherwise correct - and it corrects them on its
+  // next render, which may be minutes away or never. Left alone, the button
+  // kept offering the layout it was rendered with, so pressing it twice went
+  // to the grid and stayed there.
+  function wsRetag(view, name) {
+    var a = document.querySelector("#tab-bar a.viewtog");
+    if (!a) { return; }
+    var to = view === "grid" ? "tabs" : "grid";
+    var label = view === "grid" ? "Single pane" : "Grid: every session at once";
+    a.setAttribute("data-view-to", to);
+    a.setAttribute("href", wsUrl(name || wsActive(), to));
+    a.setAttribute("title", label);
+    a.setAttribute("aria-label", label);
+  }
+  function wsGo(name, view, focus) {
+    var bar = tabBar();
+    if (!bar) { return; }
+    document.body.setAttribute("data-view", view);
+    var target = tabEl(name) ? name : wsActive();
+    // The grid shows every session, so anything not yet mounted is mounted
+    // now; leaving it keeps every pane attached, as a background tab is.
+    if (view === "grid") { tabNames().forEach(ensurePane); wsOrder(); }
+    if (target) { wsSelect(target, focus); }
+    else { history.replaceState(null, "", wsUrl(null, view)); }
+    wsRetag(view, target);
   }
   function wsActive() {
     var bar = tabBar();
@@ -4687,13 +4923,17 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   }
   function wsSync() {
     if (!tabBar()) { return; }
-    // Drop panes whose sessions are gone; upgrade placeholders whose
+    // Drop cells whose sessions are gone; upgrade placeholders whose
     // sessions came live. No focus steal — the user may be typing.
-    document.querySelectorAll("#panes .pane[data-pane]").forEach(function (p) {
-      var name = p.getAttribute("data-pane");
-      if (!tabEl(name)) { p.remove(); return; }
+    document.querySelectorAll("#panes .cell[data-cell]").forEach(function (c) {
+      var name = c.getAttribute("data-cell");
+      if (!tabEl(name)) { c.remove(); return; }
       ensurePane(name);
     });
+    // A session added while the grid is open belongs on it straight away:
+    // that is what the layout is for. The tab layout keeps mounting a pane
+    // when it is first shown, so a load costs one terminal, not one each.
+    if (wsView() === "grid") { tabNames().forEach(ensurePane); wsOrder(); }
     var cur = wsActive();
     if (cur) { wsSelect(cur, false); }
   }
@@ -4701,7 +4941,32 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     var t = e.target && e.target.closest ? e.target.closest("#tab-bar .tab[data-tab]") : null;
     if (!t) { return; }
     e.preventDefault();
-    wsSelect(t.getAttribute("data-tab"), true);
+    // A tab means one session, so it selects one and leaves the grid - the
+    // same place its href goes with scripting off. In the grid the strip is
+    // hidden (see settings.css), so this is the tab layout's own handler
+    // there and the layout it names is the one already showing.
+    wsGo(t.getAttribute("data-tab"), "tabs", true);
+  });
+  // The tab bar's layout toggle, and a grid tile's caption: the two ways
+  // in and out of the grid. Both are real links (they work with scripting
+  // off); intercepting them keeps the terminals attached.
+  document.addEventListener("click", function (e) {
+    var a = e.target && e.target.closest
+      ? e.target.closest("#tab-bar a.viewtog") : null;
+    if (!a) { return; }
+    e.preventDefault();
+    // Derived from the layout the page is IN rather than from the button's
+    // own attribute, so the switch still switches even if that attribute is
+    // momentarily stale (a live-feed re-render lands between the flip and
+    // the next click, say).
+    wsGo(wsActive(), wsView() === "grid" ? "tabs" : "grid", false);
+  });
+  document.addEventListener("click", function (e) {
+    var h = e.target && e.target.closest
+      ? e.target.closest("#panes .cell-head[data-open]") : null;
+    if (!h) { return; }
+    e.preventDefault();
+    wsGo(h.getAttribute("data-open"), "tabs", true);
   });
 
   // Two-click close on the tab bar's x. Closing kills a live agent and
@@ -6261,23 +6526,70 @@ def render_msg(message, page, kind="ok"):
     )
 
 
-def render_pane(selected, live, stopped):
-    """The server-rendered pane: only the SELECTED session, and only
-    when its tmux session is already live — the ttyd attach wrapper
-    greets a not-yet-started session with an error and exits, so a
-    starting session gets a placeholder instead (SCRIPT swaps in the
-    iframe once the state flips; without JS, reloading does). A stopped
-    session gets an honest placeholder: nothing is coming up until a
-    start revives it.
+VIEWS = ("tabs", "grid")
+
+
+def view_href(name, view):
+    """A workspace URL: which tab is selected, and which layout it is in.
+
+    `tabs` is spelled as the ABSENCE of the parameter rather than as
+    `?view=tabs`, so every href the page already had (a tab, a Dismiss,
+    the redirect after adding a session) keeps the exact shape it has
+    always had and only the grid needs a parameter."""
+    q = ("?tab=" + urllib.parse.quote(name, safe="")) if name else ""
+    if view == "grid":
+        q = (q + "&" if q else "?") + "view=grid"
+    return TERM_HOME + q
+
+
+def render_view_toggle(selected, view):
+    """The tab bar's layout switch: four squares to spread every session
+    out at once, one square to come back to a single terminal.
+
+    A LINK, to the same page in the other layout, so the switch works
+    with scripting off; SCRIPT intercepts the click and re-lays the panes
+    in place, because following this href for real would tear down every
+    attached terminal on the page and re-attach it a moment later.
+
+    It keeps the selected tab in the href either way: leaving the grid
+    has to land on some ONE session, and the one the operator last had up
+    is the least surprising.
+
+    BOTH icons are in the markup, and CSS shows the one the current layout
+    is not (see .viewtog in settings.css). That is what lets SCRIPT flip
+    the layout without rebuilding this control: it can rewrite an href and
+    a label, but the other icon would have to be a second copy of an
+    inline SVG that already lives in this file. Before this the button
+    kept the icon and the `data-view-to` it was RENDERED with, so pressing
+    it twice went to the grid and then stayed there - a control whose
+    obvious use is in and straight back out."""
+    grid = view == "grid"
+    label = "Single pane" if grid else "Grid: every session at once"
+    return (
+        f'<a class="viewtog" data-view-to="{"tabs" if grid else "grid"}" '
+        f'href="{html.escape(view_href(selected, "tabs" if grid else "grid"), quote=True)}" '
+        f'title="{label}" aria-label="{label}">'
+        f'<span class="i-grid">{ICON_GRID}</span>'
+        f'<span class="i-single">{ICON_SINGLE}</span></a>'
+    )
+
+
+def render_pane(name, live, stopped):
+    """One session's pane, and only a live one gets a terminal. The ttyd
+    attach wrapper greets a not-yet-started session with an error and
+    exits, so a starting session gets a placeholder instead (SCRIPT swaps
+    in the iframe once the state flips; without JS, reloading does). A
+    stopped session gets an honest placeholder: nothing is coming up
+    until a start revives it.
 
     data-ph records which of the three states the pane was built for —
     on the iframe too, so SCRIPT can tell a terminal that is still wired
     to a live tmux session from one whose session has since gone (issue
-    #241)."""
-    if selected is None:
-        return '<div class="pane placeholder active">No session selected.</div>'
-    safe = html.escape(selected)
-    state = pane_state(selected, live, stopped)
+    #241). It stays on the PANE and is not repeated on the cell around
+    it, so a slice of the markup from data-ph to the next `</div>` is
+    still this pane and nothing else."""
+    safe = html.escape(name)
+    state = pane_state(name, live, stopped)
     if state == "stopped":
         # The Start button lives HERE, not only in the settings page's session
         # row: this pane is what the operator is looking at when they find out
@@ -6288,7 +6600,7 @@ def render_pane(selected, live, stopped):
         # explicitly rather than left to SESS_PAGE's default: /<user>/ is a
         # workspace for EVERY user, while that default is the settings page
         # for anyone but the primary one (CodeRabbit on PR #452).
-        return (f'<div class="pane placeholder active" data-pane="{safe}" '
+        return (f'<div class="pane placeholder" data-pane="{safe}" '
                 f'data-ph="stopped">'
                 f'<span class="ph-msg">{safe} is stopped &mdash; nothing '
                 f'starts it on its own.</span>'
@@ -6299,12 +6611,70 @@ def render_pane(selected, live, stopped):
                 f'<button type="submit" class="btn small">Start</button>'
                 f'</form></div>')
     if state == "starting":
-        return (f'<div class="pane placeholder active" data-pane="{safe}" '
+        return (f'<div class="pane placeholder" data-pane="{safe}" '
                 f'data-ph="starting">{safe} is starting&hellip; '
                 f'reload in a few seconds.</div>')
-    return (f'<iframe class="pane active" data-pane="{safe}" data-ph="live" '
-            f'src="{html.escape(session_url(selected))}" title="{safe} terminal" '
+    return (f'<iframe class="pane" data-pane="{safe}" data-ph="live" '
+            f'src="{html.escape(session_url(name))}" title="{safe} terminal" '
             f'allow="clipboard-read; clipboard-write"></iframe>')
+
+
+def render_cell(name, live, stopped, died, selected):
+    """A pane and the caption that says whose it is.
+
+    The caption is what the grid needs and the single-pane view does not
+    (there the tab bar already says it, in the same place, one row up), so
+    it is rendered either way and hidden by CSS in the tab layout: one
+    cell shape for both, which is what lets the grid re-lay the panes that
+    are already mounted instead of building a second set of its own.
+
+    The caption is a LINK to this session's own tab, which is how a tile
+    is opened full size: pressing the name of the thing you want to see
+    more of needs no explaining, and it is the same href the tab carries,
+    so it works with scripting off. `active` marks the selected session:
+    which pane is showing in the tab layout, and which tile is outlined in
+    the grid."""
+    safe = html.escape(name)
+    if name in live:
+        # The pane is up either way; whether an AGENT is in it is what the
+        # dot has to say (issue #516).
+        state = "died" if name in died else "live"
+    elif name in stopped:
+        state = "stopped"
+    else:
+        state = "starting"
+    cur = " active" if name == selected else ""
+    label = "Open " + safe + " full size"
+    return (
+        f'<div class="cell{cur}" data-cell="{safe}">'
+        f'<a class="cell-head" data-open="{safe}" '
+        f'href="{html.escape(view_href(name, "tabs"), quote=True)}" '
+        f'title="{label}" aria-label="{label}">'
+        f'<span class="state" data-state="{state}"></span>'
+        f'<span class="cell-name">{safe}</span>'
+        f'<span class="cell-open" aria-hidden="true">{ICON_EXPAND}</span>'
+        f'</a>'
+        f'{render_pane(name, live, stopped)}'
+        f'</div>'
+    )
+
+
+def render_panes(names, live, stopped, died, selected, view):
+    """What the server puts in #panes.
+
+    In the tab layout, only the SELECTED session: the others are mounted
+    by SCRIPT as they are first shown, so a page load costs one terminal
+    rather than one per session. The grid is the case where every session
+    is on screen at once, so there the server renders them all and a
+    scriptless browser gets the whole grid."""
+    if not names:
+        return '<div class="pane placeholder active">No session selected.</div>'
+    if view == "grid":
+        return "".join(
+            render_cell(n, live, stopped, died, selected) for n in names)
+    if selected is None:
+        return '<div class="pane placeholder active">No session selected.</div>'
+    return render_cell(selected, live, stopped, died, selected)
 
 
 def render_head(title):
@@ -6406,7 +6776,7 @@ def render_users():
     )
 
 
-def render_home(message="", selected=None, kind="ok"):
+def render_home(message="", selected=None, kind="ok", view="tabs"):
     entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
     names = list(entries)
     if selected not in entries:
@@ -6414,9 +6784,9 @@ def render_home(message="", selected=None, kind="ok"):
     live = live_sessions()
     stopped = {n for n, v in entries.items() if v.get("stopped")}
     died = {n for n, v in entries.items() if crashed_status(v) is not None}
-    # Dismissing keeps the selected tab (SESSION_RE names are URL-safe).
-    msg_html = render_msg(
-        message, TERM_HOME + ("?tab=" + selected if selected else ""), kind)
+    # Dismissing keeps the selected tab and the layout it was dismissed in
+    # (SESSION_RE names are URL-safe, so nothing here is escaped away).
+    msg_html = render_msg(message, view_href(selected, view), kind)
     return (
         render_head("Agent Box &mdash; " + html.escape(USER))
         + STYLE
@@ -6424,8 +6794,10 @@ def render_home(message="", selected=None, kind="ok"):
             base=html.escape(BASE),
             action_base=html.escape(SESS_BASE),
             term_base=html.escape(TERM_HOME),
+            view=view,
             tabs=render_tabs(names, live, stopped, died, selected),
-            pane=render_pane(selected, live, stopped),
+            view_toggle=render_view_toggle(selected, view),
+            panes=render_panes(names, live, stopped, died, selected, view),
             new_session_fields=render_new_session_fields(),
             message=msg_html,
             icon_info=ICON_INFO,
@@ -6755,8 +7127,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # switching mechanism); anything invalid falls back to the
             # default selection inside render_home.
             tab = (params.get("tab", [""])[0]).strip()
+            # ?view=grid lays every session out at once instead of one
+            # terminal filling the page (also the no-JS way to switch, and
+            # what makes the layout survive a reload). Anything else is the
+            # tab layout, so a stale or hand-typed value degrades to the
+            # default rather than to an error page.
+            view = (params.get("view", [""])[0]).strip()
             self._send_html(render_home(
-                message, tab if SESSION_RE.match(tab) else None, kind))
+                message, tab if SESSION_RE.match(tab) else None, kind,
+                view if view in VIEWS else "tabs"))
             return
         if not self._under_base(parsed.path):
             self._send_html("<h1>404</h1>", status=404)
