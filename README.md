@@ -102,8 +102,8 @@ refused, and a failure rolls back to what was running.
 Verifying releases against an offline signing key is tracked in
 [issue 46](https://github.com/defangdevs/agent-box/issues/46).
 
-Template source: [`aws/lightsail-template.yaml`](./aws/lightsail-template.yaml).
-See [`aws/README.md`](./aws/README.md) for design notes and the S3-hosting
+Template source: [`deploy/aws/lightsail-template.yaml`](./deploy/aws/lightsail-template.yaml).
+See [`deploy/aws/README.md`](./deploy/aws/README.md) for design notes and the S3-hosting
 setup.
 
 ### Alternative: EC2 template (on-demand, IPv6 opt-in)
@@ -135,8 +135,8 @@ DNS64/NAT64 service ([nat64.net](https://nat64.net)); set `Nat64: false`
 to opt out.
 The full cost breakdown, the Spot stop-not-terminate behavior, SSM root
 access, and the other design notes live in
-[aws/README.md](./aws/README.md); template source:
-[`aws/template.yaml`](./aws/template.yaml).
+[deploy/aws/README.md](./deploy/aws/README.md); template source:
+[`deploy/aws/template.yaml`](./deploy/aws/template.yaml).
 
 ## 1-click Azure launch
 
@@ -144,7 +144,7 @@ The same native Ubuntu + Nix box on one Azure Linux VM, from a Bicep template.
 Nothing on the subscription has to be pre-configured: the deployment brings its
 own vnet, NSG and static public IPv4.
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fdefangdevs%2Fagent-box%2Fmaster%2Fazure%2Fagent-box.json)
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fdefangdevs%2Fagent-box%2Fmaster%2Fdeploy%2Fazure%2Fagent-box.json)
 
 Pick a resource group and region, choose `agent` (`claude` or `codex`), set a
 `webPassword` (any 16&ndash;64 characters &mdash; it reaches the box
@@ -173,8 +173,8 @@ straight from GitHub, so it tracks `master` &mdash; pin a box by setting
 
 Design notes, the CLI path, what to do when a deployment fails, and the known
 gaps (IPv4-only; the Azure kernel's missing `zram`) live in
-[azure/README.md](./azure/README.md); template source:
-[`azure/agent-box.bicep`](./azure/agent-box.bicep).
+[deploy/azure/README.md](./deploy/azure/README.md); template source:
+[`deploy/azure/agent-box.bicep`](./deploy/azure/agent-box.bicep).
 
 ## Why
 

@@ -1,4 +1,4 @@
-// agent-box on Azure - the Bicep twin of aws/lightsail-template.yaml.
+// agent-box on Azure - the Bicep twin of deploy/aws/lightsail-template.yaml.
 //
 // One Ubuntu 24.04 VM that STAYS Ubuntu: Nix is installed as a plain package
 // manager, the pinned runtime profile brings the agent CLIs, tmux, ttyd and

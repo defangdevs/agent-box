@@ -10,7 +10,7 @@ user choose Claude Code or Codex.
 | `agent-box.json` | Build artifact of `az bicep build`. Do not edit by hand — it is what the Deploy button serves. |
 | `.bicep-version` | Bicep CLI version CI compiles with. |
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fdefangdevs%2Fagent-box%2Fmaster%2Fazure%2Fagent-box.json)
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fdefangdevs%2Fagent-box%2Fmaster%2Fdeploy%2Fazure%2Fagent-box.json)
 
 ## What the template does
 
@@ -34,7 +34,7 @@ user choose Claude Code or Codex.
   unattended, the daemons they obsolete restart in place, no agent session
   is ever restarted by an apt run, and the box does not reboot itself
   unless the deployment opts in with `osUpdates.automaticReboot`. See
-  "Base-OS patching" in `aws/README.md` for the whole policy — it is the
+  "Base-OS patching" in `deploy/aws/README.md` for the whole policy — it is the
   renderer's, so both clouds get the same one.
 - **Basic-auth-to-cookie web auth**, identical to the AWS path. The terminal
   lives at `/<userName>/` (default `/agent/`); Caddy prompts for the
@@ -47,7 +47,7 @@ user choose Claude Code or Codex.
   certificate — the dotted spelling resolves but fails TLS (issue #359).
 - No port 80 is opened. Caddy is configured for TLS-ALPN-01 only.
 
-## Three things that differ from `aws/lightsail-template.yaml`
+## Three things that differ from `deploy/aws/lightsail-template.yaml`
 
 This template is the Azure twin of the Lightsail one, not of the EC2 one:
 same native Ubuntu + Nix path, same `agentbox apply`, same config. Three
@@ -123,7 +123,7 @@ From the portal, use the Deploy button above. From the CLI:
 ```bash
 az group create -n agent-box -l westus3
 az deployment group create -g agent-box \
-  --template-file azure/agent-box.json \
+  --template-file deploy/azure/agent-box.json \
   --parameters webPassword='<16-64 chars>' \
                adminPasswordOrKey="$(cat ~/.ssh/id_ed25519.pub)"
 ```
@@ -194,7 +194,7 @@ auth, narrow `allowCidr`.
 The AWS 1-click templates are published to S3 by `publish-template.yml`, which
 injects the publishing commit into `AgentBoxFlakeRef` — so a 1-click AWS box
 is reproducible. **The Azure button is not pinned.** It serves
-`azure/agent-box.json` straight from `raw.githubusercontent.com` at `master`,
+`deploy/azure/agent-box.json` straight from `raw.githubusercontent.com` at `master`,
 so a 1-click Azure box tracks the default branch, and pinning is a form field:
 set `agentBoxFlakeRef` to `github:defangdevs/agent-box/<sha>`.
 
@@ -208,7 +208,7 @@ a follow-up, not a limitation of the template.
 
 1. Edit `agent-box.bicep`.
 2. Recompile: `nix run .#compile-azure-bicep` (from the repo root), or
-   `cd azure && az bicep build --file agent-box.bicep` if you don't have Nix.
+   `cd deploy/azure && az bicep build --file agent-box.bicep` if you don't have Nix.
 3. `python3 scripts/check_azure_template.py` — recompiles and diffs, renders
    the bootstrap and parses it under `bash -n`, and checks the password stays
    in `protectedSettings`. This is what `azure-ci.yml` runs.
@@ -216,7 +216,7 @@ a follow-up, not a limitation of the template.
    ```bash
    az group create -n agent-box-validate -l westus3
    az deployment group validate -g agent-box-validate \
-     --template-file azure/agent-box.json \
+     --template-file deploy/azure/agent-box.json \
      --parameters webPassword=... adminPasswordOrKey=...
    az group delete -n agent-box-validate --yes
    ```

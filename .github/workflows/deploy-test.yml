@@ -4,7 +4,7 @@ on:
   push:
     branches: [ master ]
     paths:
-      - 'aws/template.yaml'
+      - 'deploy/aws/template.yaml'
       - 'modules/**'
       - 'scripts/ws_smoke.py'
       - '.github/workflows/deploy-test.yml'
@@ -105,7 +105,7 @@ jobs:
       - name: Sanity-check required variables
         run: |
           if [ -z "$ROLE_ARN" ]; then
-            echo "::error::Missing repo variable: AWS_ROLE_ARN. See aws/README.md."
+            echo "::error::Missing repo variable: AWS_ROLE_ARN. See deploy/aws/README.md."
             exit 1
           fi
 
@@ -150,7 +150,7 @@ jobs:
           # PublicIpv4/UseSpot come from the matrix leg (see the job comment).
           # EnableSsm is now unconditionally true on BOTH legs (issue 190):
           # the stock AMI's amazon-ssm-agent runs unconditionally pre-switch
-          # (aws/template.yaml's EnableSsm description), so attaching the
+          # (deploy/aws/template.yaml's EnableSsm description), so attaching the
           # instance profile gives a root-shell diagnostic path even on a box
           # whose amazon-init dies before switch-to-configuration ever runs —
           # previously only ipv4-full got this, leaving ipv6-outputs with no
@@ -158,7 +158,7 @@ jobs:
           create() {
             aws cloudformation create-stack \
               --stack-name "$STACK_NAME" \
-              --template-body "file://aws/template.yaml" \
+              --template-body "file://deploy/aws/template.yaml" \
               --parameters \
                 "ParameterKey=PublicIpv4,ParameterValue=${{ matrix.public_ipv4 }}" \
                 "ParameterKey=UseSpot,ParameterValue=${{ (inputs.use_spot == true && matrix.public_ipv4 == 'true') && 'true' || matrix.use_spot }}" \
@@ -179,7 +179,7 @@ jobs:
           # BEFORE the stack (and the instance) is deleted — this evidence is
           # otherwise destroyed. get-console-output only ever returns amazon-
           # init's terminal "Failed to start ..." line (it logs journal-only,
-          # aws/template.yaml:456,601), so the pre-switch journal itself —
+          # deploy/aws/template.yaml:456,601), so the pre-switch journal itself —
           # where an IPv6-only DNS/resolver failure would actually show up —
           # is only reachable via SSM. EnableSsm=true above means the agent
           # (already running pre-switch on the stock AMI) has a chance to
@@ -345,7 +345,7 @@ jobs:
           # (issue 186). systemd names a unit by its DESCRIPTION while the unit
           # is still loaded, and by its UNIT ID once it is not — and
           # amazon-init masks itself in the very configuration it is switching
-          # into (aws/template.yaml: `systemd.services.amazon-init.enable =
+          # into (deploy/aws/template.yaml: `systemd.services.amazon-init.enable =
           # lib.mkForce false`, so a rebooted box does not re-apply user-data).
           # So a HEALTHY first boot ends with its own start job cancelled and
           # the console reading "[FAILED] Failed to start amazon-init.service."

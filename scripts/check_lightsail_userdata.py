@@ -2,7 +2,7 @@
 """Guard the Lightsail launch-script shell dialect.
 
 Lightsail PREPENDS its own `#!/bin/sh` preamble to an instance's launch
-script, so the shebang in `aws/lightsail-template.yaml` is only a comment
+script, so the shebang in `deploy/aws/lightsail-template.yaml` is only a comment
 in the file cloud-init runs and the script starts life under dash. The
 1-click template shipped for ten days with `set -euxo pipefail` on its
 first executable line and died there on every launch ("Illegal option -o
@@ -33,7 +33,7 @@ REPO = Path(__file__).resolve().parent.parent
 # hand-maintained list is how the guard came to skip the very template the bug
 # shipped in: `lightsail-template.yaml` was never added to it, so CI stayed
 # green over a 1-click template that could not boot (issue #390).
-TEMPLATES = sorted(REPO.glob("aws/lightsail*template.yaml"))
+TEMPLATES = sorted(REPO.glob("deploy/aws/lightsail*template.yaml"))
 GUARD = re.compile(r'exec\s+/bin/bash\s+"\$0"')
 # Sourcing the Nix profile snippet, which reads $HOME with no default.
 NIX_PROFILE_SOURCE = re.compile(r'^\s*\.\s+\S*/profile\.d/\S+\.sh')

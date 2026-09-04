@@ -3,7 +3,7 @@
 
 Why this exists
 ---------------
-Deployed boxes fetch EXACTLY ONE file — aws/template.yaml's user-data and
+Deployed boxes fetch EXACTLY ONE file — deploy/aws/template.yaml's user-data and
 agent-box-update.service both `builtins.fetchurl .../modules/agent-box.nix` and
 pin a single sha256 (issue #51). raw.githubusercontent is dual-stack (IPv6-only
 boxes reach it via NAT64) and needs no unpack step on a journal-only first boot.

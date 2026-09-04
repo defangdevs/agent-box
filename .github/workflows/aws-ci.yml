@@ -4,8 +4,8 @@ on:
   push:
     branches: [ master ]
     paths: &aws-ci-paths
-      - 'aws/template.yaml'
-      - 'aws/lightsail-template.yaml'
+      - 'deploy/aws/template.yaml'
+      - 'deploy/aws/lightsail-template.yaml'
       - 'docs/index.html'
       - 'scripts/ws_smoke.py'
       - 'scripts/check_lightsail_userdata.py'
@@ -37,13 +37,13 @@ jobs:
 
       - name: Validate CloudFormation templates
         run: |
-          cfn-lint aws/template.yaml aws/lightsail-template.yaml
+          cfn-lint deploy/aws/template.yaml deploy/aws/lightsail-template.yaml
 
       # cfn-lint reads YAML, so it cannot see that Lightsail prepends its
       # own #!/bin/sh preamble and runs the launch script under dash — the
       # failure that kept the old infect-based 1-click from ever booting
-      # (issue #390). The check discovers aws/lightsail*template.yaml itself,
-      # so a new Lightsail template cannot slip past it unguarded.
+      # (issue #390). The check discovers deploy/aws/lightsail*template.yaml
+      # itself, so a new Lightsail template cannot slip past it unguarded.
       - name: Check the Lightsail launch-script shell dialect
         run: python3 scripts/check_lightsail_userdata.py
 

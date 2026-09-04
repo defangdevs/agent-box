@@ -90,7 +90,7 @@ REBOOT_TRIGGER = f"{SYSTEMCTL} reboot --no-block"
 # Store housekeeping (issue #394). A full root wedges the whole box —
 # no journal, no profile swap, and an agent that cannot write — and on a
 # native box nobody is around to run `nix-collect-garbage` by hand. The
-# NixOS deployments get this from their host configuration (aws/template.yaml
+# NixOS deployments get this from their host configuration (deploy/aws/template.yaml
 # sets nix.gc + min-free/max-free); a native box has no such layer, so the
 # renderer owns it. Same policy as that config, deliberately: a store that
 # behaves differently depending on how the box was deployed is a support
@@ -369,7 +369,7 @@ def profile_origin(profile):
     The profile is the ground truth for "what rev is this box running", and
     the reason `Spec` does not need a `repo:`/`rev:` config field for it
     (issue #358's second open question). config.yaml as written by
-    aws/lightsail-template.yaml sets neither, so before this the
+    deploy/aws/lightsail-template.yaml sets neither, so before this the
     settings page advertised the placeholder defaults — a repo that happened
     to be right and a rev of forty zeroes — on every native box.
     """

@@ -30,7 +30,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if git diff --quiet aws/template.yaml; then
+          if git diff --quiet deploy/aws/template.yaml; then
             echo "No AMI changes."
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -39,7 +39,7 @@ jobs:
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           branch="chore/refresh-amis-${{ github.run_id }}"
           git checkout -b "$branch"
-          git add aws/template.yaml
+          git add deploy/aws/template.yaml
           git commit -m "Refresh NixOS AMI map (26.05)"
           git push origin "$branch"
           gh pr create --base "$GITHUB_REF_NAME" --head "$branch" \
@@ -57,7 +57,7 @@ jobs:
       #
       # Commits pushed (or merged) with GITHUB_TOKEN do not trigger workflows,
       # so neither the old direct push nor this merge fires publish-template.yml
-      # (which watches pushes touching aws/template.yaml) — the refreshed AMI
+      # (which watches pushes touching deploy/aws/template.yaml) — the refreshed AMI
       # map would stay on master and never reach the S3 template the 1-click
       # Launch buttons serve. That is not theoretical: 5542d8f (2026-07-06)
       # landed the only AMI bump so far, and there was no publish run for it in
@@ -69,7 +69,7 @@ jobs:
       # a review gate, but it re-enables workflow cascades for every job sharing
       # that identity. Not worth it for a job whose output is a generated map.
       #
-      # publish-template.yml runs `cfn-lint aws/template.yaml` before uploading,
+      # publish-template.yml runs `cfn-lint deploy/aws/template.yaml` before uploading,
       # so the dispatched run validates the map it is about to publish.
       - name: Publish the bump
         if: steps.commit.outputs.changed == 'true'
