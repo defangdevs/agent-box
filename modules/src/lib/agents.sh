@@ -180,10 +180,9 @@ agent_install() {
        "$AGENT_BOX_NIXPKGS#$_ai_attr" >&2; then
     rm -f "$_ai_marker"
     exec 8>&-
-    # A freshly installed codex needs the standalone layout its
-    # remote-control pairing looks for. The boot-time call to this ran
-    # before the binary existed, so it found nothing to mirror.
-    [ "$_ai_agent" = codex ] && mirror_codex_standalone
+    # No mirror_codex_standalone call here: start_session mirrors the
+    # binary it is about to launch, which on this path is the one just
+    # installed, on this same reconcile pass (issue #572).
     return 0
   fi
   # Stamp the marker at WRITE time, not with the pre-attempt $_ai_now: the
@@ -202,11 +201,28 @@ agent_install() {
 # Mirror that fixed path to the provided Codex so pairing works
 # without a curl-installed second copy.
 #
-# A function, not a straight-line block, because a JIT-installed codex
-# (issue #416) does not exist yet when this file is sourced: agent_install
-# calls this again once the binary is really there.
+# CALLED AT SESSION START, from start_session's codex branch, and nowhere
+# else (issue #572). Seeding it at INSTALL time instead needs a hook on
+# every path that can put a codex on this box, and there are more of them
+# than there were when this began: the eager closure, the JIT fetch
+# (issue #416), the settings page's Connections card — which grew its own
+# `nix profile add` and mirrored nothing, so every session on a default
+# box died with "managed standalone Codex install not found" — and a
+# user's own `nix profile add nixpkgs#codex`, which the platform guide
+# actively suggests and which no hook of ours can ever observe. Session
+# start is the one place that sees the binary about to run whatever put it
+# there, and this is two ln(1)s on an idempotent path, so re-running it
+# per launch costs nothing worth measuring.
+#
+# $1 is the codex binary to mirror (start_session passes the resolved,
+# already-JIT-installed one). A bare call resolves it like agent_bin does
+# and no-ops when there is no codex to point at.
 mirror_codex_standalone() {
-  cbin="$(agent_bin codex)" || return 0
+  if [ -n "${1:-}" ]; then
+    cbin=$1
+  else
+    cbin="$(agent_bin codex)" || return 0
+  fi
   mkdir -p "$HOME"/.codex/packages/standalone/agent-box-current
   ln -sfn "$cbin" "$HOME"/.codex/packages/standalone/agent-box-current/codex
   # `ln -sfn` only replaces `current` when it is already a symlink or a

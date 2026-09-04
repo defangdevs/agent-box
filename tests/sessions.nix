@@ -120,7 +120,19 @@ in
     # reach the network to prove the fetch.
     machine.succeed("test -x /run/current-system/sw/bin/claude")
     machine.succeed("test -x /run/current-system/sw/bin/codex")
-    machine.succeed("su -s /bin/sh agent -c 'test -x /home/agent/.codex/packages/standalone/current/codex'")
+    # The standalone layout `codex app-server daemon` insists on is seeded
+    # at codex SESSION START, not at install or boot time (issue #572), so
+    # it is absent here: only the seeded claude "main" session has run, and
+    # a codex in the closure is not by itself a reason to write into
+    # $CODEX_HOME. This is the negative control for the assertion further
+    # down that the first codex session creates it — a box that seeded it at
+    # boot passed that one whatever the session path did, which is how the
+    # Connections-card install (a codex arriving MINUTES after boot, on a
+    # default box whose closure ships none) went unnoticed.
+    machine.fail(
+        "su -s /bin/sh agent -c "
+        "'test -e /home/agent/.codex/packages/standalone/current'"
+    )
     machine.succeed("test -x /run/current-system/sw/bin/bwrap")
     # Tools agents assume exist resolve by bare name in agent tool shells.
     # Assert against the UNIT's PATH, not via as_agent(): that runs under su,
@@ -315,6 +327,25 @@ in
         "jq -e '.sessions.helper.agent == \"codex\"' "
         "/home/agent/.config/agent-box/sessions.json"
     )
+
+    # Starting a codex session is what seeds the standalone layout (issue
+    # #572), and it points at the binary the session was launched with.
+    # Asserted HERE, before the daemon assertions below, so a regression
+    # reports the missing mirror rather than surfacing as an opaque
+    # `app-server daemon` timeout 60 seconds later — which is all the
+    # original bug ever showed anyone.
+    machine.wait_until_succeeds(
+        as_agent("test -x /home/agent/.codex/packages/standalone/current/codex"),
+        timeout=60,
+    )
+    codex_store = machine.succeed(
+        "readlink -f /run/current-system/sw/bin/codex"
+    ).strip()
+    mirrored = machine.succeed(
+        "su -s /bin/sh agent -c "
+        "'readlink -f /home/agent/.codex/packages/standalone/current/codex'"
+    ).strip()
+    assert mirrored == codex_store, f"{mirrored} != {codex_store}"
 
     # Codex honours remoteControl (issue 103): with the default
     # remoteControl=true, a codex session starts the local app-server daemon,

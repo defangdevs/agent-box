@@ -281,7 +281,6 @@ sync_webhook_plugin() {
 }
 
 @@include:lib/agents.sh@@
-mirror_codex_standalone
 
 # The box's own sources, on the box (issue #242). Backgrounded on purpose:
 # the first run clones a repository over the network and no session may wait
@@ -699,6 +698,16 @@ start_session() {
       [ -n "$prompt" ] && cmd="$cmd -- $(printf '%q' "$prompt")"
       ;;
     codex)
+      # `codex app-server daemon` refuses to start unless the standalone
+      # installer layout exists at a fixed path under $CODEX_HOME, so seed
+      # it with the binary we are about to launch — here, at session start,
+      # rather than when codex was installed (issue #572, and see
+      # mirror_codex_standalone for why install time cannot be made to
+      # cover every path). Unconditional across the rc/TUI branches below:
+      # a TUI session does not need the layout, but it costs two symlinks
+      # and it means a box whose first codex session is a TUI one is
+      # already correct when someone later adds a remote-controlled one.
+      mirror_codex_standalone "$bin"
       if [ "$rc" = true ]; then
         # Codex remote control uses a dedicated app-server daemon, not a
         # TUI flag (issue 103), whereas claude takes a
@@ -728,8 +737,8 @@ start_session() {
         # wrapper gives it the host label through a private UTS namespace
         # instead (see codexRemoteControl). Pairing the
         # Codex apps to a running daemon uses `codex remote-control
-        # pair`; the standalone-path shim seeded above is what lets the
-        # Nix codex serve as the app-server. The daemon takes no
+        # pair`; the standalone-path shim seeded just above is what lets
+        # the Nix codex serve as the app-server. The daemon takes no
         # positional prompt and has no TUI transcript to resume, so the
         # kickoff/resume wiring below does not apply to it.
         cmd="$(printf '%q' "${AGENT_BOX_CODEX_RC:?}") $(printf '%q' "${AGENT_BOX_HOST_LABEL:-}") $cmd"

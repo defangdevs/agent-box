@@ -172,15 +172,64 @@ case "$call" in
   *) no "it installs from the box's pinned nixpkgs" "argv was [$call]" ;;
 esac
 
-# --- codex gets its standalone mirror re-made ---------------------------
+# --- the standalone mirror points at the binary it is handed -----------
+# The mirror is seeded at SESSION START now, not at install time (issue
+# #572): start_session hands it the binary it is about to launch, so the
+# argument is the contract these cases pin. Driving it through
+# agent_install instead — as this case used to — would only prove the JIT
+# path, which is the one path that was never broken.
 setup codexmirror
 export AGENT_BOX_AGENT_BINS="shell=/bin/bash"
-agent_install codex >/dev/null 2>&1
+printf '#!%s\n' "$BASH_BIN" > "$HOME/.nix-profile/bin/codex"
+chmod +x "$HOME/.nix-profile/bin/codex"
+mirror_codex_standalone "$HOME/.nix-profile/bin/codex"
 if [ -x "$HOME/.codex/packages/standalone/current/codex" ]; then
-  ok "a JIT-installed codex gets the standalone layout RC pairing needs"
+  ok "the standalone layout RC pairing needs is created"
 else
-  no "a JIT-installed codex gets the standalone layout RC pairing needs" \
+  no "the standalone layout RC pairing needs is created" \
      "no symlink at ~/.codex/packages/standalone/current/codex"
+fi
+is "current/codex resolves to the binary it was handed" \
+   "$(readlink -f "$HOME/.nix-profile/bin/codex")" \
+   "$(readlink -f "$HOME/.codex/packages/standalone/current/codex")"
+
+# --- a codex nothing on the box can RESOLVE is still mirrored ----------
+# The bug in issue #572: the settings page's Connections card runs its own
+# `nix profile add` and the eager table names a path the runtime profile
+# was built without, so at the moment the layout was seeded nothing could
+# resolve a codex at all. Passing the binary explicitly is what makes the
+# mirror independent of resolution — assert that with an AGENT_BOX_AGENT_BINS
+# naming a codex that does not exist, which is exactly what a native box
+# whose profile ships no harnesses has.
+setup codexmirror_unresolvable
+export AGENT_BOX_AGENT_BINS="codex=/nonexistent/profile/bin/codex shell=/bin/bash"
+printf '#!%s\n' "$BASH_BIN" > "$HOME/card-installed-codex"
+chmod +x "$HOME/card-installed-codex"
+if agent_bin codex >/dev/null 2>&1; then
+  no "the fixture really has an unresolvable codex" "agent_bin resolved one"
+fi
+mirror_codex_standalone "$HOME/card-installed-codex"
+is "an explicitly passed codex is mirrored even when agent_bin resolves none" \
+   "$HOME/card-installed-codex" \
+   "$(readlink "$HOME/.codex/packages/standalone/agent-box-current/codex")"
+
+# --- a bare call with no codex anywhere is a silent no-op --------------
+# start_session only calls this from its codex branch, so the bare form is
+# reached by nothing today — but it must not leave a half-built layout
+# behind (a `current` symlink pointing at a codex that is not there would
+# make `daemon start` fail with a dangling path instead of a clear one).
+setup codexmirror_nocodex
+export AGENT_BOX_AGENT_BINS="shell=/bin/bash"
+if mirror_codex_standalone; then
+  ok "a bare call with no codex installed returns success"
+else
+  no "a bare call with no codex installed returns success" "it returned failure"
+fi
+if [ -e "$HOME/.codex/packages/standalone/current" ]; then
+  no "a bare call with no codex leaves no layout behind" \
+     "current exists with no codex to point at"
+else
+  ok "a bare call with no codex leaves no layout behind"
 fi
 
 # --- the standalone mirror survives a pre-existing REAL directory ------
@@ -192,9 +241,11 @@ fi
 # case can only be caught here, not by the sessions VM test.
 setup codexmirror_realdir
 export AGENT_BOX_AGENT_BINS="shell=/bin/bash"
+printf '#!%s\n' "$BASH_BIN" > "$HOME/.nix-profile/bin/codex"
+chmod +x "$HOME/.nix-profile/bin/codex"
 mkdir -p "$HOME/.codex/packages/standalone/current"
 : > "$HOME/.codex/packages/standalone/current/stale-marker"
-agent_install codex >/dev/null 2>&1
+mirror_codex_standalone "$HOME/.nix-profile/bin/codex"
 if [ -L "$HOME/.codex/packages/standalone/current" ]; then
   ok "a pre-existing real 'current' directory is replaced with a symlink"
 else
