@@ -684,8 +684,34 @@ case "$cmd" in
     # The OLDEST installed copy decides: a project-scope install shadows the
     # user one, and the stalest is the one that can break the brake.
     skew=none
+    plugin_state=""
     if [ -z "$installed" ]; then
       skew=unknown
+      # plugin_versions() swallows every failure to keep status() usable when
+      # nothing is installed yet, which used to leave this reported as "is
+      # missing" even when the file exists but jq choked on it, or parsed
+      # cleanly to no versions for this plugin (issue #568) — three different
+      # states that need three different fixes, not one guess.
+      if [ ! -f "$PLUGINS" ]; then
+        plugin_state="$PLUGINS is missing"
+      elif ! "$JQ" . "$PLUGINS" >/dev/null 2>&1; then
+        # Syntax-only: -e also treats a top-level null/false as a failure,
+        # which is a parse SUCCESS by any JSON reader's definition.
+        plugin_state="$PLUGINS did not parse as JSON"
+      else
+        # Non-numeric (top-level null/false/an array — nowhere a version
+        # could live) counts the same as zero: no entry to report on.
+        entries="$("$JQ" -r '.plugins["local-webhook@local-channels"] // [] | length' \
+                     "$PLUGINS" 2>/dev/null)"
+        case "$entries" in (''|*[!0-9]*) entries=0 ;; esac
+        if [ "$entries" = 0 ]; then
+          plugin_state="$PLUGINS has no local-webhook@local-channels entry"
+        else
+          # A record exists but plugin_versions() found no .version on any
+          # of them — a different fault than no record at all.
+          plugin_state="$PLUGINS has a local-webhook@local-channels entry with no version"
+        fi
+      fi
     elif [ -n "$pinned" ]; then
       oldest="$(printf '%s\n' $installed | sort -V | head -1)"
       if [ "$oldest" = "$pinned" ]; then
@@ -749,7 +775,7 @@ case "$cmd" in
     # nothing at all.
     if [ "$skew" = unknown ]; then
       echo "agent-box-webhook: cannot tell which local-webhook a session loads" \
-           "($PLUGINS is missing) — if sessions run one, its version is unverified (issue #193)" >&2
+           "($plugin_state) — if sessions run one, its version is unverified (issue #193)" >&2
     elif [ "$skew" = older ]; then
       echo "agent-box-webhook: version skew — sessions load local-webhook $installed," \
            "OLDER than the pinned $pinned. webhook.syncSessionPlugin normally cures this at the" \

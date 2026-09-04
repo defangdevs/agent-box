@@ -390,6 +390,12 @@
     # socket "<pid>.sock", which parses to no filter key, so no live session is
     # visible and one failing run spawns a session per CI event (#192). status
     # is the only place that says so, so assert it does.
+    #
+    # "main" is stopped for the block (#568): syncSessionPlugin re-checks the
+    # cache on every (re)start of that live claude process, and a restart
+    # mid-block races the hand-written versions below. Same idiom the
+    # delivery-spawn assertion further down uses to remove a different race.
+    machine.succeed("systemctl stop agent-box@agent.service")
     hookenv = (
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
@@ -477,6 +483,27 @@
     st = status()
     assert st["peers"] == {"live": 1, "keyed": 1, "shared": 0, "legacy": 0}, st["peers"]
     machine.succeed(f"rm -f {inst}/4194305.sock")
+
+    # "cannot tell" used to say the file was missing even when it merely
+    # failed to parse, or parsed fine to no versions for this plugin (#568).
+    ip = "/home/agent/.claude/plugins/installed_plugins.json"
+    machine.succeed(f"echo 'not json' > {ip} && chown agent:users {ip}")
+    st = status(expect_warning="did not parse as JSON")
+    assert st["plugin"]["sessionVersions"] == [], st["plugin"]
+    machine.succeed(f"jq -n '{{version: 2, plugins: {{}}}}' > {ip} && chown agent:users {ip}")
+    st = status(expect_warning="has no local-webhook@local-channels entry")
+    assert st["plugin"]["sessionVersions"] == [], st["plugin"]
+    # A record exists but carries no .version: a different fault than none at
+    # all, and NOT "no entry" — jq's `-e` also used to misjudge this file's
+    # own valid-but-falsy top-level values (null, false) as unparseable.
+    machine.succeed(
+        "jq -n '{version: 2, plugins: {\"local-webhook@local-channels\": [{}]}}'"
+        f" > {ip} && chown agent:users {ip}"
+    )
+    st = status(expect_warning="entry with no version")
+    assert st["plugin"]["sessionVersions"] == [], st["plugin"]
+
+    machine.succeed("systemctl start agent-box@agent.service")
 
     # --- deliveries --------------------------------------------------------
     # A GitHub-shaped workflow_run on the subscribed repo, signed correctly.
