@@ -282,6 +282,30 @@ class ProfilePanel(ProfileFixture):
         options = module.render_profile_options(module.read_profiles())
         self.assertNotIn("triage", options)
 
+    # --- reasoning-level picker (issue #493's layout checklist) -----
+
+    def test_the_reasoning_level_field_is_a_picker_not_free_text(self):
+        """A blank value is "default" - a real, selectable option that
+        means "no --effort of its own" - and is preselected when the
+        profile carries none."""
+        module = self.daemon()
+        options = module.render_effort_options()
+        self.assertIn('<option value="" selected>default</option>', options)
+        for level in ("low", "medium", "high", "xhigh", "max"):
+            self.assertIn(f'<option value="{level}">{level}</option>', options)
+
+    def test_a_stored_effort_the_picker_does_not_know_survives_unselected(self):
+        """A value written before the picker existed (or by
+        agent-box-profile directly) must not vanish just because a save
+        with nothing touched hits Save: showing "default" while the file
+        still holds the old value would erase it on the next write."""
+        module = self.daemon()
+        options = module.render_effort_options("minimal")
+        self.assertIn('<option value="minimal" selected>minimal</option>',
+                     options)
+        self.assertIn('<option value="">default</option>', options)
+        self.assertNotIn('<option value="high" selected>', options)
+
 
 class ProfileRoutes(ProfileFixture):
     """The four POST verbs, driven over HTTP against the real handler.
@@ -366,6 +390,49 @@ class ProfileRoutes(ProfileFixture):
         self.assertNotIn("hunter2", page)
         self.post(base, "/profiles/delkey", name="review", key="API_TOKEN")
         self.assertNotIn("API_TOKEN", self.profile_text("review"))
+
+    def test_a_starting_environment_setting_rides_in_on_the_same_save(self):
+        """The "New profile" pane has no fold to add a setting to until
+        the profile exists (issue #493), so one pair travels in on the
+        same POST as the launch config, written in the SAME profile_write
+        call rather than a second round trip through /profiles/setkey's
+        must_exist gate."""
+        _, base = self.serve()
+        status, _ = self.post(base, "/profiles/set", name="fresh",
+                              HARNESS="claude", key="API_TOKEN",
+                              value="hunter2")
+        self.assertEqual(status, 303)
+        text = self.profile_text("fresh")
+        self.assertIn("HARNESS=claude", text)
+        self.assertIn("API_TOKEN=hunter2", text)
+
+    def test_a_blank_starting_setting_is_simply_skipped(self):
+        """The ordinary case: most profiles start with no environment
+        setting of their own, and a bare Save with the field left empty
+        must not fail or write an empty key."""
+        _, base = self.serve()
+        status, _ = self.post(base, "/profiles/set", name="plain",
+                              HARNESS="claude")
+        self.assertEqual(status, 303)
+        self.assertEqual(self.module.read_profiles()["plain"]["env"], [])
+
+    def test_a_reserved_name_in_the_starting_setting_is_refused(self):
+        """The same rule /profiles/setkey enforces: a reserved key is
+        launch config, cleared by leaving that field blank instead."""
+        _, base = self.serve()
+        status, body = self.post(base, "/profiles/set", name="clash",
+                                 HARNESS="claude", key="MODEL", value="x")
+        self.assertEqual(status, 400)
+        self.assertIn("Model is already a profile option", body)
+        self.assertIsNone(self.profile_text("clash"))
+
+    def test_an_invalid_starting_setting_name_is_refused(self):
+        _, base = self.serve()
+        status, body = self.post(base, "/profiles/set", name="badkey",
+                                 HARNESS="claude", key="1bad", value="x")
+        self.assertEqual(status, 400)
+        self.assertIn("Invalid setting name", body)
+        self.assertIsNone(self.profile_text("badkey"))
 
     def test_a_reserved_key_cannot_be_set_as_environment(self):
         """It is launch config, and it is cleared by saving the form with
