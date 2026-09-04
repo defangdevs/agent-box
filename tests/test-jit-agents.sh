@@ -48,6 +48,7 @@ setup() {
   export AGENT_BOX_NIXPKGS="https://example.invalid/nixpkgs.tar.xz"
   export AGENT_BOX_NIX_BIN="$work/bin/nix"
   export AGENT_BOX_FLOCK_BIN="$work/bin/flock"
+  export AGENT_BOX_ENVSTORE_BIN="$work/bin/agent-box-envstore"
   export AGENT_BOX_AGENT_BINS="shell=/bin/bash"
   export NIX_CALLS="$HOME/nix-calls"
   : > "$NIX_CALLS"
@@ -83,6 +84,25 @@ printf '%s\n' "\$*" >> "\$HOME/flock-calls"
 exit 0
 EOF
 chmod +x "$work/bin/flock"
+
+# agent-box-envstore shim: `get KEY [--profile NAME]` only, against plain
+# KEY=VALUE lines under \$HOME/.config/agent-box — no quoting support,
+# these tests never write a value that needs it. Matches the real CLI's
+# "get on a miss exits 1 with nothing on stdout" contract, which
+# resolve_codex_home relies on to fall through its precedence.
+cat > "$work/bin/agent-box-envstore" <<EOF
+#!$BASH_BIN
+cfg="\$HOME/.config/agent-box"
+[ "\${1:-}" = get ] || { echo "unsupported verb: \${1:-}" >&2; exit 2; }
+key=\$2
+file="\$cfg/env"
+[ "\${3:-}" = --profile ] && file="\$cfg/profiles/\${4:?}.env"
+[ -f "\$file" ] || exit 1
+v=\$(sed -n "s/^\$key=//p" "\$file" | tail -n1)
+[ -n "\$v" ] || exit 1
+printf '%s' "\$v"
+EOF
+chmod +x "$work/bin/agent-box-envstore"
 
 # --- attribute mapping --------------------------------------------------
 setup attr
@@ -172,15 +192,67 @@ case "$call" in
   *) no "it installs from the box's pinned nixpkgs" "argv was [$call]" ;;
 esac
 
-# --- codex gets its standalone mirror re-made ---------------------------
+# --- the standalone mirror points at the binary it is handed -----------
+# The mirror is seeded at SESSION START now, not at install time (issue
+# #572): start_session hands it the binary it is about to launch, so the
+# argument is the contract these cases pin. Driving it through
+# agent_install instead — as this case used to — would only prove the JIT
+# path, which is the one path that was never broken.
 setup codexmirror
 export AGENT_BOX_AGENT_BINS="shell=/bin/bash"
-agent_install codex >/dev/null 2>&1
+printf '#!%s\n' "$BASH_BIN" > "$HOME/.nix-profile/bin/codex"
+chmod +x "$HOME/.nix-profile/bin/codex"
+mirror_codex_standalone "$HOME/.nix-profile/bin/codex"
 if [ -x "$HOME/.codex/packages/standalone/current/codex" ]; then
-  ok "a JIT-installed codex gets the standalone layout RC pairing needs"
+  ok "the standalone layout RC pairing needs is created"
 else
-  no "a JIT-installed codex gets the standalone layout RC pairing needs" \
+  no "the standalone layout RC pairing needs is created" \
      "no symlink at ~/.codex/packages/standalone/current/codex"
+fi
+is "current/codex resolves to the binary it was handed" \
+   "$(readlink -f "$HOME/.nix-profile/bin/codex")" \
+   "$(readlink -f "$HOME/.codex/packages/standalone/current/codex")"
+
+# --- a codex nothing on the box can RESOLVE is still mirrored ----------
+# The bug in issue #572: the settings page's Connections card runs its own
+# `nix profile add` and the eager table names a path the runtime profile
+# was built without, so at the moment the layout was seeded nothing could
+# resolve a codex at all. Passing the binary explicitly is what makes the
+# mirror independent of resolution — assert that with an AGENT_BOX_AGENT_BINS
+# naming a codex that does not exist, which is exactly what a native box
+# whose profile ships no harnesses has.
+setup codexmirror_unresolvable
+export AGENT_BOX_AGENT_BINS="codex=/nonexistent/profile/bin/codex shell=/bin/bash"
+printf '#!%s\n' "$BASH_BIN" > "$HOME/card-installed-codex"
+chmod +x "$HOME/card-installed-codex"
+if agent_bin codex >/dev/null 2>&1; then
+  no "the fixture really has an unresolvable codex" "agent_bin resolved one"
+fi
+mirror_codex_standalone "$HOME/card-installed-codex"
+is "an explicitly passed codex is mirrored even when agent_bin resolves none" \
+   "$HOME/card-installed-codex" \
+   "$(readlink "$HOME/.codex/packages/standalone/agent-box-current/codex")"
+
+# --- a bare call with no codex anywhere is a silent no-op --------------
+# start_session only calls this from its codex branch, so the bare form is
+# reached by nothing today — but it must not leave a half-built layout
+# behind (a `current` symlink pointing at a codex that is not there would
+# make `daemon start` fail with a dangling path instead of a clear one).
+setup codexmirror_nocodex
+export AGENT_BOX_AGENT_BINS="shell=/bin/bash"
+if mirror_codex_standalone; then
+  ok "a bare call with no codex installed returns success"
+else
+  no "a bare call with no codex installed returns success" "it returned failure"
+fi
+# `-e` alone follows the symlink and would call a DANGLING `current`
+# absent too; `-L` catches the link itself regardless of its target.
+if [ -e "$HOME/.codex/packages/standalone/current" ] ||
+   [ -L "$HOME/.codex/packages/standalone/current" ]; then
+  no "a bare call with no codex leaves no layout behind" \
+     "current exists with no codex to point at"
+else
+  ok "a bare call with no codex leaves no layout behind"
 fi
 
 # --- the standalone mirror survives a pre-existing REAL directory ------
@@ -192,9 +264,11 @@ fi
 # case can only be caught here, not by the sessions VM test.
 setup codexmirror_realdir
 export AGENT_BOX_AGENT_BINS="shell=/bin/bash"
+printf '#!%s\n' "$BASH_BIN" > "$HOME/.nix-profile/bin/codex"
+chmod +x "$HOME/.nix-profile/bin/codex"
 mkdir -p "$HOME/.codex/packages/standalone/current"
 : > "$HOME/.codex/packages/standalone/current/stale-marker"
-agent_install codex >/dev/null 2>&1
+mirror_codex_standalone "$HOME/.nix-profile/bin/codex"
 if [ -L "$HOME/.codex/packages/standalone/current" ]; then
   ok "a pre-existing real 'current' directory is replaced with a symlink"
 else
@@ -213,6 +287,54 @@ if [ -e "$HOME/.codex/packages/standalone/current/stale-marker" ]; then
 else
   ok "the stale directory's contents are gone, not nested underneath"
 fi
+
+# --- the mirror lands under an explicit CODEX_HOME, not $HOME/.codex ----
+# issue #572 CodeRabbit follow-up: a session's profile can set CODEX_HOME,
+# and only resolve_codex_home (below) sees it from this process — but
+# mirror_codex_standalone itself just needs to honour whatever it is
+# handed instead of hardcoding $HOME/.codex.
+setup codexmirror_explicit_home
+export AGENT_BOX_AGENT_BINS="shell=/bin/bash"
+printf '#!%s\n' "$BASH_BIN" > "$HOME/.nix-profile/bin/codex"
+chmod +x "$HOME/.nix-profile/bin/codex"
+mirror_codex_standalone "$HOME/.nix-profile/bin/codex" "$HOME/custom-codex-home"
+is "an explicit CODEX_HOME is mirrored into, not \$HOME/.codex" \
+   "$HOME/.nix-profile/bin/codex" \
+   "$(readlink "$HOME/custom-codex-home/packages/standalone/agent-box-current/codex")"
+if [ -e "$HOME/.codex/packages/standalone/current" ]; then
+  no "an explicit CODEX_HOME leaves \$HOME/.codex untouched" \
+     "\$HOME/.codex/packages/standalone/current exists too"
+else
+  ok "an explicit CODEX_HOME leaves \$HOME/.codex untouched"
+fi
+
+# --- resolve_codex_home's precedence -------------------------------------
+# The same precedence env-exec.py applies at spawn (box store, then the
+# named profile on top), so the supervisor's own guess agrees with what
+# the session's own env-exec pass will actually load.
+setup resolve_codex_home_default
+is "no store, no profile: falls back to \$HOME/.codex" \
+   "$HOME/.codex" "$(resolve_codex_home '')"
+
+setup resolve_codex_home_store
+mkdir -p "$HOME/.config/agent-box"
+printf 'CODEX_HOME=%s/from-store\n' "$HOME" > "$HOME/.config/agent-box/env"
+is "the box-wide store's CODEX_HOME wins over the \$HOME/.codex fallback" \
+   "$HOME/from-store" "$(resolve_codex_home '')"
+
+setup resolve_codex_home_profile
+mkdir -p "$HOME/.config/agent-box"
+printf 'CODEX_HOME=%s/from-store\n' "$HOME" > "$HOME/.config/agent-box/env"
+mkdir -p "$HOME/.config/agent-box/profiles"
+printf 'CODEX_HOME=%s/from-profile\n' "$HOME" > "$HOME/.config/agent-box/profiles/myprofile.env"
+is "a named profile's CODEX_HOME wins over the box-wide store's" \
+   "$HOME/from-profile" "$(resolve_codex_home myprofile)"
+
+setup resolve_codex_home_profile_unset
+mkdir -p "$HOME/.config/agent-box"
+printf 'CODEX_HOME=%s/from-store\n' "$HOME" > "$HOME/.config/agent-box/env"
+is "a profile with no CODEX_HOME of its own falls through to the store's" \
+   "$HOME/from-store" "$(resolve_codex_home noprofile)"
 
 # --- failure is rate-limited -------------------------------------------
 setup cooldown

@@ -7,7 +7,8 @@
     { "name": "AGENT_BOX_FLOCK_BIN", "kind": "bin", "program": "flock" },
     { "name": "AGENT_BOX_HOSTNAME_BIN", "kind": "bin", "program": "hostname" },
     { "name": "AGENT_BOX_ENV_EXEC", "kind": "bin", "program": "agent-box-env-exec" },
-    { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" }
+    { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" },
+    { "name": "AGENT_BOX_ENVSTORE_BIN", "kind": "bin", "program": "agent-box-envstore" }
   ],
   "execStart": [
     { "kind": "bin", "program": "agent-box-supervisor" }

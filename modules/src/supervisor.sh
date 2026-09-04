@@ -281,7 +281,6 @@ sync_webhook_plugin() {
 }
 
 @@include:lib/agents.sh@@
-mirror_codex_standalone
 
 # The box's own sources, on the box (issue #242). Backgrounded on purpose:
 # the first run clones a repository over the network and no session may wait
@@ -699,6 +698,20 @@ start_session() {
       [ -n "$prompt" ] && cmd="$cmd -- $(printf '%q' "$prompt")"
       ;;
     codex)
+      # `codex app-server daemon` refuses to start unless the standalone
+      # installer layout exists at a fixed path under $CODEX_HOME, so seed
+      # it with the binary we are about to launch — here, at session start,
+      # rather than when codex was installed (issue #572, and see
+      # mirror_codex_standalone for why install time cannot be made to
+      # cover every path). Unconditional across the rc/TUI branches below:
+      # a TUI session does not need the layout, but it costs two symlinks
+      # and it means a box whose first codex session is a TUI one is
+      # already correct when someone later adds a remote-controlled one.
+      # resolve_codex_home, not a bare $CODEX_HOME: this process never
+      # sources this session's profile, only AGENT_BOX_ENV_EXEC does, once
+      # inside the pane, so the supervisor's own environment cannot see a
+      # profile's override here.
+      mirror_codex_standalone "$bin" "$(resolve_codex_home "$sprofile")"
       if [ "$rc" = true ]; then
         # Codex remote control uses a dedicated app-server daemon, not a
         # TUI flag (issue 103), whereas claude takes a
@@ -728,8 +741,8 @@ start_session() {
         # wrapper gives it the host label through a private UTS namespace
         # instead (see codexRemoteControl). Pairing the
         # Codex apps to a running daemon uses `codex remote-control
-        # pair`; the standalone-path shim seeded above is what lets the
-        # Nix codex serve as the app-server. The daemon takes no
+        # pair`; the standalone-path shim seeded just above is what lets
+        # the Nix codex serve as the app-server. The daemon takes no
         # positional prompt and has no TUI transcript to resume, so the
         # kickoff/resume wiring below does not apply to it.
         cmd="$(printf '%q' "${AGENT_BOX_CODEX_RC:?}") $(printf '%q' "${AGENT_BOX_HOST_LABEL:-}") $cmd"
@@ -830,11 +843,11 @@ start_session() {
   # which is what a session doing real work does. The global file is the
   # scope that survives that, so point it at the canonical guide — the
   # exact counterpart of claude's ~/.claude/CLAUDE.md above. IFF absent, so
-  # an agent's own global instructions win. CODEX_HOME is codex's own
-  # override for that directory and nothing here sets it, but honour it the
-  # way codex-remote-control.sh does rather than hardcoding the default.
+  # an agent's own global instructions win. resolve_codex_home, not a bare
+  # $CODEX_HOME, for the same reason the standalone mirror above needs it:
+  # a profile's override never reaches this process's own environment.
   if [ "$agent" = codex ] && [ -n "${AGENT_BOX_GUIDE_TARGET:-}" ]; then
-    cxhome="${CODEX_HOME:-$HOME/.codex}"
+    cxhome="$(resolve_codex_home "$sprofile")"
     if [ ! -e "$cxhome/AGENTS.md" ]; then
       mkdir -p "$cxhome"
       ln -s "$AGENT_BOX_GUIDE_TARGET" "$cxhome/AGENTS.md"

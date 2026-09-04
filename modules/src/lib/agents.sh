@@ -180,10 +180,9 @@ agent_install() {
        "$AGENT_BOX_NIXPKGS#$_ai_attr" >&2; then
     rm -f "$_ai_marker"
     exec 8>&-
-    # A freshly installed codex needs the standalone layout its
-    # remote-control pairing looks for. The boot-time call to this ran
-    # before the binary existed, so it found nothing to mirror.
-    [ "$_ai_agent" = codex ] && mirror_codex_standalone
+    # No mirror_codex_standalone call here: start_session mirrors the
+    # binary it is about to launch, which on this path is the one just
+    # installed, on this same reconcile pass (issue #572).
     return 0
   fi
   # Stamp the marker at WRITE time, not with the pre-attempt $_ai_now: the
@@ -202,13 +201,40 @@ agent_install() {
 # Mirror that fixed path to the provided Codex so pairing works
 # without a curl-installed second copy.
 #
-# A function, not a straight-line block, because a JIT-installed codex
-# (issue #416) does not exist yet when this file is sourced: agent_install
-# calls this again once the binary is really there.
+# CALLED AT SESSION START, from start_session's codex branch, and nowhere
+# else (issue #572). Seeding it at INSTALL time instead needs a hook on
+# every path that can put a codex on this box, and there are more of them
+# than there were when this began: the eager closure, the JIT fetch
+# (issue #416), the settings page's Connections card — which grew its own
+# `nix profile add` and mirrored nothing, so every session on a default
+# box died with "managed standalone Codex install not found" — and a
+# user's own `nix profile add nixpkgs#codex`, which the platform guide
+# actively suggests and which no hook of ours can ever observe. Session
+# start is the one place that sees the binary about to run whatever put it
+# there, and this is two ln(1)s on an idempotent path, so re-running it
+# per launch costs nothing worth measuring.
+#
+# $1 is the codex binary to mirror (start_session passes the resolved,
+# already-JIT-installed one). A bare call resolves it like agent_bin does
+# and no-ops when there is no codex to point at.
+#
+# $2 is the CODEX_HOME to mirror it under, defaulting like every other
+# reader of that variable to $HOME/.codex — but a bare fallback to the
+# environment here would read supervisor.sh's own process, not the
+# session's: a profile's CODEX_HOME only reaches the actual process
+# through AGENT_BOX_ENV_EXEC, inside the tmux pane this call is preparing
+# for. resolve_codex_home is what start_session passes instead, so the
+# layout lands where that session's app-server daemon will actually look
+# for it.
 mirror_codex_standalone() {
-  cbin="$(agent_bin codex)" || return 0
-  mkdir -p "$HOME"/.codex/packages/standalone/agent-box-current
-  ln -sfn "$cbin" "$HOME"/.codex/packages/standalone/agent-box-current/codex
+  if [ -n "${1:-}" ]; then
+    cbin=$1
+  else
+    cbin="$(agent_bin codex)" || return 0
+  fi
+  cxhome="${2:-${CODEX_HOME:-$HOME/.codex}}"
+  mkdir -p "$cxhome/packages/standalone/agent-box-current"
+  ln -sfn "$cbin" "$cxhome/packages/standalone/agent-box-current/codex"
   # `ln -sfn` only replaces `current` when it is already a symlink or a
   # plain file (issue #95). If a curl-installed Codex ever leaves `current`
   # as a REAL directory — an unusual manual layout, but a possible one —
@@ -229,7 +255,7 @@ mirror_codex_standalone() {
   # rename it over `current` — `rename()` is atomic, so a session reading
   # `current` mid-update here sees either the old or the new target, never
   # a missing path (except immediately following the repair above).
-  _mcs_current="$HOME/.codex/packages/standalone/current"
+  _mcs_current="$cxhome/packages/standalone/current"
   if [ -d "$_mcs_current" ] && [ ! -L "$_mcs_current" ]; then
     rm -rf "$_mcs_current"
   fi
@@ -237,4 +263,28 @@ mirror_codex_standalone() {
   rm -f "$_mcs_tmp"
   ln -sfn agent-box-current "$_mcs_tmp"
   mv -T "$_mcs_tmp" "$_mcs_current"
+}
+
+# The $CODEX_HOME a session's own codex process will actually see once
+# AGENT_BOX_ENV_EXEC applies its environment inside the tmux pane: the box
+# store's value, overridden by the named profile's — the same precedence
+# env-exec.py's two load_into() calls apply, since a profile's env loads
+# ON TOP of the box-wide store there. Called from the supervisor's own
+# process, which never sources either file itself, so this is what lets
+# mirror_codex_standalone (and the AGENTS.md seed below) agree with a
+# daemon that starts under a non-default CODEX_HOME instead of always
+# landing in $HOME/.codex (issue #572 CodeRabbit follow-up).
+#
+# $1 is the session's profile name, or empty for none. Best-effort like
+# env-exec.py's own load(): a missing store, a missing profile or a key
+# neither sets falls back to $HOME/.codex, never an error.
+resolve_codex_home() {
+  _rch_home="${CODEX_HOME:-}"
+  _rch_v="$("${AGENT_BOX_ENVSTORE_BIN:?}" get CODEX_HOME 2>/dev/null)" \
+    && [ -n "$_rch_v" ] && _rch_home="$_rch_v"
+  if [ -n "${1:-}" ]; then
+    _rch_v="$("$AGENT_BOX_ENVSTORE_BIN" get CODEX_HOME --profile "$1" 2>/dev/null)" \
+      && [ -n "$_rch_v" ] && _rch_home="$_rch_v"
+  fi
+  printf '%s' "${_rch_home:-$HOME/.codex}"
 }
