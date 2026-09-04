@@ -1419,10 +1419,21 @@ start_session() {
         # wrapper gives it the host label through a private UTS namespace
         # instead (see codexRemoteControl). Pairing the
         # Codex apps to a running daemon uses `codex remote-control
-        # pair`; the standalone-path shim seeded above is what lets the
-        # Nix codex serve as the app-server. The daemon takes no
-        # positional prompt and has no TUI transcript to resume, so the
-        # kickoff/resume wiring below does not apply to it.
+        # pair`; the standalone-path shim is what lets the Nix codex serve
+        # as the app-server. The daemon takes no positional prompt and has
+        # no TUI transcript to resume, so the kickoff/resume wiring below
+        # does not apply to it.
+        #
+        # Re-mirror HERE rather than trusting the boot-time call above: this
+        # runs on every (re)spawn of a remote-control codex session, by
+        # which point $bin has already been resolved above, whichever of
+        # codex's three install paths put it there. The boot-time call races
+        # a codex that arrives later (JIT install, or the settings page's
+        # Connections card, which never mirrors at all — issue #572) and
+        # silently no-ops when it loses; this call cannot lose that race,
+        # because the binary this session is about to exec is already known
+        # to exist.
+        mirror_codex_standalone
         cmd="$(printf '%q' "${AGENT_BOX_CODEX_RC:?}") $(printf '%q' "${AGENT_BOX_HOST_LABEL:-}") $cmd"
         if [ "$skip" = true ]; then
           cmd="$cmd -c approval_policy=never -c sandbox_mode=danger-full-access"
