@@ -195,6 +195,13 @@ jobs:
       - name: Check connect card checking state
         run: nix build -L .#checks.x86_64-linux.connect-card && cat result
 
+      # The connect cards' INSTALL half (issue #544): nix resolved at use,
+      # and a failed install still reaching the exit marker so the card can
+      # say what went wrong. Native box only - the module pins a nix store
+      # path and never hits this - so no VM prices it either. Seconds.
+      - name: Check connect card install path
+        run: nix build -L .#checks.x86_64-linux.connect-install && cat result
+
       # Issue #374: the native backend's two flake checks, which nothing
       # ran until that bug was found by hand. `runtime-profile` builds
       # packages.<system>.runtime — the profile a native box installs at
