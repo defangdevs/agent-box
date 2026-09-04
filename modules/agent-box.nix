@@ -17735,6 +17735,12 @@ def render_connect_card(state):
         # here; the distinction matters because the fix is different (wait
         # for a download, not go through an OAuth flow).
         pill = ("stopped", "Not installed")
+    if not state["installed"] and state["state"] == "starting":
+        # The pane is running the nix profile add from connect_start's
+        # prelude, not the CLI itself yet — "Starting…" reads as a quick
+        # sign-in about to appear, when what is actually happening is a
+        # download that can take a few minutes (issue #577).
+        pill = ("starting", "Installing&hellip;")
     if state["state"] in ("waiting", "starting", "exchanging"):
         label, confirm = None, False
     elif state["blocked"]:
@@ -17831,8 +17837,10 @@ def render_connect_step(state):
         f'<button type="submit" class="btn small">Cancel</button></form>'
     )
     if state["state"] == "starting":
-        return (f'<div class="conn-step"><p class="note">Starting the '
-                f'sign-in&hellip;</p>{cancel}</div>')
+        verb = ("Installing" if not state["installed"]
+                else "Starting the sign-in")
+        return (f'<div class="conn-step"><p class="note">{verb}'
+                f'&hellip;</p>{cancel}</div>')
     if state["state"] == "exchanging":
         return ('<div class="conn-step"><p class="note">Sign-in complete. '
                 'Checking the connection&hellip;</p></div>')
