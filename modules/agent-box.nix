@@ -4,7 +4,7 @@
 # CI (`module-generated-up-to-date`) fails if this file is stale.
 # CONTRACT: this module must remain a SINGLE self-contained file. Deployed
 # boxes fetch exactly this one file and import it from a bare store path —
-# aws/template.yaml's user-data and agent-box-update.service both
+# deploy/aws/template.yaml's user-data and agent-box-update.service both
 # `builtins.fetchurl` .../modules/agent-box.nix and pin one sha256. Any
 # `./sibling` reference (readFile, import, path interpolation) evaluates
 # against the lone store file, fails first-boot amazon-init *silently*
@@ -23,7 +23,7 @@ let
   # Base AGENTS.md content seeded into every non-shell session's working
   # directory (see users.<name>.agentsMd). This is the generic, deployment-
   # independent half; users.<name>.agentsMd is APPENDED to it, so callers add
-  # deployment-specific notes (e.g. aws/template.yaml's AgentsMd parameter for
+  # deployment-specific notes (e.g. deploy/aws/template.yaml's AgentsMd parameter for
   # EC2/CloudFormation specifics) without re-stating the common text. Kept
   # verbatim in sync with that template default — the two must only differ by
   # such appended specifics. $AGENT_BOX_URL (no braces) stays literal for the
@@ -10309,7 +10309,7 @@ in
         their sessions "agent-main@nixos" on NixOS and
         "agent-main@golden.example.org" on the native backend, whose Spec
         derives the label from the domain (bin/agentbox's Spec.host_label);
-        aws/template.yaml papered over it by setting this option to the box's
+        deploy/aws/template.yaml papered over it by setting this option to the box's
         sslip host, and a bare-metal host that never set it did not. Reported
         by one-spec-both-backends (#451, #455).
       '';
@@ -10491,7 +10491,7 @@ in
           The host configuration must import the module out of this tree
           when it exists — `imports = [ /var/lib/agent-box/src/modules/agent-box.nix ]`
           behind the same `builtins.pathExists` dance `pinFile` already uses,
-          see aws/template.yaml for the reference wiring. A host that does
+          see deploy/aws/template.yaml for the reference wiring. A host that does
           not is not broken: the updater still writes `pinFile`, so a
           configuration.nix from before this existed keeps fetching the same
           rev the tree was just moved to. It just pays for a download of what
@@ -10577,7 +10577,7 @@ in
           from the module's regular `pkgs`. The update service advances this
           pin by rewriting `agentPinFile`; the host configuration must import
           that file when it exists and wire it back into this option (same
-          pathExists dance as pinFile — see aws/template.yaml). Kept as an
+          pathExists dance as pinFile — see deploy/aws/template.yaml). Kept as an
           option rather than a file read inside the module so the module
           stays pure for flake evaluation.
         '';
@@ -11034,7 +11034,7 @@ in
       # harmless on a non-Spot box, so the safe default is "on" — a Spot box
       # that forgets to set it must not silently lose agent context (issue #20,
       # the failure that motivated this). Set false to omit the unit entirely;
-      # aws/template.yaml ties it to the UseSpot parameter for that reason.
+      # deploy/aws/template.yaml ties it to the UseSpot parameter for that reason.
       enable = lib.mkOption {
         type = lib.types.bool;
         default = true;

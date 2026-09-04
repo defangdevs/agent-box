@@ -8,7 +8,7 @@
   outputs = { self, nixpkgs, ... }:
     let
       # The module itself is arch-agnostic, and the deployed fleet is aarch64
-      # (aws/template.yaml offers Graviton instances only), so the cheap
+      # (deploy/aws/template.yaml offers Graviton instances only), so the cheap
       # eval-level checks and the assemble app are exposed for both — a
       # maintainer on an ARM box can run them natively.
       systems = [ "x86_64-linux" "aarch64-linux" ];
@@ -267,9 +267,9 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           };
 
           # `nix run .#compile-azure-bicep` — regenerate the committed
-          # azure/agent-box.json from azure/agent-box.bicep. Run from the
+          # deploy/azure/agent-box.json from deploy/azure/agent-box.bicep. Run from the
           # repo root; edits the working tree in place. Uses nixpkgs' own
-          # `bicep` rather than the CI-pinned `az bicep` (azure/.bicep-version):
+          # `bicep` rather than the CI-pinned `az bicep` (deploy/azure/.bicep-version):
           # check_azure_template.py strips the version-derived `_generator`
           # block before diffing, so any Bicep CLI produces an equivalent
           # build and nothing outside the flake needs installing.
@@ -277,9 +277,9 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             type = "app";
             program = "${pkgs.writeShellScript "agent-box-compile-azure-bicep" ''
               set -euo pipefail
-              ${pkgs.bicep}/bin/bicep build "$PWD/azure/agent-box.bicep" \
-                --outfile "$PWD/azure/agent-box.json"
-              echo "wrote azure/agent-box.json from azure/agent-box.bicep — review the diff and commit"
+              ${pkgs.bicep}/bin/bicep build "$PWD/deploy/azure/agent-box.bicep" \
+                --outfile "$PWD/deploy/azure/agent-box.json"
+              echo "wrote deploy/azure/agent-box.json from deploy/azure/agent-box.bicep — review the diff and commit"
             ''}";
           };
         });

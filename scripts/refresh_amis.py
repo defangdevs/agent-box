@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rewrite the RegionMap block in aws/template.yaml with the latest NixOS AMIs.
+"""Rewrite the RegionMap block in deploy/aws/template.yaml with the latest NixOS AMIs.
 
 Data source: https://nixos.github.io/amis/images.json (zero-auth).
 The block between the BEGIN AMI MAP / END AMI MAP markers is regenerated in
@@ -17,7 +17,7 @@ from pathlib import Path
 REGIONS = ["us-east-1", "us-west-2", "eu-central-1", "eu-west-1"]
 CHANNEL_PATTERN = re.compile(r"^nixos/26\.05\..*aarch64-linux$")
 IMAGES_URL = "https://nixos.github.io/amis/images.json"
-TEMPLATE = Path(__file__).parent.parent / "aws" / "template.yaml"
+TEMPLATE = Path(__file__).parent.parent / "deploy" / "aws" / "template.yaml"
 
 BEGIN_MARKER = "  # BEGIN AMI MAP"
 END_MARKER = "  # END AMI MAP"

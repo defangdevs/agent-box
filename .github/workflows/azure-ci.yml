@@ -4,7 +4,7 @@ on:
   push:
     branches: [ master ]
     paths: &azure-ci-paths
-      - 'azure/**'
+      - 'deploy/azure/**'
       - 'scripts/check_azure_template.py'
       - '.github/workflows/azure-ci.yml'
   pull_request:
@@ -33,7 +33,7 @@ jobs:
       # rather than as noise.
       - name: Install the pinned Bicep CLI
         run: |
-          az bicep install --version "$(cat azure/.bicep-version)"
+          az bicep install --version "$(cat deploy/azure/.bicep-version)"
           az bicep version
 
       # Recompiles and diffs (the committed JSON is what the README's Deploy

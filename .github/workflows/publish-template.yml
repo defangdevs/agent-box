@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     # Fork this repo? Configure these under Settings > Secrets and variables >
     # Actions > Variables (repo-level, not secrets — none of these are sensitive).
-    # See aws/README.md.
+    # See deploy/aws/README.md.
     # Fork? Override with a repo-scoped var AGENT_BOX_ENVIRONMENT, or edit the fallback.
     environment: ${{ vars.AGENT_BOX_ENVIRONMENT || 'defang-agent-box' }}
     env:
@@ -47,7 +47,7 @@ jobs:
           [ -n "$BUCKET" ]   || missing+=("AGENT_BOX_BUCKET")
           [ -n "$ROLE_ARN" ] || missing+=("AWS_ROLE_ARN")
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error::Missing repo variable(s): ${missing[*]}. Set under Settings > Actions > Variables. See aws/README.md."
+            echo "::error::Missing repo variable(s): ${missing[*]}. Set under Settings > Actions > Variables. See deploy/aws/README.md."
             exit 1
           fi
 
@@ -58,7 +58,7 @@ jobs:
       - name: Validate templates locally
         run: |
           pip install --quiet cfn-lint
-          cfn-lint aws/template.yaml aws/lightsail-template.yaml
+          cfn-lint deploy/aws/template.yaml deploy/aws/lightsail-template.yaml
 
       - name: Inject pinned defaults for the 1-click copies
         # The source templates deliberately ship without pinned values (see
@@ -98,11 +98,11 @@ jobs:
             /^  AgentNixpkgsSha256:$/  { sf3=1; print; next }
             sf3 && /^    Default:/    { print "    Default: " agentSha; sf3=0; next }
             { print }
-          ' aws/template.yaml > aws/filled-template.yaml
+          ' deploy/aws/template.yaml > deploy/aws/filled-template.yaml
           for want in "$rev" "$sha" "$agentUrl" "$agentSha"; do
-            if ! grep -qxF "    Default: $want" aws/filled-template.yaml; then
+            if ! grep -qxF "    Default: $want" deploy/aws/filled-template.yaml; then
               echo "::error::Default injection failed for template.yaml — expected \"Default: $want\" not present in the filled template."
-              diff aws/template.yaml aws/filled-template.yaml || true
+              diff deploy/aws/template.yaml deploy/aws/filled-template.yaml || true
               exit 1
             fi
           done
@@ -111,15 +111,15 @@ jobs:
             /^  AgentBoxFlakeRef:$/ { ff=1; print; next }
             ff && /^    Default:/    { print "    Default: " ref; ff=0; next }
             { print }
-          ' aws/lightsail-template.yaml > aws/filled-lightsail-template.yaml
-          if ! grep -qxF "    Default: $flakeRef" aws/filled-lightsail-template.yaml; then
+          ' deploy/aws/lightsail-template.yaml > deploy/aws/filled-lightsail-template.yaml
+          if ! grep -qxF "    Default: $flakeRef" deploy/aws/filled-lightsail-template.yaml; then
             echo "::error::Default injection failed for lightsail-template.yaml — expected \"Default: $flakeRef\" not present in the filled template."
-            diff aws/lightsail-template.yaml aws/filled-lightsail-template.yaml || true
+            diff deploy/aws/lightsail-template.yaml deploy/aws/filled-lightsail-template.yaml || true
             exit 1
           fi
 
           for t in $TEMPLATES; do
-            cfn-lint "aws/filled-$t"
+            cfn-lint "deploy/aws/filled-$t"
           done
 
       - name: Configure AWS credentials via OIDC
@@ -131,7 +131,7 @@ jobs:
       - name: Validate templates with CloudFormation
         run: |
           for t in $TEMPLATES; do
-            aws cloudformation validate-template --template-body "file://aws/filled-$t"
+            aws cloudformation validate-template --template-body "file://deploy/aws/filled-$t"
           done
 
       - name: Upsert bucket + public-read policy on the templates
@@ -180,7 +180,7 @@ jobs:
       - name: Upload to S3
         run: |
           for t in $TEMPLATES; do
-            aws s3 cp "aws/filled-$t" "s3://${BUCKET}/${t}" \
+            aws s3 cp "deploy/aws/filled-$t" "s3://${BUCKET}/${t}" \
               --content-type "application/x-yaml" \
               --cache-control "no-cache, max-age=0"
             echo "::notice::Published to https://${BUCKET}.s3.amazonaws.com/${t}"

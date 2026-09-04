@@ -30,7 +30,7 @@ You are an autonomous task executor for `defangdevs/agent-box`. Take the task ab
 2. Search issues and merged PRs for prior art — this repo's issue numbers carry the "why" for a lot of non-obvious behavior (`AGENTS.md` itself cites #140, #154, #244, #392 inline).
 3. Work out what the task touches:
    - `modules/agent-box.nix.in` / `modules/src/**` → the generated module; needs `nix run .#assemble` after editing.
-   - `aws/template.yaml` / `aws/lightsail-template.yaml` → needs `cfn-lint` and `scripts/check_lightsail_userdata.py`.
+   - `deploy/aws/template.yaml` / `deploy/aws/lightsail-template.yaml` → needs `cfn-lint` and `scripts/check_lightsail_userdata.py`.
    - Auth, secrets, webhook routing, sudo rules, Caddy basic-auth → flag for the security-review pass in Phase 5.
 4. Update the issue body with what you found and a concrete implementation checklist.
 
@@ -58,7 +58,7 @@ Run the targeted checks that match what you touched — **not** `nix flake check
 - `nix build -L .#checks.<system>.backend-parity` when both the NixOS module and the native renderer supply the same payload.
 - `nix build -L .#checks.<system>.golden-snapshot` for any rendered-config change.
 - `nix build -L .#checks.x86_64-linux.<name>` for the specific VM test(s) covering your change (e.g. `sessions`, `settings-page`).
-- `cfn-lint aws/template.yaml aws/lightsail-template.yaml` plus `python3 tests/test_agentbox.py` for AWS/native-renderer changes.
+- `cfn-lint deploy/aws/template.yaml deploy/aws/lightsail-template.yaml` plus `python3 tests/test_agentbox.py` for AWS/native-renderer changes.
 - `playwright test -c tests/e2e` (needs `E2E_BASE_URL`/`E2E_PASSWORD`) only for behavior that needs a real browser.
 
 Fix failures before proceeding, then check off validation in the issue/PR body.
@@ -69,7 +69,7 @@ Fix failures before proceeding, then check off validation in the issue/PR body.
 |---|---|---|
 | Always | a full code review pass (Claude Code: `/code-review`; otherwise review the diff yourself with the same rigor) | correctness, reuse/simplification, efficiency |
 | `**/auth*`, `**/secret*`, `**/*token*`, webhook routing, sudo rules, Caddy auth config | a security-focused pass (Claude Code: `/security-review`) | credential handling, auth bypass, OWASP |
-| `aws/**`, anything with IAM/networking impact | manual self-check | cost, IAM, networking, migration impact — call these out explicitly in the PR body per `AGENTS.md` |
+| `deploy/aws/**`, anything with IAM/networking impact | manual self-check | cost, IAM, networking, migration impact — call these out explicitly in the PR body per `AGENTS.md` |
 
 **Hard stop:** don't open the PR until every triggered reviewer is addressed. Record PASS/ADDRESSED against each in the issue/PR body.
 

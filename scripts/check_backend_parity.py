@@ -262,7 +262,7 @@ UNITS_BY_DESIGN = {
     "agent-box-nix-gc.service": (
         "native",
         "native only, and correct: on NixOS the DEPLOYMENT owns store "
-        "housekeeping (aws/template.yaml sets nix.gc and min-free), a layer "
+        "housekeeping (deploy/aws/template.yaml sets nix.gc and min-free), a layer "
         "a native box does not have, so its renderer owns it instead. If the "
         "module ever grows nix.gc of its own, this line goes away"),
 }

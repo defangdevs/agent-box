@@ -484,7 +484,7 @@ line and `scripts/check_lightsail_userdata.py` fails CI if that guard goes
 missing (or if a bashism appears ahead of it, or if the script sources the Nix
 profile before exporting `HOME` — cloud-init provides none, and that aborted a
 live launch 40 s in). The check **discovers** its targets with
-`aws/lightsail*template.yaml` rather than carrying a list, because a list is
+`deploy/aws/lightsail*template.yaml` rather than carrying a list, because a list is
 how it came to skip the one template that needed it.
 
 It is also why the payload is a shell script rather than the `#cloud-config`
@@ -504,7 +504,7 @@ directly:
 aws cloudformation deploy \
   --region eu-central-1 \
   --stack-name agentbox-lightsail \
-  --template-file aws/lightsail-template.yaml \
+  --template-file deploy/aws/lightsail-template.yaml \
   --parameter-overrides \
       WebPassword='<16-64 chars>' \
       AgentBoxFlakeRef="github:defangdevs/agent-box/$(git rev-parse HEAD)"
@@ -597,7 +597,7 @@ curl -I "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/template.yaml"
 `.github/workflows/aws-ci.yml` runs on pull requests that touch the AWS
 templates, launch page, browser-terminal smoke helper, or related workflows. It
 does not create AWS resources; it runs
-`cfn-lint aws/template.yaml aws/lightsail-template.yaml` and compiles
+`cfn-lint deploy/aws/template.yaml deploy/aws/lightsail-template.yaml` and compiles
 `scripts/ws_smoke.py` so template/auth-helper changes get fast PR feedback.
 
 ## End-to-end deploy test

@@ -3,8 +3,8 @@
 
 Three separate failures this catches, none of which a schema linter can:
 
-1. **JSON drift.** `azure/agent-box.json` is a build artifact of
-   `azure/agent-box.bicep` and is what the README's "Deploy to Azure" button
+1. **JSON drift.** `deploy/azure/agent-box.json` is a build artifact of
+   `deploy/azure/agent-box.bicep` and is what the README's "Deploy to Azure" button
    actually hands the portal. An edit to the Bicep that never reached the JSON
    ships nothing. So the check recompiles and compares.
 
@@ -51,8 +51,8 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-BICEP = REPO / "azure" / "agent-box.bicep"
-COMPILED = REPO / "azure" / "agent-box.json"
+BICEP = REPO / "deploy" / "azure" / "agent-box.bicep"
+COMPILED = REPO / "deploy" / "azure" / "agent-box.json"
 
 GUARD = re.compile(r'exec\s+/bin/bash\s+"\$0"')
 NIX_PROFILE_SOURCE = re.compile(r"^\s*\.\s+\S*/profile\.d/\S+\.sh")
@@ -122,7 +122,7 @@ def check_no_drift() -> int:
             "FAIL: neither `bicep` nor `az` is on PATH, so the committed JSON "
             "cannot be verified against its source.\n"
             "       Install the pinned CLI:\n"
-            '         az bicep install --version "$(cat azure/.bicep-version)"\n'
+            '         az bicep install --version "$(cat deploy/azure/.bicep-version)"\n'
             "       or pass --no-build to skip this one check.",
             file=sys.stderr,
         )
@@ -151,7 +151,7 @@ def check_no_drift() -> int:
             "       Rebuild and commit both:\n"
             "         nix run .#compile-azure-bicep\n"
             "       or, without Nix:\n"
-            "         cd azure && az bicep build --file agent-box.bicep",
+            "         cd deploy/azure && az bicep build --file agent-box.bicep",
             file=sys.stderr,
         )
         return 1
@@ -195,7 +195,7 @@ def check_chain_covers_markers(template: dict) -> int:
             "not substituted by the template's replace() chain, so a deployed "
             "box would run the literal marker.\n"
             "       Add the missing replace() to `var bootstrap` in "
-            "azure/agent-box.bicep (and its value to SAMPLE here).",
+            "deploy/azure/agent-box.bicep (and its value to SAMPLE here).",
             file=sys.stderr,
         )
         return 1
