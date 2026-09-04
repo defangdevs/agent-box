@@ -7496,7 +7496,8 @@ esac
     { "name": "AGENT_BOX_FLOCK_BIN", "kind": "bin", "program": "flock" },
     { "name": "AGENT_BOX_HOSTNAME_BIN", "kind": "bin", "program": "hostname" },
     { "name": "AGENT_BOX_ENV_EXEC", "kind": "bin", "program": "agent-box-env-exec" },
-    { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" }
+    { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" },
+    { "name": "AGENT_BOX_ENVSTORE_BIN", "kind": "bin", "program": "agent-box-envstore" }
   ],
   "execStart": [
     { "kind": "bin", "program": "agent-box-supervisor" }
@@ -9179,14 +9180,24 @@ esac
     # $1 is the codex binary to mirror (start_session passes the resolved,
     # already-JIT-installed one). A bare call resolves it like agent_bin does
     # and no-ops when there is no codex to point at.
+    #
+    # $2 is the CODEX_HOME to mirror it under, defaulting like every other
+    # reader of that variable to $HOME/.codex — but a bare fallback to the
+    # environment here would read supervisor.sh's own process, not the
+    # session's: a profile's CODEX_HOME only reaches the actual process
+    # through AGENT_BOX_ENV_EXEC, inside the tmux pane this call is preparing
+    # for. resolve_codex_home is what start_session passes instead, so the
+    # layout lands where that session's app-server daemon will actually look
+    # for it.
     mirror_codex_standalone() {
       if [ -n "''${1:-}" ]; then
         cbin=$1
       else
         cbin="$(agent_bin codex)" || return 0
       fi
-      mkdir -p "$HOME"/.codex/packages/standalone/agent-box-current
-      ln -sfn "$cbin" "$HOME"/.codex/packages/standalone/agent-box-current/codex
+      cxhome="''${2:-''${CODEX_HOME:-$HOME/.codex}}"
+      mkdir -p "$cxhome/packages/standalone/agent-box-current"
+      ln -sfn "$cbin" "$cxhome/packages/standalone/agent-box-current/codex"
       # `ln -sfn` only replaces `current` when it is already a symlink or a
       # plain file (issue #95). If a curl-installed Codex ever leaves `current`
       # as a REAL directory — an unusual manual layout, but a possible one —
@@ -9207,7 +9218,7 @@ esac
       # rename it over `current` — `rename()` is atomic, so a session reading
       # `current` mid-update here sees either the old or the new target, never
       # a missing path (except immediately following the repair above).
-      _mcs_current="$HOME/.codex/packages/standalone/current"
+      _mcs_current="$cxhome/packages/standalone/current"
       if [ -d "$_mcs_current" ] && [ ! -L "$_mcs_current" ]; then
         rm -rf "$_mcs_current"
       fi
@@ -9215,6 +9226,30 @@ esac
       rm -f "$_mcs_tmp"
       ln -sfn agent-box-current "$_mcs_tmp"
       mv -T "$_mcs_tmp" "$_mcs_current"
+    }
+
+    # The $CODEX_HOME a session's own codex process will actually see once
+    # AGENT_BOX_ENV_EXEC applies its environment inside the tmux pane: the box
+    # store's value, overridden by the named profile's — the same precedence
+    # env-exec.py's two load_into() calls apply, since a profile's env loads
+    # ON TOP of the box-wide store there. Called from the supervisor's own
+    # process, which never sources either file itself, so this is what lets
+    # mirror_codex_standalone (and the AGENTS.md seed below) agree with a
+    # daemon that starts under a non-default CODEX_HOME instead of always
+    # landing in $HOME/.codex (issue #572 CodeRabbit follow-up).
+    #
+    # $1 is the session's profile name, or empty for none. Best-effort like
+    # env-exec.py's own load(): a missing store, a missing profile or a key
+    # neither sets falls back to $HOME/.codex, never an error.
+    resolve_codex_home() {
+      _rch_home="''${CODEX_HOME:-}"
+      _rch_v="$("''${AGENT_BOX_ENVSTORE_BIN:?}" get CODEX_HOME 2>/dev/null)" \
+        && [ -n "$_rch_v" ] && _rch_home="$_rch_v"
+      if [ -n "''${1:-}" ]; then
+        _rch_v="$("$AGENT_BOX_ENVSTORE_BIN" get CODEX_HOME --profile "$1" 2>/dev/null)" \
+          && [ -n "$_rch_v" ] && _rch_home="$_rch_v"
+      fi
+      printf '%s' "''${_rch_home:-$HOME/.codex}"
     }
 
     # The box's own sources, on the box (issue #242). Backgrounded on purpose:
@@ -9642,7 +9677,11 @@ esac
           # a TUI session does not need the layout, but it costs two symlinks
           # and it means a box whose first codex session is a TUI one is
           # already correct when someone later adds a remote-controlled one.
-          mirror_codex_standalone "$bin"
+          # resolve_codex_home, not a bare $CODEX_HOME: this process never
+          # sources this session's profile, only AGENT_BOX_ENV_EXEC does, once
+          # inside the pane, so the supervisor's own environment cannot see a
+          # profile's override here.
+          mirror_codex_standalone "$bin" "$(resolve_codex_home "$sprofile")"
           if [ "$rc" = true ]; then
             # Codex remote control uses a dedicated app-server daemon, not a
             # TUI flag (issue 103), whereas claude takes a
@@ -9774,11 +9813,11 @@ esac
       # which is what a session doing real work does. The global file is the
       # scope that survives that, so point it at the canonical guide — the
       # exact counterpart of claude's ~/.claude/CLAUDE.md above. IFF absent, so
-      # an agent's own global instructions win. CODEX_HOME is codex's own
-      # override for that directory and nothing here sets it, but honour it the
-      # way codex-remote-control.sh does rather than hardcoding the default.
+      # an agent's own global instructions win. resolve_codex_home, not a bare
+      # $CODEX_HOME, for the same reason the standalone mirror above needs it:
+      # a profile's override never reaches this process's own environment.
       if [ "$agent" = codex ] && [ -n "''${AGENT_BOX_GUIDE_TARGET:-}" ]; then
-        cxhome="''${CODEX_HOME:-$HOME/.codex}"
+        cxhome="$(resolve_codex_home "$sprofile")"
         if [ ! -e "$cxhome/AGENTS.md" ]; then
           mkdir -p "$cxhome"
           ln -s "$AGENT_BOX_GUIDE_TARGET" "$cxhome/AGENTS.md"

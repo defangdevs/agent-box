@@ -48,6 +48,7 @@ setup() {
   export AGENT_BOX_NIXPKGS="https://example.invalid/nixpkgs.tar.xz"
   export AGENT_BOX_NIX_BIN="$work/bin/nix"
   export AGENT_BOX_FLOCK_BIN="$work/bin/flock"
+  export AGENT_BOX_ENVSTORE_BIN="$work/bin/agent-box-envstore"
   export AGENT_BOX_AGENT_BINS="shell=/bin/bash"
   export NIX_CALLS="$HOME/nix-calls"
   : > "$NIX_CALLS"
@@ -83,6 +84,25 @@ printf '%s\n' "\$*" >> "\$HOME/flock-calls"
 exit 0
 EOF
 chmod +x "$work/bin/flock"
+
+# agent-box-envstore shim: `get KEY [--profile NAME]` only, against plain
+# KEY=VALUE lines under \$HOME/.config/agent-box — no quoting support,
+# these tests never write a value that needs it. Matches the real CLI's
+# "get on a miss exits 1 with nothing on stdout" contract, which
+# resolve_codex_home relies on to fall through its precedence.
+cat > "$work/bin/agent-box-envstore" <<EOF
+#!$BASH_BIN
+cfg="\$HOME/.config/agent-box"
+[ "\${1:-}" = get ] || { echo "unsupported verb: \${1:-}" >&2; exit 2; }
+key=\$2
+file="\$cfg/env"
+[ "\${3:-}" = --profile ] && file="\$cfg/profiles/\${4:?}.env"
+[ -f "\$file" ] || exit 1
+v=\$(sed -n "s/^\$key=//p" "\$file" | tail -n1)
+[ -n "\$v" ] || exit 1
+printf '%s' "\$v"
+EOF
+chmod +x "$work/bin/agent-box-envstore"
 
 # --- attribute mapping --------------------------------------------------
 setup attr
@@ -225,7 +245,10 @@ if mirror_codex_standalone; then
 else
   no "a bare call with no codex installed returns success" "it returned failure"
 fi
-if [ -e "$HOME/.codex/packages/standalone/current" ]; then
+# `-e` alone follows the symlink and would call a DANGLING `current`
+# absent too; `-L` catches the link itself regardless of its target.
+if [ -e "$HOME/.codex/packages/standalone/current" ] ||
+   [ -L "$HOME/.codex/packages/standalone/current" ]; then
   no "a bare call with no codex leaves no layout behind" \
      "current exists with no codex to point at"
 else
@@ -264,6 +287,54 @@ if [ -e "$HOME/.codex/packages/standalone/current/stale-marker" ]; then
 else
   ok "the stale directory's contents are gone, not nested underneath"
 fi
+
+# --- the mirror lands under an explicit CODEX_HOME, not $HOME/.codex ----
+# issue #572 CodeRabbit follow-up: a session's profile can set CODEX_HOME,
+# and only resolve_codex_home (below) sees it from this process — but
+# mirror_codex_standalone itself just needs to honour whatever it is
+# handed instead of hardcoding $HOME/.codex.
+setup codexmirror_explicit_home
+export AGENT_BOX_AGENT_BINS="shell=/bin/bash"
+printf '#!%s\n' "$BASH_BIN" > "$HOME/.nix-profile/bin/codex"
+chmod +x "$HOME/.nix-profile/bin/codex"
+mirror_codex_standalone "$HOME/.nix-profile/bin/codex" "$HOME/custom-codex-home"
+is "an explicit CODEX_HOME is mirrored into, not \$HOME/.codex" \
+   "$HOME/.nix-profile/bin/codex" \
+   "$(readlink "$HOME/custom-codex-home/packages/standalone/agent-box-current/codex")"
+if [ -e "$HOME/.codex/packages/standalone/current" ]; then
+  no "an explicit CODEX_HOME leaves \$HOME/.codex untouched" \
+     "\$HOME/.codex/packages/standalone/current exists too"
+else
+  ok "an explicit CODEX_HOME leaves \$HOME/.codex untouched"
+fi
+
+# --- resolve_codex_home's precedence -------------------------------------
+# The same precedence env-exec.py applies at spawn (box store, then the
+# named profile on top), so the supervisor's own guess agrees with what
+# the session's own env-exec pass will actually load.
+setup resolve_codex_home_default
+is "no store, no profile: falls back to \$HOME/.codex" \
+   "$HOME/.codex" "$(resolve_codex_home '')"
+
+setup resolve_codex_home_store
+mkdir -p "$HOME/.config/agent-box"
+printf 'CODEX_HOME=%s/from-store\n' "$HOME" > "$HOME/.config/agent-box/env"
+is "the box-wide store's CODEX_HOME wins over the \$HOME/.codex fallback" \
+   "$HOME/from-store" "$(resolve_codex_home '')"
+
+setup resolve_codex_home_profile
+mkdir -p "$HOME/.config/agent-box"
+printf 'CODEX_HOME=%s/from-store\n' "$HOME" > "$HOME/.config/agent-box/env"
+mkdir -p "$HOME/.config/agent-box/profiles"
+printf 'CODEX_HOME=%s/from-profile\n' "$HOME" > "$HOME/.config/agent-box/profiles/myprofile.env"
+is "a named profile's CODEX_HOME wins over the box-wide store's" \
+   "$HOME/from-profile" "$(resolve_codex_home myprofile)"
+
+setup resolve_codex_home_profile_unset
+mkdir -p "$HOME/.config/agent-box"
+printf 'CODEX_HOME=%s/from-store\n' "$HOME" > "$HOME/.config/agent-box/env"
+is "a profile with no CODEX_HOME of its own falls through to the store's" \
+   "$HOME/from-store" "$(resolve_codex_home noprofile)"
 
 # --- failure is rate-limited -------------------------------------------
 setup cooldown

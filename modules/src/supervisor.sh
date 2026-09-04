@@ -707,7 +707,11 @@ start_session() {
       # a TUI session does not need the layout, but it costs two symlinks
       # and it means a box whose first codex session is a TUI one is
       # already correct when someone later adds a remote-controlled one.
-      mirror_codex_standalone "$bin"
+      # resolve_codex_home, not a bare $CODEX_HOME: this process never
+      # sources this session's profile, only AGENT_BOX_ENV_EXEC does, once
+      # inside the pane, so the supervisor's own environment cannot see a
+      # profile's override here.
+      mirror_codex_standalone "$bin" "$(resolve_codex_home "$sprofile")"
       if [ "$rc" = true ]; then
         # Codex remote control uses a dedicated app-server daemon, not a
         # TUI flag (issue 103), whereas claude takes a
@@ -839,11 +843,11 @@ start_session() {
   # which is what a session doing real work does. The global file is the
   # scope that survives that, so point it at the canonical guide — the
   # exact counterpart of claude's ~/.claude/CLAUDE.md above. IFF absent, so
-  # an agent's own global instructions win. CODEX_HOME is codex's own
-  # override for that directory and nothing here sets it, but honour it the
-  # way codex-remote-control.sh does rather than hardcoding the default.
+  # an agent's own global instructions win. resolve_codex_home, not a bare
+  # $CODEX_HOME, for the same reason the standalone mirror above needs it:
+  # a profile's override never reaches this process's own environment.
   if [ "$agent" = codex ] && [ -n "${AGENT_BOX_GUIDE_TARGET:-}" ]; then
-    cxhome="${CODEX_HOME:-$HOME/.codex}"
+    cxhome="$(resolve_codex_home "$sprofile")"
     if [ ! -e "$cxhome/AGENTS.md" ]; then
       mkdir -p "$cxhome"
       ln -s "$AGENT_BOX_GUIDE_TARGET" "$cxhome/AGENTS.md"

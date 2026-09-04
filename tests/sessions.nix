@@ -129,9 +129,13 @@ in
     # boot passed that one whatever the session path did, which is how the
     # Connections-card install (a codex arriving MINUTES after boot, on a
     # default box whose closure ships none) went unnoticed.
+    # `-e` alone follows the symlink and would call a DANGLING `current`
+    # absent too, so a partial layout could slip past this negative
+    # control; `-L` catches the link itself regardless of its target.
     machine.fail(
         "su -s /bin/sh agent -c "
-        "'test -e /home/agent/.codex/packages/standalone/current'"
+        "'test -e /home/agent/.codex/packages/standalone/current "
+        "-o -L /home/agent/.codex/packages/standalone/current'"
     )
     machine.succeed("test -x /run/current-system/sw/bin/bwrap")
     # Tools agents assume exist resolve by bare name in agent tool shells.
@@ -432,6 +436,41 @@ in
     full_pane = machine.succeed(tmux('capture-pane -p -S -50 -t "=helper:"'))
     assert "--harness shell" not in full_pane, full_pane
     assert "codex login --device-auth" not in full_pane, full_pane
+
+    # A profile's CODEX_HOME must land the mirror there too, not in
+    # $HOME/.codex — the supervisor's own process never sources a
+    # profile's env (only AGENT_BOX_ENV_EXEC does, inside the pane), so
+    # this is resolve_codex_home's own precedence under test, not
+    # env-exec's (CodeRabbit follow-up to issue #572). Placed after
+    # "helper"'s own sign-in pane is already asserted, and removed right
+    # after its own mirror is asserted, so this second RC daemon's own
+    # sign-in attempt has nothing else in this test reading its pane.
+    machine.succeed(
+        as_agent(
+            "agent-box-profile set codexhome HARNESS=codex "
+            "CODEX_HOME=/home/agent/custom-codex-home"
+        )
+    )
+    machine.succeed(
+        as_agent("agent-box-session add helper2 --profile codexhome")
+    )
+    machine.wait_until_succeeds(tmux("has-session -t =helper2"), timeout=60)
+    machine.wait_until_succeeds(
+        as_agent(
+            "test -x /home/agent/custom-codex-home/packages/standalone/"
+            "current/codex"
+        ),
+        timeout=60,
+    )
+    mirrored2 = machine.succeed(
+        as_agent(
+            "readlink -f /home/agent/custom-codex-home/packages/"
+            "standalone/current/codex"
+        )
+    ).strip()
+    assert mirrored2 == codex_store, f"{mirrored2} != {codex_store}"
+    machine.succeed(as_agent("agent-box-session rm helper2"))
+    machine.succeed(as_agent("agent-box-profile rm codexhome"))
 
     # --- rejected credentials re-authenticate with no keystroke (issue 187) ---
     # `codex login status` is a LOCAL check — credentials the backend has

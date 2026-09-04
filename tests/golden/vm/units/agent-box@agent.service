@@ -4,6 +4,7 @@
 Environment="AGENT_BOX_CLAUDE_SETTINGS=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-claude-hook-settings.json"
 Environment="AGENT_BOX_CODEX_FULL_ACCESS=1"
 Environment="AGENT_BOX_CODEX_RC=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-codex-remote-control"
+Environment="AGENT_BOX_ENVSTORE_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-envstore/bin/agent-box-envstore"
 Environment="AGENT_BOX_ENV_EXEC=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-env-exec"
 Environment="AGENT_BOX_FIND_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.11.0/bin/find"
 Environment="AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock"
