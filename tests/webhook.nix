@@ -1241,6 +1241,18 @@
         f" {spawn_cmd} --preamble 'github:defangdevs/*'"
     )
     assert "IGNORED, no such profile" in launch, launch
+    # ...and --resolved-profile says the same thing with no prose to parse:
+    # nothing usable resolved (a match starts the box default agent), but
+    # the box-wide name that was TRIED is still reported, so a caller can
+    # say "your AGENT_BOX_HOOK_PROFILE names a profile that no longer
+    # exists" rather than just falling silent.
+    resolved = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        f" {spawn_cmd} --resolved-profile 'github:defangdevs/*'"
+    )
+    assert json.loads(resolved) == {
+        "profile": None, "missing": ["triage"],
+    }, resolved
     machine.succeed(
         f"sudo -u agent env HOME=/home/agent agent-box-session rm {ghosted}"
     )
@@ -1348,6 +1360,15 @@
     )
     assert "agent profile watchbot" in launch, launch
     assert "spawnConfig.profile" in launch, launch
+    # --resolved-profile answers the same question as MACHINE-readable JSON
+    # (#582), for a caller that wants the bare name rather than a sentence to
+    # scrape it out of — the settings page badges a watch's row with this.
+    resolved = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        f" {spawn_cmd} --resolved-profile github:defangdevs/watch-profile"
+    )
+    assert json.loads(resolved) == {"profile": "watchbot", "missing": []}, resolved
     # A topic with no watch-level profile still reports the box-wide one.
     launch = machine.succeed(
         "sudo -u agent env HOME=/home/agent"
@@ -1355,6 +1376,12 @@
         f" {spawn_cmd} --preamble github:defangdevs/no-watch-profile"
     )
     assert "agent profile boxwide" in launch, launch
+    resolved = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        f" {spawn_cmd} --resolved-profile github:defangdevs/no-watch-profile"
+    )
+    assert json.loads(resolved) == {"profile": "boxwide", "missing": []}, resolved
 
     # An unusable WATCH profile must not cost the box-wide one. It used to:
     # the watch's name displaced the box-wide one BEFORE validation, so one
@@ -1368,6 +1395,19 @@
     )
     assert "agent profile boxwide" in launch, launch
     assert "IGNORED, no such profile" not in launch, launch
+    # ...and --resolved-profile names the box-wide profile it fell back to
+    # AND the watch-level name it passed over — so a delete-time warning and
+    # a row badge can both say "boxwide (and 'ghost' not found)" rather than
+    # only ever seeing the winner.
+    resolved = machine.succeed(
+        "sudo -u agent env HOME=/home/agent"
+        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
+        " LOCAL_WEBHOOK_SPAWN_CONFIG='{\"profile\": \"ghost\"}'"
+        f" {spawn_cmd} --resolved-profile github:defangdevs/no-watch-profile"
+    )
+    assert json.loads(resolved) == {
+        "profile": "boxwide", "missing": ["ghost"],
+    }, resolved
     # A non-string value is ignored rather than stringified into a name.
     # webhook.py drops one when it reads the filter file, so no delivery
     # carries it — but that file is documented as hand-editable, and
@@ -1886,6 +1926,10 @@
         "1 event notification",        # and counted on that session's row
         f'data-fold="subs-{hook_name}"',   # a spawned session's seeded topic
         "Automatic session rule",      # the shared dispatch list, its own panel
+        # #582: which profile a standing watch starts belongs on the ROW,
+        # not only in the fold an operator has to open to find it.
+        "Profile: panelbot",           # panel-profile's own worker...
+        "No profile - box default agent",  # ...and panel's, which names none
         # The endpoint half of the same panel: what to register in the
         # sender, per configured source, paste-ready with a copy button.
         # Until this, both halves were reachable only by running
@@ -1915,8 +1959,13 @@
         )
 
     # The standing watches are NOT session-scoped, so they are the one thing
-    # that must not have moved into a session's fold.
-    watches = page.split("Standing watch")[-1]
+    # that must not have moved into a session's fold. Split on the panel's
+    # OWN heading, not the "Standing watch" wording the panel used to carry:
+    # that string left this page entirely when the panel was renamed to
+    # "Automations" (#259), so the split matched nothing and silently
+    # returned the whole page - every assertion below still passed, just
+    # with no isolation from the Sessions and Profiles panels above it.
+    watches = page.split("<h2>Automations</h2>")[-1]
     assert "github:defangdevs/agent-box" in watches, watches
 
     # A watch row says what a match DOES, not why someone subscribed (#259):
@@ -1928,6 +1977,18 @@
     assert "You are a fresh agent session started by" in watches, watches
     assert "(&quot;standing watch: triage&quot;)" in watches, watches
     assert "hook-&lt;key&gt;-&lt;hex&gt;" in watches, watches
+    # And the row for panel-profile's own watch carries its badge, isolated
+    # to the Automations panel the same way (#582).
+    assert "Profile: panelbot" in watches, watches
+
+    # The Profiles panel says the reverse (#582): panelbot is spent by a
+    # live watch, so deleting it is not a no-op, and the row says so before
+    # anyone has to press the button to find out.
+    profiles_html = page.split("<h2>Profiles</h2>", 1)[-1].split(
+        "<h2>Automations</h2>", 1)[0]
+    assert "used by 1 standing watch" in profiles_html, profiles_html
+    assert ("It is used by 1 standing watch: github:defangdevs/panel-profile"
+            in profiles_html), profiles_html
     # And the note is no longer a paragraph on the row itself.
     assert 'wh-note">standing watch: triage' not in page, page
 
