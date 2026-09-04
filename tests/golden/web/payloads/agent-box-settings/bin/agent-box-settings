@@ -4948,6 +4948,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     var statusUrl = f.getAttribute("data-status");
 
     function afterPost(t) {
+      if (t === null) { return; }   // post() already navigated us away
       // profiles-list AND profile-picker: saving a profile changes both
       // the panel that lists it and the <select> in the row above, and the
       // picker is inside the add-session form rather than in any list, so
@@ -4966,9 +4967,23 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       else if (wasActive && tabEl(wasActive)) { wsSelect(wasActive, false); }
       wsSync();
     }
+    // Same hazard fetchPage() guards against: the daemon can decide the
+    // current URL is no longer the right page (closing the workspace's
+    // last tab 303s to the settings page, see do_GET's TERM_BASE branch).
+    // Patching fragments out of THAT answer patches nothing — applyDoc
+    // skips an id the settings page does not have — so a stale tab (an
+    // armed "Close?" pill included, issue #579) sat there until a manual
+    // reload. Follow the redirect for real instead, same as fetchPage().
     function post() {
+      var here = window.location.pathname;
       return fetch(f.getAttribute("action"), { method: "POST", body: body })
-        .then(function (r) { return r.text(); });
+        .then(function (r) {
+          if (r.redirected && new URL(r.url).pathname !== here) {
+            window.location.replace(r.url);
+            return null;
+          }
+          return r.text();
+        });
     }
 
     // The two Danger-zone actions get a long-polled progress line;
