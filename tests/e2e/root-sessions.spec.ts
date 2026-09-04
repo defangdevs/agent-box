@@ -15,7 +15,9 @@
 //   - dismissing the feedback banner without reloading the workspace,
 //   - session restart/delete on the settings page, incl. the confirm() guard,
 //   - the live feed: sessions created or deleted elsewhere show up in an
-//     already-open page without a reload.
+//     already-open page without a reload,
+//   - the grid layout: every session's terminal at once, reached and left
+//     without a page load (PR #580).
 //
 // See playwright.config.ts for the E2E_* environment contract.
 
@@ -82,6 +84,54 @@ test('?tab= selects a tab server-side (the no-JS switching path)', async ({ brow
   const page = await authedPage(browser);
   await page.goto('/?tab=main');
   await expect(page.locator('#tab-bar .tab[data-tab="main"]')).toHaveAttribute('aria-current', 'page');
+});
+
+test('the grid layout shows every session at once, and switching does not navigate', async ({ browser }) => {
+  const page = await authedPage(browser);
+  await page.goto('/');
+  const names = await tabNames(page);
+  expect(names.length).toBeGreaterThan(0);
+  const current = await page.locator('#tab-bar .tab[aria-current]').getAttribute('data-tab');
+
+  // The tab layout mounts the selected session only; the grid mounts them
+  // all. Neither may NAVIGATE, because that would tear down every attached
+  // terminal on the page and re-attach it a moment later.
+  await expect(page.locator('#panes .cell')).toHaveCount(1);
+  await page.locator('#tab-bar a.viewtog[data-view-to="grid"]').click();
+  await expect(page.locator('body')).toHaveAttribute('data-view', 'grid');
+  await expect(page.locator('#panes .cell')).toHaveCount(names.length);
+  for (const name of names) {
+    await expect(page.locator(`#panes .cell[data-cell="${name}"]`)).toBeVisible();
+  }
+  // Tiles read in tab order however they were mounted (CSS `order`: moving
+  // an iframe in the DOM would reload it).
+  const order = await page.locator('#panes .cell[data-cell]')
+    .evaluateAll((els) => els
+      .map((e) => ({ n: e.getAttribute('data-cell'), o: Number((e as HTMLElement).style.order) }))
+      .sort((a, b) => a.o - b.o)
+      .map((x) => x.n));
+  expect(order).toEqual(names);
+  expect(new URL(page.url()).searchParams.get('view')).toBe('grid');
+
+  // A tile's caption opens that session full size, and every pane stays
+  // mounted behind it.
+  const other = names.find((n) => n !== current) || names[0];
+  await page.locator(`#panes .cell[data-cell="${other}"] .cell-head`).click();
+  await expect(page.locator('body')).toHaveAttribute('data-view', 'tabs');
+  await expect(page.locator(`#tab-bar .tab[data-tab="${other}"]`)).toHaveAttribute('aria-current', 'page');
+  await expect(page.locator('#panes .cell')).toHaveCount(names.length);
+  expect(new URL(page.url()).searchParams.get('view')).toBeNull();
+
+  // ...and none of it was a page load.
+  expect(await page.evaluate(() => performance.getEntriesByType('navigation').length)).toBe(1);
+});
+
+test('?view=grid renders the whole grid server-side (the no-JS path)', async ({ browser }) => {
+  const page = await authedPage(browser);
+  await page.goto('/?view=grid');
+  const names = await tabNames(page);
+  await expect(page.locator('#panes .cell')).toHaveCount(names.length);
+  await expect(page.locator('#tab-bar a.viewtog[data-view-to="tabs"]')).toBeVisible();
 });
 
 test('no root-page href embeds URL userinfo (user@host)', async ({ browser }) => {

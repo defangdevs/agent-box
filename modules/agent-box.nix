@@ -15377,11 +15377,18 @@ STYLE = """<style>
      session twice would leave the two attachments fighting over its size.
      auto-fit rather than a fixed column count: two sessions get half the
      page each, eight get a scrolling grid of readable terminals, and a
-     phone gets one column without a media query. */
+     phone gets one column without a media query.
+
+     The track floor is min(320px, 100%) and not a bare 320px: a bare one
+     cannot shrink, so on a 320px-wide phone the 8px padding either side
+     left 304px for a track that insisted on 320 and this container
+     scrolled SIDEWAYS - one column, and still not all of it on screen
+     (CodeRabbit on PR #580). 100% is the free space, so the floor gives
+     way exactly when there is less room than a tile wants. */
   .ws[data-view=grid] .panes { position: static; display: grid; gap: 8px;
                                padding: 8px; overflow: auto;
                                grid-template-columns:
-                                 repeat(auto-fit, minmax(320px, 1fr));
+                                 repeat(auto-fit, minmax(min(320px, 100%), 1fr));
                                grid-auto-rows: minmax(240px, 1fr); }
   .ws[data-view=grid] .cell { position: relative; inset: auto;
                               visibility: visible; display: flex;
