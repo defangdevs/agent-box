@@ -12102,6 +12102,7 @@ import re
 import secrets
 import select
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -13681,7 +13682,21 @@ CONNECT_BLAME_RE = re.compile(
 # lands on one nixpkgs, not two. Empty disables the install offer rather
 # than guessing at a channel.
 CONNECT_NIXPKGS = os.environ.get("AGENT_BOX_NIXPKGS", "")
-CONNECT_NIX_BIN = os.environ.get("AGENT_BOX_NIX_BIN") or "nix"
+# The NixOS module PINS nix as a store path because it has one; a native
+# box cannot, since resolving one at apply time would bake the building
+# host's store path into a generated file and break on the next nix
+# upgrade (bin/agentbox says so where it declines to set this). So the pin
+# is optional and connect_nix_bin() resolves it at USE instead, the way
+# lib/agents.sh already does for the supervisor's own lazy install.
+CONNECT_NIX_PIN = os.environ.get("AGENT_BOX_NIX_BIN") or ""
+# Where to look when nothing pinned it. A MULTI-USER nix install puts the
+# binary in the default profile, which is on no PATH this daemon or its
+# panes carry; a single-user install puts it in the user profile, which is
+# on the pane's. Both layouts have to be covered by path, not by PATH.
+CONNECT_NIX_FALLBACKS = (
+    "/nix/var/nix/profiles/default/bin/nix",
+    "~/.nix-profile/bin/nix",
+)
 
 CONNECT_BINS = {}
 for _pair in os.environ.get("AGENT_BOX_CONNECT_BINS", "").split():
@@ -14258,6 +14273,49 @@ def connect_state(flow, keys=None, tmux_state=None):
     }
 
 
+def connect_nix_bin(server_path=None):
+    """The nix an install runs with, resolved at USE (issue #544).
+
+    The old fallback was the bare name "nix", left for the pane's shell to
+    resolve. On a native box that never works: the pane's PATH is the tmux
+    server's (see connect_server_path), which carries the agent profile and
+    the distro's bin directories and NOT
+    /nix/var/nix/profiles/default/bin, where a multi-user install puts nix.
+    So every card that had to fetch its CLI first ran "nix: not found" —
+    the install could not start at all, on any native box, for claude,
+    codex and defang alike. An interactive shell finds nix there only
+    because /etc/profile's nix-daemon.sh prepends that directory, and this
+    script is run by a non-interactive `sh -c` that sources nothing.
+
+    Order follows lib/agents.sh, which resolves the same binary for the
+    supervisor's lazy install: the pin, then PATH (the pane's first, since
+    that is the one the install will actually run under), then the two
+    standard install layouts. Returning None is a real answer — the caller
+    fails the card with something the operator can read, rather than
+    emitting a script that cannot work.
+
+    The pin is preferred but not TRUSTED - it goes through the same
+    executable check as every other candidate, so a store path the garbage
+    collector has since taken falls through to a nix that is really there
+    rather than pinning the card to a script that cannot run. This is one
+    place stricter than agents.sh, which takes its pin on faith: the shell
+    has no cheap way to say "checked, and missing" other than the error it
+    would print anyway, and this resolver does, so the operator gets "no
+    nix on this box" instead of "nix: not found" from inside a pane.
+    """
+    candidates = [CONNECT_NIX_PIN] if CONNECT_NIX_PIN else []
+    candidates += [os.path.join(entry, "nix")
+                   for entry in (server_path or "").split(os.pathsep) if entry]
+    found = shutil.which("nix")
+    if found:
+        candidates.append(found)
+    candidates.extend(os.path.expanduser(p) for p in CONNECT_NIX_FALLBACKS)
+    for candidate in candidates:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def connect_server_path():
     """The PATH a SESSION's pane gets, read off the tmux server.
 
@@ -14323,6 +14381,9 @@ def connect_start(flow):
     # resolved, so the sign-in half needs no special case.
     binary = flow["bin"]
     prelude = ""
+    # Read before the prelude is built, not after: the install half needs
+    # the same PATH the CLI half will run under, to resolve nix against it.
+    server_path = connect_server_path()
     if not binary:
         if not flow["attr"] and not flow["expr"]:
             state = connect_state(flow)
@@ -14341,6 +14402,13 @@ def connect_start(flow):
                               "package source configured to fetch it from."
                               % flow["label"])
             return state
+        nix_bin = connect_nix_bin(server_path)
+        if not nix_bin:
+            state = connect_state(flow)
+            state["state"] = "failed"
+            state["error"] = ("%s is not installed, and no nix was found on "
+                              "this box to install it with." % flow["label"])
+            return state
         # An expression wins over an attr when a card somehow has both: it
         # is the PINNED one, and pinning is the only reason a card carries
         # an expression at all.
@@ -14354,12 +14422,21 @@ def connect_start(flow):
         # path above does: ~/.nix-profile is what a session's PATH already
         # looks in, so an install landing anywhere else would succeed and
         # still leave the card saying "not installed".
+        # Chained with && and NOT "|| exit 1", which is what the card was
+        # really hiding behind (issue #544): `exit` leaves the whole shell,
+        # so a failed install skipped the exit marker AND the linger sleep
+        # below. tmux then dropped the session within milliseconds,
+        # connect_state found no pane, and the card fell back to "Not
+        # installed" with error None — every install failure, whatever its
+        # cause, looked exactly like the button doing nothing. Falling
+        # through to the marker instead lets $? carry the install's own
+        # status, so the card reaches "failed" and shows connect_error().
         prelude = (
             "echo '[agent-box] fetching %s — first use on this box, this "
             "can take a few minutes'; NIXPKGS_ALLOW_UNFREE=1 %s profile add "
-            "--impure --profile %s %s || exit 1; " % (
+            "--impure --profile %s %s && " % (
                 flow["label"],
-                shlex.quote(CONNECT_NIX_BIN),
+                shlex.quote(nix_bin),
                 shlex.quote(os.path.join(os.path.expanduser("~"),
                                          ".nix-profile")),
                 " ".join(shlex.quote(a) for a in source)))
@@ -14376,7 +14453,6 @@ def connect_start(flow):
     # other variable but the pane's PATH comes from the CLIENT regardless
     # (measured on tmux 3.6a — an -e FOO reaches the pane while an -e PATH
     # beside it is dropped), and this client is the settings daemon.
-    server_path = connect_server_path()
     if server_path:
         script = "export PATH=%s; %s" % (shlex.quote(server_path), script)
     tmux("new-session", "-d", "-s", connect_pane(flow_id),
