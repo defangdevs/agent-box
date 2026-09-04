@@ -23,10 +23,11 @@
       if (!from || !to) { return; }
       window.Idiomorph.morph(to, from, {
         // The focused element's VALUE is the operator's, not the server's:
-        // #connect-list re-renders every 2.5s while a sign-in flow waits, and
-        // the rendered (empty) input must not overwrite a half-typed code
-        // (issue #410). restoreFocus is on by default and puts focus and
-        // selection back if the focused node does have to be replaced.
+        // #connect-list can re-render at any point while a sign-in flow
+        // waits, and the rendered (empty) input must not overwrite a
+        // half-typed code (issue #410). restoreFocus is on by default and puts
+        // focus and selection back if the focused node does have to be
+        // replaced.
         ignoreActiveValue: true,
         // NOTE: these belong under `callbacks`, not beside the options above.
         // Idiomorph reads them from there and silently ignores a hook left at
@@ -318,9 +319,17 @@
   // Guided sign-in (issues #207, #208, #313). While a card is
   // mid-flight its state moves without this page posting anything: the
   // CLI prints its URL a beat after start, and the sign-in itself
-  // completes in another tab entirely. So re-fetch and swap the section
-  // while it reports itself busy, and stop as soon as it does not —
-  // there is nothing to watch on a page whose cards are all settled.
+  // completes in another tab entirely. So check in while it reports
+  // itself busy, and stop as soon as it does not — there is nothing to
+  // watch on a page whose cards are all settled.
+  //
+  // The check-in itself is cheap on purpose: {BASE}/status's fingerprint
+  // is a few bytes, versus the whole rendered page. Most ticks find the
+  // operator still mid-flow with nothing yet to show (typing a code,
+  // waiting on the provider), so this used to re-fetch and re-morph the
+  // entire page every 2.5s regardless. Now that only happens once the
+  // fingerprint actually moves — data-fp travels with the morph, so the
+  // next tick compares against whatever was last rendered.
   var connectTimer = null;
   function connectBusy() {
     var el = document.getElementById("connect-list");
@@ -331,8 +340,16 @@
     connectTimer = window.setTimeout(function () {
       connectTimer = null;
       if (document.hidden) { connectPoll(); return; }
-      fetchPage()
-        .then(function (t) { if (t !== null) { applyDoc(parseHTML(t), ["connect-list"]); } })
+      var el = document.getElementById("connect-list");
+      var url = el && el.getAttribute("data-status");
+      if (!url) { connectPoll(); return; }
+      fetchStatus(url)
+        .then(function (s) {
+          var fp = s && s.connect_fp;
+          if (!fp || fp === el.getAttribute("data-fp")) { return null; }
+          return fetchPage();
+        })
+        .then(function (t) { if (t) { applyDoc(parseHTML(t), ["connect-list"]); } })
         .catch(function () {})
         .then(function () { connectPoll(); });
     }, 2500);

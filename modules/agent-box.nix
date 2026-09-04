@@ -14580,11 +14580,14 @@ def session_counts():
 
 def status_payload():
     """Compact JSON the settings page long-polls for restart/update
-    progress. Never includes secret values or command output."""
+    progress, and connectPoll checks before fetching the full page.
+    Never includes secret values or command output."""
     payload = {"rev": REV, "sessions": session_counts()}
     update = update_service_state()
     if update is not None:
         payload["update"] = update
+    if connect_flows():
+        payload["connect_fp"] = connect_fingerprint()
     return payload
 
 
@@ -15293,7 +15296,11 @@ WEBHOOK_ENDPOINT_EMPTY_TPL = """<p class="note">%s</p>
 
 # Guided sign-in (issues #207, #208, #313). Hidden entirely when the box
 # passed no AGENT_BOX_CONNECT_BINS. data-busy tells the page whether a
-# flow is mid-flight, which is the only thing its poll loop needs to know.
+# flow is mid-flight, the only thing that decides whether to poll at all;
+# data-status + data-fp let it check {BASE}/status's tiny fingerprint
+# before paying for a full page fetch - connectPoll used to re-fetch the
+# whole page unconditionally every 2.5s while busy, regardless of whether
+# anything had actually changed.
 CONNECT_SECTION_TPL = """<section>
     <div class="sec-head">
       <h2>Connections</h2>
@@ -15301,7 +15308,8 @@ CONNECT_SECTION_TPL = """<section>
     <p class="note">Connect the accounts your assistants can use. Sign-in is
     handled securely by each provider, and this page does not display your
     credentials. API keys added manually below take priority.</p>
-    <div id="connect-list" data-busy="{busy}">{cards}</div>
+    <div id="connect-list" data-busy="{busy}" data-status="{status_url}"
+         data-fp="{fp}">{cards}</div>
   </section>"""
 
 # The user's landing page (HOME mode): a tabbed terminal workspace
@@ -15635,10 +15643,11 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       if (!from || !to) { return; }
       window.Idiomorph.morph(to, from, {
         // The focused element's VALUE is the operator's, not the server's:
-        // #connect-list re-renders every 2.5s while a sign-in flow waits, and
-        // the rendered (empty) input must not overwrite a half-typed code
-        // (issue #410). restoreFocus is on by default and puts focus and
-        // selection back if the focused node does have to be replaced.
+        // #connect-list can re-render at any point while a sign-in flow
+        // waits, and the rendered (empty) input must not overwrite a
+        // half-typed code (issue #410). restoreFocus is on by default and puts
+        // focus and selection back if the focused node does have to be
+        // replaced.
         ignoreActiveValue: true,
         // NOTE: these belong under `callbacks`, not beside the options above.
         // Idiomorph reads them from there and silently ignores a hook left at
@@ -15930,9 +15939,17 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   // Guided sign-in (issues #207, #208, #313). While a card is
   // mid-flight its state moves without this page posting anything: the
   // CLI prints its URL a beat after start, and the sign-in itself
-  // completes in another tab entirely. So re-fetch and swap the section
-  // while it reports itself busy, and stop as soon as it does not —
-  // there is nothing to watch on a page whose cards are all settled.
+  // completes in another tab entirely. So check in while it reports
+  // itself busy, and stop as soon as it does not — there is nothing to
+  // watch on a page whose cards are all settled.
+  //
+  // The check-in itself is cheap on purpose: {BASE}/status's fingerprint
+  // is a few bytes, versus the whole rendered page. Most ticks find the
+  // operator still mid-flow with nothing yet to show (typing a code,
+  // waiting on the provider), so this used to re-fetch and re-morph the
+  // entire page every 2.5s regardless. Now that only happens once the
+  // fingerprint actually moves — data-fp travels with the morph, so the
+  // next tick compares against whatever was last rendered.
   var connectTimer = null;
   function connectBusy() {
     var el = document.getElementById("connect-list");
@@ -15943,8 +15960,16 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     connectTimer = window.setTimeout(function () {
       connectTimer = null;
       if (document.hidden) { connectPoll(); return; }
-      fetchPage()
-        .then(function (t) { if (t !== null) { applyDoc(parseHTML(t), ["connect-list"]); } })
+      var el = document.getElementById("connect-list");
+      var url = el && el.getAttribute("data-status");
+      if (!url) { connectPoll(); return; }
+      fetchStatus(url)
+        .then(function (s) {
+          var fp = s && s.connect_fp;
+          if (!fp || fp === el.getAttribute("data-fp")) { return null; }
+          return fetchPage();
+        })
+        .then(function (t) { if (t) { applyDoc(parseHTML(t), ["connect-list"]); } })
         .catch(function () {})
         .then(function () { connectPoll(); });
     }, 2500);
@@ -17550,8 +17575,21 @@ def render_connect_step(state):
     return '<div class="conn-step">' + "".join(parts) + "</div>"
 
 
+def connect_fingerprint(states=None):
+    """Short digest of every connect flow's state - what connectPoll
+    compares {BASE}/status's answer against before paying for the full
+    page fetch that used to run unconditionally every 2.5s while busy."""
+    if states is None:
+        keys = read_keys()
+        tmux_state = tmux_sessions()
+        states = [connect_state(flow, keys=keys, tmux_state=tmux_state)
+                  for flow in connect_flows()]
+    raw = json.dumps(states, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
 def render_connect():
-    """Every card, plus the busy flag the page polls on."""
+    """Every card, plus the busy flag and fingerprint the page polls on."""
     keys = read_keys()
     tmux_state = tmux_sessions()
     states = [connect_state(flow, keys=keys, tmux_state=tmux_state)
@@ -17562,7 +17600,9 @@ def render_connect():
     ) else "0"
     cards = "".join(render_connect_card(s) for s in states)
     return CONNECT_SECTION_TPL.format(
-        cards='<ul class="tbl">' + cards + "</ul>", busy=busy)
+        cards='<ul class="tbl">' + cards + "</ul>", busy=busy,
+        status_url=html.escape(BASE) + "/status",
+        fp=connect_fingerprint(states))
 
 
 def render_sessions_section(subs=None, profiles=None):
