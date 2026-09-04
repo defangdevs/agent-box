@@ -4728,7 +4728,7 @@ esac
         ensure_state
         if [ "''${1:-}" != "-h" ] && [ "''${1:-}" != "--help" ]; then
           deliver_to=session; have_when=0; have_drop=0; topic=""; want=""
-          have_include=0; claims=""; profile=""; have_profile=0
+          have_include=0; have_exclude=0; claims=""; profile=""; have_profile=0
           # Filter --claim out of the argument list as we scan it: webhook.py has
           # never heard of that flag, so it is translated to --include below and
           # must not survive into the exec. Rotate idiom — take from the front,
@@ -4764,6 +4764,7 @@ esac
               --when|--when=*) have_when=1 ;;
               --drop|--drop=*) have_drop=1 ;;
               --include|--include=*) have_include=1 ;;
+              --exclude|--exclude=*) have_exclude=1 ;;
               --claim) want=claim; continue ;;
               --claim=*)
                 if [ -z "''${a#--claim=}" ]; then
@@ -4841,7 +4842,8 @@ esac
             fi
             set -- "$@" --include "$("$JQ" -nc --argjson any "$all" '{any:$any}')"
           fi
-          if [ "$deliver_to" = subagent ] && [ "$have_when" = 0 ] && [ "$have_drop" = 0 ]; then
+          if [ "$deliver_to" = subagent ] && [ "$have_when" = 0 ] && [ "$have_drop" = 0 ] \
+             && [ "$have_include" = 0 ] && [ "$have_exclude" = 0 ]; then
             # A bare "owner/repo" (no "source:" prefix at all) is the github
             # shorthand; anything with its OWN "source:" prefix — including a
             # non-github one whose key happens to contain a "/", e.g.
@@ -4917,8 +4919,34 @@ esac
         # The OLDEST installed copy decides: a project-scope install shadows the
         # user one, and the stalest is the one that can break the brake.
         skew=none
+        plugin_state=""
         if [ -z "$installed" ]; then
           skew=unknown
+          # plugin_versions() swallows every failure to keep status() usable when
+          # nothing is installed yet, which used to leave this reported as "is
+          # missing" even when the file exists but jq choked on it, or parsed
+          # cleanly to no versions for this plugin (issue #568) — three different
+          # states that need three different fixes, not one guess.
+          if [ ! -f "$PLUGINS" ]; then
+            plugin_state="$PLUGINS is missing"
+          elif ! "$JQ" . "$PLUGINS" >/dev/null 2>&1; then
+            # Syntax-only: -e also treats a top-level null/false as a failure,
+            # which is a parse SUCCESS by any JSON reader's definition.
+            plugin_state="$PLUGINS did not parse as JSON"
+          else
+            # Non-numeric (top-level null/false/an array — nowhere a version
+            # could live) counts the same as zero: no entry to report on.
+            entries="$("$JQ" -r '.plugins["local-webhook@local-channels"] // [] | length' \
+                         "$PLUGINS" 2>/dev/null)"
+            case "$entries" in ('''|*[!0-9]*) entries=0 ;; esac
+            if [ "$entries" = 0 ]; then
+              plugin_state="$PLUGINS has no local-webhook@local-channels entry"
+            else
+              # A record exists but plugin_versions() found no .version on any
+              # of them — a different fault than no record at all.
+              plugin_state="$PLUGINS has a local-webhook@local-channels entry with no version"
+            fi
+          fi
         elif [ -n "$pinned" ]; then
           oldest="$(printf '%s\n' $installed | sort -V | head -1)"
           if [ "$oldest" = "$pinned" ]; then
@@ -4982,7 +5010,7 @@ esac
         # nothing at all.
         if [ "$skew" = unknown ]; then
           echo "agent-box-webhook: cannot tell which local-webhook a session loads" \
-               "($PLUGINS is missing) — if sessions run one, its version is unverified (issue #193)" >&2
+               "($plugin_state) — if sessions run one, its version is unverified (issue #193)" >&2
         elif [ "$skew" = older ]; then
           echo "agent-box-webhook: version skew — sessions load local-webhook $installed," \
                "OLDER than the pinned $pinned. webhook.syncSessionPlugin normally cures this at the" \
@@ -14656,11 +14684,14 @@ def session_counts():
 
 def status_payload():
     """Compact JSON the settings page long-polls for restart/update
-    progress. Never includes secret values or command output."""
+    progress, and connectPoll checks before fetching the full page.
+    Never includes secret values or command output."""
     payload = {"rev": REV, "sessions": session_counts()}
     update = update_service_state()
     if update is not None:
         payload["update"] = update
+    if connect_flows():
+        payload["connect_fp"] = connect_fingerprint()
     return payload
 
 
@@ -15369,7 +15400,11 @@ WEBHOOK_ENDPOINT_EMPTY_TPL = """<p class="note">%s</p>
 
 # Guided sign-in (issues #207, #208, #313). Hidden entirely when the box
 # passed no AGENT_BOX_CONNECT_BINS. data-busy tells the page whether a
-# flow is mid-flight, which is the only thing its poll loop needs to know.
+# flow is mid-flight, the only thing that decides whether to poll at all;
+# data-status + data-fp let it check {BASE}/status's tiny fingerprint
+# before paying for a full page fetch - connectPoll used to re-fetch the
+# whole page unconditionally every 2.5s while busy, regardless of whether
+# anything had actually changed.
 CONNECT_SECTION_TPL = """<section>
     <div class="sec-head">
       <h2>Connections</h2>
@@ -15377,7 +15412,8 @@ CONNECT_SECTION_TPL = """<section>
     <p class="note">Connect the accounts your assistants can use. Sign-in is
     handled securely by each provider, and this page does not display your
     credentials. API keys added manually below take priority.</p>
-    <div id="connect-list" data-busy="{busy}">{cards}</div>
+    <div id="connect-list" data-busy="{busy}" data-status="{status_url}"
+         data-fp="{fp}">{cards}</div>
   </section>"""
 
 # The user's landing page (HOME mode): a tabbed terminal workspace
@@ -15711,10 +15747,11 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       if (!from || !to) { return; }
       window.Idiomorph.morph(to, from, {
         // The focused element's VALUE is the operator's, not the server's:
-        // #connect-list re-renders every 2.5s while a sign-in flow waits, and
-        // the rendered (empty) input must not overwrite a half-typed code
-        // (issue #410). restoreFocus is on by default and puts focus and
-        // selection back if the focused node does have to be replaced.
+        // #connect-list can re-render at any point while a sign-in flow
+        // waits, and the rendered (empty) input must not overwrite a
+        // half-typed code (issue #410). restoreFocus is on by default and puts
+        // focus and selection back if the focused node does have to be
+        // replaced.
         ignoreActiveValue: true,
         // NOTE: these belong under `callbacks`, not beside the options above.
         // Idiomorph reads them from there and silently ignores a hook left at
@@ -16006,9 +16043,17 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   // Guided sign-in (issues #207, #208, #313). While a card is
   // mid-flight its state moves without this page posting anything: the
   // CLI prints its URL a beat after start, and the sign-in itself
-  // completes in another tab entirely. So re-fetch and swap the section
-  // while it reports itself busy, and stop as soon as it does not —
-  // there is nothing to watch on a page whose cards are all settled.
+  // completes in another tab entirely. So check in while it reports
+  // itself busy, and stop as soon as it does not — there is nothing to
+  // watch on a page whose cards are all settled.
+  //
+  // The check-in itself is cheap on purpose: {BASE}/status's fingerprint
+  // is a few bytes, versus the whole rendered page. Most ticks find the
+  // operator still mid-flow with nothing yet to show (typing a code,
+  // waiting on the provider), so this used to re-fetch and re-morph the
+  // entire page every 2.5s regardless. Now that only happens once the
+  // fingerprint actually moves — data-fp travels with the morph, so the
+  // next tick compares against whatever was last rendered.
   var connectTimer = null;
   function connectBusy() {
     var el = document.getElementById("connect-list");
@@ -16019,8 +16064,16 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     connectTimer = window.setTimeout(function () {
       connectTimer = null;
       if (document.hidden) { connectPoll(); return; }
-      fetchPage()
-        .then(function (t) { if (t !== null) { applyDoc(parseHTML(t), ["connect-list"]); } })
+      var el = document.getElementById("connect-list");
+      var url = el && el.getAttribute("data-status");
+      if (!url) { connectPoll(); return; }
+      fetchStatus(url)
+        .then(function (s) {
+          var fp = s && s.connect_fp;
+          if (!fp || fp === el.getAttribute("data-fp")) { return null; }
+          return fetchPage();
+        })
+        .then(function (t) { if (t) { applyDoc(parseHTML(t), ["connect-list"]); } })
         .catch(function () {})
         .then(function () { connectPoll(); });
     }, 2500);
@@ -17626,8 +17679,21 @@ def render_connect_step(state):
     return '<div class="conn-step">' + "".join(parts) + "</div>"
 
 
+def connect_fingerprint(states=None):
+    """Short digest of every connect flow's state - what connectPoll
+    compares {BASE}/status's answer against before paying for the full
+    page fetch that used to run unconditionally every 2.5s while busy."""
+    if states is None:
+        keys = read_keys()
+        tmux_state = tmux_sessions()
+        states = [connect_state(flow, keys=keys, tmux_state=tmux_state)
+                  for flow in connect_flows()]
+    raw = json.dumps(states, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
 def render_connect():
-    """Every card, plus the busy flag the page polls on."""
+    """Every card, plus the busy flag and fingerprint the page polls on."""
     keys = read_keys()
     tmux_state = tmux_sessions()
     states = [connect_state(flow, keys=keys, tmux_state=tmux_state)
@@ -17638,7 +17704,9 @@ def render_connect():
     ) else "0"
     cards = "".join(render_connect_card(s) for s in states)
     return CONNECT_SECTION_TPL.format(
-        cards='<ul class="tbl">' + cards + "</ul>", busy=busy)
+        cards='<ul class="tbl">' + cards + "</ul>", busy=busy,
+        status_url=html.escape(BASE) + "/status",
+        fp=connect_fingerprint(states))
 
 
 def render_sessions_section(subs=None, profiles=None):
