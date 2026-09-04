@@ -248,6 +248,16 @@ in
         return json.loads(raw)["flow"]
 
 
+    def sessions():
+        # The registry: what ensure_harness_session (issue #504) wrote, if
+        # anything. Read as root — this test never seeds a session, so
+        # nothing else needs the agent user's own view of the file.
+        raw = machine.succeed(
+            "cat /home/agent/.config/agent-box/sessions.json"
+        )
+        return json.loads(raw)["sessions"]
+
+
     def tmux(cmd):
         # Route through as_agent's shlex.quote rather than splicing cmd into
         # a hand-written single-quoted string: cmd itself carries quotes
@@ -354,6 +364,16 @@ in
         # Signed in: the pane is reaped rather than left holding a stale code.
         machine.wait_until_fails(tmux("has-session -t =_connect-claude"))
 
+    with subtest("signing in leaves a real session running, not just a signed-in CLI (issue #504)"):
+        regs = sessions()
+        assert "claude" in regs, regs
+        claude_session = regs["claude"]
+        assert claude_session["agent"] == "claude", claude_session
+        # claude's rc is a flag on the ordinary worker session, so the one
+        # auto-created session is both usable AND remote-visible.
+        assert claude_session["remoteControl"] is True, claude_session
+        assert claude_session["profile"] is None, claude_session
+
     with subtest("the card shows the code the CLI printed, not its prose"):
         assert post("/agent/settings/connect/start", "flow=github") == "303"
         waiting = wait_state("github", "waiting")
@@ -399,6 +419,20 @@ in
         assert post("/agent/settings/connect/cancel", "flow=claude") == "303"
         machine.wait_until_fails(tmux("has-session -t =_connect-claude"))
         wait_state("claude", "connected")
+
+    with subtest("a repeat sign-in does not mint a second session (issue #504)"):
+        # A token refresh or a deliberate "Sign in again" cycles the card
+        # through "connected" a second time; ensure_harness_session must
+        # see the session it already made and skip, not pile up "claude-2".
+        machine.succeed("rm -f ${stateDir}/claude-in")
+        assert post("/agent/settings/connect/start", "flow=claude") == "303"
+        wait_state("claude", "waiting")
+        assert post("/agent/settings/connect/code", "flow=claude&code=abc-9999999999") == "303"
+        wait_state("claude", "connected")
+        machine.wait_until_fails(tmux("has-session -t =_connect-claude"))
+        regs = sessions()
+        claude_sessions = [n for n, s in regs.items() if s.get("agent") == "claude"]
+        assert claude_sessions == ["claude"], regs
 
     with subtest("a rejected code reports the CLI's complaint, not the transcript"):
         machine.succeed("rm -f ${stateDir}/claude-in")

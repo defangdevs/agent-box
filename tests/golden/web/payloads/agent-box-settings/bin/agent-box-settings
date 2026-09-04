@@ -1065,6 +1065,64 @@ def write_sessions(sessions, version=REGISTRY_VERSION):
         raise
 
 
+def ensure_harness_session(agent, remote_control):
+    """Auto-start one bare session for `agent` the moment its connect card
+    signs in (issue #504), so install+login leaves an actual running
+    session behind rather than just a signed-in CLI nobody has started yet.
+
+    Skipped if the user already has ANY session on that harness -- a repeat
+    sign-in (a token refresh, "Sign in again") must not mint a second one
+    every time the card cycles through "connected". No profile, no working
+    directory: this is the bare pseudo-profile shape `shell` already has
+    (see SHELL_PSEUDO_PROFILE), the one with no model, effort or prompt to
+    carry.
+
+    `remote_control` is the one thing that differs by harness. claude's rc
+    is a flag on the ordinary TUI (supervisor.sh appends --remote-control),
+    so this session is both a normal worker AND immediately visible to
+    desktop/mobile. codex's rc replaces the process outright with the
+    app-server pairing daemon (codex-remote-control.sh) -- pairing already
+    happened in the connect card's own pane, so what closes issue #504's
+    "a codex session running" is a real interactive session, which only
+    remoteControl: false ever produces. Written directly here rather than
+    through session-cli.sh/`/sessions/add`, both of which still hardcode
+    remoteControl: true unconditionally -- neither writer offers a way to
+    ask for false today.
+    """
+    if agent not in AGENTS:
+        return
+    try:
+        with sessions_lock():
+            sessions, version = load_sessions()
+            if any(isinstance(s, dict) and s.get("agent") == agent
+                   for s in sessions.values()):
+                return
+            name = gen_session_name(agent, sessions)
+            sessions[name] = {
+                "agent": agent,
+                "skipPermissions": True,
+                "remoteControl": remote_control,
+                "remoteControlName": None,
+                "workingDirectory": None,
+                "extraArgs": [],
+                "profile": None,
+                "initialPrompt": None,
+                "resumePrompt": None,
+                "boxSessionId": None,
+                "hasRun": False,
+            }
+            write_sessions(sessions, version)
+    except (RegistryUnreadable, OSError):
+        # Not the connect card's place to surface a broken registry, or a
+        # write that failed outright (disk full, a permission problem) --
+        # the session list already reports the former loudly (issue #279),
+        # and sign-in itself still succeeded either way. The pane is
+        # already reaped by the time this runs, so there is no in-flight
+        # request to retry against; the next full sign-in cycle tries
+        # again the same way a first one would.
+        pass
+
+
 _tmux_error_at = -1e9   # monotonic stamp of the last logged tmux OSError
 
 
@@ -2537,6 +2595,16 @@ def connect_state(flow, keys=None, tmux_state=None):
                 connect_cancel(flow_id)
                 running = False
                 state = "connected"
+                # One bare session per harness, started the moment sign-in
+                # lands (issue #504) -- codex gets an interactive worker
+                # session (remote_control=False) since pairing for
+                # phone/desktop already happened in this flow's own pane;
+                # claude's rc is a flag on the same worker session, so one
+                # session covers both being usable AND remote-visible.
+                if flow_id == "claude":
+                    ensure_harness_session("claude", remote_control=True)
+                elif flow_id == "codex":
+                    ensure_harness_session("codex", remote_control=False)
             else:
                 connect_expire(flow_id)
                 state = "exchanging"
