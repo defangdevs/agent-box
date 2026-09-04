@@ -83,23 +83,27 @@
       .then(function (r) { if (!r.ok) { throw new Error(); } return r.json(); })
       .catch(function () { return null; });
   }
-  // Re-fetch the page this script is running on.
-  //
   // The daemon can decide the current URL is no longer the right page:
   // /<user>/ redirects to the settings page once the last session is gone.
   // Splicing fragments out of THAT answer patches nothing — applyDoc skips an
-  // id the other document does not have — so the tab bar would sit there
-  // showing a session that no longer exists until someone reloaded by hand.
-  // Follow the redirect for real instead.
-  function fetchPage() {
-    var here = window.location.pathname;
-    return fetch(here + window.location.search).then(function (r) {
+  // id the other document does not have — so a stale fragment (a session
+  // that no longer exists, an armed "Close?" tab-close pill — issue #579)
+  // would sit there until someone reloaded by hand. Follow the redirect for
+  // real instead, whether the request was this page's own re-fetch or a
+  // form POST that ended up somewhere else.
+  function settleRedirect(fetchPromise, here) {
+    return fetchPromise.then(function (r) {
       if (r.redirected && new URL(r.url).pathname !== here) {
         window.location.replace(r.url);
         return null;
       }
       return r.text();
     });
+  }
+  // Re-fetch the page this script is running on.
+  function fetchPage() {
+    var here = window.location.pathname;
+    return settleRedirect(fetch(here + window.location.search), here);
   }
   // Re-fetch the current page and patch the live session list/tabs, so
   // the visible list tracks a restart even when nothing was "starting"
@@ -868,23 +872,14 @@
       else if (wasActive && tabEl(wasActive)) { wsSelect(wasActive, false); }
       wsSync();
     }
-    // Same hazard fetchPage() guards against: the daemon can decide the
-    // current URL is no longer the right page (closing the workspace's
-    // last tab 303s to the settings page, see do_GET's TERM_BASE branch).
-    // Patching fragments out of THAT answer patches nothing — applyDoc
-    // skips an id the settings page does not have — so a stale tab (an
-    // armed "Close?" pill included, issue #579) sat there until a manual
-    // reload. Follow the redirect for real instead, same as fetchPage().
+    // Same redirect hazard fetchPage() guards against (issue #579) — see
+    // settleRedirect()'s comment. Closing the workspace's last tab is the
+    // case that bites here: do_GET's TERM_BASE branch 303s /<user>/ on to
+    // the settings page once zero sessions remain.
     function post() {
       var here = window.location.pathname;
-      return fetch(f.getAttribute("action"), { method: "POST", body: body })
-        .then(function (r) {
-          if (r.redirected && new URL(r.url).pathname !== here) {
-            window.location.replace(r.url);
-            return null;
-          }
-          return r.text();
-        });
+      return settleRedirect(
+        fetch(f.getAttribute("action"), { method: "POST", body: body }), here);
     }
 
     // The two Danger-zone actions get a long-polled progress line;
