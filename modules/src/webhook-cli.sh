@@ -684,8 +684,21 @@ case "$cmd" in
     # The OLDEST installed copy decides: a project-scope install shadows the
     # user one, and the stalest is the one that can break the brake.
     skew=none
+    plugin_state=""
     if [ -z "$installed" ]; then
       skew=unknown
+      # plugin_versions() swallows every failure to keep status() usable when
+      # nothing is installed yet, which used to leave this reported as "is
+      # missing" even when the file exists but jq choked on it, or parsed
+      # cleanly to no versions for this plugin (issue #568) — three different
+      # states that need three different fixes, not one guess.
+      if [ ! -f "$PLUGINS" ]; then
+        plugin_state="$PLUGINS is missing"
+      elif ! "$JQ" -e . "$PLUGINS" >/dev/null 2>&1; then
+        plugin_state="$PLUGINS did not parse as JSON"
+      else
+        plugin_state="$PLUGINS has no local-webhook@local-channels entry"
+      fi
     elif [ -n "$pinned" ]; then
       oldest="$(printf '%s\n' $installed | sort -V | head -1)"
       if [ "$oldest" = "$pinned" ]; then
@@ -749,7 +762,7 @@ case "$cmd" in
     # nothing at all.
     if [ "$skew" = unknown ]; then
       echo "agent-box-webhook: cannot tell which local-webhook a session loads" \
-           "($PLUGINS is missing) — if sessions run one, its version is unverified (issue #193)" >&2
+           "($plugin_state) — if sessions run one, its version is unverified (issue #193)" >&2
     elif [ "$skew" = older ]; then
       echo "agent-box-webhook: version skew — sessions load local-webhook $installed," \
            "OLDER than the pinned $pinned. webhook.syncSessionPlugin normally cures this at the" \
