@@ -338,5 +338,21 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
 .prof-tag { border: 1px solid #30363d; border-radius: 999px;
             padding: 1px 8px; }
 /* The profile name field is narrower than a secret KEY field — a profile
-   name is a word, and the row carries four controls before the button. */
+   name is a word, and the "New profile" row carries four controls of its
+   own now that Save has moved below the prompt and the starting setting
+   (issue #493). */
 input.pname { width: 150px; }
+/* Model is a free-text field (issue #493: model IDs change too often for a
+   fixed picker), but at the harness picker's default width it alone kept
+   the row from fitting on one line next to name + assistant + reasoning
+   level. */
+input.pmodel { width: 160px; }
+/* One control height for the profile editor's own row, same fix and same
+   reason as .new-session-row above: Chrome's UA sheet renders a <select>
+   a few px shorter than a same-padding <input>, so the assistant picker
+   read as stepped against the model and reasoning-level fields beside it. */
+.profile-row select,
+.profile-row input,
+.profile-row .btn { height: 34px; }
+.env-row,
+.profile-actions { margin-top: 12px; }

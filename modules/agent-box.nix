@@ -15235,8 +15235,24 @@ STYLE = """<style>
   .prof-tag { border: 1px solid #30363d; border-radius: 999px;
               padding: 1px 8px; }
   /* The profile name field is narrower than a secret KEY field — a profile
-     name is a word, and the row carries four controls before the button. */
+     name is a word, and the "New profile" row carries four controls of its
+     own now that Save has moved below the prompt and the starting setting
+     (issue #493). */
   input.pname { width: 150px; }
+  /* Model is a free-text field (issue #493: model IDs change too often for a
+     fixed picker), but at the harness picker's default width it alone kept
+     the row from fitting on one line next to name + assistant + reasoning
+     level. */
+  input.pmodel { width: 160px; }
+  /* One control height for the profile editor's own row, same fix and same
+     reason as .new-session-row above: Chrome's UA sheet renders a <select>
+     a few px shorter than a same-padding <input>, so the assistant picker
+     read as stepped against the model and reasoning-level fields beside it. */
+  .profile-row select,
+  .profile-row input,
+  .profile-row .btn { height: 34px; }
+  .env-row,
+  .profile-actions { margin-top: 12px; }
 </style>
 """
 
@@ -15308,25 +15324,34 @@ PROFILES_SECTION_TPL = """<section>
     only to new sessions.</p>
     <div id="profile-editor" class="editor">
       <form method="post" action="{base}/profiles/set">
-        <div class="row">
+        <div class="row profile-row">
           <input type="text" name="name" placeholder="profile name" class="pname"
                  pattern="[A-Za-z0-9_-]{{1,64}}" required autocomplete="off"
                  aria-label="Profile name"
                  title="Letters, digits, underscore and hyphen; at most 64 characters">
           <select name="HARNESS" aria-label="Assistant" required>{harnesses}</select>
-          <input type="text" name="MODEL" placeholder="model (optional)"
+          <input type="text" name="MODEL" placeholder="model (optional)" class="pmodel"
                  autocomplete="off" aria-label="Model">
-          <input type="text" name="EFFORT" placeholder="reasoning level (optional)"
-                 autocomplete="off" aria-label="Reasoning level">
-          <button type="submit" class="btn">Save</button>
+          <select name="EFFORT" aria-label="Reasoning level">{effort}</select>
         </div>
         <div class="row prompt-row">
           <textarea name="SYSTEM_PROMPT" rows="2" spellcheck="false"
                     placeholder="instructions (optional) &mdash; used for every session with this profile"></textarea>
         </div>
+        <div class="row env-row">
+          <input type="text" name="key" placeholder="KEY_NAME (optional)"
+                 pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off"
+                 aria-label="Environment setting name">
+          <input type="password" name="value" placeholder="value"
+                 autocomplete="off" aria-label="Value for that setting">
+        </div>
         <p class="note">Saving a profile with the same name replaces it.
-        Leave an optional field blank to remove its current value. Add API
-        keys or other advanced settings from the profile row below.</p>
+        Leave an optional field blank to remove its current value. Add a
+        starting environment setting above, or more from the profile&rsquo;s
+        own row below once it is saved.</p>
+        <div class="row profile-actions">
+          <button type="submit" class="btn">Save</button>
+        </div>
       </form>
     </div>
     <div id="profiles-list">{profiles}</div>
@@ -16891,6 +16916,39 @@ def render_harness_options(selected=""):
     return "".join(items)
 
 
+# The reasoning-level values a profile's EFFORT may hold (issue #493's
+# layout checklist: a picker, not free text). These are the labels claude's
+# own --effort accepts; agent-box-profile passes the same string straight
+# through to codex as `-c model_reasoning_effort=VALUE`, so one list serves
+# both today's harnesses without the picker needing to know which one a
+# profile names. A harness that cannot use EFFORT at all (there is none
+# yet) would simply never be asked, exactly as a blank free-text field
+# never was.
+PROFILE_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def render_effort_options(selected=""):
+    """The profile editor's reasoning-level <select>. Blank is a real,
+    selectable value ("default") rather than a prompt: it means "start this
+    profile's harness with no --effort of its own", the same thing an empty
+    free-text field used to mean. A SELECTED value outside the known list
+    (set by an older free-text field, or by `agent-box-profile` directly) is
+    kept as its own option rather than silently dropped - the alternative is
+    a select that shows "default" while the stored profile still carries the
+    old value, so hitting Save with nothing touched would erase it.
+    """
+    blank_sel = "" if selected else " selected"
+    items = ['<option value=""%s>default</option>' % blank_sel]
+    known = selected in PROFILE_EFFORT_LEVELS
+    if selected and not known:
+        safe = html.escape(selected)
+        items.append(f'<option value="{safe}" selected>{safe}</option>')
+    for level in PROFILE_EFFORT_LEVELS:
+        sel = " selected" if level == selected else ""
+        items.append(f'<option value="{level}"{sel}>{level}</option>')
+    return "".join(items)
+
+
 def render_profiles(profiles):
     """The profiles list. Each row folds open onto its launch config and its
     environment KEY NAMES — never a value, the rule `agent-box-profile show`
@@ -16955,14 +17013,14 @@ def render_profiles(profiles):
             f'</summary><div class="fold">'
             f'<form method="post" action="{base}/profiles/set">'
             f'<input type="hidden" name="name" value="{safe}">'
-            f'<div class="row">'
+            f'<div class="row profile-row">'
             f'<select name="HARNESS" aria-label="Assistant for {safe}" required>'
             f'{render_harness_options(res.get("HARNESS") or "")}</select>'
             f'<input type="text" name="MODEL" value="{html.escape(res.get("MODEL") or "")}" '
-            f'placeholder="model" autocomplete="off" aria-label="Model for {safe}">'
-            f'<input type="text" name="EFFORT" value="{html.escape(res.get("EFFORT") or "")}" '
-            f'placeholder="reasoning level" autocomplete="off" '
-            f'aria-label="Reasoning level for {safe}">'
+            f'placeholder="model" class="pmodel" autocomplete="off" '
+            f'aria-label="Model for {safe}">'
+            f'<select name="EFFORT" aria-label="Reasoning level for {safe}">'
+            f'{render_effort_options(res.get("EFFORT") or "")}</select>'
             f'<button type="submit" class="btn">Save</button></div>'
             f'<div class="row prompt-row"><textarea name="SYSTEM_PROMPT" rows="2" '
             f'spellcheck="false" placeholder="instructions" '
@@ -17930,6 +17988,7 @@ def render_page(message="", kind="ok"):
             profiles_section=PROFILES_SECTION_TPL.format(
                 base=html.escape(BASE),
                 harnesses=render_harness_options(),
+                effort=render_effort_options(),
                 profiles=render_profiles(profiles),
             ),
             webhooks_section=(
@@ -18669,6 +18728,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 + ", ".join(PROFILE_AGENTS), kind="error"),
                     status=400)
                 return
+            # An optional starting environment setting (issue #493): the "New
+            # profile" pane has no fold to add one to until the profile
+            # exists, so this one pair rides in on the same request and the
+            # same write as the launch config, rather than needing a second
+            # round trip through /profiles/setkey's must_exist gate. Blank
+            # key is the ordinary case (most profiles start with none) and is
+            # silently skipped; a stray value with no key name is meaningless
+            # and dropped with it.
+            env_key = (form.get("key", [""])[0]).strip()
+            if env_key:
+                env_value = form.get("value", [""])[0]
+                env_value = env_value.replace("\r\n", "\n").replace("\r", "\n")
+                if not KEY_RE.match(env_key) or env_key in PROFILE_RESERVED:
+                    if env_key in PROFILE_RESERVED:
+                        message = (
+                            "%s is already a profile option. Set it in the "
+                            "form above."
+                            % PROFILE_RESERVED_LABELS.get(env_key, "That name")
+                        )
+                    else:
+                        message = (
+                            "Invalid setting name. Use letters, digits and "
+                            "underscores; do not start with a digit."
+                        )
+                    self._send_html(
+                        render_page(message, kind="error"),
+                        status=400,
+                    )
+                    return
+                assignments.append((env_key, env_value))
             try:
                 profile_write(name, assignments, drop=drop)
             except EnvStoreError as exc:
