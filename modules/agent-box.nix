@@ -4929,10 +4929,23 @@ esac
           # states that need three different fixes, not one guess.
           if [ ! -f "$PLUGINS" ]; then
             plugin_state="$PLUGINS is missing"
-          elif ! "$JQ" -e . "$PLUGINS" >/dev/null 2>&1; then
+          elif ! "$JQ" . "$PLUGINS" >/dev/null 2>&1; then
+            # Syntax-only: -e also treats a top-level null/false as a failure,
+            # which is a parse SUCCESS by any JSON reader's definition.
             plugin_state="$PLUGINS did not parse as JSON"
           else
-            plugin_state="$PLUGINS has no local-webhook@local-channels entry"
+            # Non-numeric (top-level null/false/an array — nowhere a version
+            # could live) counts the same as zero: no entry to report on.
+            entries="$("$JQ" -r '.plugins["local-webhook@local-channels"] // [] | length' \
+                         "$PLUGINS" 2>/dev/null)"
+            case "$entries" in ('''|*[!0-9]*) entries=0 ;; esac
+            if [ "$entries" = 0 ]; then
+              plugin_state="$PLUGINS has no local-webhook@local-channels entry"
+            else
+              # A record exists but plugin_versions() found no .version on any
+              # of them — a different fault than no record at all.
+              plugin_state="$PLUGINS has a local-webhook@local-channels entry with no version"
+            fi
           fi
         elif [ -n "$pinned" ]; then
           oldest="$(printf '%s\n' $installed | sort -V | head -1)"

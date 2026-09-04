@@ -493,6 +493,15 @@
     machine.succeed(f"jq -n '{{version: 2, plugins: {{}}}}' > {ip} && chown agent:users {ip}")
     st = status(expect_warning="has no local-webhook@local-channels entry")
     assert st["plugin"]["sessionVersions"] == [], st["plugin"]
+    # A record exists but carries no .version: a different fault than none at
+    # all, and NOT "no entry" — jq's `-e` also used to misjudge this file's
+    # own valid-but-falsy top-level values (null, false) as unparseable.
+    machine.succeed(
+        "jq -n '{version: 2, plugins: {\"local-webhook@local-channels\": [{}]}}'"
+        f" > {ip} && chown agent:users {ip}"
+    )
+    st = status(expect_warning="entry with no version")
+    assert st["plugin"]["sessionVersions"] == [], st["plugin"]
 
     machine.succeed("systemctl start agent-box@agent.service")
 
