@@ -4559,14 +4559,24 @@ def render_view_toggle(selected, view):
 
     It keeps the selected tab in the href either way: leaving the grid
     has to land on some ONE session, and the one the operator last had up
-    is the least surprising."""
+    is the least surprising.
+
+    BOTH icons are in the markup, and CSS shows the one the current layout
+    is not (see .viewtog in settings.css). That is what lets SCRIPT flip
+    the layout without rebuilding this control: it can rewrite an href and
+    a label, but the other icon would have to be a second copy of an
+    inline SVG that already lives in this file. Before this the button
+    kept the icon and the `data-view-to` it was RENDERED with, so pressing
+    it twice went to the grid and then stayed there - a control whose
+    obvious use is in and straight back out."""
     grid = view == "grid"
     label = "Single pane" if grid else "Grid: every session at once"
     return (
         f'<a class="viewtog" data-view-to="{"tabs" if grid else "grid"}" '
         f'href="{html.escape(view_href(selected, "tabs" if grid else "grid"), quote=True)}" '
         f'title="{label}" aria-label="{label}">'
-        f'{ICON_SINGLE if grid else ICON_GRID}</a>'
+        f'<span class="i-grid">{ICON_GRID}</span>'
+        f'<span class="i-single">{ICON_SINGLE}</span></a>'
     )
 
 

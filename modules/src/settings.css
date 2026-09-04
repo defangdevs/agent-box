@@ -309,6 +309,13 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
 .tabs a.gear, .tabs a.viewtog { text-decoration: none; }
 .tabs .hint svg, .tabs a.gear svg,
 .tabs a.viewtog svg { width: 18px; height: 18px; display: block; }
+/* The layout switch carries both icons and CSS picks the one the current
+   layout is NOT, which is the layout the button goes to. Doing it here
+   rather than in SCRIPT is what lets a client-side flip leave this control
+   correct: rewriting an href is easy, minting the other inline SVG is not
+   (it would be a second copy of one that lives in the daemon). */
+.ws:not([data-view=grid]) .viewtog .i-single,
+.ws[data-view=grid] .viewtog .i-grid { display: none; }
 .tabs .hint:hover, .tabs .hint:focus-visible,
 .tabs a.gear:hover, .tabs a.gear:focus-visible,
 .tabs a.viewtog:hover,
@@ -354,6 +361,21 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
    scrolled SIDEWAYS - one column, and still not all of it on screen
    (CodeRabbit on PR #580). 100% is the free space, so the floor gives
    way exactly when there is less room than a tile wants. */
+/* The grid REPLACES the tab strip rather than sitting under it: the two are
+   alternative views of the same list, so showing both reads as a grid
+   inside tabs, and the strip is a horizontal scroller (overflow-x on
+   .tabs above) - which on a phone means the page scrolls vertically while
+   the strip scrolls sideways, two axes where the layout promises one. At
+   390px the bar measured 737px of tabs in a 390px viewport. The bar's
+   GLOBAL controls stay: the + that adds a session, the switch back to a
+   single pane, the mouse hint and the gear. Selecting a session is what
+   the tiles are for.
+
+   Hidden in CSS rather than dropped from the markup, so toggling back
+   restores the strip with no re-render and the tab bar stays the one
+   place the layout is derived from. */
+.ws[data-view=grid] .tabs .tab-wrap,
+.ws[data-view=grid] .tabs .tab-empty { display: none; }
 .ws[data-view=grid] .panes { position: static; display: grid; gap: 8px;
                              padding: 8px; overflow: auto;
                              grid-template-columns:

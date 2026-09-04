@@ -654,6 +654,22 @@
   // Switch layout and/or selected session in one move, without navigating:
   // following the toggle's href for real would tear down every attached
   // terminal on the page and re-attach it a moment later.
+  // The layout switch, after a flip this script made: the icon follows
+  // data-view in CSS, but the href and the accessible name are attributes
+  // only the server would otherwise correct - and it corrects them on its
+  // next render, which may be minutes away or never. Left alone, the button
+  // kept offering the layout it was rendered with, so pressing it twice went
+  // to the grid and stayed there.
+  function wsRetag(view, name) {
+    var a = document.querySelector("#tab-bar a.viewtog");
+    if (!a) { return; }
+    var to = view === "grid" ? "tabs" : "grid";
+    var label = view === "grid" ? "Single pane" : "Grid: every session at once";
+    a.setAttribute("data-view-to", to);
+    a.setAttribute("href", wsUrl(name || wsActive(), to));
+    a.setAttribute("title", label);
+    a.setAttribute("aria-label", label);
+  }
   function wsGo(name, view, focus) {
     var bar = tabBar();
     if (!bar) { return; }
@@ -664,6 +680,7 @@
     if (view === "grid") { tabNames().forEach(ensurePane); wsOrder(); }
     if (target) { wsSelect(target, focus); }
     else { history.replaceState(null, "", wsUrl(null, view)); }
+    wsRetag(view, target);
   }
   function wsActive() {
     var bar = tabBar();
@@ -690,8 +707,10 @@
     var t = e.target && e.target.closest ? e.target.closest("#tab-bar .tab[data-tab]") : null;
     if (!t) { return; }
     e.preventDefault();
-    // A tab means one session, so pressing one in the grid also leaves it:
-    // the same place its href goes with scripting off.
+    // A tab means one session, so it selects one and leaves the grid - the
+    // same place its href goes with scripting off. In the grid the strip is
+    // hidden (see settings.css), so this is the tab layout's own handler
+    // there and the layout it names is the one already showing.
     wsGo(t.getAttribute("data-tab"), "tabs", true);
   });
   // The tab bar's layout toggle, and a grid tile's caption: the two ways
@@ -702,8 +721,11 @@
       ? e.target.closest("#tab-bar a.viewtog") : null;
     if (!a) { return; }
     e.preventDefault();
-    wsGo(wsActive(),
-         a.getAttribute("data-view-to") === "grid" ? "grid" : "tabs", false);
+    // Derived from the layout the page is IN rather than from the button's
+    // own attribute, so the switch still switches even if that attribute is
+    // momentarily stale (a live-feed re-render lands between the flip and
+    // the next click, say).
+    wsGo(wsActive(), wsView() === "grid" ? "tabs" : "grid", false);
   });
   document.addEventListener("click", function (e) {
     var h = e.target && e.target.closest

@@ -202,8 +202,10 @@ in
         assert ('<a class="viewtog" data-view-to="tabs" '
                 'href="/agent/?tab=claude" title="Single pane"'
                 in grid_page), grid_page
-        # A tab is still a tab: its href carries no layout, so pressing one
-        # with scripting off means "just this session".
+        # The tab strip is still in the markup, hidden by CSS: the grid
+        # REPLACES it rather than sitting under it, and keeping the markup is
+        # what lets toggling back restore the strip with no re-render. Its
+        # hrefs carry no layout either way.
         assert 'data-tab="main" href="/agent/?tab=main"' in grid_page, grid_page
         # Anything else is the tab layout, so a hand-typed or stale value
         # degrades to the default rather than to an error page.
