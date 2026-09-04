@@ -3126,7 +3126,23 @@ CONNECT_SECTION_TPL = """<section>
 # font hands back is not ours to pick. Sized in px as SVG, the pair is
 # the same 18px box everywhere and inherits currentColor like every
 # other icon on the page.
-HOME_BODY = """<body class="ws">
+#
+# data-view on the <body> is the workspace's LAYOUT: `tabs`, one terminal
+# filling the page, and `grid`, every session's terminal side by side at
+# once (an operator running four agents wants to see all four working, not
+# to click through them). It is one attribute and one set of panes for
+# both, deliberately: a session's terminal is a live tmux client, and tmux
+# sizes a window to its most recently used client, so a second attachment
+# of the same session in a second layout would resize the session out from
+# under the first. So the grid RE-LAYS the panes that are already there
+# rather than mounting a set of its own, and no session is ever attached
+# twice.
+#
+# The layout is a URL parameter (?view=grid), which is what makes it work
+# with scripting off; SCRIPT intercepts the toggle so that flipping the
+# layout does not navigate, since a navigation would tear down every
+# attached terminal on the page.
+HOME_BODY = """<body class="ws" data-view="{view}">
 <div id="msg-slot">{message}</div>
 <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}"
      data-sess-base="{action_base}">
@@ -3134,6 +3150,7 @@ HOME_BODY = """<body class="ws">
   <button type="button" class="btn add" data-toggle="session-editor"
           title="New session" aria-label="New session">+</button>
   <span class="spacer"></span>
+  {view_toggle}
   <span class="hint" tabindex="0"
         aria-label="Terminal mouse tip. Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text."
         title="Mouse wheel scrolls the pane's history. Hold Shift (Option on a Mac) while clicking and dragging to select and copy text.">{icon_info}</span>
@@ -3145,7 +3162,7 @@ HOME_BODY = """<body class="ws">
     {new_session_fields}
   </form>
 </div>
-<div class="panes" id="panes">{pane}</div>
+<div class="panes" id="panes">{panes}</div>
 </body>
 </html>
 """
@@ -3316,6 +3333,39 @@ ICON_GEAR = (
     '-.501-.29c-.447-.222-.85-.629-.997-1.189l-.289-1.105c-.029-.11-.101-.143-.137-.146a6.6 6.6 '
     '0 0 0-1.142 0ZM11 8a3 3 0 1 1-6 0 3 3 0 0 1 6 0ZM9.5 8a1.5 1.5 0 1 0-3.001.001A1.5 1.5 0 0 '
     '0 9.5 8Z"/></svg>'
+)
+# The workspace's view switch and the grid tile's own "open this one full
+# size" control. Octicons apps-16, square-16 and screen-full-16: four
+# squares for the grid, one square for the single-pane view it toggles
+# back to, and the outward arrows for a tile that wants the whole page.
+ICON_GRID = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M1.5 3.25c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5A1.75 1.75 0 '
+    '0 1 5.75 7.5h-2.5A1.75 1.75 0 0 1 1.5 5.75Zm7 0c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75'
+    '.784 1.75 1.75v2.5a1.75 1.75 0 0 1-1.75 1.75h-2.5A1.75 1.75 0 0 1 8.5 5.75Zm-7 7c0-.966'
+    '.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a1.75 1.75 0 0 1-1.75 1.75h-2.5a1.75 '
+    '1.75 0 0 1-1.75-1.75Zm7 0c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a1.75 '
+    '1.75 0 0 1-1.75 1.75h-2.5a1.75 1.75 0 0 1-1.75-1.75ZM3.25 3a.25.25 0 0 0-.25.25v2.5c0 .138'
+    '.112.25.25.25h2.5A.25.25 0 0 0 6 5.75v-2.5A.25.25 0 0 0 5.75 3Zm7 0a.25.25 0 0 0-.25.25v2.5'
+    'c0 .138.112.25.25.25h2.5a.25.25 0 0 0 .25-.25v-2.5a.25.25 0 0 0-.25-.25Zm-7 7a.25.25 0 0 0'
+    '-.25.25v2.5c0 .138.112.25.25.25h2.5a.25.25 0 0 0 .25-.25v-2.5a.25.25 0 0 0-.25-.25Zm7 0a.25'
+    '.25 0 0 0-.25.25v2.5c0 .138.112.25.25.25h2.5a.25.25 0 0 0 .25-.25v-2.5a.25.25 0 0 0-.25'
+    '-.25Z"/></svg>'
+)
+ICON_SINGLE = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M4 5.75C4 4.784 4.784 4 5.75 4h4.5c.966 0 1.75.784 1.75 1.75v4.5A1.75 1.75 0 0 1 '
+    '10.25 12h-4.5A1.75 1.75 0 0 1 4 10.25Zm1.75-.25a.25.25 0 0 0-.25.25v4.5c0 .138.112.25.25'
+    '.25h4.5a.25.25 0 0 0 .25-.25v-4.5a.25.25 0 0 0-.25-.25Z"/></svg>'
+)
+ICON_EXPAND = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M1.75 10a.75.75 0 0 1 .75.75v2.5c0 .138.112.25.25.25h2.5a.75.75 0 0 1 0 1.5h-2.5A'
+    '1.75 1.75 0 0 1 1 13.25v-2.5a.75.75 0 0 1 .75-.75Zm12.5 0a.75.75 0 0 1 .75.75v2.5A1.75 1.75 '
+    '0 0 1 13.25 15h-2.5a.75.75 0 0 1 0-1.5h2.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 .75-.75Z'
+    'M2.75 2.5a.25.25 0 0 0-.25.25v2.5a.75.75 0 0 1-1.5 0v-2.5C1 1.784 1.784 1 2.75 1h2.5a.75.75 '
+    '0 0 1 0 1.5ZM10 1.75a.75.75 0 0 1 .75-.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a.75.75 0 0 1'
+    '-1.5 0v-2.5a.25.25 0 0 0-.25-.25h-2.5a.75.75 0 0 1-.75-.75Z"/></svg>'
 )
 ICON_LOCK = (
     '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
@@ -4482,23 +4532,60 @@ def render_msg(message, page, kind="ok"):
     )
 
 
-def render_pane(selected, live, stopped):
-    """The server-rendered pane: only the SELECTED session, and only
-    when its tmux session is already live — the ttyd attach wrapper
-    greets a not-yet-started session with an error and exits, so a
-    starting session gets a placeholder instead (SCRIPT swaps in the
-    iframe once the state flips; without JS, reloading does). A stopped
-    session gets an honest placeholder: nothing is coming up until a
-    start revives it.
+VIEWS = ("tabs", "grid")
+
+
+def view_href(name, view):
+    """A workspace URL: which tab is selected, and which layout it is in.
+
+    `tabs` is spelled as the ABSENCE of the parameter rather than as
+    `?view=tabs`, so every href the page already had (a tab, a Dismiss,
+    the redirect after adding a session) keeps the exact shape it has
+    always had and only the grid needs a parameter."""
+    q = ("?tab=" + urllib.parse.quote(name, safe="")) if name else ""
+    if view == "grid":
+        q = (q + "&" if q else "?") + "view=grid"
+    return TERM_HOME + q
+
+
+def render_view_toggle(selected, view):
+    """The tab bar's layout switch: four squares to spread every session
+    out at once, one square to come back to a single terminal.
+
+    A LINK, to the same page in the other layout, so the switch works
+    with scripting off; SCRIPT intercepts the click and re-lays the panes
+    in place, because following this href for real would tear down every
+    attached terminal on the page and re-attach it a moment later.
+
+    It keeps the selected tab in the href either way: leaving the grid
+    has to land on some ONE session, and the one the operator last had up
+    is the least surprising."""
+    grid = view == "grid"
+    label = "Single pane" if grid else "Grid: every session at once"
+    return (
+        f'<a class="viewtog" data-view-to="{"tabs" if grid else "grid"}" '
+        f'href="{html.escape(view_href(selected, "tabs" if grid else "grid"), quote=True)}" '
+        f'title="{label}" aria-label="{label}">'
+        f'{ICON_SINGLE if grid else ICON_GRID}</a>'
+    )
+
+
+def render_pane(name, live, stopped):
+    """One session's pane, and only a live one gets a terminal. The ttyd
+    attach wrapper greets a not-yet-started session with an error and
+    exits, so a starting session gets a placeholder instead (SCRIPT swaps
+    in the iframe once the state flips; without JS, reloading does). A
+    stopped session gets an honest placeholder: nothing is coming up
+    until a start revives it.
 
     data-ph records which of the three states the pane was built for —
     on the iframe too, so SCRIPT can tell a terminal that is still wired
     to a live tmux session from one whose session has since gone (issue
-    #241)."""
-    if selected is None:
-        return '<div class="pane placeholder active">No session selected.</div>'
-    safe = html.escape(selected)
-    state = pane_state(selected, live, stopped)
+    #241). It stays on the PANE and is not repeated on the cell around
+    it, so a slice of the markup from data-ph to the next `</div>` is
+    still this pane and nothing else."""
+    safe = html.escape(name)
+    state = pane_state(name, live, stopped)
     if state == "stopped":
         # The Start button lives HERE, not only in the settings page's session
         # row: this pane is what the operator is looking at when they find out
@@ -4509,7 +4596,7 @@ def render_pane(selected, live, stopped):
         # explicitly rather than left to SESS_PAGE's default: /<user>/ is a
         # workspace for EVERY user, while that default is the settings page
         # for anyone but the primary one (CodeRabbit on PR #452).
-        return (f'<div class="pane placeholder active" data-pane="{safe}" '
+        return (f'<div class="pane placeholder" data-pane="{safe}" '
                 f'data-ph="stopped">'
                 f'<span class="ph-msg">{safe} is stopped &mdash; nothing '
                 f'starts it on its own.</span>'
@@ -4520,12 +4607,70 @@ def render_pane(selected, live, stopped):
                 f'<button type="submit" class="btn small">Start</button>'
                 f'</form></div>')
     if state == "starting":
-        return (f'<div class="pane placeholder active" data-pane="{safe}" '
+        return (f'<div class="pane placeholder" data-pane="{safe}" '
                 f'data-ph="starting">{safe} is starting&hellip; '
                 f'reload in a few seconds.</div>')
-    return (f'<iframe class="pane active" data-pane="{safe}" data-ph="live" '
-            f'src="{html.escape(session_url(selected))}" title="{safe} terminal" '
+    return (f'<iframe class="pane" data-pane="{safe}" data-ph="live" '
+            f'src="{html.escape(session_url(name))}" title="{safe} terminal" '
             f'allow="clipboard-read; clipboard-write"></iframe>')
+
+
+def render_cell(name, live, stopped, died, selected):
+    """A pane and the caption that says whose it is.
+
+    The caption is what the grid needs and the single-pane view does not
+    (there the tab bar already says it, in the same place, one row up), so
+    it is rendered either way and hidden by CSS in the tab layout: one
+    cell shape for both, which is what lets the grid re-lay the panes that
+    are already mounted instead of building a second set of its own.
+
+    The caption is a LINK to this session's own tab, which is how a tile
+    is opened full size: pressing the name of the thing you want to see
+    more of needs no explaining, and it is the same href the tab carries,
+    so it works with scripting off. `active` marks the selected session:
+    which pane is showing in the tab layout, and which tile is outlined in
+    the grid."""
+    safe = html.escape(name)
+    if name in live:
+        # The pane is up either way; whether an AGENT is in it is what the
+        # dot has to say (issue #516).
+        state = "died" if name in died else "live"
+    elif name in stopped:
+        state = "stopped"
+    else:
+        state = "starting"
+    cur = " active" if name == selected else ""
+    label = "Open " + safe + " full size"
+    return (
+        f'<div class="cell{cur}" data-cell="{safe}">'
+        f'<a class="cell-head" data-open="{safe}" '
+        f'href="{html.escape(view_href(name, "tabs"), quote=True)}" '
+        f'title="{label}" aria-label="{label}">'
+        f'<span class="state" data-state="{state}"></span>'
+        f'<span class="cell-name">{safe}</span>'
+        f'<span class="cell-open" aria-hidden="true">{ICON_EXPAND}</span>'
+        f'</a>'
+        f'{render_pane(name, live, stopped)}'
+        f'</div>'
+    )
+
+
+def render_panes(names, live, stopped, died, selected, view):
+    """What the server puts in #panes.
+
+    In the tab layout, only the SELECTED session: the others are mounted
+    by SCRIPT as they are first shown, so a page load costs one terminal
+    rather than one per session. The grid is the case where every session
+    is on screen at once, so there the server renders them all and a
+    scriptless browser gets the whole grid."""
+    if not names:
+        return '<div class="pane placeholder active">No session selected.</div>'
+    if view == "grid":
+        return "".join(
+            render_cell(n, live, stopped, died, selected) for n in names)
+    if selected is None:
+        return '<div class="pane placeholder active">No session selected.</div>'
+    return render_cell(selected, live, stopped, died, selected)
 
 
 def render_head(title):
@@ -4627,7 +4772,7 @@ def render_users():
     )
 
 
-def render_home(message="", selected=None, kind="ok"):
+def render_home(message="", selected=None, kind="ok", view="tabs"):
     entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
     names = list(entries)
     if selected not in entries:
@@ -4635,9 +4780,9 @@ def render_home(message="", selected=None, kind="ok"):
     live = live_sessions()
     stopped = {n for n, v in entries.items() if v.get("stopped")}
     died = {n for n, v in entries.items() if crashed_status(v) is not None}
-    # Dismissing keeps the selected tab (SESSION_RE names are URL-safe).
-    msg_html = render_msg(
-        message, TERM_HOME + ("?tab=" + selected if selected else ""), kind)
+    # Dismissing keeps the selected tab and the layout it was dismissed in
+    # (SESSION_RE names are URL-safe, so nothing here is escaped away).
+    msg_html = render_msg(message, view_href(selected, view), kind)
     return (
         render_head("Agent Box &mdash; " + html.escape(USER))
         + STYLE
@@ -4645,8 +4790,10 @@ def render_home(message="", selected=None, kind="ok"):
             base=html.escape(BASE),
             action_base=html.escape(SESS_BASE),
             term_base=html.escape(TERM_HOME),
+            view=view,
             tabs=render_tabs(names, live, stopped, died, selected),
-            pane=render_pane(selected, live, stopped),
+            view_toggle=render_view_toggle(selected, view),
+            panes=render_panes(names, live, stopped, died, selected, view),
             new_session_fields=render_new_session_fields(),
             message=msg_html,
             icon_info=ICON_INFO,
@@ -4976,8 +5123,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # switching mechanism); anything invalid falls back to the
             # default selection inside render_home.
             tab = (params.get("tab", [""])[0]).strip()
+            # ?view=grid lays every session out at once instead of one
+            # terminal filling the page (also the no-JS way to switch, and
+            # what makes the layout survive a reload). Anything else is the
+            # tab layout, so a stale or hand-typed value degrades to the
+            # default rather than to an error page.
+            view = (params.get("view", [""])[0]).strip()
             self._send_html(render_home(
-                message, tab if SESSION_RE.match(tab) else None, kind))
+                message, tab if SESSION_RE.match(tab) else None, kind,
+                view if view in VIEWS else "tabs"))
             return
         if not self._under_base(parsed.path):
             self._send_html("<h1>404</h1>", status=404)

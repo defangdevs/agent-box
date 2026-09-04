@@ -523,8 +523,81 @@
     if (st === "live" || st === "died") { return "live"; }
     return st === "stopped" ? "stopped" : "starting";
   }
+  // Which layout the page is in, and the URL that says so. `tabs` is the
+  // absence of the parameter (see view_href in the daemon), so a tab's own
+  // href keeps the shape it has always had.
+  function wsView() {
+    return document.body.getAttribute("data-view") === "grid" ? "grid" : "tabs";
+  }
+  function wsUrl(name, view) {
+    var q = name ? "?tab=" + encodeURIComponent(name) : "";
+    if (view === "grid") { q = (q ? q + "&" : "?") + "view=grid"; }
+    return tabBar().getAttribute("data-term-base") + q;
+  }
+  // The box around a pane, carrying the caption that names it. One cell
+  // shape for both layouts: the grid re-lays the cells that are already
+  // mounted instead of mounting a set of its own, because a session is a
+  // live tmux client and tmux sizes a window to its most recently used
+  // client: two attachments of one session would fight over its size.
+  function ensureCell(name) {
+    var cell = document.querySelector('#panes .cell[data-cell="' + name + '"]');
+    if (!cell) {
+      cell = document.createElement("div");
+      cell.className = "cell";
+      cell.setAttribute("data-cell", name);
+      // CLONED from a caption already on the page rather than built from
+      // scratch: the server renders one cell on every load, so there is
+      // always one to copy, and copying is what keeps the expand icon in
+      // the daemon instead of in a second copy here.
+      var tpl = document.querySelector("#panes .cell-head");
+      var head;
+      if (tpl) {
+        head = tpl.cloneNode(true);
+      } else {
+        head = document.createElement("a");
+        head.className = "cell-head";
+        var dotEl = document.createElement("span");
+        dotEl.className = "state";
+        var nameEl = document.createElement("span");
+        nameEl.className = "cell-name";
+        head.appendChild(dotEl);
+        head.appendChild(nameEl);
+      }
+      var label = "Open " + name + " full size";
+      head.setAttribute("data-open", name);
+      head.href = wsUrl(name, "tabs");
+      head.title = label;
+      head.setAttribute("aria-label", label);
+      head.querySelector(".cell-name").textContent = name;
+      cell.appendChild(head);
+      document.getElementById("panes").appendChild(cell);
+    }
+    // The dot is the tab's, read back on every sync: the live feed morphs
+    // the tab bar and never touches #panes, so this is where a session
+    // that has since died or stopped reaches its caption.
+    var dot = cell.querySelector(".cell-head .state");
+    if (dot) { dot.setAttribute("data-state", tabState(name) || "starting"); }
+    return cell;
+  }
+  // Tiles read in tab order however they were mounted: the server renders
+  // the selected session's cell and this script appends the rest as they
+  // are first shown, so DOM order is arrival order. Done with CSS `order`
+  // and never by moving the element. Re-inserting an iframe RELOADS it,
+  // which would drop the terminal inside.
+  //
+  // EVERY cell, every time, or the pass makes things worse than it found
+  // them: a cell left without an `order` keeps the initial value 0 and so
+  // sorts ahead of the ones that were given theirs.
+  function wsOrder() {
+    var names = tabNames();
+    document.querySelectorAll("#panes .cell[data-cell]").forEach(function (c) {
+      var i = names.indexOf(c.getAttribute("data-cell"));
+      c.style.order = String(i < 0 ? names.length : i);
+    });
+  }
   function ensurePane(name) {
-    var cur = document.querySelector('#panes .pane[data-pane="' + name + '"]');
+    var cell = ensureCell(name);
+    var cur = cell.querySelector('.pane[data-pane="' + name + '"]');
     // Keep a pane only while the state it was built for still holds. An
     // iframe used to be exempt from that, so it outlived the session
     // inside it: once a live session stopped (clean exit, or a stop from
@@ -556,12 +629,9 @@
     }
     el.setAttribute("data-ph", want);
     el.setAttribute("data-pane", name);
-    if (cur) {
-      if (cur.classList.contains("active")) { el.classList.add("active"); }
-      cur.replaceWith(el);
-    } else {
-      document.getElementById("panes").appendChild(el);
-    }
+    // `active` is the CELL's, so a pane swapped in here carries no state
+    // of its own and cannot disagree with the cell it lands in.
+    if (cur) { cur.replaceWith(el); } else { cell.appendChild(el); }
     return el;
   }
   function wsSelect(name, focus) {
@@ -572,14 +642,28 @@
       else { t.removeAttribute("aria-current"); }
     });
     var pane = ensurePane(name);
-    document.querySelectorAll("#panes .pane").forEach(function (p) {
-      p.classList.toggle("active", p === pane);
+    var cell = pane.parentNode;
+    document.querySelectorAll("#panes .cell").forEach(function (c) {
+      c.classList.toggle("active", c === cell);
     });
-    history.replaceState(null, "", bar.getAttribute("data-term-base") +
-                         "?tab=" + encodeURIComponent(name));
+    history.replaceState(null, "", wsUrl(name, wsView()));
     if (focus && pane.tagName === "IFRAME") {
       try { pane.contentWindow.focus(); } catch (err) { /* cross-origin never happens; be safe */ }
     }
+  }
+  // Switch layout and/or selected session in one move, without navigating:
+  // following the toggle's href for real would tear down every attached
+  // terminal on the page and re-attach it a moment later.
+  function wsGo(name, view, focus) {
+    var bar = tabBar();
+    if (!bar) { return; }
+    document.body.setAttribute("data-view", view);
+    var target = tabEl(name) ? name : wsActive();
+    // The grid shows every session, so anything not yet mounted is mounted
+    // now; leaving it keeps every pane attached, as a background tab is.
+    if (view === "grid") { tabNames().forEach(ensurePane); wsOrder(); }
+    if (target) { wsSelect(target, focus); }
+    else { history.replaceState(null, "", wsUrl(null, view)); }
   }
   function wsActive() {
     var bar = tabBar();
@@ -588,13 +672,17 @@
   }
   function wsSync() {
     if (!tabBar()) { return; }
-    // Drop panes whose sessions are gone; upgrade placeholders whose
+    // Drop cells whose sessions are gone; upgrade placeholders whose
     // sessions came live. No focus steal — the user may be typing.
-    document.querySelectorAll("#panes .pane[data-pane]").forEach(function (p) {
-      var name = p.getAttribute("data-pane");
-      if (!tabEl(name)) { p.remove(); return; }
+    document.querySelectorAll("#panes .cell[data-cell]").forEach(function (c) {
+      var name = c.getAttribute("data-cell");
+      if (!tabEl(name)) { c.remove(); return; }
       ensurePane(name);
     });
+    // A session added while the grid is open belongs on it straight away:
+    // that is what the layout is for. The tab layout keeps mounting a pane
+    // when it is first shown, so a load costs one terminal, not one each.
+    if (wsView() === "grid") { tabNames().forEach(ensurePane); wsOrder(); }
     var cur = wsActive();
     if (cur) { wsSelect(cur, false); }
   }
@@ -602,7 +690,27 @@
     var t = e.target && e.target.closest ? e.target.closest("#tab-bar .tab[data-tab]") : null;
     if (!t) { return; }
     e.preventDefault();
-    wsSelect(t.getAttribute("data-tab"), true);
+    // A tab means one session, so pressing one in the grid also leaves it:
+    // the same place its href goes with scripting off.
+    wsGo(t.getAttribute("data-tab"), "tabs", true);
+  });
+  // The tab bar's layout toggle, and a grid tile's caption: the two ways
+  // in and out of the grid. Both are real links (they work with scripting
+  // off); intercepting them keeps the terminals attached.
+  document.addEventListener("click", function (e) {
+    var a = e.target && e.target.closest
+      ? e.target.closest("#tab-bar a.viewtog") : null;
+    if (!a) { return; }
+    e.preventDefault();
+    wsGo(wsActive(),
+         a.getAttribute("data-view-to") === "grid" ? "grid" : "tabs", false);
+  });
+  document.addEventListener("click", function (e) {
+    var h = e.target && e.target.closest
+      ? e.target.closest("#panes .cell-head[data-open]") : null;
+    if (!h) { return; }
+    e.preventDefault();
+    wsGo(h.getAttribute("data-open"), "tabs", true);
   });
 
   // Two-click close on the tab bar's x. Closing kills a live agent and
