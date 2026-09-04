@@ -17214,13 +17214,22 @@ def render_profiles(profiles, usage=None):
         if topics:
             plural = "" if len(topics) == 1 else "es"
             bits.append("used by %d standing watch%s" % (len(topics), plural))
-            topic_list = ", ".join(html.escape(t) for t in topics)
+            # RAW here, not html.escape()'d: this only ever reaches the
+            # confirm() dialog below, built through json.dumps() rather than
+            # hand-spliced into a quoted JS string. A webhook topic is a
+            # source:key the operator (or a hand edit of the dispatch file)
+            # chooses, and local-webhook's own key charset allows an
+            # apostrophe - html.escape() alone would leave `&#x27;` in the
+            # HTML attribute, which the BROWSER decodes back to `'` before
+            # handing the onsubmit text to the JS parser, breaking out of a
+            # hand-quoted confirm('...') string.
+            topic_list = ", ".join(topics)
             watch_warn = (
                 " It is used by %d standing watch%s: %s. After deleting, "
-                "%s on the box default agent instead."
+                "%s the box default agent instead."
                 % (len(topics), plural, topic_list,
-                   "that watch matches" if len(topics) == 1
-                   else "those watches match")
+                   "that watch starts" if len(topics) == 1
+                   else "those watches start")
             )
         # Each bit was escaped as it went in, so the join must NOT be
         # escaped again: a MODEL holding "&" or "<" would render as visible
@@ -17250,14 +17259,26 @@ def render_profiles(profiles, usage=None):
         # stored, so an edit is an edit and not a retype. SYSTEM_PROMPT is a
         # textarea for the same reason it is one above — it can span lines.
         prompt_val = html.escape(res.get("SYSTEM_PROMPT") or "")
+        # json.dumps(), not hand-quoted JS: `name` is charset-restricted
+        # (PROFILE_NAME_RE), but watch_warn's topic names are not, so this is
+        # where the confirm() dialog's whole message gets ONE correct
+        # escaping instead of a second, wrong one — html.escape() on its own
+        # protects the HTML attribute but leaves the JS string quoting to
+        # hope, and a topic holding an apostrophe broke out of it.
+        confirm_js = html.escape(
+            json.dumps(
+                "Delete profile %s?%s Sessions already running keep what "
+                "they started with." % (name, watch_warn)
+            ),
+            quote=True,
+        )
         rows.append(
             f'<li class="foldrow prof-row"><details><summary>'
             f'<span class="nm"><code>{safe}</code></span>'
             f'<span class="meta">{meta}</span>'
             f'<span class="acts"><form class="inline" method="post" '
             f'action="{base}/profiles/delete" '
-            f'onsubmit="return confirm(\'Delete profile {safe}?{watch_warn} '
-            f'Sessions already running keep what they started with.\');">'
+            f'onsubmit="return confirm({confirm_js});">'
             f'<input type="hidden" name="name" value="{safe}">'
             f'<button type="submit" class="icon idanger" aria-label="Delete" '
             f'title="Delete profile {safe}">{ICON_TRASH}</button></form></span>'
