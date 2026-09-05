@@ -932,7 +932,10 @@ fi
 # the last one 20 minutes ago" is the standing fact an agent needs, not
 # something to forget on the next successful spawn. `deferred` records which
 # answer this wrapper gave, so `status` does not report as lost a batch the
-# receiver is still holding.
+# receiver may still be holding. It is that answer and nothing more: this
+# program is gone by the time the batch starts or is finally dropped, so
+# nothing here could keep a live queue state honest, and the field must not be
+# read as one.
 BOX_STATE="$HOME/.local/state/agent-box"
 REFUSED="$BOX_STATE/webhook-spawn-refused.json"
 
@@ -969,7 +972,7 @@ record_refusal() {
       --arg topic "${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
       --arg key "${LOCAL_WEBHOOK_SPAWN_KEY:-}" \
       --argjson live "$1" --argjson max "$MAX" --argjson count "$((prev + 1))" \
-      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). `deferred` says the wrapper exited 75, so local-webhook >= 0.16.0 KEEPS the batch and re-offers it until a slot frees or LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S runs out (agent-box#301); its absence means the batch was dropped outright. `live` is the capacity in use: hook-* sessions running or queued to start (agent-box#280). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max, deferred: true}
+      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). `deferred` records the ANSWER this wrapper gave that batch: 75, which local-webhook >= 0.16.0 reads as declined-for-retry rather than a failure that drops it (agent-box#301). It is history and is never rewritten, so it stays true after the batch starts or after the receiver gives up on it at LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S; its absence means the batch was dropped outright. `live` is the capacity in use: hook-* sessions running or queued to start (agent-box#280). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max, deferred: true}
        + (if $topic == "" then {} else {topic: $topic} end)
        + (if $key == "" then {} else {key: $key} end)' \
       > "$REFUSED.$$" 2>/dev/null; then

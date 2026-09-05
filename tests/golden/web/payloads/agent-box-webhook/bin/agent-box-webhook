@@ -92,6 +92,8 @@ Two delivery shapes:
                          wrapper declines it (exit 75) and the receiver
                          re-offers it as slots free, giving up only after
                          LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S (an hour here).
+                         `status` reports which answer the LAST refused batch
+                         got, never whether it is still waiting.
                          Stopping a session frees its slot;
                          `agent-box-session rm NAME` also delists it.
                          `status` reports the count, the ceiling and the last
@@ -179,11 +181,14 @@ branch — and is reported in the JSON (`plugin.skew`) without a warning.
 
 Its `dispatch` object is where to look when standing watches seem dead:
 `hookSessions` is the running hook-* count against the ceiling, `lastRefusal`
-is the batch the ceiling most recently turned away (with a running total, and
-`deferred: true` when the receiver kept it to re-offer as a slot frees rather
-than dropping it), and `warning` — the same field `ls` sets when the receiver
-has no spawn command — is present exactly when a match right now would spawn
-nothing.
+is the batch the ceiling most recently turned away (with a running total), and
+`warning` — the same field `ls` sets when the receiver has no spawn command —
+is present exactly when a match right now would spawn nothing.
+`lastRefusal.deferred` records the ANSWER the wrapper gave that batch — 75,
+declined for retry, rather than a failure that drops it. It is history, not a
+queue: nothing rewrites it once the batch starts, or once the receiver gives
+up on it at LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S. Whether a batch is waiting RIGHT
+NOW is the receiver's own state and is not reported here.
 
 One-time per SENDER, to make its deliveries possible at all:
   agent-box-webhook setup github   # prints that source's URL and its HMAC
@@ -382,8 +387,7 @@ hook_capacity_warning() {
 standing watch is stalled: a matching event batch starts nothing now. The \
 spawn wrapper DECLINES it (exit 75) and the receiver holds it, re-offering it \
 as slots free and dropping it only once the wait outlasts \
-LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — so clearing the cap is still the fix, and \
-lastRefusal.deferred says whether the last batch is waiting or was lost. Free \
+LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — so clearing the cap is still the fix. Free \
 a slot (agent-box-session ls, then agent-box-session stop NAME, or \
 agent-box-session rm NAME to delist it for good), or raise \
 AGENT_BOX_HOOK_SESSION_MAX on the receiver daemon unit."
