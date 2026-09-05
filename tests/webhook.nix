@@ -2163,12 +2163,17 @@
 
     # --- the hook-session ceiling is visible, not merely enforced (#170) -----
     # A standing watch is the one delivery shape with no session behind it, so
-    # when the spawn wrapper refuses a batch webhook.py drops it and NOBODY got
-    # those events. That refusal used to reach the receiver daemon's journal
-    # and nowhere else, while `ls` and `status` kept reporting a healthy
-    # subscription: four hook sessions whose agents forgot `agent-box-session
-    # rm` made every watch on the box inert, and a wedged box read exactly like
-    # a quiet week. So a refusal is written down, and both listings say it.
+    # when the spawn wrapper refuses a batch nothing else holds those events.
+    # That refusal used to reach the receiver daemon's journal and nowhere
+    # else, while `ls` and `status` kept reporting a healthy subscription: four
+    # hook sessions whose agents forgot `agent-box-session rm` made every watch
+    # on the box inert, and read exactly like a quiet week. So a refusal is
+    # written down, and both listings say it.
+    #
+    # Since #301 the refusal is also a DEFERRAL: the wrapper answers 75, the
+    # one code local-webhook reads as "declined for now" instead of "this
+    # spawner is broken", so the exit code is asserted on every refusal below.
+    # What the receiver then does with it is `webhook-defer`, a native check.
     refused = "/home/agent/.local/state/agent-box/webhook-spawn-refused.json"
 
     def dispatch_status(cap="", expect=None):
@@ -2226,8 +2231,8 @@
         f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
     )
     rc, refusal_log = machine.execute(drop_env)
-    assert rc == 1, (rc, refusal_log)
-    assert "dropping this batch" in refusal_log, refusal_log
+    assert rc == 75, (rc, refusal_log)
+    assert "declining this batch for now" in refusal_log, refusal_log
     # What the refusal is recorded against is what it was refused ON: since
     # #280 that is the capacity in USE — hook-* sessions running or queued to
     # start — and no longer the raw key count. Nothing here is `stopped`, so
@@ -2238,14 +2243,16 @@
     ][0]
     refused_used = int(refused_line.split(":", 1)[1].split()[0])
     assert refused_used == live, (refusal_log, live)
-    # The batch is gone, not queued — no session, and the record is the only
-    # thing left of it.
+    # No session started — the cap is still a cap — and the record says the
+    # wrapper answered "not yet" rather than "never", so `status` cannot
+    # report as lost a batch the receiver is still holding.
     machine.fail(
         "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-dropped\"))'"
         " /home/agent/.config/agent-box/sessions.json"
     )
     rec = json.loads(machine.succeed(f"cat {refused}"))
     assert rec["count"] == 1, rec
+    assert rec["deferred"] is True, rec
     assert rec["live"] == refused_used, (rec, refusal_log)
     assert rec["max"] == 1, rec
     assert rec["topic"] == "github:defangdevs/*", rec
@@ -2259,9 +2266,10 @@
     d = dispatch_status(cap="AGENT_BOX_HOOK_SESSION_MAX=1",
                         expect="hook-* sessions are running")
     assert d["hookSessions"] == {"live": live, "max": 1, "atCapacity": True}, d
-    assert "DROPPED" in d["warning"], d
+    assert "DECLINES it (exit 75)" in d["warning"], d
     assert "agent-box-session rm NAME" in d["warning"], d
     assert d["lastRefusal"]["count"] == 1, d
+    assert d["lastRefusal"]["deferred"] is True, d
 
     # ls says it too — a listing of standing watches is where someone goes to
     # ask why nothing fires — but on stderr, so its stdout stays byte-for-byte
@@ -2270,15 +2278,14 @@
         f"{hookenv} AGENT_BOX_HOOK_SESSION_MAX=1 agent-box-webhook ls 2>/tmp/cap.err"
     )
     ls_err = machine.succeed("cat /tmp/cap.err")
-    assert "every standing watch is inert" in ls_err, ls_err
+    assert "every standing watch is stalled" in ls_err, ls_err
     assert '"dispatch"' in ls_out, ls_out
-    assert "every standing watch is inert" not in ls_out, ls_out
+    assert "every standing watch is stalled" not in ls_out, ls_out
 
-    # Cumulative and never cleared: the dropped batches do not come back, so
-    # "N dropped since T" is the standing fact, not something the next spawn
-    # gets to forget.
+    # Cumulative and never cleared: a refused batch is at best late, so "N
+    # refused since T" is the standing fact, not something to forget.
     rc, _ = machine.execute(drop_env)
-    assert rc == 1, rc
+    assert rc == 75, rc
     rec2 = json.loads(machine.succeed(f"cat {refused}"))
     assert rec2["count"] == 2, rec2
     assert rec2["firstAt"] == rec["firstAt"], (rec, rec2)
@@ -2303,23 +2310,9 @@
     machine.succeed(f"sudo -u agent env HOME=/home/agent agent-box-session rm {again}")
     machine.succeed(f"jq -e '.count == 2' {refused} >/dev/null")
 
-    # A knob that --help documents is a knob someone will typo, and an unusable
-    # value must not refuse every batch for a reason nobody can see: it says so
-    # and falls back to the built-in ceiling.
-    rc, typo_log = machine.execute(
-        "sudo -u agent env HOME=/home/agent"
-        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
-        " AGENT_BOX_HOOK_SESSION_MAX=lots"
-        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/typo"
-        f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
-    )
-    assert rc == 0, (rc, typo_log)
-    assert "is not a number" in typo_log, typo_log
-    typo = machine.succeed(
-        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-typo-\"))'"
-        " /home/agent/.config/agent-box/sessions.json"
-    ).strip()
-    machine.succeed(f"sudo -u agent env HOME=/home/agent agent-box-session rm {typo}")
+    # An unusable AGENT_BOX_HOOK_SESSION_MAX falling back to the built-in
+    # ceiling is asserted in the `webhook-defer` native check instead: it is a
+    # pure function of one environment variable, and it cost a VM boot here.
 
     # --- the dispatch cap counts what RUNS, not registry keys (issue #280) ---
     # The cap used to count hook-* keys in sessions.json, and nothing expires a
@@ -2366,7 +2359,13 @@
             f" LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/{key}"
             f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
         )
-        return machine.succeed(cmd) if want else machine.fail(cmd)
+        if want:
+            return machine.succeed(cmd)
+        # 75 exactly: any other code drops the batch (#301), and a
+        # `machine.fail` would pass on the `exit 1` this replaced.
+        rc, out = machine.execute(cmd)
+        assert rc == 75, (rc, out)
+        return out
 
     def cap_session(key):
         return machine.succeed(
@@ -2437,8 +2436,8 @@
     )
     machine.wait_until_fails(f"{hook_ls} | grep -x {done} >/dev/null", timeout=60)
 
-    # Two hook-* keys at MAX=2, only one of them running. The old count dropped
-    # this batch for good; the new one spends the slot the finished session was
+    # Two hook-* keys at MAX=2, only one of them running. The old count refused
+    # this batch; the new one spends the slot the finished session was
     # sitting on. (Asserted, not assumed: a stray coalesced dispatch landing
     # here would otherwise turn the arithmetic below into a puzzle.)
     assert machine.succeed(hook_keys).strip() == "2"
@@ -2447,7 +2446,7 @@
     machine.wait_until_succeeds(f"{hook_ls} | grep -x {free} >/dev/null", timeout=60)
 
     # ...and the brake is not simply gone: the SAME cap, with both slots now
-    # genuinely running, still drops the batch and says so — the only
+    # genuinely running, still refuses the batch and says so — the only
     # difference between this call and the one above is liveness, which is
     # therefore worth restating as this assertion's precondition.
     machine.succeed(f"{hook_ls} | grep -x {busy} >/dev/null")

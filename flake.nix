@@ -1373,6 +1373,52 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # What the spawn wrapper ANSWERS at the hook-session ceiling, and
+          # what the pinned local-webhook does with that answer (#170, #301).
+          # A refusal used to be `exit 1`, which the dispatcher cannot tell
+          # from "command not found", so it dropped the batch — and a standing
+          # watch is for events NO session owns, so nothing else held them.
+          # 75 (EX_TEMPFAIL) is the code that means "declined for now", and
+          # the batch is then re-offered until a slot frees.
+          #
+          # Both halves run against the REAL wrapper and the REAL pinned
+          # webhook.py, because the bug was the two disagreeing about what a
+          # non-zero exit meant — the wrapper is the dispatcher's own spawn
+          # command here, and the deferral is driven end to end in seconds.
+          # The VM test keeps the wiring an interpreter cannot show; this is
+          # where the contract between the two programs lives.
+          webhook-defer =
+            pkgs.runCommand "agent-box-webhook-defer"
+              {
+                nativeBuildInputs = [
+                  pkgs.bash
+                  pkgs.coreutils
+                  pkgs.jq
+                  pkgs.python3
+                ];
+                # The whole directory, not the one file: the source form
+                # carries @@include markers and the test resolves them
+                # against its siblings, exactly as the assembler does.
+                src = ./modules/src;
+                tests = ./tests/test-webhook-defer.sh;
+                # The same pin the module and #runtime read, fetched the
+                # same way (nix/webhook-pin.nix).
+                webhookPy =
+                  let pin = import ./nix/webhook-pin.nix; in
+                  builtins.fetchurl {
+                    url = "https://raw.githubusercontent.com/${pin.repo}/${pin.rev}"
+                          + "/local-webhook/webhook.py";
+                    sha256 = pin.sha256;
+                  };
+              } ''
+              bash "$tests" "$src/webhook-spawn.sh" "$webhookPy" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Unit tests for the durable per-session lease (issue #535):
           # outcome precedence (first ending wins, never the most recent),
           # clear's delete-not-blank resolution, and the read-only accessor

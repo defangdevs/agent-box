@@ -2158,8 +2158,17 @@ class Renderer:
         if self.spec.webhook_enable:
             t.file(self.p("/etc/agent-box/units",
                           f"agent-box-webhook-{u.name}.env"),
-                   env_file([("LOCAL_WEBHOOK_STATE_DIR",
-                              f"{u.home}/.local/state/local-webhook")]))
+                   env_file([
+                       ("LOCAL_WEBHOOK_STATE_DIR",
+                        f"{u.home}/.local/state/local-webhook"),
+                       # How long a batch the hook-session cap declined
+                       # (exit 75, modules/src/webhook-spawn.sh) may wait
+                       # for a slot before the receiver drops it.
+                       # local-webhook's own default is 300s, which is
+                       # shorter than a hook session runs — see the module's
+                       # half of this file for the whole argument.
+                       ("LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S", "3600"),
+                   ]))
 
     def user_dropins(self, t, u):
         """Host-level content, per instance.
