@@ -3996,7 +3996,66 @@ def cmd_update(args):
     if args.no_restart_sessions:
         child.append("--no-restart-sessions")
     print(f"switched to {target[:12]}; applying with the new agentbox")
-    return subprocess.run(child).returncode
+    try:
+        rc = subprocess.run(child).returncode
+    except OSError as e:
+        # Not "the new release failed" but "the new release could not be
+        # STARTED" — the file is not there, the interpreter is not there,
+        # the execute bit is not set. Phase two has run no code of its own,
+        # so it has rolled nothing back.
+        print(f"agentbox: cannot execute the new agentbox: {e}",
+              file=sys.stderr)
+        rc = 127
+    if rc == 0:
+        return 0
+    return recover_handover(args, profile, generation, target, rc)
+
+
+def recover_handover(args, profile, generation, target, rc):
+    """Roll back when phase two failed BEFORE it could roll itself back.
+
+    post_switch() rolls back its own failures, so a non-zero child usually
+    means the box is already on the previous release and phase one has
+    nothing left to do. That is not always true. The child IS the newly
+    installed agentbox, and a release can fail before one line of its own
+    code runs: argparse exits 2 on an argument this release no longer
+    takes, an import fails, the interpreter or the file is missing. The
+    profile is already switched by then, so without this the box is left
+    running a release that cannot run its own updater, and nothing puts it
+    back — the one failure the rollback exists for and the one it missed.
+
+    Exit status cannot tell the two apart: post_switch returns 1, argparse
+    returns 2, and neither is reserved. So ask the PROFILE instead. If it
+    is still ahead of where phase one found it, no rollback has happened
+    and phase one owns it. That question is safe to ask when phase two DID
+    roll back, because rollback_to() stops the moment the profile is at or
+    behind its target.
+    """
+    if generation is None:
+        # Nothing to go back to — the profile is not a generation symlink,
+        # the same case that keeps --from-generation off the child's argv.
+        return rc
+    current = profile_generation(profile)
+    if current is not None and current <= generation:
+        return rc                       # phase two already put it back
+    rolled = rollback_to(profile, generation)
+    if rolled:
+        # Re-apply with the rolled-back release, as a fresh process for
+        # the same version-skew reason phase one handed over at all. The
+        # profile is a symlink, so it now resolves to the OLD agentbox.
+        run([str(profile / "bin" / "agentbox"), "apply",
+             "--config", args.config, "--profile", str(profile)], check=False)
+        restart_units(restart_sessions=not args.no_restart_sessions)
+    wall(f"update to {target[:12]} FAILED before the new release could run "
+         "its post-switch phase — profile "
+         + ("rolled back to the previous release."
+            if rolled else "COULD NOT be rolled back; see journalctl -u "
+                           f"{UPDATE_UNIT}."))
+    print("agentbox: the new release could not run its post-switch phase "
+          f"(exit {rc}); profile "
+          + ("rolled back" if rolled else "NOT rolled back"),
+          file=sys.stderr)
+    return rc
 
 
 def post_switch(args, profile):
