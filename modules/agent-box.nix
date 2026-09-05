@@ -181,10 +181,14 @@ let
       never parked, so it stays listed and attachable for you to read - `rm` it once
       you have. That cleanup is load-bearing: at most 4
       `hook-*` sessions may RUN at once, and once that ceiling is reached EVERY
-      watch on the box is inert - a matching batch is refused and dropped, never
-      queued. A stopped session frees its slot even before it is delisted. So before you conclude a repo has been quiet, run `agent-box-webhook
-      status`: its `dispatch` object has the live count against the ceiling and the
-      last batch the ceiling dropped.
+      watch on the box is stalled - a matching batch starts nothing until a slot
+      frees. It is no longer LOST while it waits: the wrapper declines it and the
+      receiver keeps it, re-offers it as slots free, and drops it only after an hour
+      of waiting. A stopped session frees its slot even before it is delisted. So
+      before you conclude a repo has been quiet, run `agent-box-webhook status`: its
+      `dispatch` object has the live count against the ceiling and the last batch the
+      ceiling turned away (`lastRefusal.deferred` says whether that batch is still
+      waiting).
 
       Payload rules (`--when` / `--drop`, JSON predicates over payload paths) ARE a
       watch's spawn policy - see `agent-box-webhook --help`. This box's watches on
@@ -4312,12 +4316,16 @@ esac
                              RUN at once (AGENT_BOX_HOOK_SESSION_MAX in the
                              receiver daemon's environment). Hook sessions are
                              removed by the agent they start, so four of them
-                             still running wedge every watch on the box — a
-                             refused batch is DROPPED, never queued. Stopping one
-                             frees its slot; `agent-box-session rm NAME` also
-                             delists it. `status` reports the count, the ceiling
-                             and the last refusal, and `ls` says so too once the
-                             box is at the ceiling.
+                             still running stall every watch on the box. A batch
+                             that arrives then is QUEUED, not dropped: the spawn
+                             wrapper declines it (exit 75) and the receiver
+                             re-offers it as slots free, giving up only after
+                             LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S (an hour here).
+                             Stopping a session frees its slot;
+                             `agent-box-session rm NAME` also delists it.
+                             `status` reports the count, the ceiling and the last
+                             refusal, and `ls` says so too once the box is at the
+                             ceiling.
 
     --ignore-sender LOGIN mutes echoes of that sender's own comments and pushes
     ("@self" is $LOCAL_WEBHOOK_SELF — the login this box acts as, resolved from
@@ -4400,9 +4408,11 @@ esac
 
     Its `dispatch` object is where to look when standing watches seem dead:
     `hookSessions` is the running hook-* count against the ceiling, `lastRefusal`
-    is the batch the ceiling most recently dropped (with a running total), and
-    `warning` — the same field `ls` sets when the receiver has no spawn command
-    — is present exactly when a match right now would spawn nothing.
+    is the batch the ceiling most recently turned away (with a running total, and
+    `deferred: true` when the receiver kept it to re-offer as a slot frees rather
+    than dropping it), and `warning` — the same field `ls` sets when the receiver
+    has no spawn command — is present exactly when a match right now would spawn
+    nothing.
 
     One-time per SENDER, to make its deliveries possible at all:
       agent-box-webhook setup github   # prints that source's URL and its HMAC
@@ -4535,11 +4545,16 @@ esac
     # ----------------------------------------------------- standing-watch cap ---
     # Standing watches are the one delivery shape with no session behind it, so
     # when the spawn wrapper refuses a batch (too many hook-* sessions running)
-    # webhook.py drops it and NOBODY got those events. That refusal used to
-    # reach only the receiver daemon journal while every listing here still said
-    # "subscribed" — four hook sessions whose agents forgot `agent-box-session rm`
-    # made the whole box inert and it read like a quiet week (issue #170). These
-    # three read the state the wrapper decides on, so `status` and `ls` can say it.
+    # nothing else is holding those events. That refusal used to reach only the
+    # receiver daemon journal while every listing here still said "subscribed" —
+    # four hook sessions whose agents forgot `agent-box-session rm` made the whole
+    # box inert and it read like a quiet week (issue #170). These three read the
+    # state the wrapper decides on, so `status` and `ls` can say it.
+    #
+    # Since #301 the refusal is a DEFERRAL (the wrapper exits 75), so the batch
+    # waits for a slot instead of dying at the cap — but the cap is still what an
+    # operator has to clear, and the wait is bounded, so the reporting below stays
+    # exactly as loud as it was.
 
     hook_sessions() {
       # The capacity in use, counted the way the wrapper counts it
@@ -4588,14 +4603,18 @@ esac
 
     hook_capacity_warning() {
       # hook_capacity_warning LIVE MAX — the one sentence `status` and `ls` both
-      # print when the ceiling has made the watches inert, and nothing when it has
+      # print when the ceiling has stalled the watches, and nothing when it has
       # not. One wording in one place: two copies would drift, and this is the
       # sentence the reader acts on.
       [ "$1" -ge "$2" ] || return 0
       printf '%s' "$1 of at most $2 hook-* sessions are running, so every \
-    standing watch is inert: a matching event batch is refused and DROPPED, never \
-    queued. Free a slot (agent-box-session ls, then agent-box-session stop NAME, \
-    or agent-box-session rm NAME to delist it for good), or raise \
+    standing watch is stalled: a matching event batch starts nothing now. The \
+    spawn wrapper DECLINES it (exit 75) and the receiver holds it, re-offering it \
+    as slots free and dropping it only once the wait outlasts \
+    LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — so clearing the cap is still the fix, and \
+    lastRefusal.deferred says whether the last batch is waiting or was lost. Free \
+    a slot (agent-box-session ls, then agent-box-session stop NAME, or \
+    agent-box-session rm NAME to delist it for good), or raise \
     AGENT_BOX_HOOK_SESSION_MAX on the receiver daemon unit."
     }
 
@@ -6643,18 +6662,38 @@ fi
 #
 # The cap itself is right — webhook.py rate-limits and coalesces spawns but
 # bounds nothing over time, so agents that forget their `agent-box-session rm`
-# would otherwise fill the box. What was wrong is where the news went: on the
-# refusal below webhook.py DROPS the batch (deliberately — retrying a broken
-# spawner would loop), and for a standing watch there is no session peer that
-# received those events anyway, so the loss is total. Its only trace was the
-# receiver daemon's journal, while `agent-box-webhook ls` and `status` kept
-# reporting a healthy subscription: four wedged hook sessions made every watch
-# on the box inert, and that reads exactly like a quiet repo (issue #170).
+# would otherwise fill the box. What was wrong was the ANSWER it gave. A
+# refusal used to print a message and `exit 1`, which the dispatcher cannot
+# tell apart from "command not found", so it dropped the batch for good — and
+# for a standing watch there is no session peer that received those events
+# anyway, so the loss was total. Its only trace was the receiver daemon's
+# journal, while `agent-box-webhook ls` and `status` kept reporting a healthy
+# subscription: four wedged hook sessions made every watch on the box inert,
+# and that reads exactly like a quiet repo (issue #170).
 #
-# So a refusal is written down where the CLI can find it, next to the other
-# per-user agent-box state. Cumulative, never cleared: the dropped batches do
-# not come back, so "5 dropped, the last one 20 minutes ago" is the standing
-# fact an agent needs, not something to forget on the next successful spawn.
+# The exit code is a three-way answer since local-webhook 0.16.0
+# (local-channels#28, agent-box#301): 0 accepted, 75 (EX_TEMPFAIL) declines
+# for NOW, anything else says the spawner is broken. Only the last drops the
+# batch. So the cap exits 75 and nothing else in this script does — a
+# malformed AGENT_BOX_HOOK_SESSION_ARGS or a failed `add` really is a broken
+# spawner, and re-offering those would loop. A declined batch goes back at the
+# head of its key's pending list, is re-offered as the rate window reopens
+# (LOCAL_WEBHOOK_SPAWN_WINDOW, 60s) and starts the moment a slot frees, with
+# every line re-checked against live session ownership first. It is dropped
+# only if the whole streak outlasts LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — which
+# the receiver unit raises well past the upstream 300s default, because a hook
+# session runs for tens of minutes and five is not a wait, it is a slower drop.
+#
+# On a box pinned to local-webhook < 0.16.0 the 75 reads as a broken spawner
+# and the batch is dropped exactly as it was before, so this is never worse
+# than what it replaces.
+#
+# Either way the refusal is written down where the CLI can find it, next to
+# the other per-user agent-box state. Cumulative, never cleared: "5 refused,
+# the last one 20 minutes ago" is the standing fact an agent needs, not
+# something to forget on the next successful spawn. `deferred` records which
+# answer this wrapper gave, so `status` does not report as lost a batch the
+# receiver is still holding.
 BOX_STATE="$HOME/.local/state/agent-box"
 REFUSED="$BOX_STATE/webhook-spawn-refused.json"
 
@@ -6675,7 +6714,7 @@ record_refusal() {
   # $1 = the used hook-* capacity that triggered the refusal — the same number
   # the message above printed, which is what is running or queued to start and
   # NOT the raw registry key count (issue #280). Best effort: a state file that
-  # cannot be written must not turn a dropped batch into a crashed spawner, so
+  # cannot be written must not turn a refused batch into a crashed spawner, so
   # every failure here is silent and the journal line above stays the fallback.
   mkdir -p "$BOX_STATE" 2>/dev/null || return 0
   prev=0
@@ -6691,7 +6730,7 @@ record_refusal() {
       --arg topic "''${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
       --arg key "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" \
       --argjson live "$1" --argjson max "$MAX" --argjson count "$((prev + 1))" \
-      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). The batch was DROPPED, not queued. `live` is the capacity in use: hook-* sessions running or queued to start (agent-box#280). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max}
+      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). `deferred` says the wrapper exited 75, so local-webhook >= 0.16.0 KEEPS the batch and re-offers it until a slot frees or LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S runs out (agent-box#301); its absence means the batch was dropped outright. `live` is the capacity in use: hook-* sessions running or queued to start (agent-box#280). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max, deferred: true}
        + (if $topic == "" then {} else {topic: $topic} end)
        + (if $key == "" then {} else {key: $key} end)' \
       > "$REFUSED.$$" 2>/dev/null; then
@@ -6763,7 +6802,8 @@ if [ -s "$REGISTRY_FILE" ]; then
   fi
   if [ "$used" -ge "$MAX" ]; then
     echo "agent-box-webhook-spawn: $used hook-* sessions are running or queued to" \
-         "start (max $MAX); dropping this batch — 'agent-box-session ls' shows" \
+         "start (max $MAX); declining this batch for now — the receiver keeps it" \
+         "and offers it again when a slot frees. 'agent-box-session ls' shows" \
          "which; stopping one frees its slot and 'agent-box-session rm NAME'" \
          "delists it for good" >&2
     # The number recorded is the number refused on: `agent-box-webhook status`
@@ -6771,7 +6811,10 @@ if [ -s "$REGISTRY_FILE" ]; then
     record_refusal "$used"
     echo "agent-box-webhook-spawn: recorded in $REFUSED;" \
          "'agent-box-webhook status' reports it" >&2
-    exit 1
+    # 75, not 1: EX_TEMPFAIL is the only code the dispatcher reads as "declined
+    # for now" rather than "this spawner is broken" (agent-box#301). Every
+    # other exit in this script stays what it was.
+    exit 75
   fi
 fi
 
@@ -20027,7 +20070,21 @@ if __name__ == "__main__":
               );
         }) terminalUsers)
         // lib.optionalAttrs webhookEnabled (lib.listToAttrs (map (name: lib.nameValuePair "agent-box/units/agent-box-webhook-${name}.env" {
-          text = "LOCAL_WEBHOOK_STATE_DIR=${webhookStateDirOf name}\n";
+          text = "LOCAL_WEBHOOK_STATE_DIR=${webhookStateDirOf name}\n"
+            # How long a batch the hook-session cap declined (exit 75, see
+            # src/webhook-spawn.sh) may wait for a slot before the receiver
+            # gives up and drops it. local-webhook's own default is 300s,
+            # chosen for a consumer that declines briefly; ours is a session
+            # ceiling, and a hook session runs for tens of minutes, so five
+            # would mean the batch is dropped anyway — a slower version of
+            # the bug #301 set out to fix. An hour is the other bound: past
+            # it the event has usually been overtaken (the PR merged, the
+            # branch re-run), and the pending list is trimmed to
+            # LOCAL_WEBHOOK_SPAWN_PENDING_MAX lines meanwhile, so the wait
+            # costs a bounded amount of memory and no duplicate sessions.
+            # Overridable per box in agent-box-webhook-<user>.local.env,
+            # which this file's unit reads after this one.
+            + "LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S=3600\n";
         }) terminalUsers));
 
       # ttyd/settings/webhook per terminal user. The unit text (see
@@ -20219,8 +20276,9 @@ if __name__ == "__main__":
         # ExecStartPre that enforces the governed watch policy. Once nix
         # garbage collection reclaims that generation the spawn command is
         # simply gone, and every matching standing-watch batch is DROPPED
-        # (never queued, agent-box#301) with the reason only in the
-        # root-owned journal. The window opens on essentially every
+        # with the reason only in the root-owned journal — the deferral
+        # #301 added does not save this one, because a command that cannot
+        # be run is a broken spawner and not a decline. The window opens on essentially every
         # rebuild, since a store-path bump is enough to change this
         # drop-in — and an update is exactly when a merge's own CI
         # deliveries are in flight.

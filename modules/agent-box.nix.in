@@ -3375,7 +3375,21 @@ in
               );
         }) terminalUsers)
         // lib.optionalAttrs webhookEnabled (lib.listToAttrs (map (name: lib.nameValuePair "agent-box/units/agent-box-webhook-${name}.env" {
-          text = "LOCAL_WEBHOOK_STATE_DIR=${webhookStateDirOf name}\n";
+          text = "LOCAL_WEBHOOK_STATE_DIR=${webhookStateDirOf name}\n"
+            # How long a batch the hook-session cap declined (exit 75, see
+            # src/webhook-spawn.sh) may wait for a slot before the receiver
+            # gives up and drops it. local-webhook's own default is 300s,
+            # chosen for a consumer that declines briefly; ours is a session
+            # ceiling, and a hook session runs for tens of minutes, so five
+            # would mean the batch is dropped anyway — a slower version of
+            # the bug #301 set out to fix. An hour is the other bound: past
+            # it the event has usually been overtaken (the PR merged, the
+            # branch re-run), and the pending list is trimmed to
+            # LOCAL_WEBHOOK_SPAWN_PENDING_MAX lines meanwhile, so the wait
+            # costs a bounded amount of memory and no duplicate sessions.
+            # Overridable per box in agent-box-webhook-<user>.local.env,
+            # which this file's unit reads after this one.
+            + "LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S=3600\n";
         }) terminalUsers));
 
       # ttyd/settings/webhook per terminal user. The unit text (see
@@ -3567,8 +3581,9 @@ in
         # ExecStartPre that enforces the governed watch policy. Once nix
         # garbage collection reclaims that generation the spawn command is
         # simply gone, and every matching standing-watch batch is DROPPED
-        # (never queued, agent-box#301) with the reason only in the
-        # root-owned journal. The window opens on essentially every
+        # with the reason only in the root-owned journal — the deferral
+        # #301 added does not save this one, because a command that cannot
+        # be run is a broken spawner and not a decline. The window opens on essentially every
         # rebuild, since a store-path bump is enough to change this
         # drop-in — and an update is exactly when a merge's own CI
         # deliveries are in flight.

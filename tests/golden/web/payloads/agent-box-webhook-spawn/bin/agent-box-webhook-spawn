@@ -901,18 +901,38 @@ fi
 #
 # The cap itself is right — webhook.py rate-limits and coalesces spawns but
 # bounds nothing over time, so agents that forget their `agent-box-session rm`
-# would otherwise fill the box. What was wrong is where the news went: on the
-# refusal below webhook.py DROPS the batch (deliberately — retrying a broken
-# spawner would loop), and for a standing watch there is no session peer that
-# received those events anyway, so the loss is total. Its only trace was the
-# receiver daemon's journal, while `agent-box-webhook ls` and `status` kept
-# reporting a healthy subscription: four wedged hook sessions made every watch
-# on the box inert, and that reads exactly like a quiet repo (issue #170).
+# would otherwise fill the box. What was wrong was the ANSWER it gave. A
+# refusal used to print a message and `exit 1`, which the dispatcher cannot
+# tell apart from "command not found", so it dropped the batch for good — and
+# for a standing watch there is no session peer that received those events
+# anyway, so the loss was total. Its only trace was the receiver daemon's
+# journal, while `agent-box-webhook ls` and `status` kept reporting a healthy
+# subscription: four wedged hook sessions made every watch on the box inert,
+# and that reads exactly like a quiet repo (issue #170).
 #
-# So a refusal is written down where the CLI can find it, next to the other
-# per-user agent-box state. Cumulative, never cleared: the dropped batches do
-# not come back, so "5 dropped, the last one 20 minutes ago" is the standing
-# fact an agent needs, not something to forget on the next successful spawn.
+# The exit code is a three-way answer since local-webhook 0.16.0
+# (local-channels#28, agent-box#301): 0 accepted, 75 (EX_TEMPFAIL) declines
+# for NOW, anything else says the spawner is broken. Only the last drops the
+# batch. So the cap exits 75 and nothing else in this script does — a
+# malformed AGENT_BOX_HOOK_SESSION_ARGS or a failed `add` really is a broken
+# spawner, and re-offering those would loop. A declined batch goes back at the
+# head of its key's pending list, is re-offered as the rate window reopens
+# (LOCAL_WEBHOOK_SPAWN_WINDOW, 60s) and starts the moment a slot frees, with
+# every line re-checked against live session ownership first. It is dropped
+# only if the whole streak outlasts LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — which
+# the receiver unit raises well past the upstream 300s default, because a hook
+# session runs for tens of minutes and five is not a wait, it is a slower drop.
+#
+# On a box pinned to local-webhook < 0.16.0 the 75 reads as a broken spawner
+# and the batch is dropped exactly as it was before, so this is never worse
+# than what it replaces.
+#
+# Either way the refusal is written down where the CLI can find it, next to
+# the other per-user agent-box state. Cumulative, never cleared: "5 refused,
+# the last one 20 minutes ago" is the standing fact an agent needs, not
+# something to forget on the next successful spawn. `deferred` records which
+# answer this wrapper gave, so `status` does not report as lost a batch the
+# receiver is still holding.
 BOX_STATE="$HOME/.local/state/agent-box"
 REFUSED="$BOX_STATE/webhook-spawn-refused.json"
 
@@ -933,7 +953,7 @@ record_refusal() {
   # $1 = the used hook-* capacity that triggered the refusal — the same number
   # the message above printed, which is what is running or queued to start and
   # NOT the raw registry key count (issue #280). Best effort: a state file that
-  # cannot be written must not turn a dropped batch into a crashed spawner, so
+  # cannot be written must not turn a refused batch into a crashed spawner, so
   # every failure here is silent and the journal line above stays the fallback.
   mkdir -p "$BOX_STATE" 2>/dev/null || return 0
   prev=0
@@ -949,7 +969,7 @@ record_refusal() {
       --arg topic "${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
       --arg key "${LOCAL_WEBHOOK_SPAWN_KEY:-}" \
       --argjson live "$1" --argjson max "$MAX" --argjson count "$((prev + 1))" \
-      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). The batch was DROPPED, not queued. `live` is the capacity in use: hook-* sessions running or queued to start (agent-box#280). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max}
+      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). `deferred` says the wrapper exited 75, so local-webhook >= 0.16.0 KEEPS the batch and re-offers it until a slot frees or LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S runs out (agent-box#301); its absence means the batch was dropped outright. `live` is the capacity in use: hook-* sessions running or queued to start (agent-box#280). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max, deferred: true}
        + (if $topic == "" then {} else {topic: $topic} end)
        + (if $key == "" then {} else {key: $key} end)' \
       > "$REFUSED.$$" 2>/dev/null; then
@@ -1021,7 +1041,8 @@ if [ -s "$REGISTRY_FILE" ]; then
   fi
   if [ "$used" -ge "$MAX" ]; then
     echo "agent-box-webhook-spawn: $used hook-* sessions are running or queued to" \
-         "start (max $MAX); dropping this batch — 'agent-box-session ls' shows" \
+         "start (max $MAX); declining this batch for now — the receiver keeps it" \
+         "and offers it again when a slot frees. 'agent-box-session ls' shows" \
          "which; stopping one frees its slot and 'agent-box-session rm NAME'" \
          "delists it for good" >&2
     # The number recorded is the number refused on: `agent-box-webhook status`
@@ -1029,7 +1050,10 @@ if [ -s "$REGISTRY_FILE" ]; then
     record_refusal "$used"
     echo "agent-box-webhook-spawn: recorded in $REFUSED;" \
          "'agent-box-webhook status' reports it" >&2
-    exit 1
+    # 75, not 1: EX_TEMPFAIL is the only code the dispatcher reads as "declined
+    # for now" rather than "this spawner is broken" (agent-box#301). Every
+    # other exit in this script stays what it was.
+    exit 75
   fi
 fi
 

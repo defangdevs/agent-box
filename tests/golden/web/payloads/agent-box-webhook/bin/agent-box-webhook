@@ -87,12 +87,16 @@ Two delivery shapes:
                          RUN at once (AGENT_BOX_HOOK_SESSION_MAX in the
                          receiver daemon's environment). Hook sessions are
                          removed by the agent they start, so four of them
-                         still running wedge every watch on the box — a
-                         refused batch is DROPPED, never queued. Stopping one
-                         frees its slot; `agent-box-session rm NAME` also
-                         delists it. `status` reports the count, the ceiling
-                         and the last refusal, and `ls` says so too once the
-                         box is at the ceiling.
+                         still running stall every watch on the box. A batch
+                         that arrives then is QUEUED, not dropped: the spawn
+                         wrapper declines it (exit 75) and the receiver
+                         re-offers it as slots free, giving up only after
+                         LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S (an hour here).
+                         Stopping a session frees its slot;
+                         `agent-box-session rm NAME` also delists it.
+                         `status` reports the count, the ceiling and the last
+                         refusal, and `ls` says so too once the box is at the
+                         ceiling.
 
 --ignore-sender LOGIN mutes echoes of that sender's own comments and pushes
 ("@self" is $LOCAL_WEBHOOK_SELF — the login this box acts as, resolved from
@@ -175,9 +179,11 @@ branch — and is reported in the JSON (`plugin.skew`) without a warning.
 
 Its `dispatch` object is where to look when standing watches seem dead:
 `hookSessions` is the running hook-* count against the ceiling, `lastRefusal`
-is the batch the ceiling most recently dropped (with a running total), and
-`warning` — the same field `ls` sets when the receiver has no spawn command
-— is present exactly when a match right now would spawn nothing.
+is the batch the ceiling most recently turned away (with a running total, and
+`deferred: true` when the receiver kept it to re-offer as a slot frees rather
+than dropping it), and `warning` — the same field `ls` sets when the receiver
+has no spawn command — is present exactly when a match right now would spawn
+nothing.
 
 One-time per SENDER, to make its deliveries possible at all:
   agent-box-webhook setup github   # prints that source's URL and its HMAC
@@ -310,11 +316,16 @@ peer_kinds() {
 # ----------------------------------------------------- standing-watch cap ---
 # Standing watches are the one delivery shape with no session behind it, so
 # when the spawn wrapper refuses a batch (too many hook-* sessions running)
-# webhook.py drops it and NOBODY got those events. That refusal used to
-# reach only the receiver daemon journal while every listing here still said
-# "subscribed" — four hook sessions whose agents forgot `agent-box-session rm`
-# made the whole box inert and it read like a quiet week (issue #170). These
-# three read the state the wrapper decides on, so `status` and `ls` can say it.
+# nothing else is holding those events. That refusal used to reach only the
+# receiver daemon journal while every listing here still said "subscribed" —
+# four hook sessions whose agents forgot `agent-box-session rm` made the whole
+# box inert and it read like a quiet week (issue #170). These three read the
+# state the wrapper decides on, so `status` and `ls` can say it.
+#
+# Since #301 the refusal is a DEFERRAL (the wrapper exits 75), so the batch
+# waits for a slot instead of dying at the cap — but the cap is still what an
+# operator has to clear, and the wait is bounded, so the reporting below stays
+# exactly as loud as it was.
 
 hook_sessions() {
   # The capacity in use, counted the way the wrapper counts it
@@ -363,14 +374,18 @@ dispatch_topics() {
 
 hook_capacity_warning() {
   # hook_capacity_warning LIVE MAX — the one sentence `status` and `ls` both
-  # print when the ceiling has made the watches inert, and nothing when it has
+  # print when the ceiling has stalled the watches, and nothing when it has
   # not. One wording in one place: two copies would drift, and this is the
   # sentence the reader acts on.
   [ "$1" -ge "$2" ] || return 0
   printf '%s' "$1 of at most $2 hook-* sessions are running, so every \
-standing watch is inert: a matching event batch is refused and DROPPED, never \
-queued. Free a slot (agent-box-session ls, then agent-box-session stop NAME, \
-or agent-box-session rm NAME to delist it for good), or raise \
+standing watch is stalled: a matching event batch starts nothing now. The \
+spawn wrapper DECLINES it (exit 75) and the receiver holds it, re-offering it \
+as slots free and dropping it only once the wait outlasts \
+LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — so clearing the cap is still the fix, and \
+lastRefusal.deferred says whether the last batch is waiting or was lost. Free \
+a slot (agent-box-session ls, then agent-box-session stop NAME, or \
+agent-box-session rm NAME to delist it for good), or raise \
 AGENT_BOX_HOOK_SESSION_MAX on the receiver daemon unit."
 }
 
