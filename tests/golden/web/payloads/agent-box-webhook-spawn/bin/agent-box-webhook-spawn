@@ -701,15 +701,16 @@ fi
 # the event. Older receivers set nothing, and an entry with no config sets `{}`,
 # so both read as "no watch-level answer" and the box-wide setting stands.
 #
-# --preamble has no delivery and so no variable: the settings page asks what a
-# named TOPIC would start, so that mode reads the watch straight out of the
-# dispatch file. Same precedence either way, because the page must not advertise
-# a worker the spawn would not use.
+# --preamble and --resolved-profile have no delivery and so no variable: the
+# settings page asks what a named TOPIC would start, so both modes read the
+# watch straight out of the dispatch file. Same precedence either way,
+# because the page must not advertise a worker the spawn would not use.
 watch_profile=""
 watch_config=""
 if [ -n "${LOCAL_WEBHOOK_SPAWN_CONFIG:-}" ]; then
   watch_config="$LOCAL_WEBHOOK_SPAWN_CONFIG"
-elif [ "${1:-}" = "--preamble" ] && [ -n "${2:-}" ] && [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ]; then
+elif { [ "${1:-}" = "--preamble" ] || [ "${1:-}" = "--resolved-profile" ]; } \
+     && [ -n "${2:-}" ] && [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ]; then
   # Best effort, like every other read here: no file, bad JSON or no such topic
   # all mean "this watch names no profile", never a failed render.
   watch_config=$("$JQ" -r --arg t "$2" \
@@ -746,6 +747,12 @@ profile_problem() {
 hook_profile=""
 hook_profile_source=""
 hook_profile_ignored=""
+# Bare names alongside the prose above, for --resolved-profile (#582): a
+# consumer that wants to warn about a named-but-missing profile needs the
+# NAME, and hook_profile_ignored only ever carries it wrapped in a sentence
+# meant for a human. Names are charset-restricted by profile_problem before
+# they land here, so a plain space-joined list round-trips with no quoting.
+hook_profile_ignored_names=""
 try_profile() {
   [ -n "$1" ] || return 0
   [ -z "$hook_profile" ] || return 0
@@ -757,6 +764,7 @@ try_profile() {
   fi
   echo "agent-box-webhook-spawn: ignoring profile '$1' from $2 — $why" >&2
   hook_profile_ignored="${hook_profile_ignored:+$hook_profile_ignored; }$2 — IGNORED, $why"
+  hook_profile_ignored_names="${hook_profile_ignored_names:+$hook_profile_ignored_names }$1"
 }
 
 try_profile "$watch_profile" "this watch's own spawnConfig.profile"
@@ -850,6 +858,24 @@ root, running sessions keep the arguments they started with:"
 ${AGENT_BOX_HOOK_ARGS_OPTION_NAME:-the fleet-wide default}, which is the \
 fallback."
 }
+
+# --resolved-profile TOPIC [NOTE]: print, as one JSON object, the profile a
+# match on TOPIC would actually use right now — {"profile": NAME or null,
+# "missing": [NAME, ...]} — and spawn nothing. Same resolution as a real
+# spawn and as --preamble's prose (the precedence above already ran by the
+# time this checks $1), but MACHINE-readable: the settings page needs a bare
+# name to badge a watch's row and to warn a profile delete out from under a
+# live watch (#582), and scraping that out of --preamble's sentences would
+# break every time the wording does. `missing` lists every named-but-unusable
+# profile that was tried and passed over, most specific (the watch's own)
+# first — empty when nothing was named, distinct from `profile` being null
+# for "nothing resolved, so the box default harness starts".
+if [ "${1:-}" = "--resolved-profile" ]; then
+  "$JQ" -n --arg p "$hook_profile" --arg m "$hook_profile_ignored_names" \
+    '{profile: (if $p == "" then null else $p end),
+      missing: (if $m == "" then [] else ($m | split(" ")) end)}'
+  exit 0
+fi
 
 # --preamble TOPIC [NOTE]: print what a match on TOPIC would launch — the
 # launch command first, then the prompt — and spawn nothing. Everything a

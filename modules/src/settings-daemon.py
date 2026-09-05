@@ -1547,6 +1547,77 @@ def hook_preamble(topic, note, stamp):
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
+@functools.lru_cache(maxsize=64)
+def hook_resolved_profile(topic, note, stamp):
+    """(profile, missing) for this standing watch, right now - profile is ""
+    when nothing resolves (a match starts the box default agent), missing is
+    a tuple of every named-but-unusable profile that was tried and passed
+    over, most specific first.
+
+    A bare answer, not prose: hook_preamble's --preamble text answers the
+    same question for a human reading the fold, but a caller that wants to
+    badge a watch's row or warn a profile delete out from under a live watch
+    (#582) needs the NAME alone, and scraping it out of a sentence would
+    break every time the wording does. Same cache key as hook_preamble, for
+    the same reason - a changed env file or profiles directory has to
+    re-render both.
+    """
+    if not HOOK_SPAWN_CMD:
+        return ("", ())
+    try:
+        proc = subprocess.run(
+            [HOOK_SPAWN_CMD, "--resolved-profile", topic, note],
+            env=dict(os.environ, LOCAL_WEBHOOK_STATE_DIR=webhook_state_dir()),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write("webhook: resolved-profile: %s\n" % exc)
+        return ("", ())
+    if proc.returncode != 0:
+        return ("", ())
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        return ("", ())
+    if not isinstance(data, dict):
+        return ("", ())
+    profile = data.get("profile")
+    missing = data.get("missing")
+    return (
+        profile if isinstance(profile, str) else "",
+        tuple(m for m in missing if isinstance(m, str))
+        if isinstance(missing, list) else (),
+    )
+
+
+def profile_usage(watches):
+    """profile name -> sorted topics whose standing watch resolves to it
+    right now, explicitly or via the box-wide AGENT_BOX_HOOK_PROFILE
+    fallback (#582). What `agent-box-profile rm`/the delete route never
+    checked: a profile deleted out from under a live watch does not stop
+    that watch, it just changes which worker future events start - silently,
+    and possibly onto a more expensive one than whoever deleted it expected.
+
+    Reuses hook_resolved_profile's own cache, so a page that already renders
+    the watch list (which looks up the same answer per row) pays for this
+    once per (topic, note, stamp), not twice.
+    """
+    stamp = hook_args_stamp()
+    usage = {}
+    for entry in watches:
+        topic = str(entry.get("topic") or "")
+        if not topic:
+            continue
+        note = str(entry.get("note") or "")
+        profile, _missing = hook_resolved_profile(topic, note, stamp)
+        if profile:
+            usage.setdefault(profile, []).append(topic)
+    return {name: sorted(topics) for name, topics in usage.items()}
+
+
 def webhook_entries(data, dispatch):
     """The topic entries of a `subscriptions` payload, session or
     dispatch side, as a list of dicts."""
@@ -3528,11 +3599,20 @@ def render_effort_options(selected=""):
     return "".join(items)
 
 
-def render_profiles(profiles):
+def render_profiles(profiles, usage=None):
     """The profiles list. Each row folds open onto its launch config and its
     environment KEY NAMES — never a value, the rule `agent-box-profile show`
     and `env ls` already keep, and the one that matters most here because a
-    profile is exactly where a token ends up."""
+    profile is exactly where a token ends up.
+
+    `usage` is profile_usage(watches) (#582): a profile a standing watch
+    resolves to right now says so on its own row, not only on the watch's,
+    because the delete button lives here and the cost of pressing it by
+    mistake is a watch quietly starting the box default agent instead - no
+    error, no dropped events, just a worker nobody chose. Defaults to none
+    in use, for a caller (a unit test, mainly) that has no watch list to
+    hand and does not care."""
+    usage = usage or {}
     base = html.escape(BASE)
     rows = []
     for name in sorted(profiles):
@@ -3550,6 +3630,28 @@ def render_profiles(profiles):
         if env_keys:
             bits.append("%d custom setting%s" % (
                 len(env_keys), "" if len(env_keys) == 1 else "s"))
+        topics = usage.get(name) or []
+        watch_warn = ""
+        if topics:
+            plural = "" if len(topics) == 1 else "es"
+            bits.append("used by %d standing watch%s" % (len(topics), plural))
+            # RAW here, not html.escape()'d: this only ever reaches the
+            # confirm() dialog below, built through json.dumps() rather than
+            # hand-spliced into a quoted JS string. A webhook topic is a
+            # source:key the operator (or a hand edit of the dispatch file)
+            # chooses, and local-webhook's own key charset allows an
+            # apostrophe - html.escape() alone would leave `&#x27;` in the
+            # HTML attribute, which the BROWSER decodes back to `'` before
+            # handing the onsubmit text to the JS parser, breaking out of a
+            # hand-quoted confirm('...') string.
+            topic_list = ", ".join(topics)
+            watch_warn = (
+                " It is used by %d standing watch%s: %s. After deleting, "
+                "%s the box default agent instead."
+                % (len(topics), plural, topic_list,
+                   "that watch starts" if len(topics) == 1
+                   else "those watches start")
+            )
         # Each bit was escaped as it went in, so the join must NOT be
         # escaped again: a MODEL holding "&" or "<" would render as visible
         # entity text ("&amp;lt;").
@@ -3578,14 +3680,26 @@ def render_profiles(profiles):
         # stored, so an edit is an edit and not a retype. SYSTEM_PROMPT is a
         # textarea for the same reason it is one above — it can span lines.
         prompt_val = html.escape(res.get("SYSTEM_PROMPT") or "")
+        # json.dumps(), not hand-quoted JS: `name` is charset-restricted
+        # (PROFILE_NAME_RE), but watch_warn's topic names are not, so this is
+        # where the confirm() dialog's whole message gets ONE correct
+        # escaping instead of a second, wrong one — html.escape() on its own
+        # protects the HTML attribute but leaves the JS string quoting to
+        # hope, and a topic holding an apostrophe broke out of it.
+        confirm_js = html.escape(
+            json.dumps(
+                "Delete profile %s?%s Sessions already running keep what "
+                "they started with." % (name, watch_warn)
+            ),
+            quote=True,
+        )
         rows.append(
             f'<li class="foldrow prof-row"><details><summary>'
             f'<span class="nm"><code>{safe}</code></span>'
             f'<span class="meta">{meta}</span>'
             f'<span class="acts"><form class="inline" method="post" '
             f'action="{base}/profiles/delete" '
-            f'onsubmit="return confirm(\'Delete profile {safe}? Sessions already '
-            f'running keep what they started with.\');">'
+            f'onsubmit="return confirm({confirm_js});">'
             f'<input type="hidden" name="name" value="{safe}">'
             f'<button type="submit" class="icon idanger" aria-label="Delete" '
             f'title="Delete profile {safe}">{ICON_TRASH}</button></form></span>'
@@ -4068,6 +4182,20 @@ def render_webhook_endpoint():
     )
 
 
+def display_hook_profile(profile, missing):
+    """The one-line answer to "what does this watch start" (#582), for the
+    row itself rather than the fold an operator has to open to find it.
+    `missing` being non-empty even when `profile` resolved is exactly the
+    case --preamble already reports via IGNORED - the watch's own name was
+    unusable and a less specific one took over - so it says so here too,
+    rather than only in the fold's prose."""
+    bit = ("Profile: %s" % profile if profile
+           else "No profile - box default agent")
+    if missing:
+        bit += " (%s not found)" % ", ".join("'%s'" % m for m in missing)
+    return bit
+
+
 def render_webhooks(watches):
     """The standing watches. Session subscriptions are NOT here: they
     belong to a session and are folded into its row above. A standing
@@ -4088,9 +4216,11 @@ def render_webhooks(watches):
             continue
         note = str(entry.get("note") or "")
         prompt = hook_preamble(topic, note, stamp)
+        profile, missing = hook_resolved_profile(topic, note, stamp)
         rows.append(render_webhook_row(
             topic,
-            [display_event_expiry(entry.get("expiresIn"))],
+            [display_event_expiry(entry.get("expiresIn")),
+             display_hook_profile(profile, missing)],
             # Only when the prompt could not be rendered: then the note is
             # the one thing left that says why this watch exists.
             "" if prompt else note,
@@ -4560,6 +4690,11 @@ def render_page(message="", kind="ok"):
     # and the panel below it — the same rule the subscription pass above
     # states, for the same reason.
     profiles = read_profiles()
+    # Which of those profiles a standing watch is actually spending right
+    # now (#582) - computed once here, from the same `watches` the webhooks
+    # panel below already walks, so the profiles panel's delete warning and
+    # that panel's per-row badge never disagree about what "in use" means.
+    usage = profile_usage(watches)
     return (
         render_head("Settings &mdash; " + html.escape(USER))
         + STYLE
@@ -4576,7 +4711,7 @@ def render_page(message="", kind="ok"):
                 base=html.escape(BASE),
                 harnesses=render_harness_options(),
                 effort=render_effort_options(),
-                profiles=render_profiles(profiles),
+                profiles=render_profiles(profiles, usage),
             ),
             webhooks_section=(
                 WEBHOOK_UNAVAILABLE_TPL.format(text=unavailable)
