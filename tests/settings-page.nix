@@ -679,8 +679,19 @@
         "/tmp/handh | head -1"
     ).strip()
     assert session, "handover set no session cookie"
+    # The daemon runs in HOME mode with one web user, so the vhost root
+    # REDIRECTS into that user's space. A 303 already proves the cookie was
+    # accepted rather than challenged -- a refusal is the 401 asserted
+    # below...
     client.succeed(
         f"{curl} -o /dev/null -w '%{{http_code}}' "
+        f"-H 'Cookie: __Host-agent_box_session_agent={session}' "
+        "https://box.test/ | grep -x 303"
+    )
+    # ...and following it proves the cookie reaches real content, not just
+    # the redirect.
+    client.succeed(
+        f"{curl} -L -o /dev/null -w '%{{http_code}}' "
         f"-H 'Cookie: __Host-agent_box_session_agent={session}' "
         "https://box.test/ | grep -x 200"
     )

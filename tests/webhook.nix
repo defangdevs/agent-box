@@ -1886,8 +1886,20 @@
     # invocation per session key, so nothing here re-implements the filter
     # format.
     machine.wait_for_unit("agent-box-settings@agent.socket")
+    # 60s, not 20s. The FIRST render of this page is expensive (it shells
+    # out to the webhook CLI and the connect probes), and CI runs four VM
+    # tests concurrently on one runner -- so the cost here is set by what
+    # the other three are doing, not by this test.
+    #
+    # Measured, on master's own green run 33932792737: this exact curl took
+    # **17.5s** against the 20s cap (00:34:07.98 -> 00:34:25.45), with
+    # sessions, sessions-web and settings-page all live. A 2.5s margin is
+    # luck, not headroom, and any test that grows on the other three VMs
+    # spends it. A budget for this has to tolerate load rather than be tuned
+    # to one observation of it; the later calls stay sub-second either way,
+    # so a larger cap costs nothing when things are fast.
     settings_curl = (
-        "curl -s --max-time 20 --unix-socket /run/agent-box-settings/agent.sock"
+        "curl -s --max-time 60 --unix-socket /run/agent-box-settings/agent.sock"
     )
     settings_page = "http://localhost/agent/settings/"
     unsubscribe_url = "http://localhost/agent/settings/webhooks/unsubscribe"
