@@ -78,7 +78,6 @@
 
 
       main()
-
     '') ];
     # A second, unrelated local user: must NOT be able to reach agent's
     # settings daemon (issue #49).
