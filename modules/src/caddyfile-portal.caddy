@@ -1,0 +1,15 @@
+# @USER@'s portal handover surface (issue #541), and the ONLY route on
+# this vhost served without auth — trading a portal-signed token for a
+# box session is what it is for, so demanding a box credential first
+# would defeat it. Two endpoints live here: POST auth/handoff (the
+# trade) and GET auth/verify (the forward_auth subrequest below).
+# Neither discloses anything to a caller holding no token: verify
+# answers 204/401 about a cookie the caller must already have, and
+# handoff answers one message for every way a token can be wrong.
+#
+# The daemon 404s both unless this box was PROVISIONED for handover
+# (portalUser + portalProject + an issuer + a key), so a box nobody
+# wired to a portal serves no unauthenticated endpoint at all.
+handle /@USER@/auth/* {
+  reverse_proxy unix/@SETTINGS_SOCKET@
+}

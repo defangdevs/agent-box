@@ -12,6 +12,21 @@
 # userinfo + an EMPTY password, and credentials typed into the
 # prompt cannot override the URL-embedded identity.
 handle {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_root header_regexp Cookie "(^|; )__Host-agent_box_session_@USER@=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_root {
+    route {
+      forward_auth unix/@SETTINGS_SOCKET@ {
+        uri /@USER@/auth/verify
+      }
+      reverse_proxy unix/@SETTINGS_SOCKET@
+    }
+  }
   @cookie_root header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
   handle @cookie_root {
     reverse_proxy unix/@SETTINGS_SOCKET@

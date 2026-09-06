@@ -64,7 +64,18 @@
 #   AGENT_BOX_WEBHOOK_PYTHON     interpreter for that script
 #   AGENT_BOX_CONNECT_BINS       "<id>=<binary>" pairs for the guided
 #                                 sign-in cards (claude, codex, github)
+#   AGENT_BOX_PORTAL_ISSUER      portal handover (issue #541): the `iss`
+#                                 a handover token must carry
+#   AGENT_BOX_PORTAL_KEYS        colon-separated Ed25519 PEM public keys
+#                                 to verify it with (all are tried)
+#   AGENT_BOX_PORTAL_USER        the portal user id this linux user is
+#   AGENT_BOX_PORTAL_PROJECT     the portal project id this linux user is
+#   AGENT_BOX_WEB_SESSION_DIR    where minted sessions and spent token
+#                                 ids live (default: beside the env file)
+#   AGENT_BOX_OPENSSL            openssl to verify signatures with
+#                                 All six empty = no handover route at all.
 
+import base64
 import contextlib
 import fcntl
 import functools
@@ -230,6 +241,56 @@ WEBHOOK_CONFIGURED = sorted(
 # match would start a session with, so the standing-watch panel shows what
 # a watch DOES instead of restating why it exists (#259).
 HOOK_SPAWN_CMD = os.environ.get("AGENT_BOX_HOOK_SPAWN_CMD", "")
+# Portal → box session handover (issue #541). The portal signs a
+# short-lived Ed25519 JWT naming a portal USER and PROJECT; this daemon
+# verifies it and mints a box session, so a browser already signed in to
+# the portal never sees the box's basic-auth prompt. The wire contract is
+# docs/portal-handoff.md, and the portal is held to it — nothing below
+# accepts a token shape that file does not describe.
+#
+# The granularity is user x project, NOT user x box (decided on #541), so
+# the token carries no box identity and the same token works at every box
+# hosting that project. Authorization is therefore NOT the signature: it is
+# whether THIS user declares exactly that (sub, project) pair below. The
+# signature only proves the portal said it.
+PORTAL_ISSUER = os.environ.get("AGENT_BOX_PORTAL_ISSUER", "")
+# PEM public keys to try, in order. More than one during a rotation: the
+# box tries all of them, so a key change never needs the portal and the
+# box to agree on a `kid` first.
+PORTAL_KEYS = [p for p in os.environ.get(
+    "AGENT_BOX_PORTAL_KEYS", "").split(":") if p]
+# The (sub, project) pair this user answers to. BOTH must be set — one
+# alone maps nothing, because a half-configured mapping that admitted
+# anyone with the other half would be worse than no handover at all.
+PORTAL_USER = os.environ.get("AGENT_BOX_PORTAL_USER", "")
+PORTAL_PROJECT = os.environ.get("AGENT_BOX_PORTAL_PROJECT", "")
+# Ed25519 verification shells out to openssl rather than importing a JWT
+# library: this daemon is deliberately stdlib-only (see the header), and
+# openssl is already a dependency of the auth path that mints the cookie
+# secrets. `pkeyutl -rawin` is openssl 3.
+OPENSSL = os.environ.get("AGENT_BOX_OPENSSL", "openssl")
+# Where minted sessions and spent token ids live. Under the user's own
+# config dir, 0700, so a session is exactly as durable as the box (it
+# survives a daemon restart and a reboot, which a browser cookie lasting
+# a day requires).
+WEB_SESSION_DIR = os.environ.get("AGENT_BOX_WEB_SESSION_DIR", "") or (
+    os.path.join(os.path.dirname(ENV_FILE), "web-sessions")
+    if ENV_FILE else "")
+# 1 day (decided on #541). Enforced against the stored record, not the
+# browser's Max-Age: the browser's copy is a hint, and a cookie that
+# outlives its record is refused by portal_session_check.
+SESSION_TTL = 86400
+# Hard ceiling on the handover token's own lifetime, whatever `exp` says.
+# The token is a redirect carrier; the portal is asked for 60s.
+TOKEN_MAX_TTL = 300
+# Clock-skew allowance on `iat`/`exp`, both directions.
+TOKEN_LEEWAY = 60
+# The handover mapping is only usable when every piece is present. A box
+# with no portal keys serves no handover route at all, which keeps the
+# unauthenticated endpoint off boxes that were never provisioned for it.
+PORTAL_HANDOFF = bool(
+    PORTAL_ISSUER and PORTAL_KEYS and PORTAL_USER
+    and PORTAL_PROJECT and WEB_SESSION_DIR)
 
 
 def webhook_unavailable():
@@ -304,7 +365,7 @@ SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,%d}$" % NAME_MAX)
 # Mirrored by the CLI's own check and by the module's session-name
 # assertion, so a name is refused wherever it is typed.
 RESERVED_NAMES = frozenset(("settings", "downloads", "webhook", "sessions",
-                            "token", "ws"))
+                            "token", "ws", "auth"))
 # Subscription topics: "source:owner/repo", or the prefix "source:owner/*"
 # (local-webhook 0.13.0 dropped "*" and "source:*" as topics). The
 # panel only ever posts back a topic it just rendered, and the CLI is
@@ -4799,6 +4860,236 @@ def render_home(message="", selected=None, kind="ok"):
     )
 
 
+def portal_b64url(text):
+    """Decode one base64url JWS segment. Rejects anything non-canonical."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", text or ""):
+        raise ValueError("segment is not base64url")
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def portal_signature_ok(signing_input, signature):
+    """True if any configured public key signs signing_input.
+
+    Ed25519 through openssl, not a python JWT library: this daemon takes no
+    third-party import (see the module header), and hand-rolling curve
+    arithmetic here would be a far worse trade than one subprocess on a
+    route that runs about once a user per day. openssl reads both operands
+    from files — `-rawin` streams the message rather than a digest of it,
+    which is what EdDSA signs.
+    """
+    if len(signature) != 64:
+        # Ed25519 is fixed-width. Reject early so a malformed token cannot
+        # reach openssl at all.
+        return False
+    with tempfile.TemporaryDirectory(prefix="portal-verify.") as work:
+        msg = os.path.join(work, "msg")
+        sig = os.path.join(work, "sig")
+        with open(msg, "wb") as handle:
+            handle.write(signing_input)
+        with open(sig, "wb") as handle:
+            handle.write(signature)
+        for key in PORTAL_KEYS:
+            try:
+                done = subprocess.run(
+                    [OPENSSL, "pkeyutl", "-verify", "-pubin", "-inkey", key,
+                     "-rawin", "-in", msg, "-sigfile", sig],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10, check=False)
+            except (OSError, subprocess.SubprocessError):
+                # A missing or unreadable key is a provisioning fault, not a
+                # verdict on the token: try the rest rather than admitting
+                # or refusing on the strength of a broken file.
+                continue
+            if done.returncode == 0:
+                return True
+    return False
+
+
+def portal_claims(token):
+    """Verify a handover token and return its claims, or raise ValueError.
+
+    The message is deliberately coarse. A caller on this route is
+    unauthenticated, so telling it WHICH check failed would let it tune a
+    token against the box one field at a time.
+    """
+    parts = (token or "").split(".")
+    if len(parts) != 3:
+        raise ValueError("malformed token")
+    try:
+        header = json.loads(portal_b64url(parts[0]))
+        payload = json.loads(portal_b64url(parts[1]))
+        signature = portal_b64url(parts[2])
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError("malformed token")
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        raise ValueError("malformed token")
+    # Fixed single algorithm, compared before anything else is read. The
+    # header does not SELECT a verifier here — there is only one — so the
+    # substitution that "alg" confusion depends on has nothing to choose.
+    if header.get("alg") != "EdDSA":
+        raise ValueError("unsupported algorithm")
+    if not portal_signature_ok(
+            (parts[0] + "." + parts[1]).encode("ascii"), signature):
+        raise ValueError("bad signature")
+    # Only now are the claims worth reading: everything below is content
+    # the portal signed.
+    if payload.get("iss") != PORTAL_ISSUER:
+        raise ValueError("wrong issuer")
+    aud = payload.get("aud")
+    if isinstance(aud, list):
+        aud = aud[0] if len(aud) == 1 else None
+    if aud != "agent-box":
+        # A constant audience, not this box's hostname — the token is scoped
+        # to a user and a project, not to a box (#541). What it separates is
+        # a HANDOVER token from every other token the portal signs with the
+        # same key, so a portal API token replayed here fails.
+        raise ValueError("wrong audience")
+    now = int(time.time())
+    try:
+        iat = int(payload["iat"])
+        exp = int(payload["exp"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("missing or malformed iat/exp")
+    if iat > now + TOKEN_LEEWAY:
+        raise ValueError("issued in the future")
+    if exp <= now - TOKEN_LEEWAY:
+        raise ValueError("expired")
+    if exp - iat > TOKEN_MAX_TTL:
+        # A long-lived handover token is a bearer credential for the box.
+        # The ceiling is the box's, so a portal bug cannot mint one.
+        raise ValueError("lifetime over the ceiling")
+    for name in ("sub", "project", "jti"):
+        value = payload.get(name)
+        if not isinstance(value, str) or not 1 <= len(value) <= 256:
+            raise ValueError("missing or malformed " + name)
+    return payload
+
+
+def portal_dir(kind):
+    """One of the handover state directories, created 0700 on demand."""
+    path = os.path.join(WEB_SESSION_DIR, kind)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def portal_record_path(kind, value):
+    """Where a record for `value` lives.
+
+    Named by the SHA-256 of the secret, never the secret: the store then
+    cannot be read back into a live cookie, and no caller-supplied string
+    ever reaches a path component.
+    """
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return os.path.join(portal_dir(kind), digest + ".json")
+
+
+def portal_spend_jti(jti, exp):
+    """Record a token id as spent. False if it was already spent.
+
+    O_EXCL is the whole mechanism: two concurrent posts of one token race
+    on the same create, and exactly one of them wins.
+    """
+    path = portal_record_path("spent", jti)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    with os.fdopen(fd, "w") as handle:
+        json.dump({"expires": exp}, handle)
+    return True
+
+
+def portal_prune(now=None):
+    """Drop expired sessions and spent token ids.
+
+    Called on the handover route (rare) rather than on verify (every
+    request that carries a session cookie): expiry is enforced per record
+    when it is read, so this only bounds the directory.
+    """
+    now = int(time.time()) if now is None else now
+    for kind in ("sessions", "spent"):
+        try:
+            names = os.listdir(portal_dir(kind))
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(portal_dir(kind), name)
+            try:
+                with open(path) as handle:
+                    expires = int(json.load(handle).get("expires", 0))
+            except (OSError, ValueError, TypeError, AttributeError):
+                # An unreadable record is not a valid session either. Drop
+                # it rather than leaving something no reader can judge.
+                expires = 0
+            if expires <= now:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+
+
+def portal_session_new(claims):
+    """Mint a box session for verified claims and return its cookie value."""
+    value = secrets.token_urlsafe(32)
+    now = int(time.time())
+    record = {
+        "sub": claims.get("sub", ""),
+        "project": claims.get("project", ""),
+        "issuer": claims.get("iss", ""),
+        "jti": claims.get("jti", ""),
+        "created": now,
+        "expires": now + SESSION_TTL,
+    }
+    path = portal_record_path("sessions", value)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".session.")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(record, handle)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return value
+
+
+def portal_session_ok(value):
+    """True if `value` names a live session. Expiry is decided HERE.
+
+    The browser's Max-Age is a hint it is free to ignore; this record is
+    what a session actually is, so a cookie that outlives it is refused.
+    """
+    if not value or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", value):
+        return False
+    try:
+        with open(portal_record_path("sessions", value)) as handle:
+            record = json.load(handle)
+        expires = int(record.get("expires", 0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    if expires <= int(time.time()):
+        with contextlib.suppress(OSError):
+            os.unlink(portal_record_path("sessions", value))
+        return False
+    return True
+
+
+def portal_cookie_name():
+    return "__Host-agent_box_session_" + os.environ.get(
+        "AGENT_BOX_SETTINGS_USER", "agent")
+
+
+def portal_cookie_value(header):
+    """Pull this box's session cookie out of a Cookie header."""
+    name = portal_cookie_name()
+    for part in (header or "").split(";"):
+        key, _, value = part.strip().partition("=")
+        if key == name:
+            return value
+    return ""
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     """Serve the authenticated settings UI and its actions."""
 
@@ -5052,9 +5343,130 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  "drop it at their next start."), "ok"),
     }
 
+    def _portal_handoff(self, form):
+        """Trade a portal handover token for a box session (issue #541).
+
+        The one UNAUTHENTICATED route this daemon serves, and the only POST
+        that skips _same_origin: it is cross-site BY DESIGN — the portal
+        posts it — so the CSRF guard would refuse exactly the request the
+        route exists for. What replaces the guard is that the token is the
+        whole credential: single-use, signed, expiring in a minute, and
+        carrying no authority the box does not already grant that project.
+        A forced post can therefore land a victim in a project the attacker
+        already holds, which is visible on the page and gains the attacker
+        nothing, but it can never reach a project they do not.
+
+        The wire contract is docs/portal-handoff.md.
+        """
+        token = form.get("token", [""])[0]
+        try:
+            claims = portal_claims(token)
+        except ValueError:
+            # Deliberately one message for every failure. The caller here is
+            # unauthenticated, so naming the field that failed would let it
+            # tune a token against the box one check at a time.
+            self._send_html(
+                "<h1>401</h1><p>This sign-in link is not valid. "
+                "Open your box from the portal again.</p>", status=401)
+            return
+        # Authorization, which the signature is NOT: the token names a user
+        # and a project, not a box (#541), so being correctly signed says
+        # only that the portal issued it. Whether THIS box serves that pair
+        # is a local question, answered from provisioning.
+        if (claims["sub"], claims["project"]) != (PORTAL_USER, PORTAL_PROJECT):
+            self._send_html(
+                "<h1>403</h1><p>This box does not host that project.</p>",
+                status=403)
+            return
+        # Replay last, so a token that would have been refused anyway does
+        # not burn its id — otherwise a spent-id store fills up with ids
+        # from tokens that never had a session coming.
+        if not portal_spend_jti(claims["jti"], int(claims["exp"])):
+            self._send_html(
+                "<h1>401</h1><p>This sign-in link was already used. "
+                "Open your box from the portal again.</p>", status=401)
+            return
+        portal_prune()
+        value = portal_session_new(claims)
+        self.send_response(303)
+        self.send_header("Location", TERM_HOME)
+        # SameSite=Lax, where the basic-auth cookie is Strict. The
+        # navigation right after this response is initiated CROSS-SITE, by
+        # the portal that posted here, and a Strict cookie is withheld on
+        # exactly that navigation — the user would land back on a
+        # basic-auth prompt and the handover would look like it did
+        # nothing. Lax is sent on top-level navigations, which is what this
+        # is. Max-Age is the browser's hint only: portal_session_ok decides
+        # expiry from the stored record.
+        self.send_header(
+            "Set-Cookie",
+            "%s=%s; Path=/; Max-Age=%d; HttpOnly; Secure; SameSite=Lax"
+            % (portal_cookie_name(), value, SESSION_TTL))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _portal_verify(self):
+        """Answer caddy's forward_auth subrequest for a session cookie.
+
+        204 admits the original request. Anything else refuses it, and
+        caddy passes this exact response back to the browser — which is
+        what the refusal below is shaped for.
+
+        A bare 401 would WEDGE the browser. caddy routes a request here
+        only because it carries a session cookie, and an expired cookie is
+        still a cookie: the browser would keep sending it, keep landing on
+        this branch, and keep being refused with nothing to act on — no
+        prompt, no link, no way back to a box it can still legitimately
+        reach with a password. So a refusal does two things at once:
+        clears the dead cookie, and asks for basic auth. The next request
+        carries no session cookie, falls through to the basic-auth branch,
+        and the operator is simply asked to sign in.
+
+        Nothing is disclosed either way. A caller learns whether the
+        HttpOnly cookie it already holds is live, which any other route
+        would have told it too.
+        """
+        if PORTAL_HANDOFF and portal_session_ok(
+                portal_cookie_value(self.headers.get("Cookie", ""))):
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(401)
+        # Max-Age=0 with the same Path and flags the cookie was set with,
+        # which is what a browser needs to actually drop it.
+        self.send_header(
+            "Set-Cookie",
+            "%s=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
+            % portal_cookie_name())
+        # The realm caddy's own basic_auth uses for this user, so the
+        # prompt the browser raises is the box's usual one.
+        self.send_header(
+            "WWW-Authenticate",
+            'Basic realm="%s"' % os.environ.get(
+                "AGENT_BOX_SETTINGS_USER", "agent"))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+        # Portal handover (issue #541), routed first and outside the BASE
+        # tree: caddy sends the forward_auth subrequest here for every
+        # request that carries a session cookie, so it must not depend on
+        # HOME mode, on BASE, or on anything the page renders.
+        if parsed.path.rstrip("/") == TERM_BASE + "/auth/verify":
+            self._portal_verify()
+            return
+        if parsed.path.rstrip("/") == TERM_BASE + "/auth/handoff":
+            # POST-only by contract: a token in a query string lands in the
+            # access log, the browser history and any outbound Referer, and
+            # the flow never needs it there.
+            self.send_response(405)
+            self.send_header("Allow", "POST")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         # Working-directory autocomplete (issue #131): the add-session
         # form asks the daemon to list one directory level at a time,
         # so the browser never sees the filesystem — only the confined
@@ -5210,6 +5622,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Validate and apply a settings-page form submission."""
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
+        # Portal handover (issue #541), ahead of the CSRF guard because it
+        # is cross-site by design — see _portal_handoff for why that is
+        # safe here and nowhere else on this daemon. The route does not
+        # exist at all unless the box was provisioned for handover, so an
+        # unprovisioned box exposes no unauthenticated endpoint.
+        if path == TERM_BASE + "/auth/handoff":
+            if not PORTAL_HANDOFF:
+                self._read_form()
+                self._send_html("<h1>404</h1>", status=404)
+                return
+            self._portal_handoff(self._read_form())
+            return
         if not self._same_origin():
             # Drain the request body BEFORE answering: replying 403 and
             # closing with unread body bytes in flight races the reverse

@@ -776,6 +776,20 @@ arbitrary command execution as the agent user.
   jail into banning a real sender: the jail's regex requires an `Authorization`
   header on the request, and webhook senders don't send one. Set
   `webhook.enable = false` to remove the path.
+- **A second, opt-in exception: `/<user>/auth/handoff`.** Off unless a box is
+  wired to a portal (`web.portalIssuer` + `web.portalKeyFiles`, and both
+  `users.<name>.web.portalUser` and `web.portalProject`) — with any of those
+  unset the route is not served at all, so the default box has exactly one
+  unauthenticated path and it is the webhook one above. Where it *is* served,
+  the trust boundary is an **Ed25519** signature over a single-use token that
+  expires in a minute, verified by the settings daemon (Caddy has no JWT
+  module in this build, and none is added). A valid signature is not
+  authority: the token names a portal user and project, and the box admits it
+  only if a user it hosts declares exactly that pair — so a correctly signed
+  token for a project this box does not host is refused. Basic auth stays an
+  independent path that never consults the daemon, so neither a portal outage
+  nor a daemon crash loop can lock the box owner out. Full wire contract:
+  [docs/portal-handoff.md](docs/portal-handoff.md).
 - **User-scoped secrets file:** each user's tokens live in their own
   `~/.config/agent-box/env` (0600, inside the 0700 `~/.config/agent-box`),
   written only by that user's settings daemon / `agent-box-session env` —
@@ -843,6 +857,10 @@ arbitrary command execution as the agent user.
 
 Maintainer and continuity notes live in the
 [project wiki](https://github.com/defangdevs/agent-box/wiki).
+
+- [Portal session handover](docs/portal-handoff.md) — the wire contract a
+  portal implements to hand a signed-in browser straight into a box, without
+  the box's HTTP Basic prompt.
 
 ## License
 
