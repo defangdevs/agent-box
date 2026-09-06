@@ -663,7 +663,7 @@
 
     # A real handover: a valid token becomes a box session.
     handoff(f"{mint}", "303")
-    client.succeed("grep -q 'Location: /agent/' /tmp/handh")
+    client.succeed("grep -qi 'Location: /agent/' /tmp/handh")
     client.succeed(
         "grep -qi 'Set-Cookie: __Host-agent_box_session_agent=' /tmp/handh")
     # 1 day, and SameSite=Lax -- Strict would be withheld on the very
