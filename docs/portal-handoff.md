@@ -124,17 +124,27 @@ the box's own provisioning record — see §5.
 ## 4. What the box does, in order
 
 1. **Parse.** Three dot-separated segments, header `alg` exactly `EdDSA`.
-   Otherwise 400.
 2. **Verify the signature** over `header.payload` against each configured
-   public key. No key verifies → 401.
-3. **Check the claims** per the table above. Any failure → 401.
-4. **Refuse a replay.** `jti` already recorded and not yet past its `exp` →
-   401. Otherwise record it until `exp`.
-5. **Map (`sub`, `project`) to a linux user.** The box admits the request
-   only if a user it hosts declares exactly that pair. No match → 403.
+   public key.
+3. **Check the claims** per the table above.
+4. **Map (`sub`, `project`) to a linux user.** The box admits the request
+   only if a user it hosts declares exactly that pair. No match → **403**.
    **A handover never creates a project** (decided on #541): the endpoint is
    unauthenticated by construction, so minting a linux account from a claim
    made on it is not a privilege the flow gets to have.
+5. **Refuse a replay.** `jti` already spent → **401**. Otherwise record it
+   as spent until `exp` plus the skew allowance, so the record outlives
+   every moment the token itself is still acceptable.
+
+**Steps 1–3 and 5 all answer a single `401`**, with one message. The caller
+here is unauthenticated, so naming the field that failed would let it tune a
+token against the box one check at a time. Only the mapping answers
+differently, and only because 403 tells an operator something they can act
+on: the token was genuine, this box just does not host that project.
+
+**The mapping is checked BEFORE the replay record is written**, so a token
+this box will refuse anyway does not burn its `jti`. Otherwise a caller could
+fill the spent-id store with ids that never had a session coming.
 6. **Mint a box session.** A 256-bit random value; the box stores only its
    SHA-256, so the session store cannot be read back into a live cookie.
 7. **Answer** `303 See Other` to `/<user>/` with:
@@ -165,14 +175,14 @@ users:
     portalProject: acme-prod
 web:
   portalIssuer: https://portal.defang.io
-  portalKeys:
+  portalKeyFiles:
     - /etc/agent-box/portal-key.pub
 ```
 
 - `portalUser` + `portalProject` are the mapping from step 5. Both must be
   set for a user to be reachable by handover; neither alone does anything.
 - `portalIssuer` is the `iss` the box demands.
-- `portalKeys` are PEM `PUBLIC KEY` files holding Ed25519 keys. List two
+- `portalKeyFiles` are PEM `PUBLIC KEY` files holding Ed25519 keys. List two
   during a rotation: the box tries all of them.
 
 A project is a linux user

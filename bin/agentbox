@@ -2833,9 +2833,14 @@ class Renderer:
         route that reaches it — and a route served without the env behind
         it is an unauthenticated endpoint that can admit nobody.
         """
+        # EVERY key path must be non-empty, not merely the list. env_file
+        # drops an empty value, so `portalKeyFiles: [""]` would hand the
+        # daemon no AGENT_BOX_PORTAL_KEYS at all -- it would then serve no
+        # handover, while caddy served the unauthenticated route anyway.
         return bool(self.spec.web_enable
                     and self.spec.portal_issuer
                     and self.spec.portal_keys
+                    and all(self.spec.portal_keys)
                     and u.portal_user
                     and u.portal_project)
 

@@ -620,6 +620,10 @@ let
     cfg.web.enable
     && cfg.web.portalIssuer != ""
     && cfg.web.portalKeyFiles != [ ]
+    # Every path non-empty, not merely the list: an empty one renders an
+    # empty AGENT_BOX_PORTAL_KEYS, the daemon then serves no handover, and
+    # the caddy route below would stand with nothing behind it.
+    && !(builtins.elem "" (map toString cfg.web.portalKeyFiles))
     && u.web.portalUser != ""
     && u.web.portalProject != "";
   seedMain = u:

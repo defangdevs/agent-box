@@ -649,6 +649,18 @@
         "'https://box.test/agent/auth/handoff?token=x' | grep -x 405"
     )
 
+    # The body is BOUNDED before it is read. This is the one route an
+    # anonymous caller can reach, and _read_form allocates whatever
+    # Content-Length claims, so without a cap the caller sizes the daemon's
+    # memory (CodeRabbit on #588).
+    client.succeed(
+        "head -c 200000 /dev/zero | tr '\\0' 'a' > /tmp/big")
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST "
+        "--data-binary @/tmp/big -H 'Content-Type: application/x-www-form-urlencoded' "
+        "https://box.test/agent/auth/handoff | grep -x 413"
+    )
+
     # A real handover: a valid token becomes a box session.
     handoff(f"{mint}", "303")
     client.succeed("grep -q 'Location: /agent/' /tmp/handh")
@@ -712,10 +724,14 @@
         "test -d /home/agent/.config/agent-box/web-sessions/sessions")
     machine.fail(
         f"grep -rq '{session}' /home/agent/.config/agent-box/web-sessions/")
+    # Every record, not merely one of them: `grep -qx 600` over a multi-line
+    # stat would pass on the first record and never look at the second.
     machine.succeed(
         "stat -c %a /home/agent/.config/agent-box/web-sessions/sessions/*.json "
-        "| grep -qx 600"
+        "> /tmp/modes"
     )
+    machine.succeed("test -s /tmp/modes")
+    machine.fail("grep -qvx 600 /tmp/modes")
 
     # And basic auth is untouched by any of it.
     client.succeed(

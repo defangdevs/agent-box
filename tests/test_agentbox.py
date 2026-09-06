@@ -3502,6 +3502,26 @@ class PortalHandoff(unittest.TestCase):
                     files["/etc/agent-box/Caddyfile"],
                     "served an unauthenticated handover route anyway")
 
+    def test_an_empty_key_path_enables_nothing(self):
+        """`portalKeyFiles: [""]` is a non-empty LIST of nothing.
+
+        env_file drops an empty value, so the daemon would be handed no
+        AGENT_BOX_PORTAL_KEYS and serve no handover — while caddy served the
+        unauthenticated route anyway. The two must agree, so an empty path
+        disables both (CodeRabbit on PR #588).
+        """
+        for keys in ([""], ["/etc/agent-box/key.pub", ""]):
+            with self.subTest(keys=keys):
+                files = self._render(
+                    {"agent": dict(self.MAPPED)},
+                    dict(self.PORTAL_WEB, portalKeyFiles=keys))
+                env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+                self.assertNotIn("AGENT_BOX_PORTAL", env)
+                self.assertNotIn(
+                    "handle /agent/auth/*",
+                    files["/etc/agent-box/Caddyfile"],
+                    "served a handover route the daemon will not answer")
+
     def test_one_users_mapping_is_not_anothers(self):
         """Two projects on one box: each gets its own route, its own env, and
         neither inherits the other's portal identity."""

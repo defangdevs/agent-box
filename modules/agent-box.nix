@@ -2665,6 +2665,10 @@ done
     cfg.web.enable
     && cfg.web.portalIssuer != ""
     && cfg.web.portalKeyFiles != [ ]
+    # Every path non-empty, not merely the list: an empty one renders an
+    # empty AGENT_BOX_PORTAL_KEYS, the daemon then serves no handover, and
+    # the caddy route below would stand with nothing behind it.
+    && !(builtins.elem "" (map toString cfg.web.portalKeyFiles))
     && u.web.portalUser != ""
     && u.web.portalProject != "";
   seedMain = u:
@@ -12510,6 +12514,13 @@ SESSION_TTL = 86400
 TOKEN_MAX_TTL = 300
 # Clock-skew allowance on `iat`/`exp`, both directions.
 TOKEN_LEEWAY = 60
+# Largest handover body this daemon will read. An Ed25519 JWT is a few
+# hundred bytes, so this is generous by two orders of magnitude — it exists
+# because the handover route is the one UNAUTHENTICATED path here, and
+# _read_form allocates whatever Content-Length claims. Without a bound, an
+# anonymous caller sizes the daemon's memory, and concurrent callers
+# multiply it.
+TOKEN_MAX_BYTES = 16384
 # The handover mapping is only usable when every piece is present. A box
 # with no portal keys serves no handover route at all, which keeps the
 # unauthenticated endpoint off boxes that were never provisioned for it.
@@ -18555,7 +18566,15 @@ def portal_signature_ok(signing_input, signature):
         # Ed25519 is fixed-width. Reject early so a malformed token cannot
         # reach openssl at all.
         return False
-    with tempfile.TemporaryDirectory(prefix="portal-verify.") as work:
+    # NOT the default /tmp. This unit runs ProtectSystem=strict with no
+    # PrivateTmp, so its whole filesystem is read-only apart from
+    # ReadWritePaths — /tmp included, and a TemporaryDirectory there raises
+    # before any of the handling below, which would answer a handover 500 on
+    # every real box. The agent unit HAS PrivateTmp and this one does not,
+    # which is exactly why a dev rig never sees it. WEB_SESSION_DIR is under
+    # the user's home, which is writable by construction.
+    with tempfile.TemporaryDirectory(
+            prefix="verify.", dir=portal_dir("verify")) as work:
         msg = os.path.join(work, "msg")
         sig = os.path.join(work, "sig")
         with open(msg, "wb") as handle:
@@ -18662,6 +18681,12 @@ def portal_spend_jti(jti, exp):
 
     O_EXCL is the whole mechanism: two concurrent posts of one token race
     on the same create, and exactly one of them wins.
+
+    The record outlives `exp` by TOKEN_LEEWAY, because the token does:
+    portal_claims accepts one until `exp + TOKEN_LEEWAY` to allow for clock
+    skew. A record pruned at `exp` would leave that window with the id no
+    longer spent, and the same token could mint a SECOND session — the one
+    thing single-use exists to stop.
     """
     path = portal_record_path("spent", jti)
     try:
@@ -18671,7 +18696,7 @@ def portal_spend_jti(jti, exp):
     except OSError:
         return False
     with os.fdopen(fd, "w") as handle:
-        json.dump({"expires": exp}, handle)
+        json.dump({"expires": exp + TOKEN_LEEWAY}, handle)
     return True
 
 
@@ -19305,6 +19330,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not PORTAL_HANDOFF:
                 self._read_form()
                 self._send_html("<h1>404</h1>", status=404)
+                return
+            # Bounded BEFORE the body is read, which is the only point at
+            # which it helps: _read_form allocates Content-Length in one go.
+            # The body is deliberately NOT drained here — draining is what
+            # the caller wanted — so the connection closes instead.
+            declared = int(self.headers.get("Content-Length", "0") or "0")
+            if declared > TOKEN_MAX_BYTES:
+                self.close_connection = True
+                self._send_html(
+                    "<h1>413</h1><p>Handover token too large.</p>",
+                    status=413)
                 return
             self._portal_handoff(self._read_form())
             return
