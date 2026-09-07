@@ -624,6 +624,17 @@ TOKEN_LEEWAY = 60
 # anonymous caller sizes the daemon's memory, and concurrent callers
 # multiply it.
 TOKEN_MAX_BYTES = 16384
+# How much of an over-sized body the 413 response below will still read and
+# discard before closing. Answering 413 and closing with the body still in
+# flight races caddy's own write of it: the kernel RSTs a socket closed with
+# unread bytes queued, and caddy reports that to the client as a 502 instead
+# of relaying our 413 (same class of race as the CSRF 403 fix a few lines
+# down, PR #152). Draining avoids it, but only up to a bound of its own -
+# _read_form's memory concern does not go away just because the caller is
+# over TOKEN_MAX_BYTES rather than over some larger number. A body past this
+# bound is not a token anybody sends by mistake, so it is refused unread,
+# 502 race and all.
+HANDOFF_DRAIN_MAX_BYTES = 1 << 20
 # The handover mapping is only usable when every piece is present. A box
 # with no portal keys serves no handover route at all, which keeps the
 # unauthenticated endpoint off boxes that were never provisioned for it.
@@ -7436,11 +7447,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             # Bounded BEFORE the body is read, which is the only point at
             # which it helps: _read_form allocates Content-Length in one go.
-            # The body is deliberately NOT drained here — draining is what
-            # the caller wanted — so the connection closes instead.
             declared = int(self.headers.get("Content-Length", "0") or "0")
             if declared > TOKEN_MAX_BYTES:
-                self.close_connection = True
+                if declared <= HANDOFF_DRAIN_MAX_BYTES:
+                    self.rfile.read(declared)
+                else:
+                    # Genuinely huge: draining it is the same unbounded
+                    # read this whole branch exists to avoid, so the
+                    # connection closes with the body unread instead.
+                    self.close_connection = True
                 self._send_html(
                     "<h1>413</h1><p>Handover token too large.</p>",
                     status=413)
