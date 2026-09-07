@@ -309,11 +309,17 @@ TOKEN_LEEWAY = 60
 # anonymous caller sizes the daemon's memory, and concurrent callers
 # multiply it.
 TOKEN_MAX_BYTES = 16384
-# How much of an over-sized body is worth reading just to answer tidily. Well
-# above TOKEN_MAX_BYTES, so an honest client that mis-sized a token gets its
-# 413; far below anything that would make discarding the body a cost of its
-# own.
-DISCARD_MAX_BYTES = 8 * 1024 * 1024
+# How much of an over-sized body the 413 response below will still read and
+# discard before closing. Answering 413 and closing with the body still in
+# flight races caddy's own write of it: the kernel RSTs a socket closed with
+# unread bytes queued, and caddy reports that to the client as a 502 instead
+# of relaying our 413 (same class of race as the CSRF 403 fix a few lines
+# down, PR #152). Draining avoids it, but only up to a bound of its own -
+# _read_form's memory concern does not go away just because the caller is
+# over TOKEN_MAX_BYTES rather than over some larger number. A body past this
+# bound is not a token anybody sends by mistake, so it is refused unread,
+# 502 race and all.
+HANDOFF_DRAIN_MAX_BYTES = 1 << 20
 # The handover mapping is only usable when every piece is present. A box
 # with no portal keys serves no handover route at all, which keeps the
 # unauthenticated endpoint off boxes that were never provisioned for it.
@@ -5828,29 +5834,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8") if length else ""
         return urllib.parse.parse_qs(raw)
 
-    def _discard_body(self, length):
-        """Read and throw away an unread request body, in bounded chunks.
-
-        For the routes that refuse a request BEFORE reading it: answering
-        while the client is still writing races the reverse proxy, which
-        sees EPIPE and reports 502 instead of the status we chose. Reading
-        it costs nothing to keep, and 64 KiB at a time means the refusal
-        does not undo the memory bound that prompted it.
-
-        Past DISCARD_MAX_BYTES it stops and lets the connection reset. A
-        caller sending that much to a route with a 16 KiB cap is not owed a
-        tidy status code, and reading gigabytes to be polite would be the
-        very amplification the cap is there to prevent.
-        """
-        left = min(length, DISCARD_MAX_BYTES)
-        while left > 0:
-            chunk = self.rfile.read(min(65536, left))
-            if not chunk:
-                break
-            left -= len(chunk)
-        if length > DISCARD_MAX_BYTES:
-            self.close_connection = True
-
     def _same_origin(self):
         """Reject cross-site state-changing POSTs (issue #117).
 
@@ -5913,15 +5896,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # which it helps: _read_form allocates Content-Length in one go.
             declared = int(self.headers.get("Content-Length", "0") or "0")
             if declared > TOKEN_MAX_BYTES:
-                # ...but DISCARD it in chunks first, rather than answering
-                # over an unread body. Replying and closing with bytes still
-                # in flight races the reverse proxy's write: caddy takes the
-                # EPIPE and turns this 413 into a 502, which is what the
-                # same-origin guard below already documents from PR #152.
-                # Chunked, so the memory bound the cap exists for still
-                # holds -- what is refused here is ALLOCATING the body, not
-                # reading past it.
-                self._discard_body(declared)
+                if declared <= HANDOFF_DRAIN_MAX_BYTES:
+                    self.rfile.read(declared)
+                else:
+                    # Genuinely huge: draining it is the same unbounded
+                    # read this whole branch exists to avoid, so the
+                    # connection closes with the body unread instead.
+                    self.close_connection = True
                 self._send_html(
                     "<h1>413</h1><p>Handover token too large.</p>",
                     status=413)
