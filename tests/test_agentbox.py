@@ -3401,6 +3401,231 @@ class PostSwitchFailureTest(unittest.TestCase):
         self.assertEqual(self.rolled_back, [])
 
 
+class HandoverFailureTest(unittest.TestCase):
+    """Phase one rolls back when phase two never got to RUN.
+
+    post_switch() rolls back its own failures, but it is the new release's
+    own code. A release whose agentbox cannot start rolls nothing back:
+    argparse exits 2 on an argument this release no longer takes, before
+    the handler it would have called; an import fails; the interpreter or
+    the file is not there. The profile is switched by then, so phase one
+    used to return that exit status and leave the box on a release that
+    cannot run its own updater — recoverable only by hand-driving nix.
+
+    Phase one cannot read the child's intent from its exit status (1 from
+    post_switch, 2 from argparse, neither reserved), so it asks the
+    profile whether a rollback actually happened. These pin that question
+    and both of its answers.
+    """
+
+    def setUp(self):
+        self.mod = load_agentbox()
+        self.calls = []
+        self.rolled_back = []
+        self.restarted = []
+        self.walls = []
+        self.mod.run = self._record
+        self.mod.wall = self.walls.append
+        self.mod.restart_units = self._restart
+        self.mod.rollback_to = self._rollback
+        self.rollback_works = True
+
+    def _record(self, cmd, check=True, capture=False):
+        self.calls.append([str(c) for c in cmd])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def _restart(self, restart_sessions=True):
+        self.restarted.append(restart_sessions)
+        return []
+
+    def _rollback(self, profile, generation):
+        self.rolled_back.append(generation)
+        if self.rollback_works:
+            # Move the symlink the way a real rollback would, so a caller
+            # that re-reads the generation sees the profile come back.
+            self._point_at(generation)
+        return self.rollback_works
+
+    def _point_at(self, generation):
+        link = self.tmp / f"profile-{generation}-link"
+        if not link.exists():
+            link.mkdir()
+        self.prof.unlink()
+        self.prof.symlink_to(link)
+
+    def _profile(self, tmp, generation):
+        """A profile that is a generation SYMLINK, the way the real one is.
+
+        build_fake_profile makes a plain directory, for which
+        profile_generation() is None — the case that keeps
+        --from-generation off the child's argv. Here the number has to be
+        readable, and has to move, because it is the whole signal.
+        """
+        self.tmp = Path(tmp)
+        built = build_fake_profile(tmp)
+        link = self.tmp / f"profile-{generation}-link"
+        built.rename(link)
+        self.prof = self.tmp / "profile"
+        self.prof.symlink_to(link)
+        return self.prof
+
+    def _args(self, **over):
+        base = dict(config="/etc/agent-box/config.json",
+                    no_restart_sessions=False)
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def _recover(self, rc=2, at=9, frm=8, **over):
+        """Run the recovery with the profile sitting at generation `at`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = self._profile(tmp, at)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                got = self.mod.recover_handover(
+                    self._args(**over), prof, frm, "b" * 40, rc)
+            return got, err.getvalue()
+
+    def test_a_child_that_never_rolled_back_is_rolled_back_by_phase_one(self):
+        """The profile is still ahead, so the rollback is phase one's."""
+        got, err = self._recover(rc=2, at=9, frm=8)
+        self.assertEqual(got, 2, "the child's exit status is preserved")
+        self.assertEqual(self.rolled_back, [8])
+        self.assertIn("rolled back", err)
+        # The rolled-back release has to re-apply, or the box keeps the
+        # units the half-finished update rendered.
+        self.assertIn("agentbox", [Path(c[0]).name for c in self.calls])
+        self.assertIn("apply", [c[1] for c in self.calls if len(c) > 1])
+        self.assertEqual(self.restarted, [True])
+
+    def test_a_child_that_already_rolled_back_is_left_alone(self):
+        """Phase two's own rollback must not be repeated.
+
+        post_switch() returns non-zero AFTER putting the profile back, so
+        the profile is already at the generation phase one recorded. Going
+        again would walk it PAST the release the box was running.
+        """
+        got, _ = self._recover(rc=1, at=8, frm=8)
+        self.assertEqual(got, 1)
+        self.assertEqual(self.rolled_back, [])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.restarted, [])
+
+    def test_a_profile_with_no_generation_attempts_nothing(self):
+        """No generation number is no rollback target, and no traceback."""
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)       # a plain dir, not a symlink
+            self.assertIsNone(self.mod.profile_generation(prof))
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                got = self.mod.recover_handover(
+                    self._args(), prof, None, "b" * 40, 2)
+        self.assertEqual(got, 2)
+        self.assertEqual(self.rolled_back, [])
+
+    def test_a_rollback_that_fails_says_so_and_does_not_re_apply(self):
+        """Nothing safe is left to run, so say it loudly instead."""
+        self.rollback_works = False
+        got, err = self._recover(rc=2, at=9, frm=8)
+        self.assertEqual(got, 2)
+        self.assertEqual(self.rolled_back, [8])
+        self.assertIn("NOT rolled back", err)
+        self.assertEqual(self.calls, [], "nothing re-applies over a switched "
+                                         "profile")
+        self.assertEqual(self.restarted, [])
+        self.assertTrue(any("COULD NOT be rolled back" in w
+                            for w in self.walls))
+
+    def test_no_restart_sessions_is_carried_into_the_recovery(self):
+        self._recover(rc=2, at=9, frm=8, no_restart_sessions=True)
+        self.assertEqual(self.restarted, [False])
+
+
+class HandoverExitStatusTest(unittest.TestCase):
+    """Phase one's wiring: which child outcomes reach the recovery.
+
+    Separate from the recovery's own behaviour above, because the bug was
+    in the WIRING — `return subprocess.run(child).returncode` never asked
+    the question at all.
+    """
+
+    def setUp(self):
+        self.mod = load_agentbox()
+        self.recovered = []
+        self.mod.recover_handover = self._recover
+
+    def _recover(self, args, profile, generation, target, rc):
+        self.recovered.append(rc)
+        return rc
+
+    def _update(self, child_rc=None, exc=None):
+        """Drive cmd_update to the handover with a fake install + child."""
+        target = "2" * 40
+        real_run = subprocess.run
+        self.addCleanup(setattr, subprocess, "run", real_run)
+
+        def fake_child(cmd, *a, **k):
+            if exc is not None:
+                raise exc
+            return subprocess.CompletedProcess(cmd, child_rc)
+        subprocess.run = fake_child
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            self.mod.source_tree = lambda *a, **k: target
+
+            def install(cmd, check=True, capture=False):
+                if "install" in cmd:
+                    manifest = prof / "manifest.json"
+                    data = json.loads(manifest.read_text())
+                    data["elements"]["runtime"]["url"] = (
+                        f"github:{FAKE_REPO}/{target}")
+                    manifest.write_text(json.dumps(data))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            self.mod.run = install
+            self.mod.wall = lambda message: None
+            args = argparse.Namespace(
+                profile=str(prof), post_switch=False, repo=None, rev=None,
+                branch=None, src="/var/lib/agent-box/src", force=False,
+                check=False, config="/etc/agent-box/x.json",
+                no_restart_sessions=False, from_generation=None,
+                from_rev=None)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                got = self.mod.cmd_update(args)
+            return got, err.getvalue()
+
+    def test_a_clean_handover_never_recovers(self):
+        got, _ = self._update(child_rc=0)
+        self.assertEqual(got, 0)
+        self.assertEqual(self.recovered, [])
+
+    def test_a_rejected_argument_reaches_the_recovery(self):
+        """The regression: argparse exits 2 before the handler runs.
+
+        A release that renames or drops --post-switch or --from-generation
+        fails exactly here, and it is the change an agent-box-on-agent-box
+        developer is most likely to make.
+        """
+        got, _ = self._update(child_rc=2)
+        self.assertEqual(got, 2)
+        self.assertEqual(self.recovered, [2])
+
+    def test_an_unstartable_child_reaches_the_recovery(self):
+        """No file, no interpreter, no execute bit — an OSError, not a rc.
+
+        Before this it escaped cmd_update as a traceback: FileNotFoundError
+        is neither ConfigError nor UpdateError, so main() did not catch it
+        either, and the profile stayed switched.
+        """
+        got, err = self._update(exc=FileNotFoundError(2, "no such file"))
+        self.assertEqual(got, 127)
+        self.assertEqual(self.recovered, [127])
+        self.assertIn("cannot execute the new agentbox", err)
+
+
 def update_fixture():
     with tempfile.TemporaryDirectory() as tmp:
         out = render(tmp, CONFIG_JSON)
