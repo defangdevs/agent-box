@@ -316,6 +316,29 @@ AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
 # one this box needs to have made for it before it ever boots. `agentbox`
 # falls back to the first entry of `agents` on its own.
 install -d -m 0755 /etc/agent-box
+
+# Bicep has no character constraint for a string parameter -- only length --
+# so a raw portalIssuer/portalUser could close the single-quoted YAML scalar
+# below, or worse, inject an extra key (same class of bug base64(webPassword)
+# above exists for, applied here because these two are not secrets and so
+# were substituted raw until now). Both travel base64-encoded and are
+# decoded and validated here, against the same character classes the CFN
+# twin's AllowedPattern enforces at the parameter itself -- Bicep has no
+# such decorator, so the check has to happen at runtime instead. A bad value
+# fails the boot rather than landing in config.yaml unvetted.
+portal_issuer="$(printf %s '@@PORTALISSUERB64@@' | base64 -d)"
+portal_user="$(printf %s '@@PORTALUSERIDB64@@' | base64 -d)"
+if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
+  if ! [[ "$portal_issuer" =~ ^https://[A-Za-z0-9._~:/?#@\!\&\(\)*+,\;=%-]+$ ]]; then
+    echo "portalIssuer is not a plain https:// URL" >&2
+    exit 1
+  fi
+  if ! [[ "$portal_user" =~ ^[A-Za-z0-9_.:@+-]{1,256}$ ]]; then
+    echo "portalUser is not a plain account id" >&2
+    exit 1
+  fi
+fi
+
 cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
 domain: auto
 agents: [claude, codex]
@@ -325,12 +348,23 @@ web:
   # default: a box deployed without the two portal parameters serves no
   # handover route and no unauthenticated endpoint. No key is configured --
   # the box fetches the portal's published key set from this issuer.
-  portalIssuer: '@@PORTALISSUER@@'
+  portalIssuer: '@PORTALISSUER@'
 users:
   @@USER@@:
     root: true
-    portalUser: '@@PORTALUSERID@@'
+    portalUser: '@PORTALUSERID@'
 AGENTBOX_CONFIG
+# The validation above already rejected a backslash, but NOT '&' --
+# portalIssuer's own class allows one, for a query string -- and sed's
+# REPLACEMENT text treats '&' as "insert the match". Escape it (and a
+# backslash, for good measure) before substituting into the heredoc just
+# written, or an issuer URL containing one would splice the placeholder
+# into config.yaml instead of the URL (same bug as the CFN twin, before its
+# own fix).
+esc_issuer=$(printf '%s' "$portal_issuer" | sed -e 's/[&\]/\\&/g')
+esc_user=$(printf '%s' "$portal_user" | sed -e 's/[&\]/\\&/g')
+sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|" \
+  /etc/agent-box/config.yaml
 
 # Extra standing instructions for the agent, if the deployment gave any.
 install -d -m 0755 /etc/agent-box-guides
@@ -385,8 +419,8 @@ var bootstrap = replace(replace(replace(replace(replace(replace(replace(
   // check_secrets() in scripts/check_azure_template.py, which fails if this
   // ever goes back to a raw substitution.
   '@@WEBPASSWORD@@', base64(webPassword)),
-  '@@PORTALISSUER@@', portalIssuerYaml),
-  '@@PORTALUSERID@@', portalUserYaml)
+  '@@PORTALISSUERB64@@', base64(portalIssuerYaml)),
+  '@@PORTALUSERIDB64@@', base64(portalUserYaml))
 
 // ---------------------------------------------------------------------------
 

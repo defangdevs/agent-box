@@ -103,7 +103,7 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
           header = {"alg": over.pop("alg", "EdDSA"), "typ": "JWT"}
           if kid:
               header["kid"] = kid
-          claims = {"iss": "https://portal.test", "aud": "agent-box",
+          claims = {"iss": "https://box.test", "aud": "agent-box",
                     "sub": "usr_2Nk9x", "project": "acme-prod",
                     "iat": now, "exp": now + 60,
                     "jti": over.pop("jti", "jti-%d" % now)}

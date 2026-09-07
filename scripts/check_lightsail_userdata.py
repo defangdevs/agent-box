@@ -69,7 +69,7 @@ def user_data_script(text: str) -> str:
             continue
         width = len(line) - len(line.lstrip())
         if indent is None:
-            if line.lstrip().startswith(("!Sub", "|", "-")):
+            if line.lstrip().startswith(("!Sub", "Fn::Sub:", "|", "-")):
                 continue  # the Fn::Sub header / block scalar marker
             indent = width
         elif width < indent:
@@ -153,49 +153,64 @@ def check(template: Path) -> int:
     return 1
 
 
+PORTAL_BLOCK = re.compile(
+    r"(install -d -m 0755 /etc/agent-box\n.*/etc/agent-box/config\.yaml)",
+    re.S)
+
+
 def check_written_config(template) -> int:
-    """The config.yaml the launch script WRITES must be valid YAML.
+    """The config.yaml the launch script WRITES must be valid YAML, and the
+    sed-escaping step that fills in portalIssuer/portalUser (#593) must
+    actually pass through a value holding the '&' sed's replacement text
+    treats specially, rather than splicing the placeholder into config.yaml
+    in its place (see the comment beside esc_issuer in the template).
 
-    `check` above proves the script's prefix parses under dash. It says
-    nothing about the file the script then writes with a heredoc -- and since
-    #593 the portal keys are spliced into that heredoc with hand-counted
-    indentation, which is what YAML punishes hardest. A stray space there
-    yields a script that runs fine and a box whose declared state `agentbox
-    apply` rejects on first boot.
-
-    Rendered both ways: handover ON (something to get wrong) and OFF (the
-    default box, where both markers render empty).
+    `check` above proves the script's prefix parses under dash. This proves
+    the fragment that writes the one file `agentbox apply` reads its
+    declared state from actually behaves, by running it for real (as bash --
+    the fragment uses `$(...)`, which the dash guard above never reaches)
+    rather than reproducing its substitution by hand.
     """
-    text = template.read_text()
-    found = re.search(
-        r"cat > /etc/agent-box/config\.yaml <<'AGENTBOX_CONFIG'\n"
-        r"(.*?)\n\s*AGENTBOX_CONFIG", text, re.S)
+    script = user_data_script(template.read_text())
+    found = PORTAL_BLOCK.search(script)
     if not found:
-        print(f"FAIL: {template.name}: no config.yaml heredoc to check.",
-              file=sys.stderr)
+        print(f"FAIL: {template.name}: no config.yaml write fragment to "
+              "check.", file=sys.stderr)
         return 1
-    # The heredoc body sits inside a YAML block scalar, so strip the block's
-    # own indent before parsing what the box would actually receive.
-    lines = found.group(1).split("\n")
-    indents = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
-    cut = min(indents) if indents else 0
-    body = "\n".join(l[cut:] if l.strip() else "" for l in lines)
+    block = re.sub(r"\$\{!([^}]*)\}", r"${\1}", found.group(1))
+    block = block.replace("${Agent}", "claude").replace("${UserName}", "agent")
+
     rc = 0
     for label, (issuer, account) in {
         "handover on": ("https://station.example.com", "usr_2Nk9x"),
         "handover off": ("", ""),
+        # '&' is IN PortalIssuer's AllowedPattern (a query string may have
+        # one) but is sed replacement-text magic -- unescaped, this is
+        # exactly the input that used to splice the placeholder into
+        # config.yaml instead of the URL.
+        "handover on, ampersand": (
+            "https://station.example.com/cb?a=1&b=2", "usr_2Nk9x"),
     }.items():
-        rendered = (body.replace("@AGENT@", "claude")
-                        .replace("@USER@", "agent")
-                        .replace("@PORTALISSUER@", issuer)
-                        .replace("@PORTALUSERID@", account))
-        try:
-            data = yaml.safe_load(rendered)
-        except yaml.YAMLError as exc:
-            print(f"FAIL: {template.name}: config.yaml ({label}) is not "
-                  f"valid YAML: {exc}\n---\n{rendered}", file=sys.stderr)
-            rc = 1
-            continue
+        text = (block.replace("${PortalIssuerPlain}", issuer)
+                     .replace("${PortalUserPlain}", account))
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            text = text.replace("/etc/agent-box", str(workdir))
+            done = subprocess.run(["bash", "-c", text],
+                                   capture_output=True, text=True)
+            if done.returncode != 0:
+                print(f"FAIL: {template.name}: config.yaml ({label}) write "
+                      f"fragment failed:\n{done.stderr}", file=sys.stderr)
+                rc = 1
+                continue
+            config_path = workdir / "config.yaml"
+            try:
+                data = yaml.safe_load(config_path.read_text())
+            except yaml.YAMLError as exc:
+                print(f"FAIL: {template.name}: config.yaml ({label}) is not "
+                      f"valid YAML: {exc}", file=sys.stderr)
+                rc = 1
+                continue
         web = data.get("web") or {}
         user = (data.get("users") or {}).get("agent") or {}
         # web.enable and root hold either way: whatever handover does, the

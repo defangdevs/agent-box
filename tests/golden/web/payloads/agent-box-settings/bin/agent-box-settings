@@ -6690,6 +6690,10 @@ def portal_jwks_fetch():
 
     HTTPS only, and the URL comes from box configuration — see
     PORTAL_JWKS_URL. Nothing in the token influences where this goes.
+    urllib follows a redirect without restricting its scheme, so a
+    response is rejected if it lands anywhere but https:// — otherwise a
+    single compromised or misconfigured hop on an otherwise-HTTPS URL
+    could downgrade every fetch to plaintext.
     """
     if not PORTAL_JWKS_URL.startswith("https://"):
         return None
@@ -6697,6 +6701,8 @@ def portal_jwks_fetch():
         PORTAL_JWKS_URL, headers={"Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
+            if not response.geturl().startswith("https://"):
+                return None
             raw = response.read(JWKS_MAX_BYTES + 1)
     except Exception:
         # Any failure — DNS, TLS, timeout, 500 — is "no keys right now".
@@ -6728,8 +6734,7 @@ def portal_jwks_read_cache():
         return None
 
 
-def portal_jwks_write_cache(document, now):
-    record = {"fetched": now, "keys": document.get("keys", [])}
+def portal_jwks_write_cache(record):
     path = portal_jwks_cache_path()
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".jwks.")
     try:
@@ -6737,7 +6742,10 @@ def portal_jwks_write_cache(document, now):
         with os.fdopen(fd, "w") as handle:
             json.dump(record, handle)
         os.replace(tmp, path)
-    except BaseException:
+    except OSError as exc:
+        sys.stderr.write("portal: jwks cache write: %s\n" % exc)
+        with contextlib.suppress(OSError):
+            os.close(fd)
         with contextlib.suppress(OSError):
             os.unlink(tmp)
     return record
@@ -6752,28 +6760,37 @@ def portal_jwks_keys(kid, force=False):
 
     `force` is for the second attempt after a `kid` misses: a key the portal
     has just published is the ordinary reason for a miss, and refusing to
-    look would make every rotation an outage. It is rate-limited to
-    JWKS_REFETCH_FLOOR so that miss cannot be used to drive traffic at the
-    portal.
+    look would make every rotation an outage.
+
+    Either path — an expired cache or a forced retry — reaches
+    portal_jwks_fetch(), so both are rate-limited by the same
+    JWKS_REFETCH_FLOOR against `attempted`, the time of the last attempt
+    WHETHER OR NOT it succeeded. Gating only the forced path left the
+    ordinary post-TTL refresh unlimited: a portal that is down (or just
+    slow, at a 10s timeout) turns every handover request arriving after
+    the cache goes stale into a fresh outbound fetch, which is the same
+    lever on the portal this floor exists to deny.
     """
     now = int(time.time())
-    cached = portal_jwks_read_cache()
-    fetched = 0
-    keys = []
-    if cached:
-        try:
-            fetched = int(cached.get("fetched", 0))
-        except (TypeError, ValueError):
-            fetched = 0
-        keys = cached.get("keys") or []
-        if not isinstance(keys, list):
-            keys = []
+    cached = portal_jwks_read_cache() or {}
+    try:
+        fetched = int(cached.get("fetched", 0))
+    except (TypeError, ValueError):
+        fetched = 0
+    try:
+        attempted = int(cached.get("attempted", 0))
+    except (TypeError, ValueError):
+        attempted = 0
+    keys = cached.get("keys") or []
+    if not isinstance(keys, list):
+        keys = []
     fresh = keys and now - fetched < JWKS_TTL
     if fresh and not force:
         return keys
-    if force and now - fetched < JWKS_REFETCH_FLOOR:
-        # Asked to refetch, but too soon since the last one. Answer from
-        # what we have rather than making the miss a lever on the portal.
+    if now - attempted < JWKS_REFETCH_FLOOR:
+        # An attempt happened too recently to try again, whether that was
+        # the ordinary refresh or a forced retry. Answer from what we have
+        # rather than making either path a lever on the portal.
         return keys
     document = portal_jwks_fetch()
     if document is None:
@@ -6781,8 +6798,13 @@ def portal_jwks_keys(kid, force=False):
         # unreachable should not lock out a handover signed by a key we
         # already hold. A withdrawn key outliving its withdrawal by up to
         # JWKS_TTL is the cost, and it is why that value is not days.
-        return keys
-    return portal_jwks_write_cache(document, now)["keys"]
+        # `attempted` still moves, so a persistent outage stays capped at
+        # one fetch per JWKS_REFETCH_FLOOR rather than one per request.
+        return portal_jwks_write_cache(
+            {"fetched": fetched, "attempted": now, "keys": keys})["keys"]
+    return portal_jwks_write_cache(
+        {"fetched": now, "attempted": now,
+         "keys": document.get("keys", [])})["keys"]
 
 
 # SubjectPublicKeyInfo prefix for an Ed25519 key: SEQUENCE { SEQUENCE {

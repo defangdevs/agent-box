@@ -3691,8 +3691,8 @@ class PortalHandoff(unittest.TestCase):
         the URL unconditionally would be a second place the default could
         drift from. An override is passed through verbatim.
         """
-        env_of = lambda web: self._render(
-            {"agent": dict(self.MAPPED)}, web)[
+        def env_of(web):
+            return self._render({"agent": dict(self.MAPPED)}, web)[
                 "/etc/agent-box/units/agent-box-settings-agent.env"]
         self.assertNotIn("AGENT_BOX_PORTAL_JWKS_URL", env_of(self.PORTAL_WEB))
         override = dict(self.PORTAL_WEB,

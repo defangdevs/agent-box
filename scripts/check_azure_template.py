@@ -75,6 +75,14 @@ BASHISMS = (
 # plaintext never appears in the rendered script.
 HOSTILE_PASSWORD = "p'; touch /tmp/pwned; '$x `id` \"q\""
 
+# Portal handover (issue #593). Plain values for readability; SAMPLE below
+# carries their base64 form, matching what the template's replace() chain
+# now substitutes (see the comment on PORTALISSUERB64 there for why: Bicep
+# has no character constraint for a string parameter, and these two are
+# validated and decoded by the bootstrap itself rather than the template).
+PORTAL_ISSUER_SAMPLE = "https://station.example.com"
+PORTAL_USER_SAMPLE = "usr_2Nk9x"
+
 # Values only need to be representative: this renders the script, it does not
 # deploy it. They deliberately carry the punctuation a real parameter can, so a
 # quoting mistake in the template shows up as a parse error.
@@ -84,11 +92,10 @@ SAMPLE = {
     "@@USER@@": "agent",
     "@@AGENTSMD@@": "## This box\n\n- A line with 'quotes' and $dollars.\n",
     "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
-    # Portal handover (issue #593). SCALARS, matching the template: the YAML
-    # lines are literal in the bootstrap, so what check_written_config
-    # verifies is the template's own indentation rather than a copy of it.
-    "@@PORTALISSUER@@": "https://station.example.com",
-    "@@PORTALUSERID@@": "usr_2Nk9x",
+    "@@PORTALISSUERB64@@": base64.b64encode(
+        PORTAL_ISSUER_SAMPLE.encode()).decode(),
+    "@@PORTALUSERIDB64@@": base64.b64encode(
+        PORTAL_USER_SAMPLE.encode()).decode(),
 }
 
 # Which parameter's defaultValue feeds which marker. The script is rendered a
@@ -96,14 +103,17 @@ SAMPLE = {
 # stands is the commonest one there is - and the defaults are where a stray
 # non-ASCII character is most likely to arrive unnoticed (agentsMd is prose).
 # webPassword has no default: it is the one field the form always demands.
+# The portal markers are the one place this substitutes a PLAIN default
+# rather than its base64 form -- safe only because both default to '', and
+# base64 of the empty string is the empty string too.
 DEFAULT_OF = {
     "@@NIXINSTALLER@@": "nixInstallerUrl",
     "@@FLAKEREF@@": "agentBoxFlakeRef",
     "@@USER@@": "userName",
     "@@AGENTSMD@@": "agentsMd",
     # Both default to '' -- handover off, which is the default box.
-    "@@PORTALISSUER@@": "portalIssuer",
-    "@@PORTALUSERID@@": "portalUser",
+    "@@PORTALISSUERB64@@": "portalIssuer",
+    "@@PORTALUSERIDB64@@": "portalUser",
 }
 
 
@@ -333,70 +343,126 @@ def check_bootstrap(template: dict, values: dict, label: str) -> int:
     return 0
 
 
+PORTAL_BLOCK = re.compile(
+    r"(install -d -m 0755 /etc/agent-box\n.*?/etc/agent-box/config\.yaml)"
+    r"\n\n# Extra standing instructions", re.S)
+
+
+def extract_portal_block(script: str) -> str:
+    """The validate-decode-write-sed run that turns the two base64 markers
+    into config.yaml's portalIssuer/portalUser -- everything check_written_
+    config below needs to actually RUN rather than text-substitute, since
+    #593's fix moved that work from Bicep's replace() (template-render time)
+    into the bootstrap script itself (decode, validate, THEN write)."""
+    found = PORTAL_BLOCK.search(script)
+    if not found:
+        raise SystemExit(
+            "FAIL: check_written_config's anchors no longer bracket the "
+            "portal config.yaml block -- update PORTAL_BLOCK to match the "
+            "current bootstrap."
+        )
+    return found.group(1)
+
+
+def run_portal_block(block: str, workdir: Path, issuer_b64: str,
+                      user_b64: str) -> subprocess.CompletedProcess:
+    text = block.replace("@@PORTALISSUERB64@@", issuer_b64)
+    text = text.replace("@@PORTALUSERIDB64@@", user_b64)
+    text = text.replace("/etc/agent-box", str(workdir))
+    return subprocess.run(
+        ["bash", "-c", text], capture_output=True, text=True)
+
+
+def b64(value: str) -> str:
+    return base64.b64encode(value.encode()).decode()
+
+
 def check_written_config(template: dict) -> int:
-    """The config.yaml the bootstrap WRITES must be valid YAML.
-
-    check_bootstrap proves the SCRIPT parses under bash. It says nothing
-    about the file that script then writes with a heredoc -- and since #593
-    the portal keys are spliced into that heredoc with hand-counted
-    indentation, which is what YAML punishes hardest. A stray space there
-    yields a script that runs fine and a box whose declared state
-    `agentbox apply` rejects on first boot.
-
-    Both cases are rendered: handover ON (something to get wrong) and OFF
-    (the default box, where both markers render empty).
+    """The config.yaml the bootstrap WRITES must be valid YAML, and the
+    validate-decode-sed step that fills in portalIssuer/portalUser (#593)
+    must actually reject a bad value and pass through a good one untouched --
+    including one holding the '&' sed's replacement text treats specially
+    (see the comment beside esc_issuer in the .bicep). check_bootstrap proves
+    the whole SCRIPT parses; this proves the fragment that writes the one
+    file `agentbox apply` reads its declared state from actually behaves,
+    by running it for real rather than reproducing its substitution by hand.
     """
     script = template["variables"]["bootstrapTemplate"]
-    cases = {
-        "handover on": {
-            "@@PORTALISSUER@@": SAMPLE["@@PORTALISSUER@@"],
-            "@@PORTALUSERID@@": SAMPLE["@@PORTALUSERID@@"],
-        },
-        "handover off": {"@@PORTALISSUER@@": "", "@@PORTALUSERID@@": ""},
-    }
+    block = extract_portal_block(script)
+    user_key = SAMPLE["@@USER@@"]
+    block = block.replace("@@USER@@", user_key)
+
+    def parsed_config(workdir: Path):
+        path = workdir / "config.yaml"
+        if not path.exists():
+            return None
+        return yaml.safe_load(path.read_text())
+
     rc = 0
-    for label, subs in cases.items():
-        text = script.replace("@@USER@@", SAMPLE["@@USER@@"])
-        for marker, value in subs.items():
-            text = text.replace(marker, value)
-        found = re.search(
-            r"cat > /etc/agent-box/config\.yaml <<'AGENTBOX_CONFIG'\n"
-            r"(.*?)\nAGENTBOX_CONFIG", text, re.S)
-        if not found:
-            print("FAIL: %s: no config.yaml heredoc in the bootstrap" % label,
-                  file=sys.stderr)
-            rc = 1
-            continue
-        body = found.group(1)
-        try:
-            data = yaml.safe_load(body)
-        except yaml.YAMLError as exc:
-            print("FAIL: %s: config.yaml is not valid YAML: %s\n---\n%s"
-                  % (label, exc, body), file=sys.stderr)
-            rc = 1
-            continue
-        web = data.get("web") or {}
-        user = (data.get("users") or {}).get(SAMPLE["@@USER@@"]) or {}
-        # True either way: whatever handover does, the box still has a web
-        # front door and a root user.
-        if web.get("enable") is not True or user.get("root") is not True:
-            print("FAIL: %s: the base config did not survive: %r"
-                  % (label, data), file=sys.stderr)
-            rc = 1
-            continue
-        on = label == "handover on"
-        got = (web.get("portalIssuer"), user.get("portalUser"))
-        # Off is empty VALUES, not absent keys, which is what the module
-        # already reads as off.
-        want = (("https://station.example.com", "usr_2Nk9x") if on
-                else ("", ""))
-        if got != want:
-            print("FAIL: %s: portal keys landed as %r, wanted %r"
-                  % (label, got, want), file=sys.stderr)
-            rc = 1
-            continue
-        print("OK: config.yaml (%s) parses and declares what it should"
-              % label)
+    cases = {
+        "handover on": (PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, True),
+        "handover off": ("", "", True),
+        # '&' is IN portalIssuer's allowed character class (a query string
+        # may have one) but is sed replacement-text magic -- unescaped, this
+        # is exactly the input that used to splice the placeholder into
+        # config.yaml instead of the URL.
+        "handover on, ampersand": (
+            "https://station.example.com/cb?a=1&b=2", PORTAL_USER_SAMPLE,
+            True),
+        "invalid issuer (not https)": (
+            "http://station.example.com", PORTAL_USER_SAMPLE, False),
+        "invalid user (space)": (
+            PORTAL_ISSUER_SAMPLE, "usr with space", False),
+    }
+    for label, (issuer, user, should_succeed) in cases.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            done = run_portal_block(block, workdir, b64(issuer), b64(user))
+            if should_succeed and done.returncode != 0:
+                print("FAIL: %s: the portal block refused a valid value:\n%s"
+                      % (label, done.stderr), file=sys.stderr)
+                rc = 1
+                continue
+            if not should_succeed:
+                if done.returncode == 0:
+                    print("FAIL: %s: the portal block accepted an invalid "
+                          "value instead of refusing the boot" % label,
+                          file=sys.stderr)
+                    rc = 1
+                    continue
+                if parsed_config(workdir) is not None:
+                    print("FAIL: %s: config.yaml was written even though "
+                          "the value was refused" % label, file=sys.stderr)
+                    rc = 1
+                    continue
+                print("OK: %s: refused, and wrote no config.yaml" % label)
+                continue
+            data = parsed_config(workdir)
+            if data is None:
+                print("FAIL: %s: no config.yaml was written" % label,
+                      file=sys.stderr)
+                rc = 1
+                continue
+            web = data.get("web") or {}
+            u = (data.get("users") or {}).get(user_key) or {}
+            # True either way: whatever handover does, the box still has a
+            # web front door and a root user.
+            if web.get("enable") is not True or u.get("root") is not True:
+                print("FAIL: %s: the base config did not survive: %r"
+                      % (label, data), file=sys.stderr)
+                rc = 1
+                continue
+            got = (web.get("portalIssuer"), u.get("portalUser"))
+            # Off is empty VALUES, not absent keys, which is what the module
+            # already reads as off.
+            want = (issuer, user) if issuer or user else ("", "")
+            if got != want:
+                print("FAIL: %s: portal keys landed as %r, wanted %r"
+                      % (label, got, want), file=sys.stderr)
+                rc = 1
+                continue
+            print("OK: config.yaml (%s) parses and declares what it should"
+                  % label)
     return rc
 
 
