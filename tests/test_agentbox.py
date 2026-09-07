@@ -3697,21 +3697,44 @@ class PortalHandoff(unittest.TestCase):
             "AGENT_BOX_PORTAL_KEYS=/etc/agent-box/old.pub:"
             "/etc/agent-box/new.pub", env)
 
-    def test_half_a_mapping_admits_nobody(self):
-        """`sub` and `project` are checked together, so a user declaring one
-        without the other must get NO route and NO env — otherwise the half
-        that is set would admit every token carrying it."""
-        for half in ({"portalUser": "usr_2Nk9x"},
-                     {"portalProject": "acme-prod"}):
-            with self.subTest(half=sorted(half)):
-                files = self._render({"agent": dict(half, root=True)},
-                                     self.PORTAL_WEB)
-                env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
-                self.assertNotIn("AGENT_BOX_PORTAL", env)
-                self.assertNotIn(
-                    "handle /agent/auth/*",
-                    files["/etc/agent-box/Caddyfile"],
-                    "served an unauthenticated handover route anyway")
+    def test_portal_user_alone_is_a_complete_mapping(self):
+        """The MVP shape: a portal account and no project.
+
+        `portalUser` IS the mapping. The route is /<user>/auth/handoff and
+        each user's daemon serves its own, so the URL has already named the
+        linux user before a claim is read — the token authorizes the user
+        addressed rather than selecting one, which is what lets the project
+        claim be dropped without becoming ambiguous.
+        """
+        files = self._render(
+            {"agent": {"root": True, "portalUser": "usr_2Nk9x"}},
+            self.PORTAL_WEB)
+        env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+        self.assertIn("AGENT_BOX_PORTAL_USER=usr_2Nk9x", env)
+        # Not passed at all when unset, so the daemon reads no project and
+        # ignores the claim. env_file drops an empty value; the module is
+        # conditional for the same reason, or the two backends would render
+        # different env files.
+        self.assertNotIn("AGENT_BOX_PORTAL_PROJECT", env)
+        self.assertIn("handle /agent/auth/*",
+                      files["/etc/agent-box/Caddyfile"])
+
+    def test_a_project_without_a_user_maps_nothing(self):
+        """portalProject NARROWS a mapping; it cannot create one.
+
+        Declared alone there is no portal account to admit, so the route
+        must not be served — otherwise an unauthenticated endpoint would
+        stand with nothing behind it to authorize against.
+        """
+        files = self._render(
+            {"agent": {"root": True, "portalProject": "acme-prod"}},
+            self.PORTAL_WEB)
+        env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+        self.assertNotIn("AGENT_BOX_PORTAL", env)
+        self.assertNotIn(
+            "handle /agent/auth/*",
+            files["/etc/agent-box/Caddyfile"],
+            "served an unauthenticated handover route anyway")
 
     def test_no_issuer_or_no_key_serves_no_handover_at_all(self):
         """A box nobody wired to a portal must expose no unauthenticated

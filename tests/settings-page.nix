@@ -711,10 +711,20 @@
     # its signature: a long-lived handover token is a bearer credential.
     handoff(f"{mint} '{{\"exp\": 2000000000}}'", "401")
 
-    # A VALID signature is not authorization. The token names a portal user
-    # and project; this box hosts one pair and admits only that pair.
-    handoff(f"{mint} '{{\"project\": \"someone-elses\"}}'", "403")
+    # A VALID signature is not authorization. Station signs EVERY
+    # account's tokens with the same key, so a signature alone would mean
+    # anybody's token opens anybody's box. What stops that is this box's
+    # own declared portalUser: another account's token is genuine, and
+    # refused anyway.
     handoff(f"{mint} '{{\"sub\": \"usr_somebody_else\"}}'", "403")
+    # This box also declares a portalProject, which NARROWS that account
+    # to one project -- so a token for a different project, and a token
+    # carrying no project at all, are both refused. A box that declares
+    # no project ignores the claim instead; that shape is locked by the
+    # portal-route eval check and the native renderer tests rather than
+    # by a second VM boot.
+    handoff(f"{mint} '{{\"project\": \"someone-elses\"}}'", "403")
+    handoff(f"{mint} '{{\"project\": null}}'", "403")
 
     # A forged session cookie is refused -- and the refusal CLEARS it and
     # asks for a password, so an expired session degrades to the normal
