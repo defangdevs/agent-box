@@ -626,14 +626,18 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                       enable = true;
                       agent = "claude";
                       users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      # The MVP shape: a portal account and no project.
+                      # portalUser IS the mapping — the route's URL already
+                      # names the linux user, so the token authorizes the one
+                      # addressed rather than selecting one.
                       users.agent.web.portalUser = "usr_2Nk9x";
-                      users.agent.web.portalProject = "acme-prod";
-                      # HALF a mapping, deliberately: bob names a portal user
-                      # and no project. Both halves are checked together, so
-                      # a config like this must admit nobody — and the way it
-                      # does that is by having no route at all.
+                      # Deliberately maps NOTHING: bob names a project with
+                      # no portal account to narrow. portalProject narrows a
+                      # mapping, it cannot create one — so bob must get no
+                      # route, or an unauthenticated endpoint would stand
+                      # with nothing behind it to authorize against.
                       users.bob.web.passwordHashFile = "/var/lib/agent-box-web/bob-hash";
-                      users.bob.web.portalUser = "usr_other";
+                      users.bob.web.portalProject = "orphan-proj";
                       web = {
                         enable = true;
                         domain = "portal.test";
@@ -669,9 +673,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 exit 1
               fi
 
-              # 3. bob has half a mapping, so he gets NO handover route.
+              # 3. bob declares a project and no account, so he gets NO
+              # handover route: there would be nothing to authorize against.
               if grep -qF 'handle /bob/auth/*' "$caddyfile"; then
-                echo "bob declares no portalProject and must have no handover route" >&2
+                echo "bob declares no portalUser and must have no handover route" >&2
                 exit 1
               fi
 

@@ -1,8 +1,14 @@
 # Portal → box session handover
 
-This is the wire contract between a portal (`DefangLabs/station`) and an
-agent-box. It lets a browser with a live portal session land in the box's
-web UI without typing the box's HTTP Basic credentials.
+This is the wire contract between a portal and an agent-box. It lets a
+browser with a live portal session land in the box's web UI without typing
+the box's HTTP Basic credentials.
+
+The portal this was written for is **Defang Station** (`DefangLabs/station`),
+which is its **own service** — it is *not* `portal.defang.io`, and nothing
+here assumes any particular hostname. The box is told the issuer it must
+trust (`web.portalIssuer`), so any portal that signs the shape below works,
+and every example issuer in this file is a placeholder.
 
 Issue [#541](https://github.com/defangdevs/agent-box/issues/541). The
 alternative-auth parent is [#201](https://github.com/defangdevs/agent-box/issues/201).
@@ -53,7 +59,7 @@ A compact JWS. Three segments, `base64url` without padding.
 
 ```json
 {
-  "iss": "https://portal.defang.io",
+  "iss": "https://station.example.com",
   "aud": "agent-box",
   "sub": "usr_2Nk9x…",
   "project": "acme-prod",
@@ -68,22 +74,28 @@ A compact JWS. Three segments, `base64url` without padding.
 | `iss` | yes | Exact string match against the box's configured issuer. |
 | `aud` | yes | MUST be the literal `agent-box`. May also be a 1-element array containing it. |
 | `sub` | yes | The portal's user id. 1–256 chars. |
-| `project` | yes | The portal's project id. 1–256 chars. |
+| `project` | **no** | A project within that account. 1–256 chars if present. Required **only** if the box declares `portalProject` — see §5. |
 | `iat` | yes | Must not be more than 60 s in the future (clock skew). |
 | `exp` | yes | Must be in the future. `exp - iat` MUST be ≤ 300 s. |
 | `jti` | yes | Unique per token. 1–256 chars. Replay is refused. |
 
 Any other claim is ignored.
 
-**Why `aud` is a constant and not the box's hostname.** The granularity of
-this token is *user × project*, decided on #541 — deliberately not
-*user × box*, so one token works at each box that hosts the project. A
-hostname audience would put box identity back into the key and the claims,
-and would mean the portal has to know which box a project currently lives on
-before it can sign. The constant audience does a different and still
-necessary job: it separates a **handover** token from every other token the
-portal signs with the same key. A portal API token replayed at the box's
-handoff endpoint fails on `aud`.
+**`sub` is the whole of what the box needs.** The endpoint is
+`/<user>/auth/handoff`, and each linux user's daemon serves its own — so the
+**URL has already named the linux user** before any claim is read. The token
+therefore *authorizes* the user being addressed; it never has to *select*
+one. That is why `project` can be omitted without becoming ambiguous, and it
+is what the MVP does.
+
+**Why `aud` is a constant and not the box's hostname.** The token is scoped to
+a portal account, deliberately not to a box (#541), so one token works at
+each box that account owns. A hostname audience would put box identity back
+into the claims, and would mean the portal has to know which box it is
+sending the browser to before it can sign. The constant audience does a
+different and still necessary job: it separates a **handover** token from
+every other token the portal signs with the same key. A portal API token
+replayed at the box's handoff endpoint fails on `aud`.
 
 **Recommended lifetime: 60 s.** The token is a redirect carrier, not a
 session. The box's hard ceiling is 300 s.
@@ -127,8 +139,9 @@ the box's own provisioning record — see §5.
 2. **Verify the signature** over `header.payload` against each configured
    public key.
 3. **Check the claims** per the table above.
-4. **Map (`sub`, `project`) to a linux user.** The box admits the request
-   only if a user it hosts declares exactly that pair. No match → **403**.
+4. **Authorize the linux user the URL named.** `sub` must match that
+   user's declared `portalUser`; if the box also declares `portalProject`,
+   the token must carry a matching `project`. No match → **403**.
    **A handover never creates a project** (decided on #541): the endpoint is
    unauthenticated by construction, so minting a linux account from a claim
    made on it is not a privilege the flow gets to have.
@@ -165,25 +178,37 @@ land back on a Basic-auth prompt and the handover would appear to do nothing.
 
 ## 5. Provisioning: what the box needs before any of this works
 
-Two additions to the box's `users:` entry, both optional:
+The MVP shape — one portal account per box, no project claim:
 
 ```yaml
 users:
   agent:
     root: true
-    portalUser: usr_2Nk9x…
-    portalProject: acme-prod
+    portalUser: usr_2Nk9x…          # the `sub` this box admits
 web:
-  portalIssuer: https://portal.defang.io
+  portalIssuer: https://station.example.com   # Station's own URL
   portalKeyFiles:
     - /etc/agent-box/portal-key.pub
 ```
 
-- `portalUser` + `portalProject` are the mapping from step 5. Both must be
-  set for a user to be reachable by handover; neither alone does anything.
-- `portalIssuer` is the `iss` the box demands.
+- **`portalUser` is the mapping.** A token whose `sub` matches it is
+  authorized for this linux user. Without it, no handover route is served at
+  all.
+- `portalIssuer` is the `iss` the box demands. Whatever Station uses — the
+  box trusts exactly this one string.
 - `portalKeyFiles` are PEM `PUBLIC KEY` files holding Ed25519 keys. List two
   during a rotation: the box tries all of them.
+- **`portalProject` is optional**, and narrows `portalUser` to one project
+  within that account:
+
+  ```yaml
+      portalUser: usr_2Nk9x…
+      portalProject: acme-prod      # now a matching `project` claim is REQUIRED
+  ```
+
+  Set it when one portal account owns several projects and a token for one
+  must not open another. Setting it *without* `portalUser` does nothing — it
+  narrows a mapping rather than creating one.
 
 A project is a linux user
 ([#352](https://github.com/defangdevs/agent-box/issues/352)), so this is
@@ -206,9 +231,9 @@ base64url — `alg: "EdDSA"` needs no digest argument.
 
 Two independent axes.
 
-1. **Per project, immediate.** Remove `portalUser`/`portalProject` from the
-   box's `users:` entry and apply. Every later handover for that project
-   fails at step 5. Existing cookies still run until they expire.
+1. **Per account, immediate.** Remove `portalUser` from the box's `users:`
+   entry and apply. That both stops serving the handover route and makes
+   every later handover fail. Existing cookies still run until they expire.
 2. **Per session, ≤ 1 day.** A session record expires on its own, and the
    browser must return through the portal — which is a live portal decision.
    The interval *is* the granularity.

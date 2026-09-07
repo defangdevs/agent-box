@@ -612,9 +612,10 @@ let
   # provisioned by the other is either a 404 or an unauthenticated route
   # with nothing behind it.
   #
-  # Both halves of the mapping, never one: `sub` and `project` are checked
-  # together, so a config that set only one would otherwise admit every
-  # token carrying the other.
+  # web.portalUser is the whole mapping. web.portalProject only NARROWS it
+  # and is deliberately not required: the MVP portal mints no project claim,
+  # and a portal user id is already a specific account, so a box declaring
+  # just that admits exactly that account.
   portalHandoffFor = name:
     let u = cfg.users.${name}; in
     cfg.web.enable
@@ -624,8 +625,7 @@ let
     # empty AGENT_BOX_PORTAL_KEYS, the daemon then serves no handover, and
     # the caddy route below would stand with nothing behind it.
     && !(builtins.elem "" (map toString cfg.web.portalKeyFiles))
-    && u.web.portalUser != ""
-    && u.web.portalProject != "";
+    && u.web.portalUser != "";
   seedMain = u:
     if u.seedMainSession != null then u.seedMainSession
     else !(userHasFrontDoor u);
@@ -1269,11 +1269,13 @@ let
           docs/portal-handoff.md). Empty (the default) means this user is
           not reachable by handover at all.
 
-          Handover admits a portal-signed token only when BOTH this and
-          web.portalProject match the token's `sub` and `project` claims.
-          One alone admits nobody: a half-declared mapping that let anyone
-          through on the strength of the other half would be worse than no
-          handover.
+          Handover admits a portal-signed token when its `sub` claim
+          matches this. That is the whole authorization: the route is
+          /${name}/auth/handoff, so the URL has already named this linux
+          user before any claim is read — the token authorizes the user
+          being addressed rather than selecting one.
+
+          web.portalProject narrows it further, and is optional.
         '';
       };
 
@@ -1282,8 +1284,12 @@ let
         default = "";
         example = "acme-prod";
         description = ''
-          The portal project id this linux user IS. See web.portalUser —
-          both are required for handover, and neither does anything alone.
+          Optionally narrow web.portalUser to one project within that
+          portal account: when this is set, a token must also carry a
+          matching `project` claim. Leave it empty (the default) when the
+          portal mints no project claim — web.portalUser alone is already a
+          specific account. Setting this WITHOUT web.portalUser does
+          nothing: it narrows a mapping rather than creating one.
         '';
       };
     };
@@ -3499,7 +3505,8 @@ in
                 "AGENT_BOX_PORTAL_ISSUER=${cfg.web.portalIssuer}\n"
                 + "AGENT_BOX_PORTAL_KEYS=${lib.concatMapStringsSep ":" toString cfg.web.portalKeyFiles}\n"
                 + "AGENT_BOX_PORTAL_USER=${cfg.users.${name}.web.portalUser}\n"
-                + "AGENT_BOX_PORTAL_PROJECT=${cfg.users.${name}.web.portalProject}\n"
+                + lib.optionalString (cfg.users.${name}.web.portalProject != "")
+                    "AGENT_BOX_PORTAL_PROJECT=${cfg.users.${name}.web.portalProject}\n"
                 # Ed25519 verification shells out to openssl (the daemon
                 # takes no third-party import), and this unit has no PATH
                 # of its own, so it is given the absolute path.

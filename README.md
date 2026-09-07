@@ -780,17 +780,18 @@ arbitrary command execution as the agent user.
   header on the request, and webhook senders don't send one. Set
   `webhook.enable = false` to remove the path.
 - **A second, opt-in exception: `/<user>/auth/handoff`.** Off unless a box is
-  wired to a portal (`web.portalIssuer` + `web.portalKeyFiles`, and both
-  `users.<name>.web.portalUser` and `web.portalProject`) — with any of those
-  unset the route is not served at all, so the default box has exactly one
-  unauthenticated path and it is the webhook one above. Where it *is* served,
+  wired to a portal (`web.portalIssuer`, `web.portalKeyFiles` and
+  `users.<name>.web.portalUser`) — with any of those unset the route is not
+  served at all, so the default box has exactly one unauthenticated path and
+  it is the webhook one above. Where it *is* served,
   the trust boundary is an **Ed25519** signature over a single-use token
   whose lifetime the box caps at 300 s however long the portal asked for (60 s
   is what the contract recommends), verified by the settings daemon (Caddy has no JWT
   module in this build, and none is added). A valid signature is not
-  authority: the token names a portal user and project, and the box admits it
-  only if a user it hosts declares exactly that pair — so a correctly signed
-  token for a project this box does not host is refused. Basic auth stays an
+  authority: the token names a portal account, and the box admits it only if
+  the linux user in the request's own URL declares that account — so a
+  correctly signed token for an account this box does not host is refused
+  (`web.portalProject` optionally narrows this to one project within it). Basic auth stays an
   independent path that never consults the daemon, so neither a portal outage
   nor a daemon crash loop can lock the box owner out. Full wire contract:
   [docs/portal-handoff.md](docs/portal-handoff.md).

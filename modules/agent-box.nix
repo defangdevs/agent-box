@@ -2662,9 +2662,10 @@ done
   # provisioned by the other is either a 404 or an unauthenticated route
   # with nothing behind it.
   #
-  # Both halves of the mapping, never one: `sub` and `project` are checked
-  # together, so a config that set only one would otherwise admit every
-  # token carrying the other.
+  # web.portalUser is the whole mapping. web.portalProject only NARROWS it
+  # and is deliberately not required: the MVP portal mints no project claim,
+  # and a portal user id is already a specific account, so a box declaring
+  # just that admits exactly that account.
   portalHandoffFor = name:
     let u = cfg.users.${name}; in
     cfg.web.enable
@@ -2674,8 +2675,7 @@ done
     # empty AGENT_BOX_PORTAL_KEYS, the daemon then serves no handover, and
     # the caddy route below would stand with nothing behind it.
     && !(builtins.elem "" (map toString cfg.web.portalKeyFiles))
-    && u.web.portalUser != ""
-    && u.web.portalProject != "";
+    && u.web.portalUser != "";
   seedMain = u:
     if u.seedMainSession != null then u.seedMainSession
     else !(userHasFrontDoor u);
@@ -8217,11 +8217,13 @@ esac
           docs/portal-handoff.md). Empty (the default) means this user is
           not reachable by handover at all.
 
-          Handover admits a portal-signed token only when BOTH this and
-          web.portalProject match the token's `sub` and `project` claims.
-          One alone admits nobody: a half-declared mapping that let anyone
-          through on the strength of the other half would be worse than no
-          handover.
+          Handover admits a portal-signed token when its `sub` claim
+          matches this. That is the whole authorization: the route is
+          /${name}/auth/handoff, so the URL has already named this linux
+          user before any claim is read — the token authorizes the user
+          being addressed rather than selecting one.
+
+          web.portalProject narrows it further, and is optional.
         '';
       };
 
@@ -8230,8 +8232,12 @@ esac
         default = "";
         example = "acme-prod";
         description = ''
-          The portal project id this linux user IS. See web.portalUser —
-          both are required for handover, and neither does anything alone.
+          Optionally narrow web.portalUser to one project within that
+          portal account: when this is set, a token must also carry a
+          matching `project` claim. Leave it empty (the default) when the
+          portal mints no project claim — web.portalUser alone is already a
+          specific account. Setting this WITHOUT web.portalUser does
+          nothing: it narrows a mapping rather than creating one.
         '';
       };
     };
@@ -12539,9 +12545,9 @@ PORTAL_ISSUER = os.environ.get("AGENT_BOX_PORTAL_ISSUER", "")
 # box to agree on a `kid` first.
 PORTAL_KEYS = [p for p in os.environ.get(
     "AGENT_BOX_PORTAL_KEYS", "").split(":") if p]
-# The (sub, project) pair this user answers to. BOTH must be set — one
-# alone maps nothing, because a half-configured mapping that admitted
-# anyone with the other half would be worse than no handover at all.
+# The portal account this linux user answers to, and optionally the project
+# within it. PORTAL_USER is the mapping; PORTAL_PROJECT only narrows it, and
+# is absent on the MVP portal, which mints no project claim.
 PORTAL_USER = os.environ.get("AGENT_BOX_PORTAL_USER", "")
 PORTAL_PROJECT = os.environ.get("AGENT_BOX_PORTAL_PROJECT", "")
 # Ed25519 verification shells out to openssl rather than importing a JWT
@@ -12575,9 +12581,11 @@ TOKEN_MAX_BYTES = 16384
 # The handover mapping is only usable when every piece is present. A box
 # with no portal keys serves no handover route at all, which keeps the
 # unauthenticated endpoint off boxes that were never provisioned for it.
+# PORTAL_PROJECT is deliberately NOT required: it narrows an already-valid
+# mapping, it does not create one. `portalUser` is a specific portal account,
+# so a box declaring only that admits exactly that account and nobody else.
 PORTAL_HANDOFF = bool(
-    PORTAL_ISSUER and PORTAL_KEYS and PORTAL_USER
-    and PORTAL_PROJECT and WEB_SESSION_DIR)
+    PORTAL_ISSUER and PORTAL_KEYS and PORTAL_USER and WEB_SESSION_DIR)
 
 
 def webhook_unavailable():
@@ -18702,10 +18710,20 @@ def portal_claims(token):
         # A long-lived handover token is a bearer credential for the box.
         # The ceiling is the box's, so a portal bug cannot mint one.
         raise ValueError("lifetime over the ceiling")
-    for name in ("sub", "project", "jti"):
+    for name in ("sub", "jti"):
         value = payload.get(name)
         if not isinstance(value, str) or not 1 <= len(value) <= 256:
             raise ValueError("missing or malformed " + name)
+    # `project` is OPTIONAL: the MVP portal mints tokens without one, and
+    # the route's URL already names the linux user being addressed, so the
+    # claims never have to SELECT one (see _portal_handoff). A box that DOES
+    # declare a project still demands a matching claim — the check is there,
+    # not here, because whether it applies is this box's configuration and
+    # not a property of the token.
+    project = payload.get("project")
+    if project is not None and (
+            not isinstance(project, str) or not 1 <= len(project) <= 256):
+        raise ValueError("malformed project")
     return payload
 
 
@@ -19119,11 +19137,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "<h1>401</h1><p>This sign-in link is not valid. "
                 "Open your box from the portal again.</p>", status=401)
             return
-        # Authorization, which the signature is NOT: the token names a user
-        # and a project, not a box (#541), so being correctly signed says
-        # only that the portal issued it. Whether THIS box serves that pair
-        # is a local question, answered from provisioning.
-        if (claims["sub"], claims["project"]) != (PORTAL_USER, PORTAL_PROJECT):
+        # Authorization, which the signature is NOT: the token names a
+        # portal USER, never a box (#541), so being correctly signed says
+        # only that the portal issued it. Whether this linux user answers to
+        # that portal user is a local question, answered from provisioning.
+        #
+        # It authorizes rather than selects: the route is /<user>/auth/handoff
+        # and each user's daemon serves its own, so the URL has already named
+        # the linux user before any claim is read. That is what lets `project`
+        # be optional without becoming ambiguous.
+        if claims["sub"] != PORTAL_USER:
+            self._send_html(
+                "<h1>403</h1><p>This box does not host that account.</p>",
+                status=403)
+            return
+        # A box that declares a project demands a matching claim. Absent
+        # PORTAL_PROJECT the claim is ignored entirely — the MVP portal does
+        # not mint one, and `portalUser` alone is already a specific account,
+        # so it is the whole boundary there.
+        if PORTAL_PROJECT and claims.get("project") != PORTAL_PROJECT:
             self._send_html(
                 "<h1>403</h1><p>This box does not host that project.</p>",
                 status=403)
@@ -20910,7 +20942,8 @@ if __name__ == "__main__":
                 "AGENT_BOX_PORTAL_ISSUER=${cfg.web.portalIssuer}\n"
                 + "AGENT_BOX_PORTAL_KEYS=${lib.concatMapStringsSep ":" toString cfg.web.portalKeyFiles}\n"
                 + "AGENT_BOX_PORTAL_USER=${cfg.users.${name}.web.portalUser}\n"
-                + "AGENT_BOX_PORTAL_PROJECT=${cfg.users.${name}.web.portalProject}\n"
+                + lib.optionalString (cfg.users.${name}.web.portalProject != "")
+                    "AGENT_BOX_PORTAL_PROJECT=${cfg.users.${name}.web.portalProject}\n"
                 # Ed25519 verification shells out to openssl (the daemon
                 # takes no third-party import), and this unit has no PATH
                 # of its own, so it is given the absolute path.

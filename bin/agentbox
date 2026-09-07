@@ -548,9 +548,9 @@ USER_SCHEMA = _Obj({
     "ttydPort": PORT,
     "root": BOOL,
     # Portal handover (issue #541). A project IS a linux user (#352), so a
-    # project's portal identity is declared on the user. Both halves or
-    # neither: `sub` and `project` are checked together, so a config with
-    # only one would admit every token carrying the other. Spelled at the
+    # project's portal identity is declared on the user. portalUser is the
+    # mapping; portalProject optionally narrows it and does nothing on its
+    # own, because it narrows a mapping rather than creating one. Spelled at the
     # top level here where the module spells them under `web` — native has
     # no per-user `web` object at all (see the comment in class User on
     # passwordHashFile), so this mirrors an existing divergence rather than
@@ -2837,7 +2837,8 @@ class Renderer:
         """Whether portal handover is provisioned for this user (#541).
 
         Mirrors portalHandoffFor in modules/agent-box.nix.in: an issuer, at
-        least one key, and BOTH halves of this user's mapping. Two callers
+        least one key, and this user's portalUser. portalProject only
+        NARROWS that mapping and is not required. Two callers
         need the same answer — the settings daemon's env and the caddy
         route that reaches it — and a route served without the env behind
         it is an unauthenticated endpoint that can admit nobody.
@@ -2850,8 +2851,7 @@ class Renderer:
                     and self.spec.portal_issuer
                     and self.spec.portal_keys
                     and all(self.spec.portal_keys)
-                    and u.portal_user
-                    and u.portal_project)
+                    and u.portal_user)
 
     def caddy(self, t):
         """Bind the shared Caddyfile fragments.
