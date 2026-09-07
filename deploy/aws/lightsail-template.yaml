@@ -22,6 +22,11 @@ Metadata:
           - UserName
           - WebPassword
       - Label:
+          default: Portal handover (optional - leave blank for password-only)
+        Parameters:
+          - PortalUser
+          - PortalIssuer
+      - Label:
           default: Size
         Parameters:
           - BundleId
@@ -67,6 +72,42 @@ Parameters:
       Linux user that owns the agent sessions, and the login name for the
       browser terminal.
 
+  # Portal handover (issue #593). Both OPTIONAL and both needed: `agentbox
+  # apply` serves no handover route unless each is set, so a launch that
+  # leaves them blank behaves exactly as it did before they existed.
+  #
+  # No key parameter: the box FETCHES the portal's signing keys from
+  # <PortalIssuer>/.well-known/jwks.json and caches them, so a rotation is
+  # the portal's business alone.
+  #
+  # PortalUser is the per-BOX value and the reason this exists: a correctly
+  # signed token proves only that the portal issued it, never who it is for.
+  # This is what makes the box refuse somebody else's valid token.
+  #
+  # Both are character-constrained because the launch script substitutes them
+  # into config.yaml with sed: a `|` would end the replacement early and a
+  # newline would end the command. Refusing those at the parameter is the
+  # only place it can be done before the value reaches the script.
+  PortalUser:
+    Type: String
+    Default: ""
+    MaxLength: 256
+    AllowedPattern: ^$|^[A-Za-z0-9_.:@+-]{1,256}$
+    Description: >-
+      The portal account id (the handover token's `sub` claim) this box is
+      instantiated for. The box admits a handover token only when `sub`
+      matches this, so another account's valid token is refused. Blank (the
+      default) disables portal handover entirely.
+  PortalIssuer:
+    Type: String
+    Default: ""
+    MaxLength: 512
+    AllowedPattern: ^$|^https://[A-Za-z0-9._~:/?#@!&()*+,;=%-]+$
+    Description: >-
+      The portal's own issuer URL, compared exactly against the token's `iss`
+      claim, and where the box fetches the portal's published signing keys
+      (<issuer>/.well-known/jwks.json). Blank (the default) disables portal
+      handover entirely.
   WebPassword:
     Type: String
     NoEcho: true
@@ -287,11 +328,32 @@ Resources:
             defaultAgent: @AGENT@
             web:
               enable: true
+              # Portal handover (issue #593). Empty is off, which is the
+              # module's own default: a box launched without the two portal
+              # parameters serves no handover route and no unauthenticated
+              # endpoint. No key is configured - the box fetches the
+              # portal's published key set from this issuer.
+              portalIssuer: '@PORTALISSUER@'
             users:
               @USER@:
                 root: true
+                portalUser: '@PORTALUSERID@'
             AGENTBOX_CONFIG
-            sed -i "s|@AGENT@|${Agent}|g; s|@USER@|${UserName}|g" \
+            # PortalIssuer's AllowedPattern admits a query string, which may
+            # carry a literal '&' -- and sed's REPLACEMENT text treats '&'
+            # as "insert the match", so passing it through unescaped would
+            # splice "@PORTALISSUER@" into config.yaml instead of the URL.
+            # Escape sed's replacement metacharacters before substituting;
+            # the double-quoted assignments below keep the raw value out of
+            # the shell's own metacharacters (the pattern already excludes
+            # a quote or a `$`).
+            portal_issuer_plain="${PortalIssuerPlain}"
+            portal_user_plain="${PortalUserPlain}"
+            esc_issuer=$(printf '%s' "$portal_issuer_plain" | sed -e 's/[&\]/\\&/g')
+            esc_user=$(printf '%s' "$portal_user_plain" | sed -e 's/[&\]/\\&/g')
+            sed -i "s|@AGENT@|${Agent}|g; s|@USER@|${UserName}|g; \
+                    s|@PORTALISSUER@|${!esc_issuer}|g; \
+                    s|@PORTALUSERID@|${!esc_user}|g" \
               /etc/agent-box/config.yaml
 
             # Extra standing instructions for the agent, if the stack gave any.
@@ -323,6 +385,8 @@ Resources:
             # stack rolls back instead of reporting a box that does not work.
             "$AGENTBOX" signal "${FirstBootHandle}"
           - WebPasswordPlain: !Ref WebPassword
+            PortalUserPlain: !Ref PortalUser
+            PortalIssuerPlain: !Ref PortalIssuer
             FirstBootHandle: !Ref FirstBootHandle
 
   # Static IPv4 - free while attached, and stable across a stop/start, so the

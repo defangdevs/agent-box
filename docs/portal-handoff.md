@@ -34,8 +34,10 @@ browser        portal                                  box
    |--------------------------------------------------->|
 ```
 
-The box is a **verifier**, never a client. It makes no call back to the
-portal, so it needs no portal credential, no egress and no JWKS fetch.
+The box is a **verifier**, never a client of the portal's API: it holds no
+portal credential and the portal never calls in. It does fetch the portal's
+**published signing keys** — see §2 — which is what lets the portal rotate
+them without redeploying a single box.
 
 ## 2. The token
 
@@ -51,9 +53,11 @@ A compact JWS. Three segments, `base64url` without padding.
   value** — not `none`, not `HS256`, not `RS256`. This is a fixed
   single-algorithm check, not a lookup driven by the header, so the usual
   algorithm-confusion substitution has nothing to select.
-- `kid` is OPTIONAL and advisory. The box tries every configured public key
-  and does not require a match, so key rotation never depends on the portal
-  and the box agreeing on a name.
+- `kid` is OPTIONAL but **recommended**. With one, the box verifies against
+  exactly that key from your JWKS, and a `kid` it has not seen makes it
+  refetch — so a key you published seconds ago works immediately. Without
+  one it tries every Ed25519 key in the set, which also works but gets
+  slower as you keep old keys around.
 
 ### Claims
 
@@ -100,6 +104,62 @@ replayed at the box's handoff endpoint fails on `aud`.
 **Recommended lifetime: 60 s.** The token is a redirect carrier, not a
 session. The box's hard ceiling is 300 s.
 
+### 2.1 Publishing the keys (`.well-known/jwks.json`)
+
+The portal MUST serve its signing keys as a JWK Set at
+
+```
+https://<issuer>/.well-known/jwks.json
+```
+
+over **HTTPS**. The box derives that URL from the issuer it was configured
+with, and **never from the token** — a `jku`-style header that could point
+the box at a key server of the caller's choosing would make the signature
+check meaningless. A portal that publishes elsewhere is accommodated by box
+configuration (`web.portalJwksUrl`), not by a claim.
+
+Each signing key is an OKP/Ed25519 JWK:
+
+```json
+{
+  "keys": [
+    {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "use": "sig",
+      "kid": "portal-2026-09",
+      "x": "vC22x8FyVqzCuadrQ-HJkZdqjeZ9S-yrrD_ereHRoRo"
+    }
+  ]
+}
+```
+
+- `kty` MUST be `OKP` and `crv` MUST be `Ed25519`. Any other key type in the
+  set is **skipped**, not guessed at.
+- `use`, if present, MUST be `sig`. A key published for encryption is not
+  accepted for signatures.
+- `x` is the 32-byte public key, base64url, unpadded.
+- `kid` is what a token's `kid` selects.
+
+In Node, `crypto.createPublicKey(pem).export({format: 'jwk'})` produces
+exactly this for an Ed25519 key.
+
+**How the box treats the set.** It caches it on disk for an hour. A `kid` it
+does not hold triggers **one** refetch, rate-limited to once a minute — so a
+newly published key is picked up at once, and a caller minting tokens with
+random `kid`s cannot turn the handover route into a way to hammer the portal.
+
+**Rotation** therefore needs nothing from the box: publish the new key
+alongside the old one, start signing with the new `kid`, and retire the old
+entry once no token bearing it can still be valid (its `exp` plus the box's
+skew allowance — so a minute after you stop using it).
+
+**An outage is survivable, but not indefinitely.** If the endpoint is
+unreachable the box keeps using the keys it already cached, so a brief blip
+does not lock anyone out. The cost is that a **withdrawn** key stays usable
+for up to the cache hour. If you need a key dead sooner than that, the
+revocation to reach for is per-account (§6), not the key set.
+
 ## 3. Delivery: POST, never a URL
 
 The portal MUST deliver the token as an `application/x-www-form-urlencoded`
@@ -136,8 +196,8 @@ the box's own provisioning record — see §5.
 ## 4. What the box does, in order
 
 1. **Parse.** Three dot-separated segments, header `alg` exactly `EdDSA`.
-2. **Verify the signature** over `header.payload` against each configured
-   public key.
+2. **Verify the signature** over `header.payload` against the keys the
+   portal publishes (§2.1), selected by `kid` when the token carries one.
 3. **Check the claims** per the table above.
 4. **Authorize the linux user the URL named.** `sub` must match that
    user's declared `portalUser`; if the box also declares `portalProject`,
@@ -187,8 +247,6 @@ users:
     portalUser: usr_2Nk9x…          # the `sub` this box admits
 web:
   portalIssuer: https://station.example.com   # Station's own URL
-  portalKeyFiles:
-    - /etc/agent-box/portal-key.pub
 ```
 
 - **`portalUser` is the mapping.** A token whose `sub` matches it is
@@ -196,8 +254,11 @@ web:
   all.
 - `portalIssuer` is the `iss` the box demands. Whatever Station uses — the
   box trusts exactly this one string.
-- `portalKeyFiles` are PEM `PUBLIC KEY` files holding Ed25519 keys. List two
-  during a rotation: the box tries all of them.
+- **No key is configured.** The box fetches them from
+  `<portalIssuer>/.well-known/jwks.json` (§2.1), so a rotation never touches
+  a box and no public key is committed to a template.
+  `web.portalJwksUrl` overrides that path for a portal that publishes
+  somewhere else.
 - **`portalProject` is optional**, and narrows `portalUser` to one project
   within that account:
 
@@ -210,22 +271,41 @@ web:
   must not open another. Setting it *without* `portalUser` does nothing — it
   narrows a mapping rather than creating one.
 
+**From a 1-click deployment** (issue #593), both values are template
+parameters, alongside the web password:
+
+| flavor | parameters |
+|---|---|
+| AWS CloudFormation (`deploy/aws/template.yaml`) | `PortalUser`, `PortalIssuer` |
+| AWS Lightsail (`deploy/aws/lightsail-template.yaml`) | `PortalUser`, `PortalIssuer` |
+| Azure Bicep (`deploy/azure/agent-box.bicep`) | `portalUser`, `portalIssuer` |
+
+Both are optional and both are needed: leave either blank and the box serves
+no handover route at all, which is what a hand-launched box gets. **There is
+no key parameter on any flavor** — that is the point of §2.1.
+
+`portalUser` is the per-box value, and it has to arrive this way rather than
+over the wire: the handover endpoint is unauthenticated by construction, so a
+token must never be able to tell a box whose it is.
+
 A project is a linux user
 ([#352](https://github.com/defangdevs/agent-box/issues/352)), so this is
 declared where every other per-project setting is — one `users:` entry in
 `/etc/agent-box/config.yaml`, reconciled by `agentbox apply`. There is no
 second spec file.
 
-Generate a keypair with the openssl the box already ships:
+Generate the portal's keypair once (the box never sees the private half,
+and never needs the public half configured either — it fetches it):
 
 ```
 openssl genpkey -algorithm ed25519 -out portal-key.pem
-openssl pkey -in portal-key.pem -pubout -out portal-key.pub
 ```
 
 In Node, `crypto.createPrivateKey` reads that PEM and
 `crypto.sign(null, data, key)` produces the 64-byte Ed25519 signature to
-base64url — `alg: "EdDSA"` needs no digest argument.
+base64url — `alg: "EdDSA"` needs no digest argument. The matching JWK for
+§2.1 is `crypto.createPublicKey(privateKey).export({format: 'jwk'})` plus a
+`kid` and `use: "sig"` of your choosing.
 
 ## 6. Revocation
 

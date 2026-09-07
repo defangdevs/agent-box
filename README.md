@@ -780,13 +780,14 @@ arbitrary command execution as the agent user.
   header on the request, and webhook senders don't send one. Set
   `webhook.enable = false` to remove the path.
 - **A second, opt-in exception: `/<user>/auth/handoff`.** Off unless a box is
-  wired to a portal (`web.portalIssuer`, `web.portalKeyFiles` and
-  `users.<name>.web.portalUser`) — with any of those unset the route is not
+  wired to a portal (`web.portalIssuer` and `users.<name>.web.portalUser`) — with any of those unset the route is not
   served at all, so the default box has exactly one unauthenticated path and
   it is the webhook one above. Where it *is* served,
   the trust boundary is an **Ed25519** signature over a single-use token
   whose lifetime the box caps at 300 s however long the portal asked for (60 s
-  is what the contract recommends), verified by the settings daemon (Caddy has no JWT
+  is what the contract recommends), verified against the portal's own
+  published keys (`<issuer>/.well-known/jwks.json`, fetched and cached, so a
+  rotation never touches a box) by the settings daemon (Caddy has no JWT
   module in this build, and none is added). A valid signature is not
   authority: the token names a portal account, and the box admits it only if
   the linux user in the request's own URL declares that account — so a

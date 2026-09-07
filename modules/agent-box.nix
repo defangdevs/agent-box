@@ -2670,11 +2670,6 @@ done
     let u = cfg.users.${name}; in
     cfg.web.enable
     && cfg.web.portalIssuer != ""
-    && cfg.web.portalKeyFiles != [ ]
-    # Every path non-empty, not merely the list: an empty one renders an
-    # empty AGENT_BOX_PORTAL_KEYS, the daemon then serves no handover, and
-    # the caddy route below would stand with nothing behind it.
-    && !(builtins.elem "" (map toString cfg.web.portalKeyFiles))
     && u.web.portalUser != "";
   seedMain = u:
     if u.seedMainSession != null then u.seedMainSession
@@ -10651,15 +10646,15 @@ in
         '';
       };
 
-      # Portal handover (issue #541). The box is a pure VERIFIER: it makes
-      # no call back to the portal, so it needs no portal credential, no
-      # egress and no JWKS fetch. Both of these plus a user's
-      # web.portalUser/web.portalProject are required before any handover
-      # route is served at all.
+      # Portal handover (issue #541). The box is a VERIFIER: it holds no
+      # portal credential and the portal never calls in. It does reach OUT,
+      # once per cache period, for the portal's published signing keys —
+      # which is what keeps a rotation from touching every box. An issuer
+      # plus a user's web.portalUser are what a handover route needs.
       portalIssuer = lib.mkOption {
         type = lib.types.str;
         default = "";
-        example = "https://portal.defang.io";
+        example = "https://station.example.com";
         description = ''
           The `iss` a portal handover token must carry, compared exactly.
           Empty (the default) disables handover: the unauthenticated
@@ -10670,20 +10665,27 @@ in
         '';
       };
 
-      portalKeyFiles = lib.mkOption {
-        type = lib.types.listOf lib.types.path;
-        default = [ ];
-        example = [ "/etc/agent-box/portal-key.pub" ];
+      portalJwksUrl = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "https://station.example.com/.well-known/jwks.json";
         description = ''
-          Ed25519 PUBLIC keys, PEM, that may sign a handover token. Every
-          key is tried, so a rotation is a two-entry list and needs no
-          agreement with the portal about a `kid` first.
+          Where the portal publishes its signing keys. Empty (the default)
+          derives it from portalIssuer as
+          <portalIssuer>/.well-known/jwks.json, which is the well-known
+          location and what a portal following it needs no configuration
+          for.
 
-          Public keys only — nothing here is a secret, which is the point of
-          signing the handover asymmetrically rather than with a per-box
-          shared secret: the portal keeps one keypair for the fleet, and a
-          token names a user and a project rather than a box (decided on
-          issue #541).
+          The box FETCHES the key set and caches it, so a key rotation is
+          the portal's business alone — no box is redeployed, and no public
+          key is committed to a template. An unknown `kid` forces one
+          rate-limited refetch, so a newly published key is picked up
+          without waiting for the cache to expire.
+
+          Derived from CONFIGURATION, never from the token: a URL a token
+          could choose (a `jku` header, say) would make the signature check
+          meaningless. Set this only for a portal that publishes somewhere
+          other than the well-known path.
         '';
       };
 
@@ -12399,8 +12401,9 @@ in
 #                                 sign-in cards (claude, codex, github)
 #   AGENT_BOX_PORTAL_ISSUER      portal handover (issue #541): the `iss`
 #                                 a handover token must carry
-#   AGENT_BOX_PORTAL_KEYS        colon-separated Ed25519 PEM public keys
-#                                 to verify it with (all are tried)
+#   AGENT_BOX_PORTAL_JWKS_URL    where the portal publishes its signing
+#                                 keys; defaults to the issuer's
+#                                 /.well-known/jwks.json
 #   AGENT_BOX_PORTAL_USER        the portal user id this linux user is
 #   AGENT_BOX_PORTAL_PROJECT     the portal project id this linux user is
 #   AGENT_BOX_WEB_SESSION_DIR    where minted sessions and spent token
@@ -12431,6 +12434,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.request
 
 # The env store's format lives in ONE place (issue #212): src/lib/envstore.py,
 # which the generated module prepends to this file (see settingsDaemon in
@@ -12587,11 +12591,26 @@ HOOK_SPAWN_CMD = os.environ.get("AGENT_BOX_HOOK_SPAWN_CMD", "")
 # whether THIS user declares exactly that (sub, project) pair below. The
 # signature only proves the portal said it.
 PORTAL_ISSUER = os.environ.get("AGENT_BOX_PORTAL_ISSUER", "")
-# PEM public keys to try, in order. More than one during a rotation: the
-# box tries all of them, so a key change never needs the portal and the
-# box to agree on a `kid` first.
-PORTAL_KEYS = [p for p in os.environ.get(
-    "AGENT_BOX_PORTAL_KEYS", "").split(":") if p]
+# Where the portal publishes its signing keys. Derived from the ISSUER, not
+# from anything in the token: a `jku`/`kid` that could point the box at a
+# key server of the caller's choosing would make the signature check
+# meaningless. An explicit override exists for a portal that publishes
+# elsewhere, but it is still box CONFIGURATION, never token content.
+PORTAL_JWKS_URL = os.environ.get("AGENT_BOX_PORTAL_JWKS_URL", "") or (
+    PORTAL_ISSUER.rstrip("/") + "/.well-known/jwks.json"
+    if PORTAL_ISSUER else "")
+# How long a fetched key set is trusted before a refetch. Keys rotate on the
+# portal's schedule, and an unknown `kid` forces a refetch before this
+# expires anyway, so this is the ceiling on how long a WITHDRAWN key stays
+# usable rather than how quickly a new one is picked up.
+JWKS_TTL = 3600
+# Floor between refetches triggered by an unknown `kid`. Without it the
+# unauthenticated handover route is an outbound-request amplifier: a caller
+# minting tokens with random `kid`s would have the box hammer the portal.
+JWKS_REFETCH_FLOOR = 60
+# Cap on the key document, so a hostile or broken endpoint cannot hand the
+# daemon an unbounded body.
+JWKS_MAX_BYTES = 262144
 # The portal account this linux user answers to, and optionally the project
 # within it. PORTAL_USER is the mapping; PORTAL_PROJECT only narrows it, and
 # is absent on the MVP portal, which mints no project claim.
@@ -12643,7 +12662,7 @@ HANDOFF_DRAIN_MAX_BYTES = 1 << 20
 # mapping, it does not create one. `portalUser` is a specific portal account,
 # so a box declaring only that admits exactly that account and nobody else.
 PORTAL_HANDOFF = bool(
-    PORTAL_ISSUER and PORTAL_KEYS and PORTAL_USER and WEB_SESSION_DIR)
+    PORTAL_ISSUER and PORTAL_JWKS_URL and PORTAL_USER and WEB_SESSION_DIR)
 
 
 def webhook_unavailable():
@@ -18669,8 +18688,167 @@ def portal_b64url(text):
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
-def portal_signature_ok(signing_input, signature):
-    """True if any configured public key signs signing_input.
+def portal_jwks_fetch():
+    """GET the portal's key set. Returns its parsed form, or None.
+
+    HTTPS only, and the URL comes from box configuration — see
+    PORTAL_JWKS_URL. Nothing in the token influences where this goes.
+    urllib follows a redirect without restricting its scheme, so a
+    response is rejected if it lands anywhere but https:// — otherwise a
+    single compromised or misconfigured hop on an otherwise-HTTPS URL
+    could downgrade every fetch to plaintext.
+    """
+    if not PORTAL_JWKS_URL.startswith("https://"):
+        return None
+    request = urllib.request.Request(
+        PORTAL_JWKS_URL, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if not response.geturl().startswith("https://"):
+                return None
+            raw = response.read(JWKS_MAX_BYTES + 1)
+    except Exception:
+        # Any failure — DNS, TLS, timeout, 500 — is "no keys right now".
+        # portal_jwks_keys falls back to the cached set, and a handover
+        # fails closed if there is none.
+        return None
+    if len(raw) > JWKS_MAX_BYTES:
+        return None
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(document, dict) or not isinstance(
+            document.get("keys"), list):
+        return None
+    return document
+
+
+def portal_jwks_cache_path():
+    return os.path.join(portal_dir("jwks"), "cache.json")
+
+
+def portal_jwks_read_cache():
+    try:
+        with open(portal_jwks_cache_path()) as handle:
+            cached = json.load(handle)
+        return cached if isinstance(cached, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def portal_jwks_write_cache(record):
+    path = portal_jwks_cache_path()
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".jwks.")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(record, handle)
+        os.replace(tmp, path)
+    except OSError as exc:
+        sys.stderr.write("portal: jwks cache write: %s\n" % exc)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+    return record
+
+
+def portal_jwks_keys(kid, force=False):
+    """The portal's keys, from cache when it is fresh enough.
+
+    Cached on disk, not in memory: this daemon is socket-activated and can be
+    restarted under it, and a per-process cache would mean a fetch on every
+    restart — on the one route an anonymous caller can reach.
+
+    `force` is for the second attempt after a `kid` misses: a key the portal
+    has just published is the ordinary reason for a miss, and refusing to
+    look would make every rotation an outage.
+
+    Either path — an expired cache or a forced retry — reaches
+    portal_jwks_fetch(), so both are rate-limited by the same
+    JWKS_REFETCH_FLOOR against `attempted`, the time of the last attempt
+    WHETHER OR NOT it succeeded. Gating only the forced path left the
+    ordinary post-TTL refresh unlimited: a portal that is down (or just
+    slow, at a 10s timeout) turns every handover request arriving after
+    the cache goes stale into a fresh outbound fetch, which is the same
+    lever on the portal this floor exists to deny.
+    """
+    now = int(time.time())
+    cached = portal_jwks_read_cache() or {}
+    try:
+        fetched = int(cached.get("fetched", 0))
+    except (TypeError, ValueError):
+        fetched = 0
+    try:
+        attempted = int(cached.get("attempted", 0))
+    except (TypeError, ValueError):
+        attempted = 0
+    keys = cached.get("keys") or []
+    if not isinstance(keys, list):
+        keys = []
+    fresh = keys and now - fetched < JWKS_TTL
+    if fresh and not force:
+        return keys
+    if now - attempted < JWKS_REFETCH_FLOOR:
+        # An attempt happened too recently to try again, whether that was
+        # the ordinary refresh or a forced retry. Answer from what we have
+        # rather than making either path a lever on the portal.
+        return keys
+    document = portal_jwks_fetch()
+    if document is None:
+        # Fetch failed. Stale keys still beat none: the portal being briefly
+        # unreachable should not lock out a handover signed by a key we
+        # already hold. A withdrawn key outliving its withdrawal by up to
+        # JWKS_TTL is the cost, and it is why that value is not days.
+        # `attempted` still moves, so a persistent outage stays capped at
+        # one fetch per JWKS_REFETCH_FLOOR rather than one per request.
+        return portal_jwks_write_cache(
+            {"fetched": fetched, "attempted": now, "keys": keys})["keys"]
+    return portal_jwks_write_cache(
+        {"fetched": now, "attempted": now,
+         "keys": document.get("keys", [])})["keys"]
+
+
+# SubjectPublicKeyInfo prefix for an Ed25519 key: SEQUENCE { SEQUENCE {
+# OID 1.3.101.112 }, BIT STRING }. Fixed, because the key length is, so
+# building the DER is a concatenation and not an encoder — no crypto here.
+ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+
+
+def portal_jwk_to_pem(jwk):
+    """PEM for an Ed25519 JWK, or None if this is not one.
+
+    Only OKP/Ed25519, which is what the handover contract requires
+    (docs/portal-handoff.md). Another key type is skipped rather than
+    guessed at: verifying with the wrong curve is not a thing to improvise.
+    """
+    if not isinstance(jwk, dict):
+        return None
+    if jwk.get("kty") != "OKP" or jwk.get("crv") != "Ed25519":
+        return None
+    # A key published for encryption must not be accepted for signatures.
+    if jwk.get("use") not in (None, "sig"):
+        return None
+    try:
+        raw = portal_b64url(jwk.get("x") or "")
+    except ValueError:
+        return None
+    if len(raw) != 32:
+        return None
+    body = base64.b64encode(ED25519_SPKI_PREFIX + raw).decode("ascii")
+    lines = [body[i:i + 64] for i in range(0, len(body), 64)]
+    return ("-----BEGIN PUBLIC KEY-----\n" + "\n".join(lines)
+            + "\n-----END PUBLIC KEY-----\n")
+
+
+def portal_signature_ok(signing_input, signature, kid=""):
+    """True if any of the portal's published keys signs signing_input.
+
+    Keys come from the portal's JWKS (see portal_jwks_keys), so a rotation
+    is the portal's business alone and no box has to be redeployed for one.
+    On a `kid` the cache does not know, this refetches ONCE — a key just
+    published is the ordinary reason for a miss.
 
     Ed25519 through openssl, not a python JWT library: this daemon takes no
     third-party import (see the module header), and hand-rolling curve
@@ -18682,6 +18860,14 @@ def portal_signature_ok(signing_input, signature):
     if len(signature) != 64:
         # Ed25519 is fixed-width. Reject early so a malformed token cannot
         # reach openssl at all.
+        return False
+    keys = portal_jwks_keys(kid)
+    pems = portal_jwks_pems(keys, kid)
+    if not pems and kid:
+        # The `kid` matched nothing we hold. Refetch once (rate-limited)
+        # and look again, so a rotation is not an outage.
+        pems = portal_jwks_pems(portal_jwks_keys(kid, force=True), kid)
+    if not pems:
         return False
     # NOT the default /tmp. This unit runs ProtectSystem=strict with no
     # PrivateTmp, so its whole filesystem is read-only apart from
@@ -18698,21 +18884,39 @@ def portal_signature_ok(signing_input, signature):
             handle.write(signing_input)
         with open(sig, "wb") as handle:
             handle.write(signature)
-        for key in PORTAL_KEYS:
+        key_path = os.path.join(work, "key.pem")
+        for pem in pems:
+            with open(key_path, "w") as handle:
+                handle.write(pem)
             try:
                 done = subprocess.run(
-                    [OPENSSL, "pkeyutl", "-verify", "-pubin", "-inkey", key,
+                    [OPENSSL, "pkeyutl", "-verify", "-pubin",
+                     "-inkey", key_path,
                      "-rawin", "-in", msg, "-sigfile", sig],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     timeout=10, check=False)
             except (OSError, subprocess.SubprocessError):
-                # A missing or unreadable key is a provisioning fault, not a
-                # verdict on the token: try the rest rather than admitting
-                # or refusing on the strength of a broken file.
+                # A key openssl will not load is a bad entry in the key set,
+                # not a verdict on the token: try the rest rather than
+                # admitting or refusing on the strength of one.
                 continue
             if done.returncode == 0:
                 return True
     return False
+
+
+def portal_jwks_pems(keys, kid=""):
+    """The candidate PEMs from a key set, most specific first.
+
+    A token carrying a `kid` narrows to that key. Without one — `kid` is
+    advisory in the contract — every Ed25519 key in the set is tried, which
+    is what makes a rotation transparent to the portal.
+    """
+    if kid:
+        keys = [k for k in keys
+                if isinstance(k, dict) and k.get("kid") == kid]
+    pems = [portal_jwk_to_pem(k) for k in keys]
+    return [pem for pem in pems if pem]
 
 
 def portal_claims(token):
@@ -18738,8 +18942,14 @@ def portal_claims(token):
     # substitution that "alg" confusion depends on has nothing to choose.
     if header.get("alg") != "EdDSA":
         raise ValueError("unsupported algorithm")
+    kid = header.get("kid")
+    if not isinstance(kid, str) or len(kid) > 256:
+        # Advisory, and bounded: it selects among keys the PORTAL published,
+        # so a hostile value can only fail to match. Anything unusable is
+        # treated as absent, which falls back to trying every key.
+        kid = ""
     if not portal_signature_ok(
-            (parts[0] + "." + parts[1]).encode("ascii"), signature):
+            (parts[0] + "." + parts[1]).encode("ascii"), signature, kid):
         raise ValueError("bad signature")
     # Only now are the claims worth reading: everything below is content
     # the portal signed.
@@ -19188,6 +19398,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             claims = portal_claims(token)
         except ValueError:
+            # A verdict on the token: refused below with the one message.
+            claims = None
+        except Exception:
+            # NOT a verdict — something inside verification broke (an
+            # unreadable cache, a key openssl cannot load, a fetch raising
+            # something urllib does not document). Fail CLOSED and say the
+            # same thing, because on an unauthenticated route a 500 plus a
+            # journal traceback is strictly worse: it tells the caller more
+            # and the operator less. The traceback is still logged by the
+            # server's own handler if it reaches there; here the operator
+            # gets a line naming the route.
+            sys.stderr.write(
+                "agent-box-settings: portal handover verification failed "
+                "unexpectedly; refusing\n")
+            claims = None
+        if claims is None:
             # Deliberately one message for every failure. The caller here is
             # unauthenticated, so naming the field that failed would let it
             # tune a token against the box one check at a time.
@@ -21002,7 +21228,11 @@ if __name__ == "__main__":
             # than passed empty.
             + lib.optionalString (portalHandoffFor name) (
                 "AGENT_BOX_PORTAL_ISSUER=${cfg.web.portalIssuer}\n"
-                + "AGENT_BOX_PORTAL_KEYS=${lib.concatMapStringsSep ":" toString cfg.web.portalKeyFiles}\n"
+                # Only when overridden: the daemon derives the well-known
+                # path from the issuer, so passing it unconditionally would
+                # be one more place the default could drift.
+                + lib.optionalString (cfg.web.portalJwksUrl != "")
+                    "AGENT_BOX_PORTAL_JWKS_URL=${cfg.web.portalJwksUrl}\n"
                 + "AGENT_BOX_PORTAL_USER=${cfg.users.${name}.web.portalUser}\n"
                 + lib.optionalString (cfg.users.${name}.web.portalProject != "")
                     "AGENT_BOX_PORTAL_PROJECT=${cfg.users.${name}.web.portalProject}\n"

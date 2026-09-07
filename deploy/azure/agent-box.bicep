@@ -40,6 +40,29 @@ param userName string = 'agent'
 @maxLength(64)
 param webPassword string
 
+// Portal handover (issue #593). Both OPTIONAL and both needed: the module
+// serves no handover route unless each is set, so leaving them empty (the
+// default) behaves exactly as before they existed.
+//
+// There is deliberately NO key parameter: the box fetches the portal's
+// signing keys from <portalIssuer>/.well-known/jwks.json and caches them, so
+// a rotation is the portal's business alone and no public key is committed
+// here.
+//
+// portalUser is the per-BOX value and the point of the issue: a correctly
+// signed token proves only that the portal issued it, never who it is FOR,
+// because the portal signs every account's tokens with one key. This is what
+// makes the box refuse somebody else's valid token, and it must arrive
+// out-of-band at provisioning -- a token must never be able to tell a box
+// whose it is.
+@description('Portal account id (the handover token\'s `sub` claim) this box is instantiated for. The box admits a handover token only when `sub` matches this, so another account\'s valid token is refused. Empty (the default) disables portal handover entirely.')
+@maxLength(256)
+param portalUser string = ''
+
+@description('The portal\'s own issuer URL, compared exactly against the token\'s `iss` claim, and where the box fetches the portal\'s published signing keys (<issuer>/.well-known/jwks.json). Whatever the portal uses -- this is NOT a Defang hostname. Empty (the default) disables portal handover entirely.')
+@maxLength(512)
+param portalIssuer string = ''
+
 // The picker annotates each value with vCPU/RAM/price because the portal's
 // generated form renders allowed values verbatim - there is no separate label
 // field, exactly as with the Lightsail template's BundleId. Only the first
@@ -293,15 +316,55 @@ AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
 # one this box needs to have made for it before it ever boots. `agentbox`
 # falls back to the first entry of `agents` on its own.
 install -d -m 0755 /etc/agent-box
+
+# Bicep has no character constraint for a string parameter -- only length --
+# so a raw portalIssuer/portalUser could close the single-quoted YAML scalar
+# below, or worse, inject an extra key (same class of bug base64(webPassword)
+# above exists for, applied here because these two are not secrets and so
+# were substituted raw until now). Both travel base64-encoded and are
+# decoded and validated here, against the same character classes the CFN
+# twin's AllowedPattern enforces at the parameter itself -- Bicep has no
+# such decorator, so the check has to happen at runtime instead. A bad value
+# fails the boot rather than landing in config.yaml unvetted.
+portal_issuer="$(printf %s '@@PORTALISSUERB64@@' | base64 -d)"
+portal_user="$(printf %s '@@PORTALUSERIDB64@@' | base64 -d)"
+if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
+  if ! [[ "$portal_issuer" =~ ^https://[A-Za-z0-9._~:/?#@\!\&\(\)*+,\;=%-]+$ ]]; then
+    echo "portalIssuer is not a plain https:// URL" >&2
+    exit 1
+  fi
+  if ! [[ "$portal_user" =~ ^[A-Za-z0-9_.:@+-]{1,256}$ ]]; then
+    echo "portalUser is not a plain account id" >&2
+    exit 1
+  fi
+fi
+
 cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
 domain: auto
 agents: [claude, codex]
 web:
   enable: true
+  # Portal handover (issue #593). Empty is off, which is the module's own
+  # default: a box deployed without the two portal parameters serves no
+  # handover route and no unauthenticated endpoint. No key is configured --
+  # the box fetches the portal's published key set from this issuer.
+  portalIssuer: '@PORTALISSUER@'
 users:
   @@USER@@:
     root: true
+    portalUser: '@PORTALUSERID@'
 AGENTBOX_CONFIG
+# The validation above already rejected a backslash, but NOT '&' --
+# portalIssuer's own class allows one, for a query string -- and sed's
+# REPLACEMENT text treats '&' as "insert the match". Escape it (and a
+# backslash, for good measure) before substituting into the heredoc just
+# written, or an issuer URL containing one would splice the placeholder
+# into config.yaml instead of the URL (same bug as the CFN twin, before its
+# own fix).
+esc_issuer=$(printf '%s' "$portal_issuer" | sed -e 's/[&\]/\\&/g')
+esc_user=$(printf '%s' "$portal_user" | sed -e 's/[&\]/\\&/g')
+sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|" \
+  /etc/agent-box/config.yaml
 
 # Extra standing instructions for the agent, if the deployment gave any.
 install -d -m 0755 /etc/agent-box-guides
@@ -337,7 +400,16 @@ set -x
 echo "agent-box bootstrap complete"
 '''
 
-var bootstrap = replace(replace(replace(replace(replace(
+// Portal handover (issue #593): both or neither, since the module needs both
+// before it serves anything.
+var portalOn = !empty(portalUser) && !empty(portalIssuer)
+// SCALARS only. The YAML lines live in the bootstrap template itself, so
+// their indentation is visible to check_written_config -- injecting whole
+// lines from here would put it somewhere no check could reach.
+var portalUserYaml = portalOn ? portalUser : ''
+var portalIssuerYaml = portalOn ? portalIssuer : ''
+
+var bootstrap = replace(replace(replace(replace(replace(replace(replace(
   bootstrapTemplate,
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
@@ -346,7 +418,9 @@ var bootstrap = replace(replace(replace(replace(replace(
   // base64, not the plaintext: see the comment above the apply, and
   // check_secrets() in scripts/check_azure_template.py, which fails if this
   // ever goes back to a raw substitution.
-  '@@WEBPASSWORD@@', base64(webPassword))
+  '@@WEBPASSWORD@@', base64(webPassword)),
+  '@@PORTALISSUERB64@@', base64(portalIssuerYaml)),
+  '@@PORTALUSERIDB64@@', base64(portalUserYaml))
 
 // ---------------------------------------------------------------------------
 

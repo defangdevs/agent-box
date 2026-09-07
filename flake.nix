@@ -642,8 +642,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                         enable = true;
                         domain = "portal.test";
                         user = "agent";
-                        portalIssuer = "https://portal.defang.io";
-                        portalKeyFiles = [ "/etc/agent-box/portal-key.pub" ];
+                        portalIssuer = "https://station.example.com";
                       };
                     };
                     system.stateVersion = "25.05";

@@ -36,9 +36,15 @@ jobs:
           az bicep install --version "$(cat deploy/azure/.bicep-version)"
           az bicep version
 
+      - name: Install PyYAML
+        # check_azure_template.py parses the config.yaml the bootstrap
+        # writes, so it needs a YAML parser.
+        run: python3 -m pip install --quiet pyyaml
+
       # Recompiles and diffs (the committed JSON is what the README's Deploy
       # button hands the portal, so an edit that never reached it ships
-      # nothing), renders the bootstrap and parses it under bash, and fails if
-      # the web password leaves the extension's protectedSettings.
+      # nothing), renders the bootstrap and parses it under bash, parses the
+      # config.yaml that bootstrap writes, and fails if the web password
+      # leaves the extension's protectedSettings.
       - name: Check the compiled template and the bootstrap it carries
         run: python3 scripts/check_azure_template.py

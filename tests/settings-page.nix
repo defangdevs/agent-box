@@ -20,9 +20,60 @@
   name = "agent-box-settings-page";
   node.pkgsReadOnly = false;
 
-  nodes.machine = { pkgs, lib, ... }: {
+  nodes.machine = { pkgs, lib, ... }: let
+    # Portal handover (issue #541) now verifies against the key set the
+    # portal PUBLISHES, so the test has to publish one. Built here rather
+    # than generated in an activation script: the private half has to be
+    # readable by the minter too, and a fixture in the store is stable
+    # across both.
+    portalKeys = pkgs.runCommand "portal-test-keys" {
+      nativeBuildInputs = [ pkgs.openssl pkgs.python3 ];
+    } ''
+      mkdir -p $out
+      openssl genpkey -algorithm ed25519 -out $out/key.pem
+      openssl pkey -in $out/key.pem -pubout -outform DER -out pub.der
+      # A SECOND keypair the JWK Set deliberately does NOT carry, for the
+      # "correctly formed, signed by a key nobody published" case.
+      openssl genpkey -algorithm ed25519 -out $out/other.pem
+      # An Ed25519 SubjectPublicKeyInfo is a fixed 12-byte prefix plus the
+      # 32-byte key, so the JWK is a slice — no encoder, no crypto.
+      python3 -c '
+import base64, json, sys
+der = open("pub.der", "rb").read()
+assert len(der) == 44, len(der)
+x = base64.urlsafe_b64encode(der[12:]).rstrip(b"=").decode()
+json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
+                     "kid": "test-key-1", "x": x}]}, sys.stdout)
+' > $out/jwks.json
+    '';
+    # A cert for box.test that the MACHINE trusts, so the settings daemon's
+    # own outbound fetch of the key set verifies. `tls internal` cannot do
+    # that job: its CA is minted at runtime, and the daemon would have to be
+    # told about it after caddy first ran.
+    portalTls = pkgs.runCommand "box-test-tls" {
+      nativeBuildInputs = [ pkgs.openssl ];
+    } ''
+      mkdir -p $out
+      openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout $out/key.pem -out $out/cert.pem \
+        -subj "/CN=box.test" -days 36500 \
+        -addext "subjectAltName=DNS:box.test"
+      chmod 0644 $out/key.pem
+    '';
+  in {
     imports = [ agent-box ];
     virtualisation.memorySize = 2048;
+    # So the settings daemon's OWN fetch of the key set verifies. Python
+    # reads /etc/ssl/certs/ca-certificates.crt by default, which is exactly
+    # what this option builds — no env var on the unit, and none needed on a
+    # real box either, where the portal has a public cert.
+    security.pki.certificateFiles = [ "${portalTls}/cert.pem" ];
+    # testScript is outside this function's scope, so the fixture is exposed
+    # at a fixed path rather than interpolated into the script.
+    environment.etc."agent-box-portal".source = portalKeys;
+    # ...and so it can RESOLVE the issuer. On a real box that is public DNS;
+    # here the box is its own portal.
+    networking.hosts."127.0.0.1" = [ "box.test" ];
     # `agent-box-mint` stands in for the PORTAL (issue #541): it signs a
     # handover token exactly as docs/portal-handoff.md says one is signed,
     # so the subtests below exercise the daemon's real verification rather
@@ -46,8 +97,13 @@
       def main():
           over = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
           now = int(time.time())
+          # `kid` selects among the keys the portal published. Overridable,
+          # so a token naming a key nobody published can be tested.
+          kid = over.pop("kid", "test-key-1")
           header = {"alg": over.pop("alg", "EdDSA"), "typ": "JWT"}
-          claims = {"iss": "https://portal.test", "aud": "agent-box",
+          if kid:
+              header["kid"] = kid
+          claims = {"iss": "https://box.test", "aud": "agent-box",
                     "sub": "usr_2Nk9x", "project": "acme-prod",
                     "iat": now, "exp": now + 60,
                     "jti": over.pop("jti", "jti-%d" % now)}
@@ -65,7 +121,7 @@
               print(signing.decode() + ".")
               return
           key_path = os.environ.get("MINT_KEY",
-                                    "/var/lib/agent-box-portal/key.pem")
+                                    "/etc/agent-box-portal/key.pem")
           with tempfile.TemporaryDirectory() as work:
               msg = os.path.join(work, "msg")
               with open(msg, "wb") as handle:
@@ -110,8 +166,9 @@
         # password hash it is world-readable — the settings daemon runs as
         # `agent` and could not read it out of the 0700 root directory the
         # hash lives in.
-        portalIssuer = "https://portal.test";
-        portalKeyFiles = [ "/var/lib/agent-box-portal/key.pub" ];
+        # The box serves the key set itself (see the Caddyfile below), so
+        # the derived well-known path resolves to its own vhost.
+        portalIssuer = "https://box.test";
       };
       # Issue 54: the settings page grows an "Update agent-box" button that triggers
       # agent-box-update.service through the allowlisted sudo rule. The VM has
@@ -136,25 +193,6 @@
       fi
     '';
 
-    system.activationScripts.agent-box-portal-key.text = ''
-      install -d -m 0755 /var/lib/agent-box-portal
-      if [ ! -s /var/lib/agent-box-portal/key.pem ]; then
-        ${pkgs.openssl}/bin/openssl genpkey -algorithm ed25519 \
-          -out /var/lib/agent-box-portal/key.pem
-        chmod 0600 /var/lib/agent-box-portal/key.pem
-        ${pkgs.openssl}/bin/openssl pkey -in /var/lib/agent-box-portal/key.pem \
-          -pubout -out /var/lib/agent-box-portal/key.pub
-        chmod 0644 /var/lib/agent-box-portal/key.pub
-      fi
-      # A second keypair the box does NOT trust, for the forged-signature
-      # subtest. Same shape, never named in portalKeyFiles.
-      if [ ! -s /var/lib/agent-box-portal/other.pem ]; then
-        ${pkgs.openssl}/bin/openssl genpkey -algorithm ed25519 \
-          -out /var/lib/agent-box-portal/other.pem
-        chmod 0600 /var/lib/agent-box-portal/other.pem
-      fi
-    '';
-
     # Minimal `tls internal` Caddyfile that keeps the settings route's auth
     # gate but proxies to the settings daemon's unix socket. Same env
     # placeholder the module wires up, so agent-web-auth-secrets still feeds
@@ -162,7 +200,15 @@
     services.caddy.configFile = lib.mkForce (pkgs.writeText "Caddyfile" ''
       box.test {
         log
-        tls internal
+        tls ${portalTls}/cert.pem ${portalTls}/key.pem
+        # The portal's published key set. Unauthenticated on purpose --
+        # these are PUBLIC keys, and the daemon fetching them holds no
+        # credential for this vhost.
+        handle /.well-known/jwks.json {
+          root * ${portalKeys}
+          rewrite * /jwks.json
+          file_server
+        }
         # Portal handover (issue #541): the one unauthenticated route, and
         # more specific than the catch-all so caddy reaches it first.
         handle /agent/auth/* {
@@ -625,7 +671,7 @@
     # therefore drive the real daemon and the real caddy together, one bent
     # field at a time. They run BEFORE the password change below, so the
     # basic-auth fallback can still be proved with the original password.
-    mint = "MINT_KEY=/var/lib/agent-box-portal/key.pem agent-box-mint"
+    mint = "MINT_KEY=/etc/agent-box-portal/key.pem agent-box-mint"
 
     def handoff(token_cmd, expect):
         """POST a minted token through caddy and assert the status."""
@@ -702,7 +748,8 @@
     handoff(f"{mint} '{{\"jti\": \"replay-me\"}}'", "401")
 
     # Everything the signature must not survive.
-    handoff("MINT_KEY=/var/lib/agent-box-portal/other.pem agent-box-mint", "401")
+    handoff("MINT_KEY=/etc/agent-box-portal/other.pem agent-box-mint",
+            "401")
     handoff(f"{mint} '{{\"alg\": \"none\"}}'", "401")
     handoff(f"{mint} '{{\"iss\": \"https://evil.test\"}}'", "401")
     handoff(f"{mint} '{{\"aud\": \"portal-api\"}}'", "401")
@@ -725,6 +772,27 @@
     # by a second VM boot.
     handoff(f"{mint} '{{\"project\": \"someone-elses\"}}'", "403")
     handoff(f"{mint} '{{\"project\": null}}'", "403")
+
+    # The keys came from the portal's own published set, over HTTPS, and are
+    # cached on disk -- so a rotation is the portal's business and a restart
+    # does not refetch on the one route an anonymous caller can reach.
+    machine.succeed(
+        "test -s /home/agent/.config/agent-box/web-sessions/jwks/cache.json")
+    machine.succeed(
+        "grep -q test-key-1 "
+        "/home/agent/.config/agent-box/web-sessions/jwks/cache.json")
+    # The key set is public and served unauthenticated, because the daemon
+    # fetching it holds no credential for this vhost.
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' "
+        "https://box.test/.well-known/jwks.json | grep -x 200")
+    # A `kid` the portal never published is refused. The daemon refetches
+    # once on a miss (a just-published key is the ordinary reason for one),
+    # and the key still is not there.
+    handoff(f"{mint} '{{\"kid\": \"never-published\"}}'", "401")
+    # No kid at all still works: the contract makes it advisory, and the box
+    # then tries every Ed25519 key in the set.
+    handoff(f"{mint} '{{\"kid\": null, \"jti\": \"nokid\"}}'", "303")
 
     # A forged session cookie is refused -- and the refusal CLEARS it and
     # asks for a password, so an expired session degrades to the normal

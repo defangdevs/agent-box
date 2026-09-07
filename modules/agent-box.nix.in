@@ -620,11 +620,6 @@ let
     let u = cfg.users.${name}; in
     cfg.web.enable
     && cfg.web.portalIssuer != ""
-    && cfg.web.portalKeyFiles != [ ]
-    # Every path non-empty, not merely the list: an empty one renders an
-    # empty AGENT_BOX_PORTAL_KEYS, the daemon then serves no handover, and
-    # the caddy route below would stand with nothing behind it.
-    && !(builtins.elem "" (map toString cfg.web.portalKeyFiles))
     && u.web.portalUser != "";
   seedMain = u:
     if u.seedMainSession != null then u.seedMainSession
@@ -1714,15 +1709,15 @@ in
         '';
       };
 
-      # Portal handover (issue #541). The box is a pure VERIFIER: it makes
-      # no call back to the portal, so it needs no portal credential, no
-      # egress and no JWKS fetch. Both of these plus a user's
-      # web.portalUser/web.portalProject are required before any handover
-      # route is served at all.
+      # Portal handover (issue #541). The box is a VERIFIER: it holds no
+      # portal credential and the portal never calls in. It does reach OUT,
+      # once per cache period, for the portal's published signing keys —
+      # which is what keeps a rotation from touching every box. An issuer
+      # plus a user's web.portalUser are what a handover route needs.
       portalIssuer = lib.mkOption {
         type = lib.types.str;
         default = "";
-        example = "https://portal.defang.io";
+        example = "https://station.example.com";
         description = ''
           The `iss` a portal handover token must carry, compared exactly.
           Empty (the default) disables handover: the unauthenticated
@@ -1733,20 +1728,27 @@ in
         '';
       };
 
-      portalKeyFiles = lib.mkOption {
-        type = lib.types.listOf lib.types.path;
-        default = [ ];
-        example = [ "/etc/agent-box/portal-key.pub" ];
+      portalJwksUrl = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "https://station.example.com/.well-known/jwks.json";
         description = ''
-          Ed25519 PUBLIC keys, PEM, that may sign a handover token. Every
-          key is tried, so a rotation is a two-entry list and needs no
-          agreement with the portal about a `kid` first.
+          Where the portal publishes its signing keys. Empty (the default)
+          derives it from portalIssuer as
+          <portalIssuer>/.well-known/jwks.json, which is the well-known
+          location and what a portal following it needs no configuration
+          for.
 
-          Public keys only — nothing here is a secret, which is the point of
-          signing the handover asymmetrically rather than with a per-box
-          shared secret: the portal keeps one keypair for the fleet, and a
-          token names a user and a project rather than a box (decided on
-          issue #541).
+          The box FETCHES the key set and caches it, so a key rotation is
+          the portal's business alone — no box is redeployed, and no public
+          key is committed to a template. An unknown `kid` forces one
+          rate-limited refetch, so a newly published key is picked up
+          without waiting for the cache to expire.
+
+          Derived from CONFIGURATION, never from the token: a URL a token
+          could choose (a `jku` header, say) would make the signature check
+          meaningless. Set this only for a portal that publishes somewhere
+          other than the well-known path.
         '';
       };
 
@@ -3503,7 +3505,11 @@ in
             # than passed empty.
             + lib.optionalString (portalHandoffFor name) (
                 "AGENT_BOX_PORTAL_ISSUER=${cfg.web.portalIssuer}\n"
-                + "AGENT_BOX_PORTAL_KEYS=${lib.concatMapStringsSep ":" toString cfg.web.portalKeyFiles}\n"
+                # Only when overridden: the daemon derives the well-known
+                # path from the issuer, so passing it unconditionally would
+                # be one more place the default could drift.
+                + lib.optionalString (cfg.web.portalJwksUrl != "")
+                    "AGENT_BOX_PORTAL_JWKS_URL=${cfg.web.portalJwksUrl}\n"
                 + "AGENT_BOX_PORTAL_USER=${cfg.users.${name}.web.portalUser}\n"
                 + lib.optionalString (cfg.users.${name}.web.portalProject != "")
                     "AGENT_BOX_PORTAL_PROJECT=${cfg.users.${name}.web.portalProject}\n"
