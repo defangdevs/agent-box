@@ -353,10 +353,15 @@ sooner. What is NOT reaped is a hook session that CRASHED: a non-zero exit is
 never parked, so it stays listed and attachable for you to read - `rm` it once
 you have. That cleanup is load-bearing: at most 4
 `hook-*` sessions may RUN at once, and once that ceiling is reached EVERY
-watch on the box is inert - a matching batch is refused and dropped, never
-queued. A stopped session frees its slot even before it is delisted. So before you conclude a repo has been quiet, run `agent-box-webhook
-status`: its `dispatch` object has the live count against the ceiling and the
-last batch the ceiling dropped.
+watch on the box is stalled - a matching batch starts nothing until a slot
+frees. It is no longer LOST while it waits: the wrapper declines it and the
+receiver keeps it, re-offers it as slots free, and drops it only after an hour
+of waiting. A stopped session frees its slot even before it is delisted. So
+before you conclude a repo has been quiet, run `agent-box-webhook status`: its
+`dispatch` object has the live count against the ceiling and the last batch the
+ceiling turned away. `lastRefusal.deferred` records the ANSWER that batch got -
+declined for retry rather than dropped - and stays true afterwards, so it is
+history and never a list of what is waiting now.
 
 Payload rules (`--when` / `--drop`, JSON predicates over payload paths) ARE a
 watch's spawn policy - see `agent-box-webhook --help`. This box's watches on

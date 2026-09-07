@@ -562,8 +562,11 @@ On by default (`webhook.enable`), needs `web.enable`. How it fits together:
   coalesce into one session; concurrent spawns are capped, and the wrapper
   refuses to accumulate more than a handful of live `hook-*` sessions — counted
   as sessions that are actually running, so a finished one frees its slot even
-  if nobody delisted it. The spawned session's prompt tells it to remove itself
-  when done.
+  if nobody delisted it. A batch that arrives at that ceiling is **queued, not
+  dropped**: the wrapper declines it with `EX_TEMPFAIL` and the receiver
+  re-offers it as slots free (bounded by `LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S`, an
+  hour here). The spawned session's prompt tells it to remove itself when
+  done.
 - The **settings page**'s **Webhook** panel carries both halves of what a
   sender's form asks for — the payload URL per configured source and that
   source's secret — each with a **copy button**, so registering a webhook needs
