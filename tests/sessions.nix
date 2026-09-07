@@ -379,6 +379,20 @@ in
             " /home/agent/.config/agent-box/sessions.json"
         )
 
+        # A --cwd that resolves outside $HOME is refused too, the same
+        # containment the settings page's add-session form already enforces
+        # (resolve_browse_dir in settings-daemon.py) — a directory that
+        # exists is not enough on its own.
+        machine.succeed("mkdir -p /tmp/outside-home")
+        machine.fail(as_agent(
+            "agent-box-session add outsidecwd --harness claude"
+            " --cwd /tmp/outside-home"
+        ))
+        machine.fail(
+            "jq -e '.sessions.outsidecwd'"
+            " /home/agent/.config/agent-box/sessions.json"
+        )
+
     # --- runtime add: no sudo, no rebuild ---------------------------------
     machine.succeed(
         "su -s /bin/sh agent -c 'agent-box-session add helper --harness codex'"

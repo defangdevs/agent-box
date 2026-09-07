@@ -73,9 +73,11 @@ usage() {
   echo '--cwd is where the session starts (default $HOME, shared by every'
   echo "session). To work a repo another session is already in, give this one"
   echo "a checkout of its own: git worktree add ~/worktrees/NAME -b BRANCH."
-  echo "--cwd must already exist; it is resolved to an absolute path before"
-  echo "the session is registered, so 'add' fails up front on a typo instead"
-  echo "of registering a session that can only ever fail to start."
+  echo "--cwd must already exist and stay inside \$HOME (like the settings"
+  echo "page's add-session form); it is resolved to an absolute path before"
+  echo "the session is registered, so 'add' fails up front on a typo or an"
+  echo "outside path instead of registering a session that can only ever"
+  echo "fail to start."
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
   echo "--ephemeral marks a ONE-SHOT session: parking it (a clean agent exit, or"
@@ -482,6 +484,19 @@ case "$cmd" in
         echo "agent-box-session: --cwd '$cwd' does not exist" >&2
         exit 2
       }
+      # Same containment rule the settings page's add-session form already
+      # enforces (resolve_browse_dir in settings-daemon.py): confined to
+      # HOME, checked AFTER symlink resolution so a symlink cannot launder a
+      # path that escapes it. Without this the CLI and the web UI accepted
+      # different --cwd contracts once both started resolving to an
+      # absolute path.
+      case "$abscwd" in
+        ("$HOME" | "$HOME/"*) ;;
+        (*)
+          echo "agent-box-session: --cwd '$cwd' resolves to '$abscwd', outside \$HOME ('$HOME')" >&2
+          exit 2
+          ;;
+      esac
       cwd="$abscwd"
     fi
     # An agent PROFILE (issue #321) resolves to a harness plus the arguments
