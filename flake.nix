@@ -600,6 +600,121 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               printf 'per-session routes present for every user, and the Caddyfile adapts\n' > "$out"
             '';
 
+          # Guard (issue #541): portal handover adds the ONE unauthenticated
+          # route on this vhost, so its shape is worth locking down in a
+          # cheap eval check rather than only in a VM test. Three things
+          # must hold, and each has a way of silently going wrong:
+          #
+          #  - the handover endpoint carries NO basic_auth (a gate there
+          #    defeats the whole flow, exactly as with the webhook ingress);
+          #  - it is EXCLUDED from the session rewrites, which run before any
+          #    handle and would otherwise turn /<user>/auth/handoff into
+          #    /<user>/handoff?arg=auth — a session named "auth" that does
+          #    not exist, with nothing to say why;
+          #  - a user WITHOUT a complete mapping gets no such route at all,
+          #    because an unauthenticated endpoint on a box nobody wired to a
+          #    portal is pure surface.
+          portal-route =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      users.agent.web.portalUser = "usr_2Nk9x";
+                      users.agent.web.portalProject = "acme-prod";
+                      # HALF a mapping, deliberately: bob names a portal user
+                      # and no project. Both halves are checked together, so
+                      # a config like this must admit nobody — and the way it
+                      # does that is by having no route at all.
+                      users.bob.web.passwordHashFile = "/var/lib/agent-box-web/bob-hash";
+                      users.bob.web.portalUser = "usr_other";
+                      web = {
+                        enable = true;
+                        domain = "portal.test";
+                        user = "agent";
+                        portalIssuer = "https://portal.defang.io";
+                        portalKeyFiles = [ "/etc/agent-box/portal-key.pub" ];
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-portal-route-ok"
+              { caddyfile = sys.config.services.caddy.configFile;
+                nativeBuildInputs = [ pkgs.caddy ]; } ''
+              # 1. The handover surface exists for the fully-mapped user...
+              grep -qF 'handle /agent/auth/*' "$caddyfile"
+              # ...and reaches the daemon, which is what verifies the token.
+              # caddy cannot: it has no JWT module in this build, which is
+              # the whole reason the check lives in the daemon (issue #541).
+              grep -qF 'reverse_proxy unix//run/agent-box-settings/agent.sock' "$caddyfile"
+
+              # 2. And carries NO auth of its own. Read the block, not the
+              # file: basic_auth appears all over this Caddyfile, so a
+              # whole-file grep would pass while the gate sat right here.
+              block=$(awk '/^[[:space:]]*handle \/agent\/auth\/\*/{f=1} f{print} \
+                           f&&/^[[:space:]]*}[[:space:]]*$/{exit}' "$caddyfile")
+              printf '%s\n' "$block" | grep -qF 'reverse_proxy'
+              if printf '%s\n' "$block" | grep -q 'basic_auth\|forward_auth'; then
+                echo "handover endpoint must be unauthenticated:" >&2
+                printf '%s\n' "$block" >&2
+                exit 1
+              fi
+
+              # 3. bob has half a mapping, so he gets NO handover route.
+              if grep -qF 'handle /bob/auth/*' "$caddyfile"; then
+                echo "bob declares no portalProject and must have no handover route" >&2
+                exit 1
+              fi
+
+              # 4. The rewrites let it through. These run BEFORE any handle,
+              # so without the exclusions the route above is unreachable and
+              # every check up to here would still pass.
+              grep -qF 'not path /agent/settings /agent/downloads /agent/webhook /agent/token /agent/ws /agent/auth' "$caddyfile"
+              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/webhook* /agent/auth/*' "$caddyfile"
+
+              # 5. Every authenticated route also admits a live portal
+              # session, and asks the daemon rather than matching a static
+              # string — including bob's, whose sessions simply never exist.
+              for u in agent bob; do
+                for m in settings_$u dl_$u home_$u sess_$u; do
+                  grep -qF "@portal_$m header_regexp Cookie" "$caddyfile"
+                done
+              done
+              grep -qF '@portal_root header_regexp Cookie' "$caddyfile"
+              [ "$(grep -c 'uri /agent/auth/verify' "$caddyfile")" = 5 ]
+
+              # 6. The basic-auth branches must NEVER consult the daemon: it
+              # is the path that has to keep working when the daemon is in a
+              # crash loop, or a bad deploy locks the box owner out of their
+              # own machine with no way back in.
+              for b in $(grep -n 'basic_auth' "$caddyfile" | cut -d: -f1); do
+                if sed -n "$((b - 4)),$((b + 4))p" "$caddyfile" | grep -q 'forward_auth'; then
+                  echo "a basic_auth branch depends on the settings daemon" >&2
+                  exit 1
+                fi
+              done
+
+              # 7. And it all parses, with the same stand-in secrets
+              # session-route uses.
+              WEB_PASSWORD_ALGORITHM_AGENT=bcrypt \
+              WEB_PASSWORD_HASH_AGENT='$2a$14$ptCNRCTOMkoUnEXBv0kPWuOJHhYtnpBWQZbLFXW/Ehg5AGKQMoS/W' \
+              WEB_COOKIE_SECRET_AGENT=0123456789abcdef \
+              WEB_PASSWORD_ALGORITHM_BOB=bcrypt \
+              WEB_PASSWORD_HASH_BOB='$2a$14$ptCNRCTOMkoUnEXBv0kPWuOJHhYtnpBWQZbLFXW/Ehg5AGKQMoS/W' \
+              WEB_COOKIE_SECRET_BOB=fedcba9876543210 \
+                caddy validate --config "$caddyfile" --adapter caddyfile
+              printf 'handover route unauthenticated, gated, reachable, and the Caddyfile adapts\n' > "$out"
+            '';
+
           # Guard (issue #101): the module's REAL generated Caddyfile (the VM
           # test below swaps in a `tls internal` stand-in) must route the
           # webhook path to the user's ingress socket, BEFORE the /<user>/*

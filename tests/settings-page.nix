@@ -23,7 +23,62 @@
   nodes.machine = { pkgs, lib, ... }: {
     imports = [ agent-box ];
     virtualisation.memorySize = 2048;
-    environment.systemPackages = [ pkgs.curl ];
+    # `agent-box-mint` stands in for the PORTAL (issue #541): it signs a
+    # handover token exactly as docs/portal-handoff.md says one is signed,
+    # so the subtests below exercise the daemon's real verification rather
+    # than a fixture the daemon and the test could drift apart on.
+    # Overrides let each subtest bend ONE field and watch it be refused.
+    environment.systemPackages = [ pkgs.curl pkgs.openssl (pkgs.writers.writePython3Bin
+      "agent-box-mint" { flakeIgnore = [ "E501" ]; } ''
+      import base64
+      import json
+      import os
+      import subprocess
+      import sys
+      import tempfile
+      import time
+
+
+      def b64(raw):
+          return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+      def main():
+          over = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
+          now = int(time.time())
+          header = {"alg": over.pop("alg", "EdDSA"), "typ": "JWT"}
+          claims = {"iss": "https://portal.test", "aud": "agent-box",
+                    "sub": "usr_2Nk9x", "project": "acme-prod",
+                    "iat": now, "exp": now + 60,
+                    "jti": over.pop("jti", "jti-%d" % now)}
+          for key, value in over.items():
+              if value is None:
+                  claims.pop(key, None)
+              else:
+                  claims[key] = value
+          head = b64(json.dumps(header).encode())
+          body = b64(json.dumps(claims).encode())
+          signing = (head + "." + body).encode("ascii")
+          if header["alg"] != "EdDSA":
+              # alg:none carries no signature at all, which is the classic
+              # forgery the daemon must refuse on the header alone.
+              print(signing.decode() + ".")
+              return
+          key_path = os.environ.get("MINT_KEY",
+                                    "/var/lib/agent-box-portal/key.pem")
+          with tempfile.TemporaryDirectory() as work:
+              msg = os.path.join(work, "msg")
+              with open(msg, "wb") as handle:
+                  handle.write(signing)
+              sig = subprocess.run(
+                  ["openssl", "pkeyutl", "-sign", "-inkey", key_path,
+                   "-rawin", "-in", msg],
+                  capture_output=True, check=True).stdout
+          print(signing.decode() + "." + b64(sig))
+
+
+      main()
+    '') ];
     # A second, unrelated local user: must NOT be able to reach agent's
     # settings daemon (issue #49).
     users.users.mallory = {
@@ -44,11 +99,19 @@
         # below fails on "error connecting to .../tmux-1000/agent-box".
         seedMainSession = true;
       };
+      users.agent.web.portalUser = "usr_2Nk9x";
+      users.agent.web.portalProject = "acme-prod";
       web = {
         enable = true;
         domain = "box.test";
         user = "agent";
         fail2ban = false;
+        # Portal handover (issue #541). The key is PUBLIC, so unlike the
+        # password hash it is world-readable — the settings daemon runs as
+        # `agent` and could not read it out of the 0700 root directory the
+        # hash lives in.
+        portalIssuer = "https://portal.test";
+        portalKeyFiles = [ "/var/lib/agent-box-portal/key.pub" ];
       };
       # Issue 54: the settings page grows an "Update agent-box" button that triggers
       # agent-box-update.service through the allowlisted sudo rule. The VM has
@@ -73,6 +136,25 @@
       fi
     '';
 
+    system.activationScripts.agent-box-portal-key.text = ''
+      install -d -m 0755 /var/lib/agent-box-portal
+      if [ ! -s /var/lib/agent-box-portal/key.pem ]; then
+        ${pkgs.openssl}/bin/openssl genpkey -algorithm ed25519 \
+          -out /var/lib/agent-box-portal/key.pem
+        chmod 0600 /var/lib/agent-box-portal/key.pem
+        ${pkgs.openssl}/bin/openssl pkey -in /var/lib/agent-box-portal/key.pem \
+          -pubout -out /var/lib/agent-box-portal/key.pub
+        chmod 0644 /var/lib/agent-box-portal/key.pub
+      fi
+      # A second keypair the box does NOT trust, for the forged-signature
+      # subtest. Same shape, never named in portalKeyFiles.
+      if [ ! -s /var/lib/agent-box-portal/other.pem ]; then
+        ${pkgs.openssl}/bin/openssl genpkey -algorithm ed25519 \
+          -out /var/lib/agent-box-portal/other.pem
+        chmod 0600 /var/lib/agent-box-portal/other.pem
+      fi
+    '';
+
     # Minimal `tls internal` Caddyfile that keeps the settings route's auth
     # gate but proxies to the settings daemon's unix socket. Same env
     # placeholder the module wires up, so agent-web-auth-secrets still feeds
@@ -81,6 +163,11 @@
       box.test {
         log
         tls internal
+        # Portal handover (issue #541): the one unauthenticated route, and
+        # more specific than the catch-all so caddy reaches it first.
+        handle /agent/auth/* {
+          reverse_proxy unix//run/agent-box-settings/agent.sock
+        }
         handle /agent/settings* {
           @cookie_settings header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
           handle @cookie_settings {
@@ -100,6 +187,18 @@
         # routes (the daemon runs in AGENT_BOX_HOME mode for web.user) —
         # same auth gate, same upstream, mirroring the module Caddyfile.
         handle {
+          # A live portal session reaches the box exactly as a basic-auth
+          # login does, and caddy asks the daemon rather than matching a
+          # static string. forward_auth is stock caddy, no plugin.
+          @portal_root header_regexp Cookie "(^|; )__Host-agent_box_session_agent=([A-Za-z0-9_-]+)(;|$)"
+          handle @portal_root {
+            route {
+              forward_auth unix//run/agent-box-settings/agent.sock {
+                uri /agent/auth/verify
+              }
+              reverse_proxy unix//run/agent-box-settings/agent.sock
+            }
+          }
           @cookie_root header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
           handle @cookie_root {
             reverse_proxy unix//run/agent-box-settings/agent.sock
@@ -514,6 +613,138 @@
         "https://box.test/agent/settings/password | grep -x 403"
     )
     client.succeed("grep -q 'Current password is incorrect' /tmp/wrong")
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "https://box.test/agent/settings/ | grep -x 200"
+    )
+
+    # -- portal session handover (issue #541) --------------------------------
+    #
+    # The daemon is the trust boundary here: caddy has no JWT module in this
+    # build, so it forwards the token and the ANSWER decides. These subtests
+    # therefore drive the real daemon and the real caddy together, one bent
+    # field at a time. They run BEFORE the password change below, so the
+    # basic-auth fallback can still be proved with the original password.
+    mint = "MINT_KEY=/var/lib/agent-box-portal/key.pem agent-box-mint"
+
+    def handoff(token_cmd, expect):
+        """POST a minted token through caddy and assert the status."""
+        token = machine.succeed(token_cmd).strip()
+        return client.succeed(
+            f"{curl} -sS -o /tmp/hand -D /tmp/handh -w '%{{http_code}}' "
+            f"--data-urlencode 'token={token}' "
+            f"https://box.test/agent/auth/handoff | grep -x {expect}"
+        )
+
+    # The route is served without any box credential at all -- that is the
+    # whole point of it, and the one place on this vhost where that is true.
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST "
+        "https://box.test/agent/auth/handoff | grep -x 401"
+    )
+    # ...but only for POST. A token in a query string would be written to
+    # caddy's access log, the browser history and any outbound Referer.
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' "
+        "'https://box.test/agent/auth/handoff?token=x' | grep -x 405"
+    )
+
+    # The body is BOUNDED before it is read. This is the one route an
+    # anonymous caller can reach, and _read_form allocates whatever
+    # Content-Length claims, so without a cap the caller sizes the daemon's
+    # memory (CodeRabbit on #588).
+    client.succeed(
+        "head -c 200000 /dev/zero | tr '\\0' 'a' > /tmp/big")
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST "
+        "--data-binary @/tmp/big -H 'Content-Type: application/x-www-form-urlencoded' "
+        "https://box.test/agent/auth/handoff | grep -x 413"
+    )
+
+    # A real handover: a valid token becomes a box session.
+    handoff(f"{mint}", "303")
+    client.succeed("grep -qi 'Location: /agent/' /tmp/handh")
+    client.succeed(
+        "grep -qi 'Set-Cookie: __Host-agent_box_session_agent=' /tmp/handh")
+    # 1 day, and SameSite=Lax -- Strict would be withheld on the very
+    # navigation the portal's POST leads to, so the user would land back on
+    # a basic-auth prompt and the handover would look like it did nothing.
+    client.succeed("grep -qi 'Max-Age=86400' /tmp/handh")
+    client.succeed("grep -qi 'SameSite=Lax' /tmp/handh")
+    client.succeed("grep -qi 'HttpOnly' /tmp/handh")
+
+    # That cookie now reaches the box, through forward_auth, with no password.
+    session = client.succeed(
+        "sed -n 's/.*__Host-agent_box_session_agent=\\([A-Za-z0-9_-]*\\).*/\\1/p' "
+        "/tmp/handh | head -1"
+    ).strip()
+    assert session, "handover set no session cookie"
+    # The daemon runs in HOME mode with one web user, so the vhost root
+    # REDIRECTS into that user's space. A 303 already proves the cookie was
+    # accepted rather than challenged -- a refusal is the 401 asserted
+    # below...
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' "
+        f"-H 'Cookie: __Host-agent_box_session_agent={session}' "
+        "https://box.test/ | grep -x 303"
+    )
+    # ...and following it proves the cookie reaches real content, not just
+    # the redirect.
+    client.succeed(
+        f"{curl} -L -o /dev/null -w '%{{http_code}}' "
+        f"-H 'Cookie: __Host-agent_box_session_agent={session}' "
+        "https://box.test/ | grep -x 200"
+    )
+
+    # Single use. The same token again is refused, so a token captured from
+    # a log or a Referer buys nothing.
+    handoff(f"{mint} '{{\"jti\": \"replay-me\"}}'", "303")
+    handoff(f"{mint} '{{\"jti\": \"replay-me\"}}'", "401")
+
+    # Everything the signature must not survive.
+    handoff("MINT_KEY=/var/lib/agent-box-portal/other.pem agent-box-mint", "401")
+    handoff(f"{mint} '{{\"alg\": \"none\"}}'", "401")
+    handoff(f"{mint} '{{\"iss\": \"https://evil.test\"}}'", "401")
+    handoff(f"{mint} '{{\"aud\": \"portal-api\"}}'", "401")
+    handoff(f"{mint} '{{\"exp\": 1700000000, \"iat\": 1699999999}}'", "401")
+    # A token whose own lifetime is over the box's ceiling, however valid
+    # its signature: a long-lived handover token is a bearer credential.
+    handoff(f"{mint} '{{\"exp\": 2000000000}}'", "401")
+
+    # A VALID signature is not authorization. The token names a portal user
+    # and project; this box hosts one pair and admits only that pair.
+    handoff(f"{mint} '{{\"project\": \"someone-elses\"}}'", "403")
+    handoff(f"{mint} '{{\"sub\": \"usr_somebody_else\"}}'", "403")
+
+    # A forged session cookie is refused -- and the refusal CLEARS it and
+    # asks for a password, so an expired session degrades to the normal
+    # login instead of wedging the browser on a bare 401 it cannot act on.
+    client.succeed(
+        f"{curl} -o /dev/null -D /tmp/refused -w '%{{http_code}}' "
+        "-H 'Cookie: __Host-agent_box_session_agent=notarealsession00000000' "
+        "https://box.test/ | grep -x 401"
+    )
+    client.succeed(
+        "grep -qi 'Set-Cookie: __Host-agent_box_session_agent=;' /tmp/refused")
+    client.succeed("grep -qi 'WWW-Authenticate: Basic' /tmp/refused")
+
+    # The session store keeps no live cookie: records are named by the
+    # SHA-256 of the secret, so reading the store back yields nothing that
+    # can be replayed as one.
+    machine.succeed(
+        "test -d /home/agent/.config/agent-box/web-sessions/sessions")
+    machine.fail(
+        f"grep -rq '{session}' /home/agent/.config/agent-box/web-sessions/")
+    # Every record, not merely one of them: `grep -qx 600` over a multi-line
+    # stat would pass on the first record and never look at the second.
+    machine.succeed(
+        "stat -c %a /home/agent/.config/agent-box/web-sessions/sessions/*.json "
+        "> /tmp/modes"
+    )
+    machine.succeed("test -s /tmp/modes")
+    machine.fail("grep -qvx 600 /tmp/modes")
+
+    # And basic auth is untouched by any of it.
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
         "https://box.test/agent/settings/ | grep -x 200"

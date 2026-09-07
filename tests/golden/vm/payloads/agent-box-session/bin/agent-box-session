@@ -578,7 +578,7 @@ valid_name() {
 # with the settings page — the more specific route wins and the session
 # becomes unreachable, with nothing on the page to say why. Mirrored by the
 # daemon's RESERVED_NAMES and the module's session-name assertion.
-RESERVED_NAMES="settings downloads webhook sessions token ws"
+RESERVED_NAMES="settings downloads webhook sessions token ws auth"
 reserved_name() {
   for r in $RESERVED_NAMES; do
     [ "$1" = "$r" ] && return 0

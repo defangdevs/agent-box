@@ -547,6 +547,16 @@ USER_SCHEMA = _Obj({
     "agent": STR,
     "ttydPort": PORT,
     "root": BOOL,
+    # Portal handover (issue #541). A project IS a linux user (#352), so a
+    # project's portal identity is declared on the user. Both halves or
+    # neither: `sub` and `project` are checked together, so a config with
+    # only one would admit every token carrying the other. Spelled at the
+    # top level here where the module spells them under `web` — native has
+    # no per-user `web` object at all (see the comment in class User on
+    # passwordHashFile), so this mirrors an existing divergence rather than
+    # inventing one.
+    "portalUser": STR,
+    "portalProject": STR,
     # attrsOf str in the module's option, so string values here too: an
     # unquoted YAML number is a config the other backend would reject.
     "environment": _Map("environment variable", STR),
@@ -568,7 +578,11 @@ BOX_SCHEMA = _Obj({
     "restartNotice": BOOL,
     "sudoAllowlist": STR_LIST,
     "jitNixpkgs": STR,
-    "web": _Obj({"enable": BOOL, "rebootButton": BOOL}),
+    # portalIssuer / portalKeyFiles: who may sign a handover token, and
+    # with which Ed25519 public keys (issue #541). The box is a pure
+    # verifier — it calls nothing back — so neither is a secret.
+    "web": _Obj({"enable": BOOL, "rebootButton": BOOL,
+                 "portalIssuer": STR, "portalKeyFiles": STR_LIST}),
     "webhook": _Obj({
         "enable": BOOL,
         "repo": STR,
@@ -660,6 +674,12 @@ class Spec:
         # like web.enable above; null still means off.
         self.reboot_button = (bool(web.get("rebootButton", True))
                               and self.web_enable)
+        # Portal handover (issue #541): the issuer a token must carry and
+        # the keys that may sign it. Empty either way means no handover
+        # route is served at all, so a box nobody wired to a portal
+        # exposes no unauthenticated endpoint.
+        self.portal_issuer = web.get("portalIssuer") or ""
+        self.portal_keys = list(web.get("portalKeyFiles") or [])
         self.protect_memory = bool(data.get("protectMemory", True))
         # Base-OS patching (see APT_CONF). Default on, because the failure
         # it prevents is silent: an unattended patch run that installs a
@@ -775,6 +795,9 @@ class User:
         # the root vhost - the config reversing what the operator wrote, for
         # the one field where that matters most.
         self.want_root = bool(data.get("root"))
+        # This user's portal identity (issue #541). See USER_SCHEMA.
+        self.portal_user = data.get("portalUser") or ""
+        self.portal_project = data.get("portalProject") or ""
         self.environment = dict(data.get("environment") or {})
         self.environment_files = list(data.get("environmentFiles") or [])
         sessions = data.get("sessions")
@@ -2145,6 +2168,21 @@ class Renderer:
                 # user, the norm, it redirects straight into them.
                 settings.append(("AGENT_BOX_WEB_USERS", ",".join(
                     x.name for x in self.spec.users)))
+            if self.portal_handoff(u):
+                # Portal handover (issue #541). Gated, not passed empty:
+                # the daemon serves no handover route unless all of these
+                # are set, which is what keeps the unauthenticated endpoint
+                # off a box nobody wired to a portal.
+                settings += [
+                    ("AGENT_BOX_PORTAL_ISSUER", self.spec.portal_issuer),
+                    ("AGENT_BOX_PORTAL_KEYS", ":".join(self.spec.portal_keys)),
+                    ("AGENT_BOX_PORTAL_USER", u.portal_user),
+                    ("AGENT_BOX_PORTAL_PROJECT", u.portal_project),
+                    # Ed25519 verification shells out to openssl (the
+                    # daemon takes no third-party import) and the unit has
+                    # systemd's default PATH, so it gets an absolute path.
+                    ("AGENT_BOX_OPENSSL", f"{self.bin}/openssl"),
+                ]
             if self.spec.webhook_enable:
                 settings.append(("AGENT_BOX_WEBHOOK_STATE_DIR",
                                  f"{u.home}/.local/state/local-webhook"))
@@ -2786,6 +2824,26 @@ class Renderer:
                f"{q(f'{self.bin}/agent-box-envstore')}\n"
                f'exec {self.bin}/agent-box-profile-bare "$@"\n', 0o755)
 
+    def portal_handoff(self, u):
+        """Whether portal handover is provisioned for this user (#541).
+
+        Mirrors portalHandoffFor in modules/agent-box.nix.in: an issuer, at
+        least one key, and BOTH halves of this user's mapping. Two callers
+        need the same answer — the settings daemon's env and the caddy
+        route that reaches it — and a route served without the env behind
+        it is an unauthenticated endpoint that can admit nobody.
+        """
+        # EVERY key path must be non-empty, not merely the list. env_file
+        # drops an empty value, so `portalKeyFiles: [""]` would hand the
+        # daemon no AGENT_BOX_PORTAL_KEYS at all -- it would then serve no
+        # handover, while caddy served the unauthenticated route anyway.
+        return bool(self.spec.web_enable
+                    and self.spec.portal_issuer
+                    and self.spec.portal_keys
+                    and all(self.spec.portal_keys)
+                    and u.portal_user
+                    and u.portal_project)
+
     def caddy(self, t):
         """Bind the shared Caddyfile fragments.
 
@@ -2836,6 +2894,10 @@ class Renderer:
         for u in self.spec.users:
             if self.spec.webhook_enable:
                 parts.append(bind("webhook", u))
+            # The handover route (issue #541), emitted only when it is
+            # provisioned — same reason the webhook block is conditional.
+            if self.portal_handoff(u):
+                parts.append(bind("portal", u))
             parts.append(bind("terminal", u))
         parts.append(bind("root", root_user))
         parts.append("}\n")

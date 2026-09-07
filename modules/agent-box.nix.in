@@ -604,6 +604,28 @@ let
   # so a user without one keeps the pre-#416 "main" session: a box with no
   # settings page and no seeded session has no way in but the console.
   userHasFrontDoor = u: cfg.web.enable && u.web.passwordHashFile != null;
+  # Portal handover (issue #541) is served for a user only when EVERY piece
+  # is declared: the box knows who signs a token and with what, and this
+  # user states both halves of its portal identity. Stated once, here,
+  # because two places need the same answer -- the daemon's env, and the
+  # caddy route that reaches it -- and an endpoint served by one but not
+  # provisioned by the other is either a 404 or an unauthenticated route
+  # with nothing behind it.
+  #
+  # Both halves of the mapping, never one: `sub` and `project` are checked
+  # together, so a config that set only one would otherwise admit every
+  # token carrying the other.
+  portalHandoffFor = name:
+    let u = cfg.users.${name}; in
+    cfg.web.enable
+    && cfg.web.portalIssuer != ""
+    && cfg.web.portalKeyFiles != [ ]
+    # Every path non-empty, not merely the list: an empty one renders an
+    # empty AGENT_BOX_PORTAL_KEYS, the daemon then serves no handover, and
+    # the caddy route below would stand with nothing behind it.
+    && !(builtins.elem "" (map toString cfg.web.portalKeyFiles))
+    && u.web.portalUser != ""
+    && u.web.portalProject != "";
   seedMain = u:
     if u.seedMainSession != null then u.seedMainSession
     else !(userHasFrontDoor u);
@@ -1233,6 +1255,37 @@ let
           `systemctl cat agent-web-terminal@<user>`.
         '';
       };
+
+      # Portal handover (issue #541). A project IS a linux user (#352), so
+      # the portal identity of a project is declared on the user, beside
+      # the password hash that is the other way in.
+      web.portalUser = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "usr_2Nk9xQ4mB7";
+        description = ''
+          The portal user id this linux user belongs to, for the portal
+          session handover (see services.agent-box.web.portalIssuer and
+          docs/portal-handoff.md). Empty (the default) means this user is
+          not reachable by handover at all.
+
+          Handover admits a portal-signed token only when BOTH this and
+          web.portalProject match the token's `sub` and `project` claims.
+          One alone admits nobody: a half-declared mapping that let anyone
+          through on the strength of the other half would be worse than no
+          handover.
+        '';
+      };
+
+      web.portalProject = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "acme-prod";
+        description = ''
+          The portal project id this linux user IS. See web.portalUser —
+          both are required for handover, and neither does anything alone.
+        '';
+      };
     };
   };
 
@@ -1652,6 +1705,42 @@ in
           `/run/current-system/sw/bin/systemctl reload caddy.service`.
           Which users get a browser terminal is separate — set
           users.<name>.web.passwordHashFile per user.
+        '';
+      };
+
+      # Portal handover (issue #541). The box is a pure VERIFIER: it makes
+      # no call back to the portal, so it needs no portal credential, no
+      # egress and no JWKS fetch. Both of these plus a user's
+      # web.portalUser/web.portalProject are required before any handover
+      # route is served at all.
+      portalIssuer = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "https://portal.defang.io";
+        description = ''
+          The `iss` a portal handover token must carry, compared exactly.
+          Empty (the default) disables handover: the unauthenticated
+          handover endpoint is not served, so a box nobody wired to a
+          portal exposes nothing extra.
+
+          The wire contract the portal is held to is docs/portal-handoff.md.
+        '';
+      };
+
+      portalKeyFiles = lib.mkOption {
+        type = lib.types.listOf lib.types.path;
+        default = [ ];
+        example = [ "/etc/agent-box/portal-key.pub" ];
+        description = ''
+          Ed25519 PUBLIC keys, PEM, that may sign a handover token. Every
+          key is tried, so a rotation is a two-entry list and needs no
+          agreement with the portal about a `kid` first.
+
+          Public keys only — nothing here is a secret, which is the point of
+          signing the handover asymmetrically rather than with a per-box
+          shared secret: the portal keeps one keypair for the fleet, and a
+          token names a user and a project rather than a box (decided on
+          issue #541).
         '';
       };
 
@@ -2460,7 +2549,7 @@ in
           # are already spoken for: the more specific route wins and the
           # session would be unreachable with nothing to say why. Mirrored by
           # the CLI's RESERVED_NAMES and the daemon's.
-          assertion = !(builtins.elem sname [ "settings" "downloads" "webhook" "sessions" "token" "ws" ]);
+          assertion = !(builtins.elem sname [ "settings" "downloads" "webhook" "sessions" "token" "ws" "auth" ]);
           message = "services.agent-box.users.${name}: session name \"${sname}\" is reserved — /${name}/${sname}/ is already a page on the web UI.";
         }
         {
@@ -3098,6 +3187,31 @@ in
         @@include:src/caddyfile-webhook.caddy@@
       '');
 
+      # ${"$"}{name}'s portal handover surface (issue #541): the one route on this
+      # vhost served UNAUTHENTICATED, because trading a portal-signed token
+      # for a box session is what it is for. The trust boundary is the
+      # token's Ed25519 signature plus this user's declared portal identity,
+      # checked by the settings daemon — not caddy, which cannot verify a
+      # signature without a plugin build this repo does not do.
+      #
+      # A SEPARATE fragment, and emitted only when portalHandoffFor says
+      # every piece is provisioned, for both of the reasons the webhook
+      # block above is one: a box nobody wired to a portal must expose no
+      # unauthenticated route at all, and a conditional interpolation inside
+      # terminalCaddyBlock would flatten that whole block's indentation.
+      #
+      # The forward_auth BRANCHES stay in terminalCaddyBlock unconditionally.
+      # They match on a cookie name that only a handover ever sets, so on a
+      # box without one they match nothing; and if a forged cookie does
+      # arrive, the daemon refuses it and asks for a password, which is the
+      # same answer every other route would give.
+      portalCaddyBlock = name: lib.optionalString (portalHandoffFor name)
+        (lib.replaceStrings
+          [ "@USER@" "@SETTINGS_SOCKET@" ]
+          [ name (settingsSocketOf name) ] ''
+        @@include:src/caddyfile-portal.caddy@@
+      '');
+
       terminalCaddyBlock = name:
         lib.replaceStrings
           [ "@USER@" "@USER_ENV@" "@SETTINGS_SOCKET@" "@DOWNLOADS_DIR@" "@TTYD_PORT@" ]
@@ -3134,7 +3248,8 @@ in
         @@include:src/caddyfile-header.caddy@@
       ''
       + lib.concatMapStringsSep "\n"
-          (name: indent "  " (webhookCaddyBlock name + terminalCaddyBlock name)) terminalUsers
+          (name: indent "  " (webhookCaddyBlock name + portalCaddyBlock name
+                              + terminalCaddyBlock name)) terminalUsers
       + "\n"
       + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
       + "}\n\n"
@@ -3372,6 +3487,23 @@ in
                 # because a terminal user is exactly the case where caddy
                 # serves that path.
                 + "AGENT_BOX_WEBHOOK_URL=https://${cfg.web.domain}${webhookPathOf name}\n"
+              )
+            # Portal handover (issue #541). Every piece must be present
+            # before the daemon serves the route at all, so the condition
+            # here is the same conjunction portalHandoffFor states: an
+            # issuer, at least one key, and BOTH halves of this user's
+            # mapping. A box missing any of them exposes no
+            # unauthenticated endpoint, which is why this is gated rather
+            # than passed empty.
+            + lib.optionalString (portalHandoffFor name) (
+                "AGENT_BOX_PORTAL_ISSUER=${cfg.web.portalIssuer}\n"
+                + "AGENT_BOX_PORTAL_KEYS=${lib.concatMapStringsSep ":" toString cfg.web.portalKeyFiles}\n"
+                + "AGENT_BOX_PORTAL_USER=${cfg.users.${name}.web.portalUser}\n"
+                + "AGENT_BOX_PORTAL_PROJECT=${cfg.users.${name}.web.portalProject}\n"
+                # Ed25519 verification shells out to openssl (the daemon
+                # takes no third-party import), and this unit has no PATH
+                # of its own, so it is given the absolute path.
+                + "AGENT_BOX_OPENSSL=${pkgs.openssl}/bin/openssl\n"
               );
         }) terminalUsers)
         // lib.optionalAttrs webhookEnabled (lib.listToAttrs (map (name: lib.nameValuePair "agent-box/units/agent-box-webhook-${name}.env" {

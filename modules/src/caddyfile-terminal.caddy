@@ -8,6 +8,21 @@ redir /@USER@ /@USER@/
 # (issue #49). More specific than /@USER@/* below, so Caddy routes
 # it here first.
 handle /@USER@/settings* {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_settings_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_session_@USER@=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_settings_@USER@ {
+    route {
+      forward_auth unix/@SETTINGS_SOCKET@ {
+        uri /@USER@/auth/verify
+      }
+      reverse_proxy unix/@SETTINGS_SOCKET@
+    }
+  }
   @cookie_settings_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
   handle @cookie_settings_@USER@ {
     reverse_proxy unix/@SETTINGS_SOCKET@
@@ -29,6 +44,23 @@ handle /@USER@/settings* {
 # here first. The agent hands the user a @USER@/downloads/<file> URL.
 redir /@USER@/downloads /@USER@/downloads/
 handle /@USER@/downloads/* {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_dl_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_session_@USER@=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_dl_@USER@ {
+    route {
+      forward_auth unix/@SETTINGS_SOCKET@ {
+        uri /@USER@/auth/verify
+      }
+      uri strip_prefix /@USER@/downloads
+      root * @DOWNLOADS_DIR@
+      file_server browse
+    }
+  }
   @cookie_dl_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
   handle @cookie_dl_@USER@ {
     uri strip_prefix /@USER@/downloads
@@ -58,6 +90,21 @@ handle /@USER@/downloads/* {
   not query arg=*
 }
 handle @home_@USER@ {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_home_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_session_@USER@=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_home_@USER@ {
+    route {
+      forward_auth unix/@SETTINGS_SOCKET@ {
+        uri /@USER@/auth/verify
+      }
+      reverse_proxy unix/@SETTINGS_SOCKET@
+    }
+  }
   @cookie_home_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
   handle @cookie_home_@USER@ {
     reverse_proxy unix/@SETTINGS_SOCKET@
@@ -86,15 +133,30 @@ handle @home_@USER@ {
 # exactly this set so no session can be shadowed by one of them.
 @sess_bare_@USER@ {
   path_regexp bare_@USER@ ^/@USER@/([^/]+)$
-  not path /@USER@/settings /@USER@/downloads /@USER@/webhook /@USER@/token /@USER@/ws
+  not path /@USER@/settings /@USER@/downloads /@USER@/webhook /@USER@/token /@USER@/ws /@USER@/auth
 }
 redir @sess_bare_@USER@ /@USER@/{re.bare_@USER@.1}/
 @sess_@USER@ {
   path_regexp sess_@USER@ ^/@USER@/([^/]+)/(.*)$
-  not path /@USER@/settings* /@USER@/downloads/* /@USER@/webhook*
+  not path /@USER@/settings* /@USER@/downloads/* /@USER@/webhook* /@USER@/auth/*
 }
 rewrite @sess_@USER@ /@USER@/{re.sess_@USER@.2}?arg={re.sess_@USER@.1}&{query}
 handle /@USER@/* {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_sess_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_session_@USER@=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_sess_@USER@ {
+    route {
+      forward_auth unix/@SETTINGS_SOCKET@ {
+        uri /@USER@/auth/verify
+      }
+      reverse_proxy 127.0.0.1:@TTYD_PORT@
+    }
+  }
   @cookie_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
   handle @cookie_@USER@ {
     reverse_proxy 127.0.0.1:@TTYD_PORT@

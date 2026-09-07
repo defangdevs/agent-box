@@ -3412,6 +3412,134 @@ def update_fixture():
     print(f"wrote {FIXTURE} and {MODES.name} — review the diff and commit")
 
 
+
+class PortalHandoff(unittest.TestCase):
+    """Portal session handover, native side (issue #541).
+
+    The renderer decides two things that must agree: whether the settings
+    daemon is TOLD about handover, and whether caddy serves the
+    unauthenticated route that reaches it. Disagreement is not a cosmetic
+    bug in either direction — a route with no env behind it is an
+    unauthenticated endpoint that can admit nobody, and env with no route is
+    provisioning that silently never applies.
+    """
+
+    def _render(self, users, web=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            mod = load_agentbox()
+            data = json.loads(CONFIG_JSON.read_text())
+            data["users"] = users
+            data.setdefault("web", {})
+            data["web"]["enable"] = True
+            data["web"].update(web or {})
+            spec_obj = mod.Spec(data, prof)
+            tree = mod.Renderer(spec_obj, prof, root=out).render()
+            return {str(k).replace(str(out), ""): v[0]
+                    for k, v in tree.files.items()}
+
+    PORTAL_WEB = {
+        "portalIssuer": "https://portal.defang.io",
+        "portalKeyFiles": ["/etc/agent-box/portal-key.pub"],
+    }
+    MAPPED = {"root": True, "portalUser": "usr_2Nk9x",
+              "portalProject": "acme-prod"}
+
+    def test_a_mapped_user_gets_the_env_and_the_route(self):
+        files = self._render({"agent": dict(self.MAPPED)}, self.PORTAL_WEB)
+        env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+        self.assertIn("AGENT_BOX_PORTAL_ISSUER=https://portal.defang.io", env)
+        self.assertIn("AGENT_BOX_PORTAL_USER=usr_2Nk9x", env)
+        self.assertIn("AGENT_BOX_PORTAL_PROJECT=acme-prod", env)
+        self.assertIn("AGENT_BOX_PORTAL_KEYS=/etc/agent-box/portal-key.pub",
+                      env)
+        # Verification shells out to openssl, and the unit has systemd's
+        # default PATH — so an absolute path or it never runs at all.
+        self.assertRegex(env, r"AGENT_BOX_OPENSSL=/.*/openssl")
+        self.assertIn("handle /agent/auth/*",
+                      files["/etc/agent-box/Caddyfile"])
+
+    def test_several_keys_are_colon_separated_for_a_rotation(self):
+        """Two keys is what a rotation looks like: the box tries both, so a
+        key change never waits on the portal and the box agreeing first."""
+        web = dict(self.PORTAL_WEB,
+                   portalKeyFiles=["/etc/agent-box/old.pub",
+                                   "/etc/agent-box/new.pub"])
+        env = self._render({"agent": dict(self.MAPPED)}, web)[
+            "/etc/agent-box/units/agent-box-settings-agent.env"]
+        self.assertIn(
+            "AGENT_BOX_PORTAL_KEYS=/etc/agent-box/old.pub:"
+            "/etc/agent-box/new.pub", env)
+
+    def test_half_a_mapping_admits_nobody(self):
+        """`sub` and `project` are checked together, so a user declaring one
+        without the other must get NO route and NO env — otherwise the half
+        that is set would admit every token carrying it."""
+        for half in ({"portalUser": "usr_2Nk9x"},
+                     {"portalProject": "acme-prod"}):
+            with self.subTest(half=sorted(half)):
+                files = self._render({"agent": dict(half, root=True)},
+                                     self.PORTAL_WEB)
+                env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+                self.assertNotIn("AGENT_BOX_PORTAL", env)
+                self.assertNotIn(
+                    "handle /agent/auth/*",
+                    files["/etc/agent-box/Caddyfile"],
+                    "served an unauthenticated handover route anyway")
+
+    def test_no_issuer_or_no_key_serves_no_handover_at_all(self):
+        """A box nobody wired to a portal must expose no unauthenticated
+        endpoint, even if a user declares a mapping."""
+        for web in ({}, {"portalIssuer": "https://portal.defang.io"},
+                    {"portalKeyFiles": ["/etc/agent-box/portal-key.pub"]}):
+            with self.subTest(web=sorted(web)):
+                files = self._render({"agent": dict(self.MAPPED)}, web)
+                env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+                self.assertNotIn("AGENT_BOX_PORTAL", env)
+                self.assertNotIn(
+                    "handle /agent/auth/*",
+                    files["/etc/agent-box/Caddyfile"],
+                    "served an unauthenticated handover route anyway")
+
+    def test_an_empty_key_path_enables_nothing(self):
+        """`portalKeyFiles: [""]` is a non-empty LIST of nothing.
+
+        env_file drops an empty value, so the daemon would be handed no
+        AGENT_BOX_PORTAL_KEYS and serve no handover — while caddy served the
+        unauthenticated route anyway. The two must agree, so an empty path
+        disables both (CodeRabbit on PR #588).
+        """
+        for keys in ([""], ["/etc/agent-box/key.pub", ""]):
+            with self.subTest(keys=keys):
+                files = self._render(
+                    {"agent": dict(self.MAPPED)},
+                    dict(self.PORTAL_WEB, portalKeyFiles=keys))
+                env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+                self.assertNotIn("AGENT_BOX_PORTAL", env)
+                self.assertNotIn(
+                    "handle /agent/auth/*",
+                    files["/etc/agent-box/Caddyfile"],
+                    "served a handover route the daemon will not answer")
+
+    def test_one_users_mapping_is_not_anothers(self):
+        """Two projects on one box: each gets its own route, its own env, and
+        neither inherits the other's portal identity."""
+        files = self._render(
+            {"agent": dict(self.MAPPED),
+             "bob": {"portalUser": "usr_bob", "portalProject": "bob-proj"}},
+            self.PORTAL_WEB)
+        agent_env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+        bob_env = files["/etc/agent-box/units/agent-box-settings-bob.env"]
+        self.assertIn("AGENT_BOX_PORTAL_PROJECT=acme-prod", agent_env)
+        self.assertIn("AGENT_BOX_PORTAL_PROJECT=bob-proj", bob_env)
+        self.assertNotIn("bob-proj", agent_env)
+        self.assertNotIn("acme-prod", bob_env)
+        caddyfile = files["/etc/agent-box/Caddyfile"]
+        self.assertIn("handle /agent/auth/*", caddyfile)
+        self.assertIn("handle /bob/auth/*", caddyfile)
+
+
 if __name__ == "__main__":
     if "--update" in sys.argv:
         update_fixture()

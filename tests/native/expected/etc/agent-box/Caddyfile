@@ -60,6 +60,21 @@ redir /agent /agent/
 # (issue #49). More specific than /agent/* below, so Caddy routes
 # it here first.
 handle /agent/settings* {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_settings_agent header_regexp Cookie "(^|; )__Host-agent_box_session_agent=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_settings_agent {
+    route {
+      forward_auth unix//run/agent-box-settings/agent.sock {
+        uri /agent/auth/verify
+      }
+      reverse_proxy unix//run/agent-box-settings/agent.sock
+    }
+  }
   @cookie_settings_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
   handle @cookie_settings_agent {
     reverse_proxy unix//run/agent-box-settings/agent.sock
@@ -81,6 +96,23 @@ handle /agent/settings* {
 # here first. The agent hands the user a agent/downloads/<file> URL.
 redir /agent/downloads /agent/downloads/
 handle /agent/downloads/* {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_dl_agent header_regexp Cookie "(^|; )__Host-agent_box_session_agent=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_dl_agent {
+    route {
+      forward_auth unix//run/agent-box-settings/agent.sock {
+        uri /agent/auth/verify
+      }
+      uri strip_prefix /agent/downloads
+      root * /var/lib/agent-box-downloads/agent
+      file_server browse
+    }
+  }
   @cookie_dl_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
   handle @cookie_dl_agent {
     uri strip_prefix /agent/downloads
@@ -110,6 +142,21 @@ handle /agent/downloads/* {
   not query arg=*
 }
 handle @home_agent {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_home_agent header_regexp Cookie "(^|; )__Host-agent_box_session_agent=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_home_agent {
+    route {
+      forward_auth unix//run/agent-box-settings/agent.sock {
+        uri /agent/auth/verify
+      }
+      reverse_proxy unix//run/agent-box-settings/agent.sock
+    }
+  }
   @cookie_home_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
   handle @cookie_home_agent {
     reverse_proxy unix//run/agent-box-settings/agent.sock
@@ -138,15 +185,30 @@ handle @home_agent {
 # exactly this set so no session can be shadowed by one of them.
 @sess_bare_agent {
   path_regexp bare_agent ^/agent/([^/]+)$
-  not path /agent/settings /agent/downloads /agent/webhook /agent/token /agent/ws
+  not path /agent/settings /agent/downloads /agent/webhook /agent/token /agent/ws /agent/auth
 }
 redir @sess_bare_agent /agent/{re.bare_agent.1}/
 @sess_agent {
   path_regexp sess_agent ^/agent/([^/]+)/(.*)$
-  not path /agent/settings* /agent/downloads/* /agent/webhook*
+  not path /agent/settings* /agent/downloads/* /agent/webhook* /agent/auth/*
 }
 rewrite @sess_agent /agent/{re.sess_agent.2}?arg={re.sess_agent.1}&{query}
 handle /agent/* {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_sess_agent header_regexp Cookie "(^|; )__Host-agent_box_session_agent=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_sess_agent {
+    route {
+      forward_auth unix//run/agent-box-settings/agent.sock {
+        uri /agent/auth/verify
+      }
+      reverse_proxy 127.0.0.1:7681
+    }
+  }
   @cookie_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
   handle @cookie_agent {
     reverse_proxy 127.0.0.1:7681
@@ -177,6 +239,21 @@ redir /robot /robot/
 # (issue #49). More specific than /robot/* below, so Caddy routes
 # it here first.
 handle /robot/settings* {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_settings_robot header_regexp Cookie "(^|; )__Host-agent_box_session_robot=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_settings_robot {
+    route {
+      forward_auth unix//run/agent-box-settings/robot.sock {
+        uri /robot/auth/verify
+      }
+      reverse_proxy unix//run/agent-box-settings/robot.sock
+    }
+  }
   @cookie_settings_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
   handle @cookie_settings_robot {
     reverse_proxy unix//run/agent-box-settings/robot.sock
@@ -198,6 +275,23 @@ handle /robot/settings* {
 # here first. The agent hands the user a robot/downloads/<file> URL.
 redir /robot/downloads /robot/downloads/
 handle /robot/downloads/* {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_dl_robot header_regexp Cookie "(^|; )__Host-agent_box_session_robot=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_dl_robot {
+    route {
+      forward_auth unix//run/agent-box-settings/robot.sock {
+        uri /robot/auth/verify
+      }
+      uri strip_prefix /robot/downloads
+      root * /var/lib/agent-box-downloads/robot
+      file_server browse
+    }
+  }
   @cookie_dl_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
   handle @cookie_dl_robot {
     uri strip_prefix /robot/downloads
@@ -227,6 +321,21 @@ handle /robot/downloads/* {
   not query arg=*
 }
 handle @home_robot {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_home_robot header_regexp Cookie "(^|; )__Host-agent_box_session_robot=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_home_robot {
+    route {
+      forward_auth unix//run/agent-box-settings/robot.sock {
+        uri /robot/auth/verify
+      }
+      reverse_proxy unix//run/agent-box-settings/robot.sock
+    }
+  }
   @cookie_home_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
   handle @cookie_home_robot {
     reverse_proxy unix//run/agent-box-settings/robot.sock
@@ -255,15 +364,30 @@ handle @home_robot {
 # exactly this set so no session can be shadowed by one of them.
 @sess_bare_robot {
   path_regexp bare_robot ^/robot/([^/]+)$
-  not path /robot/settings /robot/downloads /robot/webhook /robot/token /robot/ws
+  not path /robot/settings /robot/downloads /robot/webhook /robot/token /robot/ws /robot/auth
 }
 redir @sess_bare_robot /robot/{re.bare_robot.1}/
 @sess_robot {
   path_regexp sess_robot ^/robot/([^/]+)/(.*)$
-  not path /robot/settings* /robot/downloads/* /robot/webhook*
+  not path /robot/settings* /robot/downloads/* /robot/webhook* /robot/auth/*
 }
 rewrite @sess_robot /robot/{re.sess_robot.2}?arg={re.sess_robot.1}&{query}
 handle /robot/* {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_sess_robot header_regexp Cookie "(^|; )__Host-agent_box_session_robot=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_sess_robot {
+    route {
+      forward_auth unix//run/agent-box-settings/robot.sock {
+        uri /robot/auth/verify
+      }
+      reverse_proxy 127.0.0.1:7682
+    }
+  }
   @cookie_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
   handle @cookie_robot {
     reverse_proxy 127.0.0.1:7682
@@ -293,6 +417,21 @@ handle /robot/* {
 # userinfo + an EMPTY password, and credentials typed into the
 # prompt cannot override the URL-embedded identity.
 handle {
+  # A live portal session (issue #541) reaches this exactly as a
+  # basic-auth login does. forward_auth is stock caddy -- part of
+  # reverse_proxy, no plugin -- and the branch is FIRST so the cookie
+  # a handover just set is what answers. The basic-auth branch below
+  # never consults the daemon, so a crash loop here cannot lock the
+  # box owner out of their own machine.
+  @portal_root header_regexp Cookie "(^|; )__Host-agent_box_session_agent=([A-Za-z0-9_-]+)(;|$)"
+  handle @portal_root {
+    route {
+      forward_auth unix//run/agent-box-settings/agent.sock {
+        uri /agent/auth/verify
+      }
+      reverse_proxy unix//run/agent-box-settings/agent.sock
+    }
+  }
   @cookie_root header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
   handle @cookie_root {
     reverse_proxy unix//run/agent-box-settings/agent.sock
