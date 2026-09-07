@@ -322,6 +322,77 @@ in
         )
         machine.succeed(as_agent("agent-box-session rm themed"))
 
+    # --- --cwd is canonicalized before it becomes a trust key (issue #597) -
+    with subtest("agent-box-session add --cwd is resolved to an absolute path"):
+        # A relative or "~"-prefixed --cwd used to land in sessions.json —
+        # and so in the seeded hasTrustDialogAccepted key — as literal text
+        # that never matched the absolute, symlink-resolved cwd claude
+        # itself reports once it is actually running there: the session
+        # started, but sat on the folder-trust dialog with nobody watching.
+        # Asking a running session to `agent-box-session add` a sibling is
+        # the only way to get a new one before `claude rc` server mode
+        # landed (issue #383), so this path is reached programmatically, not
+        # just from a shell that would have expanded "~" itself first.
+        machine.succeed(as_agent("mkdir -p /home/agent/worktrees/relcwd"))
+        machine.succeed(as_agent(
+            "cd /home/agent && agent-box-session add relcwd --harness claude"
+            " --cwd worktrees/relcwd"
+        ))
+        machine.wait_until_succeeds(tmux("has-session -t =relcwd"), timeout=60)
+        machine.succeed(
+            "jq -e '.sessions.relcwd.workingDirectory"
+            " == \"/home/agent/worktrees/relcwd\"'"
+            " /home/agent/.config/agent-box/sessions.json"
+        )
+        machine.wait_until_succeeds(
+            "jq -e '.projects[\"/home/agent/worktrees/relcwd\"]"
+            ".hasTrustDialogAccepted == true' /home/agent/.claude.json",
+            timeout=60,
+        )
+        machine.succeed(as_agent("agent-box-session rm relcwd"))
+
+        # A literal "~/..." reaches the CLI unexpanded when quoted, exactly
+        # as it would from an agent that built the argument itself rather
+        # than typing it at an interactive prompt.
+        machine.succeed(as_agent(
+            "agent-box-session add tildecwd --harness claude"
+            " --cwd '~/worktrees/relcwd'"
+        ))
+        machine.wait_until_succeeds(tmux("has-session -t =tildecwd"), timeout=60)
+        machine.succeed(
+            "jq -e '.sessions.tildecwd.workingDirectory"
+            " == \"/home/agent/worktrees/relcwd\"'"
+            " /home/agent/.config/agent-box/sessions.json"
+        )
+        machine.succeed(as_agent("agent-box-session rm tildecwd"))
+
+        # A --cwd naming nothing is refused up front, the same as the
+        # settings page's add-session form already refuses one — not
+        # registered as a session that could only ever fail to spawn
+        # (tmux new-session -c fails on a missing directory).
+        machine.fail(as_agent(
+            "agent-box-session add nosuchcwd --harness claude"
+            " --cwd /home/agent/does-not-exist"
+        ))
+        machine.fail(
+            "jq -e '.sessions.nosuchcwd'"
+            " /home/agent/.config/agent-box/sessions.json"
+        )
+
+        # A --cwd that resolves outside $HOME is refused too, the same
+        # containment the settings page's add-session form already enforces
+        # (resolve_browse_dir in settings-daemon.py) — a directory that
+        # exists is not enough on its own.
+        machine.succeed("mkdir -p /tmp/outside-home")
+        machine.fail(as_agent(
+            "agent-box-session add outsidecwd --harness claude"
+            " --cwd /tmp/outside-home"
+        ))
+        machine.fail(
+            "jq -e '.sessions.outsidecwd'"
+            " /home/agent/.config/agent-box/sessions.json"
+        )
+
     # --- runtime add: no sudo, no rebuild ---------------------------------
     machine.succeed(
         "su -s /bin/sh agent -c 'agent-box-session add helper --harness codex'"
