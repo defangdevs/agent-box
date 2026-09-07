@@ -27,6 +27,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import yaml
+
 REPO = Path(__file__).resolve().parent.parent
 # Discovered, not listed. Every Lightsail launch script reaches the instance
 # through the same wrapper, so every one of them needs the same guard — and a
@@ -151,6 +153,66 @@ def check(template: Path) -> int:
     return 1
 
 
+def check_written_config(template) -> int:
+    """The config.yaml the launch script WRITES must be valid YAML.
+
+    `check` above proves the script's prefix parses under dash. It says
+    nothing about the file the script then writes with a heredoc -- and since
+    #593 the portal keys are spliced into that heredoc with hand-counted
+    indentation, which is what YAML punishes hardest. A stray space there
+    yields a script that runs fine and a box whose declared state `agentbox
+    apply` rejects on first boot.
+
+    Rendered both ways: handover ON (something to get wrong) and OFF (the
+    default box, where both markers render empty).
+    """
+    text = template.read_text()
+    found = re.search(
+        r"cat > /etc/agent-box/config\.yaml <<'AGENTBOX_CONFIG'\n"
+        r"(.*?)\n\s*AGENTBOX_CONFIG", text, re.S)
+    if not found:
+        print(f"FAIL: {template.name}: no config.yaml heredoc to check.",
+              file=sys.stderr)
+        return 1
+    # The heredoc body sits inside a YAML block scalar, so strip the block's
+    # own indent before parsing what the box would actually receive.
+    lines = found.group(1).split("\n")
+    indents = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
+    cut = min(indents) if indents else 0
+    body = "\n".join(l[cut:] if l.strip() else "" for l in lines)
+    rc = 0
+    for label, (issuer, account) in {
+        "handover on": ("https://station.example.com", "usr_2Nk9x"),
+        "handover off": ("", ""),
+    }.items():
+        rendered = (body.replace("@AGENT@", "claude")
+                        .replace("@USER@", "agent")
+                        .replace("@PORTALISSUER@", issuer)
+                        .replace("@PORTALUSERID@", account))
+        try:
+            data = yaml.safe_load(rendered)
+        except yaml.YAMLError as exc:
+            print(f"FAIL: {template.name}: config.yaml ({label}) is not "
+                  f"valid YAML: {exc}\n---\n{rendered}", file=sys.stderr)
+            rc = 1
+            continue
+        web = data.get("web") or {}
+        user = (data.get("users") or {}).get("agent") or {}
+        # web.enable and root hold either way: whatever handover does, the
+        # box still has a front door and a root user.
+        got = (web.get("enable"), user.get("root"),
+               web.get("portalIssuer"), user.get("portalUser"))
+        want = (True, True, issuer, account)
+        if got != want:
+            print(f"FAIL: {template.name}: config.yaml ({label}) landed as "
+                  f"{got!r}, wanted {want!r}", file=sys.stderr)
+            rc = 1
+            continue
+        print(f"OK: {template.name}: config.yaml ({label}) parses and "
+              f"declares what it should.")
+    return rc
+
+
 def main() -> int:
     if not TEMPLATES:
         print(
@@ -159,7 +221,8 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    return max(check(t) for t in TEMPLATES)
+    return max(max(check(t), check_written_config(t))
+               for t in TEMPLATES)
 
 
 if __name__ == "__main__":

@@ -578,11 +578,13 @@ BOX_SCHEMA = _Obj({
     "restartNotice": BOOL,
     "sudoAllowlist": STR_LIST,
     "jitNixpkgs": STR,
-    # portalIssuer / portalKeyFiles: who may sign a handover token, and
-    # with which Ed25519 public keys (issue #541). The box is a pure
-    # verifier — it calls nothing back — so neither is a secret.
+    # portalIssuer / portalJwksUrl: which portal may sign a handover token,
+    # and where it publishes the keys (issue #541). The box FETCHES the key
+    # set from the well-known path under the issuer, so a rotation never
+    # touches a box and no public key is committed anywhere; portalJwksUrl
+    # only overrides that path.
     "web": _Obj({"enable": BOOL, "rebootButton": BOOL,
-                 "portalIssuer": STR, "portalKeyFiles": STR_LIST}),
+                 "portalIssuer": STR, "portalJwksUrl": STR}),
     "webhook": _Obj({
         "enable": BOOL,
         "repo": STR,
@@ -674,12 +676,13 @@ class Spec:
         # like web.enable above; null still means off.
         self.reboot_button = (bool(web.get("rebootButton", True))
                               and self.web_enable)
-        # Portal handover (issue #541): the issuer a token must carry and
-        # the keys that may sign it. Empty either way means no handover
-        # route is served at all, so a box nobody wired to a portal
-        # exposes no unauthenticated endpoint.
+        # Portal handover (issue #541): the issuer a token must carry, and
+        # optionally where that portal publishes its signing keys (empty
+        # derives the well-known path from the issuer). An empty issuer
+        # means no handover route is served at all, so a box nobody wired to
+        # a portal exposes no unauthenticated endpoint.
         self.portal_issuer = web.get("portalIssuer") or ""
-        self.portal_keys = list(web.get("portalKeyFiles") or [])
+        self.portal_jwks_url = web.get("portalJwksUrl") or ""
         self.protect_memory = bool(data.get("protectMemory", True))
         # Base-OS patching (see APT_CONF). Default on, because the failure
         # it prevents is silent: an unattended patch run that installs a
@@ -2175,7 +2178,11 @@ class Renderer:
                 # off a box nobody wired to a portal.
                 settings += [
                     ("AGENT_BOX_PORTAL_ISSUER", self.spec.portal_issuer),
-                    ("AGENT_BOX_PORTAL_KEYS", ":".join(self.spec.portal_keys)),
+                    # env_file drops an empty value, so an unset override
+                    # simply is not passed and the daemon derives the
+                    # well-known path from the issuer itself.
+                    ("AGENT_BOX_PORTAL_JWKS_URL",
+                     self.spec.portal_jwks_url),
                     ("AGENT_BOX_PORTAL_USER", u.portal_user),
                     ("AGENT_BOX_PORTAL_PROJECT", u.portal_project),
                     # Ed25519 verification shells out to openssl (the
@@ -2836,21 +2843,16 @@ class Renderer:
     def portal_handoff(self, u):
         """Whether portal handover is provisioned for this user (#541).
 
-        Mirrors portalHandoffFor in modules/agent-box.nix.in: an issuer, at
-        least one key, and this user's portalUser. portalProject only
-        NARROWS that mapping and is not required. Two callers
-        need the same answer — the settings daemon's env and the caddy
-        route that reaches it — and a route served without the env behind
-        it is an unauthenticated endpoint that can admit nobody.
+        Mirrors portalHandoffFor in modules/agent-box.nix.in: an issuer and
+        this user's portalUser. portalProject only NARROWS that mapping and
+        is not required, and the signing keys are FETCHED rather than
+        configured. Two callers need the same answer — the settings
+        daemon's env and the caddy route that reaches it — and a route
+        served without the env behind it is an unauthenticated endpoint
+        that can admit nobody.
         """
-        # EVERY key path must be non-empty, not merely the list. env_file
-        # drops an empty value, so `portalKeyFiles: [""]` would hand the
-        # daemon no AGENT_BOX_PORTAL_KEYS at all -- it would then serve no
-        # handover, while caddy served the unauthenticated route anyway.
         return bool(self.spec.web_enable
                     and self.spec.portal_issuer
-                    and self.spec.portal_keys
-                    and all(self.spec.portal_keys)
                     and u.portal_user)
 
     def caddy(self, t):

@@ -50,6 +50,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import yaml
+
 REPO = Path(__file__).resolve().parent.parent
 BICEP = REPO / "deploy" / "azure" / "agent-box.bicep"
 COMPILED = REPO / "deploy" / "azure" / "agent-box.json"
@@ -82,6 +84,11 @@ SAMPLE = {
     "@@USER@@": "agent",
     "@@AGENTSMD@@": "## This box\n\n- A line with 'quotes' and $dollars.\n",
     "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
+    # Portal handover (issue #593). SCALARS, matching the template: the YAML
+    # lines are literal in the bootstrap, so what check_written_config
+    # verifies is the template's own indentation rather than a copy of it.
+    "@@PORTALISSUER@@": "https://station.example.com",
+    "@@PORTALUSERID@@": "usr_2Nk9x",
 }
 
 # Which parameter's defaultValue feeds which marker. The script is rendered a
@@ -94,6 +101,9 @@ DEFAULT_OF = {
     "@@FLAKEREF@@": "agentBoxFlakeRef",
     "@@USER@@": "userName",
     "@@AGENTSMD@@": "agentsMd",
+    # Both default to '' -- handover off, which is the default box.
+    "@@PORTALISSUER@@": "portalIssuer",
+    "@@PORTALUSERID@@": "portalUser",
 }
 
 
@@ -323,6 +333,73 @@ def check_bootstrap(template: dict, values: dict, label: str) -> int:
     return 0
 
 
+def check_written_config(template: dict) -> int:
+    """The config.yaml the bootstrap WRITES must be valid YAML.
+
+    check_bootstrap proves the SCRIPT parses under bash. It says nothing
+    about the file that script then writes with a heredoc -- and since #593
+    the portal keys are spliced into that heredoc with hand-counted
+    indentation, which is what YAML punishes hardest. A stray space there
+    yields a script that runs fine and a box whose declared state
+    `agentbox apply` rejects on first boot.
+
+    Both cases are rendered: handover ON (something to get wrong) and OFF
+    (the default box, where both markers render empty).
+    """
+    script = template["variables"]["bootstrapTemplate"]
+    cases = {
+        "handover on": {
+            "@@PORTALISSUER@@": SAMPLE["@@PORTALISSUER@@"],
+            "@@PORTALUSERID@@": SAMPLE["@@PORTALUSERID@@"],
+        },
+        "handover off": {"@@PORTALISSUER@@": "", "@@PORTALUSERID@@": ""},
+    }
+    rc = 0
+    for label, subs in cases.items():
+        text = script.replace("@@USER@@", SAMPLE["@@USER@@"])
+        for marker, value in subs.items():
+            text = text.replace(marker, value)
+        found = re.search(
+            r"cat > /etc/agent-box/config\.yaml <<'AGENTBOX_CONFIG'\n"
+            r"(.*?)\nAGENTBOX_CONFIG", text, re.S)
+        if not found:
+            print("FAIL: %s: no config.yaml heredoc in the bootstrap" % label,
+                  file=sys.stderr)
+            rc = 1
+            continue
+        body = found.group(1)
+        try:
+            data = yaml.safe_load(body)
+        except yaml.YAMLError as exc:
+            print("FAIL: %s: config.yaml is not valid YAML: %s\n---\n%s"
+                  % (label, exc, body), file=sys.stderr)
+            rc = 1
+            continue
+        web = data.get("web") or {}
+        user = (data.get("users") or {}).get(SAMPLE["@@USER@@"]) or {}
+        # True either way: whatever handover does, the box still has a web
+        # front door and a root user.
+        if web.get("enable") is not True or user.get("root") is not True:
+            print("FAIL: %s: the base config did not survive: %r"
+                  % (label, data), file=sys.stderr)
+            rc = 1
+            continue
+        on = label == "handover on"
+        got = (web.get("portalIssuer"), user.get("portalUser"))
+        # Off is empty VALUES, not absent keys, which is what the module
+        # already reads as off.
+        want = (("https://station.example.com", "usr_2Nk9x") if on
+                else ("", ""))
+        if got != want:
+            print("FAIL: %s: portal keys landed as %r, wanted %r"
+                  % (label, got, want), file=sys.stderr)
+            rc = 1
+            continue
+        print("OK: config.yaml (%s) parses and declares what it should"
+              % label)
+    return rc
+
+
 def check_secrets(template: dict) -> int:
     kind = template.get("parameters", {}).get("webPassword", {}).get("type")
     if kind != "securestring":
@@ -394,6 +471,7 @@ def main() -> int:
         check_bootstrap(template, SAMPLE, "hostile sample values"),
         check_bootstrap(template, defaults_render(template), "template defaults"),
         check_secrets(template),
+        check_written_config(template),
     )
     if not args.no_build:
         rc = max(rc, check_no_drift())

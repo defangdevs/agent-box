@@ -40,6 +40,29 @@ param userName string = 'agent'
 @maxLength(64)
 param webPassword string
 
+// Portal handover (issue #593). Both OPTIONAL and both needed: the module
+// serves no handover route unless each is set, so leaving them empty (the
+// default) behaves exactly as before they existed.
+//
+// There is deliberately NO key parameter: the box fetches the portal's
+// signing keys from <portalIssuer>/.well-known/jwks.json and caches them, so
+// a rotation is the portal's business alone and no public key is committed
+// here.
+//
+// portalUser is the per-BOX value and the point of the issue: a correctly
+// signed token proves only that the portal issued it, never who it is FOR,
+// because the portal signs every account's tokens with one key. This is what
+// makes the box refuse somebody else's valid token, and it must arrive
+// out-of-band at provisioning -- a token must never be able to tell a box
+// whose it is.
+@description('Portal account id (the handover token\'s `sub` claim) this box is instantiated for. The box admits a handover token only when `sub` matches this, so another account\'s valid token is refused. Empty (the default) disables portal handover entirely.')
+@maxLength(256)
+param portalUser string = ''
+
+@description('The portal\'s own issuer URL, compared exactly against the token\'s `iss` claim, and where the box fetches the portal\'s published signing keys (<issuer>/.well-known/jwks.json). Whatever the portal uses -- this is NOT a Defang hostname. Empty (the default) disables portal handover entirely.')
+@maxLength(512)
+param portalIssuer string = ''
+
 // The picker annotates each value with vCPU/RAM/price because the portal's
 // generated form renders allowed values verbatim - there is no separate label
 // field, exactly as with the Lightsail template's BundleId. Only the first
@@ -298,9 +321,15 @@ domain: auto
 agents: [claude, codex]
 web:
   enable: true
+  # Portal handover (issue #593). Empty is off, which is the module's own
+  # default: a box deployed without the two portal parameters serves no
+  # handover route and no unauthenticated endpoint. No key is configured --
+  # the box fetches the portal's published key set from this issuer.
+  portalIssuer: '@@PORTALISSUER@@'
 users:
   @@USER@@:
     root: true
+    portalUser: '@@PORTALUSERID@@'
 AGENTBOX_CONFIG
 
 # Extra standing instructions for the agent, if the deployment gave any.
@@ -337,7 +366,16 @@ set -x
 echo "agent-box bootstrap complete"
 '''
 
-var bootstrap = replace(replace(replace(replace(replace(
+// Portal handover (issue #593): both or neither, since the module needs both
+// before it serves anything.
+var portalOn = !empty(portalUser) && !empty(portalIssuer)
+// SCALARS only. The YAML lines live in the bootstrap template itself, so
+// their indentation is visible to check_written_config -- injecting whole
+// lines from here would put it somewhere no check could reach.
+var portalUserYaml = portalOn ? portalUser : ''
+var portalIssuerYaml = portalOn ? portalIssuer : ''
+
+var bootstrap = replace(replace(replace(replace(replace(replace(replace(
   bootstrapTemplate,
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
@@ -346,7 +384,9 @@ var bootstrap = replace(replace(replace(replace(replace(
   // base64, not the plaintext: see the comment above the apply, and
   // check_secrets() in scripts/check_azure_template.py, which fails if this
   // ever goes back to a raw substitution.
-  '@@WEBPASSWORD@@', base64(webPassword))
+  '@@WEBPASSWORD@@', base64(webPassword)),
+  '@@PORTALISSUER@@', portalIssuerYaml),
+  '@@PORTALUSERID@@', portalUserYaml)
 
 // ---------------------------------------------------------------------------
 

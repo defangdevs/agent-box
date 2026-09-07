@@ -10,6 +10,11 @@ Metadata:
           - UserName
           - WebPassword
       - Label:
+          default: Portal handover (optional - leave blank for password-only)
+        Parameters:
+          - PortalUser
+          - PortalIssuer
+      - Label:
           default: Compute and cost
         Parameters:
           - InstanceType
@@ -34,6 +39,10 @@ Metadata:
     ParameterLabels:
       WebPassword:
         default: Web terminal password (16-64 chars - save it, AWS masks it)
+      PortalUser:
+        default: Portal account id this box belongs to (issue #593)
+      PortalIssuer:
+        default: Portal issuer URL that signs handover tokens
       Agent:
         default: Agent CLI
       UserName:
@@ -185,6 +194,50 @@ Parameters:
       the pre-#416 behaviour - set this if you want the box usable as a
       terminal the moment it boots, without a trip through the settings page.
 
+  # Portal handover (issue #593). Both OPTIONAL and both needed: the module
+  # serves no handover route unless each is set, so a launch that leaves them
+  # blank behaves exactly as it did before they existed - basic auth only,
+  # and no unauthenticated route.
+  #
+  # There is deliberately NO key parameter. The box fetches the portal's
+  # signing keys from <PortalIssuer>/.well-known/jwks.json and caches them,
+  # so a key rotation is the portal's business alone and no public key is
+  # committed to this template.
+  #
+  # PortalUser is the per-BOX value and the reason this exists: a correctly
+  # signed token proves only that the portal issued it, never who it is for
+  # (the portal signs every account's tokens with one key). This is what makes
+  # the box refuse somebody else's valid token. It must arrive out-of-band, at
+  # provisioning, exactly like WebPassword - a token must never be able to
+  # tell a box whose it is.
+  PortalUser:
+    Type: String
+    Default: ""
+    MaxLength: 256
+    # Constrained because this value is spliced into the NixOS configuration
+    # below as `web.portalUser = "<value>"`. A quote or a dollar-brace would
+    # break out of that string literal, so the safe set is refused at the
+    # parameter rather than escaped later. Portal account ids are opaque
+    # identifiers; none of them needs a character outside this.
+    AllowedPattern: ^$|^[A-Za-z0-9_.:@+-]{1,256}$
+    Description: >-
+      The portal account id (the handover token's `sub` claim) this box is
+      instantiated for. The box admits a handover token only when `sub`
+      matches this, so another account's valid token is refused. Blank (the
+      default) disables portal handover entirely.
+  PortalIssuer:
+    Type: String
+    Default: ""
+    MaxLength: 512
+    # https only, and no character that could close the Nix string literal
+    # this is spliced into (see PortalUser above).
+    AllowedPattern: ^$|^https://[A-Za-z0-9._~:/?#@!&()*+,;=%-]+$
+    Description: >-
+      The portal's own issuer URL, compared exactly against the token's `iss`
+      claim, and where the box fetches the portal's published signing keys
+      (<issuer>/.well-known/jwks.json). This is whatever the portal uses - it
+      is NOT a Defang hostname. Blank (the default) disables portal handover
+      entirely.
   WebPassword:
     Type: String
     NoEcho: true
@@ -730,6 +783,10 @@ Resources:
                   users."${UserName}" = {
                     environment = { TERM = "xterm-256color"; };
                     web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                    # Portal handover (issue #593): the account this box is
+                    # instantiated FOR. Empty by default, and the module then
+                    # serves no handover route at all.
+                    web.portalUser = "${PortalUser}";
                     # 'true'/'false' splice verbatim as Nix booleans, same
                     # trick as UseSpot below. Default 'false' matches what
                     # seedMainSession's own null default already resolves to
@@ -759,6 +816,10 @@ Resources:
                     enable = true;
                     domain = hostname;
                     user = "${UserName}";
+                    # Portal handover (issue #593). No key here: the box
+                    # fetches the portal's published key set from this
+                    # issuer's well-known path.
+                    portalIssuer = "${PortalIssuer}";
                   };
                   # Lets the agent update the box on request:
                   #   sudo /run/current-system/sw/bin/systemctl \

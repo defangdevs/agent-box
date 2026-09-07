@@ -3664,38 +3664,42 @@ class PortalHandoff(unittest.TestCase):
             return {str(k).replace(str(out), ""): v[0]
                     for k, v in tree.files.items()}
 
-    PORTAL_WEB = {
-        "portalIssuer": "https://portal.defang.io",
-        "portalKeyFiles": ["/etc/agent-box/portal-key.pub"],
-    }
+    PORTAL_WEB = {"portalIssuer": "https://station.example.com"}
     MAPPED = {"root": True, "portalUser": "usr_2Nk9x",
               "portalProject": "acme-prod"}
 
     def test_a_mapped_user_gets_the_env_and_the_route(self):
         files = self._render({"agent": dict(self.MAPPED)}, self.PORTAL_WEB)
         env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
-        self.assertIn("AGENT_BOX_PORTAL_ISSUER=https://portal.defang.io", env)
+        self.assertIn("AGENT_BOX_PORTAL_ISSUER=https://station.example.com",
+                      env)
         self.assertIn("AGENT_BOX_PORTAL_USER=usr_2Nk9x", env)
         self.assertIn("AGENT_BOX_PORTAL_PROJECT=acme-prod", env)
-        self.assertIn("AGENT_BOX_PORTAL_KEYS=/etc/agent-box/portal-key.pub",
-                      env)
+        # Nothing about keys: they are fetched from the issuer's well-known
+        # path, so a rotation never reaches a box's env at all.
+        self.assertNotIn("AGENT_BOX_PORTAL_JWKS_URL", env)
         # Verification shells out to openssl, and the unit has systemd's
         # default PATH — so an absolute path or it never runs at all.
         self.assertRegex(env, r"AGENT_BOX_OPENSSL=/.*/openssl")
         self.assertIn("handle /agent/auth/*",
                       files["/etc/agent-box/Caddyfile"])
 
-    def test_several_keys_are_colon_separated_for_a_rotation(self):
-        """Two keys is what a rotation looks like: the box tries both, so a
-        key change never waits on the portal and the box agreeing first."""
-        web = dict(self.PORTAL_WEB,
-                   portalKeyFiles=["/etc/agent-box/old.pub",
-                                   "/etc/agent-box/new.pub"])
-        env = self._render({"agent": dict(self.MAPPED)}, web)[
-            "/etc/agent-box/units/agent-box-settings-agent.env"]
+    def test_the_jwks_url_is_passed_only_when_overridden(self):
+        """Keys are FETCHED, so there is nothing to configure per rotation.
+
+        The daemon derives <issuer>/.well-known/jwks.json itself, so passing
+        the URL unconditionally would be a second place the default could
+        drift from. An override is passed through verbatim.
+        """
+        env_of = lambda web: self._render(
+            {"agent": dict(self.MAPPED)}, web)[
+                "/etc/agent-box/units/agent-box-settings-agent.env"]
+        self.assertNotIn("AGENT_BOX_PORTAL_JWKS_URL", env_of(self.PORTAL_WEB))
+        override = dict(self.PORTAL_WEB,
+                        portalJwksUrl="https://keys.example.com/jwks.json")
         self.assertIn(
-            "AGENT_BOX_PORTAL_KEYS=/etc/agent-box/old.pub:"
-            "/etc/agent-box/new.pub", env)
+            "AGENT_BOX_PORTAL_JWKS_URL=https://keys.example.com/jwks.json",
+            env_of(override))
 
     def test_portal_user_alone_is_a_complete_mapping(self):
         """The MVP shape: a portal account and no project.
@@ -3736,11 +3740,15 @@ class PortalHandoff(unittest.TestCase):
             files["/etc/agent-box/Caddyfile"],
             "served an unauthenticated handover route anyway")
 
-    def test_no_issuer_or_no_key_serves_no_handover_at_all(self):
+    def test_no_issuer_serves_no_handover_at_all(self):
         """A box nobody wired to a portal must expose no unauthenticated
-        endpoint, even if a user declares a mapping."""
-        for web in ({}, {"portalIssuer": "https://portal.defang.io"},
-                    {"portalKeyFiles": ["/etc/agent-box/portal-key.pub"]}):
+        endpoint, even if a user declares a mapping.
+
+        The issuer is the whole of it now: it is both the trust anchor for
+        `iss` and where the signing keys are fetched from, so without one
+        there is nothing to verify against and nothing to serve.
+        """
+        for web in ({}, {"portalJwksUrl": "https://keys.example.com/j.json"}):
             with self.subTest(web=sorted(web)):
                 files = self._render({"agent": dict(self.MAPPED)}, web)
                 env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
@@ -3749,26 +3757,6 @@ class PortalHandoff(unittest.TestCase):
                     "handle /agent/auth/*",
                     files["/etc/agent-box/Caddyfile"],
                     "served an unauthenticated handover route anyway")
-
-    def test_an_empty_key_path_enables_nothing(self):
-        """`portalKeyFiles: [""]` is a non-empty LIST of nothing.
-
-        env_file drops an empty value, so the daemon would be handed no
-        AGENT_BOX_PORTAL_KEYS and serve no handover — while caddy served the
-        unauthenticated route anyway. The two must agree, so an empty path
-        disables both (CodeRabbit on PR #588).
-        """
-        for keys in ([""], ["/etc/agent-box/key.pub", ""]):
-            with self.subTest(keys=keys):
-                files = self._render(
-                    {"agent": dict(self.MAPPED)},
-                    dict(self.PORTAL_WEB, portalKeyFiles=keys))
-                env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
-                self.assertNotIn("AGENT_BOX_PORTAL", env)
-                self.assertNotIn(
-                    "handle /agent/auth/*",
-                    files["/etc/agent-box/Caddyfile"],
-                    "served a handover route the daemon will not answer")
 
     def test_one_users_mapping_is_not_anothers(self):
         """Two projects on one box: each gets its own route, its own env, and
