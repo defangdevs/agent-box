@@ -73,6 +73,9 @@ usage() {
   echo '--cwd is where the session starts (default $HOME, shared by every'
   echo "session). To work a repo another session is already in, give this one"
   echo "a checkout of its own: git worktree add ~/worktrees/NAME -b BRANCH."
+  echo "--cwd must already exist; it is resolved to an absolute path before"
+  echo "the session is registered, so 'add' fails up front on a typo instead"
+  echo "of registering a session that can only ever fail to start."
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
   echo "--ephemeral marks a ONE-SHOT session: parking it (a clean agent exit, or"
@@ -452,6 +455,35 @@ case "$cmd" in
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
     done
+    # Canonicalize --cwd the same way the settings page's add-session form
+    # already does (resolve_session_cwd/resolve_browse_dir in
+    # settings-daemon.py) — issue #597. Stored verbatim, a relative path, a
+    # "~"-prefixed one, or a trailing slash lands in sessions.json as text
+    # that does not match the ABSOLUTE, symlink-resolved cwd claude itself
+    # reports once it actually starts there (tmux `-c` and every shell in
+    # between just chdir, they don't normalize). seed_claude_state keys
+    # claude's pre-accepted-trust record by this same string, so a mismatch
+    # there means the seed silently misses and a session started this way —
+    # the only way to get a new one before `claude rc` server mode landed
+    # (issue #383): asking a running session to `agent-box-session add` a
+    # sibling — comes up parked on "Do you trust this folder?" with nobody
+    # watching. Resolve now, once, so every later use (gen_name's basename,
+    # the registry, tmux's start dir, the seeded trust key) agrees.
+    if [ -n "$cwd" ]; then
+      case "$cwd" in
+        ("~") cwd="$HOME" ;;
+        ("~/"*) cwd="$HOME/${cwd#\~/}" ;;
+      esac
+      case "$cwd" in
+        (/*) ;;
+        (*) cwd="$PWD/$cwd" ;;
+      esac
+      abscwd="$(cd -- "$cwd" 2>/dev/null && pwd -P)" || {
+        echo "agent-box-session: --cwd '$cwd' does not exist" >&2
+        exit 2
+      }
+      cwd="$abscwd"
+    fi
     # An agent PROFILE (issue #321) resolves to a harness plus the arguments
     # that make this session a particular worker — model, effort, appended
     # system prompt. Resolved by agent-box-profile, the one place that mapping
