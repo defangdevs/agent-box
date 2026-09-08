@@ -119,6 +119,36 @@ ZRAM_UNIT = "agent-box-zram.service"
 EARLYOOM_UNIT = "agent-box-earlyoom.service"
 ZRAM_HELPER = "/etc/agent-box/bin/agent-box-zram"
 MEMORY_SYSCTL = "/etc/sysctl.d/60-agent-box-memory.conf"
+
+# Rootless containers (issue #600). The unit is SHARED - it comes out of
+# the runtime profile's share/agent-box/units like every other template
+# unit - so only the host-side pieces are named here.
+DOCKER_UNIT_PREFIX = "agent-box-docker@"
+# Where the capped newuidmap/newgidmap copies go. This exact path is on
+# the shared unit's Environment=PATH; the NixOS backend's half of that
+# line is /run/wrappers/bin, and each backend has only one of the two.
+UIDMAP_DIR = "/etc/agent-box/uidmap"
+UIDMAP_HELPER = "/etc/agent-box/bin/agent-box-uidmap"
+UIDMAP_PROGRAMS = (("newuidmap", "cap_setuid+ep"),
+                   ("newgidmap", "cap_setgid+ep"))
+# XDG_RUNTIME_DIR for a user's daemon, and the socket inside it that the
+# CLI reaches it through. Also fixed by the shared unit.
+DOCKER_RUNTIME_DIR = "/run/agent-box-docker"
+# Ubuntu 23.10 and later refuse an unprivileged user namespace outright
+# unless an AppArmor profile grants the binary `userns`. This sysctl is
+# the capability probe as well as the reason: a box that does not have it
+# has no such restriction (NixOS, RHEL/SELinux), and gets no profile.
+USERNS_RESTRICT_SYSCTL = \
+    "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+APPARMOR_PROFILE = "/etc/apparmor.d/agent-box-containers"
+# The two programs rootless docker needs a namespace for. Attached by a
+# glob over the store rather than by a resolved store path: the path moves
+# on every docker bump and on every nixpkgs bump, the binaries come from
+# the USER's own profile (which apply never resolves), and a profile whose
+# attachment silently stopped matching is a daemon that stops starting
+# with nothing to say why. `*` never crosses a "/", so this names the
+# hash-name component and nothing deeper.
+APPARMOR_GLOBS = ("rootlesskit", "slirp4netns")
 # systemd-oomd is the DISTRO's OOM daemon, not ours, and it races earlyoom.
 OOMD_UNIT = "systemd-oomd.service"
 # Written only when apply itself disabled an oomd that was enabled, so
@@ -606,6 +636,15 @@ BOX_SCHEMA = _Obj({
         {"enable": BOOL, "automaticReboot": REBOOT_TIME},
         hint=" - to turn base-OS patch policy off, write "
              "`osUpdates: {enable: false}`"),
+    # containers.enable: the host capability an unprivileged session cannot
+    # give itself, so that a user's own rootless docker can run (issue
+    # #600). Same _Obj-with-a-hint shape as osUpdates above, and for the
+    # same reason: `containers: false` reads as "off" and would default
+    # `enable` back to whatever the mapping's default is.
+    "containers": _Obj(
+        {"enable": BOOL},
+        hint=" - to turn the container runtime off, write "
+             "`containers: {enable: false}`"),
     "users": _Map("user", USER_SCHEMA),
 })
 
@@ -690,6 +729,17 @@ class Spec:
         self.portal_issuer = web.get("portalIssuer") or ""
         self.portal_jwks_url = web.get("portalJwksUrl") or ""
         self.protect_memory = bool(data.get("protectMemory", True))
+        # Rootless containers for the agent users (issue #600). Off by
+        # default, and deliberately not a "the box has docker" switch:
+        # docker itself is 972 MiB and arrives from the user's own nix
+        # profile like every other tool here. What this renders is the
+        # part a session cannot render for itself - the AppArmor
+        # exemption a hardened distro needs before ANY unprivileged user
+        # namespace may be created, newuidmap/newgidmap carrying the file
+        # capabilities that apply the user's /etc/subuid range, and the
+        # supervised unit the daemon runs in.
+        containers = data.get("containers") or {}
+        self.containers_enable = bool(containers.get("enable", False))
         # Base-OS patching (see APT_CONF). Default on, because the failure
         # it prevents is silent: an unattended patch run that installs a
         # fix and restarts nothing looks exactly like one that worked.
@@ -1090,6 +1140,10 @@ class Renderer:
             self.memory_protection(t)
         else:
             self.memory_protection_off(t)
+        if self.spec.containers_enable:
+            self.containers(t)
+        else:
+            self.containers_off(t)
         if self.spec.web_enable:
             self.caddy(t)
             self.fail2ban(t)
@@ -1298,6 +1352,167 @@ class Renderer:
             if generated_by_us(path):
                 t.disable.append(unit)
         t.gone(self.p(MEMORY_SYSCTL))
+
+    # -- containers ----------------------------------------------------------
+
+    def apparmor_profile_text(self):
+        """The AppArmor exemption rootless containers need on a distro box.
+
+        Ubuntu 23.10 and later ship
+        kernel.apparmor_restrict_unprivileged_userns = 1, and an
+        unprivileged user then creates NO user namespace at all: rootlesskit
+        dies at `fork/exec /proc/self/exe: permission denied` and
+        `unshare -Ur id` at `write failed /proc/self/uid_map: Operation not
+        permitted`. Neither message names AppArmor; rootlesskit at least
+        prints a hint with the profile to write, and this is that profile.
+
+        Ubuntu ships exactly this shape for its OWN copies of these two
+        binaries (/etc/apparmor.d/rootlesskit, /etc/apparmor.d/slirp4netns,
+        both `flags=(unconfined) { userns, }`), which is what makes it the
+        conservative answer rather than a clever one - the alternative is
+        setting the sysctl to 0 and lifting the restriction for every
+        process on the box.
+
+        Attached by a glob over the store, NOT by a resolved store path.
+        These binaries come from the USER's own nix profile, which apply
+        never reads and cannot pin, and their paths move on every docker or
+        nixpkgs bump - a profile whose attachment has silently stopped
+        matching is a daemon that stops starting, with the same unnamed
+        error as having no profile at all. `*` does not cross a "/", so this
+        names the hash-name component and nothing below it. What it costs is
+        real and worth stating: any store path whose basename is one of
+        these two names may create a user namespace, which a user who can
+        run `nix build` can arrange. That is a reduction in kernel-attack
+        surface hardening and not a hole in the box's own boundary - the UID
+        is the boundary here (the Users-vs-Sessions doctrine), a NixOS box
+        allows unprivileged userns to everybody already, and this is still
+        far narrower than the sysctl.
+        """
+        lines = [GENERATED_HEADER.rstrip("\n"),
+                 "abi <abi/4.0>,",
+                 "include <tunables/global>"]
+        for program in APPARMOR_GLOBS:
+            lines += [
+                "",
+                f"profile agent-box-{program} /nix/store/*/bin/{program} "
+                "flags=(unconfined) {",
+                "  userns,",
+                "",
+                "  # Site-specific additions and overrides, the same hook "
+                "Ubuntu's own",
+                "  # profiles carry. Never written by us, so an operator's "
+                "additions",
+                "  # survive every apply.",
+                f"  include if exists <local/agent-box-{program}>",
+                "}",
+            ]
+        return "\n".join(lines) + "\n"
+
+    def containers(self, t):
+        """Rootless containers for the agent users (issue #600).
+
+        The HOST half only. Docker is not shipped: its closure is 972 MiB,
+        larger than the whole runtime profile, so it arrives from the user's
+        own nix profile like every other tool on this box, and the shared
+        unit's ConditionPathIsExecutable makes a box that never installed it
+        a no-op instead of a restart loop.
+
+        What a session genuinely cannot do for itself is all that is here:
+
+        - the AppArmor exemption above, without which no unprivileged user
+          namespace exists to put a container in;
+        - newuidmap/newgidmap carrying cap_setuid/cap_setgid as FILE
+          capabilities, which is how rootlesskit applies this user's
+          /etc/subuid range. A read-only /nix/store path cannot carry a
+          file capability, which is why these are copies and why the copy
+          is made by root at apply time rather than by the daemon;
+        - the runtime dir the socket lives in (see tmpfiles) and the unit
+          the daemon is supervised by (see shared_units).
+
+        The uidmap helper is a script rather than an ExecStart one-liner for
+        the same reason the zram one is: it has a decision to make. The
+        source path moves with the runtime profile, so the copy has to be
+        re-made when it moves and left alone when it has not - `install`
+        alone would rewrite the file on every apply and drop its
+        capabilities in the window between the write and the setcap.
+        """
+        t.dir(self.p("/etc/agent-box/bin"), 0o755)
+        t.dir(self.p(UIDMAP_DIR), 0o755)
+        t.file(self.p(UIDMAP_HELPER), "".join(line + "\n" for line in [
+            "#!/bin/sh",
+            GENERATED_HEADER.rstrip("\n"),
+            "# Put newuidmap/newgidmap where the shared docker unit's PATH",
+            "# looks for them, carrying the file capabilities that let them",
+            "# write a multi-ID /proc/<pid>/uid_map. The nix store cannot",
+            "# hold a file capability (it is read-only, and the same path is",
+            "# shared with every other box on the cache), so these are",
+            "# copies - the same thing NixOS's security.wrappers does with",
+            "# /run/wrappers/bin, and what shadow's own --with-fcaps install",
+            "# mode does on Debian and Fedora.",
+            "set -eu",
+            f'dir={shlex.quote(UIDMAP_DIR)}',
+            f'src={shlex.quote(str(self.bin))}',
+            f'setcap={shlex.quote(str(self.bin / "setcap"))}',
+            f'getcap={shlex.quote(str(self.bin / "getcap"))}',
+            'mkdir -p "$dir"',
+            "for pair in " + " ".join(
+                f"{program}={caps}" for program, caps in UIDMAP_PROGRAMS
+            ) + "; do",
+            '  program=${pair%%=*}',
+            '  caps=${pair#*=}',
+            # cmp before install: a rewrite drops the capability, and the
+            # window between the write and the setcap is a window in which
+            # a running daemon's restart would fail.
+            '  if ! cmp -s "$src/$program" "$dir/$program"; then',
+            '    install -m755 "$src/$program" "$dir/$program.new"',
+            '    mv "$dir/$program.new" "$dir/$program"',
+            '  fi',
+            # Re-asserted even when the copy was current: a capability can
+            # be lost without the bytes changing (a restore from a backup
+            # that dropped xattrs, an operator's own cp).
+            '  if ! "$getcap" "$dir/$program" | grep -q "$caps"; then',
+            '    "$setcap" "$caps" "$dir/$program"',
+            '  fi',
+            "done",
+        ]), 0o755)
+        t.file(self.p(APPARMOR_PROFILE), self.apparmor_profile_text())
+
+    def containers_off(self, t):
+        """And turning it off has to take the daemon and the grant with it.
+
+        `apply` never deletes what a render stops emitting, so without this
+        a box applied once with containers on and then off kept every user's
+        rootless daemon RUNNING, kept the AppArmor exemption loaded, and
+        kept two capped binaries in /etc - the whole capability still in
+        force with nothing left in the config that mentions it. Same shape
+        as memory_protection_off above and codexFullAccess (#394).
+
+        The per-user instances are disabled before the template is removed,
+        for the reason spelled out on memory_protection_off: `systemctl
+        disable` reads the unit file to find the wants symlink it has to
+        drop.
+
+        Not undone here: the LOADED AppArmor profile, and the containers a
+        user's daemon left behind. Removing the profile file stops it being
+        loaded at the next boot, and cmd_apply says so out loud, but
+        unloading a profile from a running kernel is `apparmor_parser -R`
+        against a file we have just deleted - and an image tree under
+        ~/.local/share/docker is the user's data, not ours to remove.
+        """
+        for u in self.spec.users:
+            unit = f"{DOCKER_UNIT_PREFIX}{u.name}.service"
+            if unit in systemd_units_live(DOCKER_UNIT_PREFIX):
+                t.disable.append(unit)
+        self.gone_shared_units(t, (DOCKER_UNIT_PREFIX,))
+        t.gone(self.p(UIDMAP_HELPER))
+        for program, _caps in UIDMAP_PROGRAMS:
+            # No header to witness (they are binaries), and no reproducible
+            # text either - so the witness is the profile's own copy, the
+            # same argument gone_shared_units makes for the template units.
+            source = self.bin / program
+            t.gone(self.p(UIDMAP_DIR, program),
+                   source.read_bytes() if source.is_file() else None)
+        t.gone(self.p(APPARMOR_PROFILE), self.apparmor_profile_text())
 
     # -- brute force ---------------------------------------------------------
 
@@ -1876,6 +2091,9 @@ class Renderer:
                                      "agent-box-settings@")) and \
                     not self.spec.web_enable:
                 continue
+            if unit.name.startswith(DOCKER_UNIT_PREFIX) and \
+                    not self.spec.containers_enable:
+                continue
             t.file(self.p("/etc/systemd/system", unit.name),
                    unit.read_text(), 0o444)
         if self.spec.web_enable:
@@ -2158,6 +2376,15 @@ class Renderer:
             if self.spec.webhook_enable:
                 pairs.append(("AGENT_BOX_WEBHOOK_URL",
                               f"https://{self.spec.domain}/{u.name}/webhook"))
+        if self.spec.containers_enable:
+            # The docker CLI reads DOCKER_HOST, so `docker compose up` in a
+            # session needs no flag and no per-agent setup, and it reaches
+            # the SUPERVISED daemon rather than whatever a session might
+            # have started by hand. This is the unit's env file and not the
+            # session's, which is enough: the supervisor starts the tmux
+            # server inside the unit, so every pane inherits it.
+            pairs.append(("DOCKER_HOST",
+                          f"unix://{DOCKER_RUNTIME_DIR}/{u.name}/docker.sock"))
         # Arbitrary per-user extras (the module's u.environment) join the
         # generated file rather than needing a drop-in.
         pairs += sorted(u.environment.items())
@@ -2699,6 +2926,20 @@ class Renderer:
             # per-user password grant above exists to avoid.
             if self.spec.reboot_button and u is self.spec.root_user:
                 cmds.append(REBOOT_TRIGGER)
+            # Each user may bring its OWN rootless daemon up and take it
+            # down, and no other user's - per-user for the same reason the
+            # reboot grant just above is box-owner-only. A rootless daemon
+            # is root over its user's containers and home, so `stop` on
+            # somebody else's would be one agent user's power over
+            # another's work. `restart` and not `start`, because it is also
+            # what picks up a NEWLY installed docker: the unit's
+            # ConditionPathIsExecutable is re-evaluated at every start.
+            if self.spec.containers_enable:
+                cmds += [
+                    f"{SYSTEMCTL} restart {DOCKER_UNIT_PREFIX}{u.name}"
+                    ".service",
+                    f"{SYSTEMCTL} stop {DOCKER_UNIT_PREFIX}{u.name}.service",
+                ]
             cmds += self.spec.sudo_allowlist
             lines.append(f"{u.name} ALL=(root) NOPASSWD: " + ", ".join(cmds))
         t.file(self.p(SUDOERS_DIR, "agent-box"),
@@ -2712,6 +2953,19 @@ class Renderer:
         systemd-tmpfiles --create to realize it.
         """
         lines = []
+        # First, matching the order the module contributes its own rules -
+        # the two lists are compared as text by one-spec-both-backends.
+        # NOT RuntimeDirectory= on the unit: systemd deletes one of those
+        # when the unit stops, and the directory has to outlive a stopped
+        # daemon, because it is the directory a session's DOCKER_HOST
+        # points into. 0700 <user>:<user>, because the socket inside it is
+        # the whole of that daemon's authority.
+        if self.spec.containers_enable:
+            lines.append(f"d {DOCKER_RUNTIME_DIR} 0755 root root - -")
+            lines += [
+                f"d {DOCKER_RUNTIME_DIR}/{u.name} 0700 {u.name} {u.name} - -"
+                for u in self.spec.users
+            ]
         if self.spec.web_enable:
             lines += [
                 "d /var/lib/agent-box-web 0700 root root - -",

@@ -1,0 +1,59 @@
+[Unit]
+Description=Rootless Docker daemon for %i
+# The agent installs docker into its OWN nix profile (`nix profile add
+# nixpkgs#docker`), the same way it installs every other tool here - the
+# closure is 972 MiB, larger than the whole runtime profile, so agent-box
+# ships the host CAPABILITY and not the runtime. A box whose user never
+# installed it therefore has nothing to start, and this condition is what
+# makes that a clean no-op ("condition failed") instead of a restart loop.
+# It is re-evaluated on every start, so `sudo systemctl restart
+# agent-box-docker@%i` right after a `nix profile add` is all it takes.
+ConditionPathIsExecutable=/home/%i/.nix-profile/bin/dockerd-rootless
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+User=%i
+Type=notify
+NotifyAccess=all
+# dockerd-rootless is a shell script wrapping rootlesskit; it reads HOME to
+# find the data root (~/.local/share/docker) and XDG_RUNTIME_DIR to place
+# both its own state and the API socket. Neither is set for a system unit,
+# and the script exits 1 on the spot without them.
+Environment=HOME=/home/%i
+Environment=XDG_RUNTIME_DIR=/run/agent-box-docker/%i
+# rootlesskit needs newuidmap/newgidmap to apply this user's /etc/subuid
+# range, and those two carry cap_setuid/cap_setgid as FILE capabilities -
+# so they cannot come from the read-only nix store and are not on the
+# wrapper's own embedded PATH. Both directories are listed because each
+# backend has exactly one of them: /run/wrappers/bin is what NixOS's
+# security.wrappers builds, /etc/agent-box/uidmap is where `agentbox apply`
+# puts capped copies on a box that has no such mechanism. The missing one
+# is simply skipped by PATH lookup, which is what lets this stay ONE
+# shared unit instead of two hand-written ones that can drift.
+Environment=PATH=/run/wrappers/bin:/etc/agent-box/uidmap:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/%i/.nix-profile/bin/dockerd-rootless
+# The daemon owns a cgroup subtree of its own, so it can put containers in
+# cgroups without a systemd --user instance (agent-box users have no login
+# session and no lingering user manager - see the PATH note above for the
+# other half of that).
+Delegate=yes
+Restart=always
+RestartSec=2s
+# Type=notify with no start timeout is what nixpkgs' own rootless unit
+# does, and it would hang `agentbox apply`: the activation phase starts
+# every unit it renders and WAITS, so a daemon that never sends its
+# readiness notification would stall a first boot (and, on the deployment
+# templates, the CloudFormation signal that follows it) forever. Bounded
+# here, and only here - a rootless daemon shutting down has containers and
+# a slirp4netns helper to take with it, so the stop side keeps nixpkgs'
+# unbounded value.
+TimeoutStartSec=180
+TimeoutStopSec=0
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+KillMode=mixed
+StandardInput=null
