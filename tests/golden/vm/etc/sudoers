@@ -4,6 +4,7 @@
 root     ALL=(ALL:ALL)    SETENV: ALL
 %wheel  ALL=(ALL:ALL)    SETENV: ALL
 agent     ALL=(ALL:ALL)    NOPASSWD: /run/current-system/sw/bin/systemctl reload caddy.service
+agent     ALL=(ALL:ALL)    NOPASSWD: /run/current-system/sw/bin/systemctl restart agent-box-docker@agent.service, NOPASSWD: /run/current-system/sw/bin/systemctl stop agent-box-docker@agent.service
 
 
 # extraConfig

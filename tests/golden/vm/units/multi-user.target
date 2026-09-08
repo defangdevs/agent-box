@@ -1,2 +1,2 @@
 [Unit]
-Wants=machines.target agent-box@agent.service
+Wants=machines.target agent-box-docker@agent.service agent-box@agent.service

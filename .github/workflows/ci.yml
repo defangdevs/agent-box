@@ -280,6 +280,13 @@ jobs:
       #                     login command (stubbed CLIs), host-anchored URL,
       #                     code forwarding, success read from the CLI, and
       #                     the refusal to start a tmux server of its own
+      #   containers        (issue 600) the host half of rootless docker —
+      #                     subuid range, capped newuidmap/newgidmap, an
+      #                     unprivileged user namespace that is allowed, the
+      #                     0700 runtime dir, DOCKER_HOST reaching the live
+      #                     supervisor, a per-user sudo grant matching the
+      #                     shipped guide, and the daemon unit as a no-op
+      #                     with no docker installed and running with one
       #   webhook           (issue 101) the default-on webhook receiver —
       #                     socket-activated 0660 <user>:caddy ingress, the
       #                     unauthenticated public path beside a still-401ing
@@ -323,7 +330,13 @@ jobs:
           # get isolated, it doesn't raise the memory budget (still three
           # VM guests at once in the worst case: one from each of the
           # `sessions`/`webhook` lanes, one from whichever pair is
-          # concurrently building in the five-check lane).
+          # concurrently building in the shared lane).
+          # THIS LIST IS THE ONE THAT DECIDES. Registering a test in
+          # flake.nix does NOT make CI run it: `nix flake check` is not
+          # used here (the filesystem-free VM configuration makes it
+          # unsuitable), so an interactive test that is not named below
+          # simply never runs, silently and with a green job over it.
+          # tests/containers.nix shipped that way for one round.
           nix build -L --max-jobs 1 .#checks.x86_64-linux.sessions &
           sessions=$!
           nix build -L --max-jobs 1 .#checks.x86_64-linux.webhook &
@@ -333,7 +346,8 @@ jobs:
             .#checks.x86_64-linux.settings-page \
             .#checks.x86_64-linux.memory-protection \
             .#checks.x86_64-linux.sessions-web \
-            .#checks.x86_64-linux.connect &
+            .#checks.x86_64-linux.connect \
+            .#checks.x86_64-linux.containers &
           rest=$!
           # All three are waited on before the step decides, so
           # --keep-going's promise still holds across the set: every result

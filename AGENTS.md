@@ -270,6 +270,18 @@ A VM test script has a hard ceiling of 128 KiB. nixpkgs passes it to the driver 
 Never end a test pipeline with `grep -q`. The driver runs each command under `set -euo pipefail`, and `grep -q` exits on the FIRST match — the producer upstream then gets EPIPE, and its non-zero status fails the whole assertion even though the pattern matched (a `must succeed` that reports exit 123 with `write error: Broken pipe` in the log). Write `… | grep PATTERN >/dev/null` instead, which drains the input, or capture to a file first and grep the file. `grep -q` is safe only with a file operand.
 
 
+### Adding a VM test: the flake is not enough
+
+`.github/workflows/ci.yml`'s "Run VM tests" step names its checks BY HAND,
+in three lanes. CI does not run `nix flake check` (the intentionally
+filesystem-free VM configuration makes it unsuitable), so a
+`runNixOSTest` you add to `flake.nix` and never add to that list simply
+never runs - no skip, no warning, a green job over it. `tests/containers.nix`
+shipped that way for one round and looked green. Add the check to the
+shared lane (the two long ones have isolated lanes for a reason - see the
+comment there before moving anything into them), and add its one-line
+"what it covers" entry above the step.
+
 ### Before you push a VM test
 
 The interactive tests are x86-only, so on an aarch64 box every mistake below

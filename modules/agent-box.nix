@@ -36,7 +36,8 @@ let
   # tokens sit flush against the next heading, so the disabled case leaves
   # no stray blank line and the enabled case supplies its own trailing one.
   defaultAgentsMd = lib.replaceStrings
-    [ "@WEBHOOK_SECTION@" "@UPDATE_SECTION@" "@HOST_SECTION@" ]
+    [ "@WEBHOOK_SECTION@" "@UPDATE_SECTION@" "@HOST_SECTION@"
+      "@CONTAINERS_SECTION@" ]
     [ (lib.optionalString webhookEnabled ''
       ## Getting told, instead of polling (webhooks)
 
@@ -355,7 +356,62 @@ let
       - Every rebuild is a generation and the previous one is still on disk, so
         a bad change is a rollback, not a reinstall.
 
-    '' ]
+    ''
+      # The container section, and the ONE command in it that differs
+      # between the two backends. It is bound from the same literal the
+      # sudo rule is granted from (dockerRestartCmdOf), because sudoers
+      # matches argv exactly and a guide that tells the agent a command
+      # the grant does not cover asks for a password instead of running
+      # (the #353 trap). $(whoami) rather than the user's name: this
+      # value is built once for the box, and the per-user guides are
+      # pointers to it.
+      (lib.optionalString cfg.containers.enable (
+        lib.replaceStrings [ "@DOCKER_RESTART_CMD@" ]
+          [ "sudo -n ${dockerRestartCmdOf "$(whoami)"}" ]
+          ''
+          ## Containers: rootless docker, one daemon per user
+
+          `docker compose up` works here, and the parts you cannot arrange for
+          yourself are already in place: an `/etc/subuid` range, `newuidmap`/`newgidmap`
+          carrying the file capabilities that apply it, and - on a distro that refuses
+          an unprivileged user namespace outright - the AppArmor exemption that lets
+          one exist at all.
+
+          What is NOT installed is docker. Its closure is about 970 MiB, larger than
+          the whole runtime profile, so it comes from your own profile like every other
+          tool on this box:
+
+              nix profile add nixpkgs#docker      # docker, dockerd-rootless, compose v2
+              @DOCKER_RESTART_CMD@
+              docker compose up
+
+          The daemon is a supervised unit, not something you start in a pane: it
+          survives your session, comes back after a reboot, and there is exactly one
+          per user. `DOCKER_HOST` is already exported into every session, so no flag
+          and no `sudo` is needed to USE it - only to restart it, which is what picks
+          up a newly installed docker (the unit checks for the binary at every start,
+          and does nothing at all while you have none). `journalctl -u
+          agent-box-docker@$(whoami)` is where it says why it would not start.
+
+          You may `restart` and `stop` your OWN daemon and no one else's. A rootless
+          daemon is root over its user's containers and home, so that grant stops at
+          the user boundary like every other one here.
+
+          Two things worth knowing before you plan work around it:
+
+          - **Images live in your home**, under `~/.local/share/docker`, and they are
+            big. On a 2 GiB box, `docker system prune` is part of finishing a task,
+            not an afterthought - and check `df -h /` before pulling something large.
+          - **Containers are not a boundary between SESSIONS.** Every rootless
+            container of one user maps into that user's own subuid range, so it
+            isolates the user from the box and never one session from its siblings.
+            If you want a boundary, the answer is a separate user, not a container.
+
+          To deploy a compose file rather than run it, `defang compose up` needs no
+          local daemon at all.
+
+          ''
+      )) ]
     ''
     # agent-box
 
@@ -529,7 +585,7 @@ let
     set it again, or make it permanent at creation with
     `agent-box-session add work --harness claude -- -n "claude: PR 42"`.
 
-    @WEBHOOK_SECTION@## Handing a file to the user
+    @CONTAINERS_SECTION@@WEBHOOK_SECTION@## Handing a file to the user
 
     To let the user download a file you produced (report, build artifact,
     archive, image), move or copy it into ~/downloads and give them the full
@@ -618,7 +674,15 @@ let
   # in this module then renders as a host-level drop-in automatically
   # (default overrideStrategy = "asDropinIfExists" detects that a unit
   # file of the same name already exists in this package).
-  agentBoxUnitsPackage = pkgs.runCommand "agent-box-units" { } ''
+  # The concatenation below MUST stay inside the parentheses. Written as
+  # `runCommand "..." { } '' ... '' + lib.optionalString ...`, the `+`
+  # binds to the whole APPLICATION rather than to its last argument, so
+  # this evaluates to a derivation-coerced-to-string and systemd.packages
+  # gets a string where it wants a package. Nothing in the eval-level
+  # checks or the golden snapshot notices - the first thing that did was
+  # tests/containers.nix, at "A definition for option
+  # `nodes.machine.systemd.packages.[...]' is not of type `package'".
+  agentBoxUnitsPackage = pkgs.runCommand "agent-box-units" { } (''
     mkdir -p $out/etc/systemd/system
     install -m444 ${pkgs.writeText "agent-box@.service" ''
       [Unit]
@@ -774,7 +838,89 @@ let
       SocketGroup=caddy
       SocketMode=0660
     ''} $out/etc/systemd/system/agent-box-webhook@.socket
-  '';
+  '' + lib.optionalString cfg.containers.enable ''
+    install -m444 ${pkgs.writeText "agent-box-docker@.service" ''
+      [Unit]
+      Description=Rootless Docker daemon for %i
+      # The agent installs docker into its OWN nix profile (`nix profile add
+      # nixpkgs#docker`), the same way it installs every other tool here - the
+      # closure is 972 MiB, larger than the whole runtime profile, so agent-box
+      # ships the host CAPABILITY and not the runtime. A box whose user never
+      # installed it therefore has nothing to start, and this condition is what
+      # makes that a clean no-op ("condition failed") instead of a restart loop.
+      # It is re-evaluated on every start, so `sudo systemctl restart
+      # agent-box-docker@%i` right after a `nix profile add` is all it takes.
+      # ConditionFileIsExecutable and NOT ConditionPathIsExecutable, which is
+      # not a systemd key at all: systemd logs "Unknown key ... ignoring" and
+      # runs the unit anyway, so the whole no-op above becomes a 203/EXEC
+      # restart loop against a binary that is not there - the exact failure this
+      # line exists to prevent, with a one-line warning in the journal as the
+      # only sign. Caught by tests/containers.nix on its first real run.
+      ConditionFileIsExecutable=/home/%i/.nix-profile/bin/dockerd-rootless
+      After=network-online.target
+      Wants=network-online.target
+      StartLimitIntervalSec=60s
+      StartLimitBurst=3
+
+      [Service]
+      User=%i
+      Type=notify
+      NotifyAccess=all
+      # dockerd-rootless is a shell script wrapping rootlesskit; it reads HOME to
+      # find the data root (~/.local/share/docker) and XDG_RUNTIME_DIR to place
+      # both its own state and the API socket. Neither is set for a system unit,
+      # and the script exits 1 on the spot without them.
+      Environment=HOME=/home/%i
+      Environment=XDG_RUNTIME_DIR=/run/agent-box-docker/%i
+      # systemd owns that directory, rather than a tmpfiles rule in each
+      # backend. A tmpfiles rule has to NAME an owner and a group, and the two
+      # backends disagree about what a user's group is: a native box's useradd
+      # makes a per-user group, a NixOS box does not (isNormalUser defaults the
+      # primary group to `users`), so `d /run/agent-box-docker/%i 0700 %i %i`
+      # is right on one and "Failed to resolve group: Unknown group" on the
+      # other - no directory, and /run is empty again every boot. This asks
+      # systemd for the same thing without naming either: RuntimeDirectory=
+      # creates it as User= and its own group, RuntimeDirectoryMode sets 0700,
+      # and RuntimeDirectoryPreserve=yes keeps it across a stop - which an
+      # earlier draft wrongly believed RuntimeDirectory could not do.
+      RuntimeDirectory=agent-box-docker/%i
+      RuntimeDirectoryMode=0700
+      RuntimeDirectoryPreserve=yes
+      # rootlesskit needs newuidmap/newgidmap to apply this user's /etc/subuid
+      # range, and those two carry cap_setuid/cap_setgid as FILE capabilities -
+      # so they cannot come from the read-only nix store and are not on the
+      # wrapper's own embedded PATH. Both directories are listed because each
+      # backend has exactly one of them: /run/wrappers/bin is what NixOS's
+      # security.wrappers builds, /etc/agent-box/uidmap is where `agentbox apply`
+      # puts capped copies on a box that has no such mechanism. The missing one
+      # is simply skipped by PATH lookup, which is what lets this stay ONE
+      # shared unit instead of two hand-written ones that can drift.
+      Environment=PATH=/run/wrappers/bin:/etc/agent-box/uidmap:/usr/local/bin:/usr/bin:/bin
+      ExecStart=/home/%i/.nix-profile/bin/dockerd-rootless
+      # The daemon owns a cgroup subtree of its own, so it can put containers in
+      # cgroups without a systemd --user instance (agent-box users have no login
+      # session and no lingering user manager - see the PATH note above for the
+      # other half of that).
+      Delegate=yes
+      Restart=always
+      RestartSec=2s
+      # Type=notify with no start timeout is what nixpkgs' own rootless unit
+      # does, and it would hang `agentbox apply`: the activation phase starts
+      # every unit it renders and WAITS, so a daemon that never sends its
+      # readiness notification would stall a first boot (and, on the deployment
+      # templates, the CloudFormation signal that follows it) forever. Bounded
+      # here, and only here - a rootless daemon shutting down has containers and
+      # a slirp4netns helper to take with it, so the stop side keeps nixpkgs'
+      # unbounded value.
+      TimeoutStartSec=180
+      TimeoutStopSec=0
+      LimitNOFILE=infinity
+      LimitNPROC=infinity
+      LimitCORE=infinity
+      KillMode=mixed
+      StandardInput=null
+    ''} $out/etc/systemd/system/agent-box-docker@.service
+  '');
   # Shared by the "agent-box@" host-level ExecSearchPath (below) and the
   # per-user "agent-box@<name>" instance drop-in's environment.PATH — they
   # MUST be the same value. Per systemd.exec(5): "ExecSearchPath= overrides
@@ -793,7 +939,7 @@ let
     [ "/home/%i/.nix-profile" config.nix.package supervisorScript ]
     ++ agentRuntimePackages
     ++ [ pkgs.bashInteractive pkgs.coreutils pkgs.git pkgs.gh pkgs.tmux ]
-    ++ lib.optional (effectiveSudoAllowlist != [ ]) "/run/wrappers"
+    ++ lib.optional sudoGranted "/run/wrappers"
     # A plain string, not a package — defang lands here once
     # agent-box-defang-cli.service finishes installing it (issue #373), with
     # no eval-time build dependency the way a package entry would add.
@@ -822,6 +968,17 @@ let
   # and reads each file through its world-read bit (default 0644). Symlinked
   # into $HOME as ~/downloads so the agent never touches /var/lib directly.
   downloadsDirOf = name: "/var/lib/agent-box-downloads/${name}";
+
+  # XDG_RUNTIME_DIR for a user's rootless docker daemon (issue 600), which
+  # is where dockerd-rootless puts its own state AND the API socket the CLI
+  # connects to. Shared with the native renderer as a literal, because the
+  # unit that reads it (src/units/agent-box-docker@.service) is one file
+  # both backends install byte-for-byte.
+  containerRuntimeDir = "/run/agent-box-docker";
+  containerRuntimeDirOf = name: "${containerRuntimeDir}/${name}";
+  # The socket the CLI reaches the daemon through, which is what a session's
+  # DOCKER_HOST names. dockerd-rootless.sh fixes the file name.
+  containerSocketOf = name: "${containerRuntimeDirOf name}/docker.sock";
 
   # The box's own sources, on the box (issue #242). A deployed box fetches
   # ONE file — the generated modules/agent-box.nix, by rev + sha256 (issue
@@ -2439,10 +2596,36 @@ done
   # trap, where a grant that differs by one flag silently asks for a
   # password instead.
   rebootCmd = "/run/current-system/sw/bin/systemctl reboot --no-block";
+  # Start/stop of one user's OWN rootless docker daemon (issue 600).
+  # Spelled once for the reason every other command here is: sudoers
+  # matches argv exactly, and the shipped guide tells an agent to type
+  # this after `nix profile add nixpkgs#docker`, so the grant and the
+  # instruction have to agree character for character.
+  #
+  # `restart` and not `start`, because it is also the command that picks
+  # up a NEWLY installed docker: the unit's ConditionPathIsExecutable is
+  # re-evaluated at every start, and restart on an inactive unit starts
+  # it, so one grant covers both "bring it up" and "pick up the upgrade".
+  dockerRestartCmdOf = name:
+    "/run/current-system/sw/bin/systemctl restart agent-box-docker@${name}.service";
+  dockerStopCmdOf = name:
+    "/run/current-system/sw/bin/systemctl stop agent-box-docker@${name}.service";
   effectiveSudoAllowlist =
     cfg.sudoAllowlist
     ++ lib.optional cfg.web.enable caddyReloadCmd
     ++ lib.optional cfg.selfUpdate.enable updateStartCmd;
+  # Whether this box grants an agent user ANY sudo, which is a different
+  # question from whether effectiveSudoAllowlist is non-empty: the
+  # containers arm grants each user `systemctl restart/stop` on its OWN
+  # docker unit and only that, so those commands are per-user rules and
+  # cannot live in a box-wide list (same reason as the reboot grant).
+  # Both consumers below are about the MECHANISM rather than the list, so
+  # both have to ask this and not the list: /run/wrappers has to be on the
+  # agent's PATH for `sudo` to exist at all, and NoNewPrivileges=true
+  # would kill the setuid wrapper it resolves to. A grant nothing can
+  # reach is worse than no grant - it reads as a capability in review and
+  # answers "sudo: command not found" on the box.
+  sudoGranted = effectiveSudoAllowlist != [ ] || cfg.containers.enable;
   # Agent CLIs (claude-code, codex) move much faster than any host channel.
   # When the host wires selfUpdate.agentNixpkgs (from the pin file the update
   # service maintains — see that option), resolve just the agent packages from
@@ -7856,7 +8039,7 @@ esac
     if cond == "always" then true
     else if cond == "webhook" then webhookEnabled
     else if cond == "web" then cfg.web.enable
-    else if cond == "no-sudo-allowlist" then effectiveSudoAllowlist == [ ]
+    else if cond == "no-sudo-allowlist" then !sudoGranted
     else if cond == "protect-memory" then cfg.protectMemory
     else throw "agent-box: contract entry has unknown condition '${cond}'";
   # A non-env serviceConfig field (ReadWritePaths/NoNewPrivileges/
@@ -10738,6 +10921,64 @@ in
       '';
     };
 
+    containers = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Let an agent user run rootless containers, and manage the
+          per-user daemon as "agent-box-docker@<user>.service" (issue
+          600). What this option provides is the HOST capability, which
+          is the half an unprivileged session cannot provide for itself:
+          a /etc/subuid range, newuidmap/newgidmap carrying the file
+          capabilities that apply it, an AppArmor exemption on the
+          distros that refuse an unprivileged user namespace outright,
+          and a supervised place for the daemon to live.
+
+          Docker itself is NOT shipped. Its closure is 972 MiB - larger
+          than the entire runtime profile - so it arrives the way every
+          other tool on this box does, from the user's own profile
+          (`nix profile add nixpkgs#docker`), and the unit's
+          ConditionPathIsExecutable makes a box that never installed it a
+          no-op rather than a restart loop.
+
+          ON by default, which is a deliberate reversal of the first
+          draft of this option and worth reading before you keep it.
+
+          The reason is that "opt-in" is not reachable on a deployed box.
+          /etc/agent-box/config.yaml is written ONCE by the deployment
+          template, is root-owned, and no sudo grant, settings-page
+          control or CLI can edit it - so a flag defaulting to false is
+          not something a box can turn on, it is a flag that is off. The
+          agent, who is the only one who wants containers, has no way to
+          ask for them.
+
+          What the default actually costs is one thing, and only on a
+          distro host: newuidmap/newgidmap gain cap_setuid/cap_setgid,
+          and two store-path globs are allowed to create user namespaces.
+          That is the baseline Debian, Fedora and Arch already ship
+          (`uidmap`, and no userns restriction at all), and the baseline
+          a NixOS agent-box already has from programs.shadow. So the
+          default brings a native box level with the module backend and
+          with an ordinary distro, rather than granting something new in
+          kind. Nothing else appears until a user installs docker: the
+          unit's condition fails, and the daemon does not exist.
+
+          Set it to false on a host that relies on its distro's
+          unprivileged-userns restriction as defence in depth. The off
+          path reconciles - the units stop, the profile and the capped
+          copies are removed - so it is a real switch and not a one-way
+          door.
+
+          It is not a per-session boundary in either state: rootless
+          containers of ONE user all map into that user's own subuid
+          range, so they isolate the user from the box and never a
+          session from its siblings (see the Users-vs-Sessions wiki
+          page).
+        '';
+      };
+    };
+
     web = {
       enable = lib.mkEnableOption ''
         browser terminals (one ttyd per user with web.passwordHashFile set)
@@ -11757,7 +11998,21 @@ in
             "AGENT_BOX_URL=https://${cfg.web.domain}/${name}/\n"
             + lib.optionalString webhookEnabled
                 "AGENT_BOX_WEBHOOK_URL=https://${cfg.web.domain}${webhookPathOf name}\n"
-          );
+          )
+        # Where this user's own rootless docker daemon listens (issue 600).
+        # The docker CLI reads DOCKER_HOST, so `docker compose up` in a
+        # session needs no flag and no per-agent setup - and it points at
+        # the SUPERVISED daemon rather than whatever a session might have
+        # started by hand, so one box has one daemon per user.
+        #
+        # This is the unit's env file, not the session's, and that is
+        # enough: the supervisor starts the tmux SERVER inside this unit,
+        # so every pane it opens inherits this. Nothing in the CLI needs
+        # write access to reach the socket - connect() on an AF_UNIX
+        # socket is exempt from a read-only mount, which the agent unit's
+        # ProtectSystem=strict otherwise puts over /run.
+        + lib.optionalString cfg.containers.enable
+            "DOCKER_HOST=unix://${containerSocketOf name}\n";
     }) cfg.users
     # Codex autonomy for the WHOLE box (issue 234, see codexFullAccess).
     # codex reads /etc/codex/config.toml as its system layer, below the
@@ -12051,6 +12306,74 @@ in
     # systemd-oomd overlaps earlyoom (two daemons racing to kill under
     # pressure); keep exactly one, explicitly.
     systemd.oomd.enable = lib.mkDefault false;
+  }) (lib.mkIf cfg.containers.enable {
+    # Rootless containers for the agent users (issue 600).
+    #
+    # Everything here is the HOST half. The daemon unit itself is shared
+    # verbatim with the native renderer
+    # (src/units/agent-box-docker@.service, installed by
+    # agentBoxUnitsPackage above), and docker is not shipped at all - see
+    # the containers.enable description for why.
+    #
+    # NixOS supplies both prerequisites already, and the assertions below
+    # say so out loud rather than trusting it silently: programs.shadow
+    # puts newuidmap/newgidmap in /run/wrappers/bin with
+    # cap_setuid/cap_setgid as FILE capabilities (shadow's own
+    # --with-fcaps mode, the same thing Debian and Fedora ship), and
+    # users-groups.nix defaults autoSubUidGidRange to true for every
+    # isNormalUser, which ours are. A host that turned either off would
+    # leave the daemon failing at "newuidmap: command not found" or
+    # "could not find newuidmap", and neither message names the option
+    # that would fix it.
+    assertions = (lib.mapAttrsToList (name: u: {
+      assertion = config.users.users.${name}.autoSubUidGidRange
+        || config.users.users.${name}.subUidRanges != [ ];
+      message =
+        "services.agent-box.containers.enable is true but user "
+        + "\"${name}\" has no /etc/subuid range: rootlesskit maps a "
+        + "container's users into it, so set "
+        + "users.users.${name}.autoSubUidGidRange = true (the NixOS "
+        + "default for a normal user) or give subUidRanges explicitly.";
+    }) cfg.users) ++ [
+      {
+        assertion = config.security.wrappers ? newuidmap
+          && config.security.wrappers ? newgidmap;
+        message =
+          "services.agent-box.containers.enable is true but "
+          + "/run/wrappers/bin has no newuidmap/newgidmap wrapper. Those "
+          + "two need cap_setuid/cap_setgid to write a multi-ID "
+          + "/proc/<pid>/uid_map, which a read-only nix store path cannot "
+          + "carry - keep programs.shadow.enable at its default.";
+      }
+    ];
+
+    # One instance per configured user. The unit is a template, and a
+    # template's own wantedBy instantiates nothing - same shape as the
+    # "agent-box@" wants above.
+    systemd.targets.multi-user.wants =
+      map (name: "agent-box-docker@${name}.service") (lib.attrNames cfg.users);
+
+    # Each user may bring its OWN daemon up and take it down, and no
+    # other user's. Per-user rules rather than an entry in the box-wide
+    # effectiveSudoAllowlist, for the same reason the reboot grant is: a
+    # rootless daemon is root over its user's containers and home, so
+    # `stop` on somebody else's would be one agent user's power over
+    # another's work (the Users-vs-Sessions doctrine - the UID is the
+    # boundary).
+    security.sudo.extraRules = lib.mapAttrsToList (name: u: {
+      users = [ name ];
+      commands = map (command: { inherit command; options = [ "NOPASSWD" ]; }) [
+        (dockerRestartCmdOf name)
+        (dockerStopCmdOf name)
+      ];
+    }) cfg.users;
+
+    # No tmpfiles rules here on purpose: the daemon's XDG_RUNTIME_DIR is
+    # the unit's own RuntimeDirectory=, with RuntimeDirectoryPreserve=yes
+    # so it survives a stopped daemon. A per-user tmpfiles rule under /run
+    # races user creation on a fresh boot ("Failed to resolve group
+    # 'agent': Unknown group") and /run has no second chance - see the
+    # shared unit for the whole reason.
   }) (lib.mkIf cfg.selfUpdate.enable {
     # Agent-triggerable box update. The agents' only power here is the
     # allowlisted `sudo systemctl start agent-box-update.service` (see

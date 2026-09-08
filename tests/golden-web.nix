@@ -48,5 +48,11 @@
       enable = true;
       rev = "0000000000000000000000000000000000000000";
     };
+    # Rootless containers on (issue 600), so the shared docker unit, the
+    # two per-user sudo grants, the runtime-dir tmpfiles rules and the
+    # DOCKER_HOST env line are all in the fixture - and so that the native
+    # renderer's own half of them is compared against this one by
+    # one-spec-both-backends rather than only against itself.
+    containers.enable = true;
   };
 }

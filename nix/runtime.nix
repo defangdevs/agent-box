@@ -311,7 +311,23 @@ let
   # a ban action whose binary comes from the distro is a lock that
   # depends on the image having shipped one.
   serviceTools = with pkgs; [ tmux ttyd caddy bubblewrap which fail2ban
-                              nftables earlyoom ];
+                              nftables earlyoom
+                              # shadow for newuidmap/newgidmap and libcap
+                              # for setcap: `agentbox apply` copies the
+                              # first pair into /etc/agent-box/uidmap and
+                              # gives them the file capabilities that let
+                              # rootless docker apply a user's /etc/subuid
+                              # range (issue #600). Both are free: shadow's
+                              # whole closure is already here (pam pulls
+                              # it in) and libcap's is all but one path, so
+                              # this adds symlinks and no download.
+                              #
+                              # Docker itself is NOT here, and that is the
+                              # point of the design: 972 MiB, larger than
+                              # this entire profile, so it comes from the
+                              # user's own nix profile the way every other
+                              # tool on the box does.
+                              shadow libcap ];
 
   # Verbatim shared assets. Both backends install these byte-for-byte; the
   # native `agentbox apply` copies them out of the profile.
@@ -327,6 +343,7 @@ let
     for j in ${src}/contract/*.json; do install -m444 "$j" $out/share/agent-box/contract/; done
     install -m444 ${src}/default-agents.md ${src}/default-agents-webhook.md \
       ${src}/default-agents-host-native.md \
+      ${src}/default-agents-containers.md \
       $out/share/agent-box/guides/
     install -m444 ${src}/settings.css ${src}/settings.js $out/share/agent-box/web/
     # The pinned Defang CLI expression (issue #461). Shipped as a FILE, not

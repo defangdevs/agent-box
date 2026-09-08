@@ -1914,6 +1914,17 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           memory-protection = pkgs.testers.runNixOSTest
             (import ./tests/memory-protection.nix { agent-box = self.nixosModules.agent-box; });
 
+          # Interactive VM test (issue 600): the HOST half of rootless
+          # docker - the subuid range, the capped newuidmap/newgidmap, an
+          # unprivileged user namespace that is actually allowed, the 0700
+          # runtime dir, DOCKER_HOST in a session, and a per-user sudo
+          # grant that stops at the user. Plus the behaviour the design
+          # leans on hardest: with no docker installed the unit is a clean
+          # "condition failed" rather than a restart loop, and the granted
+          # `restart` alone picks a newly installed one up.
+          containers = pkgs.testers.runNixOSTest
+            (import ./tests/containers.nix { agent-box = self.nixosModules.agent-box; });
+
           # Interactive VM test (issue #59): sessions are runtime data — the
           # seeded "main" session starts, `agent-box-session add/rm` brings a
           # second agent up and down as the user (no sudo, no rebuild), the

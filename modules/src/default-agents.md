@@ -170,7 +170,7 @@ The name belongs to the harness, not to agent-box, so a respawn loses it:
 set it again, or make it permanent at creation with
 `agent-box-session add work --harness claude -- -n "claude: PR 42"`.
 
-@WEBHOOK_SECTION@## Handing a file to the user
+@CONTAINERS_SECTION@@WEBHOOK_SECTION@## Handing a file to the user
 
 To let the user download a file you produced (report, build artifact,
 archive, image), move or copy it into ~/downloads and give them the full
