@@ -14,7 +14,9 @@ Environment=HOME=/var/lib/caddy
 Environment=XDG_DATA_HOME=/var/lib
 Environment=XDG_CONFIG_HOME=/var/lib
 StateDirectory=caddy
-Restart=on-failure
+RuntimeDirectory=caddy
+Restart=always
+RestartPreventExitStatus=1
 RestartSec=5s
 ProtectHome=true
 ProtectSystem=strict

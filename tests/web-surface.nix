@@ -65,6 +65,10 @@
     # globs cap at ONE `*`, so the snippet import stays per-user (as in the
     # module). `log` is what the fail2ban filter reads.
     services.caddy.configFile = lib.mkForce (pkgs.writeText "Caddyfile" ''
+      {
+        admin unix//run/caddy/admin.sock
+      }
+
       import /var/lib/agent-box-sites/agent/*.caddy
 
       box.test {
@@ -236,6 +240,56 @@
         client.wait_until_succeeds(
             f"{site} https://mysite.test/ | grep 'hello from mysite' >/dev/null",
             timeout=30,
+        )
+
+    with subtest("the caddy admin API is off TCP and on a root-only socket"):
+        # Issue #605. Caddy's default admin endpoint is 127.0.0.1:2019 and it
+        # takes NO credentials, so any process on the box -- every agent
+        # session included -- could read the live config, replace it, or stop
+        # the server. On 2026-09-03 a bare `caddy stop` meant for a local
+        # preview found this endpoint instead and took the box's front door
+        # down for 47 minutes, losing about 44 webhook deliveries.
+        #
+        # The reload in the subtest above is the other half of this and has
+        # already run: it went through `systemctl reload caddy.service`, whose
+        # ExecReload passes no --address, and the new vhost served afterwards.
+        # So the endpoint moving to a socket did not cost the reload path that
+        # ~/sites depends on.
+        machine.succeed("test -S /run/caddy/admin.sock")
+        machine.succeed("stat -c '%U' /run/caddy/admin.sock | grep -x caddy")
+        # No group or other bits: root and caddy, nobody else.
+        machine.succeed(
+            "stat -c '%a' /run/caddy/admin.sock | grep -Ex '[0-7]?[0-7]00'"
+        )
+        machine.fail("sudo -u agent test -w /run/caddy/admin.sock")
+        # And nothing is listening on the old TCP port at all. /dev/tcp rather
+        # than curl or ss, so this asserts nothing about what the image ships.
+        machine.fail("timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2019'")
+
+    with subtest("caddy comes back from a clean stop on its own"):
+        # The second half of #605. A stop through the admin API is a CLEAN
+        # exit, so Restart=on-failure saw success and left the front door
+        # dead -- and the agent cannot start it again, because the sudo
+        # allowlist has `reload`, not `start`. The only way back was a reboot,
+        # which destroys every session on the box. Restart=always is what
+        # makes that recovery need no privilege and no human.
+        machine.succeed("systemctl show -p Restart caddy.service "
+                        "| grep -x 'Restart=always'")
+        # Drive it for real: a clean stop of the MAIN process, not
+        # `systemctl stop` (which would tell systemd the unit is meant to be
+        # down and is not what happened here).
+        main = machine.succeed(
+            "systemctl show -p MainPID --value caddy.service").strip()
+        machine.succeed(f"kill -TERM {main}")
+        machine.wait_until_succeeds(
+            f"test \"$(systemctl show -p MainPID --value caddy.service)\" "
+            f"!= {main}", timeout=60)
+        machine.wait_for_unit("caddy.service")
+        # Serving again, with no operator action of any kind.
+        client.wait_until_succeeds(
+            f"curl -sk --resolve mysite.test:443:{machine_ip} "
+            "https://mysite.test/ | grep 'hello from mysite' >/dev/null",
+            timeout=60,
         )
 
     with subtest("repeated basic-auth failures get the client banned"):

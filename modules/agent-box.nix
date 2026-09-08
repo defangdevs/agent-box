@@ -21407,6 +21407,34 @@ if __name__ == "__main__":
         # New hosts get a Let's Encrypt cert on first request as long as DNS
         # for that hostname points at this box.
 
+        # Global options. This block must come FIRST in a Caddyfile, before any
+        # snippet or site block.
+        {
+          # Keep the admin API off TCP (issue #605). Caddy's default endpoint is
+          # 127.0.0.1:2019 and it takes NO credentials, so every process on this box
+          # -- every agent session included -- could read the live config, replace it,
+          # or stop the server outright. `caddy stop` IS a request to this endpoint.
+          #
+          # That is not hypothetical. On 2026-09-03 a session ran a bare `caddy stop`
+          # meaning to stop its own local preview; the preview had `admin off` and so
+          # had no endpoint of its own, the command found THIS one, and the box's
+          # front door went down -- terminal, settings page, /downloads and webhook
+          # ingress with it. The box was deaf for 47 minutes and lost about 44
+          # webhook deliveries, which no sender replays.
+          #
+          # A unix socket under the unit's RuntimeDirectory is reachable by caddy and
+          # by root, and by nobody else. `systemctl reload caddy.service` keeps
+          # working because ExecReload runs as caddy and `caddy reload` reads the
+          # endpoint out of this very file (see `caddy reload --help`: "the endpoint
+          # configuration is loaded from the --address flag if specified; otherwise
+          # it is loaded from the given config file"). An agent's stray `caddy stop`
+          # now fails to find an endpoint instead of taking the box off the air.
+          #
+          # Do NOT replace this with `admin off`: that would also disable the reload
+          # path, and ~/sites depends on it.
+          admin unix//run/caddy/admin.sock
+        }
+
         (acme_alpn_only) {
           tls {
             issuer acme {
@@ -21601,6 +21629,7 @@ if __name__ == "__main__":
         configFile = managedCaddyfile;
       };
 
+
       # The settings daemon for each terminal user may invoke only that user's
       # argument-free password helper as root. Keeping these as separate rules
       # (instead of the global agent sudoAllowlist) prevents one agent user from
@@ -21743,7 +21772,26 @@ if __name__ == "__main__":
       # ambiguity either way.
       systemd.services = {
         agent-web-auth-secrets = webAuthSecretsService;
-        caddy.serviceConfig.EnvironmentFile = "/run/agent-box-web/env";
+        caddy.serviceConfig = {
+          EnvironmentFile = "/run/agent-box-web/env";
+          # The two below are issue #605, and the native renderer writes the
+          # same pair into its own unit (bin/agentbox) -- keep them in step.
+          #
+          # /run/caddy, owned by caddy: the directory the admin API's unix
+          # socket is created in. The socket itself is configured in the
+          # global options block of src/caddyfile-header.caddy, which is
+          # where the reasoning lives. nixpkgs sets no RuntimeDirectory, so
+          # this is an addition and needs no mkForce.
+          RuntimeDirectory = "caddy";
+          # nixpkgs says "on-failure", which does not cover the case that
+          # took this box down: a stop through the admin API is a CLEAN exit,
+          # so systemd saw success and left the front door dead with no way
+          # back that did not cost every session on the box. mkForce because
+          # nixpkgs defines this one; its RestartPreventExitStatus = 1 stays
+          # as it is, and is what keeps `always` from hot-looping on a
+          # configuration caddy cannot load.
+          Restart = lib.mkForce "always";
+        };
       }
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-web-terminal@${name}" {
         overrideStrategy = "asDropin";
