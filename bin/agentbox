@@ -2295,7 +2295,26 @@ class Renderer:
             "Environment=XDG_DATA_HOME=/var/lib\n"
             "Environment=XDG_CONFIG_HOME=/var/lib\n"
             "StateDirectory=caddy\n"
-            "Restart=on-failure\n"
+            # /run/caddy, owned by caddy: where the admin API's unix socket
+            # lives (issue #605, see the global options block in
+            # src/caddyfile-header.caddy). Without this the socket has no
+            # directory to be created in and caddy refuses to start.
+            "RuntimeDirectory=caddy\n"
+            # `always`, not `on-failure` (issue #605). A stop through the
+            # admin API is a CLEAN exit, so `on-failure` saw success and left
+            # the front door down -- the box stayed dead until somebody
+            # rebooted it, taking every session with it. The agent cannot
+            # start this unit back up: the sudo allowlist has `reload`, not
+            # `start`. Restarting itself is the recovery that needs no
+            # privilege and no human.
+            #
+            # RestartPreventExitStatus mirrors what the NixOS caddy module
+            # already does, and is what keeps `always` from becoming a hot
+            # loop: caddy exits 1 on a configuration it cannot load (a broken
+            # ~/sites snippet, say), and retrying that every 5s forever would
+            # bury the reason in the journal rather than leave it legible.
+            "Restart=always\n"
+            "RestartPreventExitStatus=1\n"
             "RestartSec=5s\n"
             # Same shape as the NixOS caddy unit: it must not read /home,
             # which is why ~/sites is a symlink into /var/lib/agent-box-sites.

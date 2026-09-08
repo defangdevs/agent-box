@@ -3642,6 +3642,7 @@ in
         configFile = managedCaddyfile;
       };
 
+
       # The settings daemon for each terminal user may invoke only that user's
       # argument-free password helper as root. Keeping these as separate rules
       # (instead of the global agent sudoAllowlist) prevents one agent user from
@@ -3784,7 +3785,26 @@ in
       # ambiguity either way.
       systemd.services = {
         agent-web-auth-secrets = webAuthSecretsService;
-        caddy.serviceConfig.EnvironmentFile = "/run/agent-box-web/env";
+        caddy.serviceConfig = {
+          EnvironmentFile = "/run/agent-box-web/env";
+          # The two below are issue #605, and the native renderer writes the
+          # same pair into its own unit (bin/agentbox) -- keep them in step.
+          #
+          # /run/caddy, owned by caddy: the directory the admin API's unix
+          # socket is created in. The socket itself is configured in the
+          # global options block of src/caddyfile-header.caddy, which is
+          # where the reasoning lives. nixpkgs sets no RuntimeDirectory, so
+          # this is an addition and needs no mkForce.
+          RuntimeDirectory = "caddy";
+          # nixpkgs says "on-failure", which does not cover the case that
+          # took this box down: a stop through the admin API is a CLEAN exit,
+          # so systemd saw success and left the front door dead with no way
+          # back that did not cost every session on the box. mkForce because
+          # nixpkgs defines this one; its RestartPreventExitStatus = 1 stays
+          # as it is, and is what keeps `always` from hot-looping on a
+          # configuration caddy cannot load.
+          Restart = lib.mkForce "always";
+        };
       }
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-web-terminal@${name}" {
         overrideStrategy = "asDropin";

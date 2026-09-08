@@ -18,9 +18,10 @@ NoNewPrivileges=true
 PrivateDevices=true
 ProtectHome=true
 ReadWritePaths=/var/lib/caddy
-Restart=on-failure
+Restart=always
 RestartPreventExitStatus=1
 RestartSec=5s
+RuntimeDirectory=caddy
 StateDirectory=caddy
 User=caddy
 
