@@ -562,7 +562,7 @@ FIRST and the rebuild follows it, so between the two - and after a
 rebuild that failed and could not put the tree back, which the wall
 notice says - it reads ahead of the running system.
 
-Read what an update did in `/var/log/agent-box/update.log` - the last run, whether
+Read what an update did in `/var/log/agent-box-update.log` - the last run, whether
 it worked or not. Reach for that and NOT
 `journalctl -u agent-box-update.service`, which prints nothing at all
 for you: an agent user is in neither `adm` nor `systemd-journal`. A

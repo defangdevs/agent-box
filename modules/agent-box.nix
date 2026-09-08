@@ -2762,7 +2762,7 @@ done
   updateStartCmd = "/run/current-system/sw/bin/systemctl start --no-block agent-box-update.service";
   # The update's own output, where an agent that triggered one can read it
   # back. Kept in step with the native renderer's UPDATE_LOG.
-  updateLogFile = "/var/log/agent-box/update.log";
+  updateLogFile = "/var/log/agent-box-update.log";
   # The settings page's "Reboot box" button. --no-block for the same reason
   # the update trigger has it, only more so: the daemon must answer the
   # request before systemd starts stopping units, and the daemon is one of
@@ -13437,10 +13437,15 @@ in
       # so the only visible symptom is a rev that will not move.
       #
       # truncate:, so the file is the LAST run and cannot grow without
-      # bound; LogsDirectory= makes /var/log/agent-box without a tmpfiles
-      # rule, and systemd writes the file 0644 - readable by every agent,
-      # writable by none. Root loses nothing: it reads the same file.
-      serviceConfig.LogsDirectory = "agent-box";
+      # bound; systemd writes it 0644 - readable by every agent, writable
+      # by none. Root loses nothing: it reads the same file.
+      #
+      # Straight in /var/log and NOT a subdirectory of it. The first draft
+      # wrote /var/log/agent-box/update.log and asked LogsDirectory= to
+      # make the directory - systemd opens the output file BEFORE creating
+      # it, so the unit died at 209/STDOUT having never reached ExecStart.
+      # That shipped, and it left the box unable to update at all, with
+      # only root able to undo it. /var/log always exists.
       serviceConfig.StandardOutput = "truncate:${updateLogFile}";
       serviceConfig.StandardError = "inherit";
       script = ''
