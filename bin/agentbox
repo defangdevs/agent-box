@@ -743,8 +743,17 @@ class Spec:
         # namespace may be created, newuidmap/newgidmap carrying the file
         # capabilities that apply the user's /etc/subuid range, and the
         # supervised unit the daemon runs in.
+        # ON by default. Not because containers are always wanted, but
+        # because "opt-in" is unreachable here: config.yaml is written
+        # once by the deployment template, is root-owned, and nothing on
+        # a running box - no sudo grant, no settings control, no CLI -
+        # can edit it, so a false default is not a switch an operator can
+        # flip, it is the feature being absent. The `or {}` folds only an
+        # absent key or an explicit null; the schema's hint refuses
+        # `containers: false`, which would otherwise fold to {} and
+        # default straight back to true - the same trap osUpdates has.
         containers = data.get("containers") or {}
-        self.containers_enable = bool(containers.get("enable", False))
+        self.containers_enable = bool(containers.get("enable", True))
         # Base-OS patching (see APT_CONF). Default on, because the failure
         # it prevents is silent: an unattended patch run that installs a
         # fix and restarts nothing looks exactly like one that worked.
@@ -3906,12 +3915,22 @@ def activate(spec, tree, removed, advisory, act):
                 ["systemd-tmpfiles", "--create",
                  "/etc/tmpfiles.d/agent-box.conf"])
     if spec.containers_enable:
-        # Both before the units, and both required: a docker unit that
-        # starts without them fails in a way that names neither. The
-        # helper puts capped newuidmap/newgidmap on the unit's PATH; the
-        # profile is what lets an unprivileged user namespace exist at all
-        # on a distro that restricts them.
-        act.require("agent-box-uidmap", [UIDMAP_HELPER])
+        # Both before the units, and every one of them ADVISORY.
+        #
+        # That is the whole difference default-on makes, and it was not
+        # the first draft: with the option opt-in, a missing prerequisite
+        # was the box failing to be what the config asked for, so the
+        # AppArmor load was require(). On by default, the same line means
+        # that a distro image which restricts unprivileged user
+        # namespaces and ships no apparmor userspace fails `agentbox
+        # apply` - which on a first boot is the CloudFormation/Azure
+        # signal that never comes, and on an update is a profile rolled
+        # back. A convenience nobody asked for must not be able to take a
+        # box down, so each of these is a note that names its own fix.
+        # (Found by tests/test_agentbox.py's activation tests, which run
+        # inside a Nix sandbox that inherits this kernel's sysctl and has
+        # no apparmor_parser - the same shape as that distro image.)
+        act.optional("agent-box-uidmap", [UIDMAP_HELPER])
         if not Path(USERNS_RESTRICT_SYSCTL).exists():
             # RHEL/SELinux, or a kernel built without AppArmor. The file is
             # still RENDERED (a render must never depend on the host it
@@ -3925,15 +3944,17 @@ def activate(spec, tree, removed, advisory, act):
                 f"{APPARMOR_PROFILE} is left unloaded")
         elif apparmor_parser() is None:
             # The restriction IS in force and nothing here can lift it, so
-            # this is the box failing to be what the config asked for: no
-            # container will start until the distro's apparmor tooling is
-            # installed. Named as a required failure rather than left for
-            # the operator to infer from a daemon that will not come up.
-            act.failed(
-                "load AppArmor container profiles",
-                f"{Path(USERNS_RESTRICT_SYSCTL).name} is 1, so an "
-                "unprivileged user namespace needs an AppArmor profile, "
-                "and apparmor_parser is not installed - install your "
+            # containers will not work on this box until the distro's own
+            # apparmor userspace is installed. Said plainly, because the
+            # alternative is an operator inferring it from a daemon that
+            # will not come up - but a note and not a failure, for the
+            # reason above.
+            act.notes.append(
+                "containers: " + Path(USERNS_RESTRICT_SYSCTL).name
+                + " is 1, so an unprivileged user namespace needs an "
+                "AppArmor profile, and apparmor_parser is not installed - "
+                f"{APPARMOR_PROFILE} was written but not loaded, and no "
+                "rootless container can start until you install your "
                 "distro's apparmor package (Debian/Ubuntu: apparmor) and "
                 "re-apply")
         else:
@@ -3949,9 +3970,9 @@ def activate(spec, tree, removed, advisory, act):
             # opposite of the nftables argument elsewhere in this file -
             # there the distro's binary is a fragile dependency, here it is
             # the only correct one.
-            act.require("load AppArmor container profiles",
-                        [apparmor_parser(), "--replace", "--write-cache",
-                         APPARMOR_PROFILE])
+            act.optional("load AppArmor container profiles",
+                         [apparmor_parser(), "--replace", "--write-cache",
+                          APPARMOR_PROFILE])
     else:
         # Named from the CONFIG, not discovered: an instance enabled
         # through a target drop-in has no unit file for

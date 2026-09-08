@@ -1773,7 +1773,7 @@ in
     containers = {
       enable = lib.mkOption {
         type = lib.types.bool;
-        default = false;
+        default = true;
         description = ''
           Let an agent user run rootless containers, and manage the
           per-user daemon as "agent-box-docker@<user>.service" (issue
@@ -1791,14 +1791,39 @@ in
           ConditionPathIsExecutable makes a box that never installed it a
           no-op rather than a restart loop.
 
-          Off by default. Turning it on grants the box's agent users the
-          ability to create user namespaces, which on a NixOS host they
-          have anyway and on a hardened distro host they deliberately do
-          not - so it is the operator's call and not a default. It is not
-          a per-session boundary either: rootless containers of ONE user
-          all map into that user's own subuid range, so they isolate the
-          user from the box and never a session from its siblings (see
-          the Users-vs-Sessions wiki page).
+          ON by default, which is a deliberate reversal of the first
+          draft of this option and worth reading before you keep it.
+
+          The reason is that "opt-in" is not reachable on a deployed box.
+          /etc/agent-box/config.yaml is written ONCE by the deployment
+          template, is root-owned, and no sudo grant, settings-page
+          control or CLI can edit it - so a flag defaulting to false is
+          not something a box can turn on, it is a flag that is off. The
+          agent, who is the only one who wants containers, has no way to
+          ask for them.
+
+          What the default actually costs is one thing, and only on a
+          distro host: newuidmap/newgidmap gain cap_setuid/cap_setgid,
+          and two store-path globs are allowed to create user namespaces.
+          That is the baseline Debian, Fedora and Arch already ship
+          (`uidmap`, and no userns restriction at all), and the baseline
+          a NixOS agent-box already has from programs.shadow. So the
+          default brings a native box level with the module backend and
+          with an ordinary distro, rather than granting something new in
+          kind. Nothing else appears until a user installs docker: the
+          unit's condition fails, and the daemon does not exist.
+
+          Set it to false on a host that relies on its distro's
+          unprivileged-userns restriction as defence in depth. The off
+          path reconciles - the units stop, the profile and the capped
+          copies are removed - so it is a real switch and not a one-way
+          door.
+
+          It is not a per-session boundary in either state: rootless
+          containers of ONE user all map into that user's own subuid
+          range, so they isolate the user from the box and never a
+          session from its siblings (see the Users-vs-Sessions wiki
+          page).
         '';
       };
     };
