@@ -859,8 +859,22 @@ let
       ConditionFileIsExecutable=/home/%i/.nix-profile/bin/dockerd-rootless
       After=network-online.target
       Wants=network-online.target
-      StartLimitIntervalSec=60s
-      StartLimitBurst=3
+      # The user manager the ExecStart below insists on is logind's to start,
+      # and on NixOS the marker that tells it to is written by linger-users -
+      # a unit that does not exist on a native box, where an ordering
+      # dependency on a unit nobody ships is simply ignored. Neither one is a
+      # guarantee (logind brings user managers up after it is itself up), which
+      # is what the restart budget below is for; they just remove the part of
+      # the race that is expressible.
+      After=systemd-logind.service linger-users.service
+      # No rate limit, deliberately. The ExecStart below refuses to start
+      # until this user's bus exists, and on a cold boot that can be after
+      # logind has got round to the user manager - so ANY finite budget is a
+      # race the box can lose permanently: the budget burns down in seconds,
+      # the unit stays failed once the bus appears, and nothing retries it
+      # until an operator does. The cost of a genuine crash loop is bounded
+      # by the backoff below instead, which is the tool for that job.
+      StartLimitIntervalSec=0
 
       [Service]
       User=%i
@@ -896,14 +910,44 @@ let
       # is simply skipped by PATH lookup, which is what lets this stay ONE
       # shared unit instead of two hand-written ones that can drift.
       Environment=PATH=/run/wrappers/bin:/etc/agent-box/uidmap:/usr/local/bin:/usr/bin:/bin
-      ExecStart=/home/%i/.nix-profile/bin/dockerd-rootless
-      # The daemon owns a cgroup subtree of its own, so it can put containers in
-      # cgroups without a systemd --user instance (agent-box users have no login
-      # session and no lingering user manager - see the PATH note above for the
-      # other half of that).
+      # Rootless docker can enforce a resource limit ONLY through the systemd
+      # cgroup driver, and that driver asks THIS USER'S OWN systemd manager for
+      # every container scope, over the user bus. Nothing sets that bus for a
+      # system unit, and the failure is quiet in the worst way: moby turns
+      # cgroups off wholesale (`docker info` reads "Cgroup Driver: none"),
+      # `docker run -m 128m` still exits 0, and memory.max inside the container
+      # reads "max". A daemon that cannot enforce a limit is worse than no
+      # daemon on a 2 GiB box, so this resolves the bus first and REFUSES to
+      # start without it.
+      #
+      # The bus is /run/user/<uid>/bus and the uid cannot be written here. %U is
+      # the MANAGER's uid - 0 for a system unit - because systemd.unit(5) says
+      # %u and %U are "not influenced by the User= setting", and neither backend
+      # pins a uid for its agent users (NixOS allocates one per isNormalUser,
+      # useradd takes the next free one). So it is found at start, as the one
+      # /run/user entry this user owns.
+      #
+      # Shell BUILTINS only - no id(1), no sleep(1). The PATH above carries no
+      # coreutils on purpose and a NixOS box has none for it to find: /bin holds
+      # sh and nothing else there. `$$` is systemd's escape for a literal dollar.
+      ExecStart=/bin/sh -c 'for d in /run/user/*; do [ -O "$$d" ] && [ -S "$$d/bus" ] && bus="$$d/bus"; done; [ -n "$''${bus-}" ] || { echo "agent-box: no user bus under /run/user - is lingering enabled for %i?" >&2; exit 1; }; DBUS_SESSION_BUS_ADDRESS="unix:path=$''${bus}"; export DBUS_SESSION_BUS_ADDRESS; exec /home/%i/.nix-profile/bin/dockerd-rootless'
+      # The daemon owns a cgroup subtree of its own. This is NOT what puts a
+      # container in a cgroup - the systemd driver does that, through the user
+      # manager named above, and the scope it creates lands under
+      # /user.slice/user-<uid>.slice/user@<uid>.service rather than anywhere in
+      # this unit's subtree. An earlier draft of this file claimed the delegation
+      # made a `systemd --user` instance unnecessary; it does not, and the whole
+      # feature shipped unable to start a single container because of it.
       Delegate=yes
       Restart=always
+      # Exponential, 2s doubling to 32s (systemd 254+; an older systemd ignores
+      # the two extra keys with a warning and simply keeps retrying every 2s,
+      # which is the same behaviour, just noisier). This is what makes an
+      # unlimited Restart= cheap: a daemon that cannot start costs one spawn
+      # every 32 seconds, and a bus that appears late is still picked up.
       RestartSec=2s
+      RestartSteps=5
+      RestartMaxDelaySec=32s
       # Type=notify with no start timeout is what nixpkgs' own rootless unit
       # does, and it would hang `agentbox apply`: the activation phase starts
       # every unit it renders and WAITS, so a daemon that never sends its
@@ -12150,6 +12194,19 @@ in
       home = "/home/${name}";
       createHome = true;
       extraGroups = u.extraGroups;
+      # Without this, /run/user/<uid> only exists while a PAM login session
+      # is active — logind never creates it for a session started outside
+      # one (e.g. this module's own supervisor). That silently breaks any
+      # long-lived `systemctl --user` unit, and it is what decides whether
+      # a rootless container runtime can ENFORCE a limit: rootless docker
+      # gets one only from the systemd cgroup driver, which asks this
+      # user's own manager for every container scope over its bus. With no
+      # manager there is no bus, and `docker run -m 128m` then exits 0 with
+      # memory.max reading "max" inside the container — which is why the
+      # shared docker unit refuses to start without it. Podman fails
+      # earlier and louder, at `lstat /run/user/<uid>: no such file or
+      # directory`, which is where issue #600 found this.
+      linger = true;
       # Overridable so a host config can pick another shell (e.g. pkgs.zsh) —
       # "shell" sessions (issue #113) run whatever this resolves to. Priority
       # 900: mkDefault would TIE with the isNormalUser->useDefaultShell

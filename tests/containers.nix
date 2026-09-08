@@ -173,6 +173,18 @@
         f"runuser -u agent -- sh -c \"printf "
         f"'#!/bin/sh\\n{notify} --ready\\nexec {sleep} infinity\\n' "
         f"> {fake} && chmod 755 {fake}\"")
+    # Lingering, and the manager it brings up. This is what the daemon
+    # refuses to start without: rootless docker enforces a limit only
+    # through the systemd cgroup driver, which asks THIS user's manager
+    # for every container scope. Waited for rather than assumed - logind
+    # starts it after it is itself up, so a start here can outrun it.
+    uid = machine.succeed("id -u agent").strip()
+    linger = machine.succeed(
+        "loginctl show-user agent --property=Linger --value").strip()
+    assert linger == "yes", f"lingering is {linger} for agent, want yes"
+    machine.wait_for_unit(f"user@{uid}.service")
+    machine.wait_for_file(f"/run/user/{uid}/bus")
+
     machine.succeed(f"su -s /bin/sh agent -c 'sudo -n {restart}'")
     # The condition passed this time, and the unit is actually running the
     # binary - a start that ran nothing would be inactive, as it was above.
@@ -209,6 +221,18 @@
     assert "XDG_RUNTIME_DIR=/run/agent-box-docker/agent" in env.splitlines(), \
         ("the daemon has no XDG_RUNTIME_DIR, so it would put its socket "
          "somewhere no session's DOCKER_HOST points at")
+    # THE regression assertion. The daemon must hold the address of this
+    # user's OWN bus, with this user's numeric uid in it. Everything about
+    # enforced limits hangs off this one line: without it moby reports
+    # "Cgroup Driver: none", `docker run -m 128m` exits 0, and memory.max
+    # inside the container reads "max" - a limit accepted and discarded,
+    # which is worse than a refused one. Written as a literal uid because
+    # the obvious spelling for the unit, %U, is the MANAGER's uid (0 for a
+    # system unit) and not User='s - so a return to it fails right here
+    # instead of on some operator's box six months later.
+    want_bus = f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus"
+    assert want_bus in env.splitlines(), \
+        f"the daemon has no {want_bus}, so it can enforce no limit"
     # And the capped uidmap binaries are reachable from its PATH, which is
     # the one thing rootlesskit cannot do without.
     path = [line for line in env.splitlines() if line.startswith("PATH=")]
@@ -224,5 +248,36 @@
         "/run/current-system/sw/bin/systemctl stop "
         "agent-box-docker@agent.service'")
     machine.succeed("test -d /run/agent-box-docker/agent")
+
+    # 10. Take the manager away and the daemon must REFUSE, loudly. This is
+    #     the half that cannot be read off a config: a daemon that starts
+    #     anyway would look healthy, answer every CLI call, and silently
+    #     drop every resource limit asked of it. Last, because it undoes
+    #     the lingering everything above needs.
+    machine.succeed("loginctl disable-linger agent")
+    machine.succeed(f"systemctl stop user@{uid}.service")
+    machine.wait_until_fails(f"test -S /run/user/{uid}/bus")
+    machine.fail(
+        "su -s /bin/sh agent -c 'sudo -n "
+        "/run/current-system/sw/bin/systemctl restart "
+        "agent-box-docker@agent.service'")
+    # NOT `log`: the test driver has a global of that name (an
+    # AbstractLogger), and shadowing it fails the driver's own type check
+    # before a single VM boots - which is how this test spent one CI round.
+    journal = machine.succeed(
+        "journalctl -u agent-box-docker@agent.service -n 20 -o cat")
+    assert "no user bus" in journal, \
+        f"the daemon did not say why it would not start: {journal}"
+
+    # 11. And it must come back BY ITSELF once the manager returns. This is
+    #     the other half of refusing: a unit that gave up for good would
+    #     leave a box with no docker after any boot that brought logind's
+    #     user manager up a few seconds late, and nothing would say so.
+    #     StartLimitIntervalSec=0 plus the backoff is what makes this pass;
+    #     the six-start budget it replaced could not.
+    machine.succeed("loginctl enable-linger agent")
+    machine.wait_for_unit(f"user@{uid}.service")
+    machine.wait_for_file(f"/run/user/{uid}/bus")
+    machine.wait_for_unit("agent-box-docker@agent.service")
   '';
 }
