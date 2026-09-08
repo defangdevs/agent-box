@@ -33,6 +33,10 @@
       containers.enable = true;
       users.agent = { };
     };
+    # getcap, for the capability assertion below. NixOS puts no libcap
+    # binary on the system path by default, so without this the test fails
+    # at "getcap: command not found" and reads as a missing capability.
+    environment.systemPackages = [ pkgs.libcap ];
     system.stateVersion = "25.05";
   };
 
@@ -89,12 +93,21 @@
     assert result == "no", f"ConditionResult is {result}, want no"
 
     # 6. The session's DOCKER_HOST, so `docker compose up` needs no flag
-    #    and no per-agent setup. Read off the unit rather than out of the
-    #    env file, because the file only matters if the unit loads it.
-    env = machine.succeed(
-        "systemctl show agent-box@agent --property=Environment --value")
+    #    and no per-agent setup. Read it out of the RUNNING supervisor,
+    #    not off the unit: it arrives through EnvironmentFile=, which
+    #    `systemctl show --property=Environment` does not report, and the
+    #    question that matters is whether it reaches the process that
+    #    starts the tmux server every pane inherits from.
     want = "DOCKER_HOST=unix:///run/agent-box-docker/agent/docker.sock"
-    assert want in env, f"agent unit has no {want}: {env}"
+    pid = machine.succeed(
+        "systemctl show agent-box@agent --property=MainPID --value").strip()
+    env = machine.succeed(f"tr '\\0' '\\n' < /proc/{pid}/environ")
+    assert want in env.splitlines(), \
+        f"the supervisor's environment has no {want}"
+    # And it is in the file the unit reads, which is what survives a
+    # restart of that process.
+    machine.succeed(
+        f"grep -Fx '{want}' /etc/agent-box/units/agent.env >/dev/null")
 
     # 7. The grant, byte for byte. sudoers matches argv exactly, so a rule
     #    that differs from the command the shipped guide prints asks for a
@@ -122,20 +135,47 @@
     #    right verb to grant and the right one to document.
     machine.succeed(
         "install -d -o agent -g agent /home/agent/.nix-profile/bin")
+    # The fake sends the readiness notification a real dockerd-rootless
+    # sends, because the unit is Type=notify: without it the granted
+    # `restart` blocks for the whole TimeoutStartSec and then fails, which
+    # would be three wasted minutes and a masked assertion rather than a
+    # test. Resolved from the DRIVER's shell - the unit's own PATH is
+    # deliberately short, and hard-coding a store path here would rot.
+    notify = machine.succeed("command -v systemd-notify").strip()
+    fake = "/home/agent/.nix-profile/bin/dockerd-rootless"
     machine.succeed(
-        "printf '#!/bin/sh\\nsleep infinity\\n' "
-        "> /home/agent/.nix-profile/bin/dockerd-rootless")
-    machine.succeed("chmod 755 /home/agent/.nix-profile/bin/dockerd-rootless")
-    machine.succeed(f"su -s /bin/sh agent -c 'sudo -n {restart}' || true")
-    # Type=notify and the fake never notifies, so it stays "activating" -
-    # which is exactly what proves the condition passed and the unit is
-    # running the binary. Anything that ran nothing would be inactive.
-    machine.wait_until_succeeds(
+        f"printf '#!/bin/sh\\n{notify} --ready\\nexec sleep infinity\\n' "
+        f"> {fake}")
+    machine.succeed(f"chmod 755 {fake}")
+    machine.succeed(f"su -s /bin/sh agent -c 'sudo -n {restart}'")
+    # The condition passed this time, and the unit is actually running the
+    # binary - a start that ran nothing would be inactive, as it was above.
+    result = machine.succeed(
         "systemctl show agent-box-docker@agent.service "
-        "--property=ConditionResult --value | grep '^yes$' >/dev/null")
-    machine.succeed(
+        "--property=ConditionResult --value").strip()
+    assert result == "yes", f"ConditionResult is {result} after installing"
+    machine.wait_for_unit("agent-box-docker@agent.service")
+    # As the right user, in its own delegated cgroup, with the runtime
+    # dir and the PATH it was given - the four things the unit is for.
+    who = machine.succeed(
+        "ps -o user= -p $(systemctl show agent-box-docker@agent.service "
+        "--property=MainPID --value)").strip()
+    assert who == "agent", f"the daemon runs as {who}, want agent"
+    delegate = machine.succeed(
         "systemctl show agent-box-docker@agent.service "
-        "--property=ActiveState --value | grep -E '^(active|activating)$' "
-        ">/dev/null")
+        "--property=Delegate --value").strip()
+    assert delegate == "yes", f"Delegate is {delegate}"
+    pid = machine.succeed(
+        "systemctl show agent-box-docker@agent.service "
+        "--property=MainPID --value").strip()
+    env = machine.succeed(f"tr '\\0' '\\n' < /proc/{pid}/environ")
+    assert "XDG_RUNTIME_DIR=/run/agent-box-docker/agent" in env.splitlines(), \
+        ("the daemon has no XDG_RUNTIME_DIR, so it would put its socket "
+         "somewhere no session's DOCKER_HOST points at")
+    # And the capped uidmap binaries are reachable from its PATH, which is
+    # the one thing rootlesskit cannot do without.
+    path = [line for line in env.splitlines() if line.startswith("PATH=")]
+    assert path and "/run/wrappers/bin" in path[0], \
+        f"the daemon's PATH has no /run/wrappers/bin: {path}"
   '';
 }
