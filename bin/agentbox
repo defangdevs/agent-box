@@ -129,8 +129,13 @@ DOCKER_UNIT_PREFIX = "agent-box-docker@"
 # line is /run/wrappers/bin, and each backend has only one of the two.
 UIDMAP_DIR = "/etc/agent-box/uidmap"
 UIDMAP_HELPER = "/etc/agent-box/bin/agent-box-uidmap"
-UIDMAP_PROGRAMS = (("newuidmap", "cap_setuid+ep"),
-                   ("newgidmap", "cap_setgid+ep"))
+# Program -> the one capability it needs, by NAME. The name and not a
+# spelling, because setcap and getcap disagree on the punctuation: setcap
+# takes `cap_setuid+ep` and getcap PRINTS `cap_setuid=ep`, so a helper
+# that greps getcap's output for setcap's spelling never matches and
+# re-caps the file on every apply.
+UIDMAP_PROGRAMS = (("newuidmap", "cap_setuid"),
+                   ("newgidmap", "cap_setgid"))
 # XDG_RUNTIME_DIR for a user's daemon, and the socket inside it that the
 # CLI reaches it through. Also fixed by the shared unit.
 DOCKER_RUNTIME_DIR = "/run/agent-box-docker"
@@ -1456,10 +1461,10 @@ class Renderer:
             f'getcap={shlex.quote(str(self.bin / "getcap"))}',
             'mkdir -p "$dir"',
             "for pair in " + " ".join(
-                f"{program}={caps}" for program, caps in UIDMAP_PROGRAMS
+                f"{program}:{cap}" for program, cap in UIDMAP_PROGRAMS
             ) + "; do",
-            '  program=${pair%%=*}',
-            '  caps=${pair#*=}',
+            '  program=${pair%%:*}',
+            '  cap=${pair#*:}',
             # cmp before install: a rewrite drops the capability, and the
             # window between the write and the setcap is a window in which
             # a running daemon's restart would fail.
@@ -1470,12 +1475,21 @@ class Renderer:
             # Re-asserted even when the copy was current: a capability can
             # be lost without the bytes changing (a restore from a backup
             # that dropped xattrs, an operator's own cp).
-            '  if ! "$getcap" "$dir/$program" | grep -q "$caps"; then',
-            '    "$setcap" "$caps" "$dir/$program"',
+            # `| grep PATTERN >/dev/null` and not `grep -q`: -q exits on
+            # the first match, and the EPIPE that gives getcap would be
+            # the pipeline's story on a shell less forgiving than this
+            # one. getcap prints "<path> cap_setuid=ep" for a capped file
+            # and NOTHING AT ALL (exit 0) for an uncapped one, so the
+            # match has to be on its own spelling, not setcap's.
+            '  if ! "$getcap" "$dir/$program" \\',
+            '      | grep "$cap=ep" >/dev/null; then',
+            '    "$setcap" "$cap+ep" "$dir/$program"',
             '  fi',
             "done",
         ]), 0o755)
         t.file(self.p(APPARMOR_PROFILE), self.apparmor_profile_text())
+        for u in self.spec.users:
+            t.units.append(f"{DOCKER_UNIT_PREFIX}{u.name}.service")
 
     def containers_off(self, t):
         """And turning it off has to take the daemon and the grant with it.
@@ -2171,6 +2185,8 @@ class Renderer:
             if self.spec.webhook_enable:
                 units.append(f"agent-box-webhook@{u.name}.service")
                 sockets.append(f"agent-box-webhook@{u.name}.socket")
+            if self.spec.containers_enable:
+                units.append(f"{DOCKER_UNIT_PREFIX}{u.name}.service")
         for target, wants in (("multi-user.target", units),
                               ("sockets.target", sockets)):
             if not wants:
@@ -3478,6 +3494,21 @@ def systemd_units_live(prefix):
     return [line.split()[0] for line in out.splitlines() if line.strip()]
 
 
+def apparmor_parser():
+    """The distro's apparmor_parser, or None if it has none.
+
+    Not taken from PATH: apply runs as root under sudo's secure_path on
+    some paths and from a systemd unit's own PATH on others, and neither is
+    guaranteed to carry /usr/sbin. The two locations below are where every
+    apparmor-shipping distro puts it (Debian and Ubuntu ship both, one a
+    symlink to the other).
+    """
+    for candidate in ("/usr/sbin/apparmor_parser", "/sbin/apparmor_parser"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def zram_module_available():
     """True unless `modprobe zram` (agent-box-zram.service's ExecStart)
     can be proven to fail — a --dry-run, so this never actually loads it.
@@ -3615,6 +3646,9 @@ def validate_render(spec, tree, act, profile):
     caddyfile = tree.files.get(str(Path(CADDYFILE)))
     if spec.web_enable and caddyfile:
         validate_caddyfile(caddyfile[0], act, profile)
+    apparmor = tree.files.get(str(Path(APPARMOR_PROFILE)))
+    if spec.containers_enable and apparmor:
+        validate_apparmor(apparmor[0], act)
 
 
 def validate_sudoers(path, text, act):
@@ -3632,6 +3666,53 @@ def validate_sudoers(path, text, act):
         if act.require(f"validate {path}",
                        ["visudo", "-c", "-f", str(candidate)], quiet=True):
             print(f"validated {path}")
+
+
+def validate_apparmor(text, act):
+    """Syntax-check the container profiles before they reach /etc.
+
+    `apparmor_parser --skip-kernel-load` preprocesses, resolves the
+    `include` lines against /etc/apparmor.d and compiles the policy, and
+    loads nothing. --skip-cache with it, because compiling alone still
+    wants to WRITE /var/cache/apparmor - a validation must not leave a
+    cache entry for a temp file that is about to stop existing, and on a
+    box where that directory is not writable it would fail the check for a
+    reason that has nothing to do with the policy. That makes it the same shape of check as `visudo -c`
+    above, and it matters for the same reason - a file in
+    /etc/apparmor.d that does not parse fails the boot-time
+    apparmor.service, which is every OTHER profile on the box as well as
+    ours.
+
+    Skipped with a note where the tool or the policy directory is missing,
+    which is any box that does not restrict user namespaces in the first
+    place. A skipped check must not read as a passed one.
+    """
+    parser = apparmor_parser()
+    if parser is None:
+        act.notes.append(
+            f"{APPARMOR_PROFILE}: no apparmor_parser on this box - the "
+            "profile was written unchecked")
+        return
+    base = Path("/etc/apparmor.d")
+    if not base.is_dir():
+        # The profile opens with `include <tunables/global>`, which is
+        # resolved out of this directory - without it the parser fails on
+        # OUR include rather than on anything wrong with the policy, and a
+        # false failure here would block apply.
+        act.notes.append(
+            f"{APPARMOR_PROFILE}: no {base} to resolve `include "
+            "<tunables/global>` against - the profile was written "
+            "unchecked")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        candidate = Path(tmp) / "agent-box-containers"
+        candidate.write_text(text)
+        # Quiet on success: the parser prints a "Mode: unconfined" line per
+        # profile, which says nothing an operator wants on every apply.
+        if act.require(f"validate {APPARMOR_PROFILE}",
+                       [parser, "--skip-kernel-load", "--skip-cache",
+                        f"--base={base}", str(candidate)], quiet=True):
+            print(f"validated {APPARMOR_PROFILE}")
 
 
 def validate_caddyfile(text, act, profile):
@@ -3742,14 +3823,41 @@ def advisory_units(spec, notes):
     Everything else the render declares is a capability the config asked
     for, so its failure is the box not being what was asked for.
     """
+    advisory = set()
     if spec.protect_memory and not zram_module_available():
         notes.append(
             "zram unavailable on this kernel (modprobe zram would "
             "fail) - install linux-modules-extra-$(uname -r) (or your "
             "distro's equivalent) and re-apply; until then "
             f"{ZRAM_UNIT} fails and the box runs on disk swap only")
-        return {ZRAM_UNIT}
-    return set()
+        advisory.add(ZRAM_UNIT)
+    if spec.containers_enable:
+        # Every user's docker unit, unconditionally advisory - and this is
+        # the one case where "the config asked for it" does not make a
+        # non-running unit a failure. containers.enable asks for the host
+        # CAPABILITY; whether a daemon runs depends on whether that user
+        # ran `nix profile add nixpkgs#docker`, which is the user's call
+        # and not the config's (docker is 972 MiB, see Renderer.containers).
+        # The unit's ConditionPathIsExecutable makes `systemctl start`
+        # succeed and leave it inactive, so it is the VERIFY pass that
+        # would fail apply here - on every box whose user has not installed
+        # docker yet, which is every box on its first apply.
+        missing = [u.name for u in spec.users
+                   if not os.access(
+                       f"{u.home}/.nix-profile/bin/dockerd-rootless",
+                       os.X_OK)]
+        if missing:
+            notes.append(
+                "rootless containers are enabled but "
+                + ", ".join(missing)
+                + " has no docker installed, so "
+                + f"{DOCKER_UNIT_PREFIX}<user>.service stays inactive "
+                "(condition failed) - run `nix profile add nixpkgs#docker` "
+                f"and then `sudo {SYSTEMCTL} restart "
+                f"{DOCKER_UNIT_PREFIX}<user>.service`")
+        advisory |= {f"{DOCKER_UNIT_PREFIX}{u.name}.service"
+                     for u in spec.users}
+    return advisory
 
 
 def activate(spec, tree, removed, advisory, act):
@@ -3773,6 +3881,63 @@ def activate(spec, tree, removed, advisory, act):
     act.require("systemd-tmpfiles",
                 ["systemd-tmpfiles", "--create",
                  "/etc/tmpfiles.d/agent-box.conf"])
+    if spec.containers_enable:
+        # Both before the units, and both required: a docker unit that
+        # starts without them fails in a way that names neither. The
+        # helper puts capped newuidmap/newgidmap on the unit's PATH; the
+        # profile is what lets an unprivileged user namespace exist at all
+        # on a distro that restricts them.
+        act.require("agent-box-uidmap", [UIDMAP_HELPER])
+        if not Path(USERNS_RESTRICT_SYSCTL).exists():
+            # RHEL/SELinux, or a kernel built without AppArmor. The file is
+            # still RENDERED (a render must never depend on the host it
+            # runs on, or every `--root` fixture stops matching) and is
+            # simply left inert - which is correct rather than a shortfall,
+            # since nothing on such a box refuses the namespace in the
+            # first place.
+            act.notes.append(
+                f"no {Path(USERNS_RESTRICT_SYSCTL).name} on this kernel, "
+                "so unprivileged user namespaces are not restricted and "
+                f"{APPARMOR_PROFILE} is left unloaded")
+        elif apparmor_parser() is None:
+            # The restriction IS in force and nothing here can lift it, so
+            # this is the box failing to be what the config asked for: no
+            # container will start until the distro's apparmor tooling is
+            # installed. Named as a required failure rather than left for
+            # the operator to infer from a daemon that will not come up.
+            act.failed(
+                "load AppArmor container profiles",
+                f"{Path(USERNS_RESTRICT_SYSCTL).name} is 1, so an "
+                "unprivileged user namespace needs an AppArmor profile, "
+                "and apparmor_parser is not installed - install your "
+                "distro's apparmor package (Debian/Ubuntu: apparmor) and "
+                "re-apply")
+        else:
+            # --write-cache, because the cache is what the boot-time
+            # apparmor.service reads: without it the profile is loaded now
+            # and gone at the next boot. --replace so a re-apply is
+            # idempotent rather than a "profile already exists" failure.
+            #
+            # The DISTRO's parser deliberately, not one from the runtime
+            # profile: apparmor_parser compiles a policy for the running
+            # kernel's own AppArmor ABI, so a version from somewhere else
+            # can compile a policy this kernel refuses. That is the
+            # opposite of the nftables argument elsewhere in this file -
+            # there the distro's binary is a fragile dependency, here it is
+            # the only correct one.
+            act.require("load AppArmor container profiles",
+                        [apparmor_parser(), "--replace", "--write-cache",
+                         APPARMOR_PROFILE])
+    elif str(Path(APPARMOR_PROFILE)) in removed:
+        # Removing the file stops it loading at the next boot; the RUNNING
+        # kernel keeps the profile it already has, and unloading it would
+        # mean `apparmor_parser -R` against a file that is now gone. Same
+        # limitation, and the same reason for saying it out loud, as the
+        # live sysctl values below.
+        act.notes.append(
+            f"{APPARMOR_PROFILE} removed: unprivileged user namespaces go "
+            "back to being restricted at the next boot, but the profile "
+            "already loaded into this kernel stays until then")
     if spec.protect_memory or str(Path(MEMORY_SYSCTL)) in removed:
         # Also on the way DOWN: our file has just been removed, so this
         # is what lets whatever else sets these values have them back.
@@ -3824,7 +3989,8 @@ def activate(spec, tree, removed, advisory, act):
             failed_starts.add(unit)
     wanted = set(tree.units)
     for prefix in ("agent-box@", "agent-web-terminal@",
-                   "agent-box-settings@", "agent-box-webhook@"):
+                   "agent-box-settings@", "agent-box-webhook@",
+                   DOCKER_UNIT_PREFIX):
         for unit in systemd_units_live(prefix):
             if unit not in wanted and "@." not in unit:
                 # `disable` would be a no-op for the same reason; the
