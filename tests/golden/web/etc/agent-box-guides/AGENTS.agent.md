@@ -535,8 +535,11 @@ Read what an update did in `/var/log/agent-box/update.log` - the last run, wheth
 it worked or not. Reach for that and NOT
 `journalctl -u agent-box-update.service`, which prints nothing at all
 for you: an agent user is in neither `adm` nor `systemd-journal`. A
-failed update rolls back and leaves the box healthy, so a rev that
-will not move is the only other sign you get.
+failed update rolls back and leaves the box healthy, so the other sign
+is the rev of the RUNNING system not moving. Not the source tree's rev:
+the tree is fast-forwarded FIRST and a rollback leaves it ahead, so
+`git -C /var/lib/agent-box/src log -1` after a failed update names a
+rev this box is not running.
 
 ## This box ships its own sources
 

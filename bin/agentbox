@@ -2861,9 +2861,13 @@ class Renderer:
             "neither `adm`\n"
             "nor `systemd-journal`. A failed update rolls back and leaves "
             "the box\n"
-            "healthy, so a rev that will not move is the only other sign "
-            "you get.\n"
-            "The box's own rev is on the settings page.\n\n"
+            "healthy, so the other sign is the PROFILE rev on the settings "
+            "page not\n"
+            "moving. Not the source tree's rev: the tree is fast-forwarded "
+            "FIRST\n"
+            "and a rollback leaves it ahead: after a failed update\n"
+            f"`git -C {SRC_DIR} log -1` names a rev this box is not\n"
+            "running.\n\n"
         )
         # Which HOST this guide is describing. The module binds the NixOS
         # section here; this box is a distro host with agent-box in a Nix
