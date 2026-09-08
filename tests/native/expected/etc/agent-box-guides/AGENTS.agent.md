@@ -601,7 +601,7 @@ describes and restarts the services onto it - your own tmux session
 included, so save context first. If the new release fails to apply, the
 profile rolls back and the old one is re-applied.
 
-Read what it did in `/var/log/agent-box/update.log` - the last run, whether it worked or
+Read what it did in `/var/log/agent-box-update.log` - the last run, whether it worked or
 not. Reach for that and NOT `journalctl -u agent-box-update.service`,
 which prints nothing at all for you: an agent user is in neither `adm`
 nor `systemd-journal`. A failed update rolls back and leaves the box

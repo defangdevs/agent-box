@@ -74,7 +74,7 @@ DEFAULT_CONFIG = "/etc/agent-box/config.yaml"
 UPDATE_UNIT = "agent-box-update.service"
 # The update's own output, where an agent that triggered one can
 # read it back. See the unit for why the journal is not enough.
-UPDATE_LOG = "/var/log/agent-box/update.log"
+UPDATE_LOG = "/var/log/agent-box-update.log"
 SYSTEMCTL = "/usr/bin/systemctl"
 # The web front door reload, spelled once for the same reason as the two
 # above: the sudo grant and the command the rendered Caddyfile tells the
@@ -2190,11 +2190,20 @@ class Renderer:
                 #
                 # truncate: and not append:, so the file is the LAST run
                 # and cannot grow without bound on a box that updates
-                # nightly. LogsDirectory= makes /var/log/agent-box (0755
-                # root) without a tmpfiles rule, and systemd creates the
-                # file 0644 - readable by every agent, writable by none.
-                # Root loses nothing: it reads the same file.
-                "LogsDirectory=agent-box",
+                # nightly. systemd creates the file 0644 - readable by
+                # every agent, writable by none. Root loses nothing: it
+                # reads the same file.
+                #
+                # Straight in /var/log, NOT a subdirectory of it. The first
+                # draft of this wrote /var/log/agent-box/update.log and
+                # asked LogsDirectory= to make the directory - and systemd
+                # opens the output file BEFORE it creates that directory,
+                # so the unit died at 209/STDOUT every time, having never
+                # reached ExecStart. That shipped, and it did not just lose
+                # the log: it left the box unable to update AT ALL, and the
+                # only way out is root creating the directory by hand,
+                # which is precisely what an agent cannot do. /var/log
+                # always exists, so nothing has to be created first.
                 f"StandardOutput=truncate:{UPDATE_LOG}",
                 "StandardError=inherit",
                 f"ExecStart={self.bin}/agentbox update "

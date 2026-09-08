@@ -563,6 +563,24 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     machine.wait_until_succeeds(
         "systemctl is-failed --quiet agent-box-update.service", timeout=60
     )
+    # ...and it must have failed for the RIGHT reason. "failed" alone cannot
+    # tell an offline git fetch from a unit that never reached ExecStart at
+    # all, and that gap let a release ship in which the update unit died at
+    # 209/STDOUT on every box: StandardOutput= named a file inside a
+    # LogsDirectory= that systemd creates only AFTER it opens that file. It
+    # left boxes unable to update at all, recoverable only by root, which is
+    # the one thing an agent triggering an update cannot call on.
+    status = machine.succeed(
+        "systemctl show agent-box-update.service "
+        "--property=ExecMainStatus --value").strip()
+    assert status != "209", (
+        "the update unit died at 209/STDOUT - systemd could not open "
+        "StandardOutput=, so ExecStart never ran and no box can update")
+    # The positive half: the redirection worked and the process did run, so
+    # its own account of the failure is on disk where an agent can read it -
+    # which is the whole point of the file.
+    machine.succeed("test -s /var/log/agent-box-update.log")
+    machine.succeed("test 644 = $(stat -c %a /var/log/agent-box-update.log)")
 
     # The settings page long-polls {base}/status for restart/update progress.
     # It is read-only JSON behind the same auth gate as the page (401 without
