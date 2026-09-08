@@ -4123,8 +4123,34 @@ def activate(spec, tree, removed, advisory, act):
         # The front door, and the last thing to move: everything it proxies
         # to is up by now. Required - a box whose caddy kept the previous
         # Caddyfile is serving something other than what was applied.
-        act.require("reload caddy.service",
-                    ["systemctl", "reload-or-restart", "caddy.service"])
+        #
+        # Reload first, RESTART if that failed - and the restart is the
+        # required half. A reload cannot move caddy's admin endpoint, and
+        # issue #605's fix moved it: `caddy reload` with no --address takes
+        # the endpoint from the config file it is handed ("otherwise it is
+        # loaded from the given config file" - `caddy reload --help`), so
+        # from the commit that wrote `admin unix//run/caddy/admin.sock` into
+        # the Caddyfile, every reload on an ALREADY RUNNING caddy posted to
+        # a socket that caddy - started before that config existed - was not
+        # listening on. The reload failed, a required action with it, and so
+        # every native box that tried to cross that commit rolled its whole
+        # update back. Measured on a live box: two updates, both rolled
+        # back, caddy active and never restarted through either.
+        #
+        # NixOS never saw this because nixos-rebuild restarts a unit whose
+        # file changed. This is that, by hand, for the one unit that has an
+        # endpoint to move.
+        #
+        # Falling back this bluntly is safe because the Caddyfile was
+        # validated before anything was written (validate_caddyfile above):
+        # a reload that fails HERE is a transport problem - a moved
+        # endpoint, a stale socket - not a config caddy would refuse to
+        # start on. The failed reload is still recorded as a note, so the
+        # restart is never a silent one.
+        if not act.optional("reload caddy.service",
+                            ["systemctl", "reload", "caddy.service"]):
+            act.require("restart caddy.service",
+                        ["systemctl", "restart", "caddy.service"])
     return failed_starts
 
 
