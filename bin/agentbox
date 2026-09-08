@@ -3531,7 +3531,7 @@ def ensure_user(name, home, act, dry_run=False):
     return True
 
 
-def ensure_linger(name):
+def ensure_linger(name, act):
     """Enable systemd linger, unconditionally and every apply (not just at
     creation) — self-heals a box that was deployed before this existed.
 
@@ -3557,11 +3557,19 @@ def ensure_linger(name):
     XDG_RUNTIME_DIR of its own; its failure surfaces one step later, when
     the first container is started.
 
-    Idempotent — enabling linger that is already enabled is a no-op — so
-    best-effort (check=False) is enough; a box without systemd-logind just
-    leaves this a no-op too.
+    Idempotent — enabling linger that is already enabled is a no-op.
+
+    Through `act` and not a bare `run(..., check=False)`: check=False
+    suppresses a non-zero EXIT and nothing else, so on a box with no
+    loginctl at all the call raises FileNotFoundError, aborts activate()
+    and ends apply in a traceback — the opposite of the no-op this is
+    documented to be. Activation.optional() catches that (OSError) and
+    records a non-zero exit as a visible note, which is the other half:
+    with containers on, every docker unit is advisory, so a silent failure
+    here would let apply report success over a daemon that cannot start.
     """
-    run(["loginctl", "enable-linger", name], check=False)
+    return act.optional(f"enable lingering for {name}",
+                        ["loginctl", "enable-linger", name])
 
 
 def unit_is_enabled(unit):
@@ -3956,7 +3964,7 @@ def activate(spec, tree, removed, advisory, act):
     failed_starts = set()
     for u in spec.users:
         ensure_user(u.name, u.home, act)
-        ensure_linger(u.name)
+        ensure_linger(u.name, act)
     if spec.web_enable:
         # Advisory on its own: if the login really cannot be created,
         # caddy.service cannot start as it, and THAT is a required failure

@@ -25,12 +25,14 @@ Wants=network-online.target
 # is what the restart budget below is for; they just remove the part of
 # the race that is expressible.
 After=systemd-logind.service linger-users.service
-StartLimitIntervalSec=60s
-# 6 and not 3: the bus check above fails until logind has this
-# user's manager up, which on a cold boot can land after this unit
-# is first tried. Six tries at RestartSec=2s spans that window and
-# still catches a genuine crash loop inside the same minute.
-StartLimitBurst=6
+# No rate limit, deliberately. The ExecStart below refuses to start
+# until this user's bus exists, and on a cold boot that can be after
+# logind has got round to the user manager - so ANY finite budget is a
+# race the box can lose permanently: the budget burns down in seconds,
+# the unit stays failed once the bus appears, and nothing retries it
+# until an operator does. The cost of a genuine crash loop is bounded
+# by the backoff below instead, which is the tool for that job.
+StartLimitIntervalSec=0
 
 [Service]
 User=%i
@@ -96,7 +98,14 @@ ExecStart=/bin/sh -c 'for d in /run/user/*; do [ -O "$$d" ] && [ -S "$$d/bus" ] 
 # feature shipped unable to start a single container because of it.
 Delegate=yes
 Restart=always
+# Exponential, 2s doubling to 32s (systemd 254+; an older systemd ignores
+# the two extra keys with a warning and simply keeps retrying every 2s,
+# which is the same behaviour, just noisier). This is what makes an
+# unlimited Restart= cheap: a daemon that cannot start costs one spawn
+# every 32 seconds, and a bus that appears late is still picked up.
 RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=32s
 # Type=notify with no start timeout is what nixpkgs' own rootless unit
 # does, and it would hang `agentbox apply`: the activation phase starts
 # every unit it renders and WAITS, so a daemon that never sends its

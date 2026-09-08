@@ -261,9 +261,23 @@
         "su -s /bin/sh agent -c 'sudo -n "
         "/run/current-system/sw/bin/systemctl restart "
         "agent-box-docker@agent.service'")
-    log = machine.succeed(
+    # NOT `log`: the test driver has a global of that name (an
+    # AbstractLogger), and shadowing it fails the driver's own type check
+    # before a single VM boots - which is how this test spent one CI round.
+    journal = machine.succeed(
         "journalctl -u agent-box-docker@agent.service -n 20 -o cat")
-    assert "no user bus" in log, \
-        f"the daemon did not say why it would not start: {log}"
+    assert "no user bus" in journal, \
+        f"the daemon did not say why it would not start: {journal}"
+
+    # 11. And it must come back BY ITSELF once the manager returns. This is
+    #     the other half of refusing: a unit that gave up for good would
+    #     leave a box with no docker after any boot that brought logind's
+    #     user manager up a few seconds late, and nothing would say so.
+    #     StartLimitIntervalSec=0 plus the backoff is what makes this pass;
+    #     the six-start budget it replaced could not.
+    machine.succeed("loginctl enable-linger agent")
+    machine.wait_for_unit(f"user@{uid}.service")
+    machine.wait_for_file(f"/run/user/{uid}/bus")
+    machine.wait_for_unit("agent-box-docker@agent.service")
   '';
 }
