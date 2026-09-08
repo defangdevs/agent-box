@@ -1978,6 +1978,26 @@ class RenderTest(unittest.TestCase):
             self.assertIn("DOCKER_HOST", (
                 out / "etc/agent-box/units/agent.env").read_text())
 
+            # The capped copies are made by the helper at ACTIVATION, which
+            # a --root render never runs - so stand them up by hand, with
+            # the bytes the profile would have been copied from. They are
+            # the one thing here with no header and no reproducible TEXT to
+            # witness them, and getting that wrong is invisible from the
+            # render side: `remove_if_ours` compared the bytes witness with
+            # read_text(), so a real binary raised UnicodeDecodeError, was
+            # ruled "not ours", and survived the switch with cap_setuid
+            # still on it (CodeRabbit, PR #603). The fake profile stubs
+            # every binary as ASCII, which is exactly why the first version
+            # of this test passed over it - hence the deliberate non-UTF-8
+            # byte below.
+            capped = out / "etc/agent-box/uidmap"
+            capped.mkdir(parents=True, exist_ok=True)
+            for program in ("newuidmap", "newgidmap"):
+                src = Path(prof) / "bin" / program
+                src.write_bytes(b"\x7fELF fake \xff\xfe not utf-8\n")
+                (capped / program).write_bytes(src.read_bytes())
+            owned += [capped / "newuidmap", capped / "newgidmap"]
+
             render(False)
             for f in owned:
                 self.assertFalse(f.exists(),

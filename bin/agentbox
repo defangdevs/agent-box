@@ -734,8 +734,8 @@ class Spec:
         self.portal_issuer = web.get("portalIssuer") or ""
         self.portal_jwks_url = web.get("portalJwksUrl") or ""
         self.protect_memory = bool(data.get("protectMemory", True))
-        # Rootless containers for the agent users (issue #600). Off by
-        # default, and deliberately not a "the box has docker" switch:
+        # Rootless containers for the agent users (issue #600).
+        # Deliberately not a "the box has docker" switch:
         # docker itself is 972 MiB and arrives from the user's own nix
         # profile like every other tool here. What this renders is the
         # part a session cannot render for itself - the AppArmor
@@ -3466,12 +3466,23 @@ def remove_if_ours(path, dry_run=False, verbatim=None):
     It is strictly narrower than the header check, not wider — an edited file
     no longer matches, so it is left alone for the same reason and with the
     same message.
+
+    A witness may be `bytes`, and then the comparison is on bytes: the
+    capped newuidmap/newgidmap copies (issue #600) are BINARIES, and there
+    is nothing else to witness them with. Read as text they raise
+    UnicodeDecodeError, which this used to turn into "not ours" - so the
+    two capped binaries survived `containers: {enable: false}` with their
+    capabilities intact, which is the exact reconciliation gap the off
+    path exists to close. (`bytes != str` would never have matched even
+    without the decode error.) Caught by CodeRabbit on PR #603.
     """
     path = Path(path)
     ours = generated_by_us(path)
     if not ours and verbatim is not None and not path.is_symlink():
         try:
-            ours = path.read_text() == verbatim
+            ours = (path.read_bytes() == verbatim
+                    if isinstance(verbatim, bytes)
+                    else path.read_text() == verbatim)
         except (OSError, UnicodeDecodeError):
             ours = False
     if not ours:
