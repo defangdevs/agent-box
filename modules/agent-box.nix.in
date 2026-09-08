@@ -1031,9 +1031,11 @@ let
         description = ''
           Prompt used when the supervisor RESUMES this session after any
           respawn (crash, reboot, Spot stop→restart). A non-null value
-          overrides the built-in restart notice. When null, the notice is
-          used only if services.agent-box.restartNotice is enabled;
-          otherwise no prompt is injected. Ignored for shell sessions.
+          overrides the built-in restart notice. When null,
+          services.agent-box.restartNotice decides whether that notice is
+          injected; on "never", or on "auto" for a session with nothing
+          outstanding, no prompt is injected at all. Ignored for shell
+          sessions.
         '';
       };
     };
@@ -1572,19 +1574,38 @@ in
     };
 
     restartNotice = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
+      type = lib.types.enum [ "auto" "always" "never" ];
+      default = "auto";
+      example = "never";
       description = ''
-        Stamp the built-in "You were interrupted and automatically
+        Whether to stamp the built-in "You were interrupted and automatically
         restarted..." text onto a claude session's resume prompt after a
         respawn (crash, reboot, Spot stop→restart) whose transcript already
-        holds real work. Off by default (issue #507): `--resume` reliably
-        restores the transcript on its own, so a respawn with no
-        resumePrompt set now hands the agent no injected prompt at all
-        rather than this notice — same as passing an empty resumePrompt
-        would today.
+        holds real work.
 
-        A per-session resumePrompt still overrides either way. There is no
+        `--resume` restores the transcript, but it starts no turn: the agent
+        comes back caught up and then waits, exactly as `claude --resume`
+        does outside agent-box. For an interactive session a person types
+        eventually. For a session with an outstanding commitment — an open
+        PR, a claimed webhook topic — nobody does, and it sits silent
+        indefinitely (issue #548, where one sat for 2.5 hours while its CI
+        went red).
+
+        Sending the notice is not free either: it revives the session with
+        its whole resumed transcript as input, which on a long-running
+        session is a large prompt for what may be finished work. Hence three
+        values rather than a switch:
+
+        - "auto" (default) sends the notice only to a session that has
+          something outstanding — an unresolved hook lease, a webhook
+          subscription filter it left behind, or a transcript cut mid-turn.
+          A session that closed its last turn and holds neither stays
+          silent.
+        - "always" is issue #507's pre-#512 behaviour: every respawn whose
+          transcript holds real work.
+        - "never" is #512's: no injected prompt at all, ever.
+
+        A per-session resumePrompt still overrides all three. There is no
         equivalent for codex or a remote-controlled session: codex's own
         resume arm stamps the box/session id into its resumed prompt
         regardless (there is no built-in text to gate), and a
@@ -2780,12 +2801,13 @@ in
             # pin the restricted values back. Same for every instance.
             AGENT_BOX_CODEX_FULL_ACCESS = "1";
           }
-          // lib.optionalAttrs cfg.restartNotice {
-            # Opt-in built-in restart notice for claude respawns (issue
-            # #507). Set ONLY when true: supervisor.sh reads its presence,
-            # not its value, so exporting it unconditionally would make the
-            # off-by-default the option promises impossible to reach.
-            AGENT_BOX_RESTART_NOTICE = "1";
+          // {
+            # Built-in restart notice for claude respawns: "auto", "always"
+            # or "never" (issues #507, #548). Exported unconditionally and
+            # read by VALUE -- restart_notice_wanted in supervisor.sh treats
+            # an unset variable as "auto", so the three values have to be
+            # distinguishable rather than present/absent.
+            AGENT_BOX_RESTART_NOTICE = cfg.restartNotice;
           }
           // lib.optionalAttrs webhookEnabled {
             # Doubles as the supervisor's "webhook receiver is live" flag

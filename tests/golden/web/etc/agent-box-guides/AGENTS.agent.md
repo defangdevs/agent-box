@@ -64,6 +64,14 @@ plainly rather than handing it back.
   Claude Code under ~/.claude/projects/ (plus ~/.claude/history.jsonl),
   Codex under ~/.codex/sessions/. After a respawn, or when you take over
   another agent's session, skim the most recent one before writing code.
+- A claude session that comes back from a respawn is RESUMED, not restarted:
+  the transcript is restored, but no turn starts by itself. So if you are
+  holding work when the box goes down - an open PR, a claimed issue - you
+  wake up silent and nobody is coming to type. The box sends such a session
+  a short "you were interrupted" prompt to start one turn; when it arrives,
+  do not trust the transcript alone. No sender replays what fired while you
+  were down, so read the CURRENT state of whatever you were waiting on, and
+  check `agent-box-webhook ls` - a subscription may have expired meanwhile.
 - Your harness's own configuration lives under $HOME and so survives a
   respawn: ~/.claude/ for Claude Code (settings.json, skills/, commands/,
   and the transcripts under projects/), ~/.codex/ for Codex. A skill, a
