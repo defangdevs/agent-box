@@ -5,6 +5,8 @@ agents:
 - claude
 - codex
 codexFullAccess: true
+containers:
+  enable: true
 defaultAgent: claude
 domain: golden.example.org
 protectMemory: true

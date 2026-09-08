@@ -807,10 +807,11 @@ let
       # so they cannot come from the read-only nix store and are not on the
       # wrapper's own embedded PATH. Both directories are listed because each
       # backend has exactly one of them: /run/wrappers/bin is what NixOS's
-      # security.wrappers builds, /run/agent-box-uidmap is what `agentbox apply`
-      # renders on a box that has no such mechanism. The missing one is simply
-      # skipped, so this stays one shared unit rather than two hand-written ones.
-      Environment=PATH=/run/wrappers/bin:/run/agent-box-uidmap:/usr/local/bin:/usr/bin:/bin
+      # security.wrappers builds, /etc/agent-box/uidmap is where `agentbox apply`
+      # puts capped copies on a box that has no such mechanism. The missing one
+      # is simply skipped by PATH lookup, which is what lets this stay ONE
+      # shared unit instead of two hand-written ones that can drift.
+      Environment=PATH=/run/wrappers/bin:/etc/agent-box/uidmap:/usr/local/bin:/usr/bin:/bin
       ExecStart=/home/%i/.nix-profile/bin/dockerd-rootless
       # The daemon owns a cgroup subtree of its own, so it can put containers in
       # cgroups without a systemd --user instance (agent-box users have no login

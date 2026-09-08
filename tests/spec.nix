@@ -63,6 +63,7 @@ in
   repo = cfg.selfUpdate.repo;
   rev = cfg.selfUpdate.rev;
   protectMemory = cfg.protectMemory;
+  containers = { enable = cfg.containers.enable; };
   codexFullAccess = cfg.codexFullAccess;
   restartNotice = cfg.restartNotice;
   # Verbatim: these are operator-written sudoers command lines, and a fixture

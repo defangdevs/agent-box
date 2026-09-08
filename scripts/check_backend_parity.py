@@ -265,6 +265,24 @@ UNITS_BY_DESIGN = {
         "housekeeping (deploy/aws/template.yaml sets nix.gc and min-free), a layer "
         "a native box does not have, so its renderer owns it instead. If the "
         "module ever grows nix.gc of its own, this line goes away"),
+    "agent-box-docker@.service": (
+        "native",
+        "native only IN THE FIXTURES, and the same bytes on both boxes "
+        "(issue #600). It is a SHARED template from modules/src/units/, and "
+        "the golden manifest can only capture a unit that NixOS declares as "
+        "an attribute with `text` (flake.nix's unitFilter) - a template "
+        "installed through systemd.packages is a file in a package and has "
+        "none. Every other shared template is in that same position and "
+        "passes only because the module also renders a per-INSTANCE drop-in "
+        "with text, which the instance-vs-template normalization then folds "
+        "together; this unit needs no drop-in, so nothing on the module side "
+        "is left for the comparison to see. What locks the text instead is "
+        "tighter than this check: one source file, embedded into the module "
+        "by the assembler (`module-generated-up-to-date` fails on drift) and "
+        "installed verbatim into the runtime profile by nix/runtime.nix, "
+        "with tests/native/expected holding the bytes. Give the manifest a "
+        "way to read systemd.packages and this entry goes away - along with "
+        "the same blind spot over the other four templates"),
 }
 UNITS_KNOWN_GAPS = {
     "agent-box-defang-cli.service": (
