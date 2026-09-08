@@ -202,12 +202,43 @@ registry_valid() {
     'length == 1 and (.[0] | type == "object")
      and (.[0].sessions | type == "object")' \
     "$REGISTRY_FILE" >/dev/null 2>&1
+  _registry_valid_rc=$?
+  return "$_registry_valid_rc"
+}
+
+registry_jq_ran() {
+  # 0 when the LAST registry_valid actually got an answer out of jq, whatever
+  # that answer was. 1 when jq never ran at all.
+  #
+  # The distinction is the difference between "this file is corrupt" and "I
+  # cannot tell", and registry_selfheal DESTROYS the registry on the first
+  # reading. 126 (found, not executable) and 127 (not found) are the shell's
+  # own codes for a command it could not start, and no jq exit status
+  # collides with them: jq answers 1 for a false filter, 2 for usage, 3 for a
+  # compile error and 5 for input it could not parse.
+  #
+  # This is not hypothetical. A native box's supervisor resolves its tools
+  # through /nix/var/nix/profiles/agent-box/bin, the very symlink an update
+  # swaps -- so a long-running supervisor loses jq, flock and sleep
+  # mid-update, while it is still looping. Measured on a live box during the
+  # 2026-09-08 update: every parse check failed with 127, registry_selfheal
+  # read that as corruption, and quarantined a registry that parses
+  # perfectly, taking a runtime session (and its work) with it. The same
+  # thing had happened silently a day earlier and cost five sessions. The
+  # quarantined copies are the proof: `jq -e . sessions.json.corrupt-*`
+  # accepts both.
+  case "${_registry_valid_rc:-0}" in (126|127) return 1 ;; esac
+  return 0
 }
 
 # 1 once the "could not move it aside" warning below has been printed, so a
 # loop that calls this every couple of seconds says it once per transition
 # rather than forever.
 _registry_heal_warned=0
+# The same latch for the other refusal: jq could not be run, so nothing can
+# be judged. Separate, because the two states come and go independently -- an
+# update takes jq away and gives it back, a read-only home does not.
+_registry_jq_warned=0
 
 registry_selfheal() {
   # registry_selfheal [SEED] — a registry that does not PARSE is not an empty
@@ -239,6 +270,27 @@ registry_selfheal() {
     _registry_heal_warned=0
     return 0
   fi
+  # Could jq even run? If not, this function knows NOTHING about the file and
+  # must not act -- quarantining on an unanswered question is how a valid
+  # registry gets destroyed (see registry_jq_ran). Wait for the next tick
+  # instead: the tool comes back when the update finishes, and a registry
+  # left alone can still be read by everything else.
+  #
+  # Deliberately before the existence test below, so a MISSING file is not
+  # re-seeded either. "The file is not there" is a claim about the disk that
+  # this function has not established while its only reader is broken, and
+  # seeding over a registry that was in fact present is the same data loss by
+  # another route.
+  if ! registry_jq_ran; then
+    [ "$_registry_jq_warned" = 1 ] || \
+      echo "$REGISTRY_PROG: cannot run '$REGISTRY_JQ' (exit" \
+           "$_registry_valid_rc); leaving $REGISTRY_FILE alone rather than" \
+           "calling it corrupt, and retrying next tick (issue #279)" >&2
+    _registry_jq_warned=1
+    registry_unlock
+    return 1
+  fi
+  _registry_jq_warned=0
   # A file that is not there at all is a first boot or a deleted registry,
   # not corruption: there is nothing to keep, and registry_ensure below
   # creates it.
