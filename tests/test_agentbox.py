@@ -3298,10 +3298,28 @@ class ApplyActivationTest(unittest.TestCase):
         rc, out, err = self.apply()
         self.assertFailed(rc, out, err, "start agent-box@agent.service")
 
-    def test_a_failed_caddy_reload_fails_apply(self):
-        self.fail_when = ["reload-or-restart caddy.service"]
+    def test_a_reload_that_fails_restarts_caddy_instead(self):
+        """The #608 transition: a reload cannot move the admin endpoint.
+
+        `caddy reload` with no --address reads the endpoint out of the
+        config it is handed, so the commit that moved the admin API to a
+        unix socket made every reload on an already-running caddy talk to
+        a socket nothing was listening on. That is a required action, so
+        apply exited non-zero and every native box rolled its update back.
+        A restart is what moves an endpoint, and apply must reach for it.
+        """
+        self.fail_when = ["reload caddy.service"]
         rc, out, err = self.apply()
-        self.assertFailed(rc, out, err, "reload caddy.service")
+        self.assertEqual(rc, 0, f"apply should have recovered:\n{out}\n{err}")
+        ran = [" ".join(c) for c in self.calls]
+        self.assertIn("systemctl restart caddy.service", ran,
+                      f"a failed reload must be followed by a restart: {ran}")
+
+    def test_a_failed_caddy_reload_and_restart_fails_apply(self):
+        """The restart is the REQUIRED half: if it cannot come up, say so."""
+        self.fail_when = ["reload caddy.service", "restart caddy.service"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "restart caddy.service")
 
     def test_failed_tmpfiles_fails_apply(self):
         """The runtime dirs, ~/sites and the downloads tree come from it."""
