@@ -289,7 +289,18 @@ let
     (payload "agent-box-profile-bare" "profile-cli.sh")
     # Needs no env wrapper: it resolves its token from gh at runtime.
     (payload "agent-box-upload" "upload-cli.sh")
-  ] ++ lib.optional webhookEnabled (payload "agent-box-webhook-bare" "webhook-cli.sh");
+  ] ++ lib.optionals webhookEnabled [
+    (payload "agent-box-webhook-bare" "webhook-cli.sh")
+    # Ingress liveness and delivery recovery (issue #605). Needs no env
+    # wrapper for the same reason agent-box-upload does not: it resolves its
+    # token from gh at runtime, and the one box value it reads
+    # (AGENT_BOX_WEBHOOK_URL) is already exported into every session by the
+    # agent unit. Python, so `payload` (a bash shebang over a resolved body)
+    # cannot ship it - same treatment env-exec gets, minus the spliced
+    # library it has no need of.
+    (pkgs.writers.writePython3Bin "agent-box-webhook-backfill" { }
+      (readSrc "webhook-backfill.py"))
+  ];
 
   # Tools agents assume exist, kept in step with the module's
   # agentBaseTools. On a distro host most of these are already present as

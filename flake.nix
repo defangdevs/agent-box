@@ -1538,6 +1538,49 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # What a sweep of GitHub's delivery log re-requests, and what it
+          # leaves alone (issue #605). Every assertion is a pure function of
+          # a canned log served by a stubbed `gh`, so it runs natively in
+          # about a second rather than costing a VM boot - the move
+          # `webhook-spawn-claim` and `webhook-defer` already made out of
+          # tests/webhook.nix, which has no testScript budget left.
+          #
+          # The two locks worth naming: a 19-digit delivery id has to reach
+          # the API byte-exact (it is past 2**53, and a reader that rounds it
+          # produces an id that 404s and a sweep that silently recovers
+          # nothing), and a hook pointing at ANOTHER box must never be swept
+          # - this repo carries two, and re-requesting the other one's failed
+          # deliveries would push events at a machine that never asked.
+          webhook-backfill =
+            pkgs.runCommand "agent-box-webhook-backfill-test"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.jq pkgs.python3 ];
+                payload = ./modules/src/webhook-backfill.py;
+                # The CLI too, for the `backfill` verb's delegation and the
+                # `ingress` object `status` reports. It carries no @@include
+                # markers, so the source form IS the shipped body.
+                cli = ./modules/src/webhook-cli.sh;
+                tests = ./tests/test-webhook-backfill.py;
+                # The same pin the module and #runtime read, fetched the
+                # same way (nix/webhook-pin.nix) - `status` merges the box's
+                # own facts into what webhook.py prints, so the assertion
+                # needs the real one.
+                webhookPy =
+                  let pin = import ./nix/webhook-pin.nix; in
+                  builtins.fetchurl {
+                    url = "https://raw.githubusercontent.com/${pin.repo}/${pin.rev}"
+                          + "/local-webhook/webhook.py";
+                    sha256 = pin.sha256;
+                  };
+              } ''
+              python3 "$tests" "$payload" "$cli" "$webhookPy" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Unit tests for the durable per-session lease (issue #535):
           # outcome precedence (first ending wins, never the most recent),
           # clear's delete-not-blank resolution, and the read-only accessor
