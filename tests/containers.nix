@@ -156,13 +156,22 @@
     # sends, because the unit is Type=notify: without it the granted
     # `restart` blocks for the whole TimeoutStartSec and then fails, which
     # would be three wasted minutes and a masked assertion rather than a
-    # test. Resolved from the DRIVER's shell - the unit's own PATH is
-    # deliberately short, and hard-coding a store path here would rot.
+    # test.
+    #
+    # BOTH programs are resolved from the DRIVER's shell and used by
+    # absolute path, because the unit's PATH is deliberately short -
+    # /run/wrappers/bin, the uidmap dir, and the three distro bin dirs, of
+    # which a NixOS box has only /bin, and /bin holds `sh` and nothing
+    # else. A bare `sleep` in this fake got "exec: sleep: not found" and a
+    # start-limit-hit. The real dockerd-rootless needs none of this: it is
+    # a nixpkgs wrapper carrying its own PATH, which is exactly why the
+    # unit's is allowed to be this short.
     notify = machine.succeed("command -v systemd-notify").strip()
+    sleep = machine.succeed("command -v sleep").strip()
     fake = "/home/agent/.nix-profile/bin/dockerd-rootless"
     machine.succeed(
         f"runuser -u agent -- sh -c \"printf "
-        f"'#!/bin/sh\\n{notify} --ready\\nexec sleep infinity\\n' "
+        f"'#!/bin/sh\\n{notify} --ready\\nexec {sleep} infinity\\n' "
         f"> {fake} && chmod 755 {fake}\"")
     machine.succeed(f"su -s /bin/sh agent -c 'sudo -n {restart}'")
     # The condition passed this time, and the unit is actually running the
