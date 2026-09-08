@@ -278,7 +278,7 @@ filesystem-free VM configuration makes it unsuitable), so a
 `runNixOSTest` you add to `flake.nix` and never add to that list simply
 never runs - no skip, no warning, a green job over it. `tests/containers.nix`
 shipped that way for one round and looked green. Add the check to the
-five-item lane (the two long ones have isolated lanes for a reason - see the
+shared lane (the two long ones have isolated lanes for a reason - see the
 comment there before moving anything into them), and add its one-line
 "what it covers" entry above the step.
 

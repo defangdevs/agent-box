@@ -330,7 +330,7 @@ jobs:
           # get isolated, it doesn't raise the memory budget (still three
           # VM guests at once in the worst case: one from each of the
           # `sessions`/`webhook` lanes, one from whichever pair is
-          # concurrently building in the five-check lane).
+          # concurrently building in the shared lane).
           # THIS LIST IS THE ONE THAT DECIDES. Registering a test in
           # flake.nix does NOT make CI run it: `nix flake check` is not
           # used here (the filesystem-free VM configuration makes it
