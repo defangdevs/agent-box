@@ -78,7 +78,8 @@ class RegistryCase(unittest.TestCase):
         self.addCleanup(self.dir.cleanup)
 
     # --- composing a writer ------------------------------------------------
-    def writer(self, body, flock=None, wait=None, prog="test-writer", file=None):
+    def writer(self, body, flock=None, wait=None, prog="test-writer", file=None,
+               jq=None):
         """Write out a shell writer composed as the generated module composes
         one: the wrapper's REGISTRY_* pins, the shared library, then the body.
         """
@@ -86,7 +87,7 @@ class RegistryCase(unittest.TestCase):
         header = [
             "set -u",
             "REGISTRY_FILE=%s" % (file or self.file),
-            "REGISTRY_JQ=%s" % JQ,
+            "REGISTRY_JQ=%s" % (JQ if jq is None else jq),
             "REGISTRY_FLOCK=%s" % (FLOCK if flock is None else flock),
             "REGISTRY_PROG=%s" % prog,
         ]
@@ -598,6 +599,53 @@ class SelfHeal(RegistryCase):
         self.assertEqual(self.file.read_text(), "not json\n")
         self.assertEqual(self.corrupt_files(), [])
         self.assertEqual(done.stderr.count("could not be"), 1, done.stderr)
+
+    # --- jq itself unavailable --------------------------------------------
+    #
+    # A native box's supervisor resolves its tools through
+    # /nix/var/nix/profiles/agent-box/bin, the symlink an update swaps, so a
+    # long-running supervisor loses jq mid-update while it is still looping.
+    # Every parse check then fails with 127, which this function used to read
+    # as corruption. Measured on a live box on 2026-09-08: it quarantined a
+    # registry that parses perfectly and took a runtime session with it, and
+    # the same thing had cost five sessions a day earlier.
+
+    def test_an_unrunnable_jq_never_quarantines(self):
+        # The regression that matters: a PERFECTLY GOOD registry, and a jq
+        # that cannot be started. Nothing may be moved aside, nothing
+        # re-seeded, and the runtime session must still be there afterwards.
+        self.seed({"added-at-runtime": {"agent": "codex"}})
+        before = self.file.read_text()
+        done = self.run_writer(self.HEAL * 3, args=[str(self.seed_file)],
+                               jq=self.home / "no-such-jq", check=False)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(self.file.read_text(), before)
+        self.assertEqual(self.corrupt_files(), [])
+        # Said once per streak, not every tick for as long as the box is up,
+        # and it names the tool so an operator is not left hunting.
+        self.assertEqual(done.stderr.count("cannot run"), 1, done.stderr)
+        self.assertIn("no-such-jq", done.stderr)
+
+    def test_an_unrunnable_jq_does_not_re_seed_a_missing_file(self):
+        # The subtler half. "There is no file" is also a claim this function
+        # has not established while its only reader is broken -- seeding over
+        # a registry that was in fact present loses exactly as much as
+        # quarantining one.
+        self.assertFalse(self.file.exists())
+        done = self.run_writer(self.HEAL, args=[str(self.seed_file)],
+                               jq=self.home / "no-such-jq", check=False)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertFalse(self.file.exists(), done.stderr)
+
+    def test_a_real_parse_error_is_still_corruption(self):
+        # The negative control for the two above: jq RAN and said no, so the
+        # original #279 behaviour must be untouched. Without this, "never
+        # quarantine" would pass both tests above and reintroduce the box
+        # that silently runs nothing.
+        self.file.write_text("not json\n")
+        self.heal()
+        self.assertEqual(self.sessions(), {"main": {"agent": "claude"}})
+        self.assertEqual(len(self.corrupt_files()), 1)
 
     def test_quarantine_and_re_seed_are_one_critical_section(self):
         """The gap that would cost the declared sessions: release the lock
