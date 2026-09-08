@@ -135,7 +135,8 @@ def build_fake_profile(root):
         shutil.copy(c, share / "caddy" / c.name)
     (share / "guides").mkdir()
     for g in ("default-agents.md", "default-agents-webhook.md",
-              "default-agents-host-native.md"):
+              "default-agents-host-native.md",
+              "default-agents-containers.md"):
         shutil.copy(SRC / g, share / "guides" / g)
     (share / "contract").mkdir()
     for j in (SRC / "contract").glob("*.json"):
@@ -1848,6 +1849,148 @@ class RenderTest(unittest.TestCase):
                               "agent-box-zram.service"],
                              tree.disable)
 
+    def test_containers_render_the_host_half_and_only_that(self):
+        """What `containers.enable` puts on a box (issue #600).
+
+        The point of the option is the part an unprivileged session cannot
+        arrange for itself, so each of these is asserted for what it is
+        rather than as a file list: the AppArmor exemption without which no
+        unprivileged user namespace exists at all, the capped
+        newuidmap/newgidmap that apply the subuid range, the runtime dir
+        the socket lives in, and DOCKER_HOST so a session needs no setup.
+
+        And the negative: docker itself must NOT be rendered or referenced
+        as something the box installs. Its closure is larger than the whole
+        runtime profile, and a change that quietly starts shipping it would
+        pass every other check here.
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "o"
+            tree = mod.Renderer(mod.Spec(config, prof), prof,
+                                root=out).render()
+            files = {k: v[0] for k, v in tree.files.items()}
+
+            profile = files[str(out) + "/etc/apparmor.d/agent-box-containers"]
+            # A glob over the store, not a resolved path: these binaries
+            # come from the USER's own profile, which the renderer never
+            # reads, and their store paths move on every docker bump.
+            self.assertIn(
+                "profile agent-box-rootlesskit /nix/store/*/bin/rootlesskit "
+                "flags=(unconfined) {", profile)
+            self.assertIn("profile agent-box-slirp4netns "
+                          "/nix/store/*/bin/slirp4netns", profile)
+            self.assertEqual(2, profile.count("\n  userns,\n"))
+
+            helper = files[str(out) + "/etc/agent-box/bin/agent-box-uidmap"]
+            # setcap TAKES "cap_setuid+ep" and getcap PRINTS
+            # "cap_setuid=ep". Grepping getcap's output for setcap's
+            # spelling never matches, so the helper re-caps on every apply.
+            self.assertIn('"$setcap" "$cap+ep"', helper)
+            self.assertIn('grep "$cap=ep"', helper)
+            for program in ("newuidmap", "newgidmap"):
+                self.assertIn(f"{program}:cap_set", helper)
+
+            rules = files[str(out) + "/etc/tmpfiles.d/agent-box.conf"]
+            self.assertIn("d /run/agent-box-docker 0755 root root - -", rules)
+            # 0700 <user>:<user>. The socket in there is the whole of the
+            # daemon's authority over that user's containers and home.
+            self.assertIn("d /run/agent-box-docker/agent 0700 agent agent",
+                          rules)
+
+            env = files[str(out) + "/etc/agent-box/units/agent.env"]
+            self.assertIn(
+                "DOCKER_HOST=unix:///run/agent-box-docker/agent/docker.sock",
+                env)
+
+            sudoers = files[str(out) + "/etc/sudoers.d/agent-box"]
+            for line in sudoers.splitlines():
+                if not line.startswith("agent "):
+                    continue
+                self.assertIn("/usr/bin/systemctl restart "
+                              "agent-box-docker@agent.service", line)
+                # And nobody else's. A rootless daemon is root over its
+                # user's containers and home, so one user stopping
+                # another's would be exactly the cross-user power the
+                # per-user password grant exists to avoid.
+                self.assertNotIn("agent-box-docker@robot", line)
+
+            # The unit comes from the profile byte-for-byte, and names the
+            # user's own profile rather than anything the box installs.
+            unit = files[str(out) + "/etc/systemd/system/"
+                         "agent-box-docker@.service"]
+            self.assertEqual(
+                (SRC / "units" / "agent-box-docker@.service").read_text(),
+                unit)
+            self.assertIn("ConditionPathIsExecutable=/home/%i/.nix-profile"
+                          "/bin/dockerd-rootless", unit)
+
+            # The negative. Nothing rendered may name a docker BINARY the
+            # box would have to ship - only the user profile path above.
+            for path, text in files.items():
+                for bad in ("/bin/dockerd\n", "bin/docker-compose"):
+                    self.assertNotIn(
+                        bad, text,
+                        f"{path} names a docker binary agent-box would "
+                        "have to ship; docker comes from the user's own "
+                        "profile (its closure is larger than the runtime "
+                        "profile)")
+
+    def test_turning_containers_off_takes_the_daemon_with_it(self):
+        """The same reconcile contract protectMemory and web have.
+
+        `apply` never deletes what a render stops emitting, so without an
+        off path a box applied once with containers on and then off keeps
+        every user's rootless daemon running, keeps the AppArmor exemption
+        loaded and keeps two capped binaries in /etc - the capability
+        entirely in force with nothing left in the config that mentions it.
+        One output root, applied twice, is what can see that.
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "one-root"
+            owned = [
+                out / "etc/apparmor.d/agent-box-containers",
+                out / "etc/agent-box/bin/agent-box-uidmap",
+                out / "etc/systemd/system/agent-box-docker@.service",
+            ]
+
+            def render(enable):
+                config["containers"] = {"enable": enable}
+                cfg = Path(tmp) / "config.json"
+                cfg.write_text(json.dumps(config))
+                tree = mod.Renderer(mod.Spec(config, prof), prof,
+                                    root=out).render()
+                proc = subprocess.run(
+                    [sys.executable, str(AGENTBOX), "apply",
+                     "--config", str(cfg), "--profile", str(prof),
+                     "--root", str(out)], capture_output=True, text=True)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+                return tree
+
+            render(True)
+            for f in owned:
+                self.assertTrue(f.exists(), f"{f.name} not rendered")
+            self.assertIn("DOCKER_HOST", (
+                out / "etc/agent-box/units/agent.env").read_text())
+
+            render(False)
+            for f in owned:
+                self.assertFalse(f.exists(),
+                                 f"{f.name} survived containers: false")
+            # The grant and the session variable go too, or the box still
+            # tells every session to talk to a socket nothing serves.
+            self.assertNotIn("agent-box-docker", (
+                out / "etc/sudoers.d/agent-box").read_text())
+            self.assertNotIn("DOCKER_HOST", (
+                out / "etc/agent-box/units/agent.env").read_text())
+            self.assertNotIn("agent-box-docker", (
+                out / "etc/tmpfiles.d/agent-box.conf").read_text())
+
     def test_turning_web_off_takes_the_public_listener_with_it(self):
         """Issue #413, and the worst instance of this defect class.
 
@@ -2433,6 +2576,7 @@ class ConfigSchemaTest(unittest.TestCase):
                 "wh": webhook,
                 "web": mod.BOX_SCHEMA.fields["web"],
                 "os_updates": mod.BOX_SCHEMA.fields["osUpdates"],
+                "containers": mod.BOX_SCHEMA.fields["containers"],
                 # Not config: the webhook pin shipped beside the profile's
                 # own webhook.py, read from the profile's asset directory.
                 "pin": None,

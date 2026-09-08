@@ -343,6 +343,7 @@ let
     for j in ${src}/contract/*.json; do install -m444 "$j" $out/share/agent-box/contract/; done
     install -m444 ${src}/default-agents.md ${src}/default-agents-webhook.md \
       ${src}/default-agents-host-native.md \
+      ${src}/default-agents-containers.md \
       $out/share/agent-box/guides/
     install -m444 ${src}/settings.css ${src}/settings.js $out/share/agent-box/web/
     # The pinned Defang CLI expression (issue #461). Shipped as a FILE, not

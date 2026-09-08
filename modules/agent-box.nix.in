@@ -32,7 +32,8 @@ let
   # tokens sit flush against the next heading, so the disabled case leaves
   # no stray blank line and the enabled case supplies its own trailing one.
   defaultAgentsMd = lib.replaceStrings
-    [ "@WEBHOOK_SECTION@" "@UPDATE_SECTION@" "@HOST_SECTION@" ]
+    [ "@WEBHOOK_SECTION@" "@UPDATE_SECTION@" "@HOST_SECTION@"
+      "@CONTAINERS_SECTION@" ]
     [ (lib.optionalString webhookEnabled ''
       @@include:src/default-agents-webhook.md@@
 
@@ -98,7 +99,23 @@ let
       ''
       @@include:src/default-agents-host-nixos.md@@
 
-    '' ]
+    ''
+      # The container section, and the ONE command in it that differs
+      # between the two backends. It is bound from the same literal the
+      # sudo rule is granted from (dockerRestartCmdOf), because sudoers
+      # matches argv exactly and a guide that tells the agent a command
+      # the grant does not cover asks for a password instead of running
+      # (the #353 trap). $(whoami) rather than the user's name: this
+      # value is built once for the box, and the per-user guides are
+      # pointers to it.
+      (lib.optionalString cfg.containers.enable (
+        lib.replaceStrings [ "@DOCKER_RESTART_CMD@" ]
+          [ "sudo -n ${dockerRestartCmdOf "$(whoami)"}" ]
+          ''
+          @@include:src/default-agents-containers.md@@
+
+          ''
+      )) ]
     ''
     @@include:src/default-agents.md@@
   '';

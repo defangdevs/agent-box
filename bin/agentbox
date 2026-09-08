@@ -2801,8 +2801,26 @@ class Renderer:
         # /etc/nixos, and mistakes what it can change.
         host_md = self.share / "guides" / "default-agents-host-native.md"
         host_section = host_md.read_text().rstrip("\n") + "\n\n"
+        containers_section = ""
+        if self.spec.containers_enable:
+            containers_md = (self.share / "guides"
+                             / "default-agents-containers.md")
+            # The one command in that section which differs between the two
+            # backends, bound from the same literal the sudo rule is
+            # granted from just below (see sudoers): sudoers matches argv
+            # exactly, so a guide naming a command the grant does not cover
+            # asks the agent for a password instead of running (the #353
+            # trap). $(whoami) and not a user name, because one text is
+            # shared by every user's guide.
+            restart_cmd = (f"sudo -n {SYSTEMCTL} restart "
+                           f"{DOCKER_UNIT_PREFIX}$(whoami).service")
+            containers_section = (
+                containers_md.read_text()
+                .replace("@DOCKER_RESTART_CMD@", restart_cmd)
+                .rstrip("\n") + "\n\n")
         return (text.replace("@WEBHOOK_SECTION@", webhook_section)
                     .replace("@UPDATE_SECTION@", update_section)
+                    .replace("@CONTAINERS_SECTION@", containers_section)
                     .replace("@HOST_SECTION@", host_section))
 
     def reboot_env(self, u):
