@@ -17,4 +17,7 @@ Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026c/shar
 X-RestartIfChanged=false
 X-StopIfChanged=false
 ExecStart=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-unit-script-agent-box-update-start/bin/agent-box-update-start 
+LogsDirectory=agent-box
+StandardError=inherit
+StandardOutput=truncate:/var/log/agent-box/update.log
 Type=oneshot

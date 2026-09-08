@@ -8,4 +8,7 @@ Wants=network-online.target
 Type=oneshot
 Environment="PATH=@PROFILE@/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 TimeoutStartSec=infinity
+LogsDirectory=agent-box
+StandardOutput=truncate:/var/log/agent-box/update.log
+StandardError=inherit
 ExecStart=@PROFILE@/bin/agentbox update --config @CONFIG@
