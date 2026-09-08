@@ -270,7 +270,7 @@ A VM test script has a hard ceiling of 128 KiB. nixpkgs passes it to the driver 
 Never end a test pipeline with `grep -q`. The driver runs each command under `set -euo pipefail`, and `grep -q` exits on the FIRST match — the producer upstream then gets EPIPE, and its non-zero status fails the whole assertion even though the pattern matched (a `must succeed` that reports exit 123 with `write error: Broken pipe` in the log). Write `… | grep PATTERN >/dev/null` instead, which drains the input, or capture to a file first and grep the file. `grep -q` is safe only with a file operand.
 
 
-### Adding a VM test: the flake is not enough
+### Adding a check: the flake is not enough
 
 `.github/workflows/ci.yml`'s "Run VM tests" step names its checks BY HAND,
 in three lanes. CI does not run `nix flake check` (the intentionally
@@ -281,6 +281,28 @@ shipped that way for one round and looked green. Add the check to the
 shared lane (the two long ones have isolated lanes for a reason - see the
 comment there before moving anything into them), and add its one-line
 "what it covers" entry above the step.
+
+The same is true of a NATIVE check, and that is not hypothetical: fifteen
+of the flake's forty-four checks - `webhook-defer`, `source-tree`,
+`lease-protocol`, `testscript-fits` and eleven more - had never been named
+by any workflow, so every job was green over them. Fourteen now ride in one
+`--keep-going` invocation ("Run the remaining native checks"), which is
+where a new native check goes; keep that list alphabetical, so a diff
+against `nix eval .#checks.<system> --apply builtins.attrNames` is readable
+by eye. Do that diff after adding a check, not before: it is the only thing
+that tells you whether the check you just wrote will ever run.
+
+The fifteenth is the warning inside the warning. `testscript-fits` read
+`driver.drvAttrs.testScript`; nixpkgs moved the script off the driver
+derivation's `drvAttrs` (it passes `buildCommand` as a file now), so the
+check threw `attribute 'testScript' missing` at EVAL on every architecture
+and nothing said so, because nothing ran it. A check nobody runs does not
+merely stop catching things - it stops being a check at all, and rots
+quietly. Measure a VM test's script with `t.driver.testScript`. It is still
+out of the CI list, because with the path fixed the guard reports what it
+was built to report: `tests/webhook.nix` is 3,829 bytes over the one-page
+margin and 267 under the kernel's hard cap (issue #610). Do not add lines
+to that file until those bytes are out.
 
 ### Before you push a VM test
 

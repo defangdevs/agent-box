@@ -2029,8 +2029,14 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               # this attribute's own value and recurse forever.
               vmTests = nixpkgs.lib.filterAttrs (_: t: t ? driver)
                 (builtins.removeAttrs self.checks.${system} [ "testscript-fits" ]);
+              # t.driver.testScript, NOT t.driver.drvAttrs.testScript: nixpkgs
+              # moved the script off the driver derivation's drvAttrs (it
+              # passes buildCommand as a file now), so the old path threw
+              # "attribute 'testScript' missing" and this check failed at
+              # EVAL on every architecture. Nothing noticed, because no
+              # workflow ran it - the same gap this commit closes.
               sizes = nixpkgs.lib.mapAttrs
-                (_: t: builtins.stringLength t.driver.drvAttrs.testScript) vmTests;
+                (_: t: builtins.stringLength t.driver.testScript) vmTests;
               over = nixpkgs.lib.filterAttrs (_: n: n > limit) sizes;
               report = nixpkgs.lib.concatStringsSep "\n" (nixpkgs.lib.mapAttrsToList
                 (name: n: "  ${name}: ${toString n} bytes (${toString (n - limit)} over)")
