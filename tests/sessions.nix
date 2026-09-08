@@ -1208,15 +1208,20 @@ in
         machine.succeed(as_agent("agent-box-session rm rot"))
         machine.fail(f"test -e {rot_state}")
 
-    # --- restart notice is opt-in, off on this host (#507) -----------------
-    with subtest("claude: no injected prompt on respawn when restartNotice is off"):
-        # This host leaves services.agent-box.restartNotice at its default
-        # (false, issue #507): `--resume` already restores the transcript on
-        # its own, so a respawn whose transcript holds REAL work (unlike the
-        # empty stand-in the segment-rotation subtest above uses, which hits
-        # the earlier claude_transcript_has_work branch) must get no
-        # injected prompt at all — not the built-in "you were interrupted"
-        # text this option used to always stamp on.
+    # --- restart notice: "auto" wakes only a session with work open (#548) --
+    with subtest("claude: the auto restart notice weighs lease, watch and turn"):
+        # This host leaves services.agent-box.restartNotice at its default,
+        # "auto". `--resume` restores the transcript but starts NO turn, so a
+        # session holding outstanding work waits forever unless the supervisor
+        # injects this prompt (issue #548: one sat silent for 2.5 hours while
+        # its CI went red). Injecting one is not free either -- it revives the
+        # session with its whole resumed transcript as input -- so a session
+        # with nothing outstanding must stay silent, which is what issue #507
+        # asked for and #512 made the unconditional default.
+        #
+        # Three signals say "outstanding", and each is driven on its own here.
+        # The transcript signal is the one that CANNOT stand alone: #548's own
+        # incident had closed its last turn and was waiting on a review.
         notice_state = state_file("notice")
         machine.succeed(
             as_agent(
@@ -1230,24 +1235,89 @@ in
             timeout=60,
         )
         notice_bid = machine.succeed(f"jq -r '.launchSessionId' {notice_state}").strip()
-        # No "model":"<synthetic>" is what claude_transcript_has_work treats
-        # as a real assistant turn, unlike the empty stand-in above.
-        machine.succeed(
-            "install -D -o agent /dev/null "
-            f"/home/agent/.claude/projects/-home-agent/{notice_bid}.jsonl"
-        )
-        machine.succeed(
-            "printf %s " + shlex.quote('{"type":"assistant","model":"claude-x"}')
-            + " > /home/agent/.claude/projects/-home-agent/"
-            f"{notice_bid}.jsonl"
-        )
-        machine.succeed(tmux("kill-session -t =notice"))
-        notice_cmd = machine.wait_until_succeeds(
-            tmux('list-panes -t "=notice" -F "#{pane_start_command}"'), timeout=60
-        )
-        unescaped_notice = notice_cmd.replace("\\", "")
-        assert f"--resume {notice_bid}" in unescaped_notice, notice_cmd
-        assert "You were interrupted" not in unescaped_notice, notice_cmd
+        transcript = f"/home/agent/.claude/projects/-home-agent/{notice_bid}.jsonl"
+        # Compact separators, because claude_transcript_has_work greps for the
+        # literal '"type":"assistant"' -- json.dumps' default ", " spacing
+        # would make this transcript look like it holds no work at all.
+        def record(obj):
+            return json.dumps(obj, separators=(",", ":"))
+
+        # A real (non-synthetic) assistant turn that CLOSED: work to resume,
+        # and nobody mid-turn when the pane died.
+        closed_turn = record({
+            "type": "assistant", "model": "claude-x",
+            "message": {"role": "assistant", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "done"}]},
+        })
+        # A tool result with no assistant record after it: the pane died while
+        # the agent was working.
+        open_turn = record({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "tool_result"}]},
+        })
+        machine.succeed(f"install -D -o agent /dev/null {transcript}")
+        machine.succeed("printf '%s\\n' " + shlex.quote(closed_turn)
+                        + f" > {transcript}")
+
+        def respawn_cmdline():
+            """Kill the pane and return the command line it comes back with.
+
+            Keyed on the pane PID, not on the text: this subtest asserts an
+            ABSENCE twice, and `list-panes` run right after `kill-session`
+            happily answers from the pane that has not died yet."""
+            fmt = '"#{pane_pid} #{pane_start_command}"'
+            before = machine.succeed(
+                tmux(f'list-panes -t "=notice" -F {fmt}')).split()[0]
+            machine.succeed(tmux("kill-session -t =notice"))
+            line = machine.wait_until_succeeds(
+                tmux(f'list-panes -t "=notice" -F {fmt}')
+                + f" | grep -v '^{before} '",
+                timeout=60,
+            )
+            out = line.replace("\\", "")
+            assert f"--resume {notice_bid}" in out, line
+            return out
+
+        # 1. Nothing outstanding: resumed, and silent.
+        assert "You were interrupted" not in respawn_cmdline()
+
+        # 2. An unresolved lease (issue #546): work this box accepted and
+        #    never saw finish. lease_clear deletes the file on a clean exit,
+        #    so one that is still here is unfinished by definition.
+        machine.succeed(as_agent(
+            "mkdir -p /home/agent/.local/state/agent-box/lease && printf %s "
+            + shlex.quote('{"topic":"github:o/r","object":"42","outcome":null}')
+            + " > " + lease_file("notice")))
+        assert "You were interrupted" in respawn_cmdline()
+        machine.succeed(as_agent("rm -f " + lease_file("notice")))
+
+        # 3. A webhook subscription filter: it was waiting for an event no
+        #    sender replays. local-webhook keys the file on
+        #    LOCAL_WEBHOOK_SESSION, which the supervisor sets to
+        #    <user>-<session>, and it outlives the process that wrote it.
+        filt = "/home/agent/.local/state/local-webhook/filter.agent-notice.json"
+        machine.succeed(as_agent(
+            "mkdir -p /home/agent/.local/state/local-webhook && printf %s "
+            + shlex.quote('{"topics":[{"topic":"github:o/r"}]}') + f" > {filt}"))
+        assert "You were interrupted" in respawn_cmdline()
+        # An empty topics list is a file, not a watch.
+        machine.succeed(as_agent(
+            "printf %s " + shlex.quote('{"topics":[]}') + f" > {filt}"))
+        assert "You were interrupted" not in respawn_cmdline()
+        # Neither is a muted one: webhook.py's route_event refuses a disabled
+        # filter before it reads a topic, so this session receives nothing
+        # whatever its list still says.
+        machine.succeed(as_agent(
+            "printf %s "
+            + shlex.quote('{"enabled":false,"topics":[{"topic":"github:o/r"}]}')
+            + f" > {filt}"))
+        assert "You were interrupted" not in respawn_cmdline()
+        machine.succeed(as_agent(f"rm -f {filt}"))
+
+        # 4. A transcript cut mid-turn.
+        machine.succeed("printf '%s\\n' " + shlex.quote(open_turn)
+                        + f" >> {transcript}")
+        assert "You were interrupted" in respawn_cmdline()
         machine.succeed(as_agent("agent-box-session rm notice"))
 
     # --- env CLI writes the same file the settings page + wrapper use -----

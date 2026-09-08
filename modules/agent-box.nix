@@ -423,6 +423,18 @@ let
       Claude Code under ~/.claude/projects/ (plus ~/.claude/history.jsonl),
       Codex under ~/.codex/sessions/. After a respawn, or when you take over
       another agent's session, skim the most recent one before writing code.
+    - A claude session that comes back from a respawn is RESUMED, not restarted:
+      the transcript is restored, but no turn starts by itself. So if you are
+      holding work when the box goes down - an open PR, a claimed issue - you
+      wake up silent and nobody is coming to type. The box sends a short "you
+      were interrupted" prompt to start one turn - but only when it can SEE that
+      you had something open: a claimed hook assignment, a webhook subscription,
+      or a turn the kill cut in half. Work it cannot see - an open PR you never
+      subscribed to - wakes nobody, so subscribe to what you are waiting on
+      rather than counting on the nudge. When one does arrive, do not trust the
+      transcript alone. No sender replays what fired while you
+      were down, so read the CURRENT state of whatever you were waiting on, and
+      check `agent-box-webhook ls` - a subscription may have expired meanwhile.
     - Your harness's own configuration lives under $HOME and so survives a
       respawn: ~/.claude/ for Claude Code (settings.json, skills/, commands/,
       and the transcripts under projects/), ~/.codex/ for Codex. A skill, a
@@ -8026,9 +8038,11 @@ esac
         description = ''
           Prompt used when the supervisor RESUMES this session after any
           respawn (crash, reboot, Spot stop→restart). A non-null value
-          overrides the built-in restart notice. When null, the notice is
-          used only if services.agent-box.restartNotice is enabled;
-          otherwise no prompt is injected. Ignored for shell sessions.
+          overrides the built-in restart notice. When null,
+          services.agent-box.restartNotice decides whether that notice is
+          injected; on "never", or on "auto" for a session with nothing
+          outstanding, no prompt is injected at all. Ignored for shell
+          sessions.
         '';
       };
     };
@@ -8882,6 +8896,11 @@ esac
     # marketplace is CLONED from, e.g. defangdevs/local-channels).
     WEBHOOK_MARKETPLACE=local-channels
     WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
+    # Where local-webhook keeps its per-session subscription filters. Spelled once
+    # because two callers need to agree on it: the spawn below exports it as
+    # LOCAL_WEBHOOK_STATE_DIR, and session_watches_events reads a filter file out
+    # of it to decide whether a respawn is worth a turn (issue #548).
+    WEBHOOK_STATE_DIR="$HOME/.local/state/local-webhook"
 
     # Bring the tmux server up, unconditionally -- see ensure_tmux_server below.
     # One-shot at startup is not enough: a transient failure right here (the
@@ -9576,6 +9595,95 @@ esac
       $GREP '"type":"assistant"' "$f" 2>/dev/null | $GREP -qv '"model":"<synthetic>"'
     }
 
+    claude_turn_open() {
+      # True when $1's transcript was cut in the MIDDLE of a turn, so the agent
+      # was working when the pane died. False when the newest message record is
+      # an assistant record that closed its turn (stop_reason "end_turn"), which
+      # is a session that had finished and was waiting for someone to type.
+      #
+      # This is one of the three signals restart_notice_wanted weighs, and on its
+      # own it is not enough: issue #548's own incident was a session that closed
+      # its turn at 16:17 and then waited on CI and a review, so this test would
+      # have called it idle and left it silent for the 2.5 hours it actually sat
+      # there. The webhook and lease signals are what cover that shape.
+      #
+      # Only the tail is read. A transcript on a working box reaches tens of MB,
+      # and the trailing non-message records (system notices, the remote-control
+      # banner, a pr-link) are a handful of lines. Parsed line by line with
+      # fromjson? rather than a slurp, because a pane killed mid-write leaves a
+      # truncated final line that would otherwise fail the whole read -- and a
+      # truncated write is itself proof the turn was open.
+      [ -n "$1" ] || return 0
+      f=$($FIND "$HOME"/.claude/projects -maxdepth 3 -name "$1.jsonl" 2>/dev/null | head -n1)
+      [ -n "$f" ] || return 0
+      st=$(tail -n 200 "$f" 2>/dev/null | $JQ -Rrs '
+            [ split("\n")[] | select(length > 0) ] as $lines
+            | if ($lines | length) == 0 then "unknown"
+              elif (($lines | last | fromjson?) == null) then "open"
+              else [ $lines[] | fromjson? ]
+                   | map(select(.message and (.type == "assistant" or .type == "user")))
+                   | last
+                   | if . == null then "unknown"
+                     elif .type == "assistant" and .message.stop_reason == "end_turn"
+                     then "closed"
+                     else "open"
+                     end
+              end' 2>/dev/null) || st=unknown
+      [ "$st" != closed ]
+    }
+
+    session_watches_events() {
+      # True when $1 held at least one webhook subscription when it died. The
+      # filter file outlives the process that wrote it (local-webhook keys it on
+      # LOCAL_WEBHOOK_SESSION, which the spawn below sets to <user>-<session>),
+      # so it is readable at respawn time and says what the session was waiting
+      # for. A session waiting on an event is the one shape that looks idle in
+      # its transcript and is not: GitHub replays nothing that fired while the
+      # box was down, so nobody will ever wake it (issue #548).
+      #
+      # Expiry is deliberately not applied. local-webhook prunes an expired topic
+      # lazily, so a listed topic may already be stale -- but a TTL that lapsed
+      # while the box was off is not evidence the work finished, and the cost of
+      # being wrong here is one turn.
+      #
+      # `enabled` IS applied: webhook.py's route_event refuses a disabled filter
+      # before it looks at a single topic, so a session that muted itself is
+      # receiving nothing and is not waiting on anything, whatever its topic list
+      # still says. Spelled `.enabled == false` rather than `(.enabled // true)`,
+      # because jq's // falls through on false as well as null -- the alternative
+      # spelling can never be false and would silently do nothing. `is not False`
+      # is read_filter's own test, so a missing or null flag means enabled.
+      wf="$WEBHOOK_STATE_DIR/filter.$USER-$1.json"
+      [ -s "$wf" ] || return 1
+      n=$($JQ -r 'if .enabled == false then 0 else (.topics // []) | length end' \
+            "$wf" 2>/dev/null) || return 1
+      case "$n" in ('''|*[!0-9]*) return 1 ;; esac
+      [ "$n" -gt 0 ]
+    }
+
+    restart_notice_wanted() {
+      # restart_notice_wanted NAME LAUNCHID -- should this respawn get the
+      # built-in notice? Reviving a session costs a full resumed transcript as
+      # input, so "auto" (the default) sends one only to a session that has
+      # something outstanding, and leaves a finished one silent.
+      #
+      #   never   -- issue #507's behaviour: resume with no injected prompt.
+      #   always  -- every respawn whose transcript holds real work.
+      #   auto    -- any one of: an unresolved lease (accepted hook work this
+      #              box has not seen finish), a subscription filter (it was
+      #              waiting for an event nobody will replay), or a transcript
+      #              cut mid-turn.
+      case "''${AGENT_BOX_RESTART_NOTICE:-auto}" in
+        (0|never|false) return 1 ;;
+        (1|always|true) return 0 ;;
+      esac
+      # A lease is deleted on a clean exit (lease_clear), so one that is still
+      # here names work this box accepted and cannot say finished.
+      [ -s "$(lease_file "$1")" ] && return 0
+      session_watches_events "$1" && return 0
+      claude_turn_open "$2"
+    }
+
     codex_rollout_uuid() {
       # Echo the Codex session UUID whose rollout transcript carries our
       # "[agent-box session <boxid>]" marker (newest wins if a prior resume
@@ -9738,12 +9846,18 @@ esac
           # claude_transcript_has_work. Run the normal kickoff instead of
           # claiming an interruption nothing backs up.
           prompt="$ip"
-        elif [ "$agent" = claude ] && [ -n "''${AGENT_BOX_RESTART_NOTICE:-}" ]; then
-          prompt="You were interrupted and automatically restarted (agent-box session $bid). Your previous transcript for this session has been resumed — review what you had already done, verify the current state, and continue from where you left off. If that work was already complete, say so briefly and stop rather than redoing it."
+        elif [ "$agent" = claude ] && restart_notice_wanted "$sname" "$bid"; then
+          # An interrupted session is caught up by --resume but starts no turn of
+          # its own, so a session with outstanding work waits forever unless this
+          # prompt starts one (issue #548). What it must NOT do is imply the
+          # transcript is all there is to check: the events that decide whether
+          # the work is still needed fired while the box was down, and no sender
+          # replays them.
+          prompt="You were interrupted and automatically restarted (agent-box session $bid). Your transcript is resumed, but no event that fired while you were down was replayed. Check the current state of whatever you were waiting on -- CI and reviews on a PR you opened, an issue you claimed -- and run 'agent-box-webhook ls' to confirm your subscriptions are still live, then subscribe again if they are not. Continue from there. If the work is already finished, say so in one line and stop rather than redoing it."
         else
-          # Opt-in only (issue #507): --resume already restores the transcript
-          # on its own, so the default is no injected prompt at all — the agent
-          # wakes up mid-transcript exactly as `claude --resume` would outside
+          # Nothing outstanding (restart_notice_wanted), or the notice is turned
+          # off: --resume restores the transcript on its own, so the agent wakes
+          # up mid-transcript exactly as `claude --resume` would outside
           # agent-box, with nothing here claiming an interruption for it.
           prompt=""
         fi
@@ -10075,7 +10189,7 @@ esac
       # expansion stays one argument per token.
       whargs=""
       if [ -n "''${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
-        whargs="-e LOCAL_WEBHOOK_SESSION=$USER-$sname -e LOCAL_WEBHOOK_STATE_DIR=$HOME/.local/state/local-webhook -e LOCAL_WEBHOOK_PORT=0"
+        whargs="-e LOCAL_WEBHOOK_SESSION=$USER-$sname -e LOCAL_WEBHOOK_STATE_DIR=$WEBHOOK_STATE_DIR -e LOCAL_WEBHOOK_PORT=0"
       fi
       # AGENT_BOX_SESSION_ID rides the same session environment: it is the
       # launch id the SessionStart hook keys its live-id record by (the
@@ -10509,19 +10623,38 @@ in
     };
 
     restartNotice = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
+      type = lib.types.enum [ "auto" "always" "never" ];
+      default = "auto";
+      example = "never";
       description = ''
-        Stamp the built-in "You were interrupted and automatically
+        Whether to stamp the built-in "You were interrupted and automatically
         restarted..." text onto a claude session's resume prompt after a
         respawn (crash, reboot, Spot stop→restart) whose transcript already
-        holds real work. Off by default (issue #507): `--resume` reliably
-        restores the transcript on its own, so a respawn with no
-        resumePrompt set now hands the agent no injected prompt at all
-        rather than this notice — same as passing an empty resumePrompt
-        would today.
+        holds real work.
 
-        A per-session resumePrompt still overrides either way. There is no
+        `--resume` restores the transcript, but it starts no turn: the agent
+        comes back caught up and then waits, exactly as `claude --resume`
+        does outside agent-box. For an interactive session a person types
+        eventually. For a session with an outstanding commitment — an open
+        PR, a claimed webhook topic — nobody does, and it sits silent
+        indefinitely (issue #548, where one sat for 2.5 hours while its CI
+        went red).
+
+        Sending the notice is not free either: it revives the session with
+        its whole resumed transcript as input, which on a long-running
+        session is a large prompt for what may be finished work. Hence three
+        values rather than a switch:
+
+        - "auto" (default) sends the notice only to a session that has
+          something outstanding — an unresolved hook lease, a webhook
+          subscription filter it left behind, or a transcript cut mid-turn.
+          A session that closed its last turn and holds neither stays
+          silent.
+        - "always" is issue #507's pre-#512 behaviour: every respawn whose
+          transcript holds real work.
+        - "never" is #512's: no injected prompt at all, ever.
+
+        A per-session resumePrompt still overrides all three. There is no
         equivalent for codex or a remote-controlled session: codex's own
         resume arm stamps the box/session id into its resumed prompt
         regardless (there is no built-in text to gate), and a
@@ -11717,12 +11850,13 @@ in
             # pin the restricted values back. Same for every instance.
             AGENT_BOX_CODEX_FULL_ACCESS = "1";
           }
-          // lib.optionalAttrs cfg.restartNotice {
-            # Opt-in built-in restart notice for claude respawns (issue
-            # #507). Set ONLY when true: supervisor.sh reads its presence,
-            # not its value, so exporting it unconditionally would make the
-            # off-by-default the option promises impossible to reach.
-            AGENT_BOX_RESTART_NOTICE = "1";
+          // {
+            # Built-in restart notice for claude respawns: "auto", "always"
+            # or "never" (issues #507, #548). Exported unconditionally and
+            # read by VALUE -- restart_notice_wanted in supervisor.sh treats
+            # an unset variable as "auto", so the three values have to be
+            # distinguishable rather than present/absent.
+            AGENT_BOX_RESTART_NOTICE = cfg.restartNotice;
           }
           // lib.optionalAttrs webhookEnabled {
             # Doubles as the supervisor's "webhook receiver is live" flag
