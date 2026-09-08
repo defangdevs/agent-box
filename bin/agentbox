@@ -1506,6 +1506,16 @@ class Renderer:
         disable` reads the unit file to find the wants symlink it has to
         drop.
 
+        Stopping the running instances is activate()'s job and not this
+        method's, because a render must never ask the host anything: a
+        first draft probed `systemctl list-unit-files` from here and every
+        render inside a Nix build sandbox died at `FileNotFoundError:
+        'systemctl'`, which reads as a bug in the config rather than in the
+        renderer. It is also the wrong question - an instance enabled
+        through a target drop-in has no unit file of its own to list. So
+        the units this renders are removed here, and the instances are
+        named directly, from the config, over there.
+
         Not undone here: the LOADED AppArmor profile, and the containers a
         user's daemon left behind. Removing the profile file stops it being
         loaded at the next boot, and cmd_apply says so out loud, but
@@ -1513,10 +1523,6 @@ class Renderer:
         against a file we have just deleted - and an image tree under
         ~/.local/share/docker is the user's data, not ours to remove.
         """
-        for u in self.spec.users:
-            unit = f"{DOCKER_UNIT_PREFIX}{u.name}.service"
-            if unit in systemd_units_live(DOCKER_UNIT_PREFIX):
-                t.disable.append(unit)
         self.gone_shared_units(t, (DOCKER_UNIT_PREFIX,))
         t.gone(self.p(UIDMAP_HELPER))
         for program, _caps in UIDMAP_PROGRAMS:
@@ -3946,7 +3952,18 @@ def activate(spec, tree, removed, advisory, act):
             act.require("load AppArmor container profiles",
                         [apparmor_parser(), "--replace", "--write-cache",
                          APPARMOR_PROFILE])
-    elif str(Path(APPARMOR_PROFILE)) in removed:
+    else:
+        # Named from the CONFIG, not discovered: an instance enabled
+        # through a target drop-in has no unit file for
+        # `list-unit-files` to report, so the prefix walk further down
+        # never sees one. Advisory, like every other bit of cleanup: a
+        # daemon that will not stop is not the box failing to be what
+        # the config asks for.
+        for u in spec.users:
+            unit = f"{DOCKER_UNIT_PREFIX}{u.name}.service"
+            if unit_is_enabled(unit) or unit in active_units(unit):
+                act.optional(f"stop {unit}", ["systemctl", "stop", unit])
+    if str(Path(APPARMOR_PROFILE)) in removed:
         # Removing the file stops it loading at the next boot; the RUNNING
         # kernel keeps the profile it already has, and unloading it would
         # mean `apparmor_parser -R` against a file that is now gone. Same

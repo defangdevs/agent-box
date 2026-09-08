@@ -157,7 +157,15 @@ let
   # in this module then renders as a host-level drop-in automatically
   # (default overrideStrategy = "asDropinIfExists" detects that a unit
   # file of the same name already exists in this package).
-  agentBoxUnitsPackage = pkgs.runCommand "agent-box-units" { } ''
+  # The concatenation below MUST stay inside the parentheses. Written as
+  # `runCommand "..." { } '' ... '' + lib.optionalString ...`, the `+`
+  # binds to the whole APPLICATION rather than to its last argument, so
+  # this evaluates to a derivation-coerced-to-string and systemd.packages
+  # gets a string where it wants a package. Nothing in the eval-level
+  # checks or the golden snapshot notices - the first thing that did was
+  # tests/containers.nix, at "A definition for option
+  # `nodes.machine.systemd.packages.[...]' is not of type `package'".
+  agentBoxUnitsPackage = pkgs.runCommand "agent-box-units" { } (''
     mkdir -p $out/etc/systemd/system
     install -m444 ${pkgs.writeText "agent-box@.service" ''
       @@include:src/units/agent-box@.service@@
@@ -181,7 +189,7 @@ let
     install -m444 ${pkgs.writeText "agent-box-docker@.service" ''
       @@include:src/units/agent-box-docker@.service@@
     ''} $out/etc/systemd/system/agent-box-docker@.service
-  '';
+  '');
   # Shared by the "agent-box@" host-level ExecSearchPath (below) and the
   # per-user "agent-box@<name>" instance drop-in's environment.PATH — they
   # MUST be the same value. Per systemd.exec(5): "ExecSearchPath= overrides
