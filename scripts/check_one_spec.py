@@ -81,15 +81,26 @@ SUBSTRATE = [
 # process's own. Native's `useradd` does create a per-user group, so its
 # renderer (bin/agentbox) can and does name it. Both end up owned the
 # same way; only the literal rule text disagrees.
+#
+# Each entry is (side, reason), not a bare reason: an entry excuses its
+# rule only on the side it was written for, so if the module and native
+# ever swapped which one names a group, the same rule text turning up on
+# the OTHER side is a violation like an undeclared one, not a free pass
+# (see _report — ported from check_backend_parity.py's report(), which
+# caught exactly this for a swapped by-design pair).
 TMPFILES_BY_DESIGN = {
     "d /home/@USER@/.config 0755 @USER@ - - -":
-        "module -- no per-user group on NixOS (#604); native's is @USER@",
+        ("module only",
+         "no per-user group on NixOS (#604); native's is @USER@"),
     "d /home/@USER@/.config/agent-box 0700 @USER@ - - -":
-        "module -- no per-user group on NixOS (#604); native's is @USER@",
+        ("module only",
+         "no per-user group on NixOS (#604); native's is @USER@"),
     "d /home/@USER@/.config 0755 @USER@ @USER@ - -":
-        "native -- useradd creates a per-user group; NixOS's rule names none",
+        ("native only",
+         "useradd creates a per-user group; NixOS's rule names none"),
     "d /home/@USER@/.config/agent-box 0700 @USER@ @USER@ - -":
-        "native -- useradd creates a per-user group; NixOS's rule names none",
+        ("native only",
+         "useradd creates a per-user group; NixOS's rule names none"),
 }
 
 SUDOERS_BY_DESIGN = {}
@@ -227,21 +238,31 @@ def check_seed():
 
 
 def _report(kind, only_left, only_right, by_design, known_gaps):
-    """Print one artifact's divergences; return (violations, stale)."""
-    violations, seen = 0, set()
+    """Print one artifact's divergences; return violations.
+
+    Each table maps an item to (side, reason). An entry excuses its item
+    only on the side it was written for — the same text turning up on the
+    OTHER side is a violation like an undeclared one, because the reason no
+    longer describes what actually diverged.
+    """
+    violations = 0
     for side, items in (("module only", only_left), ("native only", only_right)):
         for item in sorted(items):
-            if item in by_design:
-                seen.add(item)
+            entry = by_design.get(item) or known_gaps.get(item)
+            if entry is not None and entry[0] != side:
+                violations += fail(
+                    f"{kind}: {side} — {item}, but its entry is written "
+                    f"for {entry[0]}")
+            elif item in by_design:
                 print(f"  ok (by design)  {kind}: {item}\n"
-                      f"                  {side} — {by_design[item]}")
+                      f"                  {side} — {by_design[item][1]}")
             elif item in known_gaps:
-                seen.add(item)
                 print(f"  known gap       {kind}: {item}\n"
-                      f"                  {side} — {known_gaps[item]}")
+                      f"                  {side} — {known_gaps[item][1]}")
             else:
                 violations += fail(f"{kind}: {side} — {item}")
-    stale = sorted((set(by_design) | set(known_gaps)) - seen)
+    stale = sorted(item for item in set(by_design) | set(known_gaps)
+                   if item not in only_left and item not in only_right)
     for item in stale:
         violations += fail(
             f"{kind}: stale exception — {item!r} no longer diverges. "
