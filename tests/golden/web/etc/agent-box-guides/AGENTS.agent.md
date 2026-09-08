@@ -329,8 +329,12 @@ outage. Default window 6 hours; `--hours` widens it, as far as GitHub's own
 retention (about three days).
 
 Two limits worth knowing. A wildcard topic (`owner/*`) names no repo, so a
-sweep cannot find its hooks - name the repo as an argument. And this needs a
-GitHub token in your environment; without one it says so and does nothing.
+sweep cannot find its hooks - name the repo as an argument. And the token in
+your environment needs webhook access: "Webhooks: read and write" on a
+fine-grained token (`repository_hooks=write`), or `admin:repo_hook` on a
+classic one. GitHub answers **404, not 403**, when that scope is missing, so
+without it a sweep reads as "no such repo" on a repo you push to daily - the
+sweep says which scope to look at rather than leaving you with the 404.
 
 For events NO session owns - new issues, new PRs, CI on a repo nobody is
 working on - don't pin a session subscription; it would interrupt whatever

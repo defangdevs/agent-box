@@ -42,6 +42,8 @@ DEFAULT_PAYLOAD = os.path.join(
     HERE, "..", "modules", "src", "webhook-backfill.py")
 
 BASE = "https://box.example.com/agent/webhook"
+# The payload's own page ceiling, so the truncation case can be built.
+MAX_PAGES = 12
 OURS = 111
 THEIRS = 222
 
@@ -382,6 +384,42 @@ def test_window_and_paging():
           "--hours narrows what is considered lost", narrow.posted())
 
 
+def test_a_truncated_walk_is_never_reported_as_clean():
+    """The page cap can end a walk before the window does. If what it read
+    happened to be all-accepted, the report must still say the walk was cut
+    short - "nothing owed" over an unfinished window is the silent-cap
+    failure this whole command exists to avoid."""
+    live = box()
+    with open(live.fixture, encoding="utf-8") as handle:
+        data = json.load(handle)
+    # One page, all accepted, and a Link header promising another: exactly
+    # what a walk stopped by the cap rather than by the window looks like.
+    page = [record for record in data["deliveries"][str(OURS)][0]]
+    for record in page:
+        record["status_code"] = 200
+        record["status"] = "OK"
+    data["deliveries"][str(OURS)] = [page] * (MAX_PAGES + 1)
+    with open(live.fixture, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    done = live.run("--hours", "24")
+    check("nothing owed" in done.stdout and "longer than one sweep" in
+          done.stdout,
+          "a page-capped sweep says so even when it found nothing owed",
+          done.stdout)
+    check(live.state_file()["repos"][0]["hooks"][0]["truncated"] is True,
+          "and records it, so status can read it back too")
+
+
+def test_missing_webhook_scope_names_the_scope():
+    """GitHub answers 404, not 403, for a token without webhook access, so
+    the bare gh error reads as "no such repo"."""
+    live = box()
+    done = live.run("--hours", "24", GH_BROKEN="1")
+    check("repository_hooks=write" in done.stderr
+          and "admin:repo_hook" in done.stderr,
+          "a failed hooks listing names the scope to look at", done.stderr)
+
+
 def test_dry_run_changes_nothing():
     live = box()
     done = live.run("--hours", "24", "--dry-run")
@@ -403,6 +441,16 @@ def test_limit_is_reported_never_silent():
           live.posted())
     check("2 older one(s) left alone" in done.stdout,
           "and says what it left behind", done.stdout)
+    check("re-requested 2" in done.stdout,
+          "and counts what it actually asked for, not the pre-cap total",
+          done.stdout)
+    dry = box()
+    done = dry.run("--hours", "24", "--limit", "2", "--dry-run")
+    check("would re-request 2" in done.stdout
+          and "2 older one(s) left alone" in done.stdout,
+          "a capped DRY run says 2 too - printing the pre-cap 4 directly "
+          "above '2 left alone' is the one thing it must not do",
+          done.stdout)
     check(live.state_file()["repos"][0]["hooks"][0]["dropped"] == 2,
           "which status can read back too")
     none = box()

@@ -314,7 +314,18 @@ def describe(record):
 
 def sweep_repo(repo, mine, cutoff, limit, dry_run):
     report = {"repo": repo, "hooks": []}
-    hooks = gh_json(f"/repos/{repo}/hooks")
+    try:
+        hooks = gh_json(f"/repos/{repo}/hooks")
+    except Failure as error:
+        # Reading a repo's hooks needs webhook access, and GitHub hides a
+        # missing scope as 404 rather than 403 - so the bare gh error reads
+        # as "no such repo" on a repo the agent pushes to daily. Name the
+        # scope here instead of leaving that to be rediscovered.
+        raise Failure(
+            f"{error}. Listing a repo's hooks (and asking for a redelivery) "
+            "needs a token with Webhooks: read and write (fine-grained: "
+            "repository_hooks=write) or admin:repo_hook (classic). GitHub "
+            "answers 404, not 403, when the scope is missing")
     if not isinstance(hooks, list):
         hooks = []
     ours = [h for h in hooks
@@ -391,25 +402,34 @@ def render(state, stream):
                 print(f"{repo['repo']} hook {hook['hookId']}: no delivery in "
                       "the window", file=stream)
             owed = hook.get("outstanding") or 0
-            if not owed:
-                print("  nothing owed - every delivery in the window was "
-                      "accepted", file=stream)
-                continue
-            verb = "would re-request" if dry else "re-requested"
-            print(f"  {owed} delivery(s) never reached this box; {verb} "
-                  f"{hook.get('requested') if not dry else owed}",
-                  file=stream)
-            for failure in hook.get("failures") or []:
-                print(f"    {failure['at']} {failure['event']} "
-                      f"({failure['statusCode']})", file=stream)
-            if hook.get("dropped"):
-                print(f"  {hook['dropped']} older one(s) left alone (--limit "
-                      f"{state.get('limit')}); raise --limit or --hours to "
-                      "reach them", file=stream)
-            if hook.get("truncated"):
-                print("  the delivery log was longer than this sweep walks; "
-                      "there may be more before the oldest shown",
+            dropped = hook.get("dropped") or 0
+            if owed:
+                # The dry-run count is what a real run WOULD ask for, which
+                # is what survived the cap - not the pre-cap total. Printing
+                # `owed` here said "would re-request 4" directly above "2
+                # older one(s) left alone", which is the one thing a report
+                # about silent truncation must not do.
+                asked = hook.get("requested") if not dry else owed - dropped
+                verb = "would re-request" if dry else "re-requested"
+                print(f"  {owed} delivery(s) never reached this box; {verb} "
+                      f"{asked}", file=stream)
+                for failure in hook.get("failures") or []:
+                    print(f"    {failure['at']} {failure['event']} "
+                          f"({failure['statusCode']})", file=stream)
+                if dropped:
+                    print(f"  {dropped} older one(s) left alone (--limit "
+                          f"{state.get('limit')}); raise --limit or --hours "
+                          "to reach them", file=stream)
+            else:
+                print("  nothing owed in what this sweep walked",
                       file=stream)
+            # Outside the branch on purpose. A page-capped walk that found
+            # nothing owed used to print "nothing owed" and stop, which
+            # reads as a clean window when the window was never finished.
+            if hook.get("truncated"):
+                print("  ...but the delivery log was longer than one sweep "
+                      "walks, so there may be more before the oldest record "
+                      "it read", file=stream)
             for error in hook.get("errors") or []:
                 print(f"  stopped: {error}", file=stream)
     for pattern in state.get("skippedTopics") or []:
