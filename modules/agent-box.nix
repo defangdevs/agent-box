@@ -12150,6 +12150,14 @@ in
       home = "/home/${name}";
       createHome = true;
       extraGroups = u.extraGroups;
+      # Without this, /run/user/<uid> only exists while a PAM login session
+      # is active — logind never creates it for a session started outside
+      # one (e.g. this module's own supervisor). That silently breaks any
+      # long-lived `systemctl --user` unit AND every rootless container
+      # runtime (subuid ranges and setuid newuidmap/newgidmap are useless
+      # without it): `podman info` / `dockerd-rootless` both fail with
+      # `lstat /run/user/<uid>: no such file or directory` (issue #600).
+      linger = true;
       # Overridable so a host config can pick another shell (e.g. pkgs.zsh) —
       # "shell" sessions (issue #113) run whatever this resolves to. Priority
       # 900: mkDefault would TIE with the isNormalUser->useDefaultShell

@@ -3531,6 +3531,39 @@ def ensure_user(name, home, act, dry_run=False):
     return True
 
 
+def ensure_linger(name):
+    """Enable systemd linger, unconditionally and every apply (not just at
+    creation) — self-heals a box that was deployed before this existed.
+
+    Without it, /run/user/<uid> only exists while a PAM login session is
+    active; logind never creates it for a session started outside one
+    (e.g. this box's own supervisor). That silently breaks any long-lived
+    `systemctl --user` unit, and it is what decides whether a rootless
+    container runtime can ENFORCE anything.
+
+    Rootless docker gets a resource limit only from the systemd cgroup
+    driver, and that driver asks this user's own manager for each
+    container's scope over its bus. With no manager there is no bus:
+    `docker run -m 128m` still exits 0 and memory.max inside the container
+    reads "max" — a limit accepted and discarded. The shared docker unit
+    therefore refuses to start without the bus, so on a box with
+    containers on this call is what makes the daemon runnable at all.
+    (Measured on this deployment: with lingering on, the same run reports
+    memory.max = 134217728.)
+
+    Podman fails earlier and louder, at `lstat /run/user/<uid>: no such
+    file or directory` — which is where issue #600 first found this. Docker
+    does not, since agent-box's own unit gives the daemon an
+    XDG_RUNTIME_DIR of its own; its failure surfaces one step later, when
+    the first container is started.
+
+    Idempotent — enabling linger that is already enabled is a no-op — so
+    best-effort (check=False) is enough; a box without systemd-logind just
+    leaves this a no-op too.
+    """
+    run(["loginctl", "enable-linger", name], check=False)
+
+
 def unit_is_enabled(unit):
     """True only for a unit systemd reports as enabled.
 
@@ -3923,6 +3956,7 @@ def activate(spec, tree, removed, advisory, act):
     failed_starts = set()
     for u in spec.users:
         ensure_user(u.name, u.home, act)
+        ensure_linger(u.name)
     if spec.web_enable:
         # Advisory on its own: if the login really cannot be created,
         # caddy.service cannot start as it, and THAT is a required failure
