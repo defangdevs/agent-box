@@ -72,6 +72,9 @@ DEFAULT_CONFIG = "/etc/agent-box/config.yaml"
 # mismatch between any two of them is issue #353 all over again (a grant
 # that does not match the command asks for a password instead).
 UPDATE_UNIT = "agent-box-update.service"
+# The update's own output, where an agent that triggered one can
+# read it back. See the unit for why the journal is not enough.
+UPDATE_LOG = "/var/log/agent-box/update.log"
 SYSTEMCTL = "/usr/bin/systemctl"
 # The web front door reload, spelled once for the same reason as the two
 # above: the sudo grant and the command the rendered Caddyfile tells the
@@ -2169,6 +2172,31 @@ class Renderer:
                 # waiting on it. A default 90 s TimeoutStartSec would kill it
                 # mid-switch.
                 "TimeoutStartSec=infinity",
+                # Where an agent can read why its own update failed.
+                #
+                # An agent may TRIGGER an update - that is the one thing
+                # the sudo allowlist grants it - and until this line it
+                # could not read a word of the result: the output went to
+                # the journal, and an agent user is in neither `adm` nor
+                # `systemd-journal`, so `journalctl -u
+                # agent-box-update.service` prints nothing at all and
+                # `systemctl status` shows a bare "failed" with no lines
+                # under it. A rollback leaves the box healthy on the old
+                # rev, so the ONLY visible symptom is a rev that will not
+                # move. Diagnosing one such failure took a polling script
+                # started with setsid so it would outlive the session the
+                # update kills - which is not a thing a box should ask of
+                # the agent it hands the trigger to.
+                #
+                # truncate: and not append:, so the file is the LAST run
+                # and cannot grow without bound on a box that updates
+                # nightly. LogsDirectory= makes /var/log/agent-box (0755
+                # root) without a tmpfiles rule, and systemd creates the
+                # file 0644 - readable by every agent, writable by none.
+                # Root loses nothing: it reads the same file.
+                "LogsDirectory=agent-box",
+                f"StandardOutput=truncate:{UPDATE_LOG}",
+                "StandardError=inherit",
                 f"ExecStart={self.bin}/agentbox update "
                 f"--config {self.config}",
             ]), 0o444)
@@ -2824,9 +2852,22 @@ class Renderer:
             "session\n"
             "included, so save context first. If the new release fails to "
             "apply, the\n"
-            "profile rolls back and the old one is re-applied. Watch it with "
-            "`journalctl -fu\n"
-            f"{UPDATE_UNIT}`; the box's own rev is on the settings page.\n\n"
+            "profile rolls back and the old one is re-applied.\n\n"
+            f"Read what it did in `{UPDATE_LOG}` - the last run, whether it "
+            "worked or\n"
+            "not. Reach for that and NOT `journalctl -u "
+            f"{UPDATE_UNIT}`,\n"
+            "which prints nothing at all for you: an agent user is in "
+            "neither `adm`\n"
+            "nor `systemd-journal`. A failed update rolls back and leaves "
+            "the box\n"
+            "healthy, so the other sign is the PROFILE rev on the settings "
+            "page not\n"
+            "moving. Not the source tree's rev: the tree is fast-forwarded "
+            "FIRST\n"
+            "and a rollback leaves it ahead: after a failed update\n"
+            f"`git -C {SRC_DIR} log -1` names a rev this box is not\n"
+            "running.\n\n"
         )
         # Which HOST this guide is describing. The module binds the NixOS
         # section here; this box is a distro host with agent-box in a Nix

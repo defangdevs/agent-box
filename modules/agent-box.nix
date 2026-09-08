@@ -336,6 +336,16 @@ let
       rebuild that failed and could not put the tree back, which the wall
       notice says - it reads ahead of the running system.
 
+      Read what an update did in `${updateLogFile}` - the last run, whether
+      it worked or not. Reach for that and NOT
+      `journalctl -u agent-box-update.service`, which prints nothing at all
+      for you: an agent user is in neither `adm` nor `systemd-journal`. A
+      failed update rolls back and leaves the box healthy, so the other sign
+      is the rev of the RUNNING system not moving. Not the source tree's rev:
+      the tree is fast-forwarded FIRST and a rollback leaves it ahead, so
+      `git -C ${cfg.selfUpdate.srcDir} log -1` after a failed update names a
+      rev this box is not running.
+
     '' + lib.optionalString checkoutEnabled ''
       ## This box ships its own sources
 
@@ -2750,6 +2760,9 @@ done
   # bin/agentbox) — the divergence one-spec-both-backends reported as
   # SUDOERS_KNOWN_GAPS, and a second way in that nothing documented.
   updateStartCmd = "/run/current-system/sw/bin/systemctl start --no-block agent-box-update.service";
+  # The update's own output, where an agent that triggered one can read it
+  # back. Kept in step with the native renderer's UPDATE_LOG.
+  updateLogFile = "/var/log/agent-box/update.log";
   # The settings page's "Reboot box" button. --no-block for the same reason
   # the update trigger has it, only more so: the daemon must answer the
   # request before systemd starts stopping units, and the daemon is one of
@@ -13414,6 +13427,22 @@ in
       restartIfChanged = false;
       stopIfChanged = false;
       serviceConfig.Type = "oneshot";
+      # Where an agent can read why its own update failed. An agent may
+      # TRIGGER an update - the sudo allowlist grants exactly that - and
+      # could not read a word of the result: the output goes to the
+      # journal, and an agent user is in neither `adm` nor
+      # `systemd-journal`, so `journalctl -u agent-box-update.service`
+      # prints nothing and `systemctl status` shows a bare "failed" with no
+      # lines under it. A rollback leaves the box healthy on the old rev,
+      # so the only visible symptom is a rev that will not move.
+      #
+      # truncate:, so the file is the LAST run and cannot grow without
+      # bound; LogsDirectory= makes /var/log/agent-box without a tmpfiles
+      # rule, and systemd writes the file 0644 - readable by every agent,
+      # writable by none. Root loses nothing: it reads the same file.
+      serviceConfig.LogsDirectory = "agent-box";
+      serviceConfig.StandardOutput = "truncate:${updateLogFile}";
+      serviceConfig.StandardError = "inherit";
       script = ''
         set -euo pipefail
 

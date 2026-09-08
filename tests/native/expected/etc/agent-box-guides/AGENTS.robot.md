@@ -599,8 +599,17 @@ This box is not NixOS, so what follows the pull is a profile swap and
 not a system rebuild: the release renders the host configuration it
 describes and restarts the services onto it - your own tmux session
 included, so save context first. If the new release fails to apply, the
-profile rolls back and the old one is re-applied. Watch it with `journalctl -fu
-agent-box-update.service`; the box's own rev is on the settings page.
+profile rolls back and the old one is re-applied.
+
+Read what it did in `/var/log/agent-box/update.log` - the last run, whether it worked or
+not. Reach for that and NOT `journalctl -u agent-box-update.service`,
+which prints nothing at all for you: an agent user is in neither `adm`
+nor `systemd-journal`. A failed update rolls back and leaves the box
+healthy, so the other sign is the PROFILE rev on the settings page not
+moving. Not the source tree's rev: the tree is fast-forwarded FIRST
+and a rollback leaves it ahead: after a failed update
+`git -C /var/lib/agent-box/src log -1` names a rev this box is not
+running.
 
 ## This platform has its own upstream repo
 
