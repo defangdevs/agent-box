@@ -27,6 +27,11 @@ export LOCAL_WEBHOOK_PORT=0
 # batch it refused (issue #170). Both are read-only here.
 SESSIONS="$HOME/.config/agent-box/sessions.json"
 HOOK_REFUSED="$HOME/.local/state/agent-box/webhook-spawn-refused.json"
+# ...and what the last ingress sweep found (issue #605): whether the SENDER
+# has managed to reach this box lately, which is the one question a session
+# waiting on events cannot answer from anything local. Written by
+# agent-box-webhook-backfill, read-only here.
+BACKFILL="$HOME/.local/state/agent-box/webhook-backfill.json"
 
 usage() {
   cat <<'USAGE'
@@ -38,6 +43,7 @@ usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
        agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent]
        agent-box-webhook ls
        agent-box-webhook status
+       agent-box-webhook backfill [OWNER/REPO]... [--dry-run] [--hours N]
        agent-box-webhook url
        agent-box-webhook setup [SOURCE]
        agent-box-webhook rotate [SOURCE]
@@ -198,6 +204,13 @@ then register that URL + secret in the sender (GitHub: repo Settings ->
 Webhooks -> Add webhook, content type application/json, pick the events).
 SOURCE is any sender that signs its body the same way (`setup stripe`, and
 so on); it defaults to github, and each source gets its own path and secret.
+
+When the wait is long and NOTHING has arrived, `backfill` is the command that
+tells a quiet repo from a deaf box: it reads GitHub's own delivery log, prints
+when a delivery was last accepted, and asks GitHub to send again everything it
+could not hand over (nothing is retried by a sender, so an outage is otherwise
+permanent loss). `status` reports what the last sweep found, with no network
+call of its own. `backfill --help` for the window and the caps.
 USAGE
 }
 
@@ -783,10 +796,47 @@ case "$cmd" in
         dwarn="$(hook_capacity_warning "$hlive" "$hmax")"
       fi
     fi
+    # ...and the fourth, which is not about this box at all: whether the
+    # SENDER has been able to reach it (issue #605). Every other field here
+    # describes machinery on this side of the wire, and all of it can be
+    # perfectly healthy while GitHub answers 502 to every delivery - which is
+    # the state a session waiting on events reads as "the repo is quiet".
+    # Reported from the last sweep's record rather than by calling GitHub:
+    # status must stay offline and instant for the callers that parse it.
+    ingress=null
+    if [ -s "$BACKFILL" ]; then
+      ingress="$("$JQ" -c 'del(.["//"])' "$BACKFILL" 2>/dev/null)" || ingress=null
+      [ -n "$ingress" ] || ingress=null
+    fi
+    iwarn=""
+    if [ "$ingress" = null ]; then
+      iwarn="no ingress sweep has run, so a silent wait cannot be told from a\
+ dead front door; ask GitHub with: agent-box-webhook backfill --dry-run"
+    else
+      # == false, not `not`: a hook with no delivery in the window has
+      # lastDelivery null, and "unknown" must not read as "refused".
+      refused="$(printf '%s' "$ingress" | "$JQ" -r \
+        '[.repos[]?.hooks[]? | select(.lastDelivery.accepted == false)] | length' \
+        2>/dev/null)" || refused=0
+      owed="$(printf '%s' "$ingress" | "$JQ" -r \
+        '[.repos[]?.hooks[]? | (.outstanding - .requested)] | add // 0' \
+        2>/dev/null)" || owed=0
+      case "$refused$owed" in (*[!0-9]*) refused=0; owed=0 ;; esac
+      swept="$(printf '%s' "$ingress" | "$JQ" -r '.at // "?"' 2>/dev/null)" || swept="?"
+      if [ "$refused" -gt 0 ]; then
+        iwarn="GitHub's last recorded delivery to this box was REFUSED (sweep\
+ at $swept) — ingress is probably down, and nothing a session subscribes to\
+ can arrive until it is back"
+      elif [ "$owed" -gt 0 ]; then
+        iwarn="$owed delivery(s) GitHub could not hand over are still\
+ outstanding (sweep at $swept) — recover them with: agent-box-webhook backfill"
+      fi
+    fi
     printf '%s' "$out" | "$JQ" \
       --arg installed "$installed" --arg pf "$PLUGINS" --arg skew "$skew" \
       --argjson keyed "$keyed" --argjson shared "$shared" --argjson legacy "$legacy" \
       --argjson hlive "$hlive" --argjson hmax "$hmax" --argjson refusal "$refusal" \
+      --argjson ingress "$ingress" \
       --arg dwarn "$dwarn" '
         .plugin = {sessionVersions: ($installed | if . == "" then [] else split(" ") end),
                    pinnedVersion: .version, skew: $skew, installedFrom: $pf}
@@ -798,7 +848,8 @@ case "$cmd" in
                         hookSessions: {live: $hlive, max: $hmax,
                                        atCapacity: ($hlive >= $hmax)},
                         lastRefusal: $refusal}
-                       + (if $dwarn == "" then {} else {warning: $dwarn} end))'
+                       + (if $dwarn == "" then {} else {warning: $dwarn} end))
+        | .ingress = $ingress'
     # Warnings on stderr only, and only when something is wrong: status stays
     # valid JSON on stdout for a caller that parses it, and a healthy box says
     # nothing at all.
@@ -814,6 +865,9 @@ case "$cmd" in
     if [ -n "$dwarn" ]; then
       echo "agent-box-webhook: $dwarn" >&2
     fi
+    if [ -n "$iwarn" ]; then
+      echo "agent-box-webhook: $iwarn" >&2
+    fi
     if [ "$legacy" -gt 0 ]; then
       echo "agent-box-webhook: $legacy live session peer(s) name their socket the pre-0.10.0" \
            "way, so they claim no subscriptions at all. The dispatch ownership brake cannot see" \
@@ -821,6 +875,20 @@ case "$cmd" in
            "#192). Updating the plugin does not reach them — a session loads its interpreter" \
            "once — so restart them: agent-box-session restart NAME" >&2
     fi
+    ;;
+  backfill)
+    # Delegated rather than written here, for a reason the payload's own
+    # header records: GitHub's delivery ids are 19 digits, and jq rounds one
+    # into a 404 the moment it builds an object around it. Resolved from PATH
+    # the way env-exec resolves agent-box-webhook-self - both backends ship
+    # it beside this CLI, so an absence is a broken install and says so.
+    bf="$(command -v agent-box-webhook-backfill 2>/dev/null || true)"
+    if [ -z "$bf" ]; then
+      echo "agent-box-webhook: agent-box-webhook-backfill is not on PATH — this" \
+           "box cannot ask GitHub what it failed to deliver (issue #605)" >&2
+      exit 1
+    fi
+    exec "$bf" "$@"
     ;;
   url)
     url="$(endpoint)"

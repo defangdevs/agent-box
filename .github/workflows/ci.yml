@@ -186,6 +186,14 @@ jobs:
       - name: Check webhook route in generated Caddyfile
         run: nix build -L .#checks.x86_64-linux.webhook-route && cat result
 
+      # Issue #605: what a sweep of GitHub's delivery log re-requests and
+      # what it leaves alone - a 19-digit delivery id reaching the API
+      # byte-exact (rounded, it 404s and the sweep silently recovers
+      # nothing), and never touching a hook that points at another box.
+      # A stubbed `gh` over a canned log, so it costs about a second.
+      - name: Check webhook ingress backfill
+        run: nix build -L .#checks.x86_64-linux.webhook-backfill && cat result
+
       # The connect cards' "checking" window (PR #557): the status probe
       # never blocks a render, so the Sign-in button must exist while the
       # pill still says "Checking" — and a destructive flow's confirm()

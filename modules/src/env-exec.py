@@ -94,6 +94,42 @@ def main(argv):
         if login:
             os.environ["LOCAL_WEBHOOK_SELF"] = login
 
+    # The other half of issue #605. A webhook delivery is fire-and-forget:
+    # everything GitHub tried to hand this box while its front door was down
+    # is lost, and no sender retries - so an outage ends in permanent loss
+    # that the waiting session reads as a quiet repo. An outage also almost
+    # always ends in a restart or a reboot, which restarts this box's
+    # sessions, so session start is exactly when to ask GitHub what it could
+    # not deliver. It has to happen HERE for the same reason the login above
+    # does: the token lives in the env store and only this process holds it.
+    #
+    # --throttled makes it a no-op when a sweep ran in the last quarter hour,
+    # so a reboot that starts five sessions still calls GitHub once (the
+    # sweeper also holds a lock, for the five that start in the same second),
+    # and it stays silent on a box with no token, no gh or no network.
+    #
+    # Backgrounded, because a session start must not wait on the network:
+    # `sh -c '... &'` forks the sweep off and exits at once, so waiting for
+    # the sh costs nothing and leaves no unreaped child in the agent's
+    # process table. Setting AGENT_BOX_WEBHOOK_BACKFILL to 0 in the env store
+    # turns it off, which is a per-user preference and so deliberately not a
+    # module option. (Spelled that way round on purpose: `<NAME>=` in any
+    # rendered payload, comment included, is what backend-parity reads as a
+    # backend SUPPLYING the name, and neither backend supplies this one.)
+    sweeper = shutil.which("agent-box-webhook-backfill")
+    if sweeper and os.environ.get("AGENT_BOX_WEBHOOK_BACKFILL", "1") != "0":
+        try:
+            subprocess.run(
+                ["sh", "-c", 'exec "$0" --throttled >/dev/null 2>&1 &',
+                 sweeper],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
     try:
         os.execvp(argv[0], argv)
     except OSError as error:

@@ -650,7 +650,7 @@ let
     ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli uploadCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
-    ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli ]
+    ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli ]
     # Same "presence tells an agent the feature is live" reasoning as the
     # two above: a box with no shipped checkout has no agent-box-checkout.
     ++ lib.optional checkoutEnabled checkoutCli
@@ -799,6 +799,26 @@ let
   # Shipped on PATH so a human can ask the same question the plumbing asks.
   webhookSelfCli = pkgs.writeShellScriptBin "agent-box-webhook-self" ''
 @@include:src/webhook-self.sh@@
+  '';
+
+  # What the SENDER could not hand this box, recovered (issue #605). A webhook
+  # delivery is fire-and-forget: everything GitHub tried to deliver while the
+  # front door was down is lost, and a subscribed session cannot tell that
+  # from a quiet repo. This asks GitHub's own delivery log both questions -
+  # when ingress was last alive, and which deliveries to send again - and it
+  # lives out here rather than in the receiver unit because the token it needs
+  # is in the user's env store, which reaches processes through env-exec and
+  # never through a unit's Environment=.
+  #
+  # Python for one measured reason, written down in the payload's own header:
+  # delivery ids are 19 digits, and building any object around one in jq
+  # rounds it past 2**53 into an id that 404s.
+  webhookBackfillCli = pkgs.writers.writePython3Bin "agent-box-webhook-backfill" {
+    # Default ignores only: the payload is written to pycodestyle's line
+    # length, and passing a list here would REPLACE the defaults and turn
+    # W503/W504 on (the trap #472's local rig documented).
+  } ''
+@@include:src/webhook-backfill.py@@
   '';
 
   # Put a screenshot into an issue or PR without committing it (issue #368).
