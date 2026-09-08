@@ -18,13 +18,13 @@
   "packages": [
     {
       "name": "idiomorph",
-      "version": "0.7.4",
-      "tag": "v0.7.4",
+      "version": "0.8.0",
+      "tag": "v0.8.0",
       "repo": "bigskysoftware/idiomorph",
       "path": "idiomorph.min.js",
-      "url": "https://raw.githubusercontent.com/bigskysoftware/idiomorph/v0.7.4/dist/idiomorph.min.js",
+      "url": "https://raw.githubusercontent.com/bigskysoftware/idiomorph/v0.8.0/dist/idiomorph.min.js",
       "url_template": "https://raw.githubusercontent.com/{repo}/{tag}/dist/idiomorph.min.js",
-      "sha256": "0eb0f881553bd509fe7a7e3064a1089141e089583c506c1217e885a2e608b4a4",
+      "sha256": "4cbd535caf7663a51eda9bce6595371c384fc430d54b8d414e29a61167f19f96",
       "license": "0BSD",
       "used_by": "modules/src/settings-daemon.py (SCRIPT), for applyDoc() in modules/src/settings.js",
       "note": "DOM morphing for the settings/workspace live swap. Replaces a wholesale replaceWith(), whose collateral damage -- lost focus, lost caret, a folded row snapping shut under the operator (issue #410) -- was being hand-repaired after every swap."
