@@ -8,7 +8,13 @@ Description=Rootless Docker daemon for %i
 # makes that a clean no-op ("condition failed") instead of a restart loop.
 # It is re-evaluated on every start, so `sudo systemctl restart
 # agent-box-docker@%i` right after a `nix profile add` is all it takes.
-ConditionPathIsExecutable=/home/%i/.nix-profile/bin/dockerd-rootless
+# ConditionFileIsExecutable and NOT ConditionPathIsExecutable, which is
+# not a systemd key at all: systemd logs "Unknown key ... ignoring" and
+# runs the unit anyway, so the whole no-op above becomes a 203/EXEC
+# restart loop against a binary that is not there - the exact failure this
+# line exists to prevent, with a one-line warning in the journal as the
+# only sign. Caught by tests/containers.nix on its first real run.
+ConditionFileIsExecutable=/home/%i/.nix-profile/bin/dockerd-rootless
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=60s
@@ -24,6 +30,18 @@ NotifyAccess=all
 # and the script exits 1 on the spot without them.
 Environment=HOME=/home/%i
 Environment=XDG_RUNTIME_DIR=/run/agent-box-docker/%i
+# systemd owns that directory, rather than a tmpfiles rule in each
+# backend. Two reasons, and the first is not theoretical: a tmpfiles rule
+# naming a per-user group races user creation on a fresh boot
+# ("Failed to resolve group 'agent': Unknown group", and no directory),
+# which /run cannot recover from because it is empty again every boot.
+# The second is that this is simply the right knob - RuntimeDirectory=
+# creates it 0700 as User=, and RuntimeDirectoryPreserve=yes is exactly
+# the "keep it when the unit stops" this needs, which is what an earlier
+# draft wrongly thought RuntimeDirectory could not do.
+RuntimeDirectory=agent-box-docker/%i
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 # rootlesskit needs newuidmap/newgidmap to apply this user's /etc/subuid
 # range, and those two carry cap_setuid/cap_setgid as FILE capabilities -
 # so they cannot come from the read-only nix store and are not on the

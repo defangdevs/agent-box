@@ -68,20 +68,14 @@
     #    routes.
     machine.succeed("su -s /bin/sh agent -c 'unshare -Ur id' >/dev/null")
 
-    # 4. XDG_RUNTIME_DIR for the daemon: 0700 agent:agent, because the
-    #    socket inside it is the whole of that daemon's authority over the
-    #    user's containers and home. NOT a RuntimeDirectory= - it has to
-    #    outlive a stopped daemon, so it must be here with the unit down.
-    machine.succeed("test -d /run/agent-box-docker/agent")
-    mode = machine.succeed(
-        "stat -c '%a %U %G' /run/agent-box-docker/agent").strip()
-    assert mode == "700 agent agent", f"runtime dir is {mode}"
-
-    # 5. No docker installed, so the unit is inactive with its CONDITION
-    #    failed - not failed, not restarting. The distinction is the whole
-    #    reason ConditionPathIsExecutable is there: Restart=always over a
-    #    missing binary would burn the start limit on every box that never
-    #    installs docker, which is every box on its first boot.
+    # 4. No docker installed, so the unit is inactive with its CONDITION
+    #    failed - not failed, not restarting. This is the assertion that
+    #    matters most in the file: the key is ConditionFileIsExecutable,
+    #    and the plausible-looking ConditionPathIsExecutable is not a
+    #    systemd key at all - systemd logs "Unknown key ... ignoring" and
+    #    runs the unit, so the no-op becomes a 203/EXEC restart loop
+    #    against a binary that is not there. That is what shipped until
+    #    this test first ran.
     machine.succeed("systemctl start agent-box-docker@agent.service")
     state = machine.succeed(
         "systemctl show agent-box-docker@agent.service "
@@ -91,6 +85,22 @@
         "systemctl show agent-box-docker@agent.service "
         "--property=ConditionResult --value").strip()
     assert result == "no", f"ConditionResult is {result}, want no"
+    # The generic guard for the same class of mistake anywhere in the unit:
+    # systemd only WARNS about a key it does not know, so a typo is a
+    # silent behaviour change. Nothing else in the repo would catch it.
+    machine.fail(
+        "journalctl -b --grep 'Unknown key' "
+        "| grep agent-box-docker >/dev/null")
+
+    # 5. The daemon's XDG_RUNTIME_DIR does NOT exist yet, and should not:
+    #    it is the unit's own RuntimeDirectory=, so it appears when the
+    #    daemon first runs and (RuntimeDirectoryPreserve=yes) stays after
+    #    it stops. An earlier draft made it with tmpfiles and got
+    #    "Failed to resolve group 'agent': Unknown group" on a fresh boot,
+    #    because that rule races user creation and /run gets no second
+    #    chance. Asserted as absent so a silent return to tmpfiles shows up
+    #    here rather than as a race nobody reproduces.
+    machine.fail("test -e /run/agent-box-docker/agent")
 
     # 6. The session's DOCKER_HOST, so `docker compose up` needs no flag
     #    and no per-agent setup. Read it out of the RUNNING supervisor,
@@ -155,6 +165,12 @@
         "--property=ConditionResult --value").strip()
     assert result == "yes", f"ConditionResult is {result} after installing"
     machine.wait_for_unit("agent-box-docker@agent.service")
+    # NOW the runtime dir exists, 0700 agent:agent - the socket inside it
+    # is the whole of that daemon's authority over the user's containers
+    # and home, so nothing outside that user and root may reach it.
+    mode = machine.succeed(
+        "stat -c '%a %U %G' /run/agent-box-docker/agent").strip()
+    assert mode == "700 agent agent", f"runtime dir is {mode}"
     # As the right user, in its own delegated cgroup, with the runtime
     # dir and the PATH it was given - the four things the unit is for.
     who = machine.succeed(
@@ -177,5 +193,15 @@
     path = [line for line in env.splitlines() if line.startswith("PATH=")]
     assert path and "/run/wrappers/bin" in path[0], \
         f"the daemon's PATH has no /run/wrappers/bin: {path}"
+
+    # 9. And the runtime dir outlives a stopped daemon, which is what
+    #    RuntimeDirectoryPreserve=yes buys and what a session's
+    #    DOCKER_HOST needs: the CLI should meet a refused connection, not
+    #    a path whose parent has gone.
+    machine.succeed(
+        "su -s /bin/sh agent -c 'sudo -n "
+        "/run/current-system/sw/bin/systemctl stop "
+        "agent-box-docker@agent.service'")
+    machine.succeed("test -d /run/agent-box-docker/agent")
   '';
 }

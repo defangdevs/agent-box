@@ -3002,19 +3002,10 @@ class Renderer:
         systemd-tmpfiles --create to realize it.
         """
         lines = []
-        # First, matching the order the module contributes its own rules -
-        # the two lists are compared as text by one-spec-both-backends.
-        # NOT RuntimeDirectory= on the unit: systemd deletes one of those
-        # when the unit stops, and the directory has to outlive a stopped
-        # daemon, because it is the directory a session's DOCKER_HOST
-        # points into. 0700 <user>:<user>, because the socket inside it is
-        # the whole of that daemon's authority.
-        if self.spec.containers_enable:
-            lines.append(f"d {DOCKER_RUNTIME_DIR} 0755 root root - -")
-            lines += [
-                f"d {DOCKER_RUNTIME_DIR}/{u.name} 0700 {u.name} {u.name} - -"
-                for u in self.spec.users
-            ]
+        # Nothing here for containers: the daemon's XDG_RUNTIME_DIR is the
+        # shared unit's own RuntimeDirectory=, kept across a stop with
+        # RuntimeDirectoryPreserve=yes. A rule here would race user
+        # creation on a fresh boot, and /run gets no second chance.
         if self.spec.web_enable:
             lines += [
                 "d /var/lib/agent-box-web 0700 root root - -",

@@ -248,21 +248,6 @@ let
   # The socket the CLI reaches the daemon through, which is what a session's
   # DOCKER_HOST names. dockerd-rootless.sh fixes the file name.
   containerSocketOf = name: "${containerRuntimeDirOf name}/docker.sock";
-  # 0700 <user>:<user>. That socket is the whole of the daemon's authority
-  # - a rootless daemon is root over its own user's containers and home -
-  # so nothing outside that user and root may reach it.
-  #
-  # NOT RuntimeDirectory= on the unit: systemd deletes a RuntimeDirectory
-  # when the unit stops, and this directory has to exist for a stopped
-  # daemon too, because the CLI's connection failure should be "connection
-  # refused" and not a path that vanished. The parent is 0755 so a future
-  # second consumer (a socket-activated proxy, say) can traverse it; every
-  # per-user leaf below it is not readable by the box's other agent users.
-  containerRuntimeRules = [
-    "d ${containerRuntimeDir} 0755 root root - -"
-  ] ++ map (name:
-    "d ${containerRuntimeDirOf name} 0700 ${name} ${name} - -"
-  ) (lib.attrNames cfg.users);
 
   # The box's own sources, on the box (issue #242). A deployed box fetches
   # ONE file — the generated modules/agent-box.nix, by rev + sha256 (issue
@@ -3217,12 +3202,12 @@ in
       ];
     }) cfg.users;
 
-    # XDG_RUNTIME_DIR for the daemon, which is where it puts both its own
-    # state and the API socket the CLI connects to.
-    systemd.tmpfiles.rules = containerRuntimeRules;
-    # The same list under the name the golden snapshot asks for, exactly
-    # as the web arm does with its own (see tmpfilesRules there).
-    services.agent-box.internal.tmpfilesRules = containerRuntimeRules;
+    # No tmpfiles rules here on purpose: the daemon's XDG_RUNTIME_DIR is
+    # the unit's own RuntimeDirectory=, with RuntimeDirectoryPreserve=yes
+    # so it survives a stopped daemon. A per-user tmpfiles rule under /run
+    # races user creation on a fresh boot ("Failed to resolve group
+    # 'agent': Unknown group") and /run has no second chance - see the
+    # shared unit for the whole reason.
   }) (lib.mkIf cfg.selfUpdate.enable {
     # Agent-triggerable box update. The agents' only power here is the
     # allowlisted `sudo systemctl start agent-box-update.service` (see

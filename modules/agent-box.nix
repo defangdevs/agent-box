@@ -850,7 +850,13 @@ let
       # makes that a clean no-op ("condition failed") instead of a restart loop.
       # It is re-evaluated on every start, so `sudo systemctl restart
       # agent-box-docker@%i` right after a `nix profile add` is all it takes.
-      ConditionPathIsExecutable=/home/%i/.nix-profile/bin/dockerd-rootless
+      # ConditionFileIsExecutable and NOT ConditionPathIsExecutable, which is
+      # not a systemd key at all: systemd logs "Unknown key ... ignoring" and
+      # runs the unit anyway, so the whole no-op above becomes a 203/EXEC
+      # restart loop against a binary that is not there - the exact failure this
+      # line exists to prevent, with a one-line warning in the journal as the
+      # only sign. Caught by tests/containers.nix on its first real run.
+      ConditionFileIsExecutable=/home/%i/.nix-profile/bin/dockerd-rootless
       After=network-online.target
       Wants=network-online.target
       StartLimitIntervalSec=60s
@@ -866,6 +872,18 @@ let
       # and the script exits 1 on the spot without them.
       Environment=HOME=/home/%i
       Environment=XDG_RUNTIME_DIR=/run/agent-box-docker/%i
+      # systemd owns that directory, rather than a tmpfiles rule in each
+      # backend. Two reasons, and the first is not theoretical: a tmpfiles rule
+      # naming a per-user group races user creation on a fresh boot
+      # ("Failed to resolve group 'agent': Unknown group", and no directory),
+      # which /run cannot recover from because it is empty again every boot.
+      # The second is that this is simply the right knob - RuntimeDirectory=
+      # creates it 0700 as User=, and RuntimeDirectoryPreserve=yes is exactly
+      # the "keep it when the unit stops" this needs, which is what an earlier
+      # draft wrongly thought RuntimeDirectory could not do.
+      RuntimeDirectory=agent-box-docker/%i
+      RuntimeDirectoryMode=0700
+      RuntimeDirectoryPreserve=yes
       # rootlesskit needs newuidmap/newgidmap to apply this user's /etc/subuid
       # range, and those two carry cap_setuid/cap_setgid as FILE capabilities -
       # so they cannot come from the read-only nix store and are not on the
@@ -959,21 +977,6 @@ let
   # The socket the CLI reaches the daemon through, which is what a session's
   # DOCKER_HOST names. dockerd-rootless.sh fixes the file name.
   containerSocketOf = name: "${containerRuntimeDirOf name}/docker.sock";
-  # 0700 <user>:<user>. That socket is the whole of the daemon's authority
-  # - a rootless daemon is root over its own user's containers and home -
-  # so nothing outside that user and root may reach it.
-  #
-  # NOT RuntimeDirectory= on the unit: systemd deletes a RuntimeDirectory
-  # when the unit stops, and this directory has to exist for a stopped
-  # daemon too, because the CLI's connection failure should be "connection
-  # refused" and not a path that vanished. The parent is 0755 so a future
-  # second consumer (a socket-activated proxy, say) can traverse it; every
-  # per-user leaf below it is not readable by the box's other agent users.
-  containerRuntimeRules = [
-    "d ${containerRuntimeDir} 0755 root root - -"
-  ] ++ map (name:
-    "d ${containerRuntimeDirOf name} 0700 ${name} ${name} - -"
-  ) (lib.attrNames cfg.users);
 
   # The box's own sources, on the box (issue #242). A deployed box fetches
   # ONE file — the generated modules/agent-box.nix, by rev + sha256 (issue
@@ -12363,12 +12366,12 @@ in
       ];
     }) cfg.users;
 
-    # XDG_RUNTIME_DIR for the daemon, which is where it puts both its own
-    # state and the API socket the CLI connects to.
-    systemd.tmpfiles.rules = containerRuntimeRules;
-    # The same list under the name the golden snapshot asks for, exactly
-    # as the web arm does with its own (see tmpfilesRules there).
-    services.agent-box.internal.tmpfilesRules = containerRuntimeRules;
+    # No tmpfiles rules here on purpose: the daemon's XDG_RUNTIME_DIR is
+    # the unit's own RuntimeDirectory=, with RuntimeDirectoryPreserve=yes
+    # so it survives a stopped daemon. A per-user tmpfiles rule under /run
+    # races user creation on a fresh boot ("Failed to resolve group
+    # 'agent': Unknown group") and /run has no second chance - see the
+    # shared unit for the whole reason.
   }) (lib.mkIf cfg.selfUpdate.enable {
     # Agent-triggerable box update. The agents' only power here is the
     # allowlisted `sudo systemctl start agent-box-update.service` (see

@@ -1893,12 +1893,16 @@ class RenderTest(unittest.TestCase):
             for program in ("newuidmap", "newgidmap"):
                 self.assertIn(f"{program}:cap_set", helper)
 
+            # NO tmpfiles rule for the runtime dir, deliberately: it is
+            # the unit's own RuntimeDirectory=, kept across a stop with
+            # RuntimeDirectoryPreserve=yes. A rule here races user
+            # creation on a fresh boot ("Failed to resolve group 'agent':
+            # Unknown group") and /run gets no second chance - measured in
+            # tests/containers.nix before this moved. Asserted as absent
+            # so a silent return to tmpfiles shows up as a test failure
+            # and not as a race nobody can reproduce.
             rules = files[str(out) + "/etc/tmpfiles.d/agent-box.conf"]
-            self.assertIn("d /run/agent-box-docker 0755 root root - -", rules)
-            # 0700 <user>:<user>. The socket in there is the whole of the
-            # daemon's authority over that user's containers and home.
-            self.assertIn("d /run/agent-box-docker/agent 0700 agent agent",
-                          rules)
+            self.assertNotIn("agent-box-docker", rules)
 
             env = files[str(out) + "/etc/agent-box/units/agent.env"]
             self.assertIn(
@@ -1924,8 +1928,21 @@ class RenderTest(unittest.TestCase):
             self.assertEqual(
                 (SRC / "units" / "agent-box-docker@.service").read_text(),
                 unit)
-            self.assertIn("ConditionPathIsExecutable=/home/%i/.nix-profile"
+            # ConditionFileIsExecutable, and NOT the plausible
+            # ConditionPathIsExecutable, which is not a systemd key:
+            # systemd warns "Unknown key ... ignoring" and runs the unit,
+            # turning the no-op into a 203/EXEC restart loop against a
+            # binary that is not there. That shipped until the VM test
+            # first ran.
+            self.assertIn("ConditionFileIsExecutable=/home/%i/.nix-profile"
                           "/bin/dockerd-rootless", unit)
+            # As a DIRECTIVE, not as a word: the comment above that line
+            # names the wrong key in order to warn about it.
+            self.assertNotIn("\nConditionPathIsExecutable=", unit)
+            # The runtime dir the unit owns, and the reason it is the
+            # unit's and not a tmpfiles rule (see above).
+            self.assertIn("RuntimeDirectory=agent-box-docker/%i", unit)
+            self.assertIn("RuntimeDirectoryPreserve=yes", unit)
 
             # The negative. Nothing rendered may name a docker BINARY the
             # box would have to ship - only the user profile path above.
