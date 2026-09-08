@@ -96,10 +96,13 @@
     #    it is the unit's own RuntimeDirectory=, so it appears when the
     #    daemon first runs and (RuntimeDirectoryPreserve=yes) stays after
     #    it stops. An earlier draft made it with tmpfiles and got
-    #    "Failed to resolve group 'agent': Unknown group" on a fresh boot,
-    #    because that rule races user creation and /run gets no second
-    #    chance. Asserted as absent so a silent return to tmpfiles shows up
-    #    here rather than as a race nobody reproduces.
+    #    "Failed to resolve group 'agent': Unknown group" - not a race, as
+    #    that draft guessed, but the plain fact that a NixOS box has no
+    #    per-user group (isNormalUser defaults the primary group to
+    #    `users`) while a native box's useradd makes one.
+    #    RuntimeDirectory= sidesteps the divergence by letting systemd
+    #    resolve User='s own group. Asserted absent so a silent return to
+    #    a tmpfiles rule fails here.
     machine.fail("test -e /run/agent-box-docker/agent")
 
     # 6. The session's DOCKER_HOST, so `docker compose up` needs no flag
@@ -143,8 +146,12 @@
     #    alone - no rebuild, no root beyond that one grant. The condition
     #    is re-evaluated at every start, which is what makes `restart` the
     #    right verb to grant and the right one to document.
+    # As the USER, which is both the faithful simulation of `nix profile
+    # add` and the only spelling that works: there is no `agent` GROUP on
+    # a NixOS box - isNormalUser defaults the primary group to `users` -
+    # so `install -g agent` fails with "invalid group".
     machine.succeed(
-        "install -d -o agent -g agent /home/agent/.nix-profile/bin")
+        "runuser -u agent -- mkdir -p /home/agent/.nix-profile/bin")
     # The fake sends the readiness notification a real dockerd-rootless
     # sends, because the unit is Type=notify: without it the granted
     # `restart` blocks for the whole TimeoutStartSec and then fails, which
@@ -154,9 +161,9 @@
     notify = machine.succeed("command -v systemd-notify").strip()
     fake = "/home/agent/.nix-profile/bin/dockerd-rootless"
     machine.succeed(
-        f"printf '#!/bin/sh\\n{notify} --ready\\nexec sleep infinity\\n' "
-        f"> {fake}")
-    machine.succeed(f"chmod 755 {fake}")
+        f"runuser -u agent -- sh -c \"printf "
+        f"'#!/bin/sh\\n{notify} --ready\\nexec sleep infinity\\n' "
+        f"> {fake} && chmod 755 {fake}\"")
     machine.succeed(f"su -s /bin/sh agent -c 'sudo -n {restart}'")
     # The condition passed this time, and the unit is actually running the
     # binary - a start that ran nothing would be inactive, as it was above.
@@ -165,12 +172,17 @@
         "--property=ConditionResult --value").strip()
     assert result == "yes", f"ConditionResult is {result} after installing"
     machine.wait_for_unit("agent-box-docker@agent.service")
-    # NOW the runtime dir exists, 0700 agent:agent - the socket inside it
-    # is the whole of that daemon's authority over the user's containers
-    # and home, so nothing outside that user and root may reach it.
+    # NOW the runtime dir exists, 0700 and owned by the agent - the socket
+    # inside it is the whole of that daemon's authority over the user's
+    # containers and home, so nothing outside that user and root may reach
+    # it. The GROUP is read from the user rather than assumed to be
+    # "agent": systemd gives the directory User='s primary group, which is
+    # `users` on NixOS and a per-user group on a native box - the very
+    # divergence that made a tmpfiles rule the wrong tool here.
+    group = machine.succeed("id -gn agent").strip()
     mode = machine.succeed(
         "stat -c '%a %U %G' /run/agent-box-docker/agent").strip()
-    assert mode == "700 agent agent", f"runtime dir is {mode}"
+    assert mode == f"700 agent {group}", f"runtime dir is {mode}"
     # As the right user, in its own delegated cgroup, with the runtime
     # dir and the PATH it was given - the four things the unit is for.
     who = machine.succeed(

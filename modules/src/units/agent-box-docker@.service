@@ -31,14 +31,16 @@ NotifyAccess=all
 Environment=HOME=/home/%i
 Environment=XDG_RUNTIME_DIR=/run/agent-box-docker/%i
 # systemd owns that directory, rather than a tmpfiles rule in each
-# backend. Two reasons, and the first is not theoretical: a tmpfiles rule
-# naming a per-user group races user creation on a fresh boot
-# ("Failed to resolve group 'agent': Unknown group", and no directory),
-# which /run cannot recover from because it is empty again every boot.
-# The second is that this is simply the right knob - RuntimeDirectory=
-# creates it 0700 as User=, and RuntimeDirectoryPreserve=yes is exactly
-# the "keep it when the unit stops" this needs, which is what an earlier
-# draft wrongly thought RuntimeDirectory could not do.
+# backend. A tmpfiles rule has to NAME an owner and a group, and the two
+# backends disagree about what a user's group is: a native box's useradd
+# makes a per-user group, a NixOS box does not (isNormalUser defaults the
+# primary group to `users`), so `d /run/agent-box-docker/%i 0700 %i %i`
+# is right on one and "Failed to resolve group: Unknown group" on the
+# other - no directory, and /run is empty again every boot. This asks
+# systemd for the same thing without naming either: RuntimeDirectory=
+# creates it as User= and its own group, RuntimeDirectoryMode sets 0700,
+# and RuntimeDirectoryPreserve=yes keeps it across a stop - which an
+# earlier draft wrongly believed RuntimeDirectory could not do.
 RuntimeDirectory=agent-box-docker/%i
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
