@@ -73,7 +73,24 @@ SUBSTRATE = [
 # The exception described the blind spot, not the box. The manifest now asks
 # the module for its own inventory (flake.nix -> internal.tmpfilesRules), so
 # both sides render both rules and there is nothing to declare.
-TMPFILES_BY_DESIGN = {}
+#
+# The ~/.config rules' GROUP field is the one thing about them that
+# legitimately differs (issue #604). `isNormalUser = true` puts a NixOS
+# agent user in the shared `users` group, not a same-named one, so the
+# module's rule names no group at all and tmpfiles keeps the creating
+# process's own. Native's `useradd` does create a per-user group, so its
+# renderer (bin/agentbox) can and does name it. Both end up owned the
+# same way; only the literal rule text disagrees.
+TMPFILES_BY_DESIGN = {
+    "d /home/@USER@/.config 0755 @USER@ - - -":
+        "module -- no per-user group on NixOS (#604); native's is @USER@",
+    "d /home/@USER@/.config/agent-box 0700 @USER@ - - -":
+        "module -- no per-user group on NixOS (#604); native's is @USER@",
+    "d /home/@USER@/.config 0755 @USER@ @USER@ - -":
+        "native -- useradd creates a per-user group; NixOS's rule names none",
+    "d /home/@USER@/.config/agent-box 0700 @USER@ @USER@ - -":
+        "native -- useradd creates a per-user group; NixOS's rule names none",
+}
 
 SUDOERS_BY_DESIGN = {}
 

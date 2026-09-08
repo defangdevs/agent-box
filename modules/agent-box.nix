@@ -21541,9 +21541,16 @@ if __name__ == "__main__":
       # (mkdir ~/.config/agent-box) fails with Permission denied in a
       # restart loop. Deployed boxes dodge this only because something else
       # creates ~/.config user-owned first; a fresh home has nothing else to.
+      #
+      # No group field (issue #604): `isNormalUser = true` puts every agent
+      # user in the shared `users` group rather than a same-named one, so a
+      # group named `${name}` does not exist here the way it does on the
+      # native backend (whose `useradd` creates one). Leaving the field
+      # blank makes tmpfiles keep the creating process's own group, which is
+      # what both backends end up with anyway - nothing here reads the group.
       ++ lib.concatMap (name: [
-        "d /home/${name}/.config 0755 ${name} ${name} - -"
-        "d /home/${name}/.config/agent-box 0700 ${name} ${name} - -"
+        "d /home/${name}/.config 0755 ${name} - - -"
+        "d /home/${name}/.config/agent-box 0700 ${name} - - -"
       ]) terminalUsers
       # Webhook ingress socket dir (issue #101). World-traversable parent; the
       # per-user socket files themselves are 0660 <user>:caddy, systemd-created
