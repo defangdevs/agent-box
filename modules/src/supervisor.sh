@@ -483,9 +483,18 @@ session_watches_events() {
   # lazily, so a listed topic may already be stale -- but a TTL that lapsed
   # while the box was off is not evidence the work finished, and the cost of
   # being wrong here is one turn.
+  #
+  # `enabled` IS applied: webhook.py's route_event refuses a disabled filter
+  # before it looks at a single topic, so a session that muted itself is
+  # receiving nothing and is not waiting on anything, whatever its topic list
+  # still says. Spelled `.enabled == false` rather than `(.enabled // true)`,
+  # because jq's // falls through on false as well as null -- the alternative
+  # spelling can never be false and would silently do nothing. `is not False`
+  # is read_filter's own test, so a missing or null flag means enabled.
   wf="$WEBHOOK_STATE_DIR/filter.$USER-$1.json"
   [ -s "$wf" ] || return 1
-  n=$($JQ -r '(.topics // []) | length' "$wf" 2>/dev/null) || return 1
+  n=$($JQ -r 'if .enabled == false then 0 else (.topics // []) | length end' \
+        "$wf" 2>/dev/null) || return 1
   case "$n" in (''|*[!0-9]*) return 1 ;; esac
   [ "$n" -gt 0 ]
 }

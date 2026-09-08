@@ -1304,6 +1304,14 @@ in
         machine.succeed(as_agent(
             "printf %s " + shlex.quote('{"topics":[]}') + f" > {filt}"))
         assert "You were interrupted" not in respawn_cmdline()
+        # Neither is a muted one: webhook.py's route_event refuses a disabled
+        # filter before it reads a topic, so this session receives nothing
+        # whatever its list still says.
+        machine.succeed(as_agent(
+            "printf %s "
+            + shlex.quote('{"enabled":false,"topics":[{"topic":"github:o/r"}]}')
+            + f" > {filt}"))
+        assert "You were interrupted" not in respawn_cmdline()
         machine.succeed(as_agent(f"rm -f {filt}"))
 
         # 4. A transcript cut mid-turn.

@@ -426,9 +426,13 @@ let
     - A claude session that comes back from a respawn is RESUMED, not restarted:
       the transcript is restored, but no turn starts by itself. So if you are
       holding work when the box goes down - an open PR, a claimed issue - you
-      wake up silent and nobody is coming to type. The box sends such a session
-      a short "you were interrupted" prompt to start one turn; when it arrives,
-      do not trust the transcript alone. No sender replays what fired while you
+      wake up silent and nobody is coming to type. The box sends a short "you
+      were interrupted" prompt to start one turn - but only when it can SEE that
+      you had something open: a claimed hook assignment, a webhook subscription,
+      or a turn the kill cut in half. Work it cannot see - an open PR you never
+      subscribed to - wakes nobody, so subscribe to what you are waiting on
+      rather than counting on the nudge. When one does arrive, do not trust the
+      transcript alone. No sender replays what fired while you
       were down, so read the CURRENT state of whatever you were waiting on, and
       check `agent-box-webhook ls` - a subscription may have expired meanwhile.
     - Your harness's own configuration lives under $HOME and so survives a
@@ -9641,9 +9645,18 @@ esac
       # lazily, so a listed topic may already be stale -- but a TTL that lapsed
       # while the box was off is not evidence the work finished, and the cost of
       # being wrong here is one turn.
+      #
+      # `enabled` IS applied: webhook.py's route_event refuses a disabled filter
+      # before it looks at a single topic, so a session that muted itself is
+      # receiving nothing and is not waiting on anything, whatever its topic list
+      # still says. Spelled `.enabled == false` rather than `(.enabled // true)`,
+      # because jq's // falls through on false as well as null -- the alternative
+      # spelling can never be false and would silently do nothing. `is not False`
+      # is read_filter's own test, so a missing or null flag means enabled.
       wf="$WEBHOOK_STATE_DIR/filter.$USER-$1.json"
       [ -s "$wf" ] || return 1
-      n=$($JQ -r '(.topics // []) | length' "$wf" 2>/dev/null) || return 1
+      n=$($JQ -r 'if .enabled == false then 0 else (.topics // []) | length end' \
+            "$wf" 2>/dev/null) || return 1
       case "$n" in ('''|*[!0-9]*) return 1 ;; esac
       [ "$n" -gt 0 ]
     }
