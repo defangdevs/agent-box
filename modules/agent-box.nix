@@ -19785,19 +19785,39 @@ def render_connect_step(state):
     if state["state"] != "waiting":
         return ""
     url = html.escape(state["url"], quote=True)
-    parts = [
-        f'<p class="note"><strong>1.</strong> '
-        f'<a href="{url}" target="_blank" rel="noopener noreferrer">'
-        f'Open the sign-in page</a> and approve the request.</p>'
-    ]
+    # Code BEFORE link, when there is one. The user has to arrive at the
+    # sign-in page with the code already on the clipboard: sending them to
+    # the page first means coming back to this one to copy it, and on a
+    # phone that is a tab switch in each direction. So the copy button is
+    # step 1 and the link is step 2, in the order the hands move.
+    parts = []
+    step = 1
     if state["code"]:
         parts.append(
-            f'<p class="note"><strong>2.</strong> Enter this code on that '
-            f'page: <code class="conn-code">{html.escape(state["code"])}</code>'
+            f'<p class="note"><strong>{step}.</strong> Copy this code: '
+            f'<code class="conn-code">{html.escape(state["code"])}</code>'
             f'{copy_button("the pairing code", value=state["code"])}</p>'
         )
+        step += 1
+    # Three flows, three endings. A code shown HERE (codex, gh) is carried
+    # to the page; a code the PAGE mints (claude, which shows none in the
+    # pane) is carried back, so the link must say to bring one home rather
+    # than "approve the request" over a paste-back field. Only a flow with
+    # neither (defang polls the auth server itself) really is just an
+    # approval.
+    if state["code"]:
+        opens = "and paste the code"
+    elif state["needs_code"]:
+        opens = "and copy the code it shows"
+    else:
+        opens = "and approve the request"
+    parts.append(
+        f'<p class="note"><strong>{step}.</strong> '
+        f'<a href="{url}" target="_blank" rel="noopener noreferrer">'
+        f'Open the sign-in page</a> {opens}.</p>'
+    )
+    step += 1
     if state["needs_code"]:
-        step = "3" if state["code"] else "2"
         parts.append(
             f'<form method="post" action="{base}/connect/code" class="row conn-form">'
             f'<input type="hidden" name="flow" value="{flow_id}">'
