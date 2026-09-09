@@ -342,10 +342,12 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
    own now that Save has moved below the prompt and the starting setting
    (issue #493). */
 input.pname { width: 150px; }
-/* Model is a free-text field (issue #493: model IDs change too often for a
-   fixed picker), but at the harness picker's default width it alone kept
-   the row from fitting on one line next to name + assistant + reasoning
-   level. */
+/* Model is an OPEN picker (issue #493): free text over a <datalist> of the
+   aliases its assistant publishes, because a model ID this box has never
+   heard of still has to be typeable. The browser draws the dropdown itself,
+   so there is nothing to style - only the width, which at the harness
+   picker's default alone kept the row from fitting on one line next to
+   name + assistant + reasoning level. */
 input.pmodel { width: 160px; }
 /* One control height for the profile editor's own row, same fix and same
    reason as .new-session-row above: Chrome's UA sheet renders a <select>

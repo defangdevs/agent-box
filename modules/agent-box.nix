@@ -17237,10 +17237,12 @@ STYLE = """<style>
      own now that Save has moved below the prompt and the starting setting
      (issue #493). */
   input.pname { width: 150px; }
-  /* Model is a free-text field (issue #493: model IDs change too often for a
-     fixed picker), but at the harness picker's default width it alone kept
-     the row from fitting on one line next to name + assistant + reasoning
-     level. */
+  /* Model is an OPEN picker (issue #493): free text over a <datalist> of the
+     aliases its assistant publishes, because a model ID this box has never
+     heard of still has to be typeable. The browser draws the dropdown itself,
+     so there is nothing to style - only the width, which at the harness
+     picker's default alone kept the row from fitting on one line next to
+     name + assistant + reasoning level. */
   input.pmodel { width: 160px; }
   /* One control height for the profile editor's own row, same fix and same
      reason as .new-session-row above: Chrome's UA sheet renders a <select>
@@ -17329,7 +17331,7 @@ PROFILES_SECTION_TPL = """<section>
                  title="Letters, digits, underscore and hyphen; at most 64 characters">
           <select name="HARNESS" aria-label="Assistant" required>{harnesses}</select>
           <input type="text" name="MODEL" placeholder="model (optional)" class="pmodel"
-                 autocomplete="off" aria-label="Model">
+                 autocomplete="off" aria-label="Model" data-model-input>
           <select name="EFFORT" aria-label="Reasoning level">{effort}</select>
         </div>
         <div class="row prompt-row">
@@ -17352,7 +17354,7 @@ PROFILES_SECTION_TPL = """<section>
         </div>
       </form>
     </div>
-    <div id="profiles-list">{profiles}</div>
+    <div id="profiles-list">{profiles}{modelhints}</div>
   </section>"""
 
 # The webhook panel (issue #227), settings page only: the workspace root
@@ -18665,6 +18667,32 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     post().then(function (t) { afterPost(t); startPolling(8); });
   });
 
+  // Model suggestions follow the assistant picker beside them (issue #493).
+  // The profile editor's model field is free text over a per-assistant
+  // <datalist>, and which list applies is a choice the server cannot see:
+  // "New profile" deliberately preselects no assistant, so its input ships
+  // with no list at all and gets one here. A saved profile's own row
+  // already names its assistant, so the daemon renders that row's list=
+  // itself and this only follows a CHANGE to it.
+  //
+  // Event-delegated, like everything else here, so it survives applyDoc()'s
+  // swaps. It sets no state worth defending against a morph: #profile-editor
+  // is not a morphed region at all, and on a saved row the worst a morph can
+  // restore is the stored assistant's suggestions under a picker the
+  // operator has changed but not yet saved — a stale hint on a field that
+  // accepts anything, which is not worth a beforeAttributeUpdated veto.
+  document.addEventListener("change", function (e) {
+    var sel = e.target;
+    if (!sel || sel.tagName !== "SELECT" || sel.name !== "HARNESS") { return; }
+    var row = sel.closest ? sel.closest(".profile-row") : null;
+    var input = row ? row.querySelector("[data-model-input]") : null;
+    if (!input) { return; }
+    var id = sel.value ? "pmodel-" + sel.value : "";
+    // No datalist means no suggestions, which is the field this already is.
+    if (id && document.getElementById(id)) { input.setAttribute("list", id); }
+    else { input.removeAttribute("list"); }
+  });
+
   // Working-directory autocomplete (issue #131). The add-session cwd
   // field browses the filesystem one level at a time: the daemon lists
   // the children of whatever directory the text names so far (up to
@@ -18957,6 +18985,166 @@ def render_effort_options(selected=""):
     return "".join(items)
 
 
+# The MODEL field is a picker, but an OPEN one (issue #493's layout
+# checklist: "if possible, make model input a picker too - but model IDs
+# change often so not sure if we can dynamically inspect?").
+#
+# Both halves of that worry are right, and they pull opposite ways, so the
+# control is an <input list> over a <datalist> rather than a <select>: a
+# model this box has never heard of stays typeable, and a profile already
+# naming one survives a Save with nothing touched - the same rule
+# render_effort_options() keeps for a value its own list does not know.
+# A closed picker would break both.
+#
+# What CAN be inspected is the alias. Aliases are the stable half of the
+# churn: `opus` and `sonnet` outlive the dated IDs behind them, which is
+# exactly why the harnesses publish them. So the list is read off the
+# harness itself and never written down here - a box learns a new alias the
+# day its harness updates, and there is no table for us to let rot.
+#
+# The `--model` option's own description block, and nothing else in the
+# help: other options quote values too (claude's --fallback-model, codex's
+# --sandbox), and harvesting those would offer a sandbox mode as a model.
+_MODEL_OPT_RE = re.compile(r"^[ \t]*(?:-[A-Za-z],[ \t]+)?--model[ \t=<\[]", re.M)
+# Where that block ends: the next option's own line. A description line
+# that happens to start with a dash truncates the block early, which costs
+# a suggestion and never invents one.
+_NEXT_OPT_RE = re.compile(r"^[ \t]{0,10}-{1,2}[A-Za-z]", re.M)
+# A quoted name inside it. The charset is what stops `model's full name`
+# from pairing that apostrophe with the next quote: the run between them
+# holds spaces, so no match is possible there and the scan resumes at the
+# real opening quote of the example that follows.
+_MODEL_NAME_RE = re.compile(r"'([A-Za-z0-9][A-Za-z0-9._-]{1,63})'")
+# An id/list reference has to survive being spliced into markup and then
+# looked up by the browser. AGENT_BOX_AGENTS is a comma-separated env
+# value, so a name from it is not automatically either.
+_HARNESS_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+
+# settings.js builds the same id when it follows the assistant picker on a
+# row the server could not resolve one for. Two spellings of one constant,
+# in two languages, the way BASE and every other id shared with that file
+# already are.
+MODEL_LIST_PREFIX = "pmodel-"
+
+
+def binary_stamp(path):
+    """(mtime, size) for a binary, or None when it is not there. Used only
+    as a cache KEY, so an upgraded harness is re-read rather than answered
+    from the list the old one published."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_mtime_ns, info.st_size)
+
+
+@functools.lru_cache(maxsize=16)
+def harness_model_aliases(binary, stamp):
+    """The model names a harness's own `--help` puts forward, as a tuple.
+
+    claude names them ("an alias for the latest model (e.g. 'fable',
+    'opus', or 'sonnet') or a model's full name (e.g. 'claude-fable-5')").
+    codex documents none - its `--model` says only "Model the agent should
+    use", and its shell completion file-completes the value - so it
+    contributes nothing here rather than us guessing a list on its behalf
+    and shipping it stale.
+
+    Empty on any failure, which is the same answer as "this harness says
+    nothing": the field is free text either way, so a probe that cannot run
+    costs a suggestion and never a save. `stamp` is binary_stamp() - not
+    read here, only keyed on.
+    """
+    if not binary:
+        return ()
+    try:
+        proc = subprocess.run(
+            [binary, "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write("profiles: model hints: %s\n" % exc)
+        return ()
+    # stdout first, but not exclusively: a CLI that prints its usage on
+    # stderr is not a CLI that has no aliases.
+    text = proc.stdout or proc.stderr or ""
+    opt = _MODEL_OPT_RE.search(text)
+    if not opt:
+        return ()
+    rest = text[opt.end():]
+    end = _NEXT_OPT_RE.search(rest)
+    block = rest[:end.start()] if end else rest
+    names = []
+    for name in _MODEL_NAME_RE.findall(block):
+        if name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def model_hints(harness, profiles):
+    """What to OFFER as a model for this harness, most useful first.
+
+    Two sources, and neither can go stale on its own. The harness's own
+    aliases come first because they are what a new profile most often
+    wants. Then every MODEL already saved in a profile that names this
+    harness: free, exactly the set this box actually uses, and the only
+    source a harness with a silent `--help` has at all.
+
+    The binary comes from the connections list (CONNECT_BINS, via
+    connect_flow) - which is where the owner's call on #493 put the harness
+    list too - so a harness the box has not installed yet is probed no more
+    than its card is: connect_flows() already dropped it to bin=None.
+    """
+    flow = connect_flow(harness)
+    binary = flow["bin"] if flow else None
+    hints = []
+    if binary:
+        for name in harness_model_aliases(binary, binary_stamp(binary)):
+            if name not in hints:
+                hints.append(name)
+    for name in sorted(profiles):
+        res = profiles[name]["reserved"]
+        model = res.get("MODEL")
+        if model and (res.get("HARNESS") or "") == harness and model not in hints:
+            hints.append(model)
+    return tuple(hints)
+
+
+def model_list_id(harness):
+    """The datalist id for this harness's suggestions, or "" for a name
+    that cannot be one."""
+    return (MODEL_LIST_PREFIX + harness) if _HARNESS_ID_RE.match(harness) else ""
+
+
+def model_hint_lists(profiles):
+    """{harness: datalist id} for every harness with something to suggest.
+
+    One place decides which lists the page will actually CARRY, so a row
+    can never point `list` at a datalist that is not there. A harness with
+    nothing to say gets no entry and its rows get no attribute, which is
+    the free-text field they already were.
+    """
+    lists = {}
+    for harness in PROFILE_AGENTS:
+        list_id = model_list_id(harness)
+        if list_id and model_hints(harness, profiles):
+            lists[harness] = list_id
+    return lists
+
+
+def render_model_hints(profiles):
+    """One <datalist> per harness that has anything to suggest."""
+    lists = []
+    for harness, list_id in model_hint_lists(profiles).items():
+        options = "".join('<option value="%s"></option>' % html.escape(h)
+                          for h in model_hints(harness, profiles))
+        lists.append('<datalist id="%s">%s</datalist>'
+                     % (html.escape(list_id), options))
+    return "".join(lists)
+
+
 def render_profiles(profiles, usage=None):
     """The profiles list. Each row folds open onto its launch config and its
     environment KEY NAMES — never a value, the rule `agent-box-profile show`
@@ -18972,6 +19160,11 @@ def render_profiles(profiles, usage=None):
     hand and does not care."""
     usage = usage or {}
     base = html.escape(BASE)
+    # Which model datalists this page carries (#493). Resolved once, not
+    # per row: the harness probe behind it is cached, but the answer has to
+    # be the SAME one render_model_hints() renders or a row would reference
+    # a list that is not on the page.
+    hint_lists = model_hint_lists(profiles)
     rows = []
     for name in sorted(profiles):
         safe = html.escape(name)
@@ -19038,6 +19231,11 @@ def render_profiles(profiles, usage=None):
         # stored, so an edit is an edit and not a retype. SYSTEM_PROMPT is a
         # textarea for the same reason it is one above — it can span lines.
         prompt_val = html.escape(res.get("SYSTEM_PROMPT") or "")
+        # This row already names its harness, so its model suggestions are
+        # known server-side. The "New profile" row's are not - nothing is
+        # preselected there - which is why settings.js follows the picker.
+        list_id = hint_lists.get(res.get("HARNESS") or "", "")
+        model_list_attr = f' list="{html.escape(list_id)}"' if list_id else ""
         # json.dumps(), not hand-quoted JS: `name` is charset-restricted
         # (PROFILE_NAME_RE), but watch_warn's topic names are not, so this is
         # where the confirm() dialog's whole message gets ONE correct
@@ -19069,6 +19267,7 @@ def render_profiles(profiles, usage=None):
             f'{render_harness_options(res.get("HARNESS") or "")}</select>'
             f'<input type="text" name="MODEL" value="{html.escape(res.get("MODEL") or "")}" '
             f'placeholder="model" class="pmodel" autocomplete="off" '
+            f'data-model-input{model_list_attr} '
             f'aria-label="Model for {safe}">'
             f'<select name="EFFORT" aria-label="Reasoning level for {safe}">'
             f'{render_effort_options(res.get("EFFORT") or "")}</select>'
@@ -20090,6 +20289,7 @@ def render_page(message="", kind="ok"):
                 harnesses=render_harness_options(),
                 effort=render_effort_options(),
                 profiles=render_profiles(profiles, usage),
+                modelhints=render_model_hints(profiles),
             ),
             webhooks_section=(
                 WEBHOOK_UNAVAILABLE_TPL.format(text=unavailable)

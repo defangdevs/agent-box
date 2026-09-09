@@ -918,6 +918,32 @@
     post().then(function (t) { afterPost(t); startPolling(8); });
   });
 
+  // Model suggestions follow the assistant picker beside them (issue #493).
+  // The profile editor's model field is free text over a per-assistant
+  // <datalist>, and which list applies is a choice the server cannot see:
+  // "New profile" deliberately preselects no assistant, so its input ships
+  // with no list at all and gets one here. A saved profile's own row
+  // already names its assistant, so the daemon renders that row's list=
+  // itself and this only follows a CHANGE to it.
+  //
+  // Event-delegated, like everything else here, so it survives applyDoc()'s
+  // swaps. It sets no state worth defending against a morph: #profile-editor
+  // is not a morphed region at all, and on a saved row the worst a morph can
+  // restore is the stored assistant's suggestions under a picker the
+  // operator has changed but not yet saved — a stale hint on a field that
+  // accepts anything, which is not worth a beforeAttributeUpdated veto.
+  document.addEventListener("change", function (e) {
+    var sel = e.target;
+    if (!sel || sel.tagName !== "SELECT" || sel.name !== "HARNESS") { return; }
+    var row = sel.closest ? sel.closest(".profile-row") : null;
+    var input = row ? row.querySelector("[data-model-input]") : null;
+    if (!input) { return; }
+    var id = sel.value ? "pmodel-" + sel.value : "";
+    // No datalist means no suggestions, which is the field this already is.
+    if (id && document.getElementById(id)) { input.setAttribute("list", id); }
+    else { input.removeAttribute("list"); }
+  });
+
   // Working-directory autocomplete (issue #131). The add-session cwd
   // field browses the filesystem one level at a time: the daemon lists
   // the children of whatever directory the text names so far (up to

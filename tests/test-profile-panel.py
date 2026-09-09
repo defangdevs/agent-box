@@ -34,6 +34,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import sys
 import tempfile
 import threading
@@ -93,6 +94,36 @@ print(json.dumps({"harness": harness, "args": args,
 """
 
 
+# What a harness's `--help` looks like to the model-hint probe (issue
+# #493). Shaped on the real ones: claude publishes its aliases in the
+# `--model` option's own description and quotes values in two OTHER
+# options as well, which is the case that decides whether the parser reads
+# a block or the whole page.
+CLAUDE_HELP = """Usage: claude [options]
+
+Options:
+  --fallback-model <model>              Enable automatic fallback to specified
+                                        model(s), e.g. 'nope-not-a-model'.
+  --model <model>                       Model for the current session. Provide
+                                        an alias for the latest model (e.g.
+                                        'fable', 'opus', or 'sonnet') or a
+                                        model's full name (e.g.
+                                        'claude-fable-5').
+  -n, --name <name>                     Set a display name for this session
+  -s, --sandbox <MODE>                  One of 'read-only', 'full'.
+"""
+
+# codex names no model anywhere: its `--model` carries a bare description,
+# and its shell completion file-completes the value.
+CODEX_HELP = """Options:
+  -m, --model <MODEL>
+          Model the agent should use
+
+      --oss
+          Use open-source provider
+"""
+
+
 def daemon_with(**env):
     """Import the settings daemon under exactly this environment.
 
@@ -144,6 +175,42 @@ class ProfileFixture(unittest.TestCase):
     def read_sessions(self):
         with open(self.sessions_file) as handle:
             return json.load(handle)["sessions"]
+
+    def harness_stub(self, name, help_text):
+        """A stand-in harness CLI that answers `--help` and nothing else.
+
+        /bin/sh rather than an env shebang, for the reason FAKE_LAUNCH
+        gives above: the nix sandbox this runs in as a flake check has no
+        /usr/bin, and the failure would surface as "this harness suggests
+        nothing" - which is also what a correct empty answer looks like.
+        """
+        path = os.path.join(self.tmp.name, name + "-stub")
+        with open(path, "w") as handle:
+            handle.write("#!/bin/sh\ncat <<'AGENTBOXHELP'\n"
+                         + help_text + "AGENTBOXHELP\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def in_fixture(self, call, *args):
+        """Run a render with HOME still pointing at the fixture.
+
+        daemon_with() restores the process environment once the import is
+        done, and connect_flows() expands "~" at CALL time - it looks for a
+        CLI the box installed into the user profile when the pinned path
+        has none (issue #416). So without this, a test that pins no binary
+        for some harness silently probes the REAL one on the machine
+        running the suite, and passes or fails on what that machine has
+        installed.
+        """
+        saved = os.environ.get("HOME")
+        os.environ["HOME"] = self.tmp.name
+        try:
+            return call(*args)
+        finally:
+            if saved is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved
 
     def write_profile(self, name, text):
         with open(os.path.join(self.profiles, name + ".env"), "w") as handle:
@@ -305,6 +372,120 @@ class ProfilePanel(ProfileFixture):
                      options)
         self.assertIn('<option value="">default</option>', options)
         self.assertNotIn('<option value="high" selected>', options)
+
+    # --- model suggestions (issue #493) ------------------------------
+
+    def test_the_model_field_is_an_open_picker_not_a_closed_one(self):
+        """<input list>, never <select>: a model ID this box has never
+        heard of has to stay typeable, and a profile already naming one
+        has to survive a Save with nothing touched - the same rule
+        render_effort_options() keeps one control along."""
+        module = self.daemon(
+            AGENT_BOX_CONNECT_BINS="claude=" + self.harness_stub(
+                "claude", CLAUDE_HELP))
+        self.write_profile("deep", 'HARNESS=claude\nMODEL=opus\n')
+        row = self.in_fixture(module.render_profiles, module.read_profiles())
+        self.assertIn('<input type="text" name="MODEL" value="opus" ', row)
+        self.assertIn('list="pmodel-claude"', row)
+
+    def test_model_suggestions_are_read_off_the_harnesss_own_help(self):
+        """The aliases are inspected, not written down: a box learns a new
+        one the day its harness updates, and there is no table here to go
+        stale behind the model IDs it would otherwise name."""
+        module = self.daemon(
+            AGENT_BOX_CONNECT_BINS="claude=" + self.harness_stub(
+                "claude", CLAUDE_HELP))
+        lists = self.in_fixture(module.render_model_hints, module.read_profiles())
+        self.assertIn('<datalist id="pmodel-claude">', lists)
+        for name in ("fable", "opus", "sonnet", "claude-fable-5"):
+            self.assertIn('<option value="%s"></option>' % name, lists)
+
+    def test_only_the_model_options_own_block_is_harvested(self):
+        """Other options quote values too. Harvesting the whole help would
+        offer --fallback-model's example and --sandbox's modes as models,
+        which is a suggestion that starts nothing."""
+        module = self.daemon(
+            AGENT_BOX_CONNECT_BINS="claude=" + self.harness_stub(
+                "claude", CLAUDE_HELP))
+        lists = self.in_fixture(module.render_model_hints, module.read_profiles())
+        self.assertNotIn("nope-not-a-model", lists)
+        self.assertNotIn("read-only", lists)
+
+    def test_an_apostrophe_in_the_prose_does_not_pair_with_a_quote(self):
+        """"a model's full name" sits between two examples, so a naive
+        scan pairs that apostrophe with the opening quote of the next one
+        and swallows both. The name charset is what stops it."""
+        module = self.daemon(
+            AGENT_BOX_CONNECT_BINS="claude=" + self.harness_stub(
+                "claude", CLAUDE_HELP))
+        binary = module.CONNECT_BINS["claude"]
+        names = module.harness_model_aliases(
+            binary, module.binary_stamp(binary))
+        self.assertEqual(names, ("fable", "opus", "sonnet", "claude-fable-5"))
+
+    def test_a_harness_that_documents_no_models_offers_none_of_ours(self):
+        """codex's --model says only "Model the agent should use". It gets
+        an empty list rather than a guessed one: a wrong suggestion here
+        outlives every box we ship it to."""
+        module = self.daemon(
+            AGENT_BOX_CONNECT_BINS="codex=" + self.harness_stub(
+                "codex", CODEX_HELP))
+        profiles = module.read_profiles()
+        self.assertEqual(
+            self.in_fixture(module.model_hints, "codex", profiles), ())
+        self.assertNotIn(
+            "pmodel-codex",
+            self.in_fixture(module.render_model_hints, profiles))
+
+    def test_a_model_already_in_use_is_offered_for_its_own_harness(self):
+        """The second source, and the only one a harness with a silent
+        --help has: what this box's own profiles already name. It is
+        offered under that harness and no other."""
+        module = self.daemon(
+            AGENT_BOX_CONNECT_BINS="codex=" + self.harness_stub(
+                "codex", CODEX_HELP))
+        self.write_profile("fast", 'HARNESS=codex\nMODEL=gpt-5.1-codex-max\n')
+        self.write_profile("deep", 'HARNESS=claude\nMODEL=opus\n')
+        profiles = module.read_profiles()
+        self.assertEqual(self.in_fixture(module.model_hints, "codex", profiles),
+                         ("gpt-5.1-codex-max",))
+        self.assertNotIn(
+            "gpt-5.1-codex-max",
+            self.in_fixture(module.model_hints, "claude", profiles))
+
+    def test_the_new_profile_row_ships_with_no_list_of_its_own(self):
+        """Nothing is preselected in that row's assistant picker (#493
+        removed the box default), so the server cannot know which list
+        applies. settings.js follows the picker instead; until it does,
+        the field is the free text it always was."""
+        module = self.daemon(
+            AGENT_BOX_CONNECT_BINS="claude=" + self.harness_stub(
+                "claude", CLAUDE_HELP))
+        pane = module.PROFILES_SECTION_TPL.format(
+            base="/x", harnesses="", effort="", profiles="",
+            modelhints=self.in_fixture(module.render_model_hints,
+                                       module.read_profiles()))
+        tag = re.search(r'<input[^>]*name="MODEL"[^>]*>', pane).group(0)
+        self.assertIn("data-model-input", tag)
+        self.assertNotIn("list=", tag)
+
+    def test_a_probe_that_cannot_answer_costs_a_suggestion_not_the_field(self):
+        """A harness the box has not installed yet is probed no more than
+        its connection card is, and a CLI whose --help fails is the same
+        answer as one with nothing to say. Either way the field stays what
+        it already was - free text - so nothing here can cost a save."""
+        broken = os.path.join(self.tmp.name, "broken-stub")
+        with open(broken, "w") as handle:
+            handle.write("#!/bin/sh\nexit 1\n")
+        os.chmod(broken, 0o755)
+        module = self.daemon(AGENT_BOX_CONNECT_BINS="claude=" + broken)
+        self.write_profile("deep", 'HARNESS=claude\n')
+        profiles = module.read_profiles()
+        self.assertEqual(
+            self.in_fixture(module.render_model_hints, profiles), "")
+        row = self.in_fixture(module.render_profiles, profiles)
+        self.assertIn('name="MODEL"', row)
+        self.assertNotIn('list="pmodel-claude"', row)
 
 
 class ProfileRoutes(ProfileFixture):
