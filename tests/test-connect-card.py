@@ -32,6 +32,7 @@ import importlib.machinery
 import importlib.util
 import os
 import pathlib
+import re
 import tempfile
 import unittest
 
@@ -117,6 +118,78 @@ class ConnectCardCheckingTest(unittest.TestCase):
         html = self.daemon.render_connect_card(base_state(state="idle"))
         self.assertIn('<button type="submit"', html)
         self.assertNotIn("onsubmit=", html)
+
+
+class ConnectStepOrderTest(unittest.TestCase):
+    """The order the wizard's steps are numbered in (the code first).
+
+    The link used to be step 1 and the pairing code step 2, so a user on a
+    phone opened the sign-in page, found it wanted a code, and switched
+    back to copy it. The code and its copy button now come first for a
+    flow that shows one, which only works if the numbering follows.
+
+    Both backends render every one of these shapes: since issue #416 a
+    card appears for a CLI the daemon can FETCH as well as one it ships,
+    so AGENT_BOX_CONNECT_BINS is no longer the card list and neither
+    backend is limited to the CLIs it happens to carry.
+    """
+
+    def setUp(self):
+        self.daemon = load_daemon()
+
+    def steps(self, state):
+        """(number, text) per rendered step, tags stripped."""
+        html = self.daemon.render_connect_step(state)
+        found = re.findall(r"<strong>(\d+)\.</strong>(.*?)</(?:p|span)>", html)
+        return [(n, re.sub(r"<[^>]+>", "", t).strip()) for n, t in found]
+
+    def waiting(self, **overrides):
+        return base_state(state="waiting", url="https://example.com/sign-in",
+                          **overrides)
+
+    def test_a_shown_code_is_step_one_and_the_link_follows(self):
+        # codex and gh print the code in the pane: it is carried TO the
+        # page, so it has to be on the clipboard before the link is taken.
+        steps = self.steps(self.waiting(id="codex", code="56D0-6G7MP",
+                                        needs_code=False))
+        self.assertEqual(["1", "2"], [n for n, _ in steps])
+        self.assertIn("Copy this code", steps[0][1])
+        self.assertIn("56D0-6G7MP", steps[0][1])
+        self.assertIn("Open the sign-in page", steps[1][1])
+        self.assertIn("paste the code", steps[1][1])
+
+    def test_the_copy_button_carries_the_shown_code(self):
+        html = self.daemon.render_connect_step(
+            self.waiting(id="codex", code="56D0-6G7MP", needs_code=False))
+        self.assertIn('data-copy="56D0-6G7MP"', html)
+        # ...and it sits in the code's own step, above the link.
+        self.assertLess(html.index("data-copy="), html.index("<a href="))
+
+    def test_a_paste_back_flow_says_to_bring_the_code_home(self):
+        # claude shows no code in the pane but does want one back, so the
+        # link must not read "approve the request" over a paste-back field.
+        steps = self.steps(self.waiting(id="claude", code=None,
+                                        needs_code=True))
+        self.assertEqual(["1", "2"], [n for n, _ in steps])
+        self.assertIn("Open the sign-in page", steps[0][1])
+        self.assertIn("copy the code it shows", steps[0][1])
+        self.assertNotIn("approve the request", steps[0][1])
+        self.assertIn("Paste the code the page gives you back", steps[1][1])
+
+    def test_a_flow_with_no_code_either_way_is_just_an_approval(self):
+        # defang polls the auth server itself; nothing is typed anywhere.
+        steps = self.steps(self.waiting(id="defang", code=None,
+                                        needs_code=False))
+        self.assertEqual(["1"], [n for n, _ in steps])
+        self.assertIn("approve the request", steps[0][1])
+
+    def test_all_three_steps_are_numbered_in_order_when_all_three_show(self):
+        steps = self.steps(self.waiting(id="gh", code="EC7A-D4B8",
+                                        needs_code=True))
+        self.assertEqual(["1", "2", "3"], [n for n, _ in steps])
+        self.assertIn("Copy this code", steps[0][1])
+        self.assertIn("Open the sign-in page", steps[1][1])
+        self.assertIn("Paste the code the page gives you back", steps[2][1])
 
 
 if __name__ == "__main__":
