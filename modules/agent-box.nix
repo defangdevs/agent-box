@@ -19799,8 +19799,18 @@ def render_connect_step(state):
             f'{copy_button("the pairing code", value=state["code"])}</p>'
         )
         step += 1
-    opens = ("and paste the code" if state["code"]
-             else "and approve the request")
+    # Three flows, three endings. A code shown HERE (codex, gh) is carried
+    # to the page; a code the PAGE mints (claude, which shows none in the
+    # pane) is carried back, so the link must say to bring one home rather
+    # than "approve the request" over a paste-back field. Only a flow with
+    # neither (defang polls the auth server itself) really is just an
+    # approval.
+    if state["code"]:
+        opens = "and paste the code"
+    elif state["needs_code"]:
+        opens = "and copy the code it shows"
+    else:
+        opens = "and approve the request"
     parts.append(
         f'<p class="note"><strong>{step}.</strong> '
         f'<a href="{url}" target="_blank" rel="noopener noreferrer">'
