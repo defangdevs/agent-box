@@ -423,6 +423,21 @@ class ProfilePanel(ProfileFixture):
             binary, module.binary_stamp(binary))
         self.assertEqual(names, ("fable", "opus", "sonnet", "claude-fable-5"))
 
+    def test_a_model_option_that_ends_the_help_cannot_run_away(self):
+        """With no next option to stop at, the block runs to the end of
+        the page - so the ceiling is what stops a help footer's quoted
+        prose from arriving as a dozen more models."""
+        tail = "  --model <M>  Try 'a1'.\n" + "".join(
+            "  see 'x%d' below.\n" % i for i in range(30))
+        module = self.daemon(
+            AGENT_BOX_CONNECT_BINS="claude=" + self.harness_stub(
+                "claude", tail))
+        binary = module.CONNECT_BINS["claude"]
+        names = module.harness_model_aliases(
+            binary, module.binary_stamp(binary))
+        self.assertEqual(names[0], "a1")
+        self.assertEqual(len(names), module._MODEL_HINT_MAX)
+
     def test_a_harness_that_documents_no_models_offers_none_of_ours(self):
         """codex's --model says only "Model the agent should use". It gets
         an empty list rather than a guessed one: a wrong suggestion here

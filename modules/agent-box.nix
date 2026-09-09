@@ -19010,6 +19010,11 @@ _MODEL_OPT_RE = re.compile(r"^[ \t]*(?:-[A-Za-z],[ \t]+)?--model[ \t=<\[]", re.M
 # that happens to start with a dash truncates the block early, which costs
 # a suggestion and never invents one.
 _NEXT_OPT_RE = re.compile(r"^[ \t]{0,10}-{1,2}[A-Za-z]", re.M)
+# The one case with no such line after it is a `--model` that ends the help,
+# where the block would run to the end of the page and quote whatever prose
+# follows. A ceiling rather than a cleverer boundary: this is a suggestion
+# list, and a dozen is already more than a picker wants to show.
+_MODEL_HINT_MAX = 12
 # A quoted name inside it. The charset is what stops `model's full name`
 # from pairing that apostrophe with the next quote: the run between them
 # holds spaces, so no match is possible there and the scan resumes at the
@@ -19080,6 +19085,8 @@ def harness_model_aliases(binary, stamp):
     for name in _MODEL_NAME_RE.findall(block):
         if name not in names:
             names.append(name)
+        if len(names) >= _MODEL_HINT_MAX:
+            break
     return tuple(names)
 
 
