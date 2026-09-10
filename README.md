@@ -42,7 +42,7 @@ launch. The stack reports
 CREATE_COMPLETE only after the box phones home from its first successful
 apply — a first boot that goes wrong rolls the
 stack back visibly instead of leaving a green stack with a dead URL. The agent runs as the
-`UserName` linux user (default `agent`). Lightsail manages the networking, so
+`UserName` linux user (default `workspace`). Lightsail manages the networking, so
 nothing on the account has to be pre-configured. The
 stack Outputs show `https://<ip>.sslip.io/<UserName>/` - open it, sign in
 as the `UserName` with your `WebPassword`, complete the selected agent's
@@ -154,7 +154,7 @@ once the box has finished its first `agentbox apply` &mdash; on Azure that
 needs no signalling handshake, because an ARM deployment waits on the VM
 extension that runs the bootstrap and a failed apply fails the deployment. The
 `webUrl` output is `https://<addr>.sslip.io/<userName>/`: open it, sign in as
-the `userName` (default `agent`) with your `webPassword`, complete the agent's
+the `userName` (default `workspace`) with your `webPassword`, complete the agent's
 one-time sign-in, done. `<userName>-main@<addr>.sslip.io` is the Claude Remote
 Control session name.
 

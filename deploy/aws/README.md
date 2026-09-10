@@ -29,7 +29,7 @@ Claude Code or Codex.
   session; `TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box -t main` - the
   socket lives under `/run` because the agent runs with `PrivateTmp`).
 - **Basic-auth-to-cookie web auth**. The terminal lives at `/<UserName>/`
-  (default `/agent/`); Caddy prompts for the `UserName` (the linux user name
+  (default `/workspace/`); Caddy prompts for the `UserName` (the linux user name
   selects the terminal) and the `WebPassword`, sets an
   `HttpOnly; Secure; SameSite=Strict` cookie, then lets browser WebSocket
   upgrades authenticate with that cookie. ttyd still binds only to localhost.
@@ -41,7 +41,7 @@ Claude Code or Codex.
   an empty password, and credentials typed into the prompt cannot override
   the URL-embedded identity (issue 56).
 - `<UserName>-main@<host>.sslip.io` becomes the Claude Remote Control session
-  name (default user: `agent`), where `<host>.sslip.io` is the box's public
+  name (default user: `workspace`), where `<host>.sslip.io` is the box's public
   address — so the box is identifiable and reachable in the Claude apps.
   Sessions added at runtime derive the same way (`<UserName>-<session>@...`).
   Override per user via `remoteControlName`, or box-wide via
@@ -608,7 +608,7 @@ the end. It runs two legs in parallel:
 
 - **ipv4-full** - forces `PublicIpv4=true` (+ Spot); GitHub runners are
   IPv4-only, so this is the only leg that can actually reach the box. It runs
-  the full connectivity smoke tests (`/agent/` serves ttyd over HTTPS after
+  the full connectivity smoke tests (`/workspace/` serves ttyd over HTTPS after
   Basic auth, unauthenticated requests get 401, the site root serves the
   session manager behind the same auth, the WebSocket upgrade returns 101
   with the auth cookie).
