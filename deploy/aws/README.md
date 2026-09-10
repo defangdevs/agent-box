@@ -230,6 +230,13 @@ provide DNS, so they can't MITM active sessions (TLS cert is ours);
 worst case is DoS of new issuance or user redirection to a decoy site
 that immediately fails cert validation.
 
+`sslip.io` is itself open source ([cunnie/sslip.io](https://github.com/cunnie/sslip.io))
+and self-hostable, so a deployment that does not want the third-party
+dependency at all can run its own copy under its own domain. The
+`SslipDomain` parameter (default `sslip.io`) is the suffix the hostname
+is derived under, on both templates - point it at a self-hosted instance
+to whitelabel the URL entirely (issue #647).
+
 ### CloudFormation quick-create requires an S3 template URL
 
 `templateURL` in the `/stacks/quickcreate` URL **must be an S3 URL** -

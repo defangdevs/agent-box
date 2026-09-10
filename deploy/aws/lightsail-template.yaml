@@ -41,6 +41,7 @@ Metadata:
           - NixInstallerUrl
           - AllowCidr
           - DebugSsh
+          - SslipDomain
     # The console renders these instead of the raw parameter names on the
     # 1-click form, which is the only UI most launches ever see.
     ParameterLabels:
@@ -62,6 +63,8 @@ Metadata:
         default: IPv4 CIDR allowed to reach 443 (and 22 when DebugSsh=true)
       DebugSsh:
         default: Open port 22 for SSH as "ubuntu" with the Lightsail default key
+      SslipDomain:
+        default: Whitelabel domain (self-hosted sslip.io clone; default is the public one)
 
 Parameters:
   UserName:
@@ -213,6 +216,23 @@ Parameters:
       nothing wipes /home or /root - so this is an ordinary Ubuntu box to
       debug.
 
+  # Whitelabel sslip.io (issue #647). sslip.io is open source
+  # (github.com/cunnie/sslip.io) and self-hostable, so a deployment that
+  # runs its own copy under its own domain can point the auto-derived
+  # hostname there instead of the public sslip.io - same dashed-IP
+  # encoding, different suffix. The default reproduces exactly the
+  # hostname this template always derived, so a launch that leaves this
+  # blank behaves exactly as it did before the parameter existed.
+  SslipDomain:
+    Type: String
+    Default: sslip.io
+    AllowedPattern: '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+'
+    Description: >-
+      Domain suffix for the auto-derived hostname. Self-host sslip.io
+      (github.com/cunnie/sslip.io) under your own domain and set that
+      domain here to whitelabel the URL; the default (sslip.io) is the
+      public service.
+
 Conditions:
   OpenSsh: !Equals [!Ref DebugSsh, 'true']
 
@@ -314,16 +334,19 @@ Resources:
             # The box's declared state. Everything host-specific the renderer
             # needs, and nothing it can discover for itself: `domain: auto`
             # tells --first-boot to settle the public IPv4 and derive the
-            # sslip.io hostname from it. No `sessions:` key - `agentbox apply`
-            # seeds none itself on a web-enabled box (issue #416/#468),
-            # landing first boot on the settings page instead of a started
-            # agent session. No opt-in back to the pre-#416 behaviour: a
-            # session seeded before the box's first sign-in cannot do
-            # anything anyway, since its agent CLI still has to authenticate
-            # first (issue #469).
+            # hostname from it, under domainSuffix (default sslip.io -
+            # issue #647 lets this point at a self-hosted sslip.io clone
+            # instead). No `sessions:` key - `agentbox apply` seeds none
+            # itself on a web-enabled box (issue #416/#468), landing first
+            # boot on the settings page instead of a started agent session.
+            # No opt-in back to the pre-#416 behaviour: a session seeded
+            # before the box's first sign-in cannot do anything anyway,
+            # since its agent CLI still has to authenticate first (issue
+            # #469).
             install -d -m 0755 /etc/agent-box
             cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
             domain: auto
+            domainSuffix: @SSLIPDOMAIN@
             agents: [claude, codex]
             defaultAgent: @AGENT@
             web:
@@ -352,6 +375,7 @@ Resources:
             esc_issuer=$(printf '%s' "$portal_issuer_plain" | sed -e 's/[&\]/\\&/g')
             esc_user=$(printf '%s' "$portal_user_plain" | sed -e 's/[&\]/\\&/g')
             sed -i "s|@AGENT@|${Agent}|g; s|@USER@|${UserName}|g; \
+                    s|@SSLIPDOMAIN@|${SslipDomain}|g; \
                     s|@PORTALISSUER@|${!esc_issuer}|g; \
                     s|@PORTALUSERID@|${!esc_user}|g" \
               /etc/agent-box/config.yaml
@@ -422,7 +446,7 @@ Outputs:
       challenge with URL userinfo plus an EMPTY password, and credentials
       typed into the prompt cannot override the URL-embedded identity.)
     Value: !Sub
-      - 'https://${Host}.sslip.io/${UserName}/'
+      - 'https://${Host}.${SslipDomain}/${UserName}/'
       - Host: !Join ['-', !Split ['.', !GetAtt StaticIp.IpAddress]]
 
   RemoteControlSession:
@@ -431,7 +455,7 @@ Outputs:
       in the browser terminal, the Claude desktop and mobile apps can drive
       this session. Only meaningful when Agent=claude.
     Value: !Sub
-      - '${UserName}-main@${Host}.sslip.io'
+      - '${UserName}-main@${Host}.${SslipDomain}'
       - Host: !Join ['-', !Split ['.', !GetAtt StaticIp.IpAddress]]
 
   PublicAddress:

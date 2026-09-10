@@ -90,6 +90,7 @@ SAMPLE = {
     "@@NIXINSTALLER@@": "https://install.determinate.systems/nix",
     "@@FLAKEREF@@": "github:defangdevs/agent-box/0123456789abcdef",
     "@@USER@@": "agent",
+    "@@SSLIPDOMAIN@@": "sslip.example.com",
     "@@AGENTSMD@@": "## This box\n\n- A line with 'quotes' and $dollars.\n",
     "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
     "@@PORTALISSUERB64@@": base64.b64encode(
@@ -110,6 +111,7 @@ DEFAULT_OF = {
     "@@NIXINSTALLER@@": "nixInstallerUrl",
     "@@FLAKEREF@@": "agentBoxFlakeRef",
     "@@USER@@": "userName",
+    "@@SSLIPDOMAIN@@": "sslipDomain",
     "@@AGENTSMD@@": "agentsMd",
     # Both default to '' -- handover off, which is the default box.
     "@@PORTALISSUERB64@@": "portalIssuer",
@@ -391,6 +393,7 @@ def check_written_config(template: dict) -> int:
     block = extract_portal_block(script)
     user_key = SAMPLE["@@USER@@"]
     block = block.replace("@@USER@@", user_key)
+    block = block.replace("@@SSLIPDOMAIN@@", SAMPLE["@@SSLIPDOMAIN@@"])
 
     def parsed_config(workdir: Path):
         path = workdir / "config.yaml"

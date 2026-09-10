@@ -122,6 +122,19 @@ param nixInstallerUrl string = 'https://install.determinate.systems/nix'
 @description('Source range allowed to reach the terminal (and SSH). A CIDR, or an Azure service tag such as Internet.')
 param allowCidr string = '0.0.0.0/0'
 
+// Whitelabel sslip.io (issue #647). sslip.io is open source
+// (github.com/cunnie/sslip.io) and self-hostable, so a deployment that runs
+// its own copy under its own domain can point the auto-derived hostname
+// there instead of the public sslip.io - same dashed-IP encoding, different
+// suffix. The default reproduces exactly the hostname this template always
+// derived, so a deployment that leaves this blank behaves exactly as it did
+// before the parameter existed. Bicep has no pattern constraint for a
+// parameter, so this travels through the bootstrap the same unvalidated way
+// nixInstallerUrl and agentBoxFlakeRef already do -- a bad value fails the
+// boot's own config.yaml load rather than landing anywhere unvetted.
+@description('Domain suffix for the auto-derived hostname. Self-host sslip.io (github.com/cunnie/sslip.io) under your own domain and set that domain here to whitelabel the URL; the default (sslip.io) is the public service.')
+param sslipDomain string = 'sslip.io'
+
 // Default false, where the AWS templates default their DebugSsh to true. Not
 // caution for its own sake: on Lightsail, SSH is the only way to read
 // /var/log/agent-box-bootstrap.log after a first boot that went wrong, so the
@@ -303,9 +316,11 @@ AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
 
 # The box's declared state. Everything host-specific the renderer needs, and
 # nothing it can discover for itself: `domain: auto` tells --first-boot to
-# settle the public IPv4 and derive the sslip.io hostname from it. That works
-# unchanged on Azure because settle_public_ip asks checkip.amazonaws.com rather
-# than a cloud's own metadata service. No `sessions:` key - `agentbox apply`
+# settle the public IPv4 and derive the hostname from it, under
+# domainSuffix (default sslip.io - issue #647 lets this point at a
+# self-hosted sslip.io clone instead). That works unchanged on Azure because
+# settle_public_ip asks checkip.amazonaws.com rather than a cloud's own
+# metadata service. No `sessions:` key - `agentbox apply`
 # seeds none itself on a web-enabled box (issue #416/#468), landing first boot
 # on the settings page instead of a started agent session. No opt-in back to
 # the pre-#416 behaviour: a session seeded before the box's first sign-in
@@ -341,6 +356,7 @@ fi
 
 cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
 domain: auto
+domainSuffix: @@SSLIPDOMAIN@@
 agents: [claude, codex]
 web:
   enable: true
@@ -409,12 +425,13 @@ var portalOn = !empty(portalUser) && !empty(portalIssuer)
 var portalUserYaml = portalOn ? portalUser : ''
 var portalIssuerYaml = portalOn ? portalIssuer : ''
 
-var bootstrap = replace(replace(replace(replace(replace(replace(replace(
+var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
   bootstrapTemplate,
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
   '@@USER@@', userName),
   '@@AGENTSMD@@', agentsMd),
+  '@@SSLIPDOMAIN@@', sslipDomain),
   // base64, not the plaintext: see the comment above the apply, and
   // check_secrets() in scripts/check_azure_template.py, which fails if this
   // ever goes back to a raw substitution.
@@ -559,8 +576,10 @@ resource bootstrapExtension 'Microsoft.Compute/virtualMachines/extensions@2024-0
 // sslip.io resolves both 4.236.84.197.sslip.io and 4-236-84-197.sslip.io, but
 // only the dashed spelling is what `agentbox apply` derives and therefore the
 // only one in the issued certificate - the dotted one fails TLS rather than
-// simply not existing (issue #359).
-var host = '${replace(publicIp.properties.ipAddress, '.', '-')}.sslip.io'
+// simply not existing (issue #359). sslipDomain (issue #647) is the same
+// suffix the bootstrap's config.yaml carries as domainSuffix, so this stays
+// in sync with whatever `agentbox apply --first-boot` actually derives.
+var host = '${replace(publicIp.properties.ipAddress, '.', '-')}.${sslipDomain}'
 
 @description('Browser terminal. Sign in with the userName and the webPassword chosen at deployment time. The first load waits on Caddy\'s ACME certificate. (The URL deliberately carries no user@ prefix: Chrome answers the auth challenge with URL userinfo plus an EMPTY password, and credentials typed into the prompt cannot override the URL-embedded identity.)')
 output webUrl string = 'https://${host}/${userName}/'
