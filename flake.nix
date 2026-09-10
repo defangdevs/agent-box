@@ -381,11 +381,23 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               unitDir = ./modules/src/units;
               templates = builtins.filter (n: nixpkgs.lib.hasSuffix "@.service" n)
                 (builtins.attrNames (builtins.readDir unitDir));
+              # DIRECTIVES only, never comments (issue #628): a comment is
+              # allowed to name another unit as a precedent, and
+              # agent-web-terminal@.service now names
+              # agent-box-settings@.socket as exactly that - which is not a
+              # socket-activation relation, and flagged this template as an
+              # offender it can never satisfy. A `#` line, leading whitespace
+              # allowed, is not configuration.
+              directives = n:
+                nixpkgs.lib.concatStringsSep "\n" (builtins.filter
+                  (l: builtins.match "[[:space:]]*#.*" l == null)
+                  (nixpkgs.lib.splitString "\n"
+                    (builtins.readFile (unitDir + "/${n}"))));
               # Either direction counts: Requires= is what makes the socket
               # start the daemon, After= alone still means the socket outlives
               # the service's stop and can re-activate it.
               activated = builtins.filter
-                (n: nixpkgs.lib.hasInfix ".socket" (builtins.readFile (unitDir + "/${n}")))
+                (n: nixpkgs.lib.hasInfix ".socket" (directives n))
                 templates;
               svc = webBaseline.config.systemd.services;
               # "agent-box-settings@.service" -> the baseline's own instance.
