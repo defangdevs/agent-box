@@ -838,10 +838,14 @@ def ensure_harness_session(agent, remote_control):
 
     Skipped if the user already has ANY session on that harness -- a repeat
     sign-in (a token refresh, "Sign in again") must not mint a second one
-    every time the card cycles through "connected". No profile, no working
-    directory: this is the bare pseudo-profile shape `shell` already has
-    (see SHELL_PSEUDO_PROFILE), the one with no model, effort or prompt to
-    carry.
+    every time the card cycles through "connected". No working directory,
+    and a PROFILE only when one already exists (agent-box-profile seed
+    creates one per installed harness, named after it, at every supervisor
+    start -- issue #508): referencing it here is what leaves the add-session
+    picker something to pick for a SECOND session afterwards (issue #623). A
+    box whose supervisor has not restarted since #508 landed has no such
+    profile yet, so this falls back to none rather than naming a file that
+    is not there.
 
     `remote_control` is the one thing that differs by harness. claude's rc
     is a flag on the ordinary TUI (supervisor.sh appends --remote-control),
@@ -864,6 +868,7 @@ def ensure_harness_session(agent, remote_control):
                    for s in sessions.values()):
                 return
             name = gen_session_name(agent, sessions)
+            profile = agent if os.path.exists(profile_path(agent)) else None
             sessions[name] = {
                 "agent": agent,
                 "skipPermissions": True,
@@ -871,7 +876,7 @@ def ensure_harness_session(agent, remote_control):
                 "remoteControlName": None,
                 "workingDirectory": None,
                 "extraArgs": [],
-                "profile": None,
+                "profile": profile,
                 "initialPrompt": None,
                 "resumePrompt": None,
                 "boxSessionId": None,
@@ -3588,6 +3593,16 @@ def render_keys(keys):
 # #493 refuses is HARNESS=shell, not the name).
 SHELL_PSEUDO_PROFILE = ":shell"
 
+# The value the profile picker posts to start codex's remote-control pairing
+# daemon instead of a profile's interactive TUI (issue #623). Same shape as
+# SHELL_PSEUDO_PROFILE and for the same reason: a profile NAME can only hold
+# [A-Za-z0-9_-] (PROFILE_NAME_RE), so a leading ":" cannot collide with one.
+# The daemon is a different PROGRAM entirely (supervisor.sh's codex+rc
+# branch), not a codex profile with a flag flipped -- it has no model,
+# effort or profile of its own, since the paired client decides those -- so
+# it gets its own pseudo-profile rather than overloading a real one.
+CODEX_RC_PSEUDO_PROFILE = ":codex-remote-control"
+
 
 def render_profile_options(profiles):
     """The session row's profile <select> - now the ONLY control on it
@@ -3627,6 +3642,10 @@ def render_profile_options(profiles):
         harness = html.escape(profiles[name]["reserved"].get("HARNESS") or "")
         label = f"{safe} ({harness})" if harness else safe
         items.append(f'<option value="{safe}">{label}</option>')
+    if "codex" in AGENTS:
+        # A real codex profile always opens the interactive TUI now (issue
+        # #623); the daemon is offered here instead, as its own entry.
+        items.append('<option value="%s">codex remote control (pairing daemon, no profile)</option>' % CODEX_RC_PSEUDO_PROFILE)
     items.append(shell_opt)
     return "".join(items)
 
@@ -6265,10 +6284,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # to say the other thing from a shell.
             profile = (form.get("profile", [""])[0]).strip()
             agent = (form.get("agent", [""])[0]).strip()
+            # Captured before profile is cleared below: the one signal that
+            # this add asked for codex's pairing daemon rather than a TUI
+            # (issue #623), read again where remoteControl is decided.
+            codex_daemon = profile == CODEX_RC_PSEUDO_PROFILE
             if profile == SHELL_PSEUDO_PROFILE:
                 # The one entry that is not a profile file: a bare shell has
                 # no model, reasoning level or instructions to carry.
                 agent, profile = "shell", ""
+            elif codex_daemon:
+                # Also not a profile file: the daemon has no model, effort
+                # or profile of its own, since the paired client decides
+                # those once it connects.
+                agent, profile = "codex", ""
             elif profile:
                 agent = ""      # resolved from the profile below
             elif not agent:
@@ -6381,7 +6409,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,
-                        "remoteControl": True,
+                        # codex's remote control is a different PROGRAM
+                        # entirely (the pairing daemon, not a TUI flag -
+                        # see ensure_harness_session), so only the explicit
+                        # pseudo-profile above asks for it; a real codex
+                        # profile, or --harness codex with none, now opens
+                        # the interactive TUI instead (issue #623). claude's
+                        # own remote control is just a flag on its ordinary
+                        # TUI and keeps the old default.
+                        "remoteControl": codex_daemon or agent != "codex",
                         "remoteControlName": None,
                         "workingDirectory": cwd,
                         "extraArgs": pargs,

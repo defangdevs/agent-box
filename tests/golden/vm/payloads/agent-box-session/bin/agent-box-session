@@ -574,7 +574,7 @@ usage() {
   echo "usage: agent-box-session ls"
   echo "       agent-box-session peers"
   echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
-  echo "                             [--cwd DIR]"
+  echo "                             [--cwd DIR] [--remote-control true|false]"
   echo "                             [--prompt TEXT] [--resume-prompt TEXT] [--ephemeral]"
   echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
@@ -603,6 +603,11 @@ usage() {
   echo "fail to start."
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
+  echo "--remote-control defaults to true, except for codex where it defaults to"
+  echo "false: claude's remote control is a flag on its ordinary TUI, but codex's"
+  echo "replaces the TUI outright with the app-server pairing daemon, so a plain"
+  echo "codex session (a profile, or --harness codex with none) now opens the"
+  echo "TUI unless this is passed explicitly."
   echo "--ephemeral marks a ONE-SHOT session: parking it (a clean agent exit, or"
   echo "'stop') delists it outright, because nobody is going to resume it. A"
   echo "CRASH still parks nothing and leaves the post-mortem shell attachable."
@@ -957,7 +962,7 @@ case "$cmd" in
       *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
     harness="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
-    profile=""; has_harness=0; ephemeral=0
+    profile=""; has_harness=0; ephemeral=0; remote_control=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --harness) harness="${2:?--harness needs a value}"; has_harness=1; shift 2 ;;
@@ -973,6 +978,13 @@ case "$cmd" in
           ;;
         --profile) profile="${2:?--profile needs a value}"; shift 2 ;;
         --cwd) cwd="${2:?--cwd needs a value}"; shift 2 ;;
+        --remote-control)
+          case "${2:?--remote-control needs 'true' or 'false'}" in
+            (true|false) remote_control="$2" ;;
+            (*) echo "agent-box-session: --remote-control must be 'true' or 'false'" >&2
+                exit 2 ;;
+          esac
+          shift 2 ;;
         --prompt) prompt="${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
         --resume-prompt) rprompt="${2?--resume-prompt needs a value}"; has_rprompt=1; shift 2 ;;
         --ephemeral) ephemeral=1; shift ;;
@@ -1062,6 +1074,16 @@ case "$cmd" in
         pargs+=("$parg")
       done < <("$JQ" -j '.args[] + "\u0000"' <<<"$pjson")
     fi
+    # codex's remote control is a different PROGRAM entirely - the app-server
+    # pairing daemon, not a TUI flag (see supervisor.sh) - so an unqualified
+    # codex session now opens the TUI by default (issue #623); claude's own
+    # remote control is just a flag on its ordinary TUI and keeps its old
+    # default. Resolved AFTER the profile above, since a profile can change
+    # $harness. An explicit --remote-control always wins.
+    if [ -z "$remote_control" ]; then
+      remote_control=true
+      [ "$harness" = codex ] && remote_control=false
+    fi
     case " $AGENTS " in
       (*" $harness "*) ;;
       (*) echo "harness '$harness' is not available (available: $AGENTS)" >&2; exit 2 ;;
@@ -1097,8 +1119,8 @@ case "$cmd" in
     registry_edit --arg n "$name" --arg a "$harness" --arg c "$cwd" \
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
-      --arg prof "$profile" --arg eph "$ephemeral" \
-      '.sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: true,
+      --arg prof "$profile" --arg eph "$ephemeral" --argjson rc "$remote_control" \
+      '.sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
                         remoteControlName: null,
                         workingDirectory: (if $c == "" then null else $c end),
                         extraArgs: $ARGS.positional,
