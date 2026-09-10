@@ -4056,10 +4056,10 @@ BODY = """<main>
   <a class="back" href="{term_home}">&larr; workspace</a>
   <h1><span class="mark">{mark}</span>Settings</h1>
   <div id="msg-slot">{message}</div>
+  {connect_section}
   {sessions_section}
   {profiles_section}
   {webhooks_section}
-  {connect_section}
   <section>
     <div class="sec-head">
       <h2>API keys and secrets</h2>
