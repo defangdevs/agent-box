@@ -438,6 +438,50 @@ class ProfilePanel(ProfileFixture):
         self.assertEqual(names[0], "a1")
         self.assertEqual(len(names), module._MODEL_HINT_MAX)
 
+    def test_a_harness_that_could_not_be_asked_is_asked_again(self):
+        """A probe that FAILED is not a fact about the harness. Pinning it
+        under the binary's own stamp - which never moves for an unchanged
+        binary - would leave a box that timed out once offering nothing
+        until the daemon restarted, with --help working the whole time."""
+        stub = os.path.join(self.tmp.name, "flaky-stub")
+        working = "#!/bin/sh\necho \"  --model <M>  e.g. 'opus'.\"\n"
+        # Padded to the same byte count, so binary_stamp() cannot tell the
+        # two apart and the cache key is genuinely unchanged.
+        broken = "#!/bin/sh\nexit 1\n#"
+        broken += "-" * (len(working) - len(broken) - 1) + "\n"
+        self.assertEqual(len(broken), len(working))
+        with open(stub, "w") as handle:
+            handle.write(broken)
+        os.chmod(stub, 0o755)
+        module = self.daemon(AGENT_BOX_CONNECT_BINS="claude=" + stub)
+        stamp = module.binary_stamp(stub)
+        self.assertEqual(module.harness_model_aliases(stub, stamp), ())
+        with open(stub, "w") as handle:
+            handle.write(working)
+        os.utime(stub, ns=(stamp[0], stamp[0]))       # and the same mtime
+        self.assertEqual(module.binary_stamp(stub), stamp)
+        # Still inside the retry window: held, so a CLI that always fails
+        # is not re-forked on every render of a per-second live feed.
+        self.assertEqual(module.harness_model_aliases(stub, stamp), ())
+        module._MODEL_ALIAS_RETRY = 0.0
+        module._model_alias_cache.clear()
+        self.assertEqual(module.harness_model_aliases(stub, stamp), ("opus",))
+
+    def test_an_answer_of_none_is_kept_and_a_non_answer_is_not(self):
+        """() and None are different things: a CLI that ran and named no
+        model is answered from cache forever, a CLI that could not be run
+        is asked again."""
+        module = self.daemon()
+        quiet = self.harness_stub("quiet", CODEX_HELP)
+        self.assertEqual(module.probe_model_aliases(quiet), ())
+        silent = os.path.join(self.tmp.name, "silent-stub")
+        with open(silent, "w") as handle:
+            handle.write("#!/bin/sh\nexit 0\n")
+        os.chmod(silent, 0o755)
+        self.assertIsNone(module.probe_model_aliases(silent))
+        self.assertIsNone(module.probe_model_aliases(
+            os.path.join(self.tmp.name, "not-a-file")))
+
     def test_a_harness_that_documents_no_models_offers_none_of_ours(self):
         """codex's --model says only "Model the agent should use". It gets
         an empty list rather than a guessed one: a wrong suggestion here

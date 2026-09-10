@@ -3743,6 +3743,14 @@ _HARNESS_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 # already are.
 MODEL_LIST_PREFIX = "pmodel-"
 
+# harness_model_aliases()' answers, keyed on (binary, stamp) and holding
+# (names, retry_at). retry_at is None for a real answer - it stands until
+# the binary itself changes - and a monotonic deadline for a probe that
+# could not be made, which is a thing to try again rather than a fact
+# about the harness.
+_MODEL_ALIAS_RETRY = 60.0
+_model_alias_cache = {}
+
 
 def binary_stamp(path):
     """(mtime, size) for a binary, or None when it is not there. Used only
@@ -3755,24 +3763,17 @@ def binary_stamp(path):
     return (info.st_mtime_ns, info.st_size)
 
 
-@functools.lru_cache(maxsize=16)
-def harness_model_aliases(binary, stamp):
-    """The model names a harness's own `--help` puts forward, as a tuple.
+def probe_model_aliases(binary):
+    """Ask one harness what models it names, or None when it could not be
+    asked at all.
 
-    claude names them ("an alias for the latest model (e.g. 'fable',
-    'opus', or 'sonnet') or a model's full name (e.g. 'claude-fable-5')").
-    codex documents none - its `--model` says only "Model the agent should
-    use", and its shell completion file-completes the value - so it
-    contributes nothing here rather than us guessing a list on its behalf
-    and shipping it stale.
-
-    Empty on any failure, which is the same answer as "this harness says
-    nothing": the field is free text either way, so a probe that cannot run
-    costs a suggestion and never a save. `stamp` is binary_stamp() - not
-    read here, only keyed on.
+    The two answers are deliberately different things. () is an ANSWER -
+    the CLI ran and its `--model` puts no name forward, which is codex
+    today. None is a non-answer: the probe timed out, or raced a lazy
+    `nix profile add` still linking the binary, or the CLI printed nothing
+    whatsoever, and asking again later may well succeed. Only the caller
+    can act on that difference, and it does - see the cache above.
     """
-    if not binary:
-        return ()
     try:
         proc = subprocess.run(
             [binary, "--help"],
@@ -3783,10 +3784,13 @@ def harness_model_aliases(binary, stamp):
         )
     except (OSError, subprocess.SubprocessError) as exc:
         sys.stderr.write("profiles: model hints: %s\n" % exc)
-        return ()
+        return None
     # stdout first, but not exclusively: a CLI that prints its usage on
-    # stderr is not a CLI that has no aliases.
+    # stderr is not a CLI that has no aliases. Nothing on EITHER is not a
+    # help page - it is a CLI that could not answer.
     text = proc.stdout or proc.stderr or ""
+    if not text.strip():
+        return None
     opt = _MODEL_OPT_RE.search(text)
     if not opt:
         return ()
@@ -3800,6 +3804,45 @@ def harness_model_aliases(binary, stamp):
         if len(names) >= _MODEL_HINT_MAX:
             break
     return tuple(names)
+
+
+def harness_model_aliases(binary, stamp):
+    """The model names a harness's own `--help` puts forward, as a tuple.
+
+    claude names them ("an alias for the latest model (e.g. 'fable',
+    'opus', or 'sonnet') or a model's full name (e.g. 'claude-fable-5')").
+    codex documents none - its `--model` says only "Model the agent should
+    use", and its shell completion file-completes the value - so it
+    contributes nothing here rather than us guessing a list on its behalf
+    and shipping it stale.
+
+    Empty either way to the caller: the field is free text, so a probe
+    that cannot run costs a suggestion and never a save. What the two
+    cases do NOT share is how long that emptiness lasts. `stamp` is
+    binary_stamp(), so a real answer is keyed to the binary that gave it
+    and an upgrade re-reads - but a FAILURE under that same key would
+    outlive its cause, and an unchanged binary's stamp never moves. A box
+    whose probe timed out once under load would then offer nothing for
+    that harness until the daemon restarted, with `claude --help` working
+    perfectly on the very next call. So a failure is held only long enough
+    not to re-fork on every render of a per-second live feed.
+    """
+    if not binary:
+        return ()
+    key = (binary, stamp)
+    hit = _model_alias_cache.get(key)
+    if hit is not None and (hit[1] is None or time.monotonic() < hit[1]):
+        return hit[0]
+    names = probe_model_aliases(binary)
+    if len(_model_alias_cache) > 16:
+        # Same reasoning as _transcript_cache: the keyspace grows with
+        # every binary ever probed, and there is nothing here worth an
+        # eviction policy.
+        _model_alias_cache.clear()
+    _model_alias_cache[key] = (
+        ((), time.monotonic() + _MODEL_ALIAS_RETRY) if names is None
+        else (names, None))
+    return names or ()
 
 
 def model_hints(harness, profiles):

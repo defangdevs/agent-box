@@ -866,6 +866,7 @@
          "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");
       if (ed) { f.reset(); ed.hidden = true; }
+      syncModelLists();   // reset() cleared the picker, not the list= (#493)
       var added = wsActive();   // the tab the fetched page marks current
       connectPoll();
       if (tabsBefore && added && tabsBefore.indexOf(added) < 0) { wsSelect(added, true); }
@@ -932,9 +933,7 @@
   // restore is the stored assistant's suggestions under a picker the
   // operator has changed but not yet saved — a stale hint on a field that
   // accepts anything, which is not worth a beforeAttributeUpdated veto.
-  document.addEventListener("change", function (e) {
-    var sel = e.target;
-    if (!sel || sel.tagName !== "SELECT" || sel.name !== "HARNESS") { return; }
+  function syncModelList(sel) {
     var row = sel.closest ? sel.closest(".profile-row") : null;
     var input = row ? row.querySelector("[data-model-input]") : null;
     if (!input) { return; }
@@ -942,6 +941,21 @@
     // No datalist means no suggestions, which is the field this already is.
     if (id && document.getElementById(id)) { input.setAttribute("list", id); }
     else { input.removeAttribute("list"); }
+  }
+  // Every row, not only the one that just changed. A `change` event is not
+  // the only way a picker's value moves: form.reset() after a save restores
+  // the "Choose an assistant" prompt while leaving the ATTRIBUTE this set,
+  // and Firefox restores a <select>'s value across a plain reload without
+  // firing anything at all - both of which would leave the previous
+  // assistant's aliases under a picker that no longer names it.
+  function syncModelLists() {
+    document.querySelectorAll(".profile-row select[name=HARNESS]")
+      .forEach(syncModelList);
+  }
+  document.addEventListener("change", function (e) {
+    var sel = e.target;
+    if (!sel || sel.tagName !== "SELECT" || sel.name !== "HARNESS") { return; }
+    syncModelList(sel);
   });
 
   // Working-directory autocomplete (issue #131). The add-session cwd
@@ -1090,6 +1104,7 @@
   checkForUpdate();
   liveUpdates();
   connectPoll();
+  syncModelLists();
   // Land in the terminal: focus the server-selected tab's pane.
   if (wsActive()) { wsSelect(wsActive(), true); }
   // Still armed for the moment before the feed reports itself open; it
