@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -85,13 +86,11 @@ class Dialect(unittest.TestCase):
     def test_an_empty_filter_is_refused(self):
         # An empty list matches nothing, so it would skip every build and
         # the gate would report green. Louder than that: a hard failure.
-        empty = ROOT / "tests" / ".empty-filter-fixture"
-        empty.write_text("# nothing but a comment\n", encoding="utf-8")
-        try:
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = pathlib.Path(tmp) / "empty.paths"
+            empty.write_text("# nothing but a comment\n", encoding="utf-8")
             with self.assertRaises(SystemExit):
                 changed_paths.load_patterns(str(empty))
-        finally:
-            empty.unlink()
 
 
 class CiFilter(unittest.TestCase):

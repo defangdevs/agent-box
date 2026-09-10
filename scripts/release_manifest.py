@@ -56,6 +56,10 @@ import urllib.request
 
 MANIFEST_VERSION = 1
 
+# A channel tarball is tens of megabytes; 15 minutes is generous for a
+# download and short enough to fail inside any job that runs this.
+PREFETCH_TIMEOUT = 900
+
 # The channel the templates' AgentNixpkgsUrl pair pins. Kept here rather
 # than in the workflow because `verify` has to resolve the same one.
 DEFAULT_CHANNEL = "https://channels.nixos.org/nixos-unstable"
@@ -158,8 +162,17 @@ def prefetch(url):
         raise ManifestError(
             "nix-prefetch-url is not on PATH, so the channel hash cannot be "
             "computed - a manifest without it is not a release manifest")
-    proc = subprocess.run([tool, "--unpack", url],
-                          capture_output=True, text=True)
+    try:
+        # Bounded, because an unbounded stall here would run the job out of
+        # its own timeout - and a job that exceeds its timeout is reported
+        # `cancelled`, which this repo has already learned is
+        # indistinguishable from a routine supersede and so reaches nobody.
+        proc = subprocess.run([tool, "--unpack", url], capture_output=True,
+                              text=True, timeout=PREFETCH_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        raise ManifestError(
+            f"nix-prefetch-url {url} did not finish within "
+            f"{PREFETCH_TIMEOUT}s") from exc
     if proc.returncode != 0:
         raise ManifestError(f"nix-prefetch-url {url} failed: {proc.stderr}")
     out = proc.stdout.strip().splitlines()

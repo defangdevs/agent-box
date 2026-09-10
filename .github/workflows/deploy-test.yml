@@ -214,8 +214,9 @@ jobs:
               echo "::error::agent_box_rev was given without agent_box_sha256 - an unpinned pair would silently fetch a different module."
               exit 1
             fi
-            if [ -n "$IN_NIXPKGS_URL" ] && [ -z "$IN_NIXPKGS_SHA" ]; then
-              echo "::error::agent_nixpkgs_url was given without agent_nixpkgs_sha256 - the template requires the pair or neither."
+            if { [ -n "$IN_NIXPKGS_URL" ] && [ -z "$IN_NIXPKGS_SHA" ]; } \
+               || { [ -z "$IN_NIXPKGS_URL" ] && [ -n "$IN_NIXPKGS_SHA" ]; }; then
+              echo "::error::agent_nixpkgs_url and agent_nixpkgs_sha256 must be given together - the template requires the pair or neither."
               exit 1
             fi
             rev="$IN_REV"
