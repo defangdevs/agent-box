@@ -488,6 +488,17 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # authenticated downloads route for a web user — the handle, the
           # strip_prefix, and file_server rooted at the caddy-readable backing
           # dir. Cheap: realises only the tiny rendered config + a grep.
+          #
+          # Since issue #631 it also guards the ORIGIN ISOLATION of that
+          # route: ~/downloads holds whatever an agent put there, it is
+          # served from the same origin as the settings page and the
+          # terminals, and served inline one hostile .html or .svg is
+          # same-origin privileged JavaScript. So the generated Caddyfile
+          # must hand those files over as attachments under a `sandbox` CSP,
+          # must NOT let an attacker-supplied index.html stand in for the
+          # listing (`index off`), and must carry the vhost-wide
+          # `frame-ancestors 'self'` that keeps a management page framable
+          # only by this box itself.
           download-route =
             let
               sys = nixpkgs.lib.nixosSystem {
@@ -517,6 +528,27 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               grep -qF 'uri strip_prefix /agent/downloads' "$caddyfile"
               grep -qF 'root * /var/lib/agent-box-downloads/agent' "$caddyfile"
               grep -qF 'file_server browse' "$caddyfile"
+              # Origin isolation (issue #631): the artifacts go out as
+              # attachments under a sandbox CSP ...
+              grep -qF "Content-Disposition \"attachment\"" "$caddyfile"
+              grep -qF \
+                "Content-Security-Policy \"sandbox; frame-ancestors 'none'\"" \
+                "$caddyfile"
+              # ... deferred, or the vhost-wide header would overwrite it:
+              # caddy sorts same-directive routes by path specificity, so the
+              # matched header runs BEFORE the unmatched one and a static set
+              # would lose.
+              grep -qE '^ *defer$' "$caddyfile"
+              # ... and only for FILES, so Caddy's own listing still renders.
+              grep -qF 'not path */' "$caddyfile"
+              # An attacker-supplied index.html must not stand in for that
+              # listing, which is the one path the matcher above exempts --
+              # once per auth branch of the downloads handle.
+              test "$(grep -cE '^ *index off$' "$caddyfile")" = 3
+              # ... and a management page is framable only by this box.
+              grep -qF \
+                "Content-Security-Policy \"frame-ancestors 'self'\"" \
+                "$caddyfile"
               printf 'downloads route present in generated Caddyfile\n' > "$out"
             '';
 
