@@ -86,9 +86,9 @@ size picker are the **compute half only**. A default box in westus3:
 | Line item | Monthly |
 | --- | --- |
 | `Standard_B2pls_v2` (2 vCPU / 4 GiB, ARM Ampere) | $21.90 |
-| Standard SSD E6, 64 GiB | $4.80 |
+| Standard SSD E4, 32 GiB | $2.40 |
 | Standard static IPv4 | $3.65 |
-| **Total** | **~$30.35** |
+| **Total** | **~$27.95** |
 
 For comparison the same shape on Lightsail is `medium_3_0` at $24/mo flat.
 
@@ -102,6 +102,11 @@ better deal.
 **4 GiB is the floor**, higher than the AWS templates' 2 GiB, because Azure
 offers nothing in between: `B2pts_v2` (1 GiB) is the only smaller 2-vCPU
 Ampere size and it does not survive substituting the profile.
+
+Standard SSD is billed by tier, not per GiB: 30–32 GiB is E4 ($2.40), 33–64 is
+E6 ($4.80), so the default is 32 and there is no value in between worth
+picking. A fresh box uses ~6 GiB (of which 2 GiB is the swapfile), leaving
+~24 GiB for the agent's work.
 
 Unlike a Lightsail bundle the OS disk is resizable later — grow only, and only
 while the VM is deallocated:

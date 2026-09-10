@@ -58,11 +58,11 @@
     },
     "osDiskSizeGB": {
       "type": "int",
-      "defaultValue": 64,
+      "defaultValue": 32,
       "minValue": 30,
       "maxValue": 2048,
       "metadata": {
-        "description": "OS disk size in GiB. Unlike a Lightsail bundle this is resizable later (stop the VM, grow the disk, grow the filesystem) - so start small."
+        "description": "OS disk size in GiB. Billed by Standard SSD tier: 32 (E4, ~$2.40/mo) and 64 (E6, ~$4.80/mo) are the only two values worth picking at the low end. Unlike a Lightsail bundle this is resizable later (stop the VM, grow the disk, grow the filesystem) - so start small."
       }
     },
     "agentsMd": {
