@@ -410,6 +410,16 @@ class ServeTest(unittest.TestCase):
         self.assertNotIn("<b>bold", page)
         self.assertIn("&lt;b&gt;bold", page)
 
+    def test_a_file_is_not_served_at_a_trailing_slash(self):
+        # "report.txt/" names nothing: caddy's file_server answered ENOTDIR
+        # for it, and the shape matters to issue #631, whose per-file
+        # response headers are matched with `not path */` -- a file served
+        # at a path ending in "/" would arrive exempt from them.
+        drop("slashed.txt")
+        status, _headers, body = self.get(BASE + "/slashed.txt/")
+        self.assertEqual(status, 404)
+        self.assertNotIn(SAFE, body.decode())
+
     def test_a_directory_redirects_to_its_slash(self):
         os.makedirs(os.path.join(ROOT, "folder"), exist_ok=True)
         status, headers, _body = self.get(BASE + "/folder")

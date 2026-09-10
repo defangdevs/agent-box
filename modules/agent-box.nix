@@ -22321,6 +22321,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     render_download_index(comps, dl_rows(fd)),
                     send_body=body)
             elif stat.S_ISREG(info.st_mode):
+                if rel.endswith("/"):
+                    # "report.html/" is not a name in this drop -- caddy's
+                    # own file_server answered ENOTDIR for it -- and the
+                    # distinction is load-bearing beyond tidiness: issue
+                    # #631 matches its per-file response headers with `not
+                    # path */`, so a FILE served at a path ending in "/"
+                    # would arrive exempt from them.
+                    self._send_html(
+                        "<h1>404</h1><p>That is a file, not a "
+                        "directory.</p>", status=404, send_body=body)
+                    return
                 self._send_file(fd, info, comps[-1] if comps else "", body)
             else:
                 # A FIFO, socket or device node an agent left in the drop.
