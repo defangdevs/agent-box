@@ -66,7 +66,7 @@ Metadata:
 Parameters:
   UserName:
     Type: String
-    Default: agent
+    Default: workspace
     AllowedPattern: '[a-z_][a-z0-9_-]{0,31}'
     Description: >-
       Linux user that owns the agent sessions, and the login name for the

@@ -4,14 +4,14 @@
   "metadata": {
     "_generator": {
       "name": "bicep",
-      "version": "0.39",
-      "templateHash": "14176839590445093856"
+      "version": "0.39.26.7824",
+      "templateHash": "5691149335067261983"
     }
   },
   "parameters": {
     "userName": {
       "type": "string",
-      "defaultValue": "agent",
+      "defaultValue": "workspace",
       "minLength": 1,
       "maxLength": 32,
       "metadata": {

@@ -32,7 +32,7 @@
 @description('Linux user that owns the agent sessions, and the login name for the browser terminal.')
 @minLength(1)
 @maxLength(32)
-param userName string = 'agent'
+param userName string = 'workspace'
 
 @description('Password for the browser terminal, 16-64 characters. Any character is safe: it reaches the bootstrap base64-encoded, so nothing in it can break out of the shell literal it lands in. Hashed with argon2id on first boot, so the plaintext never lands on the box\'s disk, and it travels in the extension\'s encrypted protectedSettings rather than in readable instance metadata. Change it later from the box\'s own settings page.')
 @secure()

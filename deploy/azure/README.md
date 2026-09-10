@@ -37,7 +37,7 @@ user choose Claude Code or Codex.
   "Base-OS patching" in `deploy/aws/README.md` for the whole policy — it is the
   renderer's, so both clouds get the same one.
 - **Basic-auth-to-cookie web auth**, identical to the AWS path. The terminal
-  lives at `/<userName>/` (default `/agent/`); Caddy prompts for the
+  lives at `/<userName>/` (default `/workspace/`); Caddy prompts for the
   `userName` and the `webPassword`, sets an
   `HttpOnly; Secure; SameSite=Strict` cookie, then lets browser WebSocket
   upgrades authenticate with that cookie. ttyd binds only to localhost.

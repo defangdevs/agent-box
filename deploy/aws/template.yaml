@@ -92,7 +92,7 @@ Parameters:
 
   UserName:
     Type: String
-    Default: agent
+    Default: workspace
     AllowedPattern: ^[a-z_][a-z0-9_-]{0,30}$
     Description: >-
       Linux user the agent CLI runs as. Doubles as the browser-terminal
@@ -246,7 +246,7 @@ Parameters:
     AllowedPattern: ^.{16,64}$
     Description: >-
       Shared secret for the browser terminal. Log in with the UserName chosen
-      above (default "agent") and this password; Caddy then sets an HttpOnly
+      above (default "workspace") and this password; Caddy then sets an HttpOnly
       Secure cookie so the WebSocket upgrade can authenticate without putting
       the secret in the URL. Use any 16-64 characters; password-manager symbols
       are supported. AWS masks this field with dots after you type it and never
@@ -958,7 +958,7 @@ Outputs:
       Browser terminal for the selected agent. Deployments are also
       drivable from the agent's apps via Remote Control after the first login.
       First load takes ~2-3 minutes while the instance provisions and Caddy
-      issues an ACME cert. Sign in with the UserName (default "agent") and the
+      issues an ACME cert. Sign in with the UserName (default "workspace") and the
       WebPassword chosen at deployment time. (The URL deliberately carries no
       user@ prefix: Chrome answers the auth challenge with URL userinfo plus an
       EMPTY password, and credentials typed into the prompt cannot override
