@@ -260,20 +260,11 @@ jobs:
       # `selfUpdate` path assertions behind it (#242); lazily-installed
       # harnesses; the durable per-session lease (#535); the portal,
       # profile-panel and session routes/panels; the session registry's
-      # write protocol; the source tree an update moves (#242); the
-      # screenshot uploader;
-      # and the four webhook units - a claim's payload rules, the
-      # ceiling's EX_TEMPFAIL contract, the settings panel's states, and
-      # the spawn wrapper's own claim parsing.
-      #
-      # `testscript-fits` is the one deliberately NOT here yet. Its
-      # attribute path is fixed in this commit - it read
-      # `driver.drvAttrs.testScript`, which nixpkgs no longer provides, so
-      # it threw at eval on every architecture and this list would go red
-      # on it immediately - but the guard it implements now reports
-      # tests/webhook.nix at 130805 bytes, 3829 over its own one-page
-      # margin and 267 under the kernel's hard cap. Getting those bytes out
-      # is issue #610; add this check here in the same change.
+      # write protocol; the source tree an update moves (#242); the VM
+      # test-script size guard itself (#610); the screenshot uploader;
+      # and the five webhook units - a claim's payload rules, the
+      # ceiling's EX_TEMPFAIL contract, the settings panel's states, the
+      # spawn wrapper's own claim parsing, and the "@self" resolver/cache.
       - name: Run the remaining native checks
         run: |
           nix build -L --keep-going --no-link \
@@ -286,10 +277,12 @@ jobs:
             .#checks.x86_64-linux.session-route \
             .#checks.x86_64-linux.sessions-registry \
             .#checks.x86_64-linux.source-tree \
+            .#checks.x86_64-linux.testscript-fits \
             .#checks.x86_64-linux.upload-cli \
             .#checks.x86_64-linux.webhook-claim \
             .#checks.x86_64-linux.webhook-defer \
             .#checks.x86_64-linux.webhook-panel-state \
+            .#checks.x86_64-linux.webhook-self \
             .#checks.x86_64-linux.webhook-spawn-claim
 
       # Interactive VM test: brute-forcing the web terminal's basic auth gets

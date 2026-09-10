@@ -2557,106 +2557,28 @@
         )
 
     # --- who "@self" is, resolved at runtime (issue #261) -------------------
-    # webhook-spawn.sh seeds every dispatched hook-* session with exactly
-    # ignoreSenders ["@self"], and webhook.py resolves that against
-    # LOCAL_WEBHOOK_SELF — which nothing set, so the mute was inert and a hook
-    # session heard its own comments come back. The identity cannot be declared
-    # at deploy time: it is a property of whatever GitHub token the user's
-    # environment carries, and the settings page can swap that token for a
-    # different account at any moment. So a resolver derives it from the token,
-    # caches it keyed by a FINGERPRINT of that token, and both readers — the
-    # session (via env-exec) and the receiver (via EnvironmentFile) — take it
-    # from there.
-    #
-    # `gh` is stubbed because this VM has no route to GitHub; everything else
-    # on this leg is the real path.
+    # webhook-spawn.sh seeds every hook-* session with ignoreSenders
+    # ["@self"]; webhook.py resolves that against LOCAL_WEBHOOK_SELF. The
+    # resolver itself is a pure function of a token, a state dir and a
+    # stubbed `gh` — asserted natively in `webhook-self` instead (#610). Only
+    # a VM shows what is downstream: a session's peer and the receiver both
+    # picking the cached answer up (via env-exec / EnvironmentFile), asserted
+    # below against one resolution seeded here with a stubbed `gh`.
     state = "/home/agent/.local/state/local-webhook"
-    selfenv = f"{state}/self.env"
-    # In the agent's own HOME, with an absolute interpreter from the system
-    # profile: a stub the agent cannot execute would fail INSIDE the resolver,
-    # where gh's stderr is deliberately silenced, and look like "no token".
     fakebin = "/home/agent/fakebin"
     machine.succeed(
         f"sudo -u agent mkdir -p {fakebin}"
         f" && sudo -u agent tee {fakebin}/gh > /dev/null <<'EOF'\n"
         f"#!{sw}/sh\n"
-        f'echo "$@" >> {fakebin}/calls\n'
-        'printf "%s\\n" "''${FAKE_LOGIN:-box-bot}"\n'
+        'printf "%s\\n" "box-bot"\n'
         "EOF\n"
         f"sudo -u agent chmod 755 {fakebin}/gh"
     )
-    # The stub answers when the agent runs it — asserted here, so a broken stub
-    # cannot masquerade as a broken resolver below.
-    machine.succeed(
-        f"sudo -u agent {fakebin}/gh api user --jq .login | grep -x box-bot >/dev/null"
-    )
-    machine.succeed(f"sudo -u agent rm -f {fakebin}/calls")
-    resolve = (
+    assert machine.succeed(
         "sudo -u agent env HOME=/home/agent"
-        f" LOCAL_WEBHOOK_STATE_DIR={state}"
-    )
-    with_gh = f"{resolve} PATH={fakebin}:$PATH"
-
-    # First resolution: asks GitHub once, answers with the login, and leaves an
-    # env-file behind — a login is not a secret, so it is world-readable.
-    assert machine.succeed(f"{with_gh} agent-box-webhook-self").strip() == "box-bot"
-    machine.succeed(f"grep -x 'LOCAL_WEBHOOK_SELF=box-bot' {selfenv} >/dev/null")
-    machine.succeed(f"grep -x '# fp=[0-9a-f]*' {selfenv} >/dev/null")
-    machine.succeed(f"stat -c '%U %a' {selfenv} | grep -x 'agent 644'")
-    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == "1"
-
-    # Same token, so the cached answer stands — without gh on PATH at all,
-    # which is what keeps this off the session-start path in the normal case.
-    assert machine.succeed(f"{resolve} agent-box-webhook-self").strip() == "box-bot"
-    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == "1"
-
-    # A DIFFERENT token is a different account until proven otherwise: the
-    # fingerprint no longer matches, so it re-resolves rather than trusting the
-    # cache. This is the case a deploy-time option gets silently wrong.
-    assert machine.succeed(
-        f"{with_gh} GH_TOKEN=second FAKE_LOGIN=other-bot agent-box-webhook-self"
-    ).strip() == "other-bot"
-    machine.succeed(f"grep -x 'LOCAL_WEBHOOK_SELF=other-bot' {selfenv} >/dev/null")
-    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == "2"
-
-    # An explicit LOCAL_WEBHOOK_SELF answers the question itself: echoed back,
-    # no lookup, and the cache is left alone (it describes the token, not this
-    # one-off override).
-    assert machine.succeed(
-        f"{with_gh} LOCAL_WEBHOOK_SELF=someone-else agent-box-webhook-self"
-    ).strip() == "someone-else"
-    machine.succeed(f"grep -x 'LOCAL_WEBHOOK_SELF=other-bot' {selfenv} >/dev/null")
-    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == "2"
-
-    # No gh and a token nothing has resolved: the last known identity beats no
-    # identity — the box did not stop being that account because GitHub was
-    # unreachable — and the failed attempt is stamped.
-    assert machine.succeed(
-        f"{resolve} GH_TOKEN=third agent-box-webhook-self"
-    ).strip() == "other-bot"
-    machine.succeed(f"test -s {state}/.self-attempt")
-    # That stamp is honored ONLY under --throttled, which is how env-exec calls
-    # it: at every session start, so an offline box must not pay a network
-    # timeout per respawn. Same token, gh now reachable, and it still does not
-    # ask — it answers from the last known login instead.
-    before = machine.succeed(f"wc -l < {fakebin}/calls").strip()
-    assert machine.succeed(
-        f"{with_gh} GH_TOKEN=third agent-box-webhook-self --throttled"
-    ).strip() == "other-bot"
-    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() == before
-    # A person (or this test) asking directly always gets a real attempt: the
-    # throttle is for the automatic caller, and whoever runs the command has
-    # just done something about the failure. This is not hypothetical — the
-    # session that starts at boot stamps a failed lookup on any box without a
-    # token, and without this rule every later call would inherit that silence
-    # for an hour.
-    assert machine.succeed(
-        f"{with_gh} GH_TOKEN=third FAKE_LOGIN=third-bot agent-box-webhook-self"
-    ).strip() == "third-bot"
-    assert machine.succeed(f"wc -l < {fakebin}/calls").strip() != before
-
-    # Back to the first token for the rest of the leg.
-    machine.succeed(f"{with_gh} agent-box-webhook-self >/dev/null")
+        f" LOCAL_WEBHOOK_STATE_DIR={state} PATH={fakebin}:$PATH"
+        " agent-box-webhook-self"
+    ).strip() == "box-bot"
 
     # A session picks it up: env-exec resolves before it execs the agent, so
     # the session's own webhook peer — the process that filters this session's

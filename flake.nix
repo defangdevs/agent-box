@@ -1581,6 +1581,33 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # What `agent-box-webhook-self` resolves and caches for the "@self"
+          # sender mute (issue #261): first resolution, cache reuse, a
+          # changed token re-resolving, an explicit LOCAL_WEBHOOK_SELF
+          # override, and the --throttled stamp. Every one is a pure
+          # function of a token and a state directory, so it runs natively
+          # in about a second rather than costing a VM boot - the move
+          # `webhook-spawn-claim` and `webhook-defer` already made out of
+          # tests/webhook.nix, which had no testScript budget left
+          # (issue #610). What only a VM can show is downstream of one
+          # resolution: a session's own webhook peer and the receiver unit
+          # both picking up the cached answer, which tests/webhook.nix
+          # still covers.
+          webhook-self =
+            pkgs.runCommand "agent-box-webhook-self-test"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils ];
+                script = ./modules/src/webhook-self.sh;
+                tests = ./tests/test-webhook-self.sh;
+              } ''
+              bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Unit tests for the durable per-session lease (issue #535):
           # outcome precedence (first ending wins, never the most recent),
           # clear's delete-not-blank resolution, and the read-only accessor

@@ -292,17 +292,21 @@ against `nix eval .#checks.<system> --apply builtins.attrNames` is readable
 by eye. Do that diff after adding a check, not before: it is the only thing
 that tells you whether the check you just wrote will ever run.
 
-The fifteenth is the warning inside the warning. `testscript-fits` read
+The fifteenth was the warning inside the warning. `testscript-fits` read
 `driver.drvAttrs.testScript`; nixpkgs moved the script off the driver
 derivation's `drvAttrs` (it passes `buildCommand` as a file now), so the
 check threw `attribute 'testScript' missing` at EVAL on every architecture
 and nothing said so, because nothing ran it. A check nobody runs does not
 merely stop catching things - it stops being a check at all, and rots
-quietly. Measure a VM test's script with `t.driver.testScript`. It is still
-out of the CI list, because with the path fixed the guard reports what it
-was built to report: `tests/webhook.nix` is 3,829 bytes over the one-page
-margin and 267 under the kernel's hard cap (issue #610). Do not add lines
-to that file until those bytes are out.
+quietly. Measure a VM test's script with `t.driver.testScript`. With the
+path fixed, the guard reported `tests/webhook.nix` at 3,829 bytes over the
+one-page margin and 267 under the kernel's hard cap; the "@self"
+resolver/cache assertions (a pure function of a token and a state
+directory) moved out into the native `webhook-self` check, and
+`testscript-fits` itself joined the CI list in the same change (issue
+#610). The margin it leaves is not generous - watch `sessions` next, at
+103 KiB and climbing - so a future addition to `tests/webhook.nix` should
+still ask whether it needs the VM before assuming there is room.
 
 ### Before you push a VM test
 
