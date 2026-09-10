@@ -17237,11 +17237,17 @@ STYLE = """<style>
      own now that Save has moved below the prompt and the starting setting
      (issue #493). */
   input.pname { width: 150px; }
-  /* Model is a free-text field (issue #493: model IDs change too often for a
-     fixed picker), but at the harness picker's default width it alone kept
-     the row from fitting on one line next to name + assistant + reasoning
-     level. */
+  /* Model is an OPEN picker (issue #493): free text over the SAME combobox
+     the working-directory field uses, because a model ID this box has never
+     heard of still has to be typeable. It began as a <datalist> and the
+     browser's own popup could not be styled to match this page, so it uses
+     the one the page draws instead - .combo and .ac below, already here.
+     The width is what keeps the row on one line next to name + assistant +
+     reasoning level, and it belongs to the .combo now that the input is
+     wrapped in one: a bare inline-block would size to its content. */
   input.pmodel { width: 160px; }
+  .profile-row .combo { width: 160px; }
+  .profile-row .combo input.pmodel { width: 100%; }
   /* One control height for the profile editor's own row, same fix and same
      reason as .new-session-row above: Chrome's UA sheet renders a <select>
      a few px shorter than a same-padding <input>, so the assistant picker
@@ -17328,8 +17334,12 @@ PROFILES_SECTION_TPL = """<section>
                  aria-label="Profile name"
                  title="Letters, digits, underscore and hyphen; at most 64 characters">
           <select name="HARNESS" aria-label="Assistant" required>{harnesses}</select>
-          <input type="text" name="MODEL" placeholder="model (optional)" class="pmodel"
-                 autocomplete="off" aria-label="Model">
+          <span class="combo">
+            <input type="text" name="MODEL" placeholder="model (optional)"
+                   class="pmodel" autocomplete="off" spellcheck="false"
+                   aria-label="Model" aria-autocomplete="list" data-model-input>
+            <ul class="ac" hidden></ul>
+          </span>
           <select name="EFFORT" aria-label="Reasoning level">{effort}</select>
         </div>
         <div class="row prompt-row">
@@ -17352,7 +17362,7 @@ PROFILES_SECTION_TPL = """<section>
         </div>
       </form>
     </div>
-    <div id="profiles-list">{profiles}</div>
+    <div id="profiles-list">{profiles}{modelhints}</div>
   </section>"""
 
 # The webhook panel (issue #227), settings page only: the workspace root
@@ -18673,9 +18683,45 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   // the next level appears — like tab-completing a path. Everything is
   // event-delegated so it survives the DOM swaps applyDoc() does; each
   // input carries its own tiny state on the element.
+  //
+  // Two fields use it now (issue #493). They share the markup, the CSS,
+  // the popup, the keyboard handling and the mouse handling; they differ
+  // only in where the entries come from and what picking one means, so
+  // exactly three functions branch and nothing else knows there are two.
+  // The model field came here from a <datalist>, which the browser draws
+  // ITSELF: no palette of ours reaches inside that popup, and on a real
+  // browser it arrived as near-black text on a dark ground. A popup the
+  // page owns cannot have that problem.
+  function acKind(el) {
+    if (!el || !el.hasAttribute) { return ""; }
+    if (el.hasAttribute("data-dir-input")) { return "dir"; }
+    if (el.hasAttribute("data-model-input")) { return "model"; }
+    return "";
+  }
   function acList(input) {
     var combo = input.closest ? input.closest(".combo") : null;
     return combo ? combo.querySelector(".ac") : null;
+  }
+  // Which assistant this row names right now. Read when the popup opens
+  // rather than mirrored onto the input, so a picker the operator changed
+  // and has not saved is still the one that decides - and there is no
+  // attribute left to go stale behind a form.reset() or a morph.
+  function acHarness(input) {
+    var row = input.closest ? input.closest(".profile-row") : null;
+    var sel = row ? row.querySelector("select[name=HARNESS]") : null;
+    return sel ? sel.value : "";
+  }
+  function acModelHints(harness) {
+    var el = document.getElementById("model-hints");
+    if (!el || !harness) { return []; }
+    try {
+      var all = JSON.parse(el.textContent);
+      return (all && all[harness]) || [];
+    } catch (err) { return []; }
+  }
+  function acFrag(input) {
+    return acKind(input) === "model"
+      ? input.value : acSplit(input.value).frag;
   }
   function acSplit(v) {
     // Directory portion (browsed) and trailing fragment (filter).
@@ -18696,13 +18742,18 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     var ul = acList(input);
     var st = input._dir;
     if (!ul || !st) { return; }
-    var frag = acSplit(input.value).frag.toLowerCase();
+    var model = acKind(input) === "model";
+    var frag = acFrag(input).toLowerCase();
     var matches = st.entries.filter(function (n) {
       return n.toLowerCase().indexOf(frag) === 0;
     });
     ul.innerHTML = "";
     st.active = -1;
     if (!st.entries.length) {
+      // A directory with no children is worth saying; an assistant with
+      // no suggestions is not - the field is free text either way, and an
+      // empty popup over it would be noise, not information.
+      if (model) { ul.hidden = true; return; }
       var e = document.createElement("li");
       e.className = "empty";
       e.textContent = "No subfolders here";
@@ -18715,13 +18766,21 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       var li = document.createElement("li");
       li.setAttribute("role", "option");
       li.setAttribute("data-name", name);
-      li.textContent = name + "/";
+      li.textContent = model ? name : name + "/";
       ul.appendChild(li);
     });
     ul.hidden = false;
   }
   function acFetch(input) {
     var st = input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 });
+    if (acKind(input) === "model") {
+      // No request to make: the daemon already put every harness's list on
+      // the page. Re-read rather than cache it, because a save re-renders
+      // that blob along with the rows it sits among.
+      st.entries = acModelHints(acHarness(input));
+      acRender(input);
+      return;
+    }
     var dir = acSplit(input.value).dir;
     if (dir === st.dir) { acRender(input); return; }
     var base = input.getAttribute("data-dir-base") || "";
@@ -18755,37 +18814,48 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     st.active = idx;
   }
   function acApply(input, li) {
+    var name = li.getAttribute("data-name");
+    if (acKind(input) === "model") {
+      // A model name is the whole value, so picking one finishes the job -
+      // there is no next level to reveal, and leaving the popup open over
+      // a field that now reads exactly what was clicked is just in the way.
+      input.value = name;
+      input.focus();
+      acClose(input);
+      return;
+    }
     var dir = acSplit(input.value).dir;
-    input.value = acJoin(dir, li.getAttribute("data-name")) + "/";
+    input.value = acJoin(dir, name) + "/";
     input.focus();
     acFetch(input); // reveal the next level
   }
   var acTimer = null;
   document.addEventListener("input", function (e) {
     var input = e.target;
-    if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+    if (!acKind(input)) { return; }
     if (acTimer) { window.clearTimeout(acTimer); }
     acTimer = window.setTimeout(function () { acTimer = null; acFetch(input); }, 120);
   });
   document.addEventListener("focusin", function (e) {
     var input = e.target;
-    if (input && input.hasAttribute && input.hasAttribute("data-dir-input")) {
-      // The field starts on the untouched default "~": select it so the
-      // first keystroke replaces it instead of appending, which is what
-      // produced an invalid "~docu" (issue #308).
-      if (input.value === "~") { input.select(); }
-      acFetch(input);
-    }
+    if (!acKind(input)) { return; }
+    // The directory field starts on the untouched default "~": select it
+    // so the first keystroke replaces it instead of appending, which is
+    // what produced an invalid "~docu" (issue #308). A model field has no
+    // such default - it starts empty, or on what the profile already says,
+    // and selecting THAT would throw the value away on a stray focus.
+    if (acKind(input) === "dir" && input.value === "~") { input.select(); }
+    acFetch(input);
   });
   document.addEventListener("focusout", function (e) {
     var input = e.target;
-    if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+    if (!acKind(input)) { return; }
     // Delay so a mousedown-selected item still registers its click.
     window.setTimeout(function () { acClose(input); }, 150);
   });
   document.addEventListener("keydown", function (e) {
     var input = e.target;
-    if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+    if (!acKind(input)) { return; }
     var ul = acList(input);
     var open = ul && !ul.hidden;
     var st = input._dir;
@@ -18804,7 +18874,8 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     if (!li) { return; }
     e.preventDefault(); // keep focus on the input (no focusout close)
     var combo = li.closest(".combo");
-    var input = combo ? combo.querySelector("[data-dir-input]") : null;
+    var input = combo
+      ? combo.querySelector("[data-dir-input],[data-model-input]") : null;
     if (input) { acApply(input, li); }
   });
 
@@ -18957,6 +19028,211 @@ def render_effort_options(selected=""):
     return "".join(items)
 
 
+# The MODEL field is a picker, but an OPEN one (issue #493's layout
+# checklist: "if possible, make model input a picker too - but model IDs
+# change often so not sure if we can dynamically inspect?").
+#
+# Both halves of that worry are right, and they pull opposite ways, so the
+# control is an <input list> over a <datalist> rather than a <select>: a
+# model this box has never heard of stays typeable, and a profile already
+# naming one survives a Save with nothing touched - the same rule
+# render_effort_options() keeps for a value its own list does not know.
+# A closed picker would break both.
+#
+# What CAN be inspected is the alias. Aliases are the stable half of the
+# churn: `opus` and `sonnet` outlive the dated IDs behind them, which is
+# exactly why the harnesses publish them. So the list is read off the
+# harness itself and never written down here - a box learns a new alias the
+# day its harness updates, and there is no table for us to let rot.
+#
+# The `--model` option's own description block, and nothing else in the
+# help: other options quote values too (claude's --fallback-model, codex's
+# --sandbox), and harvesting those would offer a sandbox mode as a model.
+_MODEL_OPT_RE = re.compile(r"^[ \t]*(?:-[A-Za-z],[ \t]+)?--model[ \t=<\[]", re.M)
+# Where that block ends: the next option's own line. A description line
+# that happens to start with a dash truncates the block early, which costs
+# a suggestion and never invents one.
+_NEXT_OPT_RE = re.compile(r"^[ \t]{0,10}-{1,2}[A-Za-z]", re.M)
+# The one case with no such line after it is a `--model` that ends the help,
+# where the block would run to the end of the page and quote whatever prose
+# follows. A ceiling rather than a cleverer boundary: this is a suggestion
+# list, and a dozen is already more than a picker wants to show.
+_MODEL_HINT_MAX = 12
+# A quoted name inside it. The charset is what stops `model's full name`
+# from pairing that apostrophe with the next quote: the run between them
+# holds spaces, so no match is possible there and the scan resumes at the
+# real opening quote of the example that follows.
+_MODEL_NAME_RE = re.compile(r"'([A-Za-z0-9][A-Za-z0-9._-]{1,63})'")
+# harness_model_aliases()' answers, keyed on (binary, stamp) and holding
+# (names, retry_at). retry_at is None for a real answer - it stands until
+# the binary itself changes - and a monotonic deadline for a probe that
+# could not be made, which is a thing to try again rather than a fact
+# about the harness.
+_MODEL_ALIAS_RETRY = 60.0
+_model_alias_cache = {}
+
+
+def binary_stamp(path):
+    """(mtime, size) for a binary, or None when it is not there. Used only
+    as a cache KEY, so an upgraded harness is re-read rather than answered
+    from the list the old one published."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_mtime_ns, info.st_size)
+
+
+def probe_model_aliases(binary):
+    """Ask one harness what models it names, or None when it could not be
+    asked at all.
+
+    The two answers are deliberately different things. () is an ANSWER -
+    the CLI ran and its `--model` puts no name forward, which is codex
+    today. None is a non-answer: the probe timed out, or raced a lazy
+    `nix profile add` still linking the binary, or the CLI printed nothing
+    whatsoever, and asking again later may well succeed. Only the caller
+    can act on that difference, and it does - see the cache above.
+    """
+    try:
+        proc = subprocess.run(
+            [binary, "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write("profiles: model hints: %s\n" % exc)
+        return None
+    # stdout first, but not exclusively: a CLI that prints its usage on
+    # stderr is not a CLI that has no aliases. Nothing on EITHER is not a
+    # help page - it is a CLI that could not answer.
+    text = proc.stdout or proc.stderr or ""
+    if not text.strip():
+        return None
+    opt = _MODEL_OPT_RE.search(text)
+    if not opt:
+        return ()
+    rest = text[opt.end():]
+    end = _NEXT_OPT_RE.search(rest)
+    block = rest[:end.start()] if end else rest
+    names = []
+    for name in _MODEL_NAME_RE.findall(block):
+        if name not in names:
+            names.append(name)
+        if len(names) >= _MODEL_HINT_MAX:
+            break
+    return tuple(names)
+
+
+def harness_model_aliases(binary, stamp):
+    """The model names a harness's own `--help` puts forward, as a tuple.
+
+    claude names them ("an alias for the latest model (e.g. 'fable',
+    'opus', or 'sonnet') or a model's full name (e.g. 'claude-fable-5')").
+    codex documents none - its `--model` says only "Model the agent should
+    use", and its shell completion file-completes the value - so it
+    contributes nothing here rather than us guessing a list on its behalf
+    and shipping it stale.
+
+    Empty either way to the caller: the field is free text, so a probe
+    that cannot run costs a suggestion and never a save. What the two
+    cases do NOT share is how long that emptiness lasts. `stamp` is
+    binary_stamp(), so a real answer is keyed to the binary that gave it
+    and an upgrade re-reads - but a FAILURE under that same key would
+    outlive its cause, and an unchanged binary's stamp never moves. A box
+    whose probe timed out once under load would then offer nothing for
+    that harness until the daemon restarted, with `claude --help` working
+    perfectly on the very next call. So a failure is held only long enough
+    not to re-fork on every render of a per-second live feed.
+    """
+    if not binary:
+        return ()
+    key = (binary, stamp)
+    hit = _model_alias_cache.get(key)
+    if hit is not None and (hit[1] is None or time.monotonic() < hit[1]):
+        return hit[0]
+    names = probe_model_aliases(binary)
+    if len(_model_alias_cache) > 16:
+        # Same reasoning as _transcript_cache: the keyspace grows with
+        # every binary ever probed, and there is nothing here worth an
+        # eviction policy.
+        _model_alias_cache.clear()
+    _model_alias_cache[key] = (
+        ((), time.monotonic() + _MODEL_ALIAS_RETRY) if names is None
+        else (names, None))
+    return names or ()
+
+
+def model_hints(harness, profiles):
+    """What to OFFER as a model for this harness, most useful first.
+
+    Two sources, and neither can go stale on its own. The harness's own
+    aliases come first because they are what a new profile most often
+    wants. Then every MODEL already saved in a profile that names this
+    harness: free, exactly the set this box actually uses, and the only
+    source a harness with a silent `--help` has at all.
+
+    The binary comes from the connections list (CONNECT_BINS, via
+    connect_flow) - which is where the owner's call on #493 put the harness
+    list too - so a harness the box has not installed yet is probed no more
+    than its card is: connect_flows() already dropped it to bin=None.
+    """
+    flow = connect_flow(harness)
+    binary = flow["bin"] if flow else None
+    hints = []
+    if binary:
+        for name in harness_model_aliases(binary, binary_stamp(binary)):
+            if name not in hints:
+                hints.append(name)
+    for name in sorted(profiles):
+        res = profiles[name]["reserved"]
+        model = res.get("MODEL")
+        if model and (res.get("HARNESS") or "") == harness and model not in hints:
+            hints.append(model)
+    return tuple(hints)
+
+
+# The id the client reads the suggestions out of. It rides inside
+# #profiles-list so a save that adds a model refreshes it with the rows.
+MODEL_HINTS_ID = "model-hints"
+
+
+def render_model_hints(profiles):
+    """Every harness's suggestions as one JSON blob the client reads.
+
+    NOT a <datalist>. The browser draws that popup itself, and these pages
+    hand it no palette it will honour - the suggestions arrived as
+    near-black text on a dark ground on a real browser, and no CSS of ours
+    reaches inside it. The working-directory field (issue #131) already
+    solved this by owning its popup outright: one <ul class="ac"> the page
+    styles like everything else. This is the same control with a different
+    source, so it inherits that answer instead of re-litigating it.
+
+    A <script type="application/json"> rather than an attribute per row:
+    the entries belong to the HARNESS, not to the row, and the row's
+    assistant is a picker the operator can change without saving. The
+    client reads the list when it opens the popup, so there is no
+    attribute to keep in step with a control beside it.
+    """
+    hints = {}
+    for harness in PROFILE_AGENTS:
+        found = model_hints(harness, profiles)
+        if found:
+            hints[harness] = list(found)
+    if not hints:
+        return ""
+    # Inside a <script>, the HTML parser looks for "</script" and nothing
+    # else, so escaping "<" is the whole of what this needs - html.escape()
+    # would be wrong here, since the client parses the text as JSON and
+    # would get "&quot;" where it wants a quote. A MODEL is operator text
+    # (an alias is charset-constrained, a saved profile's value is not).
+    blob = json.dumps(hints, sort_keys=True).replace("<", "\\u003c")
+    return ('<script type="application/json" id="%s">%s</script>'
+            % (MODEL_HINTS_ID, blob))
+
+
 def render_profiles(profiles, usage=None):
     """The profiles list. Each row folds open onto its launch config and its
     environment KEY NAMES — never a value, the rule `agent-box-profile show`
@@ -19067,9 +19343,12 @@ def render_profiles(profiles, usage=None):
             f'<div class="row profile-row">'
             f'<select name="HARNESS" aria-label="Assistant for {safe}" required>'
             f'{render_harness_options(res.get("HARNESS") or "")}</select>'
+            f'<span class="combo">'
             f'<input type="text" name="MODEL" value="{html.escape(res.get("MODEL") or "")}" '
             f'placeholder="model" class="pmodel" autocomplete="off" '
+            f'spellcheck="false" data-model-input aria-autocomplete="list" '
             f'aria-label="Model for {safe}">'
+            f'<ul class="ac" hidden></ul></span>'
             f'<select name="EFFORT" aria-label="Reasoning level for {safe}">'
             f'{render_effort_options(res.get("EFFORT") or "")}</select>'
             f'<button type="submit" class="btn">Save</button></div>'
@@ -20090,6 +20369,7 @@ def render_page(message="", kind="ok"):
                 harnesses=render_harness_options(),
                 effort=render_effort_options(),
                 profiles=render_profiles(profiles, usage),
+                modelhints=render_model_hints(profiles),
             ),
             webhooks_section=(
                 WEBHOOK_UNAVAILABLE_TPL.format(text=unavailable)

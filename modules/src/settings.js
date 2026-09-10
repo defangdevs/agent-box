@@ -926,9 +926,45 @@
   // the next level appears — like tab-completing a path. Everything is
   // event-delegated so it survives the DOM swaps applyDoc() does; each
   // input carries its own tiny state on the element.
+  //
+  // Two fields use it now (issue #493). They share the markup, the CSS,
+  // the popup, the keyboard handling and the mouse handling; they differ
+  // only in where the entries come from and what picking one means, so
+  // exactly three functions branch and nothing else knows there are two.
+  // The model field came here from a <datalist>, which the browser draws
+  // ITSELF: no palette of ours reaches inside that popup, and on a real
+  // browser it arrived as near-black text on a dark ground. A popup the
+  // page owns cannot have that problem.
+  function acKind(el) {
+    if (!el || !el.hasAttribute) { return ""; }
+    if (el.hasAttribute("data-dir-input")) { return "dir"; }
+    if (el.hasAttribute("data-model-input")) { return "model"; }
+    return "";
+  }
   function acList(input) {
     var combo = input.closest ? input.closest(".combo") : null;
     return combo ? combo.querySelector(".ac") : null;
+  }
+  // Which assistant this row names right now. Read when the popup opens
+  // rather than mirrored onto the input, so a picker the operator changed
+  // and has not saved is still the one that decides - and there is no
+  // attribute left to go stale behind a form.reset() or a morph.
+  function acHarness(input) {
+    var row = input.closest ? input.closest(".profile-row") : null;
+    var sel = row ? row.querySelector("select[name=HARNESS]") : null;
+    return sel ? sel.value : "";
+  }
+  function acModelHints(harness) {
+    var el = document.getElementById("model-hints");
+    if (!el || !harness) { return []; }
+    try {
+      var all = JSON.parse(el.textContent);
+      return (all && all[harness]) || [];
+    } catch (err) { return []; }
+  }
+  function acFrag(input) {
+    return acKind(input) === "model"
+      ? input.value : acSplit(input.value).frag;
   }
   function acSplit(v) {
     // Directory portion (browsed) and trailing fragment (filter).
@@ -949,13 +985,18 @@
     var ul = acList(input);
     var st = input._dir;
     if (!ul || !st) { return; }
-    var frag = acSplit(input.value).frag.toLowerCase();
+    var model = acKind(input) === "model";
+    var frag = acFrag(input).toLowerCase();
     var matches = st.entries.filter(function (n) {
       return n.toLowerCase().indexOf(frag) === 0;
     });
     ul.innerHTML = "";
     st.active = -1;
     if (!st.entries.length) {
+      // A directory with no children is worth saying; an assistant with
+      // no suggestions is not - the field is free text either way, and an
+      // empty popup over it would be noise, not information.
+      if (model) { ul.hidden = true; return; }
       var e = document.createElement("li");
       e.className = "empty";
       e.textContent = "No subfolders here";
@@ -968,13 +1009,21 @@
       var li = document.createElement("li");
       li.setAttribute("role", "option");
       li.setAttribute("data-name", name);
-      li.textContent = name + "/";
+      li.textContent = model ? name : name + "/";
       ul.appendChild(li);
     });
     ul.hidden = false;
   }
   function acFetch(input) {
     var st = input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 });
+    if (acKind(input) === "model") {
+      // No request to make: the daemon already put every harness's list on
+      // the page. Re-read rather than cache it, because a save re-renders
+      // that blob along with the rows it sits among.
+      st.entries = acModelHints(acHarness(input));
+      acRender(input);
+      return;
+    }
     var dir = acSplit(input.value).dir;
     if (dir === st.dir) { acRender(input); return; }
     var base = input.getAttribute("data-dir-base") || "";
@@ -1008,37 +1057,48 @@
     st.active = idx;
   }
   function acApply(input, li) {
+    var name = li.getAttribute("data-name");
+    if (acKind(input) === "model") {
+      // A model name is the whole value, so picking one finishes the job -
+      // there is no next level to reveal, and leaving the popup open over
+      // a field that now reads exactly what was clicked is just in the way.
+      input.value = name;
+      input.focus();
+      acClose(input);
+      return;
+    }
     var dir = acSplit(input.value).dir;
-    input.value = acJoin(dir, li.getAttribute("data-name")) + "/";
+    input.value = acJoin(dir, name) + "/";
     input.focus();
     acFetch(input); // reveal the next level
   }
   var acTimer = null;
   document.addEventListener("input", function (e) {
     var input = e.target;
-    if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+    if (!acKind(input)) { return; }
     if (acTimer) { window.clearTimeout(acTimer); }
     acTimer = window.setTimeout(function () { acTimer = null; acFetch(input); }, 120);
   });
   document.addEventListener("focusin", function (e) {
     var input = e.target;
-    if (input && input.hasAttribute && input.hasAttribute("data-dir-input")) {
-      // The field starts on the untouched default "~": select it so the
-      // first keystroke replaces it instead of appending, which is what
-      // produced an invalid "~docu" (issue #308).
-      if (input.value === "~") { input.select(); }
-      acFetch(input);
-    }
+    if (!acKind(input)) { return; }
+    // The directory field starts on the untouched default "~": select it
+    // so the first keystroke replaces it instead of appending, which is
+    // what produced an invalid "~docu" (issue #308). A model field has no
+    // such default - it starts empty, or on what the profile already says,
+    // and selecting THAT would throw the value away on a stray focus.
+    if (acKind(input) === "dir" && input.value === "~") { input.select(); }
+    acFetch(input);
   });
   document.addEventListener("focusout", function (e) {
     var input = e.target;
-    if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+    if (!acKind(input)) { return; }
     // Delay so a mousedown-selected item still registers its click.
     window.setTimeout(function () { acClose(input); }, 150);
   });
   document.addEventListener("keydown", function (e) {
     var input = e.target;
-    if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+    if (!acKind(input)) { return; }
     var ul = acList(input);
     var open = ul && !ul.hidden;
     var st = input._dir;
@@ -1057,7 +1117,8 @@
     if (!li) { return; }
     e.preventDefault(); // keep focus on the input (no focusout close)
     var combo = li.closest(".combo");
-    var input = combo ? combo.querySelector("[data-dir-input]") : null;
+    var input = combo
+      ? combo.querySelector("[data-dir-input],[data-model-input]") : null;
     if (input) { acApply(input, li); }
   });
 
