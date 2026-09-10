@@ -22374,11 +22374,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "source": source, "secret": secret})
             return
         if parsed.path.rstrip("/") == BASE + "/connect":
-            flow = connect_flow((params.get("flow", [""])[0]).strip())
+            wanted = (params.get("flow", [""])[0]).strip()
+            if not wanted:
+                # Every card in one answer (issue #642). A portal renders four
+                # cards and polls them together, so asking four times is four
+                # round trips for one screen. The loop shares the env keys and
+                # the single `tmux list-sessions` that connect_state would
+                # otherwise repeat per card, so this is also the cheap
+                # direction — and {BASE}/status's connect_fp still lets a
+                # caller skip it entirely when nothing has moved.
+                shared_keys = read_keys()
+                shared_tmux = tmux_sessions()
+                self._send_json({"ok": True, "flows": [
+                    connect_state(flow, keys=shared_keys,
+                                  tmux_state=shared_tmux)
+                    for flow in connect_flows()
+                ]})
+                return
+            flow = connect_flow(wanted)
             if flow is None:
                 self._send_json({"ok": False}, status=404)
             else:
                 self._send_json({"ok": True, "flow": connect_state(flow)})
+            return
+        # The env store's key NAMES, for a client that manages secrets from
+        # somewhere other than this page (issue #642: Defang Station's portal
+        # renders the Environment panel itself and drives this daemon).
+        #
+        # Names only. read_keys() is already exactly that list, and the same
+        # rule the page has always followed applies here for the same reason:
+        # this daemon must not be able to surface a stored secret, so there is
+        # no route that returns a value and this is not the first one. The
+        # write path (POST {BASE}/set) is where a value travels, in a body.
+        #
+        # Read-only, same auth block as the rest of the tree, and no CORS
+        # headers — so a cross-site page cannot read the body even with the
+        # operator's credentials attached, exactly as with the two routes
+        # above.
+        if parsed.path.rstrip("/") == BASE + "/env":
+            self._send_json({"ok": True, "keys": read_keys()})
             return
         self._send_html(render_page(message, kind))
 

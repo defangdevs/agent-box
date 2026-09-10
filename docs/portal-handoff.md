@@ -320,7 +320,56 @@ Two independent axes.
 
 Deleting the session record file revokes one browser at once.
 
-## 7. What this does not do
+## 7. Driving the box after a handover
+
+The cookie §4 mints is not only for a browser. A portal that holds it can render the
+box's **guided sign-in cards** and its **environment store** in its own UI and call
+here for what is behind them — which is what Defang Station does
+([#642](https://github.com/defangdevs/agent-box/issues/642),
+`DefangLabs/station#80`). Everything below is under `/<user>/settings`, inside the same
+auth block as the page, and needs no CORS: the portal calls from its own server with the
+cookie it was handed, and the browser never talks to the box.
+
+| method | path | answer |
+|---|---|---|
+| `GET` | `/connect` | `{"ok": true, "flows": [...]}` — every card this box offers |
+| `GET` | `/connect?flow=<id>` | `{"ok": true, "flow": {...}}` — one card |
+| `GET` | `/env` | `{"ok": true, "keys": [...]}` — env key **names** |
+| `GET` | `/status` | `{"rev", "sessions", "connect_fp"}` — a change fingerprint |
+| `POST` | `/connect/start` | `flow=<id>` → `303`, or `409` + a page it could not begin |
+| `POST` | `/connect/code` | `flow=<id>&code=<code>` → `303` |
+| `POST` | `/connect/cancel` | `flow=<id>` → `303` |
+| `POST` | `/set` | `key=&value=` → `303` |
+| `POST` | `/delete` | `key=` → `303` |
+
+A card's `state` is one of `checking`, `idle`, `starting`, `waiting`, `exchanging`,
+`connected`, `failed`, `expired`, derived from the CLI's own status command and the tmux
+pane the flow runs in — never from anything this daemon stored, which is why a card
+survives a reload, a daemon restart or a second reader. `installed: false` means the
+button offers to fetch the CLI first.
+
+**No route returns a stored secret.** `/env` answers names, `/set` is where a value
+travels, and it travels in a body. The one piece of pane text that can come back is a
+failed flow's last line, redacted first.
+
+Four things a portal has to get right, each of which has bitten one:
+
+- **`{BASE}` is `/<user>/settings`, and an unknown path under it answers `200` with the
+  settings page** — not `404`. So "does this box have that route" is decided by the
+  **content type**, not the status.
+- **The card set varies per box.** A flow whose CLI the box can neither find nor fetch is
+  not served, and `?flow=<id>` answers `404`. That means "not on this box", never
+  "broken" — and a `404` from `/auth/handoff` (§4) is a third thing again: no handover
+  route at all.
+- **The POSTs answer `303`, or `409` and a rendered page.** Do not parse the page; act,
+  then re-read the card. A JSON answer for these is ask 3 of #642 and not shipped.
+- **Poll `/status` first when polling.** `connect_fp` changes only when a card does, so a
+  1–3 s poll costs one small request until something moves.
+
+The CSRF guard admits a request that carries neither `Sec-Fetch-Site` nor `Origin`, which
+is what a non-browser client sends; a browser posting cross-site is still refused.
+
+## 8. What this does not do
 
 - **No continuous check.** Between handovers the box does not ask the portal
   whether access still holds. A session outlives a portal-side revocation by
