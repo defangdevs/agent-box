@@ -5002,7 +5002,7 @@ def first_boot(spec, args):
             # password itself is shared, so two users' stored hashes never
             # collide just because their password does.
             password_hash = (value if kind == "hash"
-                              else hash_web_password(spec.profile, value))
+                             else hash_web_password(spec.profile, value))
             Path(f"/etc/agent-box/{u.name}.hash").write_text(
                 password_hash + "\n")
             os.chmod(f"/etc/agent-box/{u.name}.hash", 0o600)
