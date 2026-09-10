@@ -420,6 +420,16 @@ class ServeTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertNotIn(SAFE, body.decode())
 
+    def test_a_dot_component_still_names_the_file(self):
+        # Caddy normalizes "/x/." to "/x" before it proxies, but the daemon
+        # must not depend on that: the "." drops out of the path and the
+        # file answers. 200 is also the RIGHT answer for issue #631, whose
+        # per-file headers match `not path */` -- this path does not end in
+        # a slash, so it is decorated like any other file.
+        drop("dotted.txt")
+        status, _headers, body = self.get(BASE + "/dotted.txt/.")
+        self.assertEqual((status, body.decode()), (200, SAFE))
+
     def test_a_directory_redirects_to_its_slash(self):
         os.makedirs(os.path.join(ROOT, "folder"), exist_ok=True)
         status, headers, _body = self.get(BASE + "/folder")
