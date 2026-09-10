@@ -261,8 +261,9 @@ jobs:
       # harnesses; the durable per-session lease (#535); the portal,
       # profile-panel and session routes/panels; the session registry's
       # write protocol; the source tree an update moves (#242); the VM
-      # test-script size guard itself (#610); the screenshot uploader;
-      # and the five webhook units - a claim's payload rules, the
+      # test-script size guard itself (#610); the screenshot uploader; the
+      # file drop's path confinement, including the symlink-swap race
+      # (#630); and the five webhook units - a claim's payload rules, the
       # ceiling's EX_TEMPFAIL contract, the settings panel's states, the
       # spawn wrapper's own claim parsing, and the "@self" resolver/cache.
       - name: Run the remaining native checks
@@ -270,6 +271,7 @@ jobs:
           nix build -L --keep-going --no-link \
             .#checks.x86_64-linux.checkout-bootstrap \
             .#checks.x86_64-linux.checkout-options \
+            .#checks.x86_64-linux.downloads-confine \
             .#checks.x86_64-linux.jit-agents \
             .#checks.x86_64-linux.lease-protocol \
             .#checks.x86_64-linux.portal-route \

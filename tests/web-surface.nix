@@ -12,12 +12,13 @@
 # The sandbox has no ACME, so the module-managed Caddyfile is replaced with a
 # `tls internal` one that reproduces the three routing shapes the module emits:
 # the per-user snippet `import`, the authenticated /<user>/downloads/ handle
-# (basic_auth -> strip_prefix -> file_server, plus the issue #631 attachment
-# and sandbox headers), and the authenticated catch-all standing in for the
-# terminal. The flake's `download-route` and `webhook-route` eval checks
-# separately assert the module's REAL Caddyfile emits those blocks; what needs
-# a booted VM is whether caddy, fail2ban, tmpfiles and the agent unit's
-# namespace agree with each other, which is what this test covers.
+# (basic_auth -> reverse_proxy to that user's settings daemon, which is what
+# serves the drop since issue #630, plus the issue #631 attachment and sandbox
+# headers), and the authenticated catch-all standing in for the terminal. The
+# flake's `download-route` and `webhook-route` eval checks separately assert
+# the module's REAL Caddyfile emits those blocks; what needs a booted VM is
+# whether caddy, fail2ban, tmpfiles and the agent unit's namespace agree with
+# each other, which is what this test covers.
 #
 # Ordering matters: the fail2ban subtest ends with the client banned at the
 # firewall, so it runs last. Running the reload-driven self-serve subtest before
@@ -94,11 +95,7 @@
             basic_auth {
               agent {$WEB_PASSWORD_HASH_AGENT}
             }
-            uri strip_prefix /agent/downloads
-            root * /var/lib/agent-box-downloads/agent
-            file_server browse {
-              index off
-            }
+            reverse_proxy unix//run/agent-box-settings/agent.sock
           }
         }
         handle {
@@ -122,6 +119,9 @@
     machine.wait_for_unit("caddy.service")
     machine.wait_for_unit("fail2ban.service")
     machine.wait_for_unit("agent-box@agent.service")
+    # The drop is the settings daemon's now (issue #630), reached over this
+    # socket -- socket-activated, so caddy's first request starts the service.
+    machine.wait_for_unit("agent-box-settings@agent.socket")
     client.wait_for_unit("multi-user.target")
 
     machine_ip = machine.succeed("ip -4 -o addr show eth1 | head -1").split()[3].split("/")[0]
@@ -195,6 +195,66 @@
         )
         client.succeed("grep -q report.txt /tmp/index.html")
 
+        # Issue #630, end to end. A synthetic sibling drop holding a marker
+        # only its own owner should ever hand out...
+        machine.succeed(
+            "install -d -o root -g caddy -m 0750 "
+            "/var/lib/agent-box-downloads/bob"
+        )
+        machine.succeed(
+            "install -m 0644 /dev/stdin "
+            "/var/lib/agent-box-downloads/bob/report.txt "
+            "<<'EOF'\nbob-private-marker\nEOF"
+        )
+        # ...which THIS caddy can read, through the group it shares with
+        # every user's drop. That is what made the escape live: the per-user
+        # auth authorized a URL and caddy's file_server then opened whatever
+        # the path resolved to, under an identity that spans all of them.
+        machine.succeed(
+            "runuser -u caddy -- cat "
+            "/var/lib/agent-box-downloads/bob/report.txt "
+            "| grep bob-private-marker >/dev/null"
+        )
+        # The agent plants the link the same way it drops a file: through
+        # ~/downloads, from inside its own unit's namespace.
+        machine.succeed(
+            f"{in_session} ln -sfn /var/lib/agent-box-downloads/bob/report.txt "
+            "/home/agent/downloads/sibling.txt"
+        )
+        # Refused, and the marker is in neither the body nor the headers.
+        # Before the fix this request answered 200 with bob's file in it.
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /tmp/sibling.html "
+            "-w '%{http_code}' "
+            "https://box.test/agent/downloads/sibling.txt | grep -x 404"
+        )
+        client.fail("grep -q bob-private-marker /tmp/sibling.html")
+
+        # An absolute link to a world-readable system file is refused for
+        # the same reason, and not because of who can read it: it is not in
+        # the drop.
+        machine.succeed(
+            f"{in_session} ln -sfn /etc/hostname "
+            "/home/agent/downloads/host.txt"
+        )
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "https://box.test/agent/downloads/host.txt | grep -x 404"
+        )
+
+        # A link that stays INSIDE the drop still resolves: the rule is
+        # confinement, not a ban on symlinks, so `ln -s` next to a file the
+        # agent already dropped keeps working.
+        machine.succeed(
+            f"{in_session} ln -sfn report.txt "
+            "/home/agent/downloads/latest.txt"
+        )
+        client.succeed(
+            f"{curl} -u agent:testpassword "
+            "https://box.test/agent/downloads/latest.txt "
+            "| grep 'hello from the box' >/dev/null"
+        )
+
     with subtest("a hostile artifact is handed over as an inert attachment"):
         # Issue #631: ~/downloads is served from the SAME origin as the
         # settings page and the terminals, so an artifact rendered INLINE is
@@ -212,6 +272,9 @@
         # An index.html in the drop directory must NOT stand in for the
         # listing: that path is the one the attachment matcher exempts, so
         # serving it would put attacker HTML back on this origin inline.
+        # Since issue #630 the listing is the daemon's own generated page
+        # and nothing looks for an index.html at all -- this asserts that
+        # rather than the `index off` it used to need.
         machine.succeed(
             f"{in_session} tee /home/agent/downloads/index.html > /dev/null <<'EOF'\n"
             "<h1>ATTACKER INDEX</h1>\n"
@@ -230,8 +293,8 @@
         client.succeed("grep -i '^x-content-type-options: nosniff' /tmp/evil.head >/dev/null")
 
         # The listing itself stays a listing: no attachment disposition (it
-        # would download instead of render), and it is Caddy's own page, not
-        # the index.html sitting next to it.
+        # would download instead of render), and it is the daemon's own page,
+        # not the index.html sitting next to it.
         client.succeed(
             f"{curl} -u agent:testpassword -D /tmp/list.head "
             "https://box.test/agent/downloads/ -o /tmp/list.html"
@@ -239,6 +302,17 @@
         client.fail("grep -i '^content-disposition' /tmp/list.head >/dev/null")
         client.fail("grep -F 'ATTACKER INDEX' /tmp/list.html >/dev/null")
         client.succeed("grep -F evil.html /tmp/list.html >/dev/null")
+
+        # The exempt shape is the LISTING and nothing else. A file asked for
+        # with a trailing slash matches `not path */` too, so if the drop
+        # served it there it would arrive without these headers -- the
+        # daemon answers 404 instead (issues #630, #631).
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /tmp/slashed.html "
+            "-w '%{http_code}' "
+            "https://box.test/agent/downloads/evil.html/ | grep -x 404"
+        )
+        client.fail("grep -F 'fetch(' /tmp/slashed.html >/dev/null")
 
         # And a management response may be framed only by this box itself --
         # the workspace iframes each session's terminal from this very origin.

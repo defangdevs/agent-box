@@ -3589,10 +3589,15 @@ in
         @@include:src/caddyfile-portal.caddy@@
       '');
 
+      # @DOWNLOADS_DIR@ is deliberately NOT in this list any more: since
+      # issue #630 the file drop is served by the per-user settings daemon
+      # over @SETTINGS_SOCKET@ rather than by caddy's own file_server, so the
+      # only thing that still needs the path is that daemon's unit
+      # environment (AGENT_BOX_DOWNLOADS_DIR, below).
       terminalCaddyBlock = name:
         lib.replaceStrings
-          [ "@USER@" "@USER_ENV@" "@SETTINGS_SOCKET@" "@DOWNLOADS_DIR@" "@TTYD_PORT@" ]
-          [ name (envName name) (settingsSocketOf name) (downloadsDirOf name) (toString portOf.${name}) ] ''
+          [ "@USER@" "@USER_ENV@" "@SETTINGS_SOCKET@" "@TTYD_PORT@" ]
+          [ name (envName name) (settingsSocketOf name) (toString portOf.${name}) ] ''
         @@include:src/caddyfile-terminal.caddy@@
       '';
 
@@ -3851,6 +3856,12 @@ in
         // lib.listToAttrs (map (name: lib.nameValuePair "agent-box/units/agent-box-settings-${name}.env" {
           text =
             "AGENT_BOX_PASSWORD_CMD=/run/wrappers/bin/sudo -n ${passwordHelperCmdOf name}\n"
+            # The file drop this user's daemon serves at
+            # /<user>/downloads/ (issue #630): caddy proxies that path
+            # here instead of serving the tree itself, so the daemon is
+            # what needs to know where the tree is. The same dir the
+            # tmpfiles rule creates and ~/downloads points at.
+            + "AGENT_BOX_DOWNLOADS_DIR=${downloadsDirOf name}\n"
             + lib.optionalString (name == rootUser) (
                 # This daemon also serves the vhost root: GET / picks a
                 # user (with one terminal user, the norm, it redirects

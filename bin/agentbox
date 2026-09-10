@@ -2530,6 +2530,13 @@ class Renderer:
             settings = [
                 ("AGENT_BOX_PASSWORD_CMD",
                  f"/usr/bin/sudo -n /etc/agent-box/bin/agent-box-password-{u.name}"),
+                # The file drop this user's daemon serves at
+                # /<user>/downloads/ (issue #630): caddy proxies that path
+                # to the daemon instead of serving the tree itself, so the
+                # daemon is what needs to know where the tree is. Same dir
+                # the tmpfiles rule below creates and ~/downloads points at.
+                ("AGENT_BOX_DOWNLOADS_DIR",
+                 f"/var/lib/agent-box-downloads/{u.name}"),
                 # Agent profiles (issue #321, step 5). The settings page
                 # resolves a profile onto harness arguments by running this,
                 # never by mapping the keys itself — one resolver, shared
@@ -3308,15 +3315,17 @@ class Renderer:
             if user is not None:
                 # Bind every token the fragments carry. The values mirror the
                 # module's helpers one for one (settingsSocketOf,
-                # downloadsDirOf, webhookSocketOf, webhookPathOf, envName),
-                # because the rendered Caddyfile has to be the same text on
-                # both backends.
+                # webhookSocketOf, webhookPathOf, envName), because the
+                # rendered Caddyfile has to be the same text on both
+                # backends. No @DOWNLOADS_DIR@ since issue #630: the file
+                # drop is served by the per-user settings daemon over
+                # @SETTINGS_SOCKET@, not by caddy's own file_server, so the
+                # path is bound into that daemon's unit environment
+                # (AGENT_BOX_DOWNLOADS_DIR) rather than into this fragment.
                 for token, value in [
                     ("@USER_ENV@", user.env_key),
                     ("@SETTINGS_SOCKET@",
                      f"/run/agent-box-settings/{user.name}.sock"),
-                    ("@DOWNLOADS_DIR@",
-                     f"/var/lib/agent-box-downloads/{user.name}"),
                     ("@TTYD_PORT@", str(user.ttyd_port)),
                     ("@WEBHOOK_PATH@", f"/{user.name}/webhook"),
                     ("@WEBHOOK_SOCKET@",
