@@ -1,21 +1,17 @@
 name: AWS template CI
 
 on:
+  # No `paths:` filter here, on purpose (issue #632): a
+  # trigger-level filter means the workflow never STARTS on a
+  # change it does not match, and a workflow that never starts
+  # reports no check run at all - so the check cannot be
+  # required without leaving unrelated pull requests pending
+  # forever. The filter lives in .github/path-filters/aws-ci.paths,
+  # read by the `changes` job; the `gate` job reports either
+  # way and is the check to require.
   push:
     branches: [ master ]
-    paths: &aws-ci-paths
-      - 'deploy/aws/template.yaml'
-      - 'deploy/aws/lightsail-template.yaml'
-      - 'docs/index.html'
-      - 'scripts/ws_smoke.py'
-      - 'scripts/check_lightsail_userdata.py'
-      - 'bin/agentbox'
-      - 'tests/test_agentbox.py'
-      - 'tests/native/**'
-      - '.github/workflows/aws-ci.yml'
-      - '.github/workflows/deploy-test.yml'
   pull_request:
-    paths: *aws-ci-paths
   workflow_dispatch:
 
 concurrency:
@@ -26,8 +22,41 @@ permissions:
   contents: read
 
 jobs:
+  # Cheap, always runs, and decides for the expensive job below (issue
+  # #632). Its own failure is a gate failure: "we could not work out
+  # whether the checks were needed" must never read as "they passed".
+  changes:
+    name: Decide whether AWS template CI's build paths changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.filter.outputs.build }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Both ends of the range have to be IN the clone; the default
+          # depth-1 checkout has neither a pull request's base nor a
+          # push's `before`.
+          fetch-depth: 0
+
+      - name: Match the changed paths against the filter
+        id: filter
+        env:
+          # HEAD for both events: on a pull request actions/checkout leaves
+          # the MERGE commit checked out, whose merge base with base.sha is
+          # base.sha itself, so `base...HEAD` is exactly the pull request's
+          # own diff.
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          answer=$(python3 scripts/changed_paths.py \
+            .github/path-filters/aws-ci.paths --base "$BASE" --head HEAD)
+          echo "build=$answer" >> "$GITHUB_OUTPUT"
+          echo "::notice::AWS template CI build paths changed: $answer"
+
   validate:
     name: Validate AWS template and smoke helper
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -57,3 +86,42 @@ jobs:
 
       - name: Compile WebSocket smoke helper
         run: python3 -m py_compile scripts/ws_smoke.py
+
+  # THE check to require in the branch ruleset (issue #632): reported on
+  # every push and every pull request, whatever paths they touch, so it
+  # can never be the required-but-never-reported check that leaves a pull
+  # request permanently unmergeable.
+  gate:
+    name: AWS template gate
+    needs: [ changes, validate ]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report the aggregate result
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          VALIDATE: ${{ needs.validate.result }}
+          BUILD: ${{ needs.changes.outputs.build }}
+        run: |
+          echo "changes=$CHANGES build=$BUILD validate=$VALIDATE"
+          if [ "$CHANGES" != "success" ]; then
+            echo "::error::the changes job did not succeed ($CHANGES), so nothing here knows whether the checks were needed."
+            exit 1
+          fi
+          case "$VALIDATE" in
+            success)
+              echo "AWS template CI passed."
+              ;;
+            skipped)
+              if [ "$BUILD" = "true" ]; then
+                echo "::error::the build paths changed but validate was skipped - the guard expression on that job is wrong."
+                exit 1
+              fi
+              echo "No relevant path changed; AWS template CI had nothing to run."
+              ;;
+            *)
+              echo "::error::validate did not pass ($VALIDATE)."
+              exit 1
+              ;;
+          esac

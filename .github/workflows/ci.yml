@@ -1,46 +1,19 @@
 name: CI
 
 on:
+  # No `paths:` filter here, on purpose (issue #632). A trigger-level
+  # filter means the workflow never STARTS on a change it does not match,
+  # and a workflow that never starts reports no check run at all - so
+  # requiring green CI in the branch ruleset would have left every
+  # docs-only pull request pending forever on a check nothing would ever
+  # report. The filter moved down a level, to
+  # .github/path-filters/ci.paths, which the `changes` job below reads:
+  # the workflow always starts, the expensive `validate` job is skipped
+  # when nothing relevant changed, and the `gate` job at the bottom
+  # reports success or failure either way. `gate` is the check to require.
   push:
     branches: [ master ]
-    paths: &build-paths
-      - '**.nix'
-      # Sources of the generated modules/agent-box.nix (issue #140): a change
-      # here can reassemble to the same bytes (a pure refactor), so it would
-      # not touch a *.nix file — match them explicitly so the module-generated-
-      # up-to-date guard (and the rest of CI) still runs.
-      - 'modules/agent-box.nix.in'
-      - 'modules/src/**'
-      - 'bin/assemble-module.py'
-      - 'tests/test-assemble-module.py'
-      # The vendored third-party assets under modules/src/vendor are matched
-      # by 'modules/src/**' above; this is the checker that verifies them.
-      - 'scripts/check_vendor.py'
-      # Every workflow, not just this one: CI validates no other workflow's
-      # YAML, so a file that cannot parse is simply never run and nothing
-      # says so. PR #483 shipped exactly that — vendor-updates.yml had a
-      # heredoc dedented out of its `run: |` block scalar, CI stayed green,
-      # and the weekly job would have silently never fired.
-      - '.github/workflows/**'
-      - 'tests/test-envstore.py'
-      # The native-render fixture (issue #154 Phase 4): the renderer under
-      # test, the test itself, and its committed expected/ snapshot must all
-      # re-run agentbox-render when any one changes, or a stale fixture only
-      # surfaces via a manual dispatch (as it did for PR #381).
-      - 'bin/agentbox'
-      - 'tests/test_agentbox.py'
-      - 'tests/native/**'
-      # The mascot mark (issue #185) is embedded into the settings daemon at
-      # assemble time, so it is a module source as much as a website asset.
-      - 'docs/potato.svg'
-      # The golden behavior snapshot (issue #154): the fixture and its
-      # renderer must re-run the golden-snapshot check when either changes.
-      - 'bin/golden-snapshot.py'
-      - 'tests/golden/**'
-      - 'flake.lock'
-      - '.github/workflows/ci.yml'
   pull_request:
-    paths: *build-paths
   workflow_dispatch:
 
 concurrency:
@@ -54,8 +27,43 @@ permissions:
   contents: read
 
 jobs:
+  # Cheap, always runs, and decides for the expensive job below. Its own
+  # failure is a gate failure: "we could not work out whether the checks
+  # were needed" must never read as "the checks passed".
+  changes:
+    name: Decide whether CI's build paths changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.filter.outputs.build }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Both ends of the range have to be IN the clone. The default
+          # depth-1 checkout has neither a pull request's base nor a
+          # push's `before`, and changed_paths.py answers "true" rather
+          # than guessing when the range is unreadable - correct, but it
+          # would run the whole VM suite on every docs commit.
+          fetch-depth: 0
+
+      - name: Match the changed paths against the filter
+        id: filter
+        env:
+          # HEAD for both events: on a pull request actions/checkout leaves
+          # the MERGE commit checked out, whose merge base with base.sha is
+          # base.sha itself, so `base...HEAD` is exactly the pull request's
+          # own diff without needing the head commit to be present.
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          answer=$(python3 scripts/changed_paths.py \
+            .github/path-filters/ci.paths --base "$BASE" --head HEAD)
+          echo "build=$answer" >> "$GITHUB_OUTPUT"
+          echo "::notice::CI build paths changed: $answer"
+
   validate:
     name: Validate module & VM
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     # A hung VM test otherwise burns the runner for GitHub's 360-minute
     # default (a sessions-test hang once ran ~60 min before dying). Green
@@ -256,24 +264,30 @@ jobs:
       # list alphabetical so the diff against `nix eval .#checks.<system>
       # --apply builtins.attrNames` is readable by eye.
       #
-      # What they cover, in order: the box's own repo checkout and the
-      # `selfUpdate` path assertions behind it (#242); lazily-installed
-      # harnesses; the durable per-session lease (#535); the portal,
-      # profile-panel and session routes/panels; the session registry's
-      # write protocol; the source tree an update moves (#242); the VM
-      # test-script size guard itself (#610); the screenshot uploader;
-      # and the five webhook units - a claim's payload rules, the
-      # ceiling's EX_TEMPFAIL contract, the settings panel's states, the
-      # spawn wrapper's own claim parsing, and the "@self" resolver/cache.
+      # What they cover, in order: the path filters this job's own gate
+      # is decided by, and the guard against a gated workflow growing a
+      # trigger-level `paths:` again (#632); the box's own repo checkout
+      # and the `selfUpdate` path assertions behind it (#242);
+      # lazily-installed harnesses; the durable per-session lease (#535);
+      # the portal and profile-panel routes/panels; the release manifest
+      # promotion records and refuses to fake (#632); the session route;
+      # the session registry's write protocol; the source tree an update
+      # moves (#242); the VM test-script size guard itself (#610); the
+      # screenshot uploader; and the five webhook units - a claim's
+      # payload rules, the ceiling's EX_TEMPFAIL contract, the settings
+      # panel's states, the spawn wrapper's own claim parsing, and the
+      # "@self" resolver/cache.
       - name: Run the remaining native checks
         run: |
           nix build -L --keep-going --no-link \
+            .#checks.x86_64-linux.changed-paths \
             .#checks.x86_64-linux.checkout-bootstrap \
             .#checks.x86_64-linux.checkout-options \
             .#checks.x86_64-linux.jit-agents \
             .#checks.x86_64-linux.lease-protocol \
             .#checks.x86_64-linux.portal-route \
             .#checks.x86_64-linux.profile-panel \
+            .#checks.x86_64-linux.release-manifest \
             .#checks.x86_64-linux.session-route \
             .#checks.x86_64-linux.sessions-registry \
             .#checks.x86_64-linux.source-tree \
@@ -409,3 +423,45 @@ jobs:
           webhook_status=0; wait "$webhook" || webhook_status=$?
           rest_status=0; wait "$rest" || rest_status=$?
           [ "$sessions_status" -eq 0 ] && [ "$webhook_status" -eq 0 ] && [ "$rest_status" -eq 0 ]
+
+  # THE check to require in the branch ruleset (issue #632): reported on
+  # every push and every pull request, whatever paths they touch, so it
+  # can never be the required-but-never-reported check that makes a pull
+  # request unmergeable. It reports what actually happened rather than
+  # what ran - including the case a plain "did validate pass?" would get
+  # wrong, where the guard expression skipped the job even though the
+  # paths did change.
+  gate:
+    name: CI gate
+    needs: [ changes, validate ]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report the aggregate CI result
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          VALIDATE: ${{ needs.validate.result }}
+          BUILD: ${{ needs.changes.outputs.build }}
+        run: |
+          echo "changes=$CHANGES build=$BUILD validate=$VALIDATE"
+          if [ "$CHANGES" != "success" ]; then
+            echo "::error::the changes job did not succeed ($CHANGES), so nothing here knows whether CI was needed."
+            exit 1
+          fi
+          case "$VALIDATE" in
+            success)
+              echo "CI passed."
+              ;;
+            skipped)
+              if [ "$BUILD" = "true" ]; then
+                echo "::error::the build paths changed but validate was skipped - the guard expression on that job is wrong."
+                exit 1
+              fi
+              echo "No build-relevant path changed; CI had nothing to run."
+              ;;
+            *)
+              echo "::error::validate did not pass ($VALIDATE)."
+              exit 1
+              ;;
+          esac

@@ -8,6 +8,57 @@ on:
       - 'modules/**'
       - 'scripts/ws_smoke.py'
       - '.github/workflows/deploy-test.yml'
+  # Called by promote.yml, so that promotion tests the EXACT candidate it
+  # is about to publish (issue #632). Everything the manifest pins arrives
+  # here as an input instead of being resolved again: `ref` is the
+  # candidate commit, and the four pin inputs are the identities
+  # release_manifest.py recorded once. A run with them set boots the same
+  # box the 1-click templates will create - which the push-triggered runs
+  # below deliberately do NOT, since a source-template launch is supposed
+  # to track the default branch and the base channel.
+  #
+  # Note which leg decides: ipv6-outputs is `continue-on-error` until
+  # issue #190 is diagnosed, so a caller waiting on this workflow is
+  # waiting on the ipv4-full leg.
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit to test (default: the caller's sha)"
+        type: string
+        default: ''
+      agent_box_rev:
+        description: AgentBoxRev from the candidate's release manifest
+        type: string
+        default: ''
+      agent_box_sha256:
+        description: AgentBoxSha256 from the candidate's release manifest
+        type: string
+        default: ''
+      agent_nixpkgs_url:
+        description: AgentNixpkgsUrl from the candidate's release manifest
+        type: string
+        default: ''
+      agent_nixpkgs_sha256:
+        description: AgentNixpkgsSha256 from the candidate's release manifest
+        type: string
+        default: ''
+      region:
+        type: string
+        default: us-west-2
+      instance_type:
+        type: string
+        default: t4g.small (2 vCPU / 2 GiB)
+      destroy:
+        type: boolean
+        default: true
+      use_spot:
+        type: boolean
+        default: false
+      web_password:
+        # Declared so the shared steps below can read it on either path;
+        # promotion never sets it.
+        type: string
+        default: ''
   workflow_dispatch:
     inputs:
       region:
@@ -110,6 +161,11 @@ jobs:
           fi
 
       - uses: actions/checkout@v5
+        with:
+          # Empty means "whatever triggered this run", which is what the
+          # push and dispatch paths want. promote.yml passes the candidate
+          # commit, so the tree tested is the tree promoted.
+          ref: ${{ inputs.ref }}
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -130,19 +186,57 @@ jobs:
             echo "value=$(openssl rand -hex 24)" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Compute module pin (AgentBoxRev + AgentBoxSha256)
+      - name: Resolve the pins this run tests
         id: pin
-        # The source template intentionally has no Default: for these — see
-        # publish-template.yml for the same computation on the S3 path. Here
-        # we pin to the commit that triggered this run so deploy-test always
-        # exercises the module content that just landed.
+        # Two callers, two meanings, and the difference is the point of
+        # issue #632.
+        #
+        # A push or a dispatch has no manifest: pin AgentBoxRev/Sha256 to
+        # the commit that triggered the run and leave the nixpkgs pair
+        # EMPTY, so the box tracks the base channel exactly as a
+        # source-template launch does. That is the early-warning run.
+        #
+        # promote.yml passes the candidate's recorded identities. Then all
+        # four are pinned, and the box this test boots is pinned to the
+        # same source AND the same dependency set the published templates
+        # will carry - which is what "run the deployment tests against
+        # THAT candidate" has to mean. Before this, deploy-test left the
+        # channel unpinned while publish-template re-resolved it, so the
+        # tested box and the 1-click box were never the same artifact.
+        env:
+          IN_REV: ${{ inputs.agent_box_rev }}
+          IN_SHA: ${{ inputs.agent_box_sha256 }}
+          IN_NIXPKGS_URL: ${{ inputs.agent_nixpkgs_url }}
+          IN_NIXPKGS_SHA: ${{ inputs.agent_nixpkgs_sha256 }}
         run: |
-          rev="${{ github.sha }}"
-          sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/agent-box.nix" \
-            | openssl dgst -sha256 -binary | base64)"
-          echo "rev=$rev" >> "$GITHUB_OUTPUT"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "::notice::Pinned AgentBoxRev=$rev AgentBoxSha256=$sha"
+          if [ -n "$IN_REV" ]; then
+            if [ -z "$IN_SHA" ]; then
+              echo "::error::agent_box_rev was given without agent_box_sha256 - an unpinned pair would silently fetch a different module."
+              exit 1
+            fi
+            if [ -n "$IN_NIXPKGS_URL" ] && [ -z "$IN_NIXPKGS_SHA" ]; then
+              echo "::error::agent_nixpkgs_url was given without agent_nixpkgs_sha256 - the template requires the pair or neither."
+              exit 1
+            fi
+            rev="$IN_REV"
+            sha="$IN_SHA"
+            nixpkgs_url="$IN_NIXPKGS_URL"
+            nixpkgs_sha="$IN_NIXPKGS_SHA"
+            echo "::notice::Testing the promotion candidate's recorded pins."
+          else
+            rev="${{ github.sha }}"
+            sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/agent-box.nix" \
+              | openssl dgst -sha256 -binary | base64)"
+            nixpkgs_url=""
+            nixpkgs_sha=""
+          fi
+          {
+            echo "rev=$rev"
+            echo "sha=$sha"
+            echo "nixpkgs_url=$nixpkgs_url"
+            echo "nixpkgs_sha=$nixpkgs_sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::Pinned AgentBoxRev=$rev AgentBoxSha256=$sha AgentNixpkgsUrl=${nixpkgs_url:-(base channel)}"
 
       - name: Create stack
         id: create
@@ -168,6 +262,8 @@ jobs:
                 "ParameterKey=EnableSsm,ParameterValue=true" \
                 "ParameterKey=AgentBoxRev,ParameterValue=${{ steps.pin.outputs.rev }}" \
                 "ParameterKey=AgentBoxSha256,ParameterValue=${{ steps.pin.outputs.sha }}" \
+                "ParameterKey=AgentNixpkgsUrl,ParameterValue=${{ steps.pin.outputs.nixpkgs_url }}" \
+                "ParameterKey=AgentNixpkgsSha256,ParameterValue=${{ steps.pin.outputs.nixpkgs_sha }}" \
               --on-failure DO_NOTHING \
               --capabilities CAPABILITY_IAM \
               --tags "Key=Purpose,Value=agent-box-e2e" "Key=RunId,Value=${{ github.run_id }}"

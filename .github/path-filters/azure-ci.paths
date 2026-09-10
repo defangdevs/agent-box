@@ -1,0 +1,9 @@
+# The build paths for .github/workflows/azure-ci.yml. Moved out of that
+# workflow's trigger blocks so the gate job is reported on every pull
+# request - see scripts/changed_paths.py and issue #632.
+
+deploy/azure/**
+scripts/check_azure_template.py
+.github/path-filters/azure-ci.paths
+scripts/changed_paths.py
+.github/workflows/azure-ci.yml
