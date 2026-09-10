@@ -35,6 +35,35 @@
   ],
   "wrappers": [
     {
+      "name": "agent-box-harness",
+      "env": [
+        {
+          "name": "AGENT_BOX_NIXPKGS",
+          "kind": "config",
+          "key": "jitNixpkgs",
+          "why": [
+            "The pin this box installs a harness FROM, and therefore the pin",
+            "`agent-box-harness upgrade` moves an installed one onto. It is the",
+            "same value the agent unit carries, but this CLI is run by a person",
+            "from a login shell where no unit's environment reaches - which is",
+            "the whole reason the three reports behind this (#559, #590, #614)",
+            "each ended in a hand-run nix command instead of a box command."
+          ]
+        },
+        {
+          "name": "AGENT_BOX_FLOCK_BIN",
+          "kind": "bin",
+          "program": "flock",
+          "why": [
+            "An upgrade removes and re-adds a profile element, so it must hold",
+            "the same lock agent_install takes: a session starting right now may",
+            "be inside the install path for the very harness being moved. A",
+            "pane's PATH does not carry flock (issue #254), so pin it."
+          ]
+        }
+      ]
+    },
+    {
       "name": "agent-box-webhook",
       "env": [
         {

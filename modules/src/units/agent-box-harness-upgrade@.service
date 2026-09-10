@@ -1,0 +1,64 @@
+[Unit]
+# Move %i's agent CLIs onto the pin this box carries now (issues #559,
+# #590, #614 - one report three times).
+#
+# A harness is installed just-in-time into the USER's profile and only
+# when the binary is missing (issue #416), so a release that moves the pin
+# reaches a box that has never started that harness and no other. The
+# update service starts this unit, per user, once the new pin is in place;
+# that is what makes "Update agent-box" do what its own button has always
+# said it does - "Updates agent-box and its AI tools".
+#
+# Per user and not one box-wide run, for the reason every other per-user
+# unit here exists: a nix profile belongs to its owner, and root writing
+# another user's profile generation is how you get a profile that user can
+# no longer manage.
+Description=Move %i's agent-box CLIs onto this box's current pin
+After=network-online.target
+Wants=network-online.target
+# Nothing to do for a user who has never started a harness - and nothing
+# to fail, either. The CLI itself is a clean no-op there ("not installed
+# for <user>"), so this is only about not paying for a unit start.
+ConditionPathIsDirectory=/home/%i/.nix-profile
+
+[Service]
+Type=oneshot
+User=%i
+# `nix profile` locates the profile through $HOME, which a system unit
+# does not set, and agent_nix_bin probes $HOME/.nix-profile/bin/nix as one
+# of the two standard install layouts.
+Environment=HOME=/home/%i
+# Both backends' locations are listed and the missing one is simply
+# skipped by PATH lookup, which is what lets this stay ONE shared unit
+# instead of two that can drift - the same trick agent-box-docker@ uses
+# for /run/wrappers/bin.
+#
+# On NixOS this line is OVERRIDDEN and that is fine. Declaring
+# systemd.services."<unit>@" to resolve the ExecStart below also gets that
+# module's own default Environment=PATH= (coreutils, findutils, gnugrep,
+# gnused, systemd) in the generated drop-in, and a drop-in's assignment
+# wins over the main file's. What the payload actually needs is coreutils
+# - timeout, mkdir, date - which that default carries; nix it finds by
+# absolute path through agent_nix_bin's probe and flock arrives as
+# AGENT_BOX_FLOCK_BIN, so neither depends on this line on either backend.
+# Said out loud because the same override silently disabled
+# ExecSearchPath= on agent-box@ and cost a debugging session there.
+Environment=PATH=/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin
+# Overridden by each backend with the resolved path of the generated
+# wrapper (contract kind "cli"), exactly as agent-box@ does for the
+# supervisor. Bare here so the shared file names a PROGRAM and never a
+# path neither backend agrees on.
+ExecStart=agent-box-harness upgrade
+# The inner nix calls are each bounded by AGENT_BOX_JIT_INSTALL_TIMEOUT_S
+# (1800s by default), and a harness closure is a few hundred MiB over a
+# link this unit does not get to choose. A unit timeout on top of that
+# would only ever cut a download that is still making progress.
+TimeoutStartSec=infinity
+# A move that did not happen is not a red unit. The commonest reason by
+# far is a box that is offline, which is a normal state and not something
+# an operator should have to clear out of `systemctl --failed`; the pin
+# file is left alone either way, so the next update simply tries again.
+# What the run actually did is in the journal, and `agent-box-harness ls`
+# says where each CLI stands without reading a unit at all.
+SuccessExitStatus=0 1
+StandardInput=null

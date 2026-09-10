@@ -138,6 +138,29 @@ SRC_TREE_BINDING = (
     "pins selfUpdate.branch, which the golden host does not, so an entry for "
     "it would be a stale line by the next run of this check")
 
+# Both halves of "after a successful update, move each user's installed
+# agent CLIs onto the new pin" (issues #559, #590, #614). Module-only for
+# exactly the SRC_TREE_BINDING reason above, one level along: the module's
+# updater IS a unit script, so what update.sh needs has to arrive as unit
+# environment, while native's updater is a Python function that already
+# holds the parsed spec and the profile - post_switch calls
+# start_harness_upgrades(args.config, profile) and reads both answers out
+# of the config it just applied. A unit line natively would be a second,
+# staler copy of a value the renderer can simply look up. The UNIT the two
+# of them start is shared and byte-identical
+# (modules/src/units/agent-box-harness-upgrade@.service); it is only the
+# trigger that lives in a different kind of place on each backend.
+HARNESS_UPGRADE_TRIGGER = (
+    "the update's trigger for the per-user harness upgrade (#559/#590/#614). "
+    "Module-only for the SRC_TREE_BINDING reason one level along: the "
+    "module's updater is a UNIT SCRIPT, so update.sh can only be told which "
+    "users to move and whether to move them through the unit's environment. "
+    "Native's updater is a function - post_switch already holds the parsed "
+    "spec and reads spec.agent_upgrade and spec.users directly - so a unit "
+    "line there would be a second copy of a value the renderer can look up, "
+    "frozen at render time. The unit both of them start is shared and "
+    "byte-identical; only the trigger differs")
+
 BY_DESIGN = {
     "AGENT_BOX_USERS": (
         "module",
@@ -218,7 +241,10 @@ BY_DESIGN = {
     "AGENT_BOX_SRC_DIR": ("module", SRC_TREE_BINDING),
     "AGENT_BOX_SRC_URL": ("module", SRC_TREE_BINDING),
     "AGENT_BOX_SRC_REV": ("module", SRC_TREE_BINDING),
+    "AGENT_BOX_AGENT_UPGRADE": ("module", HARNESS_UPGRADE_TRIGGER),
+    "AGENT_BOX_UPGRADE_USERS": ("module", HARNESS_UPGRADE_TRIGGER),
 }
+
 
 # One reason, cited by the four entries below, so it has one home rather
 # than four copies to keep in step. Box-wide only: the per-unit pass

@@ -879,6 +879,72 @@ let
       SocketGroup=caddy
       SocketMode=0660
     ''} $out/etc/systemd/system/agent-box-webhook@.socket
+    install -m444 ${pkgs.writeText "agent-box-harness-upgrade@.service" ''
+      [Unit]
+      # Move %i's agent CLIs onto the pin this box carries now (issues #559,
+      # #590, #614 - one report three times).
+      #
+      # A harness is installed just-in-time into the USER's profile and only
+      # when the binary is missing (issue #416), so a release that moves the pin
+      # reaches a box that has never started that harness and no other. The
+      # update service starts this unit, per user, once the new pin is in place;
+      # that is what makes "Update agent-box" do what its own button has always
+      # said it does - "Updates agent-box and its AI tools".
+      #
+      # Per user and not one box-wide run, for the reason every other per-user
+      # unit here exists: a nix profile belongs to its owner, and root writing
+      # another user's profile generation is how you get a profile that user can
+      # no longer manage.
+      Description=Move %i's agent-box CLIs onto this box's current pin
+      After=network-online.target
+      Wants=network-online.target
+      # Nothing to do for a user who has never started a harness - and nothing
+      # to fail, either. The CLI itself is a clean no-op there ("not installed
+      # for <user>"), so this is only about not paying for a unit start.
+      ConditionPathIsDirectory=/home/%i/.nix-profile
+
+      [Service]
+      Type=oneshot
+      User=%i
+      # `nix profile` locates the profile through $HOME, which a system unit
+      # does not set, and agent_nix_bin probes $HOME/.nix-profile/bin/nix as one
+      # of the two standard install layouts.
+      Environment=HOME=/home/%i
+      # Both backends' locations are listed and the missing one is simply
+      # skipped by PATH lookup, which is what lets this stay ONE shared unit
+      # instead of two that can drift - the same trick agent-box-docker@ uses
+      # for /run/wrappers/bin.
+      #
+      # On NixOS this line is OVERRIDDEN and that is fine. Declaring
+      # systemd.services."<unit>@" to resolve the ExecStart below also gets that
+      # module's own default Environment=PATH= (coreutils, findutils, gnugrep,
+      # gnused, systemd) in the generated drop-in, and a drop-in's assignment
+      # wins over the main file's. What the payload actually needs is coreutils
+      # - timeout, mkdir, date - which that default carries; nix it finds by
+      # absolute path through agent_nix_bin's probe and flock arrives as
+      # AGENT_BOX_FLOCK_BIN, so neither depends on this line on either backend.
+      # Said out loud because the same override silently disabled
+      # ExecSearchPath= on agent-box@ and cost a debugging session there.
+      Environment=PATH=/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin
+      # Overridden by each backend with the resolved path of the generated
+      # wrapper (contract kind "cli"), exactly as agent-box@ does for the
+      # supervisor. Bare here so the shared file names a PROGRAM and never a
+      # path neither backend agrees on.
+      ExecStart=agent-box-harness upgrade
+      # The inner nix calls are each bounded by AGENT_BOX_JIT_INSTALL_TIMEOUT_S
+      # (1800s by default), and a harness closure is a few hundred MiB over a
+      # link this unit does not get to choose. A unit timeout on top of that
+      # would only ever cut a download that is still making progress.
+      TimeoutStartSec=infinity
+      # A move that did not happen is not a red unit. The commonest reason by
+      # far is a box that is offline, which is a normal state and not something
+      # an operator should have to clear out of `systemctl --failed`; the pin
+      # file is left alone either way, so the next update simply tries again.
+      # What the run actually did is in the journal, and `agent-box-harness ls`
+      # says where each CLI stands without reading a unit at all.
+      SuccessExitStatus=0 1
+      StandardInput=null
+    ''} $out/etc/systemd/system/agent-box-harness-upgrade@.service
   '' + lib.optionalString cfg.containers.enable ''
     install -m444 ${pkgs.writeText "agent-box-docker@.service" ''
       [Unit]
@@ -2903,45 +2969,43 @@ done
     # (issue #461).
     #
     # Not in nixpkgs, so there is no `attr` a card could fetch. DefangLabs/defang
-    # ships its own canonical packaging at pkgs/defang/cli.nix - `buildGo125Module`
-    # against the repo's own src/, with a vendorHash that is only ever valid for
-    # the go.sum sitting next to it. Fetching the whole source tree at one pinned
-    # tag and calling THEIR file, rather than re-deriving a build here, means that
-    # hash never needs maintaining: it travels with the tag. (The file beside it,
-    # pkgs/defang/default.nix - a fetchurl of the prebuilt release binary - is
-    # lib.warn-marked deprecated upstream and stuck on an old version; don't reach
-    # for that one.)
+    # ships its own flake, and `packages.<system>.defang-cli` in it is
+    # `buildGo125Module` against the repo's own src/ - so this asks for that
+    # output at a release TAG and nothing else.
     #
-    # The nixpkgs pin is NOT this box's nixpkgs, and that is the whole point. A
-    # derivation's output hash is a function of every input, nixpkgs included, so
-    # building cli.nix against whatever nixpkgs the host happens to have produces a
-    # DIFFERENT derivation than DefangLabs' release CI built, silently misses the
-    # binary cache, and compiles ~100 MB of Go instead - which is what OOM'd a
-    # 2 GiB box in issue #373. So this pins the revision DefangLabs/defang's own
-    # flake.lock pins at the tag below.
+    # It used to re-implement the flake by hand: fetch the source tarball at the
+    # tag, fetch the nixpkgs revision the repo's flake.lock names, and
+    # callPackage pkgs/defang/cli.nix with it. That worked and needed THREE pins
+    # kept in step by hand ("Bump all three pins together", the note said). The
+    # flake carries its own lock, so the tag below is now the only pin, and the
+    # nixpkgs question answers itself.
     #
-    # Verified 2026-08-31: both architectures are prebuilt in the public cache, so
-    # an install substitutes rather than builds -
-    #   x86_64-linux   /nix/store/pxa0iq32xsp8pql6k2nn2gsgcll4fzf0-defang-cli-git
-    #   aarch64-linux  /nix/store/yayqldvzrg66lpajmcpnf9h5jvgvlxyd-defang-cli-git
-    # both HTTP 200 at https://defanglabs.cachix.org/<hash>.narinfo. The closure is
-    # 104.8 MiB over 4 paths, which is why it is fetched ON DEMAND and not shipped
-    # in the runtime profile.
+    # The nixpkgs the build sees is still NOT this box's, which was the whole
+    # point of the hand-written version and is preserved here: a derivation's
+    # output hash is a function of every input, so building cli.nix against
+    # whatever nixpkgs the host happens to have produces a DIFFERENT derivation
+    # than DefangLabs' release CI built, silently misses the binary cache, and
+    # compiles ~100 MB of Go instead - which is what OOM'd a 2 GiB box in issue
+    # #373. Going through the flake gets the repo's own locked nixpkgs by
+    # construction rather than by a hash somebody has to remember to move.
     #
-    # Bump all three pins together when moving to a new defang tag:
-    #   curl -sL https://raw.githubusercontent.com/DefangLabs/defang/vX.Y.Z/flake.lock \
-    #     | jq '.nodes.nixpkgs.locked | {url, sha256: .narHash}'
-    let
-      defangSrc = builtins.fetchTarball {
-        url = "https://github.com/DefangLabs/defang/archive/refs/tags/v3.15.0.tar.gz";
-        sha256 = "sha256-9wfaHVqxJprJUoP5meQEgmRfV6kJugonmO714gaR1tc=";
-      };
-      defangPkgs = import (builtins.fetchTarball {
-        url = "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1057999.afe3d8ac4395/nixexprs.tar.xz";
-        sha256 = "sha256-93GX5Q/npwBE92xpHlktxgGztuIP/2kwOMukz+qyJBk=";
-      }) { system = builtins.currentSystem; };
-    in
-    defangPkgs.callPackage "''${defangSrc}/pkgs/defang/cli.nix" { }
+    # Verified 2026-09-09, aarch64-linux: this expression and the hand-written
+    # one it replaces evaluate to the SAME store path,
+    # /nix/store/yayqldvzrg66lpajmcpnf9h5jvgvlxyd-defang-cli-git - the one the
+    # previous version of this file recorded as cache-warm at
+    # https://defanglabs.cachix.org. So the substituter still hits and no box
+    # starts compiling Go because of this change.
+    #
+    # getFlake, not fetchTarball + callPackage: both backends already enable the
+    # flakes feature box-wide (nix.settings.experimental-features on NixOS,
+    # --extra-experimental-features natively) and every caller of this file
+    # evaluates it with --impure, which is what an unlocked ref like a tag
+    # needs. builtins.currentSystem needs the same impurity and the previous
+    # version used it too.
+    #
+    # To move to a new defang release, change the tag. That is the whole edit.
+    (builtins.getFlake "github:DefangLabs/defang/v3.15.0")
+      .packages.''${builtins.currentSystem}.defang-cli
   '';
   # Where the background service installs it (outside the Nix profile, since
   # nothing here builds it eval-time) — connectBins and the curated agent
@@ -3002,7 +3066,8 @@ done
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli uploadCli ]
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli uploadCli
+         harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli ]
@@ -4711,6 +4776,595 @@ case "$cmd" in
     exit 2
     ;;
 esac
+  '');
+
+  # Moving a JIT-installed harness onto the pin the box carries now (issues
+  # #559, #590, #614). Its environment comes from the wrapper contract
+  # rather than from hand-written exports like profileCli's above: this CLI
+  # is run by a PERSON from a login shell, so nothing a unit sets reaches
+  # it, and the value it cannot do without (the pin) is one both backends
+  # must agree on to the character.
+  harnessCli = pkgs.writeShellScriptBin "agent-box-harness"
+    (wrapperEnv "agent-box-harness" + ''
+# agent-box-harness — what this box installed into your profile, and how to
+# move it (issues #559, #590, #614).
+#
+# Those three reports are one report: a model or a feature needs a newer
+# CLI, the box updates, and the CLI does not move. It cannot. A harness is
+# installed just-in-time into the USER's profile, once, when the binary is
+# missing (issue #416) — so a release that bumps the pin reaches a box that
+# has never started that harness, and no other. Both "bump nixpkgs" PRs
+# that answered those reports were therefore no-ops on any running box.
+#
+# The missing half was never a pin. It was a verb. This is the verb, and
+# the box's own update runs it; nothing here is reserved to the update,
+# because a person who wants their CLI moved now should not have to wait
+# for a release. What it deliberately does NOT do is touch the rest of
+# your profile: agent-box put claude, codex and defang there, and the
+# packages you added yourself are yours. `nix profile upgrade --all` is
+# still one command away, and this prints it.
+# Harness resolution and lazy installation (issue #416).
+#
+# Sourced by the supervisor, and unit-tested directly by
+# tests/test-jit-agents.sh — which is the reason it is a lib rather than a
+# run of straight-line code in supervisor.sh: everything here is decided by
+# what is on disk and what the network does, and neither is reachable from a
+# VM test that has to stay offline.
+#
+# From the environment: $HOME and $AGENT_BOX_AGENT_BINS always;
+# $AGENT_BOX_NIXPKGS and $AGENT_BOX_FLOCK_BIN for installs.
+# $AGENT_BOX_NIX_BIN is optional — see agent_install.
+
+# Where the lazy-harness machinery (issue #416) keeps its bookkeeping: a
+# per-harness cooldown marker so a failing install cannot become one network
+# call per respawn, and a lock so two sessions starting at once do not both
+# pay for the same download. Under ~/.local/state like the session side
+# files, so a reboot keeps them and a fresh $HOME starts clean.
+#
+# Plain locals, NOT AGENT_BOX_* names: neither backend supplies these and
+# neither should, but scripts/check_backend_parity.py reads any assigned
+# AGENT_BOX_<NAME>= as a host contract one side was missing. Tests point
+# them somewhere scratch by setting $HOME, which is the only input they
+# have.
+_jit_dir="$HOME/.local/state/agent-box/jit"
+_jit_lock="$_jit_dir/install.lock"
+
+# Which pin each harness was installed FROM, one file per harness beside
+# the markers above. agent_install writes it; agent_upgrade compares it
+# with the pin the box carries NOW and re-installs when the two differ.
+#
+# The box could not answer that question before: it installed into the
+# user's profile and recorded nothing, so a pin that moved reached an
+# existing box never (issues #559, #590 and #614 are the same report three
+# times, and both "bump nixpkgs" PRs that answered them could not have
+# worked). Provenance is written down here rather than guessed from the
+# profile manifest, because the manifest says only where an element came
+# from - on a box whose flake registry resolves to the same URL the box
+# pins, a package the USER added by hand is indistinguishable from ours.
+_jit_pin_file() { printf '%s' "$_jit_dir/$1.pin"; }
+
+agent_bin() {
+  # agent_bin NAME — resolve an agent (or "shell") to its binary via
+  # the unit's AGENT_BOX_AGENT_BINS ("name=/path ..." pairs; store and
+  # shell paths never contain whitespace, so word-splitting is safe).
+  #
+  # A JIT-installed harness (issue #416) is NOT in that table and never
+  # can be: the table is built at EVAL time from installAgents, while a
+  # lazily installed CLI lands in the user's own profile long after the
+  # system closure was fixed. ~/.nix-profile/bin is FIRST on the session
+  # PATH, so resolving it here finds exactly the binary a pane would —
+  # and, because that directory is already on PATH, an install performed
+  # now is visible to a pane that is ALREADY running.
+  #
+  # The table still wins when it has an entry, so an eagerly installed
+  # harness keeps its pinned store path and nothing about a conventional
+  # box changes — but only if that path is really there. The native
+  # backend builds this table from a fixed layout ("<profile>/bin/claude")
+  # rather than from resolved store paths, so an entry can name a harness
+  # the runtime profile was built without; returning it would exec into
+  # nothing AND shadow the profile copy a JIT install just put down.
+  for pair in ''${AGENT_BOX_AGENT_BINS:?}; do
+    case "$pair" in
+      ("$1"=*)
+        _ab_path=''${pair#*=}
+        # Falling through is only ever useful for something a profile
+        # could supply instead. "shell" is the login shell and has no
+        # second source, so it resolves from the table unconditionally,
+        # exactly as it always did — a missing one must fail at exec with
+        # the path in the message, not vanish into "not installed".
+        if [ -x "$_ab_path" ] || ! agent_attr "$1" >/dev/null 2>&1; then
+          printf '%s\n' "$_ab_path"
+          return 0
+        fi
+        break
+        ;;
+    esac
+  done
+  # Only ever a harness name we know; never an arbitrary string off the
+  # registry turned into a path.
+  agent_attr "$1" >/dev/null 2>&1 || return 1
+  if [ -x "$HOME/.nix-profile/bin/$1" ]; then
+    printf '%s\n' "$HOME/.nix-profile/bin/$1"
+    return 0
+  fi
+  return 1
+}
+
+agent_names() {
+  # Every harness this box knows how to install, one per line. The case in
+  # agent_attr below is the closed set and this is the same set spelled as
+  # a list: agent-box-harness needs to ITERATE it (an `upgrade` with no
+  # argument means all of them), and a second hand-written list somewhere
+  # else is a list that drifts.
+  printf '%s\n' claude codex
+}
+
+agent_attr() {
+  # agent_attr NAME — the nixpkgs attribute a harness installs from.
+  # Not derivable from the binary name (claude's is claude-code), and
+  # deliberately a closed set: this is the only place a session's
+  # registry data is allowed to name something to install.
+  case "$1" in
+    (claude) printf 'claude-code\n' ;;
+    (codex)  printf 'codex\n' ;;
+    (*) return 1 ;;
+  esac
+}
+
+agent_nix_bin() {
+  # The nix to install WITH, or failure when this box has none.
+  #
+  # Hoisted out of agent_install (it had this body inline) because
+  # agent_upgrade needs exactly the same answer. The probe order is the
+  # point: $AGENT_BOX_NIX_BIN is what the NixOS module pins and what the
+  # unit tests shim, then PATH, then the two standard install layouts -
+  # multi-user Nix puts nix in the default profile, which is NOT on the
+  # session PATH, while single-user puts it in the user profile, which is.
+  # A pane's PATH carries neither on this box, which is why a CLI that
+  # simply ran `nix` failed with "command not found" (issue #544).
+  _anb="''${AGENT_BOX_NIX_BIN:-}"
+  if [ -z "$_anb" ]; then
+    for _anb_cand in \
+        "$(command -v nix 2>/dev/null || true)" \
+        /nix/var/nix/profiles/default/bin/nix \
+        "$HOME/.nix-profile/bin/nix"; do
+      if [ -n "$_anb_cand" ] && [ -x "$_anb_cand" ]; then _anb=$_anb_cand; break; fi
+    done
+  fi
+  [ -n "$_anb" ] || return 1
+  printf '%s' "$_anb"
+}
+
+agent_install() {
+  # agent_install NAME — fetch a harness into the user's own profile
+  # (issue #416).
+  #
+  # Lazy harnesses are what let the box ship without ~1 GB of agent CLI
+  # in its closure: nothing is installed until a session actually asks
+  # for one. The cost is paid once, at first use, and the result is a
+  # normal profile generation — a GC root, rollback-able, and upgraded
+  # with `nix profile upgrade` instead of a system rebuild.
+  _ai_agent="$1"
+  _ai_attr="$(agent_attr "$_ai_agent")" || return 1
+  if [ -z "''${AGENT_BOX_NIXPKGS:-}" ]; then
+    echo "session: '$_ai_agent' is not installed and cannot be fetched" \
+         "(no AGENT_BOX_NIXPKGS in this unit)" >&2
+    return 1
+  fi
+  # The NixOS module pins a store path; a native box cannot, because
+  # resolving one at apply time would bake that host's nix into a generated
+  # file and break on the next upgrade. So resolve here, at use, and cover
+  # both install layouts: multi-user Nix puts nix in the default profile,
+  # which is NOT on the native session PATH, while single-user puts it in
+  # the user profile, which is.
+  if ! _ai_nix="$(agent_nix_bin)"; then
+    echo "session: '$_ai_agent' is not installed and cannot be fetched" \
+         "(no nix on this box)" >&2
+    return 1
+  fi
+
+  # One attempt per retry window, for the same reason seed_claude_state
+  # rate-limits itself: a session that cannot start is respawned every
+  # couple of seconds, so an install that fails offline must not become a
+  # network call per respawn.
+  mkdir -p "$_jit_dir"
+  _ai_marker="$_jit_dir/$_ai_agent.failed"
+  _ai_now="$(date +%s)"
+  _ai_retry="''${AGENT_BOX_JIT_RETRY_S:-300}"
+  if [ -s "$_ai_marker" ]; then
+    read -r _ai_ts _ai_rest < "$_ai_marker" || true
+    case "''${_ai_ts:-x}" in (""|*[!0-9]*) _ai_ts=0 ;; esac
+    if [ $((_ai_now - _ai_ts)) -lt "$_ai_retry" ]; then
+      echo "session: '$_ai_agent' install failed $((_ai_now - _ai_ts))s ago," \
+           "not retrying for another $((_ai_retry - _ai_now + _ai_ts))s" >&2
+      return 1
+    fi
+  fi
+
+  # Serialize installs across this user's sessions. `nix profile` takes
+  # its own profile lock, but two sessions racing here would still both
+  # pay the download; worse, the loser's error is indistinguishable from
+  # a real failure and would set the cooldown marker above.
+  #
+  # BOUNDED, not a plain flock: the supervisor's reconcile loop calls this
+  # from start_session, so waiting forever on a wedged install would stop
+  # it starting or reaping every OTHER session too. Generous enough for a
+  # real download over a slow link, and giving up just means this pass
+  # skips the session and the next one retries.
+  mkdir -p "$(dirname "$_jit_lock")"
+  exec 8>>"$_jit_lock"
+  if ! "''${AGENT_BOX_FLOCK_BIN:?}" -w "''${AGENT_BOX_JIT_LOCK_WAIT_S:-900}" 8; then
+    exec 8>&-
+    echo "session: another session is still fetching a harness; leaving" \
+         "'$_ai_agent' for the next pass" >&2
+    return 1
+  fi
+  # The winner of the race installed it while we waited; nothing to do.
+  if [ -x "$HOME/.nix-profile/bin/$_ai_agent" ]; then
+    exec 8>&-
+    return 0
+  fi
+
+  echo "session: fetching '$_ai_agent' ($_ai_attr) from the box's pinned" \
+       "nixpkgs — first use of this harness, so this can take a few minutes" >&2
+  # --impure + NIXPKGS_ALLOW_UNFREE: claude-code is unfree, and a profile
+  # install gets none of the module's allowUnfreePredicate (that governs
+  # the module's OWN second nixpkgs import, not this user's profile).
+  # AGENT_BOX_NIXPKGS is the SAME pinned channel the module resolves the
+  # eager harnesses from, so a box that also ships one gets a byte-
+  # identical store path here rather than a second copy.
+  #
+  # BOUNDED, same reason as the flock above: this runs inside the
+  # supervisor's reconcile loop, so a wedged fetch (a stalled substituter,
+  # a hung download) must not stop every OTHER session from starting.
+  # Giving up sets the cooldown marker below and the next pass retries.
+  if NIXPKGS_ALLOW_UNFREE=1 timeout "''${AGENT_BOX_JIT_INSTALL_TIMEOUT_S:-1800}" \
+       "$_ai_nix" profile add --impure \
+       "$AGENT_BOX_NIXPKGS#$_ai_attr" >&2; then
+    rm -f "$_ai_marker"
+    printf '%s\n' "$AGENT_BOX_NIXPKGS" > "$(_jit_pin_file "$_ai_agent")" \
+      || true
+    exec 8>&-
+    # No mirror_codex_standalone call here: start_session mirrors the
+    # binary it is about to launch, which on this path is the one just
+    # installed, on this same reconcile pass (issue #572).
+    return 0
+  fi
+  # Stamp the marker at WRITE time, not with the pre-attempt $_ai_now: the
+  # flock wait and the install itself can together run long past
+  # AGENT_BOX_JIT_RETRY_S, and a marker backdated to before the attempt
+  # would already read as expired on the very next reconcile pass —
+  # defeating the cooldown it exists to enforce.
+  printf '%s\n' "$(date +%s)" > "$_ai_marker"
+  exec 8>&-
+  echo "session: could not fetch '$_ai_agent' — is the box offline?" >&2
+  return 1
+}
+
+agent_upgrade() {
+  # agent_upgrade NAME - move an installed harness onto the pin this box
+  # carries NOW, and write down that it did.
+  #
+  # NOT `nix profile upgrade`, and the reason is the pin. That command
+  # re-resolves the ref an element was installed from, so it can only move
+  # an element whose ref is MUTABLE. The ref this box installs from is
+  # deliberately an immutable channel RELEASE, and re-resolving one of
+  # those returns the same content for ever - measured on a scratch
+  # profile, where an element installed from a release URL "upgrades" from
+  # that URL to the identical URL. A box therefore chooses between a
+  # reproducible pin and `nix profile upgrade`; this takes the pin. It is
+  # also the only shape that works for a CLI pinned by TAG rather than by
+  # channel, so the box has one upgrade verb instead of two.
+  #
+  # `nix profile upgrade` would carry a second, quieter defect even where
+  # it works: a mutable tarball ref is resolved through nix's own tarball
+  # cache, whose tarball-ttl is 3600s by default, so an upgrade run inside
+  # the hour reports nothing to do however far the channel has moved.
+  # Nothing here reads that cache - the pin arrives already resolved, by
+  # an updater that followed the channel redirect itself.
+  _au_agent="''${1:?agent_upgrade NAME}"
+  _au_attr="$(agent_attr "$_au_agent")" || {
+    echo "upgrade: '$_au_agent' is not a harness this box installs" >&2
+    return 1
+  }
+
+  # An EAGERLY installed harness is part of the box's own closure and
+  # moves with the release, exactly like gh. Reading the table the way
+  # agent_bin does (an entry can name a path the runtime profile was built
+  # without) keeps this from claiming a harness that is not really there.
+  for _au_pair in ''${AGENT_BOX_AGENT_BINS:-}; do
+    case "$_au_pair" in
+      ("$_au_agent"=*)
+        if [ -x "''${_au_pair#*=}" ]; then
+          echo "upgrade: '$_au_agent' ships with the box and moves with it" >&2
+          return 0
+        fi
+        ;;
+    esac
+  done
+
+  # Nothing installed for this user is not an error: the update service
+  # calls this for every user on the box, and most users have never
+  # started every harness. The next session that names one fetches it at
+  # the current pin anyway.
+  if [ ! -x "$HOME/.nix-profile/bin/$_au_agent" ]; then
+    echo "upgrade: '$_au_agent' is not installed for $(id -un 2>/dev/null)" >&2
+    return 0
+  fi
+
+  if [ -z "''${AGENT_BOX_NIXPKGS:-}" ]; then
+    echo "upgrade: cannot move '$_au_agent' (no AGENT_BOX_NIXPKGS here)" >&2
+    return 1
+  fi
+
+  _au_pin="$(_jit_pin_file "$_au_agent")"
+  _au_was=""
+  [ -r "$_au_pin" ] && read -r _au_was < "$_au_pin"
+  if [ "$_au_was" = "$AGENT_BOX_NIXPKGS" ]; then
+    echo "upgrade: '$_au_agent' is already at this box's pin" >&2
+    return 0
+  fi
+  # An install from before this bookkeeping existed has no record, so the
+  # first run on such a box re-installs once and writes one. That is the
+  # right direction: the harness a long-lived box is holding is precisely
+  # the stale one.
+
+  if ! _au_nix="$(agent_nix_bin)"; then
+    echo "upgrade: cannot move '$_au_agent' (no nix on this box)" >&2
+    return 1
+  fi
+
+  # Same lock as the install path, for the same reason and against the
+  # same competitors: a session starting right now may be inside
+  # agent_install for this very harness.
+  mkdir -p "$_jit_dir"
+  exec 8>>"$_jit_lock"
+  if ! "''${AGENT_BOX_FLOCK_BIN:?}" -w "''${AGENT_BOX_JIT_LOCK_WAIT_S:-900}" 8; then
+    exec 8>&-
+    echo "upgrade: another session holds the harness lock; leaving" \
+         "'$_au_agent' for the next run" >&2
+    return 1
+  fi
+
+  echo "upgrade: moving '$_au_agent' to $AGENT_BOX_NIXPKGS" >&2
+  # Realize the new closure BEFORE touching the profile. Between the
+  # remove and the add this user has no harness at all, so that window
+  # must be a symlink flip and not a multi-minute download that can fail
+  # halfway - the same ordering `agentbox update` uses for its own profile
+  # swap, for the same reason.
+  if ! NIXPKGS_ALLOW_UNFREE=1 \
+       timeout "''${AGENT_BOX_JIT_INSTALL_TIMEOUT_S:-1800}" \
+       "$_au_nix" build --no-link --impure \
+       "$AGENT_BOX_NIXPKGS#$_au_attr" >&2; then
+    exec 8>&-
+    echo "upgrade: could not build '$_au_agent' at the new pin - is the" \
+         "box offline? Nothing was changed." >&2
+    return 1
+  fi
+
+  # Remove first: `nix profile add` of an attribute the profile already
+  # holds does NOT replace it, it appends a SECOND element with the same
+  # attrPath (measured: two elements, `hello` and `hello-1`, one binary
+  # name and no way to say which one wins). A failure here stops the run
+  # rather than adding on top of it.
+  if ! "$_au_nix" profile remove "$_au_attr" >&2; then
+    exec 8>&-
+    echo "upgrade: could not remove the old '$_au_agent' element -" \
+         "check \`nix profile list\`. Nothing was changed." >&2
+    return 1
+  fi
+
+  if NIXPKGS_ALLOW_UNFREE=1 \
+       timeout "''${AGENT_BOX_JIT_INSTALL_TIMEOUT_S:-1800}" \
+       "$_au_nix" profile add --impure \
+       "$AGENT_BOX_NIXPKGS#$_au_attr" >&2; then
+    printf '%s\n' "$AGENT_BOX_NIXPKGS" > "$_au_pin" || true
+    exec 8>&-
+    # A session that is ALREADY running keeps the binary it started, since
+    # its process holds the old store path open. New sessions get this one.
+    echo "upgrade: '$_au_agent' moved; running sessions keep the old" \
+         "binary until they restart" >&2
+    return 0
+  fi
+
+  # The add failed with the old element already gone, which is the one
+  # state this function must not leave behind: no harness, and a pin file
+  # still naming the version that is no longer installed. Put the old one
+  # back from the pin it came from - its closure is still in the store,
+  # so this is local and fast.
+  echo "upgrade: adding '$_au_agent' at the new pin failed; restoring" \
+       "the previous one" >&2
+  if [ -n "$_au_was" ] && NIXPKGS_ALLOW_UNFREE=1 \
+       timeout "''${AGENT_BOX_JIT_INSTALL_TIMEOUT_S:-1800}" \
+       "$_au_nix" profile add --impure "$_au_was#$_au_attr" >&2; then
+    echo "upgrade: '$_au_agent' is back at $_au_was" >&2
+  elif "$_au_nix" profile rollback >&2; then
+    # No record to restore FROM - the case every box predating this
+    # bookkeeping is in, which is exactly the population this command
+    # exists for. The previous generation still has the element, so roll
+    # the profile back to it rather than leave the user with no harness.
+    # Broader than the targeted restore above (a generation is the whole
+    # profile), so it is the second choice and it says what it did.
+    rm -f "$_au_pin"
+    echo "upgrade: rolled this profile back one generation to keep" \
+         "'$_au_agent' installed - anything else added since that" \
+         "generation is rolled back too" >&2
+  else
+    # Both recoveries are gone. Drop the record rather than leave one
+    # that lies: with no pin file the next session's agent_install
+    # fetches the harness at the current pin, which is the outcome this
+    # was trying to reach anyway.
+    rm -f "$_au_pin"
+    echo "upgrade: '$_au_agent' is NOT installed now - the next session" \
+         "that names it will fetch it" >&2
+  fi
+  exec 8>&-
+  return 1
+}
+
+# Codex remote-control pairing currently requires the standalone
+# installer layout at ~/.codex/packages/standalone/current/codex.
+# Mirror that fixed path to the provided Codex so pairing works
+# without a curl-installed second copy.
+#
+# CALLED AT SESSION START, from start_session's codex branch, and nowhere
+# else (issue #572). Seeding it at INSTALL time instead needs a hook on
+# every path that can put a codex on this box, and there are more of them
+# than there were when this began: the eager closure, the JIT fetch
+# (issue #416), the settings page's Connections card — which grew its own
+# `nix profile add` and mirrored nothing, so every session on a default
+# box died with "managed standalone Codex install not found" — and a
+# user's own `nix profile add nixpkgs#codex`, which the platform guide
+# actively suggests and which no hook of ours can ever observe. Session
+# start is the one place that sees the binary about to run whatever put it
+# there, and this is two ln(1)s on an idempotent path, so re-running it
+# per launch costs nothing worth measuring.
+#
+# $1 is the codex binary to mirror (start_session passes the resolved,
+# already-JIT-installed one). A bare call resolves it like agent_bin does
+# and no-ops when there is no codex to point at.
+#
+# $2 is the CODEX_HOME to mirror it under, defaulting like every other
+# reader of that variable to $HOME/.codex — but a bare fallback to the
+# environment here would read supervisor.sh's own process, not the
+# session's: a profile's CODEX_HOME only reaches the actual process
+# through AGENT_BOX_ENV_EXEC, inside the tmux pane this call is preparing
+# for. resolve_codex_home is what start_session passes instead, so the
+# layout lands where that session's app-server daemon will actually look
+# for it.
+mirror_codex_standalone() {
+  if [ -n "''${1:-}" ]; then
+    cbin=$1
+  else
+    cbin="$(agent_bin codex)" || return 0
+  fi
+  cxhome="''${2:-''${CODEX_HOME:-$HOME/.codex}}"
+  mkdir -p "$cxhome/packages/standalone/agent-box-current"
+  ln -sfn "$cbin" "$cxhome/packages/standalone/agent-box-current/codex"
+  # `ln -sfn` only replaces `current` when it is already a symlink or a
+  # plain file (issue #95). If a curl-installed Codex ever leaves `current`
+  # as a REAL directory — an unusual manual layout, but a possible one —
+  # `-sfn` can't unlink a non-empty directory, so it silently creates
+  # `current/agent-box-current` INSIDE it instead of replacing it, and
+  # remote-control pairing keeps resolving the stale copy underneath.
+  #
+  # Clear a real directory first (the `-L` check excludes a
+  # symlink-to-a-directory, which `-sfn` already replaces correctly, so
+  # this only ever fires on the broken layout). `rename()` cannot swap a
+  # symlink over a non-empty directory in one step, so this branch is not
+  # atomic: a session reading `current` between the `rm -rf` and the `mv`
+  # below sees it briefly missing. That is an acceptable one-time cost to
+  # repair the broken layout, and every run after this one takes the
+  # atomic path below, because `current` is a symlink from here on.
+  #
+  # Build the new symlink under a temp name in the same directory and
+  # rename it over `current` — `rename()` is atomic, so a session reading
+  # `current` mid-update here sees either the old or the new target, never
+  # a missing path (except immediately following the repair above).
+  _mcs_current="$cxhome/packages/standalone/current"
+  if [ -d "$_mcs_current" ] && [ ! -L "$_mcs_current" ]; then
+    rm -rf "$_mcs_current"
+  fi
+  _mcs_tmp="$_mcs_current.tmp.$$"
+  rm -f "$_mcs_tmp"
+  ln -sfn agent-box-current "$_mcs_tmp"
+  mv -T "$_mcs_tmp" "$_mcs_current"
+}
+
+# The $CODEX_HOME a session's own codex process will actually see once
+# AGENT_BOX_ENV_EXEC applies its environment inside the tmux pane: the box
+# store's value, overridden by the named profile's — the same precedence
+# env-exec.py's two load_into() calls apply, since a profile's env loads
+# ON TOP of the box-wide store there. Called from the supervisor's own
+# process, which never sources either file itself, so this is what lets
+# mirror_codex_standalone (and the AGENTS.md seed below) agree with a
+# daemon that starts under a non-default CODEX_HOME instead of always
+# landing in $HOME/.codex (issue #572 CodeRabbit follow-up).
+#
+# $1 is the session's profile name, or empty for none. Best-effort like
+# env-exec.py's own load(): a missing store, a missing profile or a key
+# neither sets falls back to $HOME/.codex, never an error.
+resolve_codex_home() {
+  _rch_home="''${CODEX_HOME:-}"
+  _rch_v="$("''${AGENT_BOX_ENVSTORE_BIN:?}" get CODEX_HOME 2>/dev/null)" \
+    && [ -n "$_rch_v" ] && _rch_home="$_rch_v"
+  if [ -n "''${1:-}" ]; then
+    _rch_v="$("$AGENT_BOX_ENVSTORE_BIN" get CODEX_HOME --profile "$1" 2>/dev/null)" \
+      && [ -n "$_rch_v" ] && _rch_home="$_rch_v"
+  fi
+  printf '%s' "''${_rch_home:-$HOME/.codex}"
+}
+
+_hc_usage() {
+  cat >&2 <<'USAGE'
+usage: agent-box-harness ls
+       agent-box-harness upgrade [NAME...]
+
+  ls        what this box installed for you, and the pin it came from
+  upgrade   move those onto the pin this box carries now; no NAME means
+            every harness this box installed for you
+
+A harness is the CLI PROGRAM a session runs (claude, codex) — not an agent
+profile, which is a harness plus a model and an effort level. `agent-box-
+profile` is the other one.
+
+The pin moves when the box updates, so an upgrade right after one is the
+run that has something to do. Sessions already running keep the binary
+they started with until they restart.
+USAGE
+}
+
+_hc_ls() {
+  _hc_any=
+  for _hc_n in $(agent_names); do
+    _hc_bin="$HOME/.nix-profile/bin/$_hc_n"
+    [ -x "$_hc_bin" ] || continue
+    _hc_any=1
+    _hc_pin_f="$(_jit_pin_file "$_hc_n")"
+    _hc_pin="(unrecorded — installed before this box could write it down)"
+    [ -r "$_hc_pin_f" ] && read -r _hc_pin < "$_hc_pin_f"
+    printf '%s\n  installed: %s\n  pin:       %s\n' \
+      "$_hc_n" "$_hc_bin" "$_hc_pin"
+    if [ "$_hc_pin" = "''${AGENT_BOX_NIXPKGS:-}" ]; then
+      printf '  status:    current\n'
+    else
+      printf '  status:    the box now pins %s — `agent-box-harness upgrade %s`\n' \
+        "''${AGENT_BOX_NIXPKGS:-(unset)}" "$_hc_n"
+    fi
+  done
+  [ -n "$_hc_any" ] || echo "no harness installed for $(id -un) yet — a" \
+    "session that names one fetches it" >&2
+}
+
+_hc_main() {
+  case "''${1:-}" in
+    (ls|list) shift; [ $# -eq 0 ] || { _hc_usage; return 2; }; _hc_ls ;;
+    (upgrade)
+      shift
+      # No NAME means every harness this box installs. Word splitting is
+      # the point here: agent_names prints one per line and none of them
+      # can contain a space (agent_attr is a closed set of two literals).
+      # shellcheck disable=SC2046
+      [ $# -gt 0 ] || set -- $(agent_names)
+      _hc_rc=0
+      for _hc_n in "$@"; do
+        agent_upgrade "$_hc_n" || _hc_rc=1
+      done
+      # Said once, at the end, and never by agent_upgrade itself: the
+      # narrow default is a boundary, not a refusal, and a reader who is
+      # told where the boundary is does not have to guess whether the
+      # command silently skipped something (see the note at the top).
+      echo "" >&2
+      echo "This moved only what agent-box installed. For the rest of" \
+           "your own profile: nix profile upgrade --all" >&2
+      return $_hc_rc
+      ;;
+    (""|-h|--help|help) _hc_usage; return 0 ;;
+    (*) echo "agent-box-harness: unknown command '$1'" >&2; _hc_usage; return 2 ;;
+  esac
+}
+
+_hc_main "$@"
   '');
 
   # Webhook self-service, shipped on every PATH when webhookEnabled (issue #101).
@@ -8779,6 +9433,22 @@ esac
   ]
 }
   '';
+  # modules/src/contract/agent-box-harness-upgrade.json — the per-user unit
+  # the update service starts once a new pin is in place. One binding, and
+  # it is a "cli": what this unit runs is a GENERATED wrapper (the pin has
+  # to be in its environment), which lives at a store path here and in
+  # /usr/local/bin natively — exactly the split that kind exists for.
+  harnessUpgradeContract = builtins.fromJSON ''
+{
+  "unit": "agent-box-harness-upgrade@",
+  "condition": "always",
+  "env": [],
+  "execStart": [
+    { "kind": "cli", "program": "agent-box-harness" }
+  ],
+  "directives": []
+}
+  '';
   # modules/src/contract/agent-box-settings.json — the third unit family.
   # Unlike the previous two, some of its entries only apply when webhookEnabled
   # (the panel's script/interpreter/hook-spawn vars), so each entry carries a
@@ -8843,6 +9513,35 @@ esac
     "                 'nothing set' stays distinguishable from 'set to nothing'."
   ],
   "wrappers": [
+    {
+      "name": "agent-box-harness",
+      "env": [
+        {
+          "name": "AGENT_BOX_NIXPKGS",
+          "kind": "config",
+          "key": "jitNixpkgs",
+          "why": [
+            "The pin this box installs a harness FROM, and therefore the pin",
+            "`agent-box-harness upgrade` moves an installed one onto. It is the",
+            "same value the agent unit carries, but this CLI is run by a person",
+            "from a login shell where no unit's environment reaches - which is",
+            "the whole reason the three reports behind this (#559, #590, #614)",
+            "each ended in a hand-run nix command instead of a box command."
+          ]
+        },
+        {
+          "name": "AGENT_BOX_FLOCK_BIN",
+          "kind": "bin",
+          "program": "flock",
+          "why": [
+            "An upgrade removes and re-adds a profile element, so it must hold",
+            "the same lock agent_install takes: a session starting right now may",
+            "be inside the install path for the very harness being moved. A",
+            "pane's PATH does not carry flock (issue #254), so pin it."
+          ]
+        }
+      ]
+    },
     {
       "name": "agent-box-webhook",
       "env": [
@@ -9021,6 +9720,7 @@ esac
     "agent-box-session" = "${sessionCli}/bin/agent-box-session";
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
+    "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";
     "agent-box-supervisor" = "${supervisorScript}/bin/agent-box-supervisor";
@@ -9053,6 +9753,7 @@ esac
   contractConfigValue = key:
     if key == "defaultAgent" then cfg.agent
     else if key == "webhookScript" then "${localWebhookScript}"
+    else if key == "jitNixpkgs" then jitNixpkgsRef
     else if key == "hookArgsOptionName" then
       "the NixOS option services.agent-box.webhook.hookSessionArgs"
     else if key == "hookSessionArgs" then
@@ -10352,6 +11053,20 @@ esac
     _jit_dir="$HOME/.local/state/agent-box/jit"
     _jit_lock="$_jit_dir/install.lock"
 
+    # Which pin each harness was installed FROM, one file per harness beside
+    # the markers above. agent_install writes it; agent_upgrade compares it
+    # with the pin the box carries NOW and re-installs when the two differ.
+    #
+    # The box could not answer that question before: it installed into the
+    # user's profile and recorded nothing, so a pin that moved reached an
+    # existing box never (issues #559, #590 and #614 are the same report three
+    # times, and both "bump nixpkgs" PRs that answered them could not have
+    # worked). Provenance is written down here rather than guessed from the
+    # profile manifest, because the manifest says only where an element came
+    # from - on a box whose flake registry resolves to the same URL the box
+    # pins, a package the USER added by hand is indistinguishable from ours.
+    _jit_pin_file() { printf '%s' "$_jit_dir/$1.pin"; }
+
     agent_bin() {
       # agent_bin NAME — resolve an agent (or "shell") to its binary via
       # the unit's AGENT_BOX_AGENT_BINS ("name=/path ..." pairs; store and
@@ -10399,6 +11114,15 @@ esac
       return 1
     }
 
+    agent_names() {
+      # Every harness this box knows how to install, one per line. The case in
+      # agent_attr below is the closed set and this is the same set spelled as
+      # a list: agent-box-harness needs to ITERATE it (an `upgrade` with no
+      # argument means all of them), and a second hand-written list somewhere
+      # else is a list that drifts.
+      printf '%s\n' claude codex
+    }
+
     agent_attr() {
       # agent_attr NAME — the nixpkgs attribute a harness installs from.
       # Not derivable from the binary name (claude's is claude-code), and
@@ -10409,6 +11133,30 @@ esac
         (codex)  printf 'codex\n' ;;
         (*) return 1 ;;
       esac
+    }
+
+    agent_nix_bin() {
+      # The nix to install WITH, or failure when this box has none.
+      #
+      # Hoisted out of agent_install (it had this body inline) because
+      # agent_upgrade needs exactly the same answer. The probe order is the
+      # point: $AGENT_BOX_NIX_BIN is what the NixOS module pins and what the
+      # unit tests shim, then PATH, then the two standard install layouts -
+      # multi-user Nix puts nix in the default profile, which is NOT on the
+      # session PATH, while single-user puts it in the user profile, which is.
+      # A pane's PATH carries neither on this box, which is why a CLI that
+      # simply ran `nix` failed with "command not found" (issue #544).
+      _anb="''${AGENT_BOX_NIX_BIN:-}"
+      if [ -z "$_anb" ]; then
+        for _anb_cand in \
+            "$(command -v nix 2>/dev/null || true)" \
+            /nix/var/nix/profiles/default/bin/nix \
+            "$HOME/.nix-profile/bin/nix"; do
+          if [ -n "$_anb_cand" ] && [ -x "$_anb_cand" ]; then _anb=$_anb_cand; break; fi
+        done
+      fi
+      [ -n "$_anb" ] || return 1
+      printf '%s' "$_anb"
     }
 
     agent_install() {
@@ -10433,16 +11181,7 @@ esac
       # both install layouts: multi-user Nix puts nix in the default profile,
       # which is NOT on the native session PATH, while single-user puts it in
       # the user profile, which is.
-      _ai_nix="''${AGENT_BOX_NIX_BIN:-}"
-      if [ -z "$_ai_nix" ]; then
-        for _ai_cand in \
-            "$(command -v nix 2>/dev/null || true)" \
-            /nix/var/nix/profiles/default/bin/nix \
-            "$HOME/.nix-profile/bin/nix"; do
-          if [ -n "$_ai_cand" ] && [ -x "$_ai_cand" ]; then _ai_nix=$_ai_cand; break; fi
-        done
-      fi
-      if [ -z "$_ai_nix" ]; then
+      if ! _ai_nix="$(agent_nix_bin)"; then
         echo "session: '$_ai_agent' is not installed and cannot be fetched" \
              "(no nix on this box)" >&2
         return 1
@@ -10507,6 +11246,8 @@ esac
            "$_ai_nix" profile add --impure \
            "$AGENT_BOX_NIXPKGS#$_ai_attr" >&2; then
         rm -f "$_ai_marker"
+        printf '%s\n' "$AGENT_BOX_NIXPKGS" > "$(_jit_pin_file "$_ai_agent")" \
+          || true
         exec 8>&-
         # No mirror_codex_standalone call here: start_session mirrors the
         # binary it is about to launch, which on this path is the one just
@@ -10521,6 +11262,167 @@ esac
       printf '%s\n' "$(date +%s)" > "$_ai_marker"
       exec 8>&-
       echo "session: could not fetch '$_ai_agent' — is the box offline?" >&2
+      return 1
+    }
+
+    agent_upgrade() {
+      # agent_upgrade NAME - move an installed harness onto the pin this box
+      # carries NOW, and write down that it did.
+      #
+      # NOT `nix profile upgrade`, and the reason is the pin. That command
+      # re-resolves the ref an element was installed from, so it can only move
+      # an element whose ref is MUTABLE. The ref this box installs from is
+      # deliberately an immutable channel RELEASE, and re-resolving one of
+      # those returns the same content for ever - measured on a scratch
+      # profile, where an element installed from a release URL "upgrades" from
+      # that URL to the identical URL. A box therefore chooses between a
+      # reproducible pin and `nix profile upgrade`; this takes the pin. It is
+      # also the only shape that works for a CLI pinned by TAG rather than by
+      # channel, so the box has one upgrade verb instead of two.
+      #
+      # `nix profile upgrade` would carry a second, quieter defect even where
+      # it works: a mutable tarball ref is resolved through nix's own tarball
+      # cache, whose tarball-ttl is 3600s by default, so an upgrade run inside
+      # the hour reports nothing to do however far the channel has moved.
+      # Nothing here reads that cache - the pin arrives already resolved, by
+      # an updater that followed the channel redirect itself.
+      _au_agent="''${1:?agent_upgrade NAME}"
+      _au_attr="$(agent_attr "$_au_agent")" || {
+        echo "upgrade: '$_au_agent' is not a harness this box installs" >&2
+        return 1
+      }
+
+      # An EAGERLY installed harness is part of the box's own closure and
+      # moves with the release, exactly like gh. Reading the table the way
+      # agent_bin does (an entry can name a path the runtime profile was built
+      # without) keeps this from claiming a harness that is not really there.
+      for _au_pair in ''${AGENT_BOX_AGENT_BINS:-}; do
+        case "$_au_pair" in
+          ("$_au_agent"=*)
+            if [ -x "''${_au_pair#*=}" ]; then
+              echo "upgrade: '$_au_agent' ships with the box and moves with it" >&2
+              return 0
+            fi
+            ;;
+        esac
+      done
+
+      # Nothing installed for this user is not an error: the update service
+      # calls this for every user on the box, and most users have never
+      # started every harness. The next session that names one fetches it at
+      # the current pin anyway.
+      if [ ! -x "$HOME/.nix-profile/bin/$_au_agent" ]; then
+        echo "upgrade: '$_au_agent' is not installed for $(id -un 2>/dev/null)" >&2
+        return 0
+      fi
+
+      if [ -z "''${AGENT_BOX_NIXPKGS:-}" ]; then
+        echo "upgrade: cannot move '$_au_agent' (no AGENT_BOX_NIXPKGS here)" >&2
+        return 1
+      fi
+
+      _au_pin="$(_jit_pin_file "$_au_agent")"
+      _au_was=""
+      [ -r "$_au_pin" ] && read -r _au_was < "$_au_pin"
+      if [ "$_au_was" = "$AGENT_BOX_NIXPKGS" ]; then
+        echo "upgrade: '$_au_agent' is already at this box's pin" >&2
+        return 0
+      fi
+      # An install from before this bookkeeping existed has no record, so the
+      # first run on such a box re-installs once and writes one. That is the
+      # right direction: the harness a long-lived box is holding is precisely
+      # the stale one.
+
+      if ! _au_nix="$(agent_nix_bin)"; then
+        echo "upgrade: cannot move '$_au_agent' (no nix on this box)" >&2
+        return 1
+      fi
+
+      # Same lock as the install path, for the same reason and against the
+      # same competitors: a session starting right now may be inside
+      # agent_install for this very harness.
+      mkdir -p "$_jit_dir"
+      exec 8>>"$_jit_lock"
+      if ! "''${AGENT_BOX_FLOCK_BIN:?}" -w "''${AGENT_BOX_JIT_LOCK_WAIT_S:-900}" 8; then
+        exec 8>&-
+        echo "upgrade: another session holds the harness lock; leaving" \
+             "'$_au_agent' for the next run" >&2
+        return 1
+      fi
+
+      echo "upgrade: moving '$_au_agent' to $AGENT_BOX_NIXPKGS" >&2
+      # Realize the new closure BEFORE touching the profile. Between the
+      # remove and the add this user has no harness at all, so that window
+      # must be a symlink flip and not a multi-minute download that can fail
+      # halfway - the same ordering `agentbox update` uses for its own profile
+      # swap, for the same reason.
+      if ! NIXPKGS_ALLOW_UNFREE=1 \
+           timeout "''${AGENT_BOX_JIT_INSTALL_TIMEOUT_S:-1800}" \
+           "$_au_nix" build --no-link --impure \
+           "$AGENT_BOX_NIXPKGS#$_au_attr" >&2; then
+        exec 8>&-
+        echo "upgrade: could not build '$_au_agent' at the new pin - is the" \
+             "box offline? Nothing was changed." >&2
+        return 1
+      fi
+
+      # Remove first: `nix profile add` of an attribute the profile already
+      # holds does NOT replace it, it appends a SECOND element with the same
+      # attrPath (measured: two elements, `hello` and `hello-1`, one binary
+      # name and no way to say which one wins). A failure here stops the run
+      # rather than adding on top of it.
+      if ! "$_au_nix" profile remove "$_au_attr" >&2; then
+        exec 8>&-
+        echo "upgrade: could not remove the old '$_au_agent' element -" \
+             "check \`nix profile list\`. Nothing was changed." >&2
+        return 1
+      fi
+
+      if NIXPKGS_ALLOW_UNFREE=1 \
+           timeout "''${AGENT_BOX_JIT_INSTALL_TIMEOUT_S:-1800}" \
+           "$_au_nix" profile add --impure \
+           "$AGENT_BOX_NIXPKGS#$_au_attr" >&2; then
+        printf '%s\n' "$AGENT_BOX_NIXPKGS" > "$_au_pin" || true
+        exec 8>&-
+        # A session that is ALREADY running keeps the binary it started, since
+        # its process holds the old store path open. New sessions get this one.
+        echo "upgrade: '$_au_agent' moved; running sessions keep the old" \
+             "binary until they restart" >&2
+        return 0
+      fi
+
+      # The add failed with the old element already gone, which is the one
+      # state this function must not leave behind: no harness, and a pin file
+      # still naming the version that is no longer installed. Put the old one
+      # back from the pin it came from - its closure is still in the store,
+      # so this is local and fast.
+      echo "upgrade: adding '$_au_agent' at the new pin failed; restoring" \
+           "the previous one" >&2
+      if [ -n "$_au_was" ] && NIXPKGS_ALLOW_UNFREE=1 \
+           timeout "''${AGENT_BOX_JIT_INSTALL_TIMEOUT_S:-1800}" \
+           "$_au_nix" profile add --impure "$_au_was#$_au_attr" >&2; then
+        echo "upgrade: '$_au_agent' is back at $_au_was" >&2
+      elif "$_au_nix" profile rollback >&2; then
+        # No record to restore FROM - the case every box predating this
+        # bookkeeping is in, which is exactly the population this command
+        # exists for. The previous generation still has the element, so roll
+        # the profile back to it rather than leave the user with no harness.
+        # Broader than the targeted restore above (a generation is the whole
+        # profile), so it is the second choice and it says what it did.
+        rm -f "$_au_pin"
+        echo "upgrade: rolled this profile back one generation to keep" \
+             "'$_au_agent' installed - anything else added since that" \
+             "generation is rolled back too" >&2
+      else
+        # Both recoveries are gone. Drop the record rather than leave one
+        # that lies: with no pin file the next session's agent_install
+        # fetches the harness at the current pin, which is the outcome this
+        # was trying to reach anyway.
+        rm -f "$_au_pin"
+        echo "upgrade: '$_au_agent' is NOT installed now - the next session" \
+             "that names it will fetch it" >&2
+      fi
+      exec 8>&-
       return 1
     }
 
@@ -12227,6 +13129,32 @@ in
         '';
       };
 
+      agentUpgrade = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Whether an update also moves each user's already-installed agent
+          CLIs onto the new pin (issues #559, #590, #614).
+
+          The pin alone never reached a running box. A harness is installed
+          just-in-time into the USER's profile and only when the binary is
+          missing (issue #416), so advancing `agentNixpkgs` changes what a
+          box that has never started that harness will fetch, and nothing
+          else. This is what makes the pin arrive: after a successful
+          switch the update service starts
+          `agent-box-harness-upgrade@<user>.service` for each user, which
+          re-installs their harnesses at the new pin.
+
+          Turn it off for a box that must not move its CLIs on an update -
+          an air-gapped one, a validated fleet, or a small disk (each
+          upgrade leaves the previous closure as a profile generation until
+          it is wiped). `jitNixpkgs` is the other half of that answer and
+          freezes the SOURCE; this only decides whether an update acts on
+          it. Either way `agent-box-harness upgrade` still works by hand -
+          nothing here is reserved to the update service.
+        '';
+      };
+
       agentPinFile = lib.mkOption {
         type = lib.types.str;
         default = "/etc/nixos/agent-box-agent-pin.nix";
@@ -13380,6 +14308,21 @@ in
     # in the store. Verifying releases against an offline signing key is
     # tracked upstream (defangdevs/agent-box issue 46); until then this
     # trusts the pinned repo as GitHub serves it.
+    # The shared unit file (shipped in agentBoxUnitsPackage above) names a
+    # bare program, exactly as agent-box@ does; this drop-in resolves it to
+    # the generated wrapper's store path. Nothing WANTS this unit - it is
+    # started by name, per user, by the update service.
+    systemd.services."agent-box-harness-upgrade@" = {
+      # The VERB matters as much as the path: `agent-box-harness` with no
+      # argument prints usage and exits 0, so a drop-in that resolved only
+      # the program would give a unit that "succeeded" every time and moved
+      # nothing. Native's half of this appends the same word.
+      serviceConfig.ExecStart = [
+        ""
+        "${contractBin (lib.elemAt harnessUpgradeContract.execStart 0)} upgrade"
+      ];
+    };
+
     systemd.services.agent-box-update = {
       description = "Fast-forward agent-box to upstream HEAD and rebuild";
       # No wantedBy — on-demand only, via the agents' sudo rule (or root).
@@ -13392,6 +14335,14 @@ in
         CURRENT_REV = cfg.selfUpdate.rev;
         PIN_FILE = cfg.selfUpdate.pinFile;
         AGENT_PIN_FILE = cfg.selfUpdate.agentPinFile;
+        # Whether to move each user's installed harnesses onto the pin this
+        # run just advanced, and whose. Both are read by update.sh AFTER a
+        # successful switch: a rebuild that failed and rolled back must not
+        # move anybody's CLI onto a pin the box is no longer running.
+        AGENT_BOX_AGENT_UPGRADE =
+          if cfg.selfUpdate.agentUpgrade then "1" else "0";
+        AGENT_BOX_UPGRADE_USERS =
+          lib.concatStringsSep " " (lib.attrNames cfg.users);
         # What agent-box-source reads. The rev is the ancestry baseline: the
         # tree is realigned to the rev the box RUNS before the fast-forward,
         # so the guard measures from what is actually running and not from
@@ -13522,6 +14473,26 @@ in
         wall "agent-box: updating (source: $REPO@$target, agent nixpkgs: $release) — agent sessions will restart if their services changed." || true
         if /run/current-system/sw/bin/nixos-rebuild switch; then
           wall "agent-box: update to $target applied." || true
+          # Move each user's already-installed agent CLIs onto the pin this run
+          # advanced (issues #559, #590, #614). Only after a SUCCESSFUL switch: a
+          # rebuild that rolled back is running the old pin, and a CLI moved onto
+          # the new one would be the only thing on this box that had moved.
+          #
+          # Per user, because a nix profile belongs to its owner. --no-block,
+          # because a harness closure is a few hundred MiB and this unit is what
+          # the settings page polls: the update is DONE, and the CLI move reports
+          # itself through its own unit. A user who has installed no harness has
+          # a unit that condition-skips in milliseconds.
+          #
+          # This is the half that makes the Update card's own promise true — it
+          # has always said "Updates agent-box and its AI tools" — and the half
+          # that three reports asked for by asking for a newer CLI.
+          if [ "''${AGENT_BOX_AGENT_UPGRADE:-0}" = 1 ]; then
+            for u in ''${AGENT_BOX_UPGRADE_USERS:-}; do
+              /run/current-system/sw/bin/systemctl start --no-block \
+                "agent-box-harness-upgrade@$u.service" || true
+            done
+          fi
         else
           # Roll back exactly what this run changed so the next trigger retries
           # cleanly instead of believing the failed state is current. The tree comes

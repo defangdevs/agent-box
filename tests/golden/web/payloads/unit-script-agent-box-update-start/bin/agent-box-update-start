@@ -74,6 +74,26 @@ fi
 wall "agent-box: updating (source: $REPO@$target, agent nixpkgs: $release) — agent sessions will restart if their services changed." || true
 if /run/current-system/sw/bin/nixos-rebuild switch; then
   wall "agent-box: update to $target applied." || true
+  # Move each user's already-installed agent CLIs onto the pin this run
+  # advanced (issues #559, #590, #614). Only after a SUCCESSFUL switch: a
+  # rebuild that rolled back is running the old pin, and a CLI moved onto
+  # the new one would be the only thing on this box that had moved.
+  #
+  # Per user, because a nix profile belongs to its owner. --no-block,
+  # because a harness closure is a few hundred MiB and this unit is what
+  # the settings page polls: the update is DONE, and the CLI move reports
+  # itself through its own unit. A user who has installed no harness has
+  # a unit that condition-skips in milliseconds.
+  #
+  # This is the half that makes the Update card's own promise true — it
+  # has always said "Updates agent-box and its AI tools" — and the half
+  # that three reports asked for by asking for a newer CLI.
+  if [ "${AGENT_BOX_AGENT_UPGRADE:-0}" = 1 ]; then
+    for u in ${AGENT_BOX_UPGRADE_USERS:-}; do
+      /run/current-system/sw/bin/systemctl start --no-block \
+        "agent-box-harness-upgrade@$u.service" || true
+    done
+  fi
 else
   # Roll back exactly what this run changed so the next trigger retries
   # cleanly instead of believing the failed state is current. The tree comes

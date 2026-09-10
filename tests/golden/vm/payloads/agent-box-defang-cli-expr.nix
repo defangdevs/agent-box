@@ -5,42 +5,40 @@
 # (issue #461).
 #
 # Not in nixpkgs, so there is no `attr` a card could fetch. DefangLabs/defang
-# ships its own canonical packaging at pkgs/defang/cli.nix - `buildGo125Module`
-# against the repo's own src/, with a vendorHash that is only ever valid for
-# the go.sum sitting next to it. Fetching the whole source tree at one pinned
-# tag and calling THEIR file, rather than re-deriving a build here, means that
-# hash never needs maintaining: it travels with the tag. (The file beside it,
-# pkgs/defang/default.nix - a fetchurl of the prebuilt release binary - is
-# lib.warn-marked deprecated upstream and stuck on an old version; don't reach
-# for that one.)
+# ships its own flake, and `packages.<system>.defang-cli` in it is
+# `buildGo125Module` against the repo's own src/ - so this asks for that
+# output at a release TAG and nothing else.
 #
-# The nixpkgs pin is NOT this box's nixpkgs, and that is the whole point. A
-# derivation's output hash is a function of every input, nixpkgs included, so
-# building cli.nix against whatever nixpkgs the host happens to have produces a
-# DIFFERENT derivation than DefangLabs' release CI built, silently misses the
-# binary cache, and compiles ~100 MB of Go instead - which is what OOM'd a
-# 2 GiB box in issue #373. So this pins the revision DefangLabs/defang's own
-# flake.lock pins at the tag below.
+# It used to re-implement the flake by hand: fetch the source tarball at the
+# tag, fetch the nixpkgs revision the repo's flake.lock names, and
+# callPackage pkgs/defang/cli.nix with it. That worked and needed THREE pins
+# kept in step by hand ("Bump all three pins together", the note said). The
+# flake carries its own lock, so the tag below is now the only pin, and the
+# nixpkgs question answers itself.
 #
-# Verified 2026-08-31: both architectures are prebuilt in the public cache, so
-# an install substitutes rather than builds -
-#   x86_64-linux   /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-defang-cli-git
-#   aarch64-linux  /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-defang-cli-git
-# both HTTP 200 at https://defanglabs.cachix.org/<hash>.narinfo. The closure is
-# 104.8 MiB over 4 paths, which is why it is fetched ON DEMAND and not shipped
-# in the runtime profile.
+# The nixpkgs the build sees is still NOT this box's, which was the whole
+# point of the hand-written version and is preserved here: a derivation's
+# output hash is a function of every input, so building cli.nix against
+# whatever nixpkgs the host happens to have produces a DIFFERENT derivation
+# than DefangLabs' release CI built, silently misses the binary cache, and
+# compiles ~100 MB of Go instead - which is what OOM'd a 2 GiB box in issue
+# #373. Going through the flake gets the repo's own locked nixpkgs by
+# construction rather than by a hash somebody has to remember to move.
 #
-# Bump all three pins together when moving to a new defang tag:
-#   curl -sL https://raw.githubusercontent.com/DefangLabs/defang/vX.Y.Z/flake.lock \
-#     | jq '.nodes.nixpkgs.locked | {url, sha256: .narHash}'
-let
-  defangSrc = builtins.fetchTarball {
-    url = "https://github.com/DefangLabs/defang/archive/refs/tags/v3.15.0.tar.gz";
-    sha256 = "sha256-9wfaHVqxJprJUoP5meQEgmRfV6kJugonmO714gaR1tc=";
-  };
-  defangPkgs = import (builtins.fetchTarball {
-    url = "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1057999.afe3d8ac4395/nixexprs.tar.xz";
-    sha256 = "sha256-93GX5Q/npwBE92xpHlktxgGztuIP/2kwOMukz+qyJBk=";
-  }) { system = builtins.currentSystem; };
-in
-defangPkgs.callPackage "${defangSrc}/pkgs/defang/cli.nix" { }
+# Verified 2026-09-09, aarch64-linux: this expression and the hand-written
+# one it replaces evaluate to the SAME store path,
+# /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-defang-cli-git - the one the
+# previous version of this file recorded as cache-warm at
+# https://defanglabs.cachix.org. So the substituter still hits and no box
+# starts compiling Go because of this change.
+#
+# getFlake, not fetchTarball + callPackage: both backends already enable the
+# flakes feature box-wide (nix.settings.experimental-features on NixOS,
+# --extra-experimental-features natively) and every caller of this file
+# evaluates it with --impure, which is what an unlocked ref like a tag
+# needs. builtins.currentSystem needs the same impurity and the previous
+# version used it too.
+#
+# To move to a new defang release, change the tag. That is the whole edit.
+(builtins.getFlake "github:DefangLabs/defang/v3.15.0")
+  .packages.${builtins.currentSystem}.defang-cli
