@@ -3,8 +3,8 @@
 
 root     ALL=(ALL:ALL)    SETENV: ALL
 %wheel  ALL=(ALL:ALL)    SETENV: ALL
-agent     ALL=(ALL:ALL)    NOPASSWD: /run/current-system/sw/bin/systemctl reload caddy.service, NOPASSWD: /run/current-system/sw/bin/systemctl reload caddy.service, NOPASSWD: /run/current-system/sw/bin/systemctl start --no-block agent-box-update.service
-robot     ALL=(ALL:ALL)    NOPASSWD: /run/current-system/sw/bin/systemctl reload caddy.service, NOPASSWD: /run/current-system/sw/bin/systemctl reload caddy.service, NOPASSWD: /run/current-system/sw/bin/systemctl start --no-block agent-box-update.service
+agent     ALL=(ALL:ALL)    NOPASSWD: /run/current-system/sw/bin/systemctl reload caddy.service, NOPASSWD: /run/current-system/sw/bin/systemctl start --no-block agent-box-update.service
+robot     ALL=(ALL:ALL)    NOPASSWD: /run/current-system/sw/bin/systemctl reload caddy.service, NOPASSWD: /run/current-system/sw/bin/systemctl start --no-block agent-box-update.service
 agent     ALL=(ALL:ALL)    NOPASSWD: /run/current-system/sw/bin/systemctl restart agent-box-docker@agent.service, NOPASSWD: /run/current-system/sw/bin/systemctl stop agent-box-docker@agent.service
 robot     ALL=(ALL:ALL)    NOPASSWD: /run/current-system/sw/bin/systemctl restart agent-box-docker@robot.service, NOPASSWD: /run/current-system/sw/bin/systemctl stop agent-box-docker@robot.service
 agent     ALL=(ALL:ALL)    NOPASSWD: /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-password-agent/bin/agent-box-password-agent ""

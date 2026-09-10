@@ -1,0 +1,5 @@
+@SITE_HOST@ {
+  log
+  import acme_alpn_only
+  reverse_proxy @SITE_UPSTREAM@
+}

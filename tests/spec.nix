@@ -73,11 +73,17 @@ in
   # which no native box has — so the cross-backend comparison normalizes the
   # systemctl prefix rather than the generator inventing a path. Worth knowing
   # while reading tests/native/expected/etc/sudoers.d: the NixOS-shaped line
-  # there is this one, and it is also redundant, since the module grants the
-  # caddy reload itself (caddyReloadCmd, modules/agent-box.nix.in:316) — which
-  # is why the golden sudoers carries it twice.
+  # there is hosts/vm.nix's caddy-reload grant, and since issue #629 it is
+  # the ONLY source of that grant — neither backend implies it from
+  # web.enable any more, so the golden sudoers carries it exactly once.
   sudoAllowlist = cfg.sudoAllowlist;
   web = { enable = cfg.web.enable; }
+    # Operator-declared vhosts (issue #629). Emitted whenever any are
+    # declared: they render into the Caddyfile both backends produce, so a
+    # native fixture without them would describe a different box.
+    // lib.optionalAttrs (cfg.web.sites != { }) {
+      sites = lib.mapAttrs (_: s: { inherit (s) upstream; }) cfg.web.sites;
+    }
     # Only when turned OFF, for the reason `session` above emits only
     # non-defaults: both backends default the reboot button on, and writing
     # that default out would hide a divergence in either default behind an

@@ -1,6 +1,7 @@
 # VM test for the web surface a controlling user reaches: the per-user
-# ~/downloads file drop (issue #132), self-serve virtual hosts written into
-# ~/sites (issue #40), and the fail2ban jail on the terminal's basic auth.
+# ~/downloads file drop (issue #132), operator-declared virtual hosts serving
+# an agent's own files out of ~/sites (issues #40, #629), and the fail2ban
+# jail on the terminal's basic auth.
 #
 # One VM, one client, three subtests (issue #312). These were three separate
 # tests whose node definitions were the same 40 lines three times over — same
@@ -10,23 +11,24 @@
 # boots from CI, and gives the web surface one obvious place to grow.
 #
 # The sandbox has no ACME, so the module-managed Caddyfile is replaced with a
-# `tls internal` one that reproduces the three routing shapes the module emits:
-# the per-user snippet `import`, the authenticated /<user>/downloads/ handle
-# (basic_auth -> reverse_proxy to that user's settings daemon, which is what
-# serves the drop since issue #630, plus the issue #631 attachment and sandbox
-# headers), and the authenticated catch-all standing in for the terminal. The
-# flake's `download-route` and `webhook-route` eval checks separately assert
-# the module's REAL Caddyfile emits those blocks; what needs a booted VM is
-# whether caddy, fail2ban, tmpfiles and the agent unit's namespace agree with
-# each other, which is what this test covers.
+# `tls internal` one that reproduces the routing shapes the module emits: an
+# operator-declared web.sites vhost, the authenticated /<user>/downloads/
+# handle (basic_auth -> reverse_proxy to that user's settings daemon, which is
+# what serves the drop since issue #630, plus the issue #631 attachment and
+# sandbox headers), and the authenticated catch-all standing in for the
+# terminal. That the REAL Caddyfile emits those blocks — and, since issue
+# #629, that it imports nothing an agent can write — is asserted where it
+# belongs, in the `download-route`, `webhook-route` and `site-route` eval
+# checks; what needs a booted VM is whether caddy, fail2ban, tmpfiles and the
+# agent unit's namespace agree with each other, which is what this test covers.
 #
 # Ordering matters: the fail2ban subtest ends with the client banned at the
-# firewall, so it runs last. Running the reload-driven self-serve subtest before
+# firewall, so it runs last. Running the reload-driven ~/sites subtest before
 # it also means the final "correct password still works" check proves the
 # `{$WEB_PASSWORD_HASH_AGENT}` placeholder survives a `systemctl reload
-# caddy.service` — the exact sequence a real agent puts a box through, which
-# neither of the split tests could see (fail2ban never reloaded, and the
-# self-serve Caddyfile carried no placeholder).
+# caddy.service` — the exact sequence a real box goes through, which neither of
+# the split tests could see (fail2ban never reloaded, and the self-serve
+# Caddyfile carried no placeholder).
 { agent-box }:
 {
   name = "agent-box-web-surface";
@@ -50,6 +52,16 @@
     };
     system.stateVersion = "25.05";
 
+    # curl on the SERVER too, not only on the client: the ~/sites subtest
+    # asks caddy's admin socket what is actually loaded, which is a
+    # unix-socket request only root can make. python3 is what the agent
+    # serves its own site with, started as a transient unit in the script
+    # below rather than declared here — `phantom-unit-overrides` (issue
+    # #362) scans these files for systemd.services.<name> and cannot tell
+    # a test's own new unit from a drop-in naming one the module never
+    # renders.
+    environment.systemPackages = [ pkgs.curl pkgs.python3 ];
+
     # Materialize the password hash (subshell so the umask doesn't leak).
     system.activationScripts.agent-web-password-hash.text = ''
       install -d -m 0700 /var/lib/agent-box-web
@@ -64,15 +76,30 @@
     '';
 
     # Same $WEB_PASSWORD_HASH_AGENT placeholder the module wires up, so the
-    # agent-web-auth-secrets prep unit still feeds these vhosts. Caddyfile
-    # globs cap at ONE `*`, so the snippet import stays per-user (as in the
-    # module). `log` is what the fail2ban filter reads.
+    # agent-web-auth-secrets prep unit still feeds these vhosts. `log` is what
+    # the fail2ban filter reads.
+    #
+    # mysite.test is the shape web.sites renders (issue #629): a vhost the
+    # BOX's configuration declares, reverse-proxying to a port the AGENT
+    # listens on. A reverse proxy is the only shape there is — caddy serves
+    # no files here, because a `root` over an agent-writable directory is
+    # the symlink escape issue #630 already took out of the file drop
+    # ("a site root is not a filesystem sandbox", caddyfile-terminal.caddy).
+    #
+    # There is deliberately no `import /var/lib/agent-box-sites/agent/*.caddy`
+    # here any more — that import is what let an agent write a site block
+    # into the instance holding every user's WEB_COOKIE_SECRET_*, and the
+    # subtest below proves a snippet left in ~/sites reaches nothing.
     services.caddy.configFile = lib.mkForce (pkgs.writeText "Caddyfile" ''
       {
         admin unix//run/caddy/admin.sock
       }
 
-      import /var/lib/agent-box-sites/agent/*.caddy
+      mysite.test {
+        log
+        tls internal
+        reverse_proxy 127.0.0.1:3000
+      }
 
       box.test {
         log
@@ -358,19 +385,37 @@
             "/tmp/mgmt.head >/dev/null"
         )
 
-    with subtest("an agent adds a vhost by writing ~/sites and reloading caddy"):
+    with subtest("~/sites holds an operator-declared site's files, not its config"):
+        # Issue #629. ~/sites used to be an extension point for
+        # CONFIGURATION: a *.caddy snippet there was imported into the front
+        # door, which is the one Caddy instance holding every user's
+        # WEB_PASSWORD_HASH_* and WEB_COOKIE_SECRET_* and able to reach every
+        # user's settings socket. So a snippet could print a SIBLING's cookie
+        # secret through Caddy's own `{$ENV}` substitution -- and since the
+        # normal routes admit an exact cookie match, that value is a session
+        # -- or reverse_proxy straight to a sibling's settings socket with no
+        # auth gate.
+        #
+        # What is left is the useful half: the directory is still the
+        # agent's to write, and an operator declares a hostname that
+        # reaches the server the agent runs over those files (web.sites,
+        # standing in above as mysite.test -> 127.0.0.1:3000). caddy opens
+        # none of them itself.
+
         # The tmpfiles-created symlink from ~agent/sites into the caddy-readable dir.
         machine.succeed("test -L /home/agent/sites")
         machine.succeed(
             '[ "$(readlink /home/agent/sites)" = /var/lib/agent-box-sites/agent ]'
         )
 
-        # Perms: 0750 agent:caddy. The user writes; caddy reads by group.
+        # Perms: 0750 agent:caddy. The user writes; the `caddy` group is
+        # vestigial since the site became a proxy, and the mode is what
+        # keeps other agent users out.
         machine.succeed(
             "stat -c '%U:%G %a' /var/lib/agent-box-sites/agent | grep -x 'agent:caddy 750'"
         )
 
-        # The snippet dir must be writable in the AGENT UNIT's mount namespace, not
+        # The dir must be writable in the AGENT UNIT's mount namespace, not
         # just to the agent uid. ~/sites resolves to /var/lib/agent-box-sites/agent,
         # outside the ReadWritePaths of ProtectSystem=strict — so the documented
         # flow returned EROFS for every real agent while this test (which used to
@@ -380,25 +425,36 @@
             "| grep /var/lib/agent-box-sites/agent >/dev/null"
         )
 
-        # The agent writes a new vhost snippet through the ~/sites symlink — never
-        # touches /var/lib directly. `tls internal` sidesteps ACME in the sandbox.
-        # nsenter joins the running unit's mount namespace so the write is subject
-        # to the same read-only remount a tool shell inside the session gets;
-        # runuser then drops to the agent uid for the ownership check below.
+        # The agent writes its app's CONTENT through the ~/sites symlink —
+        # never touches /var/lib directly — and its own server on
+        # 127.0.0.1:3000 is what reads it back. nsenter joins the running
+        # unit's mount namespace so the write is subject to the same
+        # read-only remount a tool shell inside the session gets; runuser
+        # then drops to the agent uid for the ownership check below.
+        machine.succeed(f"{in_session} mkdir -p /home/agent/sites/public")
         machine.succeed(
             f"{in_session} "
-            "tee /home/agent/sites/mysite.caddy > /dev/null <<'CFG'\n"
-            "mysite.test {\n"
-            "  tls internal\n"
-            "  respond \"hello from mysite\" 200\n"
-            "}\n"
-            "CFG"
+            "tee /home/agent/sites/public/index.html > /dev/null <<'HTML'\n"
+            "hello from mysite\n"
+            "HTML"
+        )
+        machine.succeed(
+            "stat -c '%U' /var/lib/agent-box-sites/agent/public/index.html "
+            "| grep -x agent"
         )
 
-        # File landed inside the caddy-readable dir (symlink target), owned by agent.
+        # ...and serves it ITSELF, as itself, on loopback. This is the whole
+        # replacement for the old `root` + `file_server`: caddy proxies to
+        # this instead of opening the directory, so a symlink left in here
+        # is resolved by a process that is already the agent and reaches
+        # nothing the agent could not read anyway. A transient unit, so the
+        # server is supervised without this test declaring one.
         machine.succeed(
-            "stat -c '%U' /var/lib/agent-box-sites/agent/mysite.caddy | grep -x agent"
+            "systemd-run --unit=agent-static-site --uid=agent "
+            "--collect python3 -m http.server 3000 --bind 127.0.0.1 "
+            "--directory /var/lib/agent-box-sites/agent/public"
         )
+        machine.wait_for_open_port(3000, addr="127.0.0.1")
 
         # /run/wrappers must be on the agent unit's PATH — it holds the setuid
         # sudo wrapper, without which shells started by the agent CLI can't
@@ -408,17 +464,83 @@
             "| grep '/run/wrappers/bin' >/dev/null"
         )
 
-        # Reload caddy via the sudo rule (NOPASSWD).
-        machine.succeed(
+        # No caddy reload grant (issue #629). This configuration sets no
+        # sudoAllowlist, and web.enable no longer implies one, so the command
+        # the guide used to hand every agent is now refused. `sudo -n` fails
+        # rather than prompting, which is what makes this assertable at all.
+        machine.fail(
             "sudo -u agent -H bash -lc "
             "'sudo -n systemctl reload caddy.service'"
         )
+
+        # The reload that DOES happen is an operator's, as root. Kept here
+        # because the fail2ban subtest below depends on having reloaded once:
+        # it is what proves {$WEB_PASSWORD_HASH_AGENT} survives a reload.
+        machine.succeed("systemctl reload caddy.service")
         machine.wait_until_succeeds("systemctl is-active caddy.service", timeout=20)
 
-        # New vhost actually serves.
+        # The declared vhost serves the file the agent wrote.
         site = f"curl -sk --resolve mysite.test:443:{machine_ip}"
         client.wait_until_succeeds(
             f"{site} https://mysite.test/ | grep 'hello from mysite' >/dev/null",
+            timeout=30,
+        )
+
+    with subtest("a *.caddy snippet left in ~/sites reaches nothing"):
+        # The attack the old import allowed, run for real. The secret is
+        # genuinely in caddy's environment -- assert that first, or the
+        # negative below proves nothing -- and the snippet asks Caddy to
+        # print it on a vhost of the agent's own choosing.
+        secret = machine.succeed(
+            "grep -o 'WEB_COOKIE_SECRET_AGENT=.*' /run/agent-box-web/env "
+            "| cut -d= -f2"
+        ).strip()
+        assert len(secret) > 8, f"no cookie secret to exfiltrate: {secret!r}"
+
+        machine.succeed(
+            f"{in_session} "
+            "tee /home/agent/sites/evil.caddy > /dev/null <<'CFG'\n"
+            "evil.test {\n"
+            "  tls internal\n"
+            "  respond \"{$WEB_COOKIE_SECRET_AGENT}\" 200\n"
+            "}\n"
+            "CFG"
+        )
+        # It landed -- the write is not what is blocked here, the READING of
+        # it as configuration is.
+        machine.succeed("test -s /var/lib/agent-box-sites/agent/evil.caddy")
+
+        # An operator's reload does not pick it up, because nothing imports
+        # it. caddy stays up (a snippet that WAS imported and was malformed
+        # would fail the reload instead).
+        machine.succeed("systemctl reload caddy.service")
+        machine.wait_until_succeeds("systemctl is-active caddy.service", timeout=20)
+
+        # No such vhost exists, so nothing answers for it. Whatever comes
+        # back -- a TLS failure, a 404, the default vhost -- must not
+        # contain the secret. From the CLIENT, which is where a visitor the
+        # agent pointed at its hostname would be, and the node that has
+        # curl.
+        evil = client.succeed(
+            f"curl -sk --max-time 10 --resolve evil.test:443:{machine_ip} "
+            "https://evil.test/ || true"
+        )
+        assert secret not in evil, (
+            "a ~/sites snippet exfiltrated the cookie secret"
+        )
+        # And the vhost the agent tried to declare is not in the running
+        # config at all. Asked through the admin socket, which only root can
+        # reach (see the subtest below). `caddy adapt` is not the question
+        # here -- what is loaded is.
+        cfg = machine.succeed(
+            "curl -s --unix-socket /run/caddy/admin.sock "
+            "http://localhost/config/ || true"
+        )
+        assert "evil.test" not in cfg, "the snippet reached the live config"
+        # The site the OPERATOR declared is unaffected by any of this.
+        client.wait_until_succeeds(
+            f"curl -sk --resolve mysite.test:443:{machine_ip} "
+            "https://mysite.test/ | grep 'hello from mysite' >/dev/null",
             timeout=30,
         )
 
@@ -430,11 +552,11 @@
         # preview found this endpoint instead and took the box's front door
         # down for 47 minutes, losing about 44 webhook deliveries.
         #
-        # The reload in the subtest above is the other half of this and has
-        # already run: it went through `systemctl reload caddy.service`, whose
-        # ExecReload passes no --address, and the new vhost served afterwards.
-        # So the endpoint moving to a socket did not cost the reload path that
-        # ~/sites depends on.
+        # The reloads in the subtests above are the other half of this and
+        # have already run: they went through `systemctl reload
+        # caddy.service`, whose ExecReload passes no --address, and the
+        # declared vhost served afterwards. So the endpoint moving to a
+        # socket did not cost the reload path an operator's `apply` needs.
         machine.succeed("test -S /run/caddy/admin.sock")
         machine.succeed("stat -c '%U' /run/caddy/admin.sock | grep -x caddy")
         # No group or other bits: root and caddy, nobody else.

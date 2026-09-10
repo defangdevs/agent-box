@@ -249,7 +249,9 @@ Add the flake as an input and import the module:
       coder = { agent = "codex"; };
       ci    = { skipPermissions = false; };   # keep approval prompts on
     };
-    # The ONLY elevated powers the agents get - keep it tight.
+    # The ONLY elevated powers the agents get - keep it tight. Nothing here
+    # is required: this one lets an agent reload the web front door, which
+    # since issue #629 it has no config of its own to land through.
     sudoAllowlist = [ "/run/current-system/sw/bin/systemctl reload caddy.service" ];
     extraPackages = with pkgs; [ git ripgrep jq ];
   };
@@ -539,9 +541,37 @@ to that user's own settings daemon over a local socket, and the daemon runs
 as that user and resolves every path component inside the drop. The backing
 directory under `/var/lib`, symlinked in as `~/downloads`, is `0700`, so one
 web-server identity cannot reach across users' drops.) The seeded `AGENTS.md`
-tells the agent about this route, so "send me that file" just works. For
-unauthenticated sharing, an agent can instead run its own web service and
-expose it via `~/sites` (see the seeded `AGENTS.md`).
+tells the agent about this route, so "send me that file" just works.
+
+For unauthenticated sharing, an agent runs its own web service and YOU
+declare the hostname that fronts it - `services.agent-box.web.sites` (or
+`web.sites` in a native box's `config.yaml`):
+
+```nix
+services.agent-box.web.sites."app.example.com".upstream = "127.0.0.1:3000";
+```
+
+Each gets a Let's Encrypt certificate on first request, as long as DNS for
+the name points at the box. A site is a reverse proxy to a `host:port` and
+nothing else, validated before it reaches the Caddyfile.
+
+There is deliberately no "serve this directory" variant. It would mean caddy
+opening a directory an agent can write, and `file_server` follows a symlink
+into anything caddy can read - including `/var/lib/caddy`, which holds its
+ACME account key and every certificate's private key. An app with static
+files runs its own server for them on a loopback port
+(`python3 -m http.server --bind 127.0.0.1 3000`) and gets an `upstream`
+pointed at that, so caddy never touches agent-writable content.
+
+Agents used to add these themselves, by writing `~/sites/NAME.caddy` and
+reloading Caddy with a sudo grant `web.enable` handed out. That is gone
+(issue #629): the front door is ONE Caddy instance holding every user's
+password hash and cookie secret and able to reach every user's settings
+socket, so a Caddyfile in it was authority over the whole box - a snippet
+could print a sibling's cookie secret via Caddy's documented `{$ENV}`
+substitution, and the routes accept an exact cookie match as a login.
+`~/sites` remains the agent's own directory outside `/home`, a convenient
+place to keep such an app's files; the routing is yours.
 
 ## Webhooks: the agent gets told, instead of polling (web setups)
 

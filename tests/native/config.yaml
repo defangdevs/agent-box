@@ -35,6 +35,9 @@ users:
         agent: codex
 web:
   enable: true
+  sites:
+    app.golden.example.org:
+      upstream: 127.0.0.1:3000
 webhook:
   enable: true
   hookSessionArgs: []

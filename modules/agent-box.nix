@@ -484,8 +484,9 @@ let
 
     - Only your home directory is writable; the rest of the filesystem is
       read-only (systemd ProtectSystem=strict) and writes there fail. The one
-      exception is ~/sites, a symlink out to a caddy-readable dir (see "Serving
-      a web app publicly").
+      exception is ~/sites, a symlink out to a dir outside /home that is a handy
+      place for a public app's files (see "Serving a web app publicly" - the
+      routing itself is not yours to add).
     - $HOME is SHARED by every one of your tmux sessions (same user, all start
       in $HOME unless `--cwd` sent them elsewhere), so two sessions in one clone
       edit the same files. Give yours a checkout of its own: ~/worktrees is
@@ -646,17 +647,18 @@ let
     exposed; nothing else in your home is reachable over the web - a symlink out
     of the directory included, since a link is followed only where it stays
     inside the drop, so `ln -s ~/build/big.tar ~/downloads/` reads as a missing
-    file. For unauthenticated sharing, run your own service and expose it via
-    ~/sites.
+    file. For unauthenticated sharing you need a hostname declared for you - see
+    "Serving a web app publicly".
 
     Every file there is handed to the browser as a DOWNLOAD, never rendered:
     this directory shares an origin with the terminal and the settings page, so
     an .html or .svg opened inline would be script running with the user's own
     login. That is a deliberate trade - a report you drop here is saved, not
     read in the tab - so if you want the user to LOOK at something in their
-    browser rather than save it, serve it yourself through ~/sites, which is a
-    separate hostname with none of that authority. An `index.html` in
-    ~/downloads is not served either; the listing is always the listing.
+    browser rather than save it, it needs a hostname of its own, which has none
+    of that authority and which an operator declares for you (see "Serving a web
+    app publicly"). An `index.html` in ~/downloads is not served either; the
+    listing is always the listing.
 
     ## Putting a screenshot in a GitHub issue or PR
 
@@ -667,23 +669,51 @@ let
     `agent-box-upload --help` for the caveats that matter, the first being that
     the URL 404s until your comment references it.
 
-    ## Serving a web app publicly
+    ## Serving a web app publicly: ask, you cannot self-serve
 
-    Drop a snippet into ~/sites/NAME.caddy that reverse-proxies to a local port,
-    then reload caddy - no rebuild:
+    A public hostname is now DECLARED in the box's own configuration by whoever
+    administers it, and you cannot add one yourself. You used to: a
+    `~/sites/NAME.caddy` snippet plus `sudo systemctl reload caddy.service`. That
+    is gone, and a *.caddy file you drop in ~/sites today is read by nothing
+    (agent-box issue #629). The front door is one Caddy instance holding every
+    user's web password hash and cookie secret and able to reach every user's
+    settings socket, so a Caddyfile in it was authority over the whole box, not
+    over your own app - a snippet could print a sibling's cookie secret, which
+    their routes accept as a login.
 
-        NAME.example.com {
-          import acme_alpn_only
-          reverse_proxy 127.0.0.1:3000
-        }
+    What you CAN do is run the app and ask for the mapping. Give the person
+    administering the box the hostname and the local port, and say which of these
+    they need:
 
-    `sudo /run/current-system/sw/bin/systemctl reload caddy.service` picks it up
-    and Caddy gets a Let's Encrypt cert on first request if DNS for that name
-    points at this box. Reverse-proxy to your process; don't `file_server` from
-    $HOME (caddy can't read /home). Use the full path shown, not bare
-    `systemctl` - the sudoers rule matches on the exact command path, and a bare
-    `systemctl` resolves through PATH to a Nix store path that won't match,
-    silently falling back to asking for a password.
+        # NixOS
+        services.agent-box.web.sites."app.example.com".upstream = "127.0.0.1:3000";
+
+        # native (/etc/agent-box/config.yaml)
+        web:
+          sites:
+            app.example.com:
+              upstream: 127.0.0.1:3000
+
+    then they apply that configuration - `agentbox apply` on a distro box, a
+    rebuild on a NixOS one; "Your host" above says which kind this is. Caddy gets
+    a Let's Encrypt cert on first request if DNS for that name points at this box.
+
+    A site is always a reverse proxy to a port YOU listen on - there is no
+    "serve this directory" option, deliberately. Caddy would have to open a
+    directory you can write, and it follows symlinks into anything it can read,
+    including its own TLS private keys. So if what you have is static files,
+    serve them yourself and let the proxy reach that:
+
+        python3 -m http.server --bind 127.0.0.1 3000 --directory ~/sites/public
+
+    ~/sites is still yours to write and still outside /home (which caddy cannot
+    read at all) - it is a fine place to keep those files. You own the files and
+    the server; you do not own the routing.
+
+    Two things that need no mapping and no permission at all: ~/downloads is
+    already served behind your own login (above), and the same
+    `python3 -m http.server --bind 127.0.0.1` is enough to look at something
+    yourself without publishing it.
 
     @UPDATE_SECTION@## This platform has its own upstream repo
 
@@ -1188,7 +1218,7 @@ let
   # /<user>/downloads/ so the agent can hand a file it wrote to the user
   # (issue #132). Backed OUTSIDE /home because caddy.service runs with
   # ProtectHome=true and cannot read /home; same 0750 <user>:caddy model as
-  # the ~/sites snippet dir — the user writes, caddy reaches it via its group
+  # the ~/sites dir — the user writes, caddy reaches it via its group
   # and reads each file through its world-read bit (default 0644). Symlinked
   # into $HOME as ~/downloads so the agent never touches /var/lib directly.
   downloadsDirOf = name: "/var/lib/agent-box-downloads/${name}";
@@ -3154,10 +3184,31 @@ while "$codex" app-server daemon version >/dev/null 2>&1; do
 done
   '';
 
-  # Reload command is granted when web is enabled so the agent can add a
-  # virtual host and reload without root — pooled with the user-supplied
-  # sudoAllowlist so NoNewPrivileges + sudo rules see the same list.
-  caddyReloadCmd = "/run/current-system/sw/bin/systemctl reload caddy.service";
+  # web.sites validation (issue #629), spelled to match bin/agentbox's
+  # SITE_HOST_RE / SITE_UPSTREAM_RE character for character:
+  # the two backends render the same Caddyfile, so they have to refuse the
+  # same declarations. What every rule here is really enforcing is that the
+  # value cannot contain `{`, `}`, `$`, whitespace or a newline, so it can
+  # never carry an env placeholder, a second directive or a second block
+  # into the file that holds every user's auth secrets.
+  #
+  # builtins.match anchors both ends, so these are whole-string matches.
+  siteHostOk = host:
+    builtins.match "[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+" host != null;
+  siteUpstreamOk = upstream:
+    builtins.match "[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[1-9][0-9]{0,4}" upstream != null
+    && (let port = lib.toInt (lib.last (lib.splitString ":" upstream));
+        in port >= 1 && port <= 65535);
+
+  # NOTE (issue #629): there is deliberately no caddy reload grant here any
+  # more. It existed so an agent could land its own ~/sites/*.caddy snippet
+  # without root; with that import gone from the managed Caddyfile there is
+  # nothing an agent can put in front of a reload, and the grant reduced to
+  # a way to bounce the box's front door. A site declaration now lands with
+  # the rebuild that renders it. An operator who wants the old grant back
+  # can still add the exact command to `sudoAllowlist` — the point is that
+  # a default box no longer hands it out with web.enable.
+
   # The self-update trigger, spelled ONCE, for the same reason rebootCmd
   # below is: sudoers matches argv exactly, so every place that names this
   # command has to agree on it character for character — the sudo rule, the
@@ -3202,7 +3253,6 @@ done
     "/run/current-system/sw/bin/systemctl stop agent-box-docker@${name}.service";
   effectiveSudoAllowlist =
     cfg.sudoAllowlist
-    ++ lib.optional cfg.web.enable caddyReloadCmd
     ++ lib.optional cfg.selfUpdate.enable updateStartCmd;
   # Whether this box grants an agent user ANY sudo, which is a different
   # question from whether effectiveSudoAllowlist is non-empty: the
@@ -12961,14 +13011,10 @@ in
         username is the linux user name, so logging in picks the terminal.
         The vhost root (/) serves the primary user's (web.user) terminal
         workspace — one tab per tmux session — behind that same auth; other
-        users' terminals live at /<user>/. The top-level
-        Caddyfile is module-managed (regenerated every rebuild); each agent
-        user's own virtual hosts live in ~/sites/*.caddy (a symlink to
-        /var/lib/agent-box-sites/<user>/, which caddy can read) and land
-        with `sudo /run/current-system/sw/bin/systemctl reload
-        caddy.service` (the full path matters — a bare `systemctl` resolves
-        through PATH to a Nix store path the sudoers rule won't match, so it
-        silently asks for a password instead)
+        users' terminals live at /<user>/. The top-level Caddyfile is
+        module-managed (regenerated every rebuild) and nothing an agent
+        writes is imported into it; extra virtual hosts are declared in
+        web.sites and land with the rebuild that renders them (issue #629)
       '';
 
       domain = lib.mkOption {
@@ -12986,13 +13032,83 @@ in
         type = lib.types.str;
         default = "agent";
         description = ''
-          Which services.agent-box.users entry administers Caddy: it is
-          added to the caddy group (so it can edit /var/lib/caddy/Caddyfile)
-          and granted passwordless sudo for
-          `/run/current-system/sw/bin/systemctl reload caddy.service`.
-          Which users get a browser terminal is separate — set
-          users.<name>.web.passwordHashFile per user.
+          Which services.agent-box.users entry the vhost root (/) belongs
+          to: its terminal workspace and settings page are what a bare
+          https://<domain>/ serves. Which users get a browser terminal is
+          separate — set users.<name>.web.passwordHashFile per user.
+
+          It confers no privilege over Caddy. The Caddyfile is
+          module-managed and root-owned, no agent user is in the caddy
+          group, and since issue #629 no agent user is granted the caddy
+          reload either.
         '';
+      };
+
+      # A site is a REVERSE PROXY and nothing else -- deliberately no
+      # static-file kind (CodeRabbit, PR #655). A `root` served by caddy
+      # would have to name a directory, and the only directory an agent can
+      # put files in is its own, which caddy reaches by group. `file_server`
+      # follows symlinks, and caddy can read /var/lib/caddy -- its ACME
+      # account key and every certificate's private key. So one `ln -s` in
+      # ~/sites would publish the box's TLS keys on a hostname the agent
+      # chose: a cross-tenant read primitive, inside the change whose whole
+      # purpose is removing one. Static files are served the same way every
+      # other app here is, by the agent's own server on a loopback port.
+      #
+      # Operator-approved extra virtual hosts (issue #629). This replaces
+      # the old self-serve `import ~/sites/*.caddy`, which handed every
+      # agent user a general Caddyfile inside the ONE instance that holds
+      # every user's web auth secrets and can reach every user's settings
+      # socket: a snippet could read a sibling's cookie secret (a bearer
+      # credential -- the normal routes admit an exact match) through
+      # Caddy's documented `{$ENV}` substitution, or reverse_proxy to a
+      # sibling's privileged upstream with no auth gate in front of it.
+      #
+      # So a site is DECLARED here, by whoever administers the box, and the
+      # declaration is deliberately not a Caddyfile: a hostname plus either
+      # one upstream or one document root, each validated character by
+      # character (see the assertions in config below) so that no value can
+      # carry an env placeholder, a second directive, or a newline into the
+      # rendered file.
+      sites = lib.mkOption {
+        default = { };
+        example = lib.literalExpression ''
+          {
+            "app.example.com".upstream = "127.0.0.1:3000";
+            "docs.example.com".root = "/var/lib/agent-box-sites/agent/public";
+          }
+        '';
+        description = ''
+          Extra virtual hosts to serve, keyed by hostname. Each gets a
+          Let's Encrypt certificate via TLS-ALPN-01 on first request, so
+          DNS for the name has to point at this box.
+
+          A site reverse-proxies to `upstream`, a `host:port` something on
+          this box listens on. There is no static-file variant on purpose:
+          serving files would mean caddy opening a directory an agent can
+          write, and `file_server` follows symlinks into anything caddy can
+          read -- including its own certificate keys under /var/lib/caddy.
+          An agent that wants to publish files runs a server for them
+          (`python3 -m http.server --bind 127.0.0.1 3000`, or whatever the
+          app already is) and gets an `upstream` pointed at it, so caddy
+          never touches agent-writable content at all.
+
+          The hostname may not be web.domain: that vhost is the
+          management surface (terminal, settings, webhook ingress) and a
+          second block for it would shadow routes rather than add any.
+        '';
+        type = lib.types.attrsOf (lib.types.submodule {
+          options = {
+            upstream = lib.mkOption {
+              type = lib.types.str;
+              example = "127.0.0.1:3000";
+              description = ''
+                `host:port` to reverse-proxy this hostname to. Required:
+                a site with no upstream has nothing to serve.
+              '';
+            };
+          };
+        });
       };
 
       # Portal handover (issue #541). The box is a VERIFIER: it holds no
@@ -13047,10 +13163,12 @@ in
           counts requests that actually carried credentials, so the 401 a
           browser gets before showing the login prompt doesn't score against
           visitors. The module-managed Caddyfile includes the `log` directive
-          the jail needs; per-user snippet files under ~/sites/ share the
-          same journal stream if they include `log` too. Whitelist trusted
-          networks with services.fail2ban.ignoreIP. Also brings fail2ban's
-          default sshd jail along.
+          the jail needs, on the terminal vhost and on every web.sites
+          vhost, so all of them share one journal stream (the failregex
+          also requires an Authorization header, so a site whose own
+          upstream answers 401 does not score against the jail).
+          Whitelist trusted networks with services.fail2ban.ignoreIP.
+          Also brings fail2ban's default sshd jail along.
         '';
       };
 
@@ -24393,49 +24511,78 @@ if __name__ == "__main__":
         }
       '';
 
+      # One operator-declared vhost (issue #629), from the same fragments
+      # the native renderer binds — so both backends emit the same text and
+      # the two fixtures can be compared line for line.
+      #
+      # The declaration is a hostname plus ONE value, validated by the
+      # assertions in config below before it gets here. That is what makes
+      # substituting it into a Caddyfile safe: `upstream` and `root` cannot
+      # hold `{`, `}`, `$`, a space or a newline, so neither can smuggle in
+      # an env placeholder, a second directive or a whole second block —
+      # which is the entire difference between this and importing a
+      # snippet an agent wrote.
+      siteBlock = host: site:
+        lib.replaceStrings [ "@SITE_HOST@" "@SITE_UPSTREAM@" ]
+          [ host site.upstream ] ''
+        @SITE_HOST@ {
+          log
+          import acme_alpn_only
+          reverse_proxy @SITE_UPSTREAM@
+        }
+      '';
+
       # Rendered Caddyfile. Module-managed (regenerated every rebuild) — safe
       # to keep in the world-readable Nix store because it only holds
       # {$ENV} placeholders, never secrets.
       #
-      # Self-serve extension point: the trailing per-user `import` lines
-      # (one per agent user, since the Caddyfile `import` directive rejects
-      # multi-wildcard globs like `*/*.caddy`) pick up snippet files. Each
-      # agent user has a caddy-readable directory at
-      # /var/lib/agent-box-sites/<user>/ symlinked from ~/sites, so the agent
-      # can add a virtual host by writing ~/sites/<something>.caddy and
-      # running `sudo systemctl reload caddy.service`. No nixos-rebuild
-      # needed. Snippets should REVERSE-PROXY to a localhost port rather than
-      # serve files from $HOME — caddy.service runs with ProtectHome=true and
-      # can't read /home. See the comment block at the top of the rendered
-      # file below (agents will read that from the running box).
+      # Extra vhosts come from web.sites and nothing else (issue #629).
+      # There used to be a trailing `import /var/lib/agent-box-sites/<user>/*.caddy`
+      # per agent user, so an agent could add a virtual host by writing
+      # ~/sites/<something>.caddy and reloading caddy with no rebuild. That
+      # made a general Caddyfile the tenant-facing API for the instance that
+      # holds every user's web auth secrets and can reach every user's
+      # settings socket — a snippet could print a sibling's
+      # WEB_COOKIE_SECRET_<USER> through Caddy's documented `{$ENV}`
+      # substitution and, since the normal routes admit an exact cookie
+      # match, that value IS a session. The dirs and the ~/sites symlink
+      # stay (they are where a `root` site's files live); the import is
+      # gone, and the reload grant with it.
       managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
-      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" ]
-        [ cfg.web.domain "services.agent-box" "nixos-rebuild switch"
-          caddyReloadCmd ] ''
+      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" ]
+        [ cfg.web.domain "services.agent-box" "nixos-rebuild switch" ] ''
         # This file is managed by @MANAGED_BY@ — edits here get OVERWRITTEN on
-        # the next @APPLY_CMD@. To add your own virtual host,
-        # drop a *.caddy snippet into ~/sites/ (which is a symlink into
-        # /var/lib/agent-box-sites/<you>/, a caddy-readable location) and
-        # reload caddy with:
+        # the next @APPLY_CMD@, and nothing an agent can write is read into it.
         #
-        #     sudo @RELOAD_CMD@
+        # An extra virtual host is declared in this box's own configuration and
+        # rendered into the "Operator-approved sites" section at the bottom of
+        # this file. On NixOS:
         #
-        # spelled with the full path, because sudoers matches the command path
-        # exactly and a bare `systemctl` can resolve through PATH to one it will
-        # not match — which asks for a password the agent does not have.
+        #     services.agent-box.web.sites."foo.example.com".upstream =
+        #       "127.0.0.1:3000";
         #
-        # Recommended snippet shape — reverse-proxy to a localhost port your
-        # agent runs, NOT `file_server /home/<you>/...`. caddy.service has
-        # ProtectHome=true, so it cannot read files under /home; use file_server
-        # only against a path outside /home (e.g. /var/lib/agent-box-sites/<you>/public):
+        # and natively, in /etc/agent-box/config.yaml:
         #
-        #     foo.example.com {
-        #       import acme_alpn_only    # Let's Encrypt via TLS-ALPN-01
-        #       reverse_proxy 127.0.0.1:3000
-        #     }
+        #     web:
+        #       sites:
+        #         foo.example.com:
+        #           upstream: 127.0.0.1:3000
         #
-        # New hosts get a Let's Encrypt cert on first request as long as DNS
-        # for that hostname points at this box.
+        # then @APPLY_CMD@. `upstream` reverse-proxies to a port something on
+        # this box listens on, and that is the only shape there is: caddy never
+        # serves files from a directory here, because it would follow a symlink
+        # out of an agent-writable one into its own certificate keys. Static
+        # files get their own server on a loopback port and an upstream pointed
+        # at it. Each site gets a Let's Encrypt cert on first request as long as
+        # DNS for that hostname points at this box.
+        #
+        # An agent cannot add one, by design: a *.caddy snippet under ~/sites was
+        # once imported here and is not any more (issue #629). This instance
+        # holds every user's web auth secrets and can reach every user's
+        # settings socket, so a snippet in it could read a sibling's cookie
+        # secret — a bearer credential — through Caddy's documented `{$ENV}`
+        # substitution, or proxy to a sibling's privileged upstream with no auth
+        # gate. Ask whoever administers the box for a site declaration instead.
 
         # Global options. This block must come FIRST in a Caddyfile, before any
         # snippet or site block.
@@ -24461,7 +24608,9 @@ if __name__ == "__main__":
           # now fails to find an endpoint instead of taking the box off the air.
           #
           # Do NOT replace this with `admin off`: that would also disable the reload
-          # path, and ~/sites depends on it.
+          # path, which is how @APPLY_CMD@ lands a new site declaration without
+          # dropping live connections. No agent has that reload any more (issue
+          # #629) -- it exists for whoever administers the box.
           admin unix//run/caddy/admin.sock
         }
 
@@ -24500,19 +24649,39 @@ if __name__ == "__main__":
       + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
       + "}\n\n"
       # The same fragment the native renderer binds (issue #154 Phase 2), so
-      # both backends document — and wire — this extension point identically.
-      + lib.replaceStrings [ "@APPLY_CMD@" "@RELOAD_CMD@" ]
-          [ "nixos-rebuild switch" caddyReloadCmd ] ''
-        # Per-user snippet directories. Each agent user's ~/sites/ symlinks
-        # here. Add a file below and reload caddy — that is the whole
-        # workflow, no @APPLY_CMD@ required:
+      # both backends document — and render — the operator-declared sites
+      # section identically.
+      + lib.replaceStrings [ "@MANAGED_BY@" "@APPLY_CMD@" ]
+          [ "services.agent-box" "nixos-rebuild switch" ] ''
+        # Operator-approved sites. Each block below was declared in this box's
+        # own configuration (`services.agent-box.web.sites` on NixOS,
+        # `web.sites` in /etc/agent-box/config.yaml natively) and rendered here
+        # by @MANAGED_BY@. Adding one therefore takes
         #
-        #     sudo @RELOAD_CMD@
+        #     @APPLY_CMD@
         #
-        # One import per user: Caddyfile's `import` directive only accepts a
-        # single `*` per pattern, so we can't collapse this to `*/*.caddy`.
+        # run by whoever administers the box.
+        #
+        # Nothing under an agent's ~/sites is imported into this file any more
+        # (issue #629). It used to be: one `import
+        # /var/lib/agent-box-sites/<user>/*.caddy` per user, which made a
+        # general Caddyfile the tenant-facing API for THIS instance — the one
+        # that holds every user's web auth secrets and can reach every user's
+        # settings socket. A snippet could read another user's cookie secret
+        # through Caddy's documented `{$ENV}` substitution (that cookie is a
+        # bearer credential: the normal routes admit an exact match) or
+        # reverse_proxy straight to another user's privileged upstream with no
+        # auth gate in front of it.
+        #
+        # Every block below is a reverse proxy, never a file server. Serving
+        # files would mean caddy opening a directory an agent can write, and
+        # `file_server` follows a symlink into anything caddy can read --
+        # including /var/lib/caddy, where its ACME account key and every
+        # certificate's private key live. An app that has static files runs its
+        # own server for them on a loopback port, and gets proxied like any
+        # other.
       ''
-      + lib.concatMapStringsSep "" (name: "import /var/lib/agent-box-sites/${name}/*.caddy\n") (lib.attrNames cfg.users));
+      + lib.concatStrings (lib.mapAttrsToList (host: site: "\n" + siteBlock host site) cfg.web.sites));
 
       # Reads each terminal user's (already-hashed) password from their
       # passwordHashFile, mints a persistent per-user cookie secret if
@@ -24566,14 +24735,23 @@ if __name__ == "__main__":
       tmpfilesRules = [
         "d /var/lib/agent-box-web 0700 root root - -"
         "d /run/agent-box-web 0700 root root - -"
-        # Snippet dirs: parent is world-traversable so caddy (primary group
+        # ~/sites dirs: parent is world-traversable so caddy (primary group
         # `caddy`) can reach the per-user subdirectories, which are 0750
-        # <user>:caddy — the user writes, caddy reads, other agent users on
-        # the box can't peek. Kept OUTSIDE /var/lib/agent-box-web (0700) so
-        # caddy's `import` can traverse without loosening the secrets dir.
+        # <user>:caddy — the user writes, other agent users on the box
+        # can't peek. Kept OUTSIDE /var/lib/agent-box-web (0700) so its
+        # mode says what it means without loosening the secrets dir.
+        #
+        # The `caddy` group is vestigial here and grants nothing caddy
+        # uses: since issue #629 no *.caddy in these dirs is read as
+        # configuration, and no web.sites vhost serves files out of them
+        # either (a site is a reverse proxy, see web.sites). It stays
+        # because both backends must emit this line identically and
+        # neither can portably name a per-user group (issue #604) -- the
+        # same reasoning the file-drop rule below records for its own
+        # group.
         "d /var/lib/agent-box-sites 0755 root root - -"
         # File-drop dirs (issue #132). The parent stays world-traversable
-        # like the snippet dirs above, but for a different reason since
+        # like the ~/sites dirs above, but for a different reason since
         # issue #630: caddy no longer opens anything under here (the
         # per-user settings daemon serves /<user>/downloads/), so what has
         # to reach a drop is that user's own daemon, running as that user.
@@ -24589,7 +24767,7 @@ if __name__ == "__main__":
         "d ${ttydSocketDir} 0755 root root - -"
       ] ++ lib.concatMap (name: [
         "d /var/lib/agent-box-sites/${name} 0750 ${name} caddy - -"
-        # ~/sites -> the caddy-readable snippet dir. L+ replaces a stale
+        # ~/sites -> the caddy-readable static-content dir. L+ replaces a stale
         # symlink/file if the target differs from ours (idempotent across
         # renames). Users edit through this link and never touch /var/lib.
         "L+ /home/${name}/sites - - - - /var/lib/agent-box-sites/${name}"
@@ -24668,12 +24846,48 @@ if __name__ == "__main__":
             "services.agent-box: web-terminal user names must stay distinct "
             + "after sanitizing to env-var form ([A-Z0-9_]).";
         }
-      ];
+      ]
+      # web.sites (issue #629). Every declaration is substituted into the
+      # ONE Caddyfile that holds every user's web auth secrets, so the
+      # accepted shape is spelled out here rather than left to whatever
+      # Caddy happens to parse. These fire per site, so an operator with a
+      # typo is told which hostname and which field.
+      ++ lib.concatLists (lib.mapAttrsToList (host: site: [
+        {
+          assertion = siteHostOk host;
+          message =
+            "services.agent-box.web.sites.\"${host}\": not a hostname. Use "
+            + "lowercase dotted DNS labels (a-z, 0-9, -) with at least one "
+            + "dot, e.g. \"app.example.com\" - no wildcard, no port, no "
+            + "scheme, no path.";
+        }
+        {
+          assertion = lib.toLower host != lib.toLower cfg.web.domain;
+          message =
+            "services.agent-box.web.sites.\"${host}\": that is web.domain, "
+            + "the box's own management hostname (terminal, settings page, "
+            + "webhook ingress). A second block for it would shadow those "
+            + "routes rather than add anything. Pick another hostname.";
+        }
+        {
+          assertion = siteUpstreamOk site.upstream;
+          message =
+            "services.agent-box.web.sites.\"${host}\".upstream = "
+            + "\"${site.upstream}\": not a host:port. Use a lowercase DNS "
+            + "name or IPv4 address and a port 1-65535, e.g. "
+            + "\"127.0.0.1:3000\". Anything else - an env placeholder, a "
+            + "scheme, a path, whitespace - is refused, because this value "
+            + "is substituted into the Caddyfile that holds every user's "
+            + "web auth secrets.";
+        }
+      ]) cfg.web.sites);
 
-      # The top-level Caddyfile is module-managed (see managedCaddyfile above);
-      # each agent user's own virtual hosts live in per-user snippet files at
-      # /var/lib/agent-box-sites/<user>/*.caddy, symlinked into their $HOME
-      # as ~/sites/. Reload via the sudo rule added to effectiveSudoAllowlist.
+      # The top-level Caddyfile is module-managed (see managedCaddyfile
+      # above) and holds every route this box serves, including the
+      # operator-declared web.sites vhosts. Nothing an agent writes is
+      # imported into it (issue #629); /var/lib/agent-box-sites/<user>/,
+      # symlinked into their $HOME as ~/sites/, is now a place for a
+      # `root` site's static FILES and carries no configuration authority.
 
       networking.firewall.allowedTCPPorts = [ 443 ];
 
@@ -24687,8 +24901,9 @@ if __name__ == "__main__":
       services.caddy = {
         enable = true;
         # Module-managed. Store path is world-readable but holds only ENV
-        # placeholders, no secrets. Per-user extensions land via the trailing
-        # `import /var/lib/agent-box-sites/*/*.caddy`.
+        # placeholders, no secrets. Extra vhosts come from web.sites,
+        # rendered into this same file; nothing agent-writable is imported
+        # (issue #629).
         configFile = managedCaddyfile;
       };
 

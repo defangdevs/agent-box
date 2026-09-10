@@ -44,6 +44,13 @@
       enable = true;
       domain = "golden.example.org";
       user = "agent";
+      # One operator-declared vhost (issue #629), so the site fragment is
+      # in the fixture and one-spec-both-backends compares the native
+      # renderer's half of it against this one. It replaces the old
+      # `import ~/sites/*.caddy` lines the fixture used to carry: extra
+      # vhosts are declared in configuration now, and nothing
+      # agent-writable is imported into the gateway.
+      sites."app.golden.example.org".upstream = "127.0.0.1:3000";
     };
     selfUpdate = {
       enable = true;

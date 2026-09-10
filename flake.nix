@@ -41,11 +41,13 @@
           # Interactive VM test for the whole user-facing web surface, in one
           # guest (issue #312 — this was three tests with the same node
           # definition): the per-user ~/downloads file drop served behind the
-          # auth gate (issue #132), an agent adding a vhost by writing ~/sites/
-          # and reloading caddy via the sudoAllowlist rule with no
-          # nixos-rebuild (issue #40), and wrong-password basic-auth attempts
-          # getting the client IP banned by the fail2ban jail. Needs KVM (or
-          # slow TCG); CI enables /dev/kvm before building this.
+          # auth gate (issue #132), an operator-declared web.sites vhost
+          # serving an agent's own files out of ~/sites while a *.caddy
+          # snippet left in the same directory reaches nothing and the caddy
+          # reload grant is gone (issues #40, #629), and wrong-password
+          # basic-auth attempts getting the client IP banned by the fail2ban
+          # jail. Needs KVM (or slow TCG); CI enables /dev/kvm before
+          # building this.
           web-surface = pkgs.testers.runNixOSTest
             (import ./tests/web-surface.nix { agent-box = self.nixosModules.agent-box; });
 
@@ -736,6 +738,222 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 "Content-Security-Policy \"frame-ancestors 'self'\"" \
                 "$caddyfile"
               printf 'downloads route present, served by the daemon, and isolated\n' > "$out"
+            '';
+
+          # Guard (issue #629): the security gateway must import NOTHING an
+          # agent can write, and an operator-declared site must still
+          # serve. Both halves are in the rendered Caddyfile, so a cheap
+          # eval check can hold them - and this is the one that would go
+          # red if a future change reintroduced the `import
+          # /var/lib/agent-box-sites/<user>/*.caddy` lines, which is what
+          # let a snippet read a sibling's WEB_COOKIE_SECRET_<USER> (a
+          # bearer credential: the routes admit an exact cookie match) out
+          # of Caddy's own `{$ENV}` substitution.
+          site-route =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      # A SECOND user, because the leak this fixes was
+                      # cross-tenant: bob is the sibling whose secret a
+                      # snippet of agent's used to be able to print.
+                      users.bob.web.passwordHashFile = "/var/lib/agent-box-web/bob-hash";
+                      web = {
+                        enable = true;
+                        domain = "sites.test";
+                        user = "agent";
+                        sites."app.sites.test".upstream = "127.0.0.1:3000";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-site-route-ok"
+              { caddyfile = sys.config.services.caddy.configFile;
+                nativeBuildInputs = [ pkgs.caddy ]; } ''
+              # 1. NOTHING agent-writable is imported. `import` at all is
+              # worth grepping for: the only one left is the acme_alpn_only
+              # snippet the module itself defines, so anything reaching
+              # outside the file is a regression.
+              if grep -n 'import /var/lib/agent-box-sites' "$caddyfile"; then
+                echo "FAIL: agent-writable snippet import is back (issue #629)" >&2
+                exit 1
+              fi
+              if grep -vn 'import acme_alpn_only' "$caddyfile" | grep -n '^[0-9]*:[[:space:]]*import '; then
+                echo "FAIL: the gateway imports a file (issue #629)" >&2
+                exit 1
+              fi
+              # 2. The declared site renders as its own vhost, and as a
+              # reverse proxy: there is no file-serving variant, because
+              # caddy would then open an agent-writable directory and
+              # follow a symlink out of it into its own TLS keys.
+              grep -qF 'app.sites.test {' "$caddyfile"
+              grep -qF 'reverse_proxy 127.0.0.1:3000' "$caddyfile"
+              # Absolute, not "not from an agent's directory": since issue
+              # #630 moved the file drop to the per-user daemon, caddy
+              # opens NO file from disk on this box, and a site must not be
+              # what puts that back.
+              if grep -nE '^ *(root \*|file_server)' "$caddyfile"; then
+                echo "FAIL: caddy serves files from disk again; a site root" \
+                     "follows symlinks into /var/lib/caddy (issue #629)" >&2
+                exit 1
+              fi
+              # Each site gets ACME via TLS-ALPN-01 and the access log the
+              # fail2ban jail reads, exactly as the management vhost does.
+              [ "$(grep -c 'import acme_alpn_only' "$caddyfile")" = 2 ]
+              # 3. A site block is a SIBLING of the management vhost, never
+              # inside it: the management vhost's routes are what hold the
+              # cookie and basic-auth gates, and a block nested in it would
+              # inherit and shadow them.
+              mgmt=$(grep -n '^sites.test {' "$caddyfile" | cut -d: -f1)
+              app=$(grep -n '^app.sites.test {' "$caddyfile" | cut -d: -f1)
+              [ -n "$mgmt" ] && [ -n "$app" ] && [ "$mgmt" -lt "$app" ]
+              # 4. And it all adapts. Stand-in secrets per user, as in
+              # session-route: an unset placeholder makes caddy read the
+              # login name as the password algorithm.
+              WEB_PASSWORD_ALGORITHM_AGENT=bcrypt \
+              WEB_PASSWORD_HASH_AGENT='$2a$14$ptCNRCTOMkoUnEXBv0kPWuOJHhYtnpBWQZbLFXW/Ehg5AGKQMoS/W' \
+              WEB_COOKIE_SECRET_AGENT=0123456789abcdef \
+              WEB_PASSWORD_ALGORITHM_BOB=bcrypt \
+              WEB_PASSWORD_HASH_BOB='$2a$14$ptCNRCTOMkoUnEXBv0kPWuOJHhYtnpBWQZbLFXW/Ehg5AGKQMoS/W' \
+              WEB_COOKIE_SECRET_BOB=fedcba9876543210 \
+                caddy validate --config "$caddyfile" --adapter caddyfile
+              printf 'operator-declared sites serve; no agent-writable import\n' > "$out"
+            '';
+
+          # Eval regression for web.sites' validation (issue #629). Every
+          # declaration is substituted into the ONE Caddyfile that holds
+          # every user's web auth secrets, so what the assertions REFUSE is
+          # the security-relevant half: a value carrying `{$ENV}`, a second
+          # directive, a newline, or the management hostname itself. It asserts the accepting cases too - an
+          # assertion that rejects everything would leave the box with no
+          # way to serve a site at all, which is the failure mode a
+          # security fix is most likely to ship.
+          #
+          # Reads config.assertions rather than forcing toplevel, so a
+          # failure names WHICH declaration behaved unexpectedly. Same
+          # shape as checkout-options.
+          site-options =
+            let
+              evalWith = sites: (nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: {
+                    imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ];
+                  })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      users.agent.web.passwordHashFile =
+                        "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "box.example.org";
+                        user = "agent";
+                        inherit sites;
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              }).config.assertions;
+              # TWO module evaluations for the whole table, not one per
+              # case: the assertions are generated per site, so every
+              # declaration can be judged from a single config as long as
+              # each one has a hostname of its own to be named by. A
+              # case-per-eval version of this cost ~37 nixosSystem
+              # evaluations and several minutes of CI.
+              refusedIn = assertions: host:
+                builtins.any
+                  (a: !a.assertion
+                    && nixpkgs.lib.hasInfix ''web.sites."${host}"'' a.message)
+                  assertions;
+
+              # Accepted. Asserted as loudly as the refusals: a rule that
+              # refuses everything leaves the box with no way to serve a
+              # site at all, which is the likeliest way for a security fix
+              # to go wrong.
+              good = {
+                "loopback.example.org".upstream = "127.0.0.1:3000";
+                "named.example.org".upstream = "localhost:8080";
+                "lowport.example.org".upstream = "10.0.0.5:1";
+                "highport.example.org".upstream = "app-1.internal:65535";
+                "a.b.c.deep.example.org".upstream = "127.0.0.1:3000";
+              };
+              goodAssertions = evalWith good;
+
+              # Refused. An `upstream` and a `root` are substituted verbatim
+              # into the file that holds every user's web auth secrets, so
+              # each of these is a way to reach past the site it declares:
+              # an env placeholder (the leak in issue #629 itself), a
+              # sibling's privileged socket, a second directive, a second
+              # site block, a path into /home (which caddy's
+              # ProtectHome=true cannot read anyway).
+              badUpstreams = {
+                envref = "{$WEB_COOKIE_SECRET_AGENT}";
+                socket = "unix//run/agent-box-settings/bob.sock";
+                scheme = "http://127.0.0.1:3000";
+                two-args = "127.0.0.1:3000 127.0.0.1:3001";
+                newline = "127.0.0.1:3000\n}\nevil.example.org {";
+                path = "127.0.0.1:3000/admin";
+                semicolon = "127.0.0.1:3000;";
+                no-port = "127.0.0.1";
+                port-zero = "127.0.0.1:0";
+                port-huge = "127.0.0.1:70000";
+                uppercase = "UPPER.example.org:80";
+                empty = "";
+              };
+              # A hostname is refused for being one, so these ARE the keys.
+              badHosts = [
+                "*.example.org"            # no wildcard: ACME here is TLS-ALPN-01
+                "app.example.org:8443"
+                "https://app.example.org"
+                "localhost"                # a bare label is not a site
+                "APP.example.org"
+                "app example.org"
+                "app.example.org/admin"
+                # The management hostname: that vhost carries the terminal,
+                # the settings page and the webhook ingress, behind auth
+                # gates a second block would shadow. Both spellings, since
+                # the assertion lowercases each side.
+                "box.example.org"
+                "BOX.EXAMPLE.ORG"
+              ];
+              bad =
+                nixpkgs.lib.mapAttrs'
+                  (k: v: nixpkgs.lib.nameValuePair "up-${k}.example.org"
+                    { upstream = v; }) badUpstreams
+                // builtins.listToAttrs (map
+                  (h: { name = h; value.upstream = "127.0.0.1:3000"; })
+                  badHosts);
+              badAssertions = evalWith bad;
+
+              cases =
+                map (h: { label = "accepts ${builtins.toJSON h}";
+                          ok = !(refusedIn goodAssertions h); })
+                  (builtins.attrNames good)
+                ++ map (h: { label = "refuses ${builtins.toJSON h}";
+                             ok = refusedIn badAssertions h; })
+                  (builtins.attrNames bad);
+              failing = builtins.filter (c: !c.ok) cases;
+            in
+            assert failing == [ ] || throw ("agent-box: web.sites assertions "
+              + "did not behave as expected: "
+              + builtins.concatStringsSep ", " (map (c: c.label) failing));
+            pkgs.runCommand "agent-box-site-options-ok" { } ''
+              printf '%s\n' ${nixpkgs.lib.escapeShellArg
+                (builtins.concatStringsSep "\n" (map (c: "ok   " + c.label) cases))} \
+                | tee "$out"
             '';
 
           # Guard: the module's REAL generated Caddyfile (every VM test swaps

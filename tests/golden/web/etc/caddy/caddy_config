@@ -1,27 +1,35 @@
 # This file is managed by services.agent-box — edits here get OVERWRITTEN on
-# the next nixos-rebuild switch. To add your own virtual host,
-# drop a *.caddy snippet into ~/sites/ (which is a symlink into
-# /var/lib/agent-box-sites/<you>/, a caddy-readable location) and
-# reload caddy with:
+# the next nixos-rebuild switch, and nothing an agent can write is read into it.
 #
-#     sudo /run/current-system/sw/bin/systemctl reload caddy.service
+# An extra virtual host is declared in this box's own configuration and
+# rendered into the "Operator-approved sites" section at the bottom of
+# this file. On NixOS:
 #
-# spelled with the full path, because sudoers matches the command path
-# exactly and a bare `systemctl` can resolve through PATH to one it will
-# not match — which asks for a password the agent does not have.
+#     services.agent-box.web.sites."foo.example.com".upstream =
+#       "127.0.0.1:3000";
 #
-# Recommended snippet shape — reverse-proxy to a localhost port your
-# agent runs, NOT `file_server /home/<you>/...`. caddy.service has
-# ProtectHome=true, so it cannot read files under /home; use file_server
-# only against a path outside /home (e.g. /var/lib/agent-box-sites/<you>/public):
+# and natively, in /etc/agent-box/config.yaml:
 #
-#     foo.example.com {
-#       import acme_alpn_only    # Let's Encrypt via TLS-ALPN-01
-#       reverse_proxy 127.0.0.1:3000
-#     }
+#     web:
+#       sites:
+#         foo.example.com:
+#           upstream: 127.0.0.1:3000
 #
-# New hosts get a Let's Encrypt cert on first request as long as DNS
-# for that hostname points at this box.
+# then nixos-rebuild switch. `upstream` reverse-proxies to a port something on
+# this box listens on, and that is the only shape there is: caddy never
+# serves files from a directory here, because it would follow a symlink
+# out of an agent-writable one into its own certificate keys. Static
+# files get their own server on a loopback port and an upstream pointed
+# at it. Each site gets a Let's Encrypt cert on first request as long as
+# DNS for that hostname points at this box.
+#
+# An agent cannot add one, by design: a *.caddy snippet under ~/sites was
+# once imported here and is not any more (issue #629). This instance
+# holds every user's web auth secrets and can reach every user's
+# settings socket, so a snippet in it could read a sibling's cookie
+# secret — a bearer credential — through Caddy's documented `{$ENV}`
+# substitution, or proxy to a sibling's privileged upstream with no auth
+# gate. Ask whoever administers the box for a site declaration instead.
 
 # Global options. This block must come FIRST in a Caddyfile, before any
 # snippet or site block.
@@ -47,7 +55,9 @@
   # now fails to find an endpoint instead of taking the box off the air.
   #
   # Do NOT replace this with `admin off`: that would also disable the reload
-  # path, and ~/sites depends on it.
+  # path, which is how nixos-rebuild switch lands a new site declaration without
+  # dropping live connections. No agent has that reload any more (issue
+  # #629) -- it exists for whoever administers the box.
   admin unix//run/caddy/admin.sock
 }
 
@@ -585,13 +595,36 @@ golden.example.org {
   }
 }
 
-# Per-user snippet directories. Each agent user's ~/sites/ symlinks
-# here. Add a file below and reload caddy — that is the whole
-# workflow, no nixos-rebuild switch required:
+# Operator-approved sites. Each block below was declared in this box's
+# own configuration (`services.agent-box.web.sites` on NixOS,
+# `web.sites` in /etc/agent-box/config.yaml natively) and rendered here
+# by services.agent-box. Adding one therefore takes
 #
-#     sudo /run/current-system/sw/bin/systemctl reload caddy.service
+#     nixos-rebuild switch
 #
-# One import per user: Caddyfile's `import` directive only accepts a
-# single `*` per pattern, so we can't collapse this to `*/*.caddy`.
-import /var/lib/agent-box-sites/agent/*.caddy
-import /var/lib/agent-box-sites/robot/*.caddy
+# run by whoever administers the box.
+#
+# Nothing under an agent's ~/sites is imported into this file any more
+# (issue #629). It used to be: one `import
+# /var/lib/agent-box-sites/<user>/*.caddy` per user, which made a
+# general Caddyfile the tenant-facing API for THIS instance — the one
+# that holds every user's web auth secrets and can reach every user's
+# settings socket. A snippet could read another user's cookie secret
+# through Caddy's documented `{$ENV}` substitution (that cookie is a
+# bearer credential: the normal routes admit an exact match) or
+# reverse_proxy straight to another user's privileged upstream with no
+# auth gate in front of it.
+#
+# Every block below is a reverse proxy, never a file server. Serving
+# files would mean caddy opening a directory an agent can write, and
+# `file_server` follows a symlink into anything caddy can read --
+# including /var/lib/caddy, where its ACME account key and every
+# certificate's private key live. An app that has static files runs its
+# own server for them on a loopback port, and gets proxied like any
+# other.
+
+app.golden.example.org {
+  log
+  import acme_alpn_only
+  reverse_proxy 127.0.0.1:3000
+}

@@ -1,27 +1,35 @@
 # This file is managed by @MANAGED_BY@ — edits here get OVERWRITTEN on
-# the next @APPLY_CMD@. To add your own virtual host,
-# drop a *.caddy snippet into ~/sites/ (which is a symlink into
-# /var/lib/agent-box-sites/<you>/, a caddy-readable location) and
-# reload caddy with:
+# the next @APPLY_CMD@, and nothing an agent can write is read into it.
 #
-#     sudo @RELOAD_CMD@
+# An extra virtual host is declared in this box's own configuration and
+# rendered into the "Operator-approved sites" section at the bottom of
+# this file. On NixOS:
 #
-# spelled with the full path, because sudoers matches the command path
-# exactly and a bare `systemctl` can resolve through PATH to one it will
-# not match — which asks for a password the agent does not have.
+#     services.agent-box.web.sites."foo.example.com".upstream =
+#       "127.0.0.1:3000";
 #
-# Recommended snippet shape — reverse-proxy to a localhost port your
-# agent runs, NOT `file_server /home/<you>/...`. caddy.service has
-# ProtectHome=true, so it cannot read files under /home; use file_server
-# only against a path outside /home (e.g. /var/lib/agent-box-sites/<you>/public):
+# and natively, in /etc/agent-box/config.yaml:
 #
-#     foo.example.com {
-#       import acme_alpn_only    # Let's Encrypt via TLS-ALPN-01
-#       reverse_proxy 127.0.0.1:3000
-#     }
+#     web:
+#       sites:
+#         foo.example.com:
+#           upstream: 127.0.0.1:3000
 #
-# New hosts get a Let's Encrypt cert on first request as long as DNS
-# for that hostname points at this box.
+# then @APPLY_CMD@. `upstream` reverse-proxies to a port something on
+# this box listens on, and that is the only shape there is: caddy never
+# serves files from a directory here, because it would follow a symlink
+# out of an agent-writable one into its own certificate keys. Static
+# files get their own server on a loopback port and an upstream pointed
+# at it. Each site gets a Let's Encrypt cert on first request as long as
+# DNS for that hostname points at this box.
+#
+# An agent cannot add one, by design: a *.caddy snippet under ~/sites was
+# once imported here and is not any more (issue #629). This instance
+# holds every user's web auth secrets and can reach every user's
+# settings socket, so a snippet in it could read a sibling's cookie
+# secret — a bearer credential — through Caddy's documented `{$ENV}`
+# substitution, or proxy to a sibling's privileged upstream with no auth
+# gate. Ask whoever administers the box for a site declaration instead.
 
 # Global options. This block must come FIRST in a Caddyfile, before any
 # snippet or site block.
@@ -47,7 +55,9 @@
   # now fails to find an endpoint instead of taking the box off the air.
   #
   # Do NOT replace this with `admin off`: that would also disable the reload
-  # path, and ~/sites depends on it.
+  # path, which is how @APPLY_CMD@ lands a new site declaration without
+  # dropping live connections. No agent has that reload any more (issue
+  # #629) -- it exists for whoever administers the box.
   admin unix//run/caddy/admin.sock
 }
 

@@ -27,8 +27,9 @@ plainly rather than handing it back.
 
 - Only your home directory is writable; the rest of the filesystem is
   read-only (systemd ProtectSystem=strict) and writes there fail. The one
-  exception is ~/sites, a symlink out to a caddy-readable dir (see "Serving
-  a web app publicly").
+  exception is ~/sites, a symlink out to a dir outside /home that is a handy
+  place for a public app's files (see "Serving a web app publicly" - the
+  routing itself is not yours to add).
 - $HOME is SHARED by every one of your tmux sessions (same user, all start
   in $HOME unless `--cwd` sent them elsewhere), so two sessions in one clone
   edit the same files. Give yours a checkout of its own: ~/worktrees is
@@ -519,17 +520,18 @@ Always hand over the complete https:// URL. Only files under ~/downloads are
 exposed; nothing else in your home is reachable over the web - a symlink out
 of the directory included, since a link is followed only where it stays
 inside the drop, so `ln -s ~/build/big.tar ~/downloads/` reads as a missing
-file. For unauthenticated sharing, run your own service and expose it via
-~/sites.
+file. For unauthenticated sharing you need a hostname declared for you - see
+"Serving a web app publicly".
 
 Every file there is handed to the browser as a DOWNLOAD, never rendered:
 this directory shares an origin with the terminal and the settings page, so
 an .html or .svg opened inline would be script running with the user's own
 login. That is a deliberate trade - a report you drop here is saved, not
 read in the tab - so if you want the user to LOOK at something in their
-browser rather than save it, serve it yourself through ~/sites, which is a
-separate hostname with none of that authority. An `index.html` in
-~/downloads is not served either; the listing is always the listing.
+browser rather than save it, it needs a hostname of its own, which has none
+of that authority and which an operator declares for you (see "Serving a web
+app publicly"). An `index.html` in ~/downloads is not served either; the
+listing is always the listing.
 
 ## Putting a screenshot in a GitHub issue or PR
 
@@ -540,23 +542,51 @@ paste into the body - no binary committed, no screenshot branch. Run
 `agent-box-upload --help` for the caveats that matter, the first being that
 the URL 404s until your comment references it.
 
-## Serving a web app publicly
+## Serving a web app publicly: ask, you cannot self-serve
 
-Drop a snippet into ~/sites/NAME.caddy that reverse-proxies to a local port,
-then reload caddy - no rebuild:
+A public hostname is now DECLARED in the box's own configuration by whoever
+administers it, and you cannot add one yourself. You used to: a
+`~/sites/NAME.caddy` snippet plus `sudo systemctl reload caddy.service`. That
+is gone, and a *.caddy file you drop in ~/sites today is read by nothing
+(agent-box issue #629). The front door is one Caddy instance holding every
+user's web password hash and cookie secret and able to reach every user's
+settings socket, so a Caddyfile in it was authority over the whole box, not
+over your own app - a snippet could print a sibling's cookie secret, which
+their routes accept as a login.
 
-    NAME.example.com {
-      import acme_alpn_only
-      reverse_proxy 127.0.0.1:3000
-    }
+What you CAN do is run the app and ask for the mapping. Give the person
+administering the box the hostname and the local port, and say which of these
+they need:
 
-`sudo /run/current-system/sw/bin/systemctl reload caddy.service` picks it up
-and Caddy gets a Let's Encrypt cert on first request if DNS for that name
-points at this box. Reverse-proxy to your process; don't `file_server` from
-$HOME (caddy can't read /home). Use the full path shown, not bare
-`systemctl` - the sudoers rule matches on the exact command path, and a bare
-`systemctl` resolves through PATH to a Nix store path that won't match,
-silently falling back to asking for a password.
+    # NixOS
+    services.agent-box.web.sites."app.example.com".upstream = "127.0.0.1:3000";
+
+    # native (/etc/agent-box/config.yaml)
+    web:
+      sites:
+        app.example.com:
+          upstream: 127.0.0.1:3000
+
+then they apply that configuration - `agentbox apply` on a distro box, a
+rebuild on a NixOS one; "Your host" above says which kind this is. Caddy gets
+a Let's Encrypt cert on first request if DNS for that name points at this box.
+
+A site is always a reverse proxy to a port YOU listen on - there is no
+"serve this directory" option, deliberately. Caddy would have to open a
+directory you can write, and it follows symlinks into anything it can read,
+including its own TLS private keys. So if what you have is static files,
+serve them yourself and let the proxy reach that:
+
+    python3 -m http.server --bind 127.0.0.1 3000 --directory ~/sites/public
+
+~/sites is still yours to write and still outside /home (which caddy cannot
+read at all) - it is a fine place to keep those files. You own the files and
+the server; you do not own the routing.
+
+Two things that need no mapping and no permission at all: ~/downloads is
+already served behind your own login (above), and the same
+`python3 -m http.server --bind 127.0.0.1` is enough to look at something
+yourself without publishing it.
 
 ## Updating
 

@@ -1176,71 +1176,134 @@ class RenderTest(unittest.TestCase):
                 / "agent-box-fail2ban.service").read_text()
         self.assertIn("-c /etc/agent-box/fail2ban", unit)
 
-    def test_the_reload_the_caddyfile_documents_is_the_one_sudo_grants(self):
-        """The rendered Caddyfile tells the agent, twice, how to reload the
-        front door after adding a snippet. sudoers matches argv exactly, so
-        that sentence is part of the sudo contract: a documented command
-        that misses the grant by a path silently falls back to asking for a
-        password the agent does not have.
+    def test_the_caddyfile_tells_no_agent_to_reload_caddy(self):
+        """Issue #629. The rendered Caddyfile used to tell the agent, twice,
+        how to reload the front door after adding a ~/sites snippet, and
+        `web.enable` granted exactly that command so the sentence would
+        work. Both are gone with the snippet import: nothing in this
+        instance is agent-writable any more, so a reload has nothing of the
+        agent's to pick up and reduces to a way to bounce the box's front
+        door.
 
-        Both fragments carried a bare `sudo systemctl reload
-        caddy.service`, which resolves through PATH — fine here, where the
-        grant IS /usr/bin/systemctl, and wrong on NixOS, where the grant is
-        /run/current-system/sw/bin/systemctl (CodeRabbit, PR #545). The
-        token is bound per backend now; this asserts the two agree.
+        The fixture's sudoers DOES carry the reload, once - hosts/vm.nix
+        asks for it in `sudoAllowlist`, which is an operator's explicit
+        grant and the escape hatch this leaves open. What must not come
+        back is the IMPLIED one, so this asserts on a config that names no
+        allowlist at all.
         """
         caddyfile = (FIXTURE / "etc/agent-box/Caddyfile").read_text()
-        sudoers = (FIXTURE / "etc/sudoers.d/agent-box").read_text()
-        documented = re.findall(r"sudo (\S*systemctl reload caddy\.service)",
-                                caddyfile)
-        self.assertTrue(documented,
-                        "the rendered Caddyfile documents no reload command")
-        for cmd in set(documented):
-            self.assertIn(cmd, sudoers,
-                          f"the Caddyfile tells the agent to run `sudo {cmd}`, "
-                          f"which sudoers does not grant")
-            self.assertTrue(cmd.startswith("/"),
-                            f"`{cmd}` is a bare command name: sudoers matches "
-                            f"the path, so PATH decides whether the grant "
-                            f"applies")
+        self.assertNotRegex(
+            caddyfile, r"sudo \S*systemctl reload caddy",
+            "the Caddyfile still tells an agent to reload caddy, a grant "
+            "web.enable no longer implies (issue #629)")
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            data = json.loads(CONFIG_JSON.read_text())
+            data.pop("sudoAllowlist", None)
+            data["web"] = dict(data.get("web") or {}, enable=True)
+            tree = mod.Renderer(mod.Spec(data, prof), prof,
+                                root=out).render()
+            sudoers = next(v[0] for k, v in tree.files.items()
+                           if str(k).endswith("sudoers.d/agent-box"))
+        self.assertNotIn(
+            "reload caddy.service", sudoers,
+            "web.enable implies a caddy reload grant again (issue #629)")
+        # ...and the one thing web.enable is still allowed to imply.
+        self.assertIn("start --no-block agent-box-update.service", sudoers)
 
-    def test_a_snippet_in_sites_is_actually_served(self):
-        """The ~/sites extension point (issue #40) is four pieces: the
-        caddy-readable snippet dir, the symlink into $HOME, the sudo grant
-        to reload caddy — and the `import` that makes caddy read the
-        snippet. The native backend rendered the first three and not the
-        fourth, which is the failure that looks like success: the dir is
-        there, the reload exits 0, and the agent's vhost is never served
-        (caddy answers the TLS handshake for that hostname with an
-        internal error, since no such site exists).
+    def test_nothing_agent_writable_is_imported_into_the_gateway(self):
+        """Issue #629, the security half. This Caddy instance holds every
+        user's WEB_PASSWORD_HASH_* and WEB_COOKIE_SECRET_* and can reach
+        every user's settings socket. While it imported
+        /var/lib/agent-box-sites/<user>/*.caddy, any agent could write a
+        site block into it that printed a SIBLING's cookie secret through
+        Caddy's documented `{$ENV}` substitution - and since the normal
+        routes admit an exact cookie match, that value is a session - or
+        reverse_proxy straight to a sibling's settings socket with no auth
+        gate in front of it.
 
-        One `import` per user, because a Caddyfile glob takes a single
-        `*`, and at the TOP level — an import inside the front-door block
-        would be a snippet spliced into that vhost instead of a vhost of
-        its own.
+        So the assertion is about what is ABSENT, and it is spelled two
+        ways: no import of the per-user dirs by name, and no `import` of a
+        path at all. The second is what catches a future extension point
+        that reaches somewhere new.
         """
         caddyfile = (FIXTURE / "etc/agent-box/Caddyfile").read_text()
-        tmpfiles = (FIXTURE / "etc/tmpfiles.d/agent-box.conf").read_text()
         config = json.loads(CONFIG_JSON.read_text())
-        closing = caddyfile.rindex("\n}\n")
         for user in config["users"]:
-            line = f"import /var/lib/agent-box-sites/{user}/*.caddy"
-            self.assertIn(line, caddyfile,
-                          f"{user}'s ~/sites snippets are never imported, "
-                          f"so their vhost is never served")
-            self.assertGreater(caddyfile.index(line), closing,
-                               "the snippet import is nested inside the "
-                               "front-door block")
-            # The glob names the directory tmpfiles actually creates, not
-            # a near-miss path that would silently match nothing.
+            self.assertNotIn(f"/var/lib/agent-box-sites/{user}/*.caddy",
+                             caddyfile,
+                             f"{user}'s ~/sites is imported into the "
+                             f"gateway again (issue #629)")
+        for line in caddyfile.splitlines():
+            directive = line.strip()
+            if not directive.startswith("import "):
+                continue
+            # The only import left is of the module's OWN snippet, defined
+            # a few lines above in this same file. An import of a PATH is
+            # the regression.
+            self.assertEqual(
+                "import acme_alpn_only", directive,
+                f"the gateway imports something: {directive!r} (issue #629)")
+        # The dirs and the ~/sites symlink stay - they are where a `root`
+        # site's static files live - so their absence must not be what this
+        # test is really measuring.
+        tmpfiles = (FIXTURE / "etc/tmpfiles.d/agent-box.conf").read_text()
+        for user in config["users"]:
             self.assertIn(f"d /var/lib/agent-box-sites/{user} 0750 {user} "
                           "caddy", tmpfiles)
-        # The rendered file promises this workflow to every agent that
-        # reads it, and both backends bind the same fragment for the
-        # comment AND the imports, so promise and wiring cannot drift.
-        self.assertIn("drop a *.caddy snippet into ~/sites/", caddyfile)
+            self.assertIn(f"L+ /home/{user}/sites - - - - "
+                          f"/var/lib/agent-box-sites/{user}", tmpfiles)
+
+    def test_an_operator_declared_site_is_served(self):
+        """The replacement for ~/sites (issue #629): a hostname plus one
+        upstream or one document root, declared in config.yaml and rendered
+        into the gateway by the renderer itself.
+
+        Both fragments are exercised by the fixture config, and both
+        backends bind the SAME fragment files, so the golden snapshot and
+        this tree hold the same bytes - what one-spec-both-backends
+        compares. A site block must also be a SIBLING of the management
+        vhost: nested inside it, the block would inherit and shadow the
+        cookie and basic-auth gates that vhost's routes carry.
+        """
+        caddyfile = (FIXTURE / "etc/agent-box/Caddyfile").read_text()
+        config = json.loads(CONFIG_JSON.read_text())
+        sites = config["web"]["sites"]
+        self.assertTrue(sites, "the fixture config declares no web.sites")
+        # The management vhost's own closing brace - not the file's last
+        # one, which is now a site block's.
+        closing = caddyfile.index("\n# Operator-approved sites")
+        for host, site in sites.items():
+            block = f"{host} {{"
+            self.assertIn(block, caddyfile,
+                          f"{host} is declared but never served")
+            self.assertGreater(
+                caddyfile.index(block), closing,
+                f"{host}'s block is nested inside the management vhost, "
+                f"where it would inherit its auth gates")
+            # Always a reverse proxy - there is no file-serving variant,
+            # because a `root` over an agent-writable directory is the
+            # symlink escape issue #630 already removed from the file drop
+            # (CodeRabbit, PR #655).
+            self.assertIn(f"reverse_proxy {site['upstream']}", caddyfile)
+        # Every site gets ACME the same way the management vhost does.
+        self.assertEqual(len(sites) + 1,
+                         caddyfile.count("import acme_alpn_only"))
+        # Caddy opens no file from disk anywhere on this box: since #630
+        # even the file drop goes through the per-user daemon, so a site
+        # must not be what puts a file server back.
+        directives = [ln.strip() for ln in caddyfile.splitlines()
+                      if not ln.lstrip().startswith("#")]
+        self.assertFalse(
+            [d for d in directives
+             if d == "file_server" or d.startswith(("file_server ", "root *"))],
+            "caddy serves files from disk again")
+        # One fragment set, bound by both backends.
         module = (REPO / "modules/agent-box.nix.in").read_text()
-        self.assertIn("@@include:src/caddyfile-sites.caddy@@", module)
+        for frag in ("sites", "site-proxy"):
+            self.assertIn(f"@@include:src/caddyfile-{frag}.caddy@@", module)
 
     def test_the_guide_promises_only_commands_this_box_has(self):
         """The guide is shipped to every box and names commands by hand.
@@ -2905,6 +2968,174 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertEqual(
             {(w, who) for w, r in table.items() for who in r}, seen,
             "the receiver table names a local that no longer exists")
+
+
+class SiteDeclarationTest(unittest.TestCase):
+    """web.sites, the operator-approved replacement for ~/sites (issue #629).
+
+    A declaration is substituted verbatim into the ONE Caddy instance that
+    holds every user's WEB_PASSWORD_HASH_* and WEB_COOKIE_SECRET_* and can
+    reach every user's settings socket, so what is under test is mostly the
+    REFUSALS. A value that could carry `{$ENV}`, a second directive, a
+    newline or a path into /home would put back, one config field wide,
+    exactly the authority the snippet import used to hand out wholesale.
+
+    The module has the same list as an eval check (`site-options` in
+    flake.nix); the two backends must refuse the same declarations, because
+    they render the same file.
+    """
+
+    def setUp(self):
+        self.mod = load_agentbox()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.prof = build_fake_profile(self.tmp.name)
+
+    def spec(self, sites):
+        config = json.loads(CONFIG_JSON.read_text())
+        config.setdefault("web", {})["sites"] = sites
+        return self.mod.Spec(config, self.prof)
+
+    def refused(self, sites):
+        with self.assertRaises(self.mod.ConfigError,
+                               msg=repr(sites)) as caught:
+            self.spec(sites)
+        return str(caught.exception)
+
+    def test_a_declaration_cannot_reach_past_its_own_site(self):
+        upstreams = [
+            # The leak itself: Caddy substitutes {$VAR} from its own
+            # environment, which is where every user's cookie secret is.
+            "{$WEB_COOKIE_SECRET_AGENT}",
+            # A sibling's privileged upstream, with no auth gate.
+            "unix//run/agent-box-settings/robot.sock",
+            "http://127.0.0.1:3000",
+            # A second directive, and a whole second site block.
+            "127.0.0.1:3000 127.0.0.1:3001",
+            "127.0.0.1:3000\n}\nevil.example.org {",
+            "127.0.0.1:3000/admin",
+            "127.0.0.1:3000;",
+            "127.0.0.1",
+            "127.0.0.1:0",
+            "127.0.0.1:70000",
+            "",
+        ]
+        for bad in upstreams:
+            self.assertIn("web.sites.app.example.org",
+                          self.refused({"app.example.org":
+                                        {"upstream": bad}}))
+
+    def test_a_hostname_is_a_hostname(self):
+        for bad in ["*.example.org", "app.example.org:8443",
+                    "https://app.example.org", "localhost",
+                    "APP.example.org", "app example.org", ""]:
+            self.assertIn("web.sites",
+                          self.refused({bad: {"upstream": "127.0.0.1:3000"}}))
+
+    def test_the_management_hostname_is_not_available(self):
+        """That vhost carries the terminal, the settings page and the
+        webhook ingress, behind the auth gates a second block would
+        shadow."""
+        domain = json.loads(CONFIG_JSON.read_text())["domain"]
+        for spelling in (domain, domain.upper()):
+            self.assertIn("web.sites",
+                          self.refused({spelling:
+                                        {"upstream": "127.0.0.1:3000"}}))
+
+    def test_a_site_must_name_an_upstream(self):
+        """There is no file-serving variant to fall back on (CodeRabbit on
+        PR #655): caddy would have to open a directory an agent can write,
+        and `file_server` follows a symlink into anything caddy can read -
+        including /var/lib/caddy, which holds its ACME account key and every
+        certificate's private key."""
+        self.assertIn("not a host:port", self.refused({"app.example.org": {}}))
+        with self.assertRaises(self.mod.ConfigError):
+            self.spec({"app.example.org": {"root": "/srv/www"}})
+
+    def test_a_derived_domain_is_rechecked_for_collisions(self):
+        """Issue found by CodeRabbit on PR #655. Spec validates web.sites
+        against the domain as CONFIGURED, which on a `domain: auto` box is
+        the literal "auto" - so a site declared with the sslip.io hostname
+        the box is about to derive passed validation, and then rendered
+        twice into one Caddyfile: once as the management vhost, once as
+        itself. Caddy refuses a duplicate site address, so that box failed
+        its FIRST apply, with the reason two files from the cause.
+
+        first_boot re-runs the check once the address is real.
+        """
+        derived = "203-0-113-7.sslip.io"
+        config = json.loads(CONFIG_JSON.read_text())
+        config["domain"] = "auto"
+        config["web"]["sites"] = {derived: {"upstream": "127.0.0.1:3000"}}
+        # It gets PAST Spec, which is the whole trap.
+        spec = self.mod.Spec(config, self.prof)
+        self.assertIn(derived, spec.sites)
+
+        cfg = Path(self.tmp.name) / "first-boot.json"
+        cfg.write_text(json.dumps(config))
+        args = type("A", (), {"settle_delay": 0, "config": str(cfg)})()
+        orig = self.mod.settle_public_ip
+        self.mod.settle_public_ip = lambda **k: "203.0.113.7"
+        try:
+            with self.assertRaises(self.mod.ConfigError) as caught:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.mod.first_boot(spec, args)
+        finally:
+            self.mod.settle_public_ip = orig
+        self.assertIn("management", str(caught.exception))
+        # A site that does NOT collide survives the same resolution.
+        config["web"]["sites"] = {"app.example.org":
+                                  {"upstream": "127.0.0.1:3000"}}
+        spec = self.mod.Spec(config, self.prof)
+        cfg.write_text(json.dumps(config))
+        self.mod.settle_public_ip = lambda **k: "203.0.113.7"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.mod.first_boot(spec, args)
+        finally:
+            self.mod.settle_public_ip = orig
+        self.assertEqual(derived, spec.domain)
+
+    def test_a_valid_declaration_renders_one_vhost(self):
+        """The accepting half, which a refusal-only test would let rot into
+        a rule that refuses everything - leaving the box with no way to
+        serve a site at all, the likeliest way for a security fix to go
+        wrong."""
+        spec = self.spec({"app.example.org": {"upstream": "127.0.0.1:3000"},
+                          "docs.example.org": {"upstream": "127.0.0.1:4000"}})
+        self.assertEqual({"app.example.org": "127.0.0.1:3000",
+                          "docs.example.org": "127.0.0.1:4000"}, spec.sites)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            tree = self.mod.Renderer(spec, self.prof, root=out).render()
+            caddyfile = next(v[0] for k, v in tree.files.items()
+                             if str(k).endswith("Caddyfile"))
+        self.assertIn("app.example.org {", caddyfile)
+        self.assertIn("reverse_proxy 127.0.0.1:3000", caddyfile)
+        self.assertIn("docs.example.org {", caddyfile)
+        self.assertIn("reverse_proxy 127.0.0.1:4000", caddyfile)
+        # Never a file server. That is the symlink escape issue #630
+        # already removed from the file-drop route, in a comment still in
+        # this very Caddyfile ("a site root is not a filesystem sandbox --
+        # caddy documents that symlinks escape it"); a `root` site kind
+        # would have put it straight back, pointed at a directory an agent
+        # writes, with /var/lib/caddy's TLS keys in reach (CodeRabbit, PR
+        # #655). Matched as DIRECTIVES, since that comment names both.
+        directives = [ln.strip() for ln in caddyfile.splitlines()
+                      if not ln.lstrip().startswith("#")]
+        self.assertFalse(
+            [d for d in directives
+             if d == "file_server" or d.startswith(("file_server ", "root *"))],
+            "caddy serves files from disk again")
+        # Sorted, because the module renders in attribute order and the two
+        # Caddyfiles are compared line for line.
+        self.assertLess(caddyfile.index("app.example.org {"),
+                        caddyfile.index("docs.example.org {"))
+
+    def test_no_sites_is_the_default(self):
+        config = json.loads(CONFIG_JSON.read_text())
+        config["web"].pop("sites", None)
+        self.assertEqual({}, self.mod.Spec(config, self.prof).sites)
 
 
 class SelfUpdateRenderTest(unittest.TestCase):

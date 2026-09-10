@@ -86,12 +86,10 @@ UPDATE_UNIT = "agent-box-update.service"
 # read it back. See the unit for why the journal is not enough.
 UPDATE_LOG = "/var/log/agent-box-update.log"
 SYSTEMCTL = "/usr/bin/systemctl"
-# The web front door reload, spelled once for the same reason as the two
-# above: the sudo grant and the command the rendered Caddyfile tells the
-# agent to run have to be the same string. A documented command that
-# misses the grant by a path asks for a password the agent does not have,
-# which is how the header promised a reload NixOS agents could not run.
-CADDY_RELOAD_CMD = f"{SYSTEMCTL} reload caddy.service"
+# No CADDY_RELOAD_CMD any more (issue #629): the rendered Caddyfile no
+# longer tells an agent to reload caddy, because it no longer imports
+# anything an agent can write, and no agent is granted the reload. The
+# activation phase still reloads it, as root, by literal argv.
 UPDATE_TRIGGER = f"{SYSTEMCTL} start --no-block {UPDATE_UNIT}"
 # The settings page's "Reboot box" button. Spelled once for the same reason
 # UPDATE_TRIGGER is — the sudoers line and the AGENT_BOX_REBOOT_CMD the
@@ -622,6 +620,10 @@ SESSION_SCHEMA = _Obj({
     "resumePrompt": STR,
 })
 
+SITE_SCHEMA = _Obj({
+    "upstream": STR,
+})
+
 USER_SCHEMA = _Obj({
     "home": STR,
     "agent": STR,
@@ -678,8 +680,19 @@ BOX_SCHEMA = _Obj({
     # set from the well-known path under the issuer, so a rotation never
     # touches a box and no public key is committed anywhere; portalJwksUrl
     # only overrides that path.
+    #
+    # web.sites: operator-approved extra vhosts, keyed by hostname (issue
+    # #629). Deliberately NOT a Caddyfile - a hostname plus exactly one of
+    # `upstream` or `root`, each validated character by character in Spec,
+    # because whatever lands here is substituted into the ONE Caddy
+    # instance that holds every user's web auth secrets and can reach
+    # every user's settings socket. This replaced the per-user
+    # `import /var/lib/agent-box-sites/<user>/*.caddy` lines, under which
+    # any agent could read a sibling's WEB_COOKIE_SECRET_* - a bearer
+    # credential - out of a snippet with Caddy's `{$ENV}` substitution.
     "web": _Obj({"enable": BOOL, "rebootButton": BOOL,
-                 "portalIssuer": STR, "portalJwksUrl": STR}),
+                 "portalIssuer": STR, "portalJwksUrl": STR,
+                 "sites": _Map("site", SITE_SCHEMA)}),
     "webhook": _Obj({
         "enable": BOOL,
         "repo": STR,
@@ -717,6 +730,79 @@ def validate_config(data):
     """
     BOX_SCHEMA.check(data, "")
     return data
+
+
+# web.sites validation (issue #629). Spelled to match the module's
+# siteHostOk / siteUpstreamOk character for character: the two
+# backends render the same Caddyfile, so they have to refuse the same
+# declarations. Every rule here exists to keep `{`, `}`, `$`, whitespace and
+# newlines out of a value that is substituted into the file holding every
+# user's web auth secrets - so no declaration can smuggle in an env
+# placeholder, a second directive or a second site block.
+#
+# fullmatch() below is what anchors these, mirroring builtins.match.
+SITE_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+                          r"(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+")
+SITE_UPSTREAM_RE = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?:[1-9][0-9]{0,4}")
+
+def parse_sites(web, domain):
+    """{hostname: upstream} for web.sites, or a ConfigError.
+
+    Sorted by hostname, because the module renders these in attribute order
+    and the two Caddyfiles are compared line for line
+    (one-spec-both-backends).
+
+    `domain` is compared against so a site cannot claim the management
+    hostname. On a box whose domain is resolved rather than written
+    (`domain: auto`), the caller passes the RESOLVED one -- see
+    check_site_domain_collision, which first_boot runs once the address is
+    known. Validating only against the configured value would let
+    `auto` + a site named after the eventual sslip.io host through, and
+    caddy refuses a Caddyfile with one address declared twice, so the box
+    would fail its very first apply.
+    """
+    out = {}
+    for host in sorted((web.get("sites") or {})):
+        site = web["sites"][host] or {}
+        where = f"web.sites.{host}"
+        if not SITE_HOST_RE.fullmatch(host):
+            raise ConfigError(
+                f"{where}: not a hostname. Use lowercase dotted DNS labels "
+                "(a-z, 0-9, -) with at least one dot, e.g. "
+                "\"app.example.com\" - no wildcard, no port, no scheme, "
+                "no path.")
+        check_site_domain_collision(host, domain)
+        upstream = site.get("upstream") or ""
+        if not SITE_UPSTREAM_RE.fullmatch(upstream) or \
+                not 1 <= int(upstream.rsplit(":", 1)[1]) <= 65535:
+            raise ConfigError(
+                f"{where}.upstream = {upstream!r}: not a host:port. Use "
+                "a lowercase DNS name or IPv4 address and a port "
+                "1-65535, e.g. \"127.0.0.1:3000\". Anything else - an "
+                "env placeholder, a scheme, a path, whitespace - is "
+                "refused, because this value is substituted into the "
+                "Caddyfile that holds every user's web auth secrets.")
+        out[host] = upstream
+    return out
+
+
+def check_site_domain_collision(host, domain):
+    """Refuse a site that claims the box's own management hostname.
+
+    That vhost carries the terminal, the settings page and the webhook
+    ingress, behind auth gates a second block for the same address would
+    shadow -- and caddy rejects the duplicate address outright, so the
+    Caddyfile would not even load.
+
+    Split out of parse_sites because it has to run TWICE: once at
+    Spec-build time against the configured domain, and again from
+    first_boot once an "auto" domain has become a real address.
+    """
+    if domain and host.lower() == domain.lower():
+        raise ConfigError(
+            f"web.sites.{host}: that is `domain`, the box's own management "
+            "hostname (terminal, settings page, webhook ingress). Pick "
+            "another hostname.")
 
 
 class Spec:
@@ -793,6 +879,11 @@ class Spec:
         # a portal exposes no unauthenticated endpoint.
         self.portal_issuer = web.get("portalIssuer") or ""
         self.portal_jwks_url = web.get("portalJwksUrl") or ""
+        # Operator-approved extra vhosts (issue #629). Validated here, at
+        # the trust boundary, rather than where they are rendered: a bad
+        # declaration is a one-line ConfigError and exit 2 before apply has
+        # written anything, the same treatment every other field gets.
+        self.sites = parse_sites(web, self.domain)
         self.protect_memory = bool(data.get("protectMemory", True))
         # Rootless containers for the agent users (issue #600).
         # Deliberately not a "the box has docker" switch:
@@ -2433,14 +2524,17 @@ class Renderer:
             #
             # RestartPreventExitStatus mirrors what the NixOS caddy module
             # already does, and is what keeps `always` from becoming a hot
-            # loop: caddy exits 1 on a configuration it cannot load (a broken
-            # ~/sites snippet, say), and retrying that every 5s forever would
+            # loop: caddy exits 1 on a configuration it cannot load (a
+            # web.sites declaration naming an upstream caddy rejects, say),
+            # and retrying that every 5s forever would
             # bury the reason in the journal rather than leave it legible.
             "Restart=always\n"
             "RestartPreventExitStatus=1\n"
             "RestartSec=5s\n"
             # Same shape as the NixOS caddy unit: it must not read /home,
             # which is why ~/sites is a symlink into /var/lib/agent-box-sites.
+            # It reads nothing under there either -- a web.sites vhost is a
+            # reverse proxy, never a file server (see web.sites).
             "ProtectHome=true\n"
             "ProtectSystem=strict\n"
             "ReadWritePaths=/var/lib/caddy\n"
@@ -3099,12 +3193,15 @@ class Renderer:
         deliberately-unconverged update mechanism #154 already accepted,
         just visible here as one more condition that can't reach native's
         "locked down" branch.
+
+        web_enable used to add the caddy reload here, so an agent could
+        land its own ~/sites/*.caddy snippet without root. Issue #629 took
+        the snippet import out of the gateway, which left the grant with
+        nothing of the agent's own to pick up and only a way to bounce the
+        box's front door, so it went with it. An operator who still wants
+        it writes the exact command into `sudoAllowlist`.
         """
-        cmds = []
-        if self.spec.web_enable:
-            cmds.append(CADDY_RELOAD_CMD)
-        cmds.append(UPDATE_TRIGGER)
-        return cmds
+        return [UPDATE_TRIGGER]
 
     def sudoers(self, t):
         """Least-privilege sudo, data-driven from the config.
@@ -3368,12 +3465,11 @@ class Renderer:
         frag = self.share / "caddy"
         root_user = self.spec.root_user
 
-        def bind(name, user=None):
+        def bind(name, user=None, extra=None):
             text = (frag / f"caddyfile-{name}.caddy").read_text()
             text = text.replace("@DOMAIN@", self.spec.domain)
             text = text.replace("@MANAGED_BY@", "agentbox apply")
             text = text.replace("@APPLY_CMD@", "agentbox apply")
-            text = text.replace("@RELOAD_CMD@", CADDY_RELOAD_CMD)
             if user is not None:
                 # Bind every token the fragments carry. The values mirror the
                 # module's helpers one for one (settingsSocketOf,
@@ -3398,6 +3494,12 @@ class Renderer:
                     ("@USER@", user.name),
                 ]:
                     text = text.replace(token, value)
+            # A site fragment's own tokens (issue #629). Bound here rather
+            # than by the caller so the unbound-token check below sees the
+            # finished text - a @SITE_*@ left in it is the same class of
+            # mistake as a @USER@ left in it.
+            for token, value in (extra or {}).items():
+                text = text.replace(token, value)
             left = re.findall(r"@[A-Z_]+@", text)
             if left:
                 raise ConfigError(
@@ -3417,20 +3519,28 @@ class Renderer:
             parts.append(bind("terminal", u))
         parts.append(bind("root", root_user))
         parts.append("}\n")
-        # The self-serve extension point the header fragment documents, and
-        # the reason the sudo allowlist carries `systemctl reload
-        # caddy.service`: one `import` per user, since Caddyfile's `import`
-        # accepts a single `*` per pattern. Without these lines a native box
-        # has the whole mechanism — the caddy-readable dir, the ~/sites
-        # symlink, the reload grant, the instructions at the top of this
-        # very file — and nothing that ever reads a snippet, so an agent's
-        # virtual host is silently never served: caddy reloads happily
-        # and answers the TLS handshake for that hostname with an
-        # internal_error, because no vhost by that name exists.
-        parts.append(
-            bind("sites")
-            + "".join(f"import /var/lib/agent-box-sites/{u.name}/*.caddy\n"
-                      for u in self.spec.users))
+        # Operator-approved extra vhosts (issue #629), from the same
+        # fragments the module binds - so both backends emit the same text
+        # and the two fixtures compare line for line.
+        #
+        # There used to be one `import /var/lib/agent-box-sites/<user>/*.caddy`
+        # per user here instead, which made a general Caddyfile the
+        # tenant-facing API for THIS instance: it holds every user's web
+        # auth secrets and can reach every user's settings socket, so a
+        # snippet could print a sibling's WEB_COOKIE_SECRET_* through
+        # Caddy's documented `{$ENV}` substitution - and since the normal
+        # routes admit an exact cookie match, that value IS a session - or
+        # reverse_proxy straight to a sibling's privileged upstream with no
+        # auth gate in front of it.
+        #
+        # The values below cannot do either: Spec's parse_sites has already
+        # refused anything but a lowercase DNS hostname plus one host:port
+        # or one absolute path outside /home.
+        sites = [bind("sites")]
+        for host, upstream in self.spec.sites.items():
+            sites.append("\n" + bind("site-proxy", extra={
+                "@SITE_HOST@": host, "@SITE_UPSTREAM@": upstream}))
+        parts.append("".join(sites))
         # GENERATED_HEADER first: the fragment's own banner is shared with
         # the module and speaks NixOS ("the next nixos-rebuild"), so it is
         # not a marker of who wrote THIS file. Without a header of ours,
@@ -5232,6 +5342,16 @@ def first_boot(spec, args):
         if spec.host_label_from_domain:
             spec.host_label = spec.domain
         print(f"derived domain {spec.domain} from {ip}")
+        # Re-run the web.sites collision check against the domain we just
+        # DERIVED (CodeRabbit, PR #655). Spec built itself against the
+        # configured value, which for this box was "auto" -- so a site
+        # declared with the eventual sslip.io hostname passed validation
+        # and would now be rendered twice into one Caddyfile, once as the
+        # management vhost and once as itself. Caddy refuses a duplicate
+        # site address, so the failure would be this box's FIRST apply,
+        # with the reason two files away from the config that caused it.
+        for host in spec.sites:
+            check_site_domain_collision(host, spec.domain)
 
     kind, value = resolve_web_password_source()
     if spec.web_enable and kind:
