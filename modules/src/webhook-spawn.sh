@@ -430,9 +430,13 @@ PROMPT="$(cat)"
 #
 # A lock this program could not take is not announced: the fd is exported only
 # when it really holds one, so the CLI opens its own rather than trusting an
-# empty promise. Either way the spawn goes ahead — a webhook delivery must
-# never be dropped for want of a lock.
-registry_lock
+# empty promise. `|| true` because a refusal must not abort this script under
+# `set -e`: the cap check below is a READ, so running it unlocked costs at
+# worst a racy count, and the `add` this execs into takes the lock itself and
+# refuses with the same 75 if it cannot (issue #633) — which is exactly the
+# "declined for now" answer the dispatcher re-offers. So a webhook delivery
+# is still never dropped for want of a lock; it waits for one.
+registry_lock || true
 if [ "$REGISTRY_HELD" = 1 ]; then
   export AGENT_BOX_REGISTRY_LOCK_FD=9
 fi

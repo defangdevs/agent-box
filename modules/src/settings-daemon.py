@@ -612,6 +612,28 @@ def profile_launch(name, harness=""):
     return resolved if isinstance(resolved, dict) else None
 
 
+# Seconds a request thread waits for the sessions.json sidecar lock before
+# refusing (issue #633). The shell writers' `flock -w 10` bound, spelled the
+# same way and for the same reason: a wedged holder must never park a
+# request thread forever. Named rather than inline so the tests can shorten
+# it, exactly as REGISTRY_LOCK_WAIT lets them shorten the shell side.
+SESSIONS_LOCK_WAIT = 10
+
+
+class RegistryBusy(Exception):
+    """The sessions.json sidecar lock could not be taken (issue #633).
+
+    Raised by sessions_lock INSTEAD of running the body, so a mutation
+    route changes nothing at all: the registry is byte-for-byte what it
+    was, and the caller gets a 503 it can retry. The shell writers answer
+    the same situation with exit 75 (EX_TEMPFAIL); the reasoning for both
+    is written down once, in modules/src/lib/registry.sh.
+
+    Distinct from RegistryUnreadable, which is about the CONTENT of a file
+    this daemon did read. This one says nothing was read at all.
+    """
+
+
 @contextlib.contextmanager
 def sessions_lock():
     """Serialize one read_sessions -> write_sessions pair (issue #254).
@@ -640,9 +662,16 @@ def sessions_lock():
 
     fcntl precedent in this repo: password-helper.py's AUTH_ENV_LOCK.
 
-    Best effort by design: if the lock cannot be created or taken, the body
-    still runs — an unlockable registry must not make the web UI refuse to
-    add or delete a session.
+    Fails CLOSED: a lock that cannot be created or taken raises
+    RegistryBusy and the body never runs (issue #633). It used to run
+    anyway, on the reasoning that an unlockable registry must not stop the
+    web UI adding or deleting a session -- but the body is a
+    read-modify-write, and running it unlocked at the one moment there is
+    provably another writer is the pre-#254 lost update, reported to the
+    operator as a success. The atomic rename at the end publishes a whole
+    document; it does not make the read that produced it current. So the
+    route answers 503 and the operator presses the button again, which is
+    the cheaper of the two failures by a wide margin.
     """
     lock = None
     try:
@@ -651,29 +680,32 @@ def sessions_lock():
         # "a": create if absent, never truncate — the file is a lock, its
         # contents are irrelevant and other holders keep their offsets.
         lock = open(SESSIONS_FILE + ".lock", "a", encoding="utf-8")
+    except OSError as exc:
+        raise RegistryBusy("cannot open %s.lock: %s"
+                           % (SESSIONS_FILE, exc.strerror or exc))
+    try:
         # Bounded like the shell writers' `flock -w 10`: a request thread must
-        # never park forever behind a wedged holder. Timing out proceeds
-        # unlocked, which is the pre-#254 behavior rather than a new failure.
-        deadline = time.monotonic() + 10
+        # never park forever behind a wedged holder. The wait is what makes a
+        # refusal rare; the refusal is what makes the wait safe to bound.
+        deadline = time.monotonic() + SESSIONS_LOCK_WAIT
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except OSError:
+            except OSError as exc:
                 if time.monotonic() >= deadline:
-                    lock.close()
-                    lock = None
-                    break
+                    raise RegistryBusy(
+                        "timed out after %ss waiting for %s.lock: %s"
+                        % (SESSIONS_LOCK_WAIT, SESSIONS_FILE,
+                           exc.strerror or exc))
                 time.sleep(0.05)
-    except OSError:
-        if lock is not None:
-            lock.close()
-            lock = None
+    except BaseException:
+        lock.close()
+        raise
     try:
         yield
     finally:
-        if lock is not None:
-            lock.close()
+        lock.close()
 
 
 # What write_sessions stamps on a registry that carries no version of its
@@ -878,9 +910,9 @@ def ensure_harness_session(agent, remote_control):
                 "hasRun": False,
             }
             write_sessions(sessions, version)
-    except (RegistryUnreadable, OSError):
-        # Not the connect card's place to surface a broken registry, or a
-        # write that failed outright (disk full, a permission problem) --
+    except (RegistryUnreadable, RegistryBusy, OSError):
+        # Not the connect card's place to surface a broken or busy registry,
+        # or a write that failed outright (disk full, a permission problem) --
         # the session list already reports the former loudly (issue #279),
         # and sign-in itself still succeeded either way. The pane is
         # already reaped by the time this runs, so there is no in-flight
@@ -5773,6 +5805,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sys.stderr.write("sessions/%s refused: %s\n" % (verb, exc))
         self._redirect("ok=session_registry_unreadable", page)
 
+    def _registry_busy(self, verb, exc, page):
+        """Answer a mutation route that could not take the registry lock
+        (issue #633): nothing was read and nothing was written, so this is
+        a plain "ask again" rather than news about the file.
+
+        503 and not the ok= banner channel, for the one reason the banner
+        exists to serve and cannot here: the banner rides a 303, which
+        every client -- a browser, a script, this box's own e2e run --
+        reads as "the thing you asked for happened". A refusal that is
+        indistinguishable from a success in the status line is the shape
+        of the bug being fixed, one layer up. The body is still the page
+        the form came from, carrying the message, because the operator has
+        no shell and a bare 503 tells them nothing.
+        """
+        sys.stderr.write("sessions/%s refused: %s\n" % (verb, exc))
+        render = render_home if (HOME and page == SESS_PAGE) else render_page
+        self._send_html(
+            render("The session list is being changed by something else, so "
+                   "nothing was done. That clears within a few seconds "
+                   "\u2014 go back and try again.", kind="error"),
+            status=503,
+        )
+
     def _redirect(self, query="", page=None):
         target = (page or BASE + "/") + (("?" + query) if query else "")
         self.send_response(303)
@@ -6610,6 +6665,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "hasRun": False,
                     }
                     write_sessions(sessions, version)
+            except RegistryBusy as exc:
+                # Nothing was read, so there is nothing to say about the
+                # file itself: another writer holds it, and the answer is
+                # "press it again" (issue #633).
+                self._registry_busy("add", exc, back_page)
+                return
             except RegistryUnreadable as exc:
                 # Refuse rather than republish (issue #279). Without this the
                 # write below carried the empty dict read_sessions used to
@@ -6638,6 +6699,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         sessions, version = load_sessions()
                         sessions.pop(name, None)
                         write_sessions(sessions, version)
+                except RegistryBusy as exc:
+                    self._registry_busy("delete", exc, self._sess_page(form))
+                    return
                 except RegistryUnreadable as exc:
                     # A delete against a registry we could not read used to
                     # publish an empty one: the named session went, and so did
@@ -6690,6 +6754,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         if isinstance(entry, dict) and entry.pop("stopped", None) is not None:
                             write_sessions(sessions, version)
                             ok = "ok=session_started"
+                except RegistryBusy as exc:
+                    self._registry_busy("restart", exc, self._sess_page(form))
+                    return
                 except RegistryUnreadable as exc:
                     # Start is the button an operator presses when the box
                     # looks wrong, which is exactly when the registry might

@@ -1012,7 +1012,13 @@ start_session() {
   # done — seed_claude_state above can spend minutes inside `claude plugin
   # marketplace update` over the network, and no lock may be held across
   # that, so the section covers only reads and writes of this file.
-  registry_lock
+  # A lock this tick could not take means the section cannot be honoured, so
+  # nothing is spawned (issue #633): the pre-check would be answering from a
+  # document another writer is in the middle of replacing, and a session
+  # started against a stale answer is one a delete has already removed. The
+  # loop comes back in ~2s, which is what makes refusing cheap here; sessions
+  # already running are untouched either way.
+  registry_lock || return 0
   listed || { registry_unlock; return 0; }
   # Per-session webhook identity, passed via `tmux new-session -e` so it
   # lands in the SESSION environment — inherited by the agent AND by
@@ -1208,7 +1214,9 @@ reap_ephemeral() {
                    | .key' "$REGISTRY_FILE" 2>/dev/null)" || return 0
   [ -n "$_cand" ] || return 0
   _gone=""
-  registry_lock
+  # Same as start_session: a delist decided without the lock can revert a
+  # `restart` that landed in the gap (issue #633). Next tick.
+  registry_lock || return 0
   while IFS= read -r _n; do
     case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
     # A live pane still owns the name: mark-stopped runs as the epilogue of a
