@@ -2390,6 +2390,170 @@ class RenderTest(unittest.TestCase):
                 f"option the shared template pins")
 
 
+class ResolveWebPasswordSourceTest(unittest.TestCase):
+    """Issue #25: first boot now prefers an already-hashed password -
+    generated client-side by the launch page - over plaintext, which it
+    only hashes itself as a fallback for a hand-provisioned box. It
+    reports which KIND it found rather than hashing inline, because the
+    two kinds are applied differently: see MultiUserPasswordHashTest for
+    why that distinction has to survive into first_boot().
+    """
+
+    ENV_KEYS = ("AGENT_BOX_WEB_PASSWORD_HASH",
+                "AGENT_BOX_WEB_PASSWORD_HASH_FILE",
+                "AGENT_BOX_WEB_PASSWORD",
+                "AGENT_BOX_WEB_PASSWORD_FILE")
+
+    def _env(self, **overrides):
+        base = {k: "" for k in self.ENV_KEYS}
+        base.update(overrides)
+        return mock.patch.dict(os.environ, base)
+
+    def test_returns_none_when_nothing_is_set(self):
+        mod = load_agentbox()
+        with self._env():
+            self.assertEqual(
+                (None, None), mod.resolve_web_password_source())
+
+    def test_prefers_the_provided_hash_over_a_plaintext_password(self):
+        mod = load_agentbox()
+        given = "$argon2id$v=19$m=65536,t=3,p=1$c2FsdA$aGFzaA"
+        with self._env(AGENT_BOX_WEB_PASSWORD_HASH=given,
+                        AGENT_BOX_WEB_PASSWORD="should-be-ignored"):
+            result = mod.resolve_web_password_source()
+        self.assertEqual(("hash", given), result)
+
+    def test_reads_the_hash_from_a_file(self):
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            hash_file = Path(tmp) / "hash"
+            hash_file.write_text("$argon2id$v=19$x\n")
+            with self._env(AGENT_BOX_WEB_PASSWORD_HASH_FILE=str(hash_file)):
+                self.assertEqual(
+                    ("hash", "$argon2id$v=19$x"),
+                    mod.resolve_web_password_source())
+
+    def test_falls_back_to_a_plaintext_password(self):
+        mod = load_agentbox()
+        with self._env(AGENT_BOX_WEB_PASSWORD="a-plaintext-password"):
+            self.assertEqual(
+                ("password", "a-plaintext-password"),
+                mod.resolve_web_password_source())
+
+
+class HashWebPasswordTest(unittest.TestCase):
+    def test_hashes_a_plaintext_password_via_caddy(self):
+        mod = load_agentbox()
+        with mock.patch.object(mod.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="$argon2id$hashed\n")
+            result = mod.hash_web_password(
+                "/fake/profile", "a-plaintext-password")
+        self.assertEqual("$argon2id$hashed", result)
+        args, kwargs = run.call_args
+        self.assertEqual(
+            ["/fake/profile/bin/caddy", "hash-password",
+             "--algorithm", "argon2id"], args[0])
+        self.assertEqual("a-plaintext-password\n", kwargs["input"])
+
+
+class MultiUserPasswordHashTest(unittest.TestCase):
+    """A hash from CloudFormation is one fixed value shared by every user -
+    the same way they already shared one plaintext password before this
+    hash existed - but a plaintext password must still be hashed FRESH per
+    user, or every account's stored salt collides for no reason (a
+    regression a hoisted single hash call introduced and this guards
+    against).
+    """
+
+    def _first_boot(self, tmp, env):
+        mod = load_agentbox()
+        prof = build_fake_profile(tmp)
+        cfg = Path(tmp) / "config.json"
+        cfg.write_text(json.dumps({
+            "domain": "my-box.example",
+            "web": {"enable": True},
+            "users": {"agent": {}, "robot": {}},
+        }))
+        spec = mod.Spec(json.loads(cfg.read_text()), prof)
+        args = type("A", (), {"settle_delay": 0, "config": str(cfg)})()
+        with mock.patch.dict(os.environ, env):
+            with contextlib.redirect_stdout(io.StringIO()):
+                mod.first_boot(spec, args)
+        return {
+            name: Path(f"/etc/agent-box/{name}.hash").read_text()
+            for name in ("agent", "robot")
+        }
+
+    def test_a_provided_hash_is_shared_by_every_user(self):
+        # first_boot() writes literal /etc/agent-box paths (no --root
+        # support - see AGENT_BOX_WEB_PASSWORD's own test file for the same
+        # constraint), so this asserts on the write CALLS via a mocked
+        # Path.write_text rather than on real files under /etc.
+        given = "$argon2id$v=19$m=65536,t=3,p=1$c2FsdA$aGFzaA"
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps({
+                "domain": "my-box.example",
+                "web": {"enable": True},
+                "users": {"agent": {}, "robot": {}},
+            }))
+            spec = mod.Spec(json.loads(cfg.read_text()), prof)
+            args = type("A", (), {"settle_delay": 0, "config": str(cfg)})()
+            writes = {}
+
+            def fake_write_text(self, text, *a, **k):
+                writes[self.name] = text
+
+            with mock.patch.dict(os.environ, {
+                    "AGENT_BOX_WEB_PASSWORD_HASH": given}), \
+                 mock.patch.object(Path, "mkdir"), \
+                 mock.patch.object(Path, "write_text", fake_write_text), \
+                 mock.patch("os.chmod"), \
+                 mock.patch.object(mod, "write_auth_env"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mod.first_boot(spec, args)
+        self.assertEqual(given + "\n", writes["agent.hash"])
+        self.assertEqual(given + "\n", writes["robot.hash"])
+
+    def test_a_plaintext_password_is_hashed_separately_per_user(self):
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps({
+                "domain": "my-box.example",
+                "web": {"enable": True},
+                "users": {"agent": {}, "robot": {}},
+            }))
+            spec = mod.Spec(json.loads(cfg.read_text()), prof)
+            args = type("A", (), {"settle_delay": 0, "config": str(cfg)})()
+            writes = {}
+
+            def fake_write_text(self, text, *a, **k):
+                writes[self.name] = text
+
+            # hash_web_password() always returns a STRIPPED hash (it
+            # strips caddy's own stdout) - no trailing newline, matching
+            # the real function's contract.
+            hashes = iter(["$argon2id$one", "$argon2id$two"])
+            with mock.patch.dict(os.environ, {
+                    "AGENT_BOX_WEB_PASSWORD": "shared-plaintext"}), \
+                 mock.patch.object(Path, "mkdir"), \
+                 mock.patch.object(Path, "write_text", fake_write_text), \
+                 mock.patch("os.chmod"), \
+                 mock.patch.object(mod, "write_auth_env"), \
+                 mock.patch.object(mod, "hash_web_password",
+                                    side_effect=lambda *a: next(hashes)):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mod.first_boot(spec, args)
+        self.assertEqual("$argon2id$one\n", writes["agent.hash"])
+        self.assertEqual("$argon2id$two\n", writes["robot.hash"])
+        self.assertNotEqual(writes["agent.hash"], writes["robot.hash"])
+
+
 class ConfigSchemaTest(unittest.TestCase):
     """The typed config boundary (issue #525).
 
