@@ -229,6 +229,26 @@ var httpsRule = {
   }
 }
 
+// Raw SMTP outbound is the way a hijacked box gets used to send spam, and
+// nothing this box legitimately runs needs it: mail through a real provider
+// (SendGrid, SES, ...) goes out over authenticated submission on 587/465,
+// which this rule leaves open. Explicit and low-numbered so it is evaluated
+// ahead of the platform's own AllowInternetOutBound default rule (priority
+// 65001), which would otherwise let it straight through.
+var smtpEgressRule = {
+  name: 'block-smtp-egress'
+  properties: {
+    priority: 100
+    protocol: 'Tcp'
+    access: 'Deny'
+    direction: 'Outbound'
+    sourceAddressPrefix: '*'
+    sourcePortRange: '*'
+    destinationAddressPrefix: 'Internet'
+    destinationPortRange: '25'
+  }
+}
+
 // Verbatim, because Bicep does not interpolate inside a multi-line string -
 // which is exactly what we want for a shell script full of ${...}. Parameters
 // go in through replace() below, the same way the Lightsail template seds its
@@ -446,7 +466,7 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
   name: '${namePrefix}-nsg'
   location: location
   properties: {
-    securityRules: concat([httpsRule], sshRule)
+    securityRules: concat([httpsRule, smtpEgressRule], sshRule)
   }
 }
 

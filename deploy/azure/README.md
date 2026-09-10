@@ -46,6 +46,9 @@ user choose Claude Code or Codex.
   `agentbox apply` derives and therefore the only one in the issued
   certificate — the dotted spelling resolves but fails TLS (issue #359).
 - No port 80 is opened. Caddy is configured for TLS-ALPN-01 only.
+- Outbound TCP port 25 (raw SMTP) is denied at the NSG, so a box cannot be
+  used as a spam relay. Authenticated mail submission (587/465) through a
+  real provider is unaffected.
 
 ## Three things that differ from `deploy/aws/lightsail-template.yaml`
 
