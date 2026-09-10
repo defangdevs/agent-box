@@ -1810,6 +1810,31 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The two machine-readable reads a portal drives this daemon
+          # through (issue #642): the env store's key NAMES and every
+          # connect card in one answer. Same shape and same subject as
+          # connect-card above — the GOLDEN PAYLOAD, the daemon as it
+          # actually ships — but driven over HTTP against its own request
+          # handler, because what is under test is the route table.
+          settings-json =
+            pkgs.runCommand "agent-box-settings-json"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-settings-json.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-settings-json.py
+              python3 repo/tests/test-settings-json.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # connect_start()'s install half: resolving nix at use, and
           # letting a failed install reach the exit marker (issue #544).
           # Same shape and same subject as connect-card above - the GOLDEN
