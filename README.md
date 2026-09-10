@@ -160,8 +160,8 @@ Control session name.
 
 **Cost.** Azure has no Lightsail-style bundle, so the bill is three line items
 rather than one. A default box in westus3 &mdash; `Standard_B2pls_v2`
-(2 vCPU / 4 GiB, ARM Ampere) + a 64 GiB Standard SSD + the static IPv4 &mdash;
-is **~$30/mo**, against $24/mo flat for the equivalent Lightsail bundle.
+(2 vCPU / 4 GiB, ARM Ampere) + a 32 GiB Standard SSD + the static IPv4 &mdash;
+is **~$28/mo**, against $24/mo flat for the equivalent Lightsail bundle.
 westus3 is the cheapest region for Ampere, and Ampere is the cheapest at every
 RAM tier. Delete the resource group to stop billing.
 

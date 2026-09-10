@@ -70,8 +70,8 @@ param portalIssuer string = ''
 //
 // Azure has no Lightsail-style bundle: compute, disk and the public IPv4 are
 // three separate line items, so the prices below are the COMPUTE half only
-// (westus3, the cheapest region for Ampere). Add ~$4.80/mo for the default
-// 64 GiB Standard SSD and ~$3.65/mo for the static IPv4.
+// (westus3, the cheapest region for Ampere). Add ~$2.40/mo for the default
+// 32 GiB Standard SSD and ~$3.65/mo for the static IPv4.
 //
 // 4 GiB is the floor here rather than the 2 GiB the AWS template allows: the
 // B2pts_v2 (1 GiB) and B2pls_v2 (4 GiB) are the only two 2-vCPU Ampere sizes,
@@ -87,10 +87,14 @@ param portalIssuer string = ''
 ])
 param vmSizeChoice string = 'Standard_B2pls_v2 (2 vCPU / 4 GiB / ARM Ampere / ~$21.90 mo)'
 
-@description('OS disk size in GiB. Unlike a Lightsail bundle this is resizable later (stop the VM, grow the disk, grow the filesystem) - so start small.')
+// 32, not 30: Standard SSD is billed by tier, and 30 and 32 GiB both land in
+// E4 (~$2.40/mo). Anything from 33 to 64 GiB costs E6 (~$4.80/mo), so a value
+// between the two buys nothing. A fresh box uses ~6 GiB including the 2 GiB
+// swapfile, leaving ~24 GiB for the agent's work.
+@description('OS disk size in GiB. Billed by Standard SSD tier: 32 (E4, ~$2.40/mo) and 64 (E6, ~$4.80/mo) are the only two values worth picking at the low end. Unlike a Lightsail bundle this is resizable later (stop the VM, grow the disk, grow the filesystem) - so start small.')
 @minValue(30)
 @maxValue(2048)
-param osDiskSizeGB int = 64
+param osDiskSizeGB int = 32
 
 @description('Deployment-specific instructions APPENDED to the box\'s AGENTS.md (the agent\'s standing instructions), below the built-in platform guide. Empty = just that guide.')
 param agentsMd string = '''
