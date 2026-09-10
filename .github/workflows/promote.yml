@@ -246,6 +246,12 @@ jobs:
         # first job and the tree has been checked out again since. Anything
         # that does not match means the artifact and the tag would disagree
         # about what was promoted.
+        #
+        # AGENT_BOX_SKIP_PREFETCH because this job installs no Nix, so
+        # `nix-prefetch-url` is not here to re-hash the channel tarball -
+        # and the publish job, which does have it, already ran the full
+        # verification including that hash before anything was uploaded.
+        # Every other identity is still recomputed here.
         env:
           AGENT_BOX_SKIP_PREFETCH: "1"
         run: |
