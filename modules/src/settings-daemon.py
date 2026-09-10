@@ -3139,8 +3139,12 @@ PROFILES_SECTION_TPL = """<section>
                  aria-label="Profile name"
                  title="Letters, digits, underscore and hyphen; at most 64 characters">
           <select name="HARNESS" aria-label="Assistant" required>{harnesses}</select>
-          <input type="text" name="MODEL" placeholder="model (optional)" class="pmodel"
-                 autocomplete="off" aria-label="Model" data-model-input>
+          <span class="combo">
+            <input type="text" name="MODEL" placeholder="model (optional)"
+                   class="pmodel" autocomplete="off" spellcheck="false"
+                   aria-label="Model" aria-autocomplete="list" data-model-input>
+            <ul class="ac" hidden></ul>
+          </span>
           <select name="EFFORT" aria-label="Reasoning level">{effort}</select>
         </div>
         <div class="row prompt-row">
@@ -3732,17 +3736,6 @@ _MODEL_HINT_MAX = 12
 # holds spaces, so no match is possible there and the scan resumes at the
 # real opening quote of the example that follows.
 _MODEL_NAME_RE = re.compile(r"'([A-Za-z0-9][A-Za-z0-9._-]{1,63})'")
-# An id/list reference has to survive being spliced into markup and then
-# looked up by the browser. AGENT_BOX_AGENTS is a comma-separated env
-# value, so a name from it is not automatically either.
-_HARNESS_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
-
-# settings.js builds the same id when it follows the assistant picker on a
-# row the server could not resolve one for. Two spellings of one constant,
-# in two languages, the way BASE and every other id shared with that file
-# already are.
-MODEL_LIST_PREFIX = "pmodel-"
-
 # harness_model_aliases()' answers, keyed on (binary, stamp) and holding
 # (names, retry_at). retry_at is None for a real answer - it stands until
 # the binary itself changes - and a monotonic deadline for a probe that
@@ -3874,37 +3867,43 @@ def model_hints(harness, profiles):
     return tuple(hints)
 
 
-def model_list_id(harness):
-    """The datalist id for this harness's suggestions, or "" for a name
-    that cannot be one."""
-    return (MODEL_LIST_PREFIX + harness) if _HARNESS_ID_RE.match(harness) else ""
-
-
-def model_hint_lists(profiles):
-    """{harness: datalist id} for every harness with something to suggest.
-
-    One place decides which lists the page will actually CARRY, so a row
-    can never point `list` at a datalist that is not there. A harness with
-    nothing to say gets no entry and its rows get no attribute, which is
-    the free-text field they already were.
-    """
-    lists = {}
-    for harness in PROFILE_AGENTS:
-        list_id = model_list_id(harness)
-        if list_id and model_hints(harness, profiles):
-            lists[harness] = list_id
-    return lists
+# The id the client reads the suggestions out of. It rides inside
+# #profiles-list so a save that adds a model refreshes it with the rows.
+MODEL_HINTS_ID = "model-hints"
 
 
 def render_model_hints(profiles):
-    """One <datalist> per harness that has anything to suggest."""
-    lists = []
-    for harness, list_id in model_hint_lists(profiles).items():
-        options = "".join('<option value="%s"></option>' % html.escape(h)
-                          for h in model_hints(harness, profiles))
-        lists.append('<datalist id="%s">%s</datalist>'
-                     % (html.escape(list_id), options))
-    return "".join(lists)
+    """Every harness's suggestions as one JSON blob the client reads.
+
+    NOT a <datalist>. The browser draws that popup itself, and these pages
+    hand it no palette it will honour - the suggestions arrived as
+    near-black text on a dark ground on a real browser, and no CSS of ours
+    reaches inside it. The working-directory field (issue #131) already
+    solved this by owning its popup outright: one <ul class="ac"> the page
+    styles like everything else. This is the same control with a different
+    source, so it inherits that answer instead of re-litigating it.
+
+    A <script type="application/json"> rather than an attribute per row:
+    the entries belong to the HARNESS, not to the row, and the row's
+    assistant is a picker the operator can change without saving. The
+    client reads the list when it opens the popup, so there is no
+    attribute to keep in step with a control beside it.
+    """
+    hints = {}
+    for harness in PROFILE_AGENTS:
+        found = model_hints(harness, profiles)
+        if found:
+            hints[harness] = list(found)
+    if not hints:
+        return ""
+    # Inside a <script>, the HTML parser looks for "</script" and nothing
+    # else, so escaping "<" is the whole of what this needs - html.escape()
+    # would be wrong here, since the client parses the text as JSON and
+    # would get "&quot;" where it wants a quote. A MODEL is operator text
+    # (an alias is charset-constrained, a saved profile's value is not).
+    blob = json.dumps(hints, sort_keys=True).replace("<", "\\u003c")
+    return ('<script type="application/json" id="%s">%s</script>'
+            % (MODEL_HINTS_ID, blob))
 
 
 def render_profiles(profiles, usage=None):
@@ -3922,11 +3921,6 @@ def render_profiles(profiles, usage=None):
     hand and does not care."""
     usage = usage or {}
     base = html.escape(BASE)
-    # Which model datalists this page carries (#493). Resolved once, not
-    # per row: the harness probe behind it is cached, but the answer has to
-    # be the SAME one render_model_hints() renders or a row would reference
-    # a list that is not on the page.
-    hint_lists = model_hint_lists(profiles)
     rows = []
     for name in sorted(profiles):
         safe = html.escape(name)
@@ -3993,11 +3987,6 @@ def render_profiles(profiles, usage=None):
         # stored, so an edit is an edit and not a retype. SYSTEM_PROMPT is a
         # textarea for the same reason it is one above — it can span lines.
         prompt_val = html.escape(res.get("SYSTEM_PROMPT") or "")
-        # This row already names its harness, so its model suggestions are
-        # known server-side. The "New profile" row's are not - nothing is
-        # preselected there - which is why settings.js follows the picker.
-        list_id = hint_lists.get(res.get("HARNESS") or "", "")
-        model_list_attr = f' list="{html.escape(list_id)}"' if list_id else ""
         # json.dumps(), not hand-quoted JS: `name` is charset-restricted
         # (PROFILE_NAME_RE), but watch_warn's topic names are not, so this is
         # where the confirm() dialog's whole message gets ONE correct
@@ -4027,10 +4016,12 @@ def render_profiles(profiles, usage=None):
             f'<div class="row profile-row">'
             f'<select name="HARNESS" aria-label="Assistant for {safe}" required>'
             f'{render_harness_options(res.get("HARNESS") or "")}</select>'
+            f'<span class="combo">'
             f'<input type="text" name="MODEL" value="{html.escape(res.get("MODEL") or "")}" '
             f'placeholder="model" class="pmodel" autocomplete="off" '
-            f'data-model-input{model_list_attr} '
+            f'spellcheck="false" data-model-input aria-autocomplete="list" '
             f'aria-label="Model for {safe}">'
+            f'<ul class="ac" hidden></ul></span>'
             f'<select name="EFFORT" aria-label="Reasoning level for {safe}">'
             f'{render_effort_options(res.get("EFFORT") or "")}</select>'
             f'<button type="submit" class="btn">Save</button></div>'

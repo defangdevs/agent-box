@@ -376,17 +376,26 @@ class ProfilePanel(ProfileFixture):
     # --- model suggestions (issue #493) ------------------------------
 
     def test_the_model_field_is_an_open_picker_not_a_closed_one(self):
-        """<input list>, never <select>: a model ID this box has never
-        heard of has to stay typeable, and a profile already naming one
-        has to survive a Save with nothing touched - the same rule
-        render_effort_options() keeps one control along."""
+        """Free text over a popup, never a <select>: a model ID this box
+        has never heard of has to stay typeable, and a profile already
+        naming one has to survive a Save with nothing touched - the same
+        rule render_effort_options() keeps one control along.
+
+        And the popup is the page's OWN (.combo/.ac, the control the
+        working-directory field already uses), not a <datalist> - the
+        browser draws that one itself and no palette of ours reaches
+        inside it."""
         module = self.daemon(
             AGENT_BOX_CONNECT_BINS="claude=" + self.harness_stub(
                 "claude", CLAUDE_HELP))
         self.write_profile("deep", 'HARNESS=claude\nMODEL=opus\n')
         row = self.in_fixture(module.render_profiles, module.read_profiles())
         self.assertIn('<input type="text" name="MODEL" value="opus" ', row)
-        self.assertIn('list="pmodel-claude"', row)
+        self.assertIn("data-model-input", row)
+        self.assertIn('<span class="combo">', row)
+        self.assertIn('<ul class="ac" hidden></ul>', row)
+        self.assertNotIn("datalist", row)
+        self.assertNotIn("list=", row)
 
     def test_model_suggestions_are_read_off_the_harnesss_own_help(self):
         """The aliases are inspected, not written down: a box learns a new
@@ -395,10 +404,29 @@ class ProfilePanel(ProfileFixture):
         module = self.daemon(
             AGENT_BOX_CONNECT_BINS="claude=" + self.harness_stub(
                 "claude", CLAUDE_HELP))
-        lists = self.in_fixture(module.render_model_hints, module.read_profiles())
-        self.assertIn('<datalist id="pmodel-claude">', lists)
-        for name in ("fable", "opus", "sonnet", "claude-fable-5"):
-            self.assertIn('<option value="%s"></option>' % name, lists)
+        blob = self.in_fixture(module.render_model_hints,
+                               module.read_profiles())
+        self.assertIn('<script type="application/json" id="model-hints">',
+                      blob)
+        self.assertEqual(
+            json.loads(blob.split(">", 1)[1].rsplit("<", 1)[0])["claude"],
+            ["fable", "opus", "sonnet", "claude-fable-5"])
+
+    def test_the_hints_blob_cannot_close_the_script_that_carries_it(self):
+        """A saved profile's MODEL is operator text, and it rides into the
+        page inside a <script>. The HTML parser looks for "</script" there
+        and nothing else, so "<" is the whole of what has to go - and it
+        has to go as a JSON escape, because the client parses this as JSON
+        and html.escape() would hand it "&quot;" where it wants a quote."""
+        module = self.daemon()
+        self.write_profile(
+            "sneaky", 'HARNESS=claude\nMODEL="</script><b>x"\n')
+        blob = self.in_fixture(module.render_model_hints,
+                               module.read_profiles())
+        self.assertNotIn("</script><b>", blob)
+        self.assertIn("\\u003c", blob)
+        body = blob.split(">", 1)[1].rsplit("<", 1)[0]
+        self.assertEqual(json.loads(body)["claude"], ["</script><b>x"])
 
     def test_only_the_model_options_own_block_is_harvested(self):
         """Other options quote values too. Harvesting the whole help would
@@ -493,8 +521,7 @@ class ProfilePanel(ProfileFixture):
         self.assertEqual(
             self.in_fixture(module.model_hints, "codex", profiles), ())
         self.assertNotIn(
-            "pmodel-codex",
-            self.in_fixture(module.render_model_hints, profiles))
+            "codex", self.in_fixture(module.render_model_hints, profiles))
 
     def test_a_model_already_in_use_is_offered_for_its_own_harness(self):
         """The second source, and the only one a harness with a silent
@@ -512,7 +539,7 @@ class ProfilePanel(ProfileFixture):
             "gpt-5.1-codex-max",
             self.in_fixture(module.model_hints, "claude", profiles))
 
-    def test_the_new_profile_row_ships_with_no_list_of_its_own(self):
+    def test_the_new_profile_row_carries_the_popup_and_no_stale_list(self):
         """Nothing is preselected in that row's assistant picker (#493
         removed the box default), so the server cannot know which list
         applies. settings.js follows the picker instead; until it does,
@@ -527,6 +554,7 @@ class ProfilePanel(ProfileFixture):
         tag = re.search(r'<input[^>]*name="MODEL"[^>]*>', pane).group(0)
         self.assertIn("data-model-input", tag)
         self.assertNotIn("list=", tag)
+        self.assertIn('<ul class="ac" hidden></ul>', pane)
 
     def test_a_probe_that_cannot_answer_costs_a_suggestion_not_the_field(self):
         """A harness the box has not installed yet is probed no more than
@@ -544,7 +572,8 @@ class ProfilePanel(ProfileFixture):
             self.in_fixture(module.render_model_hints, profiles), "")
         row = self.in_fixture(module.render_profiles, profiles)
         self.assertIn('name="MODEL"', row)
-        self.assertNotIn('list="pmodel-claude"', row)
+        self.assertEqual(
+            self.in_fixture(module.model_hints, "claude", profiles), ())
 
 
 class ProfileRoutes(ProfileFixture):

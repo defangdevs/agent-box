@@ -866,7 +866,6 @@
          "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");
       if (ed) { f.reset(); ed.hidden = true; }
-      syncModelLists();   // reset() cleared the picker, not the list= (#493)
       var added = wsActive();   // the tab the fetched page marks current
       connectPoll();
       if (tabsBefore && added && tabsBefore.indexOf(added) < 0) { wsSelect(added, true); }
@@ -919,45 +918,6 @@
     post().then(function (t) { afterPost(t); startPolling(8); });
   });
 
-  // Model suggestions follow the assistant picker beside them (issue #493).
-  // The profile editor's model field is free text over a per-assistant
-  // <datalist>, and which list applies is a choice the server cannot see:
-  // "New profile" deliberately preselects no assistant, so its input ships
-  // with no list at all and gets one here. A saved profile's own row
-  // already names its assistant, so the daemon renders that row's list=
-  // itself and this only follows a CHANGE to it.
-  //
-  // Event-delegated, like everything else here, so it survives applyDoc()'s
-  // swaps. It sets no state worth defending against a morph: #profile-editor
-  // is not a morphed region at all, and on a saved row the worst a morph can
-  // restore is the stored assistant's suggestions under a picker the
-  // operator has changed but not yet saved — a stale hint on a field that
-  // accepts anything, which is not worth a beforeAttributeUpdated veto.
-  function syncModelList(sel) {
-    var row = sel.closest ? sel.closest(".profile-row") : null;
-    var input = row ? row.querySelector("[data-model-input]") : null;
-    if (!input) { return; }
-    var id = sel.value ? "pmodel-" + sel.value : "";
-    // No datalist means no suggestions, which is the field this already is.
-    if (id && document.getElementById(id)) { input.setAttribute("list", id); }
-    else { input.removeAttribute("list"); }
-  }
-  // Every row, not only the one that just changed. A `change` event is not
-  // the only way a picker's value moves: form.reset() after a save restores
-  // the "Choose an assistant" prompt while leaving the ATTRIBUTE this set,
-  // and Firefox restores a <select>'s value across a plain reload without
-  // firing anything at all - both of which would leave the previous
-  // assistant's aliases under a picker that no longer names it.
-  function syncModelLists() {
-    document.querySelectorAll(".profile-row select[name=HARNESS]")
-      .forEach(syncModelList);
-  }
-  document.addEventListener("change", function (e) {
-    var sel = e.target;
-    if (!sel || sel.tagName !== "SELECT" || sel.name !== "HARNESS") { return; }
-    syncModelList(sel);
-  });
-
   // Working-directory autocomplete (issue #131). The add-session cwd
   // field browses the filesystem one level at a time: the daemon lists
   // the children of whatever directory the text names so far (up to
@@ -966,9 +926,45 @@
   // the next level appears — like tab-completing a path. Everything is
   // event-delegated so it survives the DOM swaps applyDoc() does; each
   // input carries its own tiny state on the element.
+  //
+  // Two fields use it now (issue #493). They share the markup, the CSS,
+  // the popup, the keyboard handling and the mouse handling; they differ
+  // only in where the entries come from and what picking one means, so
+  // exactly three functions branch and nothing else knows there are two.
+  // The model field came here from a <datalist>, which the browser draws
+  // ITSELF: no palette of ours reaches inside that popup, and on a real
+  // browser it arrived as near-black text on a dark ground. A popup the
+  // page owns cannot have that problem.
+  function acKind(el) {
+    if (!el || !el.hasAttribute) { return ""; }
+    if (el.hasAttribute("data-dir-input")) { return "dir"; }
+    if (el.hasAttribute("data-model-input")) { return "model"; }
+    return "";
+  }
   function acList(input) {
     var combo = input.closest ? input.closest(".combo") : null;
     return combo ? combo.querySelector(".ac") : null;
+  }
+  // Which assistant this row names right now. Read when the popup opens
+  // rather than mirrored onto the input, so a picker the operator changed
+  // and has not saved is still the one that decides - and there is no
+  // attribute left to go stale behind a form.reset() or a morph.
+  function acHarness(input) {
+    var row = input.closest ? input.closest(".profile-row") : null;
+    var sel = row ? row.querySelector("select[name=HARNESS]") : null;
+    return sel ? sel.value : "";
+  }
+  function acModelHints(harness) {
+    var el = document.getElementById("model-hints");
+    if (!el || !harness) { return []; }
+    try {
+      var all = JSON.parse(el.textContent);
+      return (all && all[harness]) || [];
+    } catch (err) { return []; }
+  }
+  function acFrag(input) {
+    return acKind(input) === "model"
+      ? input.value : acSplit(input.value).frag;
   }
   function acSplit(v) {
     // Directory portion (browsed) and trailing fragment (filter).
@@ -989,13 +985,18 @@
     var ul = acList(input);
     var st = input._dir;
     if (!ul || !st) { return; }
-    var frag = acSplit(input.value).frag.toLowerCase();
+    var model = acKind(input) === "model";
+    var frag = acFrag(input).toLowerCase();
     var matches = st.entries.filter(function (n) {
       return n.toLowerCase().indexOf(frag) === 0;
     });
     ul.innerHTML = "";
     st.active = -1;
     if (!st.entries.length) {
+      // A directory with no children is worth saying; an assistant with
+      // no suggestions is not - the field is free text either way, and an
+      // empty popup over it would be noise, not information.
+      if (model) { ul.hidden = true; return; }
       var e = document.createElement("li");
       e.className = "empty";
       e.textContent = "No subfolders here";
@@ -1008,13 +1009,21 @@
       var li = document.createElement("li");
       li.setAttribute("role", "option");
       li.setAttribute("data-name", name);
-      li.textContent = name + "/";
+      li.textContent = model ? name : name + "/";
       ul.appendChild(li);
     });
     ul.hidden = false;
   }
   function acFetch(input) {
     var st = input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 });
+    if (acKind(input) === "model") {
+      // No request to make: the daemon already put every harness's list on
+      // the page. Re-read rather than cache it, because a save re-renders
+      // that blob along with the rows it sits among.
+      st.entries = acModelHints(acHarness(input));
+      acRender(input);
+      return;
+    }
     var dir = acSplit(input.value).dir;
     if (dir === st.dir) { acRender(input); return; }
     var base = input.getAttribute("data-dir-base") || "";
@@ -1048,37 +1057,48 @@
     st.active = idx;
   }
   function acApply(input, li) {
+    var name = li.getAttribute("data-name");
+    if (acKind(input) === "model") {
+      // A model name is the whole value, so picking one finishes the job -
+      // there is no next level to reveal, and leaving the popup open over
+      // a field that now reads exactly what was clicked is just in the way.
+      input.value = name;
+      input.focus();
+      acClose(input);
+      return;
+    }
     var dir = acSplit(input.value).dir;
-    input.value = acJoin(dir, li.getAttribute("data-name")) + "/";
+    input.value = acJoin(dir, name) + "/";
     input.focus();
     acFetch(input); // reveal the next level
   }
   var acTimer = null;
   document.addEventListener("input", function (e) {
     var input = e.target;
-    if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+    if (!acKind(input)) { return; }
     if (acTimer) { window.clearTimeout(acTimer); }
     acTimer = window.setTimeout(function () { acTimer = null; acFetch(input); }, 120);
   });
   document.addEventListener("focusin", function (e) {
     var input = e.target;
-    if (input && input.hasAttribute && input.hasAttribute("data-dir-input")) {
-      // The field starts on the untouched default "~": select it so the
-      // first keystroke replaces it instead of appending, which is what
-      // produced an invalid "~docu" (issue #308).
-      if (input.value === "~") { input.select(); }
-      acFetch(input);
-    }
+    if (!acKind(input)) { return; }
+    // The directory field starts on the untouched default "~": select it
+    // so the first keystroke replaces it instead of appending, which is
+    // what produced an invalid "~docu" (issue #308). A model field has no
+    // such default - it starts empty, or on what the profile already says,
+    // and selecting THAT would throw the value away on a stray focus.
+    if (acKind(input) === "dir" && input.value === "~") { input.select(); }
+    acFetch(input);
   });
   document.addEventListener("focusout", function (e) {
     var input = e.target;
-    if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+    if (!acKind(input)) { return; }
     // Delay so a mousedown-selected item still registers its click.
     window.setTimeout(function () { acClose(input); }, 150);
   });
   document.addEventListener("keydown", function (e) {
     var input = e.target;
-    if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+    if (!acKind(input)) { return; }
     var ul = acList(input);
     var open = ul && !ul.hidden;
     var st = input._dir;
@@ -1097,14 +1117,14 @@
     if (!li) { return; }
     e.preventDefault(); // keep focus on the input (no focusout close)
     var combo = li.closest(".combo");
-    var input = combo ? combo.querySelector("[data-dir-input]") : null;
+    var input = combo
+      ? combo.querySelector("[data-dir-input],[data-model-input]") : null;
     if (input) { acApply(input, li); }
   });
 
   checkForUpdate();
   liveUpdates();
   connectPoll();
-  syncModelLists();
   // Land in the terminal: focus the server-selected tab's pane.
   if (wsActive()) { wsSelect(wsActive(), true); }
   // Still armed for the moment before the feed reports itself open; it

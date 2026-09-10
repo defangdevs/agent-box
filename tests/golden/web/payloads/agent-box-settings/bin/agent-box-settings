@@ -3758,13 +3758,17 @@ STYLE = """<style>
      own now that Save has moved below the prompt and the starting setting
      (issue #493). */
   input.pname { width: 150px; }
-  /* Model is an OPEN picker (issue #493): free text over a <datalist> of the
-     aliases its assistant publishes, because a model ID this box has never
-     heard of still has to be typeable. The browser draws the dropdown itself,
-     so there is nothing to style - only the width, which at the harness
-     picker's default alone kept the row from fitting on one line next to
-     name + assistant + reasoning level. */
+  /* Model is an OPEN picker (issue #493): free text over the SAME combobox
+     the working-directory field uses, because a model ID this box has never
+     heard of still has to be typeable. It began as a <datalist> and the
+     browser's own popup could not be styled to match this page, so it uses
+     the one the page draws instead - .combo and .ac below, already here.
+     The width is what keeps the row on one line next to name + assistant +
+     reasoning level, and it belongs to the .combo now that the input is
+     wrapped in one: a bare inline-block would size to its content. */
   input.pmodel { width: 160px; }
+  .profile-row .combo { width: 160px; }
+  .profile-row .combo input.pmodel { width: 100%; }
   /* One control height for the profile editor's own row, same fix and same
      reason as .new-session-row above: Chrome's UA sheet renders a <select>
      a few px shorter than a same-padding <input>, so the assistant picker
@@ -3851,8 +3855,12 @@ PROFILES_SECTION_TPL = """<section>
                  aria-label="Profile name"
                  title="Letters, digits, underscore and hyphen; at most 64 characters">
           <select name="HARNESS" aria-label="Assistant" required>{harnesses}</select>
-          <input type="text" name="MODEL" placeholder="model (optional)" class="pmodel"
-                 autocomplete="off" aria-label="Model" data-model-input>
+          <span class="combo">
+            <input type="text" name="MODEL" placeholder="model (optional)"
+                   class="pmodel" autocomplete="off" spellcheck="false"
+                   aria-label="Model" aria-autocomplete="list" data-model-input>
+            <ul class="ac" hidden></ul>
+          </span>
           <select name="EFFORT" aria-label="Reasoning level">{effort}</select>
         </div>
         <div class="row prompt-row">
@@ -5136,7 +5144,6 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
          "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");
       if (ed) { f.reset(); ed.hidden = true; }
-      syncModelLists();   // reset() cleared the picker, not the list= (#493)
       var added = wsActive();   // the tab the fetched page marks current
       connectPoll();
       if (tabsBefore && added && tabsBefore.indexOf(added) < 0) { wsSelect(added, true); }
@@ -5189,45 +5196,6 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     post().then(function (t) { afterPost(t); startPolling(8); });
   });
 
-  // Model suggestions follow the assistant picker beside them (issue #493).
-  // The profile editor's model field is free text over a per-assistant
-  // <datalist>, and which list applies is a choice the server cannot see:
-  // "New profile" deliberately preselects no assistant, so its input ships
-  // with no list at all and gets one here. A saved profile's own row
-  // already names its assistant, so the daemon renders that row's list=
-  // itself and this only follows a CHANGE to it.
-  //
-  // Event-delegated, like everything else here, so it survives applyDoc()'s
-  // swaps. It sets no state worth defending against a morph: #profile-editor
-  // is not a morphed region at all, and on a saved row the worst a morph can
-  // restore is the stored assistant's suggestions under a picker the
-  // operator has changed but not yet saved — a stale hint on a field that
-  // accepts anything, which is not worth a beforeAttributeUpdated veto.
-  function syncModelList(sel) {
-    var row = sel.closest ? sel.closest(".profile-row") : null;
-    var input = row ? row.querySelector("[data-model-input]") : null;
-    if (!input) { return; }
-    var id = sel.value ? "pmodel-" + sel.value : "";
-    // No datalist means no suggestions, which is the field this already is.
-    if (id && document.getElementById(id)) { input.setAttribute("list", id); }
-    else { input.removeAttribute("list"); }
-  }
-  // Every row, not only the one that just changed. A `change` event is not
-  // the only way a picker's value moves: form.reset() after a save restores
-  // the "Choose an assistant" prompt while leaving the ATTRIBUTE this set,
-  // and Firefox restores a <select>'s value across a plain reload without
-  // firing anything at all - both of which would leave the previous
-  // assistant's aliases under a picker that no longer names it.
-  function syncModelLists() {
-    document.querySelectorAll(".profile-row select[name=HARNESS]")
-      .forEach(syncModelList);
-  }
-  document.addEventListener("change", function (e) {
-    var sel = e.target;
-    if (!sel || sel.tagName !== "SELECT" || sel.name !== "HARNESS") { return; }
-    syncModelList(sel);
-  });
-
   // Working-directory autocomplete (issue #131). The add-session cwd
   // field browses the filesystem one level at a time: the daemon lists
   // the children of whatever directory the text names so far (up to
@@ -5236,9 +5204,45 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   // the next level appears — like tab-completing a path. Everything is
   // event-delegated so it survives the DOM swaps applyDoc() does; each
   // input carries its own tiny state on the element.
+  //
+  // Two fields use it now (issue #493). They share the markup, the CSS,
+  // the popup, the keyboard handling and the mouse handling; they differ
+  // only in where the entries come from and what picking one means, so
+  // exactly three functions branch and nothing else knows there are two.
+  // The model field came here from a <datalist>, which the browser draws
+  // ITSELF: no palette of ours reaches inside that popup, and on a real
+  // browser it arrived as near-black text on a dark ground. A popup the
+  // page owns cannot have that problem.
+  function acKind(el) {
+    if (!el || !el.hasAttribute) { return ""; }
+    if (el.hasAttribute("data-dir-input")) { return "dir"; }
+    if (el.hasAttribute("data-model-input")) { return "model"; }
+    return "";
+  }
   function acList(input) {
     var combo = input.closest ? input.closest(".combo") : null;
     return combo ? combo.querySelector(".ac") : null;
+  }
+  // Which assistant this row names right now. Read when the popup opens
+  // rather than mirrored onto the input, so a picker the operator changed
+  // and has not saved is still the one that decides - and there is no
+  // attribute left to go stale behind a form.reset() or a morph.
+  function acHarness(input) {
+    var row = input.closest ? input.closest(".profile-row") : null;
+    var sel = row ? row.querySelector("select[name=HARNESS]") : null;
+    return sel ? sel.value : "";
+  }
+  function acModelHints(harness) {
+    var el = document.getElementById("model-hints");
+    if (!el || !harness) { return []; }
+    try {
+      var all = JSON.parse(el.textContent);
+      return (all && all[harness]) || [];
+    } catch (err) { return []; }
+  }
+  function acFrag(input) {
+    return acKind(input) === "model"
+      ? input.value : acSplit(input.value).frag;
   }
   function acSplit(v) {
     // Directory portion (browsed) and trailing fragment (filter).
@@ -5259,13 +5263,18 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     var ul = acList(input);
     var st = input._dir;
     if (!ul || !st) { return; }
-    var frag = acSplit(input.value).frag.toLowerCase();
+    var model = acKind(input) === "model";
+    var frag = acFrag(input).toLowerCase();
     var matches = st.entries.filter(function (n) {
       return n.toLowerCase().indexOf(frag) === 0;
     });
     ul.innerHTML = "";
     st.active = -1;
     if (!st.entries.length) {
+      // A directory with no children is worth saying; an assistant with
+      // no suggestions is not - the field is free text either way, and an
+      // empty popup over it would be noise, not information.
+      if (model) { ul.hidden = true; return; }
       var e = document.createElement("li");
       e.className = "empty";
       e.textContent = "No subfolders here";
@@ -5278,13 +5287,21 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       var li = document.createElement("li");
       li.setAttribute("role", "option");
       li.setAttribute("data-name", name);
-      li.textContent = name + "/";
+      li.textContent = model ? name : name + "/";
       ul.appendChild(li);
     });
     ul.hidden = false;
   }
   function acFetch(input) {
     var st = input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 });
+    if (acKind(input) === "model") {
+      // No request to make: the daemon already put every harness's list on
+      // the page. Re-read rather than cache it, because a save re-renders
+      // that blob along with the rows it sits among.
+      st.entries = acModelHints(acHarness(input));
+      acRender(input);
+      return;
+    }
     var dir = acSplit(input.value).dir;
     if (dir === st.dir) { acRender(input); return; }
     var base = input.getAttribute("data-dir-base") || "";
@@ -5318,37 +5335,48 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     st.active = idx;
   }
   function acApply(input, li) {
+    var name = li.getAttribute("data-name");
+    if (acKind(input) === "model") {
+      // A model name is the whole value, so picking one finishes the job -
+      // there is no next level to reveal, and leaving the popup open over
+      // a field that now reads exactly what was clicked is just in the way.
+      input.value = name;
+      input.focus();
+      acClose(input);
+      return;
+    }
     var dir = acSplit(input.value).dir;
-    input.value = acJoin(dir, li.getAttribute("data-name")) + "/";
+    input.value = acJoin(dir, name) + "/";
     input.focus();
     acFetch(input); // reveal the next level
   }
   var acTimer = null;
   document.addEventListener("input", function (e) {
     var input = e.target;
-    if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+    if (!acKind(input)) { return; }
     if (acTimer) { window.clearTimeout(acTimer); }
     acTimer = window.setTimeout(function () { acTimer = null; acFetch(input); }, 120);
   });
   document.addEventListener("focusin", function (e) {
     var input = e.target;
-    if (input && input.hasAttribute && input.hasAttribute("data-dir-input")) {
-      // The field starts on the untouched default "~": select it so the
-      // first keystroke replaces it instead of appending, which is what
-      // produced an invalid "~docu" (issue #308).
-      if (input.value === "~") { input.select(); }
-      acFetch(input);
-    }
+    if (!acKind(input)) { return; }
+    // The directory field starts on the untouched default "~": select it
+    // so the first keystroke replaces it instead of appending, which is
+    // what produced an invalid "~docu" (issue #308). A model field has no
+    // such default - it starts empty, or on what the profile already says,
+    // and selecting THAT would throw the value away on a stray focus.
+    if (acKind(input) === "dir" && input.value === "~") { input.select(); }
+    acFetch(input);
   });
   document.addEventListener("focusout", function (e) {
     var input = e.target;
-    if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+    if (!acKind(input)) { return; }
     // Delay so a mousedown-selected item still registers its click.
     window.setTimeout(function () { acClose(input); }, 150);
   });
   document.addEventListener("keydown", function (e) {
     var input = e.target;
-    if (!input || !input.hasAttribute || !input.hasAttribute("data-dir-input")) { return; }
+    if (!acKind(input)) { return; }
     var ul = acList(input);
     var open = ul && !ul.hidden;
     var st = input._dir;
@@ -5367,14 +5395,14 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     if (!li) { return; }
     e.preventDefault(); // keep focus on the input (no focusout close)
     var combo = li.closest(".combo");
-    var input = combo ? combo.querySelector("[data-dir-input]") : null;
+    var input = combo
+      ? combo.querySelector("[data-dir-input],[data-model-input]") : null;
     if (input) { acApply(input, li); }
   });
 
   checkForUpdate();
   liveUpdates();
   connectPoll();
-  syncModelLists();
   // Land in the terminal: focus the server-selected tab's pane.
   if (wsActive()) { wsSelect(wsActive(), true); }
   // Still armed for the moment before the feed reports itself open; it
@@ -5556,17 +5584,6 @@ _MODEL_HINT_MAX = 12
 # holds spaces, so no match is possible there and the scan resumes at the
 # real opening quote of the example that follows.
 _MODEL_NAME_RE = re.compile(r"'([A-Za-z0-9][A-Za-z0-9._-]{1,63})'")
-# An id/list reference has to survive being spliced into markup and then
-# looked up by the browser. AGENT_BOX_AGENTS is a comma-separated env
-# value, so a name from it is not automatically either.
-_HARNESS_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
-
-# settings.js builds the same id when it follows the assistant picker on a
-# row the server could not resolve one for. Two spellings of one constant,
-# in two languages, the way BASE and every other id shared with that file
-# already are.
-MODEL_LIST_PREFIX = "pmodel-"
-
 # harness_model_aliases()' answers, keyed on (binary, stamp) and holding
 # (names, retry_at). retry_at is None for a real answer - it stands until
 # the binary itself changes - and a monotonic deadline for a probe that
@@ -5698,37 +5715,43 @@ def model_hints(harness, profiles):
     return tuple(hints)
 
 
-def model_list_id(harness):
-    """The datalist id for this harness's suggestions, or "" for a name
-    that cannot be one."""
-    return (MODEL_LIST_PREFIX + harness) if _HARNESS_ID_RE.match(harness) else ""
-
-
-def model_hint_lists(profiles):
-    """{harness: datalist id} for every harness with something to suggest.
-
-    One place decides which lists the page will actually CARRY, so a row
-    can never point `list` at a datalist that is not there. A harness with
-    nothing to say gets no entry and its rows get no attribute, which is
-    the free-text field they already were.
-    """
-    lists = {}
-    for harness in PROFILE_AGENTS:
-        list_id = model_list_id(harness)
-        if list_id and model_hints(harness, profiles):
-            lists[harness] = list_id
-    return lists
+# The id the client reads the suggestions out of. It rides inside
+# #profiles-list so a save that adds a model refreshes it with the rows.
+MODEL_HINTS_ID = "model-hints"
 
 
 def render_model_hints(profiles):
-    """One <datalist> per harness that has anything to suggest."""
-    lists = []
-    for harness, list_id in model_hint_lists(profiles).items():
-        options = "".join('<option value="%s"></option>' % html.escape(h)
-                          for h in model_hints(harness, profiles))
-        lists.append('<datalist id="%s">%s</datalist>'
-                     % (html.escape(list_id), options))
-    return "".join(lists)
+    """Every harness's suggestions as one JSON blob the client reads.
+
+    NOT a <datalist>. The browser draws that popup itself, and these pages
+    hand it no palette it will honour - the suggestions arrived as
+    near-black text on a dark ground on a real browser, and no CSS of ours
+    reaches inside it. The working-directory field (issue #131) already
+    solved this by owning its popup outright: one <ul class="ac"> the page
+    styles like everything else. This is the same control with a different
+    source, so it inherits that answer instead of re-litigating it.
+
+    A <script type="application/json"> rather than an attribute per row:
+    the entries belong to the HARNESS, not to the row, and the row's
+    assistant is a picker the operator can change without saving. The
+    client reads the list when it opens the popup, so there is no
+    attribute to keep in step with a control beside it.
+    """
+    hints = {}
+    for harness in PROFILE_AGENTS:
+        found = model_hints(harness, profiles)
+        if found:
+            hints[harness] = list(found)
+    if not hints:
+        return ""
+    # Inside a <script>, the HTML parser looks for "</script" and nothing
+    # else, so escaping "<" is the whole of what this needs - html.escape()
+    # would be wrong here, since the client parses the text as JSON and
+    # would get "&quot;" where it wants a quote. A MODEL is operator text
+    # (an alias is charset-constrained, a saved profile's value is not).
+    blob = json.dumps(hints, sort_keys=True).replace("<", "\\u003c")
+    return ('<script type="application/json" id="%s">%s</script>'
+            % (MODEL_HINTS_ID, blob))
 
 
 def render_profiles(profiles, usage=None):
@@ -5746,11 +5769,6 @@ def render_profiles(profiles, usage=None):
     hand and does not care."""
     usage = usage or {}
     base = html.escape(BASE)
-    # Which model datalists this page carries (#493). Resolved once, not
-    # per row: the harness probe behind it is cached, but the answer has to
-    # be the SAME one render_model_hints() renders or a row would reference
-    # a list that is not on the page.
-    hint_lists = model_hint_lists(profiles)
     rows = []
     for name in sorted(profiles):
         safe = html.escape(name)
@@ -5817,11 +5835,6 @@ def render_profiles(profiles, usage=None):
         # stored, so an edit is an edit and not a retype. SYSTEM_PROMPT is a
         # textarea for the same reason it is one above — it can span lines.
         prompt_val = html.escape(res.get("SYSTEM_PROMPT") or "")
-        # This row already names its harness, so its model suggestions are
-        # known server-side. The "New profile" row's are not - nothing is
-        # preselected there - which is why settings.js follows the picker.
-        list_id = hint_lists.get(res.get("HARNESS") or "", "")
-        model_list_attr = f' list="{html.escape(list_id)}"' if list_id else ""
         # json.dumps(), not hand-quoted JS: `name` is charset-restricted
         # (PROFILE_NAME_RE), but watch_warn's topic names are not, so this is
         # where the confirm() dialog's whole message gets ONE correct
@@ -5851,10 +5864,12 @@ def render_profiles(profiles, usage=None):
             f'<div class="row profile-row">'
             f'<select name="HARNESS" aria-label="Assistant for {safe}" required>'
             f'{render_harness_options(res.get("HARNESS") or "")}</select>'
+            f'<span class="combo">'
             f'<input type="text" name="MODEL" value="{html.escape(res.get("MODEL") or "")}" '
             f'placeholder="model" class="pmodel" autocomplete="off" '
-            f'data-model-input{model_list_attr} '
+            f'spellcheck="false" data-model-input aria-autocomplete="list" '
             f'aria-label="Model for {safe}">'
+            f'<ul class="ac" hidden></ul></span>'
             f'<select name="EFFORT" aria-label="Reasoning level for {safe}">'
             f'{render_effort_options(res.get("EFFORT") or "")}</select>'
             f'<button type="submit" class="btn">Save</button></div>'
