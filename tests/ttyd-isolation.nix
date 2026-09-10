@@ -49,20 +49,22 @@ in
     services.agent-box = {
       enable = true;
       agent = "claude";
-      users.agent = {
-        web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
-        # A plain shell, so "typing into the terminal" has an unambiguous
-        # effect to assert: a file appears in the agent's home. A harness TUI
-        # would answer keystrokes with a redraw and nothing testable.
-        sessions.main.agent = "shell";
-      };
+      # No session is declared here, and "main" is added by the CLI in the
+      # test script instead. That is not a preference: `sessions.<n>.agent =
+      # "shell"` fails an eval assertion, because it checks the session's
+      # agent against installAgents, whose enum is the two agent CLIs and
+      # cannot contain the always-available "shell" pseudo-agent -- so the
+      # module's own `sessions` example (`scratch = { agent = "shell"; }`)
+      # does not evaluate. Worth a fix of its own; not this PR's, which is a
+      # security fix to the terminal transport.
+      users.agent.web.passwordHashFile =
+        "/var/lib/agent-box-web/password-hash";
       # The second local user. Nothing about her is unusual -- she has her own
       # terminal, her own password and no privilege over agent -- which is the
-      # point: the old loopback port gave her one anyway.
-      users.mallory = {
-        web.passwordHashFile = "/var/lib/agent-box-web/mallory-hash";
-        sessions.main.agent = "shell";
-      };
+      # point: the old loopback port gave her one anyway. She needs no session
+      # of her own: a ttyd (and its socket) is per USER, not per session.
+      users.mallory.web.passwordHashFile =
+        "/var/lib/agent-box-web/mallory-hash";
       web = {
         enable = true;
         domain = "box.test";
@@ -146,8 +148,13 @@ in
     machine.wait_for_unit("agent-web-terminal@agent.service")
     machine.wait_for_unit("agent-web-terminal@mallory.service")
     machine.wait_for_unit("caddy.service")
-    machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=120)
     machine.wait_for_file(sock)
+
+    # A plain shell for "main", so that typing into the terminal later has an
+    # unambiguous effect to assert -- a file appears in the agent's home. A
+    # harness TUI would answer keystrokes with a redraw and nothing testable.
+    machine.succeed(as_user("agent", "agent-box-session add main --harness shell"))
+    machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=120)
 
     # 1. There is no terminal on TCP at all. Not "not on a well-known port":
     # the whole class is gone, so a future change that reintroduces a
