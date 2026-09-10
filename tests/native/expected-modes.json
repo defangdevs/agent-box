@@ -36,6 +36,8 @@
   "etc/systemd/system/agent-box-docker@.service": "0o444",
   "etc/systemd/system/agent-box-earlyoom.service": "0o644",
   "etc/systemd/system/agent-box-fail2ban.service": "0o644",
+  "etc/systemd/system/agent-box-harness-upgrade@.service": "0o444",
+  "etc/systemd/system/agent-box-harness-upgrade@.service.d/execstart.conf": "0o444",
   "etc/systemd/system/agent-box-nix-gc.service": "0o644",
   "etc/systemd/system/agent-box-nix-gc.timer": "0o644",
   "etc/systemd/system/agent-box-settings@.service": "0o444",
@@ -60,6 +62,7 @@
   "etc/systemd/system/sockets.target.d/10-agent-box.conf": "0o644",
   "etc/tmpfiles.d/agent-box.conf": "0o644",
   "etc/tmux.conf": "0o644",
+  "usr/local/bin/agent-box-harness": "0o755",
   "usr/local/bin/agent-box-profile": "0o755",
   "usr/local/bin/agent-box-session": "0o755",
   "usr/local/bin/agent-box-webhook": "0o755"

@@ -18,6 +18,7 @@ web/payloads/agent-box-codex-remote-control -> vm/payloads/agent-box-codex-remot
 web/payloads/agent-box-defang-cli-expr.nix -> vm/payloads/agent-box-defang-cli-expr.nix
 web/payloads/agent-box-env-exec -> vm/payloads/agent-box-env-exec
 web/payloads/agent-box-envstore/bin/agent-box-envstore -> vm/payloads/agent-box-envstore/bin/agent-box-envstore
+web/payloads/agent-box-harness/bin/agent-box-harness -> vm/payloads/agent-box-harness/bin/agent-box-harness
 web/payloads/agent-box-profile/bin/agent-box-profile -> vm/payloads/agent-box-profile/bin/agent-box-profile
 web/payloads/agent-box-session/bin/agent-box-session -> vm/payloads/agent-box-session/bin/agent-box-session
 web/payloads/agent-box-spot-monitor -> vm/payloads/agent-box-spot-monitor

@@ -287,6 +287,11 @@ let
     # `agentbox apply` can pin the env store and the harness list into the
     # wrapper — this CLI runs from PATHs that carry almost nothing.
     (payload "agent-box-profile-bare" "profile-cli.sh")
+    # Moving an installed harness onto this box's pin (issues #559, #590,
+    # #614). Bare for the same reason the two above are: the pin belongs in
+    # the wrapper `agentbox apply` generates, and this CLI is run from a
+    # login shell that no unit's environment reaches.
+    (payload "agent-box-harness-bare" "harness-cli.sh")
     # Needs no env wrapper: it resolves its token from gh at runtime.
     (payload "agent-box-upload" "upload-cli.sh")
   ] ++ lib.optionals webhookEnabled [

@@ -1,0 +1,9 @@
+{
+  "unit": "agent-box-harness-upgrade@",
+  "condition": "always",
+  "env": [],
+  "execStart": [
+    { "kind": "cli", "program": "agent-box-harness" }
+  ],
+  "directives": []
+}

@@ -195,6 +195,9 @@ let
     install -m444 ${pkgs.writeText "agent-box-webhook@.socket" ''
       @@include:src/units/agent-box-webhook@.socket@@
     ''} $out/etc/systemd/system/agent-box-webhook@.socket
+    install -m444 ${pkgs.writeText "agent-box-harness-upgrade@.service" ''
+      @@include:src/units/agent-box-harness-upgrade@.service@@
+    ''} $out/etc/systemd/system/agent-box-harness-upgrade@.service
   '' + lib.optionalString cfg.containers.enable ''
     install -m444 ${pkgs.writeText "agent-box-docker@.service" ''
       @@include:src/units/agent-box-docker@.service@@
@@ -660,7 +663,8 @@ let
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli uploadCli ]
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli uploadCli
+         harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli ]
@@ -791,6 +795,17 @@ let
 @@include:src/profile-cli.sh@@
   '');
 
+  # Moving a JIT-installed harness onto the pin the box carries now (issues
+  # #559, #590, #614). Its environment comes from the wrapper contract
+  # rather than from hand-written exports like profileCli's above: this CLI
+  # is run by a PERSON from a login shell, so nothing a unit sets reaches
+  # it, and the value it cannot do without (the pin) is one both backends
+  # must agree on to the character.
+  harnessCli = pkgs.writeShellScriptBin "agent-box-harness"
+    (wrapperEnv "agent-box-harness" + ''
+@@include:src/harness-cli.sh@@
+  '');
+
   # Webhook self-service, shipped on every PATH when webhookEnabled (issue #101).
   # The plugin's MCP tools only exist inside a claude session that loaded it, so
   # a codex session, a shell session, or a script had no way to subscribe. This
@@ -919,6 +934,14 @@ let
   agentBoxContract = builtins.fromJSON ''
 @@include:src/contract/agent-box.json@@
   '';
+  # modules/src/contract/agent-box-harness-upgrade.json — the per-user unit
+  # the update service starts once a new pin is in place. One binding, and
+  # it is a "cli": what this unit runs is a GENERATED wrapper (the pin has
+  # to be in its environment), which lives at a store path here and in
+  # /usr/local/bin natively — exactly the split that kind exists for.
+  harnessUpgradeContract = builtins.fromJSON ''
+@@include:src/contract/agent-box-harness-upgrade.json@@
+  '';
   # modules/src/contract/agent-box-settings.json — the third unit family.
   # Unlike the previous two, some of its entries only apply when webhookEnabled
   # (the panel's script/interpreter/hook-spawn vars), so each entry carries a
@@ -997,6 +1020,7 @@ let
     "agent-box-session" = "${sessionCli}/bin/agent-box-session";
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
+    "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";
     "agent-box-supervisor" = "${supervisorScript}/bin/agent-box-supervisor";
@@ -1029,6 +1053,7 @@ let
   contractConfigValue = key:
     if key == "defaultAgent" then cfg.agent
     else if key == "webhookScript" then "${localWebhookScript}"
+    else if key == "jitNixpkgs" then jitNixpkgsRef
     else if key == "hookArgsOptionName" then
       "the NixOS option services.agent-box.webhook.hookSessionArgs"
     else if key == "hookSessionArgs" then
@@ -2106,6 +2131,32 @@ in
           pathExists dance as pinFile — see deploy/aws/template.yaml). Kept as an
           option rather than a file read inside the module so the module
           stays pure for flake evaluation.
+        '';
+      };
+
+      agentUpgrade = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Whether an update also moves each user's already-installed agent
+          CLIs onto the new pin (issues #559, #590, #614).
+
+          The pin alone never reached a running box. A harness is installed
+          just-in-time into the USER's profile and only when the binary is
+          missing (issue #416), so advancing `agentNixpkgs` changes what a
+          box that has never started that harness will fetch, and nothing
+          else. This is what makes the pin arrive: after a successful
+          switch the update service starts
+          `agent-box-harness-upgrade@<user>.service` for each user, which
+          re-installs their harnesses at the new pin.
+
+          Turn it off for a box that must not move its CLIs on an update -
+          an air-gapped one, a validated fleet, or a small disk (each
+          upgrade leaves the previous closure as a profile generation until
+          it is wiped). `jitNixpkgs` is the other half of that answer and
+          freezes the SOURCE; this only decides whether an update acts on
+          it. Either way `agent-box-harness upgrade` still works by hand -
+          nothing here is reserved to the update service.
         '';
       };
 
@@ -3262,6 +3313,21 @@ in
     # in the store. Verifying releases against an offline signing key is
     # tracked upstream (defangdevs/agent-box issue 46); until then this
     # trusts the pinned repo as GitHub serves it.
+    # The shared unit file (shipped in agentBoxUnitsPackage above) names a
+    # bare program, exactly as agent-box@ does; this drop-in resolves it to
+    # the generated wrapper's store path. Nothing WANTS this unit - it is
+    # started by name, per user, by the update service.
+    systemd.services."agent-box-harness-upgrade@" = {
+      # The VERB matters as much as the path: `agent-box-harness` with no
+      # argument prints usage and exits 0, so a drop-in that resolved only
+      # the program would give a unit that "succeeded" every time and moved
+      # nothing. Native's half of this appends the same word.
+      serviceConfig.ExecStart = [
+        ""
+        "${contractBin (lib.elemAt harnessUpgradeContract.execStart 0)} upgrade"
+      ];
+    };
+
     systemd.services.agent-box-update = {
       description = "Fast-forward agent-box to upstream HEAD and rebuild";
       # No wantedBy — on-demand only, via the agents' sudo rule (or root).
@@ -3274,6 +3340,14 @@ in
         CURRENT_REV = cfg.selfUpdate.rev;
         PIN_FILE = cfg.selfUpdate.pinFile;
         AGENT_PIN_FILE = cfg.selfUpdate.agentPinFile;
+        # Whether to move each user's installed harnesses onto the pin this
+        # run just advanced, and whose. Both are read by update.sh AFTER a
+        # successful switch: a rebuild that failed and rolled back must not
+        # move anybody's CLI onto a pin the box is no longer running.
+        AGENT_BOX_AGENT_UPGRADE =
+          if cfg.selfUpdate.agentUpgrade then "1" else "0";
+        AGENT_BOX_UPGRADE_USERS =
+          lib.concatStringsSep " " (lib.attrNames cfg.users);
         # What agent-box-source reads. The rev is the ancestry baseline: the
         # tree is realigned to the rev the box RUNS before the fast-forward,
         # so the guard measures from what is actually running and not from

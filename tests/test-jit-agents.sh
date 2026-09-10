@@ -63,15 +63,49 @@ cat > "$work/bin/nix" <<EOF
 #!$BASH_BIN
 printf '%s\n' "\$*" >> "\$NIX_CALLS"
 [ -n "\${NIX_FAIL:-}" ] && exit 1
+# The attribute a harness installs from, mapped back to the binary name it
+# would land as.
+_bin() {
+  case "\$1" in
+    (claude-code) printf claude ;;
+    (codex) printf codex ;;
+    (*) return 1 ;;
+  esac
+}
+_make() {
+  printf '#!$BASH_BIN\n' > "\$HOME/.nix-profile/bin/\$1"
+  chmod +x "\$HOME/.nix-profile/bin/\$1"
+}
+# The upgrade path drives three verbs beyond \`profile add\`, and each has to
+# move the fake binary the way the real one moves the real one - a remove
+# that left it in place would let a broken ordering pass. Dispatched BEFORE
+# the attribute mapping below, because \`profile rollback\` takes no
+# attribute at all and would fail that mapping.
+case "\$1 \${2:-}" in
+  ("build "*) exit 0 ;;
+  ("profile remove")
+    _n=\$(_bin "\$3") || exit 1
+    rm -f "\$HOME/.nix-profile/bin/\$_n"
+    # What a rollback would put back: nix restores the previous
+    # GENERATION, so the shim remembers the element this one dropped.
+    printf '%s' "\$_n" > "\$HOME/last-removed"
+    exit 0 ;;
+  ("profile rollback")
+    _n=\$(cat "\$HOME/last-removed" 2>/dev/null) || exit 1
+    [ -n "\$_n" ] || exit 1
+    _make "\$_n"
+    exit \${NIX_ROLLBACK_RC:-0} ;;
+esac
 # "\$AGENT_BOX_NIXPKGS#attr" is the last argument; map it back to a binary.
 attr=\${@: -1}; attr=\${attr##*#}
-case "\$attr" in
-  claude-code) name=claude ;;
-  codex) name=codex ;;
-  *) exit 1 ;;
-esac
-printf '#!$BASH_BIN\n' > "\$HOME/.nix-profile/bin/\$name"
-chmod +x "\$HOME/.nix-profile/bin/\$name"
+_n=\$(_bin "\$attr") || exit 1
+# NIX_ADD_FAIL is a SUBSTRING of the ref whose add must fail, not a flag:
+# the restore branch adds at a different ref than the one that failed, and
+# a test that failed both could not tell the two apart.
+if [ -n "\${NIX_ADD_FAIL:-}" ]; then
+  case "\${@: -1}" in (*"\$NIX_ADD_FAIL"*) exit 1 ;; esac
+fi
+_make "\$_n"
 exit 0
 EOF
 chmod +x "$work/bin/nix"
@@ -397,6 +431,113 @@ if agent_install claude >/dev/null 2>&1; then
 else
   ok "without AGENT_BOX_NIXPKGS the install refuses"
 fi
+
+# --- the pin record: what an upgrade is measured against ----------------
+#
+# The whole of issues #559, #590 and #614 is that the box installed a
+# harness and wrote nothing down, so a pin that moved could never reach an
+# existing install. These cases pin the bookkeeping that fixes it.
+setup pinrecord
+agent_install claude >/dev/null 2>&1
+is "an install records the pin it came from" \
+   "$AGENT_BOX_NIXPKGS" "$(cat "$JIT_DIR/claude.pin" 2>/dev/null)"
+
+# --- an upgrade at the same pin does nothing ----------------------------
+setup upgradenoop
+agent_install claude >/dev/null 2>&1
+: > "$NIX_CALLS"
+agent_upgrade claude >/dev/null 2>&1
+is "an upgrade at the same pin runs no nix at all" \
+   "" "$(cat "$NIX_CALLS")"
+
+# --- an upgrade to a moved pin: build, remove, add, in that order -------
+#
+# The ORDER is the assertion, not the fact that three commands ran. The
+# closure must be realized while the old element is still installed, so
+# the window with no harness is a symlink flip and not a download; and the
+# remove must precede the add, because `nix profile add` over an existing
+# attrPath appends a SECOND element rather than replacing it.
+setup upgrademoved
+agent_install claude >/dev/null 2>&1
+: > "$NIX_CALLS"
+export AGENT_BOX_NIXPKGS="https://example.invalid/moved.tar.xz"
+agent_upgrade claude >/dev/null 2>&1
+is "an upgrade realizes the new closure first" \
+   "build" "$(sed -n 1p "$NIX_CALLS" | cut -d' ' -f1)"
+is "an upgrade removes before it adds" \
+   "profile remove claude-code" "$(sed -n 2p "$NIX_CALLS")"
+is "an upgrade then adds at the new pin" \
+   "profile add --impure https://example.invalid/moved.tar.xz#claude-code" \
+   "$(sed -n 3p "$NIX_CALLS")"
+is "an upgrade records the new pin" \
+   "https://example.invalid/moved.tar.xz" "$(cat "$JIT_DIR/claude.pin")"
+if [ -x "$HOME/.nix-profile/bin/claude" ]; then
+  ok "the harness is installed after an upgrade"
+else
+  no "the harness is installed after an upgrade" "no binary in the profile"
+fi
+
+# --- an upgrade of something this user never installed is a clean no-op -
+#
+# The update service starts this unit for EVERY user, and most users have
+# never run every harness. That must be success and silence, not a failed
+# unit somebody has to go and read.
+setup upgrademissing
+if agent_upgrade codex >/dev/null 2>&1; then
+  ok "upgrading a harness this user does not have succeeds"
+else
+  no "upgrading a harness this user does not have succeeds" "it failed"
+fi
+is "upgrading a harness this user does not have runs no nix" \
+   "" "$(cat "$NIX_CALLS")"
+
+# --- a failed add puts the old harness back -----------------------------
+#
+# The one state this must never leave behind is no harness at all: the
+# remove has already happened by then. With a recorded pin it re-adds from
+# that pin, precisely.
+setup upgraderestore
+agent_install claude >/dev/null 2>&1
+was=$AGENT_BOX_NIXPKGS
+: > "$NIX_CALLS"
+export AGENT_BOX_NIXPKGS="https://example.invalid/moved.tar.xz"
+export NIX_ADD_FAIL=moved.tar.xz
+agent_upgrade claude >/dev/null 2>&1
+is "a failed add re-adds from the pin the harness came from" \
+   "profile add --impure $was#claude-code" "$(sed -n 4p "$NIX_CALLS")"
+is "a failed add leaves the recorded pin at the version installed" \
+   "$was" "$(cat "$JIT_DIR/claude.pin")"
+unset NIX_ADD_FAIL
+
+# --- with nothing recorded to restore from, roll the profile back -------
+#
+# Every box that predates this bookkeeping is in exactly this state, and
+# it is the population the command exists for - so the fallback matters
+# more than the precise path above.
+setup upgraderollback
+printf '#!%s\n' "$BASH_BIN" > "$HOME/.nix-profile/bin/claude"
+chmod +x "$HOME/.nix-profile/bin/claude"
+: > "$NIX_CALLS"
+export NIX_ADD_FAIL=nixpkgs.tar.xz
+agent_upgrade claude >/dev/null 2>&1
+is "an unrecorded harness whose add fails is rolled back, not lost" \
+   "profile rollback" "$(sed -n 4p "$NIX_CALLS")"
+if [ -x "$HOME/.nix-profile/bin/claude" ]; then
+  ok "the rollback leaves the harness installed"
+else
+  no "the rollback leaves the harness installed" "no binary in the profile"
+fi
+unset NIX_ADD_FAIL
+
+# --- the closed set is named in exactly one place -----------------------
+setup names
+for n in $(agent_names); do
+  if agent_attr "$n" >/dev/null 2>&1; then
+    ok "agent_names lists '$n', which agent_attr accepts"
+  else
+    no "agent_names lists '$n', which agent_attr accepts" "agent_attr refused it"
+  fi
+done
 
 echo
 if [ "$fails" -eq 0 ]; then echo "all assertions passed"; else
