@@ -444,7 +444,7 @@ jobs:
           # NixOS boot + nixos-rebuild + Caddy ACME can add 2-10 min after CFN reports done.
           for i in $(seq 1 60); do
             code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 \
-              -u "agent:${WEB_PASSWORD}" "$terminal_url" || true)
+              -u "workspace:${WEB_PASSWORD}" "$terminal_url" || true)
             echo "[$i/60] authenticated GET $terminal_url -> $code"
             if [ "$code" = "200" ]; then
               echo "::notice::Authenticated terminal URL is serving (HTTP 200) - Caddy + ttyd are up."
@@ -477,7 +477,7 @@ jobs:
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
           terminal_url="$url"
-          root_url="${terminal_url%agent/}"
+          root_url="${terminal_url%workspace/}"
           # The root workspace must never be public: it iframes the terminal
           # and can create sessions.
           code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$root_url" || true)
@@ -487,7 +487,7 @@ jobs:
           fi
           # -L: a single-user box's root now redirects into that user's own
           # space (#334) rather than serving the workspace at "/" directly.
-          body=$(curl -sSL --max-time 10 -u "agent:${WEB_PASSWORD}" "$root_url" || true)
+          body=$(curl -sSL --max-time 10 -u "workspace:${WEB_PASSWORD}" "$root_url" || true)
           if echo "$body" | grep -q 'href="https://[^/"]*@'; then
             echo "::error::Workspace at $root_url embeds URL userinfo (user@) in an href — Chrome auto-sends an empty password and typed credentials can't override it (issue 56):"
             echo "$body" | head -20
@@ -497,18 +497,18 @@ jobs:
           # base for iframe panes, and each session is a ?tab= link. The
           # iframe itself is NOT asserted — it only renders once the session's
           # tmux is live, which can lag boot.
-          if ! echo "$body" | grep -qF 'data-term-base="/agent/"'; then
-            echo "::error::Workspace at $root_url isn't wired to the ttyd base /agent/ (no data-term-base):"
+          if ! echo "$body" | grep -qF 'data-term-base="/workspace/"'; then
+            echo "::error::Workspace at $root_url isn't wired to the ttyd base /workspace/ (no data-term-base):"
             echo "$body" | head -20
             exit 1
           fi
           # Tab links point at TERM_HOME (this user's own path), not root
-          # (#334's render_tabs: href="{home}?tab={name}") — so /agent/?tab=,
+          # (#334's render_tabs: href="{home}?tab={name}") — so /workspace/?tab=,
           # not /?tab=.
-          if echo "$body" | grep -qF 'href="/agent/?tab='; then
+          if echo "$body" | grep -qF 'href="/workspace/?tab='; then
             echo "::notice::Workspace tab bar lists the sessions (no credentials in the URL)."
           else
-            echo "::error::Workspace at $root_url has no session tabs (href=\"/agent/?tab=\"):"
+            echo "::error::Workspace at $root_url has no session tabs (href=\"/workspace/?tab=\"):"
             echo "$body" | head -20
             exit 1
           fi
@@ -520,7 +520,7 @@ jobs:
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
           terminal_url="$url"
-          body=$(curl -sS --max-time 15 -u "agent:${WEB_PASSWORD}" "$terminal_url")
+          body=$(curl -sS --max-time 15 -u "workspace:${WEB_PASSWORD}" "$terminal_url")
           if echo "$body" | grep -qi "ttyd\|terminal"; then
             echo "::notice::ttyd HTML served correctly."
           else
@@ -537,7 +537,7 @@ jobs:
           url='${{ steps.outputs.outputs.web_url }}'
           terminal_url="$url"
           cookie_jar=$(mktemp)
-          curl -sS -o /dev/null --max-time 15 -u "agent:${WEB_PASSWORD}" -c "$cookie_jar" "$terminal_url"
+          curl -sS -o /dev/null --max-time 15 -u "workspace:${WEB_PASSWORD}" -c "$cookie_jar" "$terminal_url"
           # 101 = Switching Protocols (success). Anything else means the browser
           # terminal will show 'disconnected'. Browsers send cookies on the
           # upgrade request, so this proves the Basic-auth bootstrap cookie works.

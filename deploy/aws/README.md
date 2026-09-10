@@ -608,7 +608,7 @@ the end. It runs two legs in parallel:
 
 - **ipv4-full** - forces `PublicIpv4=true` (+ Spot); GitHub runners are
   IPv4-only, so this is the only leg that can actually reach the box. It runs
-  the full connectivity smoke tests (`/agent/` serves ttyd over HTTPS after
+  the full connectivity smoke tests (`/workspace/` serves ttyd over HTTPS after
   Basic auth, unauthenticated requests get 401, the site root serves the
   session manager behind the same auth, the WebSocket upgrade returns 101
   with the auth cookie).

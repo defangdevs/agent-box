@@ -42,7 +42,7 @@ def auth_cookie(web_url: str, password: Optional[str]) -> Optional[str]:
     if not password:
         return None
 
-    auth = base64.b64encode(f"agent:{password}".encode()).decode()
+    auth = base64.b64encode(f"workspace:{password}".encode()).decode()
     req = Request(web_url, headers={"Authorization": f"Basic {auth}"})
     with urlopen(req, timeout=20) as res:
         cookies = res.headers.get_all("Set-Cookie", [])
