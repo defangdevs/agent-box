@@ -525,9 +525,29 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             pkgs.runCommand "agent-box-download-route-ok"
               { caddyfile = sys.config.services.caddy.configFile; } ''
               grep -qF 'handle /agent/downloads/*' "$caddyfile"
-              grep -qF 'uri strip_prefix /agent/downloads' "$caddyfile"
-              grep -qF 'root * /var/lib/agent-box-downloads/agent' "$caddyfile"
-              grep -qF 'file_server browse' "$caddyfile"
+              # The drop reaches the per-user daemon, and caddy does NOT
+              # open the tree itself (issue #630): a site root is not a
+              # filesystem sandbox, and this caddy can read every user's
+              # drop, so a `file_server` here follows an agent's symlink
+              # into a sibling's files under one shared identity. The
+              # daemon runs as the one user whose drop it is. Asserted as
+              # an absence as well as a presence, because the regression
+              # is silent: the route keeps working, it just stops being
+              # confined.
+              grep -qF 'reverse_proxy unix//run/agent-box-settings/agent.sock' "$caddyfile"
+              # Comments stripped first: `file_server` is NAMED in the
+              # header fragment's prose (and in the downloads comments
+              # themselves), so a whole-file grep would fail on the
+              # explanation of the rule it is checking.
+              directives=$(grep -v '^[[:space:]]*#' "$caddyfile")
+              for pattern in 'file_server' 'root \* /var/lib/agent-box-downloads' \
+                             'uri strip_prefix /agent/downloads'; do
+                if printf '%s\n' "$directives" | grep -q "$pattern"; then
+                  echo "downloads must not be served from the filesystem by caddy:" >&2
+                  printf '%s\n' "$directives" | grep -n "$pattern" >&2
+                  exit 1
+                fi
+              done
               # Origin isolation (issue #631): the artifacts go out as
               # attachments under a sandbox CSP ...
               grep -qF "Content-Disposition \"attachment\"" "$caddyfile"
@@ -539,17 +559,19 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               # matched header runs BEFORE the unmatched one and a static set
               # would lose.
               grep -qE '^ *defer$' "$caddyfile"
-              # ... and only for FILES, so Caddy's own listing still renders.
+              # ... and only for FILES, so the listing still renders. The
+              # `index off` that used to keep that exemption safe is gone
+              # with the file_server it configured: since #630 the daemon
+              # renders every listing itself, never looks for an
+              # index.html, and 404s a FILE reached at a path ending in
+              # "/" -- so nothing attacker-supplied can occupy the one
+              # shape this matcher exempts.
               grep -qF 'not path */' "$caddyfile"
-              # An attacker-supplied index.html must not stand in for that
-              # listing, which is the one path the matcher above exempts --
-              # once per auth branch of the downloads handle.
-              test "$(grep -cE '^ *index off$' "$caddyfile")" = 3
               # ... and a management page is framable only by this box.
               grep -qF \
                 "Content-Security-Policy \"frame-ancestors 'self'\"" \
                 "$caddyfile"
-              printf 'downloads route present in generated Caddyfile\n' > "$out"
+              printf 'downloads route present, served by the daemon, and isolated\n' > "$out"
             '';
 
           # Guard: the module's REAL generated Caddyfile (every VM test swaps
@@ -1910,6 +1932,36 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
               cp "$tests" repo/tests/test-connect-install.py
               python3 repo/tests/test-connect-install.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # The file drop's path confinement (issue #630). Same shape and
+          # same subject as webhook-panel-state, profile-panel and
+          # connect-card above: the GOLDEN PAYLOAD, which is the daemon as
+          # it actually ships. What it pins is a property no static
+          # assertion can state -- that a symlink swapped in mid-request
+          # cannot redirect a download -- so the last test drives the real
+          # handler over loopback while a thread rename()s the requested
+          # name between an in-drop file and a link out of it. A
+          # realpath()-then-open() resolver passes every other test in the
+          # file and fails that one, which is the whole reason the drop
+          # resolves with fds instead.
+          downloads-confine =
+            pkgs.runCommand "agent-box-downloads-confine"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-downloads.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-downloads.py
+              python3 repo/tests/test-downloads.py > log 2>&1 || {
                 cat log
                 exit 1
               }

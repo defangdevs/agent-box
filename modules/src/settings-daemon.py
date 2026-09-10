@@ -44,6 +44,8 @@
 #   AGENT_BOX_SETTINGS_USER      the linux user name (display only)
 #   AGENT_BOX_SETTINGS_ENV_FILE  path to the env file to manage
 #   AGENT_BOX_SETTINGS_BASE      URL base path, e.g. /alice/settings
+#   AGENT_BOX_DOWNLOADS_DIR      the file drop served at /<user>/downloads/
+#                                 (empty = no drop, so the route 404s)
 #   AGENT_BOX_SETTINGS_PORT      dev fallback TCP port on 127.0.0.1
 #                                 (ignored when socket-activated)
 #   AGENT_BOX_TMUX_SOCKET        tmux -L socket name (e.g. agent-box)
@@ -78,6 +80,7 @@
 
 import base64
 import contextlib
+import errno
 import fcntl
 import functools
 import glob
@@ -85,6 +88,7 @@ import hashlib
 import html
 import http.server
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -93,6 +97,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1209,13 +1214,17 @@ def transcript_of(name, entry):
 
 
 def human_size(size):
-    """Byte count for a tooltip: whole KB/MB, since the point is only
-    whether this is a short conversation or a long one."""
+    """Byte count for a tooltip or a file-drop listing: whole KB, then one
+    decimal, since the point is only whether this is a short conversation
+    or a long one -- or, in the drop, whether a download is worth waiting
+    for."""
     if size < 1024:
         return "%d B" % size
     if size < 1024 * 1024:
         return "%d KB" % round(size / 1024)
-    return "%.1f MB" % (size / (1024 * 1024))
+    if size < 1024 * 1024 * 1024:
+        return "%.1f MB" % (size / (1024 * 1024))
+    return "%.1f GB" % (size / (1024 * 1024 * 1024))
 
 
 # --- What conversation a row holds (issue #277) -----------------------
@@ -5575,6 +5584,277 @@ def portal_cookie_value(header):
     return ""
 
 
+# --- The file drop at /<user>/downloads/ (issues #132, #630) ----------
+# Caddy used to serve this tree itself, with `root` + `file_server`. That is
+# not an access-control boundary, and caddy documents it as not being one: a
+# site root is not a filesystem sandbox and file_server follows symlinks out
+# of it. Caddy also serves every user's drop under ONE identity, which is in
+# each of their download groups -- so a symlink an agent dropped in its own
+# /var/lib/agent-box-downloads/<user> was followed under that shared
+# identity, and /alice/downloads/link, authenticated as alice, returned bob's
+# file (issue #630). The per-user auth had authorized a path; something else
+# was opened.
+#
+# So this daemon serves the drop instead. It runs as the ONE user whose tree
+# it is, which puts the kernel's own permission check back underneath the
+# HTTP one, and it resolves the request path with the confinement built into
+# the resolution rather than checked around it -- see dl_open for why that
+# distinction is the whole fix.
+
+# The caddy-readable backing dir ~/downloads points at, from the unit. Empty
+# on a box that renders no drop, which 404s the route rather than guessing a
+# path.
+DOWNLOADS_DIR = os.environ.get("AGENT_BOX_DOWNLOADS_DIR", "")
+DL_BASE = TERM_BASE + "/downloads"
+# Budgets for one resolution: generous for any real tree, small enough that a
+# symlink chain an agent wrote cannot spin a request thread.
+DL_MAX_LINKS = 16
+DL_MAX_STEPS = 256
+# Streaming chunk, and the cap on one index page (a drop with more entries
+# than this is a directory nobody reads in a browser anyway).
+DL_CHUNK = 64 * 1024
+DL_MAX_ENTRIES = 2000
+
+
+class DownloadRefused(Exception):
+    """A request path resolution will not serve. The message is shown to
+    the reader, so it says what was wrong with the path and never what
+    happens to be on the filesystem around it."""
+
+
+def dl_components(rel):
+    """The percent-decoded components of one path under DL_BASE, or None
+    if the request is malformed.
+
+    Decoding happens AFTER the split on "/", so a %2F inside a name can
+    never introduce a separator; a component that still holds one -- or a
+    NUL -- after decoding is refused rather than reinterpreted. Bytes that
+    are not valid UTF-8 survive as surrogates, which is the form os.open
+    and os.scandir already speak, so a file whose name is not UTF-8 stays
+    reachable."""
+    comps = []
+    for raw in rel.split("/"):
+        if raw in ("", "."):
+            continue
+        comp = urllib.parse.unquote(raw, errors="surrogateescape")
+        if "/" in comp or "\0" in comp:
+            return None
+        comps.append(comp)
+    return comps
+
+
+def dl_open(root, comps):
+    """Open what `comps` names under `root`, returning (fd, os.stat_result).
+
+    Confinement here is a property of the RESOLUTION, not a check around
+    it. Every component is opened with O_NOFOLLOW relative to the fd of the
+    directory just opened, so no path string is ever handed back to the
+    kernel to re-resolve, and there is no window between deciding a path is
+    inside the drop and opening it. That window is what a realpath()-then-
+    open() check leaves open, and swapping a symlink into it is how an agent
+    would defeat one (issue #630). What comes back here is an fd on the exact
+    inode this walk reached: a symlink planted a microsecond later cannot
+    change what it refers to, because nothing looks the path up again.
+
+    A symlink IS followed -- `ln -s ~/build/report.pdf ~/downloads/` is a
+    reasonable thing for an agent to do -- but followed the way openat2's
+    RESOLVE_IN_ROOT follows one: the target is resolved from the drop, so an
+    absolute target restarts at the drop's root and ".." at the root stays at
+    the root. A link out of the tree therefore names something that is not
+    there, instead of reaching a sibling user's file.
+
+    Raises DownloadRefused for a path resolution rejects, and OSError
+    (ENOENT, EACCES, ...) for one the kernel does."""
+    # O_NONBLOCK so a FIFO left in the drop cannot park a request -- and with
+    # it one server thread -- inside open() indefinitely; it changes nothing
+    # for a regular file or a directory. Rejecting the FIFO is the caller's
+    # job, once fstat has said what this is.
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    stack = [os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)]
+    try:
+        todo = list(reversed(comps))
+        links = 0
+        steps = 0
+        while todo:
+            steps += 1
+            if steps > DL_MAX_STEPS:
+                raise DownloadRefused("that path takes too many steps to "
+                                      "resolve")
+            comp = todo.pop()
+            if comp == "..":
+                # Clamped at the root: the drop has no parent as far as this
+                # resolver is concerned, exactly as under RESOLVE_IN_ROOT.
+                if len(stack) > 1:
+                    os.close(stack.pop())
+                continue
+            try:
+                fd = os.open(comp, flags, dir_fd=stack[-1])
+            except OSError as exc:
+                if exc.errno not in (errno.ELOOP, errno.EMLINK):
+                    raise
+                # O_NOFOLLOW refused a symlink (ELOOP on linux, EMLINK on
+                # some others). Read the target and resolve it here, where
+                # the clamp applies, rather than handing the kernel a path it
+                # would resolve from /.
+                links += 1
+                if links > DL_MAX_LINKS:
+                    raise DownloadRefused("that path has too many symbolic "
+                                          "links in it")
+                target = os.readlink(comp, dir_fd=stack[-1])
+                if target.startswith("/"):
+                    while len(stack) > 1:
+                        os.close(stack.pop())
+                todo.extend(reversed(
+                    [p for p in target.split("/") if p and p != "."]))
+                continue
+            info = os.fstat(fd)
+            if not stat.S_ISDIR(info.st_mode):
+                if todo:
+                    os.close(fd)
+                    raise DownloadRefused("not a directory")
+                return fd, info
+            stack.append(fd)
+        fd = stack.pop()
+        return fd, os.fstat(fd)
+    finally:
+        for spare in stack:
+            os.close(spare)
+
+
+def dl_range(header, size):
+    """One `Range: bytes=...` header against a file of `size` bytes.
+
+    Returns (first, last) inclusive for a range to honour, None when there
+    is none to honour -- absent, malformed, or multi-range, all of which
+    RFC 9110 lets a server answer with the whole body -- and () for a range
+    that is unsatisfiable, which owes a 416."""
+    spec = (header or "").strip()
+    if not spec.lower().startswith("bytes="):
+        return None
+    spec = spec[len("bytes="):].strip()
+    if "," in spec:
+        return None
+    first, sep, last = spec.partition("-")
+    if not sep:
+        return None
+    first, last = first.strip(), last.strip()
+    try:
+        if not first:
+            # A suffix range: the last N bytes of the file.
+            length = int(last)
+            if length <= 0:
+                return ()
+            start, end = max(0, size - length), size - 1
+        else:
+            start = int(first)
+            end = int(last) if last else size - 1
+    except ValueError:
+        return None
+    if start >= size or end < start:
+        return ()
+    return (start, min(end, size - 1))
+
+
+def dl_display(name):
+    """A filename as HTML. A name is bytes to the kernel, so it need not be
+    valid UTF-8; the undecodable bytes arrive here as surrogates, which no
+    encoder can represent -- replace them rather than fail the whole
+    listing for one oddly named file."""
+    return html.escape(name.encode("utf-8", "replace").decode("utf-8"))
+
+
+def dl_rows(fd):
+    """One directory's entries for the index, directories first and then
+    case-folded by name: (name, kind, size, mtime).
+
+    Read from the OPEN fd dl_open returned, so the listing describes the
+    directory the walk actually reached rather than whatever the path names
+    by the time the page renders. Nothing is followed: a symlink is listed
+    as a link, and clicking it resolves under the same clamp as any other
+    path."""
+    rows = []
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                kind = "dir"
+            elif stat.S_ISLNK(info.st_mode):
+                kind = "link"
+            elif stat.S_ISREG(info.st_mode):
+                kind = "file"
+            else:
+                kind = "other"
+            rows.append((entry.name, kind, info.st_size, info.st_mtime))
+            if len(rows) >= DL_MAX_ENTRIES:
+                break
+    rows.sort(key=lambda row: (row[1] != "dir", row[0].lower()))
+    return rows
+
+
+DL_STYLE = """<style>
+:root { color-scheme: light dark; }
+body { margin: 0; padding: 1.5rem;
+       font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+h1 { font-size: 1.1rem; margin: 0 0 .25rem; }
+p.note { margin: 0 0 1rem; opacity: .7; }
+table { border-collapse: collapse; width: 100%; max-width: 60rem; }
+th, td { text-align: left; padding: .35rem .75rem .35rem 0;
+         border-bottom: 1px solid rgba(128,128,128,.3); }
+td.num { text-align: right; padding-right: 1.5rem;
+         font-variant-numeric: tabular-nums; }
+td.kind { opacity: .7; }
+</style>"""
+
+
+def render_download_index(rel, rows):
+    """The browsable index of one directory in the drop.
+
+    Deliberately a page of its own rather than the settings shell: it
+    carries no script and opens no event stream, so a listing of files
+    somebody else's agent wrote is as inert as the listing of names it
+    is."""
+    here = "/" + "/".join(rel) if rel else "/"
+    items = []
+    if rel:
+        items.append('<tr><td><a href="../">../</a></td>'
+                     '<td class="kind">up</td><td class="num"></td>'
+                     '<td></td></tr>')
+    for name, kind, size, mtime in rows:
+        href = urllib.parse.quote(name, safe="", errors="surrogateescape")
+        slash = "/" if kind == "dir" else ""
+        items.append(
+            '<tr><td><a href="%s%s">%s%s</a></td><td class="kind">%s</td>'
+            '<td class="num">%s</td><td>%s</td></tr>' % (
+                href, slash, dl_display(name), slash,
+                "" if kind == "file" else kind,
+                human_size(size) if kind == "file" else "",
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)),
+            ))
+    if not items:
+        items.append('<tr><td colspan="4">This drop is empty.</td></tr>')
+    if len(rows) >= DL_MAX_ENTRIES:
+        # The cap is not a hint: past it the rows shown are an arbitrary
+        # slice of the directory, so say so rather than letting a reader
+        # conclude a file is not there.
+        items.append('<tr><td colspan="4">Listing stops at %d entries; '
+                     'the rest are still reachable by name.</td></tr>'
+                     % DL_MAX_ENTRIES)
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, "
+        "initial-scale=1\"><title>%s &mdash; downloads</title>%s</head><body>"
+        "<h1>%s</h1><p class=\"note\">Files %s dropped for you.</p>"
+        "<table><thead><tr><th>Name</th><th></th><th class=\"num\">Size</th>"
+        "<th>Modified</th></tr></thead><tbody>%s</tbody></table>"
+        "</body></html>" % (
+            html.escape(USER), DL_STYLE,
+            dl_display(here), html.escape(USER), "".join(items),
+        ))
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     """Serve the authenticated settings UI and its actions."""
 
@@ -5585,7 +5865,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         so we match the full public path."""
         return path == BASE or path == BASE + "/" or path.startswith(BASE + "/")
 
-    def _send_html(self, body, status=200):
+    def _send_html(self, body, status=200, send_body=True):
+        """One HTML response. send_body=False writes the headers and stops,
+        which is what a HEAD on the file drop needs: a response to HEAD
+        that carried a body would be read as the start of the next
+        one."""
         data = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -5593,7 +5877,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(data)
+        if send_body:
+            self.wfile.write(data)
 
     def _send_json(self, obj, status=200):
         data = json.dumps(obj).encode("utf-8")
@@ -5673,6 +5958,146 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.close_connection = True
                     return
                 left -= len(chunk)
+
+    def _send_drop(self, rel, body=True):
+        """Serve one path under /<user>/downloads/ (issues #132, #630).
+
+        `rel` is the request path with DL_BASE stripped, still
+        percent-encoded. Every refusal answers 404: the reader is the
+        person the drop belongs to, so the page says which of "not there"
+        and "not servable" it is, but the status stays the same either way
+        so the route cannot be used to probe the filesystem around the
+        drop."""
+        if not DOWNLOADS_DIR:
+            self._send_html(
+                "<h1>404</h1><p>This box serves no file drop.</p>",
+                status=404, send_body=body)
+            return
+        comps = dl_components(rel)
+        if comps is None:
+            self._send_html(
+                "<h1>404</h1><p>That is not a name in this drop.</p>",
+                status=404, send_body=body)
+            return
+        try:
+            fd, info = dl_open(DOWNLOADS_DIR, comps)
+        except DownloadRefused as exc:
+            self._send_html(
+                "<h1>404</h1><p>%s.</p>" % html.escape(str(exc)),
+                status=404, send_body=body)
+            return
+        except OSError:
+            # ENOENT for a name that is not there, EACCES for one this user
+            # cannot read -- and, after dl_open's clamp, for every link that
+            # pointed out of the drop, since the drop has no /etc or
+            # /var/lib of its own to resolve one into.
+            self._send_html(
+                "<h1>404</h1><p>No such file in this drop.</p>"
+                "<p>A symlink is followed only where it stays inside the "
+                "drop, so a link to a file elsewhere reads as a missing "
+                "one: move or copy the file in instead.</p>",
+                status=404, send_body=body)
+            return
+        try:
+            if stat.S_ISDIR(info.st_mode):
+                if not rel.endswith("/"):
+                    # Relative links in the index need the trailing slash.
+                    self.send_response(301)
+                    self.send_header("Location", DL_BASE + rel + "/")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self._send_html(
+                    render_download_index(comps, dl_rows(fd)),
+                    send_body=body)
+            elif stat.S_ISREG(info.st_mode):
+                if rel.endswith("/"):
+                    # "report.html/" is not a name in this drop -- caddy's
+                    # own file_server answered ENOTDIR for it -- and the
+                    # distinction is load-bearing beyond tidiness: issue
+                    # #631 matches its per-file response headers with `not
+                    # path */`, so a FILE served at a path ending in "/"
+                    # would arrive exempt from them.
+                    self._send_html(
+                        "<h1>404</h1><p>That is a file, not a "
+                        "directory.</p>", status=404, send_body=body)
+                    return
+                self._send_file(fd, info, comps[-1] if comps else "", body)
+            else:
+                # A FIFO, socket or device node an agent left in the drop.
+                # It is open (O_NONBLOCK, so opening it blocked nothing) and
+                # it is being closed again unread: reading one has no size,
+                # no end, and nothing to do with handing over a file.
+                self._send_html(
+                    "<h1>404</h1><p>Not a regular file.</p>",
+                    status=404, send_body=body)
+        finally:
+            os.close(fd)
+
+    def _send_file(self, fd, info, name, body=True):
+        """Stream one file out of the drop from the fd dl_open confined.
+
+        Content-Length is the size at open time, so send exactly that many
+        bytes: writing past the declared length desyncs the connection, and
+        a short read (the agent truncated the file mid-download) closes it
+        rather than leaving the client waiting for bytes that will not
+        come. Same contract as _send_transcript above."""
+        # Typed from the name, as caddy's file_server typed it. Whether an
+        # HTML or SVG artifact in the drop should arrive as an attachment
+        # rather than a rendered page is issue #631's question -- this is
+        # now the one place that decides it.
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        etag = '"%x-%x"' % (info.st_size, info.st_mtime_ns)
+        span = dl_range(self.headers.get("Range"), info.st_size)
+        if span == ():
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */%d" % info.st_size)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if span is None:
+            start, left = 0, info.st_size
+        else:
+            start, left = span[0], span[1] - span[0] + 1
+        self.send_response(200 if span is None else 206)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(left))
+        # A multi-gigabyte artifact over a phone link gets cancelled and
+        # resumed; caddy's file_server answered ranges, so this does too.
+        self.send_header("Accept-Ranges", "bytes")
+        if span is not None:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (
+                span[0], span[1], info.st_size))
+        self.send_header("ETag", etag)
+        self.send_header("Last-Modified", self.date_time_string(info.st_mtime))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if not body:
+            return
+        offset = start
+        while left > 0:
+            try:
+                chunk = os.pread(fd, min(DL_CHUNK, left), offset)
+            except OSError:
+                self.close_connection = True
+                return
+            if not chunk:
+                # The file shrank under us, so the body is short of the
+                # length just declared and the connection must not be
+                # reused for another response.
+                self.close_connection = True
+                return
+            try:
+                self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                # A cancelled download (easy to give up on over a phone
+                # link). Expected, so it ends the response instead of
+                # raising into the server and logging a traceback per
+                # cancel.
+                self.close_connection = True
+                return
+            offset += len(chunk)
+            left -= len(chunk)
 
     def _peer_gone(self):
         """True once the client has closed its end of a stream.
@@ -5982,6 +6407,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        # The file drop (issues #132, #630), routed here with the portal
+        # verify above and outside the BASE tree: caddy proxies
+        # /<user>/downloads/* to this daemon rather than serving the
+        # directory itself, because a site root is not a filesystem
+        # sandbox and caddy followed a symlink out of one under an
+        # identity that can read every user's drop. Resolution happens in
+        # dl_open, which is where the confinement lives.
+        if parsed.path == DL_BASE or parsed.path.startswith(DL_BASE + "/"):
+            self._send_drop(parsed.path[len(DL_BASE):])
+            return
         # Working-directory autocomplete (issue #131): the add-session
         # form asks the daemon to list one directory level at a time,
         # so the browser never sees the filesystem — only the confined
@@ -6117,6 +6552,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"ok": True, "keys": read_keys()})
             return
         self._send_html(render_page(message, kind))
+
+    def do_HEAD(self):
+        """HEAD on the file drop, which caddy's file_server used to answer
+        (a client checking a size before pulling a multi-gigabyte
+        artifact). Every other path keeps the 501 the base class has
+        always answered with -- nothing else here has a HEAD to give."""
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == DL_BASE or parsed.path.startswith(DL_BASE + "/"):
+            self._send_drop(parsed.path[len(DL_BASE):], body=False)
+            return
+        self.send_error(501, "Unsupported method (HEAD)")
 
     def _read_form(self):
         length = int(self.headers.get("Content-Length", "0") or "0")

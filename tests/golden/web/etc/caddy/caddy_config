@@ -121,11 +121,20 @@ golden.example.org {
       }
     }
   }
-  # agent's file drop (issue #132): a browsable static index of
-  # ~/downloads, served from the caddy-readable /var/lib backing dir
-  # (caddy.service can't read /home). Same cookie-or-basic auth as the
-  # terminal, and MORE specific than /agent/* below so Caddy routes it
-  # here first. The agent hands the user a agent/downloads/<file> URL.
+  # agent's file drop (issue #132): a browsable index of ~/downloads.
+  # Same cookie-or-basic auth as the terminal, and MORE specific than
+  # /agent/* below so Caddy routes it here first. The agent hands the user
+  # a agent/downloads/<file> URL.
+  #
+  # Served by agent's own settings daemon over its user+caddy-only unix
+  # socket, NOT by `root` + `file_server` here (issue #630). A site root is
+  # not a filesystem sandbox -- caddy documents that symlinks escape it --
+  # and this caddy reads every user's drop through its own group, so a
+  # symlink an agent left in its own drop was followed under that shared
+  # identity and returned a sibling user's file to a request authenticated
+  # as the agent. The daemon runs as the ONE user whose drop it is and
+  # resolves each component with O_NOFOLLOW from the fd above it, so there
+  # is no path for a swapped symlink to be re-resolved through.
   redir /agent/downloads /agent/downloads/
   # Everything under the file drop is handed to the browser as an ATTACHMENT
   # and under a maximally restrictive sandbox (issue #631). ~/downloads holds
@@ -143,11 +152,15 @@ golden.example.org {
   # document context anyway. `X-Content-Type-Options: nosniff` is already set
   # vhost-wide by the header fragment.
   #
-  # The directory listing is EXEMPT, because it is Caddy's own generated HTML
-  # and the point of the route: a listing is the one path that ends in `/`, so
-  # `not path */` is the whole distinction -- which holds only because
-  # `index off` below stops file_server serving an attacker-supplied
-  # index.html in place of that listing at exactly such a path.
+  # The directory listing is EXEMPT, because it is the daemon's own generated
+  # page and the point of the route: a listing is the one path that ends in
+  # `/`, so `not path */` is the whole distinction -- and nothing
+  # attacker-supplied may occupy that shape. Since issue #630 moved the drop
+  # to the daemon, nothing can: the daemon renders every directory itself and
+  # never looks for an index.html (so the `index off` this comment used to
+  # rely on has no subject left), and it answers 404 for a FILE reached at a
+  # path ending in `/`, which would otherwise be a file served past this
+  # matcher.
   @dl_file_agent {
     path /agent/downloads/*
     not path */
@@ -161,7 +174,8 @@ golden.example.org {
     # its value the moment it runs, which means the vhost-wide
     # `frame-ancestors 'self'` would land on top of this sandbox and undo
     # it. Deferring makes these ops apply when the response is written,
-    # which is after both the vhost-wide header and file_server itself.
+    # which is after both the vhost-wide header and the upstream response
+    # the proxy below carries back.
     defer
   }
   handle /agent/downloads/* {
@@ -177,20 +191,12 @@ golden.example.org {
         forward_auth unix//run/agent-box-settings/agent.sock {
           uri /agent/auth/verify
         }
-        uri strip_prefix /agent/downloads
-        root * /var/lib/agent-box-downloads/agent
-        file_server browse {
-          index off
-        }
+        reverse_proxy unix//run/agent-box-settings/agent.sock
       }
     }
     @cookie_dl_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
     handle @cookie_dl_agent {
-      uri strip_prefix /agent/downloads
-      root * /var/lib/agent-box-downloads/agent
-      file_server browse {
-        index off
-      }
+      reverse_proxy unix//run/agent-box-settings/agent.sock
     }
     handle {
       route {
@@ -198,11 +204,7 @@ golden.example.org {
           agent {$WEB_PASSWORD_HASH_AGENT}
         }
         header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-        uri strip_prefix /agent/downloads
-        root * /var/lib/agent-box-downloads/agent
-        file_server browse {
-          index off
-        }
+        reverse_proxy unix//run/agent-box-settings/agent.sock
       }
     }
   }
@@ -342,11 +344,20 @@ golden.example.org {
       }
     }
   }
-  # robot's file drop (issue #132): a browsable static index of
-  # ~/downloads, served from the caddy-readable /var/lib backing dir
-  # (caddy.service can't read /home). Same cookie-or-basic auth as the
-  # terminal, and MORE specific than /robot/* below so Caddy routes it
-  # here first. The agent hands the user a robot/downloads/<file> URL.
+  # robot's file drop (issue #132): a browsable index of ~/downloads.
+  # Same cookie-or-basic auth as the terminal, and MORE specific than
+  # /robot/* below so Caddy routes it here first. The agent hands the user
+  # a robot/downloads/<file> URL.
+  #
+  # Served by robot's own settings daemon over its user+caddy-only unix
+  # socket, NOT by `root` + `file_server` here (issue #630). A site root is
+  # not a filesystem sandbox -- caddy documents that symlinks escape it --
+  # and this caddy reads every user's drop through its own group, so a
+  # symlink an agent left in its own drop was followed under that shared
+  # identity and returned a sibling user's file to a request authenticated
+  # as the agent. The daemon runs as the ONE user whose drop it is and
+  # resolves each component with O_NOFOLLOW from the fd above it, so there
+  # is no path for a swapped symlink to be re-resolved through.
   redir /robot/downloads /robot/downloads/
   # Everything under the file drop is handed to the browser as an ATTACHMENT
   # and under a maximally restrictive sandbox (issue #631). ~/downloads holds
@@ -364,11 +375,15 @@ golden.example.org {
   # document context anyway. `X-Content-Type-Options: nosniff` is already set
   # vhost-wide by the header fragment.
   #
-  # The directory listing is EXEMPT, because it is Caddy's own generated HTML
-  # and the point of the route: a listing is the one path that ends in `/`, so
-  # `not path */` is the whole distinction -- which holds only because
-  # `index off` below stops file_server serving an attacker-supplied
-  # index.html in place of that listing at exactly such a path.
+  # The directory listing is EXEMPT, because it is the daemon's own generated
+  # page and the point of the route: a listing is the one path that ends in
+  # `/`, so `not path */` is the whole distinction -- and nothing
+  # attacker-supplied may occupy that shape. Since issue #630 moved the drop
+  # to the daemon, nothing can: the daemon renders every directory itself and
+  # never looks for an index.html (so the `index off` this comment used to
+  # rely on has no subject left), and it answers 404 for a FILE reached at a
+  # path ending in `/`, which would otherwise be a file served past this
+  # matcher.
   @dl_file_robot {
     path /robot/downloads/*
     not path */
@@ -382,7 +397,8 @@ golden.example.org {
     # its value the moment it runs, which means the vhost-wide
     # `frame-ancestors 'self'` would land on top of this sandbox and undo
     # it. Deferring makes these ops apply when the response is written,
-    # which is after both the vhost-wide header and file_server itself.
+    # which is after both the vhost-wide header and the upstream response
+    # the proxy below carries back.
     defer
   }
   handle /robot/downloads/* {
@@ -398,20 +414,12 @@ golden.example.org {
         forward_auth unix//run/agent-box-settings/robot.sock {
           uri /robot/auth/verify
         }
-        uri strip_prefix /robot/downloads
-        root * /var/lib/agent-box-downloads/robot
-        file_server browse {
-          index off
-        }
+        reverse_proxy unix//run/agent-box-settings/robot.sock
       }
     }
     @cookie_dl_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
     handle @cookie_dl_robot {
-      uri strip_prefix /robot/downloads
-      root * /var/lib/agent-box-downloads/robot
-      file_server browse {
-        index off
-      }
+      reverse_proxy unix//run/agent-box-settings/robot.sock
     }
     handle {
       route {
@@ -419,11 +427,7 @@ golden.example.org {
           robot {$WEB_PASSWORD_HASH_ROBOT}
         }
         header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-        uri strip_prefix /robot/downloads
-        root * /var/lib/agent-box-downloads/robot
-        file_server browse {
-          index off
-        }
+        reverse_proxy unix//run/agent-box-settings/robot.sock
       }
     }
   }

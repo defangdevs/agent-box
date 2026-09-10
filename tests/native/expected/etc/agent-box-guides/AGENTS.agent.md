@@ -547,8 +547,11 @@ downloads from ${AGENT_BOX_URL}downloads/report.pdf.
     mv ./report.pdf ~/downloads/          # or cp, to keep the original
 
 Always hand over the complete https:// URL. Only files under ~/downloads are
-exposed; nothing else in your home is reachable over the web. For
-unauthenticated sharing, run your own service and expose it via ~/sites.
+exposed; nothing else in your home is reachable over the web - a symlink out
+of the directory included, since a link is followed only where it stays
+inside the drop, so `ln -s ~/build/big.tar ~/downloads/` reads as a missing
+file. For unauthenticated sharing, run your own service and expose it via
+~/sites.
 
 Every file there is handed to the browser as a DOWNLOAD, never rendered:
 this directory shares an origin with the terminal and the settings page, so
