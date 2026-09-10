@@ -43,7 +43,8 @@ def connect(args):
 
 
 def attach(args):
-    from websocket import create_connection, ABNF
+    from websocket import (ABNF, WebSocketConnectionClosedException,
+                           WebSocketTimeoutException, create_connection)
 
     header = []
     if args.password:
@@ -73,23 +74,39 @@ def attach(args):
         return 3
 
     conn.send(json.dumps({"AuthToken": "", "columns": 120, "rows": 40}))
-    if args.send:
-        # Give the attach a moment to paint before typing into it. The
-        # trailing carriage return is the Enter key -- typing a command
-        # without pressing it proves nothing, and spelling a real newline
-        # through Nix, the shell and argparse only invites it to arrive as
-        # two characters.
-        time.sleep(1)
-        conn.send(INPUT + args.send + "\r")
+    typed = "" if (args.send is None and args.enter) else args.send
+    if typed is not None:
+        # Give the pane a moment to paint (and, when it is attaching, to
+        # exec tmux) before typing into it. The trailing carriage return is
+        # the Enter key -- typing a command without pressing it proves
+        # nothing, and spelling a real newline through Nix, the shell and
+        # argparse only invites it to arrive as two characters. --enter is
+        # that Enter with nothing typed before it, which is what the attach
+        # wrapper's "press Enter to start it here" offer waits for -- a flag
+        # rather than an empty --send, because an empty '' argument inside a
+        # Nix indented string TERMINATES the string (see AGENTS.md).
+        time.sleep(2)
+        conn.send(INPUT + typed + "\r")
 
     collected = bytearray()
     conn.settimeout(2)
+    closed = False
     deadline = time.time() + args.read
     while time.time() < deadline:
         try:
             frame = conn.recv_frame()
-        except Exception:
+        except WebSocketTimeoutException:
+            # A quiet terminal, which is the ordinary case between frames.
             continue
+        except WebSocketConnectionClosedException:
+            # NOT quiet: the peer went away. Catching this with the timeout
+            # would spin here until the deadline and then report ATTACHED
+            # over a connection that no longer exists (CodeRabbit, PR #650).
+            closed = True
+            break
+        except Exception as exc:
+            print(f"ERROR: {type(exc).__name__}: {exc}")
+            return 1
         if frame is None:
             continue
         if frame.opcode not in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT):
@@ -105,7 +122,13 @@ def attach(args):
         pass
 
     text = collected.decode("utf-8", "replace")
-    print(f"ATTACHED {len(text)} bytes")
+    if closed and not collected:
+        # An upgrade that carried nothing before the peer hung up is not an
+        # attach: the caller asked whether the terminal is reachable, and
+        # the answer here is no.
+        print("CLOSED: peer closed the WebSocket before any terminal output")
+        return 1
+    print(f"ATTACHED {len(text)} bytes{' (peer closed)' if closed else ''}")
     print(text)
     return 0
 
@@ -123,8 +146,10 @@ def main():
     two.add_argument("--user", default="")
     two.add_argument("--password", default="")
     two.add_argument("--origin", default="")
-    two.add_argument("--send", default="",
-                     help="type this line, then Enter")
+    two.add_argument("--send", default=None,
+                     help="type this line, then press Enter")
+    two.add_argument("--enter", action="store_true",
+                     help="press Enter with nothing typed")
     two.add_argument("--read", type=float, default=6.0)
     two.set_defaults(func=attach)
 

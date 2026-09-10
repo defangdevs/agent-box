@@ -239,20 +239,24 @@ in
         assert "REFUSED" in got, got
         assert "rc=3" in got, got
 
-    # 9. A stopped session still starts from the browser: the attach wrapper
-    # clears the stopped flag through the session CLI and the supervisor
-    # brings the tmux session back. Nothing about that path went through the
-    # port, but it is the one behaviour a permission mistake on the socket
-    # would break silently -- the page would look fine and the session would
-    # never come up.
+    # 9. A stopped session still starts from the browser. The pane offers
+    # "press Enter to start it here" (modules/src/attach.sh), so the probe
+    # sends a bare Enter and stays connected while the wrapper clears the
+    # stopped flag through the session CLI and the supervisor brings the
+    # tmux session back. Nothing about that path went through the port, but
+    # it is the one behaviour a permission mistake on the socket would break
+    # silently -- the page would look fine and the session would never come
+    # up. It also proves the offer is reachable at all: it only appears for
+    # a pane on a real pty, which is ttyd's end of this socket.
     machine.succeed(as_user("agent", "agent-box-session stop main"))
     machine.wait_until_fails(tmux("has-session -t =main"), timeout=60)
-    machine.succeed(
+    out = machine.succeed(
         as_user("agent",
                 "ttyd-probe attach wss://box.test/agent/main/ws"
                 " --user agent --password testpassword"
-                " --origin https://box.test --read 4")
+                " --origin https://box.test --enter --read 12")
     )
+    assert "is stopped" in out, out
     machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=120)
   '';
 }

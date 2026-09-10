@@ -172,7 +172,8 @@ gets you the exact xterm.js a box is serving. Read that before trusting
 upstream docs about which version does what; `systemctl cat
 agent-web-terminal@<user>` gives the flags actually in force. The socket
 replaced a `127.0.0.1:7681` port in issue #628 — it is 0660 `<user>:caddy`
-inside a 0750 directory, so the fetch has to run AS that user (or as caddy),
+inside a 2750 (setgid) `<user>:caddy` directory, so the fetch has to run AS
+that user (or as caddy),
 which is the whole point of the change.
 
 ## Vendoring a third-party asset

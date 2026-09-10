@@ -656,7 +656,13 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               grep -qF 'reverse_proxy unix//run/agent-box-ttyd/agent/ttyd.sock' "$caddyfile"
               grep -qF 'reverse_proxy unix//run/agent-box-ttyd/bob/ttyd.sock' "$caddyfile"
               [ "$(grep -c 'reverse_proxy unix//run/agent-box-ttyd/' "$caddyfile")" = 6 ]
-              if grep -q 'reverse_proxy 127.0.0.1:' "$caddyfile"; then
+              # Anchored at the start of a DIRECTIVE, so the header
+              # fragment's self-serve vhost example -- a comment that
+              # reverse-proxies to 127.0.0.1:3000 -- does not count. Telling
+              # an agent to proxy their own app to a localhost port is still
+              # exactly right; it is only a TERMINAL that must not be
+              # reachable that way.
+              if grep -Eq '^[[:space:]]*reverse_proxy[[:space:]]+127\.0\.0\.1:' "$caddyfile"; then
                 echo "a terminal is still proxied over a loopback port" >&2
                 exit 1
               fi
