@@ -640,6 +640,15 @@ let
     exposed; nothing else in your home is reachable over the web. For
     unauthenticated sharing, run your own service and expose it via ~/sites.
 
+    Every file there is handed to the browser as a DOWNLOAD, never rendered:
+    this directory shares an origin with the terminal and the settings page, so
+    an .html or .svg opened inline would be script running with the user's own
+    login. That is a deliberate trade - a report you drop here is saved, not
+    read in the tab - so if you want the user to LOOK at something in their
+    browser rather than save it, serve it yourself through ~/sites, which is a
+    separate hostname with none of that authority. An `index.html` in
+    ~/downloads is not served either; the listing is always the listing.
+
     ## Putting a screenshot in a GitHub issue or PR
 
     A screenshot settles a UI argument that paragraphs cannot, and you have no
@@ -23508,6 +23517,43 @@ if __name__ == "__main__":
         # terminal, and MORE specific than /@USER@/* below so Caddy routes it
         # here first. The agent hands the user a @USER@/downloads/<file> URL.
         redir /@USER@/downloads /@USER@/downloads/
+        # Everything under the file drop is handed to the browser as an ATTACHMENT
+        # and under a maximally restrictive sandbox (issue #631). ~/downloads holds
+        # whatever an agent put there -- a generated report, a build artifact, a file
+        # pulled out of somebody else's repository -- and it is served from the SAME
+        # origin as the settings page and the terminals. Served inline, one hostile
+        # .html or .svg is same-origin privileged JavaScript: HttpOnly stops a script
+        # READING the auth cookie but not SENDING it, and SameSite and the daemon's
+        # CSRF guard both see a same-origin request, so neither one fires.
+        #
+        # `Content-Disposition: attachment` means the browser saves the file instead
+        # of rendering a document from it, which is what actually closes the hole;
+        # the `sandbox` CSP (no allow-* tokens at all: opaque origin, no scripts, no
+        # forms, no navigation) is the defense in depth for anything that reaches a
+        # document context anyway. `X-Content-Type-Options: nosniff` is already set
+        # vhost-wide by the header fragment.
+        #
+        # The directory listing is EXEMPT, because it is Caddy's own generated HTML
+        # and the point of the route: a listing is the one path that ends in `/`, so
+        # `not path */` is the whole distinction -- which holds only because
+        # `index off` below stops file_server serving an attacker-supplied
+        # index.html in place of that listing at exactly such a path.
+        @dl_file_@USER@ {
+          path /@USER@/downloads/*
+          not path */
+        }
+        header @dl_file_@USER@ {
+          Content-Disposition "attachment"
+          Content-Security-Policy "sandbox; frame-ancestors 'none'"
+          # `defer` is load-bearing, not a detail. Caddy sorts same-directive
+          # routes by path specificity, so this matched `header` runs BEFORE the
+          # vhost-wide one in the header fragment -- and a static `header` writes
+          # its value the moment it runs, which means the vhost-wide
+          # `frame-ancestors 'self'` would land on top of this sandbox and undo
+          # it. Deferring makes these ops apply when the response is written,
+          # which is after both the vhost-wide header and file_server itself.
+          defer
+        }
         handle /@USER@/downloads/* {
           # A live portal session (issue #541) reaches this exactly as a
           # basic-auth login does. forward_auth is stock caddy -- part of
@@ -23523,14 +23569,18 @@ if __name__ == "__main__":
               }
               uri strip_prefix /@USER@/downloads
               root * @DOWNLOADS_DIR@
-              file_server browse
+              file_server browse {
+                index off
+              }
             }
           }
           @cookie_dl_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
           handle @cookie_dl_@USER@ {
             uri strip_prefix /@USER@/downloads
             root * @DOWNLOADS_DIR@
-            file_server browse
+            file_server browse {
+              index off
+            }
           }
           handle {
             route {
@@ -23540,7 +23590,9 @@ if __name__ == "__main__":
               header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
               uri strip_prefix /@USER@/downloads
               root * @DOWNLOADS_DIR@
-              file_server browse
+              file_server browse {
+                index off
+              }
             }
           }
         }
@@ -23774,6 +23826,13 @@ if __name__ == "__main__":
           header {
             Cache-Control "no-store"
             X-Content-Type-Options "nosniff"
+            # Only this box's own pages may frame a management page (issue #631).
+            # The tabbed workspace at /<user>/ iframes each session's terminal from
+            # this same origin, so 'self' is the tightest policy that keeps the
+            # workspace working; anything else framing the settings page or a
+            # terminal is clickjacking. The downloads route below replaces this
+            # header with a stricter one of its own.
+            Content-Security-Policy "frame-ancestors 'self'"
           }
           # This fragment ends INSIDE the block on purpose: the module appends one
           # webhook + terminal block per user (and the root block), then the closing

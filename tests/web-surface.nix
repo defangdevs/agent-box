@@ -12,11 +12,12 @@
 # The sandbox has no ACME, so the module-managed Caddyfile is replaced with a
 # `tls internal` one that reproduces the three routing shapes the module emits:
 # the per-user snippet `import`, the authenticated /<user>/downloads/ handle
-# (basic_auth -> strip_prefix -> file_server), and the authenticated catch-all
-# standing in for the terminal. The flake's `download-route` and `webhook-route`
-# eval checks separately assert the module's REAL Caddyfile emits those blocks;
-# what needs a booted VM is whether caddy, fail2ban, tmpfiles and the agent
-# unit's namespace agree with each other, which is what this test covers.
+# (basic_auth -> strip_prefix -> file_server, plus the issue #631 attachment
+# and sandbox headers), and the authenticated catch-all standing in for the
+# terminal. The flake's `download-route` and `webhook-route` eval checks
+# separately assert the module's REAL Caddyfile emits those blocks; what needs
+# a booted VM is whether caddy, fail2ban, tmpfiles and the agent unit's
+# namespace agree with each other, which is what this test covers.
 #
 # Ordering matters: the fail2ban subtest ends with the client banned at the
 # firewall, so it runs last. Running the reload-driven self-serve subtest before
@@ -74,6 +75,20 @@
       box.test {
         log
         tls internal
+        header {
+          Cache-Control "no-store"
+          X-Content-Type-Options "nosniff"
+          Content-Security-Policy "frame-ancestors 'self'"
+        }
+        @dl_file_agent {
+          path /agent/downloads/*
+          not path */
+        }
+        header @dl_file_agent {
+          Content-Disposition "attachment"
+          Content-Security-Policy "sandbox; frame-ancestors 'none'"
+          defer
+        }
         handle /agent/downloads/* {
           route {
             basic_auth {
@@ -81,7 +96,9 @@
             }
             uri strip_prefix /agent/downloads
             root * /var/lib/agent-box-downloads/agent
-            file_server browse
+            file_server browse {
+              index off
+            }
           }
         }
         handle {
@@ -177,6 +194,61 @@
             f"{curl} -u agent:testpassword https://box.test/agent/downloads/ -o /tmp/index.html"
         )
         client.succeed("grep -q report.txt /tmp/index.html")
+
+    with subtest("a hostile artifact is handed over as an inert attachment"):
+        # Issue #631: ~/downloads is served from the SAME origin as the
+        # settings page and the terminals, so an artifact rendered INLINE is
+        # same-origin privileged JavaScript running with the operator's
+        # ambient auth -- HttpOnly stops a script reading the auth cookie but
+        # not sending it. The route has to hand every file to the browser as
+        # a download instead. (What only a browser can settle -- that Chromium
+        # then really refuses to execute it -- is
+        # tests/e2e/download-isolation.spec.ts.)
+        machine.succeed(
+            f"{in_session} tee /home/agent/downloads/evil.html > /dev/null <<'EOF'\n"
+            "<script>fetch('/agent/settings')</script>\n"
+            "EOF"
+        )
+        # An index.html in the drop directory must NOT stand in for the
+        # listing: that path is the one the attachment matcher exempts, so
+        # serving it would put attacker HTML back on this origin inline.
+        machine.succeed(
+            f"{in_session} tee /home/agent/downloads/index.html > /dev/null <<'EOF'\n"
+            "<h1>ATTACKER INDEX</h1>\n"
+            "EOF"
+        )
+        client.wait_until_succeeds(
+            f"{curl} -u agent:testpassword -D /tmp/evil.head -o /dev/null "
+            "https://box.test/agent/downloads/evil.html",
+            timeout=30,
+        )
+        client.succeed("grep -i '^content-disposition: attachment' /tmp/evil.head >/dev/null")
+        client.succeed(
+            "grep -i \"^content-security-policy: sandbox; frame-ancestors 'none'\" "
+            "/tmp/evil.head >/dev/null"
+        )
+        client.succeed("grep -i '^x-content-type-options: nosniff' /tmp/evil.head >/dev/null")
+
+        # The listing itself stays a listing: no attachment disposition (it
+        # would download instead of render), and it is Caddy's own page, not
+        # the index.html sitting next to it.
+        client.succeed(
+            f"{curl} -u agent:testpassword -D /tmp/list.head "
+            "https://box.test/agent/downloads/ -o /tmp/list.html"
+        )
+        client.fail("grep -i '^content-disposition' /tmp/list.head >/dev/null")
+        client.fail("grep -F 'ATTACKER INDEX' /tmp/list.html >/dev/null")
+        client.succeed("grep -F evil.html /tmp/list.html >/dev/null")
+
+        # And a management response may be framed only by this box itself --
+        # the workspace iframes each session's terminal from this very origin.
+        client.succeed(
+            f"{curl} -u agent:testpassword -D /tmp/mgmt.head -o /dev/null https://box.test/"
+        )
+        client.succeed(
+            "grep -i \"^content-security-policy: frame-ancestors 'self'\" "
+            "/tmp/mgmt.head >/dev/null"
+        )
 
     with subtest("an agent adds a vhost by writing ~/sites and reloading caddy"):
         # The tmpfiles-created symlink from ~agent/sites into the caddy-readable dir.
