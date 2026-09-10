@@ -783,7 +783,41 @@ let
       Environment=AGENT_BOX_SESSIONS_FILE=/home/%i/.config/agent-box/sessions.json
       EnvironmentFile=-/etc/agent-box/units/agent-web-terminal-%i.env
       EnvironmentFile=-/etc/agent-box/units/agent-web-terminal-%i.local.env
-      ExecStart=ttyd --writable --url-arg -p ''${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true agent-box-attach
+      # The transport is a UNIX socket, not a loopback port (issue #628). A
+      # 127.0.0.1 port is reachable by EVERY local user, and ttyd runs --writable
+      # with no credential of its own -- Caddy authenticates the public URL, which
+      # says nothing about who else on the box can open the port. A second agent
+      # user could therefore read and type into this user's terminal. Same reason,
+      # and same 0660 <user>:caddy shape, as the settings socket (issue #49).
+      #
+      # Two mechanisms hold that shape up, and BOTH are load-bearing:
+      #   - libwebsockets chmods the socket 0660 on bind, and the socket inherits
+      #     the GROUP of the directory it is created in because that directory is
+      #     setgid (2750 %i:caddy, from the tmpfiles rules both backends render).
+      #     So the socket lands 0660 %i:caddy without this unit holding any
+      #     privilege: connect(2) needs write permission, which leaves %i and
+      #     caddy. Inheriting matters most on NixOS, where every agent user shares
+      #     the `users` primary group -- a socket carrying THAT group at 0660
+      #     would be open to every other agent user on the box.
+      #   - the directory itself is 0750 %i:caddy, so nobody else can even reach
+      #     the socket to try, whatever mode it ends up with.
+      # Not ttyd's own -U/--socket-owner: that chowns the socket, which this
+      # unprivileged unit may not do to a group it is not in -- ttyd exits without
+      # binding at all. And not SupplementaryGroups=caddy to make it able to,
+      # because the caddy group is what guards every OTHER user's ~/downloads and
+      # ~/sites, so the terminal's process tree would gain exactly the cross-user
+      # reach this change exists to remove.
+      # The path is spelled here rather than passed in per user, exactly as
+      # agent-box-settings@.socket spells its own ListenStream.
+      #
+      # --check-origin is the browser half (issue #628): it refuses a WebSocket
+      # upgrade whose Origin does not match the Host, so a page on another site
+      # cannot drive this terminal through a logged-in browser. It is defence in
+      # depth and NOT a substitute for the socket -- a local client forges any
+      # header it likes. ttyd 1.7.7 compares the origin's host:port against the
+      # Host header with default ports elided, which is what a TLS-terminating
+      # Caddy in front of it sends.
+      ExecStart=ttyd --writable --url-arg --check-origin -i /run/agent-box-ttyd/%i/ttyd.sock -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true agent-box-attach
     ''} $out/etc/systemd/system/agent-web-terminal@.service
     install -m444 ${pkgs.writeText "agent-box-settings@.service" ''
       [Unit]
@@ -1110,9 +1144,30 @@ let
   );
   tmuxSocketName = "agent-box";
   runtimeDirectory = name: "agent-box-${name}";
-  # ttyd port base; ports are assigned in sorted user-name order (see
-  # terminalUsers below).
-  ttydPortBase = 7681;
+  # Each terminal's ttyd listens on a per-user UNIX socket rather than a
+  # 127.0.0.1 port (issue #628). The port was reachable by every local user
+  # on the box, and ttyd runs --writable with no credential of its own: Caddy
+  # authenticates the public URL, which says nothing about who can open the
+  # port behind it, so a second agent user had a path into this user's tmux.
+  # Same reasoning, and the same 0660 <user>:caddy shape, as the settings
+  # socket above.
+  #
+  # The directory is where the enforcement lives, and it does two jobs. It is
+  # SETGID caddy, so the socket ttyd binds inherits group caddy (libwebsockets
+  # chmods it 0660, and connect(2) wants write) — this unit holds no privilege
+  # with which to chown one. That inheritance is what makes the NixOS backend
+  # safe at all: `isNormalUser` puts every agent user in the shared `users`
+  # group, so a socket carrying the process's own primary group at 0660 would
+  # be open to all of them. And it is 0750 <user>:caddy, so no other user can
+  # reach the socket to try, whatever mode it ends up with.
+  #
+  # The path is NOT passed to the unit as an environment variable: the shared
+  # unit text spells it with %i, exactly as agent-box-settings@.socket spells
+  # its own ListenStream. These two helpers are what the tmpfiles rules and
+  # the Caddyfile bind, and they have to agree with that unit.
+  ttydSocketDir = "/run/agent-box-ttyd";
+  ttydSocketDirOf = name: "${ttydSocketDir}/${name}";
+  ttydSocketOf = name: "${ttydSocketDirOf name}/ttyd.sock";
   # The settings daemon listens on a per-user UNIX socket, not localhost TCP:
   # a 127.0.0.1 port is reachable by EVERY local user (issue #49 — on a
   # multi-agent box, codex could rewrite claude's keys and restart claude's
@@ -10081,10 +10136,12 @@ esac
           never lands in a world-readable path. Null (the default) means no
           browser terminal for this user.
 
-          Each terminal's ttyd gets a localhost port assigned in sorted
-          user-name order starting at 7681. The top-level Caddyfile is
+          Each terminal's ttyd listens on a UNIX socket of its own,
+          /run/agent-box-ttyd/<user>/ttyd.sock, reachable only by that user
+          and caddy (issue #628) — never on a localhost port, which every
+          other local user could open. The top-level Caddyfile is
           module-managed, so adding/removing terminal users is a
-          nixos-rebuild away — check the assigned ports with
+          nixos-rebuild away — check the wiring with
           `systemctl cat agent-web-terminal@<user>`.
         '';
       };
@@ -14542,8 +14599,7 @@ in
   }) (lib.mkIf (cfg.enable && cfg.web.enable) (
     let
       webUser = cfg.web.user;
-      # Users that get a browser terminal, in sorted order (attrNames sorts) —
-      # port assignment below depends on that order being deterministic.
+      # Users that get a browser terminal, in sorted order (attrNames sorts).
       terminalUsers = lib.filter (n: cfg.users.${n}.web.passwordHashFile != null) (lib.attrNames cfg.users);
       # Whose terminal workspace the vhost ROOT serves (the / page): web.user
       # if it has a terminal, else the first terminal user. Null only when no
@@ -14556,7 +14612,6 @@ in
       # there IS one: the button lives on the settings page, and a box with
       # no terminal user serves no settings page to put it on.
       rebootButton = cfg.web.rebootButton && rootUser != null;
-      portOf = lib.listToAttrs (lib.imap0 (i: n: lib.nameValuePair n (ttydPortBase + i)) terminalUsers);
       # Public URL base path for a user's settings page (Caddy does not strip
       # a prefix, so the daemon matches this full path).
       settingsBaseOf = n: "/${n}/settings";
@@ -23924,8 +23979,8 @@ if __name__ == "__main__":
       # environment (AGENT_BOX_DOWNLOADS_DIR, below).
       terminalCaddyBlock = name:
         lib.replaceStrings
-          [ "@USER@" "@USER_ENV@" "@SETTINGS_SOCKET@" "@TTYD_PORT@" ]
-          [ name (envName name) (settingsSocketOf name) (toString portOf.${name}) ] ''
+          [ "@USER@" "@USER_ENV@" "@SETTINGS_SOCKET@" "@TTYD_SOCKET@" ]
+          [ name (envName name) (settingsSocketOf name) (ttydSocketOf name) ] ''
         # @USER@'s terminal. Cookie first — browsers refuse to attach basic
         # auth credentials to WebSocket upgrades — then basic auth with the
         # linux user name as the login name.
@@ -24092,6 +24147,14 @@ if __name__ == "__main__":
             }
           }
         }
+        # ttyd's upstream is a UNIX socket, not 127.0.0.1:<port> (issue #628): a
+        # loopback port is reachable by every local user, and ttyd runs --writable
+        # with no credential of its own, so the authentication above was the only
+        # thing standing between another user on this box and this user's terminal
+        # -- and it stood in front of the public URL, not in front of the port.
+        # 0660 @USER@:caddy, in a 0750 @USER@:caddy directory. Same model as the
+        # settings socket above.
+        #
         # One path per session: /@USER@/<session>/ is that session's terminal, and
         # everything ttyd asks for from a page loaded there (its ws and token
         # endpoints, resolved relative to the URL in the address bar) hangs off the
@@ -24127,12 +24190,12 @@ if __name__ == "__main__":
               forward_auth unix/@SETTINGS_SOCKET@ {
                 uri /@USER@/auth/verify
               }
-              reverse_proxy 127.0.0.1:@TTYD_PORT@
+              reverse_proxy unix/@TTYD_SOCKET@
             }
           }
           @cookie_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
           handle @cookie_@USER@ {
-            reverse_proxy 127.0.0.1:@TTYD_PORT@
+            reverse_proxy unix/@TTYD_SOCKET@
           }
           handle {
             route {
@@ -24140,7 +24203,7 @@ if __name__ == "__main__":
                 @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
               }
               header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-              reverse_proxy 127.0.0.1:@TTYD_PORT@
+              reverse_proxy unix/@TTYD_SOCKET@
             }
           }
         }
@@ -24383,6 +24446,10 @@ if __name__ == "__main__":
         # (created by systemd, see systemd.sockets below), and connecting
         # requires write permission on the socket file.
         "d ${settingsSocketDir} 0755 root root - -"
+        # Browser-terminal sockets live one directory down from here (issue
+        # #628). World-traversable parent, exactly as above; the per-user
+        # subdirectory below is what is closed.
+        "d ${ttydSocketDir} 0755 root root - -"
       ] ++ lib.concatMap (name: [
         "d /var/lib/agent-box-sites/${name} 0750 ${name} caddy - -"
         # ~/sites -> the caddy-readable snippet dir. L+ replaces a stale
@@ -24418,6 +24485,13 @@ if __name__ == "__main__":
       ++ lib.concatMap (name: [
         "d /home/${name}/.config 0755 ${name} - - -"
         "d /home/${name}/.config/agent-box 0700 ${name} - - -"
+        # This user's ttyd socket directory (issue #628), and the reason the
+        # transport is private: 0750 ${name}:caddy keeps every other local
+        # user out, and the SETGID bit hands the socket ttyd binds inside it
+        # group caddy — which is the only way it gets one, since the unit
+        # runs unprivileged as ${name} and cannot chown. Terminal users only:
+        # a user with no password hash runs no ttyd.
+        "d ${ttydSocketDirOf name} 2750 ${name} caddy - -"
       ]) terminalUsers
       # Webhook ingress socket dir (issue #101). World-traversable parent; the
       # per-user socket files themselves are 0660 <user>:caddy, systemd-created
@@ -24522,11 +24596,12 @@ if __name__ == "__main__":
       # #154 Phase 3) — same rationale as the "agent-box@" one above:
       # store paths/values that differ by user go here; the same value
       # for every instance goes in that unit's host drop-in instead.
+      # No agent-web-terminal-<user>.env here: the only value it ever carried
+      # was that user's ttyd port, and the socket that replaced it (issue
+      # #628) is spelled with %i in the unit itself. The unit still reads the
+      # file with a leading `-`, so a box may still drop one in by hand.
       environment.etc =
-        lib.mapAttrs' (name: _: lib.nameValuePair "agent-box/units/agent-web-terminal-${name}.env" {
-          text = "AGENT_BOX_TTYD_PORT=${toString portOf.${name}}\n";
-        }) portOf
-        // lib.listToAttrs (map (name: lib.nameValuePair "agent-box/units/agent-box-settings-${name}.env" {
+        lib.listToAttrs (map (name: lib.nameValuePair "agent-box/units/agent-box-settings-${name}.env" {
           text =
             "AGENT_BOX_PASSWORD_CMD=/run/wrappers/bin/sudo -n ${passwordHelperCmdOf name}\n"
             # The file drop this user's daemon serves at
@@ -24655,7 +24730,7 @@ if __name__ == "__main__":
         # dependency on any search-path resolution being merged correctly.
         serviceConfig.ExecStart = [
           ""
-          ''${pkgs.ttyd}/bin/ttyd --writable --url-arg -p ''${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true ${attachScript}/bin/agent-box-attach''
+          ''${pkgs.ttyd}/bin/ttyd --writable --url-arg --check-origin -i ${ttydSocketOf name} -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true ${attachScript}/bin/agent-box-attach''
         ];
       }) terminalUsers))
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-box-settings@${name}" {

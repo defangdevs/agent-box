@@ -162,12 +162,18 @@ Caddy passes the session name — and the browser console logs
 Option-drag selection flag (issue #327) was confirmed on a real Mac before it
 shipped.
 
-The whole client bundle is inlined in ttyd's `index.html`, and ttyd listens on
-localhost without Caddy's basic auth in front of it, so
-`curl -s http://127.0.0.1:7681/<user>/` gets you the exact xterm.js a box is
-serving. Read that before trusting upstream docs about which version does
-what; `systemctl cat agent-web-terminal-<user>` gives the port and the flags
-actually in force.
+The whole client bundle is inlined in ttyd's `index.html`, and ttyd answers
+without Caddy's basic auth in front of it, so
+
+    sudo -u <user> curl -s --unix-socket /run/agent-box-ttyd/<user>/ttyd.sock \
+      http://localhost/<user>/
+
+gets you the exact xterm.js a box is serving. Read that before trusting
+upstream docs about which version does what; `systemctl cat
+agent-web-terminal@<user>` gives the flags actually in force. The socket
+replaced a `127.0.0.1:7681` port in issue #628 — it is 0660 `<user>:caddy`
+inside a 0750 directory, so the fetch has to run AS that user (or as caddy),
+which is the whole point of the change.
 
 ## Vendoring a third-party asset
 

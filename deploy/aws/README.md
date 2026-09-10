@@ -25,14 +25,18 @@ Claude Code or Codex.
 - Uses EC2 user-data as a NixOS configuration: imports the pinned
   `agent-box` module, sets `services.agent-box.agent` from the `Agent`
   parameter, and enables the module's web terminal (Caddy, TLS-ALPN-01 only,
-  plus a per-user `ttyd` on `127.0.0.1:7681` that attaches to `agent`'s tmux
+  plus a per-user `ttyd` on a unix socket at
+  `/run/agent-box-ttyd/<user>/ttyd.sock` — 0660 `<user>:caddy`, reachable by
+  that user and the proxy and nobody else (issue #628) — that attaches to
+  `agent`'s tmux
   session; `TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box -t main` - the
   socket lives under `/run` because the agent runs with `PrivateTmp`).
 - **Basic-auth-to-cookie web auth**. The terminal lives at `/<UserName>/`
   (default `/workspace/`); Caddy prompts for the `UserName` (the linux user name
   selects the terminal) and the `WebPassword`, sets an
   `HttpOnly; Secure; SameSite=Strict` cookie, then lets browser WebSocket
-  upgrades authenticate with that cookie. ttyd still binds only to localhost.
+  upgrades authenticate with that cookie. ttyd itself is never on the network:
+  its socket is a file only that user and caddy may open.
   The site root serves an unauthenticated index page listing the configured
   terminals (just the one `UserName` on this template).
 - The stack output URL is `https://<host>.sslip.io/<UserName>/`; sign in as

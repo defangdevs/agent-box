@@ -27,5 +27,4 @@ web/payloads/agent-box-upload/bin/agent-box-upload -> vm/payloads/agent-box-uplo
 web/payloads/unit-script-agent-box-defang-cli-start/bin/agent-box-defang-cli-start -> vm/payloads/unit-script-agent-box-defang-cli-start/bin/agent-box-defang-cli-start
 web/units/agent-box-defang-cli.service -> vm/units/agent-box-defang-cli.service
 web/units/agent-box-webhook@robot.service -> web/units/agent-box-webhook@agent.service
-web/units/agent-web-terminal@robot.service -> web/units/agent-web-terminal@agent.service
 web/units/earlyoom.service -> vm/units/earlyoom.service

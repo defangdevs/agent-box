@@ -632,6 +632,22 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               catchall=$(grep -n 'handle /agent/\* {' "$caddyfile" | cut -d: -f1)
               [ "$home" -lt "$catchall" ]
               [ "$rw" -lt "$catchall" ]
+              # The terminal upstream is that user's UNIX socket, never a
+              # loopback port (issue #628): a port is reachable by every
+              # local user, and ttyd runs --writable with no credential of
+              # its own, so the auth in front of the public URL was all that
+              # stood between two users on one box. Both spellings are
+              # asserted -- the socket present AND no `127.0.0.1:` upstream
+              # anywhere in the file -- because a half-converted Caddyfile
+              # (one of the three auth branches left on the port) would pass
+              # a check that only looked for the socket.
+              grep -qF 'reverse_proxy unix//run/agent-box-ttyd/agent/ttyd.sock' "$caddyfile"
+              grep -qF 'reverse_proxy unix//run/agent-box-ttyd/bob/ttyd.sock' "$caddyfile"
+              [ "$(grep -c 'reverse_proxy unix//run/agent-box-ttyd/' "$caddyfile")" = 6 ]
+              if grep -q 'reverse_proxy 127.0.0.1:' "$caddyfile"; then
+                echo "a terminal is still proxied over a loopback port" >&2
+                exit 1
+              fi
               # And it all parses. The secrets are Caddy env placeholders,
               # absent in a build sandbox: stand-ins keep basic_auth happy.
               # One set PER USER — an unset algorithm placeholder collapses to
@@ -2122,6 +2138,18 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # the same box.
           sessions-web = pkgs.testers.runNixOSTest
             (import ./tests/sessions-web.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue #628): the browser terminal's
+          # transport belongs to its own user and the proxy in front of it.
+          # Two real linux users in one guest, because the user boundary is
+          # the only boundary this deployment has: nothing listens on TCP,
+          # the unix socket is 0660 <user>:caddy inside a 2750 <user>:caddy
+          # directory, the second user is refused by the kernel and by the
+          # auth gate, the owner still attaches, TYPES, reconnects and
+          # starts a stopped session, and cross-origin (and origin-less)
+          # WebSockets are refused by ttyd's --check-origin.
+          ttyd-isolation = pkgs.testers.runNixOSTest
+            (import ./tests/ttyd-isolation.nix { agent-box = self.nixosModules.agent-box; });
 
           # Interactive VM test (issue #101): the per-user webhook receiver, ON
           # BY DEFAULT. Socket-activated 0660 <user>:caddy ingress, the
