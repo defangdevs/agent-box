@@ -156,10 +156,20 @@ jobs:
         id: pins
         run: |
           m() { python3 scripts/release_manifest.py field release-manifest.json "$1"; }
+          # Assigned first, and deliberately not `echo "k=$(m ...)"`. Under
+          # `bash -e` the status of that echo is echo's own, so a failing
+          # `field` would be discarded and an EMPTY pin written to
+          # GITHUB_OUTPUT - which deploy-test then reads as "base channel"
+          # and boots an unpinned box, the exact divergence this workflow
+          # exists to prevent. An assignment carries the substitution's
+          # status, so it fails the step.
+          module_sha256=$(m module_sha256)
+          agent_nixpkgs_url=$(m agent_nixpkgs.url)
+          agent_nixpkgs_sha256=$(m agent_nixpkgs.sha256)
           {
-            echo "module_sha256=$(m module_sha256)"
-            echo "agent_nixpkgs_url=$(m agent_nixpkgs.url)"
-            echo "agent_nixpkgs_sha256=$(m agent_nixpkgs.sha256)"
+            echo "module_sha256=$module_sha256"
+            echo "agent_nixpkgs_url=$agent_nixpkgs_url"
+            echo "agent_nixpkgs_sha256=$agent_nixpkgs_sha256"
           } >> "$GITHUB_OUTPUT"
           python3 scripts/release_manifest.py show release-manifest.json \
             | tee -a "$GITHUB_STEP_SUMMARY"

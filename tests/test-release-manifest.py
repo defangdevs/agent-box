@@ -247,6 +247,32 @@ class Cli(Rig):
                             "--no-remote-check", "--rev", REV)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_field_prints_one_value_and_refuses_a_missing_one(self):
+        # `field` is the verb both workflows inject public template
+        # `Default:` values from, and a blank Default still lints and
+        # still publishes - so "missing or empty exits non-zero" is the
+        # contract keeping an unpinned template off S3.
+        out = self.tmp / "release-manifest.json"
+        self.run_cli("build", "--repo", REPO, "--rev", REV, "--source-dir",
+                     str(self.src), "--no-remote-check", "--out", str(out))
+
+        proc = self.run_cli("field", str(out), "agent_nixpkgs.url")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), CHANNEL_URL)
+        self.assertEqual(
+            self.run_cli("field", str(out), "rev").stdout.strip(), REV)
+
+        for path in ("nope", "agent_nixpkgs.nope", "rev.nope"):
+            with self.subTest(missing=path):
+                self.assertNotEqual(
+                    self.run_cli("field", str(out), path).returncode, 0)
+
+        blank = json.loads(out.read_text(encoding="utf-8"))
+        blank["agent_nixpkgs"]["url"] = ""
+        out.write_text(json.dumps(blank), encoding="utf-8")
+        self.assertNotEqual(
+            self.run_cli("field", str(out), "agent_nixpkgs.url").returncode, 0)
+
     def test_verify_exits_non_zero_on_a_difference(self):
         out = self.tmp / "release-manifest.json"
         self.run_cli("build", "--repo", REPO, "--rev", REV, "--source-dir",
