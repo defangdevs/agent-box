@@ -25,6 +25,7 @@
     system.stateVersion = "25.05";
   };
   testScript = ''
+    machine.start(allow_reboot=True)
     machine.wait_for_unit("agent-box@agent.service")
     cli = "sudo -u agent env HOME=/home/agent agent-box-session"
     panes = "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
