@@ -177,6 +177,13 @@ jobs:
 
       - name: Generate WebPassword
         id: pw
+        # inputs.web_password reaches this step as an env var, not
+        # interpolated into the script text: a dispatch caller controls
+        # that value, and splicing it directly into `run:` would let a
+        # single quote break out of the assignment and run arbitrary shell
+        # on a runner that just assumed the AWS OIDC role above.
+        env:
+          WEB_PASSWORD_OVERRIDE: ${{ inputs.web_password }}
         run: |
           # 48 hex chars by default. Dispatch runs may override the plaintext
           # to reproduce shape-specific auth bugs; the override is
@@ -187,8 +194,14 @@ jobs:
           # plaintext itself for its later login smoke tests, so both outputs
           # are kept. Caddy's own image computes the hash so this step needs
           # no new toolchain beyond the Docker the runner already has.
-          if [ -n '${{ inputs.web_password }}' ]; then
-            pw='${{ inputs.web_password }}'
+          if [ -n "$WEB_PASSWORD_OVERRIDE" ]; then
+            case "$WEB_PASSWORD_OVERRIDE" in
+              *$'\n'*|*$'\r'*)
+                echo "::error::web_password must be a single line."
+                exit 1
+                ;;
+            esac
+            pw="$WEB_PASSWORD_OVERRIDE"
             echo "::notice::Using dispatch-provided WebPassword override."
           else
             pw="$(openssl rand -hex 24)"
