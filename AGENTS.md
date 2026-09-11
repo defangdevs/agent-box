@@ -290,8 +290,9 @@ Register VM tests in `vmTestsFor` and assign each to exactly one `ciVmLanes`
 entry in `flake.nix`. The `ci-scheduling` check rejects missing or duplicate
 assignments and mismatches with the workflow matrix. Each lane prepares only
 its own drivers, then runs their exact inventory with `scripts/ci-vm-tests.sh`.
-`sessions` and `webhook` each get one test job; the rest share two. The three
-lanes use separate standard runners but still run at most four tests total.
+`sessions` and `webhook` each have a lane; `browser` and `host` split the
+remaining checks. Each lane runs one test at a time on its own standard
+runner, so at most four tests run globally.
 A test may boot multiple guests. Do not raise that budget without measuring
 memory and CPU pressure. No test assertions are removed to meet timing goals.
 

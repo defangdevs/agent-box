@@ -25,10 +25,13 @@
       ciVmLanes = {
         sessions = { jobs = 1; checks = [ "sessions" ]; };
         webhook = { jobs = 1; checks = [ "webhook" ]; };
-        rest = {
-          jobs = 2;
-          checks = [ "connect" "containers" "memory-protection" "sessions-web"
-            "settings-page" "ttyd-isolation" "web-surface" ];
+        browser = {
+          jobs = 1;
+          checks = [ "connect" "sessions-web" "settings-page" ];
+        };
+        host = {
+          jobs = 1;
+          checks = [ "containers" "memory-protection" "ttyd-isolation" "web-surface" ];
         };
       };
 

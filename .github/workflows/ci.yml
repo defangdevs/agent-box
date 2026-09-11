@@ -85,8 +85,10 @@ jobs:
             jobs: 1
           - lane: webhook
             jobs: 1
-          - lane: rest
-            jobs: 2
+          - lane: browser
+            jobs: 1
+          - lane: host
+            jobs: 1
     steps:
       - uses: actions/checkout@v5
       - uses: cachix/install-nix-action@v30
@@ -104,7 +106,7 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      # Globally still 1+1+2 simultaneous test derivations. Each test can
+      # Globally still four simultaneous test derivations. Each test can
       # boot multiple guests; separate runners reduce contention per guest.
       - name: Run VM tests
         timeout-minutes: 12

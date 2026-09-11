@@ -1125,6 +1125,16 @@ in
             BUILT. Reading the recorded pane start command rather than a live
             process, as in the codex subtest: it must not depend on claude
             surviving its (unauthenticated) resume attempt."""
+            # This test injects a clear event itself. The real CLI is still
+            # starting and can otherwise overwrite it with its startup hook
+            # (exposed by #519's less-contended runners). Quiesce that writer
+            # while keeping the session alive; the real supervisor, hook,
+            # transcript gate and both resume assertions remain under test.
+            old_pane = machine.succeed(
+                tmux('display-message -p -t "=rot:" "#{pane_pid}"')
+            ).strip()
+            machine.succeed(tmux('respawn-pane -k -t "=rot:" "exec sleep 3600"'))
+            machine.wait_until_fails(f"pgrep -g {old_pane}", timeout=30)
             payload = json.dumps(
                 {
                     "session_id": new_id,
