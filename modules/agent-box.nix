@@ -211,12 +211,13 @@ let
       it to `agent-box-session rm NAME` when done, which is the same end reached
       sooner. What is NOT reaped is a hook session that CRASHED: a non-zero exit is
       never parked, so it stays listed and attachable for you to read - `rm` it once
-      you have. That cleanup is load-bearing: at most 4
-      `hook-*` sessions may RUN at once, and once that ceiling is reached EVERY
+      you have. That cleanup is load-bearing: the configured `sessionLimit` (default 4) bounds ALL
+      sessions running or queued to start, including CLI/UI sessions, and once that ceiling is reached EVERY
       watch on the box is stalled - a matching batch starts nothing until a slot
       frees. It is no longer LOST while it waits: the wrapper declines it and the
       receiver keeps it, re-offers it as slots free, and drops it only after an hour
-      of waiting. A stopped session frees its slot even before it is delisted. So
+      of waiting. A stopped session frees its slot once its pane exits, without needing
+      to be delisted. So
       before you conclude a repo has been quiet, run `agent-box-webhook status`: its
       `dispatch` object has the live count against the ceiling and the last batch the
       ceiling turned away. `lastRefusal.deferred` records the ANSWER that batch got -
@@ -555,6 +556,11 @@ let
       the value out of the command line, the shell history and `ps`). Such a
       value is stored double-quoted, which is the one thing to preserve if you
       ever hand-edit the file.
+    - Session starts share one limit across the CLI, settings page and webhooks
+      (default 4, configured by `sessionLimit` on the box). Pending starts reserve
+      slots too. Stop a session to free capacity; restarting a stopped session
+      needs a free slot. `restart --all` refuses without changing anything if it
+      would exceed the limit. This is overload control, not a memory guarantee.
     - Manage your own sessions without a rebuild:
       `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
       plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
@@ -1975,6 +1981,203 @@ if __name__ == "__main__":
         die(str(error))
   '');
 
+  capacityLib = ''
+
+
+# Shared admission policy for the single-user v1 box (issue #662).
+# Callers hold the sessions.json sidecar lock through this check AND their
+# registry write / tmux spawn. Non-stopped entries reserve pending starts.
+import os as capacity_os
+import subprocess as capacity_subprocess
+
+
+class SessionCapacityError(Exception):
+    pass
+
+
+def capacity_limit():
+    path = capacity_os.environ.get("AGENT_BOX_SESSION_LIMIT_FILE",
+                                   "/etc/agent-box/session-limit")
+    try:
+        with open(path, encoding="ascii") as handle:
+            value = handle.read().strip()
+    except FileNotFoundError:
+        value = "4"
+    if not value.isascii() or not value.isdecimal() or int(value) < 1:
+        raise ValueError("sessionLimit must be a positive integer")
+    return int(value)
+
+
+def capacity_live():
+    command = [capacity_os.environ.get("AGENT_BOX_TMUX_BIN", "tmux"),
+               "-L", capacity_os.environ.get("AGENT_BOX_TMUX_SOCKET", "agent-box")]
+    env = dict(capacity_os.environ)
+    if env.get("AGENT_BOX_TMUX_TMPDIR"):
+        env["TMUX_TMPDIR"] = env["AGENT_BOX_TMUX_TMPDIR"]
+    proc = capacity_subprocess.run(
+        command + ["list-sessions", "-F", "#S"], capture_output=True,
+        text=True, timeout=5, env=env)
+    if proc.returncode:
+        # A missing server is empty; arbitrary tmux errors are not. Do not
+        # turn a permissions/socket failure into permission to overcommit.
+        if not any(s in proc.stderr for s in (
+                "no server running", "no sessions", "No such file or directory")):
+            raise OSError("cannot determine session capacity: " + proc.stderr.strip())
+        return set()
+    # The settings page's sign-in flows (settings-daemon.py's CONNECT_PREFIX)
+    # run on this same tmux socket as a "_connect-<flow>" pane, but they are
+    # not an agent session and were never registered — counting them would
+    # let an in-progress sign-in consume a slot a real session needs.
+    return {s for s in proc.stdout.splitlines() if not s.startswith("_connect-")}
+
+
+def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
+    """Admit new/revived targets, or one supervisor spawn.
+
+    On boot or after a limit reduction, an overfull registry is a queue:
+    keep live panes and admit pending names in sorted order up to the limit.
+    Existing panes are never killed. Ordinary adds cannot jump that queue.
+    """
+    try:
+        limit = capacity_limit() if limit is None else limit
+        live = capacity_live() if live is None else set(live)
+    except (OSError, ValueError, capacity_subprocess.TimeoutExpired) as exc:
+        raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
+    pending = {name for name, entry in sessions.items()
+               if isinstance(entry, dict) and entry.get("stopped") is not True}
+    used = live | pending
+    targets = set(targets)
+    if spawning:
+        available = max(0, limit - len(live))
+        admitted = live | set(sorted(pending - live)[:available])
+        allowed = targets <= admitted
+    else:
+        # An already-admitted session retains its slot during restart, even
+        # if an operator has since lowered the limit below the running count.
+        added = targets - used
+        allowed = not added or len(used | targets) <= limit
+    if not allowed:
+        raise SessionCapacityError(
+            "Session limit reached (%d running or queued, limit %d). "
+            "Stop a session before starting another." % (len(used), limit))
+    return {"used": len(used), "max": limit}
+  '';
+
+  capacityCli = pkgs.writers.writePython3Bin "agent-box-session-capacity" {
+    flakeIgnore = [ "E501" "E402" "E305" ];
+  } ''
+# Shared admission policy for the single-user v1 box (issue #662).
+# Callers hold the sessions.json sidecar lock through this check AND their
+# registry write / tmux spawn. Non-stopped entries reserve pending starts.
+import os as capacity_os
+import subprocess as capacity_subprocess
+
+
+class SessionCapacityError(Exception):
+    pass
+
+
+def capacity_limit():
+    path = capacity_os.environ.get("AGENT_BOX_SESSION_LIMIT_FILE",
+                                   "/etc/agent-box/session-limit")
+    try:
+        with open(path, encoding="ascii") as handle:
+            value = handle.read().strip()
+    except FileNotFoundError:
+        value = "4"
+    if not value.isascii() or not value.isdecimal() or int(value) < 1:
+        raise ValueError("sessionLimit must be a positive integer")
+    return int(value)
+
+
+def capacity_live():
+    command = [capacity_os.environ.get("AGENT_BOX_TMUX_BIN", "tmux"),
+               "-L", capacity_os.environ.get("AGENT_BOX_TMUX_SOCKET", "agent-box")]
+    env = dict(capacity_os.environ)
+    if env.get("AGENT_BOX_TMUX_TMPDIR"):
+        env["TMUX_TMPDIR"] = env["AGENT_BOX_TMUX_TMPDIR"]
+    proc = capacity_subprocess.run(
+        command + ["list-sessions", "-F", "#S"], capture_output=True,
+        text=True, timeout=5, env=env)
+    if proc.returncode:
+        # A missing server is empty; arbitrary tmux errors are not. Do not
+        # turn a permissions/socket failure into permission to overcommit.
+        if not any(s in proc.stderr for s in (
+                "no server running", "no sessions", "No such file or directory")):
+            raise OSError("cannot determine session capacity: " + proc.stderr.strip())
+        return set()
+    # The settings page's sign-in flows (settings-daemon.py's CONNECT_PREFIX)
+    # run on this same tmux socket as a "_connect-<flow>" pane, but they are
+    # not an agent session and were never registered — counting them would
+    # let an in-progress sign-in consume a slot a real session needs.
+    return {s for s in proc.stdout.splitlines() if not s.startswith("_connect-")}
+
+
+def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
+    """Admit new/revived targets, or one supervisor spawn.
+
+    On boot or after a limit reduction, an overfull registry is a queue:
+    keep live panes and admit pending names in sorted order up to the limit.
+    Existing panes are never killed. Ordinary adds cannot jump that queue.
+    """
+    try:
+        limit = capacity_limit() if limit is None else limit
+        live = capacity_live() if live is None else set(live)
+    except (OSError, ValueError, capacity_subprocess.TimeoutExpired) as exc:
+        raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
+    pending = {name for name, entry in sessions.items()
+               if isinstance(entry, dict) and entry.get("stopped") is not True}
+    used = live | pending
+    targets = set(targets)
+    if spawning:
+        available = max(0, limit - len(live))
+        admitted = live | set(sorted(pending - live)[:available])
+        allowed = targets <= admitted
+    else:
+        # An already-admitted session retains its slot during restart, even
+        # if an operator has since lowered the limit below the running count.
+        added = targets - used
+        allowed = not added or len(used | targets) <= limit
+    if not allowed:
+        raise SessionCapacityError(
+            "Session limit reached (%d running or queued, limit %d). "
+            "Stop a session before starting another." % (len(used), limit))
+    return {"used": len(used), "max": limit}
+
+import json as capacity_json
+import sys
+
+
+def capacity_main():
+    try:
+        with open(sys.argv[2], encoding="utf-8") as handle:
+            sessions = capacity_json.load(handle)["sessions"]
+    except FileNotFoundError:
+        # No registry yet — first boot, before the supervisor's own seed
+        # has run — is zero pending sessions, not an error. A read-only
+        # capacity check must never be what CREATES the registry: a file
+        # this call conjured up "exists" for the seed that runs after it,
+        # and a seed never overwrites an existing file (issue #59), so the
+        # NixOS-declared sessions would silently never get seeded.
+        sessions = {}
+    try:
+        result = capacity_check(sessions, sys.argv[3:],
+                                spawning=sys.argv[1] == "spawn")
+        print(capacity_json.dumps(result))
+        return 0
+    except SessionCapacityError as exc:
+        print(str(exc), file=sys.stderr)
+        return 75
+    except (OSError, ValueError, KeyError,
+            capacity_subprocess.TimeoutExpired) as exc:
+        print("Cannot check session capacity: %s" % exc, file=sys.stderr)
+        return 75
+
+
+if __name__ == "__main__":
+    sys.exit(capacity_main())
+  '';
+
   # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
   # quit, so the pane records stopped=true and the supervisor leaves the
   # session down. See src/mark-stopped.sh for the exact semantics.
@@ -3308,6 +3511,7 @@ done
     # script, an agent tool call, the webhook receiver unit (jq + coreutils +
     # this CLI, no util-linux) — and a lock that only some writers take is not
     # a lock. util-linux is the only package that ships flock.
+    export AGENT_BOX_CAPACITY_BIN=${capacityCli}/bin/agent-box-session-capacity
     export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
     # Agent profiles (issue #321): `add --profile` resolves the harness and
     # its arguments by shelling out to agent-box-profile, and this CLI runs
@@ -3953,7 +4157,9 @@ kill_session() {
 }
 
 usage() {
-  echo "usage: agent-box-session ls"
+  echo "usage: agent-box-session ls | capacity"
+  echo "Starts share sessionLimit (default 4), including pending starts and webhooks."
+  echo "Stop a session to free a slot. A refused start exits 75; retry is safe."
   echo "       agent-box-session peers"
   echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
   echo "                             [--cwd DIR]"
@@ -4134,6 +4340,14 @@ gen_name() {
 
 cmd="''${1:-}"; shift || true
 case "$cmd" in
+  capacity)
+    # No registry_ensure: this is read-only, and creating an empty registry
+    # here — before the supervisor's own first-boot seed runs — would make
+    # that seed find a file that already "exists" and skip seeding the
+    # NixOS-declared sessions for good (issue #59's seed-never-clobbers
+    # rule cuts both ways). A missing file reads as zero pending sessions.
+    "''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE"
+    ;;
   ls)
     live="$(t list-sessions -F '#S' 2>/dev/null || true)"
     printf '%-24s %-8s %s\n' NAME HARNESS STATE
@@ -4462,6 +4676,7 @@ case "$cmd" in
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
     fi
+    "''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
     # The id this session's FIRST spawn is launched with (Claude
     # --session-id / --resume; Codex transcript marker). Not a stable handle
     # on the conversation: a clear, a compact or a resume rotates the agent
@@ -4558,7 +4773,11 @@ case "$cmd" in
     # for parked sessions; kill-session tolerates one with nothing live.
     if [ "''${1:-}" = "--all" ]; then
       registry_ensure
+      registry_lock
+      mapfile -t restart_names < <("$JQ" -r '.sessions | keys[]' "$REGISTRY_FILE")
+      "''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "''${restart_names[@]}" >/dev/null
       registry_edit 'del(.sessions[].stopped)'
+      registry_unlock
       "$JQ" -r '.sessions | keys[]' "$REGISTRY_FILE" | while IFS= read -r n; do
         [ -n "$n" ] && kill_session "$n" || true
       done
@@ -4571,6 +4790,7 @@ case "$cmd" in
       # (issue #254) — the flag write must apply to the file the check saw.
       registry_lock
       if taken "$name"; then
+        "''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
         registry_edit --arg n "$name" 'del(.sessions[$n].stopped)'
         registry_unlock
         # A stopped session has no live tmux session to kill; kill_session
@@ -5685,9 +5905,9 @@ _hc_main "$@"
                              claim over any watch, GitHub or not.
                              A spawned session is subscribed to the event's own
                              repo for it, so its own CI spawns no sibling.
-                             THERE IS A CEILING: at most 4 hook-* sessions may
-                             RUN at once (AGENT_BOX_HOOK_SESSION_MAX in the
-                             receiver daemon's environment). Hook sessions are
+                             THERE IS A CEILING: sessionLimit (default 4) bounds all sessions
+                             running or queued. Configure it in the box
+                             configuration. Hook sessions are
                              removed by the agent they start, so four of them
                              still running stall every watch on the box. A batch
                              that arrives then is QUEUED, not dropped: the spawn
@@ -5782,7 +6002,8 @@ _hc_main "$@"
     branch — and is reported in the JSON (`plugin.skew`) without a warning.
 
     Its `dispatch` object is where to look when standing watches seem dead:
-    `hookSessions` is the running hook-* count against the ceiling, `lastRefusal`
+    `hookSessions` is the legacy field name for ALL running/queued sessions
+    against the shared ceiling, `lastRefusal`
     is the batch the ceiling most recently turned away (with a running total), and
     `warning` — the same field `ls` sets when the receiver has no spawn command —
     is present exactly when a match right now would spawn nothing.
@@ -5929,7 +6150,7 @@ _hc_main "$@"
 
     # ----------------------------------------------------- standing-watch cap ---
     # Standing watches are the one delivery shape with no session behind it, so
-    # when the spawn wrapper refuses a batch (too many hook-* sessions running)
+    # when the spawn wrapper refuses a batch (too many sessions running)
     # nothing else is holding those events. That refusal used to reach only the
     # receiver daemon journal while every listing here still said "subscribed" —
     # four hook sessions whose agents forgot `agent-box-session rm` made the whole
@@ -5941,37 +6162,24 @@ _hc_main "$@"
     # operator has to clear, and the wait is bounded, so the reporting below stays
     # exactly as loud as it was.
 
+    hook_capacity_snapshot() {
+      # A refusal (missing binary, refused lock, ...) must not be fatal here:
+      # this script runs under `set -e`, and a bare `x=$(cmd)` assignment DOES
+      # propagate a failing command's status, unlike a pipeline ending in `||`.
+      # Callers treat an empty snapshot as "unknown" (null), same as before.
+      agent-box-session capacity 2>/dev/null || true
+    }
+
     hook_sessions() {
-      # The capacity in use, counted the way the wrapper counts it
-      # (src/webhook-spawn.sh): a hook-* entry that is not `stopped` — running, or
-      # queued for the supervisor's reconcile loop to start within ~2s. A `stopped`
-      # entry is FREE capacity, so counting it here would report a healthy box as
-      # wedged (issue #280) — the same over-count that used to wedge it for real.
-      #
-      # The wrapper additionally counts live hook-* tmux panes that no entry
-      # claims, which needs the tmux binary its unit pins; this process has no such
-      # pin, and the divergence can only under-count. The wrapper stays the
-      # authority either way: when the two disagree, lastRefusal is the decision
-      # that was enforced.
-      if [ -s "$SESSIONS" ]; then
-        "$JQ" -r '[.sessions | to_entries[]
-                   | select((.key | startswith("hook-")) and .value.stopped != true)]
-                  | length' "$SESSIONS" 2>/dev/null || printf '0'
-      else
-        printf '0'
-      fi
+      # $1 = a snapshot from hook_capacity_snapshot, so a caller reading both
+      # .used and .max reads them from the SAME check — two separate
+      # `agent-box-session capacity` calls could straddle a session starting or
+      # stopping between them and report numbers that never coexisted.
+      [ -n "$1" ] && "$JQ" -er '.used' <<<"$1" 2>/dev/null || printf 'null\n'
     }
 
     hook_max() {
-      # The ceiling itself. It is an env knob on the RECEIVER daemon unit, whose
-      # environment this process does not share, so a box that raised it there and
-      # nowhere else would read the built-in here. That is why a recorded refusal
-      # carries the cap the wrapper actually applied: when the two disagree,
-      # lastRefusal.max is the one that was enforced. Unset on both sides — the
-      # normal case — makes them the same number.
-      m="''${AGENT_BOX_HOOK_SESSION_MAX:-4}"
-      case "$m" in (""|*[!0-9]*) m=4 ;; esac
-      printf '%s' "$m"
+      [ -n "$1" ] && "$JQ" -er '.max' <<<"$1" 2>/dev/null || printf 'null\n'
     }
 
     dispatch_topics() {
@@ -5991,15 +6199,19 @@ _hc_main "$@"
       # print when the ceiling has stalled the watches, and nothing when it has
       # not. One wording in one place: two copies would drift, and this is the
       # sentence the reader acts on.
+      if [ "$1" = null ] || [ "$2" = null ]; then
+        printf '%s' "Cannot determine shared session capacity; inspect agent-box-session capacity."
+        return 0
+      fi
       [ "$1" -ge "$2" ] || return 0
-      printf '%s' "$1 of at most $2 hook-* sessions are running, so every \
+      printf '%s' "$1 of at most $2 sessions are running or queued, so every \
     standing watch is stalled: a matching event batch starts nothing now. The \
     spawn wrapper DECLINES it (exit 75) and the receiver holds it, re-offering it \
     as slots free and dropping it only once the wait outlasts \
     LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — so clearing the cap is still the fix. Free \
     a slot (agent-box-session ls, then agent-box-session stop NAME, or \
     agent-box-session rm NAME to delist it for good), or raise \
-    AGENT_BOX_HOOK_SESSION_MAX on the receiver daemon unit."
+    sessionLimit in the box configuration."
     }
 
     # local-webhook >= 0.23.0 refuses to create a --deliver-to subagent entry
@@ -6292,7 +6504,8 @@ _hc_main "$@"
         ensure_state
         "$PY" "$SCRIPT" "$cmd" "$@"
         if [ "$(dispatch_topics)" -gt 0 ]; then
-          w="$(hook_capacity_warning "$(hook_sessions)" "$(hook_max)")"
+          cap="$(hook_capacity_snapshot)"
+          w="$(hook_capacity_warning "$(hook_sessions "$cap")" "$(hook_max "$cap")")"
           [ -z "$w" ] || echo "agent-box-webhook: $w Run" \
             "'agent-box-webhook status' for the last refused batch." >&2
         fi
@@ -6363,8 +6576,9 @@ _hc_main "$@"
         # ...and the third: whether a standing watch could spawn anything at all
         # (issue #170). dispatchTopicCount says how many are subscribed; it does
         # not say that the box is at its hook-* ceiling, which drops every match.
-        hlive="$(hook_sessions)"
-        hmax="$(hook_max)"
+        cap="$(hook_capacity_snapshot)"
+        hlive="$(hook_sessions "$cap")"
+        hmax="$(hook_max "$cap")"
         dtopics="$(printf '%s' "$out" | "$JQ" -r '.dispatchTopicCount // 0')"
         refusal=null
         if [ -s "$HOOK_REFUSED" ]; then
@@ -7831,457 +8045,6 @@ set -eu
 # `if`), so the failure would be silent — the watch panel would quietly report
 # the wrong worker and the wrong arguments.
 JQ="''${AGENT_BOX_JQ_BIN:-jq}"
-# The session registry — where it lives, how it is locked and how it is
-# rewritten — is one file every shell writer splices in (issue #254). This one
-# only LOCKS: the write is done by the `agent-box-session add` it execs into,
-# which inherits the lock (see below).
-REGISTRY_PROG=agent-box-webhook-spawn
-# The session registry's write protocol, spelled once (issue #254).
-#
-# ~/.config/agent-box/sessions.json is INTENT: what the operator asked this box
-# to run — name, agent, working directory, prompts, stopped. The one field
-# that is an OBSERVATION rather than intent is `died` (issue #516), and it is
-# here because it is the other half of what the pane epilogue already records
-# next to `stopped`: the same writer, the same ending, one of two branches. A
-# lost update on it costs the pre-#516 reading — a dead session shown as
-# running — never a worse one. FIVE programs
-# write it (the session CLI, the supervisor's reconcile loop, the mark-stopped
-# pane epilogue, the webhook spawn wrapper, the settings daemon's three
-# routes), and every one of them replaces the file by rename. That buys exactly
-# ONE guarantee: a reader never sees half a document. It says nothing about the
-# interval between a writer's read and its rename, so two writers that start
-# from the same base each publish a document that never contained the other's
-# edit, and a one-field update silently reverts every field the other writer
-# changed. Measured on the live box: two writers of the registry_edit shape
-# below lost 96 of 300 updates (32%).
-#
-# So the four SHELL writers splice this file in (the assembler resolves nested
-# includes) rather than carrying a copy each. What they have to agree on is
-# small — the sidecar path, the primitive, the bound, who may skip the lock —
-# and a copy per program is how those four facts drift apart. A lock only some
-# writers take is not a lock.
-#
-# The fifth writer is python: the settings daemon takes the same flock(2) on
-# the same sidecar through fcntl, and its sessions_lock() cites this file for
-# the protocol rather than restating it. tests/test-registry.py holds the two
-# implementations to it from both sides, because that agreement is the whole
-# guarantee and nothing else checks it.
-#
-# The lock is a SIDECAR file, never the registry itself: every writer REPLACES
-# that inode, so a lock taken on the inode a writer read is not the lock the
-# next writer takes.
-#
-# READERS take no lock and need none — agent-box-webhook, the spot notifier and
-# the reads in this file's own callers all get a whole document from the
-# rename. The lock exists for the interval a read-modify-write spans.
-#
-# A lock this program cannot TAKE - a holder that times us out, a sidecar it
-# cannot create - refuses the mutation and changes nothing (issue #633). It
-# used to carry on unlocked and say so, which is the pre-#254 lost-update
-# behaviour reintroduced at exactly the moment there is provably another
-# writer: the rename at the end is atomic, but two unlocked read-modify-writes
-# are not, so the loser's edit is reverted wholesale and the caller is told it
-# succeeded. Refusing costs one retry; continuing costs a session. Note that
-# this is NOT the same as having no lock at all: an EMPTY REGISTRY_FLOCK is a
-# caller stating there is no flock on this box, which still writes (see the
-# assignment below), because a box that never had the primitive must still be
-# able to add, start and stop a session.
-#
-# The refusal is REGISTRY_BUSY_RC, 75 (EX_TEMPFAIL) - the same "declined for
-# now, ask again" code agent-box-webhook-spawn already answers its dispatcher
-# with, and distinct from the 1 a jq or a rename failure returns, which no
-# retry will fix. registry_edit, registry_ensure and registry_selfheal all
-# return it; a caller under `set -e` therefore exits 75 with no ceremony. The
-# two writers that do not run under `set -e` come back later instead: the
-# supervisor skips the step and reconciles again in ~2s, and the pane
-# epilogue already retries its write three times.
-#
-# What a caller may set before the include, all optional:
-#   REGISTRY_FILE       the registry path, when the caller already knows it
-#   REGISTRY_PROG       the name the one warning below prints
-#   REGISTRY_JQ         jq, when it is not on this program's PATH
-#   REGISTRY_FLOCK      flock, likewise; EMPTY means "no lock, carry on"
-#   REGISTRY_LOCK_WAIT  seconds to wait for a holder (the test shortens it)
-#
-# AGENT_BOX_SESSIONS_FILE is what the settings daemon is told; the mark-stopped
-# epilogue is generated per user and bakes the path rather than trusting an
-# inherited $HOME, and every other writer runs as the user whose registry it
-# is.
-: "''${REGISTRY_FILE:=''${AGENT_BOX_SESSIONS_FILE:-$HOME/.config/agent-box/sessions.json}}"
-: "''${REGISTRY_PROG:=agent-box}"
-: "''${REGISTRY_JQ:=jq}"
-# flock ships in util-linux ONLY, which is not on every PATH a writer here runs
-# from: a plain `su -c 'agent-box-session ...'` gets the system PATH, the
-# webhook receiver unit's PATH is jq + coreutils + the session CLI, and the
-# pane epilogue has none worth the name. So each generated wrapper pins the
-# binary — the AGENT_BOX_*_BIN convention. Unset means no lock and no error: a
-# session must still be addable, startable and stoppable on a box whose module
-# predates this.
-# Assigned only when UNSET, never when empty: "" is a caller saying it has no
-# flock, and must not be answered with one from the environment.
-: "''${REGISTRY_FLOCK=''${AGENT_BOX_FLOCK_BIN:-}}"
-: "''${REGISTRY_LOCK_WAIT:=10}"
-# What every mutator in here returns when the lock could not be taken: 75,
-# EX_TEMPFAIL, "declined for now" (issue #633). Retryable by construction -
-# nothing was read, nothing was written - and deliberately not 1, which this
-# file already uses for the failures a retry cannot help (a filter jq refused,
-# a rename onto a full disk).
-REGISTRY_BUSY_RC=75
-# 1 while the lock is genuinely held — taken here, inherited, or nested inside
-# a section that holds it. Only the webhook spawn wrapper reads it, because it
-# may advertise an inherited fd only if it really got the lock.
-REGISTRY_HELD=0
-_registry_depth=0
-# 1 once the refusal below has been printed, so the supervisor's reconcile
-# loop says it once per streak rather than every two seconds for as long as a
-# holder is wedged or a home is read-only. Cleared by the next lock actually
-# taken, so a second outage is reported as loudly as the first. Same latch
-# shape as registry_selfheal's two.
-_registry_lock_warned=0
-
-registry_close_fd() {
-  # Close fd 9 and NOTHING ELSE. The braces are the whole point: `exec` with no
-  # command applies its redirections to the CURRENT SHELL and keeps them, so
-  # the obvious `exec 9>&- 2>/dev/null` closes the lock fd and then sends this
-  # program's stderr to /dev/null for the rest of its life. That is how the
-  # supervisor lost every diagnostic it prints after its first unlock —
-  # including the line a VM test waits for — and it is why the same shape in
-  # registry_lock wraps the OPEN in braces too: a redirection on a group is
-  # scoped to the group, while `exec`'s own fd change survives it.
-  { exec 9>&-; } 2>/dev/null || true
-}
-
-_registry_refuse() {
-  # _registry_refuse REASON - the one exit from registry_lock that did not
-  # get the lock. Unwinds the depth counter to 0 so a caller that goes on to
-  # call registry_unlock anyway unlocks nothing, and so the NEXT
-  # registry_lock starts a fresh attempt rather than believing it is nested
-  # inside a section nobody holds. That second half is why the pane epilogue
-  # skips its whole pass on a refusal: a fresh attempt means a fresh
-  # REGISTRY_LOCK_WAIT, and falling through would spend two of them.
-  _registry_depth=0
-  [ "$_registry_lock_warned" = 1 ] || \
-    echo "$REGISTRY_PROG: cannot lock $REGISTRY_FILE ($1); refusing to change" \
-         "it rather than racing another writer - nothing was written, and a" \
-         "retry is safe (issue #633)" >&2
-  _registry_lock_warned=1
-}
-
-registry_lock() {
-  # 0 with the lock held (or deliberately not taken, see REGISTRY_FLOCK),
-  # REGISTRY_BUSY_RC when it could not be taken and the caller must not
-  # write. A caller that gets non-zero must NOT call registry_unlock; doing
-  # so anyway is harmless, because the depth is already back at 0.
-  #
-  # Nesting-safe on purpose: flock(2) conflicts between two open file
-  # DESCRIPTIONS, including two of the same process, so a second fd on the
-  # sidecar blocks a writer against ITSELF (verified). Both the supervisor
-  # (start_session holds the lock across the mark_started it calls) and the
-  # session CLI (a check-then-write around registry_edit) do exactly that.
-  _registry_depth=$((_registry_depth + 1))
-  [ "$_registry_depth" = 1 ] || return 0
-  # An INHERITED lock: agent-box-webhook-spawn holds this lock across its exec
-  # into `agent-box-session add`, so its hook-session cap check and the add are
-  # one step. It hands the fd over and says so through the environment;
-  # re-opening fd 9 here would first CLOSE that description and drop the lock
-  # it took.
-  if [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" = 9 ]; then
-    REGISTRY_HELD=1
-    return 0
-  fi
-  [ -n "$REGISTRY_FLOCK" ] || return 0
-  # A missing directory is a first boot, which is the one moment when even
-  # CREATION races (issue #289) — so make it and take the lock, rather than
-  # writing the file that decides which sessions exist with no lock at all.
-  { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null \
-    || { [ -d "''${REGISTRY_FILE%/*}" ] || {
-           # mkdir -p only applies a mode when it creates every missing
-           # component and does so under umask (issue #78): the tmpfiles
-           # rule that is supposed to leave this 0700 can lose a boot-order
-           # race against this user's own creation. Only chmod on a directory
-           # we are creating here, never one that already existed — a test
-           # deliberately leaves an existing directory read-only to simulate
-           # a full disk, and this must not undo that.
-           mkdir -p "''${REGISTRY_FILE%/*}" 2>/dev/null
-           chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
-         }
-         { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
-    || { _registry_refuse "could not open $REGISTRY_FILE.lock"
-         return "$REGISTRY_BUSY_RC"; }
-  # Bounded, never an unbounded wait: nothing may park the supervisor's
-  # reconcile loop (every session on the box waits behind it) or a CLI a user
-  # is waiting on. A holder that times us out is answered with the refusal
-  # rather than an unlocked write: the wait is what makes a refusal rare, and
-  # a bad write is not a better answer than a retry (issue #633).
-  if "$REGISTRY_FLOCK" -w "$REGISTRY_LOCK_WAIT" 9; then
-    REGISTRY_HELD=1
-    _registry_lock_warned=0
-    return 0
-  fi
-  # Closed FIRST, so the fd does not outlive the attempt and block the next
-  # one, and before the message, so a caller reading stderr sees a refusal
-  # that is already complete.
-  registry_close_fd
-  _registry_refuse "timed out after ''${REGISTRY_LOCK_WAIT}s waiting for another writer"
-  return "$REGISTRY_BUSY_RC"
-}
-
-registry_unlock() {
-  [ "$_registry_depth" -gt 0 ] || return 0
-  _registry_depth=$((_registry_depth - 1))
-  [ "$_registry_depth" = 0 ] || return 0
-  # An inherited fd belongs to the process that opened it: closing it here
-  # would drop a lock this program never took.
-  [ "''${AGENT_BOX_REGISTRY_LOCK_FD:-}" != 9 ] || return 0
-  REGISTRY_HELD=0
-  registry_close_fd
-}
-
-registry_edit() {
-  # registry_edit JQ_ARGS... — rewrite the registry through jq as ONE
-  # read-modify-write under the lock. The document arrives on jq's stdin, not
-  # as an argument, so a filter may end in `--args -- "$@"` without the path
-  # being read as one of those arguments.
-  #
-  # Returns 1 with the registry untouched when jq fails, and
-  # REGISTRY_BUSY_RC with it untouched when the lock could not be taken
-  # (issue #633) — the whole read-modify-write is skipped, so the file is
-  # byte-for-byte what it was. jq's own stderr is
-  # left alone: a caller that must stay quiet — the pane epilogue prints into
-  # the user's terminal — redirects it at the call site, which keeps that
-  # policy where the reason for it is.
-  #
-  # The lock nests, so a caller already holding it across a check-then-write
-  # keeps holding it here and does not deadlock against itself.
-  registry_lock || return "$REGISTRY_BUSY_RC"
-  _registry_tmp="$(mktemp "$REGISTRY_FILE.XXXXXX")" || { registry_unlock; return 1; }
-  # The RENAME is checked too, not just jq: a read-only $HOME or a full disk
-  # must not be reported as a write to the two writers that do not run under
-  # `set -e` (the supervisor and the pane epilogue would carry on as if the
-  # flag had stuck), and must not leave a sessions.json.XXXXXX behind for the
-  # two that do.
-  if "$REGISTRY_JQ" "$@" < "$REGISTRY_FILE" > "$_registry_tmp" \
-     && mv "$_registry_tmp" "$REGISTRY_FILE"; then
-    registry_unlock
-    return 0
-  fi
-  rm -f "$_registry_tmp"
-  registry_unlock
-  return 1
-}
-
-registry_valid() {
-  # 0 when the registry is usable: ONE JSON document, an object, with a
-  # `sessions` OBJECT in it — the shape every reader here indexes by session
-  # name.
-  #
-  # `-s` is what makes this agree with the settings daemon's json.load().
-  # jq on its own reads a STREAM of values, so a registry with garbage
-  # appended parses far enough to yield the first document's session names
-  # and only then fails (measured: the reconcile loop printed "claude" and
-  # exited 5), while python refuses the same file outright. Slurping makes
-  # both sides call that same file corrupt, which matters because the
-  # daemon refuses to WRITE a file this says is fine.
-  "$REGISTRY_JQ" -s -e \
-    'length == 1 and (.[0] | type == "object")
-     and (.[0].sessions | type == "object")' \
-    "$REGISTRY_FILE" >/dev/null 2>&1
-  _registry_valid_rc=$?
-  return "$_registry_valid_rc"
-}
-
-registry_jq_ran() {
-  # 0 when the LAST registry_valid actually got an answer out of jq, whatever
-  # that answer was. 1 when jq never ran at all.
-  #
-  # The distinction is the difference between "this file is corrupt" and "I
-  # cannot tell", and registry_selfheal DESTROYS the registry on the first
-  # reading. 126 (found, not executable) and 127 (not found) are the shell's
-  # own codes for a command it could not start, and no jq exit status
-  # collides with them: jq answers 1 for a false filter, 2 for usage, 3 for a
-  # compile error and 5 for input it could not parse.
-  #
-  # This is not hypothetical. A native box's supervisor resolves its tools
-  # through /nix/var/nix/profiles/agent-box/bin, the very symlink an update
-  # swaps -- so a long-running supervisor loses jq, flock and sleep
-  # mid-update, while it is still looping. Measured on a live box during the
-  # 2026-09-08 update: every parse check failed with 127, registry_selfheal
-  # read that as corruption, and quarantined a registry that parses
-  # perfectly, taking a runtime session (and its work) with it. The same
-  # thing had happened silently a day earlier and cost five sessions. The
-  # quarantined copies are the proof: `jq -e . sessions.json.corrupt-*`
-  # accepts both.
-  case "''${_registry_valid_rc:-0}" in (126|127) return 1 ;; esac
-  return 0
-}
-
-# 1 once the "could not move it aside" warning below has been printed, so a
-# loop that calls this every couple of seconds says it once per transition
-# rather than forever.
-_registry_heal_warned=0
-# The same latch for the other refusal: jq could not be run, so nothing can
-# be judged. Separate, because the two states come and go independently -- an
-# update takes jq away and gives it back, a read-only home does not.
-_registry_jq_warned=0
-
-registry_selfheal() {
-  # registry_selfheal [SEED] — a registry that does not PARSE is not an empty
-  # registry (issue #279). Both halves of the box used to read it as one:
-  # the reconcile loop sent jq's error to /dev/null and iterated over
-  # nothing, so no session started, nothing was logged and the unit stayed
-  # `active (running)` — a box that looks idle. And the seed could not
-  # repair it, because registry_ensure re-seeds only when the file is
-  # MISSING OR EMPTY, and a corrupt one is neither.
-  #
-  # So the bad file is moved aside — kept, never deleted: it is the only
-  # record of what the operator had asked this box to run, and reading it
-  # back by hand is the one way to restore a session that is not in the
-  # seed — and the registry is re-created from the seed. Losing the
-  # declared sessions to a fresh start is a worse outcome than losing none,
-  # but both are better than a box that silently runs nothing.
-  #
-  # Only for the SUPERVISOR to call. The other writers reach the registry
-  # through registry_edit, which fails closed on a document jq cannot read
-  # and leaves the file exactly as it was; healing is the job of the one
-  # program that is already looping.
-  registry_valid && { _registry_heal_warned=0; return 0; }
-  # Nothing is quarantined, moved or re-seeded without the lock (issue #633):
-  # this function DESTROYS the registry it judges, and the writer it would be
-  # racing is one that has already read the good document and is about to
-  # rename it into place. The supervisor calls this every couple of seconds,
-  # so the answer to a busy lock is simply the next tick.
-  registry_lock || return "$REGISTRY_BUSY_RC"
-  # Re-check under the lock: every writer publishes by rename, so a document
-  # that landed between the check above and this line is WHOLE. Quarantining
-  # it would throw away a perfectly good registry.
-  if registry_valid; then
-    registry_unlock
-    _registry_heal_warned=0
-    return 0
-  fi
-  # Could jq even run? If not, this function knows NOTHING about the file and
-  # must not act -- quarantining on an unanswered question is how a valid
-  # registry gets destroyed (see registry_jq_ran). Wait for the next tick
-  # instead: the tool comes back when the update finishes, and a registry
-  # left alone can still be read by everything else.
-  #
-  # Deliberately before the existence test below, so a MISSING file is not
-  # re-seeded either. "The file is not there" is a claim about the disk that
-  # this function has not established while its only reader is broken, and
-  # seeding over a registry that was in fact present is the same data loss by
-  # another route.
-  if ! registry_jq_ran; then
-    [ "$_registry_jq_warned" = 1 ] || \
-      echo "$REGISTRY_PROG: cannot run '$REGISTRY_JQ' (exit" \
-           "$_registry_valid_rc); leaving $REGISTRY_FILE alone rather than" \
-           "calling it corrupt, and retrying next tick (issue #279)" >&2
-    _registry_jq_warned=1
-    registry_unlock
-    return 1
-  fi
-  _registry_jq_warned=0
-  # A file that is not there at all is a first boot or a deleted registry,
-  # not corruption: there is nothing to keep, and registry_ensure below
-  # creates it.
-  if [ -e "$REGISTRY_FILE" ]; then
-    _registry_bad="$REGISTRY_FILE.corrupt-$(date +%Y%m%d-%H%M%S)"
-    if mv -f "$REGISTRY_FILE" "$_registry_bad" 2>/dev/null; then
-      echo "$REGISTRY_PROG: $REGISTRY_FILE does not parse;" \
-           "moved it to $_registry_bad and re-seeding (issue #279)" >&2
-    else
-      # A read-only home or a full disk. Say so ONCE — the alternative is
-      # this line every two seconds for as long as the box is up — and
-      # leave the file alone rather than pretending it was handled.
-      [ "$_registry_heal_warned" = 1 ] || \
-        echo "$REGISTRY_PROG: $REGISTRY_FILE does not parse and could not be" \
-             "moved aside; no session can start (issue #279)" >&2
-      _registry_heal_warned=1
-      registry_unlock
-      return 1
-    fi
-  fi
-  _registry_heal_warned=0
-  # STILL HOLDING THE LOCK: moving the bad file aside and re-seeding are one
-  # step. Release between them and `agent-box-session add` can create the
-  # registry in the gap — registry_ensure never clobbers a file that exists,
-  # so the declared sessions would stay unseeded on that boot and every later
-  # one, which is the outcome this whole function exists to avoid. Same
-  # reasoning as issue #289, which put creation inside the protocol in the
-  # first place. registry_ensure takes the lock again and the lock nests, so
-  # this does not deadlock against itself.
-  registry_ensure "''${1:-}"
-  _registry_heal_rc=$?
-  registry_unlock
-  return "$_registry_heal_rc"
-}
-
-registry_ensure() {
-  # registry_ensure [SEED] — make sure the registry EXISTS, inside the same
-  # critical section as everything that writes it (issue #289).
-  #
-  # Creation was the one step outside the protocol, and two paths create the
-  # file: `agent-box-session add` (an empty registry) and the supervisor's
-  # first-boot seed (the Nix-declared one). Both asked "is it empty?" with no
-  # lock held, and the units that run them start in parallel, so on a first
-  # boot a `hook-*` session added by the webhook spawner could be replaced
-  # wholesale by the seed landing on top of it — and the batch that spawned
-  # that session is never redelivered.
-  #
-  # An existing file is never touched, seed or no seed: sessions are RUNTIME
-  # data (issue #59), so a rebuild must not clobber what the operator changed
-  # while the box was live.
-  #
-  # Which means the lock makes the first-boot race DETERMINISTIC rather than
-  # merging its two outcomes, and the losing outcome is worth stating: if an
-  # `add` gets there first — a webhook spawn on a box that has just come up —
-  # it publishes an empty registry, this seed then finds a non-empty file, and
-  # the sessions declared in the NixOS config are not seeded on that boot or
-  # any later one. That is the same rule as above (a registry that exists is
-  # the operator's, not the config's) and it is preferable to the reverse,
-  # where the seed silently deletes a session that was already added and the
-  # webhook batch behind it is never redelivered. An operator who wants the
-  # declared set back deletes sessions.json and restarts the unit.
-  # Same self-heal as registry_lock's fallback branch above, and the same
-  # existed-already guard: only chmod a directory THIS call creates, never
-  # one already there — a test deliberately leaves an existing directory
-  # read-only to simulate a full disk, and this must not undo that.
-  [ -d "''${REGISTRY_FILE%/*}" ] || {
-    mkdir -p "''${REGISTRY_FILE%/*}"
-    chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
-  }
-  # Creation is a mutation like any other and refuses like one (issue #633):
-  # the whole reason it is inside the protocol (issue #289) is that a seed
-  # landing on top of a just-added session loses that session for good, and
-  # an unlocked creation is exactly that race back again.
-  registry_lock || return "$REGISTRY_BUSY_RC"
-  if [ ! -s "$REGISTRY_FILE" ]; then
-    # A seed is trusted only after it PASSES this shape check (issue #356):
-    # two independent producers (this module's Nix-declared seed and the
-    # native backend's) write the file this reads, and a shape they disagree
-    # on — .sessions as a list instead of an object, seen live on the native
-    # side — used to be installed as-is. The reconcile loop then read a
-    # session name as an array index and jq errored "Cannot index array with
-    # string" every couple of seconds forever, with nothing pointing at the
-    # seed as the cause. Reject it once, loudly, instead.
-    if [ -n "''${1:-}" ] && "$REGISTRY_JQ" -e \
-         '(.version == 1) and (.sessions | type == "object")' \
-         "$1" >/dev/null 2>&1; then
-      install -m 0600 "$1" "$REGISTRY_FILE"
-    else
-      if [ -n "''${1:-}" ]; then
-        echo "$REGISTRY_PROG: seed $1 is not a valid sessions.json" \
-             '(want {"version":1,"sessions":{...}}); starting empty instead' >&2
-      fi
-      # 0600 like every other writer's output (the daemon's write_sessions, the
-      # seed above, and mktemp's own mode in registry_edit): the registry
-      # carries kickoff prompts and working directories, and only this user and
-      # root have any business reading them.
-      printf '{"version":1,"sessions":{}}\n' > "$REGISTRY_FILE"
-      chmod 600 "$REGISTRY_FILE"
-    fi
-  fi
-  registry_unlock
-}
 # A durable audit record for a hook-* session's GitHub claim, so an
 # assignment this box accepted is never silently lost when its worker dies
 # before saying so (issue #535).
@@ -8813,87 +8576,15 @@ fi
 PROMPT="$(cat)"
 [ -n "$PROMPT" ] || exit 0
 
-# The cap is a decision taken from a READ of the registry, and the add that
-# acts on it is a rename by another process, so the two have to be one
-# critical section or two dispatches can both pass a cap of 4 and land 5 hook
-# sessions (issue #254). The sidecar lock is held from here through the `exec`
-# into agent-box-session at the end of this script: the fd survives exec, and
-# AGENT_BOX_REGISTRY_LOCK_FD tells that CLI the lock is already ours so it
-# does not re-open fd 9 — which would first CLOSE this description and drop
-# the lock mid-decision.
-#
-# A lock this program could not take is not announced: the fd is exported only
-# when it really holds one, so the CLI opens its own rather than trusting an
-# empty promise. `|| true` because a refusal must not abort this script under
-# `set -e`: the cap check below is a READ, so running it unlocked costs at
-# worst a racy count, and the `add` this execs into takes the lock itself and
-# refuses with the same 75 if it cannot (issue #633) — which is exactly the
-# "declined for now" answer the dispatcher re-offers. So a webhook delivery
-# is still never dropped for want of a lock; it waits for one.
-registry_lock || true
-if [ "$REGISTRY_HELD" = 1 ]; then
-  export AGENT_BOX_REGISTRY_LOCK_FD=9
-fi
-
-# The ceiling on CONCURRENT hook-* sessions, and the record it leaves.
-#
-# The cap itself is right — webhook.py rate-limits and coalesces spawns but
-# bounds nothing over time, so agents that forget their `agent-box-session rm`
-# would otherwise fill the box. What was wrong was the ANSWER it gave. A
-# refusal used to print a message and `exit 1`, which the dispatcher cannot
-# tell apart from "command not found", so it dropped the batch for good — and
-# for a standing watch there is no session peer that received those events
-# anyway, so the loss was total. Its only trace was the receiver daemon's
-# journal, while `agent-box-webhook ls` and `status` kept reporting a healthy
-# subscription: four wedged hook sessions made every watch on the box inert,
-# and that reads exactly like a quiet repo (issue #170).
-#
-# The exit code is a three-way answer since local-webhook 0.16.0
-# (local-channels#28, agent-box#301): 0 accepted, 75 (EX_TEMPFAIL) declines
-# for NOW, anything else says the spawner is broken. Only the last drops the
-# batch. So the cap exits 75 and nothing else in this script does — a
-# malformed AGENT_BOX_HOOK_SESSION_ARGS or a failed `add` really is a broken
-# spawner, and re-offering those would loop. A declined batch goes back at the
-# head of its key's pending list, is re-offered as the rate window reopens
-# (LOCAL_WEBHOOK_SPAWN_WINDOW, 60s) and starts the moment a slot frees, with
-# every line re-checked against live session ownership first. It is dropped
-# only if the whole streak outlasts LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — which
-# the receiver unit raises well past the upstream 300s default, because a hook
-# session runs for tens of minutes and five is not a wait, it is a slower drop.
-#
-# On a box pinned to local-webhook < 0.16.0 the 75 reads as a broken spawner
-# and the batch is dropped exactly as it was before, so this is never worse
-# than what it replaces.
-#
-# Either way the refusal is written down where the CLI can find it, next to
-# the other per-user agent-box state. Cumulative, never cleared: "5 refused,
-# the last one 20 minutes ago" is the standing fact an agent needs, not
-# something to forget on the next successful spawn. `deferred` records which
-# answer this wrapper gave, so `status` does not report as lost a batch the
-# receiver may still be holding. It is that answer and nothing more: this
-# program is gone by the time the batch starts or is finally dropped, so
-# nothing here could keep a live queue state honest, and the field must not be
-# read as one.
+# Admission belongs to agent-box-session, shared with interactive starts.
+# The wrapper only records retryable refusals for webhook status.
 BOX_STATE="$HOME/.local/state/agent-box"
 REFUSED="$BOX_STATE/webhook-spawn-refused.json"
 
-MAX="''${AGENT_BOX_HOOK_SESSION_MAX:-4}"
-# A knob that is documented (agent-box-webhook --help) is a knob someone will
-# typo, and an unusable value must not take the standing watches down with it:
-# `[ n -ge foo ]` is a fatal error under set -e, which would refuse every batch
-# for a reason nobody could see.
-case "$MAX" in
-  (""|*[!0-9]*)
-    echo "agent-box-webhook-spawn: AGENT_BOX_HOOK_SESSION_MAX is not a number" \
-         "($MAX); using 4" >&2
-    MAX=4
-    ;;
-esac
-
 record_refusal() {
-  # $1 = the used hook-* capacity that triggered the refusal — the same number
-  # the message above printed, which is what is running or queued to start and
-  # NOT the raw registry key count (issue #280). Best effort: a state file that
+  # $1 = running/queued capacity in the post-refusal snapshot, or null
+  # when the status read failed. This is diagnostic, not an admission check.
+  # Best effort: a state file that
   # cannot be written must not turn a refused batch into a crashed spawner, so
   # every failure here is silent and the journal line above stays the fallback.
   mkdir -p "$BOX_STATE" 2>/dev/null || return 0
@@ -8910,7 +8601,7 @@ record_refusal() {
       --arg topic "''${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
       --arg key "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" \
       --argjson live "$1" --argjson max "$MAX" --argjson count "$((prev + 1))" \
-      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). `deferred` records the ANSWER this wrapper gave that batch: 75, which local-webhook >= 0.16.0 reads as declined-for-retry rather than a failure that drops it (agent-box#301). It is history and is never rewritten, so it stays true after the batch starts or after the receiver gives up on it at LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S; its absence means the batch was dropped outright. `live` is the capacity in use: hook-* sessions running or queued to start (agent-box#280). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max, deferred: true}
+      '{"//": "Written by agent-box-webhook-spawn when the shared session admission refused a standing-watch batch (agent-box#170). `deferred` records the ANSWER this wrapper gave that batch: 75, which local-webhook >= 0.16.0 reads as declined-for-retry rather than a failure that drops it (agent-box#301). It is history and is never rewritten, so it stays true after the batch starts or after the receiver gives up on it at LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S; its absence means the batch was dropped outright. `live` is the capacity in use: sessions running or queued at the post-refusal snapshot (agent-box#662). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max, deferred: true}
        + (if $topic == "" then {} else {topic: $topic} end)
        + (if $key == "" then {} else {key: $key} end)' \
       > "$REFUSED.$$" 2>/dev/null; then
@@ -8920,83 +8611,6 @@ record_refusal() {
   fi
   return 0
 }
-
-# tmux is deliberately NOT on the receiver unit's PATH (jq, coreutils and
-# agent-box-session are all of it), so the liveness probe below gets a pinned
-# binary through the unit environment instead — the AGENT_BOX_*_BIN convention
-# the supervisor and the settings daemon already use for the tools their PATH
-# withholds. Unset means "no probe", and the cap then falls back to counting
-# registry keys: over-counting drops a batch, while reading a failed probe as
-# "nothing is running" would uncap spawning altogether.
-TMUX_BIN="''${AGENT_BOX_TMUX_BIN:-tmux}"
-# The socket dir is the agent unit's RuntimeDirectory, derived here rather than
-# inherited (issue #268 — same rule and same value as src/session-cli.sh): an
-# ambient TMUX_TMPDIR, which `programs.tmux` with secureSocket exports through
-# /etc/profile, would point the probe at an empty directory where every hook
-# session looks finished and the cap would stop holding.
-export TMUX_TMPDIR="/run/agent-box-''${USER:-$(id -un)}"
-
-# Names of live hook-* tmux sessions on stdout, one per line. Exit 0 means the
-# answer can be trusted — including an empty one, which is what a box whose
-# tmux server is down legitimately reports. Exit 1 means tmux itself could not
-# be run, so the caller must not read that same empty output as "nothing is
-# running": `tmux -V` separates the two before the query.
-live_hook_sessions() {
-  "$TMUX_BIN" -V >/dev/null 2>&1 || return 1
-  "$TMUX_BIN" -L agent-box list-sessions -F '#S' 2>/dev/null || true
-}
-
-if [ -s "$REGISTRY_FILE" ]; then
-  # Registry keys: every hook-* entry, finished or not. This was the whole cap
-  # and is now only its fallback — nothing ever expires an entry (`stopped` is
-  # set by the pane epilogue, and only `agent-box-session rm` clears the key),
-  # so sessions that ended weeks ago kept holding dispatch capacity until four
-  # of them made every standing watch inert with nothing running (issue #280).
-  # The probe costs two tmux round trips, so it only runs once the keys claim
-  # we are full.
-  keys=$("$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' "$REGISTRY_FILE")
-  used="$keys"
-  if [ "$keys" -ge "$MAX" ]; then
-    if panes=$(live_hook_sessions); then
-      # Capacity is held by what is running or about to run: a live hook-* tmux
-      # session, or a listed hook-* entry that is not `stopped` — the
-      # supervisor's reconcile loop (re)starts one of those within ~2s, so it is
-      # load even in the second before it has a pane. A `stopped` entry is free:
-      # nothing respawns it until someone runs `agent-box-session restart`.
-      #
-      # Both halves matter. The listed half keeps the brake honest when the
-      # probe reaches a live tmux but the wrong (or an empty) socket dir; the
-      # pane half counts agents no entry claims — hand-started ones, and any
-      # delisted while still running.
-      used=$(printf '%s\n' "$panes" | "$JQ" -R -s --slurpfile reg "$REGISTRY_FILE" '
-        (split("\n") | map(select(startswith("hook-")))) as $panes
-        | ($reg[0].sessions // {} | to_entries
-           | map(select((.key | startswith("hook-")) and .value.stopped != true))
-           | map(.key)) as $listed
-        | $panes + $listed | unique | length')
-    else
-      echo "agent-box-webhook-spawn: cannot ask tmux which hook-* sessions are" \
-           "live ($TMUX_BIN did not run); counting all $keys registry entries" \
-           "instead, so a finished session still holds its slot" >&2
-    fi
-  fi
-  if [ "$used" -ge "$MAX" ]; then
-    echo "agent-box-webhook-spawn: $used hook-* sessions are running or queued to" \
-         "start (max $MAX); declining this batch for now — the receiver keeps it" \
-         "and offers it again when a slot frees. 'agent-box-session ls' shows" \
-         "which; stopping one frees its slot and 'agent-box-session rm NAME'" \
-         "delists it for good" >&2
-    # The number recorded is the number refused on: `agent-box-webhook status`
-    # must report the capacity the wrapper applied, not a second opinion.
-    record_refusal "$used"
-    echo "agent-box-webhook-spawn: recorded in $REFUSED;" \
-         "'agent-box-webhook status' reports it" >&2
-    # 75, not 1: EX_TEMPFAIL is the only code the dispatcher reads as "declined
-    # for now" rather than "this spawner is broken" (agent-box#301). Every
-    # other exit in this script stays what it was.
-    exit 75
-  fi
-fi
 
 # hook-<key>-<4 hex>: the key names the repo/object the events belong to,
 # so the workspace tab is readable; it is payload-derived, so sanitize to
@@ -9275,10 +8889,7 @@ note="''${LOCAL_WEBHOOK_SPAWN_NOTE:+ (\"$LOCAL_WEBHOOK_SPAWN_NOTE\")}"
 # session works. Rendered by the one command that answers it, rather than a
 # second copy of the query here.
 #
-# READ-ONLY, which is what makes it safe to run from here: this script is
-# holding the registry lock across its exec into `agent-box-session add`, and
-# a verb that took the lock would deadlock every dispatch on the box (see
-# `peers` in src/session-cli.sh, which says the same thing from its side).
+# READ-ONLY, which is what makes it safe to run from here: the peer snapshot is advisory; admission is checked atomically by add.
 #
 # stderr is folded into the text on purpose. The one thing this block must
 # never do is report a busy box as an empty one, so a probe that could not run
@@ -9308,14 +8919,20 @@ pflag=()
 # `died` rather than parked (issue #516), so it stays listed and attachable
 # for inspection exactly as before -- and every surface now says the agent
 # is gone instead of reporting the post-mortem shell as a running session.
-if [ "''${#extra[@]}" -gt 0 ]; then
-  exec "$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
+rc=0
+"$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
 
-$PROMPT" -- "''${extra[@]}"
+$PROMPT" -- "''${extra[@]}" || rc=$?
+if [ "$rc" = 75 ]; then
+  # Capacity may change after the refusal; this is a diagnostic snapshot,
+  # never a second admission decision. Lock failures are retryable too.
+  snapshot="$("$SESSION_BIN" capacity 2>/dev/null)" || snapshot='{}'
+  MAX="$(printf '%s' "$snapshot" | "$JQ" '.max // null')"
+  used="$(printf '%s' "$snapshot" | "$JQ" '.used // null')"
+  record_refusal "$used"
+  echo "agent-box-webhook-spawn: session start deferred; receiver will retry" >&2
 fi
-exec "$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
-
-$PROMPT"
+exit "$rc"
   '');
 
   # Declared standing-watch policy (webhook.watchPolicy), rendered once into
@@ -9720,6 +9337,7 @@ esac
     { "name": "AGENT_BOX_HOSTNAME_BIN", "kind": "bin", "program": "hostname" },
     { "name": "AGENT_BOX_ENV_EXEC", "kind": "bin", "program": "agent-box-env-exec" },
     { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" },
+    { "name": "AGENT_BOX_CAPACITY_BIN", "kind": "bin", "program": "agent-box-session-capacity" },
     { "name": "AGENT_BOX_ENVSTORE_BIN", "kind": "bin", "program": "agent-box-envstore" }
   ],
   "execStart": [
@@ -10019,6 +9637,7 @@ esac
     # /usr/local/bin/agent-box-session, the wrapper it generates there.
     "agent-box-session" = "${sessionCli}/bin/agent-box-session";
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
+    "agent-box-session-capacity" = "${capacityCli}/bin/agent-box-session-capacity";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
@@ -11156,6 +10775,7 @@ esac
     # loop calling this every couple of seconds says it once per failure streak
     # rather than forever (same latch shape as registry_selfheal's own).
     _tmux_boot_warned=0
+    _capacity_waiting=" "
 
     ensure_tmux_server() {
       # Bring the tmux server up before anything decides whether there is even a
@@ -11216,6 +10836,69 @@ esac
     # and a home that predates this release gains it. Best effort — a mkdir that
     # fails must never keep sessions from starting.
     mkdir -p "$HOME"/worktrees 2>/dev/null || :
+
+    # Seed nix's nixpkgs git cache from the image, when the image carries one
+    # (issue #669). A box's FIRST harness install spends ~25s of its ~36s turning
+    # the pinned nixpkgs tarball into git objects under
+    # ~/.cache/nix/tarball-cache-v2, before nix has read a line of any package
+    # definition: 54,075 blobs SHA-1'd and deflated, CPU-bound, on every box. That
+    # work is byte-identical everywhere and is the SAME revision for every harness
+    # (agent_install resolves them all against $AGENT_BOX_NIXPKGS), so an image can
+    # carry it once for ~72 MiB and every user's first install of every tool skips
+    # it. Measured on a 2-vCPU aarch64 box: 36.0s -> 10.6s.
+    #
+    # Both halves or neither: the packfiles are the objects, and the 124 KiB
+    # fetcher-cache sqlite is the URL -> treeHash map. Packs alone leave nix unable
+    # to learn the tree hash without redoing the ingest (23.7s, i.e. no saving).
+    #
+    # cp -al, so the packfiles are HARDLINKED rather than copied. They are
+    # immutable and mode 0444, so every user's cache points at one set of inodes
+    # and a second user costs no disk. git alternates would be the obvious
+    # mechanism for that and does NOT work: nix's libgit2 path ignores
+    # objects/info/alternates and re-ingests from scratch. The sqlite is mutable,
+    # so that one is a real copy. Across a filesystem boundary (a deployment that
+    # splits /var from /home) the hardlink fails and a plain copy stands in.
+    #
+    # Staged under a temp name and renamed, so a seed interrupted halfway cannot
+    # leave a PARTIAL cache behind that the -d guard would then treat as seeded.
+    #
+    # Inert on a box whose image carries no seed, which is every box today, so
+    # there is nothing to migrate. A user who already has a cache keeps it,
+    # including one holding a nixpkgs NEWER than the image's. Best effort, like
+    # the mkdir above: a seed that fails just means the first install pays what it
+    # pays today.
+    _abs_seed="''${AGENT_BOX_NIXPKGS_CACHE_SEED:-/var/lib/agent-box/nixpkgs-cache}"
+    if [ -d "$_abs_seed/tarball-cache-v2" ] &&
+       [ ! -d "$HOME/.cache/nix/tarball-cache-v2" ] &&
+       mkdir -p "$HOME"/.cache/nix 2>/dev/null; then
+      _abs_tmp="$HOME/.cache/nix/.tarball-cache-v2.seeding.$$"
+      _abs_sqlite_tmp="$HOME/.cache/nix/.fetcher-cache-v4.sqlite.seeding.$$"
+      rm -rf "$_abs_tmp" "$_abs_sqlite_tmp" 2>/dev/null || :
+      # Stage the sqlite BEFORE the packfiles: a target dir a fallback cp lands
+      # in already exists (it was created, then partly populated, by the failed
+      # cp -al before it), so cp -a copies INTO it as a nested tarball-cache-v2/
+      # rather than populating it directly - clear it between attempts. And
+      # publish the sqlite BEFORE tarball-cache-v2, not after: the -d guard above
+      # is keyed on tarball-cache-v2 alone, so it is the one file that must land
+      # LAST. Publishing it first would let a kill between the two mv's (a spot
+      # interruption, an OOM kill) leave the guard satisfied with no sqlite ever
+      # written - stuck there forever, since a later boot would see the directory
+      # and skip seeding for good. Publishing the sqlite first and the directory
+      # last means the same interruption instead leaves the guard UNsatisfied, so
+      # the next boot retries the whole seed - `mv -n` no-ops harmlessly on the
+      # sqlite that retry finds already in place.
+      if cp -an "$_abs_seed"/fetcher-cache-v4.sqlite "$_abs_sqlite_tmp" 2>/dev/null &&
+         { cp -al "$_abs_seed"/tarball-cache-v2 "$_abs_tmp" 2>/dev/null ||
+           { rm -rf "$_abs_tmp" 2>/dev/null
+             cp -a "$_abs_seed"/tarball-cache-v2 "$_abs_tmp" 2>/dev/null; }; }; then
+        if mv -n "$_abs_sqlite_tmp" "$HOME"/.cache/nix/fetcher-cache-v4.sqlite 2>/dev/null; then
+          mv -Tn "$_abs_tmp" "$HOME"/.cache/nix/tarball-cache-v2 2>/dev/null || :
+        fi
+      fi
+      rm -rf "$_abs_tmp" "$_abs_sqlite_tmp" 2>/dev/null || :
+      unset _abs_tmp _abs_sqlite_tmp
+    fi
+    unset _abs_seed
 
     # Prepopulated agent profiles (issue #493). "Add session" is profile-first,
     # so a box whose profile list is empty offers nothing to start with. The
@@ -12625,6 +12308,18 @@ esac
       # already running are untouched either way.
       registry_lock || return 0
       listed || { registry_unlock; return 0; }
+      # Reservations also constrain seed/reboot recovery and hand-edited state.
+      if capacity_notice="$("''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" spawn "$REGISTRY_FILE" "$sname" 2>&1)"; then
+        _capacity_waiting="''${_capacity_waiting// $sname / }"
+      else
+        case "$_capacity_waiting" in
+          (*" $sname "*) ;;
+          (*) echo "supervisor: $sname waiting: $capacity_notice" >&2
+              _capacity_waiting="$_capacity_waiting$sname " ;;
+        esac
+        registry_unlock
+        return 0
+      fi
       # Per-session webhook identity, passed via `tmux new-session -e` so it
       # lands in the SESSION environment — inherited by the agent AND by
       # anything the agent runs in that pane, which is what makes
@@ -12937,6 +12632,18 @@ esac
 in
 {
   options.services.agent-box = {
+    sessionLimit = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 4;
+      description = ''
+        Maximum running or queued sessions for the single-user v1 box.
+        Set this to the deployment's intended session budget (roughly one
+        per GiB). The explicit default avoids kernel memory reservations
+        rounding a nominal 4 GiB VM down to three sessions. This is overload
+        control, not a memory guarantee or a cross-user quota.
+      '';
+    };
+
     enable = lib.mkEnableOption "reproducible multi-user coding agent host";
 
     # Not a knob: what this module RENDERS, published so a test can read it
@@ -14267,7 +13974,9 @@ in
     # self-update service runs), so this always tracks the current module while
     # the seeded ~/AGENTS.md — which @imports this path — stays editable. Skipped
     # for users that opted out of seeding (agentsMd = null).
-    environment.etc = lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (name: u:
+    environment.etc = {
+      "agent-box/session-limit".text = "${toString cfg.sessionLimit}\n";
+    } // lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (name: u:
       lib.optional (u.agentsMd != null) (lib.nameValuePair "agent-box-guides/AGENTS.${name}.md" {
         source = canonicalAgentsMd name u;
         mode = "0444";
@@ -15156,7 +14865,7 @@ in
         # else in the two files shares a name — the library was written to
         # stay clear of the daemon's globals.
         flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" "E402" "F811" ];
-      } (envStoreLib + ''
+      } (envStoreLib + capacityLib + ''
 
 
 # Per-user settings daemon for agent-box (issue #36).
@@ -16029,6 +15738,9 @@ def write_sessions(sessions, version=REGISTRY_VERSION):
         raise
 
 
+_session_start_notices = {}
+
+
 def ensure_harness_session(agent, remote_control):
     """Auto-start one bare session for `agent` the moment its connect card
     signs in (issue #504), so install+login leaves an actual running
@@ -16062,6 +15774,7 @@ def ensure_harness_session(agent, remote_control):
                    for s in sessions.values()):
                 return
             name = gen_session_name(agent, sessions)
+            capacity_check(sessions, [name])
             sessions[name] = {
                 "agent": agent,
                 "skipPermissions": True,
@@ -16076,6 +15789,10 @@ def ensure_harness_session(agent, remote_control):
                 "hasRun": False,
             }
             write_sessions(sessions, version)
+            _session_start_notices.pop(agent, None)
+    except SessionCapacityError as exc:
+        _session_start_notices[agent] = "Signed in; session not started. " + str(exc)
+        return _session_start_notices[agent]
     except (RegistryUnreadable, RegistryBusy, OSError):
         # Not the connect card's place to surface a broken or busy registry,
         # or a write that failed outright (disk full, a permission problem) --
@@ -17655,9 +17372,9 @@ def connect_state(flow, keys=None, tmux_state=None):
                 # claude's rc is a flag on the same worker session, so one
                 # session covers both being usable AND remote-visible.
                 if flow_id == "claude":
-                    ensure_harness_session("claude", remote_control=True)
+                    error = ensure_harness_session("claude", remote_control=True)
                 elif flow_id == "codex":
-                    ensure_harness_session("codex", remote_control=False)
+                    error = ensure_harness_session("codex", remote_control=False)
             else:
                 connect_expire(flow_id)
                 state = "exchanging"
@@ -17675,6 +17392,14 @@ def connect_state(flow, keys=None, tmux_state=None):
         # has answered would invite a sign-in the box does not need.
         state = ("connected" if connected
                  else ("idle" if status is not None else "checking"))
+    notice = _session_start_notices.get(flow_id)
+    if connected and notice:
+        sessions = read_sessions()
+        if any(isinstance(s, dict) and s.get("agent") == flow_id
+               for s in sessions.values()):
+            _session_start_notices.pop(flow_id, None)
+        else:
+            error = notice
     keys = read_keys() if keys is None else keys
     shadow = [k for k in flow["shadow"] if k in keys]
     return {
@@ -21434,7 +21159,7 @@ def render_connect_card(state):
     # else to say stay closed (issue #449).
     open_now = (
         state["state"] in ("waiting", "starting", "checking", "exchanging")
-        or (state["state"] in ("failed", "expired") and state["error"])
+        or (state["state"] in ("failed", "expired", "connected") and state["error"])
         or state["blocked"]
         or state["shadow"]
     )
@@ -21463,7 +21188,7 @@ def render_connect_step(state):
     if state["state"] == "exchanging":
         return ('<div class="conn-step"><p class="note">Sign-in complete. '
                 'Checking the connection&hellip;</p></div>')
-    if state["state"] in ("failed", "expired") and state["error"]:
+    if state["state"] in ("failed", "expired", "connected") and state["error"]:
         return (f'<div class="conn-step"><p class="note conn-error">'
                 f'{html.escape(state["error"])}</p></div>')
     if state["state"] != "waiting":
@@ -23824,6 +23549,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # inventing one AND guarantees a unique key, so no collision
                     # or accidental-overwrite (issue 100) is possible.
                     name = gen_session_name(profile or agent, sessions, cwd)
+                    capacity_check(sessions, [name])
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,
@@ -23843,6 +23569,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "hasRun": False,
                     }
                     write_sessions(sessions, version)
+            except SessionCapacityError as exc:
+                self._send_html(render(str(exc), kind="error"), status=503)
+                return
             except RegistryBusy as exc:
                 # Nothing was read, so there is nothing to say about the
                 # file itself: another writer holds it, and the answer is
@@ -23929,9 +23658,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # entry whose value is not an object rather than
                         # dropping it (see its docstring), so the .pop below
                         # has to ask rather than assume.
+                        if isinstance(entry, dict):
+                            capacity_check(sessions, [name])
                         if isinstance(entry, dict) and entry.pop("stopped", None) is not None:
                             write_sessions(sessions, version)
                             ok = "ok=session_started"
+                except SessionCapacityError as exc:
+                    render = render_home if self._sess_page(form) == TERM_HOME else render_page
+                    self._send_html(render(str(exc), kind="error"), status=503)
+                    return
                 except RegistryBusy as exc:
                     self._registry_busy("restart", exc, self._sess_page(form))
                     return

@@ -21,6 +21,115 @@
       imageSystem = "x86_64-linux";
       vmSystems = [ imageSystem ];
 
+      # Across runners, preserve the existing four-test concurrency budget.
+      ciVmLanes = {
+        sessions = { jobs = 1; checks = [ "sessions" "session-limit" ]; };
+        webhook = { jobs = 1; checks = [ "webhook" ]; };
+        browser = {
+          jobs = 1;
+          checks = [ "connect" "sessions-web" "settings-page" ];
+        };
+        host = {
+          jobs = 1;
+          checks = [ "containers" "memory-protection" "ttyd-isolation" "web-surface" ];
+        };
+      };
+
+      # VM runners must not evaluate every native assertion to find a driver.
+      vmTestsFor = system:
+        let pkgs = nixpkgs.legacyPackages.${system}; in {
+          # Interactive VM test for the whole user-facing web surface, in one
+          # guest (issue #312 — this was three tests with the same node
+          # definition): the per-user ~/downloads file drop served behind the
+          # auth gate (issue #132), an agent adding a vhost by writing ~/sites/
+          # and reloading caddy via the sudoAllowlist rule with no
+          # nixos-rebuild (issue #40), and wrong-password basic-auth attempts
+          # getting the client IP banned by the fail2ban jail. Needs KVM (or
+          # slow TCG); CI enables /dev/kvm before building this.
+          web-surface = pkgs.testers.runNixOSTest
+            (import ./tests/web-surface.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test: the per-user settings page (issue #36) adds a
+          # secret through the browser (behind basic auth), writes the
+          # user-owned 0600 env file, lists key names only, and the agent unit
+          # picks the file up as an optional EnvironmentFile — no rebuild.
+          settings-page = pkgs.testers.runNixOSTest
+            (import ./tests/settings-page.nix { agent-box = self.nixosModules.agent-box; });
+
+          connect = pkgs.testers.runNixOSTest
+            (import ./tests/connect.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue 62): protectMemory defaults — zram
+          # swap active, agent unit's OOMScoreAdjust applied, and earlyoom
+          # kills a runaway memory hog while the box stays responsive
+          # (instead of the swapless refault livelock that froze a deployed
+          # 2 GB box for hours).
+          memory-protection = pkgs.testers.runNixOSTest
+            (import ./tests/memory-protection.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue 600): the HOST half of rootless
+          # docker - the subuid range, the capped newuidmap/newgidmap, an
+          # unprivileged user namespace that is actually allowed, the 0700
+          # runtime dir, DOCKER_HOST in a session, and a per-user sudo
+          # grant that stops at the user. Plus the behaviour the design
+          # leans on hardest: with no docker installed the unit is a clean
+          # "condition failed" rather than a restart loop, and the granted
+          # `restart` alone picks a newly installed one up.
+          containers = pkgs.testers.runNixOSTest
+            (import ./tests/containers.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue #59): sessions are runtime data — the
+          # seeded "main" session starts, `agent-box-session add/rm` brings a
+          # second agent up and down as the user (no sudo, no rebuild), the
+          # runtime session lives inside the hardened unit's cgroup, and the
+          # supervisor's own bookkeeping survives two writers racing it.
+          sessions = pkgs.testers.runNixOSTest
+            (import ./tests/sessions.nix { agent-box = self.nixosModules.agent-box; });
+
+          # The browser half of the same box (issue #312 — this and `sessions`
+          # were one test that ran for 325s, more than the other five checks
+          # put together, so no amount of --max-jobs could shorten the wave):
+          # the tabbed workspace at /<user>/, the settings page's session
+          # manager, the /sessions/* CRUD routes, the live feed and the
+          # transcript download, all behind the web auth gate. Shares
+          # tests/sessions-common.nix with `sessions`, so both halves drive
+          # the same box.
+          sessions-web = pkgs.testers.runNixOSTest
+            (import ./tests/sessions-web.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue #662): admission during BOOT RECOVERY,
+          # not just when a session is added live. A two-session limit with
+          # three configured sessions leaves one queued after first start;
+          # freeing a slot admits it, `restart`/`restart --all` refuse at
+          # capacity (exit 75) without touching the sessions they would have
+          # restarted, and the same admission decisions hold across a reboot.
+          session-limit = pkgs.testers.runNixOSTest
+            (import ./tests/session-limit.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue #628): the browser terminal's
+          # transport belongs to its own user and the proxy in front of it.
+          # Two real linux users in one guest, because the user boundary is
+          # the only boundary this deployment has: nothing listens on TCP,
+          # the unix socket is 0660 <user>:caddy inside a 2750 <user>:caddy
+          # directory, the second user is refused by the kernel and by the
+          # auth gate, the owner still attaches, TYPES, reconnects and
+          # starts a stopped session, and cross-origin (and origin-less)
+          # WebSockets are refused by ttyd's --check-origin.
+          ttyd-isolation = pkgs.testers.runNixOSTest
+            (import ./tests/ttyd-isolation.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue #101): the per-user webhook receiver, ON
+          # BY DEFAULT. Socket-activated 0660 <user>:caddy ingress, the
+          # unauthenticated public path next to a still-401ing vhost, HMAC
+          # accept/reject (and 404 before any secret exists — why default-on is
+          # safe), IPC fan-out into a stand-in session peer applying its own
+          # filter, and the discovery surface (CLI on PATH,
+          # AGENT_BOX_WEBHOOK_URL, per-session LOCAL_WEBHOOK_SESSION, seeded
+          # claude plugin settings).
+          webhook = pkgs.testers.runNixOSTest
+            (import ./tests/webhook.nix { agent-box = self.nixosModules.agent-box; });
+        };
+
       # Golden behavior snapshot (issue #154, Phase 0): every module-generated
       # systemd unit, published /etc file, tmpfiles rule and script payload
       # from the two golden configurations, with store hashes normalized to a
@@ -150,6 +259,17 @@
       # partition table + GRUB, so the base config stays usable for build-vm.
       packages = eachSystem (system:
         {
+          # Native checks are discovered, so a newly registered check cannot
+          # silently miss CI. VM lanes evaluate only vmTestsFor below.
+          ci-native = nixpkgs.legacyPackages.${system}.linkFarm
+            "agent-box-ci-native"
+            (nixpkgs.lib.mapAttrsToList (name: path:
+              assert nixpkgs.lib.assertMsg (!(path ? driver))
+                "Register VM checks in vmTestsFor so CI schedules their drivers";
+              { inherit name path; })
+              (builtins.removeAttrs self.checks.${system}
+                (builtins.attrNames (vmTestsFor system))));
+
           # Rendered golden snapshot (issue #154) — input of the
           # golden-snapshot check, materialized into tests/golden by
           # `nix run .#update-golden`.
@@ -202,7 +322,11 @@
           {
             vm = image;
             default = image;
-          }
+          } // nixpkgs.lib.mapAttrs' (lane: spec:
+            nixpkgs.lib.nameValuePair "ci-vm-${lane}"
+              (nixpkgs.legacyPackages.${system}.linkFarm "agent-box-ci-vm-${lane}"
+                (map (name: { inherit name; path = (vmTestsFor system).${name}.driver; })
+                  spec.checks))) ciVmLanes
         ));
 
       # `nix run .#assemble` — regenerate the committed modules/agent-box.nix
@@ -337,6 +461,34 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           };
         in
         {
+          ci-scheduling =
+            let
+              scheduled = nixpkgs.lib.sort builtins.lessThan
+                (nixpkgs.lib.concatMap (lane: lane.checks)
+                  (builtins.attrValues ciVmLanes));
+            in
+            assert nixpkgs.lib.assertMsg
+              (scheduled == builtins.attrNames (vmTestsFor imageSystem))
+              "Every VM check must appear in exactly one ciVmLanes entry";
+            pkgs.runCommand "agent-box-ci-scheduling" {
+              nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
+            } ''
+              python3 ${./tests/test-ci-scheduling.py} ${./scripts/ci-vm-tests.sh} \
+                ${./.github/workflows/ci.yml} \
+                ${pkgs.writeText "ci-vm-lanes.json" (builtins.toJSON ciVmLanes)}
+              touch "$out"
+            '';
+
+          # Use the flake's pin, not the runner's mutable nixpkgs registry.
+          # Shellcheck findings in deploy-test.yml are tracked separately;
+          # this preserves the existing actionlint-only gate.
+          workflow-lint = pkgs.runCommand "agent-box-workflow-lint" {
+            nativeBuildInputs = [ pkgs.actionlint ];
+          } ''
+            actionlint -shellcheck= ${./.github/workflows}/*.yml
+            touch "$out"
+          '';
+
           # Eval-level assertion; cheap.
           multi-user = assert missing == [ ];
             pkgs.runCommand "agent-box-multi-user-ok" { } ''
@@ -1053,6 +1205,8 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               {
                 cat "$srcDir/lib/envstore.py"
                 printf '\n\n'
+                cat "$srcDir/lib/session-capacity.py"
+                printf '\n\n'
                 cat want.py
               } > want-settings.py
               if ! diff -u want-settings.py <(tail -n +2 "$profile/bin/agent-box-settings") \
@@ -1659,6 +1813,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             pkgs.runCommand "agent-box-webhook-defer"
               {
                 nativeBuildInputs = [
+                  pkgs.util-linux
                   pkgs.bash
                   pkgs.coreutils
                   pkgs.jq
@@ -2071,6 +2226,16 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # rides in tests/sessions.nix and the registry-protocol check
           # below; what only this can price is the three mutation ROUTES,
           # each against five ways the file can be broken, in seconds.
+          session-capacity = pkgs.runCommand "agent-box-session-capacity-test" {
+            nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.jq pkgs.util-linux ];
+          } ''
+            mkdir -p repo/modules repo/tests
+            cp -r ${./modules/src} repo/modules/src
+            cp ${./tests/test-session-capacity.py} repo/tests/test-session-capacity.py
+            python3 repo/tests/test-session-capacity.py
+            touch $out
+          '';
+
           sessions-registry =
             pkgs.runCommand "agent-box-sessions-registry"
               {
@@ -2154,92 +2319,17 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
         # runNixOSTest wants a same-arch KVM guest (cross-arch falls back to
         # TCG, which is too slow to be useful), and vm-closure builds the
         # imageSystem-pinned nixosConfigurations.vm.
-        // nixpkgs.lib.optionalAttrs (builtins.elem system vmSystems) {
+        // nixpkgs.lib.optionalAttrs (builtins.elem system vmSystems) (vmTestsFor system // {
           # Full closure build of the VM config — the "is it actually usable"
           # proof (compiles the system agents would run in).
           vm-closure = self.nixosConfigurations.vm.config.system.build.vm;
 
-          # Interactive VM test for the whole user-facing web surface, in one
-          # guest (issue #312 — this was three tests with the same node
-          # definition): the per-user ~/downloads file drop served behind the
-          # auth gate (issue #132), an agent adding a vhost by writing ~/sites/
-          # and reloading caddy via the sudoAllowlist rule with no
-          # nixos-rebuild (issue #40), and wrong-password basic-auth attempts
-          # getting the client IP banned by the fail2ban jail. Needs KVM (or
-          # slow TCG); CI enables /dev/kvm before building this.
-          web-surface = pkgs.testers.runNixOSTest
-            (import ./tests/web-surface.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test: the per-user settings page (issue #36) adds a
-          # secret through the browser (behind basic auth), writes the
-          # user-owned 0600 env file, lists key names only, and the agent unit
-          # picks the file up as an optional EnvironmentFile — no rebuild.
-          settings-page = pkgs.testers.runNixOSTest
-            (import ./tests/settings-page.nix { agent-box = self.nixosModules.agent-box; });
-
-          connect = pkgs.testers.runNixOSTest
-            (import ./tests/connect.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test (issue 62): protectMemory defaults — zram
-          # swap active, agent unit's OOMScoreAdjust applied, and earlyoom
-          # kills a runaway memory hog while the box stays responsive
-          # (instead of the swapless refault livelock that froze a deployed
-          # 2 GB box for hours).
-          memory-protection = pkgs.testers.runNixOSTest
-            (import ./tests/memory-protection.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test (issue 600): the HOST half of rootless
-          # docker - the subuid range, the capped newuidmap/newgidmap, an
-          # unprivileged user namespace that is actually allowed, the 0700
-          # runtime dir, DOCKER_HOST in a session, and a per-user sudo
-          # grant that stops at the user. Plus the behaviour the design
-          # leans on hardest: with no docker installed the unit is a clean
-          # "condition failed" rather than a restart loop, and the granted
-          # `restart` alone picks a newly installed one up.
-          containers = pkgs.testers.runNixOSTest
-            (import ./tests/containers.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test (issue #59): sessions are runtime data — the
-          # seeded "main" session starts, `agent-box-session add/rm` brings a
-          # second agent up and down as the user (no sudo, no rebuild), the
-          # runtime session lives inside the hardened unit's cgroup, and the
-          # supervisor's own bookkeeping survives two writers racing it.
-          sessions = pkgs.testers.runNixOSTest
-            (import ./tests/sessions.nix { agent-box = self.nixosModules.agent-box; });
-
-          # The browser half of the same box (issue #312 — this and `sessions`
-          # were one test that ran for 325s, more than the other five checks
-          # put together, so no amount of --max-jobs could shorten the wave):
-          # the tabbed workspace at /<user>/, the settings page's session
-          # manager, the /sessions/* CRUD routes, the live feed and the
-          # transcript download, all behind the web auth gate. Shares
-          # tests/sessions-common.nix with `sessions`, so both halves drive
-          # the same box.
-          sessions-web = pkgs.testers.runNixOSTest
-            (import ./tests/sessions-web.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test (issue #628): the browser terminal's
-          # transport belongs to its own user and the proxy in front of it.
-          # Two real linux users in one guest, because the user boundary is
-          # the only boundary this deployment has: nothing listens on TCP,
-          # the unix socket is 0660 <user>:caddy inside a 2750 <user>:caddy
-          # directory, the second user is refused by the kernel and by the
-          # auth gate, the owner still attaches, TYPES, reconnects and
-          # starts a stopped session, and cross-origin (and origin-less)
-          # WebSockets are refused by ttyd's --check-origin.
-          ttyd-isolation = pkgs.testers.runNixOSTest
-            (import ./tests/ttyd-isolation.nix { agent-box = self.nixosModules.agent-box; });
-
-          # Interactive VM test (issue #101): the per-user webhook receiver, ON
-          # BY DEFAULT. Socket-activated 0660 <user>:caddy ingress, the
-          # unauthenticated public path next to a still-401ing vhost, HMAC
-          # accept/reject (and 404 before any secret exists — why default-on is
-          # safe), IPC fan-out into a stand-in session peer applying its own
-          # filter, and the discovery surface (CLI on PATH,
-          # AGENT_BOX_WEBHOOK_URL, per-session LOCAL_WEBHOOK_SESSION, seeded
-          # claude plugin settings).
-          webhook = pkgs.testers.runNixOSTest
-            (import ./tests/webhook.nix { agent-box = self.nixosModules.agent-box; });
+          # Force both image derivations without realizing the qcow image.
+          # Discard only the reference context, after evaluating drvPath.
+          vm-image-eval = pkgs.writeText "agent-box-vm-image-eval"
+            (builtins.unsafeDiscardStringContext (
+              self.nixosConfigurations.vm.config.system.build.vm.drvPath
+              + "\n" + self.packages.${system}.vm.drvPath + "\n"));
 
           # The cliff every VM test in this directory is walking toward, and
           # the one failure that says nothing useful when you reach it.
@@ -2267,11 +2357,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               # 128 KiB is the kernel's; one page under it is ours, so the
               # guard fires before the unreadable failure does.
               limit = 131072 - 4096;
-              # Every VM test in the check set, found by the passthru only
-              # runNixOSTest has. removeAttrs first: filterAttrs would force
-              # this attribute's own value and recurse forever.
-              vmTests = nixpkgs.lib.filterAttrs (_: t: t ? driver)
-                (builtins.removeAttrs self.checks.${system} [ "testscript-fits" ]);
+              vmTests = vmTestsFor system;
               # t.driver.testScript, NOT t.driver.drvAttrs.testScript: nixpkgs
               # moved the script off the driver derivation's drvAttrs (it
               # passes buildCommand as a file now), so the old path threw
@@ -2305,6 +2391,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 `webhook-spawn-claim`), or split the test the way
                 tests/sessions-common.nix split the session tests (issue #312).
               '';
-        });
+        }));
+
     };
 }

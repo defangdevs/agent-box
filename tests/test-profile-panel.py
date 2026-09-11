@@ -586,6 +586,8 @@ class ProfileRoutes(ProfileFixture):
 
     def serve(self, **extra):
         module = self.daemon(**extra)
+        module.capacity_live = lambda: set()
+        module.capacity_limit = lambda: 100
         self.module = module
         server = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), module.Handler)

@@ -15,6 +15,7 @@
   "etc/agent-box/guides/robot-agents-pointer.md": "0o644",
   "etc/agent-box/seed/agent-sessions.json": "0o644",
   "etc/agent-box/seed/robot-sessions.json": "0o644",
+  "etc/agent-box/session-limit": "0o644",
   "etc/agent-box/units/agent-box-settings-agent.env": "0o644",
   "etc/agent-box/units/agent-box-settings-robot.env": "0o644",
   "etc/agent-box/units/agent-box-webhook-agent.env": "0o644",

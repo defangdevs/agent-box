@@ -78,6 +78,13 @@ class ConnectCardCheckingTest(unittest.TestCase):
     def setUp(self):
         self.daemon = load_daemon()
 
+    def test_capacity_notice_keeps_signed_in_state_and_is_visible(self):
+        notice = "Signed in; session not started. Session limit reached."
+        page = self.daemon.render_connect_card(base_state(state="connected", error=notice))
+        self.assertIn(notice, page)
+        self.assertIn("Signed in", page)
+        self.assertIn(" open", page)
+
     def test_checking_non_destructive_offers_a_working_button(self):
         html = self.daemon.render_connect_card(
             base_state(state="checking", destructive=False))

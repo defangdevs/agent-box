@@ -36,6 +36,7 @@
     imports = [ agent-box ];
     virtualisation.memorySize = 2048;
     services.agent-box = {
+      sessionLimit = 64;
       enable = true;
       agent = "claude";
       users.agent = {

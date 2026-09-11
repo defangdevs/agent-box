@@ -39,6 +39,7 @@ The other half of #279 -- the supervisor moving the bad file aside so the
 box self-heals instead of idling -- is pinned in tests/test-registry.py,
 next to the rest of the registry's write protocol.
 """
+import concurrent.futures
 import fcntl
 import http.server
 import importlib.machinery
@@ -145,6 +146,8 @@ class RouteCase(unittest.TestCase):
         }
         env.update(extra)
         module = daemon_with(**env)
+        module.capacity_live = lambda: set()
+        module.capacity_limit = lambda: 100
         server = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), module.Handler)
         self.addCleanup(server.server_close)
@@ -470,6 +473,50 @@ class LockRefusal(RouteCase):
         self.assertEqual(results, [303] * adds)
         self.assertEqual(len(self.document()["sessions"]), adds,
                          self.document()["sessions"])
+
+
+class CapacityRoutes(RouteCase):
+    def test_concurrent_ui_adds_share_pending_capacity(self):
+        self.write_raw(json.dumps({"version": 1, "sessions": {}}))
+        module, _ = self.serve()
+        module.capacity_limit = lambda: 2
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(lambda _: self.post("/sessions/add", agent="shell")[0], range(6)))
+        self.assertEqual(sorted(results), [303, 303, 503, 503, 503, 503])
+        self.assertEqual(len(self.document()["sessions"]), 2)
+
+
+    def test_add_refuses_at_capacity_without_writing(self):
+        self.write_raw(json.dumps({"version": 1, "sessions": {"a": {}}}))
+        module, _ = self.serve()
+        module.capacity_limit = lambda: 1
+        before = self.raw()
+        status, _ = self.post("/sessions/add", agent="shell")
+        self.assertEqual(status, 503)
+        self.assertEqual(self.raw(), before)
+
+    def test_restart_stopped_refuses_but_running_restart_succeeds(self):
+        self.write_raw(json.dumps({"version": 1, "sessions": {
+            "a": {}, "b": {"stopped": True}}}))
+        module, _ = self.serve()
+        module.capacity_limit = lambda: 1
+        module.kill_session = lambda name: None
+        before = self.raw()
+        status, _ = self.post("/sessions/restart", name="b")
+        self.assertEqual(status, 503)
+        self.assertEqual(self.raw(), before)
+        status, _ = self.post("/sessions/restart", name="a")
+        self.assertEqual(status, 303)
+
+    def test_signin_stays_successful_and_records_autostart_notice(self):
+        self.write_raw(json.dumps({"version": 1, "sessions": {"a": {"agent": "shell"}}}))
+        module, _ = self.serve()
+        module.capacity_limit = lambda: 1
+        before = self.raw()
+        message = module.ensure_harness_session("claude", True)
+        self.assertIn("Signed in; session not started", message)
+        self.assertEqual(module._session_start_notices["claude"], message)
+        self.assertEqual(self.raw(), before)
 
 
 if __name__ == "__main__":

@@ -421,6 +421,20 @@ let
 @@include:src/envstore-cli.py@@
   '');
 
+  capacityLib = ''
+
+
+@@include:src/lib/session-capacity.py@@
+  '';
+
+  capacityCli = pkgs.writers.writePython3Bin "agent-box-session-capacity" {
+    flakeIgnore = [ "E501" "E402" "E305" ];
+  } ''
+@@include:src/lib/session-capacity.py@@
+
+@@include:src/session-capacity-cli.py@@
+  '';
+
   # Clean-exit bookkeeping (issue #167): an agent that exits 0 was ASKED to
   # quit, so the pane records stopped=true and the supervisor leaves the
   # session down. See src/mark-stopped.sh for the exact semantics.
@@ -781,6 +795,7 @@ let
     # script, an agent tool call, the webhook receiver unit (jq + coreutils +
     # this CLI, no util-linux) — and a lock that only some writers take is not
     # a lock. util-linux is the only package that ships flock.
+    export AGENT_BOX_CAPACITY_BIN=${capacityCli}/bin/agent-box-session-capacity
     export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
     # Agent profiles (issue #321): `add --profile` resolves the harness and
     # its arguments by shelling out to agent-box-profile, and this CLI runs
@@ -1040,6 +1055,7 @@ let
     # /usr/local/bin/agent-box-session, the wrapper it generates there.
     "agent-box-session" = "${sessionCli}/bin/agent-box-session";
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
+    "agent-box-session-capacity" = "${capacityCli}/bin/agent-box-session-capacity";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
@@ -1584,6 +1600,18 @@ let
 in
 {
   options.services.agent-box = {
+    sessionLimit = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 4;
+      description = ''
+        Maximum running or queued sessions for the single-user v1 box.
+        Set this to the deployment's intended session budget (roughly one
+        per GiB). The explicit default avoids kernel memory reservations
+        rounding a nominal 4 GiB VM down to three sessions. This is overload
+        control, not a memory guarantee or a cross-user quota.
+      '';
+    };
+
     enable = lib.mkEnableOption "reproducible multi-user coding agent host";
 
     # Not a knob: what this module RENDERS, published so a test can read it
@@ -2914,7 +2942,9 @@ in
     # self-update service runs), so this always tracks the current module while
     # the seeded ~/AGENTS.md — which @imports this path — stays editable. Skipped
     # for users that opted out of seeding (agentsMd = null).
-    environment.etc = lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (name: u:
+    environment.etc = {
+      "agent-box/session-limit".text = "${toString cfg.sessionLimit}\n";
+    } // lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (name: u:
       lib.optional (u.agentsMd != null) (lib.nameValuePair "agent-box-guides/AGENTS.${name}.md" {
         source = canonicalAgentsMd name u;
         mode = "0444";
@@ -3504,7 +3534,7 @@ in
         # else in the two files shares a name — the library was written to
         # stay clear of the daemon's globals.
         flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" "E402" "F811" ];
-      } (envStoreLib + ''
+      } (envStoreLib + capacityLib + ''
 
 
 @@include:src/settings-daemon.py@@

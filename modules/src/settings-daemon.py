@@ -868,6 +868,9 @@ def write_sessions(sessions, version=REGISTRY_VERSION):
         raise
 
 
+_session_start_notices = {}
+
+
 def ensure_harness_session(agent, remote_control):
     """Auto-start one bare session for `agent` the moment its connect card
     signs in (issue #504), so install+login leaves an actual running
@@ -901,6 +904,7 @@ def ensure_harness_session(agent, remote_control):
                    for s in sessions.values()):
                 return
             name = gen_session_name(agent, sessions)
+            capacity_check(sessions, [name])
             sessions[name] = {
                 "agent": agent,
                 "skipPermissions": True,
@@ -915,6 +919,10 @@ def ensure_harness_session(agent, remote_control):
                 "hasRun": False,
             }
             write_sessions(sessions, version)
+            _session_start_notices.pop(agent, None)
+    except SessionCapacityError as exc:
+        _session_start_notices[agent] = "Signed in; session not started. " + str(exc)
+        return _session_start_notices[agent]
     except (RegistryUnreadable, RegistryBusy, OSError):
         # Not the connect card's place to surface a broken or busy registry,
         # or a write that failed outright (disk full, a permission problem) --
@@ -2494,9 +2502,9 @@ def connect_state(flow, keys=None, tmux_state=None):
                 # claude's rc is a flag on the same worker session, so one
                 # session covers both being usable AND remote-visible.
                 if flow_id == "claude":
-                    ensure_harness_session("claude", remote_control=True)
+                    error = ensure_harness_session("claude", remote_control=True)
                 elif flow_id == "codex":
-                    ensure_harness_session("codex", remote_control=False)
+                    error = ensure_harness_session("codex", remote_control=False)
             else:
                 connect_expire(flow_id)
                 state = "exchanging"
@@ -2514,6 +2522,14 @@ def connect_state(flow, keys=None, tmux_state=None):
         # has answered would invite a sign-in the box does not need.
         state = ("connected" if connected
                  else ("idle" if status is not None else "checking"))
+    notice = _session_start_notices.get(flow_id)
+    if connected and notice:
+        sessions = read_sessions()
+        if any(isinstance(s, dict) and s.get("agent") == flow_id
+               for s in sessions.values()):
+            _session_start_notices.pop(flow_id, None)
+        else:
+            error = notice
     keys = read_keys() if keys is None else keys
     shadow = [k for k in flow["shadow"] if k in keys]
     return {
@@ -4757,7 +4773,7 @@ def render_connect_card(state):
     # else to say stay closed (issue #449).
     open_now = (
         state["state"] in ("waiting", "starting", "checking", "exchanging")
-        or (state["state"] in ("failed", "expired") and state["error"])
+        or (state["state"] in ("failed", "expired", "connected") and state["error"])
         or state["blocked"]
         or state["shadow"]
     )
@@ -4786,7 +4802,7 @@ def render_connect_step(state):
     if state["state"] == "exchanging":
         return ('<div class="conn-step"><p class="note">Sign-in complete. '
                 'Checking the connection&hellip;</p></div>')
-    if state["state"] in ("failed", "expired") and state["error"]:
+    if state["state"] in ("failed", "expired", "connected") and state["error"]:
         return (f'<div class="conn-step"><p class="note conn-error">'
                 f'{html.escape(state["error"])}</p></div>')
     if state["state"] != "waiting":
@@ -7147,6 +7163,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # inventing one AND guarantees a unique key, so no collision
                     # or accidental-overwrite (issue 100) is possible.
                     name = gen_session_name(profile or agent, sessions, cwd)
+                    capacity_check(sessions, [name])
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,
@@ -7166,6 +7183,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "hasRun": False,
                     }
                     write_sessions(sessions, version)
+            except SessionCapacityError as exc:
+                self._send_html(render(str(exc), kind="error"), status=503)
+                return
             except RegistryBusy as exc:
                 # Nothing was read, so there is nothing to say about the
                 # file itself: another writer holds it, and the answer is
@@ -7252,9 +7272,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # entry whose value is not an object rather than
                         # dropping it (see its docstring), so the .pop below
                         # has to ask rather than assume.
+                        if isinstance(entry, dict):
+                            capacity_check(sessions, [name])
                         if isinstance(entry, dict) and entry.pop("stopped", None) is not None:
                             write_sessions(sessions, version)
                             ok = "ok=session_started"
+                except SessionCapacityError as exc:
+                    render = render_home if self._sess_page(form) == TERM_HOME else render_page
+                    self._send_html(render(str(exc), kind="error"), status=503)
+                    return
                 except RegistryBusy as exc:
                     self._registry_busy("restart", exc, self._sess_page(form))
                     return
