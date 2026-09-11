@@ -569,6 +569,9 @@ jobs:
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
           terminal_url="$url"
+          rest=${url#https://}
+          authority=${rest%%/*}
+          origin="https://${authority}"
           cookie_jar=$(mktemp)
           curl -sS -o /dev/null --max-time 15 -u "workspace:${WEB_PASSWORD}" -c "$cookie_jar" "$terminal_url"
           # 101 = Switching Protocols (success). Anything else means the browser
@@ -579,6 +582,14 @@ jobs:
           # seconds behind, and Caddy answers 502 until it is, so retry like
           # the "tmux session is live" step below instead of failing on one
           # attempt.
+          #
+          # ttyd runs with --check-origin (issue #628): it refuses a WebSocket
+          # upgrade whose Origin doesn't match the Host, which a real browser
+          # always sends and curl does not unless told to. Without this header
+          # ttyd logs "User code denied connection" and closes the connection,
+          # which Caddy reports upstream as a 502 (agent-box#674) - it is the
+          # smoke test failing to look like a browser, not ttyd or Caddy being
+          # down.
           for i in $(seq 1 6); do
             code=$(curl -sS -o /dev/null -w "%{http_code}" --http1.1 --max-time 10 \
               -b "$cookie_jar" \
@@ -587,6 +598,7 @@ jobs:
               -H "Sec-WebSocket-Version: 13" \
               -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
               -H "Sec-WebSocket-Protocol: tty" \
+              -H "Origin: ${origin}" \
               "${terminal_url}ws" || true)
             echo "[$i/6] WebSocket upgrade attempt -> HTTP $code"
             if [ "$code" = "101" ]; then
