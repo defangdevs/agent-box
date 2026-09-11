@@ -13,7 +13,7 @@ protectMemory: true
 repo: defangdevs/agent-box
 restartNotice: auto
 rev: '0000000000000000000000000000000000000000'
-sessionLimit: 4
+sessionLimit: null
 sudoAllowlist:
 - /run/current-system/sw/bin/systemctl reload caddy.service
 users:

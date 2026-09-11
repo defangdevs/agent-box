@@ -114,8 +114,9 @@ plainly rather than handing it back.
   the value out of the command line, the shell history and `ps`). Such a
   value is stored double-quoted, which is the one thing to preserve if you
   ever hand-edit the file.
-- Session starts share one limit across the CLI, settings page and webhooks
-  (default 4, configured by `sessionLimit` on the box). Pending starts reserve
+- Session starts share one limit across the CLI, settings page and webhooks.
+  It defaults to about one session per GiB of physical RAM and can be
+  overridden by `sessionLimit` in the box configuration. Pending starts reserve
   slots too. Stop a session to free capacity; restarting a stopped session
   needs a free slot. `restart --all` refuses without changing anything if it
   would exceed the limit. This is overload control, not a memory guarantee.

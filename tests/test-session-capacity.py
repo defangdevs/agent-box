@@ -26,6 +26,44 @@ def expand(path):
 
 
 class Policy(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.work = Path(self.tmp.name)
+        self.limit = self.work / "limit"
+        self.meminfo = self.work / "meminfo"
+        self.env = mock.patch.dict(os.environ, {
+            "AGENT_BOX_SESSION_LIMIT_FILE": str(self.limit),
+            "AGENT_BOX_MEMINFO_FILE": str(self.meminfo),
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_automatic_limit_is_one_per_started_gib_of_ram(self):
+        self.limit.write_text("auto\n")
+        for memory_kib, expected in [
+                (1, 1),
+                (capacity.CAPACITY_KIB_PER_GIB, 1),
+                (4 * capacity.CAPACITY_KIB_PER_GIB - 1, 4),
+                (62 * capacity.CAPACITY_KIB_PER_GIB + 1, 63)]:
+            self.meminfo.write_text("MemTotal: %d kB\n" % memory_kib)
+            self.assertEqual(capacity.capacity_limit(), expected)
+
+    def test_missing_limit_file_uses_automatic_limit(self):
+        self.meminfo.write_text("MemTotal: 2097152 kB\n")
+        self.assertEqual(capacity.capacity_limit(), 2)
+
+    def test_explicit_limit_overrides_ram(self):
+        self.limit.write_text("7\n")
+        self.assertEqual(capacity.capacity_limit(), 7)
+
+    def test_malformed_automatic_inputs_fail_closed(self):
+        self.limit.write_text("auto\n")
+        for value in ["", "MemTotal: nope kB\n", "MemTotal: 4 MB\n"]:
+            self.meminfo.write_text(value)
+            with self.assertRaises(ValueError):
+                capacity.capacity_limit()
+
     def test_pending_and_unregistered_live_names_hold_slots(self):
         with self.assertRaises(capacity.SessionCapacityError):
             capacity.capacity_check({"pending": {}}, ["new"],
@@ -129,7 +167,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(self.registry.read_bytes(), before)
 
     def test_invalid_limit_fails_closed(self):
-        for value in ["0", "-1", "abc"]:
+        for value in ["0", "-1", "abc", "AUTO"]:
             self.limit.write_text(value)
             self.assertEqual(self.run_cli("add", "a").returncode, 75)
 

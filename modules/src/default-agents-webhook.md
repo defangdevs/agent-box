@@ -170,8 +170,9 @@ entry on its next tick, and the transcript stays on disk. Its prompt still asks
 it to `agent-box-session rm NAME` when done, which is the same end reached
 sooner. What is NOT reaped is a hook session that CRASHED: a non-zero exit is
 never parked, so it stays listed and attachable for you to read - `rm` it once
-you have. That cleanup is load-bearing: the configured `sessionLimit` (default 4) bounds ALL
-sessions running or queued to start, including CLI/UI sessions, and once that ceiling is reached EVERY
+you have. That cleanup is load-bearing: one RAM-sized limit (about one session
+per GiB by default, overridable with `sessionLimit`) bounds ALL sessions running
+or queued to start, including CLI/UI sessions, and once that ceiling is reached EVERY
 watch on the box is stalled - a matching batch starts nothing until a slot
 frees. It is no longer LOST while it waits: the wrapper declines it and the
 receiver keeps it, re-offers it as slots free, and drops it only after an hour

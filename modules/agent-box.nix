@@ -211,8 +211,9 @@ let
       it to `agent-box-session rm NAME` when done, which is the same end reached
       sooner. What is NOT reaped is a hook session that CRASHED: a non-zero exit is
       never parked, so it stays listed and attachable for you to read - `rm` it once
-      you have. That cleanup is load-bearing: the configured `sessionLimit` (default 4) bounds ALL
-      sessions running or queued to start, including CLI/UI sessions, and once that ceiling is reached EVERY
+      you have. That cleanup is load-bearing: one RAM-sized limit (about one session
+      per GiB by default, overridable with `sessionLimit`) bounds ALL sessions running
+      or queued to start, including CLI/UI sessions, and once that ceiling is reached EVERY
       watch on the box is stalled - a matching batch starts nothing until a slot
       frees. It is no longer LOST while it waits: the wrapper declines it and the
       receiver keeps it, re-offers it as slots free, and drops it only after an hour
@@ -556,8 +557,9 @@ let
       the value out of the command line, the shell history and `ps`). Such a
       value is stored double-quoted, which is the one thing to preserve if you
       ever hand-edit the file.
-    - Session starts share one limit across the CLI, settings page and webhooks
-      (default 4, configured by `sessionLimit` on the box). Pending starts reserve
+    - Session starts share one limit across the CLI, settings page and webhooks.
+      It defaults to about one session per GiB of physical RAM and can be
+      overridden by `sessionLimit` in the box configuration. Pending starts reserve
       slots too. Stop a session to free capacity; restarting a stopped session
       needs a free slot. `restart --all` refuses without changing anything if it
       would exceed the limit. This is overload control, not a memory guarantee.
@@ -1991,8 +1993,36 @@ import os as capacity_os
 import subprocess as capacity_subprocess
 
 
+CAPACITY_KIB_PER_GIB = 1024 * 1024
+
+
 class SessionCapacityError(Exception):
     pass
+
+
+def capacity_memory_limit():
+    """Return roughly one session per GiB of physical RAM, minimum one."""
+    path = capacity_os.environ.get("AGENT_BOX_MEMINFO_FILE", "/proc/meminfo")
+    with open(path, encoding="ascii") as handle:
+        for line in handle:
+            fields = line.split()
+            if fields[:1] != ["MemTotal:"]:
+                continue
+            if len(fields) != 3:
+                break
+            if not fields[1].isascii() or not fields[1].isdecimal():
+                break
+            if fields[2] != "kB":
+                break
+            memory_kib = int(fields[1])
+            if memory_kib < 1:
+                break
+            # MemTotal excludes the kernel's own reservations, so it is a
+            # little below the host's nominal RAM. Round up rather than turn
+            # a nominal 4 GiB box into three slots for that bookkeeping.
+            rounded_kib = memory_kib + CAPACITY_KIB_PER_GIB - 1
+            return max(1, rounded_kib // CAPACITY_KIB_PER_GIB)
+    raise ValueError("cannot determine MemTotal from %s" % path)
 
 
 def capacity_limit():
@@ -2002,9 +2032,11 @@ def capacity_limit():
         with open(path, encoding="ascii") as handle:
             value = handle.read().strip()
     except FileNotFoundError:
-        value = "4"
+        value = "auto"
+    if value == "auto":
+        return capacity_memory_limit()
     if not value.isascii() or not value.isdecimal() or int(value) < 1:
-        raise ValueError("sessionLimit must be a positive integer")
+        raise ValueError("sessionLimit must be 'auto' or a positive integer")
     return int(value)
 
 
@@ -2073,8 +2105,36 @@ import os as capacity_os
 import subprocess as capacity_subprocess
 
 
+CAPACITY_KIB_PER_GIB = 1024 * 1024
+
+
 class SessionCapacityError(Exception):
     pass
+
+
+def capacity_memory_limit():
+    """Return roughly one session per GiB of physical RAM, minimum one."""
+    path = capacity_os.environ.get("AGENT_BOX_MEMINFO_FILE", "/proc/meminfo")
+    with open(path, encoding="ascii") as handle:
+        for line in handle:
+            fields = line.split()
+            if fields[:1] != ["MemTotal:"]:
+                continue
+            if len(fields) != 3:
+                break
+            if not fields[1].isascii() or not fields[1].isdecimal():
+                break
+            if fields[2] != "kB":
+                break
+            memory_kib = int(fields[1])
+            if memory_kib < 1:
+                break
+            # MemTotal excludes the kernel's own reservations, so it is a
+            # little below the host's nominal RAM. Round up rather than turn
+            # a nominal 4 GiB box into three slots for that bookkeeping.
+            rounded_kib = memory_kib + CAPACITY_KIB_PER_GIB - 1
+            return max(1, rounded_kib // CAPACITY_KIB_PER_GIB)
+    raise ValueError("cannot determine MemTotal from %s" % path)
 
 
 def capacity_limit():
@@ -2084,9 +2144,11 @@ def capacity_limit():
         with open(path, encoding="ascii") as handle:
             value = handle.read().strip()
     except FileNotFoundError:
-        value = "4"
+        value = "auto"
+    if value == "auto":
+        return capacity_memory_limit()
     if not value.isascii() or not value.isdecimal() or int(value) < 1:
-        raise ValueError("sessionLimit must be a positive integer")
+        raise ValueError("sessionLimit must be 'auto' or a positive integer")
     return int(value)
 
 
@@ -4158,7 +4220,7 @@ kill_session() {
 
 usage() {
   echo "usage: agent-box-session ls | capacity"
-  echo "Starts share sessionLimit (default 4), including pending starts and webhooks."
+  echo "Starts share one RAM-sized limit (about one/GiB by default); sessionLimit overrides it."
   echo "Stop a session to free a slot. A refused start exits 75; retry is safe."
   echo "       agent-box-session peers"
   echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
@@ -5905,10 +5967,10 @@ _hc_main "$@"
                              claim over any watch, GitHub or not.
                              A spawned session is subscribed to the event's own
                              repo for it, so its own CI spawns no sibling.
-                             THERE IS A CEILING: sessionLimit (default 4) bounds all sessions
-                             running or queued. Configure it in the box
-                             configuration. Hook sessions are
-                             removed by the agent they start, so four of them
+                             THERE IS A CEILING: all sessions running or queued
+                             share a RAM-sized limit (about one/GiB by default),
+                             which sessionLimit can override. Hook sessions are
+                             removed by the agent they start, so enough of them
                              still running stall every watch on the box. A batch
                              that arrives then is QUEUED, not dropped: the spawn
                              wrapper declines it (exit 75) and the receiver
@@ -12637,14 +12699,15 @@ in
 {
   options.services.agent-box = {
     sessionLimit = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 4;
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
       description = ''
         Maximum running or queued sessions for the single-user v1 box.
-        Set this to the deployment's intended session budget (roughly one
-        per GiB). The explicit default avoids kernel memory reservations
-        rounding a nominal 4 GiB VM down to three sessions. This is overload
-        control, not a memory guarantee or a cross-user quota.
+        Null derives the limit from kernel-reported physical RAM at roughly
+        one session per GiB, rounded up so kernel reservations do not turn a
+        nominal 4 GiB VM into three slots. Set a positive integer to override
+        that automatic budget. This is overload control, not a memory
+        guarantee or a cross-user quota.
       '';
     };
 
@@ -13979,7 +14042,8 @@ in
     # the seeded ~/AGENTS.md — which @imports this path — stays editable. Skipped
     # for users that opted out of seeding (agentsMd = null).
     environment.etc = {
-      "agent-box/session-limit".text = "${toString cfg.sessionLimit}\n";
+      "agent-box/session-limit".text =
+        "${if cfg.sessionLimit == null then "auto" else toString cfg.sessionLimit}\n";
     } // lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (name: u:
       lib.optional (u.agentsMd != null) (lib.nameValuePair "agent-box-guides/AGENTS.${name}.md" {
         source = canonicalAgentsMd name u;

@@ -653,7 +653,7 @@ kill_session() {
 
 usage() {
   echo "usage: agent-box-session ls | capacity"
-  echo "Starts share sessionLimit (default 4), including pending starts and webhooks."
+  echo "Starts share one RAM-sized limit (about one/GiB by default); sessionLimit overrides it."
   echo "Stop a session to free a slot. A refused start exits 75; retry is safe."
   echo "       agent-box-session peers"
   echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"

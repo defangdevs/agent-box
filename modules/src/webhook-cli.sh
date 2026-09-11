@@ -79,10 +79,10 @@ Two delivery shapes:
                          claim over any watch, GitHub or not.
                          A spawned session is subscribed to the event's own
                          repo for it, so its own CI spawns no sibling.
-                         THERE IS A CEILING: sessionLimit (default 4) bounds all sessions
-                         running or queued. Configure it in the box
-                         configuration. Hook sessions are
-                         removed by the agent they start, so four of them
+                         THERE IS A CEILING: all sessions running or queued
+                         share a RAM-sized limit (about one/GiB by default),
+                         which sessionLimit can override. Hook sessions are
+                         removed by the agent they start, so enough of them
                          still running stall every watch on the box. A batch
                          that arrives then is QUEUED, not dropped: the spawn
                          wrapper declines it (exit 75) and the receiver
