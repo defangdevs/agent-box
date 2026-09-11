@@ -2456,12 +2456,17 @@ class Renderer:
         """PATH for a session.
 
         The user's own profile first (`nix profile add` self-service must
-        win), then the box profile, then the distro's own bin dirs — the
-        native counterpart of the module's curated store-path PATH.
+        win), then the box profile, then the default profile a multi-user
+        Nix install puts `nix` itself in (issue #679 — that directory name
+        is fixed by the installer, not a per-machine store-path hash, so
+        unlike AGENT_BOX_NIX_BIN above it carries no reproducibility
+        problem), then the distro's own bin dirs — the native counterpart
+        of the module's curated store-path PATH.
         """
         return ":".join([
             f"{user.home}/.nix-profile/bin",
             str(self.bin),
+            "/nix/var/nix/profiles/default/bin",
             "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
         ])
 
