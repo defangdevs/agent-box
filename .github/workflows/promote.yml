@@ -1,0 +1,448 @@
+name: Promote a release candidate
+
+# Explicit promotion (issue #632). Before this, "release" was whatever had
+# most recently been pushed to master: publish-template.yml ran on every
+# push, independently of CI and of the fresh-boot deployment test, and it
+# re-resolved the nixos-unstable channel at publish time - so the box the
+# public 1-click templates create was never the box anything had booted.
+#
+# This workflow is the promotion, and it is the only path to the public
+# defaults. In order, and stopping at the first failure:
+#
+#   1. resolve the candidate to a full commit sha;
+#   2. refuse it unless every aggregate CI gate is green FOR THAT SHA;
+#   3. build its release manifest ONCE (scripts/release_manifest.py);
+#   4. boot it in deploy-test with the manifest's own pins;
+#   5. publish the same manifest's pins into the S3 templates;
+#   6. record the promotion: a release-* tag, a GitHub Release carrying the
+#      manifest, and the `release` branch pointer boxes can follow.
+#
+# A failure anywhere before 5 leaves the public defaults exactly as they
+# were, which is the acceptance criterion this exists for.
+#
+# ROLLBACK: dispatch this again with `sha` set to an earlier promoted
+# commit and `allow_rollback` on. That candidate is already tested and
+# already tagged, so nothing new is tagged; its manifest is rebuilt from
+# its own immutable rev, republished, and the `release` pointer is moved
+# back. `skip_deploy_test` saves the 40 minutes when the point is to undo a
+# bad release quickly - only ever use it for a commit that was promoted
+# before.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: >-
+          Candidate commit (full or short sha, tag or branch; empty = the
+          tip of the ref this run was dispatched on)
+        type: string
+        default: ''
+      skip_deploy_test:
+        description: >-
+          Skip the fresh-boot deployment test. ONLY for re-promoting a
+          commit that already passed it - a rollback.
+        type: boolean
+        default: false
+      allow_rollback:
+        description: >-
+          Allow the `release` pointer to move to a commit that is not a
+          descendant of where it is now.
+        type: boolean
+        default: false
+      reason:
+        description: Why this candidate is being promoted (goes in the release notes)
+        type: string
+        default: ''
+
+concurrency:
+  # One promotion at a time, and never cancelled halfway: the phases move
+  # public state.
+  group: promote
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: Resolve and gate the candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      rev: ${{ steps.rev.outputs.rev }}
+      module_sha256: ${{ steps.pins.outputs.module_sha256 }}
+      agent_nixpkgs_url: ${{ steps.pins.outputs.agent_nixpkgs_url }}
+      agent_nixpkgs_sha256: ${{ steps.pins.outputs.agent_nixpkgs_sha256 }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # All of it: the candidate may be older than the tip, and the
+          # record job needs the tags to tell a first promotion from a
+          # rollback.
+          fetch-depth: 0
+
+      - name: Resolve the candidate to a full commit sha
+        id: rev
+        env:
+          WANT: ${{ inputs.sha }}
+        run: |
+          if [ -n "$WANT" ]; then
+            rev=$(git rev-parse --verify "$WANT^{commit}") || {
+              echo "::error::$WANT does not name a commit in this repository."
+              exit 1
+            }
+          else
+            rev=$(git rev-parse HEAD)
+          fi
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+          echo "::notice::Candidate is $rev"
+
+      - name: Refuse an unauthorized rollback before any public write
+        # Preflight, not just the final push guard in the `record` job: that
+        # guard only fires AFTER publish has already replaced the public S3
+        # templates and the Release has been written, which can roll public
+        # installs backward and then fail with the release branch already
+        # moved past them. Checking ancestry here, before deploy-test or
+        # publish ever run, means an unauthorized rollback never reaches a
+        # public write in the first place. The later push is kept as the
+        # concurrency-safe final check - two promotions racing each other is
+        # what THAT guards against, not this.
+        env:
+          REV: ${{ steps.rev.outputs.rev }}
+          ALLOW_ROLLBACK: ${{ inputs.allow_rollback }}
+        run: |
+          git fetch origin release:refs/remotes/origin/release 2>/dev/null || true
+          if ! git rev-parse --verify --quiet origin/release >/dev/null; then
+            echo "::notice::No release branch yet - nothing to fast-forward from."
+            exit 0
+          fi
+          if [ "$ALLOW_ROLLBACK" = "true" ]; then
+            echo "::notice::allow_rollback is set - skipping the fast-forward check."
+            exit 0
+          fi
+          if git merge-base --is-ancestor origin/release "$REV"; then
+            echo "::notice::$REV is a fast-forward of the release branch."
+          else
+            echo "::error::$REV is not a fast-forward of the release branch - refusing before any public write. Dispatch again with allow_rollback for a deliberate rollback."
+            exit 1
+          fi
+
+      - name: Require every aggregate CI gate to be green for that sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REV: ${{ steps.rev.outputs.rev }}
+        # The gates are the always-reported terminal jobs of ci.yml,
+        # aws-ci.yml and azure-ci.yml. Requiring them HERE and not only in
+        # the branch ruleset matters: a ruleset governs the merge, and an
+        # administrator can bypass one, while nothing reaches the public
+        # install default without passing through this step.
+        #
+        # "Absent" is a failure, not a pass. That is the whole reason the
+        # gates exist as separate always-running jobs: a path-filtered
+        # check that never ran reports nothing at all, and treating silence
+        # as success is how an untested candidate would be promoted.
+        run: |
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/commits/${REV}/check-runs?per_page=100" \
+            | jq '[.[].check_runs[]]' > runs.json
+          echo "Check runs reported for ${REV}:"
+          jq -r 'sort_by(.name)[] | "  \(.name): \(.status)/\(.conclusion // "none")"' runs.json
+          failed=0
+          for want in "CI gate" "AWS template gate" "Azure template gate"; do
+            verdict=$(jq -r --arg n "$want" '
+              map(select(.name == $n)) | sort_by(.started_at) | last
+              | if . == null then "absent"
+                else "\(.status)/\(.conclusion // "none")" end' runs.json)
+            if [ "$verdict" = "completed/success" ]; then
+              echo "ok: $want"
+            else
+              echo "::error::$want is $verdict for ${REV} - refusing to promote."
+              failed=1
+            fi
+          done
+          [ "$failed" -eq 0 ]
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Check out the candidate into its own directory
+        # The top-level checkout above is fetch-depth 0 so REV can be
+        # resolved from anywhere in history, but its WORKING TREE still
+        # sits at whatever ref this run was dispatched on - not at REV
+        # unless the two happen to coincide. Hashing "." here would hash
+        # the dispatch ref's files while claiming they were REV's - and
+        # release_manifest.py's own remote check catches the mismatch and
+        # fails loudly rather than promoting the wrong tree, but a
+        # candidate other than the tip could then never be promoted at
+        # all. A separate worktree gives an on-disk copy of exactly REV,
+        # while scripts/release_manifest.py itself keeps running from the
+        # trusted ref this workflow was defined on.
+        env:
+          REV: ${{ steps.rev.outputs.rev }}
+        run: git worktree add --detach _candidate "$REV"
+
+      - name: Decide whether this is a fresh candidate or a re-promotion
+        id: rollback
+        # skip_deploy_test is only ever valid for a commit that already
+        # passed the fresh-boot test - i.e. one that was promoted before
+        # and carries a release-* tag. Refusing it here (rather than
+        # discovering it later, or worse, silently rebuilding a manifest
+        # for a commit that was never boot-tested) is what closes the gap
+        # a manual dispatch of publish-template.yml shares: neither path
+        # may publish an untested candidate.
+        env:
+          REV: ${{ steps.rev.outputs.rev }}
+          SKIP_DEPLOY_TEST: ${{ inputs.skip_deploy_test }}
+        run: |
+          existing=$(git tag --points-at "$REV" --list 'release-*' | head -n 1)
+          if [ "$SKIP_DEPLOY_TEST" = "true" ] && [ -z "$existing" ]; then
+            echo "::error::skip_deploy_test was requested for $REV, but it carries no release-* tag - it was never promoted before, so there is no prior fresh-boot result to reuse. Only dispatch skip_deploy_test for a commit that already passed deploy-test (a rollback)."
+            exit 1
+          fi
+          echo "existing_tag=$existing" >> "$GITHUB_OUTPUT"
+
+      - name: Reuse the original manifest for a rollback
+        # A rollback must not re-derive anything: build() would resolve
+        # the nixos-unstable channel again, and the same source sha can
+        # acquire dependency pins that were never tested (a rebuild of one
+        # sha, hours apart, was proven to change agent_nixpkgs). The
+        # manifest this commit was ORIGINALLY promoted with is the
+        # immutable record of what was tested, so a rollback fetches it
+        # back from its Release and verifies it still describes REV rather
+        # than building a new one.
+        if: steps.rollback.outputs.existing_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rollback.outputs.existing_tag }}
+          REV: ${{ steps.rev.outputs.rev }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern release-manifest.json --clobber
+          python3 scripts/release_manifest.py verify release-manifest.json \
+            --rev "$REV" --source-dir _candidate
+
+      - name: Build the candidate's release manifest, once
+        # Once, from one commit, and every phase after this reads it
+        # instead of resolving anything again. --source-dir with the remote
+        # check on: the hashes recorded are the checked-out candidate's, and
+        # the tree is proven to be byte-identical to what GitHub serves at
+        # that rev, which is where a launching box fetches the module from.
+        if: steps.rollback.outputs.existing_tag == ''
+        env:
+          REV: ${{ steps.rev.outputs.rev }}
+        run: |
+          python3 scripts/release_manifest.py build \
+            --repo "$GITHUB_REPOSITORY" --rev "$REV" \
+            --source-dir _candidate \
+            --created-by "promote.yml run ${GITHUB_RUN_ID}" \
+            --out release-manifest.json
+
+      - name: Read the pins the deployment test has to use
+        id: pins
+        run: |
+          m() { python3 scripts/release_manifest.py field release-manifest.json "$1"; }
+          # Assigned first, and deliberately not `echo "k=$(m ...)"`. Under
+          # `bash -e` the status of that echo is echo's own, so a failing
+          # `field` would be discarded and an EMPTY pin written to
+          # GITHUB_OUTPUT - which deploy-test then reads as "base channel"
+          # and boots an unpinned box, the exact divergence this workflow
+          # exists to prevent. An assignment carries the substitution's
+          # status, so it fails the step.
+          module_sha256=$(m module_sha256)
+          agent_nixpkgs_url=$(m agent_nixpkgs.url)
+          agent_nixpkgs_sha256=$(m agent_nixpkgs.sha256)
+          {
+            echo "module_sha256=$module_sha256"
+            echo "agent_nixpkgs_url=$agent_nixpkgs_url"
+            echo "agent_nixpkgs_sha256=$agent_nixpkgs_sha256"
+          } >> "$GITHUB_OUTPUT"
+          python3 scripts/release_manifest.py show release-manifest.json \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Hand the manifest to the phases that follow
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: release-manifest.json
+          if-no-files-found: error
+
+  # Phase 4: the same candidate, booted from nothing but its manifest's
+  # identities. The reusable workflow's DEFINITION comes from the ref this
+  # run was dispatched on (a local `uses:` cannot be pinned to another
+  # ref); the tree it deploys is the candidate, via `ref`.
+  deploy-test:
+    name: Fresh-boot the candidate
+    needs: candidate
+    if: ${{ !inputs.skip_deploy_test }}
+    uses: ./.github/workflows/deploy-test.yml
+    secrets: inherit
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      ref: ${{ needs.candidate.outputs.rev }}
+      agent_box_rev: ${{ needs.candidate.outputs.rev }}
+      agent_box_sha256: ${{ needs.candidate.outputs.module_sha256 }}
+      agent_nixpkgs_url: ${{ needs.candidate.outputs.agent_nixpkgs_url }}
+      agent_nixpkgs_sha256: ${{ needs.candidate.outputs.agent_nixpkgs_sha256 }}
+
+  # Phase 5: the first step that changes anything the public can see.
+  publish:
+    name: Publish the promoted templates
+    needs: [ candidate, deploy-test ]
+    # `always()` is needed to run at all when deploy-test was skipped by
+    # input - and then every acceptable state has to be spelled out, or
+    # `always()` would also run this after a FAILED deployment test, which
+    # is precisely the thing that must leave the public defaults alone.
+    if: >-
+      always()
+      && needs.candidate.result == 'success'
+      && (needs.deploy-test.result == 'success'
+          || (needs.deploy-test.result == 'skipped' && inputs.skip_deploy_test))
+    uses: ./.github/workflows/publish-template.yml
+    secrets: inherit
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      ref: ${{ needs.candidate.outputs.rev }}
+      manifest_artifact: release-manifest
+
+  record:
+    name: Record the promotion
+    needs: [ candidate, publish ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # The tag, the Release, and the `release` branch pointer.
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.candidate.outputs.rev }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-manifest
+
+      - name: Verify the manifest still describes this commit
+        # Cheap, and it closes the window: the manifest was built in the
+        # first job and the tree has been checked out again since. Anything
+        # that does not match means the artifact and the tag would disagree
+        # about what was promoted.
+        #
+        # AGENT_BOX_SKIP_PREFETCH because this job installs no Nix, so
+        # `nix-prefetch-url` is not here to re-hash the channel tarball -
+        # and the publish job, which does have it, already ran the full
+        # verification including that hash before anything was uploaded.
+        # Every other identity is still recomputed here.
+        env:
+          AGENT_BOX_SKIP_PREFETCH: "1"
+        run: |
+          python3 scripts/release_manifest.py verify release-manifest.json \
+            --rev "${{ needs.candidate.outputs.rev }}" --source-dir .
+
+      - name: Tag the release, or recognise a rollback
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REV: ${{ needs.candidate.outputs.rev }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          existing=$(git tag --points-at "$REV" --list 'release-*' | head -n 1)
+          if [ -n "$existing" ]; then
+            # A commit is promoted at most once. Re-promoting one is a
+            # rollback, and it keeps the tag it already has - a second tag
+            # on the same commit would make the history of what was public
+            # unreadable.
+            echo "::notice::$REV is already tagged $existing - re-promoting it."
+            echo "tag=$existing" >> "$GITHUB_OUTPUT"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag="release-$(date -u +%Y%m%d-%H%M%S)-$(git rev-parse --short=7 "$REV")"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" "$REV" -m "agent-box $tag${REASON:+ - }${REASON}"
+          git push origin "refs/tags/$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::Tagged $REV as $tag"
+
+      - name: Publish the Release object carrying the manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          REV: ${{ needs.candidate.outputs.rev }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          {
+            echo "Promoted \`$REV\`."
+            echo
+            if [ -n "$REASON" ]; then
+              echo "$REASON"
+              echo
+            fi
+            echo "The attached \`release-manifest.json\` is the identity of"
+            echo "this release: the source rev, the module hash the EC2"
+            echo "template fetches, the flake ref the Lightsail template"
+            echo "installs, the flake.lock hash, and the resolved nixpkgs"
+            echo "channel snapshot. The published 1-click templates carry"
+            echo "exactly these pins, and the deployment test booted them."
+            echo
+            echo "Verify any of it with:"
+            echo '```'
+            echo "python3 scripts/release_manifest.py verify release-manifest.json --rev $REV"
+            echo '```'
+          } > notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+            gh release upload "$TAG" release-manifest.json --clobber
+          else
+            gh release create "$TAG" release-manifest.json \
+              --title "agent-box $TAG" --notes-file notes.md
+          fi
+
+      - name: Move the `release` pointer
+        env:
+          REV: ${{ needs.candidate.outputs.rev }}
+          ALLOW_ROLLBACK: ${{ inputs.allow_rollback }}
+        # The tag and the Release are the record; this branch is the thing a
+        # box can FOLLOW. `agentbox update --branch release` and the NixOS
+        # module's selfUpdate.branch both take a branch name, and
+        # agent-box-source's fast-forward guard is written around one - so a
+        # box tracking `release` moves from tested release to tested
+        # release and never through an untested tip.
+        #
+        # Fast-forward by default. A rollback is a real backwards move and
+        # has to be asked for by name, because it is the one push here that
+        # can lose a commit from the branch.
+        run: |
+          if [ "$ALLOW_ROLLBACK" = "true" ]; then
+            git push --force origin "$REV:refs/heads/release"
+            echo "::warning::\`release\` was FORCE-moved to $REV (rollback)."
+          elif ! git push origin "$REV:refs/heads/release"; then
+            echo "::error::$REV is not a fast-forward of \`release\`. If this is a deliberate rollback, dispatch again with allow_rollback."
+            exit 1
+          fi
+
+      - name: Summarise what is now public
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          REV: ${{ needs.candidate.outputs.rev }}
+        run: |
+          {
+            echo "## Promoted"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| tag | \`$TAG\` |"
+            echo "| rev | \`$REV\` |"
+            echo "| deployment test | ${{ inputs.skip_deploy_test && 'SKIPPED (re-promotion)' || 'passed' }} |"
+            echo "| \`release\` branch | \`$REV\` |"
+            echo
+            python3 scripts/release_manifest.py show release-manifest.json
+          } >> "$GITHUB_STEP_SUMMARY"

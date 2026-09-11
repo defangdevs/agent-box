@@ -578,14 +578,34 @@ commit if anything changed.
 CloudFormation's `templateURL` accepts only S3 URLs, so the templates live
 at `s3://defang-agent-box/lightsail-template.yaml` (the default Launch
 buttons) and `s3://defang-agent-box/template.yaml` (the EC2 alternative).
-`.github/workflows/publish-template.yml` uploads both on every push to
-`master` via GitHub OIDC (no static AWS keys).
+`.github/workflows/publish-template.yml` uploads both, plus the
+`release-manifest.json` that says what they pin, via GitHub OIDC (no static
+AWS keys).
+
+**It no longer runs on a push to `master`** (issue #632). Publishing was
+independent of CI and of the fresh-boot deploy test, and it re-resolved the
+nixos-unstable channel at publish time - so the box a Launch button creates
+had never been booted by anything, and its one mutable dependency was
+resolved after the last thing that could have tested it. Publishing is now
+the last phase of `.github/workflows/promote.yml`, which requires the three
+aggregate CI gates green for one exact commit, builds that candidate's
+release manifest ONCE, boots it in `deploy-test` with those pins, and only
+then calls this workflow with the same manifest. So a failed deployment test
+leaves the public defaults unchanged, and the templates always pin what was
+actually tested. See "Releases" in the repo's `AGENTS.md`, including how to
+roll back.
+
+To publish, dispatch `Promote a release candidate`. A `workflow_dispatch` of
+`Publish CFN template to S3` still exists for re-publishing an existing
+release tag; it rebuilds the manifest from that immutable rev and runs no
+tests of its own, so it is not a way to promote something new.
 
 ### Prerequisites (forking this repo)
 
 The workflow is self-bootstrapping - it upserts the bucket, its
 public-access configuration, and an `s3:GetObject` policy scoped to the two
-template objects (the only objects in the bucket) every run. The module itself
+template objects plus `release-manifest.json` (the only objects in the
+bucket) every run. The module itself
 is fetched by the box direct from `raw.githubusercontent.com` at first boot;
 that host is dual-stack, so an IPv6-only box needs no NAT64. It reads all
 deploy config from **repo-level Actions variables** (Settings > Secrets and
@@ -618,13 +638,17 @@ Verify with a `workflow_dispatch` run of `Publish CFN template to S3`, then:
 ```bash
 curl -I "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/lightsail-template.yaml"
 curl -I "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/template.yaml"
+# what those two currently pin, and what a box can be checked against
+curl -s "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/release-manifest.json"
 ```
 
 ## Pull request validation
 
-`.github/workflows/aws-ci.yml` runs on pull requests that touch the AWS
-templates, launch page, browser-terminal smoke helper, or related workflows. It
-does not create AWS resources; it runs
+`.github/workflows/aws-ci.yml` starts on every pull request. Its `AWS template
+gate` check is always reported, so it is the one to require; the `validate`
+job itself only runs when a change touches the AWS templates, launch page,
+browser-terminal smoke helper, or related workflows (issue #632). It does not
+create AWS resources; when it runs, it runs
 `cfn-lint deploy/aws/template.yaml deploy/aws/lightsail-template.yaml` and compiles
 `scripts/ws_smoke.py` so template/auth-helper changes get fast PR feedback.
 

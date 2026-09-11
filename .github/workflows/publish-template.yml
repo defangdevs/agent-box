@@ -1,19 +1,52 @@
 name: Publish CFN template to S3
 
 on:
-  # No `paths:` filter. The published templates embed AgentBoxRev/
-  # AgentBoxSha256 pinned to the commit that ran this workflow (see the
-  # "Inject pinned defaults" step below), so ANY push to master makes that
-  # pin stale, not just a push touching the template files themselves. A
-  # `paths:` filter here previously let master drift 30+ commits ahead of
-  # the S3-published templates before anything touched the two YAML files
-  # again — a freshly-launched box came up already 30 commits behind
-  # (issue #408). deploy-test never caught this: it always computes its
-  # own fresh pin from the triggering commit instead of reading the
-  # published template.
-  push:
-    branches: [ master ]
+  # No `push:` trigger any more (issue #632).
+  #
+  # It used to publish on EVERY push to master, deliberately without a
+  # `paths:` filter, because the published copies embed AgentBoxRev/
+  # AgentBoxSha256 pinned to the commit that ran the workflow - so any push
+  # made an older pin stale, and a filter once let master drift 30+ commits
+  # ahead of S3 (issue #408).
+  #
+  # That fixed the staleness and left the real problem: publishing ran
+  # independently of CI and of the fresh-boot deployment test, so whatever
+  # landed on master became the public install default within minutes,
+  # tested or not. And it re-resolved the nixos-unstable channel HERE, at
+  # publish time, which meant the dependency set in the published template
+  # had never been booted by anything.
+  #
+  # So publishing is no longer a consequence of pushing. It is the last
+  # phase of promote.yml, which builds a candidate's release manifest once,
+  # proves the aggregate CI gates are green for that exact commit, boots it
+  # in deploy-test with THOSE pins, and only then calls this workflow with
+  # the same manifest. Nothing here resolves anything; it injects what the
+  # manifest recorded.
+  #
+  # Issue #408's failure cannot come back, because the pin and the template
+  # are now always the same candidate's. What CAN happen is master running
+  # ahead of the last promoted release - and that is the intent: a 1-click
+  # launch gets the release that was tested, not the tip that was not.
+  workflow_call:
+    inputs:
+      ref:
+        description: The candidate commit to publish
+        type: string
+        required: true
+      manifest_artifact:
+        description: Run artifact holding the candidate's release-manifest.json
+        type: string
+        default: release-manifest
   workflow_dispatch:
+    inputs:
+      ref:
+        description: >-
+          Commit, tag or branch to publish (empty = the ref this run was
+          dispatched on). A manual dispatch builds the manifest here rather
+          than receiving one, so use it to re-publish an existing release
+          tag; for a new release use promote.yml, which tests first.
+        type: string
+        default: ''
 
 concurrency:
   group: publish-template
@@ -40,6 +73,9 @@ jobs:
       # step below.
       TEMPLATES: lightsail-template.yaml template.yaml
       ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      # Published beside them so anyone can read what the public default
+      # actually pins, without guessing from a Default: line.
+      MANIFEST: release-manifest.json
     steps:
       - name: Sanity-check required variables
         run: |
@@ -52,20 +88,95 @@ jobs:
           fi
 
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          # 0 so a manual dispatch (below) can see whether this commit
+          # already carries a release-* tag - a shallow clone has no tags
+          # to check.
+          fetch-depth: 0
 
       - uses: cachix/install-nix-action@v31
+
+      - name: Resolve the commit being published
+        id: rev
+        run: |
+          rev=$(git rev-parse HEAD)
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+          echo "::notice::Publishing $rev"
+
+      # A manual dispatch has no upstream candidate: nothing here runs CI
+      # or boots a box, so the ONLY thing that makes publishing it safe is
+      # that promote.yml already did those things for this exact commit.
+      # That is what a release-* tag records. Without this check, a manual
+      # dispatch on master (or any ref) reaches the S3 upload having
+      # checked nothing - the comment on the input used to say "for
+      # re-publishing" while the code let it publish anything.
+      - name: Refuse a manual publish of a commit that was never promoted
+        if: inputs.manifest_artifact == ''
+        env:
+          REV: ${{ steps.rev.outputs.rev }}
+        run: |
+          existing=$(git tag --points-at "$REV" --list 'release-*' | head -n 1)
+          if [ -z "$existing" ]; then
+            echo "::error::$REV carries no release-* tag - it was never promoted through promote.yml, which is the only path that runs the CI gates and the fresh-boot deployment test. A manual dispatch here only re-publishes an already-promoted release; to promote something new, run promote.yml instead."
+            exit 1
+          fi
+          echo "::notice::$REV is tagged $existing - re-publishing an already-promoted release."
+
+      # promote.yml already built this, from one commit, before the
+      # deployment test booted it. Downloading it here is what makes the
+      # published template the SAME artifact that was tested rather than a
+      # freshly re-resolved lookalike.
+      - name: Fetch the candidate's release manifest
+        # Keyed on the input, NOT on github.event_name: inside a called
+        # workflow that name is the CALLER's event, so a promote.yml run
+        # (itself a workflow_dispatch) would take the manual branch below
+        # and quietly rebuild the manifest it was handed.
+        if: inputs.manifest_artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.manifest_artifact }}
+
+      # A manual dispatch has no upstream candidate, so it builds one. That
+      # is fine for re-publishing an existing release tag (the identities
+      # are recomputed from that immutable rev) and is NOT a way to promote
+      # something new: nothing here runs CI or boots a box.
+      - name: Build a manifest for a manual publish
+        if: inputs.manifest_artifact == ''
+        run: |
+          python3 scripts/release_manifest.py build \
+            --repo "${{ github.repository }}" \
+            --rev "${{ steps.rev.outputs.rev }}" \
+            --source-dir . \
+            --created-by "publish-template.yml (manual dispatch)" \
+            --out "$MANIFEST"
+
+      # Refuses a manifest that describes another commit, or one whose
+      # recorded hashes no longer match the tree being published. Without
+      # this the download step above would happily inject one candidate's
+      # pins into another candidate's templates.
+      - name: Verify the manifest describes exactly this commit
+        run: |
+          python3 scripts/release_manifest.py verify "$MANIFEST" \
+            --rev "${{ steps.rev.outputs.rev }}" --source-dir .
 
       - name: Validate templates locally
         run: |
           pip install --quiet cfn-lint
           cfn-lint deploy/aws/template.yaml deploy/aws/lightsail-template.yaml
 
-      - name: Inject pinned defaults for the 1-click copies
+      - name: Inject the manifest's pins into the 1-click copies
         # The source templates deliberately ship without pinned values (see
         # the params' Descriptions): a source-template launch like
-        # deploy-test then tracks the default branch / the base channel. The
-        # 1-click Launch buttons want a reproducible box, so pinned values go
-        # into the S3 COPIES only.
+        # deploy-test's push runs then tracks the default branch / the base
+        # channel. The 1-click Launch buttons want a reproducible box, so
+        # pinned values go into the S3 COPIES only.
+        #
+        # Every value below comes out of the manifest. Nothing is computed
+        # here, which is the whole change: a curl of the module and a fresh
+        # channel redirect used to happen at this point, so the published
+        # template could differ from the tested one in the one input that
+        # was never immutable.
         #
         # The two templates pin agent-box by different means, so they get one
         # awk each:
@@ -75,13 +186,15 @@ jobs:
         #   lightsail-template.yaml    installs the runtime profile from a
         #                              flake ref -> one Default.
         run: |
-          rev="${{ github.sha }}"
-          sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/agent-box.nix" \
-            | openssl dgst -sha256 -binary | base64)"
-          agentRelease="$(curl -fsSLo /dev/null -w '%{url_effective}' https://channels.nixos.org/nixos-unstable)"
-          agentUrl="${agentRelease%/}/nixexprs.tar.xz"
-          agentSha="$(nix-prefetch-url --unpack "$agentUrl")"
-          flakeRef="github:${{ github.repository }}/${rev}"
+          # One value per call, and `field` exits non-zero on a missing or
+          # empty one - so an incomplete manifest fails here rather than
+          # injecting a blank `Default:` into a public template.
+          m() { python3 scripts/release_manifest.py field "$MANIFEST" "$1"; }
+          rev=$(m rev)
+          sha=$(m module_sha256)
+          agentUrl=$(m agent_nixpkgs.url)
+          agentSha=$(m agent_nixpkgs.sha256)
+          flakeRef=$(m flake_ref)
           echo "Rev: $rev"
           echo "Sha: $sha"
           echo "AgentUrl: $agentUrl"
@@ -154,12 +267,13 @@ jobs:
             --public-access-block-configuration \
               'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=false,RestrictPublicBuckets=false'
 
-          # Public-read on the two template objects only — CloudFormation's
-          # Launch Stack UI requires an S3 URL for templateURL. The module
-          # itself is fetched by the box direct from raw.githubusercontent.com
-          # (dual-stack), so this bucket carries no other public assets. One
-          # policy covers both objects (a single PutBucketPolicy replaces the
-          # whole document, so the two templates must not fight over it).
+          # Public-read on the two template objects and the manifest that
+          # says what they pin — CloudFormation's Launch Stack UI requires an
+          # S3 URL for templateURL. The module itself is fetched by the box
+          # direct from raw.githubusercontent.com (dual-stack), so this
+          # bucket carries no other public assets. One policy covers all
+          # three objects (a single PutBucketPolicy replaces the whole
+          # document, so they must not fight over it).
           aws s3api put-bucket-policy --bucket "$BUCKET" --policy "$(cat <<POLICY
           {
             "Version": "2012-10-17",
@@ -170,7 +284,8 @@ jobs:
               "Action": "s3:GetObject",
               "Resource": [
                 "arn:aws:s3:::${BUCKET}/lightsail-template.yaml",
-                "arn:aws:s3:::${BUCKET}/template.yaml"
+                "arn:aws:s3:::${BUCKET}/template.yaml",
+                "arn:aws:s3:::${BUCKET}/${MANIFEST}"
               ]
             }]
           }
@@ -185,3 +300,17 @@ jobs:
               --cache-control "no-cache, max-age=0"
             echo "::notice::Published to https://${BUCKET}.s3.amazonaws.com/${t}"
           done
+          # Last, and on purpose: the manifest is the claim "this is what the
+          # templates beside me pin", so it must never be readable before the
+          # templates it describes are in place.
+          aws s3 cp "$MANIFEST" "s3://${BUCKET}/${MANIFEST}" \
+            --content-type "application/json" \
+            --cache-control "no-cache, max-age=0"
+          echo "::notice::Published to https://${BUCKET}.s3.amazonaws.com/${MANIFEST}"
+
+      - name: Keep the manifest with the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-manifest
+          path: ${{ env.MANIFEST }}
+          if-no-files-found: error
