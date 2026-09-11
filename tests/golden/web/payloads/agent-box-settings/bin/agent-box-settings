@@ -2353,15 +2353,29 @@ def parse_codex_status(proc):
     return (False, "")
 
 
+_GH_ACCOUNT_RE = re.compile(r"^\S+ account (\S+)(?: \((.+)\))?$")
+
+
 def parse_gh_status(proc):
     """`gh auth status` prints "Logged in to github.com account <login>
-    (<source>)", where <source> names GH_TOKEN when the env store's key
-    is what gh is using — which is exactly what the card must say."""
+    (<source>)". <source> is GH_TOKEN when the env store's key is what
+    gh is using -- which is exactly what the card must say -- but it is
+    just as often the on-disk credential store gh wrote the token to
+    (a hosts.yml path, or "keyring"), which is internal detail nobody
+    asked for (issue #666). So only a token-env source is kept; anything
+    else is dropped and the login stands on its own."""
     text = (proc.stdout or "") + (proc.stderr or "")
     for raw in text.splitlines():
         line = raw.strip().lstrip("✓").strip()
         if line.lower().startswith("logged in to"):
-            return (True, connect_detail(line))
+            detail = connect_detail(line)
+            m = _GH_ACCOUNT_RE.match(detail)
+            if not m:
+                return (True, detail)
+            login, source = m.group(1), m.group(2)
+            if source and source.upper() in ("GH_TOKEN", "GITHUB_TOKEN"):
+                return (True, "%s (%s)" % (login, source))
+            return (True, login)
     return (False, "")
 
 
