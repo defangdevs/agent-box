@@ -100,6 +100,36 @@ jobs:
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
           echo "::notice::Candidate is $rev"
 
+      - name: Refuse an unauthorized rollback before any public write
+        # Preflight, not just the final push guard in the `record` job: that
+        # guard only fires AFTER publish has already replaced the public S3
+        # templates and the Release has been written, which can roll public
+        # installs backward and then fail with the release branch already
+        # moved past them. Checking ancestry here, before deploy-test or
+        # publish ever run, means an unauthorized rollback never reaches a
+        # public write in the first place. The later push is kept as the
+        # concurrency-safe final check - two promotions racing each other is
+        # what THAT guards against, not this.
+        env:
+          REV: ${{ steps.rev.outputs.rev }}
+          ALLOW_ROLLBACK: ${{ inputs.allow_rollback }}
+        run: |
+          git fetch origin release:refs/remotes/origin/release 2>/dev/null || true
+          if ! git rev-parse --verify --quiet origin/release >/dev/null; then
+            echo "::notice::No release branch yet - nothing to fast-forward from."
+            exit 0
+          fi
+          if [ "$ALLOW_ROLLBACK" = "true" ]; then
+            echo "::notice::allow_rollback is set - skipping the fast-forward check."
+            exit 0
+          fi
+          if git merge-base --is-ancestor origin/release "$REV"; then
+            echo "::notice::$REV is a fast-forward of the release branch."
+          else
+            echo "::error::$REV is not a fast-forward of the release branch - refusing before any public write. Dispatch again with allow_rollback for a deliberate rollback."
+            exit 1
+          fi
+
       - name: Require every aggregate CI gate to be green for that sha
         env:
           GH_TOKEN: ${{ github.token }}
@@ -137,18 +167,75 @@ jobs:
 
       - uses: cachix/install-nix-action@v31
 
+      - name: Check out the candidate into its own directory
+        # The top-level checkout above is fetch-depth 0 so REV can be
+        # resolved from anywhere in history, but its WORKING TREE still
+        # sits at whatever ref this run was dispatched on - not at REV
+        # unless the two happen to coincide. Hashing "." here would hash
+        # the dispatch ref's files while claiming they were REV's - and
+        # release_manifest.py's own remote check catches the mismatch and
+        # fails loudly rather than promoting the wrong tree, but a
+        # candidate other than the tip could then never be promoted at
+        # all. A separate worktree gives an on-disk copy of exactly REV,
+        # while scripts/release_manifest.py itself keeps running from the
+        # trusted ref this workflow was defined on.
+        env:
+          REV: ${{ steps.rev.outputs.rev }}
+        run: git worktree add --detach _candidate "$REV"
+
+      - name: Decide whether this is a fresh candidate or a re-promotion
+        id: rollback
+        # skip_deploy_test is only ever valid for a commit that already
+        # passed the fresh-boot test - i.e. one that was promoted before
+        # and carries a release-* tag. Refusing it here (rather than
+        # discovering it later, or worse, silently rebuilding a manifest
+        # for a commit that was never boot-tested) is what closes the gap
+        # a manual dispatch of publish-template.yml shares: neither path
+        # may publish an untested candidate.
+        env:
+          REV: ${{ steps.rev.outputs.rev }}
+          SKIP_DEPLOY_TEST: ${{ inputs.skip_deploy_test }}
+        run: |
+          existing=$(git tag --points-at "$REV" --list 'release-*' | head -n 1)
+          if [ "$SKIP_DEPLOY_TEST" = "true" ] && [ -z "$existing" ]; then
+            echo "::error::skip_deploy_test was requested for $REV, but it carries no release-* tag - it was never promoted before, so there is no prior fresh-boot result to reuse. Only dispatch skip_deploy_test for a commit that already passed deploy-test (a rollback)."
+            exit 1
+          fi
+          echo "existing_tag=$existing" >> "$GITHUB_OUTPUT"
+
+      - name: Reuse the original manifest for a rollback
+        # A rollback must not re-derive anything: build() would resolve
+        # the nixos-unstable channel again, and the same source sha can
+        # acquire dependency pins that were never tested (a rebuild of one
+        # sha, hours apart, was proven to change agent_nixpkgs). The
+        # manifest this commit was ORIGINALLY promoted with is the
+        # immutable record of what was tested, so a rollback fetches it
+        # back from its Release and verifies it still describes REV rather
+        # than building a new one.
+        if: steps.rollback.outputs.existing_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rollback.outputs.existing_tag }}
+          REV: ${{ steps.rev.outputs.rev }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern release-manifest.json --clobber
+          python3 scripts/release_manifest.py verify release-manifest.json \
+            --rev "$REV" --source-dir _candidate
+
       - name: Build the candidate's release manifest, once
         # Once, from one commit, and every phase after this reads it
         # instead of resolving anything again. --source-dir with the remote
-        # check on: the hashes recorded are the local tree's, and the tree
-        # is proven to be byte-identical to what GitHub serves at that rev,
-        # which is where a launching box fetches the module from.
+        # check on: the hashes recorded are the checked-out candidate's, and
+        # the tree is proven to be byte-identical to what GitHub serves at
+        # that rev, which is where a launching box fetches the module from.
+        if: steps.rollback.outputs.existing_tag == ''
         env:
           REV: ${{ steps.rev.outputs.rev }}
         run: |
           python3 scripts/release_manifest.py build \
             --repo "$GITHUB_REPOSITORY" --rev "$REV" \
-            --source-dir . \
+            --source-dir _candidate \
             --created-by "promote.yml run ${GITHUB_RUN_ID}" \
             --out release-manifest.json
 
