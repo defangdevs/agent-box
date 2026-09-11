@@ -137,15 +137,25 @@ if [ -d "$_abs_seed/tarball-cache-v2" ] &&
    [ ! -d "$HOME/.cache/nix/tarball-cache-v2" ] &&
    mkdir -p "$HOME"/.cache/nix 2>/dev/null; then
   _abs_tmp="$HOME/.cache/nix/.tarball-cache-v2.seeding.$$"
-  rm -rf "$_abs_tmp" 2>/dev/null || :
-  if cp -al "$_abs_seed"/tarball-cache-v2 "$_abs_tmp" 2>/dev/null ||
-     cp -a  "$_abs_seed"/tarball-cache-v2 "$_abs_tmp" 2>/dev/null; then
-    mv -Tn "$_abs_tmp" "$HOME"/.cache/nix/tarball-cache-v2 2>/dev/null || :
-    cp -an "$_abs_seed"/fetcher-cache-v4.sqlite "$HOME"/.cache/nix/ \
-      2>/dev/null || :
+  _abs_sqlite_tmp="$HOME/.cache/nix/.fetcher-cache-v4.sqlite.seeding.$$"
+  rm -rf "$_abs_tmp" "$_abs_sqlite_tmp" 2>/dev/null || :
+  # Stage the sqlite BEFORE the packfiles: a target dir a fallback cp lands
+  # in already exists (it was created, then partly populated, by the failed
+  # cp -al before it), so cp -a copies INTO it as a nested tarball-cache-v2/
+  # rather than populating it directly - clear it between attempts. And
+  # publish both files or neither: a tarball-cache-v2 published without its
+  # sqlite passes the -d guard above forever, so a later, complete seed
+  # attempt is skipped too.
+  if cp -an "$_abs_seed"/fetcher-cache-v4.sqlite "$_abs_sqlite_tmp" 2>/dev/null &&
+     { cp -al "$_abs_seed"/tarball-cache-v2 "$_abs_tmp" 2>/dev/null ||
+       { rm -rf "$_abs_tmp" 2>/dev/null
+         cp -a "$_abs_seed"/tarball-cache-v2 "$_abs_tmp" 2>/dev/null; }; }; then
+    if mv -Tn "$_abs_tmp" "$HOME"/.cache/nix/tarball-cache-v2 2>/dev/null; then
+      mv -n "$_abs_sqlite_tmp" "$HOME"/.cache/nix/fetcher-cache-v4.sqlite 2>/dev/null || :
+    fi
   fi
-  rm -rf "$_abs_tmp" 2>/dev/null || :
-  unset _abs_tmp
+  rm -rf "$_abs_tmp" "$_abs_sqlite_tmp" 2>/dev/null || :
+  unset _abs_tmp _abs_sqlite_tmp
 fi
 unset _abs_seed
 
