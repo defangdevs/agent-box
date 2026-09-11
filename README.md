@@ -36,19 +36,34 @@ closure to build and no reboot.
 | eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml) |
 | eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml) |
 
-Choose `Agent` (`claude` or `codex`), set a `WebPassword` (any 16&ndash;64
-characters, including password-manager symbols), pick a bundle size,
-launch. The stack reports
+Choose `Agent` (`claude` or `codex`) and set `WebPasswordHash`: an Argon2id
+hash, never the plaintext password (issue #25). The
+[project site](https://defangdevs.github.io/agent-box/) generates a
+high-entropy password and hashes it in your browser before handing you a
+launch link with the field pre-filled - use that if you want the field
+filled in for you. Launching straight from the table above, or from a
+console form you opened by hand? Compute the hash yourself and paste it in:
+
+```bash
+web_password="$(openssl rand -base64 24)" && echo "$web_password"
+caddy hash-password --algorithm argon2id --plaintext "$web_password"
+```
+
+Save what the first line prints - that is the password you will actually
+type into the browser terminal - before you launch: the hash the second
+line prints cannot be reversed back into it, and this is the only place you
+will ever see the plaintext. Pick a
+bundle size and launch. The stack reports
 CREATE_COMPLETE only after the box phones home from its first successful
 apply — a first boot that goes wrong rolls the
 stack back visibly instead of leaving a green stack with a dead URL. The agent runs as the
 `UserName` linux user (default `workspace`). Lightsail manages the networking, so
 nothing on the account has to be pre-configured. The
 stack Outputs show `https://<ip>.sslip.io/<UserName>/` - open it, sign in
-as the `UserName` with your `WebPassword`, complete the selected agent's
-one-time sign-in, done. `<UserName>-main@<host>.sslip.io` is used as the Claude
-Remote Control session name - the box's public address, so the entry in the
-Claude apps doubles as the address you reach it at.
+as the `UserName` with the password you hashed above, complete the selected
+agent's one-time sign-in, done. `<UserName>-main@<host>.sslip.io` is used as
+the Claude Remote Control session name - the box's public address, so the
+entry in the Claude apps doubles as the address you reach it at.
 
 **Cost.** The bundle price is the whole bill — no separate EBS, transfer, or
 public-IPv4 line items. The default `small_3_0` (2 vCPU / 2 GiB / 60 GiB SSD)

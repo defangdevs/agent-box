@@ -5142,6 +5142,50 @@ def settle_public_ip(attempts=60, quiet=3, sleep=10, initial=0):
     return ip
 
 
+def resolve_web_password_source():
+    """("hash", value), ("password", value), or (None, None).
+
+    Prefers an already-hashed AGENT_BOX_WEB_PASSWORD_HASH[_FILE] (issue #25:
+    what CloudFormation hands first boot now, generated client-side by the
+    launch page, so the plaintext never rides in user-data or a Lightsail
+    launch script) over a plaintext AGENT_BOX_WEB_PASSWORD[_FILE]. The
+    plaintext path stays for a hand-provisioned box, where typing a password
+    into this shell carries none of the exposure a cloud provider's
+    API-readable launch metadata does; it is never what a template should
+    reach for. Returning the KIND alongside the value (rather than hashing
+    it here) lets the caller decide how to apply it: a hash is one fixed
+    value with no plaintext behind it to re-derive anything from, while a
+    plaintext password can and should still be hashed separately per user,
+    each with its own random salt.
+    """
+    password_hash = os.environ.get("AGENT_BOX_WEB_PASSWORD_HASH", "")
+    hash_file = os.environ.get("AGENT_BOX_WEB_PASSWORD_HASH_FILE", "")
+    if not password_hash and hash_file:
+        password_hash = Path(hash_file).read_text().strip()
+    if password_hash:
+        return "hash", password_hash
+
+    password = os.environ.get("AGENT_BOX_WEB_PASSWORD", "")
+    pw_file = os.environ.get("AGENT_BOX_WEB_PASSWORD_FILE", "")
+    if not password and pw_file:
+        password = Path(pw_file).read_text().strip()
+    if password:
+        return "password", password
+    return None, None
+
+
+def hash_web_password(profile, password):
+    """argon2id, and via stdin — the same algorithm and the same invocation
+    the password helper uses for a later change, so a first-boot hash and a
+    changed one are the same kind of hash.
+    """
+    caddy = str(Path(profile) / "bin" / "caddy")
+    return subprocess.run(
+        [caddy, "hash-password", "--algorithm", "argon2id"],
+        input=password + "\n", text=True, check=True,
+        capture_output=True).stdout.strip()
+
+
 def first_boot(spec, args):
     """What the CloudFormation UserData used to do inline.
 
@@ -5156,32 +5200,31 @@ def first_boot(spec, args):
             spec.host_label = spec.domain
         print(f"derived domain {spec.domain} from {ip}")
 
-    password = os.environ.get("AGENT_BOX_WEB_PASSWORD", "")
-    pw_file = os.environ.get("AGENT_BOX_WEB_PASSWORD_FILE", "")
-    if not password and pw_file:
-        password = Path(pw_file).read_text().strip()
-    if spec.web_enable and password:
+    kind, value = resolve_web_password_source()
+    if spec.web_enable and kind:
         # Mint only what has to persist. The /run projection belongs to
         # write_auth_env, which agent-web-auth-secrets.service redoes on
         # every boot — first boot must not be the only thing that can
         # produce that file.
-        caddy = str(Path(spec.profile) / "bin" / "caddy")
         Path("/etc/agent-box").mkdir(parents=True, exist_ok=True)
         for u in spec.users:
-            # argon2id, and via stdin — the same algorithm and the same
-            # invocation the password helper uses for a later change, so a
-            # first-boot hash and a changed one are the same kind of hash.
-            hashed = subprocess.run(
-                [caddy, "hash-password", "--algorithm", "argon2id"],
-                input=password + "\n", text=True, check=True,
-                capture_output=True).stdout.strip()
-            Path(f"/etc/agent-box/{u.name}.hash").write_text(hashed + "\n")
+            # A hash IS the one fixed value CloudFormation gave us - every
+            # configured user gets that same value, same as they all shared
+            # the same plaintext password before this hash existed. A
+            # plaintext password, by contrast, is hashed FRESH per user
+            # (each call mints its own random salt) even though the
+            # password itself is shared, so two users' stored hashes never
+            # collide just because their password does.
+            password_hash = (value if kind == "hash"
+                             else hash_web_password(spec.profile, value))
+            Path(f"/etc/agent-box/{u.name}.hash").write_text(
+                password_hash + "\n")
             os.chmod(f"/etc/agent-box/{u.name}.hash", 0o600)
         # The manifest does not exist yet (render runs after first_boot), so
         # the user list is passed straight in.
         write_auth_env([(u.name, f"/etc/agent-box/{u.name}.hash")
                         for u in spec.users])
-        print(f"hashed the web password for {len(spec.users)} user(s)")
+        print(f"set the web password hash for {len(spec.users)} user(s)")
 
     # Write the resolved domain back, so a later plain `agentbox apply`
     # (a config edit, an update) renders the same hostname.

@@ -33,9 +33,11 @@ on:
         default: true
       web_password:
         description: >-
-          WebPassword override (16-64 chars of [A-Za-z0-9._~-]). Empty =
-          random hex. Use to reproduce auth issues with specific password
-          shapes; it WILL appear in the run log, so throwaway values only.
+          Plaintext WebPassword override. Empty = random hex. Only its
+          argon2id hash (issue #25) reaches the stack's WebPasswordHash
+          parameter; the plaintext still drives this workflow's own login
+          smoke tests and WILL appear in the run log, so throwaway values
+          only.
         type: string
         default: ''
       use_spot:
@@ -120,15 +122,25 @@ jobs:
       - name: Generate WebPassword
         id: pw
         run: |
-          # 48 hex chars — matches the template's AllowedPattern [A-Za-z0-9._~-]{16,64}.
-          # Dispatch runs may override the password to reproduce shape-specific
-          # auth bugs (e.g. hyphens); the override is intentionally not masked.
+          # 48 hex chars by default. Dispatch runs may override the plaintext
+          # to reproduce shape-specific auth bugs; the override is
+          # intentionally not masked. Only the HASH (issue #25) goes to the
+          # stack's WebPasswordHash parameter below - the plaintext never
+          # reaches CloudFormation, exactly like the launch page's own
+          # client-side generator - but this workflow still needs the
+          # plaintext itself for its later login smoke tests, so both outputs
+          # are kept. Caddy's own image computes the hash so this step needs
+          # no new toolchain beyond the Docker the runner already has.
           if [ -n '${{ inputs.web_password }}' ]; then
-            echo "value=${{ inputs.web_password }}" >> "$GITHUB_OUTPUT"
+            pw='${{ inputs.web_password }}'
             echo "::notice::Using dispatch-provided WebPassword override."
           else
-            echo "value=$(openssl rand -hex 24)" >> "$GITHUB_OUTPUT"
+            pw="$(openssl rand -hex 24)"
           fi
+          echo "value=$pw" >> "$GITHUB_OUTPUT"
+          hash="$(printf '%s\n' "$pw" \
+            | docker run --rm -i caddy:2 caddy hash-password --algorithm argon2id)"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
 
       - name: Compute module pin (AgentBoxRev + AgentBoxSha256)
         id: pin
@@ -146,6 +158,15 @@ jobs:
 
       - name: Create stack
         id: create
+        env:
+          # A hash-shaped value contains '$' and ',' (issue #25) - GitHub's
+          # ${{ }} substitution is a textual paste into this script, so
+          # interpolating it directly would hand bash a double-quoted string
+          # for it to re-parse, and bash treats a paste like "$m=..." as its
+          # own variable expansion. Routing it through the environment
+          # instead means bash's normal "$VAR" expansion supplies the value
+          # verbatim, with nothing in it re-scanned as shell syntax.
+          WEB_PASSWORD_HASH: ${{ steps.pw.outputs.hash }}
         run: |
           # PublicIpv4/UseSpot come from the matrix leg (see the job comment).
           # EnableSsm is now unconditionally true on BOTH legs (issue 190):
@@ -162,7 +183,7 @@ jobs:
               --parameters \
                 "ParameterKey=PublicIpv4,ParameterValue=${{ matrix.public_ipv4 }}" \
                 "ParameterKey=UseSpot,ParameterValue=${{ (inputs.use_spot == true && matrix.public_ipv4 == 'true') && 'true' || matrix.use_spot }}" \
-                "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
+                "ParameterKey=WebPasswordHash,ParameterValue=${WEB_PASSWORD_HASH}" \
                 "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't4g.small (2 vCPU / 2 GiB)' }}" \
                 "ParameterKey=SeedMainSession,ParameterValue=true" \
                 "ParameterKey=EnableSsm,ParameterValue=true" \

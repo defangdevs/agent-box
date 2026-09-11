@@ -1,0 +1,32 @@
+{
+  "_readme": [
+    "Third-party assets vendored into docs/ verbatim. This is a static",
+    "GitHub Pages site (unlike modules/src/vendor/, which exists because a",
+    "deployed box fetches modules/agent-box.nix as ONE file and its pages",
+    "load no external asset - neither constraint applies here), so vendoring",
+    "is a deliberate choice, not a requirement: keeping the hashing library",
+    "that computes WebPasswordHash (issue #25) in the repo, pinned by hash,",
+    "means the launch page's security-critical crypto is reviewable in the",
+    "same diff as everything else and never silently changes underneath a",
+    "published page.",
+    "",
+    "Each file is byte-identical to the artifact at `url`, so `sha256` is",
+    "upstream's own hash and anyone can re-derive it",
+    "(`curl -sSL <url> | sha256sum`). Never edit a vendored file in place -",
+    "a local patch makes the pin unverifiable. Bump by re-running that curl",
+    "against a newer tag and updating both the file and this pin together."
+  ],
+  "packages": [
+    {
+      "name": "hash-wasm-argon2id",
+      "version": "4.12.0",
+      "repo": "Daninet/hash-wasm",
+      "path": "hash-wasm-argon2id.umd.min.js",
+      "url": "https://cdn.jsdelivr.net/npm/hash-wasm@4.12.0/dist/argon2.umd.min.js",
+      "sha256": "dcec617a2e1b700fa132d1583a186cb70611113395e869f2dd6cc82b415d3094",
+      "license": "MIT",
+      "used_by": "docs/index.html, to compute the Argon2id WebPasswordHash client-side (issue #25)",
+      "note": "UMD build of hash-wasm's argon2id-only entry point (a WASM binary inlined as base64, no separate .wasm fetch). Exposes a global `hashwasm.argon2id({password, salt, parallelism, iterations, memorySize, hashLength, outputType}) -> Promise<string>`. Verified against a real Caddy `basic_auth argon2id` block (a hash-wasm-produced hash authenticates correctly and a wrong password is rejected) before vendoring."
+    }
+  ]
+}
