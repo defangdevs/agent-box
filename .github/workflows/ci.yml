@@ -12,31 +12,26 @@ on:
       - 'modules/agent-box.nix.in'
       - 'modules/src/**'
       - 'bin/assemble-module.py'
-      - 'tests/test-assemble-module.py'
-      # The vendored third-party assets under modules/src/vendor are matched
-      # by 'modules/src/**' above; this is the checker that verifies them.
-      - 'scripts/check_vendor.py'
+      # Native test/validator edits must trigger the discovered checks too.
+      - 'tests/**'
+      - 'scripts/**'
       # Every workflow, not just this one: CI validates no other workflow's
       # YAML, so a file that cannot parse is simply never run and nothing
       # says so. PR #483 shipped exactly that — vendor-updates.yml had a
       # heredoc dedented out of its `run: |` block scalar, CI stayed green,
       # and the weekly job would have silently never fired.
       - '.github/workflows/**'
-      - 'tests/test-envstore.py'
       # The native-render fixture (issue #154 Phase 4): the renderer under
       # test, the test itself, and its committed expected/ snapshot must all
       # re-run agentbox-render when any one changes, or a stale fixture only
       # surfaces via a manual dispatch (as it did for PR #381).
       - 'bin/agentbox'
-      - 'tests/test_agentbox.py'
-      - 'tests/native/**'
       # The mascot mark (issue #185) is embedded into the settings daemon at
       # assemble time, so it is a module source as much as a website asset.
       - 'docs/potato.svg'
       # The golden behavior snapshot (issue #154): the fixture and its
       # renderer must re-run the golden-snapshot check when either changes.
       - 'bin/golden-snapshot.py'
-      - 'tests/golden/**'
       - 'flake.lock'
       - '.github/workflows/ci.yml'
   pull_request:
@@ -54,369 +49,80 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Validate module & VM
+  native:
+    name: Native checks
     runs-on: ubuntu-latest
-    # A hung VM test otherwise burns the runner for GitHub's 360-minute
-    # default (a sessions-test hang once ran ~60 min before dying). Green
-    # runs finish in well under 10, so 25 is generous headroom.
-    timeout-minutes: 25
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@v30
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v30
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
+      # All native checks, pinned workflow lint and both image eval gates.
+      - name: Run native checks
+        timeout-minutes: 12
+        run: nix build -L --keep-going --max-jobs 4 --cores 1 --no-link .#ci-native
 
-      # Cheap and first: a workflow that does not parse is invisible to every
-      # check below it, so it can never be caught by them.
-      # `-shellcheck=` turns OFF the embedded shellcheck pass and keeps
-      # actionlint's own checks. Not a preference: deploy-test.yml already
-      # carries ten SC2016/SC2086/SC2129 style findings, and cleaning those up
-      # is a separate change from guarding the failure that motivated this one
-      # — a workflow whose YAML does not parse.
-      - name: Lint workflows
-        run: nix run nixpkgs#actionlint -- -shellcheck= .github/workflows/*.yml
-
-      - name: Show flake metadata
-        run: nix flake metadata
-
-      # Fast eval gates first — surface option/type errors before any build.
-      - name: Evaluate VM & qcow derivations
-        run: |
-          nix eval --raw .#nixosConfigurations.vm.config.system.build.vm.drvPath
-          echo
-          nix eval --raw .#packages.x86_64-linux.vm.drvPath
-          echo
-
-      # Asserts the multi-user example generates a service per agent.
-      - name: Check multi-user generation
-        run: nix build -L .#checks.x86_64-linux.multi-user && cat result
-
-      # Every socket-activated unit restarts in one step (issue #386 and its
-      # webhook-receiver twin). The default two-step restart lets the .socket
-      # re-activate the daemon from systemd's cached OLD unit definition, and
-      # the stale survivor is then never replaced.
-      - name: Check socket-activated units restart in one step
-        run: nix build -L .#checks.x86_64-linux.socket-activated-restart && cat result
-
-      # Issue #362: a unit override naming a unit the module does not render
-      # is a silent no-op. The check has existed since #362 but was never
-      # wired into CI, so it only ran when somebody built it by hand.
-      - name: Check for phantom systemd unit overrides
-        run: nix build -L .#checks.x86_64-linux.phantom-unit-overrides && cat result
-
-      # Eval-only guard for issue 51: deployed boxes (CFN user-data +
-      # self-update) fetch modules/agent-box.nix as a single file, so any
-      # ./sibling reference breaks first boot. Catch it here, not post-merge.
-      - name: Check module evaluates as a single file
-        run: nix build -L .#checks.x86_64-linux.module-single-file && cat result
-
-      # Issue 140: modules/agent-box.nix is generated from the .in template +
-      # modules/src/*. Fail (with a diff) if a source edit wasn't followed by
-      # `nix run .#assemble`, so the committed single file never drifts.
-      - name: Check generated module is up to date
-        run: nix build -L .#checks.x86_64-linux.module-generated-up-to-date && cat result
-
-      # Issue 244: the assembler's Nix escaping, decoded the way Nix's lexer
-      # does. The up-to-date check above cannot see an escaping bug — it
-      # regenerates the file with the same assembler, so both agree on the
-      # wrong bytes.
-      - name: Check assembler escaping
-        run: nix build -L .#checks.x86_64-linux.assemble-module-escaping && cat result
-
-      # Issue #51 makes this repo the distribution channel for the one
-      # third-party asset the settings page loads: boxes fetch the module as a
-      # single file and the pages load nothing from a CDN, so it is vendored.
-      # This proves each vendored file still hashes to the pin recording where
-      # it came from, and that none is unpinned or unused. The "is there a
-      # newer release?" half needs network and runs in vendor-updates.yml.
-      - name: Check vendored assets match their pins
-        run: nix build -L .#checks.x86_64-linux.vendor-integrity && cat result
-
-      # Issue 394: the native jail in front of the browser terminal, proven
-      # against a real Caddy 401 line rather than just parsed — `-t` alone
-      # accepts a jail with no filter and no action.
-      - name: Check the fail2ban jail is armed
-        run: nix build -L .#checks.x86_64-linux.fail2ban-jail && cat result
-
-      # Issue 394: the two renderers configure the same shared payloads, and
-      # #392 shipped every native box without the settings page's Connections
-      # section because only one of them set AGENT_BOX_CONNECT_BINS. Neither
-      # the golden fixture nor tests/native/expected could see it — both
-      # ratify whatever their own renderer emits — so this compares the two
-      # against each other and fails on an undeclared difference.
-      - name: Check backend parity (module vs native)
-        run: nix build -L .#checks.x86_64-linux.backend-parity && cat result
-
-      # Issue #451: the parity check above is keyed on AGENT_BOX_* names, so
-      # it cannot see a tmpfiles rule, a sudoers grant or the seed JSON —
-      # which is where #356's twin-schema bugs lived. This one first proves
-      # both backends were asked for the SAME box (tests/native/config.json is
-      # generated from the golden configuration's own options) and then
-      # compares what each made of it.
-      - name: Check one spec, both backends
-        run: nix build -L .#checks.x86_64-linux.one-spec-both-backends && cat result
-
-      # The env store's format (issue #212): round trip, no key injection, and
-      # the legacy readings a deployed box's file relies on. A unit test, not
-      # a VM test, because the format is read on the session-spawn path and
-      # every caller has to agree about it — the VM tests below prove one
-      # value survives one caller, which is the end-to-end half.
-      - name: Check env store format
-        run: nix build -L .#checks.x86_64-linux.envstore-format && cat result
-
-      # Issues 254/285/289: the session registry's write protocol — the lock
-      # five writers share, in two languages. The VM tests avoid concurrency
-      # on purpose, so this is what fails when the lock stops locking.
-      - name: Check session registry protocol
-        run: nix build -L .#checks.x86_64-linux.registry-protocol && cat result
-
-      # Eval/build check (issue 132): the module's generated Caddyfile carries
-      # the authenticated /<user>/downloads/ file-server route.
-      - name: Check downloads route in generated Caddyfile
-        run: nix build -L .#checks.x86_64-linux.download-route && cat result
-
-      # Eval/build check (issue 101): the webhook ingress route exists, comes
-      # before the /<user>/* catch-all, and carries NO basic_auth — GitHub
-      # cannot authenticate, so an auth gate there silently drops deliveries.
-      - name: Check webhook route in generated Caddyfile
-        run: nix build -L .#checks.x86_64-linux.webhook-route && cat result
-
-      # Issue #605: what a sweep of GitHub's delivery log re-requests and
-      # what it leaves alone - a 19-digit delivery id reaching the API
-      # byte-exact (rounded, it 404s and the sweep silently recovers
-      # nothing), and never touching a hook that points at another box.
-      # A stubbed `gh` over a canned log, so it costs about a second.
-      - name: Check webhook ingress backfill
-        run: nix build -L .#checks.x86_64-linux.webhook-backfill && cat result
-
-      # The connect cards' "checking" window (PR #557): the status probe
-      # never blocks a render, so the Sign-in button must exist while the
-      # pill still says "Checking" — and a destructive flow's confirm()
-      # must stay armed until that probe actually clears it. Seconds, and
-      # the connect VM test's stubs answer instantly, so nothing else
-      # prices this.
-      - name: Check connect card checking state
-        run: nix build -L .#checks.x86_64-linux.connect-card && cat result
-
-      # The connect cards' INSTALL half (issue #544): nix resolved at use,
-      # and a failed install still reaching the exit marker so the card can
-      # say what went wrong. Native box only - the module pins a nix store
-      # path and never hits this - so no VM prices it either. Seconds.
-      - name: Check connect card install path
-        run: nix build -L .#checks.x86_64-linux.connect-install && cat result
-
-      # Issue #374: the native backend's two flake checks, which nothing
-      # ran until that bug was found by hand. `runtime-profile` builds
-      # packages.<system>.runtime — the profile a native box installs at
-      # first boot — and diffs its payloads against modules/src, so a
-      # renamed asset (env-exec.sh -> .py, which broke the profile's
-      # evaluation outright) fails here instead of on a live launch.
-      # `agentbox-render` runs tests/test_agentbox.py through the flake and
-      # hands the rendered Caddyfile to `caddy validate`; aws-ci.yml runs
-      # the python directly, but only for its own path filter, which does
-      # not include the modules/src assets the render embeds.
-      - name: Check native runtime profile payloads
-        run: nix build -L .#checks.x86_64-linux.runtime-profile && cat result
-
-      - name: Check native renderer output
-        run: nix build -L .#checks.x86_64-linux.agentbox-render && cat result
-
-      # Full closure build — the real "module is usable" proof. --max-jobs
-      # auto because nix defaults to ONE: a system closure is hundreds of
-      # small independent derivations and this step served them one at a
-      # time (issue #312).
-      - name: Build VM system closure
-        run: nix build -L --max-jobs auto .#checks.x86_64-linux.vm-closure
-
-      # Behavior lock for the portability refactor (issue #154, Phase 0):
-      # rendered units/etc/tmpfiles/payload scripts must byte-match the
-      # committed tests/golden fixture (store hashes normalized). Runs after
-      # vm-closure so the shared closure is already in the store.
-      - name: Check golden behavior snapshot
-        run: nix build -L .#checks.x86_64-linux.golden-snapshot && cat result
-
-      # Everything else the flake defines that needs no VM. This step exists
-      # because the list above is written BY HAND - CI does not run `nix
-      # flake check`, since the intentionally filesystem-free VM
-      # configuration makes it unsuitable - and fifteen of the flake's
-      # forty-four checks had never been named by any workflow. They were
-      # not skipped and not reported: the job was simply green over them.
-      #
-      # Every one is a runCommand or an eval, seconds each, so they ride in
-      # one invocation with --keep-going: a failure in one must not hide the
-      # rest, and `nix build` lists every not-yet-built check beside the one
-      # that really failed if it stops at the first.
-      #
-      # A check ADDED to flake.nix still has to be added here. Keep this
-      # list alphabetical so the diff against `nix eval .#checks.<system>
-      # --apply builtins.attrNames` is readable by eye.
-      #
-      # What they cover, in order: the box's own repo checkout and the
-      # `selfUpdate` path assertions behind it (#242); lazily-installed
-      # harnesses; the durable per-session lease (#535); the portal,
-      # profile-panel and session routes/panels; the session registry's
-      # write protocol; the source tree an update moves (#242); the VM
-      # test-script size guard itself (#610); the screenshot uploader; the
-      # file drop's path confinement, including the symlink-swap race
-      # (#630); and the five webhook units - a claim's payload rules, the
-      # ceiling's EX_TEMPFAIL contract, the settings panel's states, the
-      # spawn wrapper's own claim parsing, and the "@self" resolver/cache.
-      - name: Run the remaining native checks
-        run: |
-          nix build -L --keep-going --no-link \
-            .#checks.x86_64-linux.checkout-bootstrap \
-            .#checks.x86_64-linux.checkout-options \
-            .#checks.x86_64-linux.downloads-confine \
-            .#checks.x86_64-linux.jit-agents \
-            .#checks.x86_64-linux.lease-protocol \
-            .#checks.x86_64-linux.portal-route \
-            .#checks.x86_64-linux.profile-panel \
-            .#checks.x86_64-linux.session-route \
-            .#checks.x86_64-linux.sessions-registry \
-            .#checks.x86_64-linux.source-tree \
-            .#checks.x86_64-linux.testscript-fits \
-            .#checks.x86_64-linux.upload-cli \
-            .#checks.x86_64-linux.webhook-claim \
-            .#checks.x86_64-linux.webhook-defer \
-            .#checks.x86_64-linux.webhook-panel-state \
-            .#checks.x86_64-linux.webhook-self \
-            .#checks.x86_64-linux.webhook-spawn-claim
-
-      # Interactive VM test: brute-forcing the web terminal's basic auth gets
-      # the client banned. ubuntu-latest runners have KVM but /dev/kvm is
-      # root-only by default; open it up so the qemu inside the nix build can
-      # use it (https://github.blog/changelog/2023-02-23-hardware-accelerated-android-virtualization-on-actions-linux-larger-hosted-runners/).
+  vm:
+    name: VM (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      # A failed lane must not cancel the other regression results.
+      fail-fast: false
+      matrix:
+        include:
+          - lane: sessions
+            jobs: 1
+          - lane: webhook
+            jobs: 1
+          - lane: browser
+            jobs: 1
+          - lane: host
+            jobs: 1
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      # Only this lane's drivers are evaluated/built, with no guests running.
+      - name: Prepare VM drivers
+        timeout-minutes: 7
+        run: nix build -L --keep-going --max-jobs 4 --cores 1 --out-link ci-drivers .#ci-vm-${{ matrix.lane }}
       - name: Enable KVM for the test driver
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      # The interactive VM tests, split across three nix invocations (see
-      # the lane comment below) so independent derivations build
-      # CONCURRENTLY instead of serializing per-step and via nix's default
-      # max-jobs=1. Ran back-to-back they'd take ~17 min; laned, they bound
-      # the job at roughly the slowest lane.
-      #   ubuntu-latest has 4 vCPUs / 16 GiB, and web-surface/sessions/
-      #     sessions-web/settings-page/webhook each boot TWO qemu nodes — all
-      #     7 checks at once would thrash and trade the saved minutes back
-      #     as flaky timeouts, which is why the two longest each get an
-      #     isolated lane instead (issues #312, #519).
-      #   --keep-going: one red test doesn't hide the others' results (the
-      #     failing drv is still named in the log).
-      # What each check covers:
-      #   web-surface       (issues 40/132/312) the user-facing web surface in
-      #                     one guest — per-user ~/downloads served at
-      #                     /<user>/downloads/ behind the terminal's auth
-      #                     (perms/symlink, auth gate, serving, browsable
-      #                     index), an agent adding a virtual host at runtime
-      #                     by writing a snippet to ~/sites/ and reloading
-      #                     caddy with no rebuild, and brute-forcing the basic
-      #                     auth getting the client banned
-      #   settings-page     the settings page stores a secret through the
-      #                     browser and the agent unit picks it up
-      #   memory-protection (issue 62) protectMemory — zram swap up,
-      #                     OOMScoreAdjust on the agent unit, earlyoom kills
-      #                     a memory hog while the box stays responsive
-      #   sessions          (issue 59) runtime session CRUD — seeded main
-      #                     session, agent-box-session add/rm with no sudo and
-      #                     no rebuild, cgroup containment, and two writers
-      #                     racing the registry
-      #   sessions-web      (issue 119) the browser half of the same box —
-      #                     tabbed workspace, settings-page session manager,
-      #                     /sessions/* CRUD, live feed, transcript download
-      #   connect           (issues 207/208/313) the guided sign-in cards —
-      #                     one tmux session per flow driving the tool's own
-      #                     login command (stubbed CLIs), host-anchored URL,
-      #                     code forwarding, success read from the CLI, and
-      #                     the refusal to start a tmux server of its own
-      #   containers        (issue 600) the host half of rootless docker —
-      #                     subuid range, capped newuidmap/newgidmap, an
-      #                     unprivileged user namespace that is allowed, the
-      #                     0700 runtime dir, DOCKER_HOST reaching the live
-      #                     supervisor, a per-user sudo grant matching the
-      #                     shipped guide, and the daemon unit as a no-op
-      #                     with no docker installed and running with one
-      #   ttyd-isolation    (issue 628) the browser terminal's transport is
-      #                     private — no TCP listener at all, a
-      #                     0660 <user>:caddy socket in a 2750 <user>:caddy
-      #                     directory, a second local user refused by the
-      #                     kernel and by the auth gate, the owner still
-      #                     attaching/typing/reconnecting and starting a
-      #                     stopped session, and cross-origin WebSockets
-      #                     refused
-      #   webhook           (issue 101) the default-on webhook receiver —
-      #                     socket-activated 0660 <user>:caddy ingress, the
-      #                     unauthenticated public path beside a still-401ing
-      #                     vhost, HMAC accept/reject (404 before any secret
-      #                     exists), IPC fan-out into a session peer applying
-      #                     its own filter, and the discovery surface
+      # Still four simultaneous test derivations per workflow run. Each test can
+      # boot multiple guests; separate runners reduce contention per guest.
       - name: Run VM tests
-        # The JOB timeout above cancels the run, and GitHub reports a
-        # cancelled run exactly like one that `cancel-in-progress`
-        # superseded — so a hang here is indistinguishable from routine
-        # noise, and the standing webhook watch (which spawns on
-        # `failure`/`timed_out`, never on `cancelled`) stays silent for it.
-        # A STEP timeout fails the step instead, so the job goes red and
-        # the hang gets reported.
-        #
-        # The step timeout has to beat the JOB timeout to the hang, and the
-        # steps above spend up to 219s first (measured over eight green
-        # master runs), so the step budget is 25min - 3.7min = 21.3min, not
-        # 25. 18 is under that and still 1.8x the slowest green step (596s
-        # over the same eight runs).
-        timeout-minutes: 18
+        timeout-minutes: 12
+        run: bash scripts/ci-vm-tests.sh ci-drivers ${{ matrix.jobs }}
+
+  validate:
+    # Preserve the existing status name and fail closed on failure, skip or
+    # cancellation in ANY dependency. Measure the full workflow critical
+    # path when assessing #519, not this short aggregation job in isolation.
+    name: Validate module & VM
+    needs: [native, vm]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every validation job to pass
+        env:
+          NATIVE_RESULT: ${{ needs.native.result }}
+          VM_RESULT: ${{ needs.vm.result }}
         run: |
-          # `sessions` is the longest check, so it gets its own lane and
-          # starts first, same as before (#312). But splitting `sessions`
-          # didn't stop the wave being held open by whichever check nix
-          # schedules last inside the shared "rest" bucket: measured on a
-          # green master run (32651927723, right after #344 merged),
-          # `webhook` started at +224s and closed the step at +323s even
-          # though it's shorter than `sessions` — the six-item bucket just
-          # packs in whatever order nix's own scheduler picks, not by size.
-          #
-          # `webhook.nix` has grown since: on run 33697007598 it took
-          # 223.84s (`sessions` 333.33s) and STILL started last, at +371s,
-          # holding the step open to 597s. Giving it its own lane too fixes
-          # the same flaw one level down, the way `sessions` already got
-          # fixed: three lanes now, sized so `sessions` alone bounds the
-          # window again.
-          #
-          # Total configured --max-jobs across the three lanes is 4, same
-          # as the two-lane split's 2+2 — this repartitions which checks
-          # get isolated, it doesn't raise the memory budget (still three
-          # VM guests at once in the worst case: one from each of the
-          # `sessions`/`webhook` lanes, one from whichever pair is
-          # concurrently building in the shared lane).
-          # THIS LIST IS THE ONE THAT DECIDES. Registering a test in
-          # flake.nix does NOT make CI run it: `nix flake check` is not
-          # used here (the filesystem-free VM configuration makes it
-          # unsuitable), so an interactive test that is not named below
-          # simply never runs, silently and with a green job over it.
-          # tests/containers.nix shipped that way for one round.
-          nix build -L --max-jobs 1 .#checks.x86_64-linux.sessions &
-          sessions=$!
-          nix build -L --max-jobs 1 .#checks.x86_64-linux.webhook &
-          webhook=$!
-          nix build -L --keep-going --max-jobs 2 \
-            .#checks.x86_64-linux.web-surface \
-            .#checks.x86_64-linux.settings-page \
-            .#checks.x86_64-linux.memory-protection \
-            .#checks.x86_64-linux.sessions-web \
-            .#checks.x86_64-linux.connect \
-            .#checks.x86_64-linux.containers \
-            .#checks.x86_64-linux.ttyd-isolation &
-          rest=$!
-          # All three are waited on before the step decides, so
-          # --keep-going's promise still holds across the set: every result
-          # reaches the log, and one red check cannot hide another's.
-          sessions_status=0; wait "$sessions" || sessions_status=$?
-          webhook_status=0; wait "$webhook" || webhook_status=$?
-          rest_status=0; wait "$rest" || rest_status=$?
-          [ "$sessions_status" -eq 0 ] && [ "$webhook_status" -eq 0 ] && [ "$rest_status" -eq 0 ]
+          echo "Native checks: $NATIVE_RESULT; VM lanes: $VM_RESULT"
+          [[ "$NATIVE_RESULT" == success && "$VM_RESULT" == success ]]
