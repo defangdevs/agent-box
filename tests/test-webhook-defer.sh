@@ -44,6 +44,11 @@ def expand(path, depth=0):
         lines.append(expand(src / m.group(1), depth + 1) if m else line)
     return "".join(lines)
 out.write_text(expand(script))
+(out.parent / "session.sh").write_text(expand(src / "session-cli.sh"))
+(out.parent / "capacity").write_text(
+    "#!" + sys.executable + "\n" + (src / "lib/session-capacity.py").read_text()
+    + "\n\n" + (src / "session-capacity-cli.py").read_text())
+(out.parent / "capacity").chmod(0o755)
 PY
 
 export HOME="$work/home"; mkdir -p "$HOME/.config/agent-box"
@@ -52,14 +57,15 @@ REGISTRY="$HOME/.config/agent-box/sessions.json"
 REFUSED="$HOME/.local/state/agent-box/webhook-spawn-refused.json"
 
 mkdir -p "$work/bin"
-# `add` is the wrapper's exec target and `peers` a read the preamble embeds.
-# Neither is under test, so the shim records the call and succeeds — the
-# recording is what says a spawn was ACCEPTED, since no session registry
-# entry is written when `add` is a stub.
+# Run real CLI admission, recording only successful adds.
 cat > "$work/bin/session" <<EOF
 #!$BASH_BIN
-printf '%s\n' "\$*" >> "$work/session.log"
-exit 0
+"$BASH_BIN" "$work/session.sh" "\$@"
+rc=\$?
+if [ "\$rc" = 0 ] && [ "\$1" = add ]; then
+  printf '%s\n' "\$*" >> "$work/session.log"
+fi
+exit "\$rc"
 EOF
 # No hook profile and no extra args: the env store answers "unset" (rc 1).
 cat > "$work/bin/envstore" <<EOF
@@ -69,11 +75,18 @@ EOF
 chmod +x "$work/bin/session" "$work/bin/envstore"
 export AGENT_BOX_SESSION_BIN="$work/bin/session"
 export AGENT_BOX_ENVSTORE_BIN="$work/bin/envstore"
-# No tmux here, and deliberately so: the liveness probe must not read a failure
-# as "nothing is running", so it falls back to counting registry keys and says
-# it did. That makes the capacity this test drives a pure function of the file
-# below — the same conservative path a box whose tmux is down takes.
-export AGENT_BOX_TMUX_BIN="$work/nonexistent-tmux"
+# No live panes, but non-stopped registrations still reserve capacity.
+cat > "$work/bin/tmux" <<EOF
+#!$BASH_BIN
+echo 'no server running' >&2
+exit 1
+EOF
+chmod +x "$work/bin/tmux"
+export AGENT_BOX_TMUX_BIN="$work/bin/tmux"
+export AGENT_BOX_CAPACITY_BIN="$work/capacity"
+export AGENT_BOX_SESSION_LIMIT_FILE="$work/limit"
+export AGENT_BOX_AGENTS=shell AGENT_BOX_DEFAULT_AGENT=shell
+export AGENT_BOX_FLOCK_BIN="$(command -v flock)"
 
 fails=0
 ok()   { printf 'ok   %s\n' "$1"; }
@@ -91,11 +104,11 @@ PY
 
 # spawn KEY [MAX] — drive one batch through the wrapper; echo its exit status.
 spawn() {
+  printf '%s\n' "${2:-4}" > "$work/limit"
   env LOCAL_WEBHOOK_SPAWN_SOURCE=github \
       LOCAL_WEBHOOK_SPAWN_KEY="$1" \
       LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*' \
       LOCAL_WEBHOOK_SPAWN_EVENT=issues \
-      AGENT_BOX_HOOK_SESSION_MAX="${2-}" \
       "$BASH_BIN" "$work/spawn.sh" > "$work/spawn.out" 2>&1 <<< 'hi'
   printf '%s' "$?"
 }
@@ -113,16 +126,11 @@ else
   fail "the hook-session cap exits 75 (EX_TEMPFAIL), not 1 — got $rc"
   sed 's/^/     /' "$work/spawn.out"
 fi
-if grep -q 'declining this batch for now' "$work/spawn.out"; then
+if grep -q 'session start deferred' "$work/spawn.out"; then
   ok "it says the batch is kept, not dropped"
 else
   fail "it says the batch is kept, not dropped"
   sed 's/^/     /' "$work/spawn.out"
-fi
-if grep -q 'cannot ask tmux' "$work/spawn.out"; then
-  ok "a probe that cannot run falls back to the key count and says so"
-else
-  fail "a probe that cannot run falls back to the key count and says so"
 fi
 if [ ! -s "$work/session.log" ]; then
   ok "no session is started at the ceiling"
@@ -149,19 +157,14 @@ else
   fail "a slot below the cap spawns — exit $rc"
   sed 's/^/     /' "$work/spawn.out"
 fi
-# A knob that --help documents is a knob someone will typo, and an unusable
-# value must not refuse every batch for a reason nobody can see: `[ n -ge foo ]`
-# is fatal under set -e, which would decline every batch on every box that
-# typed it. It says so and falls back to the built-in 4.
+# Invalid configuration is a retryable refusal, never an uncapped start.
 : > "$work/session.log"
 hook_registry 2
 rc=$(spawn defangdevs/typo lots)
-if [ "$rc" = 0 ] && grep -q 'is not a number' "$work/spawn.out" \
-   && grep -q 'add hook-defangdevs-typo-' "$work/session.log"; then
-  ok "an unusable AGENT_BOX_HOOK_SESSION_MAX says so and falls back to 4"
+if [ "$rc" = 75 ] && [ ! -s "$work/session.log" ]; then
+  ok "an invalid limit refuses without starting a session"
 else
-  fail "an unusable AGENT_BOX_HOOK_SESSION_MAX says so and falls back to 4 — exit $rc"
-  sed 's/^/     /' "$work/spawn.out"
+  fail "an invalid limit did not fail closed (exit $rc)"
 fi
 
 # --- and the dispatcher KEEPS what the wrapper declined ----------------------
@@ -177,7 +180,8 @@ elif [ ! -f "$WEBHOOK_PY" ]; then
 else
   : > "$work/session.log"
   hook_registry 1
-  if AGENT_BOX_HOOK_SESSION_MAX=1 SPAWN="$BASH_BIN $work/spawn.sh" \
+  echo 1 > "$work/limit"
+  if SPAWN="$BASH_BIN $work/spawn.sh" \
      REGISTRY="$REGISTRY" LOG="$work/session.log" \
      python3 - "$WEBHOOK_PY" > "$work/dispatch.out" 2>&1 <<'PY'
 import importlib.util, json, os, sys, time

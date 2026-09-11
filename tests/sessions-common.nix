@@ -21,6 +21,7 @@
     virtualisation.memorySize = 2048;
     environment.systemPackages = [ pkgs.curl pkgs.jq ];
     services.agent-box = {
+      sessionLimit = 64;
       enable = true;
       agent = "claude";
       # Both harnesses in the CLOSURE, not fetched on first use (issue #416).

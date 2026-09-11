@@ -42,6 +42,7 @@
     virtualisation.memorySize = 2048;
     environment.systemPackages = [ pkgs.jq pkgs.openssl pkgs.curl ];
     services.agent-box = {
+      sessionLimit = 64;
       enable = true;
       agent = "claude";
       # Real harnesses, no network to fetch them over (issue #416): the
@@ -2234,327 +2235,29 @@
         "test -e /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
 
-    # --- the hook-session ceiling is visible, not merely enforced (#170) -----
-    # A standing watch is the one delivery shape with no session behind it, so
-    # when the spawn wrapper refuses a batch nothing else holds those events.
-    # That refusal used to reach the receiver daemon's journal and nowhere
-    # else, while `ls` and `status` kept reporting a healthy subscription: four
-    # hook sessions whose agents forgot `agent-box-session rm` made every watch
-    # on the box inert, and read exactly like a quiet week. So a refusal is
-    # written down, and both listings say it.
-    #
-    # Since #301 the refusal is also a DEFERRAL: the wrapper answers 75, the
-    # one code local-webhook reads as "declined for now" instead of "this
-    # spawner is broken", so the exit code is asserted on every refusal below.
-    # What the receiver then does with it is `webhook-defer`, a native check.
-    refused = "/home/agent/.local/state/agent-box/webhook-spawn-refused.json"
-
-    def dispatch_status(cap="", expect=None):
-        # cap: AGENT_BOX_HOOK_SESSION_MAX as the receiver daemon would carry
-        # it. The CLI cannot read the daemon's environment, so raising the
-        # ceiling means raising it for both — which is what this passes.
-        out = machine.succeed(
-            f"{hookenv} {cap} agent-box-webhook status 2>/tmp/cap.err"
-        )
-        err = machine.succeed("cat /tmp/cap.err")
-        if expect is None:
-            assert "hook-* sessions are running" not in err, err
-        else:
-            assert expect in err, err
-        return json.loads(out)["dispatch"]
-
-    # Nothing refused yet: the object is present (so it is a place to look, not
-    # a field that appears only in trouble) and says everything is fine.
-    machine.succeed(f"test ! -e {refused}")
-    d = dispatch_status()
-    assert d["topicCount"] > 0, d
-    assert d["spawnCommand"] is True, d
-    assert d["lastRefusal"] is None, d
-    assert d["hookSessions"]["max"] == 4, d
-    assert d["hookSessions"]["atCapacity"] is False, d
-    assert "warning" not in d, d
-
-    # The session the settings page deleted just above has to be gone from
-    # tmux as well, not only from the registry: since #280 a hook-* pane that
-    # no entry claims is counted too, so a delete still in flight would make
-    # the arithmetic below off by one.
-    machine.wait_until_fails(
-        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
-        f" list-sessions -F '#S' | grep -x {hook_name} >/dev/null",
-        timeout=60,
-    )
-
-    # The issue's own smallest reproduction: lower the ceiling under the hook
-    # sessions this test already accumulated, then drive the wrapper. Capacity
-    # is held by the entries that are not `stopped` (#280), which is every one
-    # of them here — nothing has been stopped yet, and the leg below is where
-    # a stopped entry and a running one are told apart.
-    live = int(machine.succeed(
-        "jq '[.sessions | to_entries[]"
-        " | select((.key | startswith(\"hook-\")) and .value.stopped != true)]"
-        " | length' /home/agent/.config/agent-box/sessions.json"
-    ).strip())
-    assert live >= 1, live
+    # The production wrapper delegates admission to the shared session CLI.
+    # Pure count/restart races and actual dispatcher retry are native checks;
+    # this proves the installed programs share a limit with interactive work.
+    machine.succeed("echo 1 > /tmp/session-limit; chmod 644 /tmp/session-limit")
     drop_env = (
         "sudo -u agent env HOME=/home/agent"
+        " AGENT_BOX_SESSION_LIMIT_FILE=/tmp/session-limit"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
-        " AGENT_BOX_HOOK_SESSION_MAX=1"
-        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/dropped"
-        " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
+        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/cap"
         f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
     )
     rc, refusal_log = machine.execute(drop_env)
     assert rc == 75, (rc, refusal_log)
-    assert "declining this batch for now" in refusal_log, refusal_log
-    # What the refusal is recorded against is what it was refused ON: since
-    # #280 that is the capacity in USE — hook-* sessions running or queued to
-    # start — and no longer the raw key count. Nothing here is `stopped`, so
-    # the two numbers agree; the #280 leg below drives them apart and asserts
-    # the record follows the cap.
-    refused_line = [
-        ln for ln in refusal_log.splitlines() if "hook-* sessions are running" in ln
-    ][0]
-    refused_used = int(refused_line.split(":", 1)[1].split()[0])
-    assert refused_used == live, (refusal_log, live)
-    # No session started — the cap is still a cap — and the record says the
-    # wrapper answered "not yet" rather than "never", so `status` cannot
-    # report as lost a batch the receiver is still holding.
-    machine.fail(
-        "jq -e '.sessions | keys[] | select(startswith(\"hook-defangdevs-dropped\"))'"
-        " /home/agent/.config/agent-box/sessions.json"
-    )
-    rec = json.loads(machine.succeed(f"cat {refused}"))
-    assert rec["count"] == 1, rec
-    assert rec["deferred"] is True, rec
-    assert rec["live"] == refused_used, (rec, refusal_log)
-    assert rec["max"] == 1, rec
-    assert rec["topic"] == "github:defangdevs/*", rec
-    assert rec["key"] == "defangdevs/dropped", rec
-    assert rec["at"] == rec["firstAt"], rec
-
-    # status, at the ceiling: the count against the cap, the batch that was
-    # dropped, and ONE warning field — the same dispatch.warning webhook.py
-    # already sets for a receiver with no spawn command, so there is a single
-    # place to look rather than two.
-    d = dispatch_status(cap="AGENT_BOX_HOOK_SESSION_MAX=1",
-                        expect="hook-* sessions are running")
-    assert d["hookSessions"] == {"live": live, "max": 1, "atCapacity": True}, d
-    assert "DECLINES it (exit 75)" in d["warning"], d
-    assert "agent-box-session rm NAME" in d["warning"], d
-    assert d["lastRefusal"]["count"] == 1, d
-    assert d["lastRefusal"]["deferred"] is True, d
-
-    # ls says it too — a listing of standing watches is where someone goes to
-    # ask why nothing fires — but on stderr, so its stdout stays byte-for-byte
-    # webhook.py's for anything parsing it.
-    ls_out = machine.succeed(
-        f"{hookenv} AGENT_BOX_HOOK_SESSION_MAX=1 agent-box-webhook ls 2>/tmp/cap.err"
-    )
-    ls_err = machine.succeed("cat /tmp/cap.err")
-    assert "every standing watch is stalled" in ls_err, ls_err
-    assert '"dispatch"' in ls_out, ls_out
-    assert "every standing watch is stalled" not in ls_out, ls_out
-
-    # Cumulative and never cleared: a refused batch is at best late, so "N
-    # refused since T" is the standing fact, not something to forget.
-    rc, _ = machine.execute(drop_env)
-    assert rc == 75, rc
-    rec2 = json.loads(machine.succeed(f"cat {refused}"))
-    assert rec2["count"] == 2, rec2
-    assert rec2["firstAt"] == rec["firstAt"], (rec, rec2)
-
-    # Back under the ceiling: no warning anywhere, the history still reported.
-    d = dispatch_status()
-    assert d["hookSessions"]["atCapacity"] is False, d
-    assert "warning" not in d, d
-    assert d["lastRefusal"]["count"] == 2, d
-
-    # ...and the record is history, not a brake — a match still spawns.
-    machine.succeed(
-        "sudo -u agent env HOME=/home/agent"
-        " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
-        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/again"
-        f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
-    )
-    again = machine.succeed(
-        "jq -r '.sessions | keys[] | select(startswith(\"hook-defangdevs-again-\"))'"
-        " /home/agent/.config/agent-box/sessions.json"
-    ).strip()
-    machine.succeed(f"sudo -u agent env HOME=/home/agent agent-box-session rm {again}")
-    machine.succeed(f"jq -e '.count == 2' {refused} >/dev/null")
-
-    # An unusable AGENT_BOX_HOOK_SESSION_MAX falling back to the built-in
-    # ceiling is asserted in the `webhook-defer` native check instead: it is a
-    # pure function of one environment variable, and it cost a VM boot here.
-
-    # --- the dispatch cap counts what RUNS, not registry keys (issue #280) ---
-    # The cap used to count hook-* keys in sessions.json, and nothing expires a
-    # key: `stopped` is written by the pane epilogue and only
-    # `agent-box-session rm` clears it. So sessions that had long since finished
-    # kept holding dispatch capacity — the origin box sat at 2 of 4 slots held
-    # by corpses with no hook-* tmux session alive at all — and at four every
-    # standing watch went inert, journal-only (#170). Capacity now follows what
-    # the box is running.
-    #
-    # The liveness probe needs tmux, which the receiver unit's PATH deliberately
-    # does not carry (jq, coreutils and the session CLI are all of it), so the
-    # module pins the binary through the unit environment instead — the
-    # AGENT_BOX_*_BIN convention. Asserted first: without it the wrapper cannot
-    # tell a finished hook session from a running one, and would fall straight
-    # back to the count this leg exists to replace.
-    #
-    # One assignment per line, unquoted first: systemd only quotes a value that
-    # needs it (hookSessionArgs' JSON does), and the quotes would otherwise ride
-    # along into the env this leg builds.
-    recv_env = [
-        v.strip('"')
-        for v in machine.succeed(
-            "systemctl show -p Environment --value agent-box-webhook@agent.service"
-            " | tr ' ' '\\n'"
-        ).split("\n")
-    ]
-    recv_path = [v for v in recv_env if v.startswith("PATH=")][0]
-    recv_tmux = [v for v in recv_env if v.startswith("AGENT_BOX_TMUX_BIN=")][0]
-    tmux_bin = recv_tmux.split("=", 1)[1]
-    machine.fail(f"env -i {recv_path} {sw}/sh -c 'command -v tmux'")
-    machine.succeed(f"test -x {tmux_bin}")
-
-    # The wrapper is driven with exactly that environment — the receiver's own
-    # PATH plus the pinned binary — so what the cap can observe here is what it
-    # can observe in production.
-    def cap_spawn(key, maximum, tmux=None, want=True):
-        cmd = (
-            f"sudo -u agent env -i HOME=/home/agent {recv_path}"
-            f" {tmux if tmux else recv_tmux}"
-            f" AGENT_BOX_HOOK_SESSION_MAX={maximum}"
-            " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
-            " LOCAL_WEBHOOK_SPAWN_SOURCE=github"
-            f" LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/{key}"
-            f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
-        )
-        if want:
-            return machine.succeed(cmd)
-        # 75 exactly: any other code drops the batch (#301), and a
-        # `machine.fail` would pass on the `exit 1` this replaced.
-        rc, out = machine.execute(cmd)
-        assert rc == 75, (rc, out)
-        return out
-
-    def cap_session(key):
-        return machine.succeed(
-            "jq -r '.sessions | keys[]"
-            f" | select(startswith(\"hook-defangdevs-{key}-\"))'"
-            " /home/agent/.config/agent-box/sessions.json"
-        ).strip()
-
-    # Delist what the legs above left, so the arithmetic below is only about
-    # the sessions this one creates.
+    assert "Session limit reached" in refusal_log, refusal_log
+    refused = "/home/agent/.local/state/agent-box/webhook-spawn-refused.json"
+    record = json.loads(machine.succeed(f"cat {refused}"))
+    assert record["deferred"] is True and record["max"] == 1, record
+    # Remove this test's hook sessions before downstream @self assertions.
     for stale in machine.succeed(
         "jq -r '.sessions | keys[] | select(startswith(\"hook-\"))'"
         " /home/agent/.config/agent-box/sessions.json"
     ).split():
-        machine.succeed(
-            f"sudo -u agent env HOME=/home/agent agent-box-session rm {stale}"
-        )
-    hook_ls = (
-        "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
-        " list-sessions -F '#S'"
-    )
-    hook_keys = (
-        "jq '[.sessions | keys[] | select(startswith(\"hook-\"))] | length'"
-        " /home/agent/.config/agent-box/sessions.json"
-    )
-    assert machine.succeed(hook_keys).strip() == "0"
-
-    # One hook session running, one finished: the shape that wedged the watch.
-    cap_spawn("capbusy", 2)
-    busy = cap_session("capbusy")
-    machine.wait_until_succeeds(f"{hook_ls} | grep -x {busy} >/dev/null", timeout=60)
-    # The probe also has to work from where the receiver runs it, not just from
-    # a login shell: ProtectSystem=strict leaves /run read-only, which does not
-    # stop a tmux CLIENT connecting to the socket there, but a mount namespace
-    # that hid the agent unit's RuntimeDirectory would.
-    machine.succeed(
-        "systemd-run --wait --pipe --uid=agent"
-        " --property=ProtectSystem=strict --property=ProtectHome=false"
-        " --property=ReadWritePaths=/home/agent --property=PrivateDevices=true"
-        " --setenv=TMUX_TMPDIR=/run/agent-box-agent"
-        f" {tmux_bin} -L agent-box list-sessions -F '#S'"
-        f" | grep -x {busy} >/dev/null"
-    )
-    # The second one is a hook-* KEY with no pane — the divergence between the
-    # key count and what is actually running, which is the whole reason the
-    # fallback below exists. Stopped only once it has really started, so the
-    # state under test is "finished entry", not a spawn still in flight.
-    #
-    # Added DIRECTLY rather than through the spawn wrapper: a wrapper-spawned
-    # session is --ephemeral, so parking it delists it within a tick and there
-    # would be no lingering key left to count. The divergence itself is not
-    # gone with it — a hook-* entry outlives its pane whenever it is listed
-    # while the supervisor is down, caught between respawns, or predates
-    # --ephemeral — so the fallback still has to be conservative, and this is
-    # the deterministic way to put it in that state.
-    done = "hook-defangdevs-capdone-0000"
-    machine.succeed(
-        f"sudo -u agent env HOME=/home/agent agent-box-session add {done}"
-    )
-    machine.wait_until_succeeds(f"{hook_ls} | grep -x {done} >/dev/null", timeout=60)
-    machine.succeed(
-        f"sudo -u agent env HOME=/home/agent agent-box-session stop {done}"
-    )
-    machine.succeed(
-        f"jq -e '.sessions[\"{done}\"]"
-        " | .stopped == true and (has(\"ephemeral\") | not)'"
-        " /home/agent/.config/agent-box/sessions.json"
-    )
-    machine.wait_until_fails(f"{hook_ls} | grep -x {done} >/dev/null", timeout=60)
-
-    # Two hook-* keys at MAX=2, only one of them running. The old count refused
-    # this batch; the new one spends the slot the finished session was
-    # sitting on. (Asserted, not assumed: a stray coalesced dispatch landing
-    # here would otherwise turn the arithmetic below into a puzzle.)
-    assert machine.succeed(hook_keys).strip() == "2"
-    cap_spawn("capfree", 2)
-    free = cap_session("capfree")
-    machine.wait_until_succeeds(f"{hook_ls} | grep -x {free} >/dev/null", timeout=60)
-
-    # ...and the brake is not simply gone: the SAME cap, with both slots now
-    # genuinely running, still refuses the batch and says so — the only
-    # difference between this call and the one above is liveness, which is
-    # therefore worth restating as this assertion's precondition.
-    machine.succeed(f"{hook_ls} | grep -x {busy} >/dev/null")
-    machine.succeed(f"{hook_ls} | grep -x {free} >/dev/null")
-    drop = cap_spawn("capblocked", 2, want=False)
-    assert "2 hook-* sessions are running or queued to start" in drop, drop
-    # And the record #170 leaves carries THAT number, not the key count it
-    # replaced: three hook-* entries are listed here and the wrapper refused on
-    # the two that are running. One number, decided once, reported everywhere.
-    assert "recorded in" in drop, drop
-    blocked_rec = json.loads(machine.succeed(f"cat {refused}"))
-    assert blocked_rec["live"] == 2, (blocked_rec, drop)
-    assert blocked_rec["max"] == 2, blocked_rec
-    assert blocked_rec["key"] == "defangdevs/capblocked", blocked_rec
-    machine.fail(
-        "jq -e '.sessions | keys[]"
-        " | select(startswith(\"hook-defangdevs-capblocked\"))'"
-        " /home/agent/.config/agent-box/sessions.json"
-    )
-
-    # A probe that cannot run must not read as "nothing is running": it falls
-    # back to the old key count, which drops a batch it might have allowed
-    # (three keys, MAX=3) rather than uncapping spawns altogether. The same
-    # call with the pinned tmux working sees two live sessions and spawns.
-    assert machine.succeed(hook_keys).strip() == "3"
-    blind = cap_spawn(
-        "capnoprobe", 3, tmux="AGENT_BOX_TMUX_BIN=/nonexistent/tmux", want=False
-    )
-    assert "cannot ask tmux" in blind, blind
-    cap_spawn("capprobe", 3)
-    probe = cap_session("capprobe")
-    for name in [busy, done, free, probe]:
-        machine.succeed(
-            f"sudo -u agent env HOME=/home/agent agent-box-session rm {name}"
-        )
+        machine.succeed(f"sudo -u agent env HOME=/home/agent agent-box-session rm {stale}")
 
     # --- who "@self" is, resolved at runtime (issue #261) -------------------
     # webhook-spawn.sh seeds every hook-* session with ignoreSenders

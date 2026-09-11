@@ -114,6 +114,11 @@ plainly rather than handing it back.
   the value out of the command line, the shell history and `ps`). Such a
   value is stored double-quoted, which is the one thing to preserve if you
   ever hand-edit the file.
+- Session starts share one limit across the CLI, settings page and webhooks
+  (default 4, configured by `sessionLimit` on the box). Pending starts reserve
+  slots too. Stop a session to free capacity; restarting a stopped session
+  needs a free slot. `restart --all` refuses without changing anything if it
+  would exceed the limit. This is overload control, not a memory guarantee.
 - Manage your own sessions without a rebuild:
   `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
   plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -

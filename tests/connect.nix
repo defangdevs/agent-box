@@ -158,6 +158,7 @@ in
       virtualisation.memorySize = 2048;
       environment.systemPackages = [ pkgs.curl ];
       services.agent-box = {
+      sessionLimit = 64;
         enable = true;
         agent = "claude";
         installAgents = [ "claude" ];

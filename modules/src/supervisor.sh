@@ -41,6 +41,7 @@ WEBHOOK_STATE_DIR="$HOME/.local/state/local-webhook"
 # loop calling this every couple of seconds says it once per failure streak
 # rather than forever (same latch shape as registry_selfheal's own).
 _tmux_boot_warned=0
+_capacity_waiting=" "
 
 ensure_tmux_server() {
   # Bring the tmux server up before anything decides whether there is even a
@@ -1083,6 +1084,18 @@ start_session() {
   # already running are untouched either way.
   registry_lock || return 0
   listed || { registry_unlock; return 0; }
+  # Reservations also constrain seed/reboot recovery and hand-edited state.
+  if capacity_notice="$("${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" spawn "$REGISTRY_FILE" "$sname" 2>&1)"; then
+    _capacity_waiting="${_capacity_waiting// $sname / }"
+  else
+    case "$_capacity_waiting" in
+      (*" $sname "*) ;;
+      (*) echo "supervisor: $sname waiting: $capacity_notice" >&2
+          _capacity_waiting="$_capacity_waiting$sname " ;;
+    esac
+    registry_unlock
+    return 0
+  fi
   # Per-session webhook identity, passed via `tmux new-session -e` so it
   # lands in the SESSION environment — inherited by the agent AND by
   # anything the agent runs in that pane, which is what makes
