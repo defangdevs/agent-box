@@ -389,26 +389,24 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
         live = capacity_live() if live is None else set(live)
     except (OSError, ValueError, capacity_subprocess.TimeoutExpired) as exc:
         raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
-    # A crash is flagged `died`, not `stopped` (issue #516), so it stays
-    # listed and attachable for inspection -- but that leaves its pane a
-    # post-mortem shell tmux still reports, and its registry entry still
-    # lacking `stopped`, so before this it held its slot for good: nothing
-    # but `agent-box-session rm` ever cleared it, and enough of them made
-    # every standing watch inert with nothing actually running (issue #523).
-    # Nobody respawns a died session either -- same as a stopped one -- so it
-    # is excluded from both `live` and `pending`, not only the latter: its
-    # pane would otherwise still count it as running.
+    pending = {name for name, entry in sessions.items()
+               if isinstance(entry, dict) and entry.get("stopped") is not True}
+    # A crash is flagged `died`, not `stopped` (issue #516), so a died entry
+    # stays in `pending` -- it must remain its own candidate for revival by
+    # `agent-box-session restart`, or a stale flag on a session that already
+    # respawned fine (a race the pane epilogue and the supervisor both write
+    # `died`/`stopped` into) can never be admitted again to clear it. But its
+    # pane is a post-mortem shell doing no real work, so unlike a genuinely
+    # running session it must not cost anyone ELSE a slot: before this fix a
+    # died session's pane counted as real, running capacity forever, and
+    # enough of them stalled every OTHER pending session too, with nothing to
+    # clear it but `agent-box-session rm` (issue #523).
     died = {name for name, entry in sessions.items()
             if isinstance(entry, dict) and entry.get("died") is not None}
-    live = live - died
-    pending = {name for name, entry in sessions.items()
-               if isinstance(entry, dict)
-               if entry.get("stopped") is not True
-               if entry.get("died") is None}
-    used = live | pending
+    used = (live | pending) - died
     targets = set(targets)
     if spawning:
-        available = max(0, limit - len(live))
+        available = max(0, limit - len(live - died))
         admitted = live | set(sorted(pending - live)[:available])
         allowed = targets <= admitted
     else:
