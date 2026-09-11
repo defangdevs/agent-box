@@ -645,12 +645,16 @@ jobs:
             --document-name AWS-RunShellScript \
             --parameters 'commands=[
               "systemctl --failed --no-pager || true",
-              "systemctl status caddy agent-web-auth-secrets --no-pager -l 2>&1 | head -60 || true",
+              "systemctl status caddy agent-web-auth-secrets agent-box@workspace agent-web-terminal@workspace --no-pager -l 2>&1 | head -120 || true",
               "ls -la /var/lib/agent-box-web/ /run/agent-box-web/ || true",
+              "ls -la /run/agent-box-ttyd/ /run/agent-box-ttyd/workspace/ || true",
               "ls -la /etc/ec2-metadata/ || true",
               "ss -ltn || true",
+              "ss -lx | grep -i ttyd || true",
               "echo ---fetch-ec2-metadata-journal---; journalctl -u fetch-ec2-metadata --no-pager 2>&1 | tail -40 || true",
               "echo ---caddy-journal---; journalctl -u caddy --no-pager 2>&1 | tail -40 || true",
+              "echo ---agent-box-journal---; journalctl -u agent-box@workspace --no-pager 2>&1 | tail -40 || true",
+              "echo ---ttyd-journal---; journalctl -u agent-web-terminal@workspace --no-pager 2>&1 | tail -60 || true",
               "echo ---amazon-init-journal---; journalctl -u amazon-init --no-pager 2>&1 | tail -60 || true"
             ]' \
             --query Command.CommandId --output text) || { echo "::warning::SSM send-command failed (missing IAM perms?)."; exit 0; }
