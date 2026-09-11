@@ -3265,9 +3265,14 @@ done
     if lib.elem cfg.web.user terminalUsers then cfg.web.user
     else if terminalUsers != [ ] then lib.head terminalUsers
     else null;
-  # Whether web.rebootButton actually grants anything: it needs a rootUser
-  # to grant it to (see rootUser above).
-  rebootGranted = cfg.web.rebootButton && rootUser != null;
+  # Whether web.rebootButton actually grants anything: the reboot sudo rule
+  # itself only renders inside the web.enable-gated block below (rootUser
+  # there is also gated: terminalUsers reads passwordHashFile, which a user
+  # can set with web.enable = false, so rootUser above can be non-null even
+  # with web fully disabled). Ask web.enable here too, or this can go true
+  # - and grant /run/wrappers + disable NoNewPrivileges - for a rule that
+  # was never actually rendered (CodeRabbit, PR #655).
+  rebootGranted = cfg.web.enable && cfg.web.rebootButton && rootUser != null;
   # Whether this box grants an agent user ANY sudo, which is a different
   # question from whether effectiveSudoAllowlist is non-empty: the
   # containers arm grants each user `systemctl restart/stop` on its OWN
@@ -14778,15 +14783,9 @@ in
   }) (lib.mkIf (cfg.enable && cfg.web.enable) (
     let
       webUser = cfg.web.user;
-      # Users that get a browser terminal, in sorted order (attrNames sorts).
-      terminalUsers = lib.filter (n: cfg.users.${n}.web.passwordHashFile != null) (lib.attrNames cfg.users);
-      # Whose terminal workspace the vhost ROOT serves (the / page): web.user
-      # if it has a terminal, else the first terminal user. Null only when no
-      # user has a terminal at all (then the vhost serves nothing anyway).
-      rootUser =
-        if lib.elem webUser terminalUsers then webUser
-        else if terminalUsers != [ ] then lib.head terminalUsers
-        else null;
+      # terminalUsers and rootUser come from the outer `let` (see there):
+      # both depend only on cfg.users and cfg.web.user, computed once so
+      # this block and the top-level sudoGranted can't drift apart.
       # "Reboot box" (see web.rebootButton). Root user only, and only when
       # there IS one: the button lives on the settings page, and a box with
       # no terminal user serves no settings page to put it on. Same
