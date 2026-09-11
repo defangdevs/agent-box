@@ -551,18 +551,32 @@ let
   effectiveSudoAllowlist =
     cfg.sudoAllowlist
     ++ lib.optional cfg.selfUpdate.enable updateStartCmd;
+  # Mirrors the web.enable-gated block's own rootUser (see there): the web
+  # vhost's root page and "Reboot box" both go to web.user if it has a
+  # terminal, else the first terminal user, else nobody. Computed here too,
+  # unconditionally, because sudoGranted below has to ask it regardless of
+  # web.enable - it depends only on cfg.users and cfg.web.user, neither of
+  # which is gated on web.enable.
+  terminalUsers = lib.filter (n: cfg.users.${n}.web.passwordHashFile != null) (lib.attrNames cfg.users);
+  rootUser =
+    if lib.elem cfg.web.user terminalUsers then cfg.web.user
+    else if terminalUsers != [ ] then lib.head terminalUsers
+    else null;
+  # Whether web.rebootButton actually grants anything: it needs a rootUser
+  # to grant it to (see rootUser above).
+  rebootGranted = cfg.web.rebootButton && rootUser != null;
   # Whether this box grants an agent user ANY sudo, which is a different
   # question from whether effectiveSudoAllowlist is non-empty: the
   # containers arm grants each user `systemctl restart/stop` on its OWN
-  # docker unit and only that, so those commands are per-user rules and
-  # cannot live in a box-wide list (same reason as the reboot grant).
-  # Both consumers below are about the MECHANISM rather than the list, so
-  # both have to ask this and not the list: /run/wrappers has to be on the
-  # agent's PATH for `sudo` to exist at all, and NoNewPrivileges=true
-  # would kill the setuid wrapper it resolves to. A grant nothing can
-  # reach is worse than no grant - it reads as a capability in review and
-  # answers "sudo: command not found" on the box.
-  sudoGranted = effectiveSudoAllowlist != [ ] || cfg.containers.enable;
+  # docker unit and only that, and the reboot arm grants rootUser one more
+  # command - both are per-user (or single-user) rules and cannot live in a
+  # box-wide list. Both consumers below are about the MECHANISM rather than
+  # the list, so both have to ask this and not the list: /run/wrappers has
+  # to be on the agent's PATH for `sudo` to exist at all, and
+  # NoNewPrivileges=true would kill the setuid wrapper it resolves to. A
+  # grant nothing can reach is worse than no grant - it reads as a
+  # capability in review and answers "sudo: command not found" on the box.
+  sudoGranted = effectiveSudoAllowlist != [ ] || cfg.containers.enable || rebootGranted;
   # Agent CLIs (claude-code, codex) move much faster than any host channel.
   # When the host wires selfUpdate.agentNixpkgs (from the pin file the update
   # service maintains — see that option), resolve just the agent packages from
@@ -3589,8 +3603,11 @@ in
         else null;
       # "Reboot box" (see web.rebootButton). Root user only, and only when
       # there IS one: the button lives on the settings page, and a box with
-      # no terminal user serves no settings page to put it on.
-      rebootButton = cfg.web.rebootButton && rootUser != null;
+      # no terminal user serves no settings page to put it on. Same
+      # predicate as the outer rebootGranted (sudoGranted needs it
+      # unconditionally); reused here rather than recomputed so the two
+      # can't drift apart.
+      rebootButton = rebootGranted;
       # Public URL base path for a user's settings page (Caddy does not strip
       # a prefix, so the daemon matches this full path).
       settingsBaseOf = n: "/${n}/settings";
