@@ -2094,16 +2094,12 @@ start_session() {
   #     attachable for inspection and is NOT respawned over.
   #   killed (restart, reboot, Spot stop) — the pane ends without
   #     reaching either branch, so the reconcile loop respawns it.
-  # Two session kinds opt out of the parking branch:
+  # One session kind opts out of the parking branch:
   #   codex + remoteControl — the pane runs the RC daemon wrapper,
   #     whose health loop falls off its end with status 0 when the
   #     daemon dies. That is a crash to respawn over (self-heal, as
   #     before #167), not a quit somebody asked for; nothing
   #     interactive in that pane can even ask to quit.
-  #   shell — the command IS a shell, exiting it should hand you a
-  #     fresh one (via the reconcile loop), not a nested inspection
-  #     bash or a parked session; leave one closed with detach or
-  #     `agent-box-session stop`.
   # Both branches call the epilogue, and the crash branch hands it the
   # agent's own exit status: `$?` inside the group is the status of whichever
   # command in the && list failed, which is the agent (the epilogue itself
@@ -2116,7 +2112,15 @@ start_session() {
   epilogue=" && $_mark $_qname 0 || { $_mark $_qname \$?; exec bash; }"
   [ "$agent" = codex ] && [ "$rc" = true ] \
     && epilogue=" || { $_mark $_qname \$?; exec bash; }"
-  [ "$agent" = shell ] && epilogue=""
+  # shell — the pane IS a login shell, so there is no separate agent whose
+  # crash would be worth a nested post-mortem bash; whatever code it exits
+  # with, typing `exit` (or Ctrl-D) is always the user asking to be done, not
+  # a crash to self-heal over (issue #678). `;` runs the mark unconditionally,
+  # unlike the `&&`/`||` pair above, and it is always told status 0 so the
+  # session parks (stopped=true) instead of a spurious `died` — matching
+  # `/quit` on every other harness: park, don't respawn, and `agent-box-session
+  # restart` brings a fresh shell back on request.
+  [ "$agent" = shell ] && epilogue=" ; $_mark $_qname 0"
   # A delete (settings page / agent-box-session rm: delist THEN kill) or
   # a stop (agent-box-session stop: flag THEN kill) can land while this
   # function is preparing the spawn — their kill hits the OLD session
