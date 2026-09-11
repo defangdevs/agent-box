@@ -87,6 +87,13 @@ jobs:
       - name: Compile WebSocket smoke helper
         run: python3 -m py_compile scripts/ws_smoke.py
 
+      # docs/vendor's own integrity check (issue #25) - scripts/check_vendor.py
+      # only ever looks under modules/src/vendor, so a hand-edit or a
+      # corrupted re-vendor of the argon2id hashing library the launch page
+      # loads would otherwise ship to the public site with nothing to catch it.
+      - name: Check docs/vendor pins
+        run: python3 scripts/check_docs_vendor.py
+
   # THE check to require in the branch ruleset (issue #632): reported on
   # every push and every pull request, whatever paths they touch, so it
   # can never be the required-but-never-reported check that leaves a pull

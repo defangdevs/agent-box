@@ -65,14 +65,21 @@ for _ in 1 2 3; do
   # on the box. registry_edit nests inside this, and nothing this script starts
   # outlives it, so no child can carry the fd (and the lock) away.
   # Both calls are silenced, because this prints into the pane the user just
-  # quit: a lock timeout would otherwise put a warning there once per retry
+  # quit: a lock refusal would otherwise put a warning there once per retry
   # pass (`flock -w` itself printed nothing before this), and an unparseable
   # registry is the supervisor's news to report, not this script's.
-  registry_lock 2>/dev/null
-  registry_edit --arg s "$1" --argjson st "$_status" "$_edit" 2>/dev/null
-  "$REGISTRY_JQ" -e --arg s "$1" --argjson st "$_status" \
-    "$_check" "$REGISTRY_FILE" >/dev/null 2>&1 && exit 0
-  registry_unlock
+  #
+  # A pass that could not take the lock does nothing at all and waits its
+  # second out (issue #633). Falling through would cost a SECOND full
+  # REGISTRY_LOCK_WAIT inside registry_edit, which now makes its own attempt
+  # rather than nesting inside a section this one never opened - so the
+  # retry loop above would take twice as long to reach the same answer.
+  if registry_lock 2>/dev/null; then
+    registry_edit --arg s "$1" --argjson st "$_status" "$_edit" 2>/dev/null
+    "$REGISTRY_JQ" -e --arg s "$1" --argjson st "$_status" \
+      "$_check" "$REGISTRY_FILE" >/dev/null 2>&1 && exit 0
+    registry_unlock
+  fi
   sleep 1
 done
 exit 0

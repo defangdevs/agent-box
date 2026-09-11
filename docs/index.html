@@ -130,6 +130,26 @@
   }
   .note strong { color: var(--text); }
 
+  /* The client-side generated password (issue #25): a monospace value the
+     visitor is meant to select and save, plus a one-click copy affordance -
+     both sized to stay legible on a phone, where the note itself wraps. */
+  .pw-row {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin: 10px 0; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px;
+  }
+  .pw-row code {
+    color: var(--text); background: none; padding: 0; font-size: 15px;
+    word-break: break-all;
+  }
+  .pw-copy {
+    flex: none; background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 5px 12px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .pw-copy:hover { border-color: var(--muted); }
+  .pw-copy[data-copied="true"] { color: var(--accent-hi); border-color: var(--accent-hi); }
+
   footer { padding: 40px 0 60px; text-align: center; color: var(--muted); font-size: 14px; }
 
   @media (max-width: 640px) {
@@ -213,23 +233,40 @@
     <div class="regions">
       <div class="region">
         <div><div class="name">N. Virginia</div><div class="code">us-east-1</div></div>
-        <a class="launch aws" href="https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml"><svg class="mark aws-mark" aria-hidden="true"><use href="#mark-aws"/></svg> Launch &rarr;</a>
+        <a class="launch aws" data-region-launch href="https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml"><svg class="mark aws-mark" aria-hidden="true"><use href="#mark-aws"/></svg> Launch &rarr;</a>
       </div>
       <div class="region">
         <div><div class="name">Oregon</div><div class="code">us-west-2</div></div>
-        <a class="launch aws" href="https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml"><svg class="mark aws-mark" aria-hidden="true"><use href="#mark-aws"/></svg> Launch &rarr;</a>
+        <a class="launch aws" data-region-launch href="https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml"><svg class="mark aws-mark" aria-hidden="true"><use href="#mark-aws"/></svg> Launch &rarr;</a>
       </div>
       <div class="region">
         <div><div class="name">Frankfurt</div><div class="code">eu-central-1</div></div>
-        <a class="launch aws" href="https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml"><svg class="mark aws-mark" aria-hidden="true"><use href="#mark-aws"/></svg> Launch &rarr;</a>
+        <a class="launch aws" data-region-launch href="https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml"><svg class="mark aws-mark" aria-hidden="true"><use href="#mark-aws"/></svg> Launch &rarr;</a>
       </div>
       <div class="region">
         <div><div class="name">Ireland</div><div class="code">eu-west-1</div></div>
-        <a class="launch aws" href="https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml"><svg class="mark aws-mark" aria-hidden="true"><use href="#mark-aws"/></svg> Launch &rarr;</a>
+        <a class="launch aws" data-region-launch href="https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Flightsail-template.yaml"><svg class="mark aws-mark" aria-hidden="true"><use href="#mark-aws"/></svg> Launch &rarr;</a>
       </div>
     </div>
-    <div class="note">
-      <strong>Set a password you'll remember.</strong> On the AWS form, type any 16&ndash;64 character password into <code>WebPassword</code> &mdash; that's what you'll use to log into the browser terminal. AWS masks it with dots after you type it and never shows it again, so save it somewhere before you launch. Choose Claude Code or Codex, pick a bundle size, and launch. The box takes a few minutes to set itself up, and the stack turns green only after it reports a successful first boot &mdash; so a green stack always has a working URL. Your browser link appears under <strong>Outputs</strong> in the AWS console &mdash; open it, enter the password, finish the selected agent's one-time sign-in, and you're in. (Claude Code stacks can drive the box from the Claude desktop / mobile app via <strong>Remote Control</strong> after the first browser login &mdash; the session name is <code>&lt;UserName&gt;-main@&lt;host&gt;.sslip.io</code>, the box's own public address &mdash; so the entry in the Claude apps doubles as the address you reach it at.)
+    <!-- Issue #25: the plaintext password never reaches AWS. This browser
+         generates one and hashes it (Argon2id, via the vendored hash-wasm
+         build below) before the launch buttons above ever get clicked -
+         hash-password.js fills WebPasswordHash into each href and swaps
+         which of the two notes below is shown. Without JS (or if the
+         hashing library fails to load) the buttons stay exactly as they
+         were rendered and #password-manual stays the visible note, so
+         launching still works - it just asks you to compute the hash
+         yourself, same as a CLI launch. -->
+    <div class="note" id="password-manual">
+      <strong>Set a password you'll remember.</strong> On the AWS form, paste an Argon2id hash into <code>WebPasswordHash</code> &mdash; compute one from a password you pick with <code>caddy hash-password --algorithm argon2id --plaintext '&lt;your password&gt;'</code>, then use that same password (never the hash) to log into the browser terminal. Choose Claude Code or Codex, pick a bundle size, and launch. The box takes a few minutes to set itself up, and the stack turns green only after it reports a successful first boot &mdash; so a green stack always has a working URL. Your browser link appears under <strong>Outputs</strong> in the AWS console &mdash; open it, enter the password, finish the selected agent's one-time sign-in, and you're in. (Claude Code stacks can drive the box from the Claude desktop / mobile app via <strong>Remote Control</strong> after the first browser login &mdash; the session name is <code>&lt;UserName&gt;-main@&lt;host&gt;.sslip.io</code>, the box's own public address &mdash; so the entry in the Claude apps doubles as the address you reach it at.)
+    </div>
+    <div class="note" id="password-generated" hidden>
+      <strong>Save this password &mdash; you won't see it again.</strong>
+      <div class="pw-row">
+        <code id="password-generated-value"></code>
+        <button type="button" class="pw-copy" id="password-generated-copy">Copy</button>
+      </div>
+      Generated in your browser just now; the launch buttons above are already filled in with its <em>hash</em> &mdash; AWS only ever receives that hash, never the password itself. This is what you'll use to log into the browser terminal, so save it before you launch: there is no way to recover it afterwards. Choose Claude Code or Codex, pick a bundle size, and launch. The box takes a few minutes to set itself up, and the stack turns green only after it reports a successful first boot &mdash; so a green stack always has a working URL. Your browser link appears under <strong>Outputs</strong> in the AWS console &mdash; open it, enter the password above, finish the selected agent's one-time sign-in, and you're in. (Claude Code stacks can drive the box from the Claude desktop / mobile app via <strong>Remote Control</strong> after the first browser login &mdash; the session name is <code>&lt;UserName&gt;-main@&lt;host&gt;.sslip.io</code>, the box's own public address &mdash; so the entry in the Claude apps doubles as the address you reach it at.)
     </div>
     <div class="note">
       <strong>One flat monthly price.</strong> A Lightsail bundle packages compute, the SSD, the attached static IP and a multi-TB/month transfer allowance into a single line item &mdash; no separate disk or public-IPv4 charges. The default <code>small_3_0</code> (2 vCPU / 2 GiB / 60 GiB SSD) is <strong>$12/month</strong>; pick <code>medium_3_0</code> (4 GiB, $24/month) for parallel sessions or heavy builds. Every bundle is dual-stack, IPv4 and IPv6, so the box is reachable from any network. Delete the stack to stop billing. If you'd rather have EC2 &mdash; arbitrary instance types, Spot pricing, an IPv6-only box with no IPv4 charge, a root volume that grows in place &mdash; the <a href="https://github.com/defangdevs/agent-box#alternative-ec2-template-on-demand-ipv6-opt-in">EC2 template</a> is still published.
@@ -251,7 +288,7 @@
       <strong>Two credentials, not one.</strong> On the Azure form, type any 16&ndash;64 character password into <code>webPassword</code> &mdash; that's the one you'll use to log into the browser terminal, and Azure never shows it again, so save it before you deploy. Then paste an SSH public key into <code>adminPasswordOrKey</code>: that's a separate debug account (SSH stays closed at the firewall by default), and Azure refuses to create a Linux VM without one. Choose Claude Code or Codex, pick a size, deploy. The deployment reports success only once the box has finished configuring itself, so there's no green-but-dead state; open the <code>webUrl</code> output, sign in as the <code>userName</code> (default <code>agent</code>) with your <code>webPassword</code>, finish the selected agent's one-time sign-in, and you're in. (Claude Code boxes can then be driven from the Claude desktop / mobile app via <strong>Remote Control</strong>, under the session name in the <code>remoteControlSession</code> output.)
     </div>
     <div class="note">
-      <strong>Cost, and one difference from the AWS buttons.</strong> Azure has no flat bundle, so the bill is three line items: the default <code>Standard_B2pls_v2</code> (2 vCPU / 4 GiB, ARM Ampere) plus a 64 GiB SSD plus the static IPv4 comes to <strong>~$30/month</strong> in <code>westus3</code>, the cheapest region for Ampere &mdash; against $24/month flat for the same shape on Lightsail. Unlike a bundle, the disk can be grown later. Delete the resource group to stop billing. The one difference in behavior: the AWS templates are republished on every commit with that commit baked in, so a 1-click AWS box is pinned, while this button serves the committed template straight from GitHub and tracks the latest commit on <code>master</code> &mdash; set <code>agentBoxFlakeRef</code> to <code>github:defangdevs/agent-box/&lt;sha&gt;</code> on the form to pin a box. Azure boxes are IPv4-only.
+      <strong>Cost, and one difference from the AWS buttons.</strong> Azure has no flat bundle, so the bill is three line items: the default <code>Standard_B2pls_v2</code> (2 vCPU / 4 GiB, ARM Ampere) plus a 32 GiB SSD plus the static IPv4 comes to <strong>~$28/month</strong> in <code>westus3</code>, the cheapest region for Ampere &mdash; against $24/month flat for the same shape on Lightsail. Unlike a bundle, the disk can be grown later. Delete the resource group to stop billing. The one difference in behavior: the AWS templates are republished on every commit with that commit baked in, so a 1-click AWS box is pinned, while this button serves the committed template straight from GitHub and tracks the latest commit on <code>master</code> &mdash; set <code>agentBoxFlakeRef</code> to <code>github:defangdevs/agent-box/&lt;sha&gt;</code> on the form to pin a box. Azure boxes are IPv4-only.
     </div>
   </div>
 </section>
@@ -272,5 +309,101 @@
     <br>Dogfood note: this page &mdash; and most of this project &mdash; was written, tested, and shipped by a coding agent running on agent-box.
   </div>
 </footer>
+
+<!-- Vendored, pinned copy of hash-wasm's argon2id build (docs/vendor/vendor.json)
+     - own script element, per AGENTS.md's vendoring rule, so a stray
+     semicolon in either file can never glue the two together. Exposes the
+     global `hashwasm.argon2id(...)`. -->
+<script src="vendor/hash-wasm-argon2id.umd.min.js"></script>
+<script>
+// Issue #25: generate the browser terminal password HERE, in the visitor's
+// own browser, and hand AWS only its Argon2id hash - never the plaintext.
+// Progressive enhancement: until this finishes (or if it fails), the launch
+// buttons above are the plain template URLs and #password-manual - asking
+// for a hash computed by hand - stays the visible note, so launching still
+// works either way.
+(function () {
+  "use strict";
+
+  function randomPassword() {
+    // 24 random bytes -> 32 base64url characters, no padding: about 144
+    // bits of entropy, and every character is already safe to paste into a
+    // URL, a shell, or CloudFormation's console form.
+    var bytes = new Uint8Array(24);
+    crypto.getRandomValues(bytes);
+    var binary = "";
+    for (var i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function hashPassword(password) {
+    var salt = new Uint8Array(16);
+    crypto.getRandomValues(salt);
+    // Caddy's own `hash-password --algorithm argon2id` defaults to
+    // m=47104,t=1,p=1; these cost parameters are deliberately higher; a
+    // browser has to eat this cost exactly once per visit, and the module's
+    // agent-web-auth-secrets.service reads whatever parameters are already
+    // encoded in the hash string, so there is no need to match its default.
+    return hashwasm.argon2id({
+      password: password,
+      salt: salt,
+      parallelism: 1,
+      iterations: 3,
+      memorySize: 65536,
+      hashLength: 32,
+      outputType: "encoded",
+    });
+  }
+
+  function showGeneratedPassword(password) {
+    document.getElementById("password-generated-value").textContent = password;
+    document.getElementById("password-manual").hidden = true;
+    document.getElementById("password-generated").hidden = false;
+  }
+
+  function fillLaunchButtons(hash) {
+    var param = "&param_WebPasswordHash=" + encodeURIComponent(hash);
+    var links = document.querySelectorAll("[data-region-launch]");
+    for (var i = 0; i < links.length; i++) {
+      links[i].href = links[i].href + param;
+    }
+  }
+
+  function wireCopyButton(password) {
+    var btn = document.getElementById("password-generated-copy");
+    btn.addEventListener("click", function () {
+      navigator.clipboard.writeText(password).then(function () {
+        btn.textContent = "Copied";
+        btn.dataset.copied = "true";
+        setTimeout(function () {
+          btn.textContent = "Copy";
+          delete btn.dataset.copied;
+        }, 2000);
+      }, function () {
+        // Clipboard permission denied or unavailable (e.g. non-HTTPS,
+        // very old browser) - the value is still selectable text in the
+        // page, so there is nothing more to do here.
+      });
+    });
+  }
+
+  if (!window.crypto || !crypto.getRandomValues || !window.hashwasm) {
+    return; // no JS crypto or the vendored library failed to load - manual note stays up.
+  }
+
+  var password = randomPassword();
+  hashPassword(password).then(function (hash) {
+    fillLaunchButtons(hash);
+    showGeneratedPassword(password);
+    wireCopyButton(password);
+  }, function (err) {
+    // Hashing itself failed (e.g. a browser with no WebAssembly) - leave
+    // the launch buttons and the manual note exactly as rendered.
+    window.console && console.error("agent-box: could not hash the generated password", err);
+  });
+})();
+</script>
 </body>
 </html>

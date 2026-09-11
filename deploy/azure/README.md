@@ -46,6 +46,9 @@ user choose Claude Code or Codex.
   `agentbox apply` derives and therefore the only one in the issued
   certificate — the dotted spelling resolves but fails TLS (issue #359).
 - No port 80 is opened. Caddy is configured for TLS-ALPN-01 only.
+- Outbound TCP port 25 (raw SMTP) is denied at the NSG, so a box cannot be
+  used as a spam relay. Authenticated mail submission (587/465) through a
+  real provider is unaffected.
 
 ## Three things that differ from `deploy/aws/lightsail-template.yaml`
 
@@ -86,9 +89,9 @@ size picker are the **compute half only**. A default box in westus3:
 | Line item | Monthly |
 | --- | --- |
 | `Standard_B2pls_v2` (2 vCPU / 4 GiB, ARM Ampere) | $21.90 |
-| Standard SSD E6, 64 GiB | $4.80 |
+| Standard SSD E4, 32 GiB | $2.40 |
 | Standard static IPv4 | $3.65 |
-| **Total** | **~$30.35** |
+| **Total** | **~$27.95** |
 
 For comparison the same shape on Lightsail is `medium_3_0` at $24/mo flat.
 
@@ -102,6 +105,11 @@ better deal.
 **4 GiB is the floor**, higher than the AWS templates' 2 GiB, because Azure
 offers nothing in between: `B2pts_v2` (1 GiB) is the only smaller 2-vCPU
 Ampere size and it does not survive substituting the profile.
+
+Standard SSD is billed by tier, not per GiB: 30–32 GiB is E4 ($2.40), 33–64 is
+E6 ($4.80), so the default is 32 and there is no value in between worth
+picking. A fresh box uses ~6 GiB (of which 2 GiB is the swapfile), leaving
+~24 GiB for the agent's work.
 
 Unlike a Lightsail bundle the OS disk is resizable later — grow only, and only
 while the VM is deallocated:
@@ -134,6 +142,12 @@ certificate against `<addr>.sslip.io`. There is no closure to build and no
 reboot. Read the URL and the address from `properties.outputs`; its
 `remoteControlSession` is only meaningful once you have started a claude
 session from the settings page's install+sign-in cards.
+
+`sslipDomain` (default `sslip.io`) is the suffix the hostname is derived
+under. `sslip.io` is itself open source
+([cunnie/sslip.io](https://github.com/cunnie/sslip.io)) and self-hostable,
+so a deployment that runs its own copy under its own domain can point this
+parameter at it to whitelabel the URL entirely (issue #647).
 
 `webPassword` is 16-64 characters, and any character is safe. Bicep has no
 `AllowedPattern` equivalent — a parameter can be constrained by length and by a

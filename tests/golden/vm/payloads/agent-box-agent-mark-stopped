@@ -77,6 +77,27 @@ LEASE_DIR=/home/agent/.local/state/agent-box/lease
 # the reads in this file's own callers all get a whole document from the
 # rename. The lock exists for the interval a read-modify-write spans.
 #
+# A lock this program cannot TAKE - a holder that times us out, a sidecar it
+# cannot create - refuses the mutation and changes nothing (issue #633). It
+# used to carry on unlocked and say so, which is the pre-#254 lost-update
+# behaviour reintroduced at exactly the moment there is provably another
+# writer: the rename at the end is atomic, but two unlocked read-modify-writes
+# are not, so the loser's edit is reverted wholesale and the caller is told it
+# succeeded. Refusing costs one retry; continuing costs a session. Note that
+# this is NOT the same as having no lock at all: an EMPTY REGISTRY_FLOCK is a
+# caller stating there is no flock on this box, which still writes (see the
+# assignment below), because a box that never had the primitive must still be
+# able to add, start and stop a session.
+#
+# The refusal is REGISTRY_BUSY_RC, 75 (EX_TEMPFAIL) - the same "declined for
+# now, ask again" code agent-box-webhook-spawn already answers its dispatcher
+# with, and distinct from the 1 a jq or a rename failure returns, which no
+# retry will fix. registry_edit, registry_ensure and registry_selfheal all
+# return it; a caller under `set -e` therefore exits 75 with no ceremony. The
+# two writers that do not run under `set -e` come back later instead: the
+# supervisor skips the step and reconciles again in ~2s, and the pane
+# epilogue already retries its write three times.
+#
 # What a caller may set before the include, all optional:
 #   REGISTRY_FILE       the registry path, when the caller already knows it
 #   REGISTRY_PROG       the name the one warning below prints
@@ -102,11 +123,23 @@ LEASE_DIR=/home/agent/.local/state/agent-box/lease
 # flock, and must not be answered with one from the environment.
 : "${REGISTRY_FLOCK=${AGENT_BOX_FLOCK_BIN:-}}"
 : "${REGISTRY_LOCK_WAIT:=10}"
+# What every mutator in here returns when the lock could not be taken: 75,
+# EX_TEMPFAIL, "declined for now" (issue #633). Retryable by construction -
+# nothing was read, nothing was written - and deliberately not 1, which this
+# file already uses for the failures a retry cannot help (a filter jq refused,
+# a rename onto a full disk).
+REGISTRY_BUSY_RC=75
 # 1 while the lock is genuinely held — taken here, inherited, or nested inside
 # a section that holds it. Only the webhook spawn wrapper reads it, because it
 # may advertise an inherited fd only if it really got the lock.
 REGISTRY_HELD=0
 _registry_depth=0
+# 1 once the refusal below has been printed, so the supervisor's reconcile
+# loop says it once per streak rather than every two seconds for as long as a
+# holder is wedged or a home is read-only. Cleared by the next lock actually
+# taken, so a second outage is reported as loudly as the first. Same latch
+# shape as registry_selfheal's two.
+_registry_lock_warned=0
 
 registry_close_fd() {
   # Close fd 9 and NOTHING ELSE. The braces are the whole point: `exec` with no
@@ -120,7 +153,28 @@ registry_close_fd() {
   { exec 9>&-; } 2>/dev/null || true
 }
 
+_registry_refuse() {
+  # _registry_refuse REASON - the one exit from registry_lock that did not
+  # get the lock. Unwinds the depth counter to 0 so a caller that goes on to
+  # call registry_unlock anyway unlocks nothing, and so the NEXT
+  # registry_lock starts a fresh attempt rather than believing it is nested
+  # inside a section nobody holds. That second half is why the pane epilogue
+  # skips its whole pass on a refusal: a fresh attempt means a fresh
+  # REGISTRY_LOCK_WAIT, and falling through would spend two of them.
+  _registry_depth=0
+  [ "$_registry_lock_warned" = 1 ] || \
+    echo "$REGISTRY_PROG: cannot lock $REGISTRY_FILE ($1); refusing to change" \
+         "it rather than racing another writer - nothing was written, and a" \
+         "retry is safe (issue #633)" >&2
+  _registry_lock_warned=1
+}
+
 registry_lock() {
+  # 0 with the lock held (or deliberately not taken, see REGISTRY_FLOCK),
+  # REGISTRY_BUSY_RC when it could not be taken and the caller must not
+  # write. A caller that gets non-zero must NOT call registry_unlock; doing
+  # so anyway is harmless, because the depth is already back at 0.
+  #
   # Nesting-safe on purpose: flock(2) conflicts between two open file
   # DESCRIPTIONS, including two of the same process, so a second fd on the
   # sidecar blocks a writer against ITSELF (verified). Both the supervisor
@@ -154,19 +208,24 @@ registry_lock() {
            chmod 0700 "${REGISTRY_FILE%/*}" 2>/dev/null
          }
          { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
-    || return 0
+    || { _registry_refuse "could not open $REGISTRY_FILE.lock"
+         return "$REGISTRY_BUSY_RC"; }
   # Bounded, never an unbounded wait: nothing may park the supervisor's
   # reconcile loop (every session on the box waits behind it) or a CLI a user
-  # is waiting on. A holder that times us out degrades THIS write to the
-  # pre-#254 lost-update behaviour, which is a bad write rather than a hung
-  # box, and says so on stderr.
+  # is waiting on. A holder that times us out is answered with the refusal
+  # rather than an unlocked write: the wait is what makes a refusal rare, and
+  # a bad write is not a better answer than a retry (issue #633).
   if "$REGISTRY_FLOCK" -w "$REGISTRY_LOCK_WAIT" 9; then
     REGISTRY_HELD=1
-  else
-    echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-    registry_close_fd
+    _registry_lock_warned=0
+    return 0
   fi
-  return 0
+  # Closed FIRST, so the fd does not outlive the attempt and block the next
+  # one, and before the message, so a caller reading stderr sees a refusal
+  # that is already complete.
+  registry_close_fd
+  _registry_refuse "timed out after ${REGISTRY_LOCK_WAIT}s waiting for another writer"
+  return "$REGISTRY_BUSY_RC"
 }
 
 registry_unlock() {
@@ -186,14 +245,17 @@ registry_edit() {
   # as an argument, so a filter may end in `--args -- "$@"` without the path
   # being read as one of those arguments.
   #
-  # Returns 1 with the registry untouched when jq fails. jq's own stderr is
+  # Returns 1 with the registry untouched when jq fails, and
+  # REGISTRY_BUSY_RC with it untouched when the lock could not be taken
+  # (issue #633) — the whole read-modify-write is skipped, so the file is
+  # byte-for-byte what it was. jq's own stderr is
   # left alone: a caller that must stay quiet — the pane epilogue prints into
   # the user's terminal — redirects it at the call site, which keeps that
   # policy where the reason for it is.
   #
   # The lock nests, so a caller already holding it across a check-then-write
   # keeps holding it here and does not deadlock against itself.
-  registry_lock
+  registry_lock || return "$REGISTRY_BUSY_RC"
   _registry_tmp="$(mktemp "$REGISTRY_FILE.XXXXXX")" || { registry_unlock; return 1; }
   # The RENAME is checked too, not just jq: a read-only $HOME or a full disk
   # must not be reported as a write to the two writers that do not run under
@@ -285,7 +347,12 @@ registry_selfheal() {
   # and leaves the file exactly as it was; healing is the job of the one
   # program that is already looping.
   registry_valid && { _registry_heal_warned=0; return 0; }
-  registry_lock
+  # Nothing is quarantined, moved or re-seeded without the lock (issue #633):
+  # this function DESTROYS the registry it judges, and the writer it would be
+  # racing is one that has already read the good document and is about to
+  # rename it into place. The supervisor calls this every couple of seconds,
+  # so the answer to a busy lock is simply the next tick.
+  registry_lock || return "$REGISTRY_BUSY_RC"
   # Re-check under the lock: every writer publishes by rename, so a document
   # that landed between the check above and this line is WHOLE. Quarantining
   # it would throw away a perfectly good registry.
@@ -384,7 +451,11 @@ registry_ensure() {
     mkdir -p "${REGISTRY_FILE%/*}"
     chmod 0700 "${REGISTRY_FILE%/*}" 2>/dev/null
   }
-  registry_lock
+  # Creation is a mutation like any other and refuses like one (issue #633):
+  # the whole reason it is inside the protocol (issue #289) is that a seed
+  # landing on top of a just-added session loses that session for good, and
+  # an unlocked creation is exactly that race back again.
+  registry_lock || return "$REGISTRY_BUSY_RC"
   if [ ! -s "$REGISTRY_FILE" ]; then
     # A seed is trusted only after it PASSES this shape check (issue #356):
     # two independent producers (this module's Nix-declared seed and the
@@ -582,14 +653,21 @@ for _ in 1 2 3; do
   # on the box. registry_edit nests inside this, and nothing this script starts
   # outlives it, so no child can carry the fd (and the lock) away.
   # Both calls are silenced, because this prints into the pane the user just
-  # quit: a lock timeout would otherwise put a warning there once per retry
+  # quit: a lock refusal would otherwise put a warning there once per retry
   # pass (`flock -w` itself printed nothing before this), and an unparseable
   # registry is the supervisor's news to report, not this script's.
-  registry_lock 2>/dev/null
-  registry_edit --arg s "$1" --argjson st "$_status" "$_edit" 2>/dev/null
-  "$REGISTRY_JQ" -e --arg s "$1" --argjson st "$_status" \
-    "$_check" "$REGISTRY_FILE" >/dev/null 2>&1 && exit 0
-  registry_unlock
+  #
+  # A pass that could not take the lock does nothing at all and waits its
+  # second out (issue #633). Falling through would cost a SECOND full
+  # REGISTRY_LOCK_WAIT inside registry_edit, which now makes its own attempt
+  # rather than nesting inside a section this one never opened - so the
+  # retry loop above would take twice as long to reach the same answer.
+  if registry_lock 2>/dev/null; then
+    registry_edit --arg s "$1" --argjson st "$_status" "$_edit" 2>/dev/null
+    "$REGISTRY_JQ" -e --arg s "$1" --argjson st "$_status" \
+      "$_check" "$REGISTRY_FILE" >/dev/null 2>&1 && exit 0
+    registry_unlock
+  fi
   sleep 1
 done
 exit 0

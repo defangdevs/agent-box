@@ -26,9 +26,13 @@ second. It asserts what the five writers have to agree on:
   * an INHERITED lock survives the exec agent-box-webhook-spawn does, and the
     heir does not close it;
   * creation is inside the protocol too (#289), and never clobbers;
-  * every way the lock can be unavailable — no flock binary, a holder that
-    times us out — still writes, because a missing lock must never be the
-    reason a session cannot be added.
+  * a box with NO flock binary still writes, because a missing primitive
+    must never be the reason a session cannot be added;
+  * but a lock that exists and cannot be TAKEN — a holder that times us out,
+    a sidecar that cannot be created — REFUSES the mutation and leaves the
+    registry byte for byte as it was (issue #633). Continuing unlocked was
+    the pre-#254 lost update reintroduced at the one moment there is
+    provably another writer, and reported to the caller as success.
 
 Writers are composed the way the generated module composes them (a header of
 REGISTRY_* pins, then the library text, then the caller's own body), so the
@@ -281,14 +285,15 @@ class StderrSurvives(RegistryCase):
             "registry_lock\nregistry_unlock\necho %s >&2\n" % self.MARKER)
         self.assertIn(self.MARKER, done.stderr)
 
-    def test_the_program_can_still_talk_after_a_timeout(self):
-        # Same trap on the degraded path, where the fd is closed straight after
-        # the warning — and where losing stderr would also lose the reason.
+    def test_the_program_can_still_talk_after_a_refusal(self):
+        # Same trap on the refusal path, where the fd is closed straight
+        # before the message — and where losing stderr would also lose the
+        # reason the caller is about to report.
         self.seed()
         self.hold_lock_as_the_daemon_does()
         done = self.run_writer(
             "registry_lock\necho %s >&2\n" % self.MARKER, wait=1)
-        self.assertIn("lock timed out", done.stderr)
+        self.assertIn("refusing to change", done.stderr)
         self.assertIn(self.MARKER, done.stderr)
 
     def test_an_edit_leaves_stderr_alone(self):
@@ -367,40 +372,188 @@ class InheritedLock(RegistryCase):
         self.assertEqual(done.stdout, "1")
 
 
-class Degrading(RegistryCase):
-    """Every way the lock can be unavailable still writes."""
+class NoLockConfigured(RegistryCase):
+    """No flock BINARY at all is a configuration, not a failure."""
 
     def test_no_flock_binary_still_writes(self):
         # A box whose module predates the pin has no AGENT_BOX_FLOCK_BIN, and
         # a missing lock must never be the reason a session cannot be added.
+        # This is the one case that is NOT the refusal below: an empty
+        # REGISTRY_FLOCK is the caller saying this box has no primitive, and
+        # there is no other writer to be told about (issue #633).
         self.seed()
         self.run_writer(self.ADD_ONE, args=["unlocked"], flock="")
         self.assertIn("unlocked", self.sessions())
 
-    def test_a_wedged_holder_times_out_and_says_so(self):
-        # The bound is what keeps a wedged holder from parking the supervisor's
-        # reconcile loop, which every session on the box waits behind.
-        self.seed()
+
+class Refusing(RegistryCase):
+    """A lock that exists and cannot be TAKEN refuses the write (#633).
+
+    Every assertion here is the pair the issue asks for: the caller is told,
+    in a code it can retry on, and the registry is byte for byte what it was.
+    Continuing unlocked did neither -- it returned 0 over a read-modify-write
+    racing the very writer whose presence had just been proven.
+    """
+
+    BUSY = 75
+
+    def unwritable_directory(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the directory mode this test relies on")
+        os.chmod(self.file.parent, 0o500)
+        self.addCleanup(os.chmod, self.file.parent, 0o700)
+
+    def test_a_wedged_holder_is_refused_and_writes_nothing(self):
+        # The evidence in the issue: hold the lock, call the production
+        # mutator with a short timeout, and watch it report success over a
+        # registry it changed under the holder's feet.
+        self.seed({"keep": {"agent": "claude"}})
+        before = self.file.read_text()
         self.hold_lock_as_the_daemon_does()
         started = time.monotonic()
-        done = self.run_writer(self.ADD_ONE, args=["degraded"], wait=1)
+        done = self.run_writer(self.ADD_ONE, args=["refused"], wait=1,
+                               check=False)
+        # Still BOUNDED: refusing is not the same as parking the supervisor's
+        # reconcile loop, which every session on the box waits behind.
         self.assertLess(time.monotonic() - started, TIMEOUT / 2)
-        self.assertIn("degraded", self.sessions())
-        self.assertIn("lock timed out", done.stderr)
-        self.assertIn("#254", done.stderr)
+        self.assertEqual(done.returncode, self.BUSY, done.stderr)
+        self.assertEqual(self.file.read_text(), before)
+        self.assertIn("refusing to change", done.stderr)
+        self.assertIn("timed out", done.stderr)
+        self.assertIn("#633", done.stderr)
         self.assertIn("test-writer", done.stderr)
+
+    def test_a_sidecar_that_cannot_be_created_is_refused_too(self):
+        # The other half of the acceptance: lock CREATION failure. A
+        # read-only home or a full disk, with no .lock file there yet -- so
+        # the writer never gets as far as asking who holds it.
+        self.seed({"keep": {"agent": "claude"}})
+        before = self.file.read_text()
+        self.unwritable_directory()
+        done = self.run_writer(self.ADD_ONE, args=["doomed"], check=False)
+        self.assertEqual(done.returncode, self.BUSY, done.stderr)
+        self.assertEqual(self.file.read_text(), before)
+        self.assertIn("refusing to change", done.stderr)
+        self.assertIn("#633", done.stderr)
+
+    def test_a_refused_creation_creates_nothing(self):
+        # registry_ensure is a mutation too: creation is inside the protocol
+        # (#289) precisely because a seed landing on top of a just-added
+        # session loses it, and an unlocked creation is that race again.
+        seed_file = self.home / "seed.json"
+        seed_file.write_text(json.dumps({"version": 1, "sessions": {"main": {}}}))
+        self.hold_lock_as_the_daemon_does()
+        done = self.run_writer('registry_ensure "$1"\n', args=[str(seed_file)],
+                               wait=1, check=False)
+        self.assertEqual(done.returncode, self.BUSY, done.stderr)
+        self.assertFalse(self.file.exists(), done.stderr)
+
+    def test_a_refused_selfheal_quarantines_nothing(self):
+        # The most expensive mutation in the library: it MOVES the registry
+        # aside. A writer that holds the lock is one that has already read
+        # the good document and is about to rename it into place.
+        seed_file = self.home / "seed.json"
+        seed_file.write_text(json.dumps({"version": 1, "sessions": {"main": {}}}))
+        self.file.write_text("not json\n")
+        self.hold_lock_as_the_daemon_does()
+        done = self.run_writer('registry_selfheal "$1"\n', args=[str(seed_file)],
+                               wait=1, check=False)
+        self.assertEqual(done.returncode, self.BUSY, done.stderr)
+        self.assertEqual(self.file.read_text(), "not json\n")
+        self.assertEqual(list(self.file.parent.glob("sessions.json.corrupt-*")), [])
+
+    def test_the_refusal_is_said_once_per_streak(self):
+        # The supervisor calls into this every couple of seconds, so an
+        # unlatched line would be the whole journal for as long as a home is
+        # read-only. Same latch shape as registry_selfheal's two.
+        #
+        # The "\n" is load-bearing: ADD_ONE carries no separator of its own,
+        # so `ADD_ONE * 3` is ONE registry_edit with three filters mashed
+        # into its argv, and the assertion below would pass against a
+        # library that never latched anything.
+        self.seed()
+        self.unwritable_directory()
+        done = self.run_writer((self.ADD_ONE + "\n") * 3, args=["doomed"],
+                               check=False)
+        self.assertEqual(done.stderr.count("refusing to change"), 1, done.stderr)
+        self.assertEqual(self.sessions(), {})
+
+    def test_a_writer_refused_once_can_write_when_the_lock_frees(self):
+        # Retryable in the plainest sense: one program, three lock states.
+        # It is refused, it writes once the holder lets go, and it is
+        # refused AGAIN when a second holder turns up -- which is the
+        # latch's negative control: a second outage has to be reported as
+        # loudly as the first, so the line has to come back.
+        self.seed()
+        holder = self.hold_lock_as_the_daemon_does()
+        # Markers rather than pipes: reading a live child's stderr from here
+        # is how a test deadlocks on a full buffer.
+        first_rc = self.home / "first-rc"
+        wrote = self.home / "wrote"
+        hold1 = self.home / "hold1"
+        hold2 = self.home / "hold2"
+        hold1.touch()
+        # ADD_ONE's own "$1" becomes the FUNCTION's argument here, which is
+        # what makes one definition serve all three edits.
+        body = (
+            'W=%s\n'
+            'E() { %s; }\n'
+            'E first; echo "$?" > "$W/first-rc"\n'
+            'while [ -e "$W/hold1" ]; do sleep 0.05; done\n'
+            'E second; touch "$W/wrote"\n'
+            'while [ ! -e "$W/hold2" ]; do sleep 0.05; done\n'
+            'E third\n'
+        ) % (self.home, self.ADD_ONE)
+        proc = self.start_writer(body, wait=1)
+
+        self.assertTrue(wait_until(first_rc.exists), "the writer never refused")
+        self.assertEqual(first_rc.read_text().strip(), str(self.BUSY))
+        self.assertEqual(self.sessions(), {})
+
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        hold1.unlink()
+        self.assertTrue(wait_until(wrote.exists), "the writer never recovered")
+        self.assertEqual(list(self.sessions()), ["second"])
+
+        # A SECOND outage, after a lock that was genuinely taken cleared the
+        # latch.
+        self.hold_lock_as_the_daemon_does()
+        hold2.touch()
+        _, err = proc.communicate(timeout=TIMEOUT)
+        self.assertEqual(proc.returncode, self.BUSY, err)
+        self.assertEqual(list(self.sessions()), ["second"])
+        self.assertEqual(err.count("refusing to change"), 2, err)
+
+    def test_a_refusal_does_not_stop_the_other_writers(self):
+        # "Unrelated sessions keep working": the refusal is one writer's
+        # answer about one attempt, not a state the library latches onto the
+        # registry. The holder still publishes, and the next writer along
+        # still writes on top of it.
+        self.seed({"unrelated": {"agent": "codex"}})
+        holder = self.hold_lock_as_the_daemon_does()
+        refused = self.run_writer(self.ADD_ONE, args=["refused"], wait=1,
+                                  check=False)
+        self.assertEqual(refused.returncode, self.BUSY, refused.stderr)
+        # What the holder was doing all along, published by rename the way
+        # every writer here publishes.
+        self.seed({"unrelated": {"agent": "codex"}, "holder": {"agent": "claude"}})
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        self.run_writer(self.ADD_ONE, args=["after"])
+        self.assertEqual(sorted(self.sessions()), ["after", "holder", "unrelated"])
 
     def test_a_write_that_cannot_land_is_reported_as_a_failure(self):
         # The two writers that do not run under `set -e` — the supervisor and
         # the pane epilogue — act on registry_edit's status, so a publish that
         # never happened must not come back as success. A read-only directory
         # is the shape a full disk or a remounted $HOME takes here.
-        if os.geteuid() == 0:
-            self.skipTest("root ignores the directory mode this test relies on")
+        #
+        # The sidecar is created FIRST so this stays the test it has always
+        # been: the lock is taken normally and the RENAME is what fails, exit
+        # 1 -- a failure no retry fixes, and deliberately not the 75 above.
         self.seed({"keep": {"agent": "claude"}})
         before = self.file.read_text()
-        os.chmod(self.file.parent, 0o500)
-        self.addCleanup(os.chmod, self.file.parent, 0o700)
+        (self.file.parent / "sessions.json.lock").touch()
+        self.unwritable_directory()
         done = self.run_writer(self.ADD_ONE, args=["doomed"], check=False)
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertEqual(self.file.read_text(), before)
@@ -589,6 +742,11 @@ class SelfHeal(RegistryCase):
         # than be reported as handled, and the warning must not repeat every
         # tick for as long as the box is up.
         self.file.write_text("not json\n")
+        # The sidecar first, so the lock is still takeable and this stays a
+        # test about the QUARANTINE failing: with no .lock file in a
+        # read-only directory the refusal comes one step earlier instead
+        # (issue #633), which Refusing covers.
+        (self.file.parent / "sessions.json.lock").touch()
         self.file.parent.chmod(0o500)
         self.addCleanup(self.file.parent.chmod, 0o700)
         # check=False: the writer's exit status is registry_selfheal's own,

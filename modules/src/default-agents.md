@@ -181,8 +181,20 @@ downloads from ${AGENT_BOX_URL}downloads/report.pdf.
     mv ./report.pdf ~/downloads/          # or cp, to keep the original
 
 Always hand over the complete https:// URL. Only files under ~/downloads are
-exposed; nothing else in your home is reachable over the web. For
-unauthenticated sharing, run your own service and expose it via ~/sites.
+exposed; nothing else in your home is reachable over the web - a symlink out
+of the directory included, since a link is followed only where it stays
+inside the drop, so `ln -s ~/build/big.tar ~/downloads/` reads as a missing
+file. For unauthenticated sharing, run your own service and expose it via
+~/sites.
+
+Every file there is handed to the browser as a DOWNLOAD, never rendered:
+this directory shares an origin with the terminal and the settings page, so
+an .html or .svg opened inline would be script running with the user's own
+login. That is a deliberate trade - a report you drop here is saved, not
+read in the tab - so if you want the user to LOOK at something in their
+browser rather than save it, serve it yourself through ~/sites, which is a
+separate hostname with none of that authority. An `index.html` in
+~/downloads is not served either; the listing is always the listing.
 
 ## Putting a screenshot in a GitHub issue or PR
 

@@ -5,8 +5,10 @@
 deploy/aws/template.yaml
 deploy/aws/lightsail-template.yaml
 docs/index.html
+docs/vendor/**
 scripts/ws_smoke.py
 scripts/check_lightsail_userdata.py
+scripts/check_docs_vendor.py
 bin/agentbox
 tests/test_agentbox.py
 tests/native/**

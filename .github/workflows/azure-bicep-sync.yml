@@ -1,0 +1,63 @@
+name: Azure Bicep JSON sync
+
+# The "auto-fix" half of azure-ci.yml's validate job: that job proves
+# deploy/azure/agent-box.json still matches a fresh build of
+# deploy/azure/agent-box.bicep and fails CI on drift, but never fixes it -
+# regenerating and committing was left to whoever edited the .bicep (PR #651
+# needed exactly that manual round trip). This job does the
+# regenerate-and-commit half, mirroring DefangLabs/defang's go.yml
+# `nix-shell-test` job for pkgs/defang/cli.nix's vendorHash: rebuild the
+# artifact and self-commit only if it actually changed.
+#
+# Never runs on pull_request: a forked PR's GITHUB_TOKEN is read-only and
+# can't push. Never runs against master: master requires PRs (ruleset
+# 21491459, see refresh-amis.yml's comment), so a direct push here would just
+# fail GH013 - any drift that reaches master should fail azure-ci's read-only
+# validate job instead, the same way it always has.
+#
+# Self-terminating, with no separate no-op guard needed: GITHUB_TOKEN pushes
+# don't trigger new workflow runs (see refresh-amis.yml), so this job's own
+# commit can't retrigger itself - and once agent-box.json is in sync,
+# `nix run .#compile-azure-bicep` is a no-op diff, so nothing commits at
+# all.
+
+on:
+  push:
+    branches-ignore: [ master ]
+    paths:
+      - 'deploy/azure/agent-box.bicep'
+      - '.github/workflows/azure-bicep-sync.yml'
+
+concurrency:
+  group: azure-bicep-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Regenerate deploy/azure/agent-box.json if it drifted
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Rebuild deploy/azure/agent-box.json from deploy/azure/agent-box.bicep
+        run: nix run .#compile-azure-bicep
+
+      - name: Commit and push if it changed
+        run: |
+          if git diff --quiet -- deploy/azure/agent-box.json; then
+            echo "deploy/azure/agent-box.json already matches deploy/azure/agent-box.bicep"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add deploy/azure/agent-box.json
+          git commit -m "azure: regenerate agent-box.json from agent-box.bicep"
+          git push

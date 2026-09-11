@@ -637,8 +637,20 @@ let
         mv ./report.pdf ~/downloads/          # or cp, to keep the original
 
     Always hand over the complete https:// URL. Only files under ~/downloads are
-    exposed; nothing else in your home is reachable over the web. For
-    unauthenticated sharing, run your own service and expose it via ~/sites.
+    exposed; nothing else in your home is reachable over the web - a symlink out
+    of the directory included, since a link is followed only where it stays
+    inside the drop, so `ln -s ~/build/big.tar ~/downloads/` reads as a missing
+    file. For unauthenticated sharing, run your own service and expose it via
+    ~/sites.
+
+    Every file there is handed to the browser as a DOWNLOAD, never rendered:
+    this directory shares an origin with the terminal and the settings page, so
+    an .html or .svg opened inline would be script running with the user's own
+    login. That is a deliberate trade - a report you drop here is saved, not
+    read in the tab - so if you want the user to LOOK at something in their
+    browser rather than save it, serve it yourself through ~/sites, which is a
+    separate hostname with none of that authority. An `index.html` in
+    ~/downloads is not served either; the listing is always the listing.
 
     ## Putting a screenshot in a GitHub issue or PR
 
@@ -771,7 +783,41 @@ let
       Environment=AGENT_BOX_SESSIONS_FILE=/home/%i/.config/agent-box/sessions.json
       EnvironmentFile=-/etc/agent-box/units/agent-web-terminal-%i.env
       EnvironmentFile=-/etc/agent-box/units/agent-web-terminal-%i.local.env
-      ExecStart=ttyd --writable --url-arg -p ''${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true agent-box-attach
+      # The transport is a UNIX socket, not a loopback port (issue #628). A
+      # 127.0.0.1 port is reachable by EVERY local user, and ttyd runs --writable
+      # with no credential of its own -- Caddy authenticates the public URL, which
+      # says nothing about who else on the box can open the port. A second agent
+      # user could therefore read and type into this user's terminal. Same reason,
+      # and same 0660 <user>:caddy shape, as the settings socket (issue #49).
+      #
+      # Two mechanisms hold that shape up, and BOTH are load-bearing:
+      #   - libwebsockets chmods the socket 0660 on bind, and the socket inherits
+      #     the GROUP of the directory it is created in because that directory is
+      #     setgid (2750 %i:caddy, from the tmpfiles rules both backends render).
+      #     So the socket lands 0660 %i:caddy without this unit holding any
+      #     privilege: connect(2) needs write permission, which leaves %i and
+      #     caddy. Inheriting matters most on NixOS, where every agent user shares
+      #     the `users` primary group -- a socket carrying THAT group at 0660
+      #     would be open to every other agent user on the box.
+      #   - the directory itself is 0750 %i:caddy, so nobody else can even reach
+      #     the socket to try, whatever mode it ends up with.
+      # Not ttyd's own -U/--socket-owner: that chowns the socket, which this
+      # unprivileged unit may not do to a group it is not in -- ttyd exits without
+      # binding at all. And not SupplementaryGroups=caddy to make it able to,
+      # because the caddy group is what guards every OTHER user's ~/downloads and
+      # ~/sites, so the terminal's process tree would gain exactly the cross-user
+      # reach this change exists to remove.
+      # The path is spelled here rather than passed in per user, exactly as
+      # agent-box-settings@.socket spells its own ListenStream.
+      #
+      # --check-origin is the browser half (issue #628): it refuses a WebSocket
+      # upgrade whose Origin does not match the Host, so a page on another site
+      # cannot drive this terminal through a logged-in browser. It is defence in
+      # depth and NOT a substitute for the socket -- a local client forges any
+      # header it likes. ttyd 1.7.7 compares the origin's host:port against the
+      # Host header with default ports elided, which is what a TLS-terminating
+      # Caddy in front of it sends.
+      ExecStart=ttyd --writable --url-arg --check-origin -i /run/agent-box-ttyd/%i/ttyd.sock -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true agent-box-attach
     ''} $out/etc/systemd/system/agent-web-terminal@.service
     install -m444 ${pkgs.writeText "agent-box-settings@.service" ''
       [Unit]
@@ -1098,9 +1144,30 @@ let
   );
   tmuxSocketName = "agent-box";
   runtimeDirectory = name: "agent-box-${name}";
-  # ttyd port base; ports are assigned in sorted user-name order (see
-  # terminalUsers below).
-  ttydPortBase = 7681;
+  # Each terminal's ttyd listens on a per-user UNIX socket rather than a
+  # 127.0.0.1 port (issue #628). The port was reachable by every local user
+  # on the box, and ttyd runs --writable with no credential of its own: Caddy
+  # authenticates the public URL, which says nothing about who can open the
+  # port behind it, so a second agent user had a path into this user's tmux.
+  # Same reasoning, and the same 0660 <user>:caddy shape, as the settings
+  # socket above.
+  #
+  # The directory is where the enforcement lives, and it does two jobs. It is
+  # SETGID caddy, so the socket ttyd binds inherits group caddy (libwebsockets
+  # chmods it 0660, and connect(2) wants write) — this unit holds no privilege
+  # with which to chown one. That inheritance is what makes the NixOS backend
+  # safe at all: `isNormalUser` puts every agent user in the shared `users`
+  # group, so a socket carrying the process's own primary group at 0660 would
+  # be open to all of them. And it is 0750 <user>:caddy, so no other user can
+  # reach the socket to try, whatever mode it ends up with.
+  #
+  # The path is NOT passed to the unit as an environment variable: the shared
+  # unit text spells it with %i, exactly as agent-box-settings@.socket spells
+  # its own ListenStream. These two helpers are what the tmpfiles rules and
+  # the Caddyfile bind, and they have to agree with that unit.
+  ttydSocketDir = "/run/agent-box-ttyd";
+  ttydSocketDirOf = name: "${ttydSocketDir}/${name}";
+  ttydSocketOf = name: "${ttydSocketDirOf name}/ttyd.sock";
   # The settings daemon listens on a per-user UNIX socket, not localhost TCP:
   # a 127.0.0.1 port is reachable by EVERY local user (issue #49 — on a
   # multi-agent box, codex could rewrite claude's keys and restart claude's
@@ -1991,6 +2058,27 @@ if __name__ == "__main__":
     # the reads in this file's own callers all get a whole document from the
     # rename. The lock exists for the interval a read-modify-write spans.
     #
+    # A lock this program cannot TAKE - a holder that times us out, a sidecar it
+    # cannot create - refuses the mutation and changes nothing (issue #633). It
+    # used to carry on unlocked and say so, which is the pre-#254 lost-update
+    # behaviour reintroduced at exactly the moment there is provably another
+    # writer: the rename at the end is atomic, but two unlocked read-modify-writes
+    # are not, so the loser's edit is reverted wholesale and the caller is told it
+    # succeeded. Refusing costs one retry; continuing costs a session. Note that
+    # this is NOT the same as having no lock at all: an EMPTY REGISTRY_FLOCK is a
+    # caller stating there is no flock on this box, which still writes (see the
+    # assignment below), because a box that never had the primitive must still be
+    # able to add, start and stop a session.
+    #
+    # The refusal is REGISTRY_BUSY_RC, 75 (EX_TEMPFAIL) - the same "declined for
+    # now, ask again" code agent-box-webhook-spawn already answers its dispatcher
+    # with, and distinct from the 1 a jq or a rename failure returns, which no
+    # retry will fix. registry_edit, registry_ensure and registry_selfheal all
+    # return it; a caller under `set -e` therefore exits 75 with no ceremony. The
+    # two writers that do not run under `set -e` come back later instead: the
+    # supervisor skips the step and reconciles again in ~2s, and the pane
+    # epilogue already retries its write three times.
+    #
     # What a caller may set before the include, all optional:
     #   REGISTRY_FILE       the registry path, when the caller already knows it
     #   REGISTRY_PROG       the name the one warning below prints
@@ -2016,11 +2104,23 @@ if __name__ == "__main__":
     # flock, and must not be answered with one from the environment.
     : "''${REGISTRY_FLOCK=''${AGENT_BOX_FLOCK_BIN:-}}"
     : "''${REGISTRY_LOCK_WAIT:=10}"
+    # What every mutator in here returns when the lock could not be taken: 75,
+    # EX_TEMPFAIL, "declined for now" (issue #633). Retryable by construction -
+    # nothing was read, nothing was written - and deliberately not 1, which this
+    # file already uses for the failures a retry cannot help (a filter jq refused,
+    # a rename onto a full disk).
+    REGISTRY_BUSY_RC=75
     # 1 while the lock is genuinely held — taken here, inherited, or nested inside
     # a section that holds it. Only the webhook spawn wrapper reads it, because it
     # may advertise an inherited fd only if it really got the lock.
     REGISTRY_HELD=0
     _registry_depth=0
+    # 1 once the refusal below has been printed, so the supervisor's reconcile
+    # loop says it once per streak rather than every two seconds for as long as a
+    # holder is wedged or a home is read-only. Cleared by the next lock actually
+    # taken, so a second outage is reported as loudly as the first. Same latch
+    # shape as registry_selfheal's two.
+    _registry_lock_warned=0
 
     registry_close_fd() {
       # Close fd 9 and NOTHING ELSE. The braces are the whole point: `exec` with no
@@ -2034,7 +2134,28 @@ if __name__ == "__main__":
       { exec 9>&-; } 2>/dev/null || true
     }
 
+    _registry_refuse() {
+      # _registry_refuse REASON - the one exit from registry_lock that did not
+      # get the lock. Unwinds the depth counter to 0 so a caller that goes on to
+      # call registry_unlock anyway unlocks nothing, and so the NEXT
+      # registry_lock starts a fresh attempt rather than believing it is nested
+      # inside a section nobody holds. That second half is why the pane epilogue
+      # skips its whole pass on a refusal: a fresh attempt means a fresh
+      # REGISTRY_LOCK_WAIT, and falling through would spend two of them.
+      _registry_depth=0
+      [ "$_registry_lock_warned" = 1 ] || \
+        echo "$REGISTRY_PROG: cannot lock $REGISTRY_FILE ($1); refusing to change" \
+             "it rather than racing another writer - nothing was written, and a" \
+             "retry is safe (issue #633)" >&2
+      _registry_lock_warned=1
+    }
+
     registry_lock() {
+      # 0 with the lock held (or deliberately not taken, see REGISTRY_FLOCK),
+      # REGISTRY_BUSY_RC when it could not be taken and the caller must not
+      # write. A caller that gets non-zero must NOT call registry_unlock; doing
+      # so anyway is harmless, because the depth is already back at 0.
+      #
       # Nesting-safe on purpose: flock(2) conflicts between two open file
       # DESCRIPTIONS, including two of the same process, so a second fd on the
       # sidecar blocks a writer against ITSELF (verified). Both the supervisor
@@ -2068,19 +2189,24 @@ if __name__ == "__main__":
                chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
              }
              { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
-        || return 0
+        || { _registry_refuse "could not open $REGISTRY_FILE.lock"
+             return "$REGISTRY_BUSY_RC"; }
       # Bounded, never an unbounded wait: nothing may park the supervisor's
       # reconcile loop (every session on the box waits behind it) or a CLI a user
-      # is waiting on. A holder that times us out degrades THIS write to the
-      # pre-#254 lost-update behaviour, which is a bad write rather than a hung
-      # box, and says so on stderr.
+      # is waiting on. A holder that times us out is answered with the refusal
+      # rather than an unlocked write: the wait is what makes a refusal rare, and
+      # a bad write is not a better answer than a retry (issue #633).
       if "$REGISTRY_FLOCK" -w "$REGISTRY_LOCK_WAIT" 9; then
         REGISTRY_HELD=1
-      else
-        echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-        registry_close_fd
+        _registry_lock_warned=0
+        return 0
       fi
-      return 0
+      # Closed FIRST, so the fd does not outlive the attempt and block the next
+      # one, and before the message, so a caller reading stderr sees a refusal
+      # that is already complete.
+      registry_close_fd
+      _registry_refuse "timed out after ''${REGISTRY_LOCK_WAIT}s waiting for another writer"
+      return "$REGISTRY_BUSY_RC"
     }
 
     registry_unlock() {
@@ -2100,14 +2226,17 @@ if __name__ == "__main__":
       # as an argument, so a filter may end in `--args -- "$@"` without the path
       # being read as one of those arguments.
       #
-      # Returns 1 with the registry untouched when jq fails. jq's own stderr is
+      # Returns 1 with the registry untouched when jq fails, and
+      # REGISTRY_BUSY_RC with it untouched when the lock could not be taken
+      # (issue #633) — the whole read-modify-write is skipped, so the file is
+      # byte-for-byte what it was. jq's own stderr is
       # left alone: a caller that must stay quiet — the pane epilogue prints into
       # the user's terminal — redirects it at the call site, which keeps that
       # policy where the reason for it is.
       #
       # The lock nests, so a caller already holding it across a check-then-write
       # keeps holding it here and does not deadlock against itself.
-      registry_lock
+      registry_lock || return "$REGISTRY_BUSY_RC"
       _registry_tmp="$(mktemp "$REGISTRY_FILE.XXXXXX")" || { registry_unlock; return 1; }
       # The RENAME is checked too, not just jq: a read-only $HOME or a full disk
       # must not be reported as a write to the two writers that do not run under
@@ -2199,7 +2328,12 @@ if __name__ == "__main__":
       # and leaves the file exactly as it was; healing is the job of the one
       # program that is already looping.
       registry_valid && { _registry_heal_warned=0; return 0; }
-      registry_lock
+      # Nothing is quarantined, moved or re-seeded without the lock (issue #633):
+      # this function DESTROYS the registry it judges, and the writer it would be
+      # racing is one that has already read the good document and is about to
+      # rename it into place. The supervisor calls this every couple of seconds,
+      # so the answer to a busy lock is simply the next tick.
+      registry_lock || return "$REGISTRY_BUSY_RC"
       # Re-check under the lock: every writer publishes by rename, so a document
       # that landed between the check above and this line is WHOLE. Quarantining
       # it would throw away a perfectly good registry.
@@ -2298,7 +2432,11 @@ if __name__ == "__main__":
         mkdir -p "''${REGISTRY_FILE%/*}"
         chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
       }
-      registry_lock
+      # Creation is a mutation like any other and refuses like one (issue #633):
+      # the whole reason it is inside the protocol (issue #289) is that a seed
+      # landing on top of a just-added session loses that session for good, and
+      # an unlocked creation is exactly that race back again.
+      registry_lock || return "$REGISTRY_BUSY_RC"
       if [ ! -s "$REGISTRY_FILE" ]; then
         # A seed is trusted only after it PASSES this shape check (issue #356):
         # two independent producers (this module's Nix-declared seed and the
@@ -2496,14 +2634,21 @@ if __name__ == "__main__":
       # on the box. registry_edit nests inside this, and nothing this script starts
       # outlives it, so no child can carry the fd (and the lock) away.
       # Both calls are silenced, because this prints into the pane the user just
-      # quit: a lock timeout would otherwise put a warning there once per retry
+      # quit: a lock refusal would otherwise put a warning there once per retry
       # pass (`flock -w` itself printed nothing before this), and an unparseable
       # registry is the supervisor's news to report, not this script's.
-      registry_lock 2>/dev/null
-      registry_edit --arg s "$1" --argjson st "$_status" "$_edit" 2>/dev/null
-      "$REGISTRY_JQ" -e --arg s "$1" --argjson st "$_status" \
-        "$_check" "$REGISTRY_FILE" >/dev/null 2>&1 && exit 0
-      registry_unlock
+      #
+      # A pass that could not take the lock does nothing at all and waits its
+      # second out (issue #633). Falling through would cost a SECOND full
+      # REGISTRY_LOCK_WAIT inside registry_edit, which now makes its own attempt
+      # rather than nesting inside a section this one never opened - so the
+      # retry loop above would take twice as long to reach the same answer.
+      if registry_lock 2>/dev/null; then
+        registry_edit --arg s "$1" --argjson st "$_status" "$_edit" 2>/dev/null
+        "$REGISTRY_JQ" -e --arg s "$1" --argjson st "$_status" \
+          "$_check" "$REGISTRY_FILE" >/dev/null 2>&1 && exit 0
+        registry_unlock
+      fi
       sleep 1
     done
     exit 0
@@ -3185,6 +3330,15 @@ JQ=jq
 # is one of five writers, and the lock it takes has to be the same lock the
 # supervisor, the pane epilogue, the webhook spawner and the settings daemon
 # take, or it is not a lock.
+#
+# A lock it cannot take refuses the verb outright and writes nothing (issue
+# #633). Under the `set -e` above that needs no ceremony at any call site:
+# registry_ensure, registry_lock and registry_edit all return
+# REGISTRY_BUSY_RC (75, EX_TEMPFAIL), so the CLI exits 75 with the library's
+# own reason on stderr. That is the code a caller can retry on, and it is
+# distinct from 2 (a usage error) and 1 (a write that will not work next
+# time either) -- agent-box-webhook-spawn execs into this CLI and hands 75
+# straight back to its dispatcher, which re-offers the batch.
 REGISTRY_PROG=agent-box-session
 # The session registry's write protocol, spelled once (issue #254).
 #
@@ -3225,6 +3379,27 @@ REGISTRY_PROG=agent-box-session
 # the reads in this file's own callers all get a whole document from the
 # rename. The lock exists for the interval a read-modify-write spans.
 #
+# A lock this program cannot TAKE - a holder that times us out, a sidecar it
+# cannot create - refuses the mutation and changes nothing (issue #633). It
+# used to carry on unlocked and say so, which is the pre-#254 lost-update
+# behaviour reintroduced at exactly the moment there is provably another
+# writer: the rename at the end is atomic, but two unlocked read-modify-writes
+# are not, so the loser's edit is reverted wholesale and the caller is told it
+# succeeded. Refusing costs one retry; continuing costs a session. Note that
+# this is NOT the same as having no lock at all: an EMPTY REGISTRY_FLOCK is a
+# caller stating there is no flock on this box, which still writes (see the
+# assignment below), because a box that never had the primitive must still be
+# able to add, start and stop a session.
+#
+# The refusal is REGISTRY_BUSY_RC, 75 (EX_TEMPFAIL) - the same "declined for
+# now, ask again" code agent-box-webhook-spawn already answers its dispatcher
+# with, and distinct from the 1 a jq or a rename failure returns, which no
+# retry will fix. registry_edit, registry_ensure and registry_selfheal all
+# return it; a caller under `set -e` therefore exits 75 with no ceremony. The
+# two writers that do not run under `set -e` come back later instead: the
+# supervisor skips the step and reconciles again in ~2s, and the pane
+# epilogue already retries its write three times.
+#
 # What a caller may set before the include, all optional:
 #   REGISTRY_FILE       the registry path, when the caller already knows it
 #   REGISTRY_PROG       the name the one warning below prints
@@ -3250,11 +3425,23 @@ REGISTRY_PROG=agent-box-session
 # flock, and must not be answered with one from the environment.
 : "''${REGISTRY_FLOCK=''${AGENT_BOX_FLOCK_BIN:-}}"
 : "''${REGISTRY_LOCK_WAIT:=10}"
+# What every mutator in here returns when the lock could not be taken: 75,
+# EX_TEMPFAIL, "declined for now" (issue #633). Retryable by construction -
+# nothing was read, nothing was written - and deliberately not 1, which this
+# file already uses for the failures a retry cannot help (a filter jq refused,
+# a rename onto a full disk).
+REGISTRY_BUSY_RC=75
 # 1 while the lock is genuinely held — taken here, inherited, or nested inside
 # a section that holds it. Only the webhook spawn wrapper reads it, because it
 # may advertise an inherited fd only if it really got the lock.
 REGISTRY_HELD=0
 _registry_depth=0
+# 1 once the refusal below has been printed, so the supervisor's reconcile
+# loop says it once per streak rather than every two seconds for as long as a
+# holder is wedged or a home is read-only. Cleared by the next lock actually
+# taken, so a second outage is reported as loudly as the first. Same latch
+# shape as registry_selfheal's two.
+_registry_lock_warned=0
 
 registry_close_fd() {
   # Close fd 9 and NOTHING ELSE. The braces are the whole point: `exec` with no
@@ -3268,7 +3455,28 @@ registry_close_fd() {
   { exec 9>&-; } 2>/dev/null || true
 }
 
+_registry_refuse() {
+  # _registry_refuse REASON - the one exit from registry_lock that did not
+  # get the lock. Unwinds the depth counter to 0 so a caller that goes on to
+  # call registry_unlock anyway unlocks nothing, and so the NEXT
+  # registry_lock starts a fresh attempt rather than believing it is nested
+  # inside a section nobody holds. That second half is why the pane epilogue
+  # skips its whole pass on a refusal: a fresh attempt means a fresh
+  # REGISTRY_LOCK_WAIT, and falling through would spend two of them.
+  _registry_depth=0
+  [ "$_registry_lock_warned" = 1 ] || \
+    echo "$REGISTRY_PROG: cannot lock $REGISTRY_FILE ($1); refusing to change" \
+         "it rather than racing another writer - nothing was written, and a" \
+         "retry is safe (issue #633)" >&2
+  _registry_lock_warned=1
+}
+
 registry_lock() {
+  # 0 with the lock held (or deliberately not taken, see REGISTRY_FLOCK),
+  # REGISTRY_BUSY_RC when it could not be taken and the caller must not
+  # write. A caller that gets non-zero must NOT call registry_unlock; doing
+  # so anyway is harmless, because the depth is already back at 0.
+  #
   # Nesting-safe on purpose: flock(2) conflicts between two open file
   # DESCRIPTIONS, including two of the same process, so a second fd on the
   # sidecar blocks a writer against ITSELF (verified). Both the supervisor
@@ -3302,19 +3510,24 @@ registry_lock() {
            chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
          }
          { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
-    || return 0
+    || { _registry_refuse "could not open $REGISTRY_FILE.lock"
+         return "$REGISTRY_BUSY_RC"; }
   # Bounded, never an unbounded wait: nothing may park the supervisor's
   # reconcile loop (every session on the box waits behind it) or a CLI a user
-  # is waiting on. A holder that times us out degrades THIS write to the
-  # pre-#254 lost-update behaviour, which is a bad write rather than a hung
-  # box, and says so on stderr.
+  # is waiting on. A holder that times us out is answered with the refusal
+  # rather than an unlocked write: the wait is what makes a refusal rare, and
+  # a bad write is not a better answer than a retry (issue #633).
   if "$REGISTRY_FLOCK" -w "$REGISTRY_LOCK_WAIT" 9; then
     REGISTRY_HELD=1
-  else
-    echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-    registry_close_fd
+    _registry_lock_warned=0
+    return 0
   fi
-  return 0
+  # Closed FIRST, so the fd does not outlive the attempt and block the next
+  # one, and before the message, so a caller reading stderr sees a refusal
+  # that is already complete.
+  registry_close_fd
+  _registry_refuse "timed out after ''${REGISTRY_LOCK_WAIT}s waiting for another writer"
+  return "$REGISTRY_BUSY_RC"
 }
 
 registry_unlock() {
@@ -3334,14 +3547,17 @@ registry_edit() {
   # as an argument, so a filter may end in `--args -- "$@"` without the path
   # being read as one of those arguments.
   #
-  # Returns 1 with the registry untouched when jq fails. jq's own stderr is
+  # Returns 1 with the registry untouched when jq fails, and
+  # REGISTRY_BUSY_RC with it untouched when the lock could not be taken
+  # (issue #633) — the whole read-modify-write is skipped, so the file is
+  # byte-for-byte what it was. jq's own stderr is
   # left alone: a caller that must stay quiet — the pane epilogue prints into
   # the user's terminal — redirects it at the call site, which keeps that
   # policy where the reason for it is.
   #
   # The lock nests, so a caller already holding it across a check-then-write
   # keeps holding it here and does not deadlock against itself.
-  registry_lock
+  registry_lock || return "$REGISTRY_BUSY_RC"
   _registry_tmp="$(mktemp "$REGISTRY_FILE.XXXXXX")" || { registry_unlock; return 1; }
   # The RENAME is checked too, not just jq: a read-only $HOME or a full disk
   # must not be reported as a write to the two writers that do not run under
@@ -3433,7 +3649,12 @@ registry_selfheal() {
   # and leaves the file exactly as it was; healing is the job of the one
   # program that is already looping.
   registry_valid && { _registry_heal_warned=0; return 0; }
-  registry_lock
+  # Nothing is quarantined, moved or re-seeded without the lock (issue #633):
+  # this function DESTROYS the registry it judges, and the writer it would be
+  # racing is one that has already read the good document and is about to
+  # rename it into place. The supervisor calls this every couple of seconds,
+  # so the answer to a busy lock is simply the next tick.
+  registry_lock || return "$REGISTRY_BUSY_RC"
   # Re-check under the lock: every writer publishes by rename, so a document
   # that landed between the check above and this line is WHOLE. Quarantining
   # it would throw away a perfectly good registry.
@@ -3532,7 +3753,11 @@ registry_ensure() {
     mkdir -p "''${REGISTRY_FILE%/*}"
     chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
   }
-  registry_lock
+  # Creation is a mutation like any other and refuses like one (issue #633):
+  # the whole reason it is inside the protocol (issue #289) is that a seed
+  # landing on top of a just-added session loses that session for good, and
+  # an unlocked creation is exactly that race back again.
+  registry_lock || return "$REGISTRY_BUSY_RC"
   if [ ! -s "$REGISTRY_FILE" ]; then
     # A seed is trusted only after it PASSES this shape check (issue #356):
     # two independent producers (this module's Nix-declared seed and the
@@ -7650,6 +7875,27 @@ REGISTRY_PROG=agent-box-webhook-spawn
 # the reads in this file's own callers all get a whole document from the
 # rename. The lock exists for the interval a read-modify-write spans.
 #
+# A lock this program cannot TAKE - a holder that times us out, a sidecar it
+# cannot create - refuses the mutation and changes nothing (issue #633). It
+# used to carry on unlocked and say so, which is the pre-#254 lost-update
+# behaviour reintroduced at exactly the moment there is provably another
+# writer: the rename at the end is atomic, but two unlocked read-modify-writes
+# are not, so the loser's edit is reverted wholesale and the caller is told it
+# succeeded. Refusing costs one retry; continuing costs a session. Note that
+# this is NOT the same as having no lock at all: an EMPTY REGISTRY_FLOCK is a
+# caller stating there is no flock on this box, which still writes (see the
+# assignment below), because a box that never had the primitive must still be
+# able to add, start and stop a session.
+#
+# The refusal is REGISTRY_BUSY_RC, 75 (EX_TEMPFAIL) - the same "declined for
+# now, ask again" code agent-box-webhook-spawn already answers its dispatcher
+# with, and distinct from the 1 a jq or a rename failure returns, which no
+# retry will fix. registry_edit, registry_ensure and registry_selfheal all
+# return it; a caller under `set -e` therefore exits 75 with no ceremony. The
+# two writers that do not run under `set -e` come back later instead: the
+# supervisor skips the step and reconciles again in ~2s, and the pane
+# epilogue already retries its write three times.
+#
 # What a caller may set before the include, all optional:
 #   REGISTRY_FILE       the registry path, when the caller already knows it
 #   REGISTRY_PROG       the name the one warning below prints
@@ -7675,11 +7921,23 @@ REGISTRY_PROG=agent-box-webhook-spawn
 # flock, and must not be answered with one from the environment.
 : "''${REGISTRY_FLOCK=''${AGENT_BOX_FLOCK_BIN:-}}"
 : "''${REGISTRY_LOCK_WAIT:=10}"
+# What every mutator in here returns when the lock could not be taken: 75,
+# EX_TEMPFAIL, "declined for now" (issue #633). Retryable by construction -
+# nothing was read, nothing was written - and deliberately not 1, which this
+# file already uses for the failures a retry cannot help (a filter jq refused,
+# a rename onto a full disk).
+REGISTRY_BUSY_RC=75
 # 1 while the lock is genuinely held — taken here, inherited, or nested inside
 # a section that holds it. Only the webhook spawn wrapper reads it, because it
 # may advertise an inherited fd only if it really got the lock.
 REGISTRY_HELD=0
 _registry_depth=0
+# 1 once the refusal below has been printed, so the supervisor's reconcile
+# loop says it once per streak rather than every two seconds for as long as a
+# holder is wedged or a home is read-only. Cleared by the next lock actually
+# taken, so a second outage is reported as loudly as the first. Same latch
+# shape as registry_selfheal's two.
+_registry_lock_warned=0
 
 registry_close_fd() {
   # Close fd 9 and NOTHING ELSE. The braces are the whole point: `exec` with no
@@ -7693,7 +7951,28 @@ registry_close_fd() {
   { exec 9>&-; } 2>/dev/null || true
 }
 
+_registry_refuse() {
+  # _registry_refuse REASON - the one exit from registry_lock that did not
+  # get the lock. Unwinds the depth counter to 0 so a caller that goes on to
+  # call registry_unlock anyway unlocks nothing, and so the NEXT
+  # registry_lock starts a fresh attempt rather than believing it is nested
+  # inside a section nobody holds. That second half is why the pane epilogue
+  # skips its whole pass on a refusal: a fresh attempt means a fresh
+  # REGISTRY_LOCK_WAIT, and falling through would spend two of them.
+  _registry_depth=0
+  [ "$_registry_lock_warned" = 1 ] || \
+    echo "$REGISTRY_PROG: cannot lock $REGISTRY_FILE ($1); refusing to change" \
+         "it rather than racing another writer - nothing was written, and a" \
+         "retry is safe (issue #633)" >&2
+  _registry_lock_warned=1
+}
+
 registry_lock() {
+  # 0 with the lock held (or deliberately not taken, see REGISTRY_FLOCK),
+  # REGISTRY_BUSY_RC when it could not be taken and the caller must not
+  # write. A caller that gets non-zero must NOT call registry_unlock; doing
+  # so anyway is harmless, because the depth is already back at 0.
+  #
   # Nesting-safe on purpose: flock(2) conflicts between two open file
   # DESCRIPTIONS, including two of the same process, so a second fd on the
   # sidecar blocks a writer against ITSELF (verified). Both the supervisor
@@ -7727,19 +8006,24 @@ registry_lock() {
            chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
          }
          { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
-    || return 0
+    || { _registry_refuse "could not open $REGISTRY_FILE.lock"
+         return "$REGISTRY_BUSY_RC"; }
   # Bounded, never an unbounded wait: nothing may park the supervisor's
   # reconcile loop (every session on the box waits behind it) or a CLI a user
-  # is waiting on. A holder that times us out degrades THIS write to the
-  # pre-#254 lost-update behaviour, which is a bad write rather than a hung
-  # box, and says so on stderr.
+  # is waiting on. A holder that times us out is answered with the refusal
+  # rather than an unlocked write: the wait is what makes a refusal rare, and
+  # a bad write is not a better answer than a retry (issue #633).
   if "$REGISTRY_FLOCK" -w "$REGISTRY_LOCK_WAIT" 9; then
     REGISTRY_HELD=1
-  else
-    echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-    registry_close_fd
+    _registry_lock_warned=0
+    return 0
   fi
-  return 0
+  # Closed FIRST, so the fd does not outlive the attempt and block the next
+  # one, and before the message, so a caller reading stderr sees a refusal
+  # that is already complete.
+  registry_close_fd
+  _registry_refuse "timed out after ''${REGISTRY_LOCK_WAIT}s waiting for another writer"
+  return "$REGISTRY_BUSY_RC"
 }
 
 registry_unlock() {
@@ -7759,14 +8043,17 @@ registry_edit() {
   # as an argument, so a filter may end in `--args -- "$@"` without the path
   # being read as one of those arguments.
   #
-  # Returns 1 with the registry untouched when jq fails. jq's own stderr is
+  # Returns 1 with the registry untouched when jq fails, and
+  # REGISTRY_BUSY_RC with it untouched when the lock could not be taken
+  # (issue #633) — the whole read-modify-write is skipped, so the file is
+  # byte-for-byte what it was. jq's own stderr is
   # left alone: a caller that must stay quiet — the pane epilogue prints into
   # the user's terminal — redirects it at the call site, which keeps that
   # policy where the reason for it is.
   #
   # The lock nests, so a caller already holding it across a check-then-write
   # keeps holding it here and does not deadlock against itself.
-  registry_lock
+  registry_lock || return "$REGISTRY_BUSY_RC"
   _registry_tmp="$(mktemp "$REGISTRY_FILE.XXXXXX")" || { registry_unlock; return 1; }
   # The RENAME is checked too, not just jq: a read-only $HOME or a full disk
   # must not be reported as a write to the two writers that do not run under
@@ -7858,7 +8145,12 @@ registry_selfheal() {
   # and leaves the file exactly as it was; healing is the job of the one
   # program that is already looping.
   registry_valid && { _registry_heal_warned=0; return 0; }
-  registry_lock
+  # Nothing is quarantined, moved or re-seeded without the lock (issue #633):
+  # this function DESTROYS the registry it judges, and the writer it would be
+  # racing is one that has already read the good document and is about to
+  # rename it into place. The supervisor calls this every couple of seconds,
+  # so the answer to a busy lock is simply the next tick.
+  registry_lock || return "$REGISTRY_BUSY_RC"
   # Re-check under the lock: every writer publishes by rename, so a document
   # that landed between the check above and this line is WHOLE. Quarantining
   # it would throw away a perfectly good registry.
@@ -7957,7 +8249,11 @@ registry_ensure() {
     mkdir -p "''${REGISTRY_FILE%/*}"
     chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
   }
-  registry_lock
+  # Creation is a mutation like any other and refuses like one (issue #633):
+  # the whole reason it is inside the protocol (issue #289) is that a seed
+  # landing on top of a just-added session loses that session for good, and
+  # an unlocked creation is exactly that race back again.
+  registry_lock || return "$REGISTRY_BUSY_RC"
   if [ ! -s "$REGISTRY_FILE" ]; then
     # A seed is trusted only after it PASSES this shape check (issue #356):
     # two independent producers (this module's Nix-declared seed and the
@@ -8528,9 +8824,13 @@ PROMPT="$(cat)"
 #
 # A lock this program could not take is not announced: the fd is exported only
 # when it really holds one, so the CLI opens its own rather than trusting an
-# empty promise. Either way the spawn goes ahead — a webhook delivery must
-# never be dropped for want of a lock.
-registry_lock
+# empty promise. `|| true` because a refusal must not abort this script under
+# `set -e`: the cap check below is a READ, so running it unlocked costs at
+# worst a racy count, and the `add` this execs into takes the lock itself and
+# refuses with the same 75 if it cannot (issue #633) — which is exactly the
+# "declined for now" answer the dispatcher re-offers. So a webhook delivery
+# is still never dropped for want of a lock; it waits for one.
+registry_lock || true
 if [ "$REGISTRY_HELD" = 1 ]; then
   export AGENT_BOX_REGISTRY_LOCK_FD=9
 fi
@@ -10069,10 +10369,12 @@ esac
           never lands in a world-readable path. Null (the default) means no
           browser terminal for this user.
 
-          Each terminal's ttyd gets a localhost port assigned in sorted
-          user-name order starting at 7681. The top-level Caddyfile is
+          Each terminal's ttyd listens on a UNIX socket of its own,
+          /run/agent-box-ttyd/<user>/ttyd.sock, reachable only by that user
+          and caddy (issue #628) — never on a localhost port, which every
+          other local user could open. The top-level Caddyfile is
           module-managed, so adding/removing terminal users is a
-          nixos-rebuild away — check the assigned ports with
+          nixos-rebuild away — check the wiring with
           `systemctl cat agent-web-terminal@<user>`.
         '';
       };
@@ -10291,6 +10593,27 @@ esac
     # the reads in this file's own callers all get a whole document from the
     # rename. The lock exists for the interval a read-modify-write spans.
     #
+    # A lock this program cannot TAKE - a holder that times us out, a sidecar it
+    # cannot create - refuses the mutation and changes nothing (issue #633). It
+    # used to carry on unlocked and say so, which is the pre-#254 lost-update
+    # behaviour reintroduced at exactly the moment there is provably another
+    # writer: the rename at the end is atomic, but two unlocked read-modify-writes
+    # are not, so the loser's edit is reverted wholesale and the caller is told it
+    # succeeded. Refusing costs one retry; continuing costs a session. Note that
+    # this is NOT the same as having no lock at all: an EMPTY REGISTRY_FLOCK is a
+    # caller stating there is no flock on this box, which still writes (see the
+    # assignment below), because a box that never had the primitive must still be
+    # able to add, start and stop a session.
+    #
+    # The refusal is REGISTRY_BUSY_RC, 75 (EX_TEMPFAIL) - the same "declined for
+    # now, ask again" code agent-box-webhook-spawn already answers its dispatcher
+    # with, and distinct from the 1 a jq or a rename failure returns, which no
+    # retry will fix. registry_edit, registry_ensure and registry_selfheal all
+    # return it; a caller under `set -e` therefore exits 75 with no ceremony. The
+    # two writers that do not run under `set -e` come back later instead: the
+    # supervisor skips the step and reconciles again in ~2s, and the pane
+    # epilogue already retries its write three times.
+    #
     # What a caller may set before the include, all optional:
     #   REGISTRY_FILE       the registry path, when the caller already knows it
     #   REGISTRY_PROG       the name the one warning below prints
@@ -10316,11 +10639,23 @@ esac
     # flock, and must not be answered with one from the environment.
     : "''${REGISTRY_FLOCK=''${AGENT_BOX_FLOCK_BIN:-}}"
     : "''${REGISTRY_LOCK_WAIT:=10}"
+    # What every mutator in here returns when the lock could not be taken: 75,
+    # EX_TEMPFAIL, "declined for now" (issue #633). Retryable by construction -
+    # nothing was read, nothing was written - and deliberately not 1, which this
+    # file already uses for the failures a retry cannot help (a filter jq refused,
+    # a rename onto a full disk).
+    REGISTRY_BUSY_RC=75
     # 1 while the lock is genuinely held — taken here, inherited, or nested inside
     # a section that holds it. Only the webhook spawn wrapper reads it, because it
     # may advertise an inherited fd only if it really got the lock.
     REGISTRY_HELD=0
     _registry_depth=0
+    # 1 once the refusal below has been printed, so the supervisor's reconcile
+    # loop says it once per streak rather than every two seconds for as long as a
+    # holder is wedged or a home is read-only. Cleared by the next lock actually
+    # taken, so a second outage is reported as loudly as the first. Same latch
+    # shape as registry_selfheal's two.
+    _registry_lock_warned=0
 
     registry_close_fd() {
       # Close fd 9 and NOTHING ELSE. The braces are the whole point: `exec` with no
@@ -10334,7 +10669,28 @@ esac
       { exec 9>&-; } 2>/dev/null || true
     }
 
+    _registry_refuse() {
+      # _registry_refuse REASON - the one exit from registry_lock that did not
+      # get the lock. Unwinds the depth counter to 0 so a caller that goes on to
+      # call registry_unlock anyway unlocks nothing, and so the NEXT
+      # registry_lock starts a fresh attempt rather than believing it is nested
+      # inside a section nobody holds. That second half is why the pane epilogue
+      # skips its whole pass on a refusal: a fresh attempt means a fresh
+      # REGISTRY_LOCK_WAIT, and falling through would spend two of them.
+      _registry_depth=0
+      [ "$_registry_lock_warned" = 1 ] || \
+        echo "$REGISTRY_PROG: cannot lock $REGISTRY_FILE ($1); refusing to change" \
+             "it rather than racing another writer - nothing was written, and a" \
+             "retry is safe (issue #633)" >&2
+      _registry_lock_warned=1
+    }
+
     registry_lock() {
+      # 0 with the lock held (or deliberately not taken, see REGISTRY_FLOCK),
+      # REGISTRY_BUSY_RC when it could not be taken and the caller must not
+      # write. A caller that gets non-zero must NOT call registry_unlock; doing
+      # so anyway is harmless, because the depth is already back at 0.
+      #
       # Nesting-safe on purpose: flock(2) conflicts between two open file
       # DESCRIPTIONS, including two of the same process, so a second fd on the
       # sidecar blocks a writer against ITSELF (verified). Both the supervisor
@@ -10368,19 +10724,24 @@ esac
                chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
              }
              { exec 9>>"$REGISTRY_FILE.lock"; } 2>/dev/null; } \
-        || return 0
+        || { _registry_refuse "could not open $REGISTRY_FILE.lock"
+             return "$REGISTRY_BUSY_RC"; }
       # Bounded, never an unbounded wait: nothing may park the supervisor's
       # reconcile loop (every session on the box waits behind it) or a CLI a user
-      # is waiting on. A holder that times us out degrades THIS write to the
-      # pre-#254 lost-update behaviour, which is a bad write rather than a hung
-      # box, and says so on stderr.
+      # is waiting on. A holder that times us out is answered with the refusal
+      # rather than an unlocked write: the wait is what makes a refusal rare, and
+      # a bad write is not a better answer than a retry (issue #633).
       if "$REGISTRY_FLOCK" -w "$REGISTRY_LOCK_WAIT" 9; then
         REGISTRY_HELD=1
-      else
-        echo "$REGISTRY_PROG: sessions.json lock timed out; continuing unlocked (issue #254)" >&2
-        registry_close_fd
+        _registry_lock_warned=0
+        return 0
       fi
-      return 0
+      # Closed FIRST, so the fd does not outlive the attempt and block the next
+      # one, and before the message, so a caller reading stderr sees a refusal
+      # that is already complete.
+      registry_close_fd
+      _registry_refuse "timed out after ''${REGISTRY_LOCK_WAIT}s waiting for another writer"
+      return "$REGISTRY_BUSY_RC"
     }
 
     registry_unlock() {
@@ -10400,14 +10761,17 @@ esac
       # as an argument, so a filter may end in `--args -- "$@"` without the path
       # being read as one of those arguments.
       #
-      # Returns 1 with the registry untouched when jq fails. jq's own stderr is
+      # Returns 1 with the registry untouched when jq fails, and
+      # REGISTRY_BUSY_RC with it untouched when the lock could not be taken
+      # (issue #633) — the whole read-modify-write is skipped, so the file is
+      # byte-for-byte what it was. jq's own stderr is
       # left alone: a caller that must stay quiet — the pane epilogue prints into
       # the user's terminal — redirects it at the call site, which keeps that
       # policy where the reason for it is.
       #
       # The lock nests, so a caller already holding it across a check-then-write
       # keeps holding it here and does not deadlock against itself.
-      registry_lock
+      registry_lock || return "$REGISTRY_BUSY_RC"
       _registry_tmp="$(mktemp "$REGISTRY_FILE.XXXXXX")" || { registry_unlock; return 1; }
       # The RENAME is checked too, not just jq: a read-only $HOME or a full disk
       # must not be reported as a write to the two writers that do not run under
@@ -10499,7 +10863,12 @@ esac
       # and leaves the file exactly as it was; healing is the job of the one
       # program that is already looping.
       registry_valid && { _registry_heal_warned=0; return 0; }
-      registry_lock
+      # Nothing is quarantined, moved or re-seeded without the lock (issue #633):
+      # this function DESTROYS the registry it judges, and the writer it would be
+      # racing is one that has already read the good document and is about to
+      # rename it into place. The supervisor calls this every couple of seconds,
+      # so the answer to a busy lock is simply the next tick.
+      registry_lock || return "$REGISTRY_BUSY_RC"
       # Re-check under the lock: every writer publishes by rename, so a document
       # that landed between the check above and this line is WHOLE. Quarantining
       # it would throw away a perfectly good registry.
@@ -10598,7 +10967,11 @@ esac
         mkdir -p "''${REGISTRY_FILE%/*}"
         chmod 0700 "''${REGISTRY_FILE%/*}" 2>/dev/null
       }
-      registry_lock
+      # Creation is a mutation like any other and refuses like one (issue #633):
+      # the whole reason it is inside the protocol (issue #289) is that a seed
+      # landing on top of a just-added session loses that session for good, and
+      # an unlocked creation is exactly that race back again.
+      registry_lock || return "$REGISTRY_BUSY_RC"
       if [ ! -s "$REGISTRY_FILE" ]; then
         # A seed is trusted only after it PASSES this shape check (issue #356):
         # two independent producers (this module's Nix-declared seed and the
@@ -12244,7 +12617,13 @@ esac
       # done — seed_claude_state above can spend minutes inside `claude plugin
       # marketplace update` over the network, and no lock may be held across
       # that, so the section covers only reads and writes of this file.
-      registry_lock
+      # A lock this tick could not take means the section cannot be honoured, so
+      # nothing is spawned (issue #633): the pre-check would be answering from a
+      # document another writer is in the middle of replacing, and a session
+      # started against a stale answer is one a delete has already removed. The
+      # loop comes back in ~2s, which is what makes refusing cheap here; sessions
+      # already running are untouched either way.
+      registry_lock || return 0
       listed || { registry_unlock; return 0; }
       # Per-session webhook identity, passed via `tmux new-session -e` so it
       # lands in the SESSION environment — inherited by the agent AND by
@@ -12440,7 +12819,9 @@ esac
                        | .key' "$REGISTRY_FILE" 2>/dev/null)" || return 0
       [ -n "$_cand" ] || return 0
       _gone=""
-      registry_lock
+      # Same as start_session: a delist decided without the lock can revert a
+      # `restart` that landed in the gap (issue #633). Next tick.
+      registry_lock || return 0
       while IFS= read -r _n; do
         case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
         # A live pane still owns the name: mark-stopped runs as the epilogue of a
@@ -14530,8 +14911,7 @@ in
   }) (lib.mkIf (cfg.enable && cfg.web.enable) (
     let
       webUser = cfg.web.user;
-      # Users that get a browser terminal, in sorted order (attrNames sorts) —
-      # port assignment below depends on that order being deterministic.
+      # Users that get a browser terminal, in sorted order (attrNames sorts).
       terminalUsers = lib.filter (n: cfg.users.${n}.web.passwordHashFile != null) (lib.attrNames cfg.users);
       # Whose terminal workspace the vhost ROOT serves (the / page): web.user
       # if it has a terminal, else the first terminal user. Null only when no
@@ -14544,7 +14924,6 @@ in
       # there IS one: the button lives on the settings page, and a box with
       # no terminal user serves no settings page to put it on.
       rebootButton = cfg.web.rebootButton && rootUser != null;
-      portOf = lib.listToAttrs (lib.imap0 (i: n: lib.nameValuePair n (ttydPortBase + i)) terminalUsers);
       # Public URL base path for a user's settings page (Caddy does not strip
       # a prefix, so the daemon matches this full path).
       settingsBaseOf = n: "/${n}/settings";
@@ -14826,6 +15205,8 @@ in
 #   AGENT_BOX_SETTINGS_USER      the linux user name (display only)
 #   AGENT_BOX_SETTINGS_ENV_FILE  path to the env file to manage
 #   AGENT_BOX_SETTINGS_BASE      URL base path, e.g. /alice/settings
+#   AGENT_BOX_DOWNLOADS_DIR      the file drop served at /<user>/downloads/
+#                                 (empty = no drop, so the route 404s)
 #   AGENT_BOX_SETTINGS_PORT      dev fallback TCP port on 127.0.0.1
 #                                 (ignored when socket-activated)
 #   AGENT_BOX_TMUX_SOCKET        tmux -L socket name (e.g. agent-box)
@@ -14860,6 +15241,7 @@ in
 
 import base64
 import contextlib
+import errno
 import fcntl
 import functools
 import glob
@@ -14867,6 +15249,7 @@ import hashlib
 import html
 import http.server
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -14875,6 +15258,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -15394,6 +15778,28 @@ def profile_launch(name, harness=""):
     return resolved if isinstance(resolved, dict) else None
 
 
+# Seconds a request thread waits for the sessions.json sidecar lock before
+# refusing (issue #633). The shell writers' `flock -w 10` bound, spelled the
+# same way and for the same reason: a wedged holder must never park a
+# request thread forever. Named rather than inline so the tests can shorten
+# it, exactly as REGISTRY_LOCK_WAIT lets them shorten the shell side.
+SESSIONS_LOCK_WAIT = 10
+
+
+class RegistryBusy(Exception):
+    """The sessions.json sidecar lock could not be taken (issue #633).
+
+    Raised by sessions_lock INSTEAD of running the body, so a mutation
+    route changes nothing at all: the registry is byte-for-byte what it
+    was, and the caller gets a 503 it can retry. The shell writers answer
+    the same situation with exit 75 (EX_TEMPFAIL); the reasoning for both
+    is written down once, in modules/src/lib/registry.sh.
+
+    Distinct from RegistryUnreadable, which is about the CONTENT of a file
+    this daemon did read. This one says nothing was read at all.
+    """
+
+
 @contextlib.contextmanager
 def sessions_lock():
     """Serialize one read_sessions -> write_sessions pair (issue #254).
@@ -15422,9 +15828,16 @@ def sessions_lock():
 
     fcntl precedent in this repo: password-helper.py's AUTH_ENV_LOCK.
 
-    Best effort by design: if the lock cannot be created or taken, the body
-    still runs — an unlockable registry must not make the web UI refuse to
-    add or delete a session.
+    Fails CLOSED: a lock that cannot be created or taken raises
+    RegistryBusy and the body never runs (issue #633). It used to run
+    anyway, on the reasoning that an unlockable registry must not stop the
+    web UI adding or deleting a session -- but the body is a
+    read-modify-write, and running it unlocked at the one moment there is
+    provably another writer is the pre-#254 lost update, reported to the
+    operator as a success. The atomic rename at the end publishes a whole
+    document; it does not make the read that produced it current. So the
+    route answers 503 and the operator presses the button again, which is
+    the cheaper of the two failures by a wide margin.
     """
     lock = None
     try:
@@ -15433,29 +15846,32 @@ def sessions_lock():
         # "a": create if absent, never truncate — the file is a lock, its
         # contents are irrelevant and other holders keep their offsets.
         lock = open(SESSIONS_FILE + ".lock", "a", encoding="utf-8")
+    except OSError as exc:
+        raise RegistryBusy("cannot open %s.lock: %s"
+                           % (SESSIONS_FILE, exc.strerror or exc))
+    try:
         # Bounded like the shell writers' `flock -w 10`: a request thread must
-        # never park forever behind a wedged holder. Timing out proceeds
-        # unlocked, which is the pre-#254 behavior rather than a new failure.
-        deadline = time.monotonic() + 10
+        # never park forever behind a wedged holder. The wait is what makes a
+        # refusal rare; the refusal is what makes the wait safe to bound.
+        deadline = time.monotonic() + SESSIONS_LOCK_WAIT
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except OSError:
+            except OSError as exc:
                 if time.monotonic() >= deadline:
-                    lock.close()
-                    lock = None
-                    break
+                    raise RegistryBusy(
+                        "timed out after %ss waiting for %s.lock: %s"
+                        % (SESSIONS_LOCK_WAIT, SESSIONS_FILE,
+                           exc.strerror or exc))
                 time.sleep(0.05)
-    except OSError:
-        if lock is not None:
-            lock.close()
-            lock = None
+    except BaseException:
+        lock.close()
+        raise
     try:
         yield
     finally:
-        if lock is not None:
-            lock.close()
+        lock.close()
 
 
 # What write_sessions stamps on a registry that carries no version of its
@@ -15660,9 +16076,9 @@ def ensure_harness_session(agent, remote_control):
                 "hasRun": False,
             }
             write_sessions(sessions, version)
-    except (RegistryUnreadable, OSError):
-        # Not the connect card's place to surface a broken registry, or a
-        # write that failed outright (disk full, a permission problem) --
+    except (RegistryUnreadable, RegistryBusy, OSError):
+        # Not the connect card's place to surface a broken or busy registry,
+        # or a write that failed outright (disk full, a permission problem) --
         # the session list already reports the former loudly (issue #279),
         # and sign-in itself still succeeded either way. The pane is
         # already reaped by the time this runs, so there is no in-flight
@@ -15991,13 +16407,17 @@ def transcript_of(name, entry):
 
 
 def human_size(size):
-    """Byte count for a tooltip: whole KB/MB, since the point is only
-    whether this is a short conversation or a long one."""
+    """Byte count for a tooltip or a file-drop listing: whole KB, then one
+    decimal, since the point is only whether this is a short conversation
+    or a long one -- or, in the drop, whether a download is worth waiting
+    for."""
     if size < 1024:
         return "%d B" % size
     if size < 1024 * 1024:
         return "%d KB" % round(size / 1024)
-    return "%.1f MB" % (size / (1024 * 1024))
+    if size < 1024 * 1024 * 1024:
+        return "%.1f MB" % (size / (1024 * 1024))
+    return "%.1f GB" % (size / (1024 * 1024 * 1024))
 
 
 # --- What conversation a row holds (issue #277) -----------------------
@@ -16762,15 +17182,29 @@ def parse_codex_status(proc):
     return (False, "")
 
 
+_GH_ACCOUNT_RE = re.compile(r"^\S+ account (\S+)(?: \((.+)\))?$")
+
+
 def parse_gh_status(proc):
     """`gh auth status` prints "Logged in to github.com account <login>
-    (<source>)", where <source> names GH_TOKEN when the env store's key
-    is what gh is using — which is exactly what the card must say."""
+    (<source>)". <source> is GH_TOKEN when the env store's key is what
+    gh is using -- which is exactly what the card must say -- but it is
+    just as often the on-disk credential store gh wrote the token to
+    (a hosts.yml path, or "keyring"), which is internal detail nobody
+    asked for (issue #666). So only a token-env source is kept; anything
+    else is dropped and the login stands on its own."""
     text = (proc.stdout or "") + (proc.stderr or "")
     for raw in text.splitlines():
         line = raw.strip().lstrip("✓").strip()
         if line.lower().startswith("logged in to"):
-            return (True, connect_detail(line))
+            detail = connect_detail(line)
+            m = _GH_ACCOUNT_RE.match(detail)
+            if not m:
+                return (True, detail)
+            login, source = m.group(1), m.group(2)
+            if source and source.upper() in ("GH_TOKEN", "GITHUB_TOKEN"):
+                return (True, "%s (%s)" % (login, source))
+            return (True, login)
     return (False, "")
 
 
@@ -21873,6 +22307,277 @@ def portal_cookie_value(header):
     return ""
 
 
+# --- The file drop at /<user>/downloads/ (issues #132, #630) ----------
+# Caddy used to serve this tree itself, with `root` + `file_server`. That is
+# not an access-control boundary, and caddy documents it as not being one: a
+# site root is not a filesystem sandbox and file_server follows symlinks out
+# of it. Caddy also serves every user's drop under ONE identity, which is in
+# each of their download groups -- so a symlink an agent dropped in its own
+# /var/lib/agent-box-downloads/<user> was followed under that shared
+# identity, and /alice/downloads/link, authenticated as alice, returned bob's
+# file (issue #630). The per-user auth had authorized a path; something else
+# was opened.
+#
+# So this daemon serves the drop instead. It runs as the ONE user whose tree
+# it is, which puts the kernel's own permission check back underneath the
+# HTTP one, and it resolves the request path with the confinement built into
+# the resolution rather than checked around it -- see dl_open for why that
+# distinction is the whole fix.
+
+# The caddy-readable backing dir ~/downloads points at, from the unit. Empty
+# on a box that renders no drop, which 404s the route rather than guessing a
+# path.
+DOWNLOADS_DIR = os.environ.get("AGENT_BOX_DOWNLOADS_DIR", "")
+DL_BASE = TERM_BASE + "/downloads"
+# Budgets for one resolution: generous for any real tree, small enough that a
+# symlink chain an agent wrote cannot spin a request thread.
+DL_MAX_LINKS = 16
+DL_MAX_STEPS = 256
+# Streaming chunk, and the cap on one index page (a drop with more entries
+# than this is a directory nobody reads in a browser anyway).
+DL_CHUNK = 64 * 1024
+DL_MAX_ENTRIES = 2000
+
+
+class DownloadRefused(Exception):
+    """A request path resolution will not serve. The message is shown to
+    the reader, so it says what was wrong with the path and never what
+    happens to be on the filesystem around it."""
+
+
+def dl_components(rel):
+    """The percent-decoded components of one path under DL_BASE, or None
+    if the request is malformed.
+
+    Decoding happens AFTER the split on "/", so a %2F inside a name can
+    never introduce a separator; a component that still holds one -- or a
+    NUL -- after decoding is refused rather than reinterpreted. Bytes that
+    are not valid UTF-8 survive as surrogates, which is the form os.open
+    and os.scandir already speak, so a file whose name is not UTF-8 stays
+    reachable."""
+    comps = []
+    for raw in rel.split("/"):
+        if raw in ("", "."):
+            continue
+        comp = urllib.parse.unquote(raw, errors="surrogateescape")
+        if "/" in comp or "\0" in comp:
+            return None
+        comps.append(comp)
+    return comps
+
+
+def dl_open(root, comps):
+    """Open what `comps` names under `root`, returning (fd, os.stat_result).
+
+    Confinement here is a property of the RESOLUTION, not a check around
+    it. Every component is opened with O_NOFOLLOW relative to the fd of the
+    directory just opened, so no path string is ever handed back to the
+    kernel to re-resolve, and there is no window between deciding a path is
+    inside the drop and opening it. That window is what a realpath()-then-
+    open() check leaves open, and swapping a symlink into it is how an agent
+    would defeat one (issue #630). What comes back here is an fd on the exact
+    inode this walk reached: a symlink planted a microsecond later cannot
+    change what it refers to, because nothing looks the path up again.
+
+    A symlink IS followed -- `ln -s ~/build/report.pdf ~/downloads/` is a
+    reasonable thing for an agent to do -- but followed the way openat2's
+    RESOLVE_IN_ROOT follows one: the target is resolved from the drop, so an
+    absolute target restarts at the drop's root and ".." at the root stays at
+    the root. A link out of the tree therefore names something that is not
+    there, instead of reaching a sibling user's file.
+
+    Raises DownloadRefused for a path resolution rejects, and OSError
+    (ENOENT, EACCES, ...) for one the kernel does."""
+    # O_NONBLOCK so a FIFO left in the drop cannot park a request -- and with
+    # it one server thread -- inside open() indefinitely; it changes nothing
+    # for a regular file or a directory. Rejecting the FIFO is the caller's
+    # job, once fstat has said what this is.
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    stack = [os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)]
+    try:
+        todo = list(reversed(comps))
+        links = 0
+        steps = 0
+        while todo:
+            steps += 1
+            if steps > DL_MAX_STEPS:
+                raise DownloadRefused("that path takes too many steps to "
+                                      "resolve")
+            comp = todo.pop()
+            if comp == "..":
+                # Clamped at the root: the drop has no parent as far as this
+                # resolver is concerned, exactly as under RESOLVE_IN_ROOT.
+                if len(stack) > 1:
+                    os.close(stack.pop())
+                continue
+            try:
+                fd = os.open(comp, flags, dir_fd=stack[-1])
+            except OSError as exc:
+                if exc.errno not in (errno.ELOOP, errno.EMLINK):
+                    raise
+                # O_NOFOLLOW refused a symlink (ELOOP on linux, EMLINK on
+                # some others). Read the target and resolve it here, where
+                # the clamp applies, rather than handing the kernel a path it
+                # would resolve from /.
+                links += 1
+                if links > DL_MAX_LINKS:
+                    raise DownloadRefused("that path has too many symbolic "
+                                          "links in it")
+                target = os.readlink(comp, dir_fd=stack[-1])
+                if target.startswith("/"):
+                    while len(stack) > 1:
+                        os.close(stack.pop())
+                todo.extend(reversed(
+                    [p for p in target.split("/") if p and p != "."]))
+                continue
+            info = os.fstat(fd)
+            if not stat.S_ISDIR(info.st_mode):
+                if todo:
+                    os.close(fd)
+                    raise DownloadRefused("not a directory")
+                return fd, info
+            stack.append(fd)
+        fd = stack.pop()
+        return fd, os.fstat(fd)
+    finally:
+        for spare in stack:
+            os.close(spare)
+
+
+def dl_range(header, size):
+    """One `Range: bytes=...` header against a file of `size` bytes.
+
+    Returns (first, last) inclusive for a range to honour, None when there
+    is none to honour -- absent, malformed, or multi-range, all of which
+    RFC 9110 lets a server answer with the whole body -- and () for a range
+    that is unsatisfiable, which owes a 416."""
+    spec = (header or "").strip()
+    if not spec.lower().startswith("bytes="):
+        return None
+    spec = spec[len("bytes="):].strip()
+    if "," in spec:
+        return None
+    first, sep, last = spec.partition("-")
+    if not sep:
+        return None
+    first, last = first.strip(), last.strip()
+    try:
+        if not first:
+            # A suffix range: the last N bytes of the file.
+            length = int(last)
+            if length <= 0:
+                return ()
+            start, end = max(0, size - length), size - 1
+        else:
+            start = int(first)
+            end = int(last) if last else size - 1
+    except ValueError:
+        return None
+    if start >= size or end < start:
+        return ()
+    return (start, min(end, size - 1))
+
+
+def dl_display(name):
+    """A filename as HTML. A name is bytes to the kernel, so it need not be
+    valid UTF-8; the undecodable bytes arrive here as surrogates, which no
+    encoder can represent -- replace them rather than fail the whole
+    listing for one oddly named file."""
+    return html.escape(name.encode("utf-8", "replace").decode("utf-8"))
+
+
+def dl_rows(fd):
+    """One directory's entries for the index, directories first and then
+    case-folded by name: (name, kind, size, mtime).
+
+    Read from the OPEN fd dl_open returned, so the listing describes the
+    directory the walk actually reached rather than whatever the path names
+    by the time the page renders. Nothing is followed: a symlink is listed
+    as a link, and clicking it resolves under the same clamp as any other
+    path."""
+    rows = []
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                kind = "dir"
+            elif stat.S_ISLNK(info.st_mode):
+                kind = "link"
+            elif stat.S_ISREG(info.st_mode):
+                kind = "file"
+            else:
+                kind = "other"
+            rows.append((entry.name, kind, info.st_size, info.st_mtime))
+            if len(rows) >= DL_MAX_ENTRIES:
+                break
+    rows.sort(key=lambda row: (row[1] != "dir", row[0].lower()))
+    return rows
+
+
+DL_STYLE = """<style>
+:root { color-scheme: light dark; }
+body { margin: 0; padding: 1.5rem;
+       font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+h1 { font-size: 1.1rem; margin: 0 0 .25rem; }
+p.note { margin: 0 0 1rem; opacity: .7; }
+table { border-collapse: collapse; width: 100%; max-width: 60rem; }
+th, td { text-align: left; padding: .35rem .75rem .35rem 0;
+         border-bottom: 1px solid rgba(128,128,128,.3); }
+td.num { text-align: right; padding-right: 1.5rem;
+         font-variant-numeric: tabular-nums; }
+td.kind { opacity: .7; }
+</style>"""
+
+
+def render_download_index(rel, rows):
+    """The browsable index of one directory in the drop.
+
+    Deliberately a page of its own rather than the settings shell: it
+    carries no script and opens no event stream, so a listing of files
+    somebody else's agent wrote is as inert as the listing of names it
+    is."""
+    here = "/" + "/".join(rel) if rel else "/"
+    items = []
+    if rel:
+        items.append('<tr><td><a href="../">../</a></td>'
+                     '<td class="kind">up</td><td class="num"></td>'
+                     '<td></td></tr>')
+    for name, kind, size, mtime in rows:
+        href = urllib.parse.quote(name, safe="", errors="surrogateescape")
+        slash = "/" if kind == "dir" else ""
+        items.append(
+            '<tr><td><a href="%s%s">%s%s</a></td><td class="kind">%s</td>'
+            '<td class="num">%s</td><td>%s</td></tr>' % (
+                href, slash, dl_display(name), slash,
+                "" if kind == "file" else kind,
+                human_size(size) if kind == "file" else "",
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)),
+            ))
+    if not items:
+        items.append('<tr><td colspan="4">This drop is empty.</td></tr>')
+    if len(rows) >= DL_MAX_ENTRIES:
+        # The cap is not a hint: past it the rows shown are an arbitrary
+        # slice of the directory, so say so rather than letting a reader
+        # conclude a file is not there.
+        items.append('<tr><td colspan="4">Listing stops at %d entries; '
+                     'the rest are still reachable by name.</td></tr>'
+                     % DL_MAX_ENTRIES)
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, "
+        "initial-scale=1\"><title>%s &mdash; downloads</title>%s</head><body>"
+        "<h1>%s</h1><p class=\"note\">Files %s dropped for you.</p>"
+        "<table><thead><tr><th>Name</th><th></th><th class=\"num\">Size</th>"
+        "<th>Modified</th></tr></thead><tbody>%s</tbody></table>"
+        "</body></html>" % (
+            html.escape(USER), DL_STYLE,
+            dl_display(here), html.escape(USER), "".join(items),
+        ))
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     """Serve the authenticated settings UI and its actions."""
 
@@ -21883,7 +22588,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         so we match the full public path."""
         return path == BASE or path == BASE + "/" or path.startswith(BASE + "/")
 
-    def _send_html(self, body, status=200):
+    def _send_html(self, body, status=200, send_body=True):
+        """One HTML response. send_body=False writes the headers and stops,
+        which is what a HEAD on the file drop needs: a response to HEAD
+        that carried a body would be read as the start of the next
+        one."""
         data = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -21891,7 +22600,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(data)
+        if send_body:
+            self.wfile.write(data)
 
     def _send_json(self, obj, status=200):
         data = json.dumps(obj).encode("utf-8")
@@ -21971,6 +22681,146 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.close_connection = True
                     return
                 left -= len(chunk)
+
+    def _send_drop(self, rel, body=True):
+        """Serve one path under /<user>/downloads/ (issues #132, #630).
+
+        `rel` is the request path with DL_BASE stripped, still
+        percent-encoded. Every refusal answers 404: the reader is the
+        person the drop belongs to, so the page says which of "not there"
+        and "not servable" it is, but the status stays the same either way
+        so the route cannot be used to probe the filesystem around the
+        drop."""
+        if not DOWNLOADS_DIR:
+            self._send_html(
+                "<h1>404</h1><p>This box serves no file drop.</p>",
+                status=404, send_body=body)
+            return
+        comps = dl_components(rel)
+        if comps is None:
+            self._send_html(
+                "<h1>404</h1><p>That is not a name in this drop.</p>",
+                status=404, send_body=body)
+            return
+        try:
+            fd, info = dl_open(DOWNLOADS_DIR, comps)
+        except DownloadRefused as exc:
+            self._send_html(
+                "<h1>404</h1><p>%s.</p>" % html.escape(str(exc)),
+                status=404, send_body=body)
+            return
+        except OSError:
+            # ENOENT for a name that is not there, EACCES for one this user
+            # cannot read -- and, after dl_open's clamp, for every link that
+            # pointed out of the drop, since the drop has no /etc or
+            # /var/lib of its own to resolve one into.
+            self._send_html(
+                "<h1>404</h1><p>No such file in this drop.</p>"
+                "<p>A symlink is followed only where it stays inside the "
+                "drop, so a link to a file elsewhere reads as a missing "
+                "one: move or copy the file in instead.</p>",
+                status=404, send_body=body)
+            return
+        try:
+            if stat.S_ISDIR(info.st_mode):
+                if not rel.endswith("/"):
+                    # Relative links in the index need the trailing slash.
+                    self.send_response(301)
+                    self.send_header("Location", DL_BASE + rel + "/")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self._send_html(
+                    render_download_index(comps, dl_rows(fd)),
+                    send_body=body)
+            elif stat.S_ISREG(info.st_mode):
+                if rel.endswith("/"):
+                    # "report.html/" is not a name in this drop -- caddy's
+                    # own file_server answered ENOTDIR for it -- and the
+                    # distinction is load-bearing beyond tidiness: issue
+                    # #631 matches its per-file response headers with `not
+                    # path */`, so a FILE served at a path ending in "/"
+                    # would arrive exempt from them.
+                    self._send_html(
+                        "<h1>404</h1><p>That is a file, not a "
+                        "directory.</p>", status=404, send_body=body)
+                    return
+                self._send_file(fd, info, comps[-1] if comps else "", body)
+            else:
+                # A FIFO, socket or device node an agent left in the drop.
+                # It is open (O_NONBLOCK, so opening it blocked nothing) and
+                # it is being closed again unread: reading one has no size,
+                # no end, and nothing to do with handing over a file.
+                self._send_html(
+                    "<h1>404</h1><p>Not a regular file.</p>",
+                    status=404, send_body=body)
+        finally:
+            os.close(fd)
+
+    def _send_file(self, fd, info, name, body=True):
+        """Stream one file out of the drop from the fd dl_open confined.
+
+        Content-Length is the size at open time, so send exactly that many
+        bytes: writing past the declared length desyncs the connection, and
+        a short read (the agent truncated the file mid-download) closes it
+        rather than leaving the client waiting for bytes that will not
+        come. Same contract as _send_transcript above."""
+        # Typed from the name, as caddy's file_server typed it. Whether an
+        # HTML or SVG artifact in the drop should arrive as an attachment
+        # rather than a rendered page is issue #631's question -- this is
+        # now the one place that decides it.
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        etag = '"%x-%x"' % (info.st_size, info.st_mtime_ns)
+        span = dl_range(self.headers.get("Range"), info.st_size)
+        if span == ():
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */%d" % info.st_size)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if span is None:
+            start, left = 0, info.st_size
+        else:
+            start, left = span[0], span[1] - span[0] + 1
+        self.send_response(200 if span is None else 206)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(left))
+        # A multi-gigabyte artifact over a phone link gets cancelled and
+        # resumed; caddy's file_server answered ranges, so this does too.
+        self.send_header("Accept-Ranges", "bytes")
+        if span is not None:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (
+                span[0], span[1], info.st_size))
+        self.send_header("ETag", etag)
+        self.send_header("Last-Modified", self.date_time_string(info.st_mtime))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if not body:
+            return
+        offset = start
+        while left > 0:
+            try:
+                chunk = os.pread(fd, min(DL_CHUNK, left), offset)
+            except OSError:
+                self.close_connection = True
+                return
+            if not chunk:
+                # The file shrank under us, so the body is short of the
+                # length just declared and the connection must not be
+                # reused for another response.
+                self.close_connection = True
+                return
+            try:
+                self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                # A cancelled download (easy to give up on over a phone
+                # link). Expected, so it ends the response instead of
+                # raising into the server and logging a traceback per
+                # cancel.
+                self.close_connection = True
+                return
+            offset += len(chunk)
+            left -= len(chunk)
 
     def _peer_gone(self):
         """True once the client has closed its end of a stream.
@@ -22070,6 +22920,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """
         sys.stderr.write("sessions/%s refused: %s\n" % (verb, exc))
         self._redirect("ok=session_registry_unreadable", page)
+
+    def _registry_busy(self, verb, exc, page):
+        """Answer a mutation route that could not take the registry lock
+        (issue #633): nothing was read and nothing was written, so this is
+        a plain "ask again" rather than news about the file.
+
+        503 and not the ok= banner channel, for the one reason the banner
+        exists to serve and cannot here: the banner rides a 303, which
+        every client -- a browser, a script, this box's own e2e run --
+        reads as "the thing you asked for happened". A refusal that is
+        indistinguishable from a success in the status line is the shape
+        of the bug being fixed, one layer up. The body is still the page
+        the form came from, carrying the message, because the operator has
+        no shell and a bare 503 tells them nothing.
+        """
+        sys.stderr.write("sessions/%s refused: %s\n" % (verb, exc))
+        # TERM_HOME and not (HOME and SESS_PAGE): /<user>/ is EVERY user's
+        # landing page, not only the one whose daemon also serves the vhost
+        # root, so a form carrying back=workspace resolves to TERM_HOME for
+        # a second web user too - and SESS_PAGE is that user's SETTINGS
+        # page. Asking the simpler question answers both.
+        render = render_home if page == TERM_HOME else render_page
+        self._send_html(
+            render("The session list is being changed by something else, so "
+                   "nothing was done. That clears within a few seconds "
+                   "\u2014 go back and try again.", kind="error"),
+            status=503,
+        )
 
     def _redirect(self, query="", page=None):
         target = (page or BASE + "/") + (("?" + query) if query else "")
@@ -22280,6 +23158,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        # The file drop (issues #132, #630), routed here with the portal
+        # verify above and outside the BASE tree: caddy proxies
+        # /<user>/downloads/* to this daemon rather than serving the
+        # directory itself, because a site root is not a filesystem
+        # sandbox and caddy followed a symlink out of one under an
+        # identity that can read every user's drop. Resolution happens in
+        # dl_open, which is where the confinement lives.
+        if parsed.path == DL_BASE or parsed.path.startswith(DL_BASE + "/"):
+            self._send_drop(parsed.path[len(DL_BASE):])
+            return
         # Working-directory autocomplete (issue #131): the add-session
         # form asks the daemon to list one directory level at a time,
         # so the browser never sees the filesystem — only the confined
@@ -22415,6 +23303,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"ok": True, "keys": read_keys()})
             return
         self._send_html(render_page(message, kind))
+
+    def do_HEAD(self):
+        """HEAD on the file drop, which caddy's file_server used to answer
+        (a client checking a size before pulling a multi-gigabyte
+        artifact). Every other path keeps the 501 the base class has
+        always answered with -- nothing else here has a HEAD to give."""
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == DL_BASE or parsed.path.startswith(DL_BASE + "/"):
+            self._send_drop(parsed.path[len(DL_BASE):], body=False)
+            return
+        self.send_error(501, "Unsupported method (HEAD)")
 
     def _read_form(self):
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -22794,8 +23693,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._redirect("ok=deleted")
         elif path == SESS_BASE + "/sessions/add":
             back_page = self._sess_page(form)
-            # Error pages re-render the page the form came from.
-            render = render_home if (HOME and back_page == SESS_PAGE) else render_page
+            # Error pages re-render the page the form came from - see
+            # _registry_busy for why the test is TERM_HOME and not
+            # (HOME and SESS_PAGE).
+            render = render_home if back_page == TERM_HOME else render_page
             # The profile is the whole answer now (issue #493): the row has
             # no assistant <select> beside it any more, and there is no
             # box-wide default assistant left to fall back to. So the
@@ -22942,6 +23843,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "hasRun": False,
                     }
                     write_sessions(sessions, version)
+            except RegistryBusy as exc:
+                # Nothing was read, so there is nothing to say about the
+                # file itself: another writer holds it, and the answer is
+                # "press it again" (issue #633).
+                self._registry_busy("add", exc, back_page)
+                return
             except RegistryUnreadable as exc:
                 # Refuse rather than republish (issue #279). Without this the
                 # write below carried the empty dict read_sessions used to
@@ -22970,6 +23877,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         sessions, version = load_sessions()
                         sessions.pop(name, None)
                         write_sessions(sessions, version)
+                except RegistryBusy as exc:
+                    self._registry_busy("delete", exc, self._sess_page(form))
+                    return
                 except RegistryUnreadable as exc:
                     # A delete against a registry we could not read used to
                     # publish an empty one: the named session went, and so did
@@ -23022,6 +23932,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         if isinstance(entry, dict) and entry.pop("stopped", None) is not None:
                             write_sessions(sessions, version)
                             ok = "ok=session_started"
+                except RegistryBusy as exc:
+                    self._registry_busy("restart", exc, self._sess_page(form))
+                    return
                 except RegistryUnreadable as exc:
                     # Start is the button an operator presses when the box
                     # looks wrong, which is exactly when the registry might
@@ -23459,10 +24372,15 @@ if __name__ == "__main__":
         }
       '');
 
+      # @DOWNLOADS_DIR@ is deliberately NOT in this list any more: since
+      # issue #630 the file drop is served by the per-user settings daemon
+      # over @SETTINGS_SOCKET@ rather than by caddy's own file_server, so the
+      # only thing that still needs the path is that daemon's unit
+      # environment (AGENT_BOX_DOWNLOADS_DIR, below).
       terminalCaddyBlock = name:
         lib.replaceStrings
-          [ "@USER@" "@USER_ENV@" "@SETTINGS_SOCKET@" "@DOWNLOADS_DIR@" "@TTYD_PORT@" ]
-          [ name (envName name) (settingsSocketOf name) (downloadsDirOf name) (toString portOf.${name}) ] ''
+          [ "@USER@" "@USER_ENV@" "@SETTINGS_SOCKET@" "@TTYD_SOCKET@" ]
+          [ name (envName name) (settingsSocketOf name) (ttydSocketOf name) ] ''
         # @USER@'s terminal. Cookie first — browsers refuse to attach basic
         # auth credentials to WebSocket upgrades — then basic auth with the
         # linux user name as the login name.
@@ -23502,12 +24420,63 @@ if __name__ == "__main__":
             }
           }
         }
-        # @USER@'s file drop (issue #132): a browsable static index of
-        # ~/downloads, served from the caddy-readable /var/lib backing dir
-        # (caddy.service can't read /home). Same cookie-or-basic auth as the
-        # terminal, and MORE specific than /@USER@/* below so Caddy routes it
-        # here first. The agent hands the user a @USER@/downloads/<file> URL.
+        # @USER@'s file drop (issue #132): a browsable index of ~/downloads.
+        # Same cookie-or-basic auth as the terminal, and MORE specific than
+        # /@USER@/* below so Caddy routes it here first. The agent hands the user
+        # a @USER@/downloads/<file> URL.
+        #
+        # Served by @USER@'s own settings daemon over its user+caddy-only unix
+        # socket, NOT by `root` + `file_server` here (issue #630). A site root is
+        # not a filesystem sandbox -- caddy documents that symlinks escape it --
+        # and this caddy reads every user's drop through its own group, so a
+        # symlink an agent left in its own drop was followed under that shared
+        # identity and returned a sibling user's file to a request authenticated
+        # as the agent. The daemon runs as the ONE user whose drop it is and
+        # resolves each component with O_NOFOLLOW from the fd above it, so there
+        # is no path for a swapped symlink to be re-resolved through.
         redir /@USER@/downloads /@USER@/downloads/
+        # Everything under the file drop is handed to the browser as an ATTACHMENT
+        # and under a maximally restrictive sandbox (issue #631). ~/downloads holds
+        # whatever an agent put there -- a generated report, a build artifact, a file
+        # pulled out of somebody else's repository -- and it is served from the SAME
+        # origin as the settings page and the terminals. Served inline, one hostile
+        # .html or .svg is same-origin privileged JavaScript: HttpOnly stops a script
+        # READING the auth cookie but not SENDING it, and SameSite and the daemon's
+        # CSRF guard both see a same-origin request, so neither one fires.
+        #
+        # `Content-Disposition: attachment` means the browser saves the file instead
+        # of rendering a document from it, which is what actually closes the hole;
+        # the `sandbox` CSP (no allow-* tokens at all: opaque origin, no scripts, no
+        # forms, no navigation) is the defense in depth for anything that reaches a
+        # document context anyway. `X-Content-Type-Options: nosniff` is already set
+        # vhost-wide by the header fragment.
+        #
+        # The directory listing is EXEMPT, because it is the daemon's own generated
+        # page and the point of the route: a listing is the one path that ends in
+        # `/`, so `not path */` is the whole distinction -- and nothing
+        # attacker-supplied may occupy that shape. Since issue #630 moved the drop
+        # to the daemon, nothing can: the daemon renders every directory itself and
+        # never looks for an index.html (so the `index off` this comment used to
+        # rely on has no subject left), and it answers 404 for a FILE reached at a
+        # path ending in `/`, which would otherwise be a file served past this
+        # matcher.
+        @dl_file_@USER@ {
+          path /@USER@/downloads/*
+          not path */
+        }
+        header @dl_file_@USER@ {
+          Content-Disposition "attachment"
+          Content-Security-Policy "sandbox; frame-ancestors 'none'"
+          # `defer` is load-bearing, not a detail. Caddy sorts same-directive
+          # routes by path specificity, so this matched `header` runs BEFORE the
+          # vhost-wide one in the header fragment -- and a static `header` writes
+          # its value the moment it runs, which means the vhost-wide
+          # `frame-ancestors 'self'` would land on top of this sandbox and undo
+          # it. Deferring makes these ops apply when the response is written,
+          # which is after both the vhost-wide header and the upstream response
+          # the proxy below carries back.
+          defer
+        }
         handle /@USER@/downloads/* {
           # A live portal session (issue #541) reaches this exactly as a
           # basic-auth login does. forward_auth is stock caddy -- part of
@@ -23521,16 +24490,12 @@ if __name__ == "__main__":
               forward_auth unix/@SETTINGS_SOCKET@ {
                 uri /@USER@/auth/verify
               }
-              uri strip_prefix /@USER@/downloads
-              root * @DOWNLOADS_DIR@
-              file_server browse
+              reverse_proxy unix/@SETTINGS_SOCKET@
             }
           }
           @cookie_dl_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
           handle @cookie_dl_@USER@ {
-            uri strip_prefix /@USER@/downloads
-            root * @DOWNLOADS_DIR@
-            file_server browse
+            reverse_proxy unix/@SETTINGS_SOCKET@
           }
           handle {
             route {
@@ -23538,9 +24503,7 @@ if __name__ == "__main__":
                 @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
               }
               header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-              uri strip_prefix /@USER@/downloads
-              root * @DOWNLOADS_DIR@
-              file_server browse
+              reverse_proxy unix/@SETTINGS_SOCKET@
             }
           }
         }
@@ -23584,6 +24547,14 @@ if __name__ == "__main__":
             }
           }
         }
+        # ttyd's upstream is a UNIX socket, not 127.0.0.1:<port> (issue #628): a
+        # loopback port is reachable by every local user, and ttyd runs --writable
+        # with no credential of its own, so the authentication above was the only
+        # thing standing between another user on this box and this user's terminal
+        # -- and it stood in front of the public URL, not in front of the port.
+        # 0660 @USER@:caddy, in a 0750 @USER@:caddy directory. Same model as the
+        # settings socket above.
+        #
         # One path per session: /@USER@/<session>/ is that session's terminal, and
         # everything ttyd asks for from a page loaded there (its ws and token
         # endpoints, resolved relative to the URL in the address bar) hangs off the
@@ -23619,12 +24590,12 @@ if __name__ == "__main__":
               forward_auth unix/@SETTINGS_SOCKET@ {
                 uri /@USER@/auth/verify
               }
-              reverse_proxy 127.0.0.1:@TTYD_PORT@
+              reverse_proxy unix/@TTYD_SOCKET@
             }
           }
           @cookie_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
           handle @cookie_@USER@ {
-            reverse_proxy 127.0.0.1:@TTYD_PORT@
+            reverse_proxy unix/@TTYD_SOCKET@
           }
           handle {
             route {
@@ -23632,7 +24603,7 @@ if __name__ == "__main__":
                 @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
               }
               header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-              reverse_proxy 127.0.0.1:@TTYD_PORT@
+              reverse_proxy unix/@TTYD_SOCKET@
             }
           }
         }
@@ -23774,6 +24745,13 @@ if __name__ == "__main__":
           header {
             Cache-Control "no-store"
             X-Content-Type-Options "nosniff"
+            # Only this box's own pages may frame a management page (issue #631).
+            # The tabbed workspace at /<user>/ iframes each session's terminal from
+            # this same origin, so 'self' is the tightest policy that keeps the
+            # workspace working; anything else framing the settings page or a
+            # terminal is clickjacking. The downloads route below replaces this
+            # header with a stricter one of its own.
+            Content-Security-Policy "frame-ancestors 'self'"
           }
           # This fragment ends INSIDE the block on purpose: the module appends one
           # webhook + terminal block per user (and the root block), then the closing
@@ -23859,24 +24837,43 @@ if __name__ == "__main__":
         # the box can't peek. Kept OUTSIDE /var/lib/agent-box-web (0700) so
         # caddy's `import` can traverse without loosening the secrets dir.
         "d /var/lib/agent-box-sites 0755 root root - -"
-        # File-drop dirs (issue #132), same layout/permissions rationale as the
-        # snippet dirs above: parent world-traversable so caddy can reach the
-        # per-user 0750 <user>:caddy subdirs it serves at /<user>/downloads/.
+        # File-drop dirs (issue #132). The parent stays world-traversable
+        # like the snippet dirs above, but for a different reason since
+        # issue #630: caddy no longer opens anything under here (the
+        # per-user settings daemon serves /<user>/downloads/), so what has
+        # to reach a drop is that user's own daemon, running as that user.
         "d /var/lib/agent-box-downloads 0755 root root - -"
         # Settings daemon sockets live here (issue #49). World-traversable is
         # fine: the per-user socket files themselves are 0660 <user>:caddy
         # (created by systemd, see systemd.sockets below), and connecting
         # requires write permission on the socket file.
         "d ${settingsSocketDir} 0755 root root - -"
+        # Browser-terminal sockets live one directory down from here (issue
+        # #628). World-traversable parent, exactly as above; the per-user
+        # subdirectory below is what is closed.
+        "d ${ttydSocketDir} 0755 root root - -"
       ] ++ lib.concatMap (name: [
         "d /var/lib/agent-box-sites/${name} 0750 ${name} caddy - -"
         # ~/sites -> the caddy-readable snippet dir. L+ replaces a stale
         # symlink/file if the target differs from ours (idempotent across
         # renames). Users edit through this link and never touch /var/lib.
         "L+ /home/${name}/sites - - - - /var/lib/agent-box-sites/${name}"
-        # ~/downloads -> the caddy-readable file-drop dir served at
-        # /<user>/downloads/ (issue #132). Same L+/symlink rationale as ~/sites.
-        "d ${downloadsDirOf name} 0750 ${name} caddy - -"
+        # ~/downloads -> the file-drop dir served at /<user>/downloads/
+        # (issue #132). Same L+/symlink rationale as ~/sites, but NOT the
+        # same mode: 0700, not 0750. Caddy read this tree until issue #630
+        # moved the route to the per-user settings daemon, and it has no
+        # business in it now -- so the group bits come off and a caddy
+        # compromise stops being a read of every user's drop. The daemon is
+        # that user's own, so the owner bits are all it needs.
+        #
+        # The group stays `caddy` deliberately: it grants nothing at 0700,
+        # both backends have to emit this line identically, and neither can
+        # portably name a per-user group (NixOS has none, issue #604). The
+        # MODE is the boundary here, and keeping the group aligned with the
+        # ~/sites rule above leaves exactly one difference between the two
+        # lines -- which is the whole statement: snippets are caddy's to
+        # read, drops are not.
+        "d ${downloadsDirOf name} 0700 ${name} caddy - -"
         "L+ /home/${name}/downloads - - - - ${downloadsDirOf name}"
       ]) (lib.attrNames cfg.users)
       # The settings page's env dir, per terminal user. User-owned 0700 so
@@ -23903,6 +24900,13 @@ if __name__ == "__main__":
       ++ lib.concatMap (name: [
         "d /home/${name}/.config 0755 ${name} - - -"
         "d /home/${name}/.config/agent-box 0700 ${name} - - -"
+        # This user's ttyd socket directory (issue #628), and the reason the
+        # transport is private: 0750 ${name}:caddy keeps every other local
+        # user out, and the SETGID bit hands the socket ttyd binds inside it
+        # group caddy — which is the only way it gets one, since the unit
+        # runs unprivileged as ${name} and cannot chown. Terminal users only:
+        # a user with no password hash runs no ttyd.
+        "d ${ttydSocketDirOf name} 2750 ${name} caddy - -"
       ]) terminalUsers
       # Webhook ingress socket dir (issue #101). World-traversable parent; the
       # per-user socket files themselves are 0660 <user>:caddy, systemd-created
@@ -24007,13 +25011,20 @@ if __name__ == "__main__":
       # #154 Phase 3) — same rationale as the "agent-box@" one above:
       # store paths/values that differ by user go here; the same value
       # for every instance goes in that unit's host drop-in instead.
+      # No agent-web-terminal-<user>.env here: the only value it ever carried
+      # was that user's ttyd port, and the socket that replaced it (issue
+      # #628) is spelled with %i in the unit itself. The unit still reads the
+      # file with a leading `-`, so a box may still drop one in by hand.
       environment.etc =
-        lib.mapAttrs' (name: _: lib.nameValuePair "agent-box/units/agent-web-terminal-${name}.env" {
-          text = "AGENT_BOX_TTYD_PORT=${toString portOf.${name}}\n";
-        }) portOf
-        // lib.listToAttrs (map (name: lib.nameValuePair "agent-box/units/agent-box-settings-${name}.env" {
+        lib.listToAttrs (map (name: lib.nameValuePair "agent-box/units/agent-box-settings-${name}.env" {
           text =
             "AGENT_BOX_PASSWORD_CMD=/run/wrappers/bin/sudo -n ${passwordHelperCmdOf name}\n"
+            # The file drop this user's daemon serves at
+            # /<user>/downloads/ (issue #630): caddy proxies that path
+            # here instead of serving the tree itself, so the daemon is
+            # what needs to know where the tree is. The same dir the
+            # tmpfiles rule creates and ~/downloads points at.
+            + "AGENT_BOX_DOWNLOADS_DIR=${downloadsDirOf name}\n"
             + lib.optionalString (name == rootUser) (
                 # This daemon also serves the vhost root: GET / picks a
                 # user (with one terminal user, the norm, it redirects
@@ -24134,7 +25145,7 @@ if __name__ == "__main__":
         # dependency on any search-path resolution being merged correctly.
         serviceConfig.ExecStart = [
           ""
-          ''${pkgs.ttyd}/bin/ttyd --writable --url-arg -p ''${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true ${attachScript}/bin/agent-box-attach''
+          ''${pkgs.ttyd}/bin/ttyd --writable --url-arg --check-origin -i ${ttydSocketOf name} -b /%i -t disableLeaveAlert=true -t titleFixed=%i@''${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true ${attachScript}/bin/agent-box-attach''
         ];
       }) terminalUsers))
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-box-settings@${name}" {

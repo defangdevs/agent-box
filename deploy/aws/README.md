@@ -25,18 +25,22 @@ Claude Code or Codex.
 - Uses EC2 user-data as a NixOS configuration: imports the pinned
   `agent-box` module, sets `services.agent-box.agent` from the `Agent`
   parameter, and enables the module's web terminal (Caddy, TLS-ALPN-01 only,
-  plus a per-user `ttyd` on `127.0.0.1:7681` that attaches to `agent`'s tmux
+  plus a per-user `ttyd` on a unix socket at
+  `/run/agent-box-ttyd/<user>/ttyd.sock` — 0660 `<user>:caddy`, reachable by
+  that user and the proxy and nobody else (issue #628) — that attaches to
+  `agent`'s tmux
   session; `TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box -t main` - the
   socket lives under `/run` because the agent runs with `PrivateTmp`).
 - **Basic-auth-to-cookie web auth**. The terminal lives at `/<UserName>/`
   (default `/workspace/`); Caddy prompts for the `UserName` (the linux user name
-  selects the terminal) and the `WebPassword`, sets an
+  selects the terminal) and the password, sets an
   `HttpOnly; Secure; SameSite=Strict` cookie, then lets browser WebSocket
-  upgrades authenticate with that cookie. ttyd still binds only to localhost.
+  upgrades authenticate with that cookie. ttyd itself is never on the network:
+  its socket is a file only that user and caddy may open.
   The site root serves an unauthenticated index page listing the configured
   terminals (just the one `UserName` on this template).
 - The stack output URL is `https://<host>.sslip.io/<UserName>/`; sign in as
-  the `UserName` with the `WebPassword`. The URL deliberately carries no
+  the `UserName` with the password. The URL deliberately carries no
   `user@` userinfo: Chrome answers the auth challenge with URL userinfo plus
   an empty password, and credentials typed into the prompt cannot override
   the URL-embedded identity (issue 56).
@@ -166,34 +170,44 @@ The updater trusts the pinned GitHub repo as published (TLS + hash-pinning of
 what it fetched). Signature verification against an offline key is tracked in
 [issue 46](https://github.com/defangdevs/agent-box/issues/46).
 
-### WebPassword storage
+### WebPasswordHash storage (issue #25)
 
-`WebPassword` is required (16-64 chars). Even Claude Code stacks that intend to
-drive the box from the Claude apps via Remote Control need it: the first
-`claude login` still runs in the browser terminal, and Remote Control only
-takes over after that credential lands on disk. AWS masks the field once
-entered and it isn't emitted in stack outputs, so callers must save it out of
-band — the launch page copy leads with this.
+`WebPasswordHash` is required: a Caddy-compatible Argon2id hash
+(`$argon2id$v=..$m=..,t=..,p=..$<salt>$<hash>`), never the plaintext
+password. The launch page generates a high-entropy password and hashes it in
+your browser before this field is ever filled in, and shows you the plaintext
+once — save it, because there is no way to recover it from the hash. Even
+Claude Code stacks that intend to drive the box from the Claude apps via
+Remote Control need that plaintext: the first `claude login` still runs in
+the browser terminal, and Remote Control only takes over after that
+credential lands on disk. Launching by hand (CLI, or a manually-filled
+console form) rather than through the launch page? Compute the hash yourself
+with `caddy hash-password --algorithm argon2id` and paste its output into
+this field — see the CLI example below.
 
-`WebPassword` is marked `NoEcho` and is not emitted in stack Outputs. It still
-exists as plaintext in the substituted EC2 user-data, and the current
-implementation interpolates a reversible base64 projection into first-boot
-Nix/systemd material, then decodes it in the activation script so Caddy can
-derive its Basic Auth hash. Treat principals that can read instance user-data
-or the instance's local system configuration as inside the web terminal trust
-boundary.
-
-Caddy does not compare the plaintext password at request time. On first boot an
-activation script runs `caddy hash-password --algorithm argon2id` and stores
-only the Argon2id hash at
+`WebPasswordHash` is marked `NoEcho` and is not emitted in stack Outputs, but
+that is now belt-and-suspenders rather than the only thing standing between a
+reader and the credential: the value is a hash, not a secret a reader could
+use directly. It still travels through the substituted EC2 user-data as a
+reversible base64 projection (needed only so its `$` and `/` characters
+survive as inert Nix source, not to hide anything), and the activation script
+decodes and writes it straight into
 `/var/lib/agent-box-web/password-hash` (the file the module's
-`users.agent.web.passwordHashFile` points at). On every boot
-`agent-web-auth-secrets.service` writes that hash and its detected algorithm
-(`WEB_PASSWORD_HASH_AGENT` / `WEB_PASSWORD_ALGORITHM_AGENT`) plus a random
-cookie secret (`WEB_COOKIE_SECRET_AGENT`) to
-`/run/agent-box-web/env` (`0600`), and Caddy reads that environment file. The
-cookie secret is generated on the instance and stored separately at
-`/var/lib/agent-box-web/cookie-secret-agent` (`0700` parent directory).
+`users.agent.web.passwordHashFile` points at) — there is no plaintext
+password anywhere on this path for `caddy hash-password` to run against.
+Before this change, `WebPassword` carried the plaintext all the way to that
+activation script, which ran the hashing itself; treat a box launched before
+issue #25 landed as having had its password exposed to any principal that
+could read that instance's user-data, and rotate it from the box's own
+settings page.
+
+On every boot `agent-web-auth-secrets.service` reads that hash, detects its
+algorithm, and writes both (`WEB_PASSWORD_HASH_AGENT` /
+`WEB_PASSWORD_ALGORITHM_AGENT`) plus a random cookie secret
+(`WEB_COOKIE_SECRET_AGENT`) to `/run/agent-box-web/env` (`0600`), which Caddy
+reads as its Basic Auth config. The cookie secret is generated on the
+instance and stored separately at `/var/lib/agent-box-web/cookie-secret-agent`
+(`0700` parent directory).
 
 ## Design decisions & gotchas
 
@@ -229,6 +243,13 @@ certs keep serving but new stacks can't ACME. Threat model: they only
 provide DNS, so they can't MITM active sessions (TLS cert is ours);
 worst case is DoS of new issuance or user redirection to a decoy site
 that immediately fails cert validation.
+
+`sslip.io` is itself open source ([cunnie/sslip.io](https://github.com/cunnie/sslip.io))
+and self-hostable, so a deployment that does not want the third-party
+dependency at all can run its own copy under its own domain. The
+`SslipDomain` parameter (default `sslip.io`) is the suffix the hostname
+is derived under, on both templates - point it at a self-hosted instance
+to whitelabel the URL entirely (issue #647).
 
 ### CloudFormation quick-create requires an S3 template URL
 
@@ -501,14 +522,21 @@ The 1-click Launch buttons use the S3-published copy of this template (pinned
 directly:
 
 ```bash
+web_password="$(openssl rand -base64 24)" && echo "$web_password"
+web_password_hash="$(caddy hash-password --algorithm argon2id --plaintext "$web_password")"
 aws cloudformation deploy \
   --region eu-central-1 \
   --stack-name agentbox-lightsail \
   --template-file deploy/aws/lightsail-template.yaml \
   --parameter-overrides \
-      WebPassword='<16-64 chars>' \
+      WebPasswordHash="$web_password_hash" \
       AgentBoxFlakeRef="github:defangdevs/agent-box/$(git rev-parse HEAD)"
 ```
+
+Save what the first line prints before running the rest — the hash cannot be
+reversed back into it, and this is the only place you will ever see the
+plaintext. `WebPasswordHash` carries only that hash (issue #25); never pass
+a plaintext password to this or the EC2 template directly.
 
 No `--capabilities` needed: the stack creates no IAM. It blocks on the
 first-boot `WaitCondition` (timeout 1200 s) and then emits `WebURL`,

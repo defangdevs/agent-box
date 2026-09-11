@@ -11,4 +11,38 @@ Environment=TMUX_TMPDIR=/run/agent-box-%i
 Environment=AGENT_BOX_SESSIONS_FILE=/home/%i/.config/agent-box/sessions.json
 EnvironmentFile=-/etc/agent-box/units/agent-web-terminal-%i.env
 EnvironmentFile=-/etc/agent-box/units/agent-web-terminal-%i.local.env
-ExecStart=ttyd --writable --url-arg -p ${AGENT_BOX_TTYD_PORT} -i 127.0.0.1 -b /%i -t disableLeaveAlert=true -t titleFixed=%i@${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true agent-box-attach
+# The transport is a UNIX socket, not a loopback port (issue #628). A
+# 127.0.0.1 port is reachable by EVERY local user, and ttyd runs --writable
+# with no credential of its own -- Caddy authenticates the public URL, which
+# says nothing about who else on the box can open the port. A second agent
+# user could therefore read and type into this user's terminal. Same reason,
+# and same 0660 <user>:caddy shape, as the settings socket (issue #49).
+#
+# Two mechanisms hold that shape up, and BOTH are load-bearing:
+#   - libwebsockets chmods the socket 0660 on bind, and the socket inherits
+#     the GROUP of the directory it is created in because that directory is
+#     setgid (2750 %i:caddy, from the tmpfiles rules both backends render).
+#     So the socket lands 0660 %i:caddy without this unit holding any
+#     privilege: connect(2) needs write permission, which leaves %i and
+#     caddy. Inheriting matters most on NixOS, where every agent user shares
+#     the `users` primary group -- a socket carrying THAT group at 0660
+#     would be open to every other agent user on the box.
+#   - the directory itself is 0750 %i:caddy, so nobody else can even reach
+#     the socket to try, whatever mode it ends up with.
+# Not ttyd's own -U/--socket-owner: that chowns the socket, which this
+# unprivileged unit may not do to a group it is not in -- ttyd exits without
+# binding at all. And not SupplementaryGroups=caddy to make it able to,
+# because the caddy group is what guards every OTHER user's ~/downloads and
+# ~/sites, so the terminal's process tree would gain exactly the cross-user
+# reach this change exists to remove.
+# The path is spelled here rather than passed in per user, exactly as
+# agent-box-settings@.socket spells its own ListenStream.
+#
+# --check-origin is the browser half (issue #628): it refuses a WebSocket
+# upgrade whose Origin does not match the Host, so a page on another site
+# cannot drive this terminal through a logged-in browser. It is defence in
+# depth and NOT a substitute for the socket -- a local client forges any
+# header it likes. ttyd 1.7.7 compares the origin's host:port against the
+# Host header with default ports elided, which is what a TLS-terminating
+# Caddy in front of it sends.
+ExecStart=ttyd --writable --url-arg --check-origin -i /run/agent-box-ttyd/%i/ttyd.sock -b /%i -t disableLeaveAlert=true -t titleFixed=%i@${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true agent-box-attach

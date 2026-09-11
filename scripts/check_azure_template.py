@@ -90,6 +90,7 @@ SAMPLE = {
     "@@NIXINSTALLER@@": "https://install.determinate.systems/nix",
     "@@FLAKEREF@@": "github:defangdevs/agent-box/0123456789abcdef",
     "@@USER@@": "agent",
+    "@@SSLIPDOMAINB64@@": base64.b64encode(b"sslip.example.com").decode(),
     "@@AGENTSMD@@": "## This box\n\n- A line with 'quotes' and $dollars.\n",
     "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
     "@@PORTALISSUERB64@@": base64.b64encode(
@@ -103,13 +104,16 @@ SAMPLE = {
 # stands is the commonest one there is - and the defaults are where a stray
 # non-ASCII character is most likely to arrive unnoticed (agentsMd is prose).
 # webPassword has no default: it is the one field the form always demands.
-# The portal markers are the one place this substitutes a PLAIN default
-# rather than its base64 form -- safe only because both default to '', and
-# base64 of the empty string is the empty string too.
+# A `...B64@@` marker's default is base64-encoded by defaults_render below,
+# matching what the template's own base64(...) call does at deploy time --
+# sslipDomain's default ('sslip.io') is not empty, so unlike the portal
+# markers this cannot be papered over by "base64 of the empty string is the
+# empty string too".
 DEFAULT_OF = {
     "@@NIXINSTALLER@@": "nixInstallerUrl",
     "@@FLAKEREF@@": "agentBoxFlakeRef",
     "@@USER@@": "userName",
+    "@@SSLIPDOMAINB64@@": "sslipDomain",
     "@@AGENTSMD@@": "agentsMd",
     # Both default to '' -- handover off, which is the default box.
     "@@PORTALISSUERB64@@": "portalIssuer",
@@ -244,7 +248,11 @@ def defaults_render(template: dict) -> dict:
                 f"{marker} to it. Update DEFAULT_OF."
             )
         if "defaultValue" in params[name]:
-            values[marker] = params[name]["defaultValue"]
+            default = params[name]["defaultValue"]
+            values[marker] = (
+                base64.b64encode(default.encode()).decode()
+                if marker.endswith("B64@@") else default
+            )
     return values
 
 
@@ -365,9 +373,10 @@ def extract_portal_block(script: str) -> str:
 
 
 def run_portal_block(block: str, workdir: Path, issuer_b64: str,
-                      user_b64: str) -> subprocess.CompletedProcess:
+                      user_b64: str, sslip_b64: str) -> subprocess.CompletedProcess:
     text = block.replace("@@PORTALISSUERB64@@", issuer_b64)
     text = text.replace("@@PORTALUSERIDB64@@", user_b64)
+    text = text.replace("@@SSLIPDOMAINB64@@", sslip_b64)
     text = text.replace("/etc/agent-box", str(workdir))
     return subprocess.run(
         ["bash", "-c", text], capture_output=True, text=True)
@@ -377,15 +386,19 @@ def b64(value: str) -> str:
     return base64.b64encode(value.encode()).decode()
 
 
+SSLIP_DOMAIN_SAMPLE = "sslip.example.com"
+
+
 def check_written_config(template: dict) -> int:
     """The config.yaml the bootstrap WRITES must be valid YAML, and the
-    validate-decode-sed step that fills in portalIssuer/portalUser (#593)
-    must actually reject a bad value and pass through a good one untouched --
-    including one holding the '&' sed's replacement text treats specially
-    (see the comment beside esc_issuer in the .bicep). check_bootstrap proves
-    the whole SCRIPT parses; this proves the fragment that writes the one
-    file `agentbox apply` reads its declared state from actually behaves,
-    by running it for real rather than reproducing its substitution by hand.
+    validate-decode-sed steps that fill in portalIssuer/portalUser (#593) and
+    domainSuffix (#647) must actually reject a bad value and pass through a
+    good one untouched -- including one holding the '&' sed's replacement
+    text treats specially (see the comment beside esc_issuer in the .bicep).
+    check_bootstrap proves the whole SCRIPT parses; this proves the fragment
+    that writes the one file `agentbox apply` reads its declared state from
+    actually behaves, by running it for real rather than reproducing its
+    substitution by hand.
     """
     script = template["variables"]["bootstrapTemplate"]
     block = extract_portal_block(script)
@@ -400,24 +413,41 @@ def check_written_config(template: dict) -> int:
 
     rc = 0
     cases = {
-        "handover on": (PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, True),
-        "handover off": ("", "", True),
+        "handover on": (
+            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAIN_SAMPLE,
+            True),
+        "handover off": ("", "", SSLIP_DOMAIN_SAMPLE, True),
         # '&' is IN portalIssuer's allowed character class (a query string
         # may have one) but is sed replacement-text magic -- unescaped, this
         # is exactly the input that used to splice the placeholder into
         # config.yaml instead of the URL.
         "handover on, ampersand": (
             "https://station.example.com/cb?a=1&b=2", PORTAL_USER_SAMPLE,
-            True),
+            SSLIP_DOMAIN_SAMPLE, True),
         "invalid issuer (not https)": (
-            "http://station.example.com", PORTAL_USER_SAMPLE, False),
+            "http://station.example.com", PORTAL_USER_SAMPLE,
+            SSLIP_DOMAIN_SAMPLE, False),
         "invalid user (space)": (
-            PORTAL_ISSUER_SAMPLE, "usr with space", False),
+            PORTAL_ISSUER_SAMPLE, "usr with space", SSLIP_DOMAIN_SAMPLE,
+            False),
+        "invalid sslip domain (space)": (
+            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, "not a domain", False),
+        # The value a raw (non-base64) substitution used to let close the
+        # quoted heredoc: a newline plus the literal delimiter, followed by a
+        # command that would run as root if the heredoc really ended there.
+        # The DNS-suffix regex rejects any newline outright, whatever
+        # follows it -- proving the injection this replaced can no longer
+        # reach the shell at all, not merely that this one payload fails.
+        "sslip domain injection (newline closes heredoc)": (
+            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE,
+            "evil.example.com\nAGENTBOX_CONFIG\ntouch /tmp/pwned\ncat <<EOF",
+            False),
     }
-    for label, (issuer, user, should_succeed) in cases.items():
+    for label, (issuer, user, sslip, should_succeed) in cases.items():
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
-            done = run_portal_block(block, workdir, b64(issuer), b64(user))
+            done = run_portal_block(
+                block, workdir, b64(issuer), b64(user), b64(sslip))
             if should_succeed and done.returncode != 0:
                 print("FAIL: %s: the portal block refused a valid value:\n%s"
                       % (label, done.stderr), file=sys.stderr)
@@ -450,6 +480,12 @@ def check_written_config(template: dict) -> int:
             if web.get("enable") is not True or u.get("root") is not True:
                 print("FAIL: %s: the base config did not survive: %r"
                       % (label, data), file=sys.stderr)
+                rc = 1
+                continue
+            if data.get("domainSuffix") != sslip:
+                print("FAIL: %s: domainSuffix landed as %r, wanted %r"
+                      % (label, data.get("domainSuffix"), sslip),
+                      file=sys.stderr)
                 rc = 1
                 continue
             got = (web.get("portalIssuer"), u.get("portalUser"))

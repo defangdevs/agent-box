@@ -66,6 +66,13 @@
   header {
     Cache-Control "no-store"
     X-Content-Type-Options "nosniff"
+    # Only this box's own pages may frame a management page (issue #631).
+    # The tabbed workspace at /<user>/ iframes each session's terminal from
+    # this same origin, so 'self' is the tightest policy that keeps the
+    # workspace working; anything else framing the settings page or a
+    # terminal is clickjacking. The downloads route below replaces this
+    # header with a stricter one of its own.
+    Content-Security-Policy "frame-ancestors 'self'"
   }
   # This fragment ends INSIDE the block on purpose: the module appends one
   # webhook + terminal block per user (and the root block), then the closing
