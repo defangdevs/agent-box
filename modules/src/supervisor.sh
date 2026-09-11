@@ -143,15 +143,21 @@ if [ -d "$_abs_seed/tarball-cache-v2" ] &&
   # in already exists (it was created, then partly populated, by the failed
   # cp -al before it), so cp -a copies INTO it as a nested tarball-cache-v2/
   # rather than populating it directly - clear it between attempts. And
-  # publish both files or neither: a tarball-cache-v2 published without its
-  # sqlite passes the -d guard above forever, so a later, complete seed
-  # attempt is skipped too.
+  # publish the sqlite BEFORE tarball-cache-v2, not after: the -d guard above
+  # is keyed on tarball-cache-v2 alone, so it is the one file that must land
+  # LAST. Publishing it first would let a kill between the two mv's (a spot
+  # interruption, an OOM kill) leave the guard satisfied with no sqlite ever
+  # written - stuck there forever, since a later boot would see the directory
+  # and skip seeding for good. Publishing the sqlite first and the directory
+  # last means the same interruption instead leaves the guard UNsatisfied, so
+  # the next boot retries the whole seed - `mv -n` no-ops harmlessly on the
+  # sqlite that retry finds already in place.
   if cp -an "$_abs_seed"/fetcher-cache-v4.sqlite "$_abs_sqlite_tmp" 2>/dev/null &&
      { cp -al "$_abs_seed"/tarball-cache-v2 "$_abs_tmp" 2>/dev/null ||
        { rm -rf "$_abs_tmp" 2>/dev/null
          cp -a "$_abs_seed"/tarball-cache-v2 "$_abs_tmp" 2>/dev/null; }; }; then
-    if mv -Tn "$_abs_tmp" "$HOME"/.cache/nix/tarball-cache-v2 2>/dev/null; then
-      mv -n "$_abs_sqlite_tmp" "$HOME"/.cache/nix/fetcher-cache-v4.sqlite 2>/dev/null || :
+    if mv -n "$_abs_sqlite_tmp" "$HOME"/.cache/nix/fetcher-cache-v4.sqlite 2>/dev/null; then
+      mv -Tn "$_abs_tmp" "$HOME"/.cache/nix/tarball-cache-v2 2>/dev/null || :
     fi
   fi
   rm -rf "$_abs_tmp" "$_abs_sqlite_tmp" 2>/dev/null || :
