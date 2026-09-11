@@ -145,11 +145,16 @@
             '[ "$(readlink /home/agent/downloads)" = /var/lib/agent-box-downloads/agent ]'
         )
 
-        # Perms: 0750 agent:caddy, same as the ~/sites snippet dir — the user
-        # writes, caddy reaches files by its group + their world-read bit. This
-        # is why caddy's ProtectHome=true is a non-issue.
+        # Perms: 0700, where the ~/sites snippet dir beside it is 0750. The
+        # drop was caddy-readable until issue #630 moved the route to this
+        # user's own settings daemon; nothing behind the web server opens
+        # files under here any more, so the group bits came off and a caddy
+        # compromise no longer reads every user's drop. The group is still
+        # `caddy` and grants nothing at 0700 — both backends emit this rule
+        # identically and neither can portably name a per-user group, so the
+        # MODE is the boundary (issues #604, #630).
         machine.succeed(
-            "stat -c '%U:%G %a' /var/lib/agent-box-downloads/agent | grep -x 'agent:caddy 750'"
+            "stat -c '%U:%G %a' /var/lib/agent-box-downloads/agent | grep -x 'agent:caddy 700'"
         )
 
         # ~/downloads resolves to /var/lib/agent-box-downloads/agent, outside
@@ -168,7 +173,9 @@
             "hello from the box\n"
             "EOF"
         )
-        # Default umask leaves it world-readable, which is what lets caddy read it.
+        # Default umask still leaves it 0644, and that no longer matters to
+        # anyone: the 0700 directory above it is what decides who gets in,
+        # and the only reader is the daemon running as this same user.
         machine.succeed(
             "stat -c '%U %a' /var/lib/agent-box-downloads/agent/report.txt | grep -x 'agent 644'"
         )
@@ -195,44 +202,34 @@
         )
         client.succeed("grep -q report.txt /tmp/index.html")
 
-        # Issue #630, end to end. A synthetic sibling drop holding a marker
-        # only its own owner should ever hand out...
+        # Issue #630, end to end, in two layers that hold independently.
+        #
+        # Layer one is the RESOLVER, and this case isolates it: the target is
+        # a file the daemon's own user wrote and can read perfectly well, in
+        # its home, outside the drop. Nothing about permissions refuses this
+        # request — only the confinement does.
         machine.succeed(
-            "install -d -o root -g caddy -m 0750 "
-            "/var/lib/agent-box-downloads/bob"
+            f"{in_session} tee /home/agent/private-note.txt > /dev/null <<'EOF'\n"
+            "agent-home-marker\n"
+            "EOF"
         )
         machine.succeed(
-            "install -m 0644 /dev/stdin "
-            "/var/lib/agent-box-downloads/bob/report.txt "
-            "<<'EOF'\nbob-private-marker\nEOF"
+            f"{in_session} cat /home/agent/private-note.txt "
+            "| grep agent-home-marker >/dev/null"
         )
-        # ...which THIS caddy can read, through the group it shares with
-        # every user's drop. That is what made the escape live: the per-user
-        # auth authorized a URL and caddy's file_server then opened whatever
-        # the path resolved to, under an identity that spans all of them.
         machine.succeed(
-            "runuser -u caddy -- cat "
-            "/var/lib/agent-box-downloads/bob/report.txt "
-            "| grep bob-private-marker >/dev/null"
+            f"{in_session} ln -sfn /home/agent/private-note.txt "
+            "/home/agent/downloads/note.txt"
         )
-        # The agent plants the link the same way it drops a file: through
-        # ~/downloads, from inside its own unit's namespace.
-        machine.succeed(
-            f"{in_session} ln -sfn /var/lib/agent-box-downloads/bob/report.txt "
-            "/home/agent/downloads/sibling.txt"
-        )
-        # Refused, and the marker is in neither the body nor the headers.
-        # Before the fix this request answered 200 with bob's file in it.
         client.succeed(
-            f"{curl} -u agent:testpassword -o /tmp/sibling.html "
+            f"{curl} -u agent:testpassword -o /tmp/note.html "
             "-w '%{http_code}' "
-            "https://box.test/agent/downloads/sibling.txt | grep -x 404"
+            "https://box.test/agent/downloads/note.txt | grep -x 404"
         )
-        client.fail("grep -q bob-private-marker /tmp/sibling.html")
+        client.fail("grep -q agent-home-marker /tmp/note.html")
 
-        # An absolute link to a world-readable system file is refused for
-        # the same reason, and not because of who can read it: it is not in
-        # the drop.
+        # An absolute link to a system file the agent can also read is
+        # refused the same way, for the same one reason.
         machine.succeed(
             f"{in_session} ln -sfn /etc/hostname "
             "/home/agent/downloads/host.txt"
@@ -241,6 +238,42 @@
             f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
             "https://box.test/agent/downloads/host.txt | grep -x 404"
         )
+
+        # Layer two is the MODE. A synthetic sibling drop — this VM has one
+        # terminal user — created exactly as the tmpfiles rule creates a real
+        # one. Before #630's follow-up it was 0750 <user>:caddy, and caddy
+        # could read it: that shared identity is what made the symlink escape
+        # reach another user's files at all. At 0700 neither caddy nor this
+        # agent can open it, whatever any route asks for.
+        machine.succeed(
+            "install -d -o root -g caddy -m 0700 "
+            "/var/lib/agent-box-downloads/bob"
+        )
+        machine.succeed(
+            "install -m 0644 /dev/stdin "
+            "/var/lib/agent-box-downloads/bob/report.txt "
+            "<<'EOF'\nbob-private-marker\nEOF"
+        )
+        machine.fail(
+            "runuser -u caddy -- cat "
+            "/var/lib/agent-box-downloads/bob/report.txt"
+        )
+        machine.fail(
+            f"{in_session} cat /var/lib/agent-box-downloads/bob/report.txt"
+        )
+        # And the link to it is still refused by the resolver, which is the
+        # layer that would hold even if the mode were loosened again. Before
+        # #630 this request answered 200 with bob's file in it.
+        machine.succeed(
+            f"{in_session} ln -sfn /var/lib/agent-box-downloads/bob/report.txt "
+            "/home/agent/downloads/sibling.txt"
+        )
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /tmp/sibling.html "
+            "-w '%{http_code}' "
+            "https://box.test/agent/downloads/sibling.txt | grep -x 404"
+        )
+        client.fail("grep -q bob-private-marker /tmp/sibling.html")
 
         # A link that stays INSIDE the drop still resolves: the rule is
         # confinement, not a ban on symlinks, so `ln -s` next to a file the

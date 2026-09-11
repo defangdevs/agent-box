@@ -3139,7 +3139,14 @@ class Renderer:
                 lines += [
                     f"d /var/lib/agent-box-sites/{u.name} 0750 {u.name} caddy - -",
                     f"L+ {u.home}/sites - - - - /var/lib/agent-box-sites/{u.name}",
-                    f"d /var/lib/agent-box-downloads/{u.name} 0750 {u.name} caddy - -",
+                    # 0700, not the 0750 the snippet dir above gets: caddy
+                    # read this tree until issue #630 moved the route to the
+                    # per-user settings daemon, and has no business in it
+                    # now. The group stays `caddy` because it grants nothing
+                    # at 0700, both backends must emit this line identically,
+                    # and neither can portably name a per-user group (NixOS
+                    # has none, issue #604) -- the mode is the boundary.
+                    f"d /var/lib/agent-box-downloads/{u.name} 0700 {u.name} caddy - -",
                     f"L+ {u.home}/downloads - - - - /var/lib/agent-box-downloads/{u.name}",
                 ]
             # The parent is declared too, and owned by the user. Without it

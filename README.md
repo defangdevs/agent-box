@@ -518,9 +518,12 @@ mv ./report.pdf ~/downloads/    # -> https://<domain>/<user>/downloads/report.pd
 ```
 
 Only `~/downloads` is exposed this way — nothing else in the agent's home is
-reachable over the web. (`caddy.service` runs with `ProtectHome=true` and
-can't read `/home` at all; the directory is backed by a caddy-readable path
-under `/var/lib` and symlinked in as `~/downloads`.) The seeded `AGENTS.md`
+reachable over the web, and a symlink pointing out of that directory is not
+followed. (Caddy does not read the tree at all: it hands `/<user>/downloads/`
+to that user's own settings daemon over a local socket, and the daemon runs
+as that user and resolves every path component inside the drop. The backing
+directory under `/var/lib`, symlinked in as `~/downloads`, is `0700`, so one
+web-server identity cannot reach across users' drops.) The seeded `AGENTS.md`
 tells the agent about this route, so "send me that file" just works. For
 unauthenticated sharing, an agent can instead run its own web service and
 expose it via `~/sites` (see the seeded `AGENTS.md`).
