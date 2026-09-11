@@ -41,6 +41,7 @@
   "etc/systemd/system/agent-box-harness-upgrade@.service.d/execstart.conf": "0o444",
   "etc/systemd/system/agent-box-nix-gc.service": "0o644",
   "etc/systemd/system/agent-box-nix-gc.timer": "0o644",
+  "etc/systemd/system/agent-box-rollback.service": "0o444",
   "etc/systemd/system/agent-box-settings@.service": "0o444",
   "etc/systemd/system/agent-box-settings@.socket": "0o444",
   "etc/systemd/system/agent-box-settings@agent.service.d/10-host.conf": "0o644",
