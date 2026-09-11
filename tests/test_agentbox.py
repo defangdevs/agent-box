@@ -2362,6 +2362,14 @@ class RenderTest(unittest.TestCase):
             # collapsing the pair silently (CodeRabbit, PR #454).
             return re.findall(r"-t ([\w-]+)=(\S+)", execstart)
 
+        def switches(execstart):
+            # The bare flags, which carry the security posture: --writable
+            # is why the transport needs protecting at all, and
+            # --check-origin is half of that protection (issue #628).
+            # Restating them by hand is how one goes missing on one backend
+            # only, which is the whole reason this test reads the template.
+            return sorted(re.findall(r"(?<!\S)--[a-z-]+", execstart))
+
         template = next(
             x for x in (SRC / "units" / "agent-web-terminal@.service")
             .read_text().splitlines() if x.startswith("ExecStart="))
@@ -2372,6 +2380,10 @@ class RenderTest(unittest.TestCase):
             # systemd requires before a template's own value can be replaced.
             override = [x for x in conf.read_text().splitlines()
                         if x.startswith("ExecStart=")][-1]
+            self.assertEqual(
+                switches(template), switches(override),
+                f"agent-web-terminal@{user} drops or invents a bare ttyd "
+                f"flag the shared template sets")
             got, want = options(override), options(template)
             self.assertEqual(
                 sorted(n for n, _ in want), sorted(n for n, _ in got),

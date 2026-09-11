@@ -164,6 +164,14 @@ handle @home_@USER@ {
     }
   }
 }
+# ttyd's upstream is a UNIX socket, not 127.0.0.1:<port> (issue #628): a
+# loopback port is reachable by every local user, and ttyd runs --writable
+# with no credential of its own, so the authentication above was the only
+# thing standing between another user on this box and this user's terminal
+# -- and it stood in front of the public URL, not in front of the port.
+# 0660 @USER@:caddy, in a 0750 @USER@:caddy directory. Same model as the
+# settings socket above.
+#
 # One path per session: /@USER@/<session>/ is that session's terminal, and
 # everything ttyd asks for from a page loaded there (its ws and token
 # endpoints, resolved relative to the URL in the address bar) hangs off the
@@ -199,12 +207,12 @@ handle /@USER@/* {
       forward_auth unix/@SETTINGS_SOCKET@ {
         uri /@USER@/auth/verify
       }
-      reverse_proxy 127.0.0.1:@TTYD_PORT@
+      reverse_proxy unix/@TTYD_SOCKET@
     }
   }
   @cookie_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
   handle @cookie_@USER@ {
-    reverse_proxy 127.0.0.1:@TTYD_PORT@
+    reverse_proxy unix/@TTYD_SOCKET@
   }
   handle {
     route {
@@ -212,7 +220,7 @@ handle /@USER@/* {
         @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
       }
       header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-      reverse_proxy 127.0.0.1:@TTYD_PORT@
+      reverse_proxy unix/@TTYD_SOCKET@
     }
   }
 }

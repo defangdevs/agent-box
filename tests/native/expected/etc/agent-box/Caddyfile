@@ -251,6 +251,14 @@ handle @home_agent {
     }
   }
 }
+# ttyd's upstream is a UNIX socket, not 127.0.0.1:<port> (issue #628): a
+# loopback port is reachable by every local user, and ttyd runs --writable
+# with no credential of its own, so the authentication above was the only
+# thing standing between another user on this box and this user's terminal
+# -- and it stood in front of the public URL, not in front of the port.
+# 0660 agent:caddy, in a 0750 agent:caddy directory. Same model as the
+# settings socket above.
+#
 # One path per session: /agent/<session>/ is that session's terminal, and
 # everything ttyd asks for from a page loaded there (its ws and token
 # endpoints, resolved relative to the URL in the address bar) hangs off the
@@ -286,12 +294,12 @@ handle /agent/* {
       forward_auth unix//run/agent-box-settings/agent.sock {
         uri /agent/auth/verify
       }
-      reverse_proxy 127.0.0.1:7681
+      reverse_proxy unix//run/agent-box-ttyd/agent/ttyd.sock
     }
   }
   @cookie_agent header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
   handle @cookie_agent {
-    reverse_proxy 127.0.0.1:7681
+    reverse_proxy unix//run/agent-box-ttyd/agent/ttyd.sock
   }
   handle {
     route {
@@ -299,7 +307,7 @@ handle /agent/* {
         agent {$WEB_PASSWORD_HASH_AGENT}
       }
       header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-      reverse_proxy 127.0.0.1:7681
+      reverse_proxy unix//run/agent-box-ttyd/agent/ttyd.sock
     }
   }
 }
@@ -475,6 +483,14 @@ handle @home_robot {
     }
   }
 }
+# ttyd's upstream is a UNIX socket, not 127.0.0.1:<port> (issue #628): a
+# loopback port is reachable by every local user, and ttyd runs --writable
+# with no credential of its own, so the authentication above was the only
+# thing standing between another user on this box and this user's terminal
+# -- and it stood in front of the public URL, not in front of the port.
+# 0660 robot:caddy, in a 0750 robot:caddy directory. Same model as the
+# settings socket above.
+#
 # One path per session: /robot/<session>/ is that session's terminal, and
 # everything ttyd asks for from a page loaded there (its ws and token
 # endpoints, resolved relative to the URL in the address bar) hangs off the
@@ -510,12 +526,12 @@ handle /robot/* {
       forward_auth unix//run/agent-box-settings/robot.sock {
         uri /robot/auth/verify
       }
-      reverse_proxy 127.0.0.1:7682
+      reverse_proxy unix//run/agent-box-ttyd/robot/ttyd.sock
     }
   }
   @cookie_robot header_regexp Cookie "(^|; )__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}(;|$)"
   handle @cookie_robot {
-    reverse_proxy 127.0.0.1:7682
+    reverse_proxy unix//run/agent-box-ttyd/robot/ttyd.sock
   }
   handle {
     route {
@@ -523,7 +539,7 @@ handle /robot/* {
         robot {$WEB_PASSWORD_HASH_ROBOT}
       }
       header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-      reverse_proxy 127.0.0.1:7682
+      reverse_proxy unix//run/agent-box-ttyd/robot/ttyd.sock
     }
   }
 }

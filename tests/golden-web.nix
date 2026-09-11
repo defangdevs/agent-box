@@ -3,8 +3,9 @@
 # every Caddy/ttyd/settings/webhook/self-update artifact — exactly the parts
 # Phases 1-3 must not change. This overlay turns them all on, on top of
 # hosts/vm.nix:
-#   - web.enable with TWO terminal users, so the sorted-order ttyd port
-#     assignment (7681, 7682) and the rootUser selection are pinned;
+#   - web.enable with TWO terminal users, so the per-user ttyd socket paths
+#     (issue #628, which replaced a sorted-order port assignment) and the
+#     rootUser selection are pinned;
 #   - a codex user, so the supervisor's codex branch and the codex
 #     remote-control wrapper land in the snapshot;
 #   - selfUpdate.enable, so the update unit and the settings daemon's update

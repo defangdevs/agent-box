@@ -342,6 +342,14 @@ jobs:
       #                     supervisor, a per-user sudo grant matching the
       #                     shipped guide, and the daemon unit as a no-op
       #                     with no docker installed and running with one
+      #   ttyd-isolation    (issue 628) the browser terminal's transport is
+      #                     private — no TCP listener at all, a
+      #                     0660 <user>:caddy socket in a 2750 <user>:caddy
+      #                     directory, a second local user refused by the
+      #                     kernel and by the auth gate, the owner still
+      #                     attaching/typing/reconnecting and starting a
+      #                     stopped session, and cross-origin WebSockets
+      #                     refused
       #   webhook           (issue 101) the default-on webhook receiver —
       #                     socket-activated 0660 <user>:caddy ingress, the
       #                     unauthenticated public path beside a still-401ing
@@ -402,7 +410,8 @@ jobs:
             .#checks.x86_64-linux.memory-protection \
             .#checks.x86_64-linux.sessions-web \
             .#checks.x86_64-linux.connect \
-            .#checks.x86_64-linux.containers &
+            .#checks.x86_64-linux.containers \
+            .#checks.x86_64-linux.ttyd-isolation &
           rest=$!
           # All three are waited on before the step decides, so
           # --keep-going's promise still holds across the set: every result
