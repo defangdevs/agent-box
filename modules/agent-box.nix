@@ -13065,17 +13065,15 @@ in
       # sibling's privileged upstream with no auth gate in front of it.
       #
       # So a site is DECLARED here, by whoever administers the box, and the
-      # declaration is deliberately not a Caddyfile: a hostname plus either
-      # one upstream or one document root, each validated character by
-      # character (see the assertions in config below) so that no value can
-      # carry an env placeholder, a second directive, or a newline into the
-      # rendered file.
+      # declaration is deliberately not a Caddyfile: a hostname plus one
+      # upstream, validated character by character (see the assertions in
+      # config below) so that no value can carry an env placeholder, a
+      # second directive, or a newline into the rendered file.
       sites = lib.mkOption {
         default = { };
         example = lib.literalExpression ''
           {
             "app.example.com".upstream = "127.0.0.1:3000";
-            "docs.example.com".root = "/var/lib/agent-box-sites/agent/public";
           }
         '';
         description = ''
@@ -14004,7 +14002,35 @@ in
           );
           message = "services.agent-box.users.${name}: session \"${sname}\"'s remoteControlName must be non-empty and free of newlines.";
         }
-      ]) (seedSessions name u))) cfg.users);
+      ]) (seedSessions name u))) cfg.users)
+      # web.sites shape (issue #629), checked whenever the module is
+      # enabled at all: native's Spec.__init__ calls parse_sites()
+      # unconditionally, so a NixOS box must refuse the same malformed
+      # host/upstream regardless of web.enable, or the two backends
+      # disagree about what a valid config.yaml is. The domain-collision
+      # check stays below, gated on web.enable, because web.domain has
+      # no default to compare against otherwise.
+      ++ lib.concatLists (lib.mapAttrsToList (host: site: [
+        {
+          assertion = siteHostOk host;
+          message =
+            "services.agent-box.web.sites.\"${host}\": not a hostname. Use "
+            + "lowercase dotted DNS labels (a-z, 0-9, -) with at least one "
+            + "dot, e.g. \"app.example.com\" - no wildcard, no port, no "
+            + "scheme, no path.";
+        }
+        {
+          assertion = siteUpstreamOk site.upstream;
+          message =
+            "services.agent-box.web.sites.\"${host}\".upstream = "
+            + "\"${site.upstream}\": not a host:port. Use a lowercase DNS "
+            + "name or IPv4 address and a port 1-65535, e.g. "
+            + "\"127.0.0.1:3000\". Anything else - an env placeholder, a "
+            + "scheme, a path, whitespace - is refused, because this value "
+            + "is substituted into the Caddyfile that holds every user's "
+            + "web auth secrets.";
+        }
+      ]) cfg.web.sites);
 
     # Claude Code is unfree; allow just the bundled supported agent packages
     # (host can override).
@@ -24546,8 +24572,8 @@ if __name__ == "__main__":
       # WEB_COOKIE_SECRET_<USER> through Caddy's documented `{$ENV}`
       # substitution and, since the normal routes admit an exact cookie
       # match, that value IS a session. The dirs and the ~/sites symlink
-      # stay (they are where a `root` site's files live); the import is
-      # gone, and the reload grant with it.
+      # stay (a convenient place for an agent's own upstream server's
+      # files); the import is gone, and the reload grant with it.
       managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
       lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" ]
         [ cfg.web.domain "services.agent-box" "nixos-rebuild switch" ] ''
@@ -24847,20 +24873,14 @@ if __name__ == "__main__":
             + "after sanitizing to env-var form ([A-Z0-9_]).";
         }
       ]
-      # web.sites (issue #629). Every declaration is substituted into the
-      # ONE Caddyfile that holds every user's web auth secrets, so the
-      # accepted shape is spelled out here rather than left to whatever
-      # Caddy happens to parse. These fire per site, so an operator with a
-      # typo is told which hostname and which field.
+      # web.sites domain collision (issue #629). This alone stays gated on
+      # web.enable: web.domain has no default, so comparing against it
+      # outside a web.enable box would compare every site's hostname
+      # against an empty string. The host/upstream shape checks that used
+      # to live here moved to the cfg.enable-only assertions above, to
+      # match native's Spec.__init__, which validates web.sites whether or
+      # not web is enabled.
       ++ lib.concatLists (lib.mapAttrsToList (host: site: [
-        {
-          assertion = siteHostOk host;
-          message =
-            "services.agent-box.web.sites.\"${host}\": not a hostname. Use "
-            + "lowercase dotted DNS labels (a-z, 0-9, -) with at least one "
-            + "dot, e.g. \"app.example.com\" - no wildcard, no port, no "
-            + "scheme, no path.";
-        }
         {
           assertion = lib.toLower host != lib.toLower cfg.web.domain;
           message =
@@ -24868,17 +24888,6 @@ if __name__ == "__main__":
             + "the box's own management hostname (terminal, settings page, "
             + "webhook ingress). A second block for it would shadow those "
             + "routes rather than add anything. Pick another hostname.";
-        }
-        {
-          assertion = siteUpstreamOk site.upstream;
-          message =
-            "services.agent-box.web.sites.\"${host}\".upstream = "
-            + "\"${site.upstream}\": not a host:port. Use a lowercase DNS "
-            + "name or IPv4 address and a port 1-65535, e.g. "
-            + "\"127.0.0.1:3000\". Anything else - an env placeholder, a "
-            + "scheme, a path, whitespace - is refused, because this value "
-            + "is substituted into the Caddyfile that holds every user's "
-            + "web auth secrets.";
         }
       ]) cfg.web.sites);
 

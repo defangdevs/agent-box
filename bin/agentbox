@@ -682,9 +682,9 @@ BOX_SCHEMA = _Obj({
     # only overrides that path.
     #
     # web.sites: operator-approved extra vhosts, keyed by hostname (issue
-    # #629). Deliberately NOT a Caddyfile - a hostname plus exactly one of
-    # `upstream` or `root`, each validated character by character in Spec,
-    # because whatever lands here is substituted into the ONE Caddy
+    # #629). Deliberately NOT a Caddyfile - a hostname plus one `upstream`
+    # (host:port), validated character by character in Spec, because
+    # whatever lands here is substituted into the ONE Caddy
     # instance that holds every user's web auth secrets and can reach
     # every user's settings socket. This replaced the per-user
     # `import /var/lib/agent-box-sites/<user>/*.caddy` lines, under which
@@ -3534,8 +3534,7 @@ class Renderer:
         # auth gate in front of it.
         #
         # The values below cannot do either: Spec's parse_sites has already
-        # refused anything but a lowercase DNS hostname plus one host:port
-        # or one absolute path outside /home.
+        # refused anything but a lowercase DNS hostname plus one host:port.
         sites = [bind("sites")]
         for host, upstream in self.spec.sites.items():
             sites.append("\n" + bind("site-proxy", extra={
