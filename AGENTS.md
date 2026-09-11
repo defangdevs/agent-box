@@ -292,7 +292,7 @@ assignments and mismatches with the workflow matrix. Each lane prepares only
 its own drivers, then runs their exact inventory with `scripts/ci-vm-tests.sh`.
 `sessions` and `webhook` each have a lane; `browser` and `host` split the
 remaining checks. Each lane runs one test at a time on its own standard
-runner, so at most four tests run globally.
+runner, so at most four tests run per workflow run.
 A test may boot multiple guests. Do not raise that budget without measuring
 memory and CPU pressure. No test assertions are removed to meet timing goals.
 

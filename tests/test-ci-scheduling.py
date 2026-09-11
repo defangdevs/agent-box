@@ -1,4 +1,5 @@
 """Check the workflow's failure gates, lane budget and VM build invocation."""
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -62,6 +63,15 @@ sys.exit(int(os.environ["FAILURE"]))
             result, call = self.run_schedule(checks, jobs)
             self.assertNotEqual(result.returncode, 0)
             self.assertIsNone(call)
+
+    def test_native_test_and_validator_edits_trigger_ci(self):
+        # PyYAML's YAML 1.1 loader reads the unquoted `on` key as True.
+        events = WORKFLOW.get("on", WORKFLOW.get(True))
+        for event in ["push", "pull_request"]:
+            for path in ["tests/test-new-native.py", "tests/native/expected/etc/example",
+                         "scripts/check_new_native.py"]:
+                self.assertTrue(any(fnmatch.fnmatch(path, pattern)
+                                    for pattern in events[event]["paths"]), (event, path))
 
     def test_matrix_matches_nix_lanes_and_keeps_concurrency_budget(self):
         strategy = WORKFLOW["jobs"]["vm"]["strategy"]

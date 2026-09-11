@@ -12,33 +12,26 @@ on:
       - 'modules/agent-box.nix.in'
       - 'modules/src/**'
       - 'bin/assemble-module.py'
-      - 'tests/test-assemble-module.py'
-      # The vendored third-party assets under modules/src/vendor are matched
-      # by 'modules/src/**' above; this is the checker that verifies them.
-      - 'scripts/check_vendor.py'
-      - 'scripts/ci-*'
-      - 'tests/test-ci-*'
+      # Native test/validator edits must trigger the discovered checks too.
+      - 'tests/**'
+      - 'scripts/**'
       # Every workflow, not just this one: CI validates no other workflow's
       # YAML, so a file that cannot parse is simply never run and nothing
       # says so. PR #483 shipped exactly that — vendor-updates.yml had a
       # heredoc dedented out of its `run: |` block scalar, CI stayed green,
       # and the weekly job would have silently never fired.
       - '.github/workflows/**'
-      - 'tests/test-envstore.py'
       # The native-render fixture (issue #154 Phase 4): the renderer under
       # test, the test itself, and its committed expected/ snapshot must all
       # re-run agentbox-render when any one changes, or a stale fixture only
       # surfaces via a manual dispatch (as it did for PR #381).
       - 'bin/agentbox'
-      - 'tests/test_agentbox.py'
-      - 'tests/native/**'
       # The mascot mark (issue #185) is embedded into the settings daemon at
       # assemble time, so it is a module source as much as a website asset.
       - 'docs/potato.svg'
       # The golden behavior snapshot (issue #154): the fixture and its
       # renderer must re-run the golden-snapshot check when either changes.
       - 'bin/golden-snapshot.py'
-      - 'tests/golden/**'
       - 'flake.lock'
       - '.github/workflows/ci.yml'
   pull_request:
@@ -106,7 +99,7 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      # Globally still four simultaneous test derivations. Each test can
+      # Still four simultaneous test derivations per workflow run. Each test can
       # boot multiple guests; separate runners reduce contention per guest.
       - name: Run VM tests
         timeout-minutes: 12
