@@ -880,15 +880,24 @@ in
         timeout=60,
     )
     # A clean `exit` must NOT land in the post-mortem bash (that fallback is
-    # for agents only — for a shell it would be a confusing nested shell):
-    # the session dies and the reconcile loop respawns a fresh login shell.
-    old_shell_pane = machine.succeed(
-        tmux('display -p -t "=scratch:" "#{pane_pid}"')
-    ).strip()
+    # for agents only — for a shell it would be a confusing nested shell) and
+    # must NOT be respawned either (issue #678): typing `exit` parks the
+    # session, exactly like `/quit` does for the other harnesses.
     machine.succeed(tmux('send-keys -t "=scratch:" exit Enter'))
     machine.wait_until_succeeds(
-        tmux('display -p -t "=scratch:" "#{pane_pid}"')
-        + f" | grep . | grep -vx '{old_shell_pane}'",
+        "jq -e '.sessions.scratch.stopped == true' "
+        "/home/agent/.config/agent-box/sessions.json",
+        timeout=60,
+    )
+    machine.wait_until_fails(tmux("has-session -t =scratch"), timeout=60)
+    settle()
+    machine.fail(tmux("has-session -t =scratch"))
+    # `agent-box-session restart` clears the flag and hands back a fresh shell.
+    machine.succeed("su -s /bin/sh agent -c 'agent-box-session restart scratch'")
+    machine.wait_until_succeeds(tmux("has-session -t =scratch"), timeout=60)
+    machine.wait_until_succeeds(
+        tmux('display -p -t "=scratch:" "#{pane_current_command}"')
+        + " | grep -x bash",
         timeout=60,
     )
     machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm scratch'")
