@@ -150,6 +150,15 @@
       # partition table + GRUB, so the base config stays usable for build-vm.
       packages = eachSystem (system:
         {
+          # One evaluation/build graph for CI preparation. Native checks are
+          # discovered, so a newly registered check cannot silently miss CI.
+          # VM drivers include guest closures but do not execute any guests.
+          ci-native = nixpkgs.legacyPackages.${system}.linkFarm
+            "agent-box-ci-native"
+            (nixpkgs.lib.mapAttrsToList (name: path: { inherit name path; })
+              (nixpkgs.lib.filterAttrs (_: check: !(check ? driver))
+                self.checks.${system}));
+
           # Rendered golden snapshot (issue #154) — input of the
           # golden-snapshot check, materialized into tests/golden by
           # `nix run .#update-golden`.
@@ -200,6 +209,17 @@
             image = self.nixosConfigurations.vm.config.system.build.images.qemu;
           in
           {
+            ci-vm-drivers = nixpkgs.legacyPackages.${system}.linkFarm
+              "agent-box-ci-vm-drivers"
+              (nixpkgs.lib.mapAttrsToList
+                (name: check: { inherit name; path = check.driver; })
+                (nixpkgs.lib.filterAttrs (_: check: check ? driver)
+                  self.checks.${system}));
+            ci-prepare = nixpkgs.legacyPackages.${system}.linkFarm
+              "agent-box-ci-prepare" [
+                { name = "native"; path = self.packages.${system}.ci-native; }
+                { name = "drivers"; path = self.packages.${system}.ci-vm-drivers; }
+              ];
             vm = image;
             default = image;
           }
@@ -337,6 +357,23 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           };
         in
         {
+          ci-scheduling = pkgs.runCommand "agent-box-ci-scheduling" {
+            nativeBuildInputs = [ pkgs.python3 ];
+          } ''
+            python3 ${./tests/test-ci-scheduling.py} ${./scripts/ci-vm-tests.sh}
+            touch "$out"
+          '';
+
+          # Use the flake's pin, not the runner's mutable nixpkgs registry.
+          # Shellcheck findings in deploy-test.yml are tracked separately;
+          # this preserves the existing actionlint-only gate.
+          workflow-lint = pkgs.runCommand "agent-box-workflow-lint" {
+            nativeBuildInputs = [ pkgs.actionlint ];
+          } ''
+            actionlint -shellcheck= ${./.github/workflows}/*.yml
+            touch "$out"
+          '';
+
           # Eval-level assertion; cheap.
           multi-user = assert missing == [ ];
             pkgs.runCommand "agent-box-multi-user-ok" { } ''
@@ -2097,6 +2134,13 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # Full closure build of the VM config — the "is it actually usable"
           # proof (compiles the system agents would run in).
           vm-closure = self.nixosConfigurations.vm.config.system.build.vm;
+
+          # Force both image derivations without realizing the qcow image.
+          # Discard only the reference context, after evaluating drvPath.
+          vm-image-eval = pkgs.writeText "agent-box-vm-image-eval"
+            (builtins.unsafeDiscardStringContext (
+              self.nixosConfigurations.vm.config.system.build.vm.drvPath
+              + "\n" + self.packages.${system}.vm.drvPath + "\n"));
 
           # Interactive VM test for the whole user-facing web surface, in one
           # guest (issue #312 — this was three tests with the same node

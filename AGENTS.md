@@ -277,27 +277,29 @@ A VM test script has a hard ceiling of 128 KiB. nixpkgs passes it to the driver 
 Never end a test pipeline with `grep -q`. The driver runs each command under `set -euo pipefail`, and `grep -q` exits on the FIRST match — the producer upstream then gets EPIPE, and its non-zero status fails the whole assertion even though the pattern matched (a `must succeed` that reports exit 123 with `write error: Broken pipe` in the log). Write `… | grep PATTERN >/dev/null` instead, which drains the input, or capture to a file first and grep the file. `grep -q` is safe only with a file operand.
 
 
-### Adding a check: the flake is not enough
+### Adding a check: CI discovers coverage and verifies VM scheduling
 
-`.github/workflows/ci.yml`'s "Run VM tests" step names its checks BY HAND,
-in three lanes. CI does not run `nix flake check` (the intentionally
-filesystem-free VM configuration makes it unsuitable), so a
-`runNixOSTest` you add to `flake.nix` and never add to that list simply
-never runs - no skip, no warning, a green job over it. `tests/containers.nix`
-shipped that way for one round and looked green. Add the check to the
-shared lane (the two long ones have isolated lanes for a reason - see the
-comment there before moving anything into them), and add its one-line
-"what it covers" entry above the step.
+`packages.<system>.ci-native` discovers every check without a `driver`
+attribute. CI builds it together with every VM driver's closure through
+`ci-prepare`, in one `--keep-going --max-jobs 4 --cores 1` graph. New native
+checks need no workflow list edit. Run `nix build -L --keep-going .#ci-native`
+for the entire native set on your architecture. Workflow lint uses the
+flake's pinned actionlint, and `vm-image-eval` forces both image derivations
+without building the qcow image.
 
-The same is true of a NATIVE check, and that is not hypothetical: fifteen
-of the flake's forty-four checks - `webhook-defer`, `source-tree`,
-`lease-protocol`, `testscript-fits` and eleven more - had never been named
-by any workflow, so every job was green over them. Fourteen now ride in one
-`--keep-going` invocation ("Run the remaining native checks"), which is
-where a new native check goes; keep that list alphabetical, so a diff
-against `nix eval .#checks.<system> --apply builtins.attrNames` is readable
-by eye. Do that diff after adding a check, not before: it is the only thing
-that tells you whether the check you just wrote will ever run.
+VM execution remains in three lanes in `scripts/ci-vm-tests.sh`: `sessions`
+and `webhook` each get one job, and the rest share two. Add a new VM check to
+a lane and describe its coverage beside its definition in `flake.nix`.
+Before booting anything, the script compares its complete lane inventory
+against the flake-generated `ci-vm-drivers` directory. Missing, stale and
+duplicate entries fail CI instead of silently losing coverage. Every lane
+is waited on even if another fails. Do not raise the four-test concurrency
+budget without measuring guest memory and CPU pressure on the runner.
+
+This replaces a hand-maintained workflow inventory that once omitted
+fifteen of forty-four checks (#611). Keep the checks discoverable through
+`checks.<system>`; CI still does not use `nix flake check`, because the
+intentionally filesystem-free VM configuration makes it unsuitable.
 
 The fifteenth was the warning inside the warning. `testscript-fits` read
 `driver.drvAttrs.testScript`; nixpkgs moved the script off the driver
@@ -485,8 +487,8 @@ exceeds its own timeout is reported `cancelled` on `workflow_run`,
 two, so the standing watch cannot match it and a hung run reaches nobody. A
 STEP that runs out of time fails instead, which the existing rules do match.
 Size the step budget against the PRE-step time rather than the job timeout:
-setup before `Run VM tests` takes up to 219s, so a 25-minute job leaves about
-21 minutes of step budget (PR #456, at 18).
+preparation and VM execution each have a 12-minute step timeout under the
+25-minute job timeout, leaving a minute for setup and teardown.
 
 ### Finishing a CodeRabbit review
 
