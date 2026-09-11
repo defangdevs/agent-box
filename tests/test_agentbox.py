@@ -361,6 +361,33 @@ class RenderTest(unittest.TestCase):
             spec = mod.Spec({"domain": "auto", "users": {"agent": {}}}, prof)
             self.assertEqual("sslip.io", spec.domain_suffix)
 
+    def test_domain_suffix_rejects_a_malformed_suffix(self):
+        """A domainSuffix that is not a DNS suffix must fail BOX_SCHEMA.
+
+        Otherwise it reaches first_boot() unvalidated, gets appended to the
+        dashed public IP, and lands in the Caddyfile - "not a domain" becomes
+        multiple Caddy site addresses instead of a config-time error.
+        """
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for bad in ("not a domain", "-leading-hyphen.example.com",
+                        "no-dot-at-all", "trailing-dot.example.com."):
+                with self.assertRaises(mod.ConfigError, msg=repr(bad)):
+                    mod.Spec({"domain": "auto", "domainSuffix": bad,
+                              "users": {"agent": {}}}, prof)
+
+    def test_domain_suffix_accepts_empty_string(self):
+        """Empty is not malformed - Spec's own fallback already treats it as
+        absent (see test_domain_suffix_defaults_to_sslip_io)."""
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec = mod.Spec(
+                {"domain": "auto", "domainSuffix": "",
+                 "users": {"agent": {}}}, prof)
+            self.assertEqual("sslip.io", spec.domain_suffix)
+
     def test_rejects_bad_config(self):
         cases = [
             ({"users": {}}, "at least one user"),
@@ -369,6 +396,8 @@ class RenderTest(unittest.TestCase):
             ({"users": {"a": {"root": True}, "b": {"root": True}}},
              "at most one user"),
             ({"users": {"Bad Name": {}}}, "invalid user name"),
+            ({"domainSuffix": "not a domain", "users": {"a": {}}},
+             "must be empty/null or a DNS suffix"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
