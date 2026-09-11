@@ -11217,6 +11217,69 @@ esac
     # fails must never keep sessions from starting.
     mkdir -p "$HOME"/worktrees 2>/dev/null || :
 
+    # Seed nix's nixpkgs git cache from the image, when the image carries one
+    # (issue #669). A box's FIRST harness install spends ~25s of its ~36s turning
+    # the pinned nixpkgs tarball into git objects under
+    # ~/.cache/nix/tarball-cache-v2, before nix has read a line of any package
+    # definition: 54,075 blobs SHA-1'd and deflated, CPU-bound, on every box. That
+    # work is byte-identical everywhere and is the SAME revision for every harness
+    # (agent_install resolves them all against $AGENT_BOX_NIXPKGS), so an image can
+    # carry it once for ~72 MiB and every user's first install of every tool skips
+    # it. Measured on a 2-vCPU aarch64 box: 36.0s -> 10.6s.
+    #
+    # Both halves or neither: the packfiles are the objects, and the 124 KiB
+    # fetcher-cache sqlite is the URL -> treeHash map. Packs alone leave nix unable
+    # to learn the tree hash without redoing the ingest (23.7s, i.e. no saving).
+    #
+    # cp -al, so the packfiles are HARDLINKED rather than copied. They are
+    # immutable and mode 0444, so every user's cache points at one set of inodes
+    # and a second user costs no disk. git alternates would be the obvious
+    # mechanism for that and does NOT work: nix's libgit2 path ignores
+    # objects/info/alternates and re-ingests from scratch. The sqlite is mutable,
+    # so that one is a real copy. Across a filesystem boundary (a deployment that
+    # splits /var from /home) the hardlink fails and a plain copy stands in.
+    #
+    # Staged under a temp name and renamed, so a seed interrupted halfway cannot
+    # leave a PARTIAL cache behind that the -d guard would then treat as seeded.
+    #
+    # Inert on a box whose image carries no seed, which is every box today, so
+    # there is nothing to migrate. A user who already has a cache keeps it,
+    # including one holding a nixpkgs NEWER than the image's. Best effort, like
+    # the mkdir above: a seed that fails just means the first install pays what it
+    # pays today.
+    _abs_seed="''${AGENT_BOX_NIXPKGS_CACHE_SEED:-/var/lib/agent-box/nixpkgs-cache}"
+    if [ -d "$_abs_seed/tarball-cache-v2" ] &&
+       [ ! -d "$HOME/.cache/nix/tarball-cache-v2" ] &&
+       mkdir -p "$HOME"/.cache/nix 2>/dev/null; then
+      _abs_tmp="$HOME/.cache/nix/.tarball-cache-v2.seeding.$$"
+      _abs_sqlite_tmp="$HOME/.cache/nix/.fetcher-cache-v4.sqlite.seeding.$$"
+      rm -rf "$_abs_tmp" "$_abs_sqlite_tmp" 2>/dev/null || :
+      # Stage the sqlite BEFORE the packfiles: a target dir a fallback cp lands
+      # in already exists (it was created, then partly populated, by the failed
+      # cp -al before it), so cp -a copies INTO it as a nested tarball-cache-v2/
+      # rather than populating it directly - clear it between attempts. And
+      # publish the sqlite BEFORE tarball-cache-v2, not after: the -d guard above
+      # is keyed on tarball-cache-v2 alone, so it is the one file that must land
+      # LAST. Publishing it first would let a kill between the two mv's (a spot
+      # interruption, an OOM kill) leave the guard satisfied with no sqlite ever
+      # written - stuck there forever, since a later boot would see the directory
+      # and skip seeding for good. Publishing the sqlite first and the directory
+      # last means the same interruption instead leaves the guard UNsatisfied, so
+      # the next boot retries the whole seed - `mv -n` no-ops harmlessly on the
+      # sqlite that retry finds already in place.
+      if cp -an "$_abs_seed"/fetcher-cache-v4.sqlite "$_abs_sqlite_tmp" 2>/dev/null &&
+         { cp -al "$_abs_seed"/tarball-cache-v2 "$_abs_tmp" 2>/dev/null ||
+           { rm -rf "$_abs_tmp" 2>/dev/null
+             cp -a "$_abs_seed"/tarball-cache-v2 "$_abs_tmp" 2>/dev/null; }; }; then
+        if mv -n "$_abs_sqlite_tmp" "$HOME"/.cache/nix/fetcher-cache-v4.sqlite 2>/dev/null; then
+          mv -Tn "$_abs_tmp" "$HOME"/.cache/nix/tarball-cache-v2 2>/dev/null || :
+        fi
+      fi
+      rm -rf "$_abs_tmp" "$_abs_sqlite_tmp" 2>/dev/null || :
+      unset _abs_tmp _abs_sqlite_tmp
+    fi
+    unset _abs_seed
+
     # Prepopulated agent profiles (issue #493). "Add session" is profile-first,
     # so a box whose profile list is empty offers nothing to start with. The
     # work is `agent-box-profile seed`, not a loop here: that CLI already knows
