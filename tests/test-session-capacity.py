@@ -37,6 +37,29 @@ class Policy(unittest.TestCase):
         with self.assertRaises(capacity.SessionCapacityError):
             capacity.capacity_check(sessions, ["new"], live={"stopped"}, limit=1)
 
+    def test_died_never_holds_a_slot_even_with_its_pane_still_up(self):
+        # A crash is flagged `died`, not `stopped` (issue #516), so its pane
+        # lingers as a post-mortem shell tmux still reports, and its entry
+        # never gets `stopped` either -- before this fix that meant a died
+        # session held its slot for good (issue #523), unlike a stopped one
+        # which frees its slot once the pane actually exits.
+        sessions = {"crashed": {"died": 1}}
+        capacity.capacity_check(sessions, ["new"], live=set(), limit=1)
+        capacity.capacity_check(sessions, ["new"], live={"crashed"}, limit=1)
+
+    def test_died_entry_remains_its_own_revival_candidate(self):
+        # A died entry must still admit ITSELF: the supervisor's own spawn
+        # decision for the name being revived has to see it in `pending`, or
+        # `agent-box-session restart` on a died session can never re-admit it
+        # to clear the stale flag -- a real deadlock hit in CI (issue #523):
+        # excluding a died name from `pending` too, not just from counting
+        # against everyone else, made `agent-box-session restart` on a died
+        # session hang forever, because the one name being spawned was never
+        # a candidate for its own slot.
+        sessions = {"revived": {"died": 99}}
+        capacity.capacity_check(sessions, ["revived"], spawning=True,
+                                live=set(), limit=1)
+
     def test_restart_does_not_need_a_second_slot(self):
         capacity.capacity_check({"a": {}, "b": {}}, ["a"], live={"a"}, limit=1)
 

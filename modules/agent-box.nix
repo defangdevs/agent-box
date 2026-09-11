@@ -2045,10 +2045,22 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
         raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
     pending = {name for name, entry in sessions.items()
                if isinstance(entry, dict) and entry.get("stopped") is not True}
-    used = live | pending
+    # A crash is flagged `died`, not `stopped` (issue #516), so a died entry
+    # stays in `pending` -- it must remain its own candidate for revival by
+    # `agent-box-session restart`, or a stale flag on a session that already
+    # respawned fine (a race the pane epilogue and the supervisor both write
+    # `died`/`stopped` into) can never be admitted again to clear it. But its
+    # pane is a post-mortem shell doing no real work, so unlike a genuinely
+    # running session it must not cost anyone ELSE a slot: before this fix a
+    # died session's pane counted as real, running capacity forever, and
+    # enough of them stalled every OTHER pending session too, with nothing to
+    # clear it but `agent-box-session rm` (issue #523).
+    died = {name for name, entry in sessions.items()
+            if isinstance(entry, dict) and entry.get("died") is not None}
+    used = (live | pending) - died
     targets = set(targets)
     if spawning:
-        available = max(0, limit - len(live))
+        available = max(0, limit - len(live - died))
         admitted = live | set(sorted(pending - live)[:available])
         allowed = targets <= admitted
     else:
@@ -2127,10 +2139,22 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
         raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
     pending = {name for name, entry in sessions.items()
                if isinstance(entry, dict) and entry.get("stopped") is not True}
-    used = live | pending
+    # A crash is flagged `died`, not `stopped` (issue #516), so a died entry
+    # stays in `pending` -- it must remain its own candidate for revival by
+    # `agent-box-session restart`, or a stale flag on a session that already
+    # respawned fine (a race the pane epilogue and the supervisor both write
+    # `died`/`stopped` into) can never be admitted again to clear it. But its
+    # pane is a post-mortem shell doing no real work, so unlike a genuinely
+    # running session it must not cost anyone ELSE a slot: before this fix a
+    # died session's pane counted as real, running capacity forever, and
+    # enough of them stalled every OTHER pending session too, with nothing to
+    # clear it but `agent-box-session rm` (issue #523).
+    died = {name for name, entry in sessions.items()
+            if isinstance(entry, dict) and entry.get("died") is not None}
+    used = (live | pending) - died
     targets = set(targets)
     if spawning:
-        available = max(0, limit - len(live))
+        available = max(0, limit - len(live - died))
         admitted = live | set(sorted(pending - live)[:available])
         allowed = targets <= admitted
     else:
