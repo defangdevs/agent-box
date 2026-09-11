@@ -373,7 +373,7 @@ in
         # claude's rc is a flag on the ordinary worker session, so the one
         # auto-created session is both usable AND remote-visible.
         assert claude_session["remoteControl"] is True, claude_session
-        assert claude_session["profile"] is None, claude_session
+        assert claude_session["profile"] == "claude", claude_session
 
     with subtest("the card shows the code the CLI printed, not its prose"):
         assert post("/agent/settings/connect/start", "flow=github") == "303"
