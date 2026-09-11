@@ -325,6 +325,69 @@ class RenderTest(unittest.TestCase):
             self.assertEqual("my-box", spec.host_label)
             self.assertEqual("203-0-113-7.sslip.io", spec.domain)
 
+    def test_first_boot_honors_a_custom_domain_suffix(self):
+        """domainSuffix (issue #647) whitelabels a self-hosted sslip.io.
+
+        The dashed-IP encoding is unchanged; only the literal ".sslip.io"
+        this used to hard-code is now the configured suffix.
+        """
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps(
+                {"domain": "auto", "domainSuffix": "sslip.example.com",
+                 "users": {"agent": {}}}))
+            spec = mod.Spec(json.loads(cfg.read_text()), prof)
+            args = type("A", (), {"settle_delay": 0, "config": str(cfg)})()
+            orig = mod.settle_public_ip
+            mod.settle_public_ip = lambda **k: "203.0.113.7"
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mod.first_boot(spec, args)
+            finally:
+                mod.settle_public_ip = orig
+            self.assertEqual("203-0-113-7.sslip.example.com", spec.domain)
+            self.assertEqual(spec.domain, spec.host_label,
+                             "a derived label must move with the domain")
+            self.assertEqual("203-0-113-7.sslip.example.com",
+                             json.loads(cfg.read_text())["domain"])
+
+    def test_domain_suffix_defaults_to_sslip_io(self):
+        """No domainSuffix in config.yaml must behave exactly as before."""
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec = mod.Spec({"domain": "auto", "users": {"agent": {}}}, prof)
+            self.assertEqual("sslip.io", spec.domain_suffix)
+
+    def test_domain_suffix_rejects_a_malformed_suffix(self):
+        """A domainSuffix that is not a DNS suffix must fail BOX_SCHEMA.
+
+        Otherwise it reaches first_boot() unvalidated, gets appended to the
+        dashed public IP, and lands in the Caddyfile - "not a domain" becomes
+        multiple Caddy site addresses instead of a config-time error.
+        """
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            for bad in ("not a domain", "-leading-hyphen.example.com",
+                        "no-dot-at-all", "trailing-dot.example.com."):
+                with self.assertRaises(mod.ConfigError, msg=repr(bad)):
+                    mod.Spec({"domain": "auto", "domainSuffix": bad,
+                              "users": {"agent": {}}}, prof)
+
+    def test_domain_suffix_accepts_empty_string(self):
+        """Empty is not malformed - Spec's own fallback already treats it as
+        absent (see test_domain_suffix_defaults_to_sslip_io)."""
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            spec = mod.Spec(
+                {"domain": "auto", "domainSuffix": "",
+                 "users": {"agent": {}}}, prof)
+            self.assertEqual("sslip.io", spec.domain_suffix)
+
     def test_rejects_bad_config(self):
         cases = [
             ({"users": {}}, "at least one user"),
@@ -333,6 +396,8 @@ class RenderTest(unittest.TestCase):
             ({"users": {"a": {"root": True}, "b": {"root": True}}},
              "at most one user"),
             ({"users": {"Bad Name": {}}}, "invalid user name"),
+            ({"domainSuffix": "not a domain", "users": {"a": {}}},
+             "must be empty/null or a DNS suffix"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)

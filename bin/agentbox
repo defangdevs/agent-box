@@ -248,6 +248,15 @@ SOURCE_TIMEOUT = 900
 # still say which repo it came from (the settings page links the commit).
 GITHUB_REMOTE_RE = re.compile(
     r"^(?:https://github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?$")
+# domainSuffix (issue #647): the same shape the AWS template's DomainSuffix
+# parameter already enforces with its AllowedPattern
+# (deploy/aws/template.yaml). A value outside this is appended to the dashed
+# public IP in first_boot() and lands straight in the Caddyfile - "not a
+# domain" becomes multiple Caddy site addresses, and other malformed values
+# can make `caddy validate` fail and the box's first boot exit nonzero.
+DOMAIN_SUFFIX_RE = re.compile(
+    r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$")
 
 
 class ConfigError(Exception):
@@ -517,6 +526,13 @@ def _is_port(v):
 BOOL = _Scalar("true, false or null", lambda v: isinstance(v, bool))
 STR = _Scalar("a string", _is_str)
 PORT = _Scalar("a TCP port (1-65535)", _is_port)
+# Empty string is accepted alongside a real match: Spec's `or "sslip.io"`
+# fallback (see domain_suffix below) already treats "" the same as absent,
+# so an empty domainSuffix is not malformed - only a nonempty non-DNS-suffix
+# value is.
+DOMAIN_SUFFIX = _Scalar(
+    "empty/null or a DNS suffix (e.g. sslip.example.com)",
+    lambda v: v == "" or bool(DOMAIN_SUFFIX_RE.match(v)))
 STR_LIST = _Scalar("a list of strings",
                    lambda v: isinstance(v, list) and all(map(_is_str, v)))
 # osUpdates.automaticReboot is `false` or an "HH:MM" time. WHICH strings are
@@ -638,6 +654,13 @@ USER_SCHEMA = _Obj({
 BOX_SCHEMA = _Obj({
     "schemaVersion": SCHEMA_VERSION,
     "domain": STR,
+    # Only consulted when `domain` is being auto-derived from the public IP
+    # (issue #647): the suffix appended to the dashed address, so a
+    # self-hosted sslip.io-compatible resolver (github.com/cunnie/sslip.io)
+    # under a whitelabel domain can stand in for the public sslip.io. Never
+    # reaches the renderer - first_boot() consumes it and resolves `domain`
+    # to a concrete value before Spec is ever handed to Renderer.
+    "domainSuffix": DOMAIN_SUFFIX,
     "hostLabel": STR,
     "agents": STR_LIST,
     "defaultAgent": STR,
@@ -705,6 +728,11 @@ class Spec:
         validate_config(data)
         self.profile = profile
         self.domain = data.get("domain") or ""
+        # Default matches the literal that used to be baked into first_boot()
+        # (issue #647): an unset domainSuffix derives exactly the sslip.io
+        # hostname a box always has, so this is additive, not a behavior
+        # change for anyone who never sets it.
+        self.domain_suffix = data.get("domainSuffix") or "sslip.io"
         self.host_label = data.get("hostLabel") or self.domain or "agent-box"
         # Whether the label was pinned in config, or fell back to the domain
         # above. first_boot resolves an "auto"/"" domain AFTER the spec is
@@ -5193,9 +5221,9 @@ def first_boot(spec, args):
     native templates (and a hand-provisioned box) get the same behavior,
     and so it is testable.
     """
-    if spec.domain in ("", "auto", "sslip.io"):
+    if spec.domain in ("", "auto", spec.domain_suffix):
         ip = settle_public_ip(initial=args.settle_delay)
-        spec.domain = ip.replace(".", "-") + ".sslip.io"
+        spec.domain = ip.replace(".", "-") + "." + spec.domain_suffix
         if spec.host_label_from_domain:
             spec.host_label = spec.domain
         print(f"derived domain {spec.domain} from {ip}")
