@@ -20,7 +20,7 @@ Metadata:
         Parameters:
           - Agent
           - UserName
-          - WebPassword
+          - WebPasswordHash
       - Label:
           default: Portal handover (optional - leave blank for password-only)
         Parameters:
@@ -49,8 +49,8 @@ Metadata:
         default: Agent CLI
       UserName:
         default: Linux user the agent runs as
-      WebPassword:
-        default: Web terminal password (16-64 chars - save it, AWS masks it)
+      WebPasswordHash:
+        default: Web terminal password hash (paste the value the launch page generated)
       BundleId:
         default: Lightsail bundle (size / price)
       AgentsMd:
@@ -111,16 +111,27 @@ Parameters:
       claim, and where the box fetches the portal's published signing keys
       (<issuer>/.well-known/jwks.json). Blank (the default) disables portal
       handover entirely.
-  WebPassword:
+  WebPasswordHash:
     Type: String
     NoEcho: true
-    MinLength: 16
-    MaxLength: 64
-    AllowedPattern: '[A-Za-z0-9._~-]{16,64}'
+    MinLength: 40
+    MaxLength: 200
+    # A Caddy-compatible argon2id PHC hash string ($argon2id$v=..$m=..,t=..,
+    # p=..$<salt>$<hash>, both base64 without padding), never the plaintext
+    # password itself (issue #25). The launch page generates a high-entropy
+    # password and hashes it in your browser before this field is ever
+    # filled in - previously the plaintext rode along in this instance's own
+    # launch script, readable by anyone holding lightsail:GetInstance on this
+    # account. Launching by hand? Compute one with
+    # `caddy hash-password --algorithm argon2id` and paste its output here.
+    AllowedPattern: ^\$argon2id\$v=[0-9]+\$m=[0-9]+,t=[0-9]+,p=[0-9]+\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+$
     Description: >-
-      Password for the browser terminal (16-64 chars of A-Z a-z 0-9 . _ ~ -).
-      Hashed with argon2id on first boot; the plaintext is never written to
-      disk. Change it later from the box's own settings page.
+      Argon2id hash of the browser terminal password, generated in your
+      browser by the launch page (never the plaintext password itself - see
+      the note above the launch buttons). This hash is what the box's Caddy
+      checks logins against directly; save the PLAINTEXT password the launch
+      page showed you, because there is no way to recover it from this hash.
+      Change it later from the box's own settings page.
 
   Agent:
     Type: String
@@ -386,21 +397,23 @@ Resources:
             ${AgentsMd}
             AGENTBOX_AGENTSMD
 
-            # Render and start everything. The password reaches the renderer
-            # through the environment and is hashed with argon2id, so it is
-            # never written to the box's disk in the clear. It IS part of the
-            # instance's launch script, though, which anyone holding
-            # lightsail:GetInstance on this account can read - same exposure
-            # as the infect template had, and the reason the settings page
-            # can change the password afterwards.
-            # set +x for this one command: the trace this script runs under
-            # writes every expanded word to /var/log/agent-box-bootstrap.log,
-            # so leaving it on put the plaintext password in a world-readable
-            # log on the box - which is precisely what "never written to disk"
-            # was supposed to mean.
+            # Render and start everything. WebPasswordHash already IS the
+            # argon2id hash (issue #25), so there is no plaintext password
+            # here to protect - only the hash rides in this instance's own
+            # launch script, which anyone holding lightsail:GetInstance on
+            # this account can read, and a hash reveals nothing a stolen
+            # login attempt could not already try. It arrives base64-wrapped
+            # so its '$' and '/' characters survive Fn::Sub and this
+            # unquoted assignment as inert bytes rather than shell syntax.
+            # set +x for this one command anyway: the trace this script runs
+            # under writes every expanded word to
+            # /var/log/agent-box-bootstrap.log, and there is no reason to
+            # put even a hash in a world-readable log when set +x is free.
             set +x
-            AGENT_BOX_WEB_PASSWORD=${WebPasswordPlain} \
+            web_password_hash="$(printf '%s' '${WebPasswordHashBase64}' | base64 -d)"
+            AGENT_BOX_WEB_PASSWORD_HASH="$web_password_hash" \
               "$AGENTBOX" apply --first-boot --settle-delay 60
+            unset web_password_hash
             set -x
 
             # Only now, with the box actually configured and the units up,
@@ -408,7 +421,8 @@ Resources:
             # non-zero above (set -e), leaves the handle unsignalled, and the
             # stack rolls back instead of reporting a box that does not work.
             "$AGENTBOX" signal "${FirstBootHandle}"
-          - WebPasswordPlain: !Ref WebPassword
+          - WebPasswordHashBase64:
+              Fn::Base64: !Ref WebPasswordHash
             PortalUserPlain: !Ref PortalUser
             PortalIssuerPlain: !Ref PortalIssuer
             FirstBootHandle: !Ref FirstBootHandle
@@ -440,8 +454,10 @@ Resources:
 Outputs:
   WebURL:
     Description: >-
-      Browser terminal. Sign in with the UserName and the WebPassword chosen
-      at deployment time. The first load waits on Caddy's ACME certificate.
+      Browser terminal. Sign in with the UserName and the password the launch
+      page showed you at deployment time (WebPasswordHash carries only its
+      hash, never the plaintext - issue #25). The first load waits on Caddy's
+      ACME certificate.
       (The URL deliberately carries no user@ prefix: Chrome answers the auth
       challenge with URL userinfo plus an EMPTY password, and credentials
       typed into the prompt cannot override the URL-embedded identity.)

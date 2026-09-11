@@ -7,8 +7,10 @@ on:
       - 'deploy/aws/template.yaml'
       - 'deploy/aws/lightsail-template.yaml'
       - 'docs/index.html'
+      - 'docs/vendor/**'
       - 'scripts/ws_smoke.py'
       - 'scripts/check_lightsail_userdata.py'
+      - 'scripts/check_docs_vendor.py'
       - 'bin/agentbox'
       - 'tests/test_agentbox.py'
       - 'tests/native/**'
@@ -57,3 +59,10 @@ jobs:
 
       - name: Compile WebSocket smoke helper
         run: python3 -m py_compile scripts/ws_smoke.py
+
+      # docs/vendor's own integrity check (issue #25) - scripts/check_vendor.py
+      # only ever looks under modules/src/vendor, so a hand-edit or a
+      # corrupted re-vendor of the argon2id hashing library the launch page
+      # loads would otherwise ship to the public site with nothing to catch it.
+      - name: Check docs/vendor pins
+        run: python3 scripts/check_docs_vendor.py

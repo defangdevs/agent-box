@@ -37,12 +37,63 @@ handle /@USER@/settings* {
     }
   }
 }
-# @USER@'s file drop (issue #132): a browsable static index of
-# ~/downloads, served from the caddy-readable /var/lib backing dir
-# (caddy.service can't read /home). Same cookie-or-basic auth as the
-# terminal, and MORE specific than /@USER@/* below so Caddy routes it
-# here first. The agent hands the user a @USER@/downloads/<file> URL.
+# @USER@'s file drop (issue #132): a browsable index of ~/downloads.
+# Same cookie-or-basic auth as the terminal, and MORE specific than
+# /@USER@/* below so Caddy routes it here first. The agent hands the user
+# a @USER@/downloads/<file> URL.
+#
+# Served by @USER@'s own settings daemon over its user+caddy-only unix
+# socket, NOT by `root` + `file_server` here (issue #630). A site root is
+# not a filesystem sandbox -- caddy documents that symlinks escape it --
+# and this caddy reads every user's drop through its own group, so a
+# symlink an agent left in its own drop was followed under that shared
+# identity and returned a sibling user's file to a request authenticated
+# as the agent. The daemon runs as the ONE user whose drop it is and
+# resolves each component with O_NOFOLLOW from the fd above it, so there
+# is no path for a swapped symlink to be re-resolved through.
 redir /@USER@/downloads /@USER@/downloads/
+# Everything under the file drop is handed to the browser as an ATTACHMENT
+# and under a maximally restrictive sandbox (issue #631). ~/downloads holds
+# whatever an agent put there -- a generated report, a build artifact, a file
+# pulled out of somebody else's repository -- and it is served from the SAME
+# origin as the settings page and the terminals. Served inline, one hostile
+# .html or .svg is same-origin privileged JavaScript: HttpOnly stops a script
+# READING the auth cookie but not SENDING it, and SameSite and the daemon's
+# CSRF guard both see a same-origin request, so neither one fires.
+#
+# `Content-Disposition: attachment` means the browser saves the file instead
+# of rendering a document from it, which is what actually closes the hole;
+# the `sandbox` CSP (no allow-* tokens at all: opaque origin, no scripts, no
+# forms, no navigation) is the defense in depth for anything that reaches a
+# document context anyway. `X-Content-Type-Options: nosniff` is already set
+# vhost-wide by the header fragment.
+#
+# The directory listing is EXEMPT, because it is the daemon's own generated
+# page and the point of the route: a listing is the one path that ends in
+# `/`, so `not path */` is the whole distinction -- and nothing
+# attacker-supplied may occupy that shape. Since issue #630 moved the drop
+# to the daemon, nothing can: the daemon renders every directory itself and
+# never looks for an index.html (so the `index off` this comment used to
+# rely on has no subject left), and it answers 404 for a FILE reached at a
+# path ending in `/`, which would otherwise be a file served past this
+# matcher.
+@dl_file_@USER@ {
+  path /@USER@/downloads/*
+  not path */
+}
+header @dl_file_@USER@ {
+  Content-Disposition "attachment"
+  Content-Security-Policy "sandbox; frame-ancestors 'none'"
+  # `defer` is load-bearing, not a detail. Caddy sorts same-directive
+  # routes by path specificity, so this matched `header` runs BEFORE the
+  # vhost-wide one in the header fragment -- and a static `header` writes
+  # its value the moment it runs, which means the vhost-wide
+  # `frame-ancestors 'self'` would land on top of this sandbox and undo
+  # it. Deferring makes these ops apply when the response is written,
+  # which is after both the vhost-wide header and the upstream response
+  # the proxy below carries back.
+  defer
+}
 handle /@USER@/downloads/* {
   # A live portal session (issue #541) reaches this exactly as a
   # basic-auth login does. forward_auth is stock caddy -- part of
@@ -56,16 +107,12 @@ handle /@USER@/downloads/* {
       forward_auth unix/@SETTINGS_SOCKET@ {
         uri /@USER@/auth/verify
       }
-      uri strip_prefix /@USER@/downloads
-      root * @DOWNLOADS_DIR@
-      file_server browse
+      reverse_proxy unix/@SETTINGS_SOCKET@
     }
   }
   @cookie_dl_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
   handle @cookie_dl_@USER@ {
-    uri strip_prefix /@USER@/downloads
-    root * @DOWNLOADS_DIR@
-    file_server browse
+    reverse_proxy unix/@SETTINGS_SOCKET@
   }
   handle {
     route {
@@ -73,9 +120,7 @@ handle /@USER@/downloads/* {
         @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
       }
       header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-      uri strip_prefix /@USER@/downloads
-      root * @DOWNLOADS_DIR@
-      file_server browse
+      reverse_proxy unix/@SETTINGS_SOCKET@
     }
   }
 }
@@ -119,6 +164,14 @@ handle @home_@USER@ {
     }
   }
 }
+# ttyd's upstream is a UNIX socket, not 127.0.0.1:<port> (issue #628): a
+# loopback port is reachable by every local user, and ttyd runs --writable
+# with no credential of its own, so the authentication above was the only
+# thing standing between another user on this box and this user's terminal
+# -- and it stood in front of the public URL, not in front of the port.
+# 0660 @USER@:caddy, in a 0750 @USER@:caddy directory. Same model as the
+# settings socket above.
+#
 # One path per session: /@USER@/<session>/ is that session's terminal, and
 # everything ttyd asks for from a page loaded there (its ws and token
 # endpoints, resolved relative to the URL in the address bar) hangs off the
@@ -154,12 +207,12 @@ handle /@USER@/* {
       forward_auth unix/@SETTINGS_SOCKET@ {
         uri /@USER@/auth/verify
       }
-      reverse_proxy 127.0.0.1:@TTYD_PORT@
+      reverse_proxy unix/@TTYD_SOCKET@
     }
   }
   @cookie_@USER@ header_regexp Cookie "(^|; )__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}(;|$)"
   handle @cookie_@USER@ {
-    reverse_proxy 127.0.0.1:@TTYD_PORT@
+    reverse_proxy unix/@TTYD_SOCKET@
   }
   handle {
     route {
@@ -167,7 +220,7 @@ handle /@USER@/* {
         @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
       }
       header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-      reverse_proxy 127.0.0.1:@TTYD_PORT@
+      reverse_proxy unix/@TTYD_SOCKET@
     }
   }
 }

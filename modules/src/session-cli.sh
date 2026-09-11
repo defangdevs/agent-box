@@ -8,6 +8,15 @@ JQ=jq
 # is one of five writers, and the lock it takes has to be the same lock the
 # supervisor, the pane epilogue, the webhook spawner and the settings daemon
 # take, or it is not a lock.
+#
+# A lock it cannot take refuses the verb outright and writes nothing (issue
+# #633). Under the `set -e` above that needs no ceremony at any call site:
+# registry_ensure, registry_lock and registry_edit all return
+# REGISTRY_BUSY_RC (75, EX_TEMPFAIL), so the CLI exits 75 with the library's
+# own reason on stderr. That is the code a caller can retry on, and it is
+# distinct from 2 (a usage error) and 1 (a write that will not work next
+# time either) -- agent-box-webhook-spawn execs into this CLI and hands 75
+# straight back to its dispatcher, which re-offers the batch.
 REGISTRY_PROG=agent-box-session
 @@include:lib/registry.sh@@
 @@include:lib/lease.sh@@

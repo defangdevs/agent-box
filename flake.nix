@@ -381,11 +381,23 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               unitDir = ./modules/src/units;
               templates = builtins.filter (n: nixpkgs.lib.hasSuffix "@.service" n)
                 (builtins.attrNames (builtins.readDir unitDir));
+              # DIRECTIVES only, never comments (issue #628): a comment is
+              # allowed to name another unit as a precedent, and
+              # agent-web-terminal@.service now names
+              # agent-box-settings@.socket as exactly that - which is not a
+              # socket-activation relation, and flagged this template as an
+              # offender it can never satisfy. A `#` line, leading whitespace
+              # allowed, is not configuration.
+              directives = n:
+                nixpkgs.lib.concatStringsSep "\n" (builtins.filter
+                  (l: builtins.match "[[:space:]]*#.*" l == null)
+                  (nixpkgs.lib.splitString "\n"
+                    (builtins.readFile (unitDir + "/${n}"))));
               # Either direction counts: Requires= is what makes the socket
               # start the daemon, After= alone still means the socket outlives
               # the service's stop and can re-activate it.
               activated = builtins.filter
-                (n: nixpkgs.lib.hasInfix ".socket" (builtins.readFile (unitDir + "/${n}")))
+                (n: nixpkgs.lib.hasInfix ".socket" (directives n))
                 templates;
               svc = webBaseline.config.systemd.services;
               # "agent-box-settings@.service" -> the baseline's own instance.
@@ -488,6 +500,17 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # authenticated downloads route for a web user — the handle, the
           # strip_prefix, and file_server rooted at the caddy-readable backing
           # dir. Cheap: realises only the tiny rendered config + a grep.
+          #
+          # Since issue #631 it also guards the ORIGIN ISOLATION of that
+          # route: ~/downloads holds whatever an agent put there, it is
+          # served from the same origin as the settings page and the
+          # terminals, and served inline one hostile .html or .svg is
+          # same-origin privileged JavaScript. So the generated Caddyfile
+          # must hand those files over as attachments under a `sandbox` CSP,
+          # must NOT let an attacker-supplied index.html stand in for the
+          # listing (`index off`), and must carry the vhost-wide
+          # `frame-ancestors 'self'` that keeps a management page framable
+          # only by this box itself.
           download-route =
             let
               sys = nixpkgs.lib.nixosSystem {
@@ -514,10 +537,53 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             pkgs.runCommand "agent-box-download-route-ok"
               { caddyfile = sys.config.services.caddy.configFile; } ''
               grep -qF 'handle /agent/downloads/*' "$caddyfile"
-              grep -qF 'uri strip_prefix /agent/downloads' "$caddyfile"
-              grep -qF 'root * /var/lib/agent-box-downloads/agent' "$caddyfile"
-              grep -qF 'file_server browse' "$caddyfile"
-              printf 'downloads route present in generated Caddyfile\n' > "$out"
+              # The drop reaches the per-user daemon, and caddy does NOT
+              # open the tree itself (issue #630): a site root is not a
+              # filesystem sandbox, and this caddy can read every user's
+              # drop, so a `file_server` here follows an agent's symlink
+              # into a sibling's files under one shared identity. The
+              # daemon runs as the one user whose drop it is. Asserted as
+              # an absence as well as a presence, because the regression
+              # is silent: the route keeps working, it just stops being
+              # confined.
+              grep -qF 'reverse_proxy unix//run/agent-box-settings/agent.sock' "$caddyfile"
+              # Comments stripped first: `file_server` is NAMED in the
+              # header fragment's prose (and in the downloads comments
+              # themselves), so a whole-file grep would fail on the
+              # explanation of the rule it is checking.
+              directives=$(grep -v '^[[:space:]]*#' "$caddyfile")
+              for pattern in 'file_server' 'root \* /var/lib/agent-box-downloads' \
+                             'uri strip_prefix /agent/downloads'; do
+                if printf '%s\n' "$directives" | grep -q "$pattern"; then
+                  echo "downloads must not be served from the filesystem by caddy:" >&2
+                  printf '%s\n' "$directives" | grep -n "$pattern" >&2
+                  exit 1
+                fi
+              done
+              # Origin isolation (issue #631): the artifacts go out as
+              # attachments under a sandbox CSP ...
+              grep -qF "Content-Disposition \"attachment\"" "$caddyfile"
+              grep -qF \
+                "Content-Security-Policy \"sandbox; frame-ancestors 'none'\"" \
+                "$caddyfile"
+              # ... deferred, or the vhost-wide header would overwrite it:
+              # caddy sorts same-directive routes by path specificity, so the
+              # matched header runs BEFORE the unmatched one and a static set
+              # would lose.
+              grep -qE '^ *defer$' "$caddyfile"
+              # ... and only for FILES, so the listing still renders. The
+              # `index off` that used to keep that exemption safe is gone
+              # with the file_server it configured: since #630 the daemon
+              # renders every listing itself, never looks for an
+              # index.html, and 404s a FILE reached at a path ending in
+              # "/" -- so nothing attacker-supplied can occupy the one
+              # shape this matcher exempts.
+              grep -qF 'not path */' "$caddyfile"
+              # ... and a management page is framable only by this box.
+              grep -qF \
+                "Content-Security-Policy \"frame-ancestors 'self'\"" \
+                "$caddyfile"
+              printf 'downloads route present, served by the daemon, and isolated\n' > "$out"
             '';
 
           # Guard: the module's REAL generated Caddyfile (every VM test swaps
@@ -578,6 +644,28 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               catchall=$(grep -n 'handle /agent/\* {' "$caddyfile" | cut -d: -f1)
               [ "$home" -lt "$catchall" ]
               [ "$rw" -lt "$catchall" ]
+              # The terminal upstream is that user's UNIX socket, never a
+              # loopback port (issue #628): a port is reachable by every
+              # local user, and ttyd runs --writable with no credential of
+              # its own, so the auth in front of the public URL was all that
+              # stood between two users on one box. Both spellings are
+              # asserted -- the socket present AND no `127.0.0.1:` upstream
+              # anywhere in the file -- because a half-converted Caddyfile
+              # (one of the three auth branches left on the port) would pass
+              # a check that only looked for the socket.
+              grep -qF 'reverse_proxy unix//run/agent-box-ttyd/agent/ttyd.sock' "$caddyfile"
+              grep -qF 'reverse_proxy unix//run/agent-box-ttyd/bob/ttyd.sock' "$caddyfile"
+              [ "$(grep -c 'reverse_proxy unix//run/agent-box-ttyd/' "$caddyfile")" = 6 ]
+              # Anchored at the start of a DIRECTIVE, so the header
+              # fragment's self-serve vhost example -- a comment that
+              # reverse-proxies to 127.0.0.1:3000 -- does not count. Telling
+              # an agent to proxy their own app to a localhost port is still
+              # exactly right; it is only a TERMINAL that must not be
+              # reachable that way.
+              if grep -Eq '^[[:space:]]*reverse_proxy[[:space:]]+127\.0\.0\.1:' "$caddyfile"; then
+                echo "a terminal is still proxied over a loopback port" >&2
+                exit 1
+              fi
               # And it all parses. The secrets are Caddy env placeholders,
               # absent in a build sandbox: stand-ins keep basic_auth happy.
               # One set PER USER — an unset algorithm placeholder collapses to
@@ -1837,6 +1925,31 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The two machine-readable reads a portal drives this daemon
+          # through (issue #642): the env store's key NAMES and every
+          # connect card in one answer. Same shape and same subject as
+          # connect-card above — the GOLDEN PAYLOAD, the daemon as it
+          # actually ships — but driven over HTTP against its own request
+          # handler, because what is under test is the route table.
+          settings-json =
+            pkgs.runCommand "agent-box-settings-json"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-settings-json.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-settings-json.py
+              python3 repo/tests/test-settings-json.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # connect_start()'s install half: resolving nix at use, and
           # letting a failed install reach the exit marker (issue #544).
           # Same shape and same subject as connect-card above - the GOLDEN
@@ -1853,6 +1966,36 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
               cp "$tests" repo/tests/test-connect-install.py
               python3 repo/tests/test-connect-install.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # The file drop's path confinement (issue #630). Same shape and
+          # same subject as webhook-panel-state, profile-panel and
+          # connect-card above: the GOLDEN PAYLOAD, which is the daemon as
+          # it actually ships. What it pins is a property no static
+          # assertion can state -- that a symlink swapped in mid-request
+          # cannot redirect a download -- so the last test drives the real
+          # handler over loopback while a thread rename()s the requested
+          # name between an in-drop file and a link out of it. A
+          # realpath()-then-open() resolver passes every other test in the
+          # file and fails that one, which is the whole reason the drop
+          # resolves with fds instead.
+          downloads-confine =
+            pkgs.runCommand "agent-box-downloads-confine"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-downloads.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-downloads.py
+              python3 repo/tests/test-downloads.py > log 2>&1 || {
                 cat log
                 exit 1
               }
@@ -2013,6 +2156,18 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # the same box.
           sessions-web = pkgs.testers.runNixOSTest
             (import ./tests/sessions-web.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue #628): the browser terminal's
+          # transport belongs to its own user and the proxy in front of it.
+          # Two real linux users in one guest, because the user boundary is
+          # the only boundary this deployment has: nothing listens on TCP,
+          # the unix socket is 0660 <user>:caddy inside a 2750 <user>:caddy
+          # directory, the second user is refused by the kernel and by the
+          # auth gate, the owner still attaches, TYPES, reconnects and
+          # starts a stopped session, and cross-origin (and origin-less)
+          # WebSockets are refused by ttyd's --check-origin.
+          ttyd-isolation = pkgs.testers.runNixOSTest
+            (import ./tests/ttyd-isolation.nix { agent-box = self.nixosModules.agent-box; });
 
           # Interactive VM test (issue #101): the per-user webhook receiver, ON
           # BY DEFAULT. Socket-activated 0660 <user>:caddy ingress, the

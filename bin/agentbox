@@ -57,9 +57,19 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
-# ttyd ports are assigned in sorted user order, exactly as the module does,
-# so a user added later cannot renumber an existing user's port.
-TTYD_PORT_BASE = 7681
+# Each terminal's ttyd listens on a per-user UNIX socket rather than a
+# 127.0.0.1 port (issue #628): the port was reachable by every local user,
+# and ttyd runs --writable with no credential of its own, so another user on
+# the box could read and type into this user's tmux. The directory is the
+# enforcement — 0750 <user>:caddy so nobody else can reach the socket, and
+# SETGID so the socket ttyd binds inherits group caddy (libwebsockets chmods
+# it 0660, and connect(2) wants write on it). The unit spells this path with
+# %i itself; these two are what the tmpfiles rules and the Caddyfile bind.
+TTYD_SOCKET_DIR = "/run/agent-box-ttyd"
+
+
+def ttyd_socket(user_name):
+    return f"{TTYD_SOCKET_DIR}/{user_name}/ttyd.sock"
 
 DEFAULT_CONFIG = "/etc/agent-box/config.yaml"
 
@@ -615,6 +625,12 @@ SESSION_SCHEMA = _Obj({
 USER_SCHEMA = _Obj({
     "home": STR,
     "agent": STR,
+    # Inert since issue #628 put ttyd on a UNIX socket: there is no port to
+    # pick any more. Still declared, and still type-checked, because this
+    # schema is CLOSED - dropping the key would turn an existing config.yaml
+    # that sets it into a hard `agentbox apply` failure, and `agentbox
+    # update` rolls the whole release back on one of those. A security fix
+    # that refuses to apply is worse than the inert key.
     "ttydPort": PORT,
     "root": BOOL,
     # Portal handover (issue #541). A project IS a linux user (#352), so a
@@ -915,9 +931,6 @@ class Spec:
                 + ", ".join(u.name for u in flagged)
             )
         self.root_user = flagged[0] if flagged else self.users[0]
-        for i, u in enumerate(self.users):
-            if u.ttyd_port is None:
-                u.ttyd_port = TTYD_PORT_BASE + i
 
     @property
     def webhook_enable(self):
@@ -931,7 +944,6 @@ class User:
         self.spec = spec
         self.home = data.get("home") or f"/home/{name}"
         self.agent = data.get("agent") or spec.default_agent
-        self.ttyd_port = data.get("ttydPort")
         # Typed by USER_SCHEMA (issue #525): `root: "false"` used to pass
         # bool()'s truthiness check and hand this user the settings page and
         # the root vhost - the config reversing what the operator wrote, for
@@ -2553,11 +2565,17 @@ class Renderer:
         if self.spec.web_enable:
             t.file(self.p("/etc/agent-box/units",
                           f"agent-web-terminal-{u.name}.env"),
-                   env_file([("AGENT_BOX_TTYD_PORT", u.ttyd_port),
-                             ("AGENT_BOX_WEB_DOMAIN", self.spec.domain)]))
+                   env_file([("AGENT_BOX_WEB_DOMAIN", self.spec.domain)]))
             settings = [
                 ("AGENT_BOX_PASSWORD_CMD",
                  f"/usr/bin/sudo -n /etc/agent-box/bin/agent-box-password-{u.name}"),
+                # The file drop this user's daemon serves at
+                # /<user>/downloads/ (issue #630): caddy proxies that path
+                # to the daemon instead of serving the tree itself, so the
+                # daemon is what needs to know where the tree is. Same dir
+                # the tmpfiles rule below creates and ~/downloads points at.
+                ("AGENT_BOX_DOWNLOADS_DIR",
+                 f"/var/lib/agent-box-downloads/{u.name}"),
                 # Agent profiles (issue #321, step 5). The settings page
                 # resolves a profile onto harness arguments by running this,
                 # never by mapping the keys itself — one resolver, shared
@@ -2753,7 +2771,8 @@ class Renderer:
                        # restatement.
                        "ExecStart=",
                        f"ExecStart={self.bin}/ttyd --writable --url-arg "
-                       f"-p {u.ttyd_port} -i 127.0.0.1 -b /{u.name} "
+                       f"--check-origin -i {ttyd_socket(u.name)} "
+                       f"-b /{u.name} "
                        "-t disableLeaveAlert=true "
                        f"-t titleFixed={u.name}@{self.spec.domain} "
                        "-t macOptionClickForcesSelection=true "
@@ -3154,14 +3173,31 @@ class Renderer:
                 "d /var/lib/agent-box-sites 0755 root root - -",
                 "d /var/lib/agent-box-downloads 0755 root root - -",
                 "d /run/agent-box-settings 0755 root root - -",
+                # Browser-terminal sockets, one directory down (issue #628).
+                # World-traversable parent as above; the per-user
+                # subdirectory below is the closed one.
+                f"d {TTYD_SOCKET_DIR} 0755 root root - -",
             ]
         for u in self.spec.users:
             if self.spec.web_enable:
                 lines += [
                     f"d /var/lib/agent-box-sites/{u.name} 0750 {u.name} caddy - -",
                     f"L+ {u.home}/sites - - - - /var/lib/agent-box-sites/{u.name}",
-                    f"d /var/lib/agent-box-downloads/{u.name} 0750 {u.name} caddy - -",
+                    # 0700, not the 0750 the snippet dir above gets: caddy
+                    # read this tree until issue #630 moved the route to the
+                    # per-user settings daemon, and has no business in it
+                    # now. The group stays `caddy` because it grants nothing
+                    # at 0700, both backends must emit this line identically,
+                    # and neither can portably name a per-user group (NixOS
+                    # has none, issue #604) -- the mode is the boundary.
+                    f"d /var/lib/agent-box-downloads/{u.name} 0700 {u.name} caddy - -",
                     f"L+ {u.home}/downloads - - - - /var/lib/agent-box-downloads/{u.name}",
+                    # This user's ttyd socket directory (issue #628).
+                    # 0750 <user>:caddy keeps every other local user out,
+                    # and the SETGID bit is what gives the socket ttyd
+                    # binds inside it group caddy - the unit runs
+                    # unprivileged as this user and cannot chown one.
+                    f"d {TTYD_SOCKET_DIR}/{u.name} 2750 {u.name} caddy - -",
                 ]
             # The parent is declared too, and owned by the user. Without it
             # systemd-tmpfiles creates ~/.config itself as root, then refuses
@@ -3336,16 +3372,18 @@ class Renderer:
             if user is not None:
                 # Bind every token the fragments carry. The values mirror the
                 # module's helpers one for one (settingsSocketOf,
-                # downloadsDirOf, webhookSocketOf, webhookPathOf, envName),
-                # because the rendered Caddyfile has to be the same text on
-                # both backends.
+                # webhookSocketOf, webhookPathOf, envName), because the
+                # rendered Caddyfile has to be the same text on both
+                # backends. No @DOWNLOADS_DIR@ since issue #630: the file
+                # drop is served by the per-user settings daemon over
+                # @SETTINGS_SOCKET@, not by caddy's own file_server, so the
+                # path is bound into that daemon's unit environment
+                # (AGENT_BOX_DOWNLOADS_DIR) rather than into this fragment.
                 for token, value in [
                     ("@USER_ENV@", user.env_key),
                     ("@SETTINGS_SOCKET@",
                      f"/run/agent-box-settings/{user.name}.sock"),
-                    ("@DOWNLOADS_DIR@",
-                     f"/var/lib/agent-box-downloads/{user.name}"),
-                    ("@TTYD_PORT@", str(user.ttyd_port)),
+                    ("@TTYD_SOCKET@", ttyd_socket(user.name)),
                     ("@WEBHOOK_PATH@", f"/{user.name}/webhook"),
                     ("@WEBHOOK_SOCKET@",
                      f"/run/agent-box-webhook/{user.name}.sock"),
@@ -5132,6 +5170,50 @@ def settle_public_ip(attempts=60, quiet=3, sleep=10, initial=0):
     return ip
 
 
+def resolve_web_password_source():
+    """("hash", value), ("password", value), or (None, None).
+
+    Prefers an already-hashed AGENT_BOX_WEB_PASSWORD_HASH[_FILE] (issue #25:
+    what CloudFormation hands first boot now, generated client-side by the
+    launch page, so the plaintext never rides in user-data or a Lightsail
+    launch script) over a plaintext AGENT_BOX_WEB_PASSWORD[_FILE]. The
+    plaintext path stays for a hand-provisioned box, where typing a password
+    into this shell carries none of the exposure a cloud provider's
+    API-readable launch metadata does; it is never what a template should
+    reach for. Returning the KIND alongside the value (rather than hashing
+    it here) lets the caller decide how to apply it: a hash is one fixed
+    value with no plaintext behind it to re-derive anything from, while a
+    plaintext password can and should still be hashed separately per user,
+    each with its own random salt.
+    """
+    password_hash = os.environ.get("AGENT_BOX_WEB_PASSWORD_HASH", "")
+    hash_file = os.environ.get("AGENT_BOX_WEB_PASSWORD_HASH_FILE", "")
+    if not password_hash and hash_file:
+        password_hash = Path(hash_file).read_text().strip()
+    if password_hash:
+        return "hash", password_hash
+
+    password = os.environ.get("AGENT_BOX_WEB_PASSWORD", "")
+    pw_file = os.environ.get("AGENT_BOX_WEB_PASSWORD_FILE", "")
+    if not password and pw_file:
+        password = Path(pw_file).read_text().strip()
+    if password:
+        return "password", password
+    return None, None
+
+
+def hash_web_password(profile, password):
+    """argon2id, and via stdin — the same algorithm and the same invocation
+    the password helper uses for a later change, so a first-boot hash and a
+    changed one are the same kind of hash.
+    """
+    caddy = str(Path(profile) / "bin" / "caddy")
+    return subprocess.run(
+        [caddy, "hash-password", "--algorithm", "argon2id"],
+        input=password + "\n", text=True, check=True,
+        capture_output=True).stdout.strip()
+
+
 def first_boot(spec, args):
     """What the CloudFormation UserData used to do inline.
 
@@ -5146,32 +5228,31 @@ def first_boot(spec, args):
             spec.host_label = spec.domain
         print(f"derived domain {spec.domain} from {ip}")
 
-    password = os.environ.get("AGENT_BOX_WEB_PASSWORD", "")
-    pw_file = os.environ.get("AGENT_BOX_WEB_PASSWORD_FILE", "")
-    if not password and pw_file:
-        password = Path(pw_file).read_text().strip()
-    if spec.web_enable and password:
+    kind, value = resolve_web_password_source()
+    if spec.web_enable and kind:
         # Mint only what has to persist. The /run projection belongs to
         # write_auth_env, which agent-web-auth-secrets.service redoes on
         # every boot — first boot must not be the only thing that can
         # produce that file.
-        caddy = str(Path(spec.profile) / "bin" / "caddy")
         Path("/etc/agent-box").mkdir(parents=True, exist_ok=True)
         for u in spec.users:
-            # argon2id, and via stdin — the same algorithm and the same
-            # invocation the password helper uses for a later change, so a
-            # first-boot hash and a changed one are the same kind of hash.
-            hashed = subprocess.run(
-                [caddy, "hash-password", "--algorithm", "argon2id"],
-                input=password + "\n", text=True, check=True,
-                capture_output=True).stdout.strip()
-            Path(f"/etc/agent-box/{u.name}.hash").write_text(hashed + "\n")
+            # A hash IS the one fixed value CloudFormation gave us - every
+            # configured user gets that same value, same as they all shared
+            # the same plaintext password before this hash existed. A
+            # plaintext password, by contrast, is hashed FRESH per user
+            # (each call mints its own random salt) even though the
+            # password itself is shared, so two users' stored hashes never
+            # collide just because their password does.
+            password_hash = (value if kind == "hash"
+                             else hash_web_password(spec.profile, value))
+            Path(f"/etc/agent-box/{u.name}.hash").write_text(
+                password_hash + "\n")
             os.chmod(f"/etc/agent-box/{u.name}.hash", 0o600)
         # The manifest does not exist yet (render runs after first_boot), so
         # the user list is passed straight in.
         write_auth_env([(u.name, f"/etc/agent-box/{u.name}.hash")
                         for u in spec.users])
-        print(f"hashed the web password for {len(spec.users)} user(s)")
+        print(f"set the web password hash for {len(spec.users)} user(s)")
 
     # Write the resolved domain back, so a later plain `agentbox apply`
     # (a config edit, an update) renders the same hostname.

@@ -8,7 +8,7 @@ Metadata:
         Parameters:
           - Agent
           - UserName
-          - WebPassword
+          - WebPasswordHash
       - Label:
           default: Portal handover (optional - leave blank for password-only)
         Parameters:
@@ -38,8 +38,8 @@ Metadata:
           - AgentNixpkgsUrl
           - AgentNixpkgsSha256
     ParameterLabels:
-      WebPassword:
-        default: Web terminal password (16-64 chars - save it, AWS masks it)
+      WebPasswordHash:
+        default: Web terminal password hash (paste the value the launch page generated)
       PortalUser:
         default: Portal account id this box belongs to (issue #593)
       PortalIssuer:
@@ -211,8 +211,8 @@ Parameters:
   # signed token proves only that the portal issued it, never who it is for
   # (the portal signs every account's tokens with one key). This is what makes
   # the box refuse somebody else's valid token. It must arrive out-of-band, at
-  # provisioning, exactly like WebPassword - a token must never be able to
-  # tell a box whose it is.
+  # provisioning, exactly like WebPasswordHash - a token must never be able
+  # to tell a box whose it is.
   PortalUser:
     Type: String
     Default: ""
@@ -241,22 +241,33 @@ Parameters:
       (<issuer>/.well-known/jwks.json). This is whatever the portal uses - it
       is NOT a Defang hostname. Blank (the default) disables portal handover
       entirely.
-  WebPassword:
+  WebPasswordHash:
     Type: String
     NoEcho: true
-    MinLength: 16
-    MaxLength: 64
-    AllowedPattern: ^.{16,64}$
+    MinLength: 40
+    MaxLength: 200
+    # A Caddy-compatible argon2id PHC hash string ($argon2id$v=..$m=..,t=..,
+    # p=..$<salt>$<hash>, both base64 without padding), never the plaintext
+    # password itself (issue #25). The launch page generates a high-entropy
+    # password and hashes it in your browser before this field is ever
+    # filled in, so the plaintext never reaches AWS - CloudFormation, the
+    # instance's user-data and its console/API-readable attributes all see
+    # only the hash. Launching by hand? Compute one with
+    # `caddy hash-password --algorithm argon2id` and paste its output here.
+    AllowedPattern: ^\$argon2id\$v=[0-9]+\$m=[0-9]+,t=[0-9]+,p=[0-9]+\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+$
     Description: >-
-      Shared secret for the browser terminal. Log in with the UserName chosen
-      above (default "workspace") and this password; Caddy then sets an HttpOnly
-      Secure cookie so the WebSocket upgrade can authenticate without putting
-      the secret in the URL. Use any 16-64 characters; password-manager symbols
-      are supported. AWS masks this field with dots after you type it and never
-      emits it in stack outputs, so save it somewhere before you launch - there
-      is no way to recover it later. Even Claude Code stacks that plan to drive
-      the box via Remote Control need this the first time, to complete `claude
-      login` in the browser terminal.
+      Argon2id hash of the browser terminal password, generated in your
+      browser by the launch page (never the plaintext password itself - see
+      the note above the launch buttons). Log in with the UserName chosen
+      above (default "workspace") and the password the launch page showed
+      you; Caddy then sets an HttpOnly Secure cookie so the WebSocket upgrade
+      can authenticate without putting the secret in the URL. AWS masks this
+      field and never emits it in stack outputs, but it is only a hash, so
+      that no longer protects a secret by itself - save the PLAINTEXT
+      password the launch page showed you, because there is no way to
+      recover it from this hash. Even Claude Code stacks that plan to drive
+      the box via Remote Control need that password the first time, to
+      complete `claude login` in the browser terminal.
 
   AgentsMd:
     Type: String
@@ -784,11 +795,12 @@ Resources:
                     sha256 = pin.sha256;
                   };
                 hostname = "${WebHostname}";
-                # Fn::Sub receives a base64 projection of WebPassword so every
-                # password-manager symbol remains inert Nix source. The
-                # activation script decodes it only into a shell variable and
-                # pipes it to Caddy over stdin.
-                webPasswordBase64 = "${WebPasswordBase64}";
+                # Fn::Sub receives a base64 projection of WebPasswordHash so
+                # its '$' and '/' characters remain inert Nix source. The
+                # activation script only decodes and writes it - the hash
+                # already IS what Caddy needs, so nothing here ever sees a
+                # plaintext password (issue #25).
+                webPasswordHashBase64 = "${WebPasswordHashBase64}";
               in {
                 imports = [
                   "${!modulesPath}/virtualisation/amazon-image.nix"
@@ -869,13 +881,16 @@ Resources:
 
               ${Nat64Config}
               ${FirstBootSignalConfig}
-                # Materialize passwordHashFile from the plaintext CFN parameter
-                # BEFORE any service reads it. Activation scripts run at
-                # nixos-rebuild switch time (first boot from user-data), before
-                # systemd units start - perfect ordering for the module's
-                # agent-web-auth-secrets service, which reads the hash. The
-                # file lives outside /nix/store so the plaintext-derived hash
-                # doesn't end up in a world-readable store path.
+                # Materialize passwordHashFile from the CFN parameter BEFORE
+                # any service reads it. WebPasswordHash already IS the
+                # argon2id hash (issue #25) - generated client-side by the
+                # launch page, or by `caddy hash-password` for a manual
+                # launch - so activation only base64-decodes and writes it;
+                # there is no plaintext password here to hash or to protect.
+                # Activation scripts run at nixos-rebuild switch time (first
+                # boot from user-data), before systemd units start - perfect
+                # ordering for the module's agent-web-auth-secrets service,
+                # which reads the hash.
                 # Subshell: activation snippets share one shell, so a bare
                 # `umask 077` here leaks into the users/etc snippets that run
                 # later - update-users-groups.pl then writes /etc/passwd and
@@ -886,14 +901,9 @@ Resources:
                   if [ ! -s /var/lib/agent-box-web/password-hash ]; then
                     (
                       umask 077
-                      webPassword="$(
-                        ${!pkgs.coreutils}/bin/printf '%s' ${!lib.escapeShellArg webPasswordBase64} \
-                          | ${!pkgs.coreutils}/bin/base64 --decode
-                      )"
-                      ${!pkgs.coreutils}/bin/printf '%s\n' "$webPassword" \
-                        | ${!pkgs.caddy}/bin/caddy hash-password --algorithm argon2id \
-                          > /var/lib/agent-box-web/password-hash
-                      unset webPassword
+                      ${!pkgs.coreutils}/bin/printf '%s' ${!lib.escapeShellArg webPasswordHashBase64} \
+                        | ${!pkgs.coreutils}/bin/base64 --decode \
+                        > /var/lib/agent-box-web/password-hash
                     )
                     chmod 0600 /var/lib/agent-box-web/password-hash
                   fi
@@ -932,8 +942,8 @@ Resources:
                     - !Join
                         - '-'
                         - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
-              WebPasswordBase64:
-                Fn::Base64: !Ref WebPassword
+              WebPasswordHashBase64:
+                Fn::Base64: !Ref WebPasswordHash
               # First-boot health signal (issue 106): tell CloudFormation the
               # user-data config actually APPLIED. This unit only exists once
               # the rebuild switched into this config, which is exactly the
@@ -983,11 +993,13 @@ Outputs:
       Browser terminal for the selected agent. Deployments are also
       drivable from the agent's apps via Remote Control after the first login.
       First load takes ~2-3 minutes while the instance provisions and Caddy
-      issues an ACME cert. Sign in with the UserName (default "workspace") and the
-      WebPassword chosen at deployment time. (The URL deliberately carries no
-      user@ prefix: Chrome answers the auth challenge with URL userinfo plus an
-      EMPTY password, and credentials typed into the prompt cannot override
-      the URL-embedded identity - issue 56.)
+      issues an ACME cert. Sign in with the UserName (default "workspace") and
+      the password the launch page showed you at deployment time - the
+      WebPasswordHash parameter carries only its hash, never the plaintext
+      (issue #25). (The URL deliberately carries no user@ prefix: Chrome
+      answers the auth challenge with URL userinfo plus an EMPTY password,
+      and credentials typed into the prompt cannot override the URL-embedded
+      identity - issue 56.)
     Value: !Sub
       - "https://${Host}.${SslipDomain}/${UserName}/"
       - Host: !If

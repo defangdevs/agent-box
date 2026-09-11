@@ -607,6 +607,41 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
         f"status should surface the failed update run: {status}"
     )
 
+    # {base}/env and {base}/connect are the two machine-readable READS a
+    # portal drives this daemon through (issue #642): Defang Station renders
+    # the Environment panel and the connect cards in its own UI and asks here
+    # for what is behind them. Both sit inside the same auth block as the page
+    # -- which for a route that lists SECRET NAMES is the property worth
+    # asserting in a VM, not just in a unit test -- and neither may ever
+    # answer with a value. UI_KEEP survived the delete subtest above, so
+    # there is a real stored secret to withhold.
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' "
+        "https://box.test/agent/settings/env | grep -x 401"
+    )
+    env_json = client.succeed(
+        f"{curl} -u agent:testpassword https://box.test/agent/settings/env"
+    )
+    assert '"ok": true' in env_json and '"keys"' in env_json, (
+        f"env should list key names: {env_json}"
+    )
+    assert "UI_KEEP" in env_json, (
+        f"env should name the key the page saved: {env_json}"
+    )
+    assert "stays" not in env_json, (
+        f"env must never serve a stored value: {env_json}"
+    )
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' "
+        "https://box.test/agent/settings/connect | grep -x 401"
+    )
+    cards = client.succeed(
+        f"{curl} -u agent:testpassword https://box.test/agent/settings/connect"
+    )
+    assert '"flows"' in cards and '"id": "claude"' in cards, (
+        f"connect should list every card in one answer: {cards}"
+    )
+
     # Maintenance's third row restarts agent-box. A kernel or libc patch
     # installs on disk and only takes effect at a boot, unattended patching
     # deliberately never reboots, and nothing inside the box could - so

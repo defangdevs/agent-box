@@ -15,6 +15,8 @@
 //   E2E_TMUX_SOCKET   tmux -L socket name   (default: agent-box)
 //   E2E_TMUX_SESSION  tmux session name     (default: main)
 //   E2E_TMUX_TMPDIR   TMUX_TMPDIR of the agent's socket
+//   E2E_DOWNLOADS_DIR the user's ~/downloads - enables download-isolation.spec.ts,
+//                     which has to place an artifact in the drop directory
 //
 // Run with the nixpkgs runner (no npm install needed):
 //   PLAYWRIGHT_BROWSERS_PATH=$(nix build --no-link --print-out-paths \
