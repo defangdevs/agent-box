@@ -14,10 +14,15 @@ hasRun, boxSessionId and stopped gone; the panes kept running as unmanaged
 tmux sessions that nothing respawns, and re-adding a name started a fresh
 conversation.
 
-So the routes are held to three things:
+So the routes are held to four things:
 
   * a registry they could not READ is never republished -- the file comes
     through a refused add, delete or restart byte for byte;
+  * a registry they could not LOCK is not written either (issue #633).
+    Timing out used to fall through and run the read-modify-write anyway,
+    which is the pre-#254 lost update performed at the one moment there is
+    provably another writer -- and answered with a 303 the browser reads as
+    "done". Now the route changes nothing and says 503;
   * the refusal is VISIBLE. The banner is the whole feedback channel on
     these pages, and the failure it replaces was silent: "Session added",
     over a registry that no longer mentioned anything else;
@@ -34,12 +39,14 @@ The other half of #279 -- the supervisor moving the bad file aside so the
 box self-heals instead of idling -- is pinned in tests/test-registry.py,
 next to the rest of the registry's write protocol.
 """
+import fcntl
 import http.server
 import importlib.machinery
 import importlib.util
 import json
 import os
 import pathlib
+import stat
 import tempfile
 import threading
 import unittest
@@ -89,12 +96,16 @@ def daemon_with(**env):
         os.environ.update(saved)
 
 
-class SessionRoutes(unittest.TestCase):
-    """The three mutation routes, driven over HTTP against the real handler.
+class RouteCase(unittest.TestCase):
+    """Fixtures for driving the three mutation routes over HTTP against the
+    real handler.
 
     Over HTTP rather than on the functions, for the reason the profile-route
     suite gives: what is being pinned is what the handler WRITES, and the
     interesting failures live between the form and the file.
+
+    No tests of its own -- SessionRoutes and LockRefusal each bring their
+    own, and both need every fixture here.
     """
 
     LIVE = {
@@ -166,6 +177,18 @@ class SessionRoutes(unittest.TestCase):
         with urllib.request.urlopen(self.base + path) as response:
             return response.read().decode()
 
+    def post_body(self, path, **fields):
+        """POST a form and return the response BODY, redirect or not."""
+        request = urllib.request.Request(
+            self.base + path,
+            data=urllib.parse.urlencode(fields).encode(), method="POST")
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.read().decode()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.read().decode()
+
     def each_route(self):
         """The three verbs, each as (label, callable)."""
         return [
@@ -178,6 +201,10 @@ class SessionRoutes(unittest.TestCase):
             ("restart", lambda: self.post("/sessions/restart", back="settings",
                                           name="claude")),
         ]
+
+
+class SessionRoutes(RouteCase):
+    """A registry the routes could not READ is never republished (#279)."""
 
     # --- the refusal ------------------------------------------------------
     def test_a_registry_that_cannot_be_read_is_never_republished(self):
@@ -304,6 +331,145 @@ class SessionRoutes(unittest.TestCase):
                                      name="odd")
         self.assertEqual(status, 303)
         self.assertNotIn("unreadable", location)
+
+
+class LockRefusal(RouteCase):
+    """A registry the route could not LOCK is not written either (#633).
+
+    Same three verbs, same fixture, one difference: the sidecar lock is
+    held (or cannot be made) while the request runs. The evidence in the
+    issue was a mutator that answered 0 and changed the file while another
+    writer held the lock; here the equivalent is a 303 saying "Session
+    added" over a document some other writer is mid-way through replacing.
+    """
+
+    LOCK_WAIT = 0.4
+
+    def serve(self, **extra):
+        module, base = super().serve(**extra)
+        # The shipped bound is 10s, which is right on a box and would make
+        # this file thirty seconds of waiting. The knob exists for exactly
+        # this, like REGISTRY_LOCK_WAIT on the shell side.
+        module.SESSIONS_LOCK_WAIT = self.LOCK_WAIT
+        return module, base
+
+    def hold_the_lock(self):
+        """Hold the sidecar the way any of the five writers holds it."""
+        handle = open(self.sessions_file + ".lock", "a", encoding="utf-8")
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        self.addCleanup(handle.close)
+        return handle
+
+    def unwritable_config_dir(self):
+        """No sidecar, and no way to create one: a read-only home or a full
+        disk. The other half of the acceptance -- lock CREATION failure."""
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the directory mode this test needs")
+        os.chmod(self.conf, stat.S_IRUSR | stat.S_IXUSR)
+        self.addCleanup(os.chmod, self.conf, 0o700)
+
+    def refuse_every_verb(self):
+        """Post all three verbs at one registry and assert each is a 503
+        that changed nothing.
+
+        One fixture for all three, unlike the #279 suite above: a refusal
+        writes nothing, so the file the second verb meets is the same file
+        the first one did -- which makes "byte for byte" an assertion about
+        the whole sequence rather than three fresh starts.
+        """
+        before = self.raw()
+        for verb, call in self.each_route():
+            with self.subTest(route=verb):
+                status, _ = call()
+                self.assertEqual(status, 503)
+                self.assertEqual(self.raw(), before)
+
+    def test_a_registry_that_cannot_be_locked_is_never_rewritten(self):
+        """A holder that times us out. The daemon used to give up waiting
+        and do the read-modify-write anyway."""
+        self.write_raw(json.dumps({"version": 1, "sessions": self.LIVE}))
+        self.serve()
+        self.hold_the_lock()
+        self.refuse_every_verb()
+
+    def test_a_sidecar_that_cannot_be_created_is_refused_too(self):
+        """Lock CREATION failure, the other half of the acceptance."""
+        self.write_raw(json.dumps({"version": 1, "sessions": self.LIVE}))
+        self.serve()
+        self.unwritable_config_dir()
+        self.refuse_every_verb()
+
+    def test_the_refusal_is_something_the_operator_can_read_and_act_on(self):
+        """503 is for the client; the body is for the person. They have no
+        shell here, so "try again" has to be on the page."""
+        self.write_raw(json.dumps({"version": 1, "sessions": self.LIVE}))
+        self.serve()
+        self.hold_the_lock()
+        page = self.post_body("/sessions/add", back="settings",
+                              agent="shell", cwd="~", prompt="")
+        self.assertIn("nothing was done", page)
+        self.assertIn("try again", page)
+        self.assertIn('data-kind="error"', page)
+
+    def test_reads_stay_available_while_a_writer_holds_the_lock(self):
+        """The refusal is scoped to mutations. A page that stopped
+        rendering the session list under contention would take the whole
+        UI down every time two writers met."""
+        # Names nothing else on the page could be spelling: "claude" and
+        # "codex" are harness names too, so LIVE's own keys would pass this
+        # against a page listing no sessions at all.
+        self.write_raw(json.dumps({"version": 1, "sessions": {
+            "zeta-one": {"agent": "claude"}, "zeta-two": {"agent": "codex"}}}))
+        self.serve()
+        self.hold_the_lock()
+        page = self.get("/")
+        self.assertIn("zeta-one", page)
+        self.assertIn("zeta-two", page)
+
+    def test_a_refusal_does_not_stop_the_next_attempt(self):
+        """Retryable in the plainest sense: the same route, one lock
+        release apart. Nothing is latched onto the registry or the
+        daemon."""
+        self.write_raw(json.dumps({"version": 1, "sessions": self.LIVE}))
+        self.serve()
+        holder = self.hold_the_lock()
+        status, _ = self.post("/sessions/add", back="settings",
+                              agent="shell", cwd="~", prompt="")
+        self.assertEqual(status, 503)
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        status, location = self.post("/sessions/add", back="settings",
+                                     agent="shell", cwd="~", prompt="")
+        self.assertEqual(status, 303)
+        self.assertNotIn("unreadable", location)
+        self.assertEqual(set(self.document()["sessions"]),
+                         set(self.LIVE) | {"shell"})
+
+    def test_concurrent_adds_all_survive_when_the_lock_works(self):
+        """The case the refusal must not have been bought with. This
+        daemon is a ThreadingHTTPServer, so it races itself: six adds at
+        once have to leave six sessions, not one."""
+        adds = 6
+        self.write_raw(json.dumps({"version": 1, "sessions": {}}))
+        self.serve()
+        start = threading.Barrier(adds)
+        results = []
+        lock = threading.Lock()
+
+        def add():
+            start.wait(timeout=30)
+            status, _ = self.post("/sessions/add", back="settings",
+                                  agent="shell", cwd="~", prompt="")
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=add) for _ in range(adds)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertEqual(results, [303] * adds)
+        self.assertEqual(len(self.document()["sessions"]), adds,
+                         self.document()["sessions"])
 
 
 if __name__ == "__main__":
