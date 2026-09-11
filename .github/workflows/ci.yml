@@ -55,6 +55,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: cachix/install-nix-action@v30
         with:
           extra_nix_config: |
@@ -68,7 +70,7 @@ jobs:
   vm:
     name: VM (${{ matrix.lane }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       # A failed lane must not cancel the other regression results.
       fail-fast: false
@@ -84,6 +86,8 @@ jobs:
             jobs: 1
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: cachix/install-nix-action@v30
         with:
           extra_nix_config: |

@@ -494,7 +494,7 @@ two, so the standing watch cannot match it and a hung run reaches nobody. A
 STEP that runs out of time fails instead, which the existing rules do match.
 Size the step budget against the PRE-step time rather than the job timeout:
 VM preparation has a 7-minute step timeout and execution has 12 minutes
-under a 20-minute job timeout, leaving a minute for setup and teardown.
+under a 25-minute job timeout, leaving six minutes for setup and teardown.
 
 ### Finishing a CodeRabbit review
 
