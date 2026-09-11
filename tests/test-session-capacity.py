@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "modules/src"
@@ -51,6 +52,16 @@ class Policy(unittest.TestCase):
     def test_running_and_pending_are_not_double_counted(self):
         result = capacity.capacity_check({"a": {}}, ["b"], live={"a"}, limit=2)
         self.assertEqual(result["used"], 1)
+
+    def test_capacity_live_excludes_connect_flow_panes(self):
+        # The settings page's sign-in flow runs on this same tmux socket as
+        # a "_connect-<flow>" pane (settings-daemon.py's CONNECT_PREFIX) but
+        # was never registered as a session; it must not cost a slot.
+        proc = subprocess.CompletedProcess(
+            [], 0, stdout="main\n_connect-abc123\n", stderr="")
+        with mock.patch.object(capacity.capacity_subprocess, "run",
+                                return_value=proc):
+            self.assertEqual(capacity.capacity_live(), {"main"})
 
 
 class Cli(unittest.TestCase):
@@ -121,6 +132,16 @@ class Cli(unittest.TestCase):
         for value in ["0", "-1", "abc"]:
             self.limit.write_text(value)
             self.assertEqual(self.run_cli("add", "a").returncode, 75)
+
+    def test_capacity_verb_does_not_create_the_registry(self):
+        # A read-only check must never be what CREATES the registry: a
+        # supervisor seed sees an "existing" (empty) file as one already
+        # populated and never seeds the NixOS-declared sessions onto it.
+        self.registry.unlink()
+        result = self.run_cli("capacity")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["used"], 0)
+        self.assertFalse(self.registry.exists())
 
 
 if __name__ == "__main__":

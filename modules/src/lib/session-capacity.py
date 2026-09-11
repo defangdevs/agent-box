@@ -38,7 +38,11 @@ def capacity_live():
                 "no server running", "no sessions", "No such file or directory")):
             raise OSError("cannot determine session capacity: " + proc.stderr.strip())
         return set()
-    return set(proc.stdout.splitlines())
+    # The settings page's sign-in flows (settings-daemon.py's CONNECT_PREFIX)
+    # run on this same tmux socket as a "_connect-<flow>" pane, but they are
+    # not an agent session and were never registered — counting them would
+    # let an in-progress sign-in consume a slot a real session needs.
+    return {s for s in proc.stdout.splitlines() if not s.startswith("_connect-")}
 
 
 def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):

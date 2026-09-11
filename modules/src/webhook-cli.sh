@@ -336,12 +336,24 @@ peer_kinds() {
 # operator has to clear, and the wait is bounded, so the reporting below stays
 # exactly as loud as it was.
 
+hook_capacity_snapshot() {
+  # A refusal (missing binary, refused lock, ...) must not be fatal here:
+  # this script runs under `set -e`, and a bare `x=$(cmd)` assignment DOES
+  # propagate a failing command's status, unlike a pipeline ending in `||`.
+  # Callers treat an empty snapshot as "unknown" (null), same as before.
+  agent-box-session capacity 2>/dev/null || true
+}
+
 hook_sessions() {
-  agent-box-session capacity | "$JQ" -er '.used' || printf 'null\n'
+  # $1 = a snapshot from hook_capacity_snapshot, so a caller reading both
+  # .used and .max reads them from the SAME check — two separate
+  # `agent-box-session capacity` calls could straddle a session starting or
+  # stopping between them and report numbers that never coexisted.
+  [ -n "$1" ] && "$JQ" -er '.used' <<<"$1" 2>/dev/null || printf 'null\n'
 }
 
 hook_max() {
-  agent-box-session capacity | "$JQ" -er '.max' || printf 'null\n'
+  [ -n "$1" ] && "$JQ" -er '.max' <<<"$1" 2>/dev/null || printf 'null\n'
 }
 
 dispatch_topics() {
@@ -666,7 +678,8 @@ case "$cmd" in
     ensure_state
     "$PY" "$SCRIPT" "$cmd" "$@"
     if [ "$(dispatch_topics)" -gt 0 ]; then
-      w="$(hook_capacity_warning "$(hook_sessions)" "$(hook_max)")"
+      cap="$(hook_capacity_snapshot)"
+      w="$(hook_capacity_warning "$(hook_sessions "$cap")" "$(hook_max "$cap")")"
       [ -z "$w" ] || echo "agent-box-webhook: $w Run" \
         "'agent-box-webhook status' for the last refused batch." >&2
     fi
@@ -737,8 +750,9 @@ case "$cmd" in
     # ...and the third: whether a standing watch could spawn anything at all
     # (issue #170). dispatchTopicCount says how many are subscribed; it does
     # not say that the box is at its hook-* ceiling, which drops every match.
-    hlive="$(hook_sessions)"
-    hmax="$(hook_max)"
+    cap="$(hook_capacity_snapshot)"
+    hlive="$(hook_sessions "$cap")"
+    hmax="$(hook_max "$cap")"
     dtopics="$(printf '%s' "$out" | "$JQ" -r '.dispatchTopicCount // 0')"
     refusal=null
     if [ -s "$HOOK_REFUSED" ]; then

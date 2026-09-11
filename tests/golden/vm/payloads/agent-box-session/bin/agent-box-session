@@ -836,7 +836,11 @@ gen_name() {
 cmd="${1:-}"; shift || true
 case "$cmd" in
   capacity)
-    registry_ensure
+    # No registry_ensure: this is read-only, and creating an empty registry
+    # here — before the supervisor's own first-boot seed runs — would make
+    # that seed find a file that already "exists" and skip seeding the
+    # NixOS-declared sessions for good (issue #59's seed-never-clobbers
+    # rule cuts both ways). A missing file reads as zero pending sessions.
     "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE"
     ;;
   ls)
