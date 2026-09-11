@@ -644,9 +644,11 @@ curl -s "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/release-manifest.json"
 
 ## Pull request validation
 
-`.github/workflows/aws-ci.yml` runs on pull requests that touch the AWS
-templates, launch page, browser-terminal smoke helper, or related workflows. It
-does not create AWS resources; it runs
+`.github/workflows/aws-ci.yml` starts on every pull request. Its `AWS template
+gate` check is always reported, so it is the one to require; the `validate`
+job itself only runs when a change touches the AWS templates, launch page,
+browser-terminal smoke helper, or related workflows (issue #632). It does not
+create AWS resources; when it runs, it runs
 `cfn-lint deploy/aws/template.yaml deploy/aws/lightsail-template.yaml` and compiles
 `scripts/ws_smoke.py` so template/auth-helper changes get fast PR feedback.
 
