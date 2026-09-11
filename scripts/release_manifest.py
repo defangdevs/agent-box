@@ -56,9 +56,17 @@ import urllib.request
 
 MANIFEST_VERSION = 1
 
-# A channel tarball is tens of megabytes; 15 minutes is generous for a
-# download and short enough to fail inside any job that runs this.
-PREFETCH_TIMEOUT = 900
+# A channel tarball is tens of megabytes, so this is generous for the
+# download - but it has to stay BELOW the 15-minute timeout of promote.yml's
+# `candidate` job, which spends time on checkout, rev resolution and the
+# CI-gate check before ever reaching this call. At 900s (== the job's own
+# timeout) a stalled prefetch would be killed by the JOB timeout first,
+# which GitHub reports as `cancelled` - indistinguishable from a supersede,
+# and invisible to a standing webhook watch that only spawns on
+# `failure`/`timed_out` (see AGENTS.md, "Give a long job a STEP-level
+# timeout-minutes"). 600s leaves the preceding steps headroom and still
+# fails as a reported ManifestError rather than a silent cancellation.
+PREFETCH_TIMEOUT = 600
 
 # The channel the templates' AgentNixpkgsUrl pair pins. Kept here rather
 # than in the workflow because `verify` has to resolve the same one.
