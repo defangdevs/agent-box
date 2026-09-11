@@ -126,6 +126,22 @@ param nixInstallerUrl string = 'https://install.determinate.systems/nix'
 @description('Source range allowed to reach the terminal (and SSH). A CIDR, or an Azure service tag such as Internet.')
 param allowCidr string = '0.0.0.0/0'
 
+// Whitelabel sslip.io (issue #647). sslip.io is open source
+// (github.com/cunnie/sslip.io) and self-hostable, so a deployment that runs
+// its own copy under its own domain can point the auto-derived hostname
+// there instead of the public sslip.io - same dashed-IP encoding, different
+// suffix. The default reproduces exactly the hostname this template always
+// derived, so a deployment that leaves this blank behaves exactly as it did
+// before the parameter existed. Bicep has no pattern constraint for a
+// parameter -- unlike the CFN twin's DomainSuffix, which has an
+// AllowedPattern -- so this travels through the bootstrap base64-encoded
+// and is decoded and checked against the same DNS-suffix shape at runtime
+// (see the validation block above the config.yaml heredoc): a bad value
+// fails the boot rather than landing in config.yaml, or the Caddyfile
+// derived from it, unvetted.
+@description('Domain suffix for the auto-derived hostname. Self-host sslip.io (github.com/cunnie/sslip.io) under your own domain and set that domain here to whitelabel the URL; the default (sslip.io) is the public service.')
+param sslipDomain string = 'sslip.io'
+
 // Default false, where the AWS templates default their DebugSsh to true. Not
 // caution for its own sake: on Lightsail, SSH is the only way to read
 // /var/log/agent-box-bootstrap.log after a first boot that went wrong, so the
@@ -327,9 +343,11 @@ AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
 
 # The box's declared state. Everything host-specific the renderer needs, and
 # nothing it can discover for itself: `domain: auto` tells --first-boot to
-# settle the public IPv4 and derive the sslip.io hostname from it. That works
-# unchanged on Azure because settle_public_ip asks checkip.amazonaws.com rather
-# than a cloud's own metadata service. No `sessions:` key - `agentbox apply`
+# settle the public IPv4 and derive the hostname from it, under
+# domainSuffix (default sslip.io - issue #647 lets this point at a
+# self-hosted sslip.io clone instead). That works unchanged on Azure because
+# settle_public_ip asks checkip.amazonaws.com rather than a cloud's own
+# metadata service. No `sessions:` key - `agentbox apply`
 # seeds none itself on a web-enabled box (issue #416/#468), landing first boot
 # on the settings page instead of a started agent session. No opt-in back to
 # the pre-#416 behaviour: a session seeded before the box's first sign-in
@@ -342,14 +360,18 @@ AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
 install -d -m 0755 /etc/agent-box
 
 # Bicep has no character constraint for a string parameter -- only length --
-# so a raw portalIssuer/portalUser could close the single-quoted YAML scalar
-# below, or worse, inject an extra key (same class of bug base64(webPassword)
-# above exists for, applied here because these two are not secrets and so
-# were substituted raw until now). Both travel base64-encoded and are
-# decoded and validated here, against the same character classes the CFN
-# twin's AllowedPattern enforces at the parameter itself -- Bicep has no
-# such decorator, so the check has to happen at runtime instead. A bad value
-# fails the boot rather than landing in config.yaml unvetted.
+# so a raw portalIssuer/portalUser/sslipDomain could close the single-quoted
+# YAML scalar below, or worse -- for sslipDomain, whose line sits inside the
+# quoted heredoc rather than inside a YAML scalar, a newline plus the literal
+# text "AGENTBOX_CONFIG" closes the heredoc itself, and everything after runs
+# as a shell command instead of landing in config.yaml (same class of bug
+# base64(webPassword) above exists for, applied here because none of these
+# three are secrets and so were substituted raw until now). All three travel
+# base64-encoded and are decoded and validated here, against the same
+# character classes the CFN twin's AllowedPattern enforces at the parameter
+# itself -- Bicep has no such decorator, so the check has to happen at
+# runtime instead. A bad value fails the boot rather than landing in
+# config.yaml unvetted.
 portal_issuer="$(printf %s '@@PORTALISSUERB64@@' | base64 -d)"
 portal_user="$(printf %s '@@PORTALUSERIDB64@@' | base64 -d)"
 if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
@@ -362,9 +384,18 @@ if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
     exit 1
   fi
 fi
+# Same DNS-suffix shape the AWS template's DomainSuffix parameter enforces
+# with its AllowedPattern (deploy/aws/template.yaml) and BOX_SCHEMA enforces
+# for a native config.yaml (bin/agentbox) -- kept in sync across all three.
+sslip_domain="$(printf %s '@@SSLIPDOMAINB64@@' | base64 -d)"
+if ! [[ "$sslip_domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]; then
+  echo "domainSuffix is not a DNS suffix" >&2
+  exit 1
+fi
 
 cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
 domain: auto
+domainSuffix: '@SSLIPDOMAIN@'
 agents: [claude, codex]
 web:
   enable: true
@@ -384,10 +415,12 @@ AGENTBOX_CONFIG
 # backslash, for good measure) before substituting into the heredoc just
 # written, or an issuer URL containing one would splice the placeholder
 # into config.yaml instead of the URL (same bug as the CFN twin, before its
-# own fix).
+# own fix). sslip_domain's own character class already excludes both, but
+# escaping it too costs nothing and keeps the three substitutions uniform.
 esc_issuer=$(printf '%s' "$portal_issuer" | sed -e 's/[&\]/\\&/g')
 esc_user=$(printf '%s' "$portal_user" | sed -e 's/[&\]/\\&/g')
-sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|" \
+esc_sslip=$(printf '%s' "$sslip_domain" | sed -e 's/[&\]/\\&/g')
+sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@SSLIPDOMAIN@|$esc_sslip|" \
   /etc/agent-box/config.yaml
 
 # Extra standing instructions for the agent, if the deployment gave any.
@@ -433,15 +466,16 @@ var portalOn = !empty(portalUser) && !empty(portalIssuer)
 var portalUserYaml = portalOn ? portalUser : ''
 var portalIssuerYaml = portalOn ? portalIssuer : ''
 
-var bootstrap = replace(replace(replace(replace(replace(replace(replace(
+var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
   bootstrapTemplate,
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
   '@@USER@@', userName),
   '@@AGENTSMD@@', agentsMd),
-  // base64, not the plaintext: see the comment above the apply, and
-  // check_secrets() in scripts/check_azure_template.py, which fails if this
-  // ever goes back to a raw substitution.
+  // base64, not the plaintext: see the comment above the validation block,
+  // and check_secrets() in scripts/check_azure_template.py, which fails if
+  // this ever goes back to a raw substitution.
+  '@@SSLIPDOMAINB64@@', base64(sslipDomain)),
   '@@WEBPASSWORD@@', base64(webPassword)),
   '@@PORTALISSUERB64@@', base64(portalIssuerYaml)),
   '@@PORTALUSERIDB64@@', base64(portalUserYaml))
@@ -583,8 +617,10 @@ resource bootstrapExtension 'Microsoft.Compute/virtualMachines/extensions@2024-0
 // sslip.io resolves both 4.236.84.197.sslip.io and 4-236-84-197.sslip.io, but
 // only the dashed spelling is what `agentbox apply` derives and therefore the
 // only one in the issued certificate - the dotted one fails TLS rather than
-// simply not existing (issue #359).
-var host = '${replace(publicIp.properties.ipAddress, '.', '-')}.sslip.io'
+// simply not existing (issue #359). sslipDomain (issue #647) is the same
+// suffix the bootstrap's config.yaml carries as domainSuffix, so this stays
+// in sync with whatever `agentbox apply --first-boot` actually derives.
+var host = '${replace(publicIp.properties.ipAddress, '.', '-')}.${sslipDomain}'
 
 @description('Browser terminal. Sign in with the userName and the webPassword chosen at deployment time. The first load waits on Caddy\'s ACME certificate. (The URL deliberately carries no user@ prefix: Chrome answers the auth challenge with URL userinfo plus an EMPTY password, and credentials typed into the prompt cannot override the URL-embedded identity.)')
 output webUrl string = 'https://${host}/${userName}/'

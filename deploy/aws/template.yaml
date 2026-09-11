@@ -32,6 +32,7 @@ Metadata:
           - AllowCidr
           - EnableSsm
           - SeedMainSession
+          - SslipDomain
           - AgentBoxRev
           - AgentBoxSha256
           - AgentNixpkgsUrl
@@ -63,6 +64,8 @@ Metadata:
         default: Enable SSM Session Manager root access
       SeedMainSession:
         default: Seed a running "main" session on first boot
+      SslipDomain:
+        default: Whitelabel domain (self-hosted sslip.io clone; default is the public one)
       AgentsMd:
         default: AGENTS.md seeded on first agent start
       AgentBoxRev:
@@ -332,6 +335,28 @@ Parameters:
       costs nothing at runtime and skips the IAM prompt at launch time.
       false: no instance profile, no SSM session access, no CAPABILITY_IAM
       prompt.
+
+  # Whitelabel sslip.io (issue #647). sslip.io is open source
+  # (github.com/cunnie/sslip.io) and self-hostable, so a deployment that
+  # runs its own copy under its own domain can point the auto-derived
+  # hostname there instead of the public sslip.io - same dashed-IP
+  # encoding, different suffix. The default reproduces exactly the
+  # hostname this template always derived, so a launch that leaves this
+  # blank behaves exactly as it did before the parameter existed. Unlike
+  # the Lightsail/Azure templates (which resolve the hostname at first
+  # boot via `agentbox apply --first-boot`), this template computes it at
+  # STACK-CREATE time from the Elastic IP CFN already allocated, so
+  # SslipDomain is spliced straight into WebHostname/WebURL/
+  # RemoteControlSession below rather than into config.yaml.
+  SslipDomain:
+    Type: String
+    Default: sslip.io
+    AllowedPattern: '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+'
+    Description: >-
+      Domain suffix for the auto-derived hostname. Self-host sslip.io
+      (github.com/cunnie/sslip.io) under your own domain and set that
+      domain here to whitelabel the URL; the default (sslip.io) is the
+      public service.
 
   AgentBoxRev:
     Type: String
@@ -910,7 +935,7 @@ Resources:
             # a cert), and stays a single DNS label if anything ever wants
             # a *.sslip.io wildcard.
             - WebHostname: !Sub
-                - "${HostDashed}.sslip.io"
+                - "${HostDashed}.${SslipDomain}"
                 - HostDashed: !If
                     - UseIpv4
                     - !Join ['-', !Split ['.', !Ref EIP]]
@@ -976,7 +1001,7 @@ Outputs:
       and credentials typed into the prompt cannot override the URL-embedded
       identity - issue 56.)
     Value: !Sub
-      - "https://${Host}.sslip.io/${UserName}/"
+      - "https://${Host}.${SslipDomain}/${UserName}/"
       - Host: !If
           - UseIpv4
           - !Join ['-', !Split ['.', !Ref EIP]]
@@ -994,7 +1019,7 @@ Outputs:
       names itself from the hostname; its session tab signs the box in and
       prints the pairing code for the Codex apps.
     Value: !Sub
-      - "${UserName}-main@${Host}.sslip.io"
+      - "${UserName}-main@${Host}.${SslipDomain}"
       - Host: !If
           - UseIpv4
           - !Join ['-', !Split ['.', !Ref EIP]]

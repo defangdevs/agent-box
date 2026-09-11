@@ -143,6 +143,12 @@ reboot. Read the URL and the address from `properties.outputs`; its
 `remoteControlSession` is only meaningful once you have started a claude
 session from the settings page's install+sign-in cards.
 
+`sslipDomain` (default `sslip.io`) is the suffix the hostname is derived
+under. `sslip.io` is itself open source
+([cunnie/sslip.io](https://github.com/cunnie/sslip.io)) and self-hostable,
+so a deployment that runs its own copy under its own domain can point this
+parameter at it to whitelabel the URL entirely (issue #647).
+
 `webPassword` is 16-64 characters, and any character is safe. Bicep has no
 `AllowedPattern` equivalent — a parameter can be constrained by length and by a
 list of allowed values, but not by a pattern — so nothing can reject a password
