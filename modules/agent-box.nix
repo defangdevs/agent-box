@@ -24823,9 +24823,11 @@ if __name__ == "__main__":
         # the box can't peek. Kept OUTSIDE /var/lib/agent-box-web (0700) so
         # caddy's `import` can traverse without loosening the secrets dir.
         "d /var/lib/agent-box-sites 0755 root root - -"
-        # File-drop dirs (issue #132), same layout/permissions rationale as the
-        # snippet dirs above: parent world-traversable so caddy can reach the
-        # per-user 0750 <user>:caddy subdirs it serves at /<user>/downloads/.
+        # File-drop dirs (issue #132). The parent stays world-traversable
+        # like the snippet dirs above, but for a different reason since
+        # issue #630: caddy no longer opens anything under here (the
+        # per-user settings daemon serves /<user>/downloads/), so what has
+        # to reach a drop is that user's own daemon, running as that user.
         "d /var/lib/agent-box-downloads 0755 root root - -"
         # Settings daemon sockets live here (issue #49). World-traversable is
         # fine: the per-user socket files themselves are 0660 <user>:caddy
@@ -24842,9 +24844,22 @@ if __name__ == "__main__":
         # symlink/file if the target differs from ours (idempotent across
         # renames). Users edit through this link and never touch /var/lib.
         "L+ /home/${name}/sites - - - - /var/lib/agent-box-sites/${name}"
-        # ~/downloads -> the caddy-readable file-drop dir served at
-        # /<user>/downloads/ (issue #132). Same L+/symlink rationale as ~/sites.
-        "d ${downloadsDirOf name} 0750 ${name} caddy - -"
+        # ~/downloads -> the file-drop dir served at /<user>/downloads/
+        # (issue #132). Same L+/symlink rationale as ~/sites, but NOT the
+        # same mode: 0700, not 0750. Caddy read this tree until issue #630
+        # moved the route to the per-user settings daemon, and it has no
+        # business in it now -- so the group bits come off and a caddy
+        # compromise stops being a read of every user's drop. The daemon is
+        # that user's own, so the owner bits are all it needs.
+        #
+        # The group stays `caddy` deliberately: it grants nothing at 0700,
+        # both backends have to emit this line identically, and neither can
+        # portably name a per-user group (NixOS has none, issue #604). The
+        # MODE is the boundary here, and keeping the group aligned with the
+        # ~/sites rule above leaves exactly one difference between the two
+        # lines -- which is the whole statement: snippets are caddy's to
+        # read, drops are not.
+        "d ${downloadsDirOf name} 0700 ${name} caddy - -"
         "L+ /home/${name}/downloads - - - - ${downloadsDirOf name}"
       ]) (lib.attrNames cfg.users)
       # The settings page's env dir, per terminal user. User-owned 0700 so
