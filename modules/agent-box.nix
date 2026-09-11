@@ -15745,17 +15745,41 @@ def write_sessions(sessions, version=REGISTRY_VERSION):
 _session_start_notices = {}
 
 
+def ensure_claude_profile():
+    """Offer the login worker in Add session, preserving existing profiles.
+
+    An explicit successful login can recreate a deleted starter profile;
+    ordinary supervisor seeding still respects its once-per-name stamp.
+    A name already used for another harness belongs to the user.
+    """
+    if not PROFILE_BIN:
+        return None, []
+    index = 1
+    while True:
+        name = "claude" if index == 1 else "claude-%d" % index
+        path = profile_path(name)
+        with locked(path):
+            if not os.path.lexists(path):
+                save(path, [("HARNESS", "claude")], profile_header(name))
+            data = as_dict(load(path))
+        if data.get("HARNESS") == "claude":
+            resolved = profile_launch(name)
+            if resolved and resolved.get("harness") == "claude":
+                return name, [str(a) for a in (resolved.get("args") or [])]
+            return None, []
+        index += 1
+
+
 def ensure_harness_session(agent, remote_control):
-    """Auto-start one bare session for `agent` the moment its connect card
+    """Auto-start one session for `agent` the moment its connect card
     signs in (issue #504), so install+login leaves an actual running
     session behind rather than just a signed-in CLI nobody has started yet.
 
     Skipped if the user already has ANY session on that harness -- a repeat
     sign-in (a token refresh, "Sign in again") must not mint a second one
-    every time the card cycles through "connected". No profile, no working
-    directory: this is the bare pseudo-profile shape `shell` already has
-    (see SHELL_PSEUDO_PROFILE), the one with no model, effort or prompt to
-    carry.
+    every time the card cycles through "connected". Claude gets a reusable
+    starter profile, with its launch arguments resolved just like Add
+    session. Codex retains its bare interactive session.
 
     `remote_control` is the one thing that differs by harness. claude's rc
     is a flag on the ordinary TUI (supervisor.sh appends --remote-control),
@@ -15771,6 +15795,14 @@ def ensure_harness_session(agent, remote_control):
     """
     if agent not in AGENTS:
         return
+    profile, args = None, []
+    if agent == "claude":
+        try:
+            profile, args = ensure_claude_profile()
+        except OSError:
+            # Profile storage failure must not undo a successful login or
+            # prevent its worker from starting.
+            pass
     try:
         with sessions_lock():
             sessions, version = load_sessions()
@@ -15785,8 +15817,8 @@ def ensure_harness_session(agent, remote_control):
                 "remoteControl": remote_control,
                 "remoteControlName": None,
                 "workingDirectory": None,
-                "extraArgs": [],
-                "profile": None,
+                "extraArgs": args,
+                "profile": profile,
                 "initialPrompt": None,
                 "resumePrompt": None,
                 "boxSessionId": None,
@@ -17369,7 +17401,7 @@ def connect_state(flow, keys=None, tmux_state=None):
                 connect_cancel(flow_id)
                 running = False
                 state = "connected"
-                # One bare session per harness, started the moment sign-in
+                # One session per harness, started the moment sign-in
                 # lands (issue #504) -- codex gets an interactive worker
                 # session (remote_control=False) since pairing for
                 # phone/desktop already happened in this flow's own pane;

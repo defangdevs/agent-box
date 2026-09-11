@@ -229,6 +229,64 @@ class ProfileFixture(unittest.TestCase):
         return daemon_with(**env)
 
 
+class LoginProfile(ProfileFixture):
+    def daemon(self, **extra):
+        module = super().daemon(**extra)
+        module.capacity_live = lambda: set()
+        module.capacity_limit = lambda: 100
+        return module
+
+    def test_login_creates_a_launchable_profile_and_remote_session(self):
+        module = self.daemon()
+        module.ensure_harness_session("claude", True)
+        session = self.read_sessions()["claude"]
+        self.assertEqual(session["profile"], "claude")
+        self.assertTrue(session["remoteControl"])
+        self.assertEqual(session["extraArgs"], [])
+        self.assertEqual(module.profile_launch("claude")["harness"], "claude")
+        self.assertIn('value="claude"', module.render_profile_options(module.read_profiles()))
+
+    def test_login_preserves_custom_settings_and_resolves_them(self):
+        self.write_profile("claude", "HARNESS=claude\nMODEL=sonnet\nTOKEN=private\n")
+        module = self.daemon()
+        module.ensure_harness_session("claude", True)
+        self.assertEqual(self.read_sessions()["claude"]["extraArgs"], ["--model", "sonnet"])
+        self.assertEqual(module.as_dict(module.load(module.profile_path("claude")))["TOKEN"], "private")
+
+    def test_existing_session_still_gets_a_profile_without_a_duplicate(self):
+        self.write_sessions({"existing": {"agent": "claude", "profile": None}})
+        module = self.daemon()
+        module.ensure_harness_session("claude", True)
+        module.ensure_harness_session("claude", True)
+        self.assertEqual(list(self.read_sessions()), ["existing"])
+        self.assertEqual(list(module.read_profiles()), ["claude"])
+
+    def test_another_harness_profile_is_not_overwritten(self):
+        self.write_profile("claude", "HARNESS=codex\n")
+        module = self.daemon()
+        module.ensure_harness_session("claude", True)
+        self.assertEqual(self.read_sessions()["claude"]["profile"], "claude-2")
+        self.assertEqual(module.profile_launch("claude")["harness"], "codex")
+
+    def test_profile_storage_failure_still_starts_the_worker(self):
+        module = self.daemon()
+        module.PROFILES_DIR = self.env_file
+        module.ensure_harness_session("claude", True)
+        self.assertIsNone(self.read_sessions()["claude"]["profile"])
+
+    def test_codex_login_keeps_its_existing_behavior(self):
+        module = self.daemon()
+        module.ensure_harness_session("codex", False)
+        self.assertIsNone(self.read_sessions()["codex"]["profile"])
+        self.assertFalse(self.read_sessions()["codex"]["remoteControl"])
+        self.assertEqual(module.read_profiles(), {})
+
+    def test_no_resolver_retains_the_login_worker(self):
+        module = self.daemon(AGENT_BOX_PROFILE_BIN="")
+        module.ensure_harness_session("claude", True)
+        self.assertIsNone(self.read_sessions()["claude"]["profile"])
+
+
 class ProfilePanel(ProfileFixture):
     """What the panel shows."""
 
@@ -738,6 +796,22 @@ class ProfileRoutes(ProfileFixture):
         _, base = self.serve()
         status, _ = self.post(base, "/profiles/nope", name="ok")
         self.assertEqual(status, 404)
+
+    def test_login_profile_can_launch_another_remote_session(self):
+        module, base = self.serve()
+        module.ensure_harness_session("claude", True)
+        status, _ = self.post(base, "/sessions/add", back="settings",
+                              profile="claude", cwd="~", prompt="")
+        self.assertEqual(status, 303)
+        sessions = self.read_sessions()
+        self.assertEqual(len(sessions), 2)
+        for session in sessions.values():
+            self.assertEqual(session["profile"], "claude")
+            self.assertEqual(session["agent"], "claude")
+            self.assertTrue(session["remoteControl"])
+            self.assertEqual(session["extraArgs"], [])
+        module.ensure_harness_session("claude", True)
+        self.assertEqual(self.read_sessions(), sessions)
 
     def test_adding_a_session_records_the_profile_name_not_just_its_args(self):
         """The load-bearing one. The spawn wrapper re-reads the NAME at
