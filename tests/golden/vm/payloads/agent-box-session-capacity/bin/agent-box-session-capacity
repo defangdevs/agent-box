@@ -71,8 +71,9 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
             if isinstance(entry, dict) and entry.get("died") is not None}
     live = live - died
     pending = {name for name, entry in sessions.items()
-               if isinstance(entry, dict) and entry.get("stopped") is not True
-               and entry.get("died") is None}
+               if isinstance(entry, dict)
+               if entry.get("stopped") is not True
+               if entry.get("died") is None}
     used = live | pending
     targets = set(targets)
     if spawning:
