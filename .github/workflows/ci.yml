@@ -56,45 +56,74 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Validate module & VM
+  native:
+    name: Native checks
     runs-on: ubuntu-latest
-    # A hung VM test otherwise burns the runner for GitHub's 360-minute
-    # default (a sessions-test hang once ran ~60 min before dying). Green
-    # runs target 10 minutes; the step timeouts report hangs as failures.
-    timeout-minutes: 25
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@v30
+      - uses: cachix/install-nix-action@v30
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
-
-      # One pinned graph shares evaluation and builds independent checks and
-      # every guest closure before the resource-limited execution lanes.
-      # ci-native discovers all non-VM checks; ci-vm-drivers builds every
-      # driver's closure without booting it. Per-check -L logs and
-      # --keep-going retain diagnostics even when several checks fail.
-      - name: Prepare checks and VM drivers
+      # All native checks, pinned workflow lint and both image eval gates.
+      - name: Run native checks
         timeout-minutes: 12
-        run: nix build -L --keep-going --max-jobs 4 --cores 1 --out-link ci-result .#ci-prepare
+        run: nix build -L --keep-going --max-jobs 4 --cores 1 --no-link .#ci-native
 
-      # Interactive VM test: brute-forcing the web terminal's basic auth gets
-      # the client banned. ubuntu-latest runners have KVM but /dev/kvm is
-      # root-only by default; open it up so the qemu inside the nix build can
-      # use it (https://github.blog/changelog/2023-02-23-hardware-accelerated-android-virtualization-on-actions-linux-larger-hosted-runners/).
+  vm:
+    name: VM (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # A failed lane must not cancel the other regression results.
+      fail-fast: false
+      matrix:
+        include:
+          - lane: sessions
+            jobs: 1
+          - lane: webhook
+            jobs: 1
+          - lane: rest
+            jobs: 2
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      # Only this lane's drivers are evaluated/built, with no guests running.
+      - name: Prepare VM drivers
+        timeout-minutes: 7
+        run: nix build -L --keep-going --max-jobs 4 --cores 1 --out-link ci-drivers .#ci-vm-${{ matrix.lane }}
       - name: Enable KVM for the test driver
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      # Nine VM checks, at most four test derivations on this runner.
-      # A test can boot more than one guest. Keep the 1+1+2 lane budget;
-      # preparing drivers above lets the shared lane start immediately.
+      # Globally still 1+1+2 simultaneous test derivations. Each test can
+      # boot multiple guests; separate runners reduce contention per guest.
       - name: Run VM tests
         timeout-minutes: 12
-        run: bash scripts/ci-vm-tests.sh ci-result/drivers
+        run: bash scripts/ci-vm-tests.sh ci-drivers ${{ matrix.jobs }}
+
+  validate:
+    # Preserve the existing status name and fail closed on failure, skip or
+    # cancellation in ANY dependency. Measure the full workflow critical
+    # path when assessing #519, not this short aggregation job in isolation.
+    name: Validate module & VM
+    needs: [native, vm]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every validation job to pass
+        env:
+          NATIVE_RESULT: ${{ needs.native.result }}
+          VM_RESULT: ${{ needs.vm.result }}
+        run: |
+          echo "Native checks: $NATIVE_RESULT; VM lanes: $VM_RESULT"
+          [[ "$NATIVE_RESULT" == success && "$VM_RESULT" == success ]]

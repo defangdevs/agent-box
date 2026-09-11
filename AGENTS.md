@@ -279,22 +279,27 @@ Never end a test pipeline with `grep -q`. The driver runs each command under `se
 
 ### Adding a check: CI discovers coverage and verifies VM scheduling
 
-`packages.<system>.ci-native` discovers every check without a `driver`
-attribute. CI builds it together with every VM driver's closure through
-`ci-prepare`, in one `--keep-going --max-jobs 4 --cores 1` graph. New native
-checks need no workflow list edit. Run `nix build -L --keep-going .#ci-native`
-for the entire native set on your architecture. Workflow lint uses the
-flake's pinned actionlint, and `vm-image-eval` forces both image derivations
-without building the qcow image.
+`packages.<system>.ci-native` discovers every check outside `vmTestsFor`.
+CI builds them in one `--keep-going --max-jobs 4 --cores 1` graph on a
+standard runner. New native checks need no workflow list edit. Run
+`nix build -L --keep-going .#ci-native` for the entire native set on your
+architecture. Workflow lint uses the flake's pinned actionlint, and
+`vm-image-eval` forces both image derivations without building the qcow image.
 
-VM execution remains in three lanes in `scripts/ci-vm-tests.sh`: `sessions`
-and `webhook` each get one job, and the rest share two. Add a new VM check to
-a lane and describe its coverage beside its definition in `flake.nix`.
-Before booting anything, the script compares its complete lane inventory
-against the flake-generated `ci-vm-drivers` directory. Missing, stale and
-duplicate entries fail CI instead of silently losing coverage. Every lane
-is waited on even if another fails. Do not raise the four-test concurrency
-budget without measuring guest memory and CPU pressure on the runner.
+Register VM tests in `vmTestsFor` and assign each to exactly one `ciVmLanes`
+entry in `flake.nix`. The `ci-scheduling` check rejects missing or duplicate
+assignments and mismatches with the workflow matrix. Each lane prepares only
+its own drivers, then runs their exact inventory with `scripts/ci-vm-tests.sh`.
+`sessions` and `webhook` each get one test job; the rest share two. The three
+lanes use separate standard runners but still run at most four tests total.
+A test may boot multiple guests. Do not raise that budget without measuring
+memory and CPU pressure. No test assertions are removed to meet timing goals.
+
+The matrix has `fail-fast: false`. The final `Validate module & VM` job runs
+with `always()` and fails unless native checks AND every VM lane succeeded.
+For #519, measure from the first validation job's start to the final gate's
+completion, not the short final job alone. Report queue time and per-job
+preparation/test times separately, and sum job durations for runner cost.
 
 This replaces a hand-maintained workflow inventory that once omitted
 fifteen of forty-four checks (#611). Keep the checks discoverable through
@@ -487,8 +492,8 @@ exceeds its own timeout is reported `cancelled` on `workflow_run`,
 two, so the standing watch cannot match it and a hung run reaches nobody. A
 STEP that runs out of time fails instead, which the existing rules do match.
 Size the step budget against the PRE-step time rather than the job timeout:
-preparation and VM execution each have a 12-minute step timeout under the
-25-minute job timeout, leaving a minute for setup and teardown.
+VM preparation has a 7-minute step timeout and execution has 12 minutes
+under a 20-minute job timeout, leaving a minute for setup and teardown.
 
 ### Finishing a CodeRabbit review
 
