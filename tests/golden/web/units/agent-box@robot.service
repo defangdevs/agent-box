@@ -1,6 +1,7 @@
 [Unit]
 
 [Service]
+Environment="AGENT_BOX_CAPACITY_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-session-capacity/bin/agent-box-session-capacity"
 Environment="AGENT_BOX_CLAUDE_SETTINGS=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-claude-hook-settings.json"
 Environment="AGENT_BOX_CODEX_FULL_ACCESS=1"
 Environment="AGENT_BOX_CODEX_RC=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-codex-remote-control"

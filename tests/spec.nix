@@ -63,6 +63,7 @@ in
   repo = cfg.selfUpdate.repo;
   rev = cfg.selfUpdate.rev;
   protectMemory = cfg.protectMemory;
+  sessionLimit = cfg.sessionLimit;
   containers = { enable = cfg.containers.enable; };
   codexFullAccess = cfg.codexFullAccess;
   restartNotice = cfg.restartNotice;

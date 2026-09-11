@@ -23,7 +23,7 @@
 
       # Across runners, preserve the existing four-test concurrency budget.
       ciVmLanes = {
-        sessions = { jobs = 1; checks = [ "sessions" ]; };
+        sessions = { jobs = 1; checks = [ "sessions" "session-limit" ]; };
         webhook = { jobs = 1; checks = [ "webhook" ]; };
         browser = {
           jobs = 1;
@@ -96,6 +96,15 @@
           # the same box.
           sessions-web = pkgs.testers.runNixOSTest
             (import ./tests/sessions-web.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (issue #662): admission during BOOT RECOVERY,
+          # not just when a session is added live. A two-session limit with
+          # three configured sessions leaves one queued after first start;
+          # freeing a slot admits it, `restart`/`restart --all` refuse at
+          # capacity (exit 75) without touching the sessions they would have
+          # restarted, and the same admission decisions hold across a reboot.
+          session-limit = pkgs.testers.runNixOSTest
+            (import ./tests/session-limit.nix { agent-box = self.nixosModules.agent-box; });
 
           # Interactive VM test (issue #628): the browser terminal's
           # transport belongs to its own user and the proxy in front of it.
@@ -1196,6 +1205,8 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               {
                 cat "$srcDir/lib/envstore.py"
                 printf '\n\n'
+                cat "$srcDir/lib/session-capacity.py"
+                printf '\n\n'
                 cat want.py
               } > want-settings.py
               if ! diff -u want-settings.py <(tail -n +2 "$profile/bin/agent-box-settings") \
@@ -1741,6 +1752,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             pkgs.runCommand "agent-box-webhook-defer"
               {
                 nativeBuildInputs = [
+                  pkgs.util-linux
                   pkgs.bash
                   pkgs.coreutils
                   pkgs.jq
@@ -2153,6 +2165,16 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # rides in tests/sessions.nix and the registry-protocol check
           # below; what only this can price is the three mutation ROUTES,
           # each against five ways the file can be broken, in seconds.
+          session-capacity = pkgs.runCommand "agent-box-session-capacity-test" {
+            nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.jq pkgs.util-linux ];
+          } ''
+            mkdir -p repo/modules repo/tests
+            cp -r ${./modules/src} repo/modules/src
+            cp ${./tests/test-session-capacity.py} repo/tests/test-session-capacity.py
+            python3 repo/tests/test-session-capacity.py
+            touch $out
+          '';
+
           sessions-registry =
             pkgs.runCommand "agent-box-sessions-registry"
               {

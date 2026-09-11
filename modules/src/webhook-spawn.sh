@@ -11,12 +11,6 @@ set -eu
 # `if`), so the failure would be silent — the watch panel would quietly report
 # the wrong worker and the wrong arguments.
 JQ="${AGENT_BOX_JQ_BIN:-jq}"
-# The session registry — where it lives, how it is locked and how it is
-# rewritten — is one file every shell writer splices in (issue #254). This one
-# only LOCKS: the write is done by the `agent-box-session add` it execs into,
-# which inherits the lock (see below).
-REGISTRY_PROG=agent-box-webhook-spawn
-@@include:lib/registry.sh@@
 @@include:lib/lease.sh@@
 
 # The assignment sentence (#253) and the preamble below are written once and
@@ -419,87 +413,15 @@ fi
 PROMPT="$(cat)"
 [ -n "$PROMPT" ] || exit 0
 
-# The cap is a decision taken from a READ of the registry, and the add that
-# acts on it is a rename by another process, so the two have to be one
-# critical section or two dispatches can both pass a cap of 4 and land 5 hook
-# sessions (issue #254). The sidecar lock is held from here through the `exec`
-# into agent-box-session at the end of this script: the fd survives exec, and
-# AGENT_BOX_REGISTRY_LOCK_FD tells that CLI the lock is already ours so it
-# does not re-open fd 9 — which would first CLOSE this description and drop
-# the lock mid-decision.
-#
-# A lock this program could not take is not announced: the fd is exported only
-# when it really holds one, so the CLI opens its own rather than trusting an
-# empty promise. `|| true` because a refusal must not abort this script under
-# `set -e`: the cap check below is a READ, so running it unlocked costs at
-# worst a racy count, and the `add` this execs into takes the lock itself and
-# refuses with the same 75 if it cannot (issue #633) — which is exactly the
-# "declined for now" answer the dispatcher re-offers. So a webhook delivery
-# is still never dropped for want of a lock; it waits for one.
-registry_lock || true
-if [ "$REGISTRY_HELD" = 1 ]; then
-  export AGENT_BOX_REGISTRY_LOCK_FD=9
-fi
-
-# The ceiling on CONCURRENT hook-* sessions, and the record it leaves.
-#
-# The cap itself is right — webhook.py rate-limits and coalesces spawns but
-# bounds nothing over time, so agents that forget their `agent-box-session rm`
-# would otherwise fill the box. What was wrong was the ANSWER it gave. A
-# refusal used to print a message and `exit 1`, which the dispatcher cannot
-# tell apart from "command not found", so it dropped the batch for good — and
-# for a standing watch there is no session peer that received those events
-# anyway, so the loss was total. Its only trace was the receiver daemon's
-# journal, while `agent-box-webhook ls` and `status` kept reporting a healthy
-# subscription: four wedged hook sessions made every watch on the box inert,
-# and that reads exactly like a quiet repo (issue #170).
-#
-# The exit code is a three-way answer since local-webhook 0.16.0
-# (local-channels#28, agent-box#301): 0 accepted, 75 (EX_TEMPFAIL) declines
-# for NOW, anything else says the spawner is broken. Only the last drops the
-# batch. So the cap exits 75 and nothing else in this script does — a
-# malformed AGENT_BOX_HOOK_SESSION_ARGS or a failed `add` really is a broken
-# spawner, and re-offering those would loop. A declined batch goes back at the
-# head of its key's pending list, is re-offered as the rate window reopens
-# (LOCAL_WEBHOOK_SPAWN_WINDOW, 60s) and starts the moment a slot frees, with
-# every line re-checked against live session ownership first. It is dropped
-# only if the whole streak outlasts LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — which
-# the receiver unit raises well past the upstream 300s default, because a hook
-# session runs for tens of minutes and five is not a wait, it is a slower drop.
-#
-# On a box pinned to local-webhook < 0.16.0 the 75 reads as a broken spawner
-# and the batch is dropped exactly as it was before, so this is never worse
-# than what it replaces.
-#
-# Either way the refusal is written down where the CLI can find it, next to
-# the other per-user agent-box state. Cumulative, never cleared: "5 refused,
-# the last one 20 minutes ago" is the standing fact an agent needs, not
-# something to forget on the next successful spawn. `deferred` records which
-# answer this wrapper gave, so `status` does not report as lost a batch the
-# receiver may still be holding. It is that answer and nothing more: this
-# program is gone by the time the batch starts or is finally dropped, so
-# nothing here could keep a live queue state honest, and the field must not be
-# read as one.
+# Admission belongs to agent-box-session, shared with interactive starts.
+# The wrapper only records retryable refusals for webhook status.
 BOX_STATE="$HOME/.local/state/agent-box"
 REFUSED="$BOX_STATE/webhook-spawn-refused.json"
 
-MAX="${AGENT_BOX_HOOK_SESSION_MAX:-4}"
-# A knob that is documented (agent-box-webhook --help) is a knob someone will
-# typo, and an unusable value must not take the standing watches down with it:
-# `[ n -ge foo ]` is a fatal error under set -e, which would refuse every batch
-# for a reason nobody could see.
-case "$MAX" in
-  (""|*[!0-9]*)
-    echo "agent-box-webhook-spawn: AGENT_BOX_HOOK_SESSION_MAX is not a number" \
-         "($MAX); using 4" >&2
-    MAX=4
-    ;;
-esac
-
 record_refusal() {
-  # $1 = the used hook-* capacity that triggered the refusal — the same number
-  # the message above printed, which is what is running or queued to start and
-  # NOT the raw registry key count (issue #280). Best effort: a state file that
+  # $1 = running/queued capacity in the post-refusal snapshot, or null
+  # when the status read failed. This is diagnostic, not an admission check.
+  # Best effort: a state file that
   # cannot be written must not turn a refused batch into a crashed spawner, so
   # every failure here is silent and the journal line above stays the fallback.
   mkdir -p "$BOX_STATE" 2>/dev/null || return 0
@@ -516,7 +438,7 @@ record_refusal() {
       --arg topic "${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
       --arg key "${LOCAL_WEBHOOK_SPAWN_KEY:-}" \
       --argjson live "$1" --argjson max "$MAX" --argjson count "$((prev + 1))" \
-      '{"//": "Written by agent-box-webhook-spawn when the hook-* session ceiling refused a standing-watch batch (agent-box#170). `deferred` records the ANSWER this wrapper gave that batch: 75, which local-webhook >= 0.16.0 reads as declined-for-retry rather than a failure that drops it (agent-box#301). It is history and is never rewritten, so it stays true after the batch starts or after the receiver gives up on it at LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S; its absence means the batch was dropped outright. `live` is the capacity in use: hook-* sessions running or queued to start (agent-box#280). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max, deferred: true}
+      '{"//": "Written by agent-box-webhook-spawn when the shared session admission refused a standing-watch batch (agent-box#170). `deferred` records the ANSWER this wrapper gave that batch: 75, which local-webhook >= 0.16.0 reads as declined-for-retry rather than a failure that drops it (agent-box#301). It is history and is never rewritten, so it stays true after the batch starts or after the receiver gives up on it at LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S; its absence means the batch was dropped outright. `live` is the capacity in use: sessions running or queued at the post-refusal snapshot (agent-box#662). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max, deferred: true}
        + (if $topic == "" then {} else {topic: $topic} end)
        + (if $key == "" then {} else {key: $key} end)' \
       > "$REFUSED.$$" 2>/dev/null; then
@@ -526,83 +448,6 @@ record_refusal() {
   fi
   return 0
 }
-
-# tmux is deliberately NOT on the receiver unit's PATH (jq, coreutils and
-# agent-box-session are all of it), so the liveness probe below gets a pinned
-# binary through the unit environment instead — the AGENT_BOX_*_BIN convention
-# the supervisor and the settings daemon already use for the tools their PATH
-# withholds. Unset means "no probe", and the cap then falls back to counting
-# registry keys: over-counting drops a batch, while reading a failed probe as
-# "nothing is running" would uncap spawning altogether.
-TMUX_BIN="${AGENT_BOX_TMUX_BIN:-tmux}"
-# The socket dir is the agent unit's RuntimeDirectory, derived here rather than
-# inherited (issue #268 — same rule and same value as src/session-cli.sh): an
-# ambient TMUX_TMPDIR, which `programs.tmux` with secureSocket exports through
-# /etc/profile, would point the probe at an empty directory where every hook
-# session looks finished and the cap would stop holding.
-export TMUX_TMPDIR="/run/agent-box-${USER:-$(id -un)}"
-
-# Names of live hook-* tmux sessions on stdout, one per line. Exit 0 means the
-# answer can be trusted — including an empty one, which is what a box whose
-# tmux server is down legitimately reports. Exit 1 means tmux itself could not
-# be run, so the caller must not read that same empty output as "nothing is
-# running": `tmux -V` separates the two before the query.
-live_hook_sessions() {
-  "$TMUX_BIN" -V >/dev/null 2>&1 || return 1
-  "$TMUX_BIN" -L agent-box list-sessions -F '#S' 2>/dev/null || true
-}
-
-if [ -s "$REGISTRY_FILE" ]; then
-  # Registry keys: every hook-* entry, finished or not. This was the whole cap
-  # and is now only its fallback — nothing ever expires an entry (`stopped` is
-  # set by the pane epilogue, and only `agent-box-session rm` clears the key),
-  # so sessions that ended weeks ago kept holding dispatch capacity until four
-  # of them made every standing watch inert with nothing running (issue #280).
-  # The probe costs two tmux round trips, so it only runs once the keys claim
-  # we are full.
-  keys=$("$JQ" -r '[.sessions | keys[] | select(startswith("hook-"))] | length' "$REGISTRY_FILE")
-  used="$keys"
-  if [ "$keys" -ge "$MAX" ]; then
-    if panes=$(live_hook_sessions); then
-      # Capacity is held by what is running or about to run: a live hook-* tmux
-      # session, or a listed hook-* entry that is not `stopped` — the
-      # supervisor's reconcile loop (re)starts one of those within ~2s, so it is
-      # load even in the second before it has a pane. A `stopped` entry is free:
-      # nothing respawns it until someone runs `agent-box-session restart`.
-      #
-      # Both halves matter. The listed half keeps the brake honest when the
-      # probe reaches a live tmux but the wrong (or an empty) socket dir; the
-      # pane half counts agents no entry claims — hand-started ones, and any
-      # delisted while still running.
-      used=$(printf '%s\n' "$panes" | "$JQ" -R -s --slurpfile reg "$REGISTRY_FILE" '
-        (split("\n") | map(select(startswith("hook-")))) as $panes
-        | ($reg[0].sessions // {} | to_entries
-           | map(select((.key | startswith("hook-")) and .value.stopped != true))
-           | map(.key)) as $listed
-        | $panes + $listed | unique | length')
-    else
-      echo "agent-box-webhook-spawn: cannot ask tmux which hook-* sessions are" \
-           "live ($TMUX_BIN did not run); counting all $keys registry entries" \
-           "instead, so a finished session still holds its slot" >&2
-    fi
-  fi
-  if [ "$used" -ge "$MAX" ]; then
-    echo "agent-box-webhook-spawn: $used hook-* sessions are running or queued to" \
-         "start (max $MAX); declining this batch for now — the receiver keeps it" \
-         "and offers it again when a slot frees. 'agent-box-session ls' shows" \
-         "which; stopping one frees its slot and 'agent-box-session rm NAME'" \
-         "delists it for good" >&2
-    # The number recorded is the number refused on: `agent-box-webhook status`
-    # must report the capacity the wrapper applied, not a second opinion.
-    record_refusal "$used"
-    echo "agent-box-webhook-spawn: recorded in $REFUSED;" \
-         "'agent-box-webhook status' reports it" >&2
-    # 75, not 1: EX_TEMPFAIL is the only code the dispatcher reads as "declined
-    # for now" rather than "this spawner is broken" (agent-box#301). Every
-    # other exit in this script stays what it was.
-    exit 75
-  fi
-fi
 
 # hook-<key>-<4 hex>: the key names the repo/object the events belong to,
 # so the workspace tab is readable; it is payload-derived, so sanitize to
@@ -881,10 +726,7 @@ note="${LOCAL_WEBHOOK_SPAWN_NOTE:+ (\"$LOCAL_WEBHOOK_SPAWN_NOTE\")}"
 # session works. Rendered by the one command that answers it, rather than a
 # second copy of the query here.
 #
-# READ-ONLY, which is what makes it safe to run from here: this script is
-# holding the registry lock across its exec into `agent-box-session add`, and
-# a verb that took the lock would deadlock every dispatch on the box (see
-# `peers` in src/session-cli.sh, which says the same thing from its side).
+# READ-ONLY, which is what makes it safe to run from here: the peer snapshot is advisory; admission is checked atomically by add.
 #
 # stderr is folded into the text on purpose. The one thing this block must
 # never do is report a busy box as an empty one, so a probe that could not run
@@ -914,11 +756,17 @@ pflag=()
 # `died` rather than parked (issue #516), so it stays listed and attachable
 # for inspection exactly as before -- and every surface now says the agent
 # is gone instead of reporting the post-mortem shell as a running session.
-if [ "${#extra[@]}" -gt 0 ]; then
-  exec "$SESSION_BIN" add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral --prompt "$preamble
+rc=0
+"$SESSION_BIN" add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral --prompt "$preamble
 
-$PROMPT" -- "${extra[@]}"
+$PROMPT" -- "${extra[@]}" || rc=$?
+if [ "$rc" = 75 ]; then
+  # Capacity may change after the refusal; this is a diagnostic snapshot,
+  # never a second admission decision. Lock failures are retryable too.
+  snapshot="$("$SESSION_BIN" capacity 2>/dev/null)" || snapshot='{}'
+  MAX="$(printf '%s' "$snapshot" | "$JQ" '.max // null')"
+  used="$(printf '%s' "$snapshot" | "$JQ" '.used // null')"
+  record_refusal "$used"
+  echo "agent-box-webhook-spawn: session start deferred; receiver will retry" >&2
 fi
-exec "$SESSION_BIN" add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral --prompt "$preamble
-
-$PROMPT"
+exit "$rc"

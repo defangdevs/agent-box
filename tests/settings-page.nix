@@ -141,6 +141,7 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
       isNormalUser = true;
     };
     services.agent-box = {
+      sessionLimit = 64;
       enable = true;
       agent = "claude";
       # Its seeded "main" below runs the real claude, and a VM test cannot

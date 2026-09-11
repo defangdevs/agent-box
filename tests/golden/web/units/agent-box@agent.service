@@ -1,6 +1,7 @@
 [Unit]
 
 [Service]
+Environment="AGENT_BOX_CAPACITY_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-session-capacity/bin/agent-box-session-capacity"
 Environment="AGENT_BOX_CHECKOUT_DIR=/home/agent/agent-box"
 Environment="AGENT_BOX_CHECKOUT_FORK=1"
 Environment="AGENT_BOX_CHECKOUT_REV=0000000000000000000000000000000000000000"

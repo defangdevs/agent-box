@@ -57,7 +57,9 @@ kill_session() {
 }
 
 usage() {
-  echo "usage: agent-box-session ls"
+  echo "usage: agent-box-session ls | capacity"
+  echo "Starts share sessionLimit (default 4), including pending starts and webhooks."
+  echo "Stop a session to free a slot. A refused start exits 75; retry is safe."
   echo "       agent-box-session peers"
   echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
   echo "                             [--cwd DIR]"
@@ -238,6 +240,10 @@ gen_name() {
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
+  capacity)
+    registry_ensure
+    "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE"
+    ;;
   ls)
     live="$(t list-sessions -F '#S' 2>/dev/null || true)"
     printf '%-24s %-8s %s\n' NAME HARNESS STATE
@@ -566,6 +572,7 @@ case "$cmd" in
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
     fi
+    "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
     # The id this session's FIRST spawn is launched with (Claude
     # --session-id / --resume; Codex transcript marker). Not a stable handle
     # on the conversation: a clear, a compact or a resume rotates the agent
@@ -662,7 +669,11 @@ case "$cmd" in
     # for parked sessions; kill-session tolerates one with nothing live.
     if [ "${1:-}" = "--all" ]; then
       registry_ensure
+      registry_lock
+      mapfile -t restart_names < <("$JQ" -r '.sessions | keys[]' "$REGISTRY_FILE")
+      "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "${restart_names[@]}" >/dev/null
       registry_edit 'del(.sessions[].stopped)'
+      registry_unlock
       "$JQ" -r '.sessions | keys[]' "$REGISTRY_FILE" | while IFS= read -r n; do
         [ -n "$n" ] && kill_session "$n" || true
       done
@@ -675,6 +686,7 @@ case "$cmd" in
       # (issue #254) — the flag write must apply to the file the check saw.
       registry_lock
       if taken "$name"; then
+        "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
         registry_edit --arg n "$name" 'del(.sessions[$n].stopped)'
         registry_unlock
         # A stopped session has no live tmux session to kill; kill_session

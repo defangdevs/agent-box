@@ -79,9 +79,9 @@ Two delivery shapes:
                          claim over any watch, GitHub or not.
                          A spawned session is subscribed to the event's own
                          repo for it, so its own CI spawns no sibling.
-                         THERE IS A CEILING: at most 4 hook-* sessions may
-                         RUN at once (AGENT_BOX_HOOK_SESSION_MAX in the
-                         receiver daemon's environment). Hook sessions are
+                         THERE IS A CEILING: sessionLimit (default 4) bounds all sessions
+                         running or queued. Configure it in the box
+                         configuration. Hook sessions are
                          removed by the agent they start, so four of them
                          still running stall every watch on the box. A batch
                          that arrives then is QUEUED, not dropped: the spawn
@@ -176,7 +176,8 @@ NEWER than the pin is normal — claude tracks the marketplace's default
 branch — and is reported in the JSON (`plugin.skew`) without a warning.
 
 Its `dispatch` object is where to look when standing watches seem dead:
-`hookSessions` is the running hook-* count against the ceiling, `lastRefusal`
+`hookSessions` is the legacy field name for ALL running/queued sessions
+against the shared ceiling, `lastRefusal`
 is the batch the ceiling most recently turned away (with a running total), and
 `warning` — the same field `ls` sets when the receiver has no spawn command —
 is present exactly when a match right now would spawn nothing.
@@ -323,7 +324,7 @@ peer_kinds() {
 
 # ----------------------------------------------------- standing-watch cap ---
 # Standing watches are the one delivery shape with no session behind it, so
-# when the spawn wrapper refuses a batch (too many hook-* sessions running)
+# when the spawn wrapper refuses a batch (too many sessions running)
 # nothing else is holding those events. That refusal used to reach only the
 # receiver daemon journal while every listing here still said "subscribed" —
 # four hook sessions whose agents forgot `agent-box-session rm` made the whole
@@ -336,36 +337,11 @@ peer_kinds() {
 # exactly as loud as it was.
 
 hook_sessions() {
-  # The capacity in use, counted the way the wrapper counts it
-  # (src/webhook-spawn.sh): a hook-* entry that is not `stopped` — running, or
-  # queued for the supervisor's reconcile loop to start within ~2s. A `stopped`
-  # entry is FREE capacity, so counting it here would report a healthy box as
-  # wedged (issue #280) — the same over-count that used to wedge it for real.
-  #
-  # The wrapper additionally counts live hook-* tmux panes that no entry
-  # claims, which needs the tmux binary its unit pins; this process has no such
-  # pin, and the divergence can only under-count. The wrapper stays the
-  # authority either way: when the two disagree, lastRefusal is the decision
-  # that was enforced.
-  if [ -s "$SESSIONS" ]; then
-    "$JQ" -r '[.sessions | to_entries[]
-               | select((.key | startswith("hook-")) and .value.stopped != true)]
-              | length' "$SESSIONS" 2>/dev/null || printf '0'
-  else
-    printf '0'
-  fi
+  agent-box-session capacity | "$JQ" -er '.used' || printf 'null\n'
 }
 
 hook_max() {
-  # The ceiling itself. It is an env knob on the RECEIVER daemon unit, whose
-  # environment this process does not share, so a box that raised it there and
-  # nowhere else would read the built-in here. That is why a recorded refusal
-  # carries the cap the wrapper actually applied: when the two disagree,
-  # lastRefusal.max is the one that was enforced. Unset on both sides — the
-  # normal case — makes them the same number.
-  m="${AGENT_BOX_HOOK_SESSION_MAX:-4}"
-  case "$m" in (""|*[!0-9]*) m=4 ;; esac
-  printf '%s' "$m"
+  agent-box-session capacity | "$JQ" -er '.max' || printf 'null\n'
 }
 
 dispatch_topics() {
@@ -385,15 +361,19 @@ hook_capacity_warning() {
   # print when the ceiling has stalled the watches, and nothing when it has
   # not. One wording in one place: two copies would drift, and this is the
   # sentence the reader acts on.
+  if [ "$1" = null ] || [ "$2" = null ]; then
+    printf '%s' "Cannot determine shared session capacity; inspect agent-box-session capacity."
+    return 0
+  fi
   [ "$1" -ge "$2" ] || return 0
-  printf '%s' "$1 of at most $2 hook-* sessions are running, so every \
+  printf '%s' "$1 of at most $2 sessions are running or queued, so every \
 standing watch is stalled: a matching event batch starts nothing now. The \
 spawn wrapper DECLINES it (exit 75) and the receiver holds it, re-offering it \
 as slots free and dropping it only once the wait outlasts \
 LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — so clearing the cap is still the fix. Free \
 a slot (agent-box-session ls, then agent-box-session stop NAME, or \
 agent-box-session rm NAME to delist it for good), or raise \
-AGENT_BOX_HOOK_SESSION_MAX on the receiver daemon unit."
+sessionLimit in the box configuration."
 }
 
 # local-webhook >= 0.23.0 refuses to create a --deliver-to subagent entry

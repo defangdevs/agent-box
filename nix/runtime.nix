@@ -105,6 +105,8 @@ let
       {
         cat ${src}/lib/envstore.py
         printf '\n\n'
+        cat ${src}/lib/session-capacity.py
+        printf '\n\n'
         cat daemon.py
       } > page.py
       # E402/F811 as well, and only here, for the same reason the module
@@ -183,6 +185,11 @@ let
     flakeIgnore = [ "E402" "E501" ];
   } (envStoreLib + "\n\n" + readSrc "envstore-cli.py");
 
+  capacityCli = pkgs.writers.writePython3Bin "agent-box-session-capacity" {
+    flakeIgnore = [ "E501" "E402" ];
+  } (readSrc "lib/session-capacity.py" + "\n\n"
+     + readSrc "session-capacity-cli.py");
+
   agentPackage = agent:
     if agent == "claude" then agentPkgs.claude-code
     else if agent == "codex" then agentPkgs.codex
@@ -236,7 +243,7 @@ let
     (payload "agent-box-codex-remote-control" "codex-remote-control.sh")
     (payload "agent-box-claude-session-start-hook" "claude-session-start-hook.sh")
     envExecWrapper
-    envStoreCli
+    envStoreCli capacityCli
     settingsDaemon
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-spawn" "webhook-spawn.sh")
