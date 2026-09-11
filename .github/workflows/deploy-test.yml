@@ -166,6 +166,13 @@ jobs:
           # own variable expansion. Routing it through the environment
           # instead means bash's normal "$VAR" expansion supplies the value
           # verbatim, with nothing in it re-scanned as shell syntax.
+          #
+          # The commas still have to be dealt with below: aws-cli's shorthand
+          # syntax for --parameters splits each list item on ',' to find the
+          # next ParameterKey=/ParameterValue= pair, and an argon2id hash's
+          # own field separators ("$m=47104,t=1,p=1$...") are exactly that
+          # character. Unescaped, aws-cli reads "t=1" and "p=1" as their own
+          # parameter structures and rejects them ("Unknown parameter ... t").
           WEB_PASSWORD_HASH: ${{ steps.pw.outputs.hash }}
         run: |
           # PublicIpv4/UseSpot come from the matrix leg (see the job comment).
@@ -177,13 +184,18 @@ jobs:
           # previously only ipv4-full got this, leaving ipv6-outputs with no
           # way to read its (journal-only) amazon-init failure at all.
           create() {
+            # Escape commas the shorthand parser would otherwise treat as
+            # separators between parameter structures (see the env comment
+            # above) - a literal comma survives as part of the value once
+            # backslash-escaped.
+            web_password_hash_escaped="${WEB_PASSWORD_HASH//,/\\,}"
             aws cloudformation create-stack \
               --stack-name "$STACK_NAME" \
               --template-body "file://deploy/aws/template.yaml" \
               --parameters \
                 "ParameterKey=PublicIpv4,ParameterValue=${{ matrix.public_ipv4 }}" \
                 "ParameterKey=UseSpot,ParameterValue=${{ (inputs.use_spot == true && matrix.public_ipv4 == 'true') && 'true' || matrix.use_spot }}" \
-                "ParameterKey=WebPasswordHash,ParameterValue=${WEB_PASSWORD_HASH}" \
+                "ParameterKey=WebPasswordHash,ParameterValue=${web_password_hash_escaped}" \
                 "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't4g.small (2 vCPU / 2 GiB)' }}" \
                 "ParameterKey=SeedMainSession,ParameterValue=true" \
                 "ParameterKey=EnableSsm,ParameterValue=true" \
