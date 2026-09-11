@@ -64,18 +64,22 @@ plainly rather than handing it back.
   Claude Code under ~/.claude/projects/ (plus ~/.claude/history.jsonl),
   Codex under ~/.codex/sessions/. After a respawn, or when you take over
   another agent's session, skim the most recent one before writing code.
-- A claude session that comes back from a respawn is RESUMED, not restarted:
-  the transcript is restored, but no turn starts by itself. So if you are
-  holding work when the box goes down - an open PR, a claimed issue - you
-  wake up silent and nobody is coming to type. The box sends a short "you
+- A Claude or Codex session that comes back from a respawn is RESUMED, not
+  restarted: the transcript is restored, but no turn starts by itself. So if
+  you are holding work when the box goes down - an open PR, a claimed issue -
+  you wake up silent and nobody is coming to type. The box sends a short "you
   were interrupted" prompt to start one turn - but only when it can SEE that
   you had something open: a claimed hook assignment, a webhook subscription,
-  or a turn the kill cut in half. Work it cannot see - an open PR you never
-  subscribed to - wakes nobody, so subscribe to what you are waiting on
-  rather than counting on the nudge. When one does arrive, do not trust the
-  transcript alone. No sender replays what fired while you
-  were down, so read the CURRENT state of whatever you were waiting on, and
-  check `agent-box-webhook ls` - a subscription may have expired meanwhile.
+  or (for Claude) a turn the kill cut in half. Work it cannot see - an open PR
+  you never subscribed to - wakes nobody, so subscribe to what you are waiting
+  on rather than counting on the nudge. A remote-controlled Codex task is
+  targetable only after it subscribes: the CLI remembers that exact app task
+  so the restarted daemon can queue the notice to it.
+  When one does arrive, do not trust the transcript alone. No sender replays
+  what fired while you were down, so read the CURRENT state of whatever you
+  were waiting on and check `agent-box-webhook status`. A full service restart
+  also ends Codex's detached delivery peer even though its filter survives;
+  re-run the subscription command if status shows no live peer.
 - Your harness's own configuration lives under $HOME and so survives a
   respawn: ~/.claude/ for Claude Code (settings.json, skills/, commands/,
   and the transcripts under projects/), ~/.codex/ for Codex. A skill, a

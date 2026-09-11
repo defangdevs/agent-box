@@ -1753,10 +1753,9 @@ in
       default = "auto";
       example = "never";
       description = ''
-        Whether to stamp the built-in "You were interrupted and automatically
-        restarted..." text onto a claude session's resume prompt after a
-        respawn (crash, reboot, Spot stop→restart) whose transcript already
-        holds real work.
+        Whether to send the built-in "You were interrupted and automatically
+        restarted..." prompt after a session respawns (crash, reboot, Spot
+        stop→restart) with work still outstanding.
 
         `--resume` restores the transcript, but it starts no turn: the agent
         comes back caught up and then waits, exactly as `claude --resume`
@@ -1780,13 +1779,14 @@ in
           transcript holds real work.
         - "never" is #512's: no injected prompt at all, ever.
 
-        A per-session resumePrompt still overrides all three. There is no
-        equivalent for codex or a remote-controlled session: codex's own
-        resume arm stamps the box/session id into its resumed prompt
-        regardless (there is no built-in text to gate), and a
-        remote-controlled codex session is served by a per-user daemon that
-        never restarts with the box's sessions — see codexFullAccess above
-        for why that path has no launch-time injection point at all.
+        A per-session resumePrompt still overrides all three. A Codex TUI
+        receives the prompt through its exact rollout resume target. A
+        remote-controlled Codex session has no positional prompt, so a task
+        with an active session subscription is remembered as the wake target
+        and the restarted daemon queues the prompt to it with `codex queue`.
+        Without a subscribed task there is no safe Remote Control target to
+        wake. The transcript-cut signal is Claude-only; leases and subscription
+        filters apply to both harnesses.
       '';
     };
 
@@ -3090,7 +3090,7 @@ in
             AGENT_BOX_CODEX_FULL_ACCESS = "1";
           }
           // {
-            # Built-in restart notice for claude respawns: "auto", "always"
+            # Built-in restart notice for resumable agent sessions: "auto", "always"
             # or "never" (issues #507, #548). Exported unconditionally and
             # read by VALUE -- restart_notice_wanted in supervisor.sh treats
             # an unset variable as "auto", so the three values have to be
