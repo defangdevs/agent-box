@@ -466,40 +466,63 @@ class Refusing(RegistryCase):
         # The supervisor calls into this every couple of seconds, so an
         # unlatched line would be the whole journal for as long as a home is
         # read-only. Same latch shape as registry_selfheal's two.
+        #
+        # The "\n" is load-bearing: ADD_ONE carries no separator of its own,
+        # so `ADD_ONE * 3` is ONE registry_edit with three filters mashed
+        # into its argv, and the assertion below would pass against a
+        # library that never latched anything.
         self.seed()
         self.unwritable_directory()
-        done = self.run_writer(self.ADD_ONE * 3, args=["doomed"], check=False)
+        done = self.run_writer((self.ADD_ONE + "\n") * 3, args=["doomed"],
+                               check=False)
         self.assertEqual(done.stderr.count("refusing to change"), 1, done.stderr)
+        self.assertEqual(self.sessions(), {})
 
     def test_a_writer_refused_once_can_write_when_the_lock_frees(self):
-        # Retryable in the plainest sense: the same program, the same
-        # registry, one lock release apart. Also the latch's negative
-        # control -- a second outage has to be reported as loudly as the
-        # first, so the line comes back too.
+        # Retryable in the plainest sense: one program, three lock states.
+        # It is refused, it writes once the holder lets go, and it is
+        # refused AGAIN when a second holder turns up -- which is the
+        # latch's negative control: a second outage has to be reported as
+        # loudly as the first, so the line has to come back.
         self.seed()
         holder = self.hold_lock_as_the_daemon_does()
-        gate = self.home / "held"
-        gate.touch()
+        # Markers rather than pipes: reading a live child's stderr from here
+        # is how a test deadlocks on a full buffer.
         first_rc = self.home / "first-rc"
-        # The rc goes to a FILE, not to stderr: reading a live child's pipe
-        # from here is how a test deadlocks on a full buffer.
-        body = (self.ADD_ONE.replace('"$1"', '"$1-first"') + "\n"
-                'echo "$?" > "$3"\n'
-                'while [ -e "$2" ]; do sleep 0.05; done\n'
-                + self.ADD_ONE.replace('"$1"', '"$1-second"') + "\n")
-        proc = self.start_writer(
-            body, args=["retry", str(gate), str(first_rc)], wait=1)
+        wrote = self.home / "wrote"
+        hold1 = self.home / "hold1"
+        hold2 = self.home / "hold2"
+        hold1.touch()
+        # ADD_ONE's own "$1" becomes the FUNCTION's argument here, which is
+        # what makes one definition serve all three edits.
+        body = (
+            'W=%s\n'
+            'E() { %s; }\n'
+            'E first; echo "$?" > "$W/first-rc"\n'
+            'while [ -e "$W/hold1" ]; do sleep 0.05; done\n'
+            'E second; touch "$W/wrote"\n'
+            'while [ ! -e "$W/hold2" ]; do sleep 0.05; done\n'
+            'E third\n'
+        ) % (self.home, self.ADD_ONE)
+        proc = self.start_writer(body, wait=1)
+
         self.assertTrue(wait_until(first_rc.exists), "the writer never refused")
         self.assertEqual(first_rc.read_text().strip(), str(self.BUSY))
         self.assertEqual(self.sessions(), {})
+
         fcntl.flock(holder, fcntl.LOCK_UN)
-        gate.unlink()
+        hold1.unlink()
+        self.assertTrue(wait_until(wrote.exists), "the writer never recovered")
+        self.assertEqual(list(self.sessions()), ["second"])
+
+        # A SECOND outage, after a lock that was genuinely taken cleared the
+        # latch.
+        self.hold_lock_as_the_daemon_does()
+        hold2.touch()
         _, err = proc.communicate(timeout=TIMEOUT)
-        self.assertEqual(proc.returncode, 0, err)
-        self.assertEqual(list(self.sessions()), ["retry-second"])
-        # The latch let go when the lock was finally taken, so a later
-        # outage would be reported again.
-        self.assertEqual(err.count("refusing to change"), 1, err)
+        self.assertEqual(proc.returncode, self.BUSY, err)
+        self.assertEqual(list(self.sessions()), ["second"])
+        self.assertEqual(err.count("refusing to change"), 2, err)
 
     def test_a_refusal_does_not_stop_the_other_writers(self):
         # "Unrelated sessions keep working": the refusal is one writer's

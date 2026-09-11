@@ -21459,7 +21459,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         no shell and a bare 503 tells them nothing.
         """
         sys.stderr.write("sessions/%s refused: %s\n" % (verb, exc))
-        render = render_home if (HOME and page == SESS_PAGE) else render_page
+        # TERM_HOME and not (HOME and SESS_PAGE): /<user>/ is EVERY user's
+        # landing page, not only the one whose daemon also serves the vhost
+        # root, so a form carrying back=workspace resolves to TERM_HOME for
+        # a second web user too - and SESS_PAGE is that user's SETTINGS
+        # page. Asking the simpler question answers both.
+        render = render_home if page == TERM_HOME else render_page
         self._send_html(
             render("The session list is being changed by something else, so "
                    "nothing was done. That clears within a few seconds "
@@ -22156,8 +22161,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._redirect("ok=deleted")
         elif path == SESS_BASE + "/sessions/add":
             back_page = self._sess_page(form)
-            # Error pages re-render the page the form came from.
-            render = render_home if (HOME and back_page == SESS_PAGE) else render_page
+            # Error pages re-render the page the form came from - see
+            # _registry_busy for why the test is TERM_HOME and not
+            # (HOME and SESS_PAGE).
+            render = render_home if back_page == TERM_HOME else render_page
             # The profile is the whole answer now (issue #493): the row has
             # no assistant <select> beside it any more, and there is no
             # box-wide default assistant left to fall back to. So the
