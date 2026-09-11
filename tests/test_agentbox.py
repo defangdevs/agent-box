@@ -3987,6 +3987,261 @@ class HandoverFailureTest(unittest.TestCase):
         self.assertEqual(self.restarted, [False])
 
 
+class RollbackTest(unittest.TestCase):
+    """`agentbox rollback` undoes an update that SUCCEEDED (issue #676).
+
+    Every rollback path before this one lived inside the update
+    transaction: a build that fails, a profile switch that fails, an apply
+    that raises, a release that cannot run its own post-switch phase. None
+    of them can see the failure this verb is for - a release that applies
+    cleanly, restarts every unit, returns 0, and is wrong anyway. So the
+    assertions here are mostly about the two states a half-done rollback
+    would leave behind: a profile switched onto a generation whose closure
+    the garbage collector already took, and a source tree still naming a
+    rev the box is no longer running.
+    """
+
+    def setUp(self):
+        self.mod = load_agentbox()
+        self.calls = []
+        self.rolled_to = []
+        self.reset = []
+        self.walls = []
+        self.restarted = []
+        self.resolved = []
+        self.apply_rc = 0
+        self.reset_fails = False
+        self.mod.run = self._record
+        self.mod.wall = self.walls.append
+        self.mod.restart_units = self._restart
+        self.mod.rollback_to = self._rollback
+        self.mod.source_tree = self._source_tree
+
+    def _record(self, cmd, check=True, capture=False):
+        self.calls.append([str(c) for c in cmd])
+        # Resolved AT CALL TIME: the command names the profile symlink, and
+        # what that symlink points at is the whole question - by the time
+        # the assertion runs the temporary directory is gone.
+        self.resolved.append(os.path.realpath(str(cmd[0])))
+        return subprocess.CompletedProcess(cmd, self.apply_rc, "", "")
+
+    def _restart(self, restart_sessions=True):
+        self.restarted.append(restart_sessions)
+        return ["caddy.service"]
+
+    def _rollback(self, profile, generation):
+        self.rolled_to.append(generation)
+        link = self.mod.generation_link(Path(profile), generation)
+        if not link.exists():
+            return False
+        Path(profile).unlink()
+        Path(profile).symlink_to(link)
+        return True
+
+    def _source_tree(self, profile, verb, *rest, **kw):
+        self.reset.append((verb, *rest))
+        if self.reset_fails:
+            raise self.mod.UpdateError("no origin/HEAD to resolve")
+        return ""
+
+    def _generation(self, tmp, number, rev, agentbox=True):
+        """One generation of the runtime profile, as a real directory.
+
+        `rev=None` is the EMPTY generation `nix profile remove` leaves
+        behind on its way to installing the next release - elements {} and
+        no binaries. Every successful update makes one, which is why the
+        fixtures here can build them.
+        """
+        link = Path(tmp) / f"profile-{number}-link"
+        (link / "bin").mkdir(parents=True)
+        if agentbox and rev:
+            (link / "bin" / "agentbox").write_text("#!/bin/sh\n:\n")
+        elements = {} if rev is None else {"runtime": {
+            "active": True,
+            "attrPath": f"packages.x86_64-linux.{self.mod.RUNTIME_ATTR}",
+            "url": f"github:{FAKE_REPO}/{rev}",
+            "storePaths": [str(link)],
+        }}
+        (link / "manifest.json").write_text(json.dumps({
+            "version": 3, "elements": elements,
+        }) + "\n")
+        return link
+
+    def _profile(self, tmp, generations, at):
+        for number, rev, has_agentbox in generations:
+            self._generation(tmp, number, rev, has_agentbox)
+        prof = Path(tmp) / "profile"
+        prof.symlink_to(Path(tmp) / f"profile-{at}-link")
+        return prof
+
+    def _args(self, **over):
+        base = dict(config="/etc/agent-box/config.json", profile=None,
+                    to_generation=None, branch=None, src="/var/lib/src",
+                    check=False, no_restart_sessions=False)
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def _rollback_run(self, generations=((1, "a" * 40, True),
+                                         (2, None, True),
+                                         (3, "b" * 40, True)),
+                      at=3, **over):
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = self._profile(tmp, generations, at)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                got = self.mod.cmd_rollback(
+                    self._args(profile=str(prof), **over))
+            return got, out.getvalue(), err.getvalue()
+
+    # --- the happy path --------------------------------------------------
+
+    def test_it_restores_the_previous_generation_and_re_applies(self):
+        got, _, _ = self._rollback_run()
+        self.assertEqual(got, 0)
+        self.assertEqual(self.rolled_to, [1])
+        # The apply has to run the RESTORED agentbox, not this one: the
+        # renderer and the config schema move together, so the older
+        # release is the only one that can render its own assets. It is
+        # named through the profile symlink, which is exactly why the
+        # rollback has to happen first - the same path resolves to a
+        # different release either side of it.
+        self.assertEqual([c[1] for c in self.calls], ["apply"])
+        self.assertTrue(self.calls[0][0].endswith("profile/bin/agentbox"),
+                        self.calls[0][0])
+        self.assertIn("profile-1-link", self.resolved[0])
+        self.assertEqual(self.restarted, [True])
+
+    def test_it_brings_the_source_tree_back_with_the_profile(self):
+        """A tree left ahead of the profile is a rev the box is not on.
+
+        The shipped guide tells agents the tree names the running rev, and
+        the next update measures its fast-forward from it - so the stale
+        one is both a wrong answer and a wrong baseline.
+        """
+        self._rollback_run()
+        self.assertEqual(self.reset, [("reset", "a" * 40)])
+
+    def test_no_restart_sessions_is_honoured(self):
+        self._rollback_run(no_restart_sessions=True)
+        self.assertEqual(self.restarted, [False])
+
+    def test_check_reports_the_target_and_changes_nothing(self):
+        got, out, _ = self._rollback_run(check=True)
+        self.assertEqual(got, 0)
+        self.assertIn("3", out)
+        self.assertIn("1", out)
+        self.assertEqual(self.rolled_to, [])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.reset, [])
+
+    def test_to_generation_names_an_older_release_exactly(self):
+        self._rollback_run(
+            generations=((1, "9" * 40, True), (2, "a" * 40, True),
+                         (3, "b" * 40, True)),
+            at=3, to_generation="1")
+        self.assertEqual(self.rolled_to, [1])
+        self.assertEqual(self.reset, [("reset", "9" * 40)])
+
+    def test_the_updates_own_empty_generation_is_skipped(self):
+        """The regression this verb was nearly shipped with (issue #676).
+
+        cmd_update installs by removing the runtime element and adding it
+        back, and `nix profile remove` makes a generation of its own - so
+        the generation directly behind a freshly installed release is
+        EMPTY, not the release before it. Measured on a live native box:
+        generation 3 held the running release, 2 held `"elements": []`, 1
+        held the release the box was installed with. A rollback that
+        trusted N-1 would have switched that box onto a profile with no
+        runtime and no agentbox to put it back.
+        """
+        got, _, _ = self._rollback_run()
+        self.assertEqual(got, 0)
+        self.assertEqual(self.rolled_to, [1], "generation 2 is the empty one")
+        self.assertEqual(self.reset, [("reset", "a" * 40)])
+
+    # --- the refusals ----------------------------------------------------
+
+    def test_a_profile_that_is_not_a_generation_symlink_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)      # a plain dir, no generation
+            with self.assertRaises(self.mod.ConfigError) as cm:
+                self.mod.cmd_rollback(self._args(profile=str(prof)))
+        self.assertIn("not a generation symlink", str(cm.exception))
+        self.assertEqual(self.rolled_to, [])
+
+    def test_the_first_generation_has_nothing_behind_it(self):
+        with self.assertRaises(self.mod.UpdateError) as cm:
+            self._rollback_run(generations=((1, "a" * 40, True),), at=1)
+        self.assertIn("no generation below 1", str(cm.exception))
+        self.assertEqual(self.rolled_to, [])
+
+    def test_a_forward_to_generation_is_refused(self):
+        with self.assertRaises(self.mod.ConfigError) as cm:
+            self._rollback_run(to_generation="5")
+        self.assertIn("only goes backwards", str(cm.exception))
+        self.assertEqual(self.rolled_to, [])
+
+    def test_a_collected_generation_is_refused_before_the_switch(self):
+        """nix-collect-garbage deletes generations AND their closures.
+
+        agent-box-nix-gc.timer runs `--delete-older-than 7d`, so on a box
+        that has not updated inside that window there is nothing behind the
+        current release. Switching the symlink onto it anyway would leave a
+        box with no agentbox at all - which is the one state a recovery
+        command must never create.
+        """
+        with self.assertRaises(self.mod.UpdateError) as cm:
+            self._rollback_run(generations=((3, "b" * 40, True),), at=3)
+        self.assertIn("no generation below 3", str(cm.exception))
+        self.assertEqual(self.rolled_to, [])
+        self.assertEqual(self.calls, [])
+
+    def test_a_generation_whose_closure_was_half_collected_is_skipped(self):
+        """A manifest is not proof the release is still on disk."""
+        with self.assertRaises(self.mod.UpdateError):
+            self._rollback_run(generations=((2, "a" * 40, False),
+                                            (3, "b" * 40, True)), at=3)
+        self.assertEqual(self.rolled_to, [])
+
+    def test_to_generation_refuses_one_that_holds_no_release(self):
+        with self.assertRaises(self.mod.UpdateError) as cm:
+            self._rollback_run(to_generation="2")
+        self.assertIn("no runnable release", str(cm.exception))
+        self.assertEqual(self.rolled_to, [])
+
+    # --- partial failures ------------------------------------------------
+
+    def test_a_tree_that_cannot_be_reset_is_a_note_not_a_failure(self):
+        """The box is already back on the release that works.
+
+        Failing here would report a rollback that did happen as one that
+        did not, and leave the re-apply unrun on top of it.
+        """
+        self.reset_fails = True
+        got, _, err = self._rollback_run()
+        self.assertEqual(got, 0)
+        self.assertIn("NOT reset", err)
+        self.assertEqual([c[1] for c in self.calls], ["apply"])
+        self.assertTrue(any("NOT reset" in w for w in self.walls))
+
+    def test_a_failed_apply_after_the_switch_is_reported(self):
+        self.apply_rc = 1
+        with self.assertRaises(self.mod.UpdateError) as cm:
+            self._rollback_run()
+        self.assertIn("exited 1", str(cm.exception))
+        self.assertEqual(self.rolled_to, [1])
+        self.assertTrue(any("half-written" in w for w in self.walls))
+
+    def test_a_rollback_that_will_not_move_says_so(self):
+        self.mod.rollback_to = lambda profile, generation: False
+        with self.assertRaises(self.mod.UpdateError) as cm:
+            self._rollback_run()
+        self.assertIn("could not move", str(cm.exception))
+        self.assertEqual(self.calls, [], "nothing re-applies over a profile "
+                                         "that did not move")
+
+
 class HandoverExitStatusTest(unittest.TestCase):
     """Phase one's wiring: which child outcomes reach the recovery.
 

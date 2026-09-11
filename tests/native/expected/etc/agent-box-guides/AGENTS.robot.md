@@ -629,6 +629,35 @@ and a rollback leaves it ahead: after a failed update
 `git -C /var/lib/agent-box/src log -1` names a rev this box is not
 running.
 
+### Undoing one (issue #676)
+
+An update that FAILS rolls itself back, and there is nothing for you to
+do. What has no automatic answer is an update that succeeded and was
+wrong anyway - the daemons restarted, the apply returned 0, and the box
+is worse. Go back with:
+
+    sudo -n /usr/bin/systemctl start --no-block agent-box-rollback.service
+
+Full path and `--no-block` for the same reason the update trigger needs
+them: sudoers matches the whole command line. It switches the runtime
+profile back to the previous RELEASE - the newest generation below this
+one that actually holds a runtime, which is not the same as the previous
+generation, since an update leaves an empty one behind it - resets the
+source tree to the rev that generation names, re-applies with THAT
+release's own agentbox and restarts the services. Your session restarts
+with them.
+
+`agentbox rollback --check` names the generation it would restore without
+touching anything, and reading it first is worth the second it costs:
+the store is garbage-collected on a timer, so a box that has not updated
+for a while may have nothing behind it to go back to. The command
+refuses that rather than half-doing it, and writes to `/var/log/agent-box-rollback.log`
+- the same reason the update has its own log, since you can read neither
+journal.
+
+It only ever goes BACKWARDS. To return to the release you rolled back
+from, update forward again.
+
 ## This platform has its own upstream repo
 
 The box itself - the terminal, session manager, webhook wiring, this
