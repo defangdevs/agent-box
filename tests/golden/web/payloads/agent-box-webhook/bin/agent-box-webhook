@@ -33,6 +33,50 @@ HOOK_REFUSED="$HOME/.local/state/agent-box/webhook-spawn-refused.json"
 # agent-box-webhook-backfill, read-only here.
 BACKFILL="$HOME/.local/state/agent-box/webhook-backfill.json"
 
+# A remote-controlled Codex task has no MCP channel of its own. local-webhook
+# therefore delivers through `codex queue`, using a detached peer keyed to the
+# Codex thread that ran this CLI. That peer dies with the agent unit, while the
+# subscription filter deliberately survives, so remember the last subscribed
+# thread separately for the supervisor to wake after a unit restart.
+CODEX_WAKE_DIR="$HOME/.local/state/agent-box/codex-wake"
+
+codex_wake_file() {
+  _key="${LOCAL_WEBHOOK_SESSION:-}"
+  case "$_key" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
+  printf '%s/%s\n' "$CODEX_WAKE_DIR" "$_key"
+}
+
+remember_codex_wake() {
+  _thread="${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}"
+  case "$_thread" in
+    (*[!0-9a-fA-F-]*) return 0 ;;
+    (????????-????-????-????-????????????) ;;
+    (*) return 0 ;;
+  esac
+  _wake="$(codex_wake_file)" || return 0
+  mkdir -p "$CODEX_WAKE_DIR" || return 0
+  chmod 700 "$CODEX_WAKE_DIR" 2>/dev/null || true
+  _tmp="$(mktemp "$CODEX_WAKE_DIR/.wake.XXXXXX")" || return 0
+  if printf '%s\n' "$_thread" > "$_tmp"; then
+    chmod 600 "$_tmp" 2>/dev/null || true
+    mv -f "$_tmp" "$_wake" 2>/dev/null || rm -f "$_tmp"
+  else
+    rm -f "$_tmp"
+  fi
+}
+
+forget_codex_wake_if_idle() {
+  _wake="$(codex_wake_file)" || return 0
+  _filter="$STATE_DIR/filter.${LOCAL_WEBHOOK_SESSION}.json"
+  _topics=0
+  if [ -s "$_filter" ]; then
+    _topics="$($JQ -r 'if .enabled == false then 0 else (.topics // []) | length end' \
+      "$_filter" 2>/dev/null)" || return 0
+  fi
+  case "$_topics" in (''|*[!0-9]*) return 0 ;; esac
+  [ "$_topics" -gt 0 ] || rm -f "$_wake"
+}
+
 usage() {
   cat <<'USAGE'
 usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
@@ -524,9 +568,10 @@ claim_clauses() {
 cmd="${1:-}"; shift || true
 case "$cmd" in
   subscribe)
+    deliver_to=session
     ensure_state
     if [ "${1:-}" != "-h" ] && [ "${1:-}" != "--help" ]; then
-      deliver_to=session; have_when=0; have_drop=0; topic=""; want=""
+      have_when=0; have_drop=0; topic=""; want=""
       have_include=0; have_exclude=0; claims=""; profile=""; have_profile=0
       # Filter --claim out of the argument list as we scan it: webhook.py has
       # never heard of that flag, so it is translated to --include below and
@@ -671,14 +716,18 @@ case "$cmd" in
         fi
       fi
     fi
-    exec "$PY" "$SCRIPT" "$cmd" "$@"
+    "$PY" "$SCRIPT" "$cmd" "$@" || exit $?
+    if [ "$deliver_to" = session ] && [ -n "${topic:-}" ]; then
+      remember_codex_wake
+    fi
     ;;
   unsubscribe)
     # webhook.py owns topic parsing, TTL/renew semantics and the filter
     # file — including the per-session LOCAL_WEBHOOK_SESSION scope, which
     # the supervisor already put in this session's environment.
     ensure_state
-    exec "$PY" "$SCRIPT" "$cmd" "$@"
+    "$PY" "$SCRIPT" "$cmd" "$@" || exit $?
+    forget_codex_wake_if_idle
     ;;
   ls|subscriptions)
     # Same delegation, deliberately not exec'd: a listing of standing watches

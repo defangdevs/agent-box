@@ -521,18 +521,22 @@ let
       Claude Code under ~/.claude/projects/ (plus ~/.claude/history.jsonl),
       Codex under ~/.codex/sessions/. After a respawn, or when you take over
       another agent's session, skim the most recent one before writing code.
-    - A claude session that comes back from a respawn is RESUMED, not restarted:
-      the transcript is restored, but no turn starts by itself. So if you are
-      holding work when the box goes down - an open PR, a claimed issue - you
-      wake up silent and nobody is coming to type. The box sends a short "you
+    - A Claude or Codex session that comes back from a respawn is RESUMED, not
+      restarted: the transcript is restored, but no turn starts by itself. So if
+      you are holding work when the box goes down - an open PR, a claimed issue -
+      you wake up silent and nobody is coming to type. The box sends a short "you
       were interrupted" prompt to start one turn - but only when it can SEE that
       you had something open: a claimed hook assignment, a webhook subscription,
-      or a turn the kill cut in half. Work it cannot see - an open PR you never
-      subscribed to - wakes nobody, so subscribe to what you are waiting on
-      rather than counting on the nudge. When one does arrive, do not trust the
-      transcript alone. No sender replays what fired while you
-      were down, so read the CURRENT state of whatever you were waiting on, and
-      check `agent-box-webhook ls` - a subscription may have expired meanwhile.
+      or (for Claude) a turn the kill cut in half. Work it cannot see - an open PR
+      you never subscribed to - wakes nobody, so subscribe to what you are waiting
+      on rather than counting on the nudge. A remote-controlled Codex task is
+      targetable only after it subscribes: the CLI remembers that exact app task
+      so the restarted daemon can queue the notice to it.
+      When one does arrive, do not trust the transcript alone. No sender replays
+      what fired while you were down, so read the CURRENT state of whatever you
+      were waiting on and check `agent-box-webhook status`. A full service restart
+      also ends Codex's detached delivery peer even though its filter survives;
+      re-run the subscription command if status shows no live peer.
     - Your harness's own configuration lives under $HOME and so survives a
       respawn: ~/.claude/ for Claude Code (settings.json, skills/, commands/,
       and the transcripts under projects/), ~/.codex/ for Codex. A skill, a
@@ -2893,9 +2897,10 @@ if __name__ == "__main__":
   # real daemon ran unsupervised. This wrapper is that foreground command: it
   # (re)starts the daemon, then blocks for as long as its control socket
   # answers. It also tears the daemon down when the session is killed or
-  # restarted, so no detached daemon is leaked. $1 is the codex binary; the
-  # rest is forwarded to `app-server daemon start` (the -c autonomy overrides
-  # seeded below, plus any extraArgs).
+  # restarted, so no detached daemon is leaked. Its arguments are the host
+  # label, wake thread, wake prompt and codex binary, followed by the arguments
+  # forwarded to `app-server daemon start` (the -c autonomy overrides seeded
+  # below, plus any extraArgs).
   #
   # The wrapper also DRIVES onboarding (issue 159): it runs the device-code
   # sign-in and mints the pairing code in this pane. Printing the two commands
@@ -2943,6 +2948,8 @@ if [ -n "$rcname" ] && [ -z "''${AGENT_BOX_CODEX_UTS:-}" ]; then
       -- "$rcname" "$0" "$rcname" "$@"
   fi
 fi
+wake_thread=$1; shift
+wake_prompt=$1; shift
 codex=$1; shift
 stop() { "$codex" app-server daemon stop >/dev/null 2>&1 || true; }
 # A daemon left over from an earlier start would make ours a no-op and
@@ -3121,6 +3128,15 @@ EOF
 "$codex" app-server daemon start "$@" >/dev/null || { daemon_failed "start"; stop; exit 1; }
 "$codex" app-server daemon enable-remote-control >/dev/null \
   || { daemon_failed "enable remote control"; stop; exit 1; }
+wake_task() {
+  [ -n "$wake_thread" ] && [ -n "$wake_prompt" ] || return 0
+  if "$codex" queue --thread "$wake_thread" --message "$wake_prompt" >/dev/null 2>&1; then
+    printf '%s\n' "  agent-box: queued the restart notice to Codex task $wake_thread."
+  else
+    printf '%s\n' "  agent-box: could not wake Codex task $wake_thread; open it manually." >&2
+  fi
+}
+wake_task
 hr
 printf '%s\n' "  agent-box: codex Remote Control daemon is running."
 printf '%s\n' "  This pane is not a codex prompt — it signs the box in and pairs it."
@@ -4287,6 +4303,9 @@ prune_filter() {
   # dead session's subscriptions.
   _sd="''${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
   rm -f "$_sd/filter.$(id -un)-$1.json"
+  # Also forget which Codex app task owned those subscriptions.
+  _cw="$HOME/.local/state/agent-box/codex-wake/$(id -un)-$1"
+  rm -f "$_cw"
 }
 session_state_file() {
   # session_state_file NAME — the supervisor's per-session observations
@@ -5873,6 +5892,50 @@ _hc_main "$@"
     # agent-box-webhook-backfill, read-only here.
     BACKFILL="$HOME/.local/state/agent-box/webhook-backfill.json"
 
+    # A remote-controlled Codex task has no MCP channel of its own. local-webhook
+    # therefore delivers through `codex queue`, using a detached peer keyed to the
+    # Codex thread that ran this CLI. That peer dies with the agent unit, while the
+    # subscription filter deliberately survives, so remember the last subscribed
+    # thread separately for the supervisor to wake after a unit restart.
+    CODEX_WAKE_DIR="$HOME/.local/state/agent-box/codex-wake"
+
+    codex_wake_file() {
+      _key="''${LOCAL_WEBHOOK_SESSION:-}"
+      case "$_key" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
+      printf '%s/%s\n' "$CODEX_WAKE_DIR" "$_key"
+    }
+
+    remember_codex_wake() {
+      _thread="''${CODEX_THREAD_ID:-''${CODEX_SESSION_ID:-}}"
+      case "$_thread" in
+        (*[!0-9a-fA-F-]*) return 0 ;;
+        (????????-????-????-????-????????????) ;;
+        (*) return 0 ;;
+      esac
+      _wake="$(codex_wake_file)" || return 0
+      mkdir -p "$CODEX_WAKE_DIR" || return 0
+      chmod 700 "$CODEX_WAKE_DIR" 2>/dev/null || true
+      _tmp="$(mktemp "$CODEX_WAKE_DIR/.wake.XXXXXX")" || return 0
+      if printf '%s\n' "$_thread" > "$_tmp"; then
+        chmod 600 "$_tmp" 2>/dev/null || true
+        mv -f "$_tmp" "$_wake" 2>/dev/null || rm -f "$_tmp"
+      else
+        rm -f "$_tmp"
+      fi
+    }
+
+    forget_codex_wake_if_idle() {
+      _wake="$(codex_wake_file)" || return 0
+      _filter="$STATE_DIR/filter.''${LOCAL_WEBHOOK_SESSION}.json"
+      _topics=0
+      if [ -s "$_filter" ]; then
+        _topics="$($JQ -r 'if .enabled == false then 0 else (.topics // []) | length end' \
+          "$_filter" 2>/dev/null)" || return 0
+      fi
+      case "$_topics" in ('''|*[!0-9]*) return 0 ;; esac
+      [ "$_topics" -gt 0 ] || rm -f "$_wake"
+    }
+
     usage() {
       cat <<'USAGE'
     usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
@@ -6364,9 +6427,10 @@ _hc_main "$@"
     cmd="''${1:-}"; shift || true
     case "$cmd" in
       subscribe)
+        deliver_to=session
         ensure_state
         if [ "''${1:-}" != "-h" ] && [ "''${1:-}" != "--help" ]; then
-          deliver_to=session; have_when=0; have_drop=0; topic=""; want=""
+          have_when=0; have_drop=0; topic=""; want=""
           have_include=0; have_exclude=0; claims=""; profile=""; have_profile=0
           # Filter --claim out of the argument list as we scan it: webhook.py has
           # never heard of that flag, so it is translated to --include below and
@@ -6511,14 +6575,18 @@ _hc_main "$@"
             fi
           fi
         fi
-        exec "$PY" "$SCRIPT" "$cmd" "$@"
+        "$PY" "$SCRIPT" "$cmd" "$@" || exit $?
+        if [ "$deliver_to" = session ] && [ -n "''${topic:-}" ]; then
+          remember_codex_wake
+        fi
         ;;
       unsubscribe)
         # webhook.py owns topic parsing, TTL/renew semantics and the filter
         # file — including the per-session LOCAL_WEBHOOK_SESSION scope, which
         # the supervisor already put in this session's environment.
         ensure_state
-        exec "$PY" "$SCRIPT" "$cmd" "$@"
+        "$PY" "$SCRIPT" "$cmd" "$@" || exit $?
+        forget_codex_wake_if_idle
         ;;
       ls|subscriptions)
         # Same delegation, deliberately not exec'd: a listing of standing watches
@@ -10786,6 +10854,7 @@ esac
     # LOCAL_WEBHOOK_STATE_DIR, and session_watches_events reads a filter file out
     # of it to decide whether a respawn is worth a turn (issue #548).
     WEBHOOK_STATE_DIR="$HOME/.local/state/local-webhook"
+    CODEX_WAKE_DIR="$HOME/.local/state/agent-box/codex-wake"
 
     # Bring the tmux server up, unconditionally -- see ensure_tmux_server below.
     # One-shot at startup is not enough: a transient failure right here (the
@@ -11812,7 +11881,7 @@ esac
     }
 
     restart_notice_wanted() {
-      # restart_notice_wanted NAME LAUNCHID -- should this respawn get the
+      # restart_notice_wanted NAME LAUNCHID HARNESS -- should this respawn get the
       # built-in notice? Reviving a session costs a full resumed transcript as
       # input, so "auto" (the default) sends one only to a session that has
       # something outstanding, and leaves a finished one silent.
@@ -11831,6 +11900,7 @@ esac
       # here names work this box accepted and cannot say finished.
       [ -s "$(lease_file "$1")" ] && return 0
       session_watches_events "$1" && return 0
+      [ "$3" = claude ] || return 1
       claude_turn_open "$2"
     }
 
@@ -11851,6 +11921,21 @@ esac
       # rollout-<date>T<time>-<uuid>.jsonl: the UUID is the fixed trailing 36
       # chars (8-4-4-4-12), robust against the dashes inside the timestamp.
       printf '%s' "''${b: -36}"
+    }
+
+    codex_wake_thread() {
+      # A remote-controlled Codex task has no rollout owned by this pane. Its
+      # durable wake target is the last task in this agent-box session that
+      # successfully created a session subscription with agent-box-webhook.
+      _f="$CODEX_WAKE_DIR/$USER-$1"
+      _thread=""
+      read -r _thread < "$_f" 2>/dev/null || _thread=""
+      case "$_thread" in
+        (*[!0-9a-fA-F-]*) return 0 ;;
+        (????????-????-????-????-????????????) ;;
+        (*) return 0 ;;
+      esac
+      printf '%s' "$_thread"
     }
 
     start_session() {
@@ -11981,6 +12066,21 @@ esac
           hasrun=true
         fi
       fi
+      # Codex needs a concrete delivery target before a prompt can wake it. A
+      # TUI session owns a rollout transcript; Remote Control owns whichever
+      # app task last subscribed from this agent-box session. Requiring a live
+      # filter for the latter keeps an old mapping from waking an unrelated task.
+      codex_target=""
+      if [ "$agent" = codex ] && [ "$hasrun" = true ]; then
+        if [ "$rc" = true ]; then
+          if session_watches_events "$sname"; then
+            codex_target="$(codex_wake_thread "$sname")"
+          fi
+        else
+          codex_target="$(codex_rollout_uuid "$bid")"
+        fi
+      fi
+
       # Resume on every respawn (hasRun already set); the kickoff prompt fires
       # only on the very first spawn. The default resume steer both continues
       # unfinished work AND lets an already-finished task exit instead of
@@ -11996,14 +12096,16 @@ esac
           # claude_transcript_has_work. Run the normal kickoff instead of
           # claiming an interruption nothing backs up.
           prompt="$ip"
-        elif [ "$agent" = claude ] && restart_notice_wanted "$sname" "$bid"; then
+        elif { [ "$agent" = claude ] || { [ "$agent" = codex ] \
+               && [ -n "$codex_target" ]; }; } \
+             && restart_notice_wanted "$sname" "$bid" "$agent"; then
           # An interrupted session is caught up by --resume but starts no turn of
           # its own, so a session with outstanding work waits forever unless this
           # prompt starts one (issue #548). What it must NOT do is imply the
           # transcript is all there is to check: the events that decide whether
           # the work is still needed fired while the box was down, and no sender
           # replays them.
-          prompt="You were interrupted and automatically restarted (agent-box session $bid). Your transcript is resumed, but no event that fired while you were down was replayed. Check the current state of whatever you were waiting on -- CI and reviews on a PR you opened, an issue you claimed -- and run 'agent-box-webhook ls' to confirm your subscriptions are still live, then subscribe again if they are not. Continue from there. If the work is already finished, say so in one line and stop rather than redoing it."
+          prompt="You were interrupted and automatically restarted (agent-box session $bid). Your transcript is resumed, but no event that fired while you were down was replayed. Check the current state of whatever you were waiting on -- CI and reviews on a PR you opened, an issue you claimed -- and run 'agent-box-webhook status' to confirm both your subscriptions and their delivery peer are live, then subscribe again if they are not. Continue from there. If the work is already finished, say so in one line and stop rather than redoing it."
         else
           # Nothing outstanding (restart_notice_wanted), or the notice is turned
           # off: --resume restores the transcript on its own, so the agent wakes
@@ -12154,10 +12256,13 @@ esac
             # instead (see codexRemoteControl). Pairing the
             # Codex apps to a running daemon uses `codex remote-control
             # pair`; the standalone-path shim seeded just above is what lets
-            # the Nix codex serve as the app-server. The daemon takes no
-            # positional prompt and has no TUI transcript to resume, so the
-            # kickoff/resume wiring below does not apply to it.
-            cmd="$(printf '%q' "''${AGENT_BOX_CODEX_RC:?}") $(printf '%q' "''${AGENT_BOX_HOST_LABEL:-}") $cmd"
+            # the Nix codex serve as the app-server. The daemon itself takes no
+            # prompt, so the wrapper queues one to the subscribed Codex task after
+            # bringing the daemon back. The target is empty until a task in this
+            # agent-box session has subscribed successfully.
+            cmd="$(printf '%q' "''${AGENT_BOX_CODEX_RC:?}") $(printf '%q' "''${AGENT_BOX_HOST_LABEL:-}")"
+            cmd="$cmd $(printf '%q' "$codex_target") $(printf '%q' "$prompt")"
+            cmd="$cmd $(printf '%q' "$bin")"
             if [ "$skip" = true ]; then
               cmd="$cmd -c approval_policy=never -c sandbox_mode=danger-full-access"
             fi
@@ -12166,17 +12271,16 @@ esac
             # Find THIS session's transcript by our injected marker. A concrete
             # match → resume it; no match → start fresh (never `resume --last`,
             # which could grab a sibling session's transcript in a shared cwd).
-            target="$(codex_rollout_uuid "$bid")"
             # "--" before the positionals for the same reason as claude's:
             # codex's -i/--image takes MULTIPLE files, so extraArgs ending in
             # it would otherwise eat the resume target and the prompt. Here
             # "--" also protects the target, which `resume` reads as its first
             # positional (SESSION_ID) and the prompt as its second.
-            if [ -n "$target" ]; then
+            if [ -n "$codex_target" ]; then
               cmd="$cmd resume"
               codex_autonomy
               append_extra
-              cmd="$cmd -- $(printf '%q' "$target")"
+              cmd="$cmd -- $(printf '%q' "$codex_target")"
               [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "$prompt")"
             else
               codex_autonomy
@@ -12813,10 +12917,9 @@ in
       default = "auto";
       example = "never";
       description = ''
-        Whether to stamp the built-in "You were interrupted and automatically
-        restarted..." text onto a claude session's resume prompt after a
-        respawn (crash, reboot, Spot stop→restart) whose transcript already
-        holds real work.
+        Whether to send the built-in "You were interrupted and automatically
+        restarted..." prompt after a session respawns (crash, reboot, Spot
+        stop→restart) with work still outstanding.
 
         `--resume` restores the transcript, but it starts no turn: the agent
         comes back caught up and then waits, exactly as `claude --resume`
@@ -12840,13 +12943,14 @@ in
           transcript holds real work.
         - "never" is #512's: no injected prompt at all, ever.
 
-        A per-session resumePrompt still overrides all three. There is no
-        equivalent for codex or a remote-controlled session: codex's own
-        resume arm stamps the box/session id into its resumed prompt
-        regardless (there is no built-in text to gate), and a
-        remote-controlled codex session is served by a per-user daemon that
-        never restarts with the box's sessions — see codexFullAccess above
-        for why that path has no launch-time injection point at all.
+        A per-session resumePrompt still overrides all three. A Codex TUI
+        receives the prompt through its exact rollout resume target. A
+        remote-controlled Codex session has no positional prompt, so a task
+        with an active session subscription is remembered as the wake target
+        and the restarted daemon queues the prompt to it with `codex queue`.
+        Without a subscribed task there is no safe Remote Control target to
+        wake. The transcript-cut signal is Claude-only; leases and subscription
+        filters apply to both harnesses.
       '';
     };
 
@@ -14150,7 +14254,7 @@ in
             AGENT_BOX_CODEX_FULL_ACCESS = "1";
           }
           // {
-            # Built-in restart notice for claude respawns: "auto", "always"
+            # Built-in restart notice for resumable agent sessions: "auto", "always"
             # or "never" (issues #507, #548). Exported unconditionally and
             # read by VALUE -- restart_notice_wanted in supervisor.sh treats
             # an unset variable as "auto", so the three values have to be
@@ -15965,6 +16069,9 @@ LIVE_ID_DIR = os.path.join(
 SESSION_STATE_DIR = os.path.join(
     HOME_DIR, ".local", "state", "agent-box", "session"
 )
+CODEX_WAKE_DIR = os.path.join(
+    HOME_DIR, ".local", "state", "agent-box", "codex-wake"
+)
 # Session ids, as claude's --session-id and the record filenames use them.
 # Validated before it reaches a glob pattern or a path join, so it doubles as
 # the path-safety check on a value read out of sessions.json.
@@ -16490,6 +16597,11 @@ def prune_filter(name):
     subscribing again."""
     if not SESSION_RE.match(name):
         return False
+    # A remote-controlled Codex task records which app task owns this
+    # filter. Clear both together so a reused session name cannot inherit it.
+    wake = os.path.join(CODEX_WAKE_DIR, webhook_key(name))
+    with contextlib.suppress(OSError):
+        os.remove(wake)
     try:
         os.remove(os.path.join(webhook_state_dir(), "filter.%s.json" % webhook_key(name)))
     except OSError:

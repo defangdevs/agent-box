@@ -37,10 +37,36 @@ chmod +x "$work/bin/python3"
 PATH="$work/bin:$PATH"; export PATH
 
 fails=0
+
 ok() { printf 'ok   %s\n' "$1"; }
 no() { printf 'FAIL %s\n     %s\n' "$1" "${2:-}"; fails=$((fails + 1)); }
 
 run() { bash "$SCRIPT" subscribe "$@" 2>"$work/err"; }
+
+# --- a Codex session subscription leaves a durable restart target -------
+wake_id=52345678-9abc-4def-8123-456789abcdef
+export CODEX_THREAD_ID="$wake_id"
+export LOCAL_WEBHOOK_SESSION=agent-main
+wake_file="$HOME/.local/state/agent-box/codex-wake/agent-main"
+
+run defangdevs/agent-box >/dev/null
+[ "$(cat "$wake_file" 2>/dev/null)" = "$wake_id" ] \
+  && ok "a Codex session subscription records its task for restart" \
+  || no "a Codex session subscription records its task for restart"
+
+rm -f "$wake_file"
+run defangdevs/agent-box --deliver-to subagent --when '{"path":"action","in":["opened"]}' \
+  >/dev/null
+[ ! -e "$wake_file" ] \
+  && ok "a standing watch does not become a Codex restart target" \
+  || no "a standing watch does not become a Codex restart target"
+
+run defangdevs/agent-box >/dev/null
+bash "$SCRIPT" unsubscribe defangdevs/agent-box >/dev/null 2>"$work/err"
+[ ! -e "$wake_file" ] \
+  && ok "the last unsubscribe removes the Codex restart target" \
+  || no "the last unsubscribe removes the Codex restart target"
+unset CODEX_THREAD_ID LOCAL_WEBHOOK_SESSION
 # The --include value the wrapper built, or empty.
 include_of() {
   run "$@" | awk '/^--include$/ { getline; print; exit }'

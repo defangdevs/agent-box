@@ -28,6 +28,7 @@ WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
 # LOCAL_WEBHOOK_STATE_DIR, and session_watches_events reads a filter file out
 # of it to decide whether a respawn is worth a turn (issue #548).
 WEBHOOK_STATE_DIR="$HOME/.local/state/local-webhook"
+CODEX_WAKE_DIR="$HOME/.local/state/agent-box/codex-wake"
 
 # Bring the tmux server up, unconditionally -- see ensure_tmux_server below.
 # One-shot at startup is not enough: a transient failure right here (the
@@ -564,7 +565,7 @@ session_watches_events() {
 }
 
 restart_notice_wanted() {
-  # restart_notice_wanted NAME LAUNCHID -- should this respawn get the
+  # restart_notice_wanted NAME LAUNCHID HARNESS -- should this respawn get the
   # built-in notice? Reviving a session costs a full resumed transcript as
   # input, so "auto" (the default) sends one only to a session that has
   # something outstanding, and leaves a finished one silent.
@@ -583,6 +584,7 @@ restart_notice_wanted() {
   # here names work this box accepted and cannot say finished.
   [ -s "$(lease_file "$1")" ] && return 0
   session_watches_events "$1" && return 0
+  [ "$3" = claude ] || return 1
   claude_turn_open "$2"
 }
 
@@ -603,6 +605,21 @@ codex_rollout_uuid() {
   # rollout-<date>T<time>-<uuid>.jsonl: the UUID is the fixed trailing 36
   # chars (8-4-4-4-12), robust against the dashes inside the timestamp.
   printf '%s' "${b: -36}"
+}
+
+codex_wake_thread() {
+  # A remote-controlled Codex task has no rollout owned by this pane. Its
+  # durable wake target is the last task in this agent-box session that
+  # successfully created a session subscription with agent-box-webhook.
+  _f="$CODEX_WAKE_DIR/$USER-$1"
+  _thread=""
+  read -r _thread < "$_f" 2>/dev/null || _thread=""
+  case "$_thread" in
+    (*[!0-9a-fA-F-]*) return 0 ;;
+    (????????-????-????-????-????????????) ;;
+    (*) return 0 ;;
+  esac
+  printf '%s' "$_thread"
 }
 
 start_session() {
@@ -733,6 +750,21 @@ start_session() {
       hasrun=true
     fi
   fi
+  # Codex needs a concrete delivery target before a prompt can wake it. A
+  # TUI session owns a rollout transcript; Remote Control owns whichever
+  # app task last subscribed from this agent-box session. Requiring a live
+  # filter for the latter keeps an old mapping from waking an unrelated task.
+  codex_target=""
+  if [ "$agent" = codex ] && [ "$hasrun" = true ]; then
+    if [ "$rc" = true ]; then
+      if session_watches_events "$sname"; then
+        codex_target="$(codex_wake_thread "$sname")"
+      fi
+    else
+      codex_target="$(codex_rollout_uuid "$bid")"
+    fi
+  fi
+
   # Resume on every respawn (hasRun already set); the kickoff prompt fires
   # only on the very first spawn. The default resume steer both continues
   # unfinished work AND lets an already-finished task exit instead of
@@ -748,14 +780,16 @@ start_session() {
       # claude_transcript_has_work. Run the normal kickoff instead of
       # claiming an interruption nothing backs up.
       prompt="$ip"
-    elif [ "$agent" = claude ] && restart_notice_wanted "$sname" "$bid"; then
+    elif { [ "$agent" = claude ] || { [ "$agent" = codex ] \
+           && [ -n "$codex_target" ]; }; } \
+         && restart_notice_wanted "$sname" "$bid" "$agent"; then
       # An interrupted session is caught up by --resume but starts no turn of
       # its own, so a session with outstanding work waits forever unless this
       # prompt starts one (issue #548). What it must NOT do is imply the
       # transcript is all there is to check: the events that decide whether
       # the work is still needed fired while the box was down, and no sender
       # replays them.
-      prompt="You were interrupted and automatically restarted (agent-box session $bid). Your transcript is resumed, but no event that fired while you were down was replayed. Check the current state of whatever you were waiting on -- CI and reviews on a PR you opened, an issue you claimed -- and run 'agent-box-webhook ls' to confirm your subscriptions are still live, then subscribe again if they are not. Continue from there. If the work is already finished, say so in one line and stop rather than redoing it."
+      prompt="You were interrupted and automatically restarted (agent-box session $bid). Your transcript is resumed, but no event that fired while you were down was replayed. Check the current state of whatever you were waiting on -- CI and reviews on a PR you opened, an issue you claimed -- and run 'agent-box-webhook status' to confirm both your subscriptions and their delivery peer are live, then subscribe again if they are not. Continue from there. If the work is already finished, say so in one line and stop rather than redoing it."
     else
       # Nothing outstanding (restart_notice_wanted), or the notice is turned
       # off: --resume restores the transcript on its own, so the agent wakes
@@ -906,10 +940,13 @@ start_session() {
         # instead (see codexRemoteControl). Pairing the
         # Codex apps to a running daemon uses `codex remote-control
         # pair`; the standalone-path shim seeded just above is what lets
-        # the Nix codex serve as the app-server. The daemon takes no
-        # positional prompt and has no TUI transcript to resume, so the
-        # kickoff/resume wiring below does not apply to it.
-        cmd="$(printf '%q' "${AGENT_BOX_CODEX_RC:?}") $(printf '%q' "${AGENT_BOX_HOST_LABEL:-}") $cmd"
+        # the Nix codex serve as the app-server. The daemon itself takes no
+        # prompt, so the wrapper queues one to the subscribed Codex task after
+        # bringing the daemon back. The target is empty until a task in this
+        # agent-box session has subscribed successfully.
+        cmd="$(printf '%q' "${AGENT_BOX_CODEX_RC:?}") $(printf '%q' "${AGENT_BOX_HOST_LABEL:-}")"
+        cmd="$cmd $(printf '%q' "$codex_target") $(printf '%q' "$prompt")"
+        cmd="$cmd $(printf '%q' "$bin")"
         if [ "$skip" = true ]; then
           cmd="$cmd -c approval_policy=never -c sandbox_mode=danger-full-access"
         fi
@@ -918,17 +955,16 @@ start_session() {
         # Find THIS session's transcript by our injected marker. A concrete
         # match → resume it; no match → start fresh (never `resume --last`,
         # which could grab a sibling session's transcript in a shared cwd).
-        target="$(codex_rollout_uuid "$bid")"
         # "--" before the positionals for the same reason as claude's:
         # codex's -i/--image takes MULTIPLE files, so extraArgs ending in
         # it would otherwise eat the resume target and the prompt. Here
         # "--" also protects the target, which `resume` reads as its first
         # positional (SESSION_ID) and the prompt as its second.
-        if [ -n "$target" ]; then
+        if [ -n "$codex_target" ]; then
           cmd="$cmd resume"
           codex_autonomy
           append_extra
-          cmd="$cmd -- $(printf '%q' "$target")"
+          cmd="$cmd -- $(printf '%q' "$codex_target")"
           [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "$prompt")"
         else
           codex_autonomy

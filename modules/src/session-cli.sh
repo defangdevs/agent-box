@@ -163,6 +163,9 @@ prune_filter() {
   # dead session's subscriptions.
   _sd="${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
   rm -f "$_sd/filter.$(id -un)-$1.json"
+  # Also forget which Codex app task owned those subscriptions.
+  _cw="$HOME/.local/state/agent-box/codex-wake/$(id -un)-$1"
+  rm -f "$_cw"
 }
 session_state_file() {
   # session_state_file NAME — the supervisor's per-session observations

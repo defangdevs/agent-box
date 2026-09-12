@@ -39,6 +39,8 @@ if [ -n "$rcname" ] && [ -z "${AGENT_BOX_CODEX_UTS:-}" ]; then
       -- "$rcname" "$0" "$rcname" "$@"
   fi
 fi
+wake_thread=$1; shift
+wake_prompt=$1; shift
 codex=$1; shift
 stop() { "$codex" app-server daemon stop >/dev/null 2>&1 || true; }
 # A daemon left over from an earlier start would make ours a no-op and
@@ -217,6 +219,15 @@ EOF
 "$codex" app-server daemon start "$@" >/dev/null || { daemon_failed "start"; stop; exit 1; }
 "$codex" app-server daemon enable-remote-control >/dev/null \
   || { daemon_failed "enable remote control"; stop; exit 1; }
+wake_task() {
+  [ -n "$wake_thread" ] && [ -n "$wake_prompt" ] || return 0
+  if "$codex" queue --thread "$wake_thread" --message "$wake_prompt" >/dev/null 2>&1; then
+    printf '%s\n' "  agent-box: queued the restart notice to Codex task $wake_thread."
+  else
+    printf '%s\n' "  agent-box: could not wake Codex task $wake_thread; open it manually." >&2
+  fi
+}
+wake_task
 hr
 printf '%s\n' "  agent-box: codex Remote Control daemon is running."
 printf '%s\n' "  This pane is not a codex prompt — it signs the box in and pairs it."

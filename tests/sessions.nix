@@ -619,7 +619,7 @@ in
         machine.succeed(
             # The empty first argument is written with DOUBLE quotes: a bare
             # pair of single quotes would end this Nix indented string here.
-            as_agent(f'{wrapper} "" /tmp/stub-codex > /tmp/stub/out 2>&1 || true')
+            as_agent(f'{wrapper} "" "" "" /tmp/stub-codex > /tmp/stub/out 2>&1 || true')
         )
         return (
             machine.succeed("cat /tmp/stub/out"),
@@ -657,6 +657,54 @@ in
     assert "Press Enter to try again" in offline_out, offline_out
     assert "logout" not in offline_calls, offline_calls
     assert offline_calls.count("remote-control pair") == 3, offline_calls
+    # The remote-control daemon cannot accept a positional resume prompt. Its
+    # wrapper must queue the notice to the exact subscribed Codex app task.
+    wake_id = "42345678-9abc-4def-8123-456789abcdef"
+    machine.succeed("rm -rf /tmp/stub && install -d -m 0777 /tmp/stub")
+    machine.succeed("touch /tmp/stub/loggedin")
+    machine.succeed(
+        as_agent(
+            f'{wrapper} "" "{wake_id}" "resume the task" /tmp/stub-codex '
+            "> /tmp/stub/out 2>&1 || true"
+        )
+    )
+    wake_calls = machine.succeed("cat /tmp/stub/log")
+    assert f"queue --thread {wake_id} --message resume the task" in wake_calls, wake_calls
+    wake_out = machine.succeed("cat /tmp/stub/out")
+    assert "queued the restart notice" in wake_out, wake_out
+
+    # End to end, the supervisor reads the task id saved beside an active
+    # subscription and passes both it and the auto notice to the wrapper.
+    wake_filter = (
+        "/home/agent/.local/state/local-webhook/filter.agent-helper.json"
+    )
+    wake_file = (
+        "/home/agent/.local/state/agent-box/codex-wake/agent-helper"
+    )
+    machine.succeed(as_agent(
+        "mkdir -p /home/agent/.local/state/local-webhook "
+        "/home/agent/.local/state/agent-box/codex-wake"
+    ))
+    machine.succeed(as_agent(
+        "printf %s "
+        + shlex.quote('{"enabled":true,"topics":[{"topic":"github:o/r"}]}')
+        + f" > {wake_filter}"
+    ))
+    machine.succeed(as_agent(
+        "printf '%s\\n' " + shlex.quote(wake_id) + f" > {wake_file}"
+    ))
+    old_helper_pid = machine.succeed(
+        tmux('display -p -t "=helper:" "#{pane_pid}"')
+    ).strip()
+    machine.succeed(tmux("kill-session -t =helper"))
+    helper_restart = machine.wait_until_succeeds(
+        tmux('list-panes -t "=helper" -F "#{pane_pid} #{pane_start_command}"')
+        + f" | grep -v '^{old_helper_pid} '",
+        timeout=60,
+    ).replace("\\", "")
+    assert wake_id in helper_restart, helper_restart
+    assert "You were interrupted" in helper_restart, helper_restart
+    machine.succeed(as_agent(f"rm -f {wake_filter} {wake_file}"))
 
     # Re-adding an existing name errors out and must not clobber the stored
     # config (issue 100): helper keeps its codex agent.
