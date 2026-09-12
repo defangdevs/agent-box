@@ -49,7 +49,7 @@ remember_codex_wake() {
   _tmp="$(mktemp "$CODEX_WAKE_DIR/.wake.XXXXXX")" || return 0
   if printf '%s\n' "$_thread" > "$_tmp"; then
     chmod 600 "$_tmp" 2>/dev/null || true
-    mv -f "$_tmp" "$_wake"
+    mv -f "$_tmp" "$_wake" 2>/dev/null || rm -f "$_tmp"
   else
     rm -f "$_tmp"
   fi

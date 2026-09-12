@@ -2873,9 +2873,10 @@ if __name__ == "__main__":
   # real daemon ran unsupervised. This wrapper is that foreground command: it
   # (re)starts the daemon, then blocks for as long as its control socket
   # answers. It also tears the daemon down when the session is killed or
-  # restarted, so no detached daemon is leaked. $1 is the codex binary; the
-  # rest is forwarded to `app-server daemon start` (the -c autonomy overrides
-  # seeded below, plus any extraArgs).
+  # restarted, so no detached daemon is leaked. Its arguments are the host
+  # label, wake thread, wake prompt and codex binary, followed by the arguments
+  # forwarded to `app-server daemon start` (the -c autonomy overrides seeded
+  # below, plus any extraArgs).
   #
   # The wrapper also DRIVES onboarding (issue 159): it runs the device-code
   # sign-in and mints the pairing code in this pane. Printing the two commands
@@ -5893,7 +5894,7 @@ _hc_main "$@"
       _tmp="$(mktemp "$CODEX_WAKE_DIR/.wake.XXXXXX")" || return 0
       if printf '%s\n' "$_thread" > "$_tmp"; then
         chmod 600 "$_tmp" 2>/dev/null || true
-        mv -f "$_tmp" "$_wake"
+        mv -f "$_tmp" "$_wake" 2>/dev/null || rm -f "$_tmp"
       else
         rm -f "$_tmp"
       fi
