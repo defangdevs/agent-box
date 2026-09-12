@@ -1602,14 +1602,15 @@ in
 {
   options.services.agent-box = {
     sessionLimit = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 4;
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
       description = ''
         Maximum running or queued sessions for the single-user v1 box.
-        Set this to the deployment's intended session budget (roughly one
-        per GiB). The explicit default avoids kernel memory reservations
-        rounding a nominal 4 GiB VM down to three sessions. This is overload
-        control, not a memory guarantee or a cross-user quota.
+        Null derives the limit from kernel-reported physical RAM at roughly
+        one session per GiB, rounded up so kernel reservations do not turn a
+        nominal 4 GiB VM into three slots. Set a positive integer to override
+        that automatic budget. This is overload control, not a memory
+        guarantee or a cross-user quota.
       '';
     };
 
@@ -2944,7 +2945,8 @@ in
     # the seeded ~/AGENTS.md — which @imports this path — stays editable. Skipped
     # for users that opted out of seeding (agentsMd = null).
     environment.etc = {
-      "agent-box/session-limit".text = "${toString cfg.sessionLimit}\n";
+      "agent-box/session-limit".text =
+        "${if cfg.sessionLimit == null then "auto" else toString cfg.sessionLimit}\n";
     } // lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (name: u:
       lib.optional (u.agentsMd != null) (lib.nameValuePair "agent-box-guides/AGENTS.${name}.md" {
         source = canonicalAgentsMd name u;

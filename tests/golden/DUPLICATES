@@ -9,6 +9,7 @@
 # longer render the same bytes, and the copy that diverged shows up as its own
 # file in the same diff.
 web/etc/agent-box-guides/AGENTS.robot.md -> web/etc/agent-box-guides/AGENTS.agent.md
+web/etc/agent-box/session-limit -> vm/etc/agent-box/session-limit
 web/etc/codex/config.toml -> vm/etc/codex/config.toml
 web/payloads/agent-box-agent-agents-pointer.md -> vm/payloads/agent-box-agent-agents-pointer.md
 web/payloads/agent-box-agent-mark-stopped -> vm/payloads/agent-box-agent-mark-stopped

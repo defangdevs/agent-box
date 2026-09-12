@@ -176,7 +176,7 @@
               # reads — the payload capture below only scans Nix-visible
               # `environment` attrs, so these plain-text files are the review
               # surface for what moved out of that attrset.
-              "agent-box-guides/.*|agent-box/units/.*|caddy/caddy_config|codex/config\\.toml|fail2ban/(fail2ban|jail)\\.local|fail2ban/filter\\.d/agent-web-auth\\.conf|sudoers"
+              "agent-box-guides/.*|agent-box/session-limit|agent-box/units/.*|caddy/caddy_config|codex/config\\.toml|fail2ban/(fail2ban|jail)\\.local|fail2ban/filter\\.d/agent-web-auth\\.conf|sudoers"
               n != null;
           manifestOf = modules:
             let sys = nixpkgs.lib.nixosSystem { inherit system modules; }; in

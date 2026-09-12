@@ -728,7 +728,7 @@ class Spec:
         # guess what an operator meant by a value of the wrong type.
         validate_config(data)
         self.profile = profile
-        self.session_limit = data.get("sessionLimit") or 4
+        self.session_limit = data.get("sessionLimit")
         self.domain = data.get("domain") or ""
         # Default matches the literal that used to be baked into first_boot()
         # (issue #647): an unset domainSuffix derives exactly the sslip.io
@@ -3298,7 +3298,8 @@ class Renderer:
         must still get them (issue #394 review).
         """
         t.file(self.p("/etc/agent-box/session-limit"),
-               str(self.spec.session_limit) + "\n")
+               (str(self.spec.session_limit)
+                if self.spec.session_limit is not None else "auto") + "\n")
         agents = " ".join(self.spec.agents + ["shell"])
         # shlex.quote, not hand-written single quotes: these values come
         # from the box's config, and JSON does not escape an apostrophe —

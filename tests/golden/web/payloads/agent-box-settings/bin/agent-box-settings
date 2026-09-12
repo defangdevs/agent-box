@@ -337,8 +337,36 @@ import os as capacity_os
 import subprocess as capacity_subprocess
 
 
+CAPACITY_KIB_PER_GIB = 1024 * 1024
+
+
 class SessionCapacityError(Exception):
     pass
+
+
+def capacity_memory_limit():
+    """Return roughly one session per GiB of physical RAM, minimum one."""
+    path = capacity_os.environ.get("AGENT_BOX_MEMINFO_FILE", "/proc/meminfo")
+    with open(path, encoding="ascii") as handle:
+        for line in handle:
+            fields = line.split()
+            if fields[:1] != ["MemTotal:"]:
+                continue
+            if len(fields) != 3:
+                break
+            if not fields[1].isascii() or not fields[1].isdecimal():
+                break
+            if fields[2] != "kB":
+                break
+            memory_kib = int(fields[1])
+            if memory_kib < 1:
+                break
+            # MemTotal excludes the kernel's own reservations, so it is a
+            # little below the host's nominal RAM. Round up rather than turn
+            # a nominal 4 GiB box into three slots for that bookkeeping.
+            rounded_kib = memory_kib + CAPACITY_KIB_PER_GIB - 1
+            return max(1, rounded_kib // CAPACITY_KIB_PER_GIB)
+    raise ValueError("cannot determine MemTotal from %s" % path)
 
 
 def capacity_limit():
@@ -348,9 +376,11 @@ def capacity_limit():
         with open(path, encoding="ascii") as handle:
             value = handle.read().strip()
     except FileNotFoundError:
-        value = "4"
+        value = "auto"
+    if value == "auto":
+        return capacity_memory_limit()
     if not value.isascii() or not value.isdecimal() or int(value) < 1:
-        raise ValueError("sessionLimit must be a positive integer")
+        raise ValueError("sessionLimit must be 'auto' or a positive integer")
     return int(value)
 
 

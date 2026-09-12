@@ -2661,8 +2661,9 @@ class ConfigSchemaTest(unittest.TestCase):
             self.spec(mutate)
         return str(caught.exception)
 
-    def test_session_limit_is_positive_and_defaults_to_four(self):
-        self.assertEqual(self.spec(lambda c: c.pop("sessionLimit", None)).session_limit, 4)
+    def test_session_limit_is_positive_and_defaults_to_automatic(self):
+        self.assertIsNone(self.spec(lambda c: c.pop("sessionLimit", None)).session_limit)
+        self.assertIsNone(self.spec(lambda c: c.update(sessionLimit=None)).session_limit)
         self.assertEqual(self.spec(lambda c: c.update(sessionLimit=2)).session_limit, 2)
         for value in [0, -1, True, "four", 1.5]:
             self.assertIn("sessionLimit", self.refused(lambda c: c.update(sessionLimit=value)))
