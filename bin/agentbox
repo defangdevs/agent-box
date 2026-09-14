@@ -722,7 +722,12 @@ def validate_config(data):
 class Spec:
     """The validated, defaulted view of config.yaml the renderer reads."""
 
-    def __init__(self, data, profile):
+    def __init__(self, data, profile, root="/"):
+        # `root` is only read for the agent-nixpkgs pin below: it is the one
+        # field whose default comes from a file on the host rather than from
+        # `data` or `profile`, so it is the one that has to be told which
+        # tree a `--root` render is rendering.
+        #
         # Every field below is typed by BOX_SCHEMA first (issue #525), so
         # what follows reads values and applies defaults - it never has to
         # guess what an operator meant by a value of the wrong type.
@@ -899,7 +904,7 @@ class Spec:
         # updated starts from.
         self.jit_nixpkgs = (
             data.get("jitNixpkgs")
-            or read_agent_pin()
+            or read_agent_pin(root)
             or CHANNEL_NIXPKGS)
         # Whether an update moves each user's ALREADY installed harnesses
         # onto that pin. Default on: the settings page's Update card has
@@ -4416,7 +4421,7 @@ def cmd_apply(args):
     back to the previous release on a non-zero apply.
     """
     profile = resolve_profile(args.profile)
-    spec = Spec(load_config(args.config), profile)
+    spec = Spec(load_config(args.config), profile, root=args.root or "/")
     if args.first_boot:
         first_boot(spec, args)
     rend = Renderer(spec, profile, root=args.root or "/", config=args.config)
@@ -4894,10 +4899,27 @@ def recover_handover(args, profile, generation, target, rc):
     return rc
 
 
-def read_agent_pin():
-    """This box's recorded agent-nixpkgs pin, or None before its first update."""
+def read_agent_pin(root="/"):
+    """This box's recorded agent-nixpkgs pin, or None before its first update.
+
+    Rooted, because this is a RENDER input. `agentbox apply --root DIR`
+    renders a tree instead of configuring the host, and a render that reached
+    past its own root to read /etc would make its output a property of the
+    machine it ran on rather than of the config it was handed - the same
+    principle that keeps profile_manifest() a plain read under the profile
+    the caller names.
+
+    Not hypothetical, and it was already costing us twice: regenerating
+    tests/native/expected on any box that had updated silently rewrote five
+    committed files with THAT box's pin, and this file's own
+    test_both_backends_expose_the_same_jit_pin_knob failed there while
+    passing on CI - which has no pin file to find, so nothing ever flagged
+    it. The writers below stay unrooted on purpose: they run during a real
+    update on a real host, where there is no root but /.
+    """
     try:
-        return Path(AGENT_PIN_FILE).read_text().strip() or None
+        pin = Path(root) / AGENT_PIN_FILE.lstrip("/")
+        return pin.read_text().strip() or None
     except OSError:
         return None
 
