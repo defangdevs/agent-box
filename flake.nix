@@ -1215,6 +1215,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               check_payload agent-box-attach attach.sh
               check_payload agent-box-mark-stopped mark-stopped.sh
               check_payload agent-box-spot-monitor spot-monitor.sh
+              check_payload agent-box-nixpkgs-cache nixpkgs-cache.sh
               check_payload agent-box-update update.sh
               check_payload agent-box-source source-tree.sh
               check_payload agent-box-codex-remote-control codex-remote-control.sh
@@ -2067,6 +2068,28 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.git pkgs.gnugrep ];
                 script = ./modules/src/checkout-cli.sh;
                 tests = ./tests/test-checkout-bootstrap.sh;
+              } ''
+              bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # Issue #669: the producer half of the shared nixpkgs cache. The
+          # assertions that matter are the guard and the publication order —
+          # both failure modes are silent, leaving a box that is simply slow
+          # forever or one that re-ingests 72 MiB on every boot. `nix` is a
+          # shim, so there is no network and this runs on every architecture.
+          nixpkgs-cache =
+            pkgs.runCommand "agent-box-nixpkgs-cache-producer"
+              {
+                nativeBuildInputs = [
+                  pkgs.bash pkgs.coreutils pkgs.findutils pkgs.gnugrep
+                ];
+                script = ./modules/src/nixpkgs-cache.sh;
+                tests = ./tests/test-nixpkgs-cache.sh;
               } ''
               bash "$tests" "$script" > log 2>&1 || {
                 cat log

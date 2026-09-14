@@ -693,13 +693,20 @@ mkdir -p "$HOME"/worktrees 2>/dev/null || :
 # fetcher-cache sqlite is the URL -> treeHash map. Packs alone leave nix unable
 # to learn the tree hash without redoing the ingest (23.7s, i.e. no saving).
 #
-# cp -al, so the packfiles are HARDLINKED rather than copied. They are
-# immutable and mode 0444, so every user's cache points at one set of inodes
-# and a second user costs no disk. git alternates would be the obvious
-# mechanism for that and does NOT work: nix's libgit2 path ignores
+# cp -al first and cp -a behind it. The hardlink is the one that would cost no
+# disk, and on a deployed box it is the one that never happens: this unit runs
+# under ProtectSystem=strict with ReadWritePaths=$HOME, which makes the user's
+# home its OWN bind mount, and link(2) refuses to cross a mount point even when
+# both sides are one filesystem. So a seed under /var/lib fails EXDEV here and
+# always falls through to the 72 MiB copy - measured on a live box, where
+# /home/<user> and /var/lib sit on the same device and linking between them is
+# still refused. The link arm is kept because it is correct wherever that
+# boundary is absent (an image build staging a seed, the tests, and any future
+# root-side distribution - root is outside this namespace and is the only place
+# a shared inode is reachable at all). git alternates would be the obvious
+# mechanism for sharing and does NOT work either: nix's libgit2 path ignores
 # objects/info/alternates and re-ingests from scratch. The sqlite is mutable,
-# so that one is a real copy. Across a filesystem boundary (a deployment that
-# splits /var from /home) the hardlink fails and a plain copy stands in.
+# so that one is a real copy regardless.
 #
 # Staged under a temp name and renamed, so a seed interrupted halfway cannot
 # leave a PARTIAL cache behind that the -d guard would then treat as seeded.

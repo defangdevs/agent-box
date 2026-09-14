@@ -20,6 +20,7 @@ web/payloads/agent-box-defang-cli-expr.nix -> vm/payloads/agent-box-defang-cli-e
 web/payloads/agent-box-env-exec -> vm/payloads/agent-box-env-exec
 web/payloads/agent-box-envstore/bin/agent-box-envstore -> vm/payloads/agent-box-envstore/bin/agent-box-envstore
 web/payloads/agent-box-harness/bin/agent-box-harness -> vm/payloads/agent-box-harness/bin/agent-box-harness
+web/payloads/agent-box-nixpkgs-cache -> vm/payloads/agent-box-nixpkgs-cache
 web/payloads/agent-box-profile/bin/agent-box-profile -> vm/payloads/agent-box-profile/bin/agent-box-profile
 web/payloads/agent-box-session-capacity/bin/agent-box-session-capacity -> vm/payloads/agent-box-session-capacity/bin/agent-box-session-capacity
 web/payloads/agent-box-session/bin/agent-box-session -> vm/payloads/agent-box-session/bin/agent-box-session
@@ -28,5 +29,6 @@ web/payloads/agent-box-supervisor/bin/agent-box-supervisor -> vm/payloads/agent-
 web/payloads/agent-box-upload/bin/agent-box-upload -> vm/payloads/agent-box-upload/bin/agent-box-upload
 web/payloads/unit-script-agent-box-defang-cli-start/bin/agent-box-defang-cli-start -> vm/payloads/unit-script-agent-box-defang-cli-start/bin/agent-box-defang-cli-start
 web/units/agent-box-defang-cli.service -> vm/units/agent-box-defang-cli.service
+web/units/agent-box-nixpkgs-cache.service -> vm/units/agent-box-nixpkgs-cache.service
 web/units/agent-box-webhook@robot.service -> web/units/agent-box-webhook@agent.service
 web/units/earlyoom.service -> vm/units/earlyoom.service
