@@ -1,0 +1,222 @@
+# Bake the agent-box runtime closure into an Azure image (issue #697).
+#
+# Why: an Azure box spends 3m47s in its CustomScript bootstrap, and ~750 of
+# that log's 855 lines are one `nix profile install ...#runtime` copying a
+# 797 MiB closure out of cache.nixos.org. With the store already warm, that
+# exact install takes 2.9s - measured on a live aarch64 box.
+#
+# This workflow only BUILDS and PUBLISHES the image. Nothing in the deploy
+# path points at it yet: deploy/azure/agent-box.bicep still names the stock
+# Canonical marketplace image, so this is purely additive and cannot affect a
+# 1-click deployment until a later change opts in. That split is deliberate -
+# the image has to be measured against today's 3m47s before it is worth
+# pointing anything at it.
+#
+# Manual dispatch only, because every run creates billable resources (a build
+# VM for ~10 minutes, and an image version charged as a snapshot per
+# replicated region).
+name: Azure image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The agent-box commit to bake. Defaults to the ref this workflow runs on.
+        type: string
+        default: ''
+      keep_build_vm:
+        description: Leave the build VM running for post-mortem (it is deleted by default).
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+# One image build at a time: two concurrent runs would fight over the same
+# gallery image definition and the same build-VM name.
+concurrency:
+  group: azure-image
+  cancel-in-progress: false
+
+env:
+  # Azure Compute Gallery names take alphanumerics, dots and underscores - no
+  # hyphens - so this is not spelled "agent-box".
+  GALLERY: agentbox
+  IMAGE_DEF: agent-box-ubuntu-2404-arm64
+  # The default VM size in deploy/azure/agent-box.bicep is Standard_B2pls_v2,
+  # which imageSkuBySize maps to the arm64 SKU. Build on the same arch the
+  # image is for: a gallery image version is per-architecture.
+  BUILD_SIZE: Standard_B2pls_v2
+  BUILD_IMAGE: Canonical:ubuntu-24_04-lts:server-arm64:latest
+  NIXINSTALLER: https://install.determinate.systems/nix
+
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+    environment: defang-agent-box
+    timeout-minutes: 60
+    steps:
+      - name: Require the Azure variables
+        env:
+          CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ -z "$RG" ]; then
+            echo "::error::Missing AZURE_* variables on the defang-agent-box environment."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Resolve the commit being baked
+        id: src
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "flakeref=github:${GITHUB_REPOSITORY}/${sha}" >> "$GITHUB_OUTPUT"
+          # A gallery image version must be N.N.N with each part < 2^32.
+          echo "version=0.$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "vm=abbake-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC, no stored secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure the gallery and image definition exist
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          set -euxo pipefail
+          az sig create --resource-group "$RG" --gallery-name "$GALLERY" --only-show-errors
+          # TrustedLaunchSupported rather than TrustedLaunch: the Bicep sets no
+          # securityProfile, so a deployment may ask for either, and the
+          # permissive feature is the one that serves both.
+          az sig image-definition create \
+            --resource-group "$RG" --gallery-name "$GALLERY" \
+            --gallery-image-definition "$IMAGE_DEF" \
+            --publisher defangdevs --offer agent-box --sku ubuntu-2404-arm64 \
+            --os-type Linux --os-state generalized \
+            --hyper-v-generation V2 --architecture Arm64 \
+            --features SecurityType=TrustedLaunchSupported \
+            --only-show-errors
+
+      - name: Create the build VM
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          VM: ${{ steps.src.outputs.vm }}
+        run: |
+          set -euxo pipefail
+          # No public IP and no inbound rule: everything below goes through the
+          # Azure agent's run-command channel, so the build VM never needs to
+          # be reachable from the internet.
+          #
+          # The delete-options make `az vm delete` reclaim the NIC and OS disk
+          # with it, so a cleanup that runs once leaves nothing behind.
+          az vm create \
+            --resource-group "$RG" --name "$VM" \
+            --image "$BUILD_IMAGE" --size "$BUILD_SIZE" \
+            --admin-username azureuser --generate-ssh-keys \
+            --public-ip-address "" --nsg "" \
+            --os-disk-size-gb 32 \
+            --nic-delete-option Delete --os-disk-delete-option Delete \
+            --only-show-errors
+
+      - name: Bake
+        timeout-minutes: 30
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          VM: ${{ steps.src.outputs.vm }}
+          FLAKEREF: ${{ steps.src.outputs.flakeref }}
+        run: |
+          set -euo pipefail
+          # run-command's --parameters have different semantics across az
+          # versions (positional for RunShellScript in some, named in others),
+          # so compose the two values into the script instead of relying on
+          # either. printf %q keeps a ref with shell metacharacters safe.
+          {
+            printf '%s\n' '#!/usr/bin/env bash'
+            printf 'export NIXINSTALLER=%q\n' "$NIXINSTALLER"
+            printf 'export FLAKEREF=%q\n' "$FLAKEREF"
+            tail -n +2 deploy/azure/bake-image.sh
+          } > /tmp/bake-composed.sh
+
+          # `az vm run-command invoke` exits 0 even when the script inside
+          # fails - it reports on the INVOCATION, not on the exit status - so
+          # the script's own sentinel is what decides this step.
+          az vm run-command invoke \
+            --resource-group "$RG" --name "$VM" \
+            --command-id RunShellScript --scripts @/tmp/bake-composed.sh \
+            --only-show-errors --query 'value[].message' -o tsv > /tmp/bake.log
+          sed -e 's/^/    /' /tmp/bake.log
+          if ! grep BAKE_OK /tmp/bake.log > /dev/null; then
+            echo "::error::bake-image.sh did not reach its BAKE_OK sentinel"
+            exit 1
+          fi
+
+      - name: Deprovision, generalize and capture
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          VM: ${{ steps.src.outputs.vm }}
+          VERSION: ${{ steps.src.outputs.version }}
+          SHA: ${{ steps.src.outputs.sha }}
+        run: |
+          set -euxo pipefail
+          # waagent -deprovision+user removes the provisioning user, its SSH
+          # keys and the host keys. It is last because it takes the machine
+          # apart; run-command still answers, since it is the agent's own
+          # channel and the agent survives until the VM stops.
+          az vm run-command invoke \
+            --resource-group "$RG" --name "$VM" \
+            --command-id RunShellScript \
+            --scripts 'waagent -force -deprovision+user' \
+            --only-show-errors --query 'value[].message' -o tsv || true
+
+          az vm deallocate --resource-group "$RG" --name "$VM" --only-show-errors
+          az vm generalize --resource-group "$RG" --name "$VM" --only-show-errors
+
+          vm_id=$(az vm show --resource-group "$RG" --name "$VM" --query id -o tsv)
+          az sig image-version create \
+            --resource-group "$RG" --gallery-name "$GALLERY" \
+            --gallery-image-definition "$IMAGE_DEF" \
+            --gallery-image-version "$VERSION" \
+            --virtual-machine "$vm_id" \
+            --replica-count 1 \
+            --tags "agent-box:rev=$SHA" \
+            --only-show-errors
+
+      - name: Report
+        if: success()
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          SUB: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          VERSION: ${{ steps.src.outputs.version }}
+          SHA: ${{ steps.src.outputs.sha }}
+        run: |
+          {
+            echo "### Azure image published"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit baked | \`$SHA\` |"
+            echo "| version | \`$VERSION\` |"
+            echo "| image id | \`/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Compute/galleries/$GALLERY/images/$IMAGE_DEF/versions/$VERSION\` |"
+            echo
+            echo "Nothing deploys from this yet - \`deploy/azure/agent-box.bicep\` still names the stock Canonical image (issue #697)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete the build VM
+        # always(): a half-finished build must not leave a VM running. The
+        # delete-options on `az vm create` take the NIC and OS disk with it.
+        if: always() && !inputs.keep_build_vm
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          VM: ${{ steps.src.outputs.vm }}
+        run: |
+          set -eux
+          az vm delete --resource-group "$RG" --name "$VM" --yes --only-show-errors || true
