@@ -158,20 +158,21 @@
     # would be three wasted minutes and a masked assertion rather than a
     # test.
     #
-    # BOTH programs are resolved from the DRIVER's shell and used by
-    # absolute path, because the unit's PATH is deliberately short -
-    # /run/wrappers/bin, the uidmap dir, and the three distro bin dirs, of
-    # which a NixOS box has only /bin, and /bin holds `sh` and nothing
-    # else. A bare `sleep` in this fake got "exec: sleep: not found" and a
-    # start-limit-hit. The real dockerd-rootless needs none of this: it is
-    # a nixpkgs wrapper carrying its own PATH, which is exactly why the
-    # unit's is allowed to be this short.
+    # notify and sleep are resolved from the DRIVER's shell and used by
+    # absolute path so this fake does not depend on unrelated host tools.
+    # grep and id deliberately stay bare: Docker 29.8's dockerd-rootless
+    # launcher calls both, but its nixpkgs wrapper's embedded PATH contains
+    # neither. The unit must supply the NixOS system profile or the real
+    # launcher rejects a current slirp4netns and selects an unsupported
+    # fallback network mode.
     notify = machine.succeed("command -v systemd-notify").strip()
     sleep = machine.succeed("command -v sleep").strip()
     fake = "/home/agent/.nix-profile/bin/dockerd-rootless"
     machine.succeed(
         f"runuser -u agent -- sh -c \"printf "
-        f"'#!/bin/sh\\n{notify} --ready\\nexec {sleep} infinity\\n' "
+        f"'#!/bin/sh\\ngrep -q ^agent: /etc/subuid || exit 1\\n"
+        f"id -u >/dev/null || exit 1\\n{notify} --ready\\n"
+        f"exec {sleep} infinity\\n' "
         f"> {fake} && chmod 755 {fake}\"")
     # Lingering, and the manager it brings up. This is what the daemon
     # refuses to start without: rootless docker enforces a limit only
@@ -238,6 +239,8 @@
     path = [line for line in env.splitlines() if line.startswith("PATH=")]
     assert path and "/run/wrappers/bin" in path[0], \
         f"the daemon's PATH has no /run/wrappers/bin: {path}"
+    assert "/run/current-system/sw/bin" in path[0], \
+        f"the daemon's PATH has no NixOS system profile: {path}"
 
     # 9. And the runtime dir outlives a stopped daemon, which is what
     #    RuntimeDirectoryPreserve=yes buys and what a session's
