@@ -43,6 +43,21 @@ notify_user() {
   | while IFS= read -r s; do
       agent=$($JQ -r --arg s "$s" \
         '.sessions[$s].agent // ""' "$sf" 2>/dev/null)
+      rc=$($JQ -r --arg s "$s" \
+        '.sessions[$s].remoteControl // false' "$sf" 2>/dev/null)
+      # A codex remoteControl session's foreground process is the pairing
+      # daemon wrapper (codex-remote-control.sh), not a codex conversation —
+      # its pane shows a pairing code and takes single-key commands of its
+      # own ([Enter], "login"), so send-keys lands the notice on a screen
+      # with nobody reading it and can trigger the wrapper's own bindings
+      # instead of being seen as a message (issue #691). There is no
+      # per-conversation tmux target to fall back to either — every live
+      # remote thread the daemon serves shares this one pane. Log the skip
+      # rather than silently typing into it.
+      if [ "$agent" = codex ] && [ "$rc" = true ]; then
+        echo "spot-monitor: skipping '$s' — codex remote-control daemon pane, not a conversation" >&2
+        continue
+      fi
       # Target "=NAME:" — an EXACT session match resolved to its
       # active pane. Bare "=NAME" is a session target that send-keys
       # rejects as a pane ("can't find pane"); plain "NAME" would
