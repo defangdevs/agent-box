@@ -67,7 +67,13 @@ RuntimeDirectoryPreserve=yes
 # puts capped copies on a box that has no such mechanism. The missing one
 # is simply skipped by PATH lookup, which is what lets this stay ONE
 # shared unit instead of two hand-written ones that can drift.
-Environment=PATH=/run/wrappers/bin:/etc/agent-box/uidmap:/usr/local/bin:/usr/bin:/bin
+#
+# /run/current-system/sw/bin supplies ordinary host tools on NixOS. Do not
+# rely on the nixpkgs dockerd-rootless wrapper to close over every shell
+# dependency: Docker 29.8 includes rootlesskit and slirp4netns in its
+# embedded PATH, but its launcher also calls grep(1) and id(1), which are
+# absent there. The path does not exist on a native host and is skipped.
+Environment=PATH=/run/wrappers/bin:/etc/agent-box/uidmap:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
 # Rootless docker can enforce a resource limit ONLY through the systemd
 # cgroup driver, and that driver asks THIS USER'S OWN systemd manager for
 # every container scope, over the user bus. Nothing sets that bus for a
@@ -85,9 +91,9 @@ Environment=PATH=/run/wrappers/bin:/etc/agent-box/uidmap:/usr/local/bin:/usr/bin
 # useradd takes the next free one). So it is found at start, as the one
 # /run/user entry this user owns.
 #
-# Shell BUILTINS only - no id(1), no sleep(1). The PATH above carries no
-# coreutils on purpose and a NixOS box has none for it to find: /bin holds
-# sh and nothing else there. `$$` is systemd's escape for a literal dollar.
+# This preflight uses shell builtins only. The daemon launcher itself uses
+# ordinary host tools from the PATH above. `$$` is systemd's escape for a
+# literal dollar.
 ExecStart=/bin/sh -c 'for d in /run/user/*; do [ -O "$$d" ] && [ -S "$$d/bus" ] && bus="$$d/bus"; done; [ -n "$${bus-}" ] || { echo "agent-box: no user bus under /run/user - is lingering enabled for %i?" >&2; exit 1; }; DBUS_SESSION_BUS_ADDRESS="unix:path=$${bus}"; export DBUS_SESSION_BUS_ADDRESS; exec /home/%i/.nix-profile/bin/dockerd-rootless'
 # The daemon owns a cgroup subtree of its own. This is NOT what puts a
 # container in a cgroup - the systemd driver does that, through the user
