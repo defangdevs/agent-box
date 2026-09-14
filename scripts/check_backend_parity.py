@@ -175,21 +175,6 @@ BY_DESIGN = {
     "AGENT_BOX_POLL": (
         "module",
         "spot monitor, see AGENT_BOX_USERS"),
-    "AGENT_BOX_NIX_BIN": (
-        "module",
-        "lazy harnesses (#416): the module pins nix as a "
-        "store path because it HAS one. A native box does "
-        "not - resolving `nix` at apply time would bake "
-        "the BUILDING host's store path into a generated "
-        "file and break on the next nix upgrade - so "
-        "lib/agents.sh resolves it at USE from PATH and "
-        "the two standard install layouts, as does the "
-        "settings daemon's connect_nix_bin() for the "
-        "sign-in cards (issue #544 - it used to leave a "
-        "bare `nix` for the pane's shell, which on a "
-        "native box resolves against a PATH that carries "
-        "none). Both backends reach the same binary; only "
-        "one can name it ahead of time"),
     "AGENT_BOX_WEBHOOK_POLICY_FILE": (
         "module",
         "issue #457: both backends bake this "
@@ -351,6 +336,33 @@ UNIT_ALIASES = {
 # those names are one-sided box-wide, so they are one-sided in whatever unit
 # carries them, and the reason is written once where it belongs.
 UNIT_VARS_BY_DESIGN = {
+    # AGENT_BOX_NIX_BIN was a box-wide BY_DESIGN entry until issue #669 gave
+    # both backends a unit that names nix outright (agent-box-nixpkgs-cache,
+    # which has no PATH to resolve it from and no payload doing it at USE).
+    # Box-wide the name is now supplied by both, so the box-wide comparison
+    # can no longer see the divergence that is still real - exactly the blind
+    # spot this per-unit pass exists for. The reason is unchanged, and these
+    # two units are where it still applies.
+    "agent-box@.service AGENT_BOX_NIX_BIN": (
+        "module",
+        "lazy harnesses (#416): the module pins nix as a store path because "
+        "it HAS one. A native box does not - resolving `nix` at apply time "
+        "would bake the BUILDING host's store path into a generated file and "
+        "break on the next nix upgrade - so lib/agents.sh resolves it at USE "
+        "from PATH and the two standard install layouts instead. Both "
+        "backends reach the same binary; only one can name it ahead of time. "
+        "agent-box-nixpkgs-cache escapes the dilemma rather than contradicting "
+        "it: what it names natively is the Determinate profile SYMLINK "
+        "(/nix/var/nix/profiles/default/bin/nix, as agent-box-nix-gc already "
+        "does), which survives a nix upgrade precisely because it is not a "
+        "store path"),
+    "agent-box-settings@.service AGENT_BOX_NIX_BIN": (
+        "module",
+        "same divergence as agent-box@.service above, for the settings "
+        "daemon's connect_nix_bin() and the sign-in cards (issue #544 - it "
+        "used to leave a bare `nix` for the pane's shell, which on a native "
+        "box resolves against a PATH that carries none). The daemon already "
+        "treats the variable as optional and resolves it itself when unset"),
     "agent-web-terminal@.service AGENT_BOX_SESSION_BIN": (
         "native",
         "the attach wrapper needs the session CLI to start a stopped "
