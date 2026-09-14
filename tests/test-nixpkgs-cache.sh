@@ -145,6 +145,67 @@ if run && nix_ran && [ -d "$SEED/tarball-cache-v2" ]; then
   ok "an interrupted publish is finished by the next run"
 else no "an interrupted publish is finished by the next run" "$(cat "$work/out")"; fi
 
+# --- the replacement window, from both readers' point of view ------------
+# The bug this covers (CodeRabbit on PR #695): publishing the new pin while
+# the OLD tarball-cache-v2 was still in place left, on any interruption, an
+# old cache wearing a new pin - which this script's own guard then reads as
+# "already current" forever. So the pin must land LAST.
+rm -rf "$SEED"
+run "$REF_ONE"
+NIX_SHIM_REV=two run "$REF_TWO"
+if [ "$(pin)" = "$REF_TWO" ] &&
+   grep -q 'for two' "$SEED/tarball-cache-v2/objects/pack/p.pack" &&
+   grep -q 'for two' "$SEED/fetcher-cache-v4.sqlite"; then
+  ok "after a pin move the pin, the packs and the sqlite are all the new rev"
+else no "after a pin move the pin, the packs and the sqlite are all the new rev" \
+        "$(pin); $(cat "$SEED/tarball-cache-v2/objects/pack/p.pack" 2>&1)"; fi
+
+if [ -z "$(find "$SEED" -maxdepth 1 -name '.tarball-cache-v2.replacing' -print -quit)" ]; then
+  ok "the move-aside directory is reclaimed"
+else no "the move-aside directory is reclaimed" "$(ls -a "$SEED")"; fi
+
+# Now KILL the script partway through the replacement, at every publishing
+# step in turn, and assert the box always recovers to a wholly new, internally
+# consistent cache on the next run. This is the assertion that fails if the
+# pin stops being written last: the run that dies after the pin lands leaves
+# the guard satisfied, and the retry then publishes nothing at all.
+#
+# An `mv` shim on PATH counts the publishing moves and SIGKILLs the script at
+# the chosen one - a real interruption rather than a hand-built end state, so
+# it also proves the states reasoned about above are the states that occur.
+REAL_MV=$(command -v mv)
+cat > "$work/bin/mv" <<EOF
+#!$BASH_BIN
+n=\$(( \$(cat "$work/mv.count" 2>/dev/null || echo 0) + 1 ))
+echo "\$n" > "$work/mv.count"
+if [ -n "\${MV_DIE_AT:-}" ] && [ "\$n" = "\$MV_DIE_AT" ]; then kill -9 \$PPID; fi
+exec "$REAL_MV" "\$@"
+EOF
+chmod +x "$work/bin/mv"
+export PATH="$work/bin:$PATH"
+
+for die in 1 2 3 4; do
+  rm -rf "$SEED"
+  run "$REF_ONE"                              # a good cache for rev one
+  : > "$work/mv.count"
+  # In its own subshell with stderr closed: the SIGKILL is the POINT of this
+  # loop, and bash would otherwise print a "Killed" job-control line per
+  # iteration over the test's own output.
+  ( MV_DIE_AT=$die NIX_SHIM_REV=two run "$REF_TWO" ) 2>/dev/null || :
+  : > "$work/mv.count"
+  NIX_SHIM_REV=two run "$REF_TWO"             # the recovery run
+  packs=$(cat "$SEED/tarball-cache-v2/objects/pack/p.pack" 2>/dev/null)
+  sql=$(cat "$SEED/fetcher-cache-v4.sqlite" 2>/dev/null)
+  if [ "$(pin)" = "$REF_TWO" ] &&
+     [ "$packs" = "pack for two" ] && [ "$sql" = "sqlite for two" ]; then
+    ok "killed at move $die, the next run still publishes a complete new cache"
+  else
+    no "killed at move $die, the next run still publishes a complete new cache" \
+       "pin=$(pin) packs=$packs sqlite=$sql"
+  fi
+done
+unset MV_DIE_AT
+
 # --- the seed is readable by the users it exists for ---------------------
 # It is copied by OTHER users' supervisors. A private umask on whatever
 # started the unit would make every one of those copies fail, silently, and

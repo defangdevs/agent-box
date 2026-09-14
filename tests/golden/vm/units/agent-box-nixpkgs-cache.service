@@ -19,8 +19,3 @@ OOMScoreAdjust=1000
 Restart=on-failure
 RestartSec=30s
 Type=oneshot
-
-[Install]
-WantedBy=multi-user.target
-
-# X-Golden-wantedBy: multi-user.target

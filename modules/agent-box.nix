@@ -25580,10 +25580,23 @@ if __name__ == "__main__":
   }
 
   # Builds the shared nixpkgs git cache that supervisor.sh seeds each user's
-  # ~/.cache/nix from (issue #669). Started by multi-user.target and required
-  # by nothing: `WantedBy` adds no ordering, so a box reaches multi-user while
-  # this is still running, and a box that never runs it at all behaves exactly
-  # as every box does today.
+  # ~/.cache/nix from (issue #669).
+  #
+  # Driven by a TIMER, not by `wantedBy = [ "multi-user.target" ]`, which is
+  # what an earlier draft used (CodeRabbit on PR #695). A target implicitly
+  # gains `After=` on everything it Wants, unless it sets DefaultDependencies
+  # = no - so a unit wanted by multi-user.target is ordered BEFORE it, and a
+  # ~30s Type=oneshot there stalls the boot by that much. Confirmed on a live
+  # box rather than reasoned about: `systemctl show agent-box-earlyoom.service
+  # -p Before` lists multi-user.target, and multi-user.target's own `After=`
+  # names seven agent-box units. A timer sidesteps it because the only thing
+  # the target then waits for is the timer arming, which is instantaneous.
+  #
+  # OnActiveSec rather than OnBootSec: on a first boot the timer starts when
+  # apply enables it, which is AFTER the bootstrap's own ~800 MiB closure
+  # download, so the ingest does not compete with it for two cores. The daily
+  # re-arm is what picks up a moved pin without waiting for a reboot, and it
+  # costs a stat and a file read on every day the pin has not moved.
   #
   # Background and bottom-priority throughout. It is a ~30s CPU-bound ingest
   # that runs once per box (and again only when the pin moves), and it must
@@ -25592,9 +25605,16 @@ if __name__ == "__main__":
   # double, which on a 2 GiB box bounds this cgroup instead of letting earlyoom
   # pick some other victim.
   {
+    systemd.timers.agent-box-nixpkgs-cache = {
+      description = "agent-box: schedule the shared nixpkgs cache build";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnActiveSec = "2min";
+        OnUnitActiveSec = "1d";
+      };
+    };
     systemd.services.agent-box-nixpkgs-cache = {
       description = "agent-box: build the shared nixpkgs cache sessions seed from";
-      wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
       after = [ "network-online.target" ];
       serviceConfig = {
@@ -25668,7 +25688,7 @@ if __name__ == "__main__":
           # Staged in a SIBLING of the seed, so publishing is a rename inside one
           # directory rather than a 72 MiB copy across two.
           STAGE="$SEED.staging"
-          rm -rf "$STAGE" || :
+          rm -rf "$STAGE" "$SEED/.tarball-cache-v2.replacing" || :
           mkdir -p "$SEED" "$STAGE" || exit 1
           trap 'rm -rf "$STAGE"' EXIT HUP INT TERM
 
@@ -25699,25 +25719,34 @@ if __name__ == "__main__":
             exit 1
           fi
 
-          # Publication ORDER is load-bearing, and it is the same rule the consumer in
-          # supervisor.sh follows: tarball-cache-v2 is what both guards key on, so it is
-          # the last thing to land. A kill between any two steps here then leaves this
-          # script's own guard unsatisfied and the next boot redoes the whole thing -
-          # rather than leaving behind a directory that reads as "done" while sitting
-          # over a missing sqlite or a stale pin, which no later run would revisit.
-          mv -f "$STAGE/nix/fetcher-cache-v4.sqlite" "$SEED/fetcher-cache-v4.sqlite" || exit 1
-          { printf '%s\n' "$REF" > "$STAGE/pin" && mv -f "$STAGE/pin" "$SEED/pin"; } || exit 1
-
-          # rename(2) refuses a non-empty target directory, so an existing cache moves
-          # aside first. The window in which neither is in place is one rename long, and
-          # a consumer landing inside it is a best-effort seed that simply does not
-          # happen on that start.
-          rm -rf "$SEED/.tarball-cache-v2.replacing" || :
+          # Publication ORDER is load-bearing, and it has to satisfy TWO readers with
+          # different guards, which is what an earlier draft of this got wrong
+          # (CodeRabbit on PR #695).
+          #
+          #   the consumer (supervisor.sh) keys on tarball-cache-v2 ALONE, and copies
+          #   the sqlite beside it. So it must never observe a new sqlite over old
+          #   packs: the sqlite maps URL -> treeHash, and pointing a user at a tree
+          #   hash their packs do not contain is worse than not seeding them at all.
+          #   The directory is therefore moved OUT OF THE WAY first and back only when
+          #   its sqlite is already correct - for the whole replacement the consumer
+          #   sees no directory and simply does not seed, which is today's behaviour.
+          #
+          #   this script keys on tarball-cache-v2 AND a matching pin, so the pin is
+          #   the completion marker and is written LAST. Publishing it earlier is the
+          #   bug: on a pin move it would leave the OLD directory beside the NEW pin,
+          #   which the guard above reads as "already current" - so the new cache would
+          #   never be published, and no later run would ever revisit it.
+          #
+          # rename(2) refuses a non-empty target directory, hence the move-aside rather
+          # than a straight overwrite. An interrupted run leaves .replacing behind; the
+          # next run reclaims it in the cleanup above.
           if [ -d "$SEED/tarball-cache-v2" ] &&
              ! mv -T "$SEED/tarball-cache-v2" "$SEED/.tarball-cache-v2.replacing"; then
             exit 1
           fi
+          mv -f "$STAGE/nix/fetcher-cache-v4.sqlite" "$SEED/fetcher-cache-v4.sqlite" || exit 1
           mv -T "$STAGE/nix/tarball-cache-v2" "$SEED/tarball-cache-v2" || exit 1
+          { printf '%s\n' "$REF" > "$STAGE/pin" && mv -f "$STAGE/pin" "$SEED/pin"; } || exit 1
           rm -rf "$SEED/.tarball-cache-v2.replacing" || :
 
           exit 0

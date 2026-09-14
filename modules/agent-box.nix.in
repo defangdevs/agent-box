@@ -4393,10 +4393,23 @@ in
   }
 
   # Builds the shared nixpkgs git cache that supervisor.sh seeds each user's
-  # ~/.cache/nix from (issue #669). Started by multi-user.target and required
-  # by nothing: `WantedBy` adds no ordering, so a box reaches multi-user while
-  # this is still running, and a box that never runs it at all behaves exactly
-  # as every box does today.
+  # ~/.cache/nix from (issue #669).
+  #
+  # Driven by a TIMER, not by `wantedBy = [ "multi-user.target" ]`, which is
+  # what an earlier draft used (CodeRabbit on PR #695). A target implicitly
+  # gains `After=` on everything it Wants, unless it sets DefaultDependencies
+  # = no - so a unit wanted by multi-user.target is ordered BEFORE it, and a
+  # ~30s Type=oneshot there stalls the boot by that much. Confirmed on a live
+  # box rather than reasoned about: `systemctl show agent-box-earlyoom.service
+  # -p Before` lists multi-user.target, and multi-user.target's own `After=`
+  # names seven agent-box units. A timer sidesteps it because the only thing
+  # the target then waits for is the timer arming, which is instantaneous.
+  #
+  # OnActiveSec rather than OnBootSec: on a first boot the timer starts when
+  # apply enables it, which is AFTER the bootstrap's own ~800 MiB closure
+  # download, so the ingest does not compete with it for two cores. The daily
+  # re-arm is what picks up a moved pin without waiting for a reboot, and it
+  # costs a stat and a file read on every day the pin has not moved.
   #
   # Background and bottom-priority throughout. It is a ~30s CPU-bound ingest
   # that runs once per box (and again only when the pin moves), and it must
@@ -4405,9 +4418,16 @@ in
   # double, which on a 2 GiB box bounds this cgroup instead of letting earlyoom
   # pick some other victim.
   {
+    systemd.timers.agent-box-nixpkgs-cache = {
+      description = "agent-box: schedule the shared nixpkgs cache build";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnActiveSec = "2min";
+        OnUnitActiveSec = "1d";
+      };
+    };
     systemd.services.agent-box-nixpkgs-cache = {
       description = "agent-box: build the shared nixpkgs cache sessions seed from";
-      wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
       after = [ "network-online.target" ];
       serviceConfig = {

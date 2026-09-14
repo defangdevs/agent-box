@@ -17,6 +17,3 @@ Nice=19
 IOSchedulingClass=idle
 OOMScoreAdjust=1000
 MemoryMax=1G
-
-[Install]
-WantedBy=multi-user.target

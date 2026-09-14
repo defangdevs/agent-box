@@ -57,7 +57,7 @@ fi
 # Staged in a SIBLING of the seed, so publishing is a rename inside one
 # directory rather than a 72 MiB copy across two.
 STAGE="$SEED.staging"
-rm -rf "$STAGE" || :
+rm -rf "$STAGE" "$SEED/.tarball-cache-v2.replacing" || :
 mkdir -p "$SEED" "$STAGE" || exit 1
 trap 'rm -rf "$STAGE"' EXIT HUP INT TERM
 
@@ -88,25 +88,34 @@ if [ ! -d "$STAGE/nix/tarball-cache-v2" ] ||
   exit 1
 fi
 
-# Publication ORDER is load-bearing, and it is the same rule the consumer in
-# supervisor.sh follows: tarball-cache-v2 is what both guards key on, so it is
-# the last thing to land. A kill between any two steps here then leaves this
-# script's own guard unsatisfied and the next boot redoes the whole thing -
-# rather than leaving behind a directory that reads as "done" while sitting
-# over a missing sqlite or a stale pin, which no later run would revisit.
-mv -f "$STAGE/nix/fetcher-cache-v4.sqlite" "$SEED/fetcher-cache-v4.sqlite" || exit 1
-{ printf '%s\n' "$REF" > "$STAGE/pin" && mv -f "$STAGE/pin" "$SEED/pin"; } || exit 1
-
-# rename(2) refuses a non-empty target directory, so an existing cache moves
-# aside first. The window in which neither is in place is one rename long, and
-# a consumer landing inside it is a best-effort seed that simply does not
-# happen on that start.
-rm -rf "$SEED/.tarball-cache-v2.replacing" || :
+# Publication ORDER is load-bearing, and it has to satisfy TWO readers with
+# different guards, which is what an earlier draft of this got wrong
+# (CodeRabbit on PR #695).
+#
+#   the consumer (supervisor.sh) keys on tarball-cache-v2 ALONE, and copies
+#   the sqlite beside it. So it must never observe a new sqlite over old
+#   packs: the sqlite maps URL -> treeHash, and pointing a user at a tree
+#   hash their packs do not contain is worse than not seeding them at all.
+#   The directory is therefore moved OUT OF THE WAY first and back only when
+#   its sqlite is already correct - for the whole replacement the consumer
+#   sees no directory and simply does not seed, which is today's behaviour.
+#
+#   this script keys on tarball-cache-v2 AND a matching pin, so the pin is
+#   the completion marker and is written LAST. Publishing it earlier is the
+#   bug: on a pin move it would leave the OLD directory beside the NEW pin,
+#   which the guard above reads as "already current" - so the new cache would
+#   never be published, and no later run would ever revisit it.
+#
+# rename(2) refuses a non-empty target directory, hence the move-aside rather
+# than a straight overwrite. An interrupted run leaves .replacing behind; the
+# next run reclaims it in the cleanup above.
 if [ -d "$SEED/tarball-cache-v2" ] &&
    ! mv -T "$SEED/tarball-cache-v2" "$SEED/.tarball-cache-v2.replacing"; then
   exit 1
 fi
+mv -f "$STAGE/nix/fetcher-cache-v4.sqlite" "$SEED/fetcher-cache-v4.sqlite" || exit 1
 mv -T "$STAGE/nix/tarball-cache-v2" "$SEED/tarball-cache-v2" || exit 1
+{ printf '%s\n' "$REF" > "$STAGE/pin" && mv -f "$STAGE/pin" "$SEED/pin"; } || exit 1
 rm -rf "$SEED/.tarball-cache-v2.replacing" || :
 
 exit 0
