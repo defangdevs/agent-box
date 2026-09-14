@@ -495,6 +495,78 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               printf 'generated services: %s\n' ${nixpkgs.lib.escapeShellArg (toString wanted)} > "$out"
             '';
 
+          # Regression coverage for issue #687: sudoGranted (which drives
+          # NoNewPrivileges and whether /run/wrappers joins the agent's
+          # PATH) has to ask about the reboot grant in both directions —
+          # count it when the reboot sudo rule actually renders, and never
+          # count it when web.enable leaves that rule unrendered. The fix
+          # was recovered from a closed PR (#655) whose own test coverage
+          # never reached master, so this is written fresh rather than
+          # ported.
+          #
+          # containers.enable = false and no custom sudoAllowlist isolate
+          # the reboot grant as the only thing that could ever put the
+          # agent unit's escape hatch (NoNewPrivileges=false, /run/wrappers
+          # on PATH) up — web.enable itself also implies the caddy-reload
+          # grant, which is why the web-ENABLED case below can't regress on
+          # its own, but the web-DISABLED case can and, before the second
+          # fix commit, did (rootUser resolves from a user's
+          # web.passwordHashFile regardless of web.enable, so a web-off box
+          # with rebootButton left at its true default wrongly got the
+          # escape hatch for a rule that is never rendered).
+          sudo-granted-reboot-gate =
+            let
+              mkEval = webEnable: nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      containers.enable = false;
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = webEnable;
+                        domain = "sudo-granted.test";
+                        user = "agent";
+                        rebootButton = true;
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+              webOff = mkEval false;
+              webOn = mkEval true;
+              unitOf = m: m.config.systemd.services."agent-box@agent";
+              hasRebootRule = m:
+                builtins.any
+                  (r: (r.users or [ ]) == [ "agent" ] && builtins.any
+                    (c: (c.command or "") == "/run/current-system/sw/bin/systemctl reboot --no-block")
+                    (r.commands or [ ]))
+                  m.config.security.sudo.extraRules;
+              escapeHatchOpen = m:
+                let u = unitOf m; in
+                u.serviceConfig.NoNewPrivileges == false
+                && nixpkgs.lib.hasInfix "/run/wrappers" u.environment.PATH;
+              failures =
+                nixpkgs.lib.optional (hasRebootRule webOff)
+                  "web.enable = false rendered a reboot sudo rule anyway"
+                ++ nixpkgs.lib.optional (escapeHatchOpen webOff)
+                  "web.enable = false with rebootButton = true wrongly opened the sudo escape hatch (agent-box#687)"
+                ++ nixpkgs.lib.optional (! hasRebootRule webOn)
+                  "web.enable = true with rebootButton = true rendered no reboot sudo rule"
+                ++ nixpkgs.lib.optional (! escapeHatchOpen webOn)
+                  "a rendered reboot sudo rule must open the sudo escape hatch (agent-box#687)";
+            in
+            if failures != [ ]
+            then throw ("sudo-granted-reboot-gate:\n" + nixpkgs.lib.concatMapStringsSep "\n" (m: "  ${m}") failures)
+            else pkgs.runCommand "agent-box-sudo-granted-reboot-gate-ok" { } ''
+              printf 'sudoGranted tracks the reboot grant in both directions\n' > "$out"
+            '';
+
           # Guard (issue #362): a test or host example that overrides a unit
           # by an old/misspelled name — e.g. the flat "agent-box-settings-agent"
           # a rename left behind, instead of the real per-instance
