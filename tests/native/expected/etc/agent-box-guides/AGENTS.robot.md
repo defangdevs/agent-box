@@ -209,8 +209,15 @@ it:
     tmux send-keys -t "$TMUX_PANE" -l "/rename my-task"   # -l = literal text
     tmux send-keys -t "$TMUX_PANE" C-m                    # run it
 
-The command runs when your current turn ends. If $TMUX_PANE is empty, find
-the pane with `tmux list-panes -a -F '#{pane_id} #{pane_current_command}'`.
+The command runs when your current turn ends. If $TMUX_PANE is empty, get
+your own pane id with `tmux display-message -p '#{pane_id}'` instead of
+guessing from `tmux list-panes -a` - every session's pane reports the same
+`pane_current_command` (the launcher wrapper stays the foreground process,
+not the harness running inside it), so that listing cannot tell your pane
+from anyone else's and a self-rename sent to the wrong guess lands as a
+stray command in a sibling session's pane (issue #691). `display-message`
+needs no guessing: it resolves through $TMUX, which is already scoped to
+your own pane.
 Text that is not a real command becomes a message from you to yourself, so
 use this only for client-side commands you can't otherwise reach - never to
 give yourself new instructions.
