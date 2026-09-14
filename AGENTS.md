@@ -64,7 +64,9 @@ Keep the module self-contained: deployed boxes fetch `modules/agent-box.nix` as 
 - `nix build -L .#checks.<system>.checkout-bootstrap` runs `tests/test-checkout-bootstrap.sh` against `modules/src/checkout-cli.sh`, the script that puts this repo ON a deployed box (issue #242). Its assertions are mostly REFUSALS, because that is where the damage would be: it runs unattended at every supervisor start, in a tree sibling sessions are working in, so a realign that moved somebody's branch pointer would destroy work at boot on a box nobody is watching. `origin` is a local repository and `gh` is a shim, so there is no network and it runs natively on every architecture. Runnable without Nix too: `bash tests/test-checkout-bootstrap.sh modules/src/checkout-cli.sh`.
 - `nix build -L .#checks.<system>.source-tree` runs `tests/test-source-tree.sh` against `modules/src/source-tree.sh`, the tree the box is BUILT from and the whole of what an update moves (issue #242). Weighted at the refusals for the same reason: it runs as root, unattended, and the tree it leaves behind is what the next rebuild builds — so a rewritten history, a downgrade, and a baseline the tree has never heard of each get an assertion, as does the realign that makes the fast-forward guard measure ancestry from the rev the box is RUNNING. It also pins the two locks the trust boundary rests on: `check` answers from `git ls-remote` and so creates no tree and fetches into none, and git runs with `core.hooksPath` pointed at nothing, so a `post-checkout`/`post-merge` hook in the tree cannot run as root (that assertion has a negative control — remove the lock and it fails). `origin` is a local repository, so there is no network and it runs natively on every architecture. Runnable without Nix too: `bash tests/test-source-tree.sh modules/src/source-tree.sh`.
 - `nix build -L .#checks.<system>.checkout-options` is the eval regression for `selfUpdate`'s three path assertions (issue #242). It reads `config.assertions` rather than forcing `toplevel`, so a failure names WHICH assertion fired instead of only reporting that something did — and it asserts the accepting cases too, so an assertion that rejects everything fails it as loudly as one that rejects nothing. `selfUpdate.srcDir` is the one that matters most, because root BUILDS the box from that tree: it is confined to a normalized path under `/var/lib`, since owning the directory is not enough — a writable ancestor (`/home/agent/src`, `/tmp/src`) lets an agent swap the whole tree and choose what root builds. For `selfUpdate.checkout.path` the inputs that matter are the ones a first pass at "must be relative" lets through: `../agent-box` escapes the home, `.` and `""` collapse to `/home/<maintainer>` itself — which the agent unit's `ProtectSystem=strict` would refuse as EROFS inside a background job's journal — and `a//b`, which resolves to a perfectly ordinary child path and is refused for a different reason: every empty component is, because one is how the collapsing cases are spelled.
-- `nix build -L .#checks.<system>.webhook-defer` runs `tests/test-webhook-defer.sh`: what `modules/src/webhook-spawn.sh` answers when shared session admission refuses a start, and what the pinned `webhook.py` does with that answer (issues #170, #301). A refusal is `exit 75` (`EX_TEMPFAIL`), the one code the dispatcher reads as "declined for now" rather than "this spawner is broken" -- every other code drops the batch, and a standing watch is for events NO session owns, so nothing else is holding them. The second half runs the REAL wrapper as the REAL Dispatcher's spawn command, fills the cap, frees a slot and asserts the declined batch starts by itself, because the bug was the two programs disagreeing about what a non-zero exit meant. Runnable without Nix too: `bash tests/test-webhook-defer.sh modules/src/webhook-spawn.sh /path/to/webhook.py` (the dispatcher half is skipped, and says so, when no `webhook.py` is given).
+- `nix build -L .#checks.<system>.changed-paths` runs `tests/test-changed-paths.py`: the GitHub `paths` glob dialect as `scripts/changed_paths.py` reimplements it, the committed `.github/path-filters/*.paths` against the concrete paths whose bug histories put them in the list, and - the part nothing else can see - that no gated workflow has grown a trigger-level `paths:` again. That filter shape is what made green CI unrequireable (issue #632): a workflow that never starts reports no check run, so requiring it would block every docs-only PR forever. Runnable without Nix too: `python3 tests/test-changed-paths.py` (one case needs a git checkout and says so when it skips).
+- `nix build -L .#checks.<system>.release-manifest` runs `tests/test-release-manifest.py` against `scripts/release_manifest.py`, the record of what a promoted candidate actually IS (issue #632). Weighted at the refusals: a manifest that verifies when it should not is how an untested artifact becomes the public install default, and it looks exactly like a pass - so a changed module, a changed template, a changed `flake.lock`, another rev, an unpinned channel and a `flake_ref` naming a different commit each get an assertion. Hermetic - no network, and `nix-prefetch-url` is a stub the test writes itself - so it runs natively on every architecture: `python3 tests/test-release-manifest.py`.
+- `nix build -L .#checks.<system>.webhook-defer` runs `tests/test-webhook-defer.sh`: what `modules/src/webhook-spawn.sh` answers at the hook-session ceiling, and what the pinned `webhook.py` does with that answer (issues #170, #301). A refusal is `exit 75` (`EX_TEMPFAIL`), the one code the dispatcher reads as "declined for now" rather than "this spawner is broken" -- every other code drops the batch, and a standing watch is for events NO session owns, so nothing else is holding them. The second half runs the REAL wrapper as the REAL Dispatcher's spawn command, fills the cap, frees a slot and asserts the declined batch starts by itself, because the bug was the two programs disagreeing about what a non-zero exit meant. Runnable without Nix too: `bash tests/test-webhook-defer.sh modules/src/webhook-spawn.sh /path/to/webhook.py` (the dispatcher half is skipped, and says so, when no `webhook.py` is given).
 - `nix flake metadata` validates flake inputs and basic evaluation.
 - `nix build .#packages.x86_64-linux.vm` builds the bootable qcow2 image under `result/`.
 - `nix build -L .#checks.<system>.multi-user` runs the quick module/configuration assertion.
@@ -451,6 +453,69 @@ one here has already cost at least one.
   correct it. Any time a run becomes a claim to somebody else, capture the
   status without a pipe first, then look at the output.
 
+## Releases: promote a tested candidate, never the branch tip
+
+The public install default is not master. `publish-template.yml` used to run
+on every push to master, independently of CI and of the fresh-boot deployment
+test, and it re-resolved the nixos-unstable channel at publish time - so the
+box a 1-click Launch button creates had never been booted by anything, and its
+one mutable dependency was resolved after the last thing that could have
+tested it (issue #632).
+
+Promotion is now explicit and is the only path to those defaults.
+`promote.yml` (Actions > Promote a release candidate > Run workflow) does, in
+order, stopping at the first failure:
+
+1. resolves the candidate to a full commit sha;
+2. refuses it unless all three aggregate gates are `success` FOR THAT SHA -
+   and treats an ABSENT gate as a failure, which is the whole reason they are
+   separate always-running jobs;
+3. builds `release-manifest.json` ONCE with `scripts/release_manifest.py`:
+   the rev, the SRI hash of `modules/agent-box.nix` that `template.yaml`
+   fetches, the flake ref `lightsail-template.yaml` installs, the `flake.lock`
+   hash, the resolved nixpkgs channel SNAPSHOT url and its hash, and a hash
+   per deployment template;
+4. calls `deploy-test.yml` with those pins, so the box it boots is pinned to
+   the same source AND the same dependency set the published templates will
+   carry. Before this the two were never the same artifact: deploy-test left
+   `AgentNixpkgsUrl` empty and publish injected a pair it resolved itself;
+5. calls `publish-template.yml` with the SAME manifest - which now computes
+   nothing and injects only what the manifest recorded, and uploads the
+   manifest to S3 beside the templates;
+6. records it: a `release-*` tag, a GitHub Release carrying the manifest, and
+   the `release` branch pointer.
+
+So a failure anywhere before step 5 leaves the public defaults exactly as they
+were. What master running ahead of the last promoted release now means is "the
+tip has not been promoted yet", not issue #408's bug where the pin and the
+template disagreed - those always come from one candidate now.
+
+**Nothing publishes on its own any more.** If the S3 templates look stale, the
+answer is that nobody has promoted, and the fix is one workflow dispatch.
+
+**Boxes.** A launch of the published templates starts AT the promoted release.
+A box's own self-update still follows the tracked branch, which is master
+unless it is told otherwise - `agentbox update --branch release`, or
+`selfUpdate.branch = "release"` on NixOS. Making `release` the shipped default
+is deliberately not done here: it changes what every existing box updates to,
+and it needs a promotion to exist first.
+
+**Rollback.** Dispatch `promote.yml` again with `sha` set to an earlier
+promoted commit, `allow_rollback` on, and `skip_deploy_test` on (that
+candidate already passed it). It keeps the tag it already has - a commit is
+tagged at most once - rebuilds its manifest from its own immutable rev,
+republishes it, and force-moves the `release` pointer back. For one box:
+`agentbox update --rev <release tag> --force` (the `--force` is required
+because `agent-box-source`'s fast-forward guard refuses a backwards move by
+construction).
+
+**Verifying a box against a release.** `python3 scripts/release_manifest.py
+verify release-manifest.json --rev <the box's rev>` recomputes every recorded
+identity from the rev the manifest names and refuses any difference. It
+re-hashes the channel URL the manifest RECORDED rather than re-resolving the
+channel - re-resolving would compare an old release against wherever unstable
+has since moved, which would make every rollback unverifiable.
+
 ## Filing Issues, and when to skip straight to the PR
 
 When you hit something wrong - a bug, a design gap, a stale doc, a flaky check, surprising behavior you had to work around - do not let it die in a session transcript: the next agent starts with none of your context. But an issue is not automatically the right container for it. This is a repo we control, so **when you know the fix and can push it, open the PR instead**; an issue that already carries the diagnosis and the patch is churn, costing a read for every future triager and giving nothing the PR does not carry. Name the symptom in the PR body, so the work is still findable by what went wrong.
@@ -467,14 +532,24 @@ Attach those screenshots with `agent-box-upload FILE --repo defangdevs/agent-box
 
 ### Landing a PR
 
-**The branch ruleset requires no status check.** It gates on resolved
-conversations and zero approvals, and nothing else - so
-`gh pr merge NNN --squash --auto` is not a promise to wait for green here. It
-is an immediate merge with extra steps: PR #456 merged on the spot with its CI
-run still `IN_PROGRESS`. To land on green, poll the run and merge once it
-passes, or add the check to the ruleset first. Read `rules/branches` before
-assuming any gate exists; the classic branch-protection API does not describe
-this repo. This is also how stale page-copy assertions reach master at all.
+**There is a gate to require now, and requiring it is a repo-settings
+change nobody can make from a PR.** Every gated workflow ends in an
+always-reported terminal job - `CI gate`, `AWS template gate`,
+`Azure template gate` - added for issue #632. Those three are safe to
+require, because they are reported on EVERY pull request whatever it
+touches: the path filters moved off the workflow triggers into
+`.github/path-filters/*.paths`, so a docs-only change now gets a gate
+saying "nothing to run" instead of getting no check run at all. Requiring
+a path-filtered job itself would have blocked such a PR forever.
+
+**Until an admin adds them, the branch ruleset still requires no status
+check.** It gates on resolved conversations and zero approvals, and nothing
+else - so `gh pr merge NNN --squash --auto` is not a promise to wait for
+green here. It is an immediate merge with extra steps: PR #456 merged on
+the spot with its CI run still `IN_PROGRESS`. To land on green, poll the
+run and merge once it passes. Read `rules/branches` before assuming any
+gate exists; the classic branch-protection API does not describe this repo.
+This is also how stale page-copy assertions reach master at all.
 
 **A CONFLICTING PR reports "no checks reported", not a failure.** The workflows
 trigger on `pull_request`, which builds the MERGE commit, and a conflicted PR
