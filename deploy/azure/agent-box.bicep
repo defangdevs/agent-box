@@ -123,6 +123,9 @@ param agentBoxFlakeRef string = 'github:defangdevs/agent-box'
 @description('Nix installer. The Determinate installer is used deliberately: it supports SELinux (so the same script serves RHEL), survives distro upgrades, and enables flakes out of the box.')
 param nixInstallerUrl string = 'https://install.determinate.systems/nix'
 
+@description('Optional: the resource id of a Compute Gallery image version to deploy from, instead of the stock Ubuntu marketplace image. An agent-box image (built by .github/workflows/azure-image.yml) already carries nix and the runtime closure, which is most of what first boot otherwise spends its time downloading - see issue #697. Empty (the default) deploys the stock image, so the 1-click button is unaffected. The image must match the architecture of vmSizeChoice.')
+param imageId string = ''
+
 @description('Source range allowed to reach the terminal (and SSH). A CIDR, or an Azure service tag such as Internet.')
 param allowCidr string = '0.0.0.0/0'
 
@@ -570,11 +573,20 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
       vmSize: vmSize
     }
     storageProfile: {
-      imageReference: {
+      // An agent-box gallery image when one is named, the stock Canonical
+      // marketplace image otherwise (issue #697). The image carries nix and
+      // the runtime closure already realized in /nix/store, which is what
+      // takes the bootstrap's dominant phase from ~3 minutes to seconds; the
+      // bootstrap itself is identical either way and still installs the
+      // profile from agentBoxFlakeRef, so an image that has fallen behind is
+      // slower, never wrong.
+      imageReference: empty(imageId) ? {
         publisher: 'Canonical'
         offer: 'ubuntu-24_04-lts'
         sku: imageSkuBySize[vmSize]
         version: 'latest'
+      } : {
+        id: imageId
       }
       osDisk: {
         createOption: 'FromImage'
