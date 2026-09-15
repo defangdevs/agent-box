@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.39",
-      "templateHash": "6687717203730980579"
+      "templateHash": "9009336141450950037"
     }
   },
   "parameters": {
@@ -84,6 +84,13 @@
       "defaultValue": "https://install.determinate.systems/nix",
       "metadata": {
         "description": "Nix installer. The Determinate installer is used deliberately: it supports SELinux (so the same script serves RHEL), survives distro upgrades, and enables flakes out of the box."
+      }
+    },
+    "imageId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional: the resource id of a Compute Gallery image version to deploy from, instead of the stock Ubuntu marketplace image. An agent-box image (built by .github/workflows/azure-image.yml) already carries nix and the runtime closure, which is most of what first boot otherwise spends its time downloading - see issue #697. Empty (the default) deploys the stock image, so the 1-click button is unaffected. The image must match the architecture of vmSizeChoice."
       }
     },
     "allowCidr": {
@@ -277,12 +284,7 @@
           "vmSize": "[variables('vmSize')]"
         },
         "storageProfile": {
-          "imageReference": {
-            "publisher": "Canonical",
-            "offer": "ubuntu-24_04-lts",
-            "sku": "[variables('imageSkuBySize')[variables('vmSize')]]",
-            "version": "latest"
-          },
+          "imageReference": "[if(empty(parameters('imageId')), createObject('publisher', 'Canonical', 'offer', 'ubuntu-24_04-lts', 'sku', variables('imageSkuBySize')[variables('vmSize')], 'version', 'latest'), createObject('id', parameters('imageId')))]",
           "osDisk": {
             "createOption": "FromImage",
             "diskSizeGB": "[parameters('osDiskSizeGB')]",

@@ -1,0 +1,228 @@
+# Deploy a box from an agent-box gallery image and time its first boot
+# (issue #697).
+#
+# This is the number the rest of #697 turns on. The baseline it is measured
+# against is 3m47s: a real Azure box's own /var/log/agent-box-bootstrap.log,
+# 16:58:37 -> 17:02:24, Standard_B2pls_v2 in westus3, of which ~750 of the
+# log's 855 lines are one `nix profile install ...#runtime` pulling a 797 MiB
+# closure out of cache.nixos.org.
+#
+# It deploys the REAL deploy/azure/agent-box.json with the real bootstrap, so
+# what it measures is what a 1-click user would get - only `imageId` differs.
+#
+# Manual dispatch only: every run creates a VM, and deletes it again.
+name: Azure image measure
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_id:
+        description: Gallery image version resource id. Empty = newest version in the agent-box gallery.
+        type: string
+        default: ''
+      stock_baseline:
+        description: Also deploy a stock-image box in the same run, for a same-region, same-hour A/B.
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: azure-image-measure
+  cancel-in-progress: false
+
+env:
+  GALLERY: agentbox
+  IMAGE_DEF: agent-box-ubuntu-2404-arm64
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    environment: defang-agent-box
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Azure login (OIDC, no stored secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve the image and generate ephemeral credentials
+        id: prep
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          WANTED: ${{ inputs.image_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$WANTED" ]; then
+            image_id="$WANTED"
+          else
+            image_id=$(az sig image-version list \
+              --resource-group "$RG" --gallery-name "$GALLERY" \
+              --gallery-image-definition "$IMAGE_DEF" \
+              --query 'sort_by(@, &publishingProfile.publishedDate)[-1].id' -o tsv)
+          fi
+          if [ -z "$image_id" ] || [ "$image_id" = "null" ]; then
+            echo "::error::No image version found in $GALLERY/$IMAGE_DEF - run the Azure image workflow first."
+            exit 1
+          fi
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+          echo "Measuring image: $image_id"
+
+          # Ephemeral, for a box that is deleted minutes from now. The web
+          # password is masked because the log is public; it never reaches the
+          # box in plaintext anyway (the bootstrap argon2id-hashes it).
+          pw=$(openssl rand -hex 24)
+          echo "::add-mask::$pw"
+          echo "pw=$pw" >> "$GITHUB_OUTPUT"
+          ssh-keygen -t ed25519 -N '' -f /tmp/measure_key -q
+          echo "pubkey=$(cat /tmp/measure_key.pub)" >> "$GITHUB_OUTPUT"
+          echo "prefix=abm-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "stockprefix=abs-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy from the image, and time it
+        id: imaged
+        timeout-minutes: 30
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          PREFIX: ${{ steps.prep.outputs.prefix }}
+          IMAGE_ID: ${{ steps.prep.outputs.image_id }}
+          PW: ${{ steps.prep.outputs.pw }}
+          PUBKEY: ${{ steps.prep.outputs.pubkey }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          # `az deployment group create` returns when the CustomScript
+          # extension has finished, i.e. when the bootstrap has exited - so
+          # this wall clock is "click to box ready", not just "VM created".
+          az deployment group create \
+            --resource-group "$RG" --name "$PREFIX" \
+            --template-file deploy/azure/agent-box.json \
+            --parameters \
+              namePrefix="$PREFIX" \
+              webPassword="$PW" \
+              adminPasswordOrKey="$PUBKEY" \
+              imageId="$IMAGE_ID" \
+            --only-show-errors > /dev/null
+          echo "deploy_s=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      - name: Read the bootstrap's own duration
+        id: imagedboot
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          PREFIX: ${{ steps.prep.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          # birth time -> mtime of the log the bootstrap tees into. This is
+          # the number directly comparable to the 3m47s baseline, because that
+          # baseline was measured the same way on a real box.
+          az vm run-command invoke --resource-group "$RG" --name "${PREFIX}-vm" \
+            --command-id RunShellScript \
+            --scripts 'stat -c "%W %Y" /var/log/agent-box-bootstrap.log' \
+            --only-show-errors --query 'value[].message' -o tsv > /tmp/stat.txt
+          sed -e 's/^/    /' /tmp/stat.txt
+          read -r birth mtime < <(grep -oE '^[0-9]+ [0-9]+' /tmp/stat.txt | head -1)
+          if [ -z "${birth:-}" ] || [ "$birth" = "0" ]; then
+            echo "boot_s=unknown" >> "$GITHUB_OUTPUT"
+          else
+            echo "boot_s=$(( mtime - birth ))" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy a stock-image baseline, and time it
+        id: stock
+        if: inputs.stock_baseline
+        timeout-minutes: 30
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          PREFIX: ${{ steps.prep.outputs.stockprefix }}
+          PW: ${{ steps.prep.outputs.pw }}
+          PUBKEY: ${{ steps.prep.outputs.pubkey }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          # Same template, same region, same hour - imageId left empty.
+          az deployment group create \
+            --resource-group "$RG" --name "$PREFIX" \
+            --template-file deploy/azure/agent-box.json \
+            --parameters \
+              namePrefix="$PREFIX" \
+              webPassword="$PW" \
+              adminPasswordOrKey="$PUBKEY" \
+            --only-show-errors > /dev/null
+          echo "deploy_s=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          az vm run-command invoke --resource-group "$RG" --name "${PREFIX}-vm" \
+            --command-id RunShellScript \
+            --scripts 'stat -c "%W %Y" /var/log/agent-box-bootstrap.log' \
+            --only-show-errors --query 'value[].message' -o tsv > /tmp/stat-stock.txt
+          read -r birth mtime < <(grep -oE '^[0-9]+ [0-9]+' /tmp/stat-stock.txt | head -1)
+          if [ -z "${birth:-}" ] || [ "$birth" = "0" ]; then
+            echo "boot_s=unknown" >> "$GITHUB_OUTPUT"
+          else
+            echo "boot_s=$(( mtime - birth ))" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report
+        if: always()
+        env:
+          IMAGE_ID: ${{ steps.prep.outputs.image_id }}
+          I_DEPLOY: ${{ steps.imaged.outputs.deploy_s }}
+          I_BOOT: ${{ steps.imagedboot.outputs.boot_s }}
+          S_DEPLOY: ${{ steps.stock.outputs.deploy_s }}
+          S_BOOT: ${{ steps.stock.outputs.boot_s }}
+        run: |
+          {
+            echo "### First boot, from an agent-box image"
+            echo
+            echo "| | deployment (click to ready) | bootstrap only |"
+            echo "|---|---|---|"
+            echo "| from the image | ${I_DEPLOY:-n/a}s | ${I_BOOT:-n/a}s |"
+            if [ -n "${S_DEPLOY:-}" ]; then
+              echo "| stock image, same run | ${S_DEPLOY}s | ${S_BOOT:-n/a}s |"
+            fi
+            echo "| recorded baseline (a real box, westus3, B2pls_v2) | - | 227s |"
+            echo
+            echo "Image: \`${IMAGE_ID:-n/a}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete everything this run created
+        # always(): a measurement that failed halfway must not leave a VM
+        # running. Contributor here is scoped to one resource group, so there
+        # is no group to drop - resources are matched by this run's own name
+        # prefix instead.
+        if: always()
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          PREFIX: ${{ steps.prep.outputs.prefix }}
+          STOCKPREFIX: ${{ steps.prep.outputs.stockprefix }}
+        run: |
+          set -uo pipefail
+          for p in "$PREFIX" "$STOCKPREFIX"; do
+            [ -n "$p" ] || continue
+            # VMs first: that releases the NIC and the OS disk, which cannot
+            # be deleted while attached.
+            for id in $(az resource list -g "$RG" \
+                --query "[?starts_with(name,'$p') && type=='Microsoft.Compute/virtualMachines'].id" \
+                -o tsv); do
+              az vm delete --ids "$id" --yes --only-show-errors || true
+            done
+            # Then the rest, retried: NIC before subnet, IP after NIC, and so
+            # on - ordering still matters and a single pass can leave stragglers.
+            for _ in 1 2 3; do
+              ids=$(az resource list -g "$RG" \
+                --query "[?starts_with(name,'$p')].id" -o tsv)
+              [ -n "$ids" ] || break
+              # shellcheck disable=SC2086
+              az resource delete --ids $ids --only-show-errors || true
+              sleep 10
+            done
+            left=$(az resource list -g "$RG" --query "[?starts_with(name,'$p')].name" -o tsv)
+            if [ -n "$left" ]; then
+              echo "::warning::resources left behind for $p:"
+              echo "$left"
+            fi
+          done
