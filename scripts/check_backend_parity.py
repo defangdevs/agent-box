@@ -311,6 +311,17 @@ UNITS_BY_DESIGN = {
         "the same blind spot over the other four templates"),
 }
 UNITS_KNOWN_GAPS = {
+    "agent-box-rollback.service": (
+        "native",
+        "#676: the undo for an update that succeeded and was wrong. Native "
+        "only because the UNIT is - `agentbox rollback` walks the runtime "
+        "profile back a generation, and a NixOS box has no such profile to "
+        "walk: it rebuilds, so its equivalent is a system generation "
+        "(`nixos-rebuild switch --rollback`) and a different unit "
+        "altogether. The CAPABILITY gap is real and one-sided though, which "
+        "is why this is here and not in UNITS_BY_DESIGN: a NixOS agent can "
+        "trigger an update through the same sudo grant and cannot undo it. "
+        "#676 owns the module side"),
     "agent-box-defang-cli.service": (
         "module",
         "#461: a PRE-fetch, not the card. The "

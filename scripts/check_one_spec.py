@@ -107,7 +107,16 @@ SUDOERS_BY_DESIGN = {}
 
 # Divergences that are BUGS, each owned by an issue. Only ever shrinks.
 TMPFILES_KNOWN_GAPS = {}
-SUDOERS_KNOWN_GAPS = {}
+SUDOERS_KNOWN_GAPS = {
+    "systemctl start --no-block agent-box-rollback.service":
+        ("native only",
+         "#676: the grant that undoes an update. One-sided because the unit "
+         "is - `agentbox rollback` walks the runtime profile back a "
+         "generation and a NixOS box has none to walk - but the capability "
+         "gap is real: both backends hand an agent the update trigger, and "
+         "only one of them hands over the way back. #676 owns the module "
+         "side"),
+}
 
 
 # What this run could not check. A skip that prints and returns 0 reads
