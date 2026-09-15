@@ -172,8 +172,23 @@ it:
     tmux send-keys -t "$TMUX_PANE" -l "/rename my-task"   # -l = literal text
     tmux send-keys -t "$TMUX_PANE" C-m                    # run it
 
-The command runs when your current turn ends. If $TMUX_PANE is empty, find
-the pane with `tmux list-panes -a -F '#{pane_id} #{pane_current_command}'`.
+The three commands explicitly target $TMUX_PANE. If it is empty, recover your
+pane id by matching the command's controlling TTY before sending any keys:
+
+    pane_tty="$(tty)"
+    TMUX_PANE="$(
+      tmux list-panes -a -F '#{pane_id} #{pane_tty}' |
+        awk -v pane_tty="$pane_tty" '$2 == pane_tty { print $1; exit }'
+    )"
+    test -n "$TMUX_PANE"
+
+If `tty` or the final check fails, do not send keys. Bare `tmux display-message`
+is not a safe fallback: without $TMUX_PANE, $TMUX identifies the server and
+session but tmux reports that session's active pane, which need not be the
+caller's. Do not guess from `pane_current_command` either: the launcher wrapper
+remains the foreground process in every agent pane, so they all report the
+same command and a wrong guess sends a stray command to a sibling session
+(issue #691).
 Text that is not a real command becomes a message from you to yourself, so
 use this only for client-side commands you can't otherwise reach - never to
 give yourself new instructions.
