@@ -11031,13 +11031,20 @@ esac
     # fetcher-cache sqlite is the URL -> treeHash map. Packs alone leave nix unable
     # to learn the tree hash without redoing the ingest (23.7s, i.e. no saving).
     #
-    # cp -al, so the packfiles are HARDLINKED rather than copied. They are
-    # immutable and mode 0444, so every user's cache points at one set of inodes
-    # and a second user costs no disk. git alternates would be the obvious
-    # mechanism for that and does NOT work: nix's libgit2 path ignores
+    # cp -al first and cp -a behind it. The hardlink is the one that would cost no
+    # disk, and on a deployed box it is the one that never happens: this unit runs
+    # under ProtectSystem=strict with ReadWritePaths=$HOME, which makes the user's
+    # home its OWN bind mount, and link(2) refuses to cross a mount point even when
+    # both sides are one filesystem. So a seed under /var/lib fails EXDEV here and
+    # always falls through to the 72 MiB copy - measured on a live box, where
+    # /home/<user> and /var/lib sit on the same device and linking between them is
+    # still refused. The link arm is kept because it is correct wherever that
+    # boundary is absent (an image build staging a seed, the tests, and any future
+    # root-side distribution - root is outside this namespace and is the only place
+    # a shared inode is reachable at all). git alternates would be the obvious
+    # mechanism for sharing and does NOT work either: nix's libgit2 path ignores
     # objects/info/alternates and re-ingests from scratch. The sqlite is mutable,
-    # so that one is a real copy. Across a filesystem boundary (a deployment that
-    # splits /var from /home) the hardlink fails and a plain copy stands in.
+    # so that one is a real copy regardless.
     #
     # Staged under a temp name and renamed, so a seed interrupted halfway cannot
     # leave a PARTIAL cache behind that the -d guard would then treat as seeded.
@@ -25569,6 +25576,196 @@ if __name__ == "__main__":
         ln -sfn current/bin "$binDir"
         printf '%s' ${lib.escapeShellArg defangCliExpr} > "$stamp"
       '';
+    };
+  }
+
+  # Builds the shared nixpkgs git cache that supervisor.sh seeds each user's
+  # ~/.cache/nix from (issue #669).
+  #
+  # Driven by a TIMER, not by `wantedBy = [ "multi-user.target" ]`, which is
+  # what an earlier draft used (CodeRabbit on PR #695). A target implicitly
+  # gains `After=` on everything it Wants, unless it sets DefaultDependencies
+  # = no - so a unit wanted by multi-user.target is ordered BEFORE it, and a
+  # ~30s Type=oneshot there stalls the boot by that much. Confirmed on a live
+  # box rather than reasoned about: `systemctl show agent-box-earlyoom.service
+  # -p Before` lists multi-user.target, and multi-user.target's own `After=`
+  # names seven agent-box units. A timer sidesteps it because the only thing
+  # the target then waits for is the timer arming, which is instantaneous.
+  #
+  # OnActiveSec rather than OnBootSec: on a first boot the timer starts when
+  # apply enables it, which is AFTER the bootstrap's own ~800 MiB closure
+  # download, so the ingest does not compete with it for two cores. The daily
+  # re-arm is what picks up a moved pin without waiting for a reboot, and it
+  # costs a stat and a file read on every day the pin has not moved.
+  #
+  # Background and bottom-priority throughout. It is a ~30s CPU-bound ingest
+  # that runs once per box (and again only when the pin moves), and it must
+  # never be the reason a session is slow or an agent's own build loses the
+  # OOM lottery: measured peak RSS is 508 MiB, so the cap below is roughly
+  # double, which on a 2 GiB box bounds this cgroup instead of letting earlyoom
+  # pick some other victim.
+  {
+    systemd.timers.agent-box-nixpkgs-cache = {
+      description = "agent-box: schedule the shared nixpkgs cache build";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnActiveSec = "2min";
+        OnUnitActiveSec = "1d";
+      };
+    };
+    systemd.services.agent-box-nixpkgs-cache = {
+      description = "agent-box: build the shared nixpkgs cache sessions seed from";
+      wants = [ "network-online.target" ];
+      after = [ "network-online.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        # A first boot can win the race against DNS. Retry a few times and
+        # then stop, rather than re-ingesting every 30s forever against a ref
+        # that is permanently wrong (a channel URL that has 404'd, say).
+        Restart = "on-failure";
+        RestartSec = "30s";
+        Nice = 19;
+        IOSchedulingClass = "idle";
+        OOMScoreAdjust = 1000;
+        MemoryMax = "1G";
+        ExecStart = pkgs.writeShellScript "agent-box-nixpkgs-cache" ''
+          set -u
+          # Build the shared nixpkgs git cache that every user's FIRST harness install
+          # reads (issue #669).
+          #
+          # This is the producing half. supervisor.sh has carried the consuming half
+          # since PR #670 and has been inert on every box ever since, because nothing
+          # has ever written the directory it reads.
+          #
+          # What it buys: a box's first `nix profile add` spends ~25s of its ~36s turning
+          # the pinned nixpkgs tarball into git objects - 54,075 blobs SHA-1'd and
+          # deflated, CPU-bound - before nix has read a line of any package definition.
+          # That work is byte-identical on every box, and it is the SAME revision for
+          # every harness, because agent_install resolves them all against
+          # $AGENT_BOX_NIXPKGS. Measured on a 2-vCPU aarch64 box: the eval below takes
+          # 27.6s against an empty cache and 1.4s against the one it leaves behind.
+          #
+          # Issue #669 asked for this to be baked into the VM image. There is no custom
+          # image build in this repo for either cloud - AWS tracks stock upstream NixOS
+          # AMIs and Azure deploys a stock marketplace image - so the box builds its own
+          # instead, once, in the background, from the ref it is actually pinned to.
+          # That has one property a baked image cannot have: it can never be stale
+          # relative to THIS box's own pin. It also does not close the image door - an
+          # image build that wants to bake the cache runs this same script, and the unit
+          # then finds the pin already current and exits.
+          NIX="''${AGENT_BOX_NIX_BIN:?}"
+          SEED="''${AGENT_BOX_NIXPKGS_CACHE_SEED:-/var/lib/agent-box/nixpkgs-cache}"
+          REF="''${AGENT_BOX_NIXPKGS:-}"
+
+          # Everything written here is read by OTHER users - that is the entire point -
+          # so none of it may inherit a private umask from whoever started the unit.
+          umask 022
+
+          # No pin, nothing to build. Both renderers always set it, so this is the
+          # hand-run and the test, not a box.
+          [ -n "$REF" ] || exit 0
+
+          # The ordinary boot: one stat and one short read, then out. The pin is
+          # COMPARED rather than merely required to exist, so a box whose jitNixpkgs
+          # moved under it - a self-update advancing selfUpdate.agentNixpkgs - rebuilds
+          # against what its sessions will actually install, instead of handing every
+          # new user a cache for a revision the box has stopped using.
+          #
+          # That comparison is only as sharp as the ref is specific, and on a box with
+          # no agent-nixpkgs pin the ref is the MUTABLE channel URL. The string then
+          # never changes however far the channel moves, so the cache is never rebuilt
+          # and a new user gets one built for an older revision. That degrades rather
+          # than breaks: git dedupes ~92% of the objects, which the issue measured at
+          # 7.3s against 23.8s cold. Resolving the channel to its immutable release
+          # here would sharpen it, but that is the job of the pin the update service
+          # already maintains, and duplicating it would give the box two answers to
+          # one question.
+          if [ -d "$SEED/tarball-cache-v2" ] &&
+             [ "$(cat "$SEED/pin" 2>/dev/null || :)" = "$REF" ]; then
+            exit 0
+          fi
+
+          # Staged in a SIBLING of the seed, so publishing is a rename inside one
+          # directory rather than a 72 MiB copy across two.
+          STAGE="$SEED.staging"
+          rm -rf "$STAGE" "$SEED/.tarball-cache-v2.replacing" || :
+          mkdir -p "$SEED" "$STAGE" || exit 1
+          trap 'rm -rf "$STAGE"' EXIT HUP INT TERM
+
+          # `lib.version`, not a harness attribute. The git ingest is a property of the
+          # TARBALL rather than of whatever is evaluated out of it, so the cheapest
+          # attribute in the flake produces byte-identical objects - verified rather
+          # than assumed: a cache built this way resolves claude-code's outPath in 1.4s.
+          # Evaluating a harness instead would additionally need NIXPKGS_ALLOW_UNFREE
+          # and would pin this unit to the harness list for no gain.
+          #
+          # --impure mirrors how agent_install resolves the same ref. The experimental
+          # features are named explicitly because the nix.conf in force here is the
+          # box's, not a session's.
+          if ! XDG_CACHE_HOME="$STAGE" "$NIX" eval --impure --raw \
+               --extra-experimental-features 'nix-command flakes' \
+               "$REF#lib.version" > /dev/null; then
+            echo "nixpkgs-cache: could not evaluate $REF" >&2
+            exit 1
+          fi
+
+          # Both halves or neither: the packfiles are the objects, and the small
+          # fetcher-cache sqlite is the URL -> treeHash map. Handed only the packs, nix
+          # cannot learn the tree hash without redoing the entire ingest, so a seed
+          # missing the sqlite saves nobody anything.
+          if [ ! -d "$STAGE/nix/tarball-cache-v2" ] ||
+             [ ! -f "$STAGE/nix/fetcher-cache-v4.sqlite" ]; then
+            echo "nixpkgs-cache: nix left no usable cache under $STAGE/nix" >&2
+            exit 1
+          fi
+
+          # Publication ORDER is load-bearing, and it has to satisfy TWO readers with
+          # different guards, which is what an earlier draft of this got wrong
+          # (CodeRabbit on PR #695).
+          #
+          #   the consumer (supervisor.sh) keys on tarball-cache-v2 ALONE, and copies
+          #   the sqlite beside it. So it must never observe a new sqlite over old
+          #   packs: the sqlite maps URL -> treeHash, and pointing a user at a tree
+          #   hash their packs do not contain is worse than not seeding them at all.
+          #   The directory is therefore moved OUT OF THE WAY first and back only when
+          #   its sqlite is already correct - for the whole replacement the consumer
+          #   sees no directory and simply does not seed, which is today's behaviour.
+          #
+          #   this script keys on tarball-cache-v2 AND a matching pin, so the pin is
+          #   the completion marker and is written LAST. Publishing it earlier is the
+          #   bug: on a pin move it would leave the OLD directory beside the NEW pin,
+          #   which the guard above reads as "already current" - so the new cache would
+          #   never be published, and no later run would ever revisit it.
+          #
+          # rename(2) refuses a non-empty target directory, hence the move-aside rather
+          # than a straight overwrite. An interrupted run leaves .replacing behind; the
+          # next run reclaims it in the cleanup above.
+          if [ -d "$SEED/tarball-cache-v2" ] &&
+             ! mv -T "$SEED/tarball-cache-v2" "$SEED/.tarball-cache-v2.replacing"; then
+            exit 1
+          fi
+          mv -f "$STAGE/nix/fetcher-cache-v4.sqlite" "$SEED/fetcher-cache-v4.sqlite" || exit 1
+          mv -T "$STAGE/nix/tarball-cache-v2" "$SEED/tarball-cache-v2" || exit 1
+          { printf '%s\n' "$REF" > "$STAGE/pin" && mv -f "$STAGE/pin" "$SEED/pin"; } || exit 1
+          rm -rf "$SEED/.tarball-cache-v2.replacing" || :
+
+          exit 0
+        '';
+      };
+      # StartLimit* belong to [Unit], not [Service]; RestartSec above is longer
+      # than systemd's default 10s window, so without an explicit interval the
+      # default burst limit could never trip and the retry would be unbounded.
+      unitConfig = {
+        StartLimitIntervalSec = "1h";
+        StartLimitBurst = 5;
+      };
+      path = [ pkgs.coreutils ];
+      environment = {
+        AGENT_BOX_NIXPKGS = jitNixpkgsRef;
+        # `nix` is addressed absolutely for the same reason the native
+        # renderer does it: this unit has no session PATH to inherit.
+        AGENT_BOX_NIX_BIN = "${config.nix.package}/bin/nix";
+      };
     };
   }
   ]);

@@ -234,6 +234,7 @@ let
     (payload "agent-box-attach" "attach.sh")
     (payload "agent-box-mark-stopped" "mark-stopped.sh")
     (payload "agent-box-spot-monitor" "spot-monitor.sh")
+    (payload "agent-box-nixpkgs-cache" "nixpkgs-cache.sh")
     (payload "agent-box-update" "update.sh")
     # The box's own source tree manager (issue #242). Not a unit payload in
     # the usual sense — `agentbox update` execs it rather than systemd — but

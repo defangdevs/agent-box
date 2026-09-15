@@ -1,0 +1,12 @@
+[Unit]
+Description=agent-box: schedule the shared nixpkgs cache build
+
+[Timer]
+OnActiveSec=2min
+OnUnitActiveSec=1d
+
+
+[Install]
+WantedBy=timers.target
+
+# X-Golden-wantedBy: timers.target
