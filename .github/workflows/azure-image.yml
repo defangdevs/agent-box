@@ -160,6 +160,14 @@ jobs:
           fi
 
       - name: Deprovision, generalize and capture
+        # A STEP timeout, not just the job's. A job that exceeds its own
+        # timeout is reported `cancelled` on workflow_run, workflow_job and
+        # check_run alike - byte-identical to a cancel-in-progress supersede,
+        # with no payload field separating them - so a hung capture would
+        # reach nobody. A step that runs out of time FAILS, which is a state
+        # the standing watch matches. Capturing and replicating a 32 GiB OS
+        # disk legitimately takes 15-40 minutes, so the budget is generous.
+        timeout-minutes: 45
         env:
           RG: ${{ vars.AZURE_RESOURCE_GROUP }}
           VM: ${{ steps.src.outputs.vm }}
