@@ -54,17 +54,53 @@ let
           agent-box-webhook ls                     # what this session listens to
           agent-box-webhook unsubscribe OWNER/REPO # when you wrap up
 
-      When you pick up ONE issue or PR, say so with `--claim`. That both narrows
-      what reaches you and tells a standing watch the work is taken, so a review or
-      a comment on it no longer starts a second session on top of you:
+      When you pick up ONE issue or PR, say so with `--claim`, and say which of its
+      events you need with `--events`. The claim tells a standing watch the work is
+      taken, so a review or a comment on it no longer starts a second session on top
+      of you; the policy is what keeps the rest of the object's lifecycle out of your
+      context:
 
           agent-box-webhook subscribe OWNER/REPO \
             --note "PR 42: waiting on CI + review" \
-            --claim 42 --claim branch:fix/42-thing
+            --claim 42 --claim branch:fix/42-thing --events actionable
 
-      `--claim` is the whole of it: `42` for an issue or PR by number,
-      `branch:NAME` for everything CI reports against a branch. Repeat it, and the
-      clauses OR together.
+      `--claim` names the object: `42` for an issue or PR by number, `branch:NAME`
+      for everything CI reports against a branch, `sha:<40 characters>` for
+      everything it reports against ONE commit. Repeat it, and the clauses OR
+      together.
+
+      A session claim REQUIRES a policy. `--events actionable` is terminal CI
+      failure, a review verdict, a comment, an assignment, the object closing;
+      `--events terminal-ci` is runs that have FINISHED, whatever the outcome, and
+      nothing queued, in progress or merely created. Write `--include` yourself for
+      anything else - it is ANDed with the claim, not refused alongside it - or say
+      `--all-events` if you really do want the whole lifecycle. Scope-only claims
+      are refused because they are how one `--claim branch:master` queued 37
+      submissions into a Codex session in under two minutes, 21 of them `check_run`
+      events for work that merely landed on the branch.
+
+      Narrowing delivery cannot cost you the claim: whatever policy you pick, an
+      event a watch could spawn on - a review, a comment, an assignment, a red run -
+      still arrives, because one rule answers both questions and dropping it would
+      put a second agent on your own PR.
+
+      **The repository default branch is not claimable.** `--claim branch:master`
+      (or whatever that repo's default is - it is resolved, not guessed) is refused:
+      it moves, everybody merges onto it, and the claim would match every later
+      commit and every workflow/check lifecycle event on them for the whole TTL. A
+      claim is a bounded unit of work. To WATCH the default branch, subscribe with
+      `--events terminal-ci` and no claim - an observation subscription, not
+      ownership.
+
+      **A numbered claim stops at the merge.** It covers the PR, its comments and
+      its reviews while it is open; after a merge the work is on the default branch,
+      which you cannot claim. The CLI says so when you make the claim. Follow it
+      across with the commit instead:
+
+          agent-box-webhook subscribe OWNER/REPO \
+            --note "PR 42 merged: watching post-merge CI" \
+            --claim "sha:$(gh pr view 42 --json mergeCommit --jq .mergeCommit.oid)" \
+            --events terminal-ci
 
       Use the BARE number for a PR, as above. GitHub reports a PR comment as an
       `issue_comment` carrying `issue.number`, not `pull_request.number` - so
@@ -82,14 +118,21 @@ let
       `--claim branch:` writes five of the six - `workflow_run`, `workflow_job`,
       `check_run`, `check_suite` and `deployment_status` (via `deployment.ref`) -
       plus the push `ref` and `pull_request.head.ref`. The sixth, a bare commit
-      **status**, cannot be claimed at all: it carries no scalar branch, only a
-      `branches` array, and the payload language indexes lists by number only, so any
-      rule would be guessing at an order the payload does not promise. On a repo
-      whose CI reports through commit statuses, that shape stays unclaimed - expect a
-      sibling there.
+      **status**, cannot be claimed BY BRANCH at all: it carries no scalar branch,
+      only a `branches` array, and the payload language indexes lists by number only,
+      so any rule would be guessing at an order the payload does not promise. On a
+      repo whose CI reports through commit statuses, that shape stays unclaimed -
+      expect a sibling there.
 
-      `--include` still exists for rules `--claim` cannot express; the two are
-      mutually exclusive.
+      `--claim sha:` has no such gap: every one of the six carries the commit as a
+      scalar, including the bare status. It is also the only claim that cannot widen
+      under you, since a branch claim covers whatever is pushed to that branch next.
+      Pass the full 40 characters - the match is exact, so an abbreviated sha reads
+      as a claim and matches nothing.
+
+      `--include` still exists for rules `--claim` cannot express. It is no longer
+      refused beside a claim: the two are ANDed, since the claim says which object
+      and the predicate says which of its events.
 
       Claude Code has the same as MCP tools (`webhook_subscribe`,
       `webhook_unsubscribe`, `webhook_subscriptions`); both share one list. Those
@@ -6045,6 +6088,7 @@ _hc_main "$@"
                                              [--renew-on-event] [--ignore-sender LOGIN]...
                                              [--when JSON] [--drop JSON]
                                              [--claim SPEC]... [--profile NAME]
+                                             [--events POLICY | --all-events]
            agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent]
            agent-box-webhook ls
            agent-box-webhook status
@@ -6127,11 +6171,44 @@ _hc_main "$@"
       pr:42           ONLY the pull request (see below)
       issue:42        only the issue
       branch:NAME     everything CI reports against that branch
+      sha:COMMIT      everything CI reports against that ONE commit (full 40
+                      characters; the only claim that covers all six shapes,
+                      and the only one that cannot widen under you)
 
-    Repeatable; the clauses OR together. Picking up a PR is normally both:
+    Repeatable; the clauses OR together. Picking up a PR is normally both, plus
+    a policy saying which of its events you actually need:
 
       agent-box-webhook subscribe OWNER/REPO --note "PR 42: CI + review" \
-        --claim 42 --claim branch:fix/42-thing
+        --claim 42 --claim branch:fix/42-thing --events actionable
+
+    The repository's DEFAULT branch is refused as a claim: it moves, everyone
+    merges onto it, and a claim on it matches every later commit and every
+    workflow/check lifecycle event on them for the whole TTL. To watch it
+    without owning it, subscribe with --events and no claim.
+
+    A numbered claim stops at the merge, and this prints so when you make one:
+    the work moves onto the default branch, which you cannot claim, so after a
+    merge re-subscribe with --claim sha:<merge commit>.
+
+    --events POLICY is the OTHER half, and a session --claim requires one:
+    scope says which object is yours, not which of its events you need, and a
+    scope-only claim used to subscribe you to the whole lifecycle (37
+    submissions in two minutes, issue #706). POLICY is one of:
+
+      actionable      something is asking you to do something — terminal CI
+                      FAILURE, a review verdict, a comment, an assignment, the
+                      object closing
+      terminal-ci     runs that have FINISHED, whatever the outcome; excludes
+                      queued, in_progress and check-created
+
+    --include JSON does the same job with your own predicate, and is ANDed with
+    the claim rather than refused alongside it. --all-events is the explicit
+    opt-in to every lifecycle event of the claimed object.
+
+    Whichever you pick, an event a standing watch could spawn on stays claimed
+    and is delivered: webhook.py reads this one rule both to deliver and to
+    decide ownership, so a policy that dropped a review would also stop claiming
+    it and a reviewer would start a second session on your PR.
 
     Use the BARE number for a PR. GitHub reports a PR comment as an
     issue_comment carrying issue.number, not pull_request.number, so pr:42
@@ -6149,12 +6226,11 @@ _hc_main "$@"
     workflow_job.head_branch, check_run.check_suite.head_branch,
     check_suite.head_branch, deployment.ref), plus the push ref and
     pull_request.head.ref, which are not CI. The sixth, a bare commit status,
-    CANNOT be claimed: it carries no scalar branch, only a `branches` array,
-    and the payload language indexes lists by number only. If your repo's CI
-    reports through commit statuses, you stay exposed on that one shape.
-
-    --claim and --include are mutually exclusive; write --include yourself
-    only for rules --claim cannot express.
+    CANNOT be claimed by branch: it carries no scalar branch, only a `branches`
+    array, and the payload language indexes lists by number only. If your repo's
+    CI reports through commit statuses, you stay exposed on that one shape —
+    unless you claim the COMMIT, which every one of the six carries as a
+    scalar: --claim sha:<40 characters> reaches all of them.
 
     --profile NAME (subagent watches only) names the agent profile the sessions
     THIS watch spawns start on — a harness, a model, an effort level, an appended
@@ -6447,6 +6523,196 @@ _hc_main "$@"
       fi
     }
 
+    # The other half of a claim (issue #706): WHICH of the claimed object's events
+    # this session actually needs. A claim answers "which object is mine"; on its
+    # own it says nothing about relevance, and webhook.py hands a session every
+    # event its `include` matches — so a scope-only claim subscribes you to the
+    # whole lifecycle. `--claim branch:master --ttl 4` queued 37 submissions into
+    # one Codex session in under two minutes (21 check_run, 15 workflow, 1 push),
+    # and an earlier one reached that harness's 100-submission ceiling outright.
+    #
+    # So `--events` names the second dimension and the two are ANDed. The values
+    # are deliberately few: a policy nobody can predict the meaning of is worse
+    # than writing the predicate out.
+    #
+    #   terminal-ci   a run that has FINISHED, whatever the outcome — the six
+    #                 shapes CI reports through. Excludes queued, in_progress and
+    #                 check-created, which is the bulk of the noise.
+    #   actionable    something is asking you to do something: terminal CI
+    #                 FAILURE (a green run asks for nothing), a review verdict, a
+    #                 comment, an assignment, the object closing or reopening.
+    #
+    # Every conclusion GitHub can report on a finished run. Wider than
+    # ci_failure_json on purpose: "did my build pass" is the other half of what a
+    # session waits for, and `notIn: [null]` cannot express "has finished" — an
+    # ABSENT path passes notIn, so it would match every event in the repo.
+    ci_terminal_json='["success","failure","cancelled","timed_out","action_required","neutral","skipped","stale","startup_failure"]'
+    events_predicate() {
+      # events_predicate POLICY — the event-relevance predicate, as JSON.
+      case "$1" in
+        (terminal-ci)
+          "$JQ" -nc --argjson t "$ci_terminal_json" '
+            {any: [
+              {path:"workflow_run.conclusion", "in":$t}, {path:"workflow_job.conclusion", "in":$t},
+              {path:"check_run.conclusion", "in":$t}, {path:"check_suite.conclusion", "in":$t},
+              {path:"deployment_status.state", "in":["success","error","failure","inactive"]},
+              {path:"state", "in":["success","error","failure"]}
+            ]}' ;;
+        (actionable)
+          # `action` alone cannot carry these clauses: a check_run reports
+          # action "created" too, and that is precisely the noise being
+          # excluded. So the comment and review clauses name a path only that
+          # event shape has. `contains` is the presence test the language
+          # offers — an absent path fails it, where an absent path PASSES
+          # notIn — and every comment URL holds "http".
+          "$JQ" -nc --argjson ci "$ci_failure_json" '
+            {any: [
+              {path:"workflow_run.conclusion", "in":$ci}, {path:"workflow_job.conclusion", "in":$ci},
+              {path:"check_run.conclusion", "in":$ci}, {path:"check_suite.conclusion", "in":$ci},
+              {path:"deployment_status.state", "in":["error","failure"]},
+              {path:"state", "in":["error","failure"]},
+              {path:"action", "in":["closed","assigned","review_requested"]},
+              {all: [{path:"action", "in":["submitted"]},
+                     {path:"review.state", "in":["approved","changes_requested","commented","dismissed"]}]},
+              {all: [{path:"action", "in":["created"]},
+                     {path:"comment.html_url", contains:["http"]}]}
+            ]}' ;;
+        (*)
+          echo "agent-box-webhook: --events '$1' is not a policy — use" \
+               "terminal-ci or actionable, write --include yourself, or say" \
+               "--all-events to keep the whole lifecycle" >&2
+          return 1 ;;
+      esac
+    }
+
+    # The floor under every relevance policy (issue #706).
+    #
+    # webhook.py reads one `include` to answer two questions: what to deliver to
+    # this session, and — through filter_claims() — whether a standing watch
+    # should spawn a SECOND session onto this work. Narrowing delivery therefore
+    # narrows ownership, so a policy that dropped a review would also stop
+    # claiming it, and a reviewer's comment would start a sibling on the PR you
+    # are holding. That is #417's collision reached from the other side.
+    #
+    # So whatever policy is asked for, an event a watch could spawn on stays
+    # claimed and is delivered. That is `actionable` plus the one verb it leaves
+    # out: an object OPENING is spawn-worthy for a watch and asks nothing of a
+    # session that already owns it.
+    #
+    # Deliberately NOT default_subagent_when(): that one narrows its assignment,
+    # mention and review clauses to LOCAL_WEBHOOK_SELF, and on a box whose login
+    # is unknown they vanish entirely — which would silently drop the floor to
+    # CI outcomes and re-open the collision on exactly the boxes least able to
+    # notice. A floor has to be at least as wide as any watch policy it stands
+    # under, so it is written sender-agnostically.
+    watch_spawn_floor() {
+      "$JQ" -nc --argjson a "$(events_predicate actionable)" \
+        '{any: ($a.any + [{path:"action", "in":["opened","reopened"]}])}'
+    }
+
+    # The repository DEFAULT branch is not a claimable object (issue #706).
+    #
+    # A claim is a statement about a BOUNDED unit of work, and a shared default
+    # branch is the opposite of one: it moves, everybody merges onto it, and a
+    # claim on it matches every future commit and every workflow/check lifecycle
+    # event reported against them for the whole TTL. Object scope is not an event
+    # policy, but a moving shared ref is not even object scope.
+    #
+    # Dispatched sessions already work this way — webhook-spawn.sh keys a spawned
+    # session's CI claim to the triggering COMMIT and never to a shared ref
+    # (issues #510, #511). `--claim sha:` is that same primitive, made available
+    # to a session that asks for it rather than only to one that was spawned.
+    #
+    # Resolved from the repository rather than guessed at, because a repository's
+    # default branch is whatever it says it is: refusing only "main" and "master"
+    # would wave `--claim branch:trunk` through on a repo whose default is trunk.
+    # Those two names stay a BACKSTOP for the box that cannot ask — offline, no
+    # gh, no token — where guessing permissively is the expensive direction.
+    DEFAULT_BRANCH_CACHE="$STATE_DIR/default-branch.json"
+    DEFAULT_BRANCH_TTL_S=86400
+    DEFAULT_BRANCH_FALLBACK='main master'
+    # Set by the subscribe scan loop before the claims are turned into rules: the
+    # topic is what says WHICH repository a branch claim is a claim against.
+    claim_topic=""
+
+    repo_default_branch() {
+      # repo_default_branch OWNER/REPO — print its default branch, or nothing.
+      _db_key=$1
+      case "$_db_key" in
+        (*[!A-Za-z0-9._/-]*) return 1 ;;          # a wildcard names no repository
+      esac
+      case "$_db_key" in
+        (*/*/*|/*|*/) return 1 ;;
+        (*/*) ;;
+        (*) return 1 ;;
+      esac
+      _db_now=$(date +%s 2>/dev/null) || _db_now=0
+      case "$_db_now" in ('''|*[!0-9]*) _db_now=0 ;; esac
+      if [ -s "$DEFAULT_BRANCH_CACHE" ]; then
+        _db_hit=$("$JQ" -r --arg k "$_db_key" --argjson now "$_db_now" \
+          --argjson ttl "$DEFAULT_BRANCH_TTL_S" \
+          '(.[$k] // empty) | select((.at // 0) + $ttl > $now) | .branch // empty' \
+          "$DEFAULT_BRANCH_CACHE" 2>/dev/null) || _db_hit=""
+        if [ -n "$_db_hit" ]; then printf '%s\n' "$_db_hit"; return 0; fi
+      fi
+      command -v gh >/dev/null 2>&1 || return 1
+      # gh, not curl: it resolves the token the same way every other tool on this
+      # box does, so the answer describes the repository this agent actually sees.
+      _db_branch=$(timeout 8 gh api "repos/$_db_key" --jq .default_branch 2>/dev/null \
+        | tr -d '\r' | head -1) || _db_branch=""
+      case "$_db_branch" in (''' | *[!A-Za-z0-9._/-]*) return 1 ;; esac
+      # Cached because the answer is stable for months and this runs on an
+      # interactive path; a stale entry can only be wrong in the direction of
+      # refusing a branch that USED to be the default, which is recoverable.
+      mkdir -p "$STATE_DIR" 2>/dev/null || true
+      _db_old=$("$JQ" -c 'if type == "object" then . else {} end' \
+        "$DEFAULT_BRANCH_CACHE" 2>/dev/null) || _db_old='{}'
+      case "$_db_old" in (''') _db_old='{}' ;; esac
+      _db_tmp="$DEFAULT_BRANCH_CACHE.$$"
+      if "$JQ" -nc --argjson old "$_db_old" --arg k "$_db_key" --arg b "$_db_branch" \
+           --argjson now "$_db_now" '$old + {($k): {branch: $b, at: $now}}' \
+           > "$_db_tmp" 2>/dev/null; then
+        mv -f "$_db_tmp" "$DEFAULT_BRANCH_CACHE" 2>/dev/null || rm -f "$_db_tmp"
+      else
+        rm -f "$_db_tmp" 2>/dev/null || true
+      fi
+      printf '%s\n' "$_db_branch"
+    }
+
+    reject_default_branch() {
+      # reject_default_branch NAME — 1, with a diagnosis, when NAME is the topic
+      # repository's default branch. 0 for a topic branch, and for a topic that
+      # names no repository to ask about.
+      _rd_branch=$1
+      case "$claim_topic" in
+        (github:*) _rd_repo=''${claim_topic#github:} ;;
+        (*:*)      return 0 ;;    # another source: no GitHub default branch here
+        (*/*)      _rd_repo=$claim_topic ;;
+        (*)        return 0 ;;
+      esac
+      _rd_default=$(repo_default_branch "$_rd_repo") || _rd_default=""
+      if [ -n "$_rd_default" ]; then
+        [ "$_rd_branch" = "$_rd_default" ] || return 0
+        _rd_why="the default branch of $_rd_repo"
+      else
+        _rd_hit=0
+        for _rd_n in $DEFAULT_BRANCH_FALLBACK; do
+          if [ "$_rd_branch" = "$_rd_n" ]; then _rd_hit=1; fi
+        done
+        [ "$_rd_hit" = 1 ] || return 0
+        _rd_why="a default branch name (could not ask $_rd_repo which branch is its own)"
+      fi
+      echo "agent-box-webhook: --claim branch:$_rd_branch is $_rd_why, which is not" \
+           "a bounded unit of work — it moves, everyone merges onto it, and the" \
+           "claim would match every later commit and every workflow/check" \
+           "lifecycle event on it for the whole TTL (issue #706). Claim what is" \
+           "actually yours: --claim <PR number>, --claim branch:<topic branch>," \
+           "or --claim sha:<40-character commit> for one run's CI. To WATCH the" \
+           "default branch without owning it, subscribe with --events terminal-ci" \
+           "and no claim." >&2
+      return 1
+    }
+
     # --claim SPEC (issue #420): the ergonomic way to say "I have picked this up".
     #
     # A claim is what stops a standing watch spawning a second session on top of
@@ -6462,6 +6728,7 @@ _hc_main "$@"
     #   --claim pr:42              just the pull request
     #   --claim issue:42           just the issue
     #   --claim branch:fix/42      everything CI reports against that branch
+    #   --claim sha:<40 hex>       everything CI reports against that ONE commit
     #
     # Repeatable, and the clauses OR together — `--claim pr:42 --claim
     # branch:fix/42-thing` is the normal shape for picking up a PR.
@@ -6472,6 +6739,11 @@ _hc_main "$@"
         (pr:*)     _cl_kind=pr;     _cl_val=''${_cl_spec#pr:} ;;
         (issue:*)  _cl_kind=issue;  _cl_val=''${_cl_spec#issue:} ;;
         (branch:*) _cl_kind=branch; _cl_val=''${_cl_spec#branch:} ;;
+        # Two spellings of one thing. `sha:` is what webhook-spawn.sh's seeded
+        # claim and local-webhook's spawn meta both call it; `commit:` is what a
+        # person reaches for. Neither is worth making somebody look up.
+        (sha:*)    _cl_kind=sha;    _cl_val=''${_cl_spec#sha:} ;;
+        (commit:*) _cl_kind=sha;    _cl_val=''${_cl_spec#commit:} ;;
         (*)        _cl_kind=number; _cl_val=$_cl_spec ;;
       esac
       if [ -z "$_cl_val" ]; then
@@ -6486,6 +6758,25 @@ _hc_main "$@"
                    "use branch:NAME to claim a branch" >&2
               return 1 ;;
           esac ;;
+        (sha)
+          case "$_cl_val" in
+            (*[!0-9a-fA-F]*)
+              echo "agent-box-webhook: --claim $_cl_spec is not a commit sha" >&2
+              return 1 ;;
+          esac
+          # Full sha only. A claim compares the payload's value EXACTLY (the
+          # predicate language has `in`, not a prefix test), and GitHub always
+          # sends 40 characters — so an abbreviated sha would look claimed and
+          # match nothing, which is the one failure mode this vocabulary exists
+          # to prevent.
+          if [ "''${#_cl_val}" -ne 40 ]; then
+            echo "agent-box-webhook: --claim $_cl_spec is ''${#_cl_val} characters;" \
+                 "a claim matches the payload's sha exactly, so an abbreviated one" \
+                 "would match nothing — pass the full 40 (git rev-parse REF)" >&2
+            return 1
+          fi
+          # GitHub sends lowercase hex; an uppercase claim would never match.
+          _cl_val=$(printf '%s' "$_cl_val" | tr 'A-F' 'a-f') ;;
       esac
       case "$_cl_kind" in
         (pr)     "$JQ" -nc --argjson n "$_cl_val" \
@@ -6515,7 +6806,23 @@ _hc_main "$@"
         # get_path — an all-digits segment, no wildcard). `branches.0.name`
         # would be a guess at an order the payload does not promise, which is
         # worse than an honest gap: it would look claimed and match nothing.
-        (branch) "$JQ" -nc --arg b "$_cl_val" \
+        #
+        # A commit, unlike a branch, is claimable on ALL SIX shapes: every one of
+        # them carries the sha as a scalar, including the bare commit status,
+        # whose only branch field is the unindexable `branches` array. It is also
+        # the only claim that cannot widen under you — a sha is immutable, where
+        # a branch claim covers whatever is pushed to it next. Same six paths
+        # webhook-spawn.sh seeds into a dispatched session (issues #510, #511),
+        # so both halves of the mechanism spell a commit the same way.
+        (sha)    "$JQ" -nc --arg s "$_cl_val" \
+                   '[{path:"workflow_run.head_sha", "in":[$s]},
+                     {path:"workflow_job.head_sha", "in":[$s]},
+                     {path:"check_run.head_sha", "in":[$s]},
+                     {path:"check_suite.head_sha", "in":[$s]},
+                     {path:"deployment.sha", "in":[$s]},
+                     {path:"sha", "in":[$s]}]' ;;
+        (branch) reject_default_branch "$_cl_val" || return 1
+                 "$JQ" -nc --arg b "$_cl_val" \
                    '[{path:"workflow_run.head_branch", "in":[$b]},
                      {path:"workflow_job.head_branch", "in":[$b]},
                      {path:"check_run.check_suite.head_branch", "in":[$b]},
@@ -6534,6 +6841,14 @@ _hc_main "$@"
         if [ "''${1:-}" != "-h" ] && [ "''${1:-}" != "--help" ]; then
           have_when=0; have_drop=0; topic=""; want=""
           have_include=0; have_exclude=0; claims=""; profile=""; have_profile=0
+          # Issue #706: the event-relevance dimension, and the two arguments that
+          # have to be CAPTURED rather than forwarded because this script now
+          # rewrites them — the caller's own predicate (ANDed with the claim
+          # instead of refused alongside it) and the note (which carries the
+          # merge boundary to a session that has forgotten how it subscribed).
+          events_policy=""; have_events=0; all_events=0
+          user_include=""; user_include_flag=""
+          note=""; have_note=0
           # Filter --claim out of the argument list as we scan it: webhook.py has
           # never heard of that flag, so it is translated to --include below and
           # must not survive into the exec. Rotate idiom — take from the front,
@@ -6559,6 +6874,9 @@ _hc_main "$@"
                   fi
                   claims="$claims $a"; want=""; continue ;;
                 (profile) profile="$a"; have_profile=1; want=""; continue ;;
+                (events) events_policy="$a"; have_events=1; want=""; continue ;;
+                (uinclude) user_include="$a"; want=""; continue ;;
+                (note) note="$a"; have_note=1; want=""; continue ;;
               esac
               want=""
               set -- "$@" "$a"; continue
@@ -6566,10 +6884,30 @@ _hc_main "$@"
             case "$a" in
               --deliver-to) want=deliver-to ;;
               --deliver-to=*) deliver_to="''${a#--deliver-to=}" ;;
-              --when|--when=*) have_when=1 ;;
               --drop|--drop=*) have_drop=1 ;;
-              --include|--include=*) have_include=1 ;;
               --exclude|--exclude=*) have_exclude=1 ;;
+              # --include and its old name --when are captured, not forwarded:
+              # with a claim they are ANDed into one rule below, and without one
+              # they are re-emitted unchanged under the spelling the caller used.
+              --include|--when)
+                case "$a" in (--when) have_when=1 ;; (*) have_include=1 ;; esac
+                user_include_flag="$a"; want=uinclude; continue ;;
+              --include=*|--when=*)
+                case "$a" in
+                  (--when=*) have_when=1; user_include_flag=--when
+                             user_include="''${a#--when=}" ;;
+                  (*)        have_include=1; user_include_flag=--include
+                             user_include="''${a#--include=}" ;;
+                esac
+                continue ;;
+              # The relevance dimension. Both are consumed here: webhook.py has
+              # never heard of either, and --all-events is a statement to THIS
+              # script that the whole lifecycle really is wanted.
+              --events) want=events; continue ;;
+              --events=*) events_policy="''${a#--events=}"; have_events=1; continue ;;
+              --all-events) all_events=1; continue ;;
+              --note) want=note; continue ;;
+              --note=*) note="''${a#--note=}"; have_note=1; continue ;;
               --claim) want=claim; continue ;;
               --claim=*)
                 if [ -z "''${a#--claim=}" ]; then
@@ -6622,13 +6960,37 @@ _hc_main "$@"
                 set -- "$@" --spawn-config "profile=$profile" ;;
             esac
           fi
-          if [ -n "$claims" ]; then
-            if [ "$have_include" = 1 ]; then
-              echo "agent-box-webhook: pass --claim OR --include, not both —" \
-                   "--claim builds the --include for you; write --include" \
-                   "yourself if you need rules --claim cannot express" >&2
+          # The relevance dimension, resolved once: a named policy or the
+          # caller's own predicate, never both — they are two spellings of the
+          # same thing and a precedence rule between them would be a coin toss.
+          event_pred=""
+          if [ "$have_events" = 1 ]; then
+            if [ -n "$user_include_flag" ]; then
+              echo "agent-box-webhook: --events and $user_include_flag both name" \
+                   "WHICH events you want; pass one. --events is the shorthand," \
+                   "$user_include_flag is for rules it cannot express" >&2
               exit 2
             fi
+            if [ "$all_events" = 1 ]; then
+              echo "agent-box-webhook: --events and --all-events contradict each" \
+                   "other; pass one" >&2
+              exit 2
+            fi
+            event_pred="$(events_predicate "$events_policy")" || exit 2
+          elif [ -n "$user_include_flag" ]; then
+            if [ -z "$user_include" ]; then
+              echo "agent-box-webhook: $user_include_flag needs a value" >&2
+              exit 2
+            fi
+            if [ "$all_events" = 1 ]; then
+              echo "agent-box-webhook: --all-events and $user_include_flag" \
+                   "contradict each other; pass one" >&2
+              exit 2
+            fi
+            event_pred="$user_include"
+          fi
+          claim_topic="$topic"
+          if [ -n "$claims" ]; then
             all="[]"
             # Unquoted on purpose: claims is a space-separated list this script
             # built, and a spec cannot contain whitespace (a branch name cannot).
@@ -6645,7 +7007,89 @@ _hc_main "$@"
                    "subscribe to a filter that matches nothing" >&2
               exit 2
             fi
-            set -- "$@" --include "$("$JQ" -nc --argjson any "$all" '{any:$any}')"
+            claim_any="$("$JQ" -nc --argjson any "$all" '{any:$any}')"
+            if [ -n "$event_pred" ]; then
+              # Scope AND relevance (issue #706) — but never below the floor.
+              #
+              # webhook.py reads this same `include` twice: once to decide what
+              # reaches this session, and once, through filter_claims(), to
+              # decide whether a standing watch should spawn a second session
+              # onto this work. Narrowing delivery therefore narrows OWNERSHIP,
+              # and a review on a PR claimed with --events terminal-ci would
+              # stop being recognised as taken — the #417 collision, reached
+              # from the other side.
+              #
+              # So the relevance predicate is ORed with watch_spawn_floor()
+              # before it is ANDed with the claim. Queued, in_progress and
+              # check-created noise is still excluded; anything that would
+              # otherwise start a sibling on your own object still arrives,
+              # which is the one delivery nobody would want dropped.
+              set -- "$@" --include "$("$JQ" -nc \
+                --argjson c "$claim_any" --argjson e "$event_pred" \
+                --argjson f "$(watch_spawn_floor)" \
+                '{all: [$c, {any: [$e, $f]}]}')"
+            elif [ "$all_events" = 1 ] || [ "$deliver_to" != session ]; then
+              # --all-events is the explicit opt-in to what a scope-only claim
+              # used to mean. A standing watch keeps it without asking: its own
+              # --when is already its entire spawn policy, and a claim there is
+              # extra scoping on top rather than a delivery filter.
+              set -- "$@" --include "$claim_any"
+            else
+              echo "agent-box-webhook: --claim says WHICH object is yours, not" \
+                   "WHICH of its events you need, and a scope-only claim" \
+                   "subscribes this session to the object's whole lifecycle —" \
+                   "37 submissions in under two minutes, on the incident that" \
+                   "opened issue #706. Add one of:" \
+                   "--events actionable (comments, reviews, assignments," \
+                   "closes, terminal CI failure);" \
+                   "--events terminal-ci (finished runs only, whatever the" \
+                   "outcome);" \
+                   "--include JSON (your own predicate, ANDed with the claim);" \
+                   "--all-events (say you really do want every lifecycle" \
+                   "event). Whichever you pick, events that could spawn a" \
+                   "standing watch onto your own object are still delivered." >&2
+              exit 2
+            fi
+          elif [ "$have_events" = 1 ]; then
+            # No claim: --events is still the sanctioned way to OBSERVE a repo
+            # or a shared branch — a filtered observation subscription, which is
+            # what watching the default branch has to be instead of claiming it.
+            # (A caller's own --include needs no rewriting here and is re-emitted
+            # under its own spelling below.)
+            set -- "$@" --include "$event_pred"
+          elif [ "$all_events" = 1 ]; then
+            echo "agent-box-webhook: --all-events only means something next to" \
+                 "--claim, where it opts back in to the whole lifecycle of the" \
+                 "claimed object; a subscription with neither is already" \
+                 "unfiltered" >&2
+            exit 2
+          fi
+          # The merge boundary (issue #706), said where a resumed session will
+          # still see it. A numbered claim covers the PR, its comments and its
+          # reviews — and stops dead at the merge, because the work moves onto
+          # the default branch and the default branch is not claimable. There is
+          # no static predicate for the merge commit: its sha does not exist yet
+          # when the subscription is written. So this is a handoff, not a
+          # transition — local-channels#54 is the ask for the stateful version.
+          merge_note=""
+          for c in $claims; do
+            case "$c" in
+              (pr:*|[0-9]*) merge_note=1 ;;
+            esac
+          done
+          if [ -n "$merge_note" ] && [ "$deliver_to" = session ]; then
+            hint="post-merge CI is NOT covered: when it merges, re-subscribe with \
+    --claim sha:<merge commit>, never branch:<default>"
+            if [ "$have_note" = 1 ]; then
+              case "$note" in
+                (*"post-merge CI is NOT covered"*) ;;
+                (*) note="$note [$hint]" ;;
+              esac
+            fi
+          fi
+          if [ "$have_note" = 1 ]; then set -- "$@" --note "$note"; fi
+          if [ -n "$user_include_flag" ] && [ -z "$claims" ]; then
+            set -- "$@" "$user_include_flag" "$user_include"
           fi
           if [ "$deliver_to" = subagent ] && [ "$have_when" = 0 ] && [ "$have_drop" = 0 ] \
              && [ "$have_include" = 0 ] && [ "$have_exclude" = 0 ]; then
@@ -6678,6 +7122,18 @@ _hc_main "$@"
           fi
         fi
         "$PY" "$SCRIPT" "$cmd" "$@" || exit $?
+        # Said after the subscription exists, so it never describes one that was
+        # refused. The boundary is real and invisible: a numbered claim ends at
+        # the merge, and the obvious next move — claiming the branch the work
+        # merged onto — is the one this CLI now refuses (issue #706).
+        if [ -n "''${merge_note:-}" ] && [ "$deliver_to" = session ]; then
+          echo "agent-box-webhook: that claim covers the PR or issue itself, its" \
+               "comments and its reviews, while it is open. POST-MERGE CI IS NOT" \
+               "COVERED — the work moves onto the default branch, and a default" \
+               "branch cannot be claimed. When it merges, re-subscribe with" \
+               "--claim sha:<merge commit> (gh pr view N --json mergeCommit --jq" \
+               ".mergeCommit.oid), never --claim branch:<default>." >&2
+        fi
         if [ "$deliver_to" = session ] && [ -n "''${topic:-}" ]; then
           remember_codex_wake
         fi
@@ -8468,9 +8924,11 @@ finish or remove this session rather than leaving it idle, and yield rather \
 than duplicate work another session has already started (the rule below). \
 What you own is the OBJECT you were started for, not \
 the whole repository (agent-box#251), so when you open a PR or push a branch, \
-subscribe again naming it — agent-box-webhook subscribe REPO --include with \
-pull_request.number and workflow_run.head_branch — and its CI then reaches you \
-instead of starting a second agent on your work. If a CI outcome started you, \
+subscribe again naming it — agent-box-webhook subscribe REPO --claim <PR \
+number> --claim branch:<your branch> --events actionable — and its CI and its \
+reviews then reach you instead of starting a second agent on your work. Do \
+not claim the default branch; the CLI refuses it, because it moves under you \
+(agent-box#706). If a CI outcome started you, \
 your seeded claim is the CI of that one COMMIT — every shape the same run \
 reports under, and nothing else — so the run in front of you reaches you \
 rather than a sibling, on master and on a tag exactly as on a topic branch. \

@@ -275,9 +275,11 @@ finish or remove this session rather than leaving it idle, and yield rather \
 than duplicate work another session has already started (the rule below). \
 What you own is the OBJECT you were started for, not \
 the whole repository (agent-box#251), so when you open a PR or push a branch, \
-subscribe again naming it — agent-box-webhook subscribe REPO --include with \
-pull_request.number and workflow_run.head_branch — and its CI then reaches you \
-instead of starting a second agent on your work. If a CI outcome started you, \
+subscribe again naming it — agent-box-webhook subscribe REPO --claim <PR \
+number> --claim branch:<your branch> --events actionable — and its CI and its \
+reviews then reach you instead of starting a second agent on your work. Do \
+not claim the default branch; the CLI refuses it, because it moves under you \
+(agent-box#706). If a CI outcome started you, \
 your seeded claim is the CI of that one COMMIT — every shape the same run \
 reports under, and nothing else — so the run in front of you reaches you \
 rather than a sibling, on master and on a tag exactly as on a topic branch. \

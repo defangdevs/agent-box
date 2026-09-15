@@ -1746,11 +1746,29 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           webhook-claim =
             pkgs.runCommand "agent-box-webhook-claim"
               {
-                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.jq pkgs.gawk ];
+                nativeBuildInputs = [
+                  pkgs.bash
+                  pkgs.coreutils
+                  pkgs.jq
+                  pkgs.gawk
+                  pkgs.python3
+                ];
                 script = ./modules/src/webhook-cli.sh;
                 tests = ./tests/test-webhook-claim.sh;
+                # Since issue #706 a claim is ANDed with a delivery policy,
+                # and which lifecycle events that lets through is a question
+                # only the matcher can answer — so the same pin the module
+                # and #runtime read (nix/webhook-pin.nix) is handed to the
+                # test, exactly as webhook-spawn-claim already does.
+                webhookPy =
+                  let pin = import ./nix/webhook-pin.nix; in
+                  builtins.fetchurl {
+                    url = "https://raw.githubusercontent.com/${pin.repo}/${pin.rev}"
+                          + "/local-webhook/webhook.py";
+                    sha256 = pin.sha256;
+                  };
               } ''
-              bash "$tests" "$script" > log 2>&1 || {
+              bash "$tests" "$script" "$webhookPy" > log 2>&1 || {
                 cat log
                 exit 1
               }
