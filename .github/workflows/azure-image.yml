@@ -188,14 +188,38 @@ jobs:
         run: |
           set -euxo pipefail
           # waagent -deprovision+user removes the provisioning user, its SSH
-          # keys and the host keys. It is last because it takes the machine
-          # apart; run-command still answers, since it is the agent's own
-          # channel and the agent survives until the VM stops.
-          az vm run-command invoke \
+          # keys and the host keys, so the image does not ship this build's
+          # credentials to everyone who deploys it.
+          #
+          # BOUNDED, because it tears down the very agent that delivers and
+          # ACKNOWLEDGES this run-command: the deprovision itself finishes on
+          # the VM in seconds, but the reply never comes back, so the
+          # invocation hangs forever. That is what actually consumed runs
+          # 34924618809 (cancelled at the 60m job timeout) and 34931658264
+          # (failed at the 90m step timeout) - in both, `az sig image-version
+          # create` was never reached at all, and the earlier comment here
+          # claiming "the agent survives until the VM stops" was simply wrong.
+          # `|| true` cannot rescue a hang; only a deadline can. But a bare
+          # `|| echo ...` cannot tell that hang apart from a REAL failure
+          # (bad credentials, wrong VM, a transient Azure error) - both fall
+          # through to deallocate/generalize/publish either way, which can
+          # ship an image that was never actually deprovisioned. `timeout`
+          # itself exits 124 only when IT killed the command; any other
+          # non-zero is the command failing on its own, and that must stop
+          # the workflow before it captures anything.
+          rc=0
+          timeout 180 az vm run-command invoke \
             --resource-group "$RG" --name "$VM" \
             --command-id RunShellScript \
             --scripts 'waagent -force -deprovision+user' \
-            --only-show-errors --query 'value[].message' -o tsv || true
+            --only-show-errors --query 'value[].message' -o tsv || rc=$?
+
+          if [ "$rc" -eq 124 ]; then
+            echo "deprovision acknowledgement not returned (expected); continuing"
+          elif [ "$rc" -ne 0 ]; then
+            echo "::error::deprovision run-command failed (exit $rc, not a timeout) - not continuing to generalize/publish"
+            exit "$rc"
+          fi
 
           az vm deallocate --resource-group "$RG" --name "$VM" --only-show-errors
           az vm generalize --resource-group "$RG" --name "$VM" --only-show-errors
