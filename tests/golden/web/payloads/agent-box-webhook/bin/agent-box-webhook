@@ -983,6 +983,18 @@ case "$cmd" in
                "contradict each other; pass one" >&2
           exit 2
         fi
+        # Parsed HERE, not left to the jq that composes the AND below.
+        # That jq's exit status cannot be seen through the `set -- "$@"` it
+        # feeds, so a malformed body used to compose to an EMPTY --include
+        # and exit 0 — the worst answer this whole file can give, since a
+        # filter matching nothing reads as a successful subscription and
+        # then delivers silence forever. webhook.py validates predicates
+        # too; this is about never handing it an empty one in the first
+        # place.
+        if ! printf '%s' "$user_include" | "$JQ" -e . >/dev/null 2>&1; then
+          echo "agent-box-webhook: $user_include_flag is not valid JSON" >&2
+          exit 2
+        fi
         event_pred="$user_include"
       fi
       claim_topic="$topic"
@@ -1020,10 +1032,20 @@ case "$cmd" in
           # check-created noise is still excluded; anything that would
           # otherwise start a sibling on your own object still arrives,
           # which is the one delivery nobody would want dropped.
-          set -- "$@" --include "$("$JQ" -nc \
+          #
+          # Composed into a variable first: a command substitution inside
+          # `set -- "$@" ...` hides its own exit status, so a jq that failed
+          # would append an empty argument rather than stop.
+          composed="$("$JQ" -nc \
             --argjson c "$claim_any" --argjson e "$event_pred" \
             --argjson f "$(watch_spawn_floor)" \
-            '{all: [$c, {any: [$e, $f]}]}')"
+            '{all: [$c, {any: [$e, $f]}]}')" || exit 2
+          if [ -z "$composed" ]; then
+            echo "agent-box-webhook: could not combine the claim with the" \
+                 "delivery policy; refusing to subscribe to an empty filter" >&2
+            exit 2
+          fi
+          set -- "$@" --include "$composed"
         elif [ "$all_events" = 1 ] || [ "$deliver_to" != session ]; then
           # --all-events is the explicit opt-in to what a scope-only claim
           # used to mean. A standing watch keeps it without asking: its own

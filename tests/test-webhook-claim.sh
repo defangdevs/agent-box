@@ -359,6 +359,19 @@ if run defangdevs/agent-box --claim 42 --when '{"path":"action","in":["closed"]}
 then no "--when is folded into the claim, not forwarded alongside it"
 else ok "--when is folded into the claim, not forwarded alongside it"; fi
 
+# A malformed predicate beside a claim used to compose to an EMPTY
+# --include and exit 0: the composing jq failed, but a command substitution
+# inside `set -- "$@"` hides its status, so the caller believed they were
+# claimed and subscribed and no event would ever arrive.
+run defangdevs/agent-box --claim 42 --include 'not json' >"$work/out"
+st=$?
+if [ "$st" -eq 0 ] || grep -q '^$' "$work/out"; then
+  no "a malformed --include is refused, never composed into an empty filter" \
+     "exit $st, argv: $(tr '\n' ' ' < "$work/out")"
+else
+  ok "a malformed --include is refused, never composed into an empty filter"
+fi
+
 run defangdevs/agent-box --claim 42 --events terminal-ci --all-events >/dev/null
 [ $? -ne 0 ] && grep -q "contradict" "$work/err" \
   && ok "--events and --all-events are refused together" \
