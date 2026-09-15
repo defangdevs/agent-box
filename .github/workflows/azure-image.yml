@@ -122,19 +122,20 @@ jobs:
           # The delete-options make `az vm delete` reclaim the NIC and OS disk
           # with it, so a cleanup that runs once leaves nothing behind.
           #
-          # 16 GiB, not the template's 32: a gallery image version is captured
-          # and replicated by DISK size rather than by bytes used, so halving
-          # the build disk roughly halves the slowest step in this workflow. A
-          # deployment may ask for a LARGER os disk than its image - and
-          # agent-box.bicep's osDiskSizeGB still defaults to 32 - but never a
-          # smaller one, so this caps nothing for the boxes built from it.
-          # Ubuntu plus nix plus the 797 MiB closure sits well under 16 GiB.
+          # No --os-disk-size-gb at all, deliberately. Capture time scales with
+          # DISK size rather than bytes used, so a smaller build disk looked
+          # like free speed - but the floor is the source image's own disk and
+          # not our usage: `--os-disk-size-gb 16` is refused outright with
+          # "The specified disk size 16 GB is smaller than the size of the
+          # corresponding disk in the VM image: 30 GB" (run 34930003775). The
+          # Canonical image is 30 GB, the template's default is 32, and the 2
+          # GB between them is not worth a flag. Omitting it inherits the
+          # image's own size, which is the smallest legal value.
           az vm create \
             --resource-group "$RG" --name "$VM" \
             --image "$BUILD_IMAGE" --size "$BUILD_SIZE" \
             --admin-username azureuser --generate-ssh-keys \
             --public-ip-address "" --nsg "" \
-            --os-disk-size-gb 16 \
             --nic-delete-option Delete --os-disk-delete-option Delete \
             --only-show-errors
 
