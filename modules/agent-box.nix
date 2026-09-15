@@ -7070,7 +7070,7 @@ _hc_main "$@"
           # the default branch and the default branch is not claimable. There is
           # no static predicate for the merge commit: its sha does not exist yet
           # when the subscription is written. So this is a handoff, not a
-          # transition — local-channels#54 is the ask for the stateful version.
+          # transition — local-channels#62 is the ask for the stateful version.
           merge_note=""
           for c in $claims; do
             case "$c" in
