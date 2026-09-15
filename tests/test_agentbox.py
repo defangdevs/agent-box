@@ -1641,12 +1641,69 @@ class RenderTest(unittest.TestCase):
         config = json.loads(CONFIG_JSON.read_text())
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
+            # root=tmp, not the default "/": the channel fallback is only
+            # reached when no pin FILE is found, and on a real agent-box that
+            # has updated there is one. Without a root this assertion read
+            # the host's own pin and failed there while passing on CI, which
+            # has no pin to find.
             self.assertEqual(
                 "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz",
-                mod.Spec(config, prof).jit_nixpkgs)
+                mod.Spec(config, prof, root=tmp).jit_nixpkgs)
             config["jitNixpkgs"] = "https://example.invalid/p.tar.xz"
             self.assertEqual("https://example.invalid/p.tar.xz",
-                             mod.Spec(config, prof).jit_nixpkgs)
+                             mod.Spec(config, prof, root=tmp).jit_nixpkgs)
+
+    def test_the_agent_pin_is_read_from_the_render_root(self):
+        """A `--root` render must not reach past its root to read /etc.
+
+        `agentbox apply --root DIR` renders a tree instead of configuring
+        the host, and its output is supposed to be a property of the config
+        it was handed. The agent-nixpkgs pin was the one render input still
+        read from an absolute host path, so regenerating
+        tests/native/expected on any box that had updated silently rewrote
+        five committed files with that box's own immutable release URL.
+
+        AGENT_PIN_FILE is repointed at a real file here rather than trusting
+        the machine to have one: on CI nothing exists at the true path, so a
+        test that merely asserted "no pin found" would pass just as happily
+        with the rooting removed.
+        """
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            host_pin = Path(tmp) / "host-pin"
+            host_pin.write_text("https://example.invalid/HOST.tar.xz\n")
+            rooted = Path(tmp) / "root"
+            (rooted / "etc" / "agent-box").mkdir(parents=True)
+            original = mod.AGENT_PIN_FILE
+            mod.AGENT_PIN_FILE = str(host_pin)
+            try:
+                # Sanity: unrooted, the "host" pin is what wins - so the
+                # assertions below are about rooting, not about an
+                # unreadable file.
+                self.assertEqual("https://example.invalid/HOST.tar.xz",
+                                 mod.read_agent_pin())
+                # A root with no pin in it must NOT fall back to the host's.
+                # This is the assertion that fails if the rooting is removed.
+                self.assertIsNone(mod.read_agent_pin(root=str(rooted)))
+                self.assertEqual(
+                    "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz",
+                    mod.Spec(config, prof, root=str(rooted)).jit_nixpkgs)
+            finally:
+                mod.AGENT_PIN_FILE = original
+            # And with the real constant back: a pin INSIDE the root is the
+            # one a rooted render reads, so rooting redirects rather than
+            # merely disabling the lookup.
+            (rooted / mod.AGENT_PIN_FILE.lstrip("/")).parent.mkdir(
+                parents=True, exist_ok=True)
+            (rooted / mod.AGENT_PIN_FILE.lstrip("/")).write_text(
+                "https://example.invalid/ROOTED.tar.xz\n")
+            self.assertEqual("https://example.invalid/ROOTED.tar.xz",
+                             mod.read_agent_pin(root=str(rooted)))
+            self.assertEqual(
+                "https://example.invalid/ROOTED.tar.xz",
+                mod.Spec(config, prof, root=str(rooted)).jit_nixpkgs)
 
     def test_hook_session_args_rejects_a_bare_string(self):
         """A bare string is iterable, so list() would silently turn
