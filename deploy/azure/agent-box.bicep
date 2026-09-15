@@ -325,7 +325,19 @@ fi
 # Nix as a package manager. Not NixOS: this box stays Ubuntu, so apt keeps
 # owning the base OS (and unattended-upgrades keeps patching it).
 # `agentbox apply` never calls apt.
-curl -fsSL "@@NIXINSTALLER@@" | sh -s -- install linux --no-confirm --determinate
+#
+# Guarded, because the installer REFUSES a host that already has /nix and
+# exits non-zero - which under `set -e` takes the whole bootstrap, and with it
+# the deployment, down with it. A stock marketplace image has no /nix and this
+# is a plain install as before; a box deployed from an agent-box image built by
+# .github/workflows/azure-image.yml already has nix and the 797 MiB runtime
+# closure in its store (issue #697), and skipping straight to the profile
+# install below is the entire point of that image.
+if [ -x /nix/var/nix/profiles/default/bin/nix ]; then
+  echo "nix already present (image-provided); skipping the installer"
+else
+  curl -fsSL "@@NIXINSTALLER@@" | sh -s -- install linux --no-confirm --determinate
+fi
 # `set +u` around a script we do not own: the installer's profile snippet is
 # free to reference whatever the next release wants, and it must not be able to
 # abort the bootstrap.
