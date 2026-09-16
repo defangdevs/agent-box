@@ -528,6 +528,41 @@ again=$(awk '/^--note$/ { getline; print; exit }' "$work/out")
 [ "$again" = "$stored" ] \
   && ok "re-subscribing does not stack the boundary onto the note again" \
   || no "re-subscribing does not stack the boundary onto the note again" "$again"
+# A claim made with NO --note at all still has to leave the boundary
+# somewhere durable: stderr is gone by the time the session that holds the
+# claim has had its context cleared, and the note is what every delivery
+# echoes. (CodeRabbit, PR #708.)
+rm -f "$LOCAL_WEBHOOK_STATE_DIR"/filter*.json
+run defangdevs/agent-box --claim 42 --events actionable >"$work/out"
+synth=$(awk '/^--note$/ { getline; print; exit }' "$work/out")
+case "$synth" in
+  (*"post-merge CI is NOT covered"*)
+    ok "a claim with no --note still stores the merge boundary" ;;
+  (*) no "a claim with no --note still stores the merge boundary" \
+         "note was: [$synth]" ;;
+esac
+# ...but omitting --note is also how webhook.py is told to KEEP the stored
+# note on a renew, so synthesizing one unconditionally would overwrite the
+# caller's own text every time they re-subscribe.
+mkdir -p "$LOCAL_WEBHOOK_STATE_DIR"
+cat > "$LOCAL_WEBHOOK_STATE_DIR/filter.json" <<'FILTER'
+{"enabled": true, "topics": [{"topic": "github:defangdevs/agent-box",
+                              "note": "PR 42: the note I wrote myself"}]}
+FILTER
+run defangdevs/agent-box --claim 42 --events actionable >"$work/out"
+if awk '/^--note$/ { getline; print; exit }' "$work/out" | grep -q .; then
+  no "a renew with no --note leaves the stored note alone" \
+     "sent: $(awk '/^--note$/ { getline; print; exit }' "$work/out")"
+else
+  ok "a renew with no --note leaves the stored note alone"
+fi
+# An explicit empty --note is a request to CLEAR, not an invitation to write.
+run defangdevs/agent-box --claim 42 --events actionable --note "" >"$work/out"
+cleared=$(awk '/^--note$/ { getline; print; exit }' "$work/out")
+[ -z "$cleared" ] && ok "an explicit --note '' is honoured as a clear" \
+  || no "an explicit --note '' is honoured as a clear" "note was: [$cleared]"
+rm -f "$LOCAL_WEBHOOK_STATE_DIR"/filter*.json
+
 # A branch or sha claim has no merge to explain, and the sentence would be
 # noise under every delivery.
 run defangdevs/agent-box --claim "sha:$SHA" --events terminal-ci >/dev/null

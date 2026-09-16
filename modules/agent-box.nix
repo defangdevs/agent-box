@@ -6081,6 +6081,27 @@ _hc_main "$@"
       [ "$_topics" -gt 0 ] || rm -f "$_wake"
     }
 
+    existing_note_for() {
+      # existing_note_for TOPIC — the note this session already stores for that
+      # topic, or nothing. Read-only, and silent about every way it can fail: a
+      # missing or unreadable filter simply means "no note stored", which is the
+      # answer that makes the caller write one.
+      _en_topic=''${1:-}
+      [ -n "$_en_topic" ] || return 0
+      if [ -n "''${LOCAL_WEBHOOK_SESSION:-}" ]; then
+        _en_file="$STATE_DIR/filter.''${LOCAL_WEBHOOK_SESSION}.json"
+      else
+        _en_file="$STATE_DIR/filter.json"
+      fi
+      [ -s "$_en_file" ] || return 0
+      # A bare "owner/repo" is the github shorthand and is stored normalized, so
+      # ask about both spellings rather than missing the entry on a renew.
+      "$JQ" -r --arg t "$_en_topic" \
+        '[(.topics // [])[] | select(.topic == $t or .topic == "github:" + $t)
+          | .note // ""] | map(select(. != "")) | first // ""' \
+        "$_en_file" 2>/dev/null || true
+    }
+
     usage() {
       cat <<'USAGE'
     usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
@@ -7144,10 +7165,24 @@ _hc_main "$@"
             hint="post-merge CI is NOT covered: when it merges, re-subscribe with \
     --claim sha:<merge commit>, never branch:<default>"
             if [ "$have_note" = 1 ]; then
+              # An explicit --note "" is a request to CLEAR the note, and
+              # writing one back would be disobeying it; the stderr line above
+              # still says the same thing to whoever typed it.
               case "$note" in
-                (*"post-merge CI is NOT covered"*) ;;
+                (""|*"post-merge CI is NOT covered"*) ;;
                 (*) note="$note [$hint]" ;;
               esac
+            elif [ -z "$(existing_note_for "$topic")" ]; then
+              # No --note at all, and nothing stored for this topic either: the
+              # boundary would survive only as a stderr line this session will
+              # not have after its context is cleared, which is the reader the
+              # note exists for. So write one.
+              #
+              # Guarded on the STORED note rather than written unconditionally:
+              # omitting --note is how webhook.py is told to KEEP the existing
+              # note on a renew, so always sending one would replace a note the
+              # caller wrote with this bare sentence every time they re-subscribe.
+              note="claim: $hint"; have_note=1
             fi
           fi
           if [ "$have_note" = 1 ]; then set -- "$@" --note "$note"; fi
