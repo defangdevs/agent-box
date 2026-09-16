@@ -91,6 +91,7 @@ PUBLIC_IP_SAMPLE = "203.0.113.7"
 SAMPLE = {
     "@@NIXINSTALLER@@": "https://install.determinate.systems/nix",
     "@@FLAKEREF@@": "github:defangdevs/agent-box/0123456789abcdef",
+    "@@IMAGERUNTIME@@": "false",
     "@@USER@@": "agent",
     "@@SSLIPDOMAINB64@@": base64.b64encode(b"sslip.example.com").decode(),
     "@@AGENTSMD@@": "## This box\n\n- A line with 'quotes' and $dollars.\n",
@@ -115,6 +116,7 @@ SAMPLE = {
 DEFAULT_OF = {
     "@@NIXINSTALLER@@": "nixInstallerUrl",
     "@@FLAKEREF@@": "agentBoxFlakeRef",
+    "@@IMAGERUNTIME@@": "imageIncludesRuntime",
     "@@USER@@": "userName",
     "@@SSLIPDOMAINB64@@": "sslipDomain",
     "@@AGENTSMD@@": "agentsMd",
@@ -305,10 +307,13 @@ def defaults_render(template: dict) -> dict:
             )
         if "defaultValue" in params[name]:
             default = params[name]["defaultValue"]
-            values[marker] = (
-                base64.b64encode(default.encode()).decode()
-                if marker.endswith("B64@@") else default
-            )
+            if marker.endswith("B64@@"):
+                values[marker] = base64.b64encode(default.encode()).decode()
+            elif isinstance(default, bool):
+                # ARM's string(bool) replacement emits lowercase shell booleans.
+                values[marker] = str(default).lower()
+            else:
+                values[marker] = default
     return values
 
 

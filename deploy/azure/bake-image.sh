@@ -16,11 +16,11 @@
 #   what has changed since. An image that has fallen behind master is
 #   therefore slower, never wrong.
 #
-#   the PROFILE, no. /nix/var/nix/profiles/agent-box is box STATE, and
-#   `nix profile install` refuses an element it already has. Baking it would
-#   make the bootstrap fail on every boot from this image; leaving it out
-#   means the bootstrap runs completely unchanged and simply finds its work
-#   already done.
+#   the PROFILE, yes. The Azure bootstrap distinguishes an image carrying the
+#   runtime profile from a stock image, verifies that profile, then goes straight
+#   to `agentbox apply --first-boot`. The profile is immutable runtime software,
+#   not per-Station state; this is what eliminates the last post-boot runtime
+#   install rather than merely making it a warm-store operation.
 #
 #   any agent-box CONFIGURATION, no. This script never runs `agentbox apply`,
 #   so there is no /etc/agent-box, no user, no password hash, no host key and
@@ -61,14 +61,12 @@ set +u
 . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
 set -u
 
-# Realize the runtime closure into the store. `nix build` rather than
-# `nix profile install` for the reason in the header - and --out-link into
-# /nix/var/nix/gcroots so the paths are a GC ROOT. Without that, the nix-gc
-# timer a deployed box enables could reclaim the whole point of this image
-# before anything has used it.
-install -d -m 0755 /nix/var/nix/gcroots
-nix build --print-out-paths \
-  --out-link /nix/var/nix/gcroots/agent-box-image \
+# Install the runtime profile at its deployed path. It is a Nix GC root, and
+# unlike the prior out-link it is directly executable by first boot. This is
+# deliberately the only agent-box state the image contains: configuration,
+# users, passwords, host keys and sessions still first appear after capture.
+nix profile install \
+  --profile /nix/var/nix/profiles/agent-box \
   "$FLAKEREF#runtime"
 
 # Warm root's own flake/tarball cache too. First boot still has to EVALUATE

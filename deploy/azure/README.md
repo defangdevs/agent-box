@@ -36,6 +36,10 @@ user choose Claude Code or Codex.
   unless the deployment opts in with `osUpdates.automaticReboot`. See
   "Base-OS patching" in `deploy/aws/README.md` for the whole policy — it is the
   renderer's, so both clouds get the same one.
+- `imageId` can select an immutable image version produced by the Azure-image
+  workflow. Set `imageIncludesRuntime=true` only for that exact image: first
+  boot then verifies its already-installed runtime and goes directly to
+  configuration, instead of resolving a runtime profile again.
 - **Basic-auth-to-cookie web auth**, identical to the AWS path. The terminal
   lives at `/<userName>/` (default `/workspace/`); Caddy prompts for the
   `userName` and the `webPassword`, sets an
