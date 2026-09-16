@@ -24,7 +24,8 @@
         "main": {},
         "review": {
           "agent": "codex",
-          "cwd": "/home/agent/agent-box"
+          "cwd": "/home/agent/agent-box",
+          "remoteControl": false
         }
       }
     },
@@ -38,7 +39,8 @@
       ],
       "sessions": {
         "main": {
-          "agent": "codex"
+          "agent": "codex",
+          "remoteControl": false
         }
       }
     }

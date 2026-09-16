@@ -6,7 +6,7 @@
       "extraArgs": [],
       "hasRun": false,
       "initialPrompt": null,
-      "remoteControl": true,
+      "remoteControl": false,
       "remoteControlName": null,
       "resumePrompt": null,
       "skipPermissions": true,

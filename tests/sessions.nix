@@ -406,8 +406,11 @@ in
         )
 
     # --- runtime add: no sudo, no rebuild ---------------------------------
+    # --remote-control true: a bare codex add now defaults to the TUI
+    # (issue #623), and this subtest is specifically exercising the daemon.
     machine.succeed(
-        "su -s /bin/sh agent -c 'agent-box-session add helper --harness codex'"
+        "su -s /bin/sh agent -c "
+        "'agent-box-session add helper --harness codex --remote-control true'"
     )
     machine.wait_until_succeeds(tmux("has-session -t =helper"), timeout=60)
     machine.succeed(
@@ -434,9 +437,10 @@ in
     ).strip()
     assert mirrored == codex_store, f"{mirrored} != {codex_store}"
 
-    # Codex honours remoteControl (issue 103): with the default
-    # remoteControl=true, a codex session starts the local app-server daemon,
-    # enables Remote Control on it, and does NOT run the interactive TUI. The
+    # Codex honours remoteControl (issue 103): with remoteControl=true
+    # (requested explicitly above; issue #623 made it the non-default for
+    # codex), a codex session starts the local app-server daemon, enables
+    # Remote Control on it, and does NOT run the interactive TUI. The
     # offline-safe local start matters here because the VM has no Codex login.
     # The daemon detaches, so the session's foreground command is the agent-box
     # supervisor wrapper that owns its lifecycle;
@@ -1081,11 +1085,12 @@ in
                "NkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
         machine.succeed(as_agent(f"echo {png} | base64 -d > /home/agent/shot.png"))
         # Written straight into sessions.json instead of through
-        # `agent-box-session add`: the CLI always writes remoteControl=true, and
-        # a remote-controlled codex session runs the app-server daemon, which
-        # takes no positional prompt at all — remoteControl=false is what puts
-        # the prompt on a command line. One write, so the supervisor's first
-        # spawn already sees the final config (no add-then-edit race).
+        # `agent-box-session add`: a remote-controlled codex session runs the
+        # app-server daemon, which takes no positional prompt at all —
+        # remoteControl=false (now also the CLI's own default for codex,
+        # issue #623) is what puts the prompt on a command line. One write,
+        # so the supervisor's first spawn already sees the final config (no
+        # add-then-edit race).
         machine.succeed(
             as_agent(
                 'jq \'.sessions.vcodex = {agent: "codex", skipPermissions: true, '

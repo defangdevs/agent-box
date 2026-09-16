@@ -10490,7 +10490,7 @@ esac
   # One session = one agent CLI in one tmux session. These options are the
   # FIRST-BOOT SEED only (see users.<name>.sessions); at runtime the same
   # fields live as JSON in ~/.config/agent-box/sessions.json.
-  sessionOpts = {
+  sessionOpts = { config, ... }: {
     options = {
       agent = lib.mkOption {
         type = lib.types.nullOr (lib.types.enum (sessionKinds supportedAgents));
@@ -10514,7 +10514,14 @@ esac
       };
       remoteControl = lib.mkOption {
         type = lib.types.bool;
-        default = true;
+        # codex's remote control is a different PROGRAM entirely (the
+        # app-server pairing daemon, not a TUI flag), so a seeded codex
+        # session left unset now defaults to the interactive TUI, the same
+        # default the CLI and web add-session writers use (issue #623).
+        # Every other harness keeps the old default. "codex" falls back to
+        # cfg.agent so a null (box-default) agent is judged the same way
+        # sessionsSeedFile itself resolves it.
+        default = (if config.agent != null then config.agent else cfg.agent) != "codex";
         description = "Make the session drivable from the agent's apps (see users.<name>.remoteControl).";
       };
       remoteControlName = lib.mkOption {
@@ -10567,7 +10574,7 @@ esac
     };
   };
 
-  userOpts = { name, ... }: {
+  userOpts = { name, config, ... }: {
     options = {
       sessions = lib.mkOption {
         type = lib.types.attrsOf (lib.types.submodule sessionOpts);
@@ -10647,11 +10654,17 @@ esac
       };
       remoteControl = lib.mkOption {
         type = lib.types.bool;
-        default = true;
+        # See sessionOpts.remoteControl (issue #623): codex's remote control
+        # is the app-server pairing daemon, not a TUI flag, so a "main"
+        # session seeded for codex now defaults to false (the TUI) unless
+        # this is set explicitly. Every other harness keeps `true`.
+        default = (if config.agent != null then config.agent else cfg.agent) != "codex";
         description = ''
           Make the session drivable from the agent's desktop and mobile apps.
           Default `true` because "drive it from your phone" is one of the
-          module's headline features.
+          module's headline features -- except for codex, which defaults to
+          `false` (see below) since remote control there means a different
+          program altogether.
 
           Set false to disable remote-app control for this user — then the
           agent is only reachable through the local tmux session (or the
