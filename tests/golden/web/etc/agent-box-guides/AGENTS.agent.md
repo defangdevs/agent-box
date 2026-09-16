@@ -266,17 +266,53 @@ context still knows what the event is about.
     agent-box-webhook ls                     # what this session listens to
     agent-box-webhook unsubscribe OWNER/REPO # when you wrap up
 
-When you pick up ONE issue or PR, say so with `--claim`. That both narrows
-what reaches you and tells a standing watch the work is taken, so a review or
-a comment on it no longer starts a second session on top of you:
+When you pick up ONE issue or PR, say so with `--claim`, and say which of its
+events you need with `--events`. The claim tells a standing watch the work is
+taken, so a review or a comment on it no longer starts a second session on top
+of you; the policy is what keeps the rest of the object's lifecycle out of your
+context:
 
     agent-box-webhook subscribe OWNER/REPO \
       --note "PR 42: waiting on CI + review" \
-      --claim 42 --claim branch:fix/42-thing
+      --claim 42 --claim branch:fix/42-thing --events actionable
 
-`--claim` is the whole of it: `42` for an issue or PR by number,
-`branch:NAME` for everything CI reports against a branch. Repeat it, and the
-clauses OR together.
+`--claim` names the object: `42` for an issue or PR by number, `branch:NAME`
+for everything CI reports against a branch, `sha:<40 characters>` for
+everything it reports against ONE commit. Repeat it, and the clauses OR
+together.
+
+A session claim REQUIRES a policy. `--events actionable` is terminal CI
+failure, a review verdict, a comment, an assignment, the object closing;
+`--events terminal-ci` is runs that have FINISHED, whatever the outcome, and
+nothing queued, in progress or merely created. Write `--include` yourself for
+anything else - it is ANDed with the claim, not refused alongside it - or say
+`--all-events` if you really do want the whole lifecycle. Scope-only claims
+are refused because they are how one `--claim branch:master` queued 37
+submissions into a Codex session in under two minutes, 21 of them `check_run`
+events for work that merely landed on the branch.
+
+Narrowing delivery cannot cost you the claim: whatever policy you pick, an
+event a watch could spawn on - a review, a comment, an assignment, a red run -
+still arrives, because one rule answers both questions and dropping it would
+put a second agent on your own PR.
+
+**The repository default branch is not claimable.** `--claim branch:master`
+(or whatever that repo's default is - it is resolved, not guessed) is refused:
+it moves, everybody merges onto it, and the claim would match every later
+commit and every workflow/check lifecycle event on them for the whole TTL. A
+claim is a bounded unit of work. To WATCH the default branch, subscribe with
+`--events terminal-ci` and no claim - an observation subscription, not
+ownership.
+
+**A numbered claim stops at the merge.** It covers the PR, its comments and
+its reviews while it is open; after a merge the work is on the default branch,
+which you cannot claim. The CLI says so when you make the claim. Follow it
+across with the commit instead:
+
+    agent-box-webhook subscribe OWNER/REPO \
+      --note "PR 42 merged: watching post-merge CI" \
+      --claim "sha:$(gh pr view 42 --json mergeCommit --jq .mergeCommit.oid)" \
+      --events terminal-ci
 
 Use the BARE number for a PR, as above. GitHub reports a PR comment as an
 `issue_comment` carrying `issue.number`, not `pull_request.number` - so
@@ -294,14 +330,21 @@ up with two sessions editing the same git worktree.
 `--claim branch:` writes five of the six - `workflow_run`, `workflow_job`,
 `check_run`, `check_suite` and `deployment_status` (via `deployment.ref`) -
 plus the push `ref` and `pull_request.head.ref`. The sixth, a bare commit
-**status**, cannot be claimed at all: it carries no scalar branch, only a
-`branches` array, and the payload language indexes lists by number only, so any
-rule would be guessing at an order the payload does not promise. On a repo
-whose CI reports through commit statuses, that shape stays unclaimed - expect a
-sibling there.
+**status**, cannot be claimed BY BRANCH at all: it carries no scalar branch,
+only a `branches` array, and the payload language indexes lists by number only,
+so any rule would be guessing at an order the payload does not promise. On a
+repo whose CI reports through commit statuses, that shape stays unclaimed -
+expect a sibling there.
 
-`--include` still exists for rules `--claim` cannot express; the two are
-mutually exclusive.
+`--claim sha:` has no such gap: every one of the six carries the commit as a
+scalar, including the bare status. It is also the only claim that cannot widen
+under you, since a branch claim covers whatever is pushed to that branch next.
+Pass the full 40 characters - the match is exact, so an abbreviated sha reads
+as a claim and matches nothing.
+
+`--include` still exists for rules `--claim` cannot express. It is no longer
+refused beside a claim: the two are ANDed, since the claim says which object
+and the predicate says which of its events.
 
 Claude Code has the same as MCP tools (`webhook_subscribe`,
 `webhook_unsubscribe`, `webhook_subscriptions`); both share one list. Those
