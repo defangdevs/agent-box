@@ -357,12 +357,13 @@ nix profile install \
 AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
 
 # The box's declared state. Everything host-specific the renderer needs, and
-# nothing it can discover for itself: `domain: auto` tells --first-boot to
-# settle the public IPv4 and derive the hostname from it, under
-# domainSuffix (default sslip.io - issue #647 lets this point at a
-# self-hosted sslip.io clone instead). That works unchanged on Azure because
-# settle_public_ip asks checkip.amazonaws.com rather than a cloud's own
-# metadata service. No `sessions:` key - `agentbox apply`
+# nothing it has to rediscover for itself: ARM allocated the static public IP
+# before it could attach the NIC and start this VM, and the same `host` value
+# drives the deployment output. Supplying it explicitly keeps Caddy's
+# certificate name and the displayed URL identical without spending first
+# boot's old 60-second delay plus three 10-second stability checks asking an
+# external check-IP service for an address Azure already gave us. No
+# `sessions:` key - `agentbox apply`
 # seeds none itself on a web-enabled box (issue #416/#468), landing first boot
 # on the settings page instead of a started agent session. No opt-in back to
 # the pre-#416 behaviour: a session seeded before the box's first sign-in
@@ -381,12 +382,12 @@ install -d -m 0755 /etc/agent-box
 # text "AGENTBOX_CONFIG" closes the heredoc itself, and everything after runs
 # as a shell command instead of landing in config.yaml (same class of bug
 # base64(webPassword) above exists for, applied here because none of these
-# three are secrets and so were substituted raw until now). All three travel
-# base64-encoded and are decoded and validated here, against the same
-# character classes the CFN twin's AllowedPattern enforces at the parameter
-# itself -- Bicep has no such decorator, so the check has to happen at
-# runtime instead. A bad value fails the boot rather than landing in
-# config.yaml unvetted.
+# three are secrets and so were substituted raw until now). Those values and
+# Azure's public IP travel base64-encoded and are decoded and validated here.
+# The user-supplied values use the same character classes the CFN twin's
+# AllowedPattern enforces at the parameter itself -- Bicep has no such
+# decorator, so the check has to happen at runtime instead. A bad value fails
+# the boot rather than landing in config.yaml unvetted.
 portal_issuer="$(printf %s '@@PORTALISSUERB64@@' | base64 -d)"
 portal_user="$(printf %s '@@PORTALUSERIDB64@@' | base64 -d)"
 if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
@@ -407,9 +408,15 @@ if ! [[ "$sslip_domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-
   echo "domainSuffix is not a DNS suffix" >&2
   exit 1
 fi
+public_ip="$(printf %s '@@PUBLICIPB64@@' | base64 -d)"
+if ! [[ "$public_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+  echo "Azure public IP is not a plain IPv4 address" >&2
+  exit 1
+fi
+box_domain="${public_ip//./-}.${sslip_domain}"
 
 cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
-domain: auto
+domain: '@DOMAIN@'
 domainSuffix: '@SSLIPDOMAIN@'
 agents: [claude, codex]
 web:
@@ -430,12 +437,13 @@ AGENTBOX_CONFIG
 # backslash, for good measure) before substituting into the heredoc just
 # written, or an issuer URL containing one would splice the placeholder
 # into config.yaml instead of the URL (same bug as the CFN twin, before its
-# own fix). sslip_domain's own character class already excludes both, but
-# escaping it too costs nothing and keeps the three substitutions uniform.
+# own fix). sslip_domain and box_domain already exclude both, but escaping
+# them too costs nothing and keeps all substitutions uniform.
 esc_issuer=$(printf '%s' "$portal_issuer" | sed -e 's/[&\]/\\&/g')
 esc_user=$(printf '%s' "$portal_user" | sed -e 's/[&\]/\\&/g')
 esc_sslip=$(printf '%s' "$sslip_domain" | sed -e 's/[&\]/\\&/g')
-sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@SSLIPDOMAIN@|$esc_sslip|" \
+esc_domain=$(printf '%s' "$box_domain" | sed -e 's/[&\]/\\&/g')
+sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@SSLIPDOMAIN@|$esc_sslip|; s|@DOMAIN@|$esc_domain|" \
   /etc/agent-box/config.yaml
 
 # Extra standing instructions for the agent, if the deployment gave any.
@@ -463,7 +471,7 @@ AGENTBOX_AGENTSMD
 # /var/lib/waagent/custom-script/download/0/stdout.
 set +x
 AGENT_BOX_WEB_PASSWORD="$(printf %s '@@WEBPASSWORD@@' | base64 -d)" \
-  "$AGENTBOX" apply --first-boot --settle-delay 60
+  "$AGENTBOX" apply --first-boot
 set -x
 
 # No signal step. This script's exit code is the deployment's: a failed apply
@@ -481,7 +489,7 @@ var portalOn = !empty(portalUser) && !empty(portalIssuer)
 var portalUserYaml = portalOn ? portalUser : ''
 var portalIssuerYaml = portalOn ? portalIssuer : ''
 
-var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
+var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(replace(
   bootstrapTemplate,
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
@@ -493,7 +501,8 @@ var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
   '@@SSLIPDOMAINB64@@', base64(sslipDomain)),
   '@@WEBPASSWORD@@', base64(webPassword)),
   '@@PORTALISSUERB64@@', base64(portalIssuerYaml)),
-  '@@PORTALUSERIDB64@@', base64(portalUserYaml))
+  '@@PORTALUSERIDB64@@', base64(portalUserYaml)),
+  '@@PUBLICIPB64@@', base64(publicIp.properties.ipAddress))
 
 // ---------------------------------------------------------------------------
 

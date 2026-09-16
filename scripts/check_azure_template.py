@@ -82,6 +82,8 @@ HOSTILE_PASSWORD = "p'; touch /tmp/pwned; '$x `id` \"q\""
 # validated and decoded by the bootstrap itself rather than the template).
 PORTAL_ISSUER_SAMPLE = "https://station.example.com"
 PORTAL_USER_SAMPLE = "usr_2Nk9x"
+DOMAIN_SAMPLE = "203-0-113-7.sslip.example.com"
+PUBLIC_IP_SAMPLE = "203.0.113.7"
 
 # Values only need to be representative: this renders the script, it does not
 # deploy it. They deliberately carry the punctuation a real parameter can, so a
@@ -97,6 +99,7 @@ SAMPLE = {
         PORTAL_ISSUER_SAMPLE.encode()).decode(),
     "@@PORTALUSERIDB64@@": base64.b64encode(
         PORTAL_USER_SAMPLE.encode()).decode(),
+    "@@PUBLICIPB64@@": base64.b64encode(PUBLIC_IP_SAMPLE.encode()).decode(),
 }
 
 # Which parameter's defaultValue feeds which marker. The script is rendered a
@@ -197,6 +200,31 @@ def render_bootstrap(template: dict, values: dict | None = None) -> str:
     return script
 
 
+def bootstrap_chain(template: dict) -> str:
+    """The compiled expression that substitutes and encodes the bootstrap.
+
+    Bicep preserves a parameter-only expression as variables.bootstrap, but
+    inlines it into the extension when one replacement reads a runtime
+    resource property (the Azure-allocated static Public IP). Both are the
+    same source expression, so validate whichever compiled shape exists.
+    """
+    chain = template.get("variables", {}).get("bootstrap")
+    if chain:
+        return chain
+    for resource in template.get("resources", []):
+        if resource.get("type") != "Microsoft.Compute/virtualMachines/extensions":
+            continue
+        script = (resource.get("properties", {}).get("protectedSettings", {})
+                  .get("script"))
+        if script:
+            return script
+    raise SystemExit(
+        "FAIL: the compiled template has neither variables.bootstrap nor a "
+        "protected extension script - this check cannot see the replacement "
+        "chain it exists to guard."
+    )
+
+
 def check_chain_covers_markers(template: dict) -> int:
     """Every marker in the script must be substituted by the Bicep itself.
 
@@ -205,12 +233,14 @@ def check_chain_covers_markers(template: dict) -> int:
     from the chain in the .bicep while leaving its marker in the script and the
     render here still substitutes it from SAMPLE and reports OK, while the
     deployed VM runs a literal `@@MARKER@@`. So compare the two directly: the
-    compiled `bootstrap` variable is the whole `replace()` chain as one ARM
-    expression, and a marker it substitutes appears in it quoted.
+    compiled bootstrap expression is the whole `replace()` chain as one ARM
+    expression, and a marker it substitutes appears in it quoted. Bicep may
+    retain that expression as a variable or inline it into the extension;
+    bootstrap_chain() handles both shapes.
     """
     variables = template.get("variables", {})
     script = variables.get("bootstrapTemplate", "")
-    chain = variables.get("bootstrap", "")
+    chain = bootstrap_chain(template)
     missing = [m for m in sorted(set(PLACEHOLDER.findall(script)))
                if f"'{m}'" not in chain]
     if missing:
@@ -234,6 +264,32 @@ def check_chain_covers_markers(template: dict) -> int:
         return 1
     print(f"OK: all {len(SAMPLE)} markers are substituted by the template's own "
           "replace() chain.")
+    return 0
+
+
+def check_static_domain(template: dict) -> int:
+    """Azure's allocated Public IP must drive both config and the output URL."""
+    script = template.get("variables", {}).get("bootstrapTemplate", "")
+    chain = bootstrap_chain(template)
+    web_url = template.get("outputs", {}).get("webUrl", {}).get("value", "")
+    public_ip_ref = "reference(resourceId('Microsoft.Network/publicIPAddresses'"
+    failures = []
+    if "--settle-delay" in script:
+        failures.append("bootstrap still requests an avoidable settle delay")
+    if "domain: 'auto'" in script:
+        failures.append("config still asks agentbox to rediscover the address")
+    if public_ip_ref not in chain:
+        failures.append("bootstrap does not receive Azure's allocated Public IP")
+    if "'@@PUBLICIPB64@@', base64(" not in chain:
+        failures.append("Azure's Public IP is not encoded before shell insertion")
+    if public_ip_ref not in web_url:
+        failures.append("webUrl is not derived from Azure's allocated Public IP")
+    if failures:
+        print("FAIL: static Azure domain wiring:\n       "
+              + "\n       ".join(failures), file=sys.stderr)
+        return 1
+    print("OK: Azure's allocated Public IP drives config and webUrl with no "
+          "settlement delay.")
     return 0
 
 
@@ -372,11 +428,14 @@ def extract_portal_block(script: str) -> str:
     return found.group(1)
 
 
-def run_portal_block(block: str, workdir: Path, issuer_b64: str,
-                      user_b64: str, sslip_b64: str) -> subprocess.CompletedProcess:
+def run_portal_block(
+    block: str, workdir: Path, issuer_b64: str, user_b64: str,
+    sslip_b64: str, public_ip: str = PUBLIC_IP_SAMPLE,
+) -> subprocess.CompletedProcess:
     text = block.replace("@@PORTALISSUERB64@@", issuer_b64)
     text = text.replace("@@PORTALUSERIDB64@@", user_b64)
     text = text.replace("@@SSLIPDOMAINB64@@", sslip_b64)
+    text = text.replace("@@PUBLICIPB64@@", b64(public_ip))
     text = text.replace("/etc/agent-box", str(workdir))
     return subprocess.run(
         ["bash", "-c", text], capture_output=True, text=True)
@@ -415,23 +474,25 @@ def check_written_config(template: dict) -> int:
     cases = {
         "handover on": (
             PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAIN_SAMPLE,
-            True),
-        "handover off": ("", "", SSLIP_DOMAIN_SAMPLE, True),
+            PUBLIC_IP_SAMPLE, True),
+        "handover off": (
+            "", "", SSLIP_DOMAIN_SAMPLE, PUBLIC_IP_SAMPLE, True),
         # '&' is IN portalIssuer's allowed character class (a query string
         # may have one) but is sed replacement-text magic -- unescaped, this
         # is exactly the input that used to splice the placeholder into
         # config.yaml instead of the URL.
         "handover on, ampersand": (
             "https://station.example.com/cb?a=1&b=2", PORTAL_USER_SAMPLE,
-            SSLIP_DOMAIN_SAMPLE, True),
+            SSLIP_DOMAIN_SAMPLE, PUBLIC_IP_SAMPLE, True),
         "invalid issuer (not https)": (
             "http://station.example.com", PORTAL_USER_SAMPLE,
-            SSLIP_DOMAIN_SAMPLE, False),
+            SSLIP_DOMAIN_SAMPLE, PUBLIC_IP_SAMPLE, False),
         "invalid user (space)": (
             PORTAL_ISSUER_SAMPLE, "usr with space", SSLIP_DOMAIN_SAMPLE,
-            False),
+            PUBLIC_IP_SAMPLE, False),
         "invalid sslip domain (space)": (
-            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, "not a domain", False),
+            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, "not a domain",
+            PUBLIC_IP_SAMPLE, False),
         # The value a raw (non-base64) substitution used to let close the
         # quoted heredoc: a newline plus the literal delimiter, followed by a
         # command that would run as root if the heredoc really ended there.
@@ -441,13 +502,16 @@ def check_written_config(template: dict) -> int:
         "sslip domain injection (newline closes heredoc)": (
             PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE,
             "evil.example.com\nAGENTBOX_CONFIG\ntouch /tmp/pwned\ncat <<EOF",
-            False),
+            PUBLIC_IP_SAMPLE, False),
+        "invalid public IP (shell syntax)": (
+            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAIN_SAMPLE,
+            "203.0.113.7; touch /tmp/pwned", False),
     }
-    for label, (issuer, user, sslip, should_succeed) in cases.items():
+    for label, (issuer, user, sslip, public_ip, should_succeed) in cases.items():
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
             done = run_portal_block(
-                block, workdir, b64(issuer), b64(user), b64(sslip))
+                block, workdir, b64(issuer), b64(user), b64(sslip), public_ip)
             if should_succeed and done.returncode != 0:
                 print("FAIL: %s: the portal block refused a valid value:\n%s"
                       % (label, done.stderr), file=sys.stderr)
@@ -488,6 +552,12 @@ def check_written_config(template: dict) -> int:
                       file=sys.stderr)
                 rc = 1
                 continue
+            if data.get("domain") != DOMAIN_SAMPLE:
+                print("FAIL: %s: domain landed as %r, wanted %r"
+                      % (label, data.get("domain"), DOMAIN_SAMPLE),
+                      file=sys.stderr)
+                rc = 1
+                continue
             got = (web.get("portalIssuer"), u.get("portalUser"))
             # Off is empty VALUES, not absent keys, which is what the module
             # already reads as off.
@@ -513,7 +583,7 @@ def check_secrets(template: dict) -> int:
         )
         return 1
 
-    chain = template.get("variables", {}).get("bootstrap", "")
+    chain = bootstrap_chain(template)
     if "base64(parameters('webPassword'))" not in chain:
         print(
             "FAIL: the replace() chain does not substitute "
@@ -570,6 +640,7 @@ def main() -> int:
     template = json.loads(COMPILED.read_text())
     rc = max(
         check_chain_covers_markers(template),
+        check_static_domain(template),
         check_bootstrap(template, SAMPLE, "hostile sample values"),
         check_bootstrap(template, defaults_render(template), "template defaults"),
         check_secrets(template),
