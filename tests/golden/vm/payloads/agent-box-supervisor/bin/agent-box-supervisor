@@ -1226,18 +1226,6 @@ agent_upgrade() {
     return 1
   fi
 
-  _au_pin="$(_jit_pin_file "$_au_agent")"
-  _au_was=""
-  [ -r "$_au_pin" ] && read -r _au_was < "$_au_pin"
-  if [ "$_au_was" = "$AGENT_BOX_NIXPKGS" ]; then
-    echo "upgrade: '$_au_agent' is already at this box's pin" >&2
-    return 0
-  fi
-  # An install from before this bookkeeping existed has no record, so the
-  # first run on such a box re-installs once and writes one. That is the
-  # right direction: the harness a long-lived box is holding is precisely
-  # the stale one.
-
   if ! _au_nix="$(agent_nix_bin)"; then
     echo "upgrade: cannot move '$_au_agent' (no nix on this box)" >&2
     return 1
@@ -1254,6 +1242,27 @@ agent_upgrade() {
          "'$_au_agent' for the next run" >&2
     return 1
   fi
+
+  # Read the pin only NOW, holding the lock: two upgrades for the same
+  # agent can both reach this function before either acquires it (the
+  # update service loops over every user; a person can run this by hand
+  # at the same moment). Reading it earlier let the second process act on
+  # a pin the first had already moved past - if the second's own `nix
+  # profile add` then failed, its recovery path restored what it still
+  # believed was "the previous pin", silently undoing the first process's
+  # already-successful upgrade.
+  _au_pin="$(_jit_pin_file "$_au_agent")"
+  _au_was=""
+  [ -r "$_au_pin" ] && read -r _au_was < "$_au_pin"
+  if [ "$_au_was" = "$AGENT_BOX_NIXPKGS" ]; then
+    exec 8>&-
+    echo "upgrade: '$_au_agent' is already at this box's pin" >&2
+    return 0
+  fi
+  # An install from before this bookkeeping existed has no record, so the
+  # first run on such a box re-installs once and writes one. That is the
+  # right direction: the harness a long-lived box is holding is precisely
+  # the stale one.
 
   echo "upgrade: moving '$_au_agent' to $AGENT_BOX_NIXPKGS" >&2
   # Realize the new closure BEFORE touching the profile. Between the

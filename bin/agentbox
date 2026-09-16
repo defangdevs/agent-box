@@ -5030,6 +5030,12 @@ def resolve_agent_pin(ref):
     who set `jitNixpkgs:` to a release, a tag or a local path has already
     pinned it, and re-pointing that at nixos-unstable would be the opposite
     of what they asked for.
+
+    Returns None when the channel URL could not be resolved to a release -
+    a caller writing this straight into the pin file would otherwise
+    downgrade a good immutable pin to the mutable channel URL on nothing
+    worse than a transient network blip, and that write survives an
+    otherwise-successful update (issue #707's review).
     """
     tail = "/nixexprs.tar.xz"
     if not ref.startswith("https://channels.nixos.org/") \
@@ -5041,15 +5047,15 @@ def resolve_agent_pin(ref):
             final = resp.geturl()
     except Exception as e:  # noqa: BLE001 - offline is a normal outcome
         print(f"agentbox: could not resolve {base} ({e}); keeping the "
-              "channel URL", file=sys.stderr)
-        return ref
+              "existing pin", file=sys.stderr)
+        return None
     final = final.rstrip("/")
     # A redirect that landed somewhere unexpected is not a pin. Say so and
-    # keep the mutable URL rather than writing a pin nobody can build.
+    # keep the existing pin rather than writing one nobody can build.
     if not final.startswith("https://releases.nixos.org/"):
         print(f"agentbox: {base} redirected to {final}, which is not a "
-              "nixpkgs release; keeping the channel URL", file=sys.stderr)
-        return ref
+              "nixpkgs release; keeping the existing pin", file=sys.stderr)
+        return None
     return final + tail
 
 
@@ -5088,8 +5094,10 @@ def post_switch(args, profile):
         # box was before this existed. Failing here instead would roll back
         # a good release over a file nobody has asked for yet.
         try:
-            previous_pin = write_agent_pin(resolve_agent_pin(CHANNEL_NIXPKGS))
-            pin_written = True
+            resolved_pin = resolve_agent_pin(CHANNEL_NIXPKGS)
+            if resolved_pin is not None:
+                previous_pin = write_agent_pin(resolved_pin)
+                pin_written = True
         except OSError as e:
             print(f"agentbox: could not record the agent pin ({e}) - the "
                   "agent CLIs stay at the pin they already have",
