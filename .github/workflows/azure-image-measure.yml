@@ -68,10 +68,9 @@ jobs:
               --query 'sort_by(@, &publishingProfile.publishedDate)[-1].id' -o tsv)
           fi
           if [ -z "$image_id" ] || [ "$image_id" = "null" ]; then
-            echo "::error::No image version found in $GALLERY/$IMAGE_DEF - run the Azure image workflow first."
+            echo "::error::No image version found in $GALLERY/$IMAGE_DEF - provide an image_id from a trusted publisher."
             exit 1
           fi
-          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
           echo "Measuring image: $image_id"
 
           # Ephemeral, for a box that is deleted minutes from now. The web
@@ -79,11 +78,14 @@ jobs:
           # box in plaintext anyway (the bootstrap argon2id-hashes it).
           pw=$(openssl rand -hex 24)
           echo "::add-mask::$pw"
-          echo "pw=$pw" >> "$GITHUB_OUTPUT"
           ssh-keygen -t ed25519 -N '' -f /tmp/measure_key -q
-          echo "pubkey=$(cat /tmp/measure_key.pub)" >> "$GITHUB_OUTPUT"
-          echo "prefix=abm-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
-          echo "stockprefix=abs-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          {
+            echo "image_id=$image_id"
+            echo "pw=$pw"
+            echo "pubkey=$(cat /tmp/measure_key.pub)"
+            echo "prefix=abm-${GITHUB_RUN_ID}"
+            echo "stockprefix=abs-${GITHUB_RUN_ID}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Deploy from the image, and time it
         id: imaged
@@ -108,6 +110,7 @@ jobs:
               webPassword="$PW" \
               adminPasswordOrKey="$PUBKEY" \
               imageId="$IMAGE_ID" \
+              imageIncludesRuntime=true \
             --only-show-errors > /dev/null
           echo "deploy_s=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
 
