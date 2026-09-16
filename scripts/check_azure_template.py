@@ -280,6 +280,8 @@ def check_static_domain(template: dict) -> int:
         failures.append("config still asks agentbox to rediscover the address")
     if public_ip_ref not in chain:
         failures.append("bootstrap does not receive Azure's allocated Public IP")
+    if "'@@PUBLICIPB64@@', base64(" not in chain:
+        failures.append("Azure's Public IP is not encoded before shell insertion")
     if public_ip_ref not in web_url:
         failures.append("webUrl is not derived from Azure's allocated Public IP")
     if failures:

@@ -383,12 +383,11 @@ install -d -m 0755 /etc/agent-box
 # as a shell command instead of landing in config.yaml (same class of bug
 # base64(webPassword) above exists for, applied here because none of these
 # three are secrets and so were substituted raw until now). Those values and
-# Azure's public IP travel base64-encoded and are decoded and validated here,
-# against the same
-# character classes the CFN twin's AllowedPattern enforces at the parameter
-# itself -- Bicep has no such decorator, so the check has to happen at
-# runtime instead. A bad value fails the boot rather than landing in
-# config.yaml unvetted.
+# Azure's public IP travel base64-encoded and are decoded and validated here.
+# The user-supplied values use the same character classes the CFN twin's
+# AllowedPattern enforces at the parameter itself -- Bicep has no such
+# decorator, so the check has to happen at runtime instead. A bad value fails
+# the boot rather than landing in config.yaml unvetted.
 portal_issuer="$(printf %s '@@PORTALISSUERB64@@' | base64 -d)"
 portal_user="$(printf %s '@@PORTALUSERIDB64@@' | base64 -d)"
 if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
