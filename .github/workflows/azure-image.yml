@@ -5,12 +5,9 @@
 # 797 MiB closure out of cache.nixos.org. With the store already warm, that
 # exact install takes 2.9s - measured on a live aarch64 box.
 #
-# This workflow only BUILDS and PUBLISHES the image. Nothing in the deploy
-# path points at it yet: deploy/azure/agent-box.bicep still names the stock
-# Canonical marketplace image, so this is purely additive and cannot affect a
-# 1-click deployment until a later change opts in. That split is deliberate -
-# the image has to be measured against today's 3m47s before it is worth
-# pointing anything at it.
+# This workflow builds a complete runtime image. A consumer selects an immutable
+# version through `imageId` plus `imageIncludesRuntime=true`; it must advance
+# that pin only after this workflow succeeds.
 #
 # Manual dispatch only, because every run creates billable resources (a build
 # VM for ~10 minutes, and an image version charged as a snapshot per
@@ -44,6 +41,9 @@ env:
   # hyphens - so this is not spelled "agent-box".
   GALLERY: agentbox
   IMAGE_DEF: agent-box-ubuntu-2404-arm64
+  # Station runs in West US. Keep the source gallery in West US 3 but publish
+  # each immutable version to the customer region as well.
+  TARGET_REGION: westus
   # The default VM size in deploy/azure/agent-box.bicep is Standard_B2pls_v2,
   # which imageSkuBySize maps to the arm64 SKU. Build on the same arch the
   # image is for: a gallery image version is per-architecture.
@@ -230,7 +230,7 @@ jobs:
             --gallery-image-definition "$IMAGE_DEF" \
             --gallery-image-version "$VERSION" \
             --virtual-machine "$vm_id" \
-            --replica-count 1 \
+            --target-regions "$TARGET_REGION=1" \
             --tags "agent-box:rev=$SHA" \
             --only-show-errors
 
@@ -251,7 +251,9 @@ jobs:
             echo "| version | \`$VERSION\` |"
             echo "| image id | \`/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Compute/galleries/$GALLERY/images/$IMAGE_DEF/versions/$VERSION\` |"
             echo
-            echo "Nothing deploys from this yet - \`deploy/azure/agent-box.bicep\` still names the stock Canonical image (issue #697)."
+            echo "| replicated region | \`$TARGET_REGION\` |"
+            echo
+            echo "Deploy with this exact image id and \`imageIncludesRuntime=true\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Delete the build VM

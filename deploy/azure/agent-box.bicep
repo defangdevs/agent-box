@@ -123,8 +123,11 @@ param agentBoxFlakeRef string = 'github:defangdevs/agent-box'
 @description('Nix installer. The Determinate installer is used deliberately: it supports SELinux (so the same script serves RHEL), survives distro upgrades, and enables flakes out of the box.')
 param nixInstallerUrl string = 'https://install.determinate.systems/nix'
 
-@description('Optional: the resource id of a Compute Gallery image version to deploy from, instead of the stock Ubuntu marketplace image. An agent-box image (built by .github/workflows/azure-image.yml) already carries nix and the runtime closure, which is most of what first boot otherwise spends its time downloading - see issue #697. Empty (the default) deploys the stock image, so the 1-click button is unaffected. The image must match the architecture of vmSizeChoice.')
+@description('Optional: the resource id of a Compute Gallery image version to deploy from, instead of the stock Ubuntu marketplace image. The image must match the architecture of vmSizeChoice.')
 param imageId string = ''
+
+@description('The selected gallery image contains the agent-box runtime profile at its deployed path. When true, first boot verifies and uses it instead of resolving and installing agentBoxFlakeRef. Only set this for an immutable image produced by .github/workflows/azure-image.yml at the same agent-box revision.')
+param imageIncludesRuntime bool = false
 
 @description('Source range allowed to reach the terminal (and SSH). A CIDR, or an Azure service tag such as Internet.')
 param allowCidr string = '0.0.0.0/0'
@@ -362,11 +365,22 @@ set -u
 
 # The runtime profile: payloads, tools, agent CLIs, shared assets. A system
 # profile, so `nix profile rollback --profile ...` is the undo button and no
-# user's own profile is touched.
-nix profile install \
-  --profile /nix/var/nix/profiles/agent-box \
-  "@@FLAKEREF@@#runtime"
+# user's own profile is touched. A Station image built for the exact runtime
+# carries this profile already; skipping its re-resolution is intentional and
+# is the fast path's whole point. Verify the executable instead of silently
+# falling through to a slower mutable bootstrap if the wrong image was named.
 AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
+if [ '@@IMAGERUNTIME@@' = true ]; then
+  if [ ! -x "$AGENTBOX" ]; then
+    echo "imageIncludesRuntime was set but the agent-box runtime profile is absent" >&2
+    exit 1
+  fi
+  echo "using image-provided agent-box runtime"
+else
+  nix profile install \
+    --profile /nix/var/nix/profiles/agent-box \
+    "@@FLAKEREF@@#runtime"
+fi
 
 # The box's declared state. Everything host-specific the renderer needs, and
 # nothing it has to rediscover for itself: ARM allocated the static public IP
@@ -501,7 +515,7 @@ var portalOn = !empty(portalUser) && !empty(portalIssuer)
 var portalUserYaml = portalOn ? portalUser : ''
 var portalIssuerYaml = portalOn ? portalIssuer : ''
 
-var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(replace(
+var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   bootstrapTemplate,
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
@@ -514,6 +528,7 @@ var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
   '@@WEBPASSWORD@@', base64(webPassword)),
   '@@PORTALISSUERB64@@', base64(portalIssuerYaml)),
   '@@PORTALUSERIDB64@@', base64(portalUserYaml)),
+  '@@IMAGERUNTIME@@', string(imageIncludesRuntime)),
   '@@PUBLICIPB64@@', base64(publicIp.properties.ipAddress))
 
 // ---------------------------------------------------------------------------
