@@ -15211,6 +15211,20 @@ in
         ""
         "${contractBin (lib.elemAt harnessUpgradeContract.execStart 0)} upgrade"
       ];
+      # Same self-inflicted restart as agent-box-update just below, and the
+      # same fix. This unit's definition changes on every non-noop run (the
+      # ExecStart above resolves through the whole system closure), and
+      # update.sh starts it --no-block right after a successful switch, so a
+      # harness closure a few hundred MiB wide can still be downloading when
+      # the NEXT update's switch-to-configuration runs. Without these two,
+      # that switch tries to stop-then-restart an instance still mid-flight,
+      # which is what surfaced as switch-to-configuration exiting 4 with
+      # "Failed to start agent-box-harness-upgrade@<user>.service: Unit ...
+      # not found" and rolling the whole update back (issue #707). Leaving
+      # this run alone costs nothing: the next trigger starts fresh from the
+      # new unit file anyway.
+      restartIfChanged = false;
+      stopIfChanged = false;
     };
 
     systemd.services.agent-box-update = {
