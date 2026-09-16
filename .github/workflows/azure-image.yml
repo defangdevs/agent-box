@@ -225,12 +225,26 @@ jobs:
           az vm generalize --resource-group "$RG" --name "$VM" --only-show-errors
 
           vm_id=$(az vm show --resource-group "$RG" --name "$VM" --query id -o tsv)
+
+          # A gallery image version's target-regions must include the region
+          # the source VM (and gallery) actually live in - Azure rejects a
+          # list that omits it with "Gallery image version publishing profile
+          # regions ... must contain the location of image version" (run
+          # 35137301005). $RG lives in West US 3, not $TARGET_REGION
+          # (westus), so ask Azure for the real source region instead of
+          # hardcoding a second constant that could drift from it.
+          source_region=$(az group show --name "$RG" --query location -o tsv)
+          target_regions=("$TARGET_REGION=1")
+          if [ "$source_region" != "$TARGET_REGION" ]; then
+            target_regions+=("$source_region=1")
+          fi
+
           az sig image-version create \
             --resource-group "$RG" --gallery-name "$GALLERY" \
             --gallery-image-definition "$IMAGE_DEF" \
             --gallery-image-version "$VERSION" \
             --virtual-machine "$vm_id" \
-            --target-regions "$TARGET_REGION=1" \
+            --target-regions "${target_regions[@]}" \
             --tags "agent-box:rev=$SHA" \
             --only-show-errors
 
