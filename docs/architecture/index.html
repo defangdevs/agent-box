@@ -1,0 +1,677 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noai,noimageai">
+  <meta name="description" content="Interactive C4 architecture explorer for agent-box and local-channels.">
+  <meta name="theme-color" content="#07111f">
+  <title>agent-box + local-channels &mdash; C4 architecture</title>
+  <link rel="icon" href="../potato.svg">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07111f;
+      --panel: #0b1829;
+      --panel-2: #102238;
+      --line: #203853;
+      --line-bright: #49647e;
+      --text: #eef6ff;
+      --muted: #8fa8bf;
+      --cyan: #5cc8ff;
+      --mint: #7be0c3;
+      --amber: #f5bf68;
+      --violet: #b5a4ff;
+      --red: #ff8b8b;
+      --blue: #508cff;
+      --shadow: 0 18px 50px rgba(0, 0, 0, .26);
+      --radius: 14px;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 45% -20%, rgba(80, 140, 255, .14), transparent 37%),
+        var(--bg);
+      color: var(--text);
+      font: 16px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    button, input { font: inherit; }
+    button { color: inherit; }
+
+    .app {
+      height: 100dvh;
+      display: grid;
+      grid-template-columns: 252px minmax(0, 1fr) 326px;
+      grid-template-rows: 74px minmax(0, 1fr);
+    }
+
+    header {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      padding: 0 22px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(7, 17, 31, .88);
+      backdrop-filter: blur(16px);
+      z-index: 10;
+    }
+
+    .brand {
+      min-width: 230px;
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      color: inherit;
+      text-decoration: none;
+    }
+
+    .brand-mark {
+      width: 35px;
+      height: 35px;
+      display: grid;
+      place-items: center;
+      border: 1px solid #315170;
+      border-radius: 9px;
+      color: var(--mint);
+      background: #0c1d30;
+      box-shadow: inset 0 0 18px rgba(123, 224, 195, .05);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 1rem;
+      letter-spacing: -.01em;
+      font-weight: 680;
+    }
+
+    .brand p, .view-meta { margin: 2px 0 0; color: var(--muted); font-size: .78rem; }
+    .view-heading { flex: 1; min-width: 0; }
+    .view-heading strong { font-size: .9rem; font-weight: 650; }
+
+    .top-actions { display: flex; align-items: center; gap: 8px; }
+    .icon-button, .segmented button, .nav-button, .filter-button {
+      border: 1px solid var(--line);
+      background: #0c1a2c;
+      border-radius: 9px;
+      cursor: pointer;
+      transition: border-color .16s ease, background .16s ease, color .16s ease, transform .16s ease;
+    }
+    .icon-button:hover, .segmented button:hover, .nav-button:hover, .filter-button:hover { border-color: var(--line-bright); }
+    .icon-button:active, .nav-button:active, .filter-button:active { transform: translateY(1px); }
+    .icon-button { width: 38px; height: 38px; display: grid; place-items: center; }
+    .icon-button svg { width: 18px; height: 18px; }
+
+    aside {
+      min-height: 0;
+      background: rgba(9, 22, 38, .72);
+    }
+
+    .rail {
+      border-right: 1px solid var(--line);
+      padding: 22px 16px;
+      overflow-y: auto;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px 8px;
+      color: #6f899f;
+      font: 700 .7rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+
+    .nav-stack { display: grid; gap: 7px; }
+    .nav-button {
+      min-height: 58px;
+      padding: 10px 11px;
+      display: grid;
+      grid-template-columns: 26px 1fr;
+      gap: 10px;
+      text-align: left;
+      background: transparent;
+    }
+    .nav-button.active {
+      border-color: #315675;
+      background: linear-gradient(110deg, rgba(35, 73, 104, .55), rgba(18, 42, 67, .7));
+      box-shadow: inset 3px 0 var(--mint);
+    }
+    .nav-number { color: var(--mint); font: 600 .75rem/1.5 ui-monospace, monospace; }
+    .nav-copy strong { display: block; font-size: .86rem; font-weight: 650; }
+    .nav-copy span { display: block; margin-top: 2px; color: var(--muted); font-size: .74rem; }
+
+    .rule { height: 1px; margin: 23px 7px; background: var(--line); }
+    .legend { display: grid; gap: 10px; padding: 0 8px; color: var(--muted); font-size: .76rem; }
+    .legend-row { display: flex; align-items: center; gap: 9px; }
+    .swatch { width: 10px; height: 10px; border-radius: 3px; background: var(--cyan); }
+    .swatch.external { background: transparent; border: 1px dashed var(--amber); }
+    .swatch.boundary { background: transparent; border: 1px dashed #627f99; }
+    .swatch.flow { height: 2px; border-radius: 0; background: var(--mint); }
+
+    main {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      background-image:
+        linear-gradient(rgba(102, 146, 179, .055) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(102, 146, 179, .055) 1px, transparent 1px);
+      background-size: 28px 28px;
+    }
+
+    .canvas-toolbar {
+      position: absolute;
+      z-index: 5;
+      top: 16px;
+      left: 16px;
+      right: 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      pointer-events: none;
+    }
+
+    .canvas-toolbar > * { pointer-events: auto; }
+    .segmented {
+      display: flex;
+      gap: 3px;
+      padding: 3px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: rgba(9, 23, 39, .92);
+      box-shadow: var(--shadow);
+    }
+    .segmented button { padding: 6px 10px; border-color: transparent; background: transparent; color: var(--muted); font-size: .75rem; }
+    .segmented button.active { background: #1b3652; color: var(--text); }
+    .filter-button { padding: 8px 11px; color: var(--muted); font-size: .76rem; box-shadow: var(--shadow); }
+    .filter-button.active { color: var(--mint); border-color: #366f68; background: #102c2c; }
+    .toolbar-spacer { flex: 1; }
+    .zoom-readout { color: var(--muted); font: .72rem ui-monospace, monospace; }
+
+    #diagram {
+      width: 100%;
+      height: 100%;
+      display: block;
+      touch-action: none;
+      user-select: none;
+      cursor: grab;
+    }
+    #diagram.dragging { cursor: grabbing; }
+
+    .node { cursor: pointer; outline: none; }
+    .node .node-body { fill: #10233a; stroke: #33506a; stroke-width: 1.2; filter: url(#shadow); transition: opacity .15s ease, stroke .15s ease; }
+    .node.external .node-body { fill: #211c18; stroke: var(--amber); stroke-dasharray: 5 4; }
+    .node.person .node-body { fill: #172b42; stroke: var(--cyan); }
+    .node.channel .node-body { fill: #102f31; stroke: var(--mint); }
+    .node.platform .node-body { fill: #242039; stroke: var(--violet); }
+    .node.selected .node-body, .node:hover .node-body, .node:focus .node-body { stroke: #fff; stroke-width: 2; }
+    .node.dimmed { opacity: .18; }
+    .node-title { fill: var(--text); font-size: 15px; font-weight: 680; pointer-events: none; }
+    .node-type { fill: #7f9bb2; font: 10px ui-monospace, monospace; letter-spacing: .1em; text-transform: uppercase; pointer-events: none; }
+    .node-desc { fill: #a8bdcf; font-size: 11px; pointer-events: none; }
+    .node-chip { fill: #193552; stroke: #31516d; }
+    .node-chip-text { fill: #b9d3e9; font: 10px ui-monospace, monospace; pointer-events: none; }
+
+    .boundary { fill: rgba(12, 28, 47, .44); stroke: #38536d; stroke-width: 1.2; stroke-dasharray: 8 7; }
+    .boundary-label { fill: #7690a7; font: 11px ui-monospace, monospace; letter-spacing: .08em; }
+    .relationship { fill: none; stroke: #54718a; stroke-width: 1.35; marker-end: url(#arrow); transition: opacity .15s ease, stroke .15s ease, stroke-width .15s ease; }
+    .relationship.async { stroke-dasharray: 6 5; }
+    .relationship.highlight { stroke: var(--mint); stroke-width: 2.5; marker-end: url(#arrow-active); }
+    .relationship.dimmed { opacity: .12; }
+    .rel-label { fill: #819bb2; font-size: 10.5px; paint-order: stroke; stroke: var(--bg); stroke-width: 5px; stroke-linejoin: round; pointer-events: none; }
+    .flow-step { fill: #0d2831; stroke: var(--mint); stroke-width: 1.2; }
+    .flow-number { fill: var(--mint); font: 700 12px ui-monospace, monospace; }
+
+    .empty-hint {
+      position: absolute;
+      left: 20px;
+      bottom: 16px;
+      margin: 0;
+      color: #688298;
+      font-size: .74rem;
+      pointer-events: none;
+    }
+
+    .inspector {
+      border-left: 1px solid var(--line);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .inspector-head { padding: 22px 21px 16px; border-bottom: 1px solid var(--line); }
+    .inspector-kicker { margin: 0 0 8px; color: var(--mint); font: 700 .68rem ui-monospace, monospace; letter-spacing: .11em; text-transform: uppercase; }
+    .inspector h2 { margin: 0; font-size: 1.14rem; line-height: 1.25; letter-spacing: -.02em; }
+    .inspector-summary { margin: 9px 0 0; color: var(--muted); font-size: .82rem; }
+    .inspector-scroll { min-height: 0; overflow-y: auto; padding: 17px 21px 28px; }
+    .detail-section { margin-bottom: 22px; }
+    .detail-section h3 { margin: 0 0 9px; color: #7892a9; font: 700 .68rem ui-monospace, monospace; letter-spacing: .11em; text-transform: uppercase; }
+    .detail-section p { margin: 0; color: #c1d2e1; font-size: .8rem; }
+    .detail-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+    .detail-list li { padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: rgba(18, 41, 65, .5); color: #bdd0df; font-size: .76rem; }
+    .detail-list strong { color: var(--text); font-weight: 650; }
+    .tech-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tech { padding: 4px 7px; border: 1px solid #2f4c65; border-radius: 5px; color: #a9c1d3; background: #0b1a2b; font: .68rem ui-monospace, monospace; }
+    .source-link { color: var(--cyan); text-decoration: none; }
+    .source-link:hover { text-decoration: underline; }
+
+    .mobile-inspector-toggle { display: none; }
+
+    @media (max-width: 1040px) {
+      .app { grid-template-columns: 210px minmax(0, 1fr); }
+      .inspector {
+        position: absolute;
+        z-index: 20;
+        top: 74px;
+        right: 0;
+        bottom: 0;
+        width: min(360px, 90vw);
+        transform: translateX(100%);
+        transition: transform .2s ease;
+        background: var(--panel);
+        box-shadow: -20px 0 45px rgba(0,0,0,.35);
+      }
+      .inspector.open { transform: translateX(0); }
+      .mobile-inspector-toggle { display: grid; }
+    }
+
+    @media (max-width: 720px) {
+      body { overflow: hidden; }
+      .app { grid-template-columns: 1fr; grid-template-rows: 66px 74px minmax(0, 1fr); }
+      header { padding: 0 14px; gap: 10px; }
+      .brand { min-width: 0; flex: 1; }
+      .brand p, .view-heading { display: none; }
+      .rail {
+        grid-row: 2;
+        padding: 9px 10px;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+        overflow-x: auto;
+      }
+      .rail .eyebrow, .rail .rule, .rail .legend { display: none; }
+      .nav-stack { display: flex; gap: 7px; min-width: max-content; }
+      .nav-button { min-height: 54px; width: 178px; }
+      main { grid-row: 3; }
+      .canvas-toolbar { top: 10px; left: 10px; right: 10px; }
+      .filter-button { display: none; }
+      .zoom-readout { display: none; }
+      .inspector { top: 66px; }
+      .empty-hint { display: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="4" width="8" height="6" rx="1.5"/><rect x="13" y="14" width="8" height="6" rx="1.5"/><path d="M11 7h3.5v10H13"/></svg>
+        </div>
+        <div><h1>agent-box <span style="color:#5c7489">+</span> local-channels</h1><p>Interactive C4 architecture</p></div>
+      </div>
+      <div class="view-heading"><strong id="view-title">System context</strong><p class="view-meta" id="view-meta">People, systems, and trust boundaries</p></div>
+      <div class="top-actions">
+        <button class="icon-button mobile-inspector-toggle" id="toggle-inspector" aria-label="Toggle details panel" title="Details">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg>
+        </button>
+        <a class="icon-button" href="../" aria-label="Return to agent-box homepage" title="Project home">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m4 10 8-6 8 6v9a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1Z"/></svg>
+        </a>
+        <a class="icon-button" href="https://github.com/defangdevs/agent-box" target="_blank" rel="noreferrer" aria-label="Open agent-box repository" title="Source on GitHub">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 5h5v5M10 14 19 5"/><path d="M19 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/></svg>
+        </a>
+      </div>
+    </header>
+
+    <aside class="rail" aria-label="Diagram levels">
+      <p class="eyebrow">C4 views</p>
+      <nav class="nav-stack">
+        <button class="nav-button active" data-view="context"><span class="nav-number">01</span><span class="nav-copy"><strong>System context</strong><span>Who uses what</span></span></button>
+        <button class="nav-button" data-view="containers"><span class="nav-number">02</span><span class="nav-copy"><strong>Containers</strong><span>Runtime building blocks</span></span></button>
+        <button class="nav-button" data-view="flow"><span class="nav-number">&rarr;</span><span class="nav-copy"><strong>Delivery trace</strong><span>Webhook to agent</span></span></button>
+      </nav>
+      <div class="rule"></div>
+      <p class="eyebrow">Notation</p>
+      <div class="legend">
+        <div class="legend-row"><span class="swatch"></span> Internal system</div>
+        <div class="legend-row"><span class="swatch external"></span> External dependency</div>
+        <div class="legend-row"><span class="swatch boundary"></span> Trust boundary</div>
+        <div class="legend-row"><span class="swatch flow"></span> Selected relationship</div>
+      </div>
+    </aside>
+
+    <main>
+      <div class="canvas-toolbar" aria-label="Diagram controls">
+        <div class="segmented" aria-label="Harness filter">
+          <button class="active" data-harness="all">All</button>
+          <button data-harness="claude">Claude</button>
+          <button data-harness="codex">Codex</button>
+        </div>
+        <button class="filter-button" id="security-filter">Trust boundaries</button>
+        <div class="toolbar-spacer"></div>
+        <span class="zoom-readout" id="zoom-readout">100%</span>
+        <button class="icon-button" id="fit" aria-label="Fit diagram to viewport" title="Fit diagram">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/></svg>
+        </button>
+      </div>
+      <svg id="diagram" role="img" aria-labelledby="svg-title svg-desc" viewBox="0 0 1100 700">
+        <title id="svg-title">agent-box and local-channels architecture</title>
+        <desc id="svg-desc">An interactive diagram. Select a node to inspect its responsibilities and relationships.</desc>
+        <defs>
+          <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#000" flood-opacity=".22"/></filter>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="#54718a"/></marker>
+          <marker id="arrow-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="#7be0c3"/></marker>
+        </defs>
+        <g id="viewport"></g>
+      </svg>
+      <p class="empty-hint">Scroll to zoom &middot; drag the canvas to pan &middot; select any element to trace relationships</p>
+    </main>
+
+    <aside class="inspector" id="inspector" aria-live="polite">
+      <div class="inspector-head">
+        <p class="inspector-kicker" id="detail-type">Architecture map</p>
+        <h2 id="detail-title">Select a system</h2>
+        <p class="inspector-summary" id="detail-summary">Choose any element to isolate its relationships and see why it exists.</p>
+      </div>
+      <div class="inspector-scroll" id="detail-body">
+        <section class="detail-section"><h3>Reading the map</h3><p>Use the three C4 views on the left. Filter by harness, expose trust boundaries, or follow the numbered webhook path end to end.</p></section>
+        <section class="detail-section"><h3>Core rule</h3><p>A Linux user is the trust boundary. A session is a unit of concurrent work and deliberately is not an isolation boundary.</p></section>
+      </div>
+    </aside>
+  </div>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const views = {
+        context: {
+          title: 'System context', meta: 'People, systems, and trust boundaries', size: [1100, 700],
+          boundaries: [
+            { x: 280, y: 76, w: 520, h: 540, label: 'AGENT-BOX HOST \u00b7 OPERATOR-CONTROLLED SANDBOX' },
+            { x: 323, y: 162, w: 430, h: 384, label: 'LINUX USER \u00b7 TRUST BOUNDARY' }
+          ],
+          nodes: [
+            { id: 'operator', x: 35, y: 165, w: 190, h: 106, type: 'Person', title: 'Operator', desc: ['Uses browser workspace', 'and settings UI'], kind: 'person', tech: ['Browser'] },
+            { id: 'sender', x: 35, y: 403, w: 190, h: 106, type: 'External system', title: 'Event sender', desc: ['GitHub, Linear, Stripe,', 'or a local sensor'], kind: 'external', tech: ['HTTPS', 'HMAC-SHA256'] },
+            { id: 'agentbox', x: 349, y: 213, w: 378, h: 120, type: 'Software system', title: 'agent-box', desc: ['Runs persistent coding-agent sessions', 'inside hardened, unprivileged user accounts'], kind: 'platform', tech: ['Nix / NixOS', 'systemd', 'tmux'] },
+            { id: 'channels', x: 349, y: 397, w: 378, h: 120, type: 'Software system', title: 'local-channels', desc: ['Verifies, routes, and delivers external', 'events to live or newly spawned sessions'], kind: 'channel', tech: ['Python 3', 'JSON-RPC', 'Unix sockets'] },
+            { id: 'model', x: 851, y: 165, w: 210, h: 106, type: 'External system', title: 'Model provider', desc: ['Claude or OpenAI', 'agent service'], kind: 'external', tech: ['HTTPS'] },
+            { id: 'github', x: 851, y: 403, w: 210, h: 106, type: 'External system', title: 'Code + CI systems', desc: ['Repositories, checks,', 'reviews, and issues'], kind: 'external', tech: ['Git', 'APIs'] }
+          ],
+          rels: [
+            { from: 'operator', to: 'agentbox', label: 'controls sessions and configuration' },
+            { from: 'sender', to: 'channels', label: 'posts signed events', async: true },
+            { from: 'channels', to: 'agentbox', label: 'queues or dispatches work', async: true },
+            { from: 'agentbox', to: 'model', label: 'runs harness against' },
+            { from: 'agentbox', to: 'github', label: 'reads and changes code' }
+          ]
+        },
+        containers: {
+          title: 'Container view', meta: 'Processes and data stores inside one agent-box user', size: [1240, 760],
+          boundaries: [
+            { x: 116, y: 62, w: 1008, h: 642, label: 'AGENT-BOX HOST' },
+            { x: 280, y: 150, w: 804, h: 470, label: 'LINUX USER \u00b7 TRUST BOUNDARY (SHARED HOME + TMUX)' }
+          ],
+          nodes: [
+            { id: 'browser', x: 10, y: 180, w: 190, h: 98, type: 'Person / browser', title: 'Web workspace', desc: ['Terminal + settings'], kind: 'person', tech: ['HTTPS'] },
+            { id: 'sender2', x: 10, y: 466, w: 190, h: 98, type: 'External system', title: 'Webhook sender', desc: ['Signed JSON events'], kind: 'external', tech: ['HMAC-SHA256'] },
+            { id: 'caddy', x: 150, y: 92, w: 210, h: 92, type: 'Container', title: 'Caddy', desc: ['TLS + basic auth', 'reverse proxy'], kind: 'platform', tech: ['Caddy'] },
+            { id: 'settings', x: 327, y: 212, w: 220, h: 105, type: 'Container', title: 'Settings daemon', desc: ['Sessions, secrets,', 'box operations'], kind: 'platform', tech: ['Python', 'HTTP'] },
+            { id: 'supervisor', x: 327, y: 400, w: 220, h: 105, type: 'Container', title: 'Session supervisor', desc: ['Owns lifecycle of', 'persistent tmux sessions'], kind: 'platform', tech: ['Shell', 'tmux'] },
+            { id: 'receiver', x: 620, y: 212, w: 230, h: 105, type: 'Container', title: 'Webhook receiver', desc: ['Verifies once, normalizes,', 'fans out envelopes'], kind: 'channel', tech: ['webhook.py', 'socket activation'] },
+            { id: 'state', x: 620, y: 432, w: 230, h: 105, type: 'Data store', title: 'Webhook state', desc: ['Sources, secrets, filters,', 'peer sockets + leases'], kind: 'channel', tech: ['JSON', 'Unix sockets'] },
+            { id: 'claude', x: 905, y: 190, w: 190, h: 112, type: 'Container', title: 'Claude session', desc: ['Channel plugin emits', 'JSON-RPC notifications'], kind: 'platform', harness: 'claude', tech: ['Claude Code', 'MCP stdio'] },
+            { id: 'codex', x: 905, y: 374, w: 190, h: 112, type: 'Container', title: 'Codex session', desc: ['Detached peer queues', 'messages at turn boundary'], kind: 'platform', harness: 'codex', tech: ['Codex', 'codex queue'] },
+            { id: 'hook', x: 905, y: 548, w: 190, h: 98, type: 'Container', title: 'Hook session', desc: ['Ephemeral agent for', 'standing-watch matches'], kind: 'platform', tech: ['agent-box-session'] },
+            { id: 'providers', x: 1135, y: 274, w: 95, h: 150, type: 'External', title: 'APIs', desc: ['Models', 'Git', 'SaaS'], kind: 'external', tech: ['HTTPS'] }
+          ],
+          rels: [
+            { from: 'browser', to: 'caddy', label: 'HTTPS' },
+            { from: 'caddy', to: 'settings', label: 'settings routes' },
+            { from: 'settings', to: 'supervisor', label: 'create / stop / restart' },
+            { from: 'sender2', to: 'caddy', label: 'POST /<user>/webhook/<source>', async: true },
+            { from: 'caddy', to: 'receiver', label: 'Unix socket' },
+            { from: 'receiver', to: 'state', label: 'reads sources; broadcasts envelopes' },
+            { from: 'state', to: 'claude', label: 'per-session filter + peer socket', async: true },
+            { from: 'state', to: 'codex', label: 'per-session filter + detached peer', async: true },
+            { from: 'receiver', to: 'hook', label: 'spawn command on watch match', async: true },
+            { from: 'supervisor', to: 'claude', label: 'starts and respawns' },
+            { from: 'supervisor', to: 'codex', label: 'starts and respawns' },
+            { from: 'claude', to: 'providers', label: 'acts through tools' },
+            { from: 'codex', to: 'providers', label: 'acts through tools' },
+            { from: 'hook', to: 'providers', label: 'triages / fixes / reports' }
+          ]
+        },
+        flow: {
+          title: 'Delivery trace', meta: 'A verified event from sender to the right agent session', size: [1240, 720],
+          boundaries: [
+            { x: 210, y: 100, w: 1010, h: 520, label: 'AGENT-BOX HOST' },
+            { x: 520, y: 330, w: 665, h: 238, label: 'LINUX USER \u00b7 ROUTING + SESSIONS' }
+          ],
+          nodes: [
+            { id: 'f-sender', x: 18, y: 260, w: 175, h: 98, type: '1 \u00b7 Sender', title: 'Signed event', desc: ['GitHub or another', 'HMAC sender'], kind: 'external', tech: ['HTTPS'] },
+            { id: 'f-caddy', x: 235, y: 260, w: 175, h: 98, type: '2 \u00b7 Edge', title: 'Caddy', desc: ['Terminates TLS', 'routes by source'], kind: 'platform', tech: ['Reverse proxy'] },
+            { id: 'f-receiver', x: 452, y: 260, w: 205, h: 98, type: '3 \u00b7 Trust gate', title: 'Receiver', desc: ['Verifies HMAC once', 'normalizes envelope'], kind: 'channel', tech: ['Fail closed'] },
+            { id: 'f-fanout', x: 700, y: 260, w: 185, h: 98, type: '4 \u00b7 Bus', title: 'IPC fan-out', desc: ['One NDJSON line to', 'every peer socket'], kind: 'channel', tech: ['Unix sockets'] },
+            { id: 'f-filter', x: 925, y: 260, w: 190, h: 98, type: '5 \u00b7 Routing', title: 'Session filter', desc: ['Topic + payload rules', 'TTL + sender mute'], kind: 'channel', tech: ['filter.<session>.json'] },
+            { id: 'f-claude', x: 680, y: 446, w: 190, h: 98, type: '6A \u00b7 Delivery', title: 'Claude channel', desc: ['JSON-RPC notification', 'on plugin stdio'], kind: 'platform', harness: 'claude', tech: ['MCP'] },
+            { id: 'f-codex', x: 920, y: 446, w: 190, h: 98, type: '6B \u00b7 Delivery', title: 'Codex queue', desc: ['Detached peer queues', 'next turn message'], kind: 'platform', harness: 'codex', tech: ['codex queue'] },
+            { id: 'f-hook', x: 925, y: 78, w: 190, h: 98, type: '6C \u00b7 Dispatch', title: 'Fresh hook session', desc: ['Standing watch spawns', 'bounded ephemeral work'], kind: 'platform', tech: ['EX_TEMPFAIL retry'] }
+          ],
+          rels: [
+            { from: 'f-sender', to: 'f-caddy', label: '1 \u00b7 POST raw JSON', async: true },
+            { from: 'f-caddy', to: 'f-receiver', label: '2 \u00b7 forward request' },
+            { from: 'f-receiver', to: 'f-fanout', label: '3 \u00b7 verified envelope', async: true },
+            { from: 'f-fanout', to: 'f-filter', label: '4 \u00b7 broadcast', async: true },
+            { from: 'f-filter', to: 'f-claude', label: '5A \u00b7 matching live session', async: true },
+            { from: 'f-filter', to: 'f-codex', label: '5B \u00b7 matching live session', async: true },
+            { from: 'f-filter', to: 'f-hook', label: '5C \u00b7 matching standing watch', async: true }
+          ]
+        }
+      };
+
+      const details = {
+        operator: { summary: 'The human who opens the browser workspace and controls a declared trust domain.', responsibilities: ['Starts, stops, and names sessions', 'Manages secrets and webhook wiring in the settings page', 'Chooses when a separate Linux user is required'], tech: ['Browser', 'Caddy-authenticated UI'] },
+        sender: { summary: 'Any system able to send JSON and sign the raw body with HMAC-SHA256.', responsibilities: ['Chooses the source-specific URL', 'Supplies event, delivery, sender, and routing metadata', 'Treats 200 as accepted, 401 as a failed trust check'], tech: ['GitHub', 'Linear', 'Stripe', 'Local emitters'] },
+        agentbox: { summary: 'A reproducible multi-user sandbox that keeps autonomous coding agents alive and reachable.', responsibilities: ['Declares users as security boundaries', 'Runs one job per persistent tmux session', 'Provides browser workspace, settings, lifecycle, and narrow sudo operations'], tech: ['Nix / NixOS', 'systemd', 'tmux', 'Caddy', 'ttyd'] },
+        channels: { summary: 'A one-way event channel: untrusted deliveries enter a live agent conversation without polling.', responsibilities: ['Verifies signed webhook bodies', 'Normalizes and fans out each accepted event', 'Filters per session or dispatches a new hook session'], tech: ['Python 3', 'JSON-RPC', 'Unix sockets', 'NDJSON'] },
+        model: { summary: 'The external model service used by the selected coding-agent harness.', responsibilities: ['Interprets the task and event data', 'Calls tools exposed by the harness', 'Returns agent output to the persistent session'], tech: ['Claude', 'OpenAI'] },
+        github: { summary: 'The external systems the agent reads and changes while doing development work.', responsibilities: ['Hosts code and reviews', 'Emits CI, issue, PR, and comment events', 'Accepts authenticated changes from the agent'], tech: ['GitHub API', 'Git', 'CI'] },
+        browser: { summary: 'The operator-facing workspace for terminals, settings, sessions, secrets, and webhook setup.', responsibilities: ['Embeds the terminal', 'Calls settings routes', 'Keeps the operator inside one authenticated origin'], tech: ['HTML', 'ttyd', 'HTTP'] },
+        caddy: { summary: 'The only public web edge on the box.', responsibilities: ['Terminates TLS', 'Authenticates operator-facing routes', 'Routes webhook ingress to a per-user Unix socket'], tech: ['Caddy', 'TLS', 'Unix sockets'] },
+        settings: { summary: 'The per-user control plane for the box.', responsibilities: ['Renders session and connection state', 'Writes the user-owned environment store', 'Invokes tightly-scoped lifecycle operations'], tech: ['Python HTTP server', 'JSON state'] },
+        supervisor: { summary: 'Maintains the desired set of persistent tmux-backed sessions.', responsibilities: ['Starts the chosen harness or profile', 'Respawns cleanly when a process exits', 'Seeds Claude plugin configuration and Codex remote-control mode'], tech: ['Shell', 'tmux', 'systemd'] },
+        receiver: { summary: 'The single ingress owner in agent-box daemon mode.', responsibilities: ['Adopts the systemd-activated socket', 'Verifies the raw request body before parsing', 'Broadcasts a normalized envelope to every live peer'], tech: ['webhook.py', 'Python http.server', 'socket activation'] },
+        state: { summary: 'Shared per-user runtime state for sources, routing, subscriptions, and peers.', responsibilities: ['Keeps source configuration and 0600 secrets', 'Stores one filter per session plus shared standing watches', 'Tracks live peer sockets and spawn leases'], tech: ['sources.json', 'filter.<session>.json', 'instances/*.sock'] },
+        claude: { summary: 'A persistent Claude Code job with the local-webhook channel plugin attached at launch.', responsibilities: ['Reads its own subscription filter', 'Receives notifications/claude/channel over stdio', 'Treats payload text as untrusted data'], tech: ['Claude Code', 'MCP', 'Channel plugin'] },
+        codex: { summary: 'A persistent Codex job using the same receiver, filters, and routing semantics.', responsibilities: ['Runs a small detached delivery peer', 'Queues an event into the exact Codex task', 'Consumes it at the next turn boundary'], tech: ['Codex', 'codex queue'] },
+        hook: { summary: 'A fresh, bounded session spawned only when a standing-watch rule matches.', responsibilities: ['Claims the event object or commit it was created for', 'Yields to an interactive session already holding the work', 'Removes itself after completion'], tech: ['agent-box-session', 'spawnConfig', 'lease / cap'] },
+        providers: { summary: 'External model, source-control, CI, and application APIs used while the agent works.', responsibilities: ['Provide model inference', 'Store code and collaboration state', 'Receive tool-driven changes'], tech: ['HTTPS', 'Git', 'MCP'] },
+        sender2: { summary: 'An external event producer that can reach the public webhook route.', responsibilities: ['Signs the exact request body', 'Uses the configured source path', 'Retries according to its own delivery policy'], tech: ['HTTPS', 'HMAC-SHA256'] },
+        'f-sender': { summary: 'Step 1: an event producer signs the raw JSON body and sends it to the source-specific public route.', responsibilities: ['Preserve the exact bytes being signed', 'Attach source event and delivery headers'], tech: ['HTTPS', 'HMAC-SHA256'] },
+        'f-caddy': { summary: 'Step 2: Caddy terminates TLS and forwards the request to the user-scoped ingress socket.', responsibilities: ['Expose one stable public URL', 'Keep the receiver off the public TCP interface'], tech: ['TLS', 'reverse_proxy'] },
+        'f-receiver': { summary: 'Step 3: the receiver selects the source configuration, verifies the signature, and only then parses JSON.', responsibilities: ['Fail closed on unknown source or bad signature', 'Normalize source, event, key, sender, delivery, and payload'], tech: ['constant-time compare', 'sources.json'] },
+        'f-fanout': { summary: 'Step 4: one verified envelope is written to every live per-session peer socket.', responsibilities: ['Use newline-delimited JSON', 'Remove stale sockets after failed delivery'], tech: ['AF_UNIX', 'NDJSON'] },
+        'f-filter': { summary: 'Step 5: each peer independently decides whether this verified event belongs to its session.', responsibilities: ['Match source:key topic patterns', 'Apply include / exclude rules and TTL', 'Enforce sender mutes and claim brakes'], tech: ['filter.<session>.json', 'hot reload'] },
+        'f-claude': { summary: 'Step 6A: a matching Claude peer emits an untrusted-marked channel notification on plugin stdio.', responsibilities: ['Summarize known GitHub event types', 'Truncate and mark free text as untrusted'], tech: ['notifications/claude/channel'] },
+        'f-codex': { summary: 'Step 6B: a detached peer queues the same event into the subscribed Codex task.', responsibilities: ['Target the exact remote-controlled task', 'Wake an idle task or wait for the turn boundary'], tech: ['codex queue'] },
+        'f-hook': { summary: 'Step 6C: a standing-watch match asks agent-box to create a fresh ephemeral worker.', responsibilities: ['Respect the shared session admission cap', 'Return EX_TEMPFAIL when the batch must be retried', 'Seed the new session with a narrow event claim'], tech: ['spawn command', 'EX_TEMPFAIL'] }
+      };
+
+      const sourceLinks = {
+        agentbox: ['agent-box repository', 'https://github.com/defangdevs/agent-box'],
+        channels: ['local-channels repository', 'https://github.com/defangdevs/local-channels'],
+        receiver: ['local-webhook implementation', 'https://github.com/defangdevs/local-channels/tree/main/local-webhook']
+      };
+
+      const svg = document.querySelector('#diagram');
+      const viewport = document.querySelector('#viewport');
+      const inspector = document.querySelector('#inspector');
+      let currentView = 'context';
+      let harness = 'all';
+      let selected = null;
+      let showSecurity = false;
+      let scale = 1;
+      let tx = 0;
+      let ty = 0;
+      let pointer = null;
+
+      const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+      function center(node) { return { x: node.x + node.w / 2, y: node.y + node.h / 2 }; }
+      function edgePoint(a, b) {
+        const ca = center(a), cb = center(b), dx = cb.x - ca.x, dy = cb.y - ca.y;
+        const t = Math.min(Math.abs((a.w / 2) / (dx || .001)), Math.abs((a.h / 2) / (dy || .001)));
+        return { x: ca.x + dx * t, y: ca.y + dy * t };
+      }
+
+      function render() {
+        const view = views[currentView];
+        document.querySelector('#view-title').textContent = view.title;
+        document.querySelector('#view-meta').textContent = view.meta;
+        svg.setAttribute('viewBox', `0 0 ${view.size[0]} ${view.size[1]}`);
+
+        const visible = view.nodes.filter(n => harness === 'all' || !n.harness || n.harness === harness);
+        const ids = new Set(visible.map(n => n.id));
+        const boundaries = showSecurity ? view.boundaries : view.boundaries.slice(0, 1);
+        const related = new Set();
+        if (selected) {
+          view.rels.forEach(r => {
+            if (r.from === selected || r.to === selected) { related.add(r.from); related.add(r.to); }
+          });
+          related.add(selected);
+        }
+
+        let html = boundaries.map(b => `<g><rect class="boundary" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="18"/><text class="boundary-label" x="${b.x + 18}" y="${b.y + 25}">${esc(b.label)}</text></g>`).join('');
+        html += view.rels.filter(r => ids.has(r.from) && ids.has(r.to)).map(r => {
+          const a = view.nodes.find(n => n.id === r.from), b = view.nodes.find(n => n.id === r.to);
+          const p1 = edgePoint(a, b), p2 = edgePoint(b, a);
+          const mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2;
+          const active = selected && (r.from === selected || r.to === selected);
+          const dim = selected && !active;
+          const curve = Math.abs(p2.x - p1.x) < 80 ? `M${p1.x},${p1.y} C${p1.x + 70},${p1.y} ${p2.x + 70},${p2.y} ${p2.x},${p2.y}` : `M${p1.x},${p1.y} C${mx},${p1.y} ${mx},${p2.y} ${p2.x},${p2.y}`;
+          return `<g class="${dim ? 'dimmed' : ''}"><path class="relationship ${r.async ? 'async' : ''} ${active ? 'highlight' : ''}" d="${curve}"/><text class="rel-label" x="${mx}" y="${my - 7}" text-anchor="middle">${esc(r.label)}</text></g>`;
+        }).join('');
+        html += visible.map(nodeMarkup).join('');
+        viewport.innerHTML = html;
+        viewport.setAttribute('transform', `translate(${tx} ${ty}) scale(${scale})`);
+        viewport.querySelectorAll('.node').forEach(el => {
+          el.addEventListener('click', event => { event.stopPropagation(); selectNode(el.dataset.id); });
+          el.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectNode(el.dataset.id); } });
+        });
+      }
+
+      function nodeMarkup(n) {
+        const dim = selected && !isRelated(n.id);
+        const chips = n.tech.slice(0, 2).map((t, i) => {
+          const x = n.x + 16 + i * 94;
+          const width = Math.min(88, 18 + t.length * 6.1);
+          return `<rect class="node-chip" x="${x}" y="${n.y + n.h - 27}" width="${width}" height="17" rx="4"/><text class="node-chip-text" x="${x + 7}" y="${n.y + n.h - 15}">${esc(t)}</text>`;
+        }).join('');
+        return `<g class="node ${esc(n.kind)} ${selected === n.id ? 'selected' : ''} ${dim ? 'dimmed' : ''}" data-id="${esc(n.id)}" tabindex="0" role="button" aria-label="Inspect ${esc(n.title)}"><rect class="node-body" x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="12"/><text class="node-type" x="${n.x + 16}" y="${n.y + 21}">${esc(n.type)}</text><text class="node-title" x="${n.x + 16}" y="${n.y + 47}">${esc(n.title)}</text>${n.desc.map((line, i) => `<text class="node-desc" x="${n.x + 16}" y="${n.y + 66 + i * 15}">${esc(line)}</text>`).join('')}${chips}</g>`;
+      }
+
+      function isRelated(id) {
+        if (!selected) return true;
+        return id === selected || views[currentView].rels.some(r => (r.from === selected && r.to === id) || (r.to === selected && r.from === id));
+      }
+
+      function selectNode(id) {
+        selected = selected === id ? null : id;
+        const node = views[currentView].nodes.find(n => n.id === selected);
+        if (!node) { resetDetails(); render(); return; }
+        const detail = details[node.id] || { summary: node.desc.join(' '), responsibilities: [], tech: node.tech };
+        document.querySelector('#detail-type').textContent = node.type;
+        document.querySelector('#detail-title').textContent = node.title;
+        document.querySelector('#detail-summary').textContent = detail.summary;
+        const relationships = views[currentView].rels.filter(r => r.from === node.id || r.to === node.id).map(r => {
+          const outgoing = r.from === node.id;
+          const peer = views[currentView].nodes.find(n => n.id === (outgoing ? r.to : r.from));
+          return `<li><strong>${outgoing ? 'To' : 'From'} ${esc(peer.title)}:</strong> ${esc(r.label)}</li>`;
+        }).join('');
+        const source = sourceLinks[node.id];
+        document.querySelector('#detail-body').innerHTML = `
+          <section class="detail-section"><h3>Responsibilities</h3><ul class="detail-list">${detail.responsibilities.map(x => `<li>${esc(x)}</li>`).join('')}</ul></section>
+          <section class="detail-section"><h3>Relationships</h3><ul class="detail-list">${relationships || '<li>No visible relationships in this filtered view.</li>'}</ul></section>
+          <section class="detail-section"><h3>Technology</h3><div class="tech-row">${detail.tech.map(x => `<span class="tech">${esc(x)}</span>`).join('')}</div></section>
+          ${source ? `<section class="detail-section"><h3>Source</h3><p><a class="source-link" href="${source[1]}" target="_blank" rel="noreferrer">${esc(source[0])} \u2197</a></p></section>` : ''}`;
+        inspector.classList.add('open');
+        render();
+      }
+
+      function resetDetails() {
+        document.querySelector('#detail-type').textContent = 'Architecture map';
+        document.querySelector('#detail-title').textContent = 'Select a system';
+        document.querySelector('#detail-summary').textContent = 'Choose any element to isolate its relationships and see why it exists.';
+        document.querySelector('#detail-body').innerHTML = '<section class="detail-section"><h3>Reading the map</h3><p>Use the three C4 views on the left. Filter by harness, expose trust boundaries, or follow the numbered webhook path end to end.</p></section><section class="detail-section"><h3>Core rule</h3><p>A Linux user is the trust boundary. A session is a unit of concurrent work and deliberately is not an isolation boundary.</p></section>';
+      }
+
+      function fit() {
+        scale = 1; tx = 0; ty = 0;
+        viewport.setAttribute('transform', 'translate(0 0) scale(1)');
+        updateZoom();
+      }
+
+      function updateZoom() { document.querySelector('#zoom-readout').textContent = `${Math.round(scale * 100)}%`; }
+
+      document.querySelectorAll('.nav-button').forEach(button => button.addEventListener('click', () => {
+        currentView = button.dataset.view;
+        selected = null;
+        document.querySelectorAll('.nav-button').forEach(b => b.classList.toggle('active', b === button));
+        resetDetails(); fit(); render();
+      }));
+
+      document.querySelectorAll('[data-harness]').forEach(button => button.addEventListener('click', () => {
+        harness = button.dataset.harness;
+        selected = null;
+        document.querySelectorAll('[data-harness]').forEach(b => b.classList.toggle('active', b === button));
+        resetDetails(); render();
+      }));
+
+      document.querySelector('#security-filter').addEventListener('click', event => {
+        showSecurity = !showSecurity;
+        event.currentTarget.classList.toggle('active', showSecurity);
+        render();
+      });
+      document.querySelector('#fit').addEventListener('click', fit);
+      document.querySelector('#toggle-inspector').addEventListener('click', () => inspector.classList.toggle('open'));
+      svg.addEventListener('click', () => { selected = null; resetDetails(); render(); });
+      svg.addEventListener('wheel', event => {
+        event.preventDefault();
+        const direction = event.deltaY < 0 ? 1.1 : .9;
+        scale = Math.min(2.1, Math.max(.55, scale * direction));
+        viewport.setAttribute('transform', `translate(${tx} ${ty}) scale(${scale})`);
+        updateZoom();
+      }, { passive: false });
+      svg.addEventListener('pointerdown', event => {
+        if (event.target.closest('.node')) return;
+        pointer = { id: event.pointerId, x: event.clientX, y: event.clientY, tx, ty };
+        svg.setPointerCapture(event.pointerId);
+        svg.classList.add('dragging');
+      });
+      svg.addEventListener('pointermove', event => {
+        if (!pointer || pointer.id !== event.pointerId) return;
+        const rect = svg.getBoundingClientRect();
+        const vb = svg.viewBox.baseVal;
+        tx = pointer.tx + (event.clientX - pointer.x) * vb.width / rect.width;
+        ty = pointer.ty + (event.clientY - pointer.y) * vb.height / rect.height;
+        viewport.setAttribute('transform', `translate(${tx} ${ty}) scale(${scale})`);
+      });
+      svg.addEventListener('pointerup', () => { pointer = null; svg.classList.remove('dragging'); });
+      svg.addEventListener('pointercancel', () => { pointer = null; svg.classList.remove('dragging'); });
+
+      render();
+    })();
+  </script>
+</body>
+</html>
