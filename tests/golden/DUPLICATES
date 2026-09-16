@@ -29,6 +29,7 @@ web/payloads/agent-box-supervisor/bin/agent-box-supervisor -> vm/payloads/agent-
 web/payloads/agent-box-upload/bin/agent-box-upload -> vm/payloads/agent-box-upload/bin/agent-box-upload
 web/payloads/unit-script-agent-box-defang-cli-start/bin/agent-box-defang-cli-start -> vm/payloads/unit-script-agent-box-defang-cli-start/bin/agent-box-defang-cli-start
 web/units/agent-box-defang-cli.service -> vm/units/agent-box-defang-cli.service
+web/units/agent-box-harness-upgrade@robot.service -> web/units/agent-box-harness-upgrade@agent.service
 web/units/agent-box-nixpkgs-cache.service -> vm/units/agent-box-nixpkgs-cache.service
 web/units/agent-box-nixpkgs-cache.timer -> vm/units/agent-box-nixpkgs-cache.timer
 web/units/agent-box-webhook@robot.service -> web/units/agent-box-webhook@agent.service
