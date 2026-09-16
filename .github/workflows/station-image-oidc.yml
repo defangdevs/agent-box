@@ -1,0 +1,54 @@
+name: Authorize Station image publishing
+
+on:
+  push:
+    branches:
+      - refactor/azure-images-to-station
+    paths:
+      - .github/workflows/station-image-oidc.yml
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    environment: defang-agent-box
+    steps:
+      - name: Azure login with the existing Agent Box trust
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Trust Station's production environment
+        env:
+          CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          set -euo pipefail
+          identity_id=$(az identity list \
+            --resource-group "$RG" \
+            --query "[?clientId=='$CLIENT_ID'].id | [0]" \
+            --output tsv)
+          if [ -z "$identity_id" ]; then
+            echo "::error::No user-assigned identity in $RG has client id $CLIENT_ID"
+            exit 1
+          fi
+
+          az rest \
+            --method put \
+            --url "https://management.azure.com${identity_id}/federatedIdentityCredentials/station-defang-production?api-version=2023-01-31" \
+            --body '{
+              "properties": {
+                "audiences": ["api://AzureADTokenExchange"],
+                "issuer": "https://token.actions.githubusercontent.com",
+                "subject": "repo:DefangLabs/station:environment:defang-production"
+              }
+            }' \
+            --only-show-errors \
+            --output none
+
+          echo "Station OIDC subject authorized on $identity_id"
