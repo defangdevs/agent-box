@@ -6572,7 +6572,7 @@ _hc_main "$@"
               {path:"deployment_status.state", "in":["error","failure"]},
               {path:"state", "in":["error","failure"]},
               {path:"action", "in":["closed","assigned","review_requested"]},
-              {all: [{path:"action", "in":["submitted"]},
+              {all: [{path:"action", "in":["submitted","dismissed"]},
                      {path:"review.state", "in":["approved","changes_requested","commented","dismissed"]}]},
               {all: [{path:"action", "in":["created"]},
                      {path:"comment.html_url", contains:["http"]}]}
@@ -6595,9 +6595,18 @@ _hc_main "$@"
     # are holding. That is #417's collision reached from the other side.
     #
     # So whatever policy is asked for, an event a watch could spawn on stays
-    # claimed and is delivered. That is `actionable` plus the one verb it leaves
-    # out: an object OPENING is spawn-worthy for a watch and asks nothing of a
-    # session that already owns it.
+    # claimed and is delivered. That is `actionable` plus the two verbs it
+    # leaves out, each because a watch spawns on it where a session that already
+    # owns the object needs no prompting:
+    #
+    #   opened/reopened   spawn-worthy for a watch; you opened it yourself.
+    #   an EDITED comment the governed watchPolicy spawns on `created` OR
+    #                     `edited` with a mention (see agent-box.nix.in), and
+    #                     `actionable` deliberately keeps only `created` — so
+    #                     without this clause an edited @mention on your own PR
+    #                     would be unclaimed and start a sibling. That is the
+    #                     exact shape of the #417 collision, and a scope-only
+    #                     claim used to cover it.
     #
     # Deliberately NOT default_subagent_when(): that one narrows its assignment,
     # mention and review clauses to LOCAL_WEBHOOK_SELF, and on a box whose login
@@ -6607,7 +6616,9 @@ _hc_main "$@"
     # under, so it is written sender-agnostically.
     watch_spawn_floor() {
       "$JQ" -nc --argjson a "$(events_predicate actionable)" \
-        '{any: ($a.any + [{path:"action", "in":["opened","reopened"]}])}'
+        '{any: ($a.any + [{path:"action", "in":["opened","reopened"]},
+                          {all: [{path:"action", "in":["edited"]},
+                                 {path:"comment.html_url", contains:["http"]}]}])}'
     }
 
     # The repository DEFAULT branch is not a claimable object (issue #706).
@@ -6847,6 +6858,12 @@ _hc_main "$@"
           # instead of refused alongside it) and the note (which carries the
           # merge boundary to a session that has forgotten how it subscribed).
           events_policy=""; have_events=0; all_events=0
+          # Set by every path below that appends an --include of its own. A
+          # generated include is a rule like any other, and webhook.py prefers
+          # `include` over `when` — so appending the subagent default --when on
+          # top of one produced a watch whose printed policy ("defaulting to the
+          # box's own GitHub triage rules") was silently dead.
+          emitted_include=0
           user_include=""; user_include_flag=""
           note=""; have_note=0
           # Filter --claim out of the argument list as we scan it: webhook.py has
@@ -6928,7 +6945,13 @@ _hc_main "$@"
             set -- "$@" "$a"
           done
           if [ -n "$want" ]; then
-            echo "agent-box-webhook: --$want needs a value" >&2
+            # `uinclude` is this script's internal name for the captured
+            # --include/--when slot; the caller typed one of those and must be
+            # told about the flag that exists.
+            case "$want" in
+              (uinclude) echo "agent-box-webhook: $user_include_flag needs a value" >&2 ;;
+              (*)        echo "agent-box-webhook: --$want needs a value" >&2 ;;
+            esac
             exit 2
           fi
           if [ "$have_profile" = 1 ]; then
@@ -6995,8 +7018,15 @@ _hc_main "$@"
             # then delivers silence forever. webhook.py validates predicates
             # too; this is about never handing it an empty one in the first
             # place.
-            if ! printf '%s' "$user_include" | "$JQ" -e . >/dev/null 2>&1; then
-              echo "agent-box-webhook: $user_include_flag is not valid JSON" >&2
+            # `type == "object"` and not a bare parse check: `null` and `false`
+            # parse fine and are not predicates, and webhook.py's own way to
+            # clear one is `{}` — which IS an object, so it still passes here
+            # and reaches webhook.py to mean what it means there.
+            if ! printf '%s' "$user_include" \
+                 | "$JQ" -e 'type == "object"' >/dev/null 2>&1; then
+              echo "agent-box-webhook: $user_include_flag needs a JSON predicate" \
+                   "object ({\"any\": [...]} / {\"all\": [...]} over" \
+                   "{\"path\": ..., \"in\": [...]} leaves)" >&2
               exit 2
             fi
             event_pred="$user_include"
@@ -7040,22 +7070,32 @@ _hc_main "$@"
               # Composed into a variable first: a command substitution inside
               # `set -- "$@" ...` hides its own exit status, so a jq that failed
               # would append an empty argument rather than stop.
+              # The clause lists are flattened and de-duplicated rather than
+              # nested: `--events actionable` is the recommended policy and the
+              # floor is a strict superset of it, so a plain {any:[$e,$f]} would
+              # store all nine clauses twice in a rule that `ls` prints and a
+              # person reads. Order is preserved (no `unique`, which sorts) so
+              # the policy's own clauses still come first.
               composed="$("$JQ" -nc \
                 --argjson c "$claim_any" --argjson e "$event_pred" \
                 --argjson f "$(watch_spawn_floor)" \
-                '{all: [$c, {any: [$e, $f]}]}')" || exit 2
+                '($e | if has("any") then .any else [.] end) + $f.any
+                 | reduce .[] as $x ([]; if index([$x]) then . else . + [$x] end)
+                 | {all: [$c, {any: .}]}')" || exit 2
               if [ -z "$composed" ]; then
                 echo "agent-box-webhook: could not combine the claim with the" \
                      "delivery policy; refusing to subscribe to an empty filter" >&2
                 exit 2
               fi
               set -- "$@" --include "$composed"
+              emitted_include=1
             elif [ "$all_events" = 1 ] || [ "$deliver_to" != session ]; then
               # --all-events is the explicit opt-in to what a scope-only claim
               # used to mean. A standing watch keeps it without asking: its own
               # --when is already its entire spawn policy, and a claim there is
               # extra scoping on top rather than a delivery filter.
               set -- "$@" --include "$claim_any"
+              emitted_include=1
             else
               echo "agent-box-webhook: --claim says WHICH object is yours, not" \
                    "WHICH of its events you need, and a scope-only claim" \
@@ -7079,6 +7119,7 @@ _hc_main "$@"
             # (A caller's own --include needs no rewriting here and is re-emitted
             # under its own spelling below.)
             set -- "$@" --include "$event_pred"
+            emitted_include=1
           elif [ "$all_events" = 1 ]; then
             echo "agent-box-webhook: --all-events only means something next to" \
                  "--claim, where it opts back in to the whole lifecycle of the" \
@@ -7114,7 +7155,8 @@ _hc_main "$@"
             set -- "$@" "$user_include_flag" "$user_include"
           fi
           if [ "$deliver_to" = subagent ] && [ "$have_when" = 0 ] && [ "$have_drop" = 0 ] \
-             && [ "$have_include" = 0 ] && [ "$have_exclude" = 0 ]; then
+             && [ "$have_include" = 0 ] && [ "$have_exclude" = 0 ] \
+             && [ "$emitted_include" = 0 ]; then
             # A bare "owner/repo" (no "source:" prefix at all) is the github
             # shorthand; anything with its OWN "source:" prefix — including a
             # non-github one whose key happens to contain a "/", e.g.

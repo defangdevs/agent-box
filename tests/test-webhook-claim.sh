@@ -537,6 +537,73 @@ else
   ok "a sha claim gets no merge-boundary sentence"
 fi
 
+# --- what the review pass on the #706 PR caught -------------------------
+# The floor must be at least as wide as the watch policy it stands under,
+# and the governed one (services.agent-box.webhook.watchPolicy, mirrored in
+# default_subagent_when) spawns on `created` OR `edited` with a mention. The
+# `actionable` policy deliberately keeps only `created`, so without an
+# edited-comment clause in the FLOOR an edited @mention on your own PR is
+# unclaimed and starts a sibling — and a scope-only claim used to cover it.
+if include_of defangdevs/agent-box --claim 42 --events actionable \
+   | jq -e '[.all[1].any[] | select(.all) | select([.all[].in[]?] | index("edited"))] | length > 0' \
+   >/dev/null 2>&1
+then ok "the floor covers an EDITED comment, as the watch policy does"
+else no "the floor covers an EDITED comment, as the watch policy does" \
+        "$(include_of defangdevs/agent-box --claim 42 --events actionable)"; fi
+
+# A review DISMISSAL arrives as action "dismissed", not "submitted", so
+# pinning review.state under a submitted-only clause made that value dead.
+if include_of defangdevs/agent-box --claim 42 --events actionable \
+   | jq -e '[.all[1].any[] | select(.all) | .all[] | select(.path=="action") | .in[]] | index("dismissed")' \
+   >/dev/null 2>&1
+then ok "a review dismissal is reachable, not pinned under submitted only"
+else no "a review dismissal is reachable, not pinned under submitted only"; fi
+
+# The floor is a strict superset of `actionable`, so ORing them stored the
+# whole nine-clause list twice in a rule `ls` prints and a person reads.
+dup=$(include_of defangdevs/agent-box --claim 42 --events actionable \
+      | jq '[.all[1].any[]] as $c | ($c | length) - ($c | unique | length)')
+[ "$dup" = 0 ] && ok "the policy and the floor are de-duplicated" \
+  || no "the policy and the floor are de-duplicated" "$dup duplicate clause(s)"
+
+# A watch whose include THIS script generated must not also get the default
+# --when appended: webhook.py prefers include and discards when, so the
+# warning described a policy that was not in force.
+out=$(run defangdevs/agent-box --deliver-to subagent --events actionable)
+if printf '%s\n' "$out" | grep -qx -- '--when'; then
+  no "a generated include suppresses the subagent default --when" "argv: $out"
+else
+  ok "a generated include suppresses the subagent default --when"
+fi
+if grep -q "no --when/--drop given" "$work/err"; then
+  no "...and gets no false 'no --when/--drop given' warning" "$(cat "$work/err")"
+else
+  ok "...and gets no false 'no --when/--drop given' warning"
+fi
+
+# The internal name for the captured --include/--when slot must not leak
+# into a message: the caller typed a flag that exists and needs to see it.
+run defangdevs/agent-box --claim 42 --include >/dev/null
+if grep -q -- "--uinclude" "$work/err"; then
+  no "a valueless --include names the flag the caller typed" "$(cat "$work/err")"
+else
+  grep -q -- "--include needs a value" "$work/err" \
+    && ok "a valueless --include names the flag the caller typed" \
+    || no "a valueless --include names the flag the caller typed" \
+          "$(cat "$work/err")"
+fi
+
+# `null` and `false` parse as JSON and are not predicates; `{}` is
+# webhook.py's own way to clear one and must still get through.
+run defangdevs/agent-box --claim 42 --include null >/dev/null
+[ $? -ne 0 ] && grep -q "JSON predicate" "$work/err" \
+  && ok "--include null is refused as a non-predicate, not as a parse error" \
+  || no "--include null is refused as a non-predicate" "$(cat "$work/err")"
+run defangdevs/agent-box --include '{}' >/dev/null
+[ $? -eq 0 ] && ok "--include {} still reaches webhook.py to mean 'clear'" \
+  || no "--include {} still reaches webhook.py to mean 'clear'" \
+        "$(cat "$work/err")"
+
 # --- the matcher's half of the promise ----------------------------------
 #
 # Shape is what the wrapper wrote; what an agent RECEIVES is the pinned
@@ -586,6 +653,12 @@ wanted = [
      'pull_request': {'number': 42}},
     {'action': 'created', 'issue': {'number': 42},
      'comment': {'html_url': 'https://github.com/o/r/pull/42#issuecomment-1'}},
+    # The governed watch spawns on an EDITED comment carrying a mention, so
+    # the floor has to claim one too or the watch starts a sibling on a PR
+    # this session is holding.
+    {'action': 'edited', 'issue': {'number': 42},
+     'comment': {'body': 'ping @defangdevs',
+                 'html_url': 'https://github.com/o/r/pull/42#issuecomment-1'}},
 ]
 for p in wanted:
     assert m.match_predicate(policy, p), p
