@@ -7562,7 +7562,8 @@ _hc_main "$@"
         -f 'config[url]=$url/$src' -f 'config[secret]=$secret' \\
         -f 'config[content_type]=json' \\
         -f 'events[]=push' -f 'events[]=pull_request' \\
-        -f 'events[]=pull_request_review' -f 'events[]=issue_comment' \\
+        -f 'events[]=pull_request_review' \\
+        -f 'events[]=pull_request_review_comment' -f 'events[]=issue_comment' \\
         -f 'events[]=workflow_run' -f 'events[]=check_run'
     EOF
         fi

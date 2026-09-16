@@ -299,6 +299,7 @@
         " agent-box-webhook setup"
     )
     assert "https://box.test/agent/webhook/github" in setup, setup
+    assert "events[]=pull_request_review_comment" in setup, setup
     machine.succeed(
         "stat -c '%U %a' /home/agent/.local/state/local-webhook/github.secret"
         " | grep -x 'agent 600'"
