@@ -310,9 +310,21 @@ APT="apt-get -o DPkg::Lock::Timeout=600 -qq"
 # of that bug; whatever module-side fix #435 lands can drop these two lines.
 # Non-fatal: a box without compressed swap is degraded, not broken - earlyoom
 # still runs - and a kernel with no matching package must not fail the deploy.
-$APT update || true
-$APT install -y "linux-modules-extra-$(uname -r)" || \
-  echo "WARNING: linux-modules-extra unavailable; zram will be missing (issue #435)"
+#
+# Guarded the same way the nix install below is: an agent-box image built by
+# .github/workflows/azure-image.yml already installs this package for this
+# exact kernel (deploy/azure/bake-image.sh), since the image is a generalized
+# snapshot of a VM that ran the same uname -r this script sees. Checking the
+# module itself (rather than dpkg's database) is what the image actually
+# provides; apt update is a network round trip this box does not owe on every
+# boot when the answer is already yes (issue #697).
+if modinfo zram >/dev/null 2>&1; then
+  echo "zram module already present (image-provided); skipping apt"
+else
+  $APT update || true
+  $APT install -y "linux-modules-extra-$(uname -r)" || \
+    echo "WARNING: linux-modules-extra unavailable; zram will be missing (issue #435)"
+fi
 
 # Swap. There is no closure build on this path, but substituting the profile
 # peaks high enough to be worth carrying, and the agent's own work leans on it.
