@@ -36,6 +36,13 @@ user choose Claude Code or Codex.
   unless the deployment opts in with `osUpdates.automaticReboot`. See
   "Base-OS patching" in `deploy/aws/README.md` for the whole policy — it is the
   renderer's, so both clouds get the same one.
+- `imageId` can select an immutable image version produced by a trusted
+  consumer-owned image pipeline. Set `imageIncludesRuntime=true` only when
+  that exact image installs the agent-box runtime profile at
+  `/nix/var/nix/profiles/agent-box`: first boot then verifies the profile and
+  goes directly to configuration instead of resolving it again. Agent Box
+  deliberately does not publish provider- or region-specific images; the
+  consumer that chooses the cloud, region and storage spend owns that policy.
 - **Basic-auth-to-cookie web auth**, identical to the AWS path. The terminal
   lives at `/<userName>/` (default `/workspace/`); Caddy prompts for the
   `userName` and the `webPassword`, sets an
