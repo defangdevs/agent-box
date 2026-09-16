@@ -370,7 +370,7 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/></svg>
         </button>
       </div>
-      <svg id="diagram" role="img" aria-labelledby="svg-title svg-desc" viewBox="0 0 1100 700">
+      <svg id="diagram" role="group" aria-labelledby="svg-title svg-desc" viewBox="0 0 1100 700">
         <title id="svg-title">agent-box and local-channels architecture</title>
         <desc id="svg-desc">An interactive diagram. Select a node to inspect its responsibilities and relationships.</desc>
         <defs>
@@ -601,7 +601,12 @@
         document.querySelector('#detail-type').textContent = node.type;
         document.querySelector('#detail-title').textContent = node.title;
         document.querySelector('#detail-summary').textContent = detail.summary;
-        const relationships = views[currentView].rels.filter(r => r.from === node.id || r.to === node.id).map(r => {
+        const visibleIds = new Set(views[currentView].nodes
+          .filter(n => harness === 'all' || !n.harness || n.harness === harness)
+          .map(n => n.id));
+        const relationships = views[currentView].rels.filter(r =>
+          visibleIds.has(r.from) && visibleIds.has(r.to) && (r.from === node.id || r.to === node.id)
+        ).map(r => {
           const outgoing = r.from === node.id;
           const peer = views[currentView].nodes.find(n => n.id === (outgoing ? r.to : r.from));
           return `<li><strong>${outgoing ? 'To' : 'From'} ${esc(peer.title)}:</strong> ${esc(r.label)}</li>`;
@@ -660,26 +665,35 @@
       document.querySelector('#zoom-out').addEventListener('click', () => zoomBy(.82));
       document.querySelector('#zoom-in').addEventListener('click', () => zoomBy(1.22));
       document.querySelector('#toggle-inspector').addEventListener('click', () => inspector.classList.toggle('open'));
-      svg.addEventListener('click', () => { selected = null; resetDetails(); render(); });
+      let suppressClick = false;
+      svg.addEventListener('click', () => {
+        if (suppressClick) { suppressClick = false; return; }
+        selected = null; resetDetails(); render();
+      });
       svg.addEventListener('wheel', event => {
         event.preventDefault();
         zoomBy(event.deltaY < 0 ? 1.1 : .9);
       }, { passive: false });
       svg.addEventListener('pointerdown', event => {
         if (event.target.closest('.node')) return;
-        pointer = { id: event.pointerId, x: event.clientX, y: event.clientY, tx, ty };
+        suppressClick = false;
+        pointer = { id: event.pointerId, x: event.clientX, y: event.clientY, tx, ty, moved: false };
         svg.setPointerCapture(event.pointerId);
         svg.classList.add('dragging');
       });
       svg.addEventListener('pointermove', event => {
         if (!pointer || pointer.id !== event.pointerId) return;
+        if (Math.abs(event.clientX - pointer.x) > 3 || Math.abs(event.clientY - pointer.y) > 3) pointer.moved = true;
         const rect = svg.getBoundingClientRect();
         const vb = svg.viewBox.baseVal;
         tx = pointer.tx + (event.clientX - pointer.x) * vb.width / rect.width;
         ty = pointer.ty + (event.clientY - pointer.y) * vb.height / rect.height;
         viewport.setAttribute('transform', `translate(${tx} ${ty}) scale(${scale})`);
       });
-      svg.addEventListener('pointerup', () => { pointer = null; svg.classList.remove('dragging'); });
+      svg.addEventListener('pointerup', () => {
+        if (pointer && pointer.moved) suppressClick = true;
+        pointer = null; svg.classList.remove('dragging');
+      });
       svg.addEventListener('pointercancel', () => { pointer = null; svg.classList.remove('dragging'); });
 
       render();
