@@ -15191,18 +15191,29 @@ in
     # 'agent': Unknown group") and /run has no second chance - see the
     # shared unit for the whole reason.
   }) (lib.mkIf cfg.selfUpdate.enable {
-    # Agent-triggerable box update. The agents' only power here is the
-    # allowlisted `sudo systemctl start agent-box-update.service` (see
-    # updateStartCmd) — a trigger with no arguments, so everything below
-    # (source repo, pin file, rebuild) is fixed at build time and immutable
-    # in the store. Verifying releases against an offline signing key is
-    # tracked upstream (defangdevs/agent-box issue 46); until then this
-    # trusts the pinned repo as GitHub serves it.
     # The shared unit file (shipped in agentBoxUnitsPackage above) names a
-    # bare program, exactly as agent-box@ does; this drop-in resolves it to
-    # the generated wrapper's store path. Nothing WANTS this unit - it is
-    # started by name, per user, by the update service.
-    systemd.services."agent-box-harness-upgrade@" = {
+    # bare program, exactly as agent-box@ does; this per-instance drop-in
+    # resolves it to the generated wrapper's store path. Nothing WANTS these
+    # units - each is started by name, per user, by the update service.
+    #
+    # Per-INSTANCE ("agent-box-harness-upgrade@${name}"), not a single
+    # template-level "agent-box-harness-upgrade@" drop-in, for the same
+    # reason agent-box@ is (see that comment above, and PR #295): a
+    # template-level drop-in was confirmed to silently never merge into an
+    # INSTANTIATED unit's config on a real boot, even right after a
+    # daemon-reload. That matters here specifically for restartIfChanged/
+    # stopIfChanged below - both are switch-to-configuration's own read of
+    # this unit's properties, not something a fresh `systemctl start` merges
+    # at run time, so a template-level drop-in would leave switch-to-
+    # configuration reading the DEFAULT (true) for every real instance and
+    # never actually fix #707. A separate mkIf list element (rather than a
+    # second `systemd.services...` key sharing this one's attrset) because
+    # this assignment is a computed `lib.mapAttrs'` value, not a `{ ... }`
+    # literal, and Nix only merges two definitions of the same dotted path
+    # within one set when both sides are literal attrsets.
+    systemd.services = lib.mapAttrs' (name: _: lib.nameValuePair
+      "agent-box-harness-upgrade@${name}" {
+      overrideStrategy = "asDropin";
       # The VERB matters as much as the path: `agent-box-harness` with no
       # argument prints usage and exits 0, so a drop-in that resolved only
       # the program would give a unit that "succeeded" every time and moved
@@ -15225,8 +15236,15 @@ in
       # new unit file anyway.
       restartIfChanged = false;
       stopIfChanged = false;
-    };
-
+    }) cfg.users;
+  }) (lib.mkIf cfg.selfUpdate.enable {
+    # Agent-triggerable box update. The agents' only power here is the
+    # allowlisted `sudo systemctl start agent-box-update.service` (see
+    # updateStartCmd) — a trigger with no arguments, so everything below
+    # (source repo, pin file, rebuild) is fixed at build time and immutable
+    # in the store. Verifying releases against an offline signing key is
+    # tracked upstream (defangdevs/agent-box issue 46); until then this
+    # trusts the pinned repo as GitHub serves it.
     systemd.services.agent-box-update = {
       description = "Fast-forward agent-box to upstream HEAD and rebuild";
       # No wantedBy — on-demand only, via the agents' sudo rule (or root).
