@@ -3,6 +3,27 @@ set -e
 
 set -euo pipefail
 
+# $CURRENT_REV is baked into this unit's own Environment= at Nix build time
+# (cfg.selfUpdate.rev), and it is not the only thing that can go stale: a
+# `nixos-rebuild switch` that reaches its daemon-reload step before failing
+# on something unrelated (issue #719) reloads THAT candidate value into
+# systemd's live unit table even though the switch as a whole rolls back.
+# The failure path below restores files on disk — $PIN_FILE, the tree — but
+# has no way to un-reload a unit's own cached environment, so the next
+# trigger can start with a $CURRENT_REV that names the candidate rev instead
+# of the rev this box actually durably runs. $PIN_FILE is the ground truth
+# this script itself keeps in sync with what applied; read it fresh every
+# run rather than trusting whatever systemd handed this invocation, and feed
+# the same corrected value to agent-box-source, whose own "realign to the
+# running rev" logic (source-tree.sh) trusts $AGENT_BOX_SRC_REV exactly the
+# same way and would otherwise re-derive the same stale baseline.
+durable_rev="$CURRENT_REV"
+if [ -e "$PIN_FILE" ]; then
+  pin_rev="$(sed -n 's/.*rev[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$PIN_FILE" | head -n1)"
+  [ -n "$pin_rev" ] && durable_rev="$pin_rev"
+fi
+export AGENT_BOX_SRC_REV="$durable_rev"
+
 # Update by `git pull` (issue #242). The box holds the tree it is built
 # from — $AGENT_BOX_SRC_DIR, root-owned, maintained by agent-box-source —
 # and the host configuration imports the module OUT of that tree, so
@@ -13,7 +34,7 @@ set -euo pipefail
 # by git instead of asked of a server.
 target="$(agent-box-source pull)"
 update_module=1
-if [ "$target" = "$CURRENT_REV" ]; then
+if [ "$target" = "$durable_rev" ]; then
   update_module=0
 fi
 
@@ -48,7 +69,7 @@ if [ "$update_module" = 1 ]; then
   module="$AGENT_BOX_SRC_DIR/modules/agent-box.nix"
   if [ ! -e "$module" ]; then
     echo "the source tree at $AGENT_BOX_SRC_DIR has no modules/agent-box.nix — refusing to rebuild from it" >&2
-    agent-box-source reset "$CURRENT_REV" || true
+    agent-box-source reset "$durable_rev" || true
     exit 1
   fi
   sha="sha256-$(openssl dgst -sha256 -binary "$module" | base64)"
@@ -108,8 +129,8 @@ else
     # the tree names the rev the box runs, so a tree left ahead of a failed
     # rebuild is a wrong answer somebody will read. The next pull realigns it.
     tree_state="rolled back"
-    agent-box-source reset "$CURRENT_REV" \
-      || tree_state="NOT rolled back, it still reads past $CURRENT_REV"
+    agent-box-source reset "$durable_rev" \
+      || tree_state="NOT rolled back, it still reads past $durable_rev"
     if [ -e "$PIN_FILE.prev" ]; then
       mv "$PIN_FILE.prev" "$PIN_FILE"
     else
