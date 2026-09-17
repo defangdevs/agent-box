@@ -94,9 +94,9 @@ usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
                                          [--deliver-to session|subagent]
                                          [--renew-on-event] [--ignore-sender LOGIN]...
                                          [--when JSON] [--drop JSON]
-                                         [--claim SPEC]... [--profile NAME]
+                                         [--claim SPEC]... [--profile NAME] [--name NAME]
                                          [--events POLICY | --all-events]
-       agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent]
+       agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent] [--name NAME]
        agent-box-webhook ls
        agent-box-webhook status
        agent-box-webhook backfill [OWNER/REPO]... [--dry-run] [--hours N]
@@ -238,6 +238,14 @@ array, and the payload language indexes lists by number only. If your repo's
 CI reports through commit statuses, you stay exposed on that one shape —
 unless you claim the COMMIT, which every one of the six carries as a
 scalar: --claim sha:<40 characters> reaches all of them.
+
+--name NAME gives a watch an independent identity on the same topic. Use
+separate names and non-overlapping --when rules for different event profiles.
+Re-subscribing updates only (topic, name); unsubscribe TOPIC --name NAME
+--deliver-to subagent removes only that watch. Without --name, both commands
+target only the unnamed watch. Names are 1-64 letters, digits, dots, _ or -.
+If several rules accept an event, the earliest-subscribed matching watch wins.
+Named watches are not rewritten by the topic-based declared watch policy.
 
 --profile NAME (subagent watches only) names the agent profile the sessions
 THIS watch spawns start on — a harness, a model, an effort level, an appended
@@ -907,6 +915,7 @@ case "$cmd" in
         fi
         case "$a" in
           --deliver-to) want=deliver-to ;;
+          --name) want=name ;;
           --deliver-to=*) deliver_to="${a#--deliver-to=}" ;;
           --drop|--drop=*) have_drop=1 ;;
           --exclude|--exclude=*) have_exclude=1 ;;

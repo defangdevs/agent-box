@@ -201,9 +201,25 @@ let
 
       Matching events spawn a FRESH `hook-*` session primed with the event text,
       and bursts coalesce into one. Watches are SHARED, never expire by default,
-      and `agent-box-webhook ls` lists them under `dispatch`. A watch tries not to
-      double up on work you own, and how well it manages depends on what you told
-      it. local-webhook >= 0.23.0 has no built-in policy left: a subagent watch
+      and `agent-box-webhook ls` lists them under `dispatch`.
+
+      Use `--name NAME` to give different event rules on the same topic their own
+      profiles. For example, subscribe an `issues` rule with `--profile triage` and
+      an independent `ci` rule with `--profile debugger`, each with its own
+      `--when` predicate. Names contain 1-64 letters, digits, dots, `_` or `-`.
+      Re-subscribing updates only that (topic, name) pair. To remove it, pass the
+      same `--name` to `unsubscribe --deliver-to subagent`; without a name, only
+      the unnamed watch is changed. The Automations panel can also add and edit
+      named rules, select their profiles, and delete each independently.
+
+      The earliest-subscribed matching watch wins an event. Make rules disjoint,
+      including any older wildcard or unnamed watch, or it can take the event
+      before a new named rule. Named watches keep their event rules across
+      receiver restarts: the topic-based declared watch policy governs only
+      unnamed watches. Profiles still fall back to the box default if unavailable.
+
+      A watch tries not to double up on work you own, and how well it manages
+      depends on what you told it. local-webhook >= 0.23.0 has no built-in policy left: a subagent watch
       MUST carry `--when`/`--drop` rules or it is refused outright, so
       `agent-box-webhook subscribe` fills in a default `--when` for a rule-less
       GitHub topic like the one-liner above - opened/reopened issues and PRs, an
@@ -1362,8 +1378,8 @@ let
 # module-generated-up-to-date check fails until it matches.
 {
   repo = "defangdevs/local-channels";
-  rev = "35acd82182405fdadc089cc32ac4b4f0be3f81a3";
-  sha256 = "sha256-2SsXigjRBkpIWDhLjD9ibMRLaOoilTz9kT5kz1o1jck=";
+  rev = "251a3fca3d41c319ddc1b5cca9c18a2d315f750c";
+  sha256 = "sha256-Di62HWb/9Ha5seDhO98ovwhTtiHXNwURTjJoqDxmJlE=";
 }
   ;
   localWebhookScript = builtins.fetchurl {
@@ -6117,9 +6133,9 @@ _hc_main "$@"
                                              [--deliver-to session|subagent]
                                              [--renew-on-event] [--ignore-sender LOGIN]...
                                              [--when JSON] [--drop JSON]
-                                             [--claim SPEC]... [--profile NAME]
+                                             [--claim SPEC]... [--profile NAME] [--name NAME]
                                              [--events POLICY | --all-events]
-           agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent]
+           agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent] [--name NAME]
            agent-box-webhook ls
            agent-box-webhook status
            agent-box-webhook backfill [OWNER/REPO]... [--dry-run] [--hours N]
@@ -6261,6 +6277,14 @@ _hc_main "$@"
     CI reports through commit statuses, you stay exposed on that one shape —
     unless you claim the COMMIT, which every one of the six carries as a
     scalar: --claim sha:<40 characters> reaches all of them.
+
+    --name NAME gives a watch an independent identity on the same topic. Use
+    separate names and non-overlapping --when rules for different event profiles.
+    Re-subscribing updates only (topic, name); unsubscribe TOPIC --name NAME
+    --deliver-to subagent removes only that watch. Without --name, both commands
+    target only the unnamed watch. Names are 1-64 letters, digits, dots, _ or -.
+    If several rules accept an event, the earliest-subscribed matching watch wins.
+    Named watches are not rewritten by the topic-based declared watch policy.
 
     --profile NAME (subagent watches only) names the agent profile the sessions
     THIS watch spawns start on — a harness, a model, an effort level, an appended
@@ -6930,6 +6954,7 @@ _hc_main "$@"
             fi
             case "$a" in
               --deliver-to) want=deliver-to ;;
+              --name) want=name ;;
               --deliver-to=*) deliver_to="''${a#--deliver-to=}" ;;
               --drop|--drop=*) have_drop=1 ;;
               --exclude|--exclude=*) have_exclude=1 ;;
@@ -9145,8 +9170,8 @@ elif { [ "''${1:-}" = "--preamble" ] || [ "''${1:-}" = "--resolved-profile" ]; }
      && [ -n "''${2:-}" ] && [ -n "''${LOCAL_WEBHOOK_STATE_DIR:-}" ]; then
   # Best effort, like every other read here: no file, bad JSON or no such topic
   # all mean "this watch names no profile", never a failed render.
-  watch_config=$("$JQ" -r --arg t "$2" \
-    '[(.topics // [])[] | select(type == "object" and (.topic // "") == $t)][0]
+  watch_config=$("$JQ" -r --arg t "$2" --arg n "''${4:-}" \
+    '[(.topics // [])[] | select(type == "object" and (.topic // "") == $t and (.name // "") == $n)][0]
      | (if type == "object" then (.spawnConfig // {}) else {} end) | tojson' \
     "$LOCAL_WEBHOOK_STATE_DIR/filter.dispatch.json" 2>/dev/null) || watch_config=""
 fi
@@ -9291,7 +9316,7 @@ root, running sessions keep the arguments they started with:"
 fallback."
 }
 
-# --resolved-profile TOPIC [NOTE]: print, as one JSON object, the profile a
+# --resolved-profile TOPIC [NOTE] [WATCH_NAME]: print, as one JSON object, the profile a
 # match on TOPIC would actually use right now — {"profile": NAME or null,
 # "missing": [NAME, ...]} — and spawn nothing. Same resolution as a real
 # spawn and as --preamble's prose (the precedence above already ran by the
@@ -9309,7 +9334,7 @@ if [ "''${1:-}" = "--resolved-profile" ]; then
   exit 0
 fi
 
-# --preamble TOPIC [NOTE]: print what a match on TOPIC would launch — the
+# --preamble TOPIC [NOTE] [WATCH_NAME]: print what a match on TOPIC would launch — the
 # launch command first, then the prompt — and spawn nothing. Everything a
 # delivery decides is left as a <placeholder>: the event key names the session
 # and the topic it owns, and the batch text is what arms the assignment
@@ -9727,7 +9752,9 @@ if [ -z "$POLICY" ] || [ ! -s "$FILE" ]; then
   echo "agent-box-webhook-policy: no policy or no dispatch file yet; nothing to govern" >&2
   exit 0
 fi
-# For every entry whose topic is declared: the declaration REPLACES the
+# Named watches have independent event rules; topic policy governs only the
+# legacy unnamed watch (issue #723).
+# For every unnamed entry whose topic is declared: the declaration REPLACES the
 # managed fields (the payload predicates, ignoreSenders, note) wholesale —
 # partial merges would let config and state drift apart. Runtime fields
 # (ttlHours, renewOnEvent, spawnConfig, timestamps) stay the entry's own.
@@ -9754,7 +9781,7 @@ if "$JQ" --slurpfile pol "$POLICY" '
       | .topics = [ (.topics // [])[]
           | (if type == "string" then {topic: .} else . end)
           | (if type == "object" then (.topic // "") else "" end) as $t
-          | if $t != "" and ($p | has($t)) then
+          | if $t != "" and (.name // "") == "" and ($p | has($t)) then
               $p[$t] as $r
               | del(.when, .drop, .include, .exclude, .ignoreSenders)
               | (if $r.when != null then .include = $r.when else . end)
@@ -9769,7 +9796,8 @@ if "$JQ" --slurpfile pol "$POLICY" '
     # worked (#170). Best-effort: this is a report, not the enforcement
     # itself, so a failure here must not undo it or fail the unit.
     "$JQ" -r --slurpfile pol "$POLICY" '
-          [ .topics[] | if type == "string" then . else (.topic // "") end ] as $subs
+          [ .topics[] | if type == "string" then .
+              elif (.name // "") == "" then (.topic // "") else empty end ] as $subs
           | [ ($pol[0] | keys[]) | select(. as $t | $subs | index($t)) ]
           | if length > 0 then "agent-box-webhook-policy: enforced declared rules on " + join(", ")
             else "agent-box-webhook-policy: no declared topic is subscribed; policy idle" end
@@ -14485,7 +14513,9 @@ in
         };
         description = ''
           Declarative policy for standing watches (#197), keyed by exact
-          topic. The module never creates a watch: sessions do that
+          topic, applied only to the unnamed watch. Named watches own their
+          independent rules and are left untouched (#723).
+          The module never creates a watch: sessions do that
           (`agent-box-webhook subscribe --deliver-to subagent`). What this
           option owns is the POLICY on such a watch — before each user's
           receiver daemon starts, the declared when/drop/ignoreSenders/note
@@ -17394,13 +17424,149 @@ def webhook_subscriptions(key):
     return data if isinstance(data, dict) else {}
 
 
-def webhook_unsubscribe(key, topic, dispatch):
+def webhook_unsubscribe(key, topic, dispatch, watch_name=""):
     """Drop one topic. True when the CLI reported success."""
-    args = ["unsubscribe", topic]
+    args = ["unsubscribe", topic, "--name", watch_name]
     if dispatch:
         args += ["--deliver-to", "subagent"]
     proc = webhook_cli(key, args)
     return proc is not None and proc.returncode == 0
+
+
+WATCH_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+WATCH_EVENTS = {
+    "issues": ("New or reopened issues", {"all": [
+        {"path": "event", "in": ["issues"]},
+        {"path": "action", "in": ["opened", "reopened"]}]}),
+    "pulls": ("New or reopened pull requests", {"all": [
+        {"path": "event", "in": ["pull_request"]},
+        {"path": "action", "in": ["opened", "reopened"]}]}),
+    "reviews": ("Submitted pull request reviews", {"all": [
+        {"path": "event", "in": ["pull_request_review"]},
+        {"path": "action", "in": ["submitted"]}]}),
+    "ci": ("Failed CI or deployments", {"any": [
+        {"path": path, "in": ["failure", "timed_out", "action_required",
+                              "startup_failure", "stale", "error"]}
+        for path in ("workflow_run.conclusion", "workflow_job.conclusion",
+                     "check_run.conclusion", "check_suite.conclusion",
+                     "deployment_status.state", "state")]}),
+}
+
+
+def webhook_save(form):
+    """Use the upstream validator and locked writer, never edit filters here.
+
+    An unnamed watch may be governed by host policy. Its editor changes only
+    the profile; named rules own their predicates independently of that policy.
+    """
+    topic = form.get("topic", [""])[0].strip()
+    name = form.get("watch_name", [""])[0]
+    profile = form.get("profile", [""])[0].strip()
+    mode = form.get("mode", [""])[0]
+    if not TOPIC_RE.fullmatch(topic) or topic.startswith("-"):
+        return False
+    if name and not WATCH_NAME_RE.fullmatch(name):
+        return False
+    if profile and (not PROFILE_NAME_RE.fullmatch(profile)
+                    or profile not in read_profiles()):
+        return False
+    if mode not in ("create", "edit", "profile"):
+        return False
+    if (mode == "profile") != (not name):
+        return False
+    topic = topic if ":" in topic else "github:" + topic
+    watches = webhook_entries(webhook_subscriptions(webhook_key("")), True)
+    existing = next((e for e in watches if e.get("topic", "").lower() == topic.lower()
+                     and e.get("name", "") == name), None)
+    exists = existing is not None
+    if (mode == "create" and exists) or (mode != "create" and not exists):
+        return False
+    config = dict((existing or {}).get("spawnConfig") or {})
+    if profile:
+        config["profile"] = profile
+    else:
+        config.pop("profile", None)
+    args = ["subscribe", topic, "--deliver-to", "subagent", "--name", name,
+            "--no-spawn-config"]
+    for key, value in config.items():
+        args += ["--spawn-config", key + "=" + value]
+    if mode != "profile":
+        preset = form.get("events", [""])[0]
+        try:
+            include = (WATCH_EVENTS[preset][1] if preset in WATCH_EVENTS
+                       else json.loads(form.get("include", [""])[0])
+                       if preset == "custom" else None)
+            exclude = json.loads(form.get("exclude", [""])[0] or "{}")
+        except (ValueError, RecursionError):
+            return False
+        if not isinstance(include, dict) or not include or not isinstance(exclude, dict):
+            return False
+        args += ["--include", json.dumps(include), "--exclude", json.dumps(exclude),
+                 "--note", form.get("note", [""])[0].strip()]
+    proc = webhook_cli(webhook_key(""), args)
+    return proc is not None and proc.returncode == 0
+
+
+def render_watch_editor(entry=None):
+    creating = entry is None
+    entry = entry or {}
+    name = str(entry.get("name") or "")
+    topic = str(entry.get("topic") or "")
+    mode = "create" if creating else "edit" if name else "profile"
+    esc = html.escape
+    profile = (entry.get("spawnConfig") or {}).get("profile", "")
+    profiles = read_profiles()
+    choices = ["", *profiles]
+    if profile and profile not in profiles:
+        choices.append(profile)
+    options = "".join(
+        '<option value="%s"%s>%s</option>' % (
+            esc(p), " selected" if p == profile else "",
+            esc(p + (" (missing)" if p and p not in profiles else ""))
+            if p else "Use box default profile") for p in choices)
+    fields = (
+        '<input type="hidden" name="mode" value="%s">' % mode
+        + ('<label>Repository or topic<input name="topic" required maxlength="128" '
+           'placeholder="owner/repo"></label>' if creating else
+           '<input type="hidden" name="topic" value="%s">' % esc(topic))
+        + ('<label>Rule name<input name="watch_name" required maxlength="64" '
+           'pattern="[A-Za-z0-9._\\-]+" placeholder="issue-triage"></label>' if creating else
+           '<input type="hidden" name="watch_name" value="%s">' % esc(name))
+        + '<label>Profile<select name="profile">%s</select></label>' % options)
+    if mode != "profile":
+        selected = "issues" if creating else next(
+            (key for key, (_label, rule) in WATCH_EVENTS.items()
+             if rule == entry.get("include")), "custom")
+        event_options = "".join('<option value="%s"%s>%s</option>' % (
+            key, " selected" if key == selected else "", value[0])
+            for key, value in WATCH_EVENTS.items())
+        event_options += '<option value="custom"%s>Custom (advanced filters)</option>' % (
+            " selected" if selected == "custom" else "")
+        fields += (
+            '<label>Events<select name="events">%s</select></label>' % event_options
+            + '<details%s><summary>Advanced event filters</summary>' % (
+                " open" if selected == "custom" or entry.get("exclude") else "")
+            + '<label>Custom event predicate (JSON; used only for Custom events)'
+            '<textarea name="include" rows="4">%s</textarea></label>' % esc(
+                json.dumps(entry.get("include") or {}, indent=2))
+            + '<label>Exclude matching events (optional JSON predicate)'
+            '<textarea name="exclude" rows="2">%s</textarea></label>' % esc(
+                json.dumps(entry.get("exclude") or {}, indent=2))
+            + '</details><label>Instructions for the spawned session'
+            '<input name="note" maxlength="300" value="%s"></label>' % esc(
+                str(entry.get("note") or "")))
+    else:
+        fields += ('<p class="note">This unnamed rule keeps its existing event policy. '
+                   'Add a named rule to choose different events.</p>')
+    return (
+        '<details class="watch-editor" data-fold="watch-editor-%s-%s">'
+        '<summary>%s</summary><form method="post" action="%s/webhooks/save">'
+        '%s<p class="note">The first matching rule in the list wins. '
+        'Choose events that do not overlap with earlier rules, including wildcard rules. '
+        'Existing sessions that claimed the work still receive it.</p>'
+        '<button class="btn" type="submit">Save rule</button></form></details>'
+        % (esc(topic), esc(name), "Add automatic session rule" if creating else "Edit rule",
+           esc(BASE), fields))
 
 
 def hook_args_stamp():
@@ -17437,7 +17603,7 @@ def hook_args_stamp():
 
 
 @functools.lru_cache(maxsize=64)
-def hook_preamble(topic, note, stamp):
+def hook_preamble(topic, note, stamp, watch_name=""):
     """What a match on this standing watch launches: the launch command,
     then the prompt the new session is given.
 
@@ -17457,7 +17623,7 @@ def hook_preamble(topic, note, stamp):
         return ""
     try:
         proc = subprocess.run(
-            [HOOK_SPAWN_CMD, "--preamble", topic, note],
+            [HOOK_SPAWN_CMD, "--preamble", topic, note, watch_name],
             # The script reads the dispatch file to find THIS watch's own
             # profile (#321); under socket activation nothing else puts the
             # state dir in this daemon's environment.
@@ -17474,7 +17640,7 @@ def hook_preamble(topic, note, stamp):
 
 
 @functools.lru_cache(maxsize=64)
-def hook_resolved_profile(topic, note, stamp):
+def hook_resolved_profile(topic, note, stamp, watch_name=""):
     """(profile, missing) for this standing watch, right now - profile is ""
     when nothing resolves (a match starts the box default agent), missing is
     a tuple of every named-but-unusable profile that was tried and passed
@@ -17492,7 +17658,7 @@ def hook_resolved_profile(topic, note, stamp):
         return ("", ())
     try:
         proc = subprocess.run(
-            [HOOK_SPAWN_CMD, "--resolved-profile", topic, note],
+            [HOOK_SPAWN_CMD, "--resolved-profile", topic, note, watch_name],
             env=dict(os.environ, LOCAL_WEBHOOK_STATE_DIR=webhook_state_dir()),
             check=False,
             capture_output=True,
@@ -17538,9 +17704,10 @@ def profile_usage(watches):
         if not topic:
             continue
         note = str(entry.get("note") or "")
-        profile, _missing = hook_resolved_profile(topic, note, stamp)
+        profile, _missing = hook_resolved_profile(topic, note, stamp, str(entry.get("name") or ""))
         if profile:
-            usage.setdefault(profile, []).append(topic)
+            usage.setdefault(profile, []).append(
+                topic + (" / " + entry["name"] if entry.get("name") else ""))
     return {name: sorted(topics) for name, topics in usage.items()}
 
 
@@ -19296,6 +19463,11 @@ STYLE = """<style>
   .profile-row .btn { height: 34px; }
   .env-row,
   .profile-actions { margin-top: 12px; }
+
+  .watch-editor { margin: 12px 0; }
+  .watch-editor form { max-width: 640px; padding: 12px 0; }
+  .watch-editor label { display: block; margin-bottom: 12px; }
+  .watch-editor label > input, .watch-editor label > select { display: block; width: 100%; }
 </style>
 """
 
@@ -21670,6 +21842,7 @@ def render_session_subs(sub, name):
                 str(entry.get("note") or ""),
                 sub["key"],
                 dispatch=False,
+                watch_name=str(entry.get("name") or ""),
             ))
     if sub and sub["file"]:
         # Two labels, because one word cannot be honest about both cases:
@@ -21702,7 +21875,7 @@ def render_session_subs(sub, name):
     return '<ul class="tbl subs">' + "".join(rows) + "</ul>"
 
 
-def render_webhook_row(topic, meta, note, key, dispatch, fold=""):
+def render_webhook_row(topic, meta, note, key, dispatch, fold="", watch_name="", editor=""):
     """One subscription row: what it is, why it exists, and its delete.
     Every row this renders names a topic, so every row can drop it.
 
@@ -21711,6 +21884,9 @@ def render_webhook_row(topic, meta, note, key, dispatch, fold=""):
     long to sit on the row itself and too useful to leave off the page."""
     base = html.escape(BASE)
     safe_topic = html.escape(topic)
+    safe_name = html.escape(watch_name)
+    label = safe_topic + (" / " + safe_name if watch_name else "")
+    fold_key = safe_topic + ("#" + safe_name if watch_name else "")
     bits = "".join(
         f'<span class="meta">{html.escape(b)}</span>' for b in meta if b
     )
@@ -21719,30 +21895,31 @@ def render_webhook_row(topic, meta, note, key, dispatch, fold=""):
     )
     item_name = "automatic session rule" if dispatch else "event notification rule"
     row = (
-        f'<span class="nm wh"><code>{safe_topic}</code>{bits}{note_html}</span>'
+        f'<span class="nm wh"><code>{label}</code>{bits}{note_html}</span>'
         f'<span class="acts">'
         f'<form class="inline" method="post" action="{base}/webhooks/unsubscribe" '
         f'onsubmit="return confirm(\'Delete the {item_name} for {safe_topic}?\');">'
         f'<input type="hidden" name="topic" value="{safe_topic}">'
+        f'<input type="hidden" name="watch_name" value="{safe_name}">'
         f'<input type="hidden" name="key" value="{html.escape(key)}">'
         f'<input type="hidden" name="dispatch" value="{"1" if dispatch else ""}">'
         f'<button type="submit" class="icon idanger" aria-label="Delete" '
         f'title="Delete {item_name} for {safe_topic}">{ICON_TRASH}</button></form>'
         f'</span>'
     )
-    if not fold:
+    if not fold and not editor:
         return f"<li>{row}</li>"
     # Same fold shape as a session row (data-fold and all, so the live
     # feed's DOM swap restores an open one). The label inside says which
     # parts of the prompt an event fills in; without it the placeholders
     # read as text the session would really receive.
     return (
-        f'<li class="foldrow"><details data-fold="watch-{safe_topic}">'
+        f'<li class="foldrow"><details data-fold="watch-{fold_key}">'
         f'<summary title="Show what this rule starts">{row}</summary>'
         f'<div class="wh-prompt"><p class="note">A matching event starts a new '
         f'session with the setup and instructions shown below. Text in '
         f'&lt;&hellip;&gt; comes from the event.</p>'
-        f'<pre>{html.escape(fold)}</pre></div>'
+        f'<pre>{html.escape(fold)}</pre></div>{editor}'
         f'</details></li>'
     )
 
@@ -21891,8 +22068,8 @@ def render_webhooks(watches):
         if not topic:
             continue
         note = str(entry.get("note") or "")
-        prompt = hook_preamble(topic, note, stamp)
-        profile, missing = hook_resolved_profile(topic, note, stamp)
+        prompt = hook_preamble(topic, note, stamp, str(entry.get("name") or ""))
+        profile, missing = hook_resolved_profile(topic, note, stamp, str(entry.get("name") or ""))
         rows.append(render_webhook_row(
             topic,
             [display_event_expiry(entry.get("expiresIn")),
@@ -21904,11 +22081,13 @@ def render_webhooks(watches):
             webhook_key(""),
             dispatch=True,
             fold=prompt,
+            watch_name=str(entry.get("name") or ""),
+            editor=render_watch_editor(entry),
         ))
     if not rows:
         rows.append('<li class="empty">No automatic session rules.</li>')
     return ('<ul class="tbl"><li class="tbl-head">Automatic session rule</li>'
-            + "".join(rows) + "</ul>")
+            + "".join(rows) + "</ul>" + render_watch_editor())
 
 
 def render_reboot_line():
@@ -23622,6 +23801,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "webhook_kept_secret": (("Could not replace that secret from this "
                                  "page. Open a session and run "
                                  "`agent-box-webhook rotate SOURCE`."), "error"),
+        "webhook_saved": ("Automatic session rule saved. Changes apply to the next event.", "ok"),
+        "webhook_invalid": (("Could not save the rule. Check its topic, name, profile and event predicate. "
+                             "Rule names must be unique within a topic."), "error"),
         "webhook_deleted": ("Event rule deleted. The change applies to the next event.", "ok"),
         "webhook_forgotten": ("Event notification rules cleared for this session.", "ok"),
         "webhook_kept": ("Could not delete that event rule. It may already be gone.", "error"),
@@ -24594,24 +24776,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if back_page == TERM_HOME and SESSION_RE.match(name):
                 ok += "&tab=" + name
             self._redirect(ok, back_page)
+        elif path == BASE + "/webhooks/save" and WEBHOOKS:
+            ok = webhook_save(form)
+            self._redirect("ok=webhook_saved" if ok else "ok=webhook_invalid")
         elif path == BASE + "/webhooks/unsubscribe" and WEBHOOKS:
             topic = (form.get("topic", [""])[0]).strip()
             key = (form.get("key", [""])[0]).strip()
             dispatch = bool(form.get("dispatch", [""])[0])
+            watch_name = form.get("watch_name", [""])[0]
             # The key names a filter file, so hold it to the shape the
             # supervisor mints: this user, and one of this user's own
             # sessions (or the bare user key, which only reads the shared
             # dispatch list).
             name = key[len(USER) + 1:] if key.startswith(USER + "-") else ""
             known = key == USER or (SESSION_RE.match(name) and name in read_sessions())
-            if not (TOPIC_RE.match(topic) and known):
+            if not (TOPIC_RE.fullmatch(topic) and known
+                    and (not watch_name or WATCH_NAME_RE.fullmatch(watch_name))):
                 self._redirect("ok=webhook_kept")
                 return
-            ok = webhook_unsubscribe(key, topic, dispatch)
+            ok = webhook_unsubscribe(key, topic, dispatch, watch_name)
             self._redirect("ok=webhook_deleted" if ok else "ok=webhook_kept")
         elif path == BASE + "/webhooks/rotate" and WEBHOOKS:
-            # Replace one source's secret. The page's only webhook WRITE:
-            # everything else here reads, and topic edits go through
+            # Replace one source's secret. Other webhook writes go through
             # webhook.py's own CLI. Bounded by webhook_secret_path() to a
             # secret file inside the state dir belonging to a configured
             # source that setup itself created.

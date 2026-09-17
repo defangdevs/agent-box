@@ -2656,7 +2656,9 @@ in
         };
         description = ''
           Declarative policy for standing watches (#197), keyed by exact
-          topic. The module never creates a watch: sessions do that
+          topic, applied only to the unnamed watch. Named watches own their
+          independent rules and are left untouched (#723).
+          The module never creates a watch: sessions do that
           (`agent-box-webhook subscribe --deliver-to subagent`). What this
           option owns is the POLICY on such a watch — before each user's
           receiver daemon starts, the declared when/drop/ignoreSenders/note
