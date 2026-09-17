@@ -223,8 +223,8 @@ elif { [ "${1:-}" = "--preamble" ] || [ "${1:-}" = "--resolved-profile" ]; } \
      && [ -n "${2:-}" ] && [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ]; then
   # Best effort, like every other read here: no file, bad JSON or no such topic
   # all mean "this watch names no profile", never a failed render.
-  watch_config=$("$JQ" -r --arg t "$2" \
-    '[(.topics // [])[] | select(type == "object" and (.topic // "") == $t)][0]
+  watch_config=$("$JQ" -r --arg t "$2" --arg n "${4:-}" \
+    '[(.topics // [])[] | select(type == "object" and (.topic // "") == $t and (.name // "") == $n)][0]
      | (if type == "object" then (.spawnConfig // {}) else {} end) | tojson' \
     "$LOCAL_WEBHOOK_STATE_DIR/filter.dispatch.json" 2>/dev/null) || watch_config=""
 fi
@@ -369,7 +369,7 @@ ${AGENT_BOX_HOOK_ARGS_OPTION_NAME:-the fleet-wide default}, which is the \
 fallback."
 }
 
-# --resolved-profile TOPIC [NOTE]: print, as one JSON object, the profile a
+# --resolved-profile TOPIC [NOTE] [WATCH_NAME]: print, as one JSON object, the profile a
 # match on TOPIC would actually use right now — {"profile": NAME or null,
 # "missing": [NAME, ...]} — and spawn nothing. Same resolution as a real
 # spawn and as --preamble's prose (the precedence above already ran by the
@@ -387,7 +387,7 @@ if [ "${1:-}" = "--resolved-profile" ]; then
   exit 0
 fi
 
-# --preamble TOPIC [NOTE]: print what a match on TOPIC would launch — the
+# --preamble TOPIC [NOTE] [WATCH_NAME]: print what a match on TOPIC would launch — the
 # launch command first, then the prompt — and spawn nothing. Everything a
 # delivery decides is left as a <placeholder>: the event key names the session
 # and the topic it owns, and the batch text is what arms the assignment

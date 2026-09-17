@@ -1825,6 +1825,33 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          watch-profiles =
+            pkgs.runCommand "agent-box-watch-profiles"
+              {
+                nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.coreutils pkgs.jq ];
+                src = ./modules/src;
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-watch-profiles.py;
+                webhookPy =
+                  let pin = import ./nix/webhook-pin.nix; in
+                  builtins.fetchurl {
+                    url = "https://raw.githubusercontent.com/${pin.repo}/${pin.rev}"
+                          + "/local-webhook/webhook.py";
+                    sha256 = pin.sha256;
+                  };
+              } ''
+              install -d repo/modules repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp -r "$src" repo/modules/src
+              cp "$daemon" repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-watch-profiles.py
+              python3 repo/tests/test-watch-profiles.py "$webhookPy" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # What the spawn wrapper ANSWERS at the hook-session ceiling, and
           # what the pinned local-webhook does with that answer (#170, #301).
           # A refusal used to be `exit 1`, which the dispatcher cannot tell

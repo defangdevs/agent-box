@@ -14,7 +14,9 @@ if [ -z "$POLICY" ] || [ ! -s "$FILE" ]; then
   echo "agent-box-webhook-policy: no policy or no dispatch file yet; nothing to govern" >&2
   exit 0
 fi
-# For every entry whose topic is declared: the declaration REPLACES the
+# Named watches have independent event rules; topic policy governs only the
+# legacy unnamed watch (issue #723).
+# For every unnamed entry whose topic is declared: the declaration REPLACES the
 # managed fields (the payload predicates, ignoreSenders, note) wholesale —
 # partial merges would let config and state drift apart. Runtime fields
 # (ttlHours, renewOnEvent, spawnConfig, timestamps) stay the entry's own.
@@ -41,7 +43,7 @@ if "$JQ" --slurpfile pol "$POLICY" '
       | .topics = [ (.topics // [])[]
           | (if type == "string" then {topic: .} else . end)
           | (if type == "object" then (.topic // "") else "" end) as $t
-          | if $t != "" and ($p | has($t)) then
+          | if $t != "" and (.name // "") == "" and ($p | has($t)) then
               $p[$t] as $r
               | del(.when, .drop, .include, .exclude, .ignoreSenders)
               | (if $r.when != null then .include = $r.when else . end)
@@ -56,7 +58,8 @@ if "$JQ" --slurpfile pol "$POLICY" '
     # worked (#170). Best-effort: this is a report, not the enforcement
     # itself, so a failure here must not undo it or fail the unit.
     "$JQ" -r --slurpfile pol "$POLICY" '
-          [ .topics[] | if type == "string" then . else (.topic // "") end ] as $subs
+          [ .topics[] | if type == "string" then .
+              elif (.name // "") == "" then (.topic // "") else empty end ] as $subs
           | [ ($pol[0] | keys[]) | select(. as $t | $subs | index($t)) ]
           | if length > 0 then "agent-box-webhook-policy: enforced declared rules on " + join(", ")
             else "agent-box-webhook-policy: no declared topic is subscribed; policy idle" end

@@ -450,9 +450,25 @@ session is active, indefinitely. Add a standing watch instead:
 
 Matching events spawn a FRESH `hook-*` session primed with the event text,
 and bursts coalesce into one. Watches are SHARED, never expire by default,
-and `agent-box-webhook ls` lists them under `dispatch`. A watch tries not to
-double up on work you own, and how well it manages depends on what you told
-it. local-webhook >= 0.23.0 has no built-in policy left: a subagent watch
+and `agent-box-webhook ls` lists them under `dispatch`.
+
+Use `--name NAME` to give different event rules on the same topic their own
+profiles. For example, subscribe an `issues` rule with `--profile triage` and
+an independent `ci` rule with `--profile debugger`, each with its own
+`--when` predicate. Names contain 1-64 letters, digits, dots, `_` or `-`.
+Re-subscribing updates only that (topic, name) pair. To remove it, pass the
+same `--name` to `unsubscribe --deliver-to subagent`; without a name, only
+the unnamed watch is changed. The Automations panel can also add and edit
+named rules, select their profiles, and delete each independently.
+
+The earliest-subscribed matching watch wins an event. Make rules disjoint,
+including any older wildcard or unnamed watch, or it can take the event
+before a new named rule. Named watches keep their event rules across
+receiver restarts: the topic-based declared watch policy governs only
+unnamed watches. Profiles still fall back to the box default if unavailable.
+
+A watch tries not to double up on work you own, and how well it manages
+depends on what you told it. local-webhook >= 0.23.0 has no built-in policy left: a subagent watch
 MUST carry `--when`/`--drop` rules or it is refused outright, so
 `agent-box-webhook subscribe` fills in a default `--when` for a rule-less
 GitHub topic like the one-liner above - opened/reopened issues and PRs, an

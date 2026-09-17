@@ -362,3 +362,8 @@ input.pmodel { width: 160px; }
 .profile-row .btn { height: 34px; }
 .env-row,
 .profile-actions { margin-top: 12px; }
+
+.watch-editor { margin: 12px 0; }
+.watch-editor form { max-width: 640px; padding: 12px 0; }
+.watch-editor label { display: block; margin-bottom: 12px; }
+.watch-editor label > input, .watch-editor label > select { display: block; width: 100%; }
