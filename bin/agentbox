@@ -3126,16 +3126,25 @@ class Renderer:
         supervisor on a live box: `jq: Cannot index array with string ("0")`
         in a restart loop, with the seeded session showing up as one named
         "0" and never starting. Defaults mirror the module's per-session
-        options (modules/agent-box.nix.in: skipPermissions/remoteControl
-        default true, everything else null/[]).
+        options (modules/agent-box.nix.in): skipPermissions defaults true;
+        remoteControl defaults true except for codex, which defaults false
+        since remote control there is a different program, not a TUI flag
+        (issue #623); everything else null/[].
         """
         sessions = {}
         for sname in sorted(u.sessions):
             s = u.sessions[sname] or {}
+            agent = s.get("agent") or u.agent
             sessions[sname] = {
-                "agent": s.get("agent") or u.agent,
+                "agent": agent,
                 "skipPermissions": bool(s.get("skipPermissions", True)),
-                "remoteControl": bool(s.get("remoteControl", True)),
+                # codex's remote control is a different PROGRAM entirely
+                # (the app-server pairing daemon, not a TUI flag), so a
+                # seeded codex session left unset now defaults to the
+                # interactive TUI (issue #623), mirroring
+                # sessionOpts.remoteControl's default in agent-box.nix.in.
+                # Every other harness keeps the old default.
+                "remoteControl": bool(s.get("remoteControl", agent != "codex")),
                 "extraArgs": list(s.get("extraArgs") or []),
                 # null → the supervisor derives "<user>-<session>@<host>"
                 # at start time.

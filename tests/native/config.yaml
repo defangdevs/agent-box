@@ -24,6 +24,7 @@ users:
       review:
         agent: codex
         cwd: /home/agent/agent-box
+        remoteControl: false
   robot:
     agent: codex
     environment:
@@ -33,6 +34,7 @@ users:
     sessions:
       main:
         agent: codex
+        remoteControl: false
 web:
   enable: true
 webhook:

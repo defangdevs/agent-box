@@ -373,6 +373,11 @@ in
         # claude's rc is a flag on the ordinary worker session, so the one
         # auto-created session is both usable AND remote-visible.
         assert claude_session["remoteControl"] is True, claude_session
+        # agent-box-profile seed (issue #508) already ran at supervisor
+        # start and created a "claude" profile (installAgents = [ "claude" ]
+        # above), so ensure_harness_session references it instead of
+        # leaving the session profile-less (issue #623) - a second claude
+        # session added from the picker afterwards then has one to pick.
         assert claude_session["profile"] == "claude", claude_session
 
     with subtest("the card shows the code the CLI printed, not its prose"):
