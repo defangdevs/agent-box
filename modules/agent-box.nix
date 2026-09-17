@@ -749,6 +749,16 @@ let
     `systemctl` resolves through PATH to a Nix store path that won't match,
     silently falling back to asking for a password.
 
+    A Codex session running its OWN sandbox (`skipPermissions = false`, i.e. not
+    this box's `codexFullAccess` default) cannot run this at all: Codex's Linux
+    sandbox execs commands inside an unprivileged `bubblewrap` user namespace,
+    where root is never mapped, so `sudo` shows up owned by `nobody:nogroup` and
+    refuses - "must be owned by uid 0 and have the setuid bit set" - no matter
+    what the sudoers file allows (agent-box#726). That is every sudoAllowlist
+    entry, not just this one; there is no per-command workaround. Use a session
+    with full access for this, or reload caddy from a different session that
+    has it.
+
     @UPDATE_SECTION@## This platform has its own upstream repo
 
     The box itself - the terminal, session manager, webhook wiring, this
@@ -13595,6 +13605,16 @@ in
         USER, shared by every remote thread, so there is nothing per-session
         to override. The codex TUI arms do honour it — the supervisor pins
         the restricted values back on the command line.
+
+        A TUI session with skipPermissions = false runs codex's OWN
+        sandbox instead (sandbox_mode=workspace-write), which execs
+        commands inside an unprivileged bubblewrap user namespace. Root is
+        never mapped in that namespace, so sudo — including every
+        sudoAllowlist entry, not just the self-serve caddy reload — shows
+        up owned by nobody:nogroup and refuses outright (issue 726). That
+        opt-out trades away this option's autonomy AND the box's own sudo
+        escape hatch; there is no substitute privileged path for a session
+        in that mode yet.
       '';
     };
 
@@ -25312,6 +25332,13 @@ if __name__ == "__main__":
         # exactly and a bare `systemctl` can resolve through PATH to one it will
         # not match — which asks for a password the agent does not have.
         #
+        # A Codex session running its OWN sandbox (skipPermissions = false, i.e. not
+        # this box's codexFullAccess default) cannot run this reload at all: that
+        # sandbox execs commands inside an unprivileged bubblewrap user namespace,
+        # where root is never mapped, so sudo shows up owned by nobody:nogroup and
+        # refuses regardless of the sudoers file (agent-box#726). Use a session with
+        # full access for this, or reload from one that has it.
+        #
         # Recommended snippet shape — reverse-proxy to a localhost port your
         # agent runs, NOT `file_server /home/<you>/...`. caddy.service has
         # ProtectHome=true, so it cannot read files under /home; use file_server
@@ -25399,6 +25426,9 @@ if __name__ == "__main__":
         #
         # One import per user: Caddyfile's `import` directive only accepts a
         # single `*` per pattern, so we can't collapse this to `*/*.caddy`.
+        #
+        # A sandboxed Codex session can't run that reload at all — see the note at
+        # the top of this file (agent-box#726).
       ''
       + lib.concatMapStringsSep "" (name: "import /var/lib/agent-box-sites/${name}/*.caddy\n") (lib.attrNames cfg.users));
 

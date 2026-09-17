@@ -10,6 +10,13 @@
 # exactly and a bare `systemctl` can resolve through PATH to one it will
 # not match — which asks for a password the agent does not have.
 #
+# A Codex session running its OWN sandbox (skipPermissions = false, i.e. not
+# this box's codexFullAccess default) cannot run this reload at all: that
+# sandbox execs commands inside an unprivileged bubblewrap user namespace,
+# where root is never mapped, so sudo shows up owned by nobody:nogroup and
+# refuses regardless of the sudoers file (agent-box#726). Use a session with
+# full access for this, or reload from one that has it.
+#
 # Recommended snippet shape — reverse-proxy to a localhost port your
 # agent runs, NOT `file_server /home/<you>/...`. caddy.service has
 # ProtectHome=true, so it cannot read files under /home; use file_server
@@ -593,5 +600,8 @@ golden.example.org {
 #
 # One import per user: Caddyfile's `import` directive only accepts a
 # single `*` per pattern, so we can't collapse this to `*/*.caddy`.
+#
+# A sandboxed Codex session can't run that reload at all — see the note at
+# the top of this file (agent-box#726).
 import /var/lib/agent-box-sites/agent/*.caddy
 import /var/lib/agent-box-sites/robot/*.caddy
