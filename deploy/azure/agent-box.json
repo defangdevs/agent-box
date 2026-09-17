@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.39",
-      "templateHash": "14799518032267237352"
+      "templateHash": "12388340165903942313"
     }
   },
   "parameters": {
@@ -333,7 +333,7 @@
         "typeHandlerVersion": "2.1",
         "autoUpgradeMinorVersion": true,
         "protectedSettings": {
-          "script": "[base64(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(variables('bootstrapTemplate'), '@@NIXINSTALLER@@', parameters('nixInstallerUrl')), '@@FLAKEREF@@', parameters('agentBoxFlakeRef')), '@@USER@@', parameters('userName')), '@@AGENTSMD@@', parameters('agentsMd')), '@@SSLIPDOMAINB64@@', base64(parameters('sslipDomain'))), '@@WEBPASSWORD@@', base64(parameters('webPassword'))), '@@PORTALISSUERB64@@', base64(variables('portalIssuerYaml'))), '@@PORTALUSERIDB64@@', base64(variables('portalUserYaml'))), '@@IMAGERUNTIME@@', string(parameters('imageIncludesRuntime'))), '@@PUBLICIPB64@@', base64(reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress)))]"
+          "script": "[base64(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(variables('bootstrapTemplate'), '@@NIXINSTALLER@@', parameters('nixInstallerUrl')), '@@FLAKEREF@@', parameters('agentBoxFlakeRef')), '@@USER@@', parameters('userName')), '@@AGENTSMD@@', parameters('agentsMd')), '@@SSLIPDOMAINB64@@', base64(parameters('sslipDomain'))), '@@WEBPASSWORD@@', base64(parameters('webPassword'))), '@@PORTALISSUERB64@@', base64(variables('portalIssuerYaml'))), '@@PORTALUSERIDB64@@', base64(variables('portalUserYaml'))), '@@IMAGERUNTIME@@', toLower(string(parameters('imageIncludesRuntime')))), '@@PUBLICIPB64@@', base64(reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress)))]"
         }
       },
       "dependsOn": [
