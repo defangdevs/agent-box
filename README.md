@@ -777,11 +777,12 @@ arbitrary command execution as the agent user.
   containment for scoped elevation.
 - **Tight sudo:** whatever's in `sudoAllowlist` is the entire root-capable
   surface. `NOPASSWD` only - no `SETENV`, no blanket sudo, no ALL. None of it
-  is reachable from a codex session running codex's own sandbox
-  (`skipPermissions = false`, i.e. not `codexFullAccess`): that sandbox execs
-  through an unprivileged bubblewrap user namespace where root is never
-  mapped, so sudo shows up owned by nobody:nogroup and refuses outright
-  regardless of the allowlist (issue #726).
+  is reachable from a codex TUI session with `skipPermissions = false`, even
+  when `codexFullAccess` is `true` (that per-session override reaches a TUI
+  session only, not a remote-controlled one): it runs codex's own sandbox
+  instead, through an unprivileged bubblewrap user namespace where root is
+  never mapped, so sudo shows up owned by nobody:nogroup and refuses
+  outright regardless of the allowlist (issue #726).
 - **Login on everything a human reaches, brute-force damping (web
   deployments):** the terminal workspace, per-session terminals, settings, and
   the `/<user>/downloads/` file drop all sit behind the login (the CI tests

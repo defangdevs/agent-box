@@ -248,15 +248,16 @@ $HOME (caddy can't read /home). Use the full path shown, not bare
 `systemctl` resolves through PATH to a Nix store path that won't match,
 silently falling back to asking for a password.
 
-A Codex session running its OWN sandbox (`skipPermissions = false`, i.e. not
-this box's `codexFullAccess` default) cannot run this at all: Codex's Linux
-sandbox execs commands inside an unprivileged `bubblewrap` user namespace,
-where root is never mapped, so `sudo` shows up owned by `nobody:nogroup` and
-refuses - "must be owned by uid 0 and have the setuid bit set" - no matter
-what the sudoers file allows (agent-box#726). That is every sudoAllowlist
-entry, not just this one; there is no per-command workaround. Use a session
-with full access for this, or reload caddy from a different session that
-has it.
+A Codex TUI session with `skipPermissions = false` runs Codex's OWN sandbox
+instead, even when this box's `codexFullAccess` default is `true` (that
+per-session override reaches a TUI session only, not a remote-controlled
+one). That sandbox cannot run this at all: it execs commands inside an
+unprivileged `bubblewrap` user namespace, where root is never mapped, so
+`sudo` shows up owned by `nobody:nogroup` and refuses - "must be owned by
+uid 0 and have the setuid bit set" - no matter what the sudoers file allows
+(agent-box#726). That is every sudoAllowlist entry, not just this one; there
+is no per-command workaround. Use a session with full access for this, or
+reload caddy from a different session that has it.
 
 @UPDATE_SECTION@## This platform has its own upstream repo
 
