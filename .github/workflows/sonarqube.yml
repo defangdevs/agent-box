@@ -1,0 +1,62 @@
+name: SonarQube
+# Setup and scan scope: https://github.com/defangdevs/agent-box/wiki/Development#sonarqube-static-analysis
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sonarqube-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: SonarQube analysis
+    # Forks and Dependabot cannot access the repository's scan token. Never
+    # switch this to pull_request_target to scan untrusted code with secrets.
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL || 'https://sonarcloud.io' }}
+      SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+      SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate SonarQube configuration
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [[ -z "$SONAR_TOKEN" || -z "$SONAR_PROJECT_KEY" ]]; then
+            echo '::error::Configure the SONAR_TOKEN secret and SONAR_PROJECT_KEY variable in repository Actions settings.'
+            exit 1
+          fi
+          if [[ "$SONAR_HOST_URL" == https://sonarcloud.io* || "$SONAR_HOST_URL" == https://sonarqube.us* ]]; then
+            if [[ -z "$SONAR_ORGANIZATION" ]]; then
+              echo '::error::SonarQube Cloud also requires the SONAR_ORGANIZATION repository variable.'
+              exit 1
+            fi
+          fi
+      - name: Scan and check quality gate
+        uses: SonarSource/sonarqube-scan-action@ba9859eae8dd6bd29e412f25ddbbef3d032000f4 # v8.2.2
+        timeout-minutes: 15
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >-
+            "-Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}"
+            "-Dsonar.organization=${{ env.SONAR_ORGANIZATION }}"
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
