@@ -526,7 +526,9 @@ var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
   '@@WEBPASSWORD@@', base64(webPassword)),
   '@@PORTALISSUERB64@@', base64(portalIssuerYaml)),
   '@@PORTALUSERIDB64@@', base64(portalUserYaml)),
-  '@@IMAGERUNTIME@@', string(imageIncludesRuntime)),
+  // ARM string(true) renders `True`, while the shell branch deliberately
+  // compares its marker to lowercase `true`.
+  '@@IMAGERUNTIME@@', toLower(string(imageIncludesRuntime))),
   '@@PUBLICIPB64@@', base64(publicIp.properties.ipAddress))
 
 // ---------------------------------------------------------------------------
