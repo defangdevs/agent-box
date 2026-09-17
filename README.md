@@ -733,7 +733,7 @@ All under `services.agent-box`:
 | `package` | selected agent default | Override package to run for every agent user. |
 | `installAgents` | all supported | Harnesses installed on the box (independent of what sessions run). |
 | `sessionLimit` | `null` (automatic) | Maximum running or queued sessions. Null derives roughly one slot per GiB of physical RAM; a positive integer overrides it. |
-| `codexFullAccess` | `true` | Run codex with no approval prompts and no sandbox, box-wide, via `/etc/codex/config.toml`. The box is the sandbox. That file is codex's *system* config layer, so a user's own `~/.codex/config.toml` still overrides it — and it is the only path that reaches the app-server daemon behind a remote-controlled codex session. |
+| `codexFullAccess` | `true` | Run codex with no approval prompts and no sandbox, box-wide, via `/etc/codex/config.toml`. The box is the sandbox. That file is codex's *system* config layer, so a user's own `~/.codex/config.toml` still overrides it — and it is the only path that reaches the app-server daemon behind a remote-controlled codex session. Opting a TUI session out (`skipPermissions = false`) switches it to codex's own bubblewrap sandbox, where `sudoAllowlist` stops working entirely (issue #726). |
 | `restartNotice` | `"auto"` | Whether a resumed Claude or Codex session gets the built-in "you were interrupted and automatically restarted" prompt. `"auto"` sends it for an unresolved hook lease, a webhook subscription filter, or a Claude turn cut mid-turn; `"always"` sends it whenever there is a concrete resume target; `"never"` never does. A Codex TUI uses its exact rollout target. Remote-controlled Codex can be targeted only after an app task creates a session subscription; the restarted daemon wakes that task with `codex queue`. A per-session `resumePrompt` overrides the built-in text. |
 | `remoteControlHost` | `fqdnOrHostName` | Host label for the `@<host>` suffix of auto-derived Remote Control names. Empty -> falls back to the public `web.domain`, then the live kernel hostname. The AWS image sets it to the box's public sslip.io host. |
 | `users.<name>.sessions.<s>.*` | `{}` | Seed sessions (first boot only): per session `agent`, `skipPermissions`, `remoteControl`, `remoteControlName`, `workingDirectory`, `extraArgs`. Empty = the legacy per-user options below seed a session named `main`. |
@@ -776,7 +776,13 @@ arbitrary command execution as the agent user.
   setuid and needs the euid transition) - a deliberate trade of a bit of
   containment for scoped elevation.
 - **Tight sudo:** whatever's in `sudoAllowlist` is the entire root-capable
-  surface. `NOPASSWD` only - no `SETENV`, no blanket sudo, no ALL.
+  surface. `NOPASSWD` only - no `SETENV`, no blanket sudo, no ALL. None of it
+  is reachable from a codex TUI session with `skipPermissions = false`, even
+  when `codexFullAccess` is `true` (that per-session override reaches a TUI
+  session only, not a remote-controlled one): it runs codex's own sandbox
+  instead, through an unprivileged bubblewrap user namespace where root is
+  never mapped, so sudo shows up owned by nobody:nogroup and refuses
+  outright regardless of the allowlist (issue #726).
 - **Login on everything a human reaches, brute-force damping (web
   deployments):** the terminal workspace, per-session terminals, settings, and
   the `/<user>/downloads/` file drop all sit behind the login (the CI tests

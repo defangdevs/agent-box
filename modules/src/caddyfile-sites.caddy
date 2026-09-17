@@ -6,3 +6,6 @@
 #
 # One import per user: Caddyfile's `import` directive only accepts a
 # single `*` per pattern, so we can't collapse this to `*/*.caddy`.
+#
+# A sandboxed Codex session can't run that reload at all — see the note at
+# the top of this file (agent-box#726).

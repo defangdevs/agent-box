@@ -1779,6 +1779,16 @@ in
         USER, shared by every remote thread, so there is nothing per-session
         to override. The codex TUI arms do honour it — the supervisor pins
         the restricted values back on the command line.
+
+        A TUI session with skipPermissions = false runs codex's OWN
+        sandbox instead (sandbox_mode=workspace-write), which execs
+        commands inside an unprivileged bubblewrap user namespace. Root is
+        never mapped in that namespace, so sudo — including every
+        sudoAllowlist entry, not just the self-serve caddy reload — shows
+        up owned by nobody:nogroup and refuses outright (issue 726). That
+        opt-out trades away this option's autonomy AND the box's own sudo
+        escape hatch; there is no substitute privileged path for a session
+        in that mode yet.
       '';
     };
 
