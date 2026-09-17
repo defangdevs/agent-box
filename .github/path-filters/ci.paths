@@ -1,0 +1,69 @@
+# The build paths for .github/workflows/ci.yml.
+#
+# This list used to be the workflow's own `on: push/pull_request: paths:`
+# block. It moved here because a trigger-level filter reports NO check run
+# on a pull request it does not match, which makes the check unrequireable
+# (issue #632) - see scripts/changed_paths.py for the whole reasoning. The
+# workflow's `changes` job reads this file; its `gate` job reports either
+# way.
+#
+# Blank lines and `#` comments are ignored. The dialect is GitHub's own
+# `paths` glob, so an entry moved here from a trigger block needs no
+# rewriting.
+
+**.nix
+
+# Sources of the generated modules/agent-box.nix (issue #140): a change
+# here can reassemble to the same bytes (a pure refactor), so it would
+# not touch a *.nix file - match them explicitly so the module-generated-
+# up-to-date guard (and the rest of CI) still runs.
+modules/agent-box.nix.in
+modules/src/**
+bin/assemble-module.py
+tests/test-assemble-module.py
+
+# The vendored third-party assets under modules/src/vendor are matched
+# by 'modules/src/**' above; this is the checker that verifies them.
+scripts/check_vendor.py
+
+# Every workflow, not just this one: CI validates no other workflow's
+# YAML, so a file that cannot parse is simply never run and nothing
+# says so. PR #483 shipped exactly that - vendor-updates.yml had a
+# heredoc dedented out of its `run: |` block scalar, CI stayed green,
+# and the weekly job would have silently never fired.
+.github/workflows/**
+
+# The path filters themselves, and the matcher that reads them. Editing
+# one of these decides which jobs run at all, so it has to run the jobs
+# (issue #632).
+.github/path-filters/**
+scripts/changed_paths.py
+tests/test-changed-paths.py
+
+tests/test-envstore.py
+
+# The native-render fixture (issue #154 Phase 4): the renderer under
+# test, the test itself, and its committed expected/ snapshot must all
+# re-run agentbox-render when any one changes, or a stale fixture only
+# surfaces via a manual dispatch (as it did for PR #381).
+bin/agentbox
+tests/test_agentbox.py
+tests/native/**
+
+# The mascot mark (issue #185) is embedded into the settings daemon at
+# assemble time, so it is a module source as much as a website asset.
+docs/potato.svg
+
+# The golden behavior snapshot (issue #154): the fixture and its
+# renderer must re-run the golden-snapshot check when either changes.
+bin/golden-snapshot.py
+tests/golden/**
+
+# The release manifest (issue #632) is what promotion records and what
+# publish-template.yml consumes instead of re-resolving anything, so its
+# builder and its tests are build paths like any other checked script.
+scripts/release_manifest.py
+tests/test-release-manifest.py
+
+flake.lock
+.github/workflows/ci.yml

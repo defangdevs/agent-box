@@ -1,5 +1,4 @@
 """Check the workflow's failure gates, lane budget and VM build invocation."""
-import fnmatch
 import json
 import os
 from pathlib import Path
@@ -64,14 +63,18 @@ sys.exit(int(os.environ["FAILURE"]))
             self.assertNotEqual(result.returncode, 0)
             self.assertIsNone(call)
 
-    def test_native_test_and_validator_edits_trigger_ci(self):
-        # PyYAML's YAML 1.1 loader reads the unquoted `on` key as True.
-        events = WORKFLOW.get("on", WORKFLOW.get(True))
-        for event in ["push", "pull_request"]:
-            for path in ["tests/test-new-native.py", "tests/native/expected/etc/example",
-                         "scripts/check_new_native.py"]:
-                self.assertTrue(any(fnmatch.fnmatch(path, pattern)
-                                    for pattern in events[event]["paths"]), (event, path))
+    # Whether a native-test or validator edit actually triggers CI is now a
+    # question about .github/path-filters/ci.paths, not this workflow's
+    # trigger (issue #632 removed the trigger-level `paths:` entirely) -
+    # see tests/test-changed-paths.py's CiFilter and Wiring cases instead.
+
+    def test_native_and_vm_are_gated_on_changes(self):
+        for job in ("native", "vm"):
+            with self.subTest(job=job):
+                self.assertEqual(WORKFLOW["jobs"][job]["needs"], "changes")
+                self.assertEqual(
+                    WORKFLOW["jobs"][job]["if"],
+                    "needs.changes.outputs.build == 'true'")
 
     def test_matrix_matches_nix_lanes_and_keeps_concurrency_budget(self):
         strategy = WORKFLOW["jobs"]["vm"]["strategy"]
@@ -83,23 +86,49 @@ sys.exit(int(os.environ["FAILURE"]))
         self.assertEqual(sum(row["jobs"] for row in matrix), 4)
 
     def test_gate_rejects_failure_cancellation_and_skipped_jobs(self):
-        gate = WORKFLOW["jobs"]["validate"]
-        self.assertEqual(gate["name"], "Validate module & VM")
-        self.assertEqual(sorted(gate["needs"]), ["native", "vm"])
-        self.assertEqual(gate["if"], "${{ always() }}")
+        # The `changes` job deciding whether CI's build paths changed sits
+        # in front of `native`/`vm` (issue #632); the `gate` job at the
+        # bottom is what the branch ruleset requires, and it has to report
+        # correctly whether or not those two jobs even ran.
+        gate = WORKFLOW["jobs"]["gate"]
+        self.assertEqual(gate["name"], "CI gate")
+        self.assertEqual(sorted(gate["needs"]), ["changes", "native", "vm"])
+        self.assertEqual(gate["if"], "always()")
         step, = gate["steps"]
         self.assertEqual(step["env"], {
-            "NATIVE_RESULT": "${{ needs.native.result }}",
-            "VM_RESULT": "${{ needs.vm.result }}",
+            "CHANGES": "${{ needs.changes.result }}",
+            "NATIVE": "${{ needs.native.result }}",
+            "VM": "${{ needs.vm.result }}",
+            "BUILD": "${{ needs.changes.outputs.build }}",
         })
-        for native in ["success", "failure", "cancelled", "skipped"]:
-            for vm in ["success", "failure", "cancelled", "skipped"]:
-                result = subprocess.run(
-                    ["bash", "-e", "-c", step["run"]], capture_output=True,
-                    env={**os.environ, "NATIVE_RESULT": native, "VM_RESULT": vm},
-                    timeout=10,
-                )
-                self.assertEqual(result.returncode == 0, native == vm == "success")
+        for changes in ["success", "failure"]:
+            for build in ["true", "false"]:
+                for native in ["success", "failure", "cancelled", "skipped"]:
+                    for vm in ["success", "failure", "cancelled", "skipped"]:
+                        with self.subTest(changes=changes, build=build,
+                                          native=native, vm=vm):
+                            result = subprocess.run(
+                                ["bash", "-e", "-c", step["run"]],
+                                capture_output=True,
+                                env={**os.environ, "CHANGES": changes,
+                                     "BUILD": build, "NATIVE": native,
+                                     "VM": vm},
+                                timeout=10,
+                            )
+                            # `changes` must succeed, and each of native/vm
+                            # must either succeed outright, or be skipped
+                            # while the build paths did NOT change (a skip
+                            # while they DID change means the job's own
+                            # guard expression is broken).
+                            def ok(job_result):
+                                return (job_result == "success"
+                                        or (job_result == "skipped"
+                                            and build != "true"))
+                            expected = (changes == "success"
+                                        and ok(native) and ok(vm))
+                            self.assertEqual(
+                                result.returncode == 0, expected,
+                                result.stderr)
 
 
 if __name__ == "__main__":
