@@ -4,20 +4,12 @@
 # /var/lib/agent-box-sites/<you>/, a caddy-readable location) and
 # reload caddy with:
 #
-#     sudo @RELOAD_CMD@
+#     @RELOAD_CMD@
 #
-# spelled with the full path, because sudoers matches the command path
-# exactly and a bare `systemctl` can resolve through PATH to one it will
-# not match — which asks for a password the agent does not have.
-#
-# A Codex TUI session with skipPermissions = false runs Codex's OWN sandbox
-# instead, even when this box's codexFullAccess default is true (that
-# per-session override reaches a TUI session only, not a remote-controlled
-# one). That sandbox cannot run this reload at all: it execs commands inside
-# an unprivileged bubblewrap user namespace, where root is never mapped, so
-# sudo shows up owned by nobody:nogroup and refuses regardless of the
-# sudoers file (agent-box#726). Use a session with full access for this, or
-# reload from one that has it.
+# No sudo: agent-box authorizes configured agent users for exactly the reload
+# verb on caddy.service through polkit. Stop, restart and every other unit stay
+# unauthorized. This also works inside Codex's unprivileged command sandbox,
+# where setuid sudo is unavailable (agent-box#726).
 #
 # Recommended snippet shape — reverse-proxy to a localhost port your
 # agent runs, NOT `file_server /home/<you>/...`. caddy.service has
@@ -86,4 +78,3 @@
   # This fragment ends INSIDE the block on purpose: the module appends one
   # webhook + terminal block per user (and the root block), then the closing
   # brace. Nothing is missing here.
-

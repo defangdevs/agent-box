@@ -86,11 +86,10 @@ UPDATE_UNIT = "agent-box-update.service"
 # read it back. See the unit for why the journal is not enough.
 UPDATE_LOG = "/var/log/agent-box-update.log"
 SYSTEMCTL = "/usr/bin/systemctl"
-# The web front door reload, spelled once for the same reason as the two
-# above: the sudo grant and the command the rendered Caddyfile tells the
-# agent to run have to be the same string. A documented command that
-# misses the grant by a path asks for a password the agent does not have,
-# which is how the header promised a reload NixOS agents could not run.
+# The web front door reload, spelled once because the command the rendered
+# Caddyfile and shipped guide tell the agent to run must stay identical.
+# It needs no sudo: caddy_reload_policy() grants configured users exactly
+# this unit+verb through polkit (issue #726).
 CADDY_RELOAD_CMD = f"{SYSTEMCTL} reload caddy.service"
 UPDATE_TRIGGER = f"{SYSTEMCTL} start --no-block {UPDATE_UNIT}"
 # The settings page's "Reboot box" button. Spelled once for the same reason
@@ -123,6 +122,7 @@ CLAUDE_SETTINGS = "/etc/agent-box/claude-hook-settings.json"
 # before committing it (issue #526), so the validator and the renderer
 # have to name the same file.
 CADDYFILE = "/etc/agent-box/Caddyfile"
+CADDY_RELOAD_POLICY = "/etc/polkit-1/rules.d/50-agent-box-caddy-reload.rules"
 SUDOERS_DIR = "/etc/sudoers.d"
 # Memory protection (issue #62, #394 gap 9). Names match the module's
 # pieces, prefixed because these are OUR units on a distro that may have
@@ -1242,6 +1242,7 @@ class Renderer:
             self.containers_off(t)
         if self.spec.web_enable:
             self.caddy(t)
+            self.caddy_reload_policy(t)
             self.fail2ban(t)
         else:
             self.web_off(t)
@@ -1825,7 +1826,7 @@ class Renderer:
         # removed on the byte-identical witness instead.
         t.gone(self.p(WEB_USERS_FILE), self.web_users_text())
         for path, (text, _mode) in self.would_have_written(
-                self.caddy, self.fail2ban).items():
+                self.caddy, self.caddy_reload_policy, self.fail2ban).items():
             t.gone(path, text)
         # NOT removed: /etc/agent-box/<user>.hash and the cookie secrets
         # under /var/lib/agent-box-web. They are credentials this renderer
@@ -2519,7 +2520,7 @@ class Renderer:
             # admin API is a CLEAN exit, so `on-failure` saw success and left
             # the front door down -- the box stayed dead until somebody
             # rebooted it, taking every session with it. The agent cannot
-            # start this unit back up: the sudo allowlist has `reload`, not
+            # start this unit back up: the polkit rule has `reload`, not
             # `start`. Restarting itself is the recovery that needs no
             # privilege and no human.
             #
@@ -2785,14 +2786,14 @@ class Renderer:
             # Mirrors the module's effectiveSudoAllowlist (CodeRabbit
             # review on #487): the configured allowlist PLUS whatever
             # config flags imply a real grant. self.spec.sudo_allowlist
-            # alone missed the two grants sudoers() always adds — caddy
-            # reload when web_enable, and (unlike the module, which can
-            # turn this off via selfUpdate.enable) an UNCONDITIONAL update
-            # trigger on every native box — so a box with only those
-            # implied grants and no custom allowlist would have had this
+            # alone missed the grant sudoers() always adds: unlike the
+            # module, which can turn this off via selfUpdate.enable, the
+            # update trigger is unconditional on every native box. A box
+            # with only that implied grant and no custom allowlist would
+            # have had this
             # condition true and NoNewPrivileges=true, silently blocking
-            # `sudo -n systemctl start --no-block agent-box-update.service`
-            # and the caddy reload. implied_sudo_commands() is the same
+            # `sudo -n systemctl start --no-block agent-box-update.service`.
+            # implied_sudo_commands() is the same
             # list sudoers() grants beyond the per-user password helper,
             # so the two cannot drift apart again.
             "no-sudo-allowlist": not (
@@ -3189,7 +3190,7 @@ class Renderer:
         "no-sudo-allowlist" directive condition (issue #451) can't drift
         from what sudoers() actually grants (a Major finding on #487's
         review: it originally checked only self.spec.sudo_allowlist,
-        missing these two implied grants entirely).
+        missing the implied grants entirely).
 
         Box-wide, not per-user (mirrors the module's effectiveSudoAllowlist,
         which is likewise not per-user) — unlike sudoers()'s own per-user
@@ -3206,17 +3207,14 @@ class Renderer:
         just visible here as one more condition that can't reach native's
         "locked down" branch.
         """
-        cmds = []
-        if self.spec.web_enable:
-            cmds.append(CADDY_RELOAD_CMD)
-        cmds.append(UPDATE_TRIGGER)
-        return cmds
+        return [UPDATE_TRIGGER]
 
     def sudoers(self, t):
         """Least-privilege sudo, data-driven from the config.
 
-        Only the exact commands the box needs: reload the web front door,
-        trigger the self-update unit, and each user's own password helper.
+        Only the exact commands the box needs: trigger the self-update unit
+        and each user's own password helper. Reloading the web front door is
+        authorized without sudo by caddy_reload_policy() (issue #726).
         The update grant is spelled from UPDATE_TRIGGER rather than by hand
         so it cannot drift from the unit `update_unit` renders or from the
         command the guide documents (issue #358; #353 for why a grant that
@@ -3525,11 +3523,11 @@ class Renderer:
         parts.append(bind("root", root_user))
         parts.append("}\n")
         # The self-serve extension point the header fragment documents, and
-        # the reason the sudo allowlist carries `systemctl reload
+        # the reason caddy_reload_policy() permits `systemctl reload
         # caddy.service`: one `import` per user, since Caddyfile's `import`
         # accepts a single `*` per pattern. Without these lines a native box
         # has the whole mechanism — the caddy-readable dir, the ~/sites
-        # symlink, the reload grant, the instructions at the top of this
+        # symlink, the polkit reload grant, the instructions at the top of this
         # very file — and nothing that ever reads a snippet, so an agent's
         # virtual host is silently never served: caddy reloads happily
         # and answers the TLS handshake for that hostname with an
@@ -3614,6 +3612,31 @@ class Renderer:
                    "# Generated by `agentbox apply` - do not edit.\n"
                    + self.wrapper_env("agent-box-webhook-spawn")
                    + f'exec {self.bin}/agent-box-webhook-spawn "$@"\n', 0o755)
+
+    def caddy_reload_policy(self, t):
+        """Let configured agents reload Caddy without crossing setuid sudo.
+
+        systemd's manage-units polkit check supplies both the unit and verb.
+        Match both, plus the exact configured usernames: this is not a general
+        systemctl grant, and stop/restart of Caddy or any action on another
+        unit remains unauthorized. Ubuntu 24.04's cloud image ships polkitd;
+        unlike a setuid helper, D-Bus authorization also works from Codex's
+        unprivileged command namespace (issue #726).
+        """
+        users = json.dumps([u.name for u in self.spec.users])
+        t.dir(self.p("/etc/polkit-1/rules.d"), 0o755)
+        t.file(self.p(CADDY_RELOAD_POLICY),
+               "// Generated by `agentbox apply` - do not edit.\n"
+               "polkit.addRule(function(action, subject) {\n"
+               f"  var agentBoxUsers = {users};\n"
+               "  if (action.id == "
+               "\"org.freedesktop.systemd1.manage-units\" &&\n"
+               "      action.lookup(\"unit\") == \"caddy.service\" &&\n"
+               "      action.lookup(\"verb\") == \"reload\" &&\n"
+               "      agentBoxUsers.indexOf(subject.user) !== -1) {\n"
+               "    return polkit.Result.YES;\n"
+               "  }\n"
+               "});\n")
 
 
 # --------------------------------------------------------------------------

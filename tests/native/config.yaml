@@ -14,8 +14,7 @@ repo: defangdevs/agent-box
 restartNotice: auto
 rev: '0000000000000000000000000000000000000000'
 sessionLimit: null
-sudoAllowlist:
-- /run/current-system/sw/bin/systemctl reload caddy.service
+sudoAllowlist: []
 users:
   agent:
     root: true

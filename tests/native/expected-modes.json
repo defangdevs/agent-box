@@ -31,6 +31,7 @@
   "etc/gitconfig": "0o644",
   "etc/needrestart/conf.d/50-agent-box.conf": "0o644",
   "etc/nix/nix.custom.conf": "0o644",
+  "etc/polkit-1/rules.d/50-agent-box-caddy-reload.rules": "0o644",
   "etc/sudoers.d/agent-box": "0o440",
   "etc/sysctl.d/60-agent-box-memory.conf": "0o644",
   "etc/systemd/journald.conf.d/agent-box.conf": "0o644",

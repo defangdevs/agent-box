@@ -100,8 +100,8 @@ and signs out every browser by rotating the authentication-cookie secret.
 **Updating the box.** Click "Update box" on the settings page (the gear icon
 next to your terminal; the card also shows the running agent-box rev, linked
 to its GitHub commit), or ask the agent in its terminal to run
-`sudo systemctl start --no-block agent-box-update.service` — a root oneshot (alongside
-the caddy reload, the only sudo the agent holds) that fast-forwards the box
+`sudo systemctl start --no-block agent-box-update.service` — a root oneshot
+(the only built-in box-wide sudo grant; Caddy reloads use polkit) that fast-forwards the box
 to this repo's latest master and applies it: on Lightsail that is a swap of
 the pinned Nix profile followed by `agentbox apply` (the newly installed
 release renders its own configuration), on the EC2 NixOS template a
@@ -249,8 +249,8 @@ Add the flake as an input and import the module:
       coder = { agent = "codex"; };
       ci    = { skipPermissions = false; };   # keep approval prompts on
     };
-    # The ONLY elevated powers the agents get - keep it tight.
-    sudoAllowlist = [ "/run/current-system/sw/bin/systemctl reload caddy.service" ];
+    # Additional passwordless sudo powers - keep these tight.
+    sudoAllowlist = [ "/run/current-system/sw/bin/systemctl restart my-service.service" ];
     extraPackages = with pkgs; [ git ripgrep jq ];
   };
 }
@@ -733,7 +733,7 @@ All under `services.agent-box`:
 | `package` | selected agent default | Override package to run for every agent user. |
 | `installAgents` | all supported | Harnesses installed on the box (independent of what sessions run). |
 | `sessionLimit` | `null` (automatic) | Maximum running or queued sessions. Null derives roughly one slot per GiB of physical RAM; a positive integer overrides it. |
-| `codexFullAccess` | `true` | Run codex with no approval prompts and no sandbox, box-wide, via `/etc/codex/config.toml`. The box is the sandbox. That file is codex's *system* config layer, so a user's own `~/.codex/config.toml` still overrides it — and it is the only path that reaches the app-server daemon behind a remote-controlled codex session. Opting a TUI session out (`skipPermissions = false`) switches it to codex's own bubblewrap sandbox, where `sudoAllowlist` stops working entirely (issue #726). |
+| `codexFullAccess` | `true` | Run codex with no approval prompts and no sandbox, box-wide, via `/etc/codex/config.toml`. The box is the sandbox. That file is codex's *system* config layer, so a user's own `~/.codex/config.toml` still overrides it — and it is the only path that reaches the app-server daemon behind a remote-controlled codex session. Opting a TUI session out (`skipPermissions = false`) switches it to codex's own bubblewrap sandbox, where setuid tools such as `sudo` are unavailable. The built-in Caddy reload uses polkit instead (issue #726). |
 | `restartNotice` | `"auto"` | Whether a resumed Claude or Codex session gets the built-in "you were interrupted and automatically restarted" prompt. `"auto"` sends it for an unresolved hook lease, a webhook subscription filter, or a Claude turn cut mid-turn; `"always"` sends it whenever there is a concrete resume target; `"never"` never does. A Codex TUI uses its exact rollout target. Remote-controlled Codex can be targeted only after an app task creates a session subscription; the restarted daemon wakes that task with `codex queue`. A per-session `resumePrompt` overrides the built-in text. |
 | `remoteControlHost` | `fqdnOrHostName` | Host label for the `@<host>` suffix of auto-derived Remote Control names. Empty -> falls back to the public `web.domain`, then the live kernel hostname. The AWS image sets it to the box's public sslip.io host. |
 | `users.<name>.sessions.<s>.*` | `{}` | Seed sessions (first boot only): per session `agent`, `skipPermissions`, `remoteControl`, `remoteControlName`, `workingDirectory`, `extraArgs`. Empty = the legacy per-user options below seed a session named `main`. |
@@ -775,7 +775,7 @@ arbitrary command execution as the agent user.
   `sudoAllowlist` is empty; a non-empty allowlist keeps NNP off (sudo is
   setuid and needs the euid transition) - a deliberate trade of a bit of
   containment for scoped elevation.
-- **Tight sudo:** whatever's in `sudoAllowlist` is the entire root-capable
+- **Tight sudo:** whatever's in `sudoAllowlist` is the entire setuid-sudo
   surface. `NOPASSWD` only - no `SETENV`, no blanket sudo, no ALL. None of it
   is reachable from a codex TUI session with `skipPermissions = false`, even
   when `codexFullAccess` is `true` (that per-session override reaches a TUI
@@ -783,6 +783,10 @@ arbitrary command execution as the agent user.
   instead, through an unprivileged bubblewrap user namespace where root is
   never mapped, so sudo shows up owned by nobody:nogroup and refuses
   outright regardless of the allowlist (issue #726).
+- **Narrow Caddy reload:** web-enabled boxes authorize configured agent users
+  through polkit for only the `reload` verb on `caddy.service`. No setuid
+  transition is involved; stop, restart, other units and daemon-reload remain
+  unauthorized.
 - **Login on everything a human reaches, brute-force damping (web
   deployments):** the terminal workspace, per-session terminals, settings, and
   the `/<user>/downloads/` file drop all sit behind the login (the CI tests

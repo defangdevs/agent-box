@@ -2,10 +2,10 @@
 # here. Add a file below and reload caddy — that is the whole
 # workflow, no @APPLY_CMD@ required:
 #
-#     sudo @RELOAD_CMD@
+#     @RELOAD_CMD@
 #
 # One import per user: Caddyfile's `import` directive only accepts a
 # single `*` per pattern, so we can't collapse this to `*/*.caddy`.
 #
-# A sandboxed Codex session can't run that reload at all — see the note at
-# the top of this file (agent-box#726).
+# The narrow polkit grant behind this command is documented at the top of
+# this file (agent-box#726).

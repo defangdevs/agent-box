@@ -42,7 +42,7 @@
           # guest (issue #312 — this was three tests with the same node
           # definition): the per-user ~/downloads file drop served behind the
           # auth gate (issue #132), an agent adding a vhost by writing ~/sites/
-          # and reloading caddy via the sudoAllowlist rule with no
+          # and reloading caddy via the narrow polkit rule with no
           # nixos-rebuild (issue #40), and wrong-password basic-auth attempts
           # getting the client IP banned by the fail2ban jail. Needs KVM (or
           # slow TCG); CI enables /dev/kvm before building this.

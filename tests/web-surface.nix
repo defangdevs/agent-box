@@ -400,20 +400,30 @@
             "stat -c '%U' /var/lib/agent-box-sites/agent/mysite.caddy | grep -x agent"
         )
 
-        # /run/wrappers must be on the agent unit's PATH — it holds the setuid
-        # sudo wrapper, without which shells started by the agent CLI can't
-        # invoke sudo even though the sudoers rule permits the command.
+        # Reload directly through systemd's D-Bus API. The narrow polkit rule
+        # is the whole #726 fix: no setuid sudo transition, so this remains
+        # callable from Codex's unprivileged command namespace.
         machine.succeed(
-            "systemctl show agent-box@agent --property=Environment "
-            "| grep '/run/wrappers/bin' >/dev/null"
-        )
-
-        # Reload caddy via the sudo rule (NOPASSWD).
-        machine.succeed(
-            "sudo -u agent -H bash -lc "
-            "'sudo -n systemctl reload caddy.service'"
+            f"{in_session} "
+            "/run/current-system/sw/bin/systemctl reload caddy.service"
         )
         machine.wait_until_succeeds("systemctl is-active caddy.service", timeout=20)
+
+        # Authorization is the exact (unit, verb, user) tuple, not general
+        # service management. These must remain denied to the same caller.
+        machine.fail(
+            f"{in_session} "
+            "/run/current-system/sw/bin/systemctl stop caddy.service"
+        )
+        machine.fail(
+            f"{in_session} "
+            "/run/current-system/sw/bin/systemctl restart caddy.service"
+        )
+        machine.fail(
+            f"{in_session} "
+            "/run/current-system/sw/bin/systemctl reload fail2ban.service"
+        )
+        machine.succeed("systemctl is-active caddy.service")
 
         # New vhost actually serves.
         site = f"curl -sk --resolve mysite.test:443:{machine_ip}"

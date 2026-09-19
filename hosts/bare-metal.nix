@@ -41,11 +41,6 @@
       };
     };
 
-    # The ONLY elevated powers the agents get. Keep this tight and explicit.
-    sudoAllowlist = [
-      "/run/current-system/sw/bin/systemctl reload caddy.service"
-    ];
-
     extraPackages = with pkgs; [ git ripgrep jq ];
   };
 

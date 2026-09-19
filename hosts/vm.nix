@@ -10,9 +10,6 @@
     enable = true;
     agent = "claude";
     users.agent = { };
-    sudoAllowlist = [
-      "/run/current-system/sw/bin/systemctl reload caddy.service"
-    ];
     extraPackages = with pkgs; [ git ripgrep jq ];
   };
 
