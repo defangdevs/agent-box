@@ -1176,37 +1176,37 @@ class RenderTest(unittest.TestCase):
                 / "agent-box-fail2ban.service").read_text()
         self.assertIn("-c /etc/agent-box/fail2ban", unit)
 
-    def test_the_reload_the_caddyfile_documents_is_the_one_sudo_grants(self):
-        """The rendered Caddyfile tells the agent, twice, how to reload the
-        front door after adding a snippet. sudoers matches argv exactly, so
-        that sentence is part of the sudo contract: a documented command
-        that misses the grant by a path silently falls back to asking for a
-        password the agent does not have.
+    def test_the_documented_caddy_reload_has_one_narrow_polkit_grant(self):
+        """The Caddyfile's command works without a setuid transition.
 
-        Both fragments carried a bare `sudo systemctl reload
-        caddy.service`, which resolves through PATH — fine here, where the
-        grant IS /usr/bin/systemctl, and wrong on NixOS, where the grant is
-        /run/current-system/sw/bin/systemctl (CodeRabbit, PR #545). The
-        token is bound per backend now; this asserts the two agree.
+        Issue #726 is specifically that sudo cannot cross Codex's command
+        namespace. The replacement authorization must name the documented
+        command's exact unit and verb, and must not leave the old broad
+        setuid path in sudoers.
         """
+        mod = load_agentbox()
         caddyfile = (FIXTURE / "etc/agent-box/Caddyfile").read_text()
         sudoers = (FIXTURE / "etc/sudoers.d/agent-box").read_text()
-        documented = re.findall(r"sudo (\S*systemctl reload caddy\.service)",
-                                caddyfile)
+        policy = (FIXTURE / mod.CADDY_RELOAD_POLICY.lstrip("/")).read_text()
+        documented = re.findall(
+            r"(?m)^#\s+(\S*systemctl reload caddy\.service)$", caddyfile)
         self.assertTrue(documented,
                         "the rendered Caddyfile documents no reload command")
         for cmd in set(documented):
-            self.assertIn(cmd, sudoers,
-                          f"the Caddyfile tells the agent to run `sudo {cmd}`, "
-                          f"which sudoers does not grant")
+            self.assertNotIn(cmd, sudoers,
+                             "Caddy reload still crosses setuid sudo")
             self.assertTrue(cmd.startswith("/"),
-                            f"`{cmd}` is a bare command name: sudoers matches "
-                            f"the path, so PATH decides whether the grant "
-                            f"applies")
+                            f"`{cmd}` is a bare command name")
+        self.assertIn('action.lookup("unit") == "caddy.service"', policy)
+        self.assertIn('action.lookup("verb") == "reload"', policy)
+        self.assertIn('"org.freedesktop.systemd1.manage-units"', policy)
+        self.assertIn('var agentBoxUsers = ["agent", "robot"]', policy)
+        self.assertNotIn('"stop"', policy)
+        self.assertNotIn('"restart"', policy)
 
     def test_a_snippet_in_sites_is_actually_served(self):
         """The ~/sites extension point (issue #40) is four pieces: the
-        caddy-readable snippet dir, the symlink into $HOME, the sudo grant
+        caddy-readable snippet dir, the symlink into $HOME, the polkit grant
         to reload caddy — and the `import` that makes caddy read the
         snippet. The native backend rendered the first three and not the
         fourth, which is the failure that looks like success: the dir is
@@ -2173,6 +2173,7 @@ class RenderTest(unittest.TestCase):
                 out / "etc/systemd/system/agent-web-terminal@.service",
                 out / "etc/systemd/system/agent-box-settings@.service",
                 out / "etc/agent-box/Caddyfile",
+                out / mod.CADDY_RELOAD_POLICY.lstrip("/"),
                 out / "etc/agent-box/web-users",
                 out / "etc/agent-box/fail2ban/jail.conf",
                 out / "etc/agent-box/fail2ban/fail2ban.conf",

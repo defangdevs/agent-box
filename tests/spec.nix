@@ -67,15 +67,10 @@ in
   containers = { enable = cfg.containers.enable; };
   codexFullAccess = cfg.codexFullAccess;
   restartNotice = cfg.restartNotice;
-  # Verbatim: these are operator-written sudoers command lines, and a fixture
-  # generator has no business rewriting one. They ARE substrate-specific —
-  # this configuration's entry names /run/current-system/sw/bin/systemctl,
-  # which no native box has — so the cross-backend comparison normalizes the
-  # systemctl prefix rather than the generator inventing a path. Worth knowing
-  # while reading tests/native/expected/etc/sudoers.d: the NixOS-shaped line
-  # there is this one, and it is also redundant, since the module grants the
-  # caddy reload itself (caddyReloadCmd, modules/agent-box.nix.in:316) — which
-  # is why the golden sudoers carries it twice.
+  # Verbatim: these are operator-written, substrate-specific sudoers command
+  # lines, and a fixture generator has no business rewriting one. The current
+  # golden box leaves this empty: Caddy reloads use a narrow polkit rule
+  # instead of a sudo grant (issue #726).
   sudoAllowlist = cfg.sudoAllowlist;
   web = { enable = cfg.web.enable; }
     # Only when turned OFF, for the reason `session` above emits only
