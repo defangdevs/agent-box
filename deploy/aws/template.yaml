@@ -417,13 +417,13 @@ Mappings:
   # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py — do not edit by hand)
   RegionMap:
     us-east-1:
-      AMI: ami-069ac9a132c510ae8
+      AMI: ami-0440021f8750306fb
     us-west-2:
-      AMI: ami-09317bdf00acaf4d8
+      AMI: ami-03600a79c7c7f56e1
     eu-central-1:
-      AMI: ami-09a01e76a15ce453f
+      AMI: ami-0a104202d932e8997
     eu-west-1:
-      AMI: ami-0e7c4359ef305482d
+      AMI: ami-03a606191cf2c630d
   # END AMI MAP
 
 Resources:
