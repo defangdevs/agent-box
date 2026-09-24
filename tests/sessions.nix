@@ -661,6 +661,46 @@ in
     assert "Press Enter to try again" in offline_out, offline_out
     assert "logout" not in offline_calls, offline_calls
     assert offline_calls.count("remote-control pair") == 3, offline_calls
+
+    # A remote Codex conversation can inherit this pane's $TMUX_PANE and send
+    # it a line meant for a real Codex prompt (issue #691) — /rename, or
+    # anything else. The pane must refuse that rather than treat it as
+    # Enter: the old "*) onboard" case minted a fresh pairing code for every
+    # unrecognised line. run_pane cannot exercise this — its daemon-version
+    # stub always fails, so the keyboard loop body never runs — and the
+    # backdoor's own fd 0 is already a tty (issue #452), so piping stdin
+    # straight into the wrapper would not give IT a pty either; `script`
+    # supplies one that the wrapper's own `[ -t 0 ]` check sees.
+    machine.succeed("rm -rf /tmp/stub && install -d -m 0777 /tmp/stub")
+    machine.succeed("touch /tmp/stub/loggedin")
+    machine.succeed(
+        "cat > /tmp/stub-codex-kb <<'EOF'\n"
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >> /tmp/stub/log\n'
+        'case "$*" in\n'
+        '"app-server daemon version")\n'
+        "  test -f /tmp/stub/dv2 && exit 1\n"
+        "  if test -f /tmp/stub/dv1; then touch /tmp/stub/dv2;"
+        " else touch /tmp/stub/dv1; fi\n"
+        "  exit 0 ;;\n"
+        '"login status") test -f /tmp/stub/loggedin ;;\n'
+        '"remote-control pair") echo "Pairing code: TEST-PAIR" ;;\n'
+        "esac\n"
+        "EOF"
+    )
+    machine.succeed("chmod 0755 /tmp/stub-codex-kb")
+    keyboard_cmd = f'{wrapper} "" "" "" /tmp/stub-codex-kb'
+    keyboard_out = machine.succeed(as_agent(
+        "printf '/rename my-task\\n\\n' | timeout 20 script -q -c "
+        + shlex.quote(keyboard_cmd) + " /dev/null || true"
+    ))
+    assert "is not a Codex prompt" in keyboard_out, keyboard_out
+    keyboard_calls = machine.succeed("cat /tmp/stub/log")
+    # Two mints total: the wrapper's own startup onboard(), then the bare
+    # Enter that follows the refused line — never a third, which the
+    # garbage line would have caused under the old "*) onboard" behaviour.
+    assert keyboard_calls.count("remote-control pair") == 2, keyboard_calls
+
     # The remote-control daemon cannot accept a positional resume prompt. Its
     # wrapper must queue the notice to the exact subscribed Codex app task.
     wake_id = "42345678-9abc-4def-8123-456789abcdef"

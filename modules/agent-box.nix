@@ -674,6 +674,18 @@ let
         tmux send-keys -t "$TMUX_PANE" -l "/rename my-task"   # -l = literal text
         tmux send-keys -t "$TMUX_PANE" C-m                    # run it
 
+    This applies only when the interactive agent TUI is running in that pane. A
+    conversation opened from a Codex desktop or mobile app through Remote Control
+    runs inside `codex app-server`; its inherited `$TMUX_PANE` belongs to the
+    pairing daemon, not to that conversation. Never send keys to that pane from a
+    remote Codex conversation, including to rename yourself: there is no Codex
+    prompt there, and Enter asks the wrapper for a fresh pairing code (issue #691).
+    Rename that conversation through the Codex app instead: use its
+    `set_thread_title` tool when available (with no thread id, it targets the
+    calling thread). An app-server client can make the equivalent
+    `thread/name/set` request with that conversation's `threadId` and the new
+    title as `name`.
+
     The three commands explicitly target $TMUX_PANE. If it is empty, recover your
     pane id by matching the command's controlling TTY before sending any keys:
 
@@ -707,6 +719,10 @@ let
     part of $AGENT_BOX_URL) - then the topic. `/rename` is the Claude Code
     command; other CLIs name it differently, so type `/` in the TUI to list the
     commands, or read `--help` for a start-time flag (Claude Code: `-n, --name`).
+    For a Codex Remote Control conversation, satisfy this step with the Codex
+    app's `set_thread_title` tool instead. If it is unavailable, leave the title
+    for the user to set in the app; never send `/rename` to the shared pairing
+    daemon's tmux pane.
 
     The name belongs to the harness, not to agent-box, so a respawn loses it:
     set it again, or make it permanent at creation with
@@ -3312,7 +3328,17 @@ while "$codex" app-server daemon version >/dev/null 2>&1; do
           relogin_tried=true
           relogin
           ;;
-        *) onboard ;;
+        "") onboard ;;
+        # Anything else is not a word this pane understands — most often a
+        # remote Codex conversation's inherited $TMUX_PANE catching a
+        # /rename or other line meant for a real Codex prompt (issue #691).
+        # Refuse it rather than treating it as Enter: onboard() used to run
+        # for every unrecognised line, so a rename attempt silently minted a
+        # fresh pairing code instead of failing loudly.
+        *)
+          printf '\n  ✗ "%s" is not a Codex prompt: this pane only signs the box in and\n' "$key" >&2
+          printf '    pairs it. Type: login   or press Enter for a fresh pairing code.\n' >&2
+          ;;
       esac
     elif [ "$rc" -le 128 ]; then
       keyboard=false
