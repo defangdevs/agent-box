@@ -259,7 +259,17 @@ while "$codex" app-server daemon version >/dev/null 2>&1; do
           relogin_tried=true
           relogin
           ;;
-        *) onboard ;;
+        "") onboard ;;
+        # Anything else is not a word this pane understands — most often a
+        # remote Codex conversation's inherited $TMUX_PANE catching a
+        # /rename or other line meant for a real Codex prompt (issue #691).
+        # Refuse it rather than treating it as Enter: onboard() used to run
+        # for every unrecognised line, so a rename attempt silently minted a
+        # fresh pairing code instead of failing loudly.
+        *)
+          printf '\n  ✗ "%s" is not a Codex prompt: this pane only signs the box in and\n' "$key" >&2
+          printf '    pairs it. Type: login   or press Enter for a fresh pairing code.\n' >&2
+          ;;
       esac
     elif [ "$rc" -le 128 ]; then
       keyboard=false
