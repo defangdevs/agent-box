@@ -218,7 +218,8 @@ prompt there, and Enter asks the wrapper for a fresh pairing code (issue #691).
 Rename that conversation through the Codex app instead: use its
 `set_thread_title` tool when available (with no thread id, it targets the
 calling thread). An app-server client can make the equivalent
-`thread/name/set` request with that conversation's thread id.
+`thread/name/set` request with that conversation's `threadId` and the new
+title as `name`.
 
 The three commands explicitly target $TMUX_PANE. If it is empty, recover your
 pane id by matching the command's controlling TTY before sending any keys:
