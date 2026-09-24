@@ -680,6 +680,10 @@ let
     pairing daemon, not to that conversation. Never send keys to that pane from a
     remote Codex conversation, including to rename yourself: there is no Codex
     prompt there, and Enter asks the wrapper for a fresh pairing code (issue #691).
+    Rename that conversation through the Codex app instead: use its
+    `set_thread_title` tool when available (with no thread id, it targets the
+    calling thread). An app-server client can make the equivalent
+    `thread/name/set` request with that conversation's thread id.
 
     The three commands explicitly target $TMUX_PANE. If it is empty, recover your
     pane id by matching the command's controlling TTY before sending any keys:
@@ -714,8 +718,10 @@ let
     part of $AGENT_BOX_URL) - then the topic. `/rename` is the Claude Code
     command; other CLIs name it differently, so type `/` in the TUI to list the
     commands, or read `--help` for a start-time flag (Claude Code: `-n, --name`).
-    Skip this step for a Codex Remote Control conversation: the Codex app owns its
-    conversation title, and the tmux pane belongs to the shared pairing daemon.
+    For a Codex Remote Control conversation, satisfy this step with the Codex
+    app's `set_thread_title` tool instead. If it is unavailable, leave the title
+    for the user to set in the app; never send `/rename` to the shared pairing
+    daemon's tmux pane.
 
     The name belongs to the harness, not to agent-box, so a respawn loses it:
     set it again, or make it permanent at creation with
