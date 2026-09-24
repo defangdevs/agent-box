@@ -209,6 +209,13 @@ it:
     tmux send-keys -t "$TMUX_PANE" -l "/rename my-task"   # -l = literal text
     tmux send-keys -t "$TMUX_PANE" C-m                    # run it
 
+This applies only when the interactive agent TUI is running in that pane. A
+conversation opened from a Codex desktop or mobile app through Remote Control
+runs inside `codex app-server`; its inherited `$TMUX_PANE` belongs to the
+pairing daemon, not to that conversation. Never send keys to that pane from a
+remote Codex conversation, including to rename yourself: there is no Codex
+prompt there, and Enter asks the wrapper for a fresh pairing code (issue #691).
+
 The three commands explicitly target $TMUX_PANE. If it is empty, recover your
 pane id by matching the command's controlling TTY before sending any keys:
 
@@ -242,6 +249,8 @@ Keep your identity in it - your login name (`whoami`) and the box (the host
 part of $AGENT_BOX_URL) - then the topic. `/rename` is the Claude Code
 command; other CLIs name it differently, so type `/` in the TUI to list the
 commands, or read `--help` for a start-time flag (Claude Code: `-n, --name`).
+Skip this step for a Codex Remote Control conversation: the Codex app owns its
+conversation title, and the tmux pane belongs to the shared pairing daemon.
 
 The name belongs to the harness, not to agent-box, so a respawn loses it:
 set it again, or make it permanent at creation with
