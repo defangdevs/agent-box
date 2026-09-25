@@ -790,6 +790,50 @@ class RenderTest(unittest.TestCase):
             self.assertNotIn(str(conf), again.files,
                              "appended the substituter a second time")
 
+    def test_a_symlinked_nix_custom_conf_keeps_the_symlink(self):
+        """/etc/nix/nix.custom.conf can itself be a symlink to a file some
+        other config tool manages (CodeRabbit review, PR #738) — appending
+        must write through the link, not replace it with a plain file, or
+        the operator's tool stops seeing the config it thinks it owns.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            (out / "etc/nix").mkdir(parents=True)
+            real = out / "etc/nix/real-nix.conf"
+            theirs = "# managed elsewhere\nmax-jobs = 2\n"
+            real.write_text(theirs)
+            conf = out / "etc/nix/nix.custom.conf"
+            conf.symlink_to("real-nix.conf")
+            mod = load_agentbox()
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            tree = rend.render()
+            self.assertNotIn(str(conf), tree.files,
+                             "queued a rewrite at the symlink itself")
+            written = tree.files[str(real)][0]
+            self.assertIn(theirs, written, "clobbered the managed file")
+            self.assertIn("min-free = 1073741824", written)
+
+    def test_a_foreign_nix_custom_conf_keeps_its_mode(self):
+        """A root-owned nix.custom.conf can carry access-tokens and be
+        mode 0600 (CodeRabbit review, PR #738, CWE-732) — appending must
+        not fall back to the 0644 every generated file here otherwise gets.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            (out / "etc/nix").mkdir(parents=True)
+            conf = out / "etc/nix/nix.custom.conf"
+            conf.write_text("# theirs\nmax-jobs = 2\n")
+            conf.chmod(0o600)
+            mod = load_agentbox()
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            tree = rend.render()
+            self.assertEqual(0o600, tree.files[str(conf)][1],
+                             "widened a foreign file's mode to the default")
+
     def test_a_half_configured_defang_cache_is_completed(self):
         """A substituter without its public key is REFUSED by nix, which
         falls back to building — the ~100 MB compile the cache exists to

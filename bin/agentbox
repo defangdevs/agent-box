@@ -44,6 +44,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2152,7 +2153,19 @@ class Renderer:
         if not want:
             return
         self.notes.append(f"{path}: appended {' and '.join(added)}")
-        t.file(path, existing.rstrip("\n") + "\n\n" + want)
+        # This file is foreign, so its mode and its identity as a symlink
+        # are somebody else's decisions, not ours to make for them. `path`
+        # may point at an operator-managed file elsewhere (root-owned config
+        # tooling commonly symlinks its output in); write through the link
+        # rather than replacing it with a plain file, and keep whatever mode
+        # is already there (0600 if the file also carries access-tokens)
+        # rather than defaulting to the 0644 every OTHER file here gets.
+        target = path.resolve() if path.is_symlink() else path
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError:
+            mode = 0o644
+        t.file(target, existing.rstrip("\n") + "\n\n" + want, mode=mode)
 
     # -- base-OS patching ----------------------------------------------------
 
