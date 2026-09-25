@@ -720,6 +720,46 @@ class RenderTest(unittest.TestCase):
             self.assertTrue(any("min-free" in n for n in rend.notes),
                             "skipped the scalars without saying so")
 
+    def test_a_determinate_nix_custom_conf_gets_the_scalars(self):
+        """The file the Determinate installer writes is foreign but has no
+        OPINION about min-free, and that is the file on essentially every
+        real box (issue #467). Skipping the scalars there left every
+        Lightsail and Azure box without the store-fill protection while the
+        setting read as implemented. A file that names neither key gets
+        them; the test above covers the file that names one.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            (out / "etc/nix").mkdir(parents=True)
+            theirs = ("# Written by https://github.com/DeterminateSystems/"
+                      "nix-installer.\n# The contents below are based on "
+                      "options specified at installation time.\n")
+            (out / "etc/nix/nix.custom.conf").write_text(theirs)
+            mod = load_agentbox()
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            tree = rend.render()
+            written = tree.files[str(out / "etc/nix/nix.custom.conf")][0]
+            self.assertIn(theirs, written, "clobbered the installer's file")
+            self.assertIn("min-free = 1073741824", written)
+            self.assertIn("max-free = 5368709120", written)
+            self.assertIn("#467", written, "added scalars without saying who")
+            self.assertFalse(
+                any("left unset" in n for n in rend.notes),
+                "still reporting the scalars as skipped after adding them")
+            # A second apply sees its own min-free in there. It must read
+            # that as "already done", not as a human's value to defer to,
+            # or every later apply appends a duplicate or argues with
+            # itself in the notes.
+            (out / "etc/nix/nix.custom.conf").write_text(written)
+            again = mod.Renderer(spec_obj, prof, root=out)
+            again.render()
+            self.assertNotIn(str(out / "etc/nix/nix.custom.conf"),
+                             again.render().files, "rewrote a settled file")
+            self.assertFalse([n for n in again.notes if "min-free" in n],
+                             "re-reported its own block as somebody else's")
+
     def test_a_foreign_nix_custom_conf_still_gets_the_defang_cache(self):
         """The substituter is ADDITIVE, so unlike the scalars above it can
         be added to a file we do not own without taking anything away.
@@ -749,6 +789,50 @@ class RenderTest(unittest.TestCase):
             again = mod.Renderer(spec_obj, prof, root=out).render()
             self.assertNotIn(str(conf), again.files,
                              "appended the substituter a second time")
+
+    def test_a_symlinked_nix_custom_conf_keeps_the_symlink(self):
+        """/etc/nix/nix.custom.conf can itself be a symlink to a file some
+        other config tool manages (CodeRabbit review, PR #738) — appending
+        must write through the link, not replace it with a plain file, or
+        the operator's tool stops seeing the config it thinks it owns.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            (out / "etc/nix").mkdir(parents=True)
+            real = out / "etc/nix/real-nix.conf"
+            theirs = "# managed elsewhere\nmax-jobs = 2\n"
+            real.write_text(theirs)
+            conf = out / "etc/nix/nix.custom.conf"
+            conf.symlink_to("real-nix.conf")
+            mod = load_agentbox()
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            tree = rend.render()
+            self.assertNotIn(str(conf), tree.files,
+                             "queued a rewrite at the symlink itself")
+            written = tree.files[str(real)][0]
+            self.assertIn(theirs, written, "clobbered the managed file")
+            self.assertIn("min-free = 1073741824", written)
+
+    def test_a_foreign_nix_custom_conf_keeps_its_mode(self):
+        """A root-owned nix.custom.conf can carry access-tokens and be
+        mode 0600 (CodeRabbit review, PR #738, CWE-732) — appending must
+        not fall back to the 0644 every generated file here otherwise gets.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            (out / "etc/nix").mkdir(parents=True)
+            conf = out / "etc/nix/nix.custom.conf"
+            conf.write_text("# theirs\nmax-jobs = 2\n")
+            conf.chmod(0o600)
+            mod = load_agentbox()
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            tree = rend.render()
+            self.assertEqual(0o600, tree.files[str(conf)][1],
+                             "widened a foreign file's mode to the default")
 
     def test_a_half_configured_defang_cache_is_completed(self):
         """A substituter without its public key is REFUSED by nix, which
