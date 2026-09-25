@@ -405,6 +405,32 @@ in
             " /home/agent/.config/agent-box/sessions.json"
         )
 
+        # Claude 2.1.245 persists trust for a linked worktree under its
+        # shared git common directory, not the worktree cwd. The cwd remains
+        # seeded for older clients, while the repo-scoped key prevents the
+        # current client from parking before its kickoff prompt (issue #740).
+        machine.succeed(as_agent(
+            "mkdir -p /home/agent/repos/source"
+            " && git -C /home/agent/repos/source init -q"
+            " && git -C /home/agent/repos/source"
+            " -c user.name=Test -c user.email=test@example.invalid"
+            " commit -q --allow-empty -m initial"
+            " && git -C /home/agent/repos/source worktree add -q"
+            " /home/agent/worktrees/linked"
+        ))
+        machine.succeed(as_agent(
+            "agent-box-session add linked --harness claude"
+            " --cwd /home/agent/worktrees/linked"
+        ))
+        machine.wait_until_succeeds(
+            "jq -e '.projects[\"/home/agent/worktrees/linked\"]"
+            ".hasTrustDialogAccepted == true"
+            " and .projects[\"/home/agent/repos/source/.git\"]"
+            ".hasTrustDialogAccepted == true' /home/agent/.claude.json",
+            timeout=60,
+        )
+        machine.succeed(as_agent("agent-box-session rm linked"))
+
     # --- runtime add: no sudo, no rebuild ---------------------------------
     # --remote-control true: a bare codex add now defaults to the TUI
     # (issue #623), and this subtest is specifically exercising the daemon.

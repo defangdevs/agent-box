@@ -11808,8 +11808,16 @@ esac
     # be the one-time OAuth login. claude persists both acceptances in
     # per-user state files, which it round-trips (read-modify-write), so
     # values seeded before first launch survive login/onboarding:
-    #   ~/.claude.json          projects.<workdir>.hasTrustDialogAccepted
+    #   ~/.claude.json          projects.<project-key>.hasTrustDialogAccepted
     #   ~/.claude/settings.json skipDangerousModePermissionPrompt
+    # Claude 2.1.245 keys a linked git worktree by its absolute git common
+    # directory instead of its cwd. That is the repository-scoped identity the
+    # normal trust dialog persists: every worktree of the same repo shares it.
+    # Seed both spellings for compatibility with older clients, but only select
+    # the common directory when --git-dir proves this is a linked worktree. A
+    # normal repo (including one whose .git file points elsewhere) keeps the cwd
+    # as its only trust key. This is still scoped to the directory the user
+    # explicitly registered; it does not disable Claude's trust check globally.
     #
     # hasCompletedOnboarding skips the whole first-run onboarding wizard,
     # whose first screen is the theme picker ("Choose the text style that
@@ -11839,8 +11847,19 @@ esac
     # dialogs. $1 = working directory, $2 = skipPermissions (true/false).
     seed_claude_state() {
       mkdir -p "$HOME"/.claude
+      claude_project_key="$1"
+      claude_git_dir="$(git -C "$1" rev-parse --path-format=absolute --git-dir 2>/dev/null)" \
+        || claude_git_dir=
+      claude_git_common_dir="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+        || claude_git_common_dir=
+      if [ -n "$claude_git_common_dir" ] \
+           && [ "$claude_git_dir" != "$claude_git_common_dir" ]; then
+        claude_project_key="$claude_git_common_dir"
+      fi
       seed_json "$HOME"/.claude.json --arg wd "$1" \
+        --arg project_key "$claude_project_key" \
         '.projects[$wd] = ((.projects[$wd] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})
+         | .projects[$project_key] = ((.projects[$project_key] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})
          | .hasCompletedOnboarding = true'
       seed_json "$HOME"/.claude/settings.json '.theme //= "dark" | .tui //= "default"'
       if [ "$2" = true ]; then
