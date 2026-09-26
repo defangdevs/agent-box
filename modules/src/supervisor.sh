@@ -244,8 +244,9 @@ seed_json() {
 #
 # Runs before every claude session start (idempotent), which also
 # covers upstream's occasional failure to persist an interactive
-# acceptance (anthropics/claude-code issue 36403). Codex has no such
-# dialogs. $1 = working directory, $2 = skipPermissions (true/false).
+# acceptance (anthropics/claude-code issue 36403). Codex has its own
+# trust state and seeder below. $1 = working directory, $2 =
+# skipPermissions (true/false).
 seed_claude_state() {
   mkdir -p "$HOME"/.claude
   claude_project_key="$1"
@@ -289,6 +290,59 @@ seed_claude_state() {
        | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
     sync_webhook_plugin
   fi
+}
+
+# Pre-accept Codex's project-trust dialog for the exact working directory the
+# user registered with agent-box. `--dangerously-bypass-approvals-and-sandbox`
+# does NOT bypass this separate gate (verified against Codex 0.154.0), and a
+# session with a kickoff prompt otherwise parks before the prompt runs.
+#
+# Do not edit config.toml with sed: it is user-owned TOML, Codex may be writing
+# it at the same time, and a path is not safe to interpolate into a TOML table
+# header. Use Codex's own config/value/write API instead. Its `projects` upsert
+# accepts the path as a JSON object key, preserves every sibling project and
+# publishes the file through Codex's normal config writer. A short-lived
+# app-server is needed because the CLI exposes no config-write subcommand.
+# Keep its stdin open until request 2 answers; closing the pipe immediately can
+# make app-server exit after initialize without processing the queued write.
+#
+# Best effort, like seed_claude_state: an old/broken Codex must still start and
+# show its ordinary dialog rather than make the whole agent-box session fail.
+# $1 = working directory, $2 = agent profile name (or empty), $3 = Codex bin.
+seed_codex_state() {
+  local wd=$1 profile=$2 bin=$3 cxhome init write pid out_fd in_fd line ok
+  cxhome="$(resolve_codex_home "$profile")"
+  mkdir -p "$cxhome"
+  init="$($JQ -cn \
+    '{jsonrpc:"2.0", id:1, method:"initialize", params:{clientInfo:{name:"agent-box", version:"0"}}}')" \
+    || return 0
+  write="$($JQ -cn --arg wd "$wd" \
+    '{jsonrpc:"2.0", id:2, method:"config/value/write", params:{keyPath:"projects", value:{($wd):{trust_level:"trusted"}}, mergeStrategy:"upsert"}}')" \
+    || return 0
+
+  coproc CODEX_CONFIG_WRITER {
+    CODEX_HOME="$cxhome" "$bin" app-server --listen stdio:// 2>/dev/null
+  }
+  pid="${CODEX_CONFIG_WRITER_PID:-}"
+  out_fd="${CODEX_CONFIG_WRITER[0]:-}"
+  in_fd="${CODEX_CONFIG_WRITER[1]:-}"
+  ok=false
+  if [ -n "$pid" ] && [ -n "$out_fd" ] && [ -n "$in_fd" ] \
+       && printf '%s\n' "$init" "$write" >&"$in_fd"; then
+    while IFS= read -r -t 5 -u "$out_fd" line; do
+      if $JQ -e '.id == 2 and .result.status == "ok"' \
+           >/dev/null 2>&1 <<<"$line"; then
+        ok=true
+        break
+      fi
+      $JQ -e '.id == 2 and .error != null' \
+        >/dev/null 2>&1 <<<"$line" && break
+    done
+  fi
+  [ -z "$pid" ] || kill "$pid" 2>/dev/null || :
+  [ -z "$pid" ] || wait "$pid" 2>/dev/null || :
+  [ "$ok" = true ] || echo \
+    "session: could not pre-trust Codex directory $wd; Codex may ask interactively" >&2
 }
 
 # Keep the local-webhook a SESSION loads in step with the one the box PINS
@@ -1028,6 +1082,8 @@ start_session() {
     # the cache before each claude launch forces a full policy fetch.
     rm -f "$HOME"/.claude/remote-settings.json
     seed_claude_state "$wd" "$skip"
+  elif [ "$agent" = codex ]; then
+    seed_codex_state "$wd" "$sprofile" "$bin"
   fi
   # Seed the minimal editable AGENTS.md (points at the read-only canonical
   # guide) IFF absent, so the agent's own edits or a repo checkout there

@@ -431,6 +431,28 @@ in
         )
         machine.succeed(as_agent("agent-box-session rm linked"))
 
+        # Codex has a distinct trust store and its full-access flag does not
+        # bypass the project-trust dialog. The supervisor writes the exact
+        # registered cwd through Codex's own config API before launching it,
+        # so the kickoff can run unattended without globally disabling trust.
+        machine.succeed(as_agent(
+            "agent-box-session add linked-codex --harness codex"
+            " --cwd /home/agent/worktrees/linked"
+        ))
+        machine.wait_until_succeeds(
+            "grep -F '[projects.\"/home/agent/worktrees/linked\"]'"
+            " /home/agent/.codex/config.toml >/dev/null",
+            timeout=60,
+        )
+        machine.wait_until_succeeds(
+            tmux("has-session -t =linked-codex"), timeout=60
+        )
+        linked_codex_pane = machine.succeed(
+            tmux('capture-pane -p -S - -t "=linked-codex:"')
+        )
+        assert "Do you trust the contents" not in linked_codex_pane, linked_codex_pane
+        machine.succeed(as_agent("agent-box-session rm linked-codex"))
+
     # --- runtime add: no sudo, no rebuild ---------------------------------
     # --remote-control true: a bare codex add now defaults to the TUI
     # (issue #623), and this subtest is specifically exercising the daemon.
