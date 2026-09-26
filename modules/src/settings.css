@@ -7,6 +7,12 @@ h1 { font-size: 24px; font-weight: 600; margin: 8px 0 4px;
    page, so the three surfaces read as one identity. */
 .mark svg { width: 28px; height: 28px; display: block; }
 h2 { font-size: 16px; font-weight: 600; margin: 0; }
+.heading-anchor { display: inline-flex; margin-left: 6px; padding: 3px;
+                  color: #8b949e; opacity: 0; vertical-align: middle; }
+.heading-anchor svg { width: 14px; height: 14px; fill: currentColor; }
+h2:hover .heading-anchor, h2:focus-within .heading-anchor,
+.heading-anchor:focus { opacity: 1; }
+.heading-anchor:hover { color: #58a6ff; }
 section { margin: 28px 0; }
 .sec-head { display: flex; align-items: center; justify-content: space-between;
             gap: 12px; }
