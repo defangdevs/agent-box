@@ -784,8 +784,16 @@ seed_json() {
 # be the one-time OAuth login. claude persists both acceptances in
 # per-user state files, which it round-trips (read-modify-write), so
 # values seeded before first launch survive login/onboarding:
-#   ~/.claude.json          projects.<workdir>.hasTrustDialogAccepted
+#   ~/.claude.json          projects.<project-key>.hasTrustDialogAccepted
 #   ~/.claude/settings.json skipDangerousModePermissionPrompt
+# Claude 2.1.245 keys a linked git worktree by its absolute git common
+# directory instead of its cwd. That is the repository-scoped identity the
+# normal trust dialog persists: every worktree of the same repo shares it.
+# Seed both spellings for compatibility with older clients, but only select
+# the common directory when --git-dir proves this is a linked worktree. A
+# normal repo (including one whose .git file points elsewhere) keeps the cwd
+# as its only trust key. This is still scoped to the directory the user
+# explicitly registered; it does not disable Claude's trust check globally.
 #
 # hasCompletedOnboarding skips the whole first-run onboarding wizard,
 # whose first screen is the theme picker ("Choose the text style that
@@ -811,12 +819,31 @@ seed_json() {
 #
 # Runs before every claude session start (idempotent), which also
 # covers upstream's occasional failure to persist an interactive
-# acceptance (anthropics/claude-code issue 36403). Codex has no such
-# dialogs. $1 = working directory, $2 = skipPermissions (true/false).
+# acceptance (anthropics/claude-code issue 36403). Codex has its own
+# trust state and seeder below. $1 = working directory, $2 =
+# skipPermissions (true/false).
 seed_claude_state() {
   mkdir -p "$HOME"/.claude
+  claude_project_key="$1"
+  # `git -C` changes directories but does not override inherited repository
+  # selectors. Trust must follow the registered cwd, not a GIT_* setting from
+  # the supervisor environment that points at some other repository.
+  claude_git_dir="$(env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE \
+    -u GIT_OBJECT_DIRECTORY \
+    git -C "$1" rev-parse --path-format=absolute --git-dir 2>/dev/null)" \
+    || claude_git_dir=
+  claude_git_common_dir="$(env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE \
+    -u GIT_OBJECT_DIRECTORY \
+    git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+    || claude_git_common_dir=
+  if [ -n "$claude_git_common_dir" ] \
+       && [ "$claude_git_dir" != "$claude_git_common_dir" ]; then
+    claude_project_key="$claude_git_common_dir"
+  fi
   seed_json "$HOME"/.claude.json --arg wd "$1" \
+    --arg project_key "$claude_project_key" \
     '.projects[$wd] = ((.projects[$wd] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})
+     | .projects[$project_key] = ((.projects[$project_key] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})
      | .hasCompletedOnboarding = true'
   seed_json "$HOME"/.claude/settings.json '.theme //= "dark" | .tui //= "default"'
   if [ "$2" = true ]; then
@@ -845,6 +872,66 @@ seed_claude_state() {
        | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
     sync_webhook_plugin
   fi
+}
+
+# Pre-accept Codex's project-trust dialog for the exact working directory the
+# user registered with agent-box. `--dangerously-bypass-approvals-and-sandbox`
+# does NOT bypass this separate gate (verified against Codex 0.154.0), and a
+# session with a kickoff prompt otherwise parks before the prompt runs.
+#
+# Do not edit config.toml with sed: it is user-owned TOML, Codex may be writing
+# it at the same time, and a path is not safe to interpolate into a TOML table
+# header. Use Codex's own config/value/write API instead. Its `projects` upsert
+# accepts the path as a JSON object key, preserves every sibling project and
+# publishes the file through Codex's normal config writer. A short-lived
+# app-server is needed because the CLI exposes no config-write subcommand.
+# Keep its stdin open until request 2 answers; closing the pipe immediately can
+# make app-server exit after initialize without processing the queued write.
+#
+# Best effort, like seed_claude_state: an old/broken Codex must still start and
+# show its ordinary dialog rather than make the whole agent-box session fail.
+# $1 = working directory, $2 = agent profile name (or empty), $3 = Codex bin.
+seed_codex_state() {
+  local wd=$1 profile=$2 bin=$3 cxhome init write pid out_fd in_fd line ok
+  local deadline remaining
+  cxhome="$(resolve_codex_home "$profile")"
+  mkdir -p "$cxhome"
+  init="$($JQ -cn \
+    '{jsonrpc:"2.0", id:1, method:"initialize", params:{clientInfo:{name:"agent-box", version:"0"}}}')" \
+    || return 0
+  write="$($JQ -cn --arg wd "$wd" \
+    '{jsonrpc:"2.0", id:2, method:"config/value/write", params:{keyPath:"projects", value:{($wd):{trust_level:"trusted"}}, mergeStrategy:"upsert"}}')" \
+    || return 0
+
+  coproc CODEX_CONFIG_WRITER {
+    # The outer lifetime bound also bounds cleanup if app-server ignores the
+    # SIGTERM below; timeout escalates to SIGKILL one second later.
+    exec env CODEX_HOME="$cxhome" timeout --signal=TERM --kill-after=1s 7s \
+      "$bin" app-server --listen stdio:// 2>/dev/null
+  }
+  pid="${CODEX_CONFIG_WRITER_PID:-}"
+  out_fd="${CODEX_CONFIG_WRITER[0]:-}"
+  in_fd="${CODEX_CONFIG_WRITER[1]:-}"
+  ok=false
+  if [ -n "$pid" ] && [ -n "$out_fd" ] && [ -n "$in_fd" ] \
+       && printf '%s\n' "$init" "$write" >&"$in_fd"; then
+    deadline=$((SECONDS + 5))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      remaining=$((deadline - SECONDS))
+      IFS= read -r -t "$remaining" -u "$out_fd" line || break
+      if $JQ -e '.id == 2 and .result.status == "ok"' \
+           >/dev/null 2>&1 <<<"$line"; then
+        ok=true
+        break
+      fi
+      $JQ -e '.id == 2 and .error != null' \
+        >/dev/null 2>&1 <<<"$line" && break
+    done
+  fi
+  [ -z "$pid" ] || kill "$pid" 2>/dev/null || :
+  [ -z "$pid" ] || wait "$pid" 2>/dev/null || :
+  [ "$ok" = true ] || echo \
+    "session: could not pre-trust Codex directory $wd; Codex may ask interactively" >&2
 }
 
 # Keep the local-webhook a SESSION loads in step with the one the box PINS
@@ -2083,6 +2170,8 @@ start_session() {
     # the cache before each claude launch forces a full policy fetch.
     rm -f "$HOME"/.claude/remote-settings.json
     seed_claude_state "$wd" "$skip"
+  elif [ "$agent" = codex ]; then
+    seed_codex_state "$wd" "$sprofile" "$bin"
   fi
   # Seed the minimal editable AGENTS.md (points at the read-only canonical
   # guide) IFF absent, so the agent's own edits or a repo checkout there
