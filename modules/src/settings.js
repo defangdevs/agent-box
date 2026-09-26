@@ -647,9 +647,14 @@
       var cw = (w - (c - 1) * TILE_GAP) / c;
       var ch = Math.max(TILE_MIN_H, (h - (r - 1) * TILE_GAP) / r);
       var score = Math.min(cw / TILE_ASPECT, ch);
-      // Strictly better only: on a tie the fewer columns win, which keeps
-      // an empty slot out of the last row where it can.
-      if (score > best.score) { best = { cols: c, rows: r, score: score }; }
+      // On a tie, fewer rows win. Ties are what the row floor produces: in a
+      // short pane every candidate bottoms out at TILE_MIN_H, and keeping
+      // the first would stack all the tiles in one scrolling column when
+      // the width had room for them side by side (CodeRabbit on PR #745).
+      if (score > best.score ||
+          (score === best.score && r < best.rows)) {
+        best = { cols: c, rows: r, score: score };
+      }
     }
     return best;
   }
