@@ -308,6 +308,41 @@ test('the tab close button arms first and only closes on a second click', async 
   await expect(page.locator(`#panes .pane[data-pane="${name}"]`)).toHaveCount(0);
 });
 
+test('a grid tile closes itself with the same two-click x, staying in the grid', async ({ browser }) => {
+  const page = await authedPage(browser);
+  await page.goto('/?view=grid');
+  const before = await tabNames(page);
+  await openSessionEditor(page, 'New session');
+  await page.locator('#session-editor button[type="submit"]').click();
+  await expect.poll(async () => (await tabNames(page)).length).toBe(before.length + 1);
+  const name = (await tabNames(page)).find((n) => !before.includes(n)) as string;
+
+  // The tab strip is hidden in the grid, so the tile is where the x lives.
+  const cell = page.locator(`#panes .cell[data-cell="${name}"]`);
+  const x = cell.locator('.tab-x');
+  await expect(x).toBeVisible();
+  await x.click();
+  await expect(x).toHaveText('Close?');
+  await expect(page.locator('#panes .cell.arm')).toHaveCount(1);
+  await page.waitForTimeout(500);   // past SETTLE_MS, well inside ARM_MS
+  await x.click();
+  await expect(cell).toHaveCount(0);
+  await expect(page.locator('body')).toHaveAttribute('data-view', 'grid');
+});
+
+test('the grid picks its column count from the window, not only its width', async ({ browser }) => {
+  const page = await authedPage(browser);
+  const panes = page.locator('#panes');
+  // A phone: one column, however many sessions, and nothing sideways.
+  await page.setViewportSize({ width: 390, height: 780 });
+  await page.goto('/?view=grid');
+  await expect(panes).toHaveAttribute('data-cols', '1');
+  expect(await panes.evaluate((e) => e.scrollWidth <= e.clientWidth)).toBeTruthy();
+  // Leaving the grid drops the shape, so the tab layout is untouched by it.
+  await page.locator('#tab-bar a.viewtog').click();
+  await expect(panes).not.toHaveAttribute('data-cols', /.*/);
+});
+
 test('the working-directory picker suggests folders one level at a time', async ({ browser }) => {
   const page = await authedPage(browser);
   await page.goto('/');

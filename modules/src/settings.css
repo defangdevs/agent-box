@@ -381,6 +381,15 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
                              grid-template-columns:
                                repeat(auto-fit, minmax(min(320px, 100%), 1fr));
                              grid-auto-rows: minmax(240px, 1fr); }
+/* SCRIPT's refinement of the above: data-cols is set once it has measured
+   the box and picked a column count for the number of tiles (gridShape in
+   settings.js - 2x2 for four on a desktop, one column on a phone). Every
+   row gets an equal share of the height down to a readable floor, and
+   rows past that floor scroll. The 160px must match TILE_MIN_H there. */
+.ws[data-view=grid] .panes[data-cols] {
+  grid-template-columns: repeat(var(--cols), minmax(0, 1fr));
+  grid-template-rows: repeat(var(--rows), minmax(160px, 1fr));
+  grid-auto-rows: minmax(160px, 1fr); }
 .ws[data-view=grid] .cell { position: relative; inset: auto;
                             visibility: visible; display: flex;
                             flex-direction: column; min-height: 0;
@@ -390,7 +399,8 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
    same answer, so it gets the same accent the current tab has. */
 .ws[data-view=grid] .cell.active { border-color: #58a6ff; }
 .ws[data-view=grid] .cell-head { display: flex; align-items: center;
-                                 gap: 8px; flex: none; padding: 5px 8px;
+                                 gap: 8px; flex: none;
+                                 padding: 5px 34px 5px 8px;
                                  font-size: 12px; color: #8b949e;
                                  text-decoration: none; background: #010409;
                                  border-bottom: 1px solid #21262d; }
@@ -403,6 +413,15 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
              flex: 1; }
 .cell-open { display: flex; flex: none; }
 .cell-open svg { width: 14px; height: 14px; display: block; }
+/* A tile's close (x): the tab's own button, placed over the caption's
+   extra right padding the way .tab-x sits over the tab's. Grid only - in
+   the tab layout the caption is hidden and the tab bar carries the x. The
+   armed state tints the whole tile, as it tints the whole tab. */
+.cell-close { display: none; margin: 0; }
+.ws[data-view=grid] .cell-close { display: block; position: absolute;
+                                  top: 0; right: 0; height: 27px; }
+.ws[data-view=grid] .cell-close .tab-x { top: 4px; right: 6px; bottom: 4px; }
+.ws[data-view=grid] .cell.arm { border-color: #f85149; }
 /* The pane is the rest of the tile, and a flex child rather than an
    absolute fill: the caption above it is part of the box now. */
 .ws[data-view=grid] .pane { position: static; inset: auto; flex: 1;
