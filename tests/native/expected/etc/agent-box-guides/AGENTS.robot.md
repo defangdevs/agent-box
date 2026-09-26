@@ -6,7 +6,9 @@ agent-box deploys as a NixOS system and as a Nix profile on an ordinary
 distro, and the two differ in ways worth knowing before you change
 anything outside $HOME.) Your workspace is at $AGENT_BOX_URL
 (`echo $AGENT_BOX_URL` prints it): one tab per session, and each session also
-has a terminal of its own at ${AGENT_BOX_URL}<session>/. Share those URLs
+has a terminal of its own at ${AGENT_BOX_URL}<session>/. The grid button at
+the end of the tab bar (or ${AGENT_BOX_URL}?view=grid) shows every session at
+once, which is the URL to hand somebody who is watching several agents work. Share those URLs
 with anyone who needs to view or take over your session; the sign-in username
 is your own login name (`whoami`) and the password was set at deploy time.
 
