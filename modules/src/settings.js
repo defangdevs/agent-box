@@ -574,6 +574,7 @@
       head.setAttribute("aria-label", label);
       head.querySelector(".cell-name").textContent = name;
       cell.appendChild(head);
+      cell.appendChild(closeForm(name));
       document.getElementById("panes").appendChild(cell);
     }
     // The dot is the tab's, read back on every sync: the live feed morphs
@@ -582,6 +583,31 @@
     var dot = cell.querySelector(".cell-head .state");
     if (dot) { dot.setAttribute("data-state", tabState(name) || "starting"); }
     return cell;
+  }
+  // A tile's close (x), the same form the tab carries (see render_cell):
+  // built rather than cloned, because the one on the page belongs to some
+  // other session and a stale hidden name is exactly the wrong thing to
+  // post to a delete route.
+  function closeForm(name) {
+    var f = document.createElement("form");
+    f.className = "cell-close";
+    f.method = "post";
+    f.action = (tabBar().getAttribute("data-sess-base") || "") +
+      "/sessions/delete";
+    var hidden = document.createElement("input");
+    hidden.type = "hidden";
+    hidden.name = "name";
+    hidden.value = name;
+    var b = document.createElement("button");
+    b.type = "submit";
+    b.className = "tab-x";
+    b.setAttribute("data-close", name);
+    b.setAttribute("aria-label", "Close " + name);
+    b.title = "Close " + name;
+    b.textContent = "×";
+    f.appendChild(hidden);
+    f.appendChild(b);
+    return f;
   }
   // Tiles read in tab order however they were mounted: the server renders
   // the selected session's cell and this script appends the rest as they
@@ -598,6 +624,74 @@
       var i = names.indexOf(c.getAttribute("data-cell"));
       c.style.order = String(i < 0 ? names.length : i);
     });
+  }
+  // How many columns the grid gets. CSS auto-fit alone cannot answer this:
+  // it fills a row with as many 320px tracks as fit and never looks at the
+  // height, so four sessions on a wide monitor came out as one row of four
+  // tall slivers, where anyone would lay them out 2x2. So pick the column
+  // count the way a video-call grid does: for each candidate, the largest
+  // terminal-shaped box (TILE_ASPECT) that fits in one cell, and keep the
+  // count whose box is biggest. Four panes: 2x2 on a desktop window, one
+  // column of four on a phone (TILE_MIN_W allows only one column there),
+  // 2x2 on a phone held sideways. Rows that do not fit at TILE_MIN_H
+  // scroll rather than shrink past a readable terminal.
+  //
+  // The scriptless grid keeps the CSS auto-fit (see settings.css): this
+  // only ever REFINES a layout that already works without it.
+  var TILE_MIN_W = 320, TILE_MIN_H = 160, TILE_ASPECT = 1.6, TILE_GAP = 8;
+  function gridShape(n, w, h) {
+    var maxCols = Math.max(1, Math.floor((w + TILE_GAP) / (TILE_MIN_W + TILE_GAP)));
+    var best = { cols: 1, rows: n, score: -1 };
+    for (var c = 1; c <= Math.min(n, maxCols); c++) {
+      var r = Math.ceil(n / c);
+      var cw = (w - (c - 1) * TILE_GAP) / c;
+      var ch = Math.max(TILE_MIN_H, (h - (r - 1) * TILE_GAP) / r);
+      var score = Math.min(cw / TILE_ASPECT, ch);
+      // On a tie, fewer rows win. Ties are what the row floor produces: in a
+      // short pane every candidate bottoms out at TILE_MIN_H, and keeping
+      // the first would stack all the tiles in one scrolling column when
+      // the width had room for them side by side (CodeRabbit on PR #745).
+      if (score > best.score ||
+          (score === best.score && r < best.rows)) {
+        best = { cols: c, rows: r, score: score };
+      }
+    }
+    return best;
+  }
+  function wsTile() {
+    var panes = document.getElementById("panes");
+    if (!panes) { return; }
+    var cells = Array.prototype.slice.call(
+      panes.querySelectorAll(".cell[data-cell]"));
+    cells.forEach(function (c) { c.style.gridColumn = ""; });
+    if (wsView() !== "grid" || !cells.length) {
+      panes.removeAttribute("data-cols");
+      panes.style.removeProperty("--cols");
+      panes.style.removeProperty("--rows");
+      return;
+    }
+    var cs = window.getComputedStyle(panes);
+    var w = panes.clientWidth -
+      parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+    var h = panes.clientHeight -
+      parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+    if (!(w > 0 && h > 0)) { return; }
+    var shape = gridShape(cells.length, w, h);
+    panes.setAttribute("data-cols", String(shape.cols));
+    panes.style.setProperty("--cols", String(shape.cols));
+    panes.style.setProperty("--rows", String(shape.rows));
+    // A short last row: its final tile (in tab order - see wsOrder) spans
+    // the leftover columns, the way tmux's own tiled layout does, instead
+    // of leaving a hole in the corner of the grid.
+    var spare = shape.cols * shape.rows - cells.length;
+    if (spare > 0) {
+      var last = cells.reduce(function (a, b) {
+        // >= so that with no `order` set yet (a server-rendered grid is
+        // already in tab order) the last in the DOM is the last tile.
+        return Number(b.style.order) >= Number(a.style.order) ? b : a;
+      });
+      last.style.gridColumn = "span " + (spare + 1);
+    }
   }
   function ensurePane(name) {
     var cell = ensureCell(name);
@@ -682,6 +776,7 @@
     // The grid shows every session, so anything not yet mounted is mounted
     // now; leaving it keeps every pane attached, as a background tab is.
     if (view === "grid") { tabNames().forEach(ensurePane); wsOrder(); }
+    wsTile();
     if (target) { wsSelect(target, focus); }
     else { history.replaceState(null, "", wsUrl(null, view)); }
     wsRetag(view, target);
@@ -704,8 +799,12 @@
     // that is what the layout is for. The tab layout keeps mounting a pane
     // when it is first shown, so a load costs one terminal, not one each.
     if (wsView() === "grid") { tabNames().forEach(ensurePane); wsOrder(); }
+    wsTile();
     var cur = wsActive();
     if (cur) { wsSelect(cur, false); }
+    // The live feed re-renders the tab bar with the toggle as the SERVER
+    // last saw the layout; put it back in step with the one showing.
+    wsRetag(wsView(), cur);
   }
   document.addEventListener("click", function (e) {
     var t = e.target && e.target.closest ? e.target.closest("#tab-bar .tab[data-tab]") : null;
@@ -755,7 +854,7 @@
   var armedX = null;
   var armedAt = 0;
   var armTimer = null;
-  function wrapOf(b) { return b.closest ? b.closest(".tab-wrap") : null; }
+  function wrapOf(b) { return b.closest ? b.closest(".tab-wrap, .cell") : null; }
   function clearArm() {
     if (armTimer) { window.clearTimeout(armTimer); armTimer = null; }
     var b = armedX;
@@ -787,7 +886,8 @@
     armTimer = window.setTimeout(disarmX, ARM_MS);
   }
   document.addEventListener("click", function (e) {
-    var x = e.target && e.target.closest ? e.target.closest("#tab-bar .tab-x") : null;
+    var x = e.target && e.target.closest
+      ? e.target.closest("#tab-bar .tab-x, #panes .tab-x") : null;
     // Second click on the armed button: fall through with no
     // preventDefault so the form submits (the submit handler below
     // upgrades it to fetch + patch, like every other form here). Only
@@ -1257,6 +1357,16 @@
   connectPoll();
   // Land in the terminal: focus the server-selected tab's pane.
   if (wsActive()) { wsSelect(wsActive(), true); }
+  // The grid's shape depends on the box it has, so it is re-picked whenever
+  // that box changes: a window resize, a phone turning, a banner above the
+  // panes being dismissed.
+  wsTile();
+  var panesEl = document.getElementById("panes");
+  if (panesEl && window.ResizeObserver) {
+    new ResizeObserver(function () { wsTile(); }).observe(panesEl);
+  } else {
+    window.addEventListener("resize", wsTile);
+  }
   // Still armed for the moment before the feed reports itself open; it
   // no-ops from then on.
   startPolling(8);
