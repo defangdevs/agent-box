@@ -11910,6 +11910,7 @@ esac
     # $1 = working directory, $2 = agent profile name (or empty), $3 = Codex bin.
     seed_codex_state() {
       local wd=$1 profile=$2 bin=$3 cxhome init write pid out_fd in_fd line ok
+      local deadline remaining
       cxhome="$(resolve_codex_home "$profile")"
       mkdir -p "$cxhome"
       init="$($JQ -cn \
@@ -11920,7 +11921,10 @@ esac
         || return 0
 
       coproc CODEX_CONFIG_WRITER {
-        CODEX_HOME="$cxhome" "$bin" app-server --listen stdio:// 2>/dev/null
+        # The outer lifetime bound also bounds cleanup if app-server ignores the
+        # SIGTERM below; timeout escalates to SIGKILL one second later.
+        exec env CODEX_HOME="$cxhome" timeout --signal=TERM --kill-after=1s 7s \
+          "$bin" app-server --listen stdio:// 2>/dev/null
       }
       pid="''${CODEX_CONFIG_WRITER_PID:-}"
       out_fd="''${CODEX_CONFIG_WRITER[0]:-}"
@@ -11928,7 +11932,10 @@ esac
       ok=false
       if [ -n "$pid" ] && [ -n "$out_fd" ] && [ -n "$in_fd" ] \
            && printf '%s\n' "$init" "$write" >&"$in_fd"; then
-        while IFS= read -r -t 5 -u "$out_fd" line; do
+        deadline=$((SECONDS + 5))
+        while [ "$SECONDS" -lt "$deadline" ]; do
+          remaining=$((deadline - SECONDS))
+          IFS= read -r -t "$remaining" -u "$out_fd" line || break
           if $JQ -e '.id == 2 and .result.status == "ok"' \
                >/dev/null 2>&1 <<<"$line"; then
             ok=true
