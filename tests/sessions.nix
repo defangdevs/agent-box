@@ -417,7 +417,27 @@ in
             " commit -q --allow-empty -m initial"
             " && git -C /home/agent/repos/source worktree add -q"
             " /home/agent/worktrees/linked"
+            " && mkdir -p /home/agent/repos/poison"
+            " && git -C /home/agent/repos/poison init -q"
         ))
+
+        # A configured supervisor environment can carry Git's repository
+        # selectors. `git -C` alone does not neutralize them, so before the
+        # fix this made the trust lookup follow the unrelated poison repo
+        # instead of the registered linked-worktree cwd. Exercise the real
+        # unit environment rather than only probing git in isolation.
+        machine.succeed(
+            "install -d /run/systemd/system/agent-box@agent.service.d"
+            " && printf '%s\\n' '[Service]'"
+            " 'Environment=GIT_DIR=/home/agent/repos/poison/.git'"
+            " 'Environment=GIT_COMMON_DIR=/home/agent/repos/poison/.git'"
+            " 'Environment=GIT_WORK_TREE=/home/agent/repos/poison'"
+            " 'Environment=GIT_OBJECT_DIRECTORY=/home/agent/repos/poison/.git/objects'"
+            " > /run/systemd/system/agent-box@agent.service.d/poison-git.conf"
+            " && systemctl daemon-reload"
+            " && systemctl restart agent-box@agent.service"
+        )
+        machine.wait_for_unit("agent-box@agent.service")
         machine.succeed(as_agent(
             "agent-box-session add linked --harness claude"
             " --cwd /home/agent/worktrees/linked"
@@ -430,6 +450,12 @@ in
             timeout=60,
         )
         machine.succeed(as_agent("agent-box-session rm linked"))
+        machine.succeed(
+            "rm -f /run/systemd/system/agent-box@agent.service.d/poison-git.conf"
+            " && systemctl daemon-reload"
+            " && systemctl restart agent-box@agent.service"
+        )
+        machine.wait_for_unit("agent-box@agent.service")
 
         # Codex has a distinct trust store and its full-access flag does not
         # bypass the project-trust dialog. The supervisor writes the exact

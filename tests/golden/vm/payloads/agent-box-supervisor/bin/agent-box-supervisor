@@ -825,9 +825,16 @@ seed_json() {
 seed_claude_state() {
   mkdir -p "$HOME"/.claude
   claude_project_key="$1"
-  claude_git_dir="$(git -C "$1" rev-parse --path-format=absolute --git-dir 2>/dev/null)" \
+  # `git -C` changes directories but does not override inherited repository
+  # selectors. Trust must follow the registered cwd, not a GIT_* setting from
+  # the supervisor environment that points at some other repository.
+  claude_git_dir="$(env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE \
+    -u GIT_OBJECT_DIRECTORY \
+    git -C "$1" rev-parse --path-format=absolute --git-dir 2>/dev/null)" \
     || claude_git_dir=
-  claude_git_common_dir="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+  claude_git_common_dir="$(env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE \
+    -u GIT_OBJECT_DIRECTORY \
+    git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
     || claude_git_common_dir=
   if [ -n "$claude_git_common_dir" ] \
        && [ "$claude_git_dir" != "$claude_git_common_dir" ]; then
