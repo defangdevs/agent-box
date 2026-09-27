@@ -5384,8 +5384,15 @@ def render_cell(name, live, stopped, died, selected):
     more of needs no explaining, and it is the same href the tab carries,
     so it works with scripting off. `active` marks the selected session:
     which pane is showing in the tab layout, and which tile is outlined in
-    the grid."""
+    the grid.
+
+    The close (x) is the tab's own: in the grid the tab strip is hidden,
+    so without one here a session could only be closed by leaving the
+    layout that shows it. Same route, same class, so SCRIPT gives it the
+    same two-click arming, and a SIBLING of the caption link rather than
+    a child of it, for the reason render_tabs gives."""
     safe = html.escape(name)
+    base = html.escape(SESS_BASE)
     if name in live:
         # The pane is up either way; whether an AGENT is in it is what the
         # dot has to say (issue #516).
@@ -5405,6 +5412,11 @@ def render_cell(name, live, stopped, died, selected):
         f'<span class="cell-name">{safe}</span>'
         f'<span class="cell-open" aria-hidden="true">{ICON_EXPAND}</span>'
         f'</a>'
+        f'<form class="cell-close" method="post" action="{base}/sessions/delete">'
+        f'<input type="hidden" name="name" value="{safe}">'
+        f'<button type="submit" class="tab-x" data-close="{safe}" '
+        f'aria-label="Close {safe}" title="Close {safe}">&times;</button>'
+        f'</form>'
         f'{render_pane(name, live, stopped)}'
         f'</div>'
     )

@@ -199,6 +199,15 @@ in
         # The selected session is the tile the grid outlines, and the one
         # leaving the grid lands on.
         assert '<div class="cell active" data-cell="claude">' in grid_page, grid_page
+        # Each tile carries the tab's close (x), because the grid hides the
+        # tab strip: the same route, and the same button class the
+        # client-side two-click arming keys on. A sibling of the caption
+        # link, never inside it.
+        assert ('</a><form class="cell-close" method="post" '
+                'action="/sessions/delete">'
+                '<input type="hidden" name="name" value="main">'
+                '<button type="submit" class="tab-x" data-close="main"'
+                in grid_page), grid_page
         assert ('<a class="viewtog" data-view-to="tabs" '
                 'href="/agent/?tab=claude" title="Single pane"'
                 in grid_page), grid_page
