@@ -19293,6 +19293,12 @@ STYLE = """<style>
      page, so the three surfaces read as one identity. */
   .mark svg { width: 28px; height: 28px; display: block; }
   h2 { font-size: 16px; font-weight: 600; margin: 0; }
+  .heading-anchor { display: inline-flex; margin-left: 6px; padding: 3px;
+                    color: #8b949e; opacity: 0; vertical-align: middle; }
+  .heading-anchor svg { width: 14px; height: 14px; fill: currentColor; }
+  h2:hover .heading-anchor, h2:focus-within .heading-anchor,
+  .heading-anchor:focus { opacity: 1; }
+  .heading-anchor:hover { color: #58a6ff; }
   section { margin: 28px 0; }
   .sec-head { display: flex; align-items: center; justify-content: space-between;
               gap: 12px; }
@@ -19776,7 +19782,7 @@ default is your home folder (<code>~</code>).</p>
 # rather than on SESS_PAGE (issue #119).
 SESSIONS_SECTION_TPL = """<section>
     <div class="sec-head">
-      <h2>Sessions</h2>
+      <h2 id="sessions">Sessions<a class="heading-anchor" href="#sessions" aria-label="Copy link to Sessions" title="Copy link to Sessions"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
       <button type="button" class="btn" data-toggle="session-editor">Add session</button>
     </div>
     <p class="note">Each session opens a separate terminal tab for an AI
@@ -19800,7 +19806,7 @@ SESSIONS_SECTION_TPL = """<section>
 # because the session row now has two controls that both name a harness.
 PROFILES_SECTION_TPL = """<section>
     <div class="sec-head">
-      <h2>Profiles</h2>
+      <h2 id="profiles">Profiles<a class="heading-anchor" href="#profiles" aria-label="Copy link to Profiles" title="Copy link to Profiles"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
       <button type="button" class="btn" data-toggle="profile-editor">Add profile</button>
     </div>
     <p class="note">Profiles save how an assistant should start, including
@@ -19858,7 +19864,7 @@ PROFILES_SECTION_TPL = """<section>
 # own header still says which of the two it is.
 WEBHOOKS_SECTION_TPL = """<section>
     <div class="sec-head">
-      <h2>Automations</h2>
+      <h2 id="automations">Automations<a class="heading-anchor" href="#automations" aria-label="Copy link to Automations" title="Copy link to Automations"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
     </div>
     <div id="webhook-endpoint">{endpoint}</div>
     <p class="note">Automatic session rules start a new session when a
@@ -19873,7 +19879,7 @@ WEBHOOKS_SECTION_TPL = """<section>
 # is off or the box is wrong. See webhook_unavailable() for the states.
 WEBHOOK_UNAVAILABLE_TPL = """<section>
     <div class="sec-head">
-      <h2>Automations</h2>
+      <h2 id="automations">Automations<a class="heading-anchor" href="#automations" aria-label="Copy link to Automations" title="Copy link to Automations"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
     </div>
     <p class="note">{text}</p>
   </section>"""
@@ -19921,7 +19927,7 @@ WEBHOOK_ENDPOINT_EMPTY_TPL = """<p class="note">%s</p>
 # anything had actually changed.
 CONNECT_SECTION_TPL = """<section>
     <div class="sec-head">
-      <h2>Connections</h2>
+      <h2 id="connections">Connections<a class="heading-anchor" href="#connections" aria-label="Copy link to Connections" title="Copy link to Connections"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
     </div>
     <p class="note">Connect the accounts your assistants can use. Sign-in is
     handled securely by each provider, and this page does not display your
@@ -20039,7 +20045,7 @@ BODY = """<main>
   {webhooks_section}
   <section>
     <div class="sec-head">
-      <h2>API keys and secrets</h2>
+      <h2 id="api-keys-and-secrets">API keys and secrets<a class="heading-anchor" href="#api-keys-and-secrets" aria-label="Copy link to API keys and secrets" title="Copy link to API keys and secrets"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
       <button type="button" class="btn" data-toggle="secret-editor">Add secret</button>
     </div>
     <p class="note">Store API keys and other credentials used by your
@@ -20065,7 +20071,7 @@ BODY = """<main>
   </section>
   {password_section}
   <section>
-    <h2>Maintenance</h2>
+    <h2 id="maintenance">Maintenance<a class="heading-anchor" href="#maintenance" aria-label="Copy link to Maintenance" title="Copy link to Maintenance"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
     <ul class="tbl danger">
       <li>
         <span class="dz"><strong>Restart all sessions</strong>
@@ -20089,7 +20095,7 @@ BODY = """<main>
 
 PASSWORD_SECTION = """<section>
     <div class="sec-head">
-      <h2>Account</h2>
+      <h2 id="account">Account<a class="heading-anchor" href="#account" aria-label="Copy link to Account" title="Copy link to Account"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
       <button type="button" class="btn" data-toggle="password-editor">Change password</button>
     </div>
     <p class="note">Change the password used to open agent-box. You will be
@@ -20346,6 +20352,18 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   function parseHTML(text) {
     return new DOMParser().parseFromString(text, "text/html");
   }
+
+  // Heading links remain ordinary fragment links; copy their absolute URL
+  // as a convenience for sharing a direct route to a settings section.
+  document.addEventListener("click", function (e) {
+    var link = e.target.closest("a.heading-anchor");
+    if (!link || !navigator.clipboard || !navigator.clipboard.writeText) { return; }
+    var original = link.title;
+    navigator.clipboard.writeText(link.href).then(function () {
+      link.title = "Link copied";
+      window.setTimeout(function () { link.title = original; }, 1500);
+    }).catch(function () {});
+  });
 
   // Shared writer for the Danger-zone progress spans (#restart-status,
   // #update-status): set the data-state colour + text, optionally

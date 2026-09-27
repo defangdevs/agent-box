@@ -59,6 +59,18 @@
     return new DOMParser().parseFromString(text, "text/html");
   }
 
+  // Heading links remain ordinary fragment links; copy their absolute URL
+  // as a convenience for sharing a direct route to a settings section.
+  document.addEventListener("click", function (e) {
+    var link = e.target.closest("a.heading-anchor");
+    if (!link || !navigator.clipboard || !navigator.clipboard.writeText) { return; }
+    var original = link.title;
+    navigator.clipboard.writeText(link.href).then(function () {
+      link.title = "Link copied";
+      window.setTimeout(function () { link.title = original; }, 1500);
+    }).catch(function () {});
+  });
+
   // Shared writer for the Danger-zone progress spans (#restart-status,
   // #update-status): set the data-state colour + text, optionally
   // appending a trailing link.
