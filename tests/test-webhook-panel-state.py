@@ -160,7 +160,7 @@ class WebhookPanelState(unittest.TestCase):
         module = daemon_with()
         html = module.WEBHOOK_UNAVAILABLE_TPL.format(
             text=module.webhook_unavailable())
-        self.assertIn("<h2>Automations</h2>", html)
+        self.assertIn('<h2 id="automations">Automations<a class="heading-anchor"', html)
         self.assertIn("Automations are not enabled", html)
 
 
