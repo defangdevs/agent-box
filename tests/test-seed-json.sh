@@ -56,6 +56,19 @@ if [ ! -s "$work/midwrite.err" ]; then
   ok "a retry that succeeds says nothing"
 else fail "a retry that succeeds says nothing: $(cat "$work/midwrite.err")"; fi
 
+# --- an all-whitespace file is never replaced with an empty one ----------
+# jq reads it as zero inputs: exit 0, no output. Taking that as success
+# published an empty file over ~/.claude.json (CodeRabbit on PR #755).
+f="$work/blank.json"
+printf '\n' > "$f"
+seed "$f" "$filter" 2> "$work/blank.err"
+if [ "$(cat "$f")" = "" ] && [ "$(wc -c < "$f")" = 1 ]; then
+  ok "a blank file is left as it was, not emptied"
+else fail "a blank file is left as it was, not emptied: $(wc -c < "$f") bytes"; fi
+if grep -q "could not parse $f" "$work/blank.err"; then
+  ok "a blank file is reported like any other unparseable one"
+else fail "a blank file is reported: $(cat "$work/blank.err")"; fi
+
 # --- a file that never parses is left alone, and SAYS so -----------------
 f="$work/broken.json"
 printf 'not json' > "$f"

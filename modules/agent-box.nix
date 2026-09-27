@@ -11800,10 +11800,17 @@ esac
       # the key a new session's folder-trust dialog depends on was simply never
       # written. A file that is still unparseable after the retries is really
       # broken, and says so in the journal instead of vanishing.
+      #
+      # Success is jq exiting 0 AND printing something. jq reads an empty or
+      # all-whitespace file as zero inputs, prints nothing and exits 0 - so a
+      # file truncated between the size check below and the read would have
+      # been replaced with an empty one, wiping every other key claude keeps
+      # there, not just ours (CodeRabbit on PR #755).
       file=$1; shift
       [ -s "$file" ] || printf '{}' > "$file"
       seed_try=0
-      until $JQ "$@" "$file" > "$file.seed-tmp" 2>/dev/null; do
+      until $JQ "$@" "$file" > "$file.seed-tmp" 2>/dev/null \
+          && [ -s "$file.seed-tmp" ]; do
         seed_try=$((seed_try + 1))
         if [ "$seed_try" -ge 5 ]; then
           rm -f "$file.seed-tmp"
