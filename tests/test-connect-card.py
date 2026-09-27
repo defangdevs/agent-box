@@ -210,43 +210,54 @@ class ReloginRestartTest(unittest.TestCase):
     moved elsewhere, would come back with the same credential it had.
     """
 
+    SIGNED_IN = 1000
+
     def setUp(self):
         self.daemon = load_daemon()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.daemon.ENV_FILE = os.path.join(self.tmp.name, "env")
         self.daemon.PROFILES_DIR = os.path.join(self.tmp.name, "profiles")
+        self.daemon.CONNECT_DONE_DIR = os.path.join(self.tmp.name, "state")
         os.makedirs(self.daemon.PROFILES_DIR)
-        self.daemon._relogin_done.clear()
+        os.makedirs(self.daemon.CONNECT_DONE_DIR)
         self.daemon._relogin_notices.clear()
         self.flow = next(f for f in self.daemon.CONNECT_DEFS if f["id"] == "claude")
         self.killed = []
         self.sessions = {}
-        self.live = set()
-        self.stamp = "1000"
+        self.created = {}
 
         class Proc:
             returncode = 0
 
         def tmux(*_args):
             proc = Proc()
-            proc.stdout = self.stamp + "\n"
+            proc.stdout = "".join(
+                "%s %d\n" % kv for kv in sorted(self.created.items()))
             return proc
 
         self.daemon.tmux = tmux
-        self.daemon.live_sessions = lambda: set(self.live)
         self.daemon.read_sessions = lambda: dict(self.sessions)
         self.daemon.kill_session = self.killed.append
+        self.daemon.ensure_harness_session = lambda *a, **k: None
 
     def profile(self, name, text):
         path = os.path.join(self.daemon.PROFILES_DIR, name + ".env")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("HARNESS=claude\n" + text)
 
-    def add(self, name, live=True, **entry):
+    def add(self, name, created=SIGNED_IN - 60, **entry):
         self.sessions[name] = dict({"agent": "claude"}, **entry)
-        if live:
-            self.live.add(name)
+        if created is not None:
+            self.created[name] = created
+
+    def restart(self):
+        return self.daemon.restart_login_sessions(self.flow, self.SIGNED_IN)
+
+    def mark_done(self, when=SIGNED_IN):
+        path = self.daemon.connect_done_path("claude")
+        open(path, "w").close()
+        os.utime(path, (when, when))
 
     def test_restarts_only_sessions_on_the_stored_login(self):
         self.profile("keyed", "ANTHROPIC_API_KEY=sk-ant-x\n")
@@ -258,54 +269,80 @@ class ReloginRestartTest(unittest.TestCase):
         self.add("moved", profile="moved")
         self.add("parked", stopped=True)
         self.add("crashed", died=1)
-        self.add("pending", live=False)
+        self.add("pending", created=None)
+        self.add("fresh", created=self.SIGNED_IN + 5)
         self.add("cx", agent="codex")
-        notice = self.daemon.restart_login_sessions(self.flow)
+        notice = self.restart()
         self.assertEqual(self.killed, ["main", "same"])
         self.assertIn("Restarted 2 sessions", notice)
         self.assertIn("keyed (uses ANTHROPIC_API_KEY)", notice)
         self.assertIn("moved (has its own CLAUDE_CONFIG_DIR)", notice)
-        self.assertNotIn("parked", notice)
-        self.assertNotIn("crashed", notice)
+        for name in ("parked", "crashed", "pending", "fresh", "cx"):
+            self.assertNotIn(name, notice)
 
     def test_an_env_store_key_shadows_the_login_for_every_session(self):
         with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as fh:
             fh.write("CLAUDE_CODE_OAUTH_TOKEN=tok\n")
         self.add("main")
-        notice = self.daemon.restart_login_sessions(self.flow)
+        notice = self.restart()
         self.assertEqual(self.killed, [])
         self.assertIn("main (uses CLAUDE_CODE_OAUTH_TOKEN)", notice)
 
-    def test_once_per_sign_in_pane(self):
+    def test_the_marker_is_claimed_once(self):
+        # Several renders can see one sign-in finish; only the one that
+        # removes the marker restarts anything.
         self.add("main")
-        self.daemon.restart_login_sessions(self.flow)
-        self.daemon.restart_login_sessions(self.flow)
+        self.mark_done()
+        self.daemon.connect_signed_in(self.flow)
+        self.daemon.connect_signed_in(self.flow)
         self.assertEqual(self.killed, ["main"])
-        self.stamp = "2000"
-        self.daemon.restart_login_sessions(self.flow)
-        self.assertEqual(self.killed, ["main", "main"])
 
-    def test_gone_pane_restarts_nothing(self):
+    def test_no_marker_restarts_nothing(self):
         self.add("main")
-        self.stamp = ""
-        self.assertIsNone(self.daemon.restart_login_sessions(self.flow))
+        self.daemon.connect_signed_in(self.flow)
         self.assertEqual(self.killed, [])
+
+    def test_a_closed_pane_still_finishes_the_sign_in(self):
+        # The pane lingers only CONNECT_LINGER seconds after the CLI exits,
+        # and a device flow finishes on another device: a render that comes
+        # later finds no pane, only the marker.
+        self.add("main")
+        self.mark_done()
+        flow = dict(self.flow, bin="/bin/true")
+        now = self.daemon.time.monotonic()
+        self.daemon._connect_status_cache["claude"] = (now, (True, "x"))
+        got = self.daemon.connect_state(flow, keys=set(), tmux_state=(True, set()))
+        self.assertEqual(got["state"], "connected")
+        self.assertEqual(self.killed, ["main"])
+        self.assertIn("Restarted 1 session", got["notice"])
+        self.assertFalse(os.path.exists(self.daemon.connect_done_path("claude")))
+
+    def test_a_closed_pane_waits_for_a_fresh_probe(self):
+        self.add("main")
+        self.mark_done()
+        flow = dict(self.flow, bin="/bin/true")
+        self.daemon._connect_status_cache["claude"] = (0.0, (True, "x"))
+        self.daemon._connect_probing.add("claude")  # no real probe thread
+        got = self.daemon.connect_state(flow, keys=set(), tmux_state=(True, set()))
+        self.assertEqual(got["state"], "exchanging")
+        self.assertEqual(self.killed, [])
+        self.assertTrue(os.path.exists(self.daemon.connect_done_path("claude")))
 
     def test_flows_that_reread_their_credential_restart_nothing(self):
         self.add("main", agent="github")
         gh = next(f for f in self.daemon.CONNECT_DEFS if f["id"] == "github")
-        self.assertIsNone(self.daemon.restart_login_sessions(gh))
+        self.mark_done()
+        self.daemon.connect_signed_in(gh)
         self.assertEqual(self.killed, [])
 
     def test_notice_shows_on_the_signed_in_card(self):
         self.add("main")
-        notice = self.daemon.restart_login_sessions(self.flow)
+        notice = self.restart()
         self.assertEqual(self.daemon.relogin_notice("claude"), notice)
         page = self.daemon.render_connect_card(
             base_state(state="connected", notice=notice))
         self.assertIn("Restarted 1 session so it uses the new sign-in: main.", page)
         self.assertIn(" open", page)
-
 
 if __name__ == "__main__":
     unittest.main()
