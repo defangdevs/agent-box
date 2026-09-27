@@ -2649,6 +2649,121 @@ def connect_error(text):
     return tail[:CONNECT_ERROR_MAX]
 
 
+# The config directory each harness keeps its stored login in, and the
+# variable that moves it. A session whose environment points that variable
+# somewhere else reads a DIFFERENT credential store from the one the card
+# just signed in, so a restart would not change what it runs with.
+RELOGIN_CONFIG_DIRS = {
+    "claude": ("CLAUDE_CONFIG_DIR", "~/.claude"),
+    "codex": ("CODEX_HOME", "~/.codex"),
+}
+# How long the card keeps saying which sessions a sign-in restarted.
+RELOGIN_NOTICE_TTL = 600
+_relogin_lock = threading.Lock()
+# flow id -> the #{session_created} of the sign-in pane already acted on,
+# so the several renders that can all see one pane finish restart once.
+_relogin_done = {}
+# flow id -> (monotonic stamp, text) for the card.
+_relogin_notices = {}
+
+
+def relogin_reason(flow, entry, stored):
+    """Why a restart would NOT hand this session the login the card just
+    stored, or "" when it would.
+
+    Answered from what env-exec gives the session on its NEXT spawn (the
+    env store, then its profile's own environment), since that is exactly
+    what a restart would change. A key that shadows the login wins over it
+    in the harness itself, so that session was never using the login; a
+    moved config dir means it reads another credential store entirely.
+    """
+    env = dict(stored)
+    profile = entry.get("profile")
+    if isinstance(profile, str) and PROFILE_NAME_RE.match(profile):
+        for key, value in as_dict(load(profile_path(profile))).items():
+            if key not in PROFILE_RESERVED:
+                env[key] = value
+    for key in flow["shadow"]:
+        if env.get(key):
+            return "uses " + key
+    var, default = RELOGIN_CONFIG_DIRS.get(flow["id"], (None, None))
+    if var and env.get(var):
+        moved = os.path.realpath(os.path.expanduser(env[var]))
+        if moved != os.path.realpath(os.path.expanduser(default)):
+            return "has its own " + var
+    return ""
+
+
+def restart_login_sessions(flow):
+    """Restart the running sessions that were started with the login this
+    sign-in just replaced.
+
+    Every claude (or codex) session on the box shares one stored login and
+    reads it once, at start: when the login expires, they all break together
+    (remote-control sessions drop, each pane asks for /login), and signing
+    in again from the card fixed none of them until each was restarted by
+    hand. codex is the sharper case: `login --device-auth` DELETES the old
+    credential when it starts, so every running codex session is holding
+    one that no longer exists.
+
+    Restart is the Restart button's kill: the supervisor respawns the
+    session and resumes its transcript. Left alone: stopped sessions (they
+    read the new login when started), died ones (the post-mortem pane is
+    kept for reading), and any whose environment means a restart would not
+    change its credential (relogin_reason). Returns the card's notice, or
+    None when there was nothing to say.
+    """
+    flow_id = flow["id"]
+    if flow_id not in RELOGIN_CONFIG_DIRS:
+        return None
+    proc = tmux("display-message", "-p", "-t", connect_target(flow_id),
+                "#{session_created}")
+    stamp = proc.stdout.strip() if proc is not None and proc.returncode == 0 else ""
+    with _relogin_lock:
+        # No stamp means the pane is already gone, which is another render
+        # having got here first.
+        if not stamp or _relogin_done.get(flow_id) == stamp:
+            return None
+        _relogin_done[flow_id] = stamp
+    live = live_sessions()
+    stored = as_dict(load(ENV_FILE))
+    restarted, kept = [], []
+    for name, entry in sorted(read_sessions().items()):
+        if (not SESSION_RE.match(name) or entry.get("agent") != flow_id
+                or entry.get("stopped") or crashed_status(entry) is not None
+                or name not in live):
+            continue
+        reason = relogin_reason(flow, entry, stored)
+        if reason:
+            kept.append("%s (%s)" % (name, reason))
+            continue
+        kill_session(name)
+        restarted.append(name)
+    parts = []
+    if restarted:
+        parts.append("Restarted %s so %s the new sign-in: %s." % (
+            "1 session" if len(restarted) == 1 else "%d sessions" % len(restarted),
+            "it uses" if len(restarted) == 1 else "they use",
+            ", ".join(restarted)))
+    if kept:
+        parts.append("Left running: %s." % ", ".join(kept))
+    if not parts:
+        _relogin_notices.pop(flow_id, None)
+        return None
+    _relogin_notices[flow_id] = (time.monotonic(), " ".join(parts))
+    return _relogin_notices[flow_id][1]
+
+
+def relogin_notice(flow_id):
+    hit = _relogin_notices.get(flow_id)
+    if not hit:
+        return None
+    if time.monotonic() - hit[0] > RELOGIN_NOTICE_TTL:
+        _relogin_notices.pop(flow_id, None)
+        return None
+    return hit[1]
+
+
 def connect_state(flow, keys=None, tmux_state=None):
     """What the card shows, derived from the CLI and the pane — never
     from anything the daemon stored."""
@@ -2677,6 +2792,9 @@ def connect_state(flow, keys=None, tmux_state=None):
                 state = "failed"
                 error = connect_error(text)
             elif connected and connect_fresh(flow_id):
+                # Before the cancel: the pane's creation stamp is what makes
+                # the restart happen once per sign-in (issue #751).
+                restart_login_sessions(flow)
                 connect_cancel(flow_id)
                 running = False
                 state = "connected"
@@ -2726,6 +2844,9 @@ def connect_state(flow, keys=None, tmux_state=None):
         "url": url,
         "code": code,
         "error": error,
+        # What the last completed sign-in did to the sessions already
+        # running on it (issue #751), shown on a signed-in card only.
+        "notice": relogin_notice(flow_id) if state == "connected" else None,
         "needs_code": flow["needs_code"],
         # False means the CLI is not on this box yet, so the button offers
         # to fetch it first (issue #416). A card with neither an `attr` nor
@@ -2835,6 +2956,8 @@ def connect_start(flow):
             if connect_pane(flow_id) not in live_sessions():
                 break
             time.sleep(0.02)
+    # A new sign-in: what the previous one restarted is no longer news.
+    _relogin_notices.pop(flow_id, None)
     if not tmux_server_up():
         state = connect_state(flow)
         state["state"] = "failed"
@@ -5030,6 +5153,7 @@ def render_connect_card(state):
     open_now = (
         state["state"] in ("waiting", "starting", "checking", "exchanging")
         or (state["state"] in ("failed", "expired", "connected") and state["error"])
+        or (state["state"] == "connected" and state.get("notice"))
         or state["blocked"]
         or state["shadow"]
     )
@@ -5061,6 +5185,9 @@ def render_connect_step(state):
     if state["state"] in ("failed", "expired", "connected") and state["error"]:
         return (f'<div class="conn-step"><p class="note conn-error">'
                 f'{html.escape(state["error"])}</p></div>')
+    if state["state"] == "connected" and state.get("notice"):
+        return (f'<div class="conn-step"><p class="note">'
+                f'{html.escape(state["notice"])}</p></div>')
     if state["state"] != "waiting":
         return ""
     url = html.escape(state["url"], quote=True)

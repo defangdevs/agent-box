@@ -440,6 +440,42 @@ in
         claude_sessions = [n for n, s in regs.items() if s.get("agent") == "claude"]
         assert claude_sessions == ["claude"], regs
 
+    with subtest("signing in again restarts the sessions that use the login (issue #751)"):
+        # The login a harness stores is read once, at session start, so
+        # when it expires every session on it breaks together and signing
+        # in again from this card used to fix none of them until each was
+        # restarted by hand. A session whose profile carries its own API
+        # key never used that login, so it must be left alone.
+        machine.succeed(as_agent(
+            "agent-box-profile set keyed HARNESS=claude ANTHROPIC_API_KEY=sk-ant-stub"
+        ))
+        machine.succeed(as_agent("agent-box-session add keyed --profile keyed"))
+
+        def pane(name):
+            machine.wait_until_succeeds(tmux(f"has-session -t ={name}"), timeout=60)
+            return machine.succeed(
+                tmux(f"display -p -t '={name}:' '#{{pane_pid}}'")
+            ).strip()
+
+        claude_pane, keyed_pane = pane("claude"), pane("keyed")
+        machine.succeed("rm -f ${stateDir}/claude-in")
+        assert post("/agent/settings/connect/start", "flow=claude") == "303"
+        wait_state("claude", "waiting")
+        assert post("/agent/settings/connect/code", "flow=claude&code=abc-5555555555") == "303"
+        got = wait_state("claude", "connected")
+        machine.wait_until_succeeds(
+            tmux("display -p -t '=claude:' '#{pane_pid}'")
+            + f" | grep . | grep -vx '{claude_pane}'",
+            timeout=60,
+        )
+        assert pane("keyed") == keyed_pane, "keyed session was restarted"
+        notice = state("claude")["notice"] or ""
+        assert "Restarted 1 session" in notice and "claude" in notice, got
+        assert "keyed (uses ANTHROPIC_API_KEY)" in notice, notice
+        assert "Restarted 1 session" in get("/agent/settings/")
+        machine.succeed(as_agent("agent-box-session rm keyed"))
+        machine.succeed(as_agent("agent-box-profile rm keyed"))
+
     with subtest("a rejected code reports the CLI's complaint, not the transcript"):
         machine.succeed("rm -f ${stateDir}/claude-in")
         assert post("/agent/settings/connect/start", "flow=claude") == "303"
