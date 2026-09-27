@@ -222,6 +222,7 @@ class ReloginRestartTest(unittest.TestCase):
         os.makedirs(self.daemon.PROFILES_DIR)
         os.makedirs(self.daemon.CONNECT_DONE_DIR)
         self.daemon._relogin_notices.clear()
+        self.daemon._connect_probe_began.clear()
         self.flow = next(f for f in self.daemon.CONNECT_DEFS if f["id"] == "claude")
         self.killed = []
         self.sessions = {}
@@ -240,6 +241,8 @@ class ReloginRestartTest(unittest.TestCase):
         self.daemon.read_sessions = lambda: dict(self.sessions)
         self.daemon.kill_session = self.killed.append
         self.daemon.ensure_harness_session = lambda *a, **k: None
+        self.base = {}
+        self.daemon.supervisor_environ = lambda: dict(self.base)
 
     def profile(self, name, text):
         path = os.path.join(self.daemon.PROFILES_DIR, name + ".env")
@@ -288,6 +291,26 @@ class ReloginRestartTest(unittest.TestCase):
         self.assertEqual(self.killed, [])
         self.assertIn("main (uses CLAUDE_CODE_OAUTH_TOKEN)", notice)
 
+    def test_a_key_from_the_box_configuration_shadows_the_login(self):
+        # users.<name>.environment / environmentFiles reach a session
+        # through the supervisor, never through this daemon's own env.
+        self.base = {"ANTHROPIC_API_KEY": "sk-ant-config"}
+        self.add("main")
+        notice = self.restart()
+        self.assertEqual(self.killed, [])
+        self.assertIn("main (uses ANTHROPIC_API_KEY)", notice)
+
+    def test_the_config_dir_is_compared_with_the_sign_in_panes(self):
+        # The sign-in pane inherits the supervisor's environment too, so a
+        # config dir moved THERE is where the new login landed.
+        self.base = {"CLAUDE_CONFIG_DIR": "/srv/claude"}
+        self.profile("own", "CLAUDE_CONFIG_DIR=/elsewhere\n")
+        self.add("main")
+        self.add("own", profile="own")
+        notice = self.restart()
+        self.assertEqual(self.killed, ["main"])
+        self.assertIn("own (has its own CLAUDE_CONFIG_DIR)", notice)
+
     def test_the_marker_is_claimed_once(self):
         # Several renders can see one sign-in finish; only the one that
         # removes the marker restarts anything.
@@ -311,6 +334,7 @@ class ReloginRestartTest(unittest.TestCase):
         flow = dict(self.flow, bin="/bin/true")
         now = self.daemon.time.monotonic()
         self.daemon._connect_status_cache["claude"] = (now, (True, "x"))
+        self.daemon._connect_probe_began["claude"] = self.SIGNED_IN + 1
         got = self.daemon.connect_state(flow, keys=set(), tmux_state=(True, set()))
         self.assertEqual(got["state"], "connected")
         self.assertEqual(self.killed, ["main"])
@@ -327,6 +351,28 @@ class ReloginRestartTest(unittest.TestCase):
         self.assertEqual(got["state"], "exchanging")
         self.assertEqual(self.killed, [])
         self.assertTrue(os.path.exists(self.daemon.connect_done_path("claude")))
+
+    def test_a_probe_older_than_the_marker_cannot_discard_it(self):
+        # A fresh "not signed in" whose probe began before the sign-in
+        # finished says nothing about the new login: re-probe rather than
+        # throw the marker, and the restart with it, away.
+        self.add("main")
+        self.mark_done()
+        flow = dict(self.flow, bin="/bin/true")
+        now = self.daemon.time.monotonic()
+        self.daemon._connect_status_cache["claude"] = (now, (False, ""))
+        self.daemon._connect_probe_began["claude"] = self.SIGNED_IN - 1
+        self.daemon._connect_probing.add("claude")  # no real probe thread
+        got = self.daemon.connect_state(flow, keys=set(), tmux_state=(True, set()))
+        self.assertEqual(got["state"], "exchanging")
+        self.assertTrue(os.path.exists(self.daemon.connect_done_path("claude")))
+        # ...while one that began after it may.
+        self.daemon._connect_status_cache["claude"] = (now, (False, ""))
+        self.daemon._connect_probe_began["claude"] = self.SIGNED_IN + 1
+        got = self.daemon.connect_state(flow, keys=set(), tmux_state=(True, set()))
+        self.assertEqual(got["state"], "idle")
+        self.assertFalse(os.path.exists(self.daemon.connect_done_path("claude")))
+        self.assertEqual(self.killed, [])
 
     def test_flows_that_reread_their_credential_restart_nothing(self):
         self.add("main", agent="github")

@@ -18322,6 +18322,9 @@ CONNECT_DEFS = [
 ]
 
 _connect_status_cache = {}
+# flow id -> wall-clock time the cached answer's probe STARTED, so an answer
+# can be compared with the sign-in completion marker's mtime (issue #751).
+_connect_probe_began = {}
 _connect_probing = set()
 _connect_lock = threading.Lock()
 
@@ -18443,10 +18446,12 @@ def connect_run(flow, args, timeout=15):
 def connect_probe(flow):
     """Ask one CLI whether it is signed in, off the request path."""
     try:
+        began = time.time()
         proc = connect_run(flow, flow["status"])
         value = (False, "") if proc is None else CONNECT_PARSERS[flow["parse"]](proc)
         with _connect_lock:
             _connect_status_cache[flow["id"]] = (time.monotonic(), value)
+            _connect_probe_began[flow["id"]] = began
     finally:
         with _connect_lock:
             _connect_probing.discard(flow["id"])
@@ -18635,17 +18640,45 @@ def connect_claim_done(flow_id):
     return when
 
 
-def relogin_reason(flow, entry, stored):
+def supervisor_environ():
+    """The session supervisor's own environment, or {} when it cannot be
+    read.
+
+    Sessions inherit it through the tmux server the supervisor starts, and
+    so does the sign-in pane, so it carries whatever the box configuration
+    gives a session before env-exec's overlays: the per-user `environment`
+    option and `environmentFiles` secrets alike. This daemon's own
+    environment has neither.
+    """
+    for pid in find_supervisor_pids():
+        try:
+            with open("/proc/%d/environ" % pid, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        env = {}
+        for item in raw.split(b"\0"):
+            key, sep, value = item.decode("utf-8", "replace").partition("=")
+            if sep and key:
+                env[key] = value
+        return env
+    return {}
+
+
+def relogin_reason(flow, entry, stored, base):
     """Why a restart would NOT hand this session the login the card just
     stored, or "" when it would.
 
-    Answered from what env-exec gives the session on its NEXT spawn (the
-    env store, then its profile's own environment), since that is exactly
-    what a restart would change. A key that shadows the login wins over it
-    in the harness itself, so that session was never using the login; a
-    moved config dir means it reads another credential store entirely.
+    Answered from what the session gets on its NEXT spawn: the supervisor's
+    environment (`base`), then env-exec's overlays (the env store, then the
+    session's profile), since that is exactly what a restart would change.
+    A key that shadows the login wins over it in the harness itself, so that
+    session was never using the login. A config dir other than the one the
+    sign-in pane wrote to (which sees `base` only) means the session reads
+    another credential store entirely.
     """
-    env = dict(stored)
+    env = dict(base)
+    env.update(stored)
     profile = entry.get("profile")
     if isinstance(profile, str) and PROFILE_NAME_RE.match(profile):
         for key, value in as_dict(load(profile_path(profile))).items():
@@ -18655,9 +18688,10 @@ def relogin_reason(flow, entry, stored):
         if env.get(key):
             return "uses " + key
     var, default = RELOGIN_CONFIG_DIRS.get(flow["id"], (None, None))
-    if var and env.get(var):
-        moved = os.path.realpath(os.path.expanduser(env[var]))
-        if moved != os.path.realpath(os.path.expanduser(default)):
+    if var:
+        def where(e):
+            return os.path.realpath(os.path.expanduser(e.get(var) or default))
+        if where(env) != where(base):
             return "has its own " + var
     return ""
 
@@ -18693,13 +18727,14 @@ def restart_login_sessions(flow, signed_in_at):
         if created.isdigit():
             started[name] = int(created)
     stored = as_dict(load(ENV_FILE))
+    base = supervisor_environ()
     restarted, kept = [], []
     for name, entry in sorted(read_sessions().items()):
         if (not SESSION_RE.match(name) or entry.get("agent") != flow_id
                 or entry.get("stopped") or crashed_status(entry) is not None
                 or started.get(name, signed_in_at + 1) > signed_in_at):
             continue
-        reason = relogin_reason(flow, entry, stored)
+        reason = relogin_reason(flow, entry, stored, base)
         if reason:
             kept.append("%s (%s)" % (name, reason))
             continue
@@ -18798,9 +18833,17 @@ def connect_state(flow, keys=None, tmux_state=None):
             state = "waiting" if url else "starting"
     elif os.path.exists(connect_done_path(flow_id)):
         # The pane already closed on a sign-in no render saw finish (issue
-        # #751): finish it now, on the first FRESH probe that agrees, and
-        # stay "exchanging" until then so the page keeps polling.
-        if connect_fresh(flow_id):
+        # #751): finish it now, on a fresh probe that STARTED after the
+        # marker was written, and stay "exchanging" until one has so the
+        # page keeps polling. An older probe may predate the new login, and
+        # its "not signed in" would throw the marker away.
+        try:
+            done_at = os.stat(connect_done_path(flow_id)).st_mtime
+        except OSError:
+            done_at = float("inf")
+        with _connect_lock:
+            began = _connect_probe_began.get(flow_id, 0.0)
+        if connect_fresh(flow_id) and began >= done_at:
             if connected:
                 state = "connected"
                 error = connect_signed_in(flow)
@@ -19031,15 +19074,16 @@ def connect_start(flow):
     # The exit marker turns "the CLI is done" into something the state
     # machine can see, and the sleep keeps the final screen readable
     # until then. Both are shell-level, so no CLI has to cooperate.
-    # A harness flow also leaves the completion marker (issue #751), before
-    # the linger, so a render that never sees this pane can still finish
-    # the sign-in.
+    # A harness flow also leaves the completion marker (issue #751), so a
+    # render that never sees this pane can still finish the sign-in.
     done = ""
     if flow_id in RELOGIN_CONFIG_DIRS:
         done = ' [ "$s" != 0 ] || { mkdir -p %s && : > %s; };' % (
             shlex.quote(CONNECT_DONE_DIR),
             shlex.quote(connect_done_path(flow_id)))
-    script = "%s; s=$?; printf '\\n[agent-box] exit=%%s\\n' \"$s\";%s sleep %d" % (
+    # The marker BEFORE the exit line: a render that sees the line may kill
+    # the pane at once, and the marker must already be there by then.
+    script = "%s; s=$?;%s printf '\\n[agent-box] exit=%%s\\n' \"$s\"; sleep %d" % (
         inner, done, CONNECT_LINGER)
     # In the script, not `new-session -e PATH=...`: tmux honours -e for any
     # other variable but the pane's PATH comes from the CLIENT regardless

@@ -2829,6 +2829,9 @@ CONNECT_DEFS = [
 ]
 
 _connect_status_cache = {}
+# flow id -> wall-clock time the cached answer's probe STARTED, so an answer
+# can be compared with the sign-in completion marker's mtime (issue #751).
+_connect_probe_began = {}
 _connect_probing = set()
 _connect_lock = threading.Lock()
 
@@ -2950,10 +2953,12 @@ def connect_run(flow, args, timeout=15):
 def connect_probe(flow):
     """Ask one CLI whether it is signed in, off the request path."""
     try:
+        began = time.time()
         proc = connect_run(flow, flow["status"])
         value = (False, "") if proc is None else CONNECT_PARSERS[flow["parse"]](proc)
         with _connect_lock:
             _connect_status_cache[flow["id"]] = (time.monotonic(), value)
+            _connect_probe_began[flow["id"]] = began
     finally:
         with _connect_lock:
             _connect_probing.discard(flow["id"])
@@ -3142,17 +3147,45 @@ def connect_claim_done(flow_id):
     return when
 
 
-def relogin_reason(flow, entry, stored):
+def supervisor_environ():
+    """The session supervisor's own environment, or {} when it cannot be
+    read.
+
+    Sessions inherit it through the tmux server the supervisor starts, and
+    so does the sign-in pane, so it carries whatever the box configuration
+    gives a session before env-exec's overlays: the per-user `environment`
+    option and `environmentFiles` secrets alike. This daemon's own
+    environment has neither.
+    """
+    for pid in find_supervisor_pids():
+        try:
+            with open("/proc/%d/environ" % pid, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        env = {}
+        for item in raw.split(b"\0"):
+            key, sep, value = item.decode("utf-8", "replace").partition("=")
+            if sep and key:
+                env[key] = value
+        return env
+    return {}
+
+
+def relogin_reason(flow, entry, stored, base):
     """Why a restart would NOT hand this session the login the card just
     stored, or "" when it would.
 
-    Answered from what env-exec gives the session on its NEXT spawn (the
-    env store, then its profile's own environment), since that is exactly
-    what a restart would change. A key that shadows the login wins over it
-    in the harness itself, so that session was never using the login; a
-    moved config dir means it reads another credential store entirely.
+    Answered from what the session gets on its NEXT spawn: the supervisor's
+    environment (`base`), then env-exec's overlays (the env store, then the
+    session's profile), since that is exactly what a restart would change.
+    A key that shadows the login wins over it in the harness itself, so that
+    session was never using the login. A config dir other than the one the
+    sign-in pane wrote to (which sees `base` only) means the session reads
+    another credential store entirely.
     """
-    env = dict(stored)
+    env = dict(base)
+    env.update(stored)
     profile = entry.get("profile")
     if isinstance(profile, str) and PROFILE_NAME_RE.match(profile):
         for key, value in as_dict(load(profile_path(profile))).items():
@@ -3162,9 +3195,10 @@ def relogin_reason(flow, entry, stored):
         if env.get(key):
             return "uses " + key
     var, default = RELOGIN_CONFIG_DIRS.get(flow["id"], (None, None))
-    if var and env.get(var):
-        moved = os.path.realpath(os.path.expanduser(env[var]))
-        if moved != os.path.realpath(os.path.expanduser(default)):
+    if var:
+        def where(e):
+            return os.path.realpath(os.path.expanduser(e.get(var) or default))
+        if where(env) != where(base):
             return "has its own " + var
     return ""
 
@@ -3200,13 +3234,14 @@ def restart_login_sessions(flow, signed_in_at):
         if created.isdigit():
             started[name] = int(created)
     stored = as_dict(load(ENV_FILE))
+    base = supervisor_environ()
     restarted, kept = [], []
     for name, entry in sorted(read_sessions().items()):
         if (not SESSION_RE.match(name) or entry.get("agent") != flow_id
                 or entry.get("stopped") or crashed_status(entry) is not None
                 or started.get(name, signed_in_at + 1) > signed_in_at):
             continue
-        reason = relogin_reason(flow, entry, stored)
+        reason = relogin_reason(flow, entry, stored, base)
         if reason:
             kept.append("%s (%s)" % (name, reason))
             continue
@@ -3305,9 +3340,17 @@ def connect_state(flow, keys=None, tmux_state=None):
             state = "waiting" if url else "starting"
     elif os.path.exists(connect_done_path(flow_id)):
         # The pane already closed on a sign-in no render saw finish (issue
-        # #751): finish it now, on the first FRESH probe that agrees, and
-        # stay "exchanging" until then so the page keeps polling.
-        if connect_fresh(flow_id):
+        # #751): finish it now, on a fresh probe that STARTED after the
+        # marker was written, and stay "exchanging" until one has so the
+        # page keeps polling. An older probe may predate the new login, and
+        # its "not signed in" would throw the marker away.
+        try:
+            done_at = os.stat(connect_done_path(flow_id)).st_mtime
+        except OSError:
+            done_at = float("inf")
+        with _connect_lock:
+            began = _connect_probe_began.get(flow_id, 0.0)
+        if connect_fresh(flow_id) and began >= done_at:
             if connected:
                 state = "connected"
                 error = connect_signed_in(flow)
@@ -3538,15 +3581,16 @@ def connect_start(flow):
     # The exit marker turns "the CLI is done" into something the state
     # machine can see, and the sleep keeps the final screen readable
     # until then. Both are shell-level, so no CLI has to cooperate.
-    # A harness flow also leaves the completion marker (issue #751), before
-    # the linger, so a render that never sees this pane can still finish
-    # the sign-in.
+    # A harness flow also leaves the completion marker (issue #751), so a
+    # render that never sees this pane can still finish the sign-in.
     done = ""
     if flow_id in RELOGIN_CONFIG_DIRS:
         done = ' [ "$s" != 0 ] || { mkdir -p %s && : > %s; };' % (
             shlex.quote(CONNECT_DONE_DIR),
             shlex.quote(connect_done_path(flow_id)))
-    script = "%s; s=$?; printf '\\n[agent-box] exit=%%s\\n' \"$s\";%s sleep %d" % (
+    # The marker BEFORE the exit line: a render that sees the line may kill
+    # the pane at once, and the marker must already be there by then.
+    script = "%s; s=$?;%s printf '\\n[agent-box] exit=%%s\\n' \"$s\"; sleep %d" % (
         inner, done, CONNECT_LINGER)
     # In the script, not `new-session -e PATH=...`: tmux honours -e for any
     # other variable but the pane's PATH comes from the CLIENT regardless
@@ -3977,6 +4021,12 @@ STYLE = """<style>
      page, so the three surfaces read as one identity. */
   .mark svg { width: 28px; height: 28px; display: block; }
   h2 { font-size: 16px; font-weight: 600; margin: 0; }
+  .heading-anchor { display: inline-flex; margin-left: 6px; padding: 3px;
+                    color: #8b949e; opacity: 0; vertical-align: middle; }
+  .heading-anchor svg { width: 14px; height: 14px; fill: currentColor; }
+  h2:hover .heading-anchor, h2:focus-within .heading-anchor,
+  .heading-anchor:focus { opacity: 1; }
+  .heading-anchor:hover { color: #58a6ff; }
   section { margin: 28px 0; }
   .sec-head { display: flex; align-items: center; justify-content: space-between;
               gap: 12px; }
@@ -4479,7 +4529,7 @@ default is your home folder (<code>~</code>).</p>
 # rather than on SESS_PAGE (issue #119).
 SESSIONS_SECTION_TPL = """<section>
     <div class="sec-head">
-      <h2>Sessions</h2>
+      <h2 id="sessions">Sessions<a class="heading-anchor" href="#sessions" aria-label="Copy link to Sessions" title="Copy link to Sessions"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
       <button type="button" class="btn" data-toggle="session-editor">Add session</button>
     </div>
     <p class="note">Each session opens a separate terminal tab for an AI
@@ -4503,7 +4553,7 @@ SESSIONS_SECTION_TPL = """<section>
 # because the session row now has two controls that both name a harness.
 PROFILES_SECTION_TPL = """<section>
     <div class="sec-head">
-      <h2>Profiles</h2>
+      <h2 id="profiles">Profiles<a class="heading-anchor" href="#profiles" aria-label="Copy link to Profiles" title="Copy link to Profiles"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
       <button type="button" class="btn" data-toggle="profile-editor">Add profile</button>
     </div>
     <p class="note">Profiles save how an assistant should start, including
@@ -4561,7 +4611,7 @@ PROFILES_SECTION_TPL = """<section>
 # own header still says which of the two it is.
 WEBHOOKS_SECTION_TPL = """<section>
     <div class="sec-head">
-      <h2>Automations</h2>
+      <h2 id="automations">Automations<a class="heading-anchor" href="#automations" aria-label="Copy link to Automations" title="Copy link to Automations"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
     </div>
     <div id="webhook-endpoint">{endpoint}</div>
     <p class="note">Automatic session rules start a new session when a
@@ -4576,7 +4626,7 @@ WEBHOOKS_SECTION_TPL = """<section>
 # is off or the box is wrong. See webhook_unavailable() for the states.
 WEBHOOK_UNAVAILABLE_TPL = """<section>
     <div class="sec-head">
-      <h2>Automations</h2>
+      <h2 id="automations">Automations<a class="heading-anchor" href="#automations" aria-label="Copy link to Automations" title="Copy link to Automations"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
     </div>
     <p class="note">{text}</p>
   </section>"""
@@ -4624,7 +4674,7 @@ WEBHOOK_ENDPOINT_EMPTY_TPL = """<p class="note">%s</p>
 # anything had actually changed.
 CONNECT_SECTION_TPL = """<section>
     <div class="sec-head">
-      <h2>Connections</h2>
+      <h2 id="connections">Connections<a class="heading-anchor" href="#connections" aria-label="Copy link to Connections" title="Copy link to Connections"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
     </div>
     <p class="note">Connect the accounts your assistants can use. Sign-in is
     handled securely by each provider, and this page does not display your
@@ -4742,7 +4792,7 @@ BODY = """<main>
   {webhooks_section}
   <section>
     <div class="sec-head">
-      <h2>API keys and secrets</h2>
+      <h2 id="api-keys-and-secrets">API keys and secrets<a class="heading-anchor" href="#api-keys-and-secrets" aria-label="Copy link to API keys and secrets" title="Copy link to API keys and secrets"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
       <button type="button" class="btn" data-toggle="secret-editor">Add secret</button>
     </div>
     <p class="note">Store API keys and other credentials used by your
@@ -4768,7 +4818,7 @@ BODY = """<main>
   </section>
   {password_section}
   <section>
-    <h2>Maintenance</h2>
+    <h2 id="maintenance">Maintenance<a class="heading-anchor" href="#maintenance" aria-label="Copy link to Maintenance" title="Copy link to Maintenance"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
     <ul class="tbl danger">
       <li>
         <span class="dz"><strong>Restart all sessions</strong>
@@ -4792,7 +4842,7 @@ BODY = """<main>
 
 PASSWORD_SECTION = """<section>
     <div class="sec-head">
-      <h2>Account</h2>
+      <h2 id="account">Account<a class="heading-anchor" href="#account" aria-label="Copy link to Account" title="Copy link to Account"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
       <button type="button" class="btn" data-toggle="password-editor">Change password</button>
     </div>
     <p class="note">Change the password used to open agent-box. You will be
@@ -5049,6 +5099,18 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   function parseHTML(text) {
     return new DOMParser().parseFromString(text, "text/html");
   }
+
+  // Heading links remain ordinary fragment links; copy their absolute URL
+  // as a convenience for sharing a direct route to a settings section.
+  document.addEventListener("click", function (e) {
+    var link = e.target.closest("a.heading-anchor");
+    if (!link || !navigator.clipboard || !navigator.clipboard.writeText) { return; }
+    var original = link.title;
+    navigator.clipboard.writeText(link.href).then(function () {
+      link.title = "Link copied";
+      window.setTimeout(function () { link.title = original; }, 1500);
+    }).catch(function () {});
+  });
 
   // Shared writer for the Danger-zone progress spans (#restart-status,
   // #update-status): set the data-state colour + text, optionally
