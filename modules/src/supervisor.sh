@@ -190,13 +190,28 @@ seed_json() {
   # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
   # if missing. A file jq can't parse is left untouched: the dialog
   # comes back, but the agent still starts.
+  #
+  # A parse failure is retried before it is believed (issue #749). This
+  # supervisor is not the file's only writer: every running claude rewrites
+  # ~/.claude.json itself, in place and under no lock of ours, so a seed that
+  # reads it mid-write sees truncated JSON. That used to skip the seed with
+  # no word said, and nothing seeds a session again until its next start -
+  # the key a new session's folder-trust dialog depends on was simply never
+  # written. A file that is still unparseable after the retries is really
+  # broken, and says so in the journal instead of vanishing.
   file=$1; shift
   [ -s "$file" ] || printf '{}' > "$file"
-  if $JQ "$@" "$file" > "$file.seed-tmp" 2>/dev/null; then
-    mv "$file.seed-tmp" "$file"
-  else
-    rm -f "$file.seed-tmp"
-  fi
+  seed_try=0
+  until $JQ "$@" "$file" > "$file.seed-tmp" 2>/dev/null; do
+    seed_try=$((seed_try + 1))
+    if [ "$seed_try" -ge 5 ]; then
+      rm -f "$file.seed-tmp"
+      echo "session: could not parse $file after $seed_try tries; not seeding it this start" >&2
+      return 0
+    fi
+    sleep 0.2
+  done
+  mv "$file.seed-tmp" "$file"
 }
 
 # Pre-accept claude-code's one-time startup dialogs. A fresh home

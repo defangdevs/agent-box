@@ -1992,6 +1992,25 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # seed_json, the supervisor's in-place edit of ~/.claude.json
+          # (issue #749): a half-written file is retried before it is
+          # believed, and giving up is reported rather than silent. Cut out
+          # of supervisor.sh by name, so it runs natively in a second.
+          seed-json =
+            pkgs.runCommand "agent-box-seed-json"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnused pkgs.gnugrep pkgs.jq ];
+                supervisor = ./modules/src/supervisor.sh;
+                tests = ./tests/test-seed-json.sh;
+              } ''
+              bash "$tests" "$supervisor" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Eval regression for selfUpdate.checkout's two assertions
           # (issue #242, PR #478 review). Both guard a value whose only
           # other feedback is a background job failing with EROFS in a
