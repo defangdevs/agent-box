@@ -1979,7 +1979,11 @@
     # "Automations" (#259), so the split matched nothing and silently
     # returned the whole page - every assertion below still passed, just
     # with no isolation from the Sessions and Profiles panels above it.
-    watches = page.split("<h2>Automations</h2>")[-1]
+    # It happened a second time when #747 gave every heading an id and a
+    # link, so the split now asserts its own delimiter first.
+    assert '<h2 id="automations">' in page, page
+    assert '<h2 id="profiles">' in page, page
+    watches = page.split('<h2 id="automations">')[-1]
     assert "github:defangdevs/agent-box" in watches, watches
 
     # A watch row says what a match DOES, not why someone subscribed (#259):
@@ -1998,8 +2002,8 @@
     # The Profiles panel says the reverse (#582): panelbot is spent by a
     # live watch, so deleting it is not a no-op, and the row says so before
     # anyone has to press the button to find out.
-    profiles_html = page.split("<h2>Profiles</h2>", 1)[-1].split(
-        "<h2>Automations</h2>", 1)[0]
+    profiles_html = page.split('<h2 id="profiles">', 1)[-1].split(
+        '<h2 id="automations">', 1)[0]
     assert "used by 1 standing watch" in profiles_html, profiles_html
     assert ("It is used by 1 standing watch: github:defangdevs/panel-profile"
             in profiles_html), profiles_html
