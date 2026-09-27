@@ -356,11 +356,26 @@ in
             " == \"/home/agent/worktrees/relcwd\"'"
             " /home/agent/.config/agent-box/sessions.json"
         )
-        machine.wait_until_succeeds(
-            "jq -e '.projects[\"/home/agent/worktrees/relcwd\"]"
-            ".hasTrustDialogAccepted == true' /home/agent/.claude.json",
-            timeout=60,
-        )
+        # This wait has timed out intermittently with the session up and the
+        # key absent (issue #749). Should it happen again, leave the evidence
+        # in the log: which projects the file does hold, which claude wrote
+        # it, and whether the supervisor said it could not parse the file.
+        try:
+            machine.wait_until_succeeds(
+                "jq -e '.projects[\"/home/agent/worktrees/relcwd\"]"
+                ".hasTrustDialogAccepted == true' /home/agent/.claude.json",
+                timeout=60,
+            )
+        except Exception:
+            print(machine.execute(
+                "jq -c '.projects | keys' /home/agent/.claude.json;"
+                " head -c 400 /home/agent/.claude.json; echo;"
+                " stat -c '%i %s %y' /home/agent/.claude.json;"
+                " " + as_agent("claude --version") + ";"
+                " journalctl -u agent-box-agent.service --no-pager"
+                " | grep -E 'could not parse|relcwd' | tail -20"
+            )[1])
+            raise
         machine.succeed(as_agent("agent-box-session rm relcwd"))
 
         # A literal "~/..." reaches the CLI unexpanded when quoted, exactly
