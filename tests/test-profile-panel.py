@@ -1047,7 +1047,7 @@ class ProfileRoutes(ProfileFixture):
         # And the page still renders, naming the profile the session was
         # started as even though it is gone.
         page = urllib.request.urlopen(base + "/").read().decode()
-        self.assertIn("<h2>Profiles</h2>", page)
+        self.assertIn('<h2 id="profiles">Profiles<a class="heading-anchor"', page)
         self.assertNotIn("harness plus the model", page)
         self.assertIn("reasoning level", page)
         self.assertIn("prof-tag", page)

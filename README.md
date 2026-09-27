@@ -282,6 +282,16 @@ fetched from DefangLabs' own binary cache on first use, on whichever backend
 you are running. A NixOS box normally has it already, from a background unit
 that fetches it at first boot.
 
+A harness reads its stored login once, when a session starts, so an expired
+Claude or Codex login breaks every session on it at once (remote-control
+sessions drop, each pane asks to sign in again). Signing in again from the card
+therefore also restarts the running sessions of that harness that use the stored
+login (issue #751). Each one resumes its transcript, just as the Restart button
+does. The card lists what it restarted. It leaves running any session whose env
+store or profile gives it `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` or
+`OPENAI_API_KEY`, or its own `CLAUDE_CONFIG_DIR`/`CODEX_HOME`, because a restart
+would not change its credential. Stopped and died sessions are left alone too.
+
 Setting `GH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` or
 `DEFANG_ACCESS_TOKEN` by hand under Environment secrets keeps working, and
 keeps winning: every one of these CLIs prefers its environment variable over

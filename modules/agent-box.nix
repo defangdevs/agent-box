@@ -18322,6 +18322,9 @@ CONNECT_DEFS = [
 ]
 
 _connect_status_cache = {}
+# flow id -> wall-clock time the cached answer's probe STARTED, so an answer
+# can be compared with the sign-in completion marker's mtime (issue #751).
+_connect_probe_began = {}
 _connect_probing = set()
 _connect_lock = threading.Lock()
 
@@ -18443,10 +18446,12 @@ def connect_run(flow, args, timeout=15):
 def connect_probe(flow):
     """Ask one CLI whether it is signed in, off the request path."""
     try:
+        began = time.time()
         proc = connect_run(flow, flow["status"])
         value = (False, "") if proc is None else CONNECT_PARSERS[flow["parse"]](proc)
         with _connect_lock:
             _connect_status_cache[flow["id"]] = (time.monotonic(), value)
+            _connect_probe_began[flow["id"]] = began
     finally:
         with _connect_lock:
             _connect_probing.discard(flow["id"])
@@ -18595,6 +18600,193 @@ def connect_error(text):
     return tail[:CONNECT_ERROR_MAX]
 
 
+# The config directory each harness keeps its stored login in, and the
+# variable that moves it. A session whose environment points that variable
+# somewhere else reads a DIFFERENT credential store from the one the card
+# just signed in, so a restart would not change what it runs with.
+RELOGIN_CONFIG_DIRS = {
+    "claude": ("CLAUDE_CONFIG_DIR", "~/.claude"),
+    "codex": ("CODEX_HOME", "~/.codex"),
+}
+# How long the card keeps saying which sessions a sign-in restarted.
+RELOGIN_NOTICE_TTL = 600
+# Where a harness's sign-in pane records that its CLI exited 0 (issue #751).
+# Written by the PANE, not by a render: the pane closes itself
+# CONNECT_LINGER seconds after the CLI exits, and a device flow finishes in
+# a browser on another device, so no render need land inside that window.
+# The marker is what lets the next one, however late, finish the sign-in.
+CONNECT_DONE_DIR = os.path.join(HOME_DIR, ".local", "state", "agent-box")
+# flow id -> (monotonic stamp, text) for the card.
+_relogin_notices = {}
+
+
+def connect_done_path(flow_id):
+    return os.path.join(CONNECT_DONE_DIR, "connect-%s.done" % flow_id)
+
+
+def connect_claim_done(flow_id):
+    """The time this flow's last successful sign-in finished, or None.
+
+    Claiming removes the marker, and only one unlink of it can succeed, so
+    of the several renders that can see one sign-in finish, exactly one
+    acts on it.
+    """
+    path = connect_done_path(flow_id)
+    try:
+        when = os.stat(path).st_mtime
+        os.unlink(path)
+    except OSError:
+        return None
+    return when
+
+
+def supervisor_environ():
+    """The session supervisor's own environment, or {} when it cannot be
+    read.
+
+    Sessions inherit it through the tmux server the supervisor starts, and
+    so does the sign-in pane, so it carries whatever the box configuration
+    gives a session before env-exec's overlays: the per-user `environment`
+    option and `environmentFiles` secrets alike. This daemon's own
+    environment has neither.
+    """
+    for pid in find_supervisor_pids():
+        try:
+            with open("/proc/%d/environ" % pid, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        env = {}
+        for item in raw.split(b"\0"):
+            key, sep, value = item.decode("utf-8", "replace").partition("=")
+            if sep and key:
+                env[key] = value
+        return env
+    return {}
+
+
+def relogin_reason(flow, entry, stored, base):
+    """Why a restart would NOT hand this session the login the card just
+    stored, or "" when it would.
+
+    Answered from what the session gets on its NEXT spawn: the supervisor's
+    environment (`base`), then env-exec's overlays (the env store, then the
+    session's profile), since that is exactly what a restart would change.
+    A key that shadows the login wins over it in the harness itself, so that
+    session was never using the login. A config dir other than the one the
+    sign-in pane wrote to (which sees `base` only) means the session reads
+    another credential store entirely.
+    """
+    env = dict(base)
+    env.update(stored)
+    profile = entry.get("profile")
+    if isinstance(profile, str) and PROFILE_NAME_RE.match(profile):
+        for key, value in as_dict(load(profile_path(profile))).items():
+            if key not in PROFILE_RESERVED:
+                env[key] = value
+    for key in flow["shadow"]:
+        if env.get(key):
+            return "uses " + key
+    var, default = RELOGIN_CONFIG_DIRS.get(flow["id"], (None, None))
+    if var:
+        def where(e):
+            return os.path.realpath(os.path.expanduser(e.get(var) or default))
+        if where(env) != where(base):
+            return "has its own " + var
+    return ""
+
+
+def restart_login_sessions(flow, signed_in_at):
+    """Restart the running sessions that were started with the login this
+    sign-in just replaced.
+
+    Every claude (or codex) session on the box shares one stored login and
+    reads it once, at start: when the login expires, they all break together
+    (remote-control sessions drop, each pane asks for /login), and signing
+    in again from the card fixed none of them until each was restarted by
+    hand. codex is the sharper case: `login --device-auth` DELETES the old
+    credential when it starts, so every running codex session is holding
+    one that no longer exists.
+
+    Restart is the Restart button's kill: the supervisor respawns the
+    session and resumes its transcript. Only sessions created before
+    `signed_in_at` qualify, since a later one already started with the new
+    login. Left alone: stopped sessions (they read the new login when
+    started), died ones (the post-mortem pane is kept for reading), and any
+    whose environment means a restart would not change its credential
+    (relogin_reason). Returns the card's notice, or None when there was
+    nothing to say.
+    """
+    flow_id = flow["id"]
+    proc = tmux("list-sessions", "-F", "#S #{session_created}")
+    if proc is None or proc.returncode != 0:
+        return None
+    started = {}
+    for line in proc.stdout.splitlines():
+        name, _, created = line.partition(" ")
+        if created.isdigit():
+            started[name] = int(created)
+    stored = as_dict(load(ENV_FILE))
+    base = supervisor_environ()
+    restarted, kept = [], []
+    for name, entry in sorted(read_sessions().items()):
+        if (not SESSION_RE.match(name) or entry.get("agent") != flow_id
+                or entry.get("stopped") or crashed_status(entry) is not None
+                or started.get(name, signed_in_at + 1) > signed_in_at):
+            continue
+        reason = relogin_reason(flow, entry, stored, base)
+        if reason:
+            kept.append("%s (%s)" % (name, reason))
+            continue
+        kill_session(name)
+        restarted.append(name)
+    parts = []
+    if restarted:
+        parts.append("Restarted %s so %s the new sign-in: %s." % (
+            "1 session" if len(restarted) == 1 else "%d sessions" % len(restarted),
+            "it uses" if len(restarted) == 1 else "they use",
+            ", ".join(restarted)))
+    if kept:
+        parts.append("Left running: %s." % ", ".join(kept))
+    if not parts:
+        _relogin_notices.pop(flow_id, None)
+        return None
+    _relogin_notices[flow_id] = (time.monotonic(), " ".join(parts))
+    return _relogin_notices[flow_id][1]
+
+
+def connect_signed_in(flow):
+    """Everything a completed harness sign-in sets in motion: restart the
+    sessions on the old login, once per sign-in (issue #751), then make sure
+    one session exists at all (issue #504). Returns the card's error, if
+    starting that session failed."""
+    flow_id = flow["id"]
+    signed_in_at = connect_claim_done(flow_id)
+    if signed_in_at is not None and flow_id in RELOGIN_CONFIG_DIRS:
+        restart_login_sessions(flow, signed_in_at)
+    # One session per harness, started the moment sign-in lands (issue
+    # #504) -- codex gets an interactive worker session
+    # (remote_control=False) since pairing for phone/desktop already
+    # happened in this flow's own pane; claude's rc is a flag on the same
+    # worker session, so one session covers both being usable AND
+    # remote-visible.
+    if flow_id == "claude":
+        return ensure_harness_session("claude", remote_control=True)
+    if flow_id == "codex":
+        return ensure_harness_session("codex", remote_control=False)
+    return None
+
+
+def relogin_notice(flow_id):
+    hit = _relogin_notices.get(flow_id)
+    if not hit:
+        return None
+    if time.monotonic() - hit[0] > RELOGIN_NOTICE_TTL:
+        _relogin_notices.pop(flow_id, None)
+        return None
+    return hit[1]
+
+
 def connect_state(flow, keys=None, tmux_state=None):
     """What the card shows, derived from the CLI and the pane — never
     from anything the daemon stored."""
@@ -18626,16 +18818,7 @@ def connect_state(flow, keys=None, tmux_state=None):
                 connect_cancel(flow_id)
                 running = False
                 state = "connected"
-                # One session per harness, started the moment sign-in
-                # lands (issue #504) -- codex gets an interactive worker
-                # session (remote_control=False) since pairing for
-                # phone/desktop already happened in this flow's own pane;
-                # claude's rc is a flag on the same worker session, so one
-                # session covers both being usable AND remote-visible.
-                if flow_id == "claude":
-                    error = ensure_harness_session("claude", remote_control=True)
-                elif flow_id == "codex":
-                    error = ensure_harness_session("codex", remote_control=False)
+                error = connect_signed_in(flow)
             else:
                 connect_expire(flow_id)
                 state = "exchanging"
@@ -18648,6 +18831,28 @@ def connect_state(flow, keys=None, tmux_state=None):
             url = connect_trusted_url(text, flow["hosts"])
             code = connect_user_code(text) if flow["show_code"] else None
             state = "waiting" if url else "starting"
+    elif os.path.exists(connect_done_path(flow_id)):
+        # The pane already closed on a sign-in no render saw finish (issue
+        # #751): finish it now, on a fresh probe that STARTED after the
+        # marker was written, and stay "exchanging" until one has so the
+        # page keeps polling. An older probe may predate the new login, and
+        # its "not signed in" would throw the marker away.
+        try:
+            done_at = os.stat(connect_done_path(flow_id)).st_mtime
+        except OSError:
+            done_at = float("inf")
+        with _connect_lock:
+            began = _connect_probe_began.get(flow_id, 0.0)
+        if connect_fresh(flow_id) and began >= done_at:
+            if connected:
+                state = "connected"
+                error = connect_signed_in(flow)
+            else:
+                connect_claim_done(flow_id)
+                state = "idle"
+        else:
+            connect_expire(flow_id)
+            state = "exchanging"
     else:
         # "checking" is not "signed out": saying the latter before the CLI
         # has answered would invite a sign-in the box does not need.
@@ -18672,6 +18877,9 @@ def connect_state(flow, keys=None, tmux_state=None):
         "url": url,
         "code": code,
         "error": error,
+        # What the last completed sign-in did to the sessions already
+        # running on it (issue #751), shown on a signed-in card only.
+        "notice": relogin_notice(flow_id) if state == "connected" else None,
         "needs_code": flow["needs_code"],
         # False means the CLI is not on this box yet, so the button offers
         # to fetch it first (issue #416). A card with neither an `attr` nor
@@ -18781,6 +18989,10 @@ def connect_start(flow):
             if connect_pane(flow_id) not in live_sessions():
                 break
             time.sleep(0.02)
+    # A new sign-in: what the previous one restarted is no longer news,
+    # and a marker it left unclaimed belongs to a login this one replaces.
+    _relogin_notices.pop(flow_id, None)
+    connect_claim_done(flow_id)
     if not tmux_server_up():
         state = connect_state(flow)
         state["state"] = "failed"
@@ -18862,8 +19074,17 @@ def connect_start(flow):
     # The exit marker turns "the CLI is done" into something the state
     # machine can see, and the sleep keeps the final screen readable
     # until then. Both are shell-level, so no CLI has to cooperate.
-    script = "%s; printf '\\n[agent-box] exit=%%s\\n' \"$?\"; sleep %d" % (
-        inner, CONNECT_LINGER)
+    # A harness flow also leaves the completion marker (issue #751), so a
+    # render that never sees this pane can still finish the sign-in.
+    done = ""
+    if flow_id in RELOGIN_CONFIG_DIRS:
+        done = ' [ "$s" != 0 ] || { mkdir -p %s && : > %s; };' % (
+            shlex.quote(CONNECT_DONE_DIR),
+            shlex.quote(connect_done_path(flow_id)))
+    # The marker BEFORE the exit line: a render that sees the line may kill
+    # the pane at once, and the marker must already be there by then.
+    script = "%s; s=$?;%s printf '\\n[agent-box] exit=%%s\\n' \"$s\"; sleep %d" % (
+        inner, done, CONNECT_LINGER)
     # In the script, not `new-session -e PATH=...`: tmux honours -e for any
     # other variable but the pane's PATH comes from the CLIENT regardless
     # (measured on tmux 3.6a — an -e FOO reaches the pane while an -e PATH
@@ -22859,6 +23080,7 @@ def render_connect_card(state):
     open_now = (
         state["state"] in ("waiting", "starting", "checking", "exchanging")
         or (state["state"] in ("failed", "expired", "connected") and state["error"])
+        or (state["state"] == "connected" and state.get("notice"))
         or state["blocked"]
         or state["shadow"]
     )
@@ -22890,6 +23112,9 @@ def render_connect_step(state):
     if state["state"] in ("failed", "expired", "connected") and state["error"]:
         return (f'<div class="conn-step"><p class="note conn-error">'
                 f'{html.escape(state["error"])}</p></div>')
+    if state["state"] == "connected" and state.get("notice"):
+        return (f'<div class="conn-step"><p class="note">'
+                f'{html.escape(state["notice"])}</p></div>')
     if state["state"] != "waiting":
         return ""
     url = html.escape(state["url"], quote=True)
