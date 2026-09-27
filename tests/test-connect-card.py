@@ -199,5 +199,113 @@ class ConnectStepOrderTest(unittest.TestCase):
         self.assertIn("Paste the code the page gives you back", steps[2][1])
 
 
+
+class ReloginRestartTest(unittest.TestCase):
+    """Which sessions a completed sign-in restarts (issue #751).
+
+    Every session of a harness reads the one stored login at start, so an
+    expired login breaks them all and a fresh sign-in fixes none until each
+    restarts. Only the sessions that USE that login may be restarted: one
+    whose env carries a key the harness prefers, or whose config dir is
+    moved elsewhere, would come back with the same credential it had.
+    """
+
+    def setUp(self):
+        self.daemon = load_daemon()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.daemon.ENV_FILE = os.path.join(self.tmp.name, "env")
+        self.daemon.PROFILES_DIR = os.path.join(self.tmp.name, "profiles")
+        os.makedirs(self.daemon.PROFILES_DIR)
+        self.daemon._relogin_done.clear()
+        self.daemon._relogin_notices.clear()
+        self.flow = next(f for f in self.daemon.CONNECT_DEFS if f["id"] == "claude")
+        self.killed = []
+        self.sessions = {}
+        self.live = set()
+        self.stamp = "1000"
+
+        class Proc:
+            returncode = 0
+
+        def tmux(*_args):
+            proc = Proc()
+            proc.stdout = self.stamp + "\n"
+            return proc
+
+        self.daemon.tmux = tmux
+        self.daemon.live_sessions = lambda: set(self.live)
+        self.daemon.read_sessions = lambda: dict(self.sessions)
+        self.daemon.kill_session = self.killed.append
+
+    def profile(self, name, text):
+        path = os.path.join(self.daemon.PROFILES_DIR, name + ".env")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("HARNESS=claude\n" + text)
+
+    def add(self, name, live=True, **entry):
+        self.sessions[name] = dict({"agent": "claude"}, **entry)
+        if live:
+            self.live.add(name)
+
+    def test_restarts_only_sessions_on_the_stored_login(self):
+        self.profile("keyed", "ANTHROPIC_API_KEY=sk-ant-x\n")
+        self.profile("moved", "CLAUDE_CONFIG_DIR=/elsewhere\n")
+        self.profile("same", "CLAUDE_CONFIG_DIR=~/.claude\n")
+        self.add("main")
+        self.add("same", profile="same")
+        self.add("keyed", profile="keyed")
+        self.add("moved", profile="moved")
+        self.add("parked", stopped=True)
+        self.add("crashed", died=1)
+        self.add("pending", live=False)
+        self.add("cx", agent="codex")
+        notice = self.daemon.restart_login_sessions(self.flow)
+        self.assertEqual(self.killed, ["main", "same"])
+        self.assertIn("Restarted 2 sessions", notice)
+        self.assertIn("keyed (uses ANTHROPIC_API_KEY)", notice)
+        self.assertIn("moved (has its own CLAUDE_CONFIG_DIR)", notice)
+        self.assertNotIn("parked", notice)
+        self.assertNotIn("crashed", notice)
+
+    def test_an_env_store_key_shadows_the_login_for_every_session(self):
+        with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as fh:
+            fh.write("CLAUDE_CODE_OAUTH_TOKEN=tok\n")
+        self.add("main")
+        notice = self.daemon.restart_login_sessions(self.flow)
+        self.assertEqual(self.killed, [])
+        self.assertIn("main (uses CLAUDE_CODE_OAUTH_TOKEN)", notice)
+
+    def test_once_per_sign_in_pane(self):
+        self.add("main")
+        self.daemon.restart_login_sessions(self.flow)
+        self.daemon.restart_login_sessions(self.flow)
+        self.assertEqual(self.killed, ["main"])
+        self.stamp = "2000"
+        self.daemon.restart_login_sessions(self.flow)
+        self.assertEqual(self.killed, ["main", "main"])
+
+    def test_gone_pane_restarts_nothing(self):
+        self.add("main")
+        self.stamp = ""
+        self.assertIsNone(self.daemon.restart_login_sessions(self.flow))
+        self.assertEqual(self.killed, [])
+
+    def test_flows_that_reread_their_credential_restart_nothing(self):
+        self.add("main", agent="github")
+        gh = next(f for f in self.daemon.CONNECT_DEFS if f["id"] == "github")
+        self.assertIsNone(self.daemon.restart_login_sessions(gh))
+        self.assertEqual(self.killed, [])
+
+    def test_notice_shows_on_the_signed_in_card(self):
+        self.add("main")
+        notice = self.daemon.restart_login_sessions(self.flow)
+        self.assertEqual(self.daemon.relogin_notice("claude"), notice)
+        page = self.daemon.render_connect_card(
+            base_state(state="connected", notice=notice))
+        self.assertIn("Restarted 1 session so it uses the new sign-in: main.", page)
+        self.assertIn(" open", page)
+
+
 if __name__ == "__main__":
     unittest.main()
