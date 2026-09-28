@@ -148,6 +148,13 @@ plainly rather than handing it back.
   `agent-box-webhook subscribe TOPIC --deliver-to subagent --profile NAME`,
   which beats it. So cheap triage can take new issues while a red build
   starts something that can fix it.
+- One profile can be the DEFAULT: `agent-box-profile default NAME` (or the
+  star on its row in settings). It is preselected in every "new session"
+  picker, used by `agent-box-session add` given neither `--profile` nor
+  `--harness`, and started by a standing watch that names no profile and
+  has no `AGENT_BOX_HOOK_PROFILE`. `agent-box-profile default --clear`
+  unsets it, and deleting the default profile clears it too - the next
+  session then asks which profile to start.
 
 ## Slash commands: type them into your own pane
 

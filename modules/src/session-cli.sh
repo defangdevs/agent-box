@@ -78,6 +78,8 @@ usage() {
   echo "--profile names an agent profile (agent-box-profile ls): a harness plus"
   echo "a model, an effort level, an appended system prompt and session env."
   echo "--harness and a '-- EXTRA_ARGS' tail override what the profile resolved."
+  echo "With neither --profile nor --harness, the default profile is used when"
+  echo "one is set (agent-box-profile default)."
   echo "(--agent is the old name for --harness and still works. It is"
   echo "deprecated: claude and opencode both spell --agent for the PROFILE,"
   echo "which is this box's --profile, so the two meanings collided.)"
@@ -547,6 +549,12 @@ case "$cmd" in
     # this CLI also runs from the webhook receiver unit's PATH, which carries
     # jq, coreutils and this script and nothing else.
     pargs=()
+    # Neither --profile nor --harness: the DEFAULT profile, when one is set
+    # (agent-box-profile default). An explicit --harness still means that bare
+    # harness, so a script that names one keeps getting exactly it.
+    if [ -z "$profile" ] && [ "$has_harness" = 0 ]; then
+      profile="$("${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" default 2>/dev/null)" || profile=""
+    fi
     if [ -n "$profile" ]; then
       # --harness on the command line wins over the profile's harness, the same
       # override order the env file has over the NixOS option elsewhere here —

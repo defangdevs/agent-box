@@ -43,6 +43,7 @@ usage() {
   echo "       agent-box-profile show NAME"
   echo "       agent-box-profile set NAME KEY=VALUE..."
   echo "       agent-box-profile rm NAME [KEY...]"
+  echo "       agent-box-profile default [NAME | --clear]"
   echo "       agent-box-profile launch NAME [HARNESS]   (JSON, for agent-box-session)"
   echo "       agent-box-profile seed                    (prepopulate, once per harness)"
   echo "A profile is a worker: a harness plus the knobs that tell two sessions"
@@ -59,6 +60,10 @@ usage() {
   echo "/proc/<pid>/environ (issue #135, wiki: Users-vs-Sessions), so a secret"
   echo "in a profile is a secret every session of this user has."
   echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters."
+  echo "The DEFAULT profile (at most one) is preselected when a session is"
+  echo "started from the settings page or workspace, used by"
+  echo "'agent-box-session add' given neither --profile nor --harness, and by a"
+  echo "standing watch that names no profile. Deleting it clears the default."
   echo "Changes apply to sessions started AFTERWARDS: a running session keeps"
   echo "the arguments and environment it started with."
 }
@@ -74,6 +79,29 @@ valid_key() {
   case "$1" in (*[!A-Za-z0-9_]*|""|[0-9]*) return 1 ;; esac
 }
 file_for() { printf '%s/%s.env\n' "$DIR" "$1"; }
+
+# The default profile is ONE pointer file naming it, not a DEFAULT=true key in
+# each profile: a key could be set in two files at once and every reader would
+# have to agree which one wins, while a pointer is at most one by construction.
+# A pointer at a profile that no longer exists (deleted by hand, say) reads as
+# no default at all, so nobody has to keep the two in step for it to be right.
+DEFAULT_FILE="$DIR/.default"
+default_name() {
+  [ -r "$DEFAULT_FILE" ] || return 0
+  d=""
+  IFS= read -r d < "$DEFAULT_FILE" 2>/dev/null || [ -n "$d" ] || return 0
+  valid_name "$d" || return 0
+  [ -f "$(file_for "$d")" ] || return 0
+  printf '%s\n' "$d"
+}
+# Written to a temporary file and renamed, so a reader never sees half a name
+# and the directory's mtime moves (the settings page keys its caches on it).
+default_write() {
+  mkdir -p "$DIR"
+  t="$(mktemp "$DIR/.default.XXXXXX")"
+  printf '%s\n' "$1" > "$t"
+  mv -f "$t" "$DEFAULT_FILE"
+}
 
 # read_profile NAME — set the res_<KEY> variables for the reserved keys and
 # collect the remaining key NAMES in env_keys. The file is read by the env
@@ -204,22 +232,30 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   ls)
     [ -d "$DIR" ] || exit 0
+    def="$(default_name)"
     printf '%-20s %-8s %-18s %s\n' NAME HARNESS MODEL EFFORT
     for f in "$DIR"/*.env; do
       [ -f "$f" ] || continue
       n="${f##*/}"; n="${n%.env}"
       valid_name "$n" || continue
       read_profile "$n" || continue
-      printf '%-20s %-8s %-18s %s\n' "$n" "${res_HARNESS:-?}" \
+      label="$n"
+      [ "$n" = "$def" ] && label="$n *"
+      printf '%-20s %-8s %-18s %s\n' "$label" "${res_HARNESS:-?}" \
         "${res_MODEL:--}" "${res_EFFORT:--}"
     done
+    [ -z "$def" ] || echo "* default: preselected for new sessions (agent-box-profile default --clear to unset)"
     ;;
   show)
     name="${1:-}"
     valid_name "$name" || { usage >&2; exit 2; }
     read_profile "$name" || { echo "no such profile: '$name' (see agent-box-profile ls)" >&2; exit 2; }
     j="$(launch_json "$name")" || exit 2
-    printf 'profile %s (%s)\n' "$name" "$(file_for "$name")"
+    if [ "$(default_name)" = "$name" ]; then
+      printf 'profile %s (%s) [default]\n' "$name" "$(file_for "$name")"
+    else
+      printf 'profile %s (%s)\n' "$name" "$(file_for "$name")"
+    fi
     printf '  HARNESS        %s\n' "$("$JQ" -r '.harness' <<<"$j")"
     printf '  MODEL          %s\n' "${res_MODEL:--}"
     printf '  EFFORT         %s\n' "${res_EFFORT:--}"
@@ -280,6 +316,15 @@ case "$cmd" in
     if [ $# -eq 0 ]; then
       rm -f "$f"
       echo "profile '$name' removed — sessions already running with it are unaffected"
+      # Deleting the default clears it rather than promoting another profile:
+      # the next session asks which worker to start, instead of quietly
+      # becoming one nobody picked.
+      d=""
+      [ -r "$DEFAULT_FILE" ] && { IFS= read -r d < "$DEFAULT_FILE" || :; }
+      if [ "$d" = "$name" ]; then
+        rm -f "$DEFAULT_FILE"
+        echo "it was the default profile; there is no default now"
+      fi
     else
       for k in "$@"; do
         valid_key "$k" || { usage >&2; exit 2; }
@@ -331,6 +376,25 @@ case "$cmd" in
       printf '%s\n' "$h" >> "$stamp"
       echo "profile '$h' created - 'agent-box-session add --profile $h' starts a session with it"
     done
+    ;;
+  default)
+    # No argument: print the default's name, or nothing when there is none -
+    # the machine-readable answer agent-box-session add reads. Exit 0 either
+    # way, so "no default" is an answer and not an error.
+    case "${1:-}" in
+      ("") default_name ;;
+      (--clear)
+        rm -f "$DEFAULT_FILE"
+        echo "no default profile: new sessions ask which one to start"
+        ;;
+      (*)
+        name="$1"
+        valid_name "$name" || { usage >&2; exit 2; }
+        [ -f "$(file_for "$name")" ] || { echo "no such profile: '$name' (see agent-box-profile ls)" >&2; exit 2; }
+        default_write "$name"
+        echo "profile '$name' is now the default: it is preselected for new sessions"
+        ;;
+    esac
     ;;
   launch)
     # The machine-readable half of `show`, for `agent-box-session add

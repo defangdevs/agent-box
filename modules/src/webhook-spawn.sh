@@ -279,6 +279,18 @@ try_profile() {
 
 try_profile "$watch_profile" "this watch's own spawnConfig.profile"
 try_profile "$box_profile" "$box_profile_source"
+# Last, the user's DEFAULT profile (agent-box-profile default): the worker
+# they preselect for every other new session, so a watch that names none
+# starts it too rather than the bare box harness. Read straight from the
+# pointer file, like profile_problem reads the profiles above. A pointer at a
+# profile that is gone means "no default" (agent-box-profile's own reading),
+# not a named-but-missing profile to warn about on every delivery.
+default_profile=""
+if [ -r "$HOME/.config/agent-box/profiles/.default" ]; then
+  IFS= read -r default_profile < "$HOME/.config/agent-box/profiles/.default" || :
+fi
+[ -z "$(profile_problem "$default_profile")" ] || default_profile=""
+try_profile "$default_profile" "the default profile (agent-box-profile default)"
 if [ -n "$hook_profile" ]; then
   [ -z "$hook_profile_ignored" ] \
     || echo "agent-box-webhook-spawn: starting this session on profile" \

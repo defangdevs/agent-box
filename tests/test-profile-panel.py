@@ -350,6 +350,28 @@ class ProfilePanel(ProfileFixture):
         # Nothing posts an empty profile any more.
         self.assertNotIn('<option value="">', options)
 
+    def test_the_default_profile_is_preselected(self):
+        """Issue #753: the one exception to asking. A pointer at a profile
+        that no longer exists reads as no default, so the picker asks."""
+        self.write_profile("triage", "HARNESS=claude\n")
+        self.write_profile("review", "HARNESS=codex\n")
+        with open(os.path.join(self.profiles, ".default"), "w") as handle:
+            handle.write("triage\n")
+        module = self.daemon()
+        profiles = module.read_profiles()
+        options = module.render_profile_options(profiles)
+        self.assertIn('<option value="" disabled>Choose a profile</option>', options)
+        self.assertIn('<option value="triage" selected>triage (claude), default</option>',
+                      options)
+        self.assertIn('<option value="review">review (codex)</option>', options)
+        panel = module.render_profiles(profiles)
+        self.assertEqual(panel.count('aria-pressed="true"'), 1)
+        with open(os.path.join(self.profiles, ".default"), "w") as handle:
+            handle.write("gone\n")
+        options = module.render_profile_options(module.read_profiles())
+        self.assertTrue(options.startswith('<option value="" disabled selected>'))
+        self.assertNotIn(" selected>triage", options)
+
     def test_a_profile_may_be_named_shell_without_colliding(self):
         """A profile NAME of "shell" is legal - what #493 refuses is
         HARNESS=shell - so the pseudo-entry cannot use the bare word as its
@@ -694,6 +716,42 @@ class ProfileRoutes(ProfileFixture):
         text = self.profile_text("review")
         self.assertNotIn("MODEL=", text)
         self.assertNotIn("Review only.", text)
+
+    def default_pointer(self):
+        path = os.path.join(self.profiles, ".default")
+        return open(path).read().strip() if os.path.exists(path) else None
+
+    def test_the_default_is_set_moved_cleared_and_dropped_with_its_profile(self):
+        """Issue #753: at most one default, and deleting it leaves none
+        rather than promoting another profile."""
+        self.write_profile("triage", "HARNESS=claude\n")
+        self.write_profile("review", "HARNESS=codex\n")
+        _, base = self.serve()
+        status, _ = self.post(base, "/profiles/default", name="triage", on="1")
+        self.assertEqual(status, 303)
+        self.assertEqual(self.default_pointer(), "triage")
+        self.post(base, "/profiles/default", name="review", on="1")
+        self.assertEqual(self.default_pointer(), "review")
+        # A stale tab still showing triage as the default must not clear
+        # the default somebody has since moved to review.
+        self.post(base, "/profiles/default", name="triage", on="0")
+        self.assertEqual(self.default_pointer(), "review")
+        self.post(base, "/profiles/default", name="review", on="0")
+        self.assertIsNone(self.default_pointer())
+        self.post(base, "/profiles/default", name="triage", on="1")
+        self.post(base, "/profiles/delete", name="triage")
+        self.assertIsNone(self.default_pointer())
+        # Deleting a profile that is NOT the default leaves the default alone.
+        self.post(base, "/profiles/default", name="review", on="1")
+        self.write_profile("other", "HARNESS=claude\n")
+        self.post(base, "/profiles/delete", name="other")
+        self.assertEqual(self.default_pointer(), "review")
+
+    def test_a_missing_profile_cannot_become_the_default(self):
+        _, base = self.serve()
+        status, _ = self.post(base, "/profiles/default", name="nosuch", on="1")
+        self.assertEqual(status, 404)
+        self.assertIsNone(self.default_pointer())
 
     def test_a_key_the_harness_cannot_use_is_reported_when_it_is_saved(self):
         """Not at the next session start, which is where the operator has

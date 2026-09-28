@@ -665,6 +665,13 @@ let
       `agent-box-webhook subscribe TOPIC --deliver-to subagent --profile NAME`,
       which beats it. So cheap triage can take new issues while a red build
       starts something that can fix it.
+    - One profile can be the DEFAULT: `agent-box-profile default NAME` (or the
+      star on its row in settings). It is preselected in every "new session"
+      picker, used by `agent-box-session add` given neither `--profile` nor
+      `--harness`, and started by a standing watch that names no profile and
+      has no `AGENT_BOX_HOOK_PROFILE`. `agent-box-profile default --clear`
+      unsets it, and deleting the default profile clears it too - the next
+      session then asks which profile to start.
 
     ## Slash commands: type them into your own pane
 
@@ -4422,6 +4429,8 @@ usage() {
   echo "--profile names an agent profile (agent-box-profile ls): a harness plus"
   echo "a model, an effort level, an appended system prompt and session env."
   echo "--harness and a '-- EXTRA_ARGS' tail override what the profile resolved."
+  echo "With neither --profile nor --harness, the default profile is used when"
+  echo "one is set (agent-box-profile default)."
   echo "(--agent is the old name for --harness and still works. It is"
   echo "deprecated: claude and opencode both spell --agent for the PROFILE,"
   echo "which is this box's --profile, so the two meanings collided.)"
@@ -4891,6 +4900,12 @@ case "$cmd" in
     # this CLI also runs from the webhook receiver unit's PATH, which carries
     # jq, coreutils and this script and nothing else.
     pargs=()
+    # Neither --profile nor --harness: the DEFAULT profile, when one is set
+    # (agent-box-profile default). An explicit --harness still means that bare
+    # harness, so a script that names one keeps getting exactly it.
+    if [ -z "$profile" ] && [ "$has_harness" = 0 ]; then
+      profile="$("''${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" default 2>/dev/null)" || profile=""
+    fi
     if [ -n "$profile" ]; then
       # --harness on the command line wins over the profile's harness, the same
       # override order the env file has over the NixOS option elsewhere here —
@@ -5186,6 +5201,7 @@ usage() {
   echo "       agent-box-profile show NAME"
   echo "       agent-box-profile set NAME KEY=VALUE..."
   echo "       agent-box-profile rm NAME [KEY...]"
+  echo "       agent-box-profile default [NAME | --clear]"
   echo "       agent-box-profile launch NAME [HARNESS]   (JSON, for agent-box-session)"
   echo "       agent-box-profile seed                    (prepopulate, once per harness)"
   echo "A profile is a worker: a harness plus the knobs that tell two sessions"
@@ -5202,6 +5218,10 @@ usage() {
   echo "/proc/<pid>/environ (issue #135, wiki: Users-vs-Sessions), so a secret"
   echo "in a profile is a secret every session of this user has."
   echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters."
+  echo "The DEFAULT profile (at most one) is preselected when a session is"
+  echo "started from the settings page or workspace, used by"
+  echo "'agent-box-session add' given neither --profile nor --harness, and by a"
+  echo "standing watch that names no profile. Deleting it clears the default."
   echo "Changes apply to sessions started AFTERWARDS: a running session keeps"
   echo "the arguments and environment it started with."
 }
@@ -5217,6 +5237,29 @@ valid_key() {
   case "$1" in (*[!A-Za-z0-9_]*|""|[0-9]*) return 1 ;; esac
 }
 file_for() { printf '%s/%s.env\n' "$DIR" "$1"; }
+
+# The default profile is ONE pointer file naming it, not a DEFAULT=true key in
+# each profile: a key could be set in two files at once and every reader would
+# have to agree which one wins, while a pointer is at most one by construction.
+# A pointer at a profile that no longer exists (deleted by hand, say) reads as
+# no default at all, so nobody has to keep the two in step for it to be right.
+DEFAULT_FILE="$DIR/.default"
+default_name() {
+  [ -r "$DEFAULT_FILE" ] || return 0
+  d=""
+  IFS= read -r d < "$DEFAULT_FILE" 2>/dev/null || [ -n "$d" ] || return 0
+  valid_name "$d" || return 0
+  [ -f "$(file_for "$d")" ] || return 0
+  printf '%s\n' "$d"
+}
+# Written to a temporary file and renamed, so a reader never sees half a name
+# and the directory's mtime moves (the settings page keys its caches on it).
+default_write() {
+  mkdir -p "$DIR"
+  t="$(mktemp "$DIR/.default.XXXXXX")"
+  printf '%s\n' "$1" > "$t"
+  mv -f "$t" "$DEFAULT_FILE"
+}
 
 # read_profile NAME — set the res_<KEY> variables for the reserved keys and
 # collect the remaining key NAMES in env_keys. The file is read by the env
@@ -5347,22 +5390,30 @@ cmd="''${1:-}"; shift || true
 case "$cmd" in
   ls)
     [ -d "$DIR" ] || exit 0
+    def="$(default_name)"
     printf '%-20s %-8s %-18s %s\n' NAME HARNESS MODEL EFFORT
     for f in "$DIR"/*.env; do
       [ -f "$f" ] || continue
       n="''${f##*/}"; n="''${n%.env}"
       valid_name "$n" || continue
       read_profile "$n" || continue
-      printf '%-20s %-8s %-18s %s\n' "$n" "''${res_HARNESS:-?}" \
+      label="$n"
+      [ "$n" = "$def" ] && label="$n *"
+      printf '%-20s %-8s %-18s %s\n' "$label" "''${res_HARNESS:-?}" \
         "''${res_MODEL:--}" "''${res_EFFORT:--}"
     done
+    [ -z "$def" ] || echo "* default: preselected for new sessions (agent-box-profile default --clear to unset)"
     ;;
   show)
     name="''${1:-}"
     valid_name "$name" || { usage >&2; exit 2; }
     read_profile "$name" || { echo "no such profile: '$name' (see agent-box-profile ls)" >&2; exit 2; }
     j="$(launch_json "$name")" || exit 2
-    printf 'profile %s (%s)\n' "$name" "$(file_for "$name")"
+    if [ "$(default_name)" = "$name" ]; then
+      printf 'profile %s (%s) [default]\n' "$name" "$(file_for "$name")"
+    else
+      printf 'profile %s (%s)\n' "$name" "$(file_for "$name")"
+    fi
     printf '  HARNESS        %s\n' "$("$JQ" -r '.harness' <<<"$j")"
     printf '  MODEL          %s\n' "''${res_MODEL:--}"
     printf '  EFFORT         %s\n' "''${res_EFFORT:--}"
@@ -5423,6 +5474,15 @@ case "$cmd" in
     if [ $# -eq 0 ]; then
       rm -f "$f"
       echo "profile '$name' removed — sessions already running with it are unaffected"
+      # Deleting the default clears it rather than promoting another profile:
+      # the next session asks which worker to start, instead of quietly
+      # becoming one nobody picked.
+      d=""
+      [ -r "$DEFAULT_FILE" ] && { IFS= read -r d < "$DEFAULT_FILE" || :; }
+      if [ "$d" = "$name" ]; then
+        rm -f "$DEFAULT_FILE"
+        echo "it was the default profile; there is no default now"
+      fi
     else
       for k in "$@"; do
         valid_key "$k" || { usage >&2; exit 2; }
@@ -5474,6 +5534,25 @@ case "$cmd" in
       printf '%s\n' "$h" >> "$stamp"
       echo "profile '$h' created - 'agent-box-session add --profile $h' starts a session with it"
     done
+    ;;
+  default)
+    # No argument: print the default's name, or nothing when there is none -
+    # the machine-readable answer agent-box-session add reads. Exit 0 either
+    # way, so "no default" is an answer and not an error.
+    case "''${1:-}" in
+      ("") default_name ;;
+      (--clear)
+        rm -f "$DEFAULT_FILE"
+        echo "no default profile: new sessions ask which one to start"
+        ;;
+      (*)
+        name="$1"
+        valid_name "$name" || { usage >&2; exit 2; }
+        [ -f "$(file_for "$name")" ] || { echo "no such profile: '$name' (see agent-box-profile ls)" >&2; exit 2; }
+        default_write "$name"
+        echo "profile '$name' is now the default: it is preselected for new sessions"
+        ;;
+    esac
     ;;
   launch)
     # The machine-readable half of `show`, for `agent-box-session add
@@ -9291,6 +9370,18 @@ try_profile() {
 
 try_profile "$watch_profile" "this watch's own spawnConfig.profile"
 try_profile "$box_profile" "$box_profile_source"
+# Last, the user's DEFAULT profile (agent-box-profile default): the worker
+# they preselect for every other new session, so a watch that names none
+# starts it too rather than the bare box harness. Read straight from the
+# pointer file, like profile_problem reads the profiles above. A pointer at a
+# profile that is gone means "no default" (agent-box-profile's own reading),
+# not a named-but-missing profile to warn about on every delivery.
+default_profile=""
+if [ -r "$HOME/.config/agent-box/profiles/.default" ]; then
+  IFS= read -r default_profile < "$HOME/.config/agent-box/profiles/.default" || :
+fi
+[ -z "$(profile_problem "$default_profile")" ] || default_profile=""
+try_profile "$default_profile" "the default profile (agent-box-profile default)"
 if [ -n "$hook_profile" ]; then
   [ -z "$hook_profile_ignored" ] \
     || echo "agent-box-webhook-spawn: starting this session on profile" \
@@ -16538,7 +16629,10 @@ def profile_write(name, assignments, drop=(), must_exist=False):
 def profile_remove(name):
     """Delete under the SAME lock profile_write takes. Without it a save can
     read the file, this can unlink it, and the save can then write it back —
-    a profile the operator deleted, quietly recreated."""
+    a profile the operator deleted, quietly recreated.
+
+    Deleting the default profile clears the default rather than promoting
+    another one, so the next session asks which worker to start."""
     path = profile_path(name)
     try:
         with locked(path):
@@ -16550,6 +16644,56 @@ def profile_remove(name):
         # The lock itself is unavailable (the directory is gone, say). There
         # is then nothing to delete either.
         pass
+    if read_default_pointer() == name:
+        set_default_profile("")
+
+
+# The default profile: ONE pointer file naming it, the same one
+# `agent-box-profile default` writes. A pointer is at most one default by
+# construction, where a DEFAULT=true key could be set in two profiles at once.
+DEFAULT_PROFILE_FILE = os.path.join(PROFILES_DIR, ".default")
+
+
+def read_default_pointer():
+    """The name the pointer holds, "" when none or not a profile name. Not
+    checked against the profiles on disk: callers that offer it compare
+    against the list they already read."""
+    try:
+        with open(DEFAULT_PROFILE_FILE, encoding="utf-8") as fh:
+            name = fh.readline().strip()
+    except OSError:
+        return ""
+    return name if PROFILE_NAME_RE.match(name) else ""
+
+
+def default_profile(profiles):
+    """The default profile when it still exists, else "" - a pointer at a
+    profile deleted by hand reads as no default, as it does in the CLI."""
+    name = read_default_pointer()
+    return name if name in profiles else ""
+
+
+def set_default_profile(name):
+    """Point the default at `name`, or clear it for "". Written to a temp
+    file and renamed, so a reader never sees half a name."""
+    if not name:
+        try:
+            os.unlink(DEFAULT_PROFILE_FILE)
+        except OSError:
+            pass
+        return
+    os.makedirs(PROFILES_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".default.", dir=PROFILES_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(name + "\n")
+        os.replace(tmp, DEFAULT_PROFILE_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def profile_launch(name, harness=""):
@@ -19688,6 +19832,8 @@ STYLE = """<style>
           text-decoration: none; }
   .icon:hover { background: #21262d; color: #e6edf3; }
   .icon.idanger:hover { color: #f85149; background: rgba(248,81,73,.1); }
+  /* The default profile's star (issue #753): filled and amber on the default. */
+  .icon.idefault.on { color: #d29922; }
   .danger-btn { color: #f85149; }
   .danger-btn:hover { background: #da3633; border-color: #f85149; color: #fff; }
   .tbl.danger { border-color: rgba(248,81,73,.4); }
@@ -20523,6 +20669,21 @@ ICON_CHECK = (
     '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
     '<path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L1.72 9.78a.751.751 '
     '0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 11.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"/></svg>'
+)
+ICON_STAR = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 '
+    '2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72'
+    '-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Zm0 2.445'
+    'L6.615 5.5a.75.75 0 0 1-.564.41l-3.097.45 2.24 2.184a.75.75 0 0 1 .216.664l-.528 3.084 '
+    '2.769-1.456a.75.75 0 0 1 .698 0l2.77 1.456-.53-3.084a.75.75 0 0 1 .216-.664l2.24-2.183'
+    '-3.096-.45a.75.75 0 0 1-.564-.41L8 2.694Z"/></svg>'
+)
+ICON_STAR_FILL = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 '
+    '2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72'
+    '-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z"/></svg>'
 )
 ICON_TRASH = (
     '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
@@ -21997,9 +22158,10 @@ def render_profile_options(profiles):
     or instructions to save, which is the same reason agent-box-profile
     refuses it as a HARNESS.
 
-    Nothing is preselected. The box no longer has a default assistant, so
-    the page asks rather than guessing - the rule the profile editor's own
-    picker already follows.
+    Nothing is preselected unless the user marked a DEFAULT profile
+    (issue #753). The box has no default assistant of its own, so without
+    that choice the page asks rather than guessing - the rule the profile
+    editor's own picker already follows.
 
     Without a resolver there is no picker at all. The settings unit is
     socket activated with stopIfChanged = false, so a daemon that survived
@@ -22013,12 +22175,17 @@ def render_profile_options(profiles):
     if not PROFILE_BIN:
         return ('<option value="" disabled selected>Restart the settings '
                 'service to list profiles</option>' + shell_opt)
-    items = ['<option value="" disabled selected>Choose a profile</option>']
+    default = default_profile(profiles)
+    items = ['<option value="" disabled%s>Choose a profile</option>'
+             % ("" if default else " selected")]
     for name in sorted(profiles):
         safe = html.escape(name)
         harness = html.escape(profiles[name]["reserved"].get("HARNESS") or "")
         label = f"{safe} ({harness})" if harness else safe
-        items.append(f'<option value="{safe}">{label}</option>')
+        if name == default:
+            label += ", default"
+        sel = " selected" if name == default else ""
+        items.append(f'<option value="{safe}"{sel}>{label}</option>')
     if "codex" in AGENTS:
         # A real codex profile always opens the interactive TUI now (issue
         # #623); the daemon is offered here instead, as its own entry.
@@ -22313,13 +22480,15 @@ def render_profiles(profiles, usage=None):
     hand and does not care."""
     usage = usage or {}
     base = html.escape(BASE)
+    default = default_profile(profiles)
     rows = []
     for name in sorted(profiles):
         safe = html.escape(name)
         res = profiles[name]["reserved"]
+        is_default = name == default
         # The summary line answers "what worker is this" without a click:
         # the harness, then whatever narrows it.
-        bits = []
+        bits = ["default"] if is_default else []
         for key in ("HARNESS", "MODEL", "EFFORT"):
             if res.get(key):
                 bits.append(html.escape(res[key]))
@@ -22387,16 +22556,37 @@ def render_profiles(profiles, usage=None):
         # hope, and a topic holding an apostrophe broke out of it.
         confirm_js = html.escape(
             json.dumps(
-                "Delete profile %s?%s Sessions already running keep what "
-                "they started with." % (name, watch_warn)
+                "Delete profile %s?%s%s Sessions already running keep what "
+                "they started with." % (
+                    name, watch_warn,
+                    " It is the default profile: new sessions will ask "
+                    "which profile to start." if is_default else "")
             ),
             quote=True,
         )
+        # A star toggles the default (issue #753): filled on the default,
+        # outline on the rest. One button, the same form either way - `on`
+        # says which direction it goes.
+        if is_default:
+            star = (f'<input type="hidden" name="on" value="0">'
+                    f'<button type="submit" class="icon idefault on" '
+                    f'aria-label="Default profile" aria-pressed="true" '
+                    f'title="{safe} is the default profile - click to unset">'
+                    f'{ICON_STAR_FILL}</button>')
+        else:
+            star = (f'<input type="hidden" name="on" value="1">'
+                    f'<button type="submit" class="icon idefault" '
+                    f'aria-label="Make default" aria-pressed="false" '
+                    f'title="Make {safe} the default profile for new sessions">'
+                    f'{ICON_STAR}</button>')
         rows.append(
             f'<li class="foldrow prof-row"><details><summary>'
             f'<span class="nm"><code>{safe}</code></span>'
             f'<span class="meta">{meta}</span>'
             f'<span class="acts"><form class="inline" method="post" '
+            f'action="{base}/profiles/default">'
+            f'<input type="hidden" name="name" value="{safe}">{star}</form>'
+            f'<form class="inline" method="post" '
             f'action="{base}/profiles/delete" '
             f'onsubmit="return confirm({confirm_js});">'
             f'<input type="hidden" name="name" value="{safe}">'
@@ -24791,6 +24981,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "profile_saved": ("Profile saved. Sessions started from now on use it.", "ok"),
         "profile_deleted": (("Profile deleted. Sessions already running keep "
                              "their current settings."), "ok"),
+        "profile_default_set": (("Default profile set. New sessions start with "
+                                 "it preselected."), "ok"),
+        "profile_default_cleared": (("No default profile. New sessions ask "
+                                     "which profile to start."), "ok"),
         "profile_key_saved": (("Setting added to the profile. Sessions on it pick "
                                "it up at their next start."), "ok"),
         "profile_key_deleted": (("Setting removed from the profile. Sessions on it "
@@ -25318,7 +25512,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # every message below says "from now on" rather than "applied".
             action = path[len(BASE + "/profiles/"):]
             name = (form.get("name", [""])[0]).strip()
-            if action not in ("set", "delete", "setkey", "delkey"):
+            if action not in ("set", "delete", "setkey", "delkey", "default"):
                 self._send_html("<h1>404</h1>", status=404)
                 return
             if not PROFILE_NAME_RE.match(name):
@@ -25331,6 +25525,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if action == "delete":
                 profile_remove(name)
                 self._redirect("ok=profile_deleted")
+                return
+            if action == "default":
+                on = form.get("on", ["1"])[0] != "0"
+                if on:
+                    if name not in read_profiles():
+                        self._send_html(
+                            render_page("No profile named '%s' \u2014 it may "
+                                        "have just been deleted." % name,
+                                        kind="error"),
+                            status=404)
+                        return
+                    set_default_profile(name)
+                    self._redirect("ok=profile_default_set")
+                else:
+                    # Only clear the default this row showed: a stale tab
+                    # must not unset a default somebody moved elsewhere.
+                    if read_default_pointer() == name:
+                        set_default_profile("")
+                    self._redirect("ok=profile_default_cleared")
                 return
             if action == "delkey":
                 key = (form.get("key", [""])[0]).strip()

@@ -159,6 +159,8 @@ ul.tbl.subs li { padding-left: 40px; }
         text-decoration: none; }
 .icon:hover { background: #21262d; color: #e6edf3; }
 .icon.idanger:hover { color: #f85149; background: rgba(248,81,73,.1); }
+/* The default profile's star (issue #753): filled and amber on the default. */
+.icon.idefault.on { color: #d29922; }
 .danger-btn { color: #f85149; }
 .danger-btn:hover { background: #da3633; border-color: #f85149; color: #fff; }
 .tbl.danger { border-color: rgba(248,81,73,.4); }
