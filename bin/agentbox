@@ -3366,7 +3366,7 @@ class Renderer:
                "\n".join(lines) + "\n")
 
     def tmux(self, t):
-        """System-wide /etc/tmux.conf: `set -g mouse on` (issue #495).
+        """System-wide /etc/tmux.conf, from share/agent-box/tmux.conf (#495).
 
         Without it, a mouse wheel scroll is forwarded to the foreground
         program as arrow-key presses instead of scrolling tmux's own pane
@@ -3386,10 +3386,12 @@ class Renderer:
         path = self.p("/etc/tmux.conf")
         if foreign_file(path):
             self.notes.append(
-                f"{path}: not written by agentbox — left alone; add "
-                f"`set -g mouse on` yourself so mouse wheel scroll works")
+                f"{path}: not written by agentbox — left alone; copy "
+                f"{self.share / 'tmux.conf'} into it yourself so mouse "
+                f"wheel scroll works and web tiles stay on their session")
             return
-        t.file(path, GENERATED_HEADER + "set -g mouse on\n")
+        body = (self.share / "tmux.conf").read_text(encoding="utf-8")
+        t.file(path, GENERATED_HEADER + body)
 
     def gitconfig(self, t):
         """System-wide /etc/gitconfig: gh's credential helper for github.com

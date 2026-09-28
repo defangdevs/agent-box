@@ -141,6 +141,7 @@ def build_fake_profile(root):
     (share / "contract").mkdir()
     for j in (SRC / "contract").glob("*.json"):
         shutil.copy(j, share / "contract" / j.name)
+    shutil.copy(SRC / "tmux.conf", share / "tmux.conf")
     # The pinned local-webhook the profile ships (issue #425), and the pin it
     # came from. A box needs no webhook config because these are here — so a
     # fake profile without them would test the pre-#425 world.
@@ -905,7 +906,11 @@ class RenderTest(unittest.TestCase):
             spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
             rend = mod.Renderer(spec_obj, prof, root=out)
             written = rend.render().files[str(conf)][0]
-            self.assertEqual(mod.GENERATED_HEADER + "set -g mouse on\n", written)
+            self.assertEqual(
+                mod.GENERATED_HEADER + (SRC / "tmux.conf").read_text(),
+                written)
+            self.assertIn("unbind-key -T prefix s", written,
+                          "web clients can still switch session (choose-tree)")
 
     def test_a_foreign_gitconfig_is_left_alone(self):
         """/etc/gitconfig is a general system file, not one of agentbox's

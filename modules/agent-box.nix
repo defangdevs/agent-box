@@ -14975,14 +14975,24 @@ in
       };
     };
 
-    # Without this, a mouse wheel scroll is forwarded to the foreground
-    # program as arrow-key presses instead of scrolling tmux's own pane
-    # history — tmux's default fallback for apps that don't handle the
-    # mouse themselves. System-wide /etc/tmux.conf so every user's tmux
-    # server picks it up without touching each ~/.tmux.conf.
+    # System-wide /etc/tmux.conf so every user's tmux server picks it up
+    # without touching each ~/.tmux.conf. The body is shared with the
+    # native renderer (share/agent-box/tmux.conf).
     programs.tmux = {
       enable = true;
-      extraConfig = "set -g mouse on";
+      extraConfig = ''
+        # Wheel scrolls tmux's pane history instead of sending arrow keys (#265).
+        set -g mouse on
+        # A web tile shows ONE session, so a client must not wander to another:
+        # the tab would keep its name while showing a different session's pane.
+        unbind-key -T prefix '('
+        unbind-key -T prefix ')'
+        unbind-key -T prefix L
+        unbind-key -T prefix s
+        unbind-key -T prefix w
+        unbind-key -T root MouseDown3StatusLeft
+        unbind-key -T root M-MouseDown3StatusLeft
+      '';
     };
 
     users.users = lib.mapAttrs (name: u: {
