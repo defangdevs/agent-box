@@ -1992,10 +1992,12 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
-          # seed_json, the supervisor's in-place edit of ~/.claude.json
-          # (issue #749): a half-written file is retried before it is
-          # believed, and giving up is reported rather than silent. Cut out
-          # of supervisor.sh by name, so it runs natively in a second.
+          # seed_json and seed_json_settled, the supervisor's in-place edit
+          # of ~/.claude.json (issue #749): it takes claude's own lock, puts
+          # back an edit an unlocked writer renamed away, retries a file
+          # that does not parse, and reports giving up rather than going
+          # silent. Cut out of supervisor.sh by name, so it runs natively in
+          # seconds.
           seed-json =
             pkgs.runCommand "agent-box-seed-json"
               {
