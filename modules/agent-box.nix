@@ -14990,6 +14990,7 @@ in
         unbind-key -T prefix L
         unbind-key -T prefix s
         unbind-key -T prefix w
+        unbind-key -T prefix f
         unbind-key -T root MouseDown3StatusLeft
         unbind-key -T root M-MouseDown3StatusLeft
       '';

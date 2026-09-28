@@ -905,7 +905,7 @@ arbitrary command execution as the agent user.
   `macOptionClickForcesSelection` client option (off by default).
 - Each web tab shows one session, so `/etc/tmux.conf` removes tmux's
   stock ways to move a client to another session (prefix `(` `)` `L` `s`
-  `w`, and the session menu on the status bar). Without this, the tab
+  `w` `f`, and the session menu on the status bar). Without this, the tab
   kept its name but showed a different session's pane.
 
 ## Docs
