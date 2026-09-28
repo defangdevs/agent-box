@@ -191,14 +191,30 @@ seed_json() {
   # if missing. A file jq can't parse is left untouched: the dialog
   # comes back, but the agent still starts.
   #
-  # A parse failure is retried before it is believed (issue #749). This
-  # supervisor is not the file's only writer: every running claude rewrites
-  # ~/.claude.json itself, in place and under no lock of ours, so a seed that
-  # reads it mid-write sees truncated JSON. That used to skip the seed with
-  # no word said, and nothing seeds a session again until its next start -
-  # the key a new session's folder-trust dialog depends on was simply never
-  # written. A file that is still unparseable after the retries is really
-  # broken, and says so in the journal instead of vanishing.
+  # The edit runs under claude's OWN lock on the file (issue #749). This
+  # supervisor is not ~/.claude.json's only writer: every running claude
+  # rewrites it, many times at startup and again on exit, each time as a
+  # read-modify-write under proper-lockfile's lock - a DIRECTORY named
+  # "<file>.lock", taken with mkdir, and called stale once its mtime is 10s
+  # old (the holder refreshes it every 5s). A seed that skipped that lock
+  # could land between a claude's read and its rename, and the claude then
+  # published its copy without our key. A lost key left the session parked
+  # on the folder-trust dialog, and nothing seeds a session again until its
+  # next start. Taking the lock serializes us with every such write, because
+  # each claude re-reads the file after it acquires the lock. (An exiting
+  # claude writes without it; seed_json_settled below covers that. Measured
+  # against claude 2.1.260 with sessions starting and exiting beside the
+  # seeds: 3 trust keys lost in 40 with neither, 2 in 80 with the lock
+  # alone, none in 80 with both.) claude holds
+  # the lock for milliseconds and backs off for about 10s itself, so we wait
+  # up to 5s. If we still cannot get it, the seed goes ahead unlocked and
+  # says so, rather than hold up the start. For a file claude does not lock,
+  # the lock directory is only a harmless moment of mkdir and rmdir.
+  #
+  # claude writes through a temp file and a rename, so it never shows a
+  # reader a half-written file. The retry below covers any other writer that
+  # does, such as a hand edit. A file that still does not parse after the
+  # retries is really broken, and says so in the journal instead of vanishing.
   #
   # Success is jq exiting 0 AND printing something. jq reads an empty or
   # all-whitespace file as zero inputs, prints nothing and exits 0 - so a
@@ -206,6 +222,38 @@ seed_json() {
   # been replaced with an empty one, wiping every other key claude keeps
   # there, not just ours (CodeRabbit on PR #755).
   file=$1; shift
+  seed_lock=$file.lock
+  seed_locked=
+  seed_wait=0
+  while [ "$seed_wait" -lt 50 ]; do
+    if mkdir "$seed_lock" 2>/dev/null; then
+      seed_locked=1
+      break
+    fi
+    # proper-lockfile's own staleness rule: a lock nobody has refreshed in
+    # 10s belongs to a process that died holding it. It is renamed aside
+    # before it is judged, never removed by path: between the stat and a
+    # removal the stale holder could let go and a live claude take a fresh
+    # lock, which an rmdir by path would delete from under it (CodeRabbit
+    # on PR #758). The rename is atomic, so the directory judged is the one
+    # removed, and a fresh one caught in the swap goes back.
+    seed_lock_mtime=$(stat -c %Y "$seed_lock" 2>/dev/null) || seed_lock_mtime=
+    if [ -n "$seed_lock_mtime" ] \
+        && [ $(( $(date +%s) - seed_lock_mtime )) -gt 10 ] \
+        && mv -T "$seed_lock" "$seed_lock.stale.$$" 2>/dev/null; then
+      seed_lock_mtime=$(stat -c %Y "$seed_lock.stale.$$" 2>/dev/null) \
+        || seed_lock_mtime=0
+      if [ $(( $(date +%s) - seed_lock_mtime )) -gt 10 ]; then
+        rmdir "$seed_lock.stale.$$" 2>/dev/null || :
+      else
+        mv -T "$seed_lock.stale.$$" "$seed_lock" 2>/dev/null || :
+      fi
+    fi
+    seed_wait=$((seed_wait + 1))
+    sleep 0.1
+  done
+  [ -n "$seed_locked" ] \
+    || echo "session: $seed_lock stayed held for 5s; seeding $file without it" >&2
   [ -s "$file" ] || printf '{}' > "$file"
   seed_try=0
   until $JQ "$@" "$file" > "$file.seed-tmp" 2>/dev/null \
@@ -214,11 +262,55 @@ seed_json() {
     if [ "$seed_try" -ge 5 ]; then
       rm -f "$file.seed-tmp"
       echo "session: could not parse $file after $seed_try tries; not seeding it this start" >&2
+      [ -z "$seed_locked" ] || rmdir "$seed_lock" 2>/dev/null || :
       return 0
     fi
     sleep 0.2
   done
   mv "$file.seed-tmp" "$file"
+  [ -z "$seed_locked" ] || rmdir "$seed_lock" 2>/dev/null || :
+}
+
+seed_json_settled() {
+  # seed_json_settled FILE JQ_ARGS... - seed_json, then make sure the edit
+  # is still in the file before the caller starts the pane (issue #749).
+  #
+  # The lock in seed_json does not cover every claude write. A claude that
+  # is EXITING (a session being removed or restarted, SIGHUP from tmux)
+  # writes ~/.claude.json twice, a read and a rename each, without taking
+  # its lock. One that read the file just before our mv renames its copy
+  # over ours a few milliseconds later, and the new session reads a file
+  # with no trust key and parks on the dialog. Traced against claude
+  # 2.1.260: the exiting claude read at +4ms, our mv landed at about +11ms,
+  # and its rename at +15ms dropped the key. That is exactly tests/
+  # sessions.nix removing `themed` right before it adds `relcwd`.
+  #
+  # Such a write reads before our mv and finishes soon after it. So wait
+  # half a second, then ask whether applying the edit again would change
+  # anything, from ONE read, so an unrelated claude write between two reads
+  # cannot fake a difference. A file that no longer holds the edit is seeded
+  # again. The check runs a few times before the caller spawns, and reports
+  # in the journal if the edit still has not stuck.
+  seed_json "$@"
+  settle_file=$1; shift
+  settle_prog=${!#}
+  settle_args=("${@:1:$#-1}")
+  settle_try=0
+  while :; do
+    sleep 0.5
+    $JQ -e "${settle_args[@]}" \
+        ". as \$seed_orig | ($settle_prog) == \$seed_orig" \
+        "$settle_file" >/dev/null 2>&1 && return 0
+    # A file that does not parse is seed_json's to report, not ours.
+    $JQ -e . "$settle_file" >/dev/null 2>&1 || return 0
+    settle_try=$((settle_try + 1))
+    if [ "$settle_try" -ge 5 ]; then
+      echo "session: the seed of $settle_file kept being overwritten; starting anyway" >&2
+      return 0
+    fi
+    echo "session: a concurrent write dropped the seed of $settle_file; seeding it again" >&2
+    seed_json "$settle_file" "$@"
+  done
 }
 
 # Pre-accept claude-code's one-time startup dialogs. A fresh home
@@ -287,7 +379,7 @@ seed_claude_state() {
        && [ "$claude_git_dir" != "$claude_git_common_dir" ]; then
     claude_project_key="$claude_git_common_dir"
   fi
-  seed_json "$HOME"/.claude.json --arg wd "$1" \
+  seed_json_settled "$HOME"/.claude.json --arg wd "$1" \
     --arg project_key "$claude_project_key" \
     '.projects[$wd] = ((.projects[$wd] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})
      | .projects[$project_key] = ((.projects[$project_key] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})
