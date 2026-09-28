@@ -26574,6 +26574,13 @@ if __name__ == "__main__":
           # Access log to the journal — the fail2ban jail counts 401s here.
           log
           import acme_alpn_only
+          # zstd only (no gzip fallback): the terminal, settings and downloads
+          # payloads here are all served to browsers new enough to run this
+          # page's JS in the first place, and zstd's default level is cheap on
+          # both CPU and memory next to gzip -- a fit for a box that may be
+          # running on 1 vCPU. A streaming ttyd websocket upgrade has no
+          # compressible response body, so this does not touch it.
+          encode zstd
           header {
             Cache-Control "no-store"
             X-Content-Type-Options "nosniff"
