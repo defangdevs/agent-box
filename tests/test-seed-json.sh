@@ -119,6 +119,9 @@ if jq -e '.projects["/w"].hasTrustDialogAccepted' "$f" >/dev/null \
     && [ $(( $(date +%s) - start )) -lt 3 ] && [ ! -e "$f.lock" ]; then
   ok "a lock nobody refreshed in 10s is broken at once"
 else fail "a lock nobody refreshed in 10s is broken at once: $(cat "$work/stale.err")"; fi
+if ! ls -d "$f".lock.stale.* >/dev/null 2>&1; then
+  ok "breaking a stale lock leaves nothing renamed aside"
+else fail "breaking a stale lock leaves nothing renamed aside"; fi
 
 # --- a lock that never frees delays the seed, never blocks it ------------
 f="$work/held.json"

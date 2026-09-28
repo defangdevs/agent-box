@@ -806,11 +806,23 @@ seed_json() {
       break
     fi
     # proper-lockfile's own staleness rule: a lock nobody has refreshed in
-    # 10s belongs to a process that died holding it.
+    # 10s belongs to a process that died holding it. It is renamed aside
+    # before it is judged, never removed by path: between the stat and a
+    # removal the stale holder could let go and a live claude take a fresh
+    # lock, which an rmdir by path would delete from under it (CodeRabbit
+    # on PR #758). The rename is atomic, so the directory judged is the one
+    # removed, and a fresh one caught in the swap goes back.
     seed_lock_mtime=$(stat -c %Y "$seed_lock" 2>/dev/null) || seed_lock_mtime=
     if [ -n "$seed_lock_mtime" ] \
-        && [ $(( $(date +%s) - seed_lock_mtime )) -gt 10 ]; then
-      rmdir "$seed_lock" 2>/dev/null || :
+        && [ $(( $(date +%s) - seed_lock_mtime )) -gt 10 ] \
+        && mv -T "$seed_lock" "$seed_lock.stale.$$" 2>/dev/null; then
+      seed_lock_mtime=$(stat -c %Y "$seed_lock.stale.$$" 2>/dev/null) \
+        || seed_lock_mtime=0
+      if [ $(( $(date +%s) - seed_lock_mtime )) -gt 10 ]; then
+        rmdir "$seed_lock.stale.$$" 2>/dev/null || :
+      else
+        mv -T "$seed_lock.stale.$$" "$seed_lock" 2>/dev/null || :
+      fi
     fi
     seed_wait=$((seed_wait + 1))
     sleep 0.1
