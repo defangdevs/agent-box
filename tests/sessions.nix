@@ -1786,7 +1786,18 @@ in
             "Review PRs.\n\nBe terse.\n\n",
         ], stored
         machine.succeed(as_agent("agent-box-session rm proser"))
+        # The DEFAULT profile (issue #753): `add` with neither --profile nor
+        # --harness starts it, an explicit --harness still means that bare
+        # harness, and deleting the default profile clears the default.
+        machine.succeed(as_agent("agent-box-profile default prosaic"))
+        machine.succeed(as_agent("agent-box-session add dflt"))
+        machine.succeed(f"jq -e '.sessions.dflt.profile == \"prosaic\"' {sfile}")
+        machine.succeed(as_agent("agent-box-session rm dflt"))
+        machine.succeed(as_agent("agent-box-session add bare --harness shell"))
+        machine.succeed(f"jq -e '.sessions.bare.profile == null' {sfile}")
+        machine.succeed(as_agent("agent-box-session rm bare"))
         machine.succeed(as_agent("agent-box-profile rm prosaic"))
+        assert machine.succeed(as_agent("agent-box-profile default")) == ""
         assert launch["args"] == [
             "--model", "sonnet", "--effort", "low",
             "--append-system-prompt", "You review PRs.",

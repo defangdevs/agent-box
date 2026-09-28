@@ -1023,7 +1023,10 @@ def profile_write(name, assignments, drop=(), must_exist=False):
 def profile_remove(name):
     """Delete under the SAME lock profile_write takes. Without it a save can
     read the file, this can unlink it, and the save can then write it back —
-    a profile the operator deleted, quietly recreated."""
+    a profile the operator deleted, quietly recreated.
+
+    Deleting the default profile clears the default rather than promoting
+    another one, so the next session asks which worker to start."""
     path = profile_path(name)
     try:
         with locked(path):
@@ -1035,6 +1038,56 @@ def profile_remove(name):
         # The lock itself is unavailable (the directory is gone, say). There
         # is then nothing to delete either.
         pass
+    if read_default_pointer() == name:
+        set_default_profile("")
+
+
+# The default profile: ONE pointer file naming it, the same one
+# `agent-box-profile default` writes. A pointer is at most one default by
+# construction, where a DEFAULT=true key could be set in two profiles at once.
+DEFAULT_PROFILE_FILE = os.path.join(PROFILES_DIR, ".default")
+
+
+def read_default_pointer():
+    """The name the pointer holds, "" when none or not a profile name. Not
+    checked against the profiles on disk: callers that offer it compare
+    against the list they already read."""
+    try:
+        with open(DEFAULT_PROFILE_FILE, encoding="utf-8") as fh:
+            name = fh.readline().strip()
+    except OSError:
+        return ""
+    return name if PROFILE_NAME_RE.match(name) else ""
+
+
+def default_profile(profiles):
+    """The default profile when it still exists, else "" - a pointer at a
+    profile deleted by hand reads as no default, as it does in the CLI."""
+    name = read_default_pointer()
+    return name if name in profiles else ""
+
+
+def set_default_profile(name):
+    """Point the default at `name`, or clear it for "". Written to a temp
+    file and renamed, so a reader never sees half a name."""
+    if not name:
+        try:
+            os.unlink(DEFAULT_PROFILE_FILE)
+        except OSError:
+            pass
+        return
+    os.makedirs(PROFILES_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".default.", dir=PROFILES_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(name + "\n")
+        os.replace(tmp, DEFAULT_PROFILE_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def profile_launch(name, harness=""):
@@ -4173,6 +4226,8 @@ STYLE = """<style>
           text-decoration: none; }
   .icon:hover { background: #21262d; color: #e6edf3; }
   .icon.idanger:hover { color: #f85149; background: rgba(248,81,73,.1); }
+  /* The default profile's star (issue #753): filled and amber on the default. */
+  .icon.idefault.on { color: #d29922; }
   .danger-btn { color: #f85149; }
   .danger-btn:hover { background: #da3633; border-color: #f85149; color: #fff; }
   .tbl.danger { border-color: rgba(248,81,73,.4); }
@@ -5008,6 +5063,21 @@ ICON_CHECK = (
     '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
     '<path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L1.72 9.78a.751.751 '
     '0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 11.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"/></svg>'
+)
+ICON_STAR = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 '
+    '2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72'
+    '-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Zm0 2.445'
+    'L6.615 5.5a.75.75 0 0 1-.564.41l-3.097.45 2.24 2.184a.75.75 0 0 1 .216.664l-.528 3.084 '
+    '2.769-1.456a.75.75 0 0 1 .698 0l2.77 1.456-.53-3.084a.75.75 0 0 1 .216-.664l2.24-2.183'
+    '-3.096-.45a.75.75 0 0 1-.564-.41L8 2.694Z"/></svg>'
+)
+ICON_STAR_FILL = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 '
+    '2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72'
+    '-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z"/></svg>'
 )
 ICON_TRASH = (
     '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
@@ -6482,9 +6552,10 @@ def render_profile_options(profiles):
     or instructions to save, which is the same reason agent-box-profile
     refuses it as a HARNESS.
 
-    Nothing is preselected. The box no longer has a default assistant, so
-    the page asks rather than guessing - the rule the profile editor's own
-    picker already follows.
+    Nothing is preselected unless the user marked a DEFAULT profile
+    (issue #753). The box has no default assistant of its own, so without
+    that choice the page asks rather than guessing - the rule the profile
+    editor's own picker already follows.
 
     Without a resolver there is no picker at all. The settings unit is
     socket activated with stopIfChanged = false, so a daemon that survived
@@ -6498,12 +6569,17 @@ def render_profile_options(profiles):
     if not PROFILE_BIN:
         return ('<option value="" disabled selected>Restart the settings '
                 'service to list profiles</option>' + shell_opt)
-    items = ['<option value="" disabled selected>Choose a profile</option>']
+    default = default_profile(profiles)
+    items = ['<option value="" disabled%s>Choose a profile</option>'
+             % ("" if default else " selected")]
     for name in sorted(profiles):
         safe = html.escape(name)
         harness = html.escape(profiles[name]["reserved"].get("HARNESS") or "")
         label = f"{safe} ({harness})" if harness else safe
-        items.append(f'<option value="{safe}">{label}</option>')
+        if name == default:
+            label += ", default"
+        sel = " selected" if name == default else ""
+        items.append(f'<option value="{safe}"{sel}>{label}</option>')
     if "codex" in AGENTS:
         # A real codex profile always opens the interactive TUI now (issue
         # #623); the daemon is offered here instead, as its own entry.
@@ -6798,13 +6874,15 @@ def render_profiles(profiles, usage=None):
     hand and does not care."""
     usage = usage or {}
     base = html.escape(BASE)
+    default = default_profile(profiles)
     rows = []
     for name in sorted(profiles):
         safe = html.escape(name)
         res = profiles[name]["reserved"]
+        is_default = name == default
         # The summary line answers "what worker is this" without a click:
         # the harness, then whatever narrows it.
-        bits = []
+        bits = ["default"] if is_default else []
         for key in ("HARNESS", "MODEL", "EFFORT"):
             if res.get(key):
                 bits.append(html.escape(res[key]))
@@ -6872,16 +6950,37 @@ def render_profiles(profiles, usage=None):
         # hope, and a topic holding an apostrophe broke out of it.
         confirm_js = html.escape(
             json.dumps(
-                "Delete profile %s?%s Sessions already running keep what "
-                "they started with." % (name, watch_warn)
+                "Delete profile %s?%s%s Sessions already running keep what "
+                "they started with." % (
+                    name, watch_warn,
+                    " It is the default profile: new sessions will ask "
+                    "which profile to start." if is_default else "")
             ),
             quote=True,
         )
+        # A star toggles the default (issue #753): filled on the default,
+        # outline on the rest. One button, the same form either way - `on`
+        # says which direction it goes.
+        if is_default:
+            star = (f'<input type="hidden" name="on" value="0">'
+                    f'<button type="submit" class="icon idefault on" '
+                    f'aria-label="Default profile" aria-pressed="true" '
+                    f'title="{safe} is the default profile - click to unset">'
+                    f'{ICON_STAR_FILL}</button>')
+        else:
+            star = (f'<input type="hidden" name="on" value="1">'
+                    f'<button type="submit" class="icon idefault" '
+                    f'aria-label="Make default" aria-pressed="false" '
+                    f'title="Make {safe} the default profile for new sessions">'
+                    f'{ICON_STAR}</button>')
         rows.append(
             f'<li class="foldrow prof-row"><details><summary>'
             f'<span class="nm"><code>{safe}</code></span>'
             f'<span class="meta">{meta}</span>'
             f'<span class="acts"><form class="inline" method="post" '
+            f'action="{base}/profiles/default">'
+            f'<input type="hidden" name="name" value="{safe}">{star}</form>'
+            f'<form class="inline" method="post" '
             f'action="{base}/profiles/delete" '
             f'onsubmit="return confirm({confirm_js});">'
             f'<input type="hidden" name="name" value="{safe}">'
@@ -9276,6 +9375,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "profile_saved": ("Profile saved. Sessions started from now on use it.", "ok"),
         "profile_deleted": (("Profile deleted. Sessions already running keep "
                              "their current settings."), "ok"),
+        "profile_default_set": (("Default profile set. New sessions start with "
+                                 "it preselected."), "ok"),
+        "profile_default_cleared": (("No default profile. New sessions ask "
+                                     "which profile to start."), "ok"),
         "profile_key_saved": (("Setting added to the profile. Sessions on it pick "
                                "it up at their next start."), "ok"),
         "profile_key_deleted": (("Setting removed from the profile. Sessions on it "
@@ -9803,7 +9906,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # every message below says "from now on" rather than "applied".
             action = path[len(BASE + "/profiles/"):]
             name = (form.get("name", [""])[0]).strip()
-            if action not in ("set", "delete", "setkey", "delkey"):
+            if action not in ("set", "delete", "setkey", "delkey", "default"):
                 self._send_html("<h1>404</h1>", status=404)
                 return
             if not PROFILE_NAME_RE.match(name):
@@ -9816,6 +9919,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if action == "delete":
                 profile_remove(name)
                 self._redirect("ok=profile_deleted")
+                return
+            if action == "default":
+                on = form.get("on", ["1"])[0] != "0"
+                if on:
+                    if name not in read_profiles():
+                        self._send_html(
+                            render_page("No profile named '%s' \u2014 it may "
+                                        "have just been deleted." % name,
+                                        kind="error"),
+                            status=404)
+                        return
+                    set_default_profile(name)
+                    self._redirect("ok=profile_default_set")
+                else:
+                    # Only clear the default this row showed: a stale tab
+                    # must not unset a default somebody moved elsewhere.
+                    if read_default_pointer() == name:
+                        set_default_profile("")
+                    self._redirect("ok=profile_default_cleared")
                 return
             if action == "delkey":
                 key = (form.get("key", [""])[0]).strip()
