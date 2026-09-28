@@ -667,9 +667,10 @@ let
       starts something that can fix it.
     - One profile can be the DEFAULT: `agent-box-profile default NAME` (or the
       star on its row in settings). It is preselected in every "new session"
-      picker, used by `agent-box-session add` given neither `--profile` nor
-      `--harness`, and started by a standing watch that names no profile and
-      has no `AGENT_BOX_HOOK_PROFILE`. `agent-box-profile default --clear`
+      picker and used by `agent-box-session add` given neither `--profile` nor
+      `--harness`. A standing watch never uses it: a watch's worker is always
+      the one it names (or `AGENT_BOX_HOOK_PROFILE`), so changing the default
+      cannot change what an event starts. `agent-box-profile default --clear`
       unsets it, and deleting the default profile clears it too - the next
       session then asks which profile to start.
 
@@ -5219,9 +5220,9 @@ usage() {
   echo "in a profile is a secret every session of this user has."
   echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters."
   echo "The DEFAULT profile (at most one) is preselected when a session is"
-  echo "started from the settings page or workspace, used by"
-  echo "'agent-box-session add' given neither --profile nor --harness, and by a"
-  echo "standing watch that names no profile. Deleting it clears the default."
+  echo "started from the settings page or workspace, and used by"
+  echo "'agent-box-session add' given neither --profile nor --harness. Standing"
+  echo "watches never use it. Deleting it clears the default."
   echo "Changes apply to sessions started AFTERWARDS: a running session keeps"
   echo "the arguments and environment it started with."
 }
@@ -9370,18 +9371,6 @@ try_profile() {
 
 try_profile "$watch_profile" "this watch's own spawnConfig.profile"
 try_profile "$box_profile" "$box_profile_source"
-# Last, the user's DEFAULT profile (agent-box-profile default): the worker
-# they preselect for every other new session, so a watch that names none
-# starts it too rather than the bare box harness. Read straight from the
-# pointer file, like profile_problem reads the profiles above. A pointer at a
-# profile that is gone means "no default" (agent-box-profile's own reading),
-# not a named-but-missing profile to warn about on every delivery.
-default_profile=""
-if [ -r "$HOME/.config/agent-box/profiles/.default" ]; then
-  IFS= read -r default_profile < "$HOME/.config/agent-box/profiles/.default" || :
-fi
-[ -z "$(profile_problem "$default_profile")" ] || default_profile=""
-try_profile "$default_profile" "the default profile (agent-box-profile default)"
 if [ -n "$hook_profile" ]; then
   [ -z "$hook_profile_ignored" ] \
     || echo "agent-box-webhook-spawn: starting this session on profile" \
@@ -9428,9 +9417,10 @@ fi
 # thing that sends it, so the settings page shells out here rather than
 # keeping a copy that would drift.
 #
-# The agent is never chosen here — the spawn calls `agent-box-session add`
-# with no --harness — so the box default is what a match really starts. The
-# wrapper exports it for exactly this line; unset only in a hand-run script.
+# With no profile the spawn names the box default harness outright
+# (`agent-box-session add --harness`, never the user's default profile), so
+# that is what a match really starts. The wrapper exports it for exactly this
+# line and the spawn; unset only in a hand-run script.
 render_launch() {
   # The example is a variable so the copy-paste line keeps the shell quoting
   # the user needs: the value is JSON, and bare brackets and quotes would not
@@ -9849,8 +9839,17 @@ preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded" "$p
 # --profile resolves the harness and its arguments (issue #321); the extra
 # args stay a `--` tail after it, so hookSessionArgs still has the last word
 # over a profile's own model.
+#
+# With no profile, the box default harness is named OUTRIGHT rather than left
+# to `add`: a bare `add` starts the user's DEFAULT profile (issue #753), and a
+# watch's worker must be the one it names, never whatever is preselected for
+# interactive sessions at the moment an event lands.
 pflag=()
-[ -n "$hook_profile" ] && pflag=(--profile "$hook_profile")
+if [ -n "$hook_profile" ]; then
+  pflag=(--profile "$hook_profile")
+elif [ -n "''${AGENT_BOX_DEFAULT_AGENT:-}" ]; then
+  pflag=(--harness "$AGENT_BOX_DEFAULT_AGENT")
+fi
 # --ephemeral: a hook session exists to work ONE event batch, and nobody
 # resumes it afterwards. Without it a hook agent that finishes and quits
 # cleanly is PARKED (mark-stopped records stopped=true, src/supervisor.sh),

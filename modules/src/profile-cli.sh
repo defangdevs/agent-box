@@ -61,9 +61,9 @@ usage() {
   echo "in a profile is a secret every session of this user has."
   echo "NAME: letters, digits, '_' and '-', at most $NAME_MAX characters."
   echo "The DEFAULT profile (at most one) is preselected when a session is"
-  echo "started from the settings page or workspace, used by"
-  echo "'agent-box-session add' given neither --profile nor --harness, and by a"
-  echo "standing watch that names no profile. Deleting it clears the default."
+  echo "started from the settings page or workspace, and used by"
+  echo "'agent-box-session add' given neither --profile nor --harness. Standing"
+  echo "watches never use it. Deleting it clears the default."
   echo "Changes apply to sessions started AFTERWARDS: a running session keeps"
   echo "the arguments and environment it started with."
 }

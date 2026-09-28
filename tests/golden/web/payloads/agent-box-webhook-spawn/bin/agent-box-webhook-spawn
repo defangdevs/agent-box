@@ -443,18 +443,6 @@ try_profile() {
 
 try_profile "$watch_profile" "this watch's own spawnConfig.profile"
 try_profile "$box_profile" "$box_profile_source"
-# Last, the user's DEFAULT profile (agent-box-profile default): the worker
-# they preselect for every other new session, so a watch that names none
-# starts it too rather than the bare box harness. Read straight from the
-# pointer file, like profile_problem reads the profiles above. A pointer at a
-# profile that is gone means "no default" (agent-box-profile's own reading),
-# not a named-but-missing profile to warn about on every delivery.
-default_profile=""
-if [ -r "$HOME/.config/agent-box/profiles/.default" ]; then
-  IFS= read -r default_profile < "$HOME/.config/agent-box/profiles/.default" || :
-fi
-[ -z "$(profile_problem "$default_profile")" ] || default_profile=""
-try_profile "$default_profile" "the default profile (agent-box-profile default)"
 if [ -n "$hook_profile" ]; then
   [ -z "$hook_profile_ignored" ] \
     || echo "agent-box-webhook-spawn: starting this session on profile" \
@@ -501,9 +489,10 @@ fi
 # thing that sends it, so the settings page shells out here rather than
 # keeping a copy that would drift.
 #
-# The agent is never chosen here — the spawn calls `agent-box-session add`
-# with no --harness — so the box default is what a match really starts. The
-# wrapper exports it for exactly this line; unset only in a hand-run script.
+# With no profile the spawn names the box default harness outright
+# (`agent-box-session add --harness`, never the user's default profile), so
+# that is what a match really starts. The wrapper exports it for exactly this
+# line and the spawn; unset only in a hand-run script.
 render_launch() {
   # The example is a variable so the copy-paste line keeps the shell quoting
   # the user needs: the value is JSON, and bare brackets and quotes would not
@@ -922,8 +911,17 @@ preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded" "$p
 # --profile resolves the harness and its arguments (issue #321); the extra
 # args stay a `--` tail after it, so hookSessionArgs still has the last word
 # over a profile's own model.
+#
+# With no profile, the box default harness is named OUTRIGHT rather than left
+# to `add`: a bare `add` starts the user's DEFAULT profile (issue #753), and a
+# watch's worker must be the one it names, never whatever is preselected for
+# interactive sessions at the moment an event lands.
 pflag=()
-[ -n "$hook_profile" ] && pflag=(--profile "$hook_profile")
+if [ -n "$hook_profile" ]; then
+  pflag=(--profile "$hook_profile")
+elif [ -n "${AGENT_BOX_DEFAULT_AGENT:-}" ]; then
+  pflag=(--harness "$AGENT_BOX_DEFAULT_AGENT")
+fi
 # --ephemeral: a hook session exists to work ONE event batch, and nobody
 # resumes it afterwards. Without it a hook agent that finishes and quits
 # cleanly is PARKED (mark-stopped records stopped=true, src/supervisor.sh),
