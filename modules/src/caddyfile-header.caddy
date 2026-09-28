@@ -64,6 +64,37 @@
   # Access log to the journal — the fail2ban jail counts 401s here.
   log
   import acme_alpn_only
+  # zstd only (no gzip fallback): the terminal, settings and downloads
+  # payloads here are all served to browsers new enough to run this
+  # page's JS in the first place, and zstd's default level is cheap on
+  # both CPU and memory next to gzip -- a fit for a box that may be
+  # running on 1 vCPU. A streaming ttyd websocket upgrade has no
+  # compressible response body, so this does not touch it.
+  #
+  # Explicit matcher, not bare `encode zstd`: Caddy's own built-in
+  # default (used when no `match` is given) is content-type based and
+  # does not cover the settings daemon's `application/x-ndjson`
+  # transcript downloads, so those would silently ship uncompressed.
+  # It also has no way to EXCLUDE a type, and this vhost serves one
+  # response that must stay uncompressed for a reason that has nothing
+  # to do with bandwidth: the sessions-list `text/event-stream` (SSE)
+  # in settings-daemon.py is deliberately engineered to reach the
+  # browser with no buffering layer between it and the client (see its
+  # own X-Accel-Buffering comment) — compressing a stream of small,
+  # frequent frames is the same latency-over-bandwidth tradeoff already
+  # rejected for the ttyd websocket above, so it is named here as
+  # exactly what it is: everything the daemon sends EXCEPT that stream.
+  # `application/octet-stream` (arbitrary ~/downloads content whose
+  # type is guessed from the filename) is left uncompressed too,
+  # deliberately -- this vhost's own responses are the ones enumerated.
+  encode {
+    match {
+      header Content-Type text/html*
+      header Content-Type application/json*
+      header Content-Type application/x-ndjson*
+    }
+    zstd
+  }
   header {
     Cache-Control "no-store"
     X-Content-Type-Options "nosniff"
