@@ -215,6 +215,44 @@ The rules, all enforced by `scripts/check_vendor.py`:
 - **Give it its own `<script>` element.** Concatenating a minified bundle above
   our own IIFE is one missing semicolon away from ASI gluing them into a call.
 
+## Keeping the local-webhook pin from going stale
+
+`nix/webhook-pin.nix` vendors one file (`local-webhook/webhook.py`) from
+`defangdevs/local-channels`, but not through `scripts/check_vendor.py` - it
+has no `vendor.json` entry and no weekly `--upstream` check, so nothing here
+notices when local-channels tags a release. The pin drifts until whoever
+remembers to look bumps it by hand, following the steps in that file's own
+header comment (`nix-prefetch-url` + `nix hash convert` + `nix run
+.#assemble`).
+
+A running box can close that gap itself with a standing webhook watch
+instead of a person remembering: subscribe `defangdevs/local-channels` for a
+version-tag push, deliver to a subagent, and give that watch its own profile
+whose system prompt requires sanity checks before it touches anything - the
+new tag's commit is on green CI, no live session or open PR is already
+bumping it, and the commits since the current pin are read for any
+default-behavior change agent-box depends on - and only then runs the
+mechanical bump and opens a PR, never a merge:
+
+    agent-box-profile set webhook-pin-bumper HARNESS=claude \
+      SYSTEM_PROMPT="<sanity checks first, then the bump, then a PR - never a merge>"
+    agent-box-webhook subscribe defangdevs/local-channels \
+      --deliver-to subagent --name webhook-pin-bump \
+      --profile webhook-pin-bumper \
+      --when '{"all":[{"path":"event","in":["push"]},
+                       {"path":"ref","contains":["refs/tags/v"]},
+                       {"path":"deleted","notIn":[true]}]}' \
+      --note "..."
+
+This is box-local state (`~/.local/state/local-webhook`,
+`~/.config/agent-box/profiles/`), set up per deployment rather than shipped
+in the module, so a fresh box - or one nobody has run this command on - gets
+no automation and the pin still has to be noticed by hand. Whether every
+deployment should get this by default, in
+`services.agent-box.webhook.watchPolicy`, is a real design question - it
+means every box opens PRs against a repo it may not have push access to -
+and is left open rather than decided here.
+
 ## Coding Style & Naming Conventions
 
 Follow existing formatting: two-space indentation for Nix and TypeScript, four spaces for Python, and trailing semicolons in TypeScript. Use kebab-case for Nix check names and filenames, descriptive camelCase for Nix locals, and `UPPER_SNAKE_CASE` for environment variables. Keep comments focused on security constraints or non-obvious deployment behavior. No repository-wide formatter is configured, so match adjacent code.
