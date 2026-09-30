@@ -601,6 +601,13 @@ dup=$(include_of defangdevs/agent-box --claim 42 --events actionable \
 [ "$dup" = 0 ] && ok "the policy and the floor are de-duplicated" \
   || no "the policy and the floor are de-duplicated" "$dup duplicate clause(s)"
 
+# A PR update that GitHub reports as dirty means it entered merge conflict.
+if include_of defangdevs/agent-box --claim 42 --events actionable \
+   | jq -e '[.all[1].any[] | select(.path=="pull_request.mergeable_state") | .in[]] | index("dirty")' \
+   >/dev/null 2>&1
+then ok "actionable claims include PR merge conflicts"
+else no "actionable claims include PR merge conflicts"; fi
+
 # A watch whose include THIS script generated must not also get the default
 # --when appended: webhook.py prefers include and discards when, so the
 # warning described a policy that was not in force.
@@ -694,6 +701,9 @@ wanted = [
     {'action': 'edited', 'issue': {'number': 42},
      'comment': {'body': 'ping @defangdevs',
                  'html_url': 'https://github.com/o/r/pull/42#issuecomment-1'}},
+    # Mergeability can be reported on a PR event when it is dirty.
+    {'action': 'synchronize',
+     'pull_request': {'number': 42, 'mergeable_state': 'dirty'}},
 ]
 for p in wanted:
     assert m.match_predicate(policy, p), p

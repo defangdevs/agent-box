@@ -204,7 +204,7 @@ submissions in two minutes, issue #706). POLICY is one of:
 
   actionable      something is asking you to do something — terminal CI
                   FAILURE, a review verdict, a comment, an assignment, the
-                  object closing
+                  object closing or reopening, or a PR entering conflict
   terminal-ci     runs that have FINISHED, whatever the outcome; excludes
                   queued, in_progress and check-created
 
@@ -555,7 +555,8 @@ default_subagent_when() {
 #                 check-created, which is the bulk of the noise.
 #   actionable    something is asking you to do something: terminal CI
 #                 FAILURE (a green run asks for nothing), a review verdict, a
-#                 comment, an assignment, the object closing or reopening.
+#                 comment, an assignment, the object closing or reopening,
+#                 or a PR entering merge conflict.
 #
 # Every conclusion GitHub can report on a finished run. Wider than
 # ci_failure_json on purpose: "did my build pass" is the other half of what a
@@ -586,6 +587,7 @@ events_predicate() {
           {path:"check_run.conclusion", "in":$ci}, {path:"check_suite.conclusion", "in":$ci},
           {path:"deployment_status.state", "in":["error","failure"]},
           {path:"state", "in":["error","failure"]},
+          {path:"pull_request.mergeable_state", "in":["dirty"]},
           {path:"action", "in":["closed","assigned","review_requested"]},
           {all: [{path:"action", "in":["submitted","dismissed"]},
                  {path:"review.state", "in":["approved","changes_requested","commented","dismissed"]}]},
