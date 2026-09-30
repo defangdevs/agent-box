@@ -1,41 +1,20 @@
 name: CI
 
 on:
+  # No `paths:` filter here, on purpose (issue #632). A trigger-level
+  # filter means the workflow never STARTS on a change it does not match,
+  # and a workflow that never starts reports no check run at all - so
+  # requiring green CI in the branch ruleset would have left every
+  # docs-only pull request pending forever on a check nothing would ever
+  # report. The filter moved down a level, to
+  # .github/path-filters/ci.paths, which the `changes` job below reads:
+  # the workflow always starts, the expensive `native`/`vm` jobs are
+  # skipped when nothing relevant changed, and the `gate` job at the
+  # bottom reports success or failure either way. `gate` is the check to
+  # require.
   push:
     branches: [ master ]
-    paths: &build-paths
-      - '**.nix'
-      # Sources of the generated modules/agent-box.nix (issue #140): a change
-      # here can reassemble to the same bytes (a pure refactor), so it would
-      # not touch a *.nix file — match them explicitly so the module-generated-
-      # up-to-date guard (and the rest of CI) still runs.
-      - 'modules/agent-box.nix.in'
-      - 'modules/src/**'
-      - 'bin/assemble-module.py'
-      # Native test/validator edits must trigger the discovered checks too.
-      - 'tests/**'
-      - 'scripts/**'
-      # Every workflow, not just this one: CI validates no other workflow's
-      # YAML, so a file that cannot parse is simply never run and nothing
-      # says so. PR #483 shipped exactly that — vendor-updates.yml had a
-      # heredoc dedented out of its `run: |` block scalar, CI stayed green,
-      # and the weekly job would have silently never fired.
-      - '.github/workflows/**'
-      # The native-render fixture (issue #154 Phase 4): the renderer under
-      # test, the test itself, and its committed expected/ snapshot must all
-      # re-run agentbox-render when any one changes, or a stale fixture only
-      # surfaces via a manual dispatch (as it did for PR #381).
-      - 'bin/agentbox'
-      # The mascot mark (issue #185) is embedded into the settings daemon at
-      # assemble time, so it is a module source as much as a website asset.
-      - 'docs/potato.svg'
-      # The golden behavior snapshot (issue #154): the fixture and its
-      # renderer must re-run the golden-snapshot check when either changes.
-      - 'bin/golden-snapshot.py'
-      - 'flake.lock'
-      - '.github/workflows/ci.yml'
   pull_request:
-    paths: *build-paths
   workflow_dispatch:
 
 concurrency:
@@ -49,8 +28,43 @@ permissions:
   contents: read
 
 jobs:
+  # Cheap, always runs, and decides for the expensive jobs below. Its own
+  # failure is a gate failure: "we could not work out whether the checks
+  # were needed" must never read as "the checks passed".
+  changes:
+    name: Decide whether CI's build paths changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.filter.outputs.build }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Both ends of the range have to be IN the clone. The default
+          # depth-1 checkout has neither a pull request's base nor a
+          # push's `before`, and changed_paths.py answers "true" rather
+          # than guessing when the range is unreadable - correct, but it
+          # would run the whole VM suite on every docs commit.
+          fetch-depth: 0
+
+      - name: Match the changed paths against the filter
+        id: filter
+        env:
+          # HEAD for both events: on a pull request actions/checkout leaves
+          # the MERGE commit checked out, whose merge base with base.sha is
+          # base.sha itself, so `base...HEAD` is exactly the pull request's
+          # own diff without needing the head commit to be present.
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          answer=$(python3 scripts/changed_paths.py \
+            .github/path-filters/ci.paths --base "$BASE" --head HEAD)
+          echo "build=$answer" >> "$GITHUB_OUTPUT"
+          echo "::notice::CI build paths changed: $answer"
+
   native:
     name: Native checks
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -69,6 +83,8 @@ jobs:
 
   vm:
     name: VM (${{ matrix.lane }})
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -109,20 +125,58 @@ jobs:
         timeout-minutes: 12
         run: bash scripts/ci-vm-tests.sh ci-drivers ${{ matrix.jobs }}
 
-  validate:
-    # Preserve the existing status name and fail closed on failure, skip or
-    # cancellation in ANY dependency. Measure the full workflow critical
-    # path when assessing #519, not this short aggregation job in isolation.
-    name: Validate module & VM
-    needs: [native, vm]
-    if: ${{ always() }}
+  # THE check to require in the branch ruleset (issue #632): reported on
+  # every push and every pull request, whatever paths they touch, so it
+  # can never be the required-but-never-reported check that makes a pull
+  # request unmergeable. It reports what actually happened rather than
+  # what ran - including the case a plain "did native/vm pass?" would get
+  # wrong, where the guard expression skipped the job even though the
+  # paths did change.
+  gate:
+    name: CI gate
+    needs: [ changes, native, vm ]
+    if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 5
     steps:
-      - name: Require every validation job to pass
+      - name: Report the aggregate CI result
         env:
-          NATIVE_RESULT: ${{ needs.native.result }}
-          VM_RESULT: ${{ needs.vm.result }}
+          CHANGES: ${{ needs.changes.result }}
+          NATIVE: ${{ needs.native.result }}
+          VM: ${{ needs.vm.result }}
+          BUILD: ${{ needs.changes.outputs.build }}
         run: |
-          echo "Native checks: $NATIVE_RESULT; VM lanes: $VM_RESULT"
-          [[ "$NATIVE_RESULT" == success && "$VM_RESULT" == success ]]
+          echo "changes=$CHANGES build=$BUILD native=$NATIVE vm=$VM"
+          if [ "$CHANGES" != "success" ]; then
+            echo "::error::the changes job did not succeed ($CHANGES), so nothing here knows whether CI was needed."
+            exit 1
+          fi
+
+          check_job() {
+            local name=$1 result=$2
+            case "$result" in
+              success)
+                return 0
+                ;;
+              skipped)
+                if [ "$BUILD" = "true" ]; then
+                  echo "::error::the build paths changed but $name was skipped - the guard expression on that job is wrong."
+                  exit 1
+                fi
+                return 0
+                ;;
+              *)
+                echo "::error::$name did not pass ($result)."
+                exit 1
+                ;;
+            esac
+          }
+
+          check_job native "$NATIVE"
+          check_job vm "$VM"
+
+          if [ "$BUILD" = "true" ]; then
+            echo "CI passed."
+          else
+            echo "No build-relevant path changed; CI had nothing to run."
+          fi
