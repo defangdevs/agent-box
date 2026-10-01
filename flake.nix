@@ -2143,6 +2143,26 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # `agent-box-profile rm` names what still stores the deleted name
+          # (standing watches, AGENT_BOX_HOOK_PROFILE, listed sessions) and
+          # never fails because of it. Real env store, no network.
+          profile-rm-references =
+            pkgs.runCommand "agent-box-profile-rm-references"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.jq pkgs.python3 ];
+                script = ./modules/src/profile-cli.sh;
+                lib = ./modules/src/lib/envstore.py;
+                cli = ./modules/src/envstore-cli.py;
+                tests = ./tests/test-profile-rm-references.sh;
+              } ''
+              bash "$tests" "$script" "$lib" "$cli" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Issue #669: the producer half of the shared nixpkgs cache. The
           # assertions that matter are the guard and the publication order —
           # both failure modes are silent, leaving a box that is simply slow

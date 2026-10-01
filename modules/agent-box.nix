@@ -5271,6 +5271,53 @@ default_write() {
   mv -f "$t" "$DEFAULT_FILE"
 }
 
+# warn_references NAME - after a delete, name every place that still stores
+# the profile's name. Deleting it never fails anything loudly: a standing
+# watch falls back to AGENT_BOX_HOOK_PROFILE or the box default agent (a
+# delivery must never be dropped over a profile, see webhook-spawn.sh), and a
+# listed session keeps its launch arguments but silently loses the profile's
+# environment at its next restart. The settings page's delete confirm already
+# lists the watches (#582); this is the CLI's half, so a delete from chat is
+# not the quiet one. Advisory and best effort: an unreadable file is skipped,
+# never a failed rm. Paths follow the same $HOME-relative defaults the
+# session and webhook CLIs use, so this works on both backends.
+warn_references() {
+  n="$1"
+  envf="$HOME/.config/agent-box/env"
+  if [ -r "$envf" ] && v="$("$ENVSTORE" --file "$envf" get AGENT_BOX_HOOK_PROFILE 2>/dev/null)" \
+     && [ "$v" = "$n" ]; then
+    echo "warning: AGENT_BOX_HOOK_PROFILE still names '$n', so standing watches without a --profile of their own now start the box default agent" >&2
+    echo "  fix: agent-box-session env set AGENT_BOX_HOOK_PROFILE OTHER (or: agent-box-session env rm AGENT_BOX_HOOK_PROFILE)" >&2
+  fi
+  dispatch="''${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}/filter.dispatch.json"
+  if [ -r "$dispatch" ]; then
+    # One line per watch: its topic, then " / NAME" for a named one.
+    w="$("$JQ" -r --arg p "$n" \
+      '(.topics // [])[] | select(type == "object" and (.spawnConfig | type) == "object"
+         and .spawnConfig.profile == $p and (.topic // "") != "")
+       | .topic + (if (.name // "") == "" then "" else " / " + .name end)' \
+      "$dispatch" 2>/dev/null)" || w=""
+    if [ -n "$w" ]; then
+      while IFS= read -r label; do
+        echo "warning: standing watch '$label' still names '$n' with --profile; its next event starts on AGENT_BOX_HOOK_PROFILE or the box default agent instead" >&2
+      done <<<"$w"
+      # Named once, not per watch: recreating the profile repairs every watch
+      # at once and rewrites none of their rules.
+      echo "  fix: recreate it (agent-box-profile set $n HARNESS=...), or give each watch another --profile (agent-box-webhook --help)" >&2
+    fi
+  fi
+  reg="''${REGISTRY_FILE:-$HOME/.config/agent-box/sessions.json}"
+  if [ -r "$reg" ]; then
+    s="$("$JQ" -r --arg p "$n" \
+      '[(.sessions // {}) | to_entries[] | select((.value | type) == "object" and .value.profile == $p) | .key] | join(" ")' \
+      "$reg" 2>/dev/null)" || s=""
+    if [ -n "$s" ]; then
+      echo "warning: listed session(s) $s were started with '$n'; they keep its harness, model and prompt, but its environment is no longer applied when they restart" >&2
+    fi
+  fi
+  return 0
+}
+
 # read_profile NAME — set the res_<KEY> variables for the reserved keys and
 # collect the remaining key NAMES in env_keys. The file is read by the env
 # store's own parser (issue #212), so a value that spans lines arrives whole
@@ -5493,6 +5540,7 @@ case "$cmd" in
         rm -f "$DEFAULT_FILE"
         echo "it was the default profile; there is no default now"
       fi
+      warn_references "$name"
     else
       for k in "$@"; do
         valid_key "$k" || { usage >&2; exit 2; }
