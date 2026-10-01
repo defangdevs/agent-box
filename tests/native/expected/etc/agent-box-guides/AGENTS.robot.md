@@ -345,7 +345,8 @@ everything it reports against ONE commit. Repeat it, and the clauses OR
 together.
 
 A session claim REQUIRES a policy. `--events actionable` is terminal CI
-failure, a review verdict, a comment, an assignment, the object closing;
+failure, a review verdict, a comment, an assignment, the object closing, or
+a pull request entering merge conflict state;
 `--events terminal-ci` is runs that have FINISHED, whatever the outcome, and
 nothing queued, in progress or merely created. Write `--include` yourself for
 anything else - it is ANDed with the claim, not refused alongside it - or say
