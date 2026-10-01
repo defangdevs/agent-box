@@ -156,8 +156,10 @@ test('basic auth renders the page and sets the auth cookie; cookie alone then su
   await expect(cookiePage).toHaveURL(target);
 
   await cookiePage.goto('https://outside.example/');
-  await cookiePage.goBack({ waitUntil: 'domcontentloaded' });
+  const back = await cookiePage.goBack({ waitUntil: 'domcontentloaded' });
+  expect(back?.status()).toBe(200);
   await expect(cookiePage).toHaveURL(target);
+  await expect(cookiePage).toHaveTitle(/ttyd/i);
 });
 
 // Regression for the bug where settings.js's init-time collapse list
