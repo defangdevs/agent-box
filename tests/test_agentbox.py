@@ -429,6 +429,10 @@ class RenderTest(unittest.TestCase):
              "must be empty/null or a DNS suffix"),
             ({"domain": "203.0.113.7", "web": {"alias": "203.0.113.9"},
               "users": {"a": {}}}, "web.alias must be a DNS name"),
+            ({"web": {"alias": True}, "users": {"a": {}}},
+             "web.alias must be empty/null or a DNS suffix"),
+            ({"web": {"alias": 42}, "users": {"a": {}}},
+             "web.alias must be empty/null or a DNS suffix"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)

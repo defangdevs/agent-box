@@ -536,7 +536,8 @@ PORT = _Scalar("a TCP port (1-65535)", _is_port)
 # value is.
 DOMAIN_SUFFIX = _Scalar(
     "empty/null or a DNS suffix (e.g. sslip.example.com)",
-    lambda v: v == "" or bool(DOMAIN_SUFFIX_RE.match(v)))
+    lambda v: isinstance(v, str) and
+              (v == "" or bool(DOMAIN_SUFFIX_RE.match(v))))
 STR_LIST = _Scalar("a list of strings",
                    lambda v: isinstance(v, list) and all(map(_is_str, v)))
 # osUpdates.automaticReboot is `false` or an "HH:MM" time. WHICH strings are
