@@ -273,6 +273,8 @@ def check_static_domain(template: dict) -> int:
     chain = bootstrap_chain(template)
     web_url = template.get("outputs", {}).get("webUrl", {}).get("value", "")
     sslip_url = template.get("outputs", {}).get("sslipUrl", {}).get("value", "")
+    sslip_default = (template.get("parameters", {}).get("sslipDomain", {})
+                     .get("defaultValue"))
     public_ip_ref = "reference(resourceId('Microsoft.Network/publicIPAddresses'"
     failures = []
     if "--settle-delay" in script:
@@ -289,6 +291,8 @@ def check_static_domain(template: dict) -> int:
         failures.append("webUrl still depends on the optional DNS alias")
     if "if(empty(parameters('sslipDomain'))" not in sslip_url:
         failures.append("sslipUrl is not empty when no alias is configured")
+    if sslip_default != "":
+        failures.append("sslipDomain must default to no DNS alias")
     if failures:
         print("FAIL: static Azure domain wiring:\n       "
               + "\n       ".join(failures), file=sys.stderr)
