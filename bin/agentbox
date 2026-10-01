@@ -39,6 +39,7 @@ comparison.
 
 import argparse
 import contextlib
+import ipaddress
 import json
 import os
 import re
@@ -535,7 +536,7 @@ PORT = _Scalar("a TCP port (1-65535)", _is_port)
 # value is.
 DOMAIN_SUFFIX = _Scalar(
     "empty/null or a DNS suffix (e.g. sslip.example.com)",
-    lambda v: v == "" or bool(DOMAIN_SUFFIX_RE.match(v)))
+    lambda v: _is_str(v) and (v == "" or bool(DOMAIN_SUFFIX_RE.match(v))))
 STR_LIST = _Scalar("a list of strings",
                    lambda v: isinstance(v, list) and all(map(_is_str, v)))
 # osUpdates.automaticReboot is `false` or an "HH:MM" time. WHICH strings are
@@ -682,6 +683,7 @@ BOX_SCHEMA = _Obj({
     # touches a box and no public key is committed anywhere; portalJwksUrl
     # only overrides that path.
     "web": _Obj({"enable": BOOL, "rebootButton": BOOL,
+                 "alias": DOMAIN_SUFFIX,
                  "portalIssuer": STR, "portalJwksUrl": STR}),
     "webhook": _Obj({
         "enable": BOOL,
@@ -786,6 +788,16 @@ class Spec:
         # web.enable gates webhook_enable too, so a quoted "false" here
         # would turn webhooks loose as well. null still means off.
         self.web_enable = bool(web.get("enable", True))
+        self.web_alias = web.get("alias") or ""
+        if self.web_alias and self.web_alias == self.domain:
+            raise ConfigError("web.alias must differ from domain")
+        if self.web_alias:
+            try:
+                ipaddress.ip_address(self.web_alias)
+            except ValueError:
+                pass
+            else:
+                raise ConfigError("web.alias must be a DNS name")
         # "Reboot box" in the settings page's Danger zone (the module's
         # web.rebootButton). Default on: a kernel or libc patch installs on
         # disk and takes effect at a boot, unattended patching deliberately
@@ -3520,6 +3532,20 @@ class Renderer:
         def bind(name, user=None):
             text = (frag / f"caddyfile-{name}.caddy").read_text()
             text = text.replace("@DOMAIN@", self.spec.domain)
+            text = text.replace("@ALIAS@", self.spec.web_alias)
+            if "@TLS_POLICY@" in text:
+                try:
+                    ip = ipaddress.ip_address(self.spec.domain)
+                except ValueError:
+                    ip = None
+                policy = ("acme_ip_shortlived"
+                          if isinstance(ip, ipaddress.IPv4Address)
+                          else "acme_alpn_only")
+                text = text.replace("@TLS_POLICY@", policy)
+                text = text.replace(
+                    "@DEFAULT_SNI@",
+                    f"  default_sni {self.spec.domain}"
+                    if isinstance(ip, ipaddress.IPv4Address) else "")
             text = text.replace("@MANAGED_BY@", "agentbox apply")
             text = text.replace("@APPLY_CMD@", "agentbox apply")
             text = text.replace("@RELOAD_CMD@", CADDY_RELOAD_CMD)
@@ -3566,6 +3592,8 @@ class Renderer:
             parts.append(bind("terminal", u))
         parts.append(bind("root", root_user))
         parts.append("}\n")
+        if self.spec.web_alias:
+            parts.append(bind("alias"))
         # The self-serve extension point the header fragment documents, and
         # the reason caddy_reload_policy() permits `systemctl reload
         # caddy.service`: one `import` per user, since Caddyfile's `import`

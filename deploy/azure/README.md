@@ -16,8 +16,8 @@ user choose Claude Code or Codex.
 
 - Provisions a vnet (`10.42.0.0/16`, one `/24` subnet — same CIDR as the AWS
   template, so the two are diffable side by side), an NSG, and a **Standard
-  SKU static public IPv4**. Static because the box's hostname is derived from
-  the address: a changed IP is a changed URL and a certificate that no longer
+  SKU static public IPv4**. Static because the box's URL uses the address:
+  a changed IP is a changed URL and a certificate that no longer
   matches.
 - Launches one VM from the current Canonical Ubuntu 24.04 image
   (`server-arm64`, or `server` for the x64 size), with a `StandardSSD_LRS` OS
@@ -48,10 +48,10 @@ user choose Claude Code or Codex.
   `userName` and the `webPassword`, sets an
   `HttpOnly; Secure; SameSite=Strict` cookie, then lets browser WebSocket
   upgrades authenticate with that cookie. ttyd binds only to localhost.
-- Outputs `https://<addr>.sslip.io/<userName>/`, where `<addr>` is the static
-  IPv4 with dots replaced by dashes. Only that dashed spelling is what
-  `agentbox apply` derives and therefore the only one in the issued
-  certificate — the dotted spelling resolves but fails TLS (issue #359).
+- Outputs `https://<public-ip>/<userName>/`. Caddy obtains a Let's Encrypt
+  `shortlived` IP certificate and renews it from persistent storage.
+  `sslipDomain` optionally adds a dashed-IP DNS alias, whose certificate is
+  requested only on the first visit. The alias redirects to the IP URL.
 - No port 80 is opened. Caddy is configured for TLS-ALPN-01 only.
 - Outbound TCP port 25 (raw SMTP) is denied at the NSG, so a box cannot be
   used as a spam relay. Authenticated mail submission (587/465) through a
@@ -145,16 +145,17 @@ az deployment group create -g agent-box \
 
 The deployment finishes when the box is actually configured — a few minutes:
 installing Nix, substituting the profile, and Caddy issuing a Let's Encrypt
-certificate against `<addr>.sslip.io`. There is no closure to build and no
+certificate for the public IPv4. There is no closure to build and no
 reboot. Read the URL and the address from `properties.outputs`; its
 `remoteControlSession` is only meaningful once you have started a claude
 session from the settings page's install+sign-in cards.
 
-`sslipDomain` (default `sslip.io`) is the suffix the hostname is derived
-under. `sslip.io` is itself open source
+`sslipDomain` defaults to empty. Set it to `sslip.io` or a compatible
+self-hosted suffix to add an optional DNS alias. `sslip.io` is open source
 ([cunnie/sslip.io](https://github.com/cunnie/sslip.io)) and self-hostable,
-so a deployment that runs its own copy under its own domain can point this
-parameter at it to whitelabel the URL entirely (issue #647).
+so a deployment that runs its own copy under its own domain can use that
+suffix for the alias (issue #647). Caddy obtains its certificate on demand
+when someone visits that address; an unused alias requests no certificate.
 
 `webPassword` is 16-64 characters, and any character is safe. Bicep has no
 `AllowedPattern` equivalent — a parameter can be constrained by length and by a

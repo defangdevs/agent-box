@@ -50,6 +50,7 @@
   # Do NOT replace this with `admin off`: that would also disable the reload
   # path, and ~/sites depends on it.
   admin unix//run/caddy/admin.sock
+@DEFAULT_SNI@
 }
 
 (acme_alpn_only) {
@@ -60,10 +61,19 @@
   }
 }
 
+(acme_ip_shortlived) {
+  tls {
+    issuer acme https://acme-v02.api.letsencrypt.org/directory {
+      profile shortlived
+      disable_http_challenge
+    }
+  }
+}
+
 @DOMAIN@ {
   # Access log to the journal — the fail2ban jail counts 401s here.
   log
-  import acme_alpn_only
+  import @TLS_POLICY@
   # zstd only (no gzip fallback): the terminal, settings and downloads
   # payloads here are all served to browsers new enough to run this
   # page's JS in the first place, and zstd's default level is cheap on

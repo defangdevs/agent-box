@@ -230,6 +230,34 @@ def tree_modes(root):
 
 
 class RenderTest(unittest.TestCase):
+    def test_ip_certificate_and_optional_dns_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps({
+                "domain": "203.0.113.7",
+                "web": {"enable": True, "alias": "203-0-113-7.sslip.io"},
+                "users": {"agent": {"root": True}},
+            }))
+            caddyfile = (render(tmp, cfg) / "etc/agent-box/Caddyfile").read_text()
+            self.assertIn("default_sni 203.0.113.7", caddyfile)
+            self.assertIn("203.0.113.7 {", caddyfile)
+            self.assertIn("import acme_ip_shortlived", caddyfile)
+            self.assertIn("profile shortlived", caddyfile)
+            self.assertIn("203-0-113-7.sslip.io {", caddyfile)
+            self.assertIn("on_demand", caddyfile)
+            self.assertIn("redir https://203.0.113.7{uri} permanent", caddyfile)
+
+            no_alias = Path(tmp) / "no-alias"
+            no_alias.mkdir()
+            cfg = no_alias / "config.json"
+            cfg.write_text(json.dumps({
+                "domain": "203.0.113.7",
+                "web": {"enable": True},
+                "users": {"agent": {"root": True}},
+            }))
+            without_alias = (render(no_alias, cfg) / "etc/agent-box/Caddyfile").read_text()
+            self.assertNotIn("203-0-113-7.sslip.io", without_alias)
+
     def test_matches_committed_fixture(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = render(tmp, CONFIG_JSON)
@@ -399,6 +427,12 @@ class RenderTest(unittest.TestCase):
             ({"users": {"Bad Name": {}}}, "invalid user name"),
             ({"domainSuffix": "not a domain", "users": {"a": {}}},
              "must be empty/null or a DNS suffix"),
+            ({"domain": "203.0.113.7", "web": {"alias": "203.0.113.9"},
+              "users": {"a": {}}}, "web.alias must be a DNS name"),
+            ({"web": {"alias": True}, "users": {"a": {}}},
+             "web.alias must be empty/null or a DNS suffix"),
+            ({"web": {"alias": 42}, "users": {"a": {}}},
+             "web.alias must be empty/null or a DNS suffix"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
