@@ -14259,12 +14259,24 @@ in
 
       domain = lib.mkOption {
         type = lib.types.str;
+        example = "203.0.113.7";
+        description = ''
+          Public IPv4 address or DNS name for the browser terminal. An IPv4
+          address uses a Let's Encrypt shortlived certificate; a DNS name uses
+          the normal ACME profile. Caddy renews certificates in its persistent
+          /var/lib/caddy state directory.
+        '';
+      };
+
+      alias = lib.mkOption {
+        type = lib.types.str;
+        default = "";
         example = "1-2-3-4.sslip.io";
         description = ''
-          Public hostname for the browser terminal. Used to seed
-          /var/lib/caddy/Caddyfile the first time only — subsequent edits are
-          preserved. Set this to whatever DNS name resolves to the host
-          (sslip.io on AWS, a custom domain on bare metal, etc).
+          Optional DNS alias for the primary web.domain. Caddy redirects it to
+          the primary URL and obtains its certificate on demand, only if a
+          client actually visits the alias. Leave empty to request no DNS
+          alias certificate.
         '';
       };
 
@@ -26507,6 +26519,9 @@ if __name__ == "__main__":
       # Per-user env var suffix for the Caddyfile placeholders; linux user
       # names may contain chars that are invalid in env var names.
       envName = n: lib.toUpper (lib.stringAsChars (c: if builtins.match "[a-zA-Z0-9]" c != null then c else "_") n);
+      ipv4Octet = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
+      isIpv4 = value: builtins.match "${ipv4Octet}(\\.${ipv4Octet}){3}" value != null;
+      webDomainIsIpv4 = isIpv4 cfg.web.domain;
 
       # Prefix every non-blank line — Nix indented strings strip the common
       # leading whitespace, so composed fragments need explicit re-indenting.
@@ -26889,9 +26904,11 @@ if __name__ == "__main__":
       # can't read /home. See the comment block at the top of the rendered
       # file below (agents will read that from the running box).
       managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
-      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" ]
+      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@TLS_POLICY@" "@DEFAULT_SNI@" ]
         [ cfg.web.domain "services.agent-box" "nixos-rebuild switch"
-          caddyReloadCmd ] ''
+          caddyReloadCmd
+          (if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only")
+          (if webDomainIsIpv4 then "  default_sni ${cfg.web.domain}" else "") ] ''
         # This file is managed by @MANAGED_BY@ — edits here get OVERWRITTEN on
         # the next @APPLY_CMD@. To add your own virtual host,
         # drop a *.caddy snippet into ~/sites/ (which is a symlink into
@@ -26944,6 +26961,7 @@ if __name__ == "__main__":
           # Do NOT replace this with `admin off`: that would also disable the reload
           # path, and ~/sites depends on it.
           admin unix//run/caddy/admin.sock
+        @DEFAULT_SNI@
         }
 
         (acme_alpn_only) {
@@ -26954,10 +26972,19 @@ if __name__ == "__main__":
           }
         }
 
+        (acme_ip_shortlived) {
+          tls {
+            issuer acme https://acme-v02.api.letsencrypt.org/directory {
+              profile shortlived
+              disable_http_challenge
+            }
+          }
+        }
+
         @DOMAIN@ {
           # Access log to the journal — the fail2ban jail counts 401s here.
           log
-          import acme_alpn_only
+          import @TLS_POLICY@
           # zstd only (no gzip fallback): the terminal, settings and downloads
           # payloads here are all served to browsers new enough to run this
           # page's JS in the first place, and zstd's default level is cheap on
@@ -27021,6 +27048,21 @@ if __name__ == "__main__":
       + "\n"
       + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
       + "}\n\n"
+      + lib.optionalString (cfg.web.alias != "") (
+        lib.replaceStrings [ "@ALIAS@" "@DOMAIN@" ]
+          [ cfg.web.alias cfg.web.domain ] ''
+          # A DNS alias is served only when configured. Its certificate is requested
+          # on the first TLS handshake, so an unused sslip.io name consumes no quota.
+          @ALIAS@ {
+            tls {
+              issuer acme {
+                disable_http_challenge
+              }
+              on_demand
+            }
+            redir https://@DOMAIN@{uri} permanent
+          }
+        '' + "\n")
       # The same fragment the native renderer binds (issue #154 Phase 2), so
       # both backends document — and wire — this extension point identically.
       + lib.replaceStrings [ "@APPLY_CMD@" "@RELOAD_CMD@" ]
@@ -27175,6 +27217,24 @@ if __name__ == "__main__":
     in
     {
       assertions = [
+        {
+          assertion = !webDomainIsIpv4 || lib.versionAtLeast pkgs.caddy.version "2.11.4";
+          message = "services.agent-box.web.domain is an IPv4 address, which requires Caddy 2.11.4 or newer for ACME IP certificates.";
+        }
+        {
+          assertion = cfg.web.alias == "" || cfg.web.alias != cfg.web.domain;
+          message = "services.agent-box.web.alias must differ from web.domain.";
+        }
+        {
+          assertion = cfg.web.alias == "" || !isIpv4 cfg.web.alias;
+          message = "services.agent-box.web.alias must be a DNS name, not an IPv4 address.";
+        }
+        {
+          assertion = cfg.web.alias == "" || builtins.match
+            "[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+"
+            cfg.web.alias != null;
+          message = "services.agent-box.web.alias must be a DNS name with at least two labels.";
+        }
         {
           assertion = cfg.users ? ${webUser};
           message =

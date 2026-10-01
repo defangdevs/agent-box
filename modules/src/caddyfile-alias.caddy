@@ -1,0 +1,11 @@
+# A DNS alias is served only when configured. Its certificate is requested
+# on the first TLS handshake, so an unused sslip.io name consumes no quota.
+@ALIAS@ {
+  tls {
+    issuer acme {
+      disable_http_challenge
+    }
+    on_demand
+  }
+  redir https://@DOMAIN@{uri} permanent
+}

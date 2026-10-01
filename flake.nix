@@ -719,6 +719,61 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 printf 'no phantom systemd unit overrides in tests/ or hosts/\n' > "$out"
               '';
 
+          # An IP site must select Let's Encrypt's shortlived profile. A DNS
+          # alias has its own policy and must wait until a client uses it.
+          web-ip-cert =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "203.0.113.7";
+                        alias = "203-0-113-7.sslip.io";
+                        user = "agent";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-web-ip-cert-ok"
+              { caddyfile = sys.config.services.caddy.configFile;
+                nativeBuildInputs = [ pkgs.caddy pkgs.python3 ]; } ''
+              export WEB_PASSWORD_ALGORITHM_AGENT=argon2id
+              export WEB_PASSWORD_HASH_AGENT='$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$YWJj'
+              export WEB_COOKIE_SECRET_AGENT=abc
+              caddy adapt --validate --config "$caddyfile" --adapter caddyfile > adapted.json
+              python3 - <<'PY'
+              import json
+              data = json.load(open("adapted.json"))
+              policies = data["apps"]["tls"]["automation"]["policies"]
+              by_name = {name: policy for policy in policies
+                         for name in policy["subjects"]}
+              ip = by_name["203.0.113.7"]
+              alias = by_name["203-0-113-7.sslip.io"]
+              assert not ip.get("on_demand"), ip
+              assert ip["issuers"][0]["profile"] == "shortlived", ip
+              assert ip["issuers"][0]["ca"] == "https://acme-v02.api.letsencrypt.org/directory", ip
+              assert ip["issuers"][0]["challenges"]["http"]["disabled"], ip
+              assert alias["on_demand"] is True, alias
+              assert "profile" not in alias["issuers"][0], alias
+              servers = data["apps"]["http"]["servers"]
+              assert any(policy.get("default_sni") == "203.0.113.7"
+                         for server in servers.values()
+                         for policy in server.get("tls_connection_policies", []))
+              PY
+              touch "$out"
+            '';
+
           # Guard (issue #132): the module's REAL generated Caddyfile (the VM
           # test below swaps in a `tls internal` stand-in) must carry the
           # authenticated downloads route for a web user — the handle, the

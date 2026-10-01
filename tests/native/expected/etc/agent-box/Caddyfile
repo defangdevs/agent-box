@@ -51,11 +51,21 @@
   # Do NOT replace this with `admin off`: that would also disable the reload
   # path, and ~/sites depends on it.
   admin unix//run/caddy/admin.sock
+
 }
 
 (acme_alpn_only) {
   tls {
     issuer acme {
+      disable_http_challenge
+    }
+  }
+}
+
+(acme_ip_shortlived) {
+  tls {
+    issuer acme https://acme-v02.api.letsencrypt.org/directory {
+      profile shortlived
       disable_http_challenge
     }
   }

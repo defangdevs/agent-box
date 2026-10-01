@@ -82,8 +82,8 @@ HOSTILE_PASSWORD = "p'; touch /tmp/pwned; '$x `id` \"q\""
 # validated and decoded by the bootstrap itself rather than the template).
 PORTAL_ISSUER_SAMPLE = "https://station.example.com"
 PORTAL_USER_SAMPLE = "usr_2Nk9x"
-DOMAIN_SAMPLE = "203-0-113-7.sslip.example.com"
 PUBLIC_IP_SAMPLE = "203.0.113.7"
+DOMAIN_SAMPLE = PUBLIC_IP_SAMPLE
 
 # Values only need to be representative: this renders the script, it does not
 # deploy it. They deliberately carry the punctuation a real parameter can, so a
@@ -110,9 +110,7 @@ SAMPLE = {
 # webPassword has no default: it is the one field the form always demands.
 # A `...B64@@` marker's default is base64-encoded by defaults_render below,
 # matching what the template's own base64(...) call does at deploy time --
-# sslipDomain's default ('sslip.io') is not empty, so unlike the portal
-# markers this cannot be papered over by "base64 of the empty string is the
-# empty string too".
+# sslipDomain's empty default means the primary IP URL has no DNS alias.
 DEFAULT_OF = {
     "@@NIXINSTALLER@@": "nixInstallerUrl",
     "@@FLAKEREF@@": "agentBoxFlakeRef",
@@ -274,6 +272,7 @@ def check_static_domain(template: dict) -> int:
     script = template.get("variables", {}).get("bootstrapTemplate", "")
     chain = bootstrap_chain(template)
     web_url = template.get("outputs", {}).get("webUrl", {}).get("value", "")
+    sslip_url = template.get("outputs", {}).get("sslipUrl", {}).get("value", "")
     public_ip_ref = "reference(resourceId('Microsoft.Network/publicIPAddresses'"
     failures = []
     if "--settle-delay" in script:
@@ -286,6 +285,10 @@ def check_static_domain(template: dict) -> int:
         failures.append("Azure's Public IP is not encoded before shell insertion")
     if public_ip_ref not in web_url:
         failures.append("webUrl is not derived from Azure's allocated Public IP")
+    if "parameters('sslipDomain')" in web_url:
+        failures.append("webUrl still depends on the optional DNS alias")
+    if "if(empty(parameters('sslipDomain'))" not in sslip_url:
+        failures.append("sslipUrl is not empty when no alias is configured")
     if failures:
         print("FAIL: static Azure domain wiring:\n       "
               + "\n       ".join(failures), file=sys.stderr)
@@ -481,7 +484,7 @@ def check_written_config(template: dict) -> int:
             PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAIN_SAMPLE,
             PUBLIC_IP_SAMPLE, True),
         "handover off": (
-            "", "", SSLIP_DOMAIN_SAMPLE, PUBLIC_IP_SAMPLE, True),
+            "", "", "", PUBLIC_IP_SAMPLE, True),
         # '&' is IN portalIssuer's allowed character class (a query string
         # may have one) but is sed replacement-text magic -- unescaped, this
         # is exactly the input that used to splice the placeholder into
@@ -551,9 +554,11 @@ def check_written_config(template: dict) -> int:
                       % (label, data), file=sys.stderr)
                 rc = 1
                 continue
-            if data.get("domainSuffix") != sslip:
-                print("FAIL: %s: domainSuffix landed as %r, wanted %r"
-                      % (label, data.get("domainSuffix"), sslip),
+            alias = (public_ip.replace(".", "-") + "." + sslip
+                     if sslip else "")
+            if web.get("alias") != alias:
+                print("FAIL: %s: web.alias landed as %r, wanted %r"
+                      % (label, web.get("alias"), alias),
                       file=sys.stderr)
                 rc = 1
                 continue
