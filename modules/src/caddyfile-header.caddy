@@ -106,6 +106,17 @@
     # header with a stricter one of its own.
     Content-Security-Policy "frame-ancestors 'self'"
   }
+  # Caddy's basic_auth returns a bare 401 with no Content-Type or body.
+  # With nosniff above, browsers offer that response as a download when
+  # the user cancels the password dialog (issue #746). Keep the Basic
+  # challenge that basic_auth already set, and make the refusal renderable.
+  handle_errors {
+    @auth_error expression {http.error.status_code} == 401
+    handle @auth_error {
+      header Content-Type "text/html; charset=utf-8"
+      respond "<!doctype html><title>Sign in required</title><h1>Sign in required</h1><p>Reload this page to sign in.</p>" 401
+    }
+  }
   # This fragment ends INSIDE the block on purpose: the module appends one
   # webhook + terminal block per user (and the root block), then the closing
   # brace. Nothing is missing here.

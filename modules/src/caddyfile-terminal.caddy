@@ -1,6 +1,10 @@
 # @USER@'s terminal. Cookie first — browsers refuse to attach basic
 # auth credentials to WebSocket upgrades — then basic auth with the
 # linux user name as the login name.
+# The shared __Host- cookie uses SameSite=Lax so a top-level return from
+# another site carries it. Cross-site POSTs still omit it; the settings
+# daemon also checks request origin because Basic auth has no SameSite
+# protection (issue #117).
 redir /@USER@ /@USER@/
 # @USER@'s settings page (issue #36). Same auth surface as the
 # terminal (cookie-or-basic-auth, same user name), just a different
@@ -32,7 +36,7 @@ handle /@USER@/settings* {
       basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
         @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
       }
-      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix/@SETTINGS_SOCKET@
     }
   }
@@ -119,7 +123,7 @@ handle /@USER@/downloads/* {
       basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
         @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
       }
-      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix/@SETTINGS_SOCKET@
     }
   }
@@ -159,7 +163,7 @@ handle @home_@USER@ {
       basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
         @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
       }
-      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix/@SETTINGS_SOCKET@
     }
   }
@@ -219,7 +223,7 @@ handle /@USER@/* {
       basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
         @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
       }
-      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix/@TTYD_SOCKET@
     }
   }
