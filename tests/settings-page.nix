@@ -202,6 +202,14 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
       box.test {
         log
         tls ${portalTls}/cert.pem ${portalTls}/key.pem
+        header X-Content-Type-Options "nosniff"
+        handle_errors {
+          @auth_error expression {http.error.status_code} == 401
+          handle @auth_error {
+            header Content-Type "text/html; charset=utf-8"
+            respond "<!doctype html><title>Sign in required</title><h1>Sign in required</h1><p>Reload this page to sign in.</p>" 401
+          }
+        }
         # The portal's published key set. Unauthenticated on purpose --
         # these are PUBLIC keys, and the daemon fetching them holds no
         # credential for this vhost.
@@ -225,7 +233,7 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
               basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
                 agent {$WEB_PASSWORD_HASH_AGENT}
               }
-              header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
               reverse_proxy unix//run/agent-box-settings/agent.sock
             }
           }
@@ -255,7 +263,7 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
               basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
                 agent {$WEB_PASSWORD_HASH_AGENT}
               }
-              header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
               reverse_proxy unix//run/agent-box-settings/agent.sock
             }
           }
@@ -339,10 +347,15 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
         f"su -s /bin/sh mallory -c '{sock_curl} -X POST http://localhost/agent/settings/restart'"
     )
 
-    # Unauthenticated request to the settings path is rejected (401).
+    # A cancelled Basic prompt must leave a renderable page, not an empty
+    # download (issue #746), while preserving the challenge and 401 status.
     client.succeed(
-        f"{curl} -o /dev/null -w '%{{http_code}}' https://box.test/agent/settings/ | grep -x 401"
+        f"{curl} -o /tmp/auth-error -D /tmp/auth-error-headers "
+        "-w '%{http_code}' https://box.test/agent/settings/ | grep -x 401"
     )
+    client.succeed("grep -qi '^Content-Type: text/html; charset=utf-8' /tmp/auth-error-headers")
+    client.succeed("grep -qi '^WWW-Authenticate: Basic' /tmp/auth-error-headers")
+    client.succeed("grep -q 'Sign in required' /tmp/auth-error")
 
     # Authenticated GET renders the page.
     auth_page = client.succeed(
@@ -852,13 +865,15 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     # asks for a password, so an expired session degrades to the normal
     # login instead of wedging the browser on a bare 401 it cannot act on.
     client.succeed(
-        f"{curl} -o /dev/null -D /tmp/refused -w '%{{http_code}}' "
+        f"{curl} -o /tmp/refused-body -D /tmp/refused -w '%{{http_code}}' "
         "-H 'Cookie: __Host-agent_box_session_agent=notarealsession00000000' "
         "https://box.test/ | grep -x 401"
     )
     client.succeed(
         "grep -qi 'Set-Cookie: __Host-agent_box_session_agent=;' /tmp/refused")
     client.succeed("grep -qi 'WWW-Authenticate: Basic' /tmp/refused")
+    client.succeed("grep -qi '^Content-Type: text/html; charset=utf-8' /tmp/refused")
+    client.succeed("grep -q 'Sign in required' /tmp/refused-body")
 
     # The session store keeps no live cookie: records are named by the
     # SHA-256 of the secret, so reading the store back yields nothing that

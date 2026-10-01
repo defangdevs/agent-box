@@ -107,6 +107,17 @@ golden.example.org {
     # header with a stricter one of its own.
     Content-Security-Policy "frame-ancestors 'self'"
   }
+  # Caddy's basic_auth returns a bare 401 with no Content-Type or body.
+  # With nosniff above, browsers offer that response as a download when
+  # the user cancels the password dialog (issue #746). Keep the Basic
+  # challenge that basic_auth already set, and make the refusal renderable.
+  handle_errors {
+    @auth_error expression {http.error.status_code} == 401
+    handle @auth_error {
+      header Content-Type "text/html; charset=utf-8"
+      respond "<!doctype html><title>Sign in required</title><h1>Sign in required</h1><p>Reload this page to sign in.</p>" 401
+    }
+  }
   # This fragment ends INSIDE the block on purpose: the module appends one
   # webhook + terminal block per user (and the root block), then the closing
   # brace. Nothing is missing here.
@@ -119,6 +130,10 @@ handle /agent/webhook* {
 # agent's terminal. Cookie first — browsers refuse to attach basic
 # auth credentials to WebSocket upgrades — then basic auth with the
 # linux user name as the login name.
+# The shared __Host- cookie uses SameSite=Lax so a top-level return from
+# another site carries it. Cross-site POSTs still omit it; the settings
+# daemon also checks request origin because Basic auth has no SameSite
+# protection (issue #117).
 redir /agent /agent/
 # agent's settings page (issue #36). Same auth surface as the
 # terminal (cookie-or-basic-auth, same user name), just a different
@@ -150,7 +165,7 @@ handle /agent/settings* {
       basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
         agent {$WEB_PASSWORD_HASH_AGENT}
       }
-      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix//run/agent-box-settings/agent.sock
     }
   }
@@ -237,7 +252,7 @@ handle /agent/downloads/* {
       basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
         agent {$WEB_PASSWORD_HASH_AGENT}
       }
-      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix//run/agent-box-settings/agent.sock
     }
   }
@@ -277,7 +292,7 @@ handle @home_agent {
       basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
         agent {$WEB_PASSWORD_HASH_AGENT}
       }
-      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix//run/agent-box-settings/agent.sock
     }
   }
@@ -337,7 +352,7 @@ handle /agent/* {
       basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
         agent {$WEB_PASSWORD_HASH_AGENT}
       }
-      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix//run/agent-box-ttyd/agent/ttyd.sock
     }
   }
@@ -351,6 +366,10 @@ handle /robot/webhook* {
 # robot's terminal. Cookie first — browsers refuse to attach basic
 # auth credentials to WebSocket upgrades — then basic auth with the
 # linux user name as the login name.
+# The shared __Host- cookie uses SameSite=Lax so a top-level return from
+# another site carries it. Cross-site POSTs still omit it; the settings
+# daemon also checks request origin because Basic auth has no SameSite
+# protection (issue #117).
 redir /robot /robot/
 # robot's settings page (issue #36). Same auth surface as the
 # terminal (cookie-or-basic-auth, same user name), just a different
@@ -382,7 +401,7 @@ handle /robot/settings* {
       basic_auth {$WEB_PASSWORD_ALGORITHM_ROBOT} robot {
         robot {$WEB_PASSWORD_HASH_ROBOT}
       }
-      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix//run/agent-box-settings/robot.sock
     }
   }
@@ -469,7 +488,7 @@ handle /robot/downloads/* {
       basic_auth {$WEB_PASSWORD_ALGORITHM_ROBOT} robot {
         robot {$WEB_PASSWORD_HASH_ROBOT}
       }
-      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix//run/agent-box-settings/robot.sock
     }
   }
@@ -509,7 +528,7 @@ handle @home_robot {
       basic_auth {$WEB_PASSWORD_ALGORITHM_ROBOT} robot {
         robot {$WEB_PASSWORD_HASH_ROBOT}
       }
-      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix//run/agent-box-settings/robot.sock
     }
   }
@@ -569,7 +588,7 @@ handle /robot/* {
       basic_auth {$WEB_PASSWORD_ALGORITHM_ROBOT} robot {
         robot {$WEB_PASSWORD_HASH_ROBOT}
       }
-      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_robot={$WEB_COOKIE_SECRET_ROBOT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix//run/agent-box-ttyd/robot/ttyd.sock
     }
   }
@@ -613,7 +632,7 @@ handle {
       basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
         agent {$WEB_PASSWORD_HASH_AGENT}
       }
-      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix//run/agent-box-settings/agent.sock
     }
   }

@@ -25229,7 +25229,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         value = portal_session_new(claims)
         self.send_response(303)
         self.send_header("Location", TERM_HOME)
-        # SameSite=Lax, where the basic-auth cookie is Strict. The
+        # SameSite=Lax, like the basic-auth cookie. The
         # navigation right after this response is initiated CROSS-SITE, by
         # the portal that posted here, and a Strict cookie is withheld on
         # exactly that navigation — the user would land back on a
@@ -25271,6 +25271,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        body = ("<!doctype html><title>Sign in required</title>"
+                "<h1>Sign in required</h1><p>Reload this page to sign in.</p>")
+        data = body.encode("utf-8")
         self.send_response(401)
         # Max-Age=0 with the same Path and flags the cookie was set with,
         # which is what a browser needs to actually drop it.
@@ -25284,8 +25287,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "WWW-Authenticate",
             'Basic realm="%s"' % os.environ.get(
                 "AGENT_BOX_SETTINGS_USER", "agent"))
-        self.send_header("Content-Length", "0")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
+        self.wfile.write(data)
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -25480,10 +25485,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         Every POST route here mutates state (secrets, sessions, the
         box update). Auth alone does not stop CSRF: the __Host- cookie
-        is SameSite=Strict, but the basic-auth fallback has no SameSite
-        equivalent, and browsers reattach cached basic credentials to
-        cross-site requests — so a lured, basic-authenticated operator
-        could be forced to e.g. inject a GH_TOKEN via /set.
+        is SameSite=Lax (which withholds it from cross-site POSTs), but the
+        basic-auth fallback has no SameSite equivalent, and browsers
+        reattach cached basic credentials to cross-site requests. A lured,
+        basic-authenticated operator could be forced to inject a GH_TOKEN
+        via /set.
 
         Browsers always send Sec-Fetch-Site; a genuine form post from
         our own page is "same-origin". Anything a browser labels
@@ -26589,6 +26595,10 @@ if __name__ == "__main__":
         # @USER@'s terminal. Cookie first — browsers refuse to attach basic
         # auth credentials to WebSocket upgrades — then basic auth with the
         # linux user name as the login name.
+        # The shared __Host- cookie uses SameSite=Lax so a top-level return from
+        # another site carries it. Cross-site POSTs still omit it; the settings
+        # daemon also checks request origin because Basic auth has no SameSite
+        # protection (issue #117).
         redir /@USER@ /@USER@/
         # @USER@'s settings page (issue #36). Same auth surface as the
         # terminal (cookie-or-basic-auth, same user name), just a different
@@ -26620,7 +26630,7 @@ if __name__ == "__main__":
               basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
                 @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
               }
-              header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
               reverse_proxy unix/@SETTINGS_SOCKET@
             }
           }
@@ -26707,7 +26717,7 @@ if __name__ == "__main__":
               basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
                 @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
               }
-              header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
               reverse_proxy unix/@SETTINGS_SOCKET@
             }
           }
@@ -26747,7 +26757,7 @@ if __name__ == "__main__":
               basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
                 @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
               }
-              header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
               reverse_proxy unix/@SETTINGS_SOCKET@
             }
           }
@@ -26807,7 +26817,7 @@ if __name__ == "__main__":
               basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
                 @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
               }
-              header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
               reverse_proxy unix/@TTYD_SOCKET@
             }
           }
@@ -26856,7 +26866,7 @@ if __name__ == "__main__":
               basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
                 @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
               }
-              header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
               reverse_proxy unix/@SETTINGS_SOCKET@
             }
           }
@@ -26989,6 +26999,17 @@ if __name__ == "__main__":
             # terminal is clickjacking. The downloads route below replaces this
             # header with a stricter one of its own.
             Content-Security-Policy "frame-ancestors 'self'"
+          }
+          # Caddy's basic_auth returns a bare 401 with no Content-Type or body.
+          # With nosniff above, browsers offer that response as a download when
+          # the user cancels the password dialog (issue #746). Keep the Basic
+          # challenge that basic_auth already set, and make the refusal renderable.
+          handle_errors {
+            @auth_error expression {http.error.status_code} == 401
+            handle @auth_error {
+              header Content-Type "text/html; charset=utf-8"
+              respond "<!doctype html><title>Sign in required</title><h1>Sign in required</h1><p>Reload this page to sign in.</p>" 401
+            }
           }
           # This fragment ends INSIDE the block on purpose: the module appends one
           # webhook + terminal block per user (and the root block), then the closing

@@ -36,7 +36,7 @@ handle {
       basic_auth {$WEB_PASSWORD_ALGORITHM_@USER_ENV@} @USER@ {
         @USER@ {$WEB_PASSWORD_HASH_@USER_ENV@}
       }
-      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+      header >Set-Cookie "__Host-agent_box_auth_@USER@={$WEB_COOKIE_SECRET_@USER_ENV@}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
       reverse_proxy unix/@SETTINGS_SOCKET@
     }
   }
