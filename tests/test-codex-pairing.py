@@ -106,10 +106,18 @@ class FakeControlSocket:
                          "deviceModel": "iPhone17,1", "appVersion": "1.2026.270",
                          "lastSeenAt": 1790870000, "osVersion": "26"}]
         self.fail = {}
+        # Protocol violations the fake saw. Recorded rather than asserted:
+        # the serving thread swallows errors, so an assert there would pass
+        # silently (and Sonar S5779 rightly objects).
+        self.violations = []
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(path)
         self.listener.listen(8)
         threading.Thread(target=self.accept, daemon=True).start()
+
+    def check(self, ok, message):
+        if not ok:
+            self.violations.append(message)
 
     def close(self):
         self.listener.close()
@@ -136,7 +144,7 @@ class FakeControlSocket:
 
     def read_frame(self, conn):
         b0, b1 = self.recv_exact(conn, 2)
-        assert b1 & 0x80, "client frames must be masked"
+        self.check(b1 & 0x80, "client frames must be masked")
         n = b1 & 0x7F
         if n == 126:
             n = struct.unpack(">H", self.recv_exact(conn, 2))[0]
@@ -176,10 +184,11 @@ class FakeControlSocket:
                     initialized = True
                     continue
                 if method == "initialize":
-                    assert msg["params"]["capabilities"]["experimentalApi"] is True
+                    self.check(msg["params"]["capabilities"]["experimentalApi"]
+                               is True, "initialize without experimentalApi")
                     self.send_frame(conn, {"id": msg["id"], "result": {}})
                     continue
-                assert initialized, "request before initialized"
+                self.check(initialized, "request before initialized")
                 self.calls.append((method, msg.get("params")))
                 # A notification first, as the real server sends them.
                 self.send_frame(conn, {"method": "remoteControl/status/changed",
@@ -190,7 +199,7 @@ class FakeControlSocket:
                 else:
                     self.send_frame(conn, {"id": msg["id"],
                                            "result": self.result(method, msg)})
-        except (EOFError, OSError, AssertionError):
+        except (EOFError, OSError):
             pass
         finally:
             conn.close()
@@ -204,16 +213,17 @@ class FakeControlSocket:
             self.status = "connected"
             return {"status": self.status, "serverName": "box.example"}
         if method == "remoteControl/pairing/start":
-            assert params == {"manualCode": True}
+            self.check(params == {"manualCode": True}, "bad pairing/start")
             self.claimed = False
             return {"pairingCode": QR, "manualPairingCode": CODE,
                     "environmentId": "env_1",
                     "expiresAt": int(time.time()) + 300}
         if method == "remoteControl/pairing/status":
-            assert params == {"manualPairingCode": CODE}
+            self.check(params == {"manualPairingCode": CODE},
+                       "bad pairing/status")
             return {"claimed": self.claimed}
         if method == "remoteControl/client/list":
-            assert params["environmentId"] == "env_1"
+            self.check(params["environmentId"] == "env_1", "bad client/list")
             return {"data": list(self.devices), "nextCursor": None}
         if method == "remoteControl/client/revoke":
             self.devices = [d for d in self.devices
@@ -244,6 +254,7 @@ class Pairing(unittest.TestCase):
         os.chmod(self.codex, 0o755)
         self.control = FakeControlSocket(self.sock_path)
         self.addCleanup(self.control.close)
+        self.addCleanup(lambda: self.assertEqual(self.control.violations, []))
         self.module = daemon_with(
             AGENT_BOX_SETTINGS_ENV_FILE=self.env_file,
             AGENT_BOX_SESSIONS_FILE=self.sessions_file,
