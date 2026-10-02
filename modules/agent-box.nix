@@ -14595,16 +14595,12 @@ in
         '';
       };
 
-      # Issue #242: "agent-box should ship with its own fork". The box
-      # fetches one generated file and never saw its own sources, so it
-      # could not answer for itself and an agent could not fix it. The
-      # checkout is the agent's WORKING COPY — the source ships, the agent
-      # edits it, pushes to a fork, opens a PR. It is not the tree the box
-      # BUILDS from: that is `srcDir`, root-owned, and the two are separate
-      # on purpose. A rebuild from an agent-writable path would make that
-      # user root-equivalent (issue #127 — users are the trust boundary), so
-      # a fix reaches the running box the way any other change does: through
-      # the repo, and the next `git pull`.
+      # Issue #242: ship the box's own sources at the running rev so agents
+      # can inspect them and iterate locally. Fork creation is separate and
+      # opt-in. This is the agent's working copy, not the tree the box builds
+      # from: `srcDir` is root-owned. Rebuilding from an agent-writable path
+      # would make that user root-equivalent (issue #127), so a local change
+      # reaches the running box only through the configured repo and updater.
       checkout = {
         enable = lib.mkOption {
           type = lib.types.bool;
@@ -14675,12 +14671,13 @@ in
 
         fork = lib.mkOption {
           type = lib.types.bool;
-          default = true;
-          example = false;
+          default = false;
+          example = true;
           description = ''
-            Also add a `fork` remote to the checkout, forking `repo` into
-            the account the box's `GH_TOKEN` belongs to, so an agent can
-            push a branch and open a PR without write access upstream.
+            Opt in to creating a fork of `repo` in the account the box's
+            `GH_TOKEN` belongs to, then add it as the checkout's `fork`
+            remote. The source checkout is available without creating a
+            repository in that account.
 
             Attempted on the first supervisor start that finds a token and
             no `fork` remote — so a box that gets its token later still
@@ -14688,7 +14685,6 @@ in
             checkout. `origin` is never renamed: it stays the repo this box
             is built from, which is what `rev` is a rev OF.
 
-            Set false on a box whose token must not create repositories.
             Note that pushing to the fork does not make the box run it: the
             updater fetches from `repo`, chosen at deploy time. A box that
             should update from its own fork sets `repo` to that fork.

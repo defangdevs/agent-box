@@ -2068,11 +2068,11 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
-          # Eval regression for selfUpdate.checkout's two assertions
-          # (issue #242, PR #478 review). Both guard a value whose only
-          # other feedback is a background job failing with EROFS in a
-          # journal nobody reads, so what matters is that the REFUSAL
-          # happens at eval — and `..`, `.` and the empty component are
+          # Eval regression for selfUpdate.checkout's assertions and fork
+          # opt-in (issue #242, PR #478 review). The path assertion guards
+          # a value whose only other feedback is a background job failing
+          # with EROFS in a journal nobody reads, so the REFUSAL must
+          # happen at eval - and `..`, `.` and the empty component are
           # exactly the inputs a first pass at "must be relative" lets
           # through.
           #
@@ -2081,7 +2081,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # a failed build would only say that something did.
           checkout-options =
             let
-              evalWith = extra: (nixpkgs.lib.nixosSystem {
+              evalConfig = extra: (nixpkgs.lib.nixosSystem {
                 inherit system;
                 modules = [
                   self.nixosModules.agent-box
@@ -2100,7 +2100,9 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                     system.stateVersion = "25.05";
                   }
                 ];
-              }).config.assertions;
+              }).config;
+              evalWith = extra: (evalConfig extra).assertions;
+              checkoutEnv = extra: (evalConfig extra).systemd.services."agent-box@agent".environment;
               failed = extra:
                 builtins.filter (a: !a.assertion) (evalWith extra);
               # Does SOME assertion fire, and does its message name the
@@ -2140,6 +2142,12 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                   { label = "accepts a null maintainer";
                     ok = !(rejects "checkout.maintainer"
                       { selfUpdate.checkout.maintainer = null; }); }
+                  { label = "checkout defaults on without creating a fork";
+                    ok = builtins.hasAttr "AGENT_BOX_CHECKOUT_DIR" (checkoutEnv { })
+                      && !(builtins.hasAttr "AGENT_BOX_CHECKOUT_FORK" (checkoutEnv { })); }
+                  { label = "fork creation requires an explicit opt-in";
+                    ok = builtins.hasAttr "AGENT_BOX_CHECKOUT_FORK"
+                      (checkoutEnv { selfUpdate.checkout.fork = true; }); }
                 ];
               bad = builtins.filter (c: !c.ok) cases;
             in
