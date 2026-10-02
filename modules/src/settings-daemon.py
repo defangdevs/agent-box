@@ -991,13 +991,17 @@ def ensure_harness_session(agent, remote_control):
     elif os.path.exists(profile_path(agent)):
         profile = agent
     try:
+        # Read before the lock (issue #748): capacity_check's tmux spawn must
+        # not run while holding sessions_lock(), or a slow/contended tmux
+        # starves every other writer waiting on the same lock.
+        live = capacity_live_checked()
         with sessions_lock():
             sessions, version = load_sessions()
             if any(isinstance(s, dict) and s.get("agent") == agent
                    for s in sessions.values()):
                 return
             name = gen_session_name(agent, sessions)
-            capacity_check(sessions, [name])
+            capacity_check(sessions, [name], live=live)
             sessions[name] = {
                 "agent": agent,
                 "skipPermissions": True,
@@ -7898,6 +7902,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # second thread, or the CLI — could pick the same free name, and
             # the later rename would drop the earlier session outright.
             try:
+                # Read before the lock (issue #748): capacity_check's tmux
+                # spawn must not run while holding sessions_lock(), or a
+                # slow/contended tmux starves every other writer waiting on
+                # the same lock.
+                live = capacity_live_checked()
                 with sessions_lock():
                     sessions, version = load_sessions()
                     # The name is always auto-derived: there is no name field
@@ -7908,7 +7917,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # inventing one AND guarantees a unique key, so no collision
                     # or accidental-overwrite (issue 100) is possible.
                     name = gen_session_name(profile or agent, sessions, cwd)
-                    capacity_check(sessions, [name])
+                    capacity_check(sessions, [name], live=live)
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,
@@ -8018,6 +8027,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # initialPrompt, and the supervisor then re-fired the kickoff
                 # prompt under a new id the next time that session died.
                 try:
+                    # Read before the lock (issue #748): capacity_check's
+                    # tmux spawn must not run while holding sessions_lock(),
+                    # or a slow/contended tmux starves every other writer
+                    # waiting on the same lock. Paid even when the name turns
+                    # out not to be a live entry below -- cheap next to a
+                    # lock held across a tmux subprocess.
+                    live = capacity_live_checked()
                     with sessions_lock():
                         sessions, version = load_sessions()
                         entry = sessions.get(name)
@@ -8026,7 +8042,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # dropping it (see its docstring), so the .pop below
                         # has to ask rather than assume.
                         if isinstance(entry, dict):
-                            capacity_check(sessions, [name])
+                            capacity_check(sessions, [name], live=live)
                         if isinstance(entry, dict) and entry.pop("stopped", None) is not None:
                             write_sessions(sessions, version)
                             ok = "ok=session_started"
