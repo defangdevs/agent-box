@@ -933,7 +933,8 @@ fi
 # for inspection exactly as before -- and every surface now says the agent
 # is gone instead of reporting the post-mortem shell as a running session.
 rc=0
-"$SESSION_BIN" add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral --prompt "$preamble
+"$SESSION_BIN" add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral \
+  --origin webhook --hook "${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" "${LOCAL_WEBHOOK_SPAWN_KEY:-}" --prompt "$preamble
 
 $PROMPT" -- "${extra[@]}" || rc=$?
 if [ "$rc" = 75 ]; then

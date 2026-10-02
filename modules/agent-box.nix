@@ -4946,6 +4946,7 @@ case "$cmd" in
     esac
     harness="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
     profile=""; has_harness=0; ephemeral=0; remote_control=""; whatsapp=false
+    origin="user"; hook_source=""; hook_repo=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --harness) harness="''${2:?--harness needs a value}"; has_harness=1; shift 2 ;;
@@ -4977,6 +4978,16 @@ case "$cmd" in
         --prompt) prompt="''${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
         --resume-prompt) rprompt="''${2?--resume-prompt needs a value}"; has_rprompt=1; shift 2 ;;
         --ephemeral) ephemeral=1; shift ;;
+        # Recorded for the web session list (issue #787); the webhook
+        # spawner passes both. --hook is SOURCE then REPOSITORY.
+        --origin)
+          case "''${2:?--origin needs a value}" in
+            (user|agent|webhook) origin="$2" ;;
+            (*) echo "agent-box-session: --origin must be user, agent or webhook" >&2
+                exit 2 ;;
+          esac
+          shift 2 ;;
+        --hook) hook_source="''${2:?--hook needs SOURCE REPOSITORY}"; hook_repo="''${3?--hook needs SOURCE REPOSITORY}"; shift 3 ;;
         --) shift; break ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
@@ -5121,6 +5132,7 @@ case "$cmd" in
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
       --arg prof "$profile" --arg eph "$ephemeral" --argjson rc "$remote_control" \
       --argjson whatsapp "$whatsapp" \
+      --arg origin "$origin" --arg hsrc "$hook_source" --arg hrepo "$hook_repo" \
       '.sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
                         whatsapp: $whatsapp,
                         remoteControlName: null,
@@ -5130,7 +5142,14 @@ case "$cmd" in
                         initialPrompt: (if $pp == "1" then $p else null end),
                         resumePrompt: (if $rpp == "1" then $rp else null end),
                         boxSessionId: (if $bid == "" then null else $bid end),
-                        hasRun: false}
+                        hasRun: false,
+                        origin: $origin,
+                        createdAt: (now | floor)}
+                       # Who started it, for the web list (issue #787); the
+                       # webhook spawner says which event source and repo.
+                       + (if $hsrc != "" and $hrepo != "" then
+                            {hook: {source: $hsrc, repository: $hrepo}}
+                          else {} end)
                        # Added only when set, so every session that is NOT
                        # one-shot keeps the entry shape it has always had.
                        + (if $eph == "1" then {ephemeral: true} else {} end))' \
@@ -10239,7 +10258,8 @@ fi
 # for inspection exactly as before -- and every surface now says the agent
 # is gone instead of reporting the post-mortem shell as a running session.
 rc=0
-"$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral --prompt "$preamble
+"$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral \
+  --origin webhook --hook "''${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" --prompt "$preamble
 
 $PROMPT" -- "''${extra[@]}" || rc=$?
 if [ "$rc" = 75 ]; then
@@ -17680,6 +17700,8 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
                 "resumePrompt": None,
                 "boxSessionId": None,
                 "hasRun": False,
+                "origin": "pairing" if only_rc else "sign_in",
+                "createdAt": int(time.time()),
             }
             write_sessions(sessions, version)
             _session_start_notices.pop(agent, None)
@@ -20632,6 +20654,72 @@ def session_view():
         ]
         for name in entries
     ]
+
+
+SESSION_ORIGINS = ("user", "sign_in", "pairing", "webhook", "agent")
+
+
+def session_list_payload():
+    """The GET {SESS_BASE}/sessions/list answer (issue #787): every listed
+    session as metadata a portal can show, plus the box's own capacity
+    arithmetic.
+
+    An allow-list, not a filter: each row is built field by field, so a
+    field added to sessions.json later (argv, env, prompts, transcript ids)
+    cannot leak here by being there. Same line /sessions/events draws.
+    Raises SessionCapacityError when the limit cannot be read and
+    RegistryUnreadable when the registry cannot.
+    """
+    # load_sessions, not read_sessions: an unreadable registry is an error
+    # for a portal, not an empty list (RegistryUnreadable is the caller's 503).
+    sessions = {n: v for n, v in load_sessions()[0].items()
+                if SESSION_RE.match(n) and isinstance(v, dict)}
+    live = capacity_live_checked()
+    capacity = capacity_check(sessions, [], live=live)
+    limit = capacity["max"]
+    pending = {n for n, e in sessions.items() if e.get("stopped") is not True}
+    died = {n for n, e in sessions.items() if e.get("died") is not None}
+    # The same admission order capacity_check's spawn branch uses: a pending
+    # name past the free slots is queued, not starting.
+    admitted = live | set(sorted(pending - live)[:max(0, limit - len(live - died))])
+    rows = []
+    for name, entry in sessions.items():
+        if entry.get("stopped") is True:
+            state = "stopped"
+        elif name in died and name in live:
+            state = "died"
+        elif name in live:
+            state = "running"
+        elif name in admitted:
+            state = "starting"
+        else:
+            state = "queued"
+        origin = entry.get("origin")
+        hook = entry.get("hook")
+        if not (isinstance(hook, dict) and isinstance(hook.get("source"), str)
+                and isinstance(hook.get("repository"), str)):
+            hook = None
+        rc_name = entry.get("remoteControlName")
+        cwd = entry.get("workingDirectory")
+        created = entry.get("createdAt")
+        rows.append({
+            "name": name,
+            "agent": str(entry.get("agent") or "?"),
+            "profile": entry["profile"] if isinstance(entry.get("profile"), str) else None,
+            "state": state,
+            "exit_status": crashed_status(entry) if state == "died" else None,
+            "origin": origin if origin in SESSION_ORIGINS else None,
+            "remote_control": entry.get("remoteControl") is not False,
+            "remote_control_name": rc_name if isinstance(rc_name, str) else None,
+            "working_directory": cwd if isinstance(cwd, str) and cwd else os.path.expanduser("~"),
+            "ephemeral": entry.get("ephemeral") is True,
+            "created_at": created if isinstance(created, int) and not isinstance(created, bool) else None,
+            "hook": ({"source": hook["source"], "repository": hook["repository"]}
+                     if hook else None),
+        })
+    return {"ok": True,
+            "capacity": {"used": capacity["used"], "limit": limit},
+            "sessions": rows}
 
 
 def session_fingerprint():
@@ -26275,6 +26363,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             WATCHER.release()
 
+    def _wants_json(self):
+        """A portal caller (issue #787): it asks for JSON, so a refusal
+        carries {"ok": false, "reason": ...} instead of a page to scrape."""
+        return "application/json" in self.headers.get("Accept", "").lower()
+
+    def _sess_error(self, form, text, status):
+        """Refuse a /sessions/* POST: JSON for a portal, the page the form
+        came from for a browser."""
+        if self._wants_json():
+            self._send_json({"ok": False, "reason": text}, status=status)
+            return
+        render = render_home if self._sess_page(form) == TERM_HOME else render_page
+        self._send_html(render(text, kind="error"), status=status)
+
     def _registry_refusal(self, verb, exc, page):
         """Answer a mutation route that could not read the registry
         (issue #279): say so in the journal, where the detail belongs, and
@@ -26285,6 +26387,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         just republished no longer mentioned any of the other sessions.
         """
         sys.stderr.write("sessions/%s refused: %s\n" % (verb, exc))
+        if self._wants_json():
+            self._send_json({"ok": False, "reason": "The session list could "
+                             "not be read. It clears within a few seconds."},
+                            status=503)
+            return
         self._redirect("ok=session_registry_unreadable", page)
 
     def _registry_busy(self, verb, exc, page):
@@ -26302,6 +26409,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         no shell and a bare 503 tells them nothing.
         """
         sys.stderr.write("sessions/%s refused: %s\n" % (verb, exc))
+        if self._wants_json():
+            self._send_json({"ok": False, "reason": "The session list is "
+                             "being changed by something else, so nothing "
+                             "was done. Try again in a few seconds."},
+                            status=503)
+            return
         # TERM_HOME and not (HOME and SESS_PAGE): /<user>/ is EVERY user's
         # landing page, not only the one whose daemon also serves the vhost
         # root, so a form carrying back=workspace resolves to TERM_HOME for
@@ -26339,6 +26452,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "session_deleted": ("Session deleted.", "ok"),
         "session_restarted": ("Session restart requested.", "ok"),
         "whatsapp_saved": ("WhatsApp setting saved. Restart a running Claude session to load its channel.", "ok"),
+        "session_stopped": ("Session stopped \u2014 it keeps its place in the list.", "ok"),
         "session_started": ("Session started \u2014 it comes up within a few seconds.", "ok"),
         "session_registry_unreadable": (
             "The session list could not be read, so nothing was changed. "
@@ -26683,6 +26797,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # and in HOME mode SESS_BASE is "" so the path is not under BASE.
         if parsed.path.rstrip("/") == SESS_BASE + "/sessions/transcript":
             self._send_transcript((params.get("name", [""])[0]).strip())
+            return
+        if parsed.path.rstrip("/") == SESS_BASE + "/sessions/list":
+            # Session metadata as JSON for a portal (issue #787).
+            try:
+                self._send_json(session_list_payload())
+            except (SessionCapacityError, RegistryUnreadable) as exc:
+                self._send_json({"ok": False, "reason": str(exc)}, status=503)
             return
         if parsed.path.rstrip("/") == SESS_BASE + "/sessions/events":
             if params.get("poll"):
@@ -27445,6 +27566,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "resumePrompt": None,
                         "boxSessionId": None,
                         "hasRun": False,
+                        "origin": "user",
+                        "createdAt": int(time.time()),
                     }
                     write_sessions(sessions, version)
             except SessionCapacityError as exc:
@@ -27507,10 +27630,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # resurrected entry is a session the supervisor starts and no
                 # delete path knows about. The kill stays OUTSIDE: tmux is not
                 # this file, and nothing may hold the lock across a subprocess.
+                known = True
                 try:
                     with sessions_lock():
                         sessions, version = load_sessions()
-                        sessions.pop(name, None)
+                        known = sessions.pop(name, None) is not None
                         write_sessions(sessions, version)
                 except RegistryBusy as exc:
                     self._registry_busy("delete", exc, self._sess_page(form))
@@ -27520,6 +27644,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # publish an empty one: the named session went, and so did
                     # every other (issue #279).
                     self._registry_refusal("delete", exc, self._sess_page(form))
+                    return
+                if not known and self._wants_json():
+                    # A portal asked to delete something we do not list: say
+                    # so without touching a tmux session that merely shares
+                    # the name. The browser path keeps cleaning one up.
+                    self._send_json({"ok": False, "reason": "No such session."},
+                                    status=404)
                     return
                 kill_session(name)
                 # Delisted and killed, so its filter file routes nothing —
@@ -27538,7 +27669,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         os.remove(state_path)
                     except OSError:
                         pass
+            elif self._wants_json():
+                self._send_json({"ok": False, "reason": "No such session."},
+                                status=404)
+                return
             self._redirect("ok=session_deleted", self._sess_page(form))
+        elif path == SESS_BASE + "/sessions/stop":
+            # The web twin of `agent-box-session stop` (issue #787): park the
+            # session so it frees its slot and keeps its entry. Flag first,
+            # then kill, so the supervisor's post-spawn re-check sees a spawn
+            # that raced the kill (session-cli.sh, issue #167).
+            name = (form.get("name", [""])[0]).strip()
+            try:
+                with sessions_lock():
+                    sessions, version = load_sessions()
+                    entry = sessions.get(name) if SESSION_RE.match(name) else None
+                    # Existence and flag in one step, and no stub entry for a
+                    # name that is not there (issue #254).
+                    if isinstance(entry, dict):
+                        entry["stopped"] = True
+                        write_sessions(sessions, version)
+            except RegistryBusy as exc:
+                self._registry_busy("stop", exc, self._sess_page(form))
+                return
+            except RegistryUnreadable as exc:
+                self._registry_refusal("stop", exc, self._sess_page(form))
+                return
+            if not isinstance(entry, dict):
+                self._sess_error(form, "No such session.", 404)
+                return
+            kill_session(name)
+            self._redirect("ok=session_stopped", self._sess_page(form))
         elif path == SESS_BASE + "/sessions/restart":
             name = (form.get("name", [""])[0]).strip()
             # The row calls this route Start on a stopped session, so say
@@ -27573,12 +27734,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # has to ask rather than assume.
                         if isinstance(entry, dict):
                             capacity_check(sessions, [name], live=live)
+                        elif self._wants_json():
+                            self._send_json({"ok": False, "reason": "No such session."},
+                                            status=404)
+                            return
                         if isinstance(entry, dict) and entry.pop("stopped", None) is not None:
                             write_sessions(sessions, version)
                             ok = "ok=session_started"
                 except SessionCapacityError as exc:
-                    render = render_home if self._sess_page(form) == TERM_HOME else render_page
-                    self._send_html(render(str(exc), kind="error"), status=503)
+                    self._sess_error(form, str(exc), 503)
                     return
                 except RegistryBusy as exc:
                     self._registry_busy("restart", exc, self._sess_page(form))
@@ -27591,6 +27755,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._registry_refusal("restart", exc, self._sess_page(form))
                     return
                 kill_session(name)
+            elif self._wants_json():
+                self._send_json({"ok": False, "reason": "No such session."},
+                                status=404)
+                return
             back_page = self._sess_page(form)
             # On the workspace, land on the tab of the session just started —
             # the pane's own Start button posts here, and dropping the operator
