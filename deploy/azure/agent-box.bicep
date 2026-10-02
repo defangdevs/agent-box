@@ -465,9 +465,10 @@ sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@ALIAS@|$e
 
 # Extra standing instructions for the agent, if the deployment gave any.
 install -d -m 0755 /etc/agent-box-guides
-cat > /etc/agent-box-guides/AGENTS.stack.md <<'AGENTBOX_AGENTSMD'
-@@AGENTSMD@@
-AGENTBOX_AGENTSMD
+# base64, like every other free-text parameter: a quoted heredoc still ends at
+# a line reading its own terminator, and a raw value could also carry a later
+# marker (such as the web password's) into this file (issue #777).
+printf %s '@@AGENTSMDB64@@' | base64 -d > /etc/agent-box-guides/AGENTS.stack.md
 
 # Render and start everything. The password reaches the renderer through the
 # environment and is hashed with argon2id, so it is never written to the box's
@@ -511,10 +512,10 @@ var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
   '@@USER@@', userName),
-  '@@AGENTSMD@@', agentsMd),
   // base64, not the plaintext: see the comment above the validation block,
   // and check_secrets() in scripts/check_azure_template.py, which fails if
   // this ever goes back to a raw substitution.
+  '@@AGENTSMDB64@@', base64(agentsMd)),
   '@@SSLIPDOMAINB64@@', base64(sslipDomain)),
   '@@WEBPASSWORD@@', base64(webPassword)),
   '@@PORTALISSUERB64@@', base64(portalIssuerYaml)),
