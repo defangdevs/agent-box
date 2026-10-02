@@ -2291,6 +2291,31 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The settings daemon's Codex pairing API (issue #780): the JSON
+          # a portal pairs the Codex apps with. Same subject as the checks
+          # above (the GOLDEN PAYLOAD), plus a fake codex app-server on a
+          # real Unix socket, so the daemon's WebSocket client runs for real.
+          # Pins that the code never leaves memory, that `claimed` is sticky
+          # and which status codes Station keys on.
+          codex-pairing =
+            pkgs.runCommand "agent-box-codex-pairing"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-codex-pairing.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-codex-pairing.py
+              python3 repo/tests/test-codex-pairing.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # render_connect_card()'s "checking" window: the status probe
           # never blocks a render, so every card starts "checking" on a
           # cold cache and the Sign-in button must exist there — while a

@@ -53,6 +53,14 @@ trap 'stop; exit 0' HUP INT TERM
 # Control cannot enroll until someone signs in (issue #159).
 hr() { printf '%s\n' "────────────────────────────────────────────────────────────"; }
 signed_in() { "$codex" login status >/dev/null 2>&1; }
+# When the settings page drives pairing (its /codex/pairing API, issue #780),
+# a code minted HERE would be a second live code beside the page's, and it
+# would print to a pane the user never needed to open. The page's
+# `AGENT_BOX_CODEX_SESSION_DEFAULT=remote-control` is the signal. In that
+# mode the pane signs in and reports status on its own; it mints a code only
+# when someone presses Enter.
+quiet=false
+[ "${AGENT_BOX_CODEX_SESSION_DEFAULT:-}" = remote-control ] && quiet=true
 # Run the sign-in HERE rather than printing the command for someone to paste
 # into another session. This box is headless, so device auth is the only
 # flow that works: plain `codex login` serves a localhost URL no outside
@@ -160,9 +168,13 @@ EOF
 # successful pairing, so a token that expires later in the same pane's life
 # still gets one automatic recovery.
 relogin_tried=false
+# $1 = "key" when a person pressed Enter, so quiet mode still mints.
 onboard() {
   device_login || true
-  if signed_in; then
+  if signed_in && [ "$quiet" = true ] && [ "${1:-}" != key ]; then
+    printf '\n%s\n' "  ✓ Signed in. Remote Control is running: pair from your Station's"
+    printf '%s\n' "    page, or press Enter here for a pairing code."
+  elif signed_in; then
     pair; pairrc=$?
     if [ "$pairrc" -eq 0 ]; then
       relogin_tried=false
@@ -259,7 +271,7 @@ while "$codex" app-server daemon version >/dev/null 2>&1; do
           relogin_tried=true
           relogin
           ;;
-        "") onboard ;;
+        "") onboard key ;;
         # Anything else is not a word this pane understands — most often a
         # remote Codex conversation's inherited $TMUX_PANE catching a
         # /rename or other line meant for a real Codex prompt (issue #691).
