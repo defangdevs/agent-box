@@ -75,6 +75,12 @@ BASHISMS = (
 # plaintext never appears in the rendered script.
 HOSTILE_PASSWORD = "p'; touch /tmp/pwned; '$x `id` \"q\""
 
+# Free text that would close the AGENTS.stack.md heredoc early and run what
+# follows as root, and that names a later marker so a dumb whole-string
+# replace() would splice a secret into the file (issue #777). Like the
+# password, the template must substitute it base64-encoded.
+HOSTILE_AGENTSMD = "x\nAGENTBOX_AGENTSMD\ntouch /tmp/pwned\n@@WEBPASSWORD@@\n"
+
 # Portal handover (issue #593). Plain values for readability; SAMPLE below
 # carries their base64 form, matching what the template's replace() chain
 # now substitutes (see the comment on PORTALISSUERB64 there for why: Bicep
@@ -94,7 +100,7 @@ SAMPLE = {
     "@@IMAGERUNTIME@@": "false",
     "@@USER@@": "agent",
     "@@SSLIPDOMAINB64@@": base64.b64encode(b"sslip.example.com").decode(),
-    "@@AGENTSMD@@": "## This box\n\n- A line with 'quotes' and $dollars.\n",
+    "@@AGENTSMDB64@@": base64.b64encode(HOSTILE_AGENTSMD.encode()).decode(),
     "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
     "@@PORTALISSUERB64@@": base64.b64encode(
         PORTAL_ISSUER_SAMPLE.encode()).decode(),
@@ -117,7 +123,7 @@ DEFAULT_OF = {
     "@@IMAGERUNTIME@@": "imageIncludesRuntime",
     "@@USER@@": "userName",
     "@@SSLIPDOMAINB64@@": "sslipDomain",
-    "@@AGENTSMD@@": "agentsMd",
+    "@@AGENTSMDB64@@": "agentsMd",
     # Both default to '' -- handover off, which is the default box.
     "@@PORTALISSUERB64@@": "portalIssuer",
     "@@PORTALUSERIDB64@@": "portalUser",
@@ -334,6 +340,14 @@ def check_bootstrap(template: dict, values: dict, label: str) -> int:
             f"FAIL: placeholder(s) {sorted(set(left))} survive substitution — the "
             "Bicep replace() chain and the script have drifted apart, so the VM "
             "would run a literal marker.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if "AGENTBOX_AGENTSMD" in script or "touch /tmp/pwned\n@@" in script:
+        print(
+            f"FAIL: the rendered bootstrap ({label}) carries agentsMd in the "
+            "clear (issue #777). It must travel base64-encoded.",
             file=sys.stderr,
         )
         return 1
@@ -604,6 +618,16 @@ def check_secrets(template: dict) -> int:
             "base64(parameters('webPassword')). A raw substitution puts the "
             "password inside a shell literal it can close - see "
             "HOSTILE_PASSWORD above.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if "base64(parameters('agentsMd'))" not in chain:
+        print(
+            "FAIL: the replace() chain does not substitute "
+            "base64(parameters('agentsMd')). A raw substitution lets free text "
+            "close the AGENTS.stack.md heredoc, or carry a later marker such "
+            "as @@WEBPASSWORD@@ into the file - see HOSTILE_AGENTSMD above.",
             file=sys.stderr,
         )
         return 1
