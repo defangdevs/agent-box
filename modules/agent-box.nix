@@ -24411,20 +24411,10 @@ def portal_prune(now=None):
                     os.unlink(path)
 
 
-def portal_session_new(claims):
-    """Mint a box session for verified claims and return its cookie value."""
-    value = secrets.token_urlsafe(32)
-    now = int(time.time())
-    record = {
-        "sub": claims.get("sub", ""),
-        "project": claims.get("project", ""),
-        "issuer": claims.get("iss", ""),
-        "jti": claims.get("jti", ""),
-        "created": now,
-        "expires": now + SESSION_TTL,
-    }
-    path = portal_record_path("sessions", value)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".session.")
+def portal_write_json_atomic(path, record, prefix):
+    """Write `record` to `path` 0600: a reader sees the whole old document
+    or the whole new one, and both file and directory are fsynced."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=prefix)
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as handle:
@@ -24441,6 +24431,22 @@ def portal_session_new(claims):
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def portal_session_new(claims):
+    """Mint a box session for verified claims and return its cookie value."""
+    value = secrets.token_urlsafe(32)
+    now = int(time.time())
+    record = {
+        "sub": claims.get("sub", ""),
+        "project": claims.get("project", ""),
+        "issuer": claims.get("iss", ""),
+        "jti": claims.get("jti", ""),
+        "created": now,
+        "expires": now + SESSION_TTL,
+    }
+    path = portal_record_path("sessions", value)
+    portal_write_json_atomic(path, record, ".session.")
     return value
 
 
@@ -24549,23 +24555,7 @@ def portal_identity_write(sub, request_id):
     """
     path = portal_identity_path()
     record = {"sub": sub, "requestId": request_id, "updated": int(time.time())}
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".identity.")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            json.dump(record, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-        dfd = os.open(os.path.dirname(path), os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
+    portal_write_json_atomic(path, record, ".identity.")
 
 
 def portal_user_current():
