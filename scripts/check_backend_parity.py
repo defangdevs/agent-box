@@ -223,6 +223,14 @@ BY_DESIGN = {
         "Python only and never builds this Nix "
         "payload, while the golden snapshot "
         "captures the real store-built one"),
+    "AGENT_BOX_CODEX_SESSION_DEFAULT": (
+        "module",
+        "a runtime setting, not configuration (issue #780): the settings "
+        "daemon and codex-remote-control.sh read it from the env store "
+        "(`agent-box-session env set`), so neither backend supplies it - "
+        "the module's golden payloads are only where the check's regex "
+        "sees the assignment in the shared payload text, the same shape "
+        "as AGENT_BOX_HOOK_SESSION_ARGS above"),
     "AGENT_BOX_SRC_DIR": ("module", SRC_TREE_BINDING),
     "AGENT_BOX_SRC_URL": ("module", SRC_TREE_BINDING),
     "AGENT_BOX_SRC_REV": ("module", SRC_TREE_BINDING),

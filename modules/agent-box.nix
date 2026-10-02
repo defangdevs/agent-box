@@ -3173,6 +3173,14 @@ trap 'stop; exit 0' HUP INT TERM
 # Control cannot enroll until someone signs in (issue #159).
 hr() { printf '%s\n' "────────────────────────────────────────────────────────────"; }
 signed_in() { "$codex" login status >/dev/null 2>&1; }
+# When the settings page drives pairing (its /codex/pairing API, issue #780),
+# a code minted HERE would be a second live code beside the page's, and it
+# would print to a pane the user never needed to open. The page's
+# `AGENT_BOX_CODEX_SESSION_DEFAULT=remote-control` is the signal. In that
+# mode the pane signs in and reports status on its own; it mints a code only
+# when someone presses Enter.
+quiet=false
+[ "''${AGENT_BOX_CODEX_SESSION_DEFAULT:-}" = remote-control ] && quiet=true
 # Run the sign-in HERE rather than printing the command for someone to paste
 # into another session. This box is headless, so device auth is the only
 # flow that works: plain `codex login` serves a localhost URL no outside
@@ -3280,9 +3288,13 @@ EOF
 # successful pairing, so a token that expires later in the same pane's life
 # still gets one automatic recovery.
 relogin_tried=false
+# $1 = "key" when a person pressed Enter, so quiet mode still mints.
 onboard() {
   device_login || true
-  if signed_in; then
+  if signed_in && [ "$quiet" = true ] && [ "''${1:-}" != key ]; then
+    printf '\n%s\n' "  ✓ Signed in. Remote Control is running: pair from your Station's"
+    printf '%s\n' "    page, or press Enter here for a pairing code."
+  elif signed_in; then
     pair; pairrc=$?
     if [ "$pairrc" -eq 0 ]; then
       relogin_tried=false
@@ -3379,7 +3391,7 @@ while "$codex" app-server daemon version >/dev/null 2>&1; do
           relogin_tried=true
           relogin
           ;;
-        "") onboard ;;
+        "") onboard key ;;
         # Anything else is not a word this pane understands — most often a
         # remote Codex conversation's inherited $TMUX_PANE catching a
         # /rename or other line meant for a real Codex prompt (issue #691).
@@ -17213,7 +17225,8 @@ def ensure_claude_profile():
         index += 1
 
 
-def ensure_harness_session(agent, remote_control):
+def ensure_harness_session(agent, remote_control, only_rc=False,
+                           raise_capacity=False):
     """Auto-start one session for `agent` the moment its connect card
     signs in (issue #504), so install+login leaves an actual running
     session behind rather than just a signed-in CLI nobody has started yet.
@@ -17234,13 +17247,21 @@ def ensure_harness_session(agent, remote_control):
     is a flag on the ordinary TUI (supervisor.sh appends --remote-control),
     so this session is both a normal worker AND immediately visible to
     desktop/mobile. codex's rc replaces the process outright with the
-    app-server pairing daemon (codex-remote-control.sh) -- pairing already
-    happened in the connect card's own pane, so what closes issue #504's
-    "a codex session running" is a real interactive session, which only
-    remoteControl: false ever produces. Written directly here rather than
+    app-server pairing daemon (codex-remote-control.sh). The connect card
+    only SIGNS IN (`codex login --device-auth`); it pairs nothing. Pairing
+    is the /codex/pairing API below, or Enter in an rc session's pane. So
+    by default what closes issue #504's "a codex session running" is a real
+    interactive session (remoteControl: false), and a box configured with
+    AGENT_BOX_CODEX_SESSION_DEFAULT=remote-control gets the daemon instead
+    (issue #780). Written directly here rather than
     through session-cli.sh/`/sessions/add`, both of which still hardcode
     remoteControl: true unconditionally -- neither writer offers a way to
     ask for false today.
+
+    `only_rc` narrows "already has a session" to "already has a REMOTE-CONTROL
+    one", for the pairing API (issue #780): a TUI codex session cannot be
+    paired, so it does not count there. `raise_capacity` lets that caller
+    answer 503 itself instead of getting the card's notice string.
     """
     if agent not in AGENTS:
         return
@@ -17252,7 +17273,9 @@ def ensure_harness_session(agent, remote_control):
             # Profile storage failure must not undo a successful login or
             # prevent its worker from starting.
             pass
-    elif os.path.exists(profile_path(agent)):
+    elif os.path.exists(profile_path(agent)) and not remote_control:
+        # A remote-control codex session is the pairing daemon, which has no
+        # model, effort or profile of its own.
         profile = agent
     try:
         # Read before the lock (issue #748): capacity_check's tmux spawn must
@@ -17262,6 +17285,7 @@ def ensure_harness_session(agent, remote_control):
         with sessions_lock():
             sessions, version = load_sessions()
             if any(isinstance(s, dict) and s.get("agent") == agent
+                   and (not only_rc or s.get("remoteControl") is not False)
                    for s in sessions.values()):
                 return
             name = gen_session_name(agent, sessions)
@@ -17282,6 +17306,8 @@ def ensure_harness_session(agent, remote_control):
             write_sessions(sessions, version)
             _session_start_notices.pop(agent, None)
     except SessionCapacityError as exc:
+        if raise_capacity:
+            raise
         _session_start_notices[agent] = "Signed in; session not started. " + str(exc)
         return _session_start_notices[agent]
     except (RegistryUnreadable, RegistryBusy, OSError):
@@ -19140,16 +19166,433 @@ def connect_signed_in(flow):
     if signed_in_at is not None and flow_id in RELOGIN_CONFIG_DIRS:
         restart_login_sessions(flow, signed_in_at)
     # One session per harness, started the moment sign-in lands (issue
-    # #504) -- codex gets an interactive worker session
-    # (remote_control=False) since pairing for phone/desktop already
-    # happened in this flow's own pane; claude's rc is a flag on the same
-    # worker session, so one session covers both being usable AND
-    # remote-visible.
+    # #504). The sign-in pane only signs in; it never paired anything. So
+    # codex gets an interactive worker session (remote_control=False) unless
+    # the box asks for remote control (issue #780), whose daemon is what the
+    # Codex apps can see. claude's rc is a flag on the same worker session,
+    # so one session covers both being usable AND remote-visible.
     if flow_id == "claude":
         return ensure_harness_session("claude", remote_control=True)
     if flow_id == "codex":
-        return ensure_harness_session("codex", remote_control=False)
+        return ensure_harness_session(
+            "codex", remote_control=codex_session_default() == "remote-control")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Codex pairing API (issue #780)
+#
+# Defang Station pairs the Codex desktop and ChatGPT mobile apps from its own
+# page, so the manual pairing code has to reach it as JSON instead of as text
+# in a tmux pane. Codex's app-server exposes the primitives as experimental
+# JSON-RPC over a WebSocket on a Unix socket; codex_rc_rpc() is the smallest
+# client that speaks it (stdlib only: one HTTP/1.1 Upgrade, masked text
+# frames).
+#
+# The code is a credential: whoever claims it controls this box's Codex. It
+# lives in _codex_pairing in memory and is never logged, written to disk,
+# put in an error string, or echoed to the pane.
+
+CODEX_SESSION_DEFAULT_KEY = "AGENT_BOX_CODEX_SESSION_DEFAULT"
+CODEX_START_MIN_INTERVAL = 5.0
+CODEX_CACHE_TTL = 2.0
+CODEX_DAEMON_WAIT = 10.0
+# How long a start may stay "starting" (no daemon yet) before it is "failed".
+CODEX_STARTING_GRACE = 90.0
+CODEX_DEVICE_LIMIT = 50
+CODEX_ERROR_MAX = 200
+CODEX_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+# A URL, a request id or a cf-ray in a server message is transport detail
+# that belongs in a bug report, not on a card -- and a URL may carry a code.
+CODEX_REDACT_RES = (
+    re.compile(r"https?://\S+"),
+    re.compile(r"(request-id|cf-ray)[:= ]+\S+", re.IGNORECASE),
+    re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4}\b"),
+)
+
+
+def codex_session_default():
+    """"remote-control" or "tui": what a finished Codex sign-in starts.
+
+    A runtime setting read from the env store (the module deliberately has no
+    option for it: `agent-box-session env set` needs no root and no rebuild).
+    The value is not a secret, so reading the one key is fine; nothing else
+    in the store is looked at.
+    """
+    value = ""
+    try:
+        value = as_dict(load(ENV_FILE)).get(CODEX_SESSION_DEFAULT_KEY, "")
+    except (OSError, ValueError):
+        pass
+    return "remote-control" if value.strip() == "remote-control" else "tui"
+
+
+def codex_redact(text):
+    """One short line from a Codex error: its own message, no URLs, ids or
+    anything shaped like a pairing code."""
+    text = " ".join(str(text or "").split())
+    # `... failed at `https://...`: HTTP 404 Not Found, request-id: ...,
+    # body: {"detail":"..."}` -> keep the detail when there is one.
+    found = re.search(r'"(?:detail|message)"\s*:\s*"([^"]+)"', text)
+    if found:
+        text = found.group(1)
+    for rx in CODEX_REDACT_RES:
+        text = rx.sub("[redacted]", text)
+    return CONNECT_SECRET_RE.sub("[redacted]", text)[:CODEX_ERROR_MAX]
+
+
+class CodexRpcError(Exception):
+    """A control-socket call that failed. str() is already redacted."""
+
+
+def _codex_recv_exact(sock, count):
+    buf = b""
+    while len(buf) < count:
+        chunk = sock.recv(count - len(buf))
+        if not chunk:
+            raise CodexRpcError("control socket closed")
+        buf += chunk
+    return buf
+
+
+def _codex_ws_send(sock, data, opcode=1):
+    data = data.encode("utf-8") if isinstance(data, str) else data
+    size = len(data)
+    head = bytes([0x80 | opcode])
+    if size < 126:
+        head += bytes([0x80 | size])
+    elif size < 65536:
+        head += bytes([0x80 | 126]) + size.to_bytes(2, "big")
+    else:
+        head += bytes([0x80 | 127]) + size.to_bytes(8, "big")
+    mask = secrets.token_bytes(4)
+    sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+
+def _codex_ws_recv(sock):
+    """One complete text message; ping/pong/close handled on the way."""
+    message = b""
+    while True:
+        b0, b1 = _codex_recv_exact(sock, 2)
+        opcode, fin, size = b0 & 0x0F, b0 & 0x80, b1 & 0x7F
+        if b1 & 0x80:
+            raise CodexRpcError("control socket sent a masked frame")
+        if size == 126:
+            size = int.from_bytes(_codex_recv_exact(sock, 2), "big")
+        elif size == 127:
+            size = int.from_bytes(_codex_recv_exact(sock, 8), "big")
+        if size > 4 * 1024 * 1024:
+            raise CodexRpcError("control socket frame too large")
+        data = _codex_recv_exact(sock, size)
+        if opcode == 8:
+            raise CodexRpcError("control socket closed")
+        if opcode == 9:
+            _codex_ws_send(sock, data, opcode=10)
+            continue
+        if opcode == 10:
+            continue
+        message += data
+        if fin:
+            return message.decode("utf-8", "replace")
+
+
+def codex_rc_rpc(socket_path, method, params=None, timeout=10):
+    """Call one experimental app-server method and return its result.
+
+    Raises CodexRpcError with a redacted message. Handshake as the daemon's
+    own client does it: initialize with experimentalApi, `initialized`, then
+    the request. One connection per call keeps this stateless; callers cache.
+    """
+    deadline = time.monotonic() + timeout
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(timeout)
+    try:
+        conn.connect(socket_path)
+        key = base64.b64encode(secrets.token_bytes(16)).decode()
+        conn.sendall((
+            "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+            "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n" % key).encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(1024)
+            if not chunk or len(buf) > 8192:
+                raise CodexRpcError("control socket refused the upgrade")
+            buf += chunk
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        if b" 101" not in head.split(b"\r\n")[0] or rest:
+            raise CodexRpcError("control socket refused the upgrade")
+
+        def call(ident, name, args=None):
+            request = {"jsonrpc": "2.0", "id": ident, "method": name}
+            if args is not None:
+                request["params"] = args
+            _codex_ws_send(conn, json.dumps(request))
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise CodexRpcError("timed out waiting for " + name)
+                conn.settimeout(left)
+                reply = json.loads(_codex_ws_recv(conn))
+                if not isinstance(reply, dict) or reply.get("id") != ident:
+                    continue    # a notification, not our answer
+                if "error" in reply:
+                    detail = reply["error"]
+                    raise CodexRpcError(codex_redact(
+                        detail.get("message") if isinstance(detail, dict)
+                        else detail) or "request failed")
+                return reply.get("result")
+
+        call(1, "initialize", {
+            "clientInfo": {"name": "agent-box-settings", "version": "1"},
+            "capabilities": {"experimentalApi": True}})
+        _codex_ws_send(conn, json.dumps(
+            {"jsonrpc": "2.0", "method": "initialized"}))
+        return call(2, method, params)
+    except (OSError, ValueError) as exc:
+        raise CodexRpcError(
+            "control socket unavailable (%s)" % exc.__class__.__name__)
+    finally:
+        conn.close()
+
+
+# Everything below is guarded by _codex_lock. `rec` is the outstanding code,
+# if any; the two caches keep a polling client from costing a WebSocket
+# connection per request.
+_codex_lock = threading.Lock()
+_codex_pairing = {
+    "manual_code": None, "environment_id": None, "expires_at": None,
+    "claimed": False, "error": None, "started_at": None,
+    "last_start": 0.0, "last_poll": 0.0,
+}
+_codex_cache = {"status": None, "devices": None}
+
+
+def codex_control_socket(flow):
+    """The running daemon's control socket, or None. Starts nothing."""
+    proc = connect_run(flow, ["app-server", "daemon", "version"], timeout=10)
+    if proc is None or proc.returncode != 0:
+        return None
+    try:
+        info = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+    path = info.get("socketPath") if isinstance(info, dict) else None
+    if (isinstance(path, str) and info.get("status") == "running"
+            and os.path.exists(path)):
+        return path
+    return None
+
+
+def codex_cached(slot, fetch):
+    """fetch() at most once per CODEX_CACHE_TTL; errors are cached too."""
+    now = time.monotonic()
+    with _codex_lock:
+        hit = _codex_cache.get(slot)
+    if hit and now - hit[0] < CODEX_CACHE_TTL:
+        return hit[1]
+    value = fetch()
+    with _codex_lock:
+        _codex_cache[slot] = (now, value)
+    return value
+
+
+def codex_status(flow):
+    """("ok", status dict) | ("down", None) | ("error", message)."""
+    def fetch():
+        sock = codex_control_socket(flow)
+        if sock is None:
+            return ("down", None, None)
+        try:
+            return ("ok", codex_rc_rpc(sock, "remoteControl/status/read"), sock)
+        except CodexRpcError as exc:
+            return ("error", str(exc), sock)
+    return codex_cached("status", fetch)
+
+
+def codex_devices(sock, environment_id):
+    def fetch():
+        try:
+            result = codex_rc_rpc(sock, "remoteControl/client/list", {
+                "environmentId": environment_id,
+                "limit": CODEX_DEVICE_LIMIT, "order": "desc"})
+        except CodexRpcError as exc:
+            return ([], str(exc))
+        devices = []
+        for item in (result or {}).get("data") or []:
+            if not isinstance(item, dict) or not item.get("clientId"):
+                continue
+            devices.append({
+                "client_id": item.get("clientId"),
+                "display_name": item.get("displayName"),
+                "device_type": item.get("deviceType"),
+                "platform": item.get("platform"),
+                "device_model": item.get("deviceModel"),
+                "app_version": item.get("appVersion"),
+                "last_seen_at": item.get("lastSeenAt"),
+            })
+        return (devices[:CODEX_DEVICE_LIMIT], None)
+    return codex_cached("devices", fetch)
+
+
+def codex_pairing_state(flow):
+    """The GET body. Starts nothing: a box with no daemon and nothing
+    outstanding costs one `codex login status` (cached) and one
+    `daemon version`."""
+    status = connect_status(flow) if flow["bin"] else (False, "")
+    signed_in = bool(status and status[0])
+    out = {"state": "signed_out", "server_name": None, "code": None,
+           "expires_at": None, "error": None, "devices": [],
+           "devices_error": None}
+    if status is None:
+        out["state"] = "starting"
+        return out
+    if not signed_in:
+        return out
+    kind, info, sock = codex_status(flow)
+    with _codex_lock:
+        rec = dict(_codex_pairing)
+    if kind == "ok":
+        out["server_name"] = info.get("serverName")
+        env_id = info.get("environmentId")
+        if env_id:
+            out["devices"], out["devices_error"] = codex_devices(sock, env_id)
+    now = time.time()
+    if rec["error"]:
+        out.update(state="failed", error=rec["error"])
+    elif kind == "error":
+        out.update(state="failed", error=info)
+    elif kind == "down":
+        began = rec["started_at"]
+        if began is not None and time.monotonic() - began > CODEX_STARTING_GRACE:
+            out.update(state="failed",
+                       error="Codex remote control did not start")
+        elif began is not None:
+            out["state"] = "starting"
+        else:
+            out["state"] = "ready"
+    elif info.get("status") == "errored":
+        out.update(state="failed", error="Codex remote control reported an error")
+    elif info.get("status") == "connecting":
+        out["state"] = "starting"
+    elif rec["claimed"]:
+        out["state"] = "claimed"
+    elif rec["manual_code"] is None:
+        out["state"] = "ready"
+    elif now >= (rec["expires_at"] or 0):
+        out["state"] = "expired"
+    else:
+        # At most one pairing/status per CODEX_CACHE_TTL, and only here.
+        claimed = False
+        with _codex_lock:
+            due = time.monotonic() - _codex_pairing["last_poll"] >= CODEX_CACHE_TTL
+            if due:
+                _codex_pairing["last_poll"] = time.monotonic()
+        if due:
+            try:
+                answer = codex_rc_rpc(sock, "remoteControl/pairing/status",
+                                      {"manualPairingCode": rec["manual_code"]})
+                claimed = bool((answer or {}).get("claimed"))
+            except CodexRpcError:
+                claimed = False
+        if claimed:
+            with _codex_lock:
+                if _codex_pairing["manual_code"] == rec["manual_code"]:
+                    _codex_pairing.update(claimed=True, manual_code=None,
+                                          expires_at=None)
+                    _codex_cache["devices"] = None
+            out["state"] = "claimed"
+        else:
+            with _codex_lock:
+                now_claimed = _codex_pairing["claimed"]
+            if now_claimed:
+                out["state"] = "claimed"
+            else:
+                out.update(state="waiting", code=rec["manual_code"],
+                           expires_at=rec["expires_at"])
+    return out
+
+
+def codex_pairing_start(flow):
+    """POST .../pairing/start. Returns (http status, text)."""
+    status = connect_status(flow)
+    if not (status and status[0]):
+        return 409, "Codex is not signed in."
+    with _codex_lock:
+        if time.monotonic() - _codex_pairing["last_start"] < CODEX_START_MIN_INTERVAL:
+            return 429, "A pairing code was just requested. Wait a few seconds."
+        _codex_pairing["last_start"] = time.monotonic()
+        _codex_pairing.update(manual_code=None, environment_id=None,
+                              expires_at=None, claimed=False, error=None,
+                              started_at=time.monotonic())
+        _codex_cache["status"] = _codex_cache["devices"] = None
+    try:
+        # One rc session owns the daemon; the supervisor starts it within a
+        # few seconds. Two would kill each other's daemon (issue #159).
+        ensure_harness_session("codex", remote_control=True, only_rc=True,
+                               raise_capacity=True)
+    except SessionCapacityError as exc:
+        with _codex_lock:
+            _codex_pairing["started_at"] = None
+        return 503, str(exc)
+    deadline = time.monotonic() + CODEX_DAEMON_WAIT
+    while True:
+        with _codex_lock:
+            _codex_cache["status"] = None
+        kind, info, sock = codex_status(flow)
+        if kind == "ok" and info.get("status") == "connected":
+            break
+        if kind == "ok" and info.get("status") == "disabled":
+            try:
+                codex_rc_rpc(sock, "remoteControl/enable")
+            except CodexRpcError:
+                pass
+        if time.monotonic() >= deadline:
+            return 303, ""      # the GET says starting, then failed
+        time.sleep(0.5)
+    try:
+        result = codex_rc_rpc(sock, "remoteControl/pairing/start",
+                              {"manualCode": True})
+    except CodexRpcError as exc:
+        with _codex_lock:
+            _codex_pairing["error"] = str(exc)
+        return 303, ""
+    code = (result or {}).get("manualPairingCode")
+    with _codex_lock:
+        if code:
+            _codex_pairing.update(
+                manual_code=code, expires_at=(result or {}).get("expiresAt"),
+                environment_id=(result or {}).get("environmentId"))
+        else:
+            _codex_pairing["error"] = "Codex returned no manual pairing code"
+    return 303, ""
+
+
+def codex_pairing_cancel():
+    with _codex_lock:
+        _codex_pairing.update(manual_code=None, environment_id=None,
+                              expires_at=None, claimed=False, error=None,
+                              started_at=None)
+
+
+def codex_device_revoke(flow, client_id):
+    """Returns (http status, text)."""
+    kind, info, sock = codex_status(flow)
+    if kind != "ok" or not info.get("environmentId"):
+        return 404, "Codex remote control is not running."
+    with _codex_lock:
+        _codex_cache["devices"] = None
+    devices, _ = codex_devices(sock, info["environmentId"])
+    if client_id not in {d["client_id"] for d in devices}:
+        return 404, "No such device."
+    try:
+        codex_rc_rpc(sock, "remoteControl/client/revoke", {
+            "environmentId": info["environmentId"], "clientId": client_id})
+    except CodexRpcError as exc:
+        return 502, str(exc)
+    with _codex_lock:
+        _codex_cache["devices"] = None
+    return 303, ""
 
 
 def relogin_notice(flow_id):
@@ -25469,6 +25912,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self._send_json({"ok": True, "source": source, "secret": secret})
             return
+        # Codex pairing state as JSON (issue #780): the manual code, whether
+        # it was claimed, and the paired devices. The code is a credential
+        # for this box's Codex, so it is only ever in this response (and
+        # _send_json says no-store), never in a log or a file. 404 where the
+        # Connections card for codex would not exist either.
+        if parsed.path.rstrip("/") == BASE + "/codex/pairing":
+            flow = connect_flow("codex")
+            if flow is None:
+                self._send_json({"ok": False}, status=404)
+            else:
+                self._send_json({"ok": True, "pairing": codex_pairing_state(flow)})
+            return
         if parsed.path.rstrip("/") == BASE + "/connect":
             wanted = (params.get("flow", [""])[0]).strip()
             if not wanted:
@@ -25684,6 +26139,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             self._redirect("ok=saved")
+        elif path in (BASE + "/codex/pairing/start",
+                      BASE + "/codex/pairing/cancel",
+                      BASE + "/codex/devices/revoke"):
+            # Codex pairing from a portal (issue #780). Same admission as
+            # /connect, and the same answer shape: 303 on success so the
+            # caller re-reads the GET, a short free-text reason otherwise.
+            flow = connect_flow("codex")
+            if flow is None or not flow["bin"]:
+                self._send_json({"ok": False, "error": "Codex is not installed."},
+                                status=404 if flow is None else 409)
+                return
+            if path.endswith("/pairing/cancel"):
+                codex_pairing_cancel()
+                self._redirect()
+                return
+            if path.endswith("/pairing/start"):
+                code, text = codex_pairing_start(flow)
+            else:
+                client_id = (form.get("client_id", [""])[0]).strip()
+                if not CODEX_CLIENT_ID_RE.match(client_id):
+                    self._send_json({"ok": False, "error": "No such device."},
+                                    status=404)
+                    return
+                code, text = codex_device_revoke(flow, client_id)
+            if code == 303:
+                self._redirect()
+            else:
+                self._send_json({"ok": False, "error": text}, status=code)
         elif path.startswith(BASE + "/connect/"):
             # Guided sign-in (issues #207, #208, #313). All three verbs
             # act on ONE tmux session per flow and store nothing here, so
