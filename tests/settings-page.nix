@@ -277,6 +277,8 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
   };
 
   testScript = ''
+    import json
+
     start_all()
     machine.wait_for_unit("caddy.service")
     machine.wait_for_unit("agent-box@agent.service")
@@ -860,6 +862,134 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     # No kid at all still works: the contract makes it advisory, and the box
     # then tries every Ed25519 key in the set.
     handoff(f"{mint} '{{\"kid\": null, \"jti\": \"nokid\"}}'", "303")
+
+    # -- portalUser compare-and-swap (issue #774) -----------------------
+    #
+    # A different route, under a different signing audience and action
+    # claim, so neither an ordinary handover token, nor this box's own
+    # session cookie or web password, can reach it: a control plane
+    # authenticates with its own bearer credential, and everything the
+    # operation acts on -- from, to, its own idempotency key -- is read
+    # out of THAT token, never the request body, which the route drains
+    # but never parses.
+    def admin_token(sub, frm, jti, act="portal-user-transfer",
+                    aud="agent-box-portal-user", key_cmd=mint):
+        """Mint a portalUser-transfer management token. frm=None omits
+        the `from` claim entirely, for the "missing from" case below."""
+        fields = {"sub": sub, "jti": jti, "act": act, "aud": aud}
+        if frm is not None:
+            fields["from"] = frm
+        return machine.succeed(f"{key_cmd} '{json.dumps(fields)}'").strip()
+
+    def transfer(token, expect):
+        """POST a minted transfer token as a bearer credential, and assert."""
+        return client.succeed(
+            f"{curl} -sS -o /tmp/xfer -D /tmp/xferh -w '%{{http_code}}' "
+            f"-H 'Authorization: Bearer {token}' -X POST "
+            f"https://box.test/agent/auth/portal-user | grep -x {expect}"
+        )
+
+    # No credential at all.
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST "
+        "https://box.test/agent/auth/portal-user | grep -x 401"
+    )
+    # Neither the session cookie nor the web password reach it -- this is a
+    # control-plane credential, not a browser one.
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST "
+        f"-H 'Cookie: __Host-agent_box_session_agent={session}' "
+        "https://box.test/agent/auth/portal-user | grep -x 401"
+    )
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' -X POST "
+        "https://box.test/agent/auth/portal-user | grep -x 401"
+    )
+    # A genuine, current, correctly-signed HANDOVER token is refused too --
+    # the audience is what separates what a signature AUTHORIZES, and a
+    # handoff token's aud is "agent-box", not this route's.
+    handoff_token = machine.succeed(mint).strip()
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' -X POST "
+        f"-H 'Authorization: Bearer {handoff_token}' "
+        "https://box.test/agent/auth/portal-user | grep -x 401"
+    )
+    # Right audience, wrong action claim -- in case the portal ever signs a
+    # second kind of token under this same audience.
+    transfer(
+        admin_token("usr_next", "usr_2Nk9x", "xfer-wrong-act",
+                    act="something-else"),
+        "401")
+    # No `from` claim at all.
+    transfer(admin_token("usr_next", None, "xfer-no-from"), "401")
+    # from == to is a bad request, not a no-op swap.
+    transfer(
+        admin_token("usr_2Nk9x", "usr_2Nk9x", "xfer-same"),
+        "400")
+    # A genuine signature is not authorization for THIS action either --
+    # same forgery proof as the handoff route, same reason.
+    transfer(
+        admin_token("usr_next", "usr_2Nk9x", "xfer-forged",
+                    key_cmd="MINT_KEY=/etc/agent-box-portal/other.pem "
+                            "agent-box-mint"),
+        "401")
+
+    # A real transfer: this box's declared usr_2Nk9x hands off to usr_next.
+    transfer(admin_token("usr_next", "usr_2Nk9x", "xfer-1"), "200")
+
+    # The OLD identity is refused a new handover immediately...
+    handoff(f"{mint}", "403")
+    # ...and the session minted for it BEFORE the transfer is refused too,
+    # through the real forward_auth path -- not merely deleted from disk,
+    # but rejected on every subsequent use (the daemon's own per-request
+    # check, not only the transfer's one-time sweep).
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' "
+        f"-H 'Cookie: __Host-agent_box_session_agent={session}' "
+        "https://box.test/ | grep -x 401"
+    )
+    # The NEW identity can complete a handover.
+    handoff(f"{mint} '{{\"sub\": \"usr_next\", \"jti\": \"xfer-new-handoff\"}}'",
+            "303")
+
+    # A conflicting attempt -- a stale `from` that no longer matches the
+    # CURRENT identity -- is refused, and changes nothing.
+    transfer(admin_token("usr_third", "usr_2Nk9x", "xfer-stale"), "409")
+
+    # Repeating the exact same request (a fresh token, same from/to/jti) is
+    # successful and makes no additional change -- the safe retry a caller
+    # that got no answer the first time around is expected to make.
+    transfer(admin_token("usr_next", "usr_2Nk9x", "xfer-1"), "200")
+
+    # The mapping survives a daemon restart. No unit restart, and certainly
+    # no `agentbox apply`, is needed to make a transfer effective, but one
+    # must not UNDO it either.
+    machine.succeed("systemctl restart agent-box-settings@agent.service")
+    machine.wait_for_unit("agent-box-settings@agent.service")
+    handoff(f"{mint} '{{\"sub\": \"usr_2Nk9x\", \"jti\": \"post-restart-old\"}}'",
+            "403")
+    handoff(f"{mint} '{{\"sub\": \"usr_next\", \"jti\": \"post-restart-new\"}}'",
+            "303")
+
+    # Transfer back, leaving the box in the configuration the rest of this
+    # suite -- and a freshly deployed one -- assumes.
+    transfer(admin_token("usr_2Nk9x", "usr_next", "xfer-back"), "200")
+    handoff(f"{mint} '{{\"jti\": \"post-restore\"}}'", "303")
+    # ABA: the identity is back at usr_2Nk9x, so a replay of the FIRST
+    # transfer (same request id) matches its `from` again. It is spent,
+    # and must not move the identity back to usr_next.
+    transfer(admin_token("usr_next", "usr_2Nk9x", "xfer-1"), "409")
+    handoff(f"{mint} '{{\"jti\": \"post-replay\"}}'", "303")
+
+    # A damaged identity file fails CLOSED: the box does not fall back to
+    # the declared portalUser, and a transfer is refused with 503.
+    idfile = "/home/agent/.config/agent-box/web-sessions/identity/current.json"
+    machine.succeed(f"cp {idfile} /tmp/current.json.good")
+    machine.succeed(f"runuser -u agent -- sh -c 'printf \"{{trunc\" > {idfile}'")
+    transfer(admin_token("usr_next", "usr_2Nk9x", "xfer-corrupt"), "503")
+    machine.succeed(f"cp /tmp/current.json.good {idfile}")
+    machine.succeed(f"chown agent: {idfile}")
+    handoff(f"{mint} '{{\"jti\": \"post-corrupt-restore\"}}'", "303")
 
     # A forged session cookie is refused -- and the refusal CLEARS it and
     # asks for a password, so an expired session degrades to the normal

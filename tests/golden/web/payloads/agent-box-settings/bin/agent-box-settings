@@ -541,6 +541,11 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
 #                                 keys; defaults to the issuer's
 #                                 /.well-known/jwks.json
 #   AGENT_BOX_PORTAL_USER        the portal user id this linux user is
+#                                 provisioned for. A completed portalUser
+#                                 transfer (issue #774) overrides this at
+#                                 runtime from WEB_SESSION_DIR/identity/,
+#                                 without needing this variable, or the
+#                                 unit's environment, to change at all.
 #   AGENT_BOX_PORTAL_PROJECT     the portal project id this linux user is
 #   AGENT_BOX_WEB_SESSION_DIR    where minted sessions and spent token
 #                                 ids live (default: beside the env file)
@@ -794,14 +799,14 @@ TOKEN_MAX_BYTES = 16384
 # bound is not a token anybody sends by mistake, so it is refused unread,
 # 502 race and all.
 HANDOFF_DRAIN_MAX_BYTES = 1 << 20
-# The handover mapping is only usable when every piece is present. A box
-# with no portal keys serves no handover route at all, which keeps the
-# unauthenticated endpoint off boxes that were never provisioned for it.
-# PORTAL_PROJECT is deliberately NOT required: it narrows an already-valid
-# mapping, it does not create one. `portalUser` is a specific portal account,
-# so a box declaring only that admits exactly that account and nobody else.
-PORTAL_HANDOFF = bool(
-    PORTAL_ISSUER and PORTAL_JWKS_URL and PORTAL_USER and WEB_SESSION_DIR)
+# Whether the handover route is usable at all is decided by
+# portal_handoff_enabled() (issue #774): a box with no portal keys, or with
+# no CURRENT portal user (nothing declared and no transfer has ever set
+# one), serves no handover route, which keeps the unauthenticated endpoint
+# off boxes that were never provisioned for it. It is a function rather
+# than a constant because a portalUser transfer can change the answer
+# without a daemon restart. PORTAL_PROJECT is deliberately never part of
+# that gate: it narrows an already-valid mapping, it does not create one.
 
 
 def webhook_unavailable():
@@ -8494,8 +8499,16 @@ def portal_jwks_pems(keys, kid=""):
     return [pem for pem in pems if pem]
 
 
-def portal_claims(token):
-    """Verify a handover token and return its claims, or raise ValueError.
+def portal_claims(token, expected_aud="agent-box"):
+    """Verify a portal-signed token and return its claims, or raise
+    ValueError.
+
+    `expected_aud` separates what this signature is FOR: a handover token
+    (the default, "agent-box") authorizes establishing a session for the
+    `sub` it names, where a portal-user-transfer token (see
+    portal_admin_claims) authorizes changing WHICH portal user this linux
+    user answers to. Both are signed with the same key, so the audience is
+    the only thing stopping one from being replayed as the other.
 
     The message is deliberately coarse. A caller on this route is
     unauthenticated, so telling it WHICH check failed would let it tune a
@@ -8533,7 +8546,7 @@ def portal_claims(token):
     aud = payload.get("aud")
     if isinstance(aud, list):
         aud = aud[0] if len(aud) == 1 else None
-    if aud != "agent-box":
+    if aud != expected_aud:
         # A constant audience, not this box's hostname — the token is scoped
         # to a user and a project, not to a box (#541). What it separates is
         # a HANDOVER token from every other token the portal signs with the
@@ -8588,7 +8601,7 @@ def portal_record_path(kind, value):
     return os.path.join(portal_dir(kind), digest + ".json")
 
 
-def portal_spend_jti(jti, exp):
+def portal_spend_jti(jti, exp, kind="spent"):
     """Record a token id as spent. False if it was already spent.
 
     O_EXCL is the whole mechanism: two concurrent posts of one token race
@@ -8600,7 +8613,7 @@ def portal_spend_jti(jti, exp):
     longer spent, and the same token could mint a SECOND session — the one
     thing single-use exists to stop.
     """
-    path = portal_record_path("spent", jti)
+    path = portal_record_path(kind, jti)
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
@@ -8620,7 +8633,7 @@ def portal_prune(now=None):
     when it is read, so this only bounds the directory.
     """
     now = int(time.time()) if now is None else now
-    for kind in ("sessions", "spent"):
+    for kind in ("sessions", "spent", "transfer-spent"):
         try:
             names = os.listdir(portal_dir(kind))
         except OSError:
@@ -8639,6 +8652,28 @@ def portal_prune(now=None):
                     os.unlink(path)
 
 
+def portal_write_json_atomic(path, record, prefix):
+    """Write `record` to `path` 0600: a reader sees the whole old document
+    or the whole new one, and both file and directory are fsynced."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=prefix)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(record, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        dfd = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def portal_session_new(claims):
     """Mint a box session for verified claims and return its cookie value."""
     value = secrets.token_urlsafe(32)
@@ -8652,16 +8687,7 @@ def portal_session_new(claims):
         "expires": now + SESSION_TTL,
     }
     path = portal_record_path("sessions", value)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".session.")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            json.dump(record, handle)
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
+    portal_write_json_atomic(path, record, ".session.")
     return value
 
 
@@ -8670,6 +8696,14 @@ def portal_session_ok(value):
 
     The browser's Max-Age is a hint it is free to ignore; this record is
     what a session actually is, so a cookie that outlives it is refused.
+
+    Also decided here (issue #774): a session is only live for the portal
+    user this box CURRENTLY answers to. A completed transfer's
+    portal_revoke_sessions already deletes the old identity's records up
+    front, but a handoff racing that same transfer could mint one in the
+    narrow window between that scan and the new mapping being published --
+    this per-use check is what catches that one too, rather than relying
+    on the one-time scan alone.
     """
     if not value or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", value):
         return False
@@ -8677,9 +8711,10 @@ def portal_session_ok(value):
         with open(portal_record_path("sessions", value)) as handle:
             record = json.load(handle)
         expires = int(record.get("expires", 0))
+        sub = record.get("sub")
     except (OSError, ValueError, TypeError, AttributeError):
         return False
-    if expires <= int(time.time()):
+    if expires <= int(time.time()) or sub != portal_user_current():
         with contextlib.suppress(OSError):
             os.unlink(portal_record_path("sessions", value))
         return False
@@ -8699,6 +8734,183 @@ def portal_cookie_value(header):
         if key == name:
             return value
     return ""
+
+
+# --- Compare-and-swap the portalUser identity (issue #774) ------------
+# AGENT_BOX_PORTAL_USER is read once, at process start, from whatever the
+# unit's environment declared. That is fine for a box provisioned once for
+# one account, but a control plane that recycles a warm box -- provision it
+# under an internal, non-login identity, then hand it to the first paying
+# customer -- has no narrow way to change that mapping: today it would have
+# to rewrite host configuration and re-run `agentbox apply`, or redeploy.
+#
+# This section adds that lever, authenticated by the same portal signing
+# key as a handover token but under a DIFFERENT audience and action claim,
+# so neither a handover token nor any other token the portal signs can
+# reach it. The new mapping lives in a small state file under
+# WEB_SESSION_DIR rather than in the process environment, so it takes
+# effect immediately -- no unit restart, no `agentbox apply` -- and survives
+# both a daemon restart and a host reboot, because it is read fresh on
+# every request rather than cached at import time.
+PORTAL_ADMIN_AUD = "agent-box-portal-user"
+PORTAL_IDENTITY_LOCK_WAIT = 10
+
+
+class PortalTransferBusy(Exception):
+    """Raised by portal_identity_lock instead of running the body."""
+
+
+def portal_configured():
+    """True once this box has portal integration set up at all.
+
+    Independent of the CURRENT portalUser, which portal_user_current() may
+    report as empty on a box provisioned for handover but never yet
+    assigned an identity -- deliberately so, since bootstrapping that first
+    identity through this same compare-and-swap (from "" to the internal
+    pool identity) is a legitimate use of it.
+    """
+    return bool(PORTAL_ISSUER and PORTAL_JWKS_URL and WEB_SESSION_DIR)
+
+
+def portal_identity_path():
+    return os.path.join(portal_dir("identity"), "current.json")
+
+
+def portal_identity_read():
+    """{} if never written; None if present but unusable (fail closed)."""
+    try:
+        with open(portal_identity_path()) as handle:
+            record = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def portal_identity_write(sub, request_id):
+    """Atomically replace the persisted identity mapping.
+
+    Same tempfile-in-directory + os.replace dance as portal_session_new:
+    a reader either sees the whole old document or the whole new one.
+    """
+    path = portal_identity_path()
+    record = {"sub": sub, "requestId": request_id, "updated": int(time.time())}
+    portal_write_json_atomic(path, record, ".identity.")
+
+
+def portal_user_current():
+    """The portalUser this box currently answers to.
+
+    A completed transfer (see _portal_user_transfer) overrides whatever
+    AGENT_BOX_PORTAL_USER the unit's environment declared at process
+    start; absent one, that declared value is the whole mapping, exactly
+    as it was before issue #774.
+    """
+    record = portal_identity_read()
+    if record is None:
+        return ""
+    sub = record.get("sub")
+    if isinstance(sub, str) and sub:
+        return sub
+    return PORTAL_USER
+
+
+def portal_handoff_enabled():
+    """Whether /auth/handoff and /auth/verify serve this user at all."""
+    return bool(portal_configured() and portal_user_current())
+
+
+@contextlib.contextmanager
+def portal_identity_lock():
+    """Serialize one read-decide-write of the identity mapping.
+
+    Same shape as sessions_lock (issue #254), for the same reason: a
+    compare-and-swap that ran unlocked could let two concurrent transfer
+    requests both read "current == from" and both believe they won, with
+    the second write silently discarding the first's revocation. Fails
+    CLOSED -- a lock that cannot be taken refuses the request rather than
+    running it unlocked.
+    """
+    path = portal_identity_path() + ".lock"
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        lock = open(path, "a", encoding="utf-8")
+    except OSError as exc:
+        raise PortalTransferBusy(
+            "cannot open %s: %s" % (path, exc.strerror or exc))
+    try:
+        deadline = time.monotonic() + PORTAL_IDENTITY_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise PortalTransferBusy(
+                        "timed out after %ss waiting for %s: %s"
+                        % (PORTAL_IDENTITY_LOCK_WAIT, path,
+                           exc.strerror or exc))
+                time.sleep(0.05)
+    except BaseException:
+        lock.close()
+        raise
+    try:
+        yield
+    finally:
+        lock.close()
+
+
+def portal_revoke_sessions(sub):
+    """Unlink every live session record minted for `sub`.
+
+    Same directory portal_prune already scans, the same way: there is no
+    index from a portal user id to its sessions, and adding one is more
+    state to keep consistent for a path this rare. Missing or unreadable
+    records are left for portal_prune, same as there.
+    """
+    try:
+        names = os.listdir(portal_dir("sessions"))
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(portal_dir("sessions"), name)
+        try:
+            with open(path) as handle:
+                record = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if record.get("sub") == sub:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+
+
+def portal_admin_claims(token):
+    """Verify a portalUser-transfer management token; see portal_claims.
+
+    A separate audience from "agent-box" (used by handover tokens) means
+    an ordinary handover token -- or any other token the portal signs with
+    the same key for a different purpose -- cannot reach this route no
+    matter who holds it; the `act` claim narrows it further, in case the
+    portal ever signs a second kind of token under this same audience.
+    `from` is validated the same way portal_claims already validates
+    `sub`: a length bound only, matching web.portalUser, which is an
+    opaque string with no charset rule of its own.
+
+    Returns the verified payload with `to` and `requestId` added as
+    aliases for `sub` and `jti` -- the same claims a handover token
+    carries, read here for a different purpose (the identity to move TO,
+    and this request's own idempotency key).
+    """
+    payload = portal_claims(token, expected_aud=PORTAL_ADMIN_AUD)
+    if payload.get("act") != "portal-user-transfer":
+        raise ValueError("wrong action")
+    from_sub = payload.get("from")
+    if not isinstance(from_sub, str) or len(from_sub) > 256:
+        raise ValueError("missing or malformed from")
+    payload["to"] = payload["sub"]
+    payload["requestId"] = payload["jti"]
+    return payload
 
 
 # --- The file drop at /<user>/downloads/ (issues #132, #630) ----------
@@ -9456,7 +9668,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # and each user's daemon serves its own, so the URL has already named
         # the linux user before any claim is read. That is what lets `project`
         # be optional without becoming ambiguous.
-        if claims["sub"] != PORTAL_USER:
+        if claims["sub"] != portal_user_current():
             self._send_html(
                 "<h1>403</h1><p>This box does not host that account.</p>",
                 status=403)
@@ -9497,6 +9709,117 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _portal_user_transfer(self):
+        """POST /<user>/auth/portal-user -- compare-and-swap the portal
+        identity this linux user answers to (issue #774).
+
+        Authenticated by a portal-signed management token in the
+        Authorization header, under its own audience and action claim --
+        never by the session cookie, the web password, or a handover
+        token, all of which are bearer credentials for the CURRENT
+        identity rather than for changing it. The request body carries no
+        authority: every fact this operation acts on (from, to, its own
+        idempotency key) comes out of the verified token, so nothing a
+        caller puts in the body -- forged or not -- can change what this
+        does. It is read and discarded only to keep the connection
+        well-behaved.
+
+        One message for every authentication failure, as in
+        _portal_handoff and for the same reason: the caller here presents
+        its own credential rather than riding a browser's, but it is still
+        a caller that must not be able to tune a token against the box one
+        check at a time.
+        """
+        declared = int(self.headers.get("Content-Length", "0") or "0")
+        if declared > TOKEN_MAX_BYTES:
+            if declared <= HANDOFF_DRAIN_MAX_BYTES:
+                self.rfile.read(declared)
+            else:
+                self.close_connection = True
+            self._send_json({"ok": False, "reason": "too large"}, status=413)
+            return
+        if declared:
+            self.rfile.read(declared)
+        if not portal_configured():
+            self._send_json({"ok": False, "reason": "not found"}, status=404)
+            return
+        scheme, _, token = self.headers.get(
+            "Authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            self._send_json(
+                {"ok": False, "reason": "unauthorized"}, status=401)
+            return
+        try:
+            claims = portal_admin_claims(token)
+        except ValueError:
+            self._send_json(
+                {"ok": False, "reason": "unauthorized"}, status=401)
+            return
+        from_sub = claims["from"]
+        to_sub = claims["to"]
+        request_id = claims["requestId"]
+        if from_sub == to_sub:
+            self._send_json(
+                {"ok": False, "reason": "from and to must differ"},
+                status=400)
+            return
+        try:
+            with portal_identity_lock():
+                record = portal_identity_read()
+                if record is None:
+                    # Present but unreadable: refuse rather than guess.
+                    self._send_json(
+                        {"ok": False, "reason": "identity unavailable"},
+                        status=503)
+                    return
+                current_sub = record.get("sub") or PORTAL_USER
+                if (current_sub == to_sub
+                        and record.get("requestId") == request_id):
+                    # Idempotent retry of a transfer already completed --
+                    # including one retried after a crash between the
+                    # revoke below and this response, which is exactly
+                    # when a caller that got no answer would retry.
+                    portal_spend_jti(request_id, int(claims["exp"]),
+                                     "transfer-spent")
+                    self._send_json({"ok": True}, status=200)
+                    return
+                # A token whose transfer already happened is spent, even
+                # when the identity has since come back to its `from`
+                # (X->Y, Y->X, replay of the first): compare-and-swap
+                # alone cannot see that ABA.
+                if os.path.exists(portal_record_path(
+                        "transfer-spent", request_id)):
+                    self._send_json(
+                        {"ok": False, "reason": "conflict"}, status=409)
+                    return
+                if current_sub != from_sub:
+                    self._send_json(
+                        {"ok": False, "reason": "conflict"}, status=409)
+                    return
+                # Revoke BEFORE the mapping is published: a crash in
+                # between leaves the mapping still `from`, so a retry of
+                # this same request re-enters this branch and finishes the
+                # revoke, rather than a crash AFTER the swap leaving some
+                # of `from`'s sessions live under an identity that can no
+                # longer mint new ones but never had its old ones cut off.
+                portal_revoke_sessions(from_sub)
+                portal_identity_write(to_sub, request_id)
+                # Marked AFTER the write: a crash between the two leaves
+                # the idempotent branch above to finish the mark on retry,
+                # where marking first would strand that retry on 409.
+                portal_spend_jti(request_id, int(claims["exp"]),
+                                 "transfer-spent")
+        except PortalTransferBusy:
+            self._send_json({"ok": False, "reason": "busy"}, status=503)
+            return
+        # Non-secret context only: never the bearer token, never a session
+        # value (see portal_session_new / portal_record_path for why those
+        # are never logged either).
+        sys.stderr.write(
+            "agent-box-settings: portal-user transfer %s -> %s "
+            "(request %s)\n" % (from_sub, to_sub, request_id))
+        self._send_json({"ok": True}, status=200)
+
     def _portal_verify(self):
         """Answer caddy's forward_auth subrequest for a session cookie.
 
@@ -9518,7 +9841,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         HttpOnly cookie it already holds is live, which any other route
         would have told it too.
         """
-        if PORTAL_HANDOFF and portal_session_ok(
+        if portal_handoff_enabled() and portal_session_ok(
                 portal_cookie_value(self.headers.get("Cookie", ""))):
             self.send_response(204)
             self.send_header("Content-Length", "0")
@@ -9788,7 +10111,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # exist at all unless the box was provisioned for handover, so an
         # unprovisioned box exposes no unauthenticated endpoint.
         if path == TERM_BASE + "/auth/handoff":
-            if not PORTAL_HANDOFF:
+            if not portal_handoff_enabled():
                 self._read_form()
                 self._send_html("<h1>404</h1>", status=404)
                 return
@@ -9808,6 +10131,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     status=413)
                 return
             self._portal_handoff(self._read_form())
+            return
+        # portalUser compare-and-swap (issue #774), ahead of the CSRF guard
+        # for the same reason as the handoff route above: the caller here
+        # is a control plane presenting its own bearer token, never a
+        # browser carrying this daemon's cookie, so there is no ambient
+        # credential for a cross-site request to ride on.
+        if path == TERM_BASE + "/auth/portal-user":
+            self._portal_user_transfer()
             return
         if not self._same_origin():
             # Drain the request body BEFORE answering: replying 403 and
