@@ -106,6 +106,7 @@ class FakeControlSocket:
                          "deviceModel": "iPhone17,1", "appVersion": "1.2026.270",
                          "lastSeenAt": 1790870000, "osVersion": "26"}]
         self.fail = {}
+        self.delay = {}
         # Protocol violations the fake saw. Recorded rather than asserted:
         # the serving thread swallows errors, so an assert there would pass
         # silently (and Sonar S5779 rightly objects).
@@ -190,6 +191,7 @@ class FakeControlSocket:
                     continue
                 self.check(initialized, "request before initialized")
                 self.calls.append((method, msg.get("params")))
+                time.sleep(self.delay.get(method, 0))
                 # A notification first, as the real server sends them.
                 self.send_frame(conn, {"method": "remoteControl/status/changed",
                                        "params": {}})
@@ -525,6 +527,43 @@ class Pairing(unittest.TestCase):
                     data = handle.read()
                 self.assertNotIn(CODE.encode(), data, path)
                 self.assertNotIn(QR.encode(), data, path)
+
+    # --- review findings (PR #781) --------------------------------------
+
+    def test_a_stopped_rc_session_is_revived_not_waited_on(self):
+        self.write_sessions({"codex": {"agent": "codex", "remoteControl": True,
+                                       "stopped": True}})
+        self.assertEqual(self.post("/codex/pairing/start")[0], 303)
+        self.assertNotIn("stopped", self.sessions()["codex"])
+        self.assertEqual(list(self.sessions()), ["codex"])
+        self.assertEqual(self.get()["state"], "waiting")
+
+    def test_a_crashed_rc_session_says_so_instead_of_timing_out(self):
+        self.write_sessions({"codex": {"agent": "codex", "remoteControl": True,
+                                       "died": 1}})
+        self.control.close()
+        self.assertEqual(self.post("/codex/pairing/start")[0], 303)
+        pairing = self.get()
+        self.assertEqual(pairing["state"], "failed")
+        self.assertIn("crashed", pairing["error"])
+
+    def test_a_cancel_during_a_start_is_not_undone(self):
+        self.control.delay["remoteControl/pairing/start"] = 1.0
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(self.post("/codex/pairing/start")))
+        thread.start()
+        deadline = time.time() + 5
+        while ("remoteControl/pairing/start" not in
+               [name for name, _ in self.control.calls]):
+            self.assertLess(time.time(), deadline)
+            time.sleep(0.05)
+        self.post("/codex/pairing/cancel")
+        thread.join()
+        self.assertEqual(result[0][0], 303)
+        pairing = self.get()
+        self.assertEqual(pairing["state"], "ready")
+        self.assertIsNone(pairing["code"])
 
     # --- the sign-in default -------------------------------------------
 

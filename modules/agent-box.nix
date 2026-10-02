@@ -17284,9 +17284,21 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
         live = capacity_live_checked()
         with sessions_lock():
             sessions, version = load_sessions()
-            if any(isinstance(s, dict) and s.get("agent") == agent
-                   and (not only_rc or s.get("remoteControl") is not False)
-                   for s in sessions.values()):
+            if only_rc:
+                # A stopped rc session is parked, not running, and the
+                # supervisor never starts it by itself: reviving it is what
+                # `agent-box-session restart` does (clear the flag), so do
+                # that rather than wait on a daemon nobody will start.
+                rc = [s for s in sessions.values()
+                      if isinstance(s, dict) and s.get("agent") == agent
+                      and s.get("remoteControl") is not False]
+                if rc and all(s.get("stopped") for s in rc):
+                    rc[0].pop("stopped", None)
+                    write_sessions(sessions, version)
+                if rc:
+                    return
+            elif any(isinstance(s, dict) and s.get("agent") == agent
+                     for s in sessions.values()):
                 return
             name = gen_session_name(agent, sessions)
             capacity_check(sessions, [name], live=live)
@@ -19364,6 +19376,11 @@ _codex_pairing = {
     "manual_code": None, "environment_id": None, "expires_at": None,
     "claimed": False, "error": None, "started_at": None,
     "last_start": 0.0, "last_poll": 0.0,
+    # Bumped by every start and cancel. A start holds no lock while it waits
+    # for the daemon, so it only writes its result if nothing superseded it:
+    # otherwise a cancel in that window would be undone and the cancelled
+    # credential would reappear.
+    "gen": 0,
 }
 _codex_cache = {"status": None, "devices": None}
 
@@ -19525,6 +19542,8 @@ def codex_pairing_start(flow):
         _codex_pairing.update(manual_code=None, environment_id=None,
                               expires_at=None, claimed=False, error=None,
                               started_at=time.monotonic())
+        _codex_pairing["gen"] += 1
+        gen = _codex_pairing["gen"]
         _codex_cache["status"] = _codex_cache["devices"] = None
     try:
         # One rc session owns the daemon; the supervisor starts it within a
@@ -19533,8 +19552,19 @@ def codex_pairing_start(flow):
                                raise_capacity=True)
     except SessionCapacityError as exc:
         with _codex_lock:
-            _codex_pairing["started_at"] = None
+            if _codex_pairing["gen"] == gen:
+                _codex_pairing["started_at"] = None
         return 503, str(exc)
+    if codex_rc_session_crashed():
+        # Its pane is a post-mortem shell, and nothing restarts that by
+        # itself (issue #516): say so rather than time out on a daemon that
+        # is not coming.
+        with _codex_lock:
+            if _codex_pairing["gen"] == gen:
+                _codex_pairing["error"] = (
+                    "The Codex remote control session crashed. Restart it "
+                    "from the sessions list, then try again.")
+        return 303, ""
     deadline = time.monotonic() + CODEX_DAEMON_WAIT
     while True:
         with _codex_lock:
@@ -19549,16 +19579,22 @@ def codex_pairing_start(flow):
                 pass
         if time.monotonic() >= deadline:
             return 303, ""      # the GET says starting, then failed
+        with _codex_lock:
+            if _codex_pairing["gen"] != gen:
+                return 303, ""  # cancelled or superseded while waiting
         time.sleep(0.5)
     try:
         result = codex_rc_rpc(sock, "remoteControl/pairing/start",
                               {"manualCode": True})
     except CodexRpcError as exc:
         with _codex_lock:
-            _codex_pairing["error"] = str(exc)
+            if _codex_pairing["gen"] == gen:
+                _codex_pairing["error"] = str(exc)
         return 303, ""
     code = (result or {}).get("manualPairingCode")
     with _codex_lock:
+        if _codex_pairing["gen"] != gen:
+            return 303, ""      # cancelled meanwhile: keep the code unseen
         if code:
             _codex_pairing.update(
                 manual_code=code, expires_at=(result or {}).get("expiresAt"),
@@ -19568,8 +19604,21 @@ def codex_pairing_start(flow):
     return 303, ""
 
 
+def codex_rc_session_crashed():
+    """True when every remote-control codex session is a post-mortem shell."""
+    try:
+        sessions, _ = load_sessions()
+    except (RegistryUnreadable, RegistryBusy, OSError):
+        return False
+    rc = [s for s in sessions.values()
+          if isinstance(s, dict) and s.get("agent") == "codex"
+          and s.get("remoteControl") is not False]
+    return bool(rc) and all(crashed_status(s) is not None for s in rc)
+
+
 def codex_pairing_cancel():
     with _codex_lock:
+        _codex_pairing["gen"] += 1
         _codex_pairing.update(manual_code=None, environment_id=None,
                               expires_at=None, claimed=False, error=None,
                               started_at=None)
