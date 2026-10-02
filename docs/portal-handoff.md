@@ -320,6 +320,10 @@ Two independent axes.
 
 Deleting the session record file revokes one browser at once.
 
+A third axis exists without touching host configuration at all: §9's
+compare-and-swap revokes every session for the OLD identity as part of
+changing the mapping, immediately and without a reboot or `agentbox apply`.
+
 ## 7. Driving the box after a handover
 
 The cookie §4 mints is not only for a browser. A portal that holds it can render the
@@ -382,3 +386,128 @@ is what a non-browser client sends; a browser posting cross-site is still refuse
 - **Basic auth still works.** It is an independent path that never consults
   the portal or the settings daemon, so a portal outage — or a daemon crash
   loop — can never lock the box owner out of their own machine.
+
+## 9. PortalUser transfer (compare-and-swap)
+
+A second, independent capability on the same daemon: changing WHICH portal
+user this linux user answers to, without rewriting host configuration or
+running `agentbox apply`. Issue
+[#774](https://github.com/defangdevs/agent-box/issues/774). This is what
+lets a control plane provision a box once, under an internal pool identity,
+and later assign it to the first paying customer by flipping the mapping
+alone.
+
+This is not a handover token used differently -- it is a **different
+credential for a different caller**. A handover token authorizes a browser
+to establish a session for the `sub` it already names; this authorizes
+changing what `sub` means on this box at all. Reusing the handover
+audience for both would mean a token good for one is good for the other.
+
+### 9.1 The token
+
+Same shape as §2 -- a compact `EdDSA` JWS, verified against the same
+`portalIssuer` and the same published key set -- with a claim set that marks
+it for this operation and no other:
+
+```json
+{
+  "iss": "https://station.example.com",
+  "aud": "agent-box-portal-user",
+  "act": "portal-user-transfer",
+  "sub": "usr_customer…",
+  "from": "usr_internal_pool…",
+  "iat": 1788700000,
+  "exp": 1788700060,
+  "jti": "01JZ8Q0T5S6P7R8V9W0X1Y2Z3A"
+}
+```
+
+| claim | required | rule the box enforces |
+|---|---|---|
+| `iss` | yes | Exact string match against the box's configured issuer -- same check as §2. |
+| `aud` | yes | MUST be the literal `agent-box-portal-user`. A handover token's `agent-box` is refused here, and this token is refused at `/auth/handoff`. |
+| `act` | yes | MUST be the literal `portal-user-transfer`, so a second kind of token the portal might one day sign under this same audience does not land here by accident. |
+| `sub` | yes | The portal user to transfer **to**. 1–256 chars. |
+| `from` | yes | The portal user this box must **currently** answer to for the swap to apply. 1–256 chars. |
+| `iat`, `exp`, `jti` | yes | Same rules as §2: ≤60 s clock skew, `exp - iat` ≤ 300 s, unique per logical request -- see idempotency below for what "unique" means here. |
+
+Any other claim, including `project`, is ignored: this operation changes an
+identity mapping, not a session, and it is not scoped to a project.
+
+### 9.2 Delivery and authentication
+
+```
+POST https://<box-domain>/<user>/auth/portal-user
+Authorization: Bearer <jwt>
+```
+
+**The request body carries no authority and is never parsed** -- it is read
+only to keep the connection well-behaved, then discarded. Every fact this
+operation acts on (`from`, `to`, its own idempotency key) comes out of the
+verified token. A control plane posts no form and no JSON; the bearer token
+is the whole request.
+
+Authenticated **only** by that token. Explicitly NOT by any of: the session
+cookie a browser holds, this box's HTTP Basic web password, or a handover
+token -- even a genuine, current, correctly-signed one, which a different
+`aud` makes meaningless here. Like §3, this route sits ahead of the
+same-origin/CSRF guard the rest of `/<user>/*` enforces: the caller is a
+control plane presenting its own credential, never a browser riding an
+ambient one.
+
+### 9.3 Semantics: compare-and-swap, not a write
+
+The box holds one persisted mapping (its current `sub`) plus the `jti` of
+the request that last set it. A request is answered from exactly one of
+three outcomes, decided while holding an internal lock so two concurrent
+requests cannot both believe they won:
+
+| current mapping | this request's `from` | this request's `sub` + `jti` | answer |
+|---|---|---|---|
+| equals `from` | — | — | **200.** Swap to `sub`, revoke every session minted under `from` (§9.4), record this `jti`. |
+| equals `sub` already, same `jti` as the recorded one | — | matches the recorded transfer | **200, no change.** A safe retry of a request already completed -- including one retried because the caller never saw the first answer. |
+| anything else | — | — | **409.** The box is not in the state this request assumes. Nothing changes. |
+
+`from == sub` in the same request is refused with **400** before any of the
+above: it is not a meaningful no-op swap, and the box does not guess which
+case was meant.
+
+Unlike a handover token's `jti` (§4, step 5), this request's `jti` is
+**never** burned as spent on its own. Replay protection here is the
+idempotency rule above, which deliberately lets the identical logical
+request succeed twice -- a control plane that times out waiting for an
+answer must be able to retry safely rather than land on a 401 it cannot
+distinguish from a real replay.
+
+### 9.4 What a completed transfer does, atomically
+
+1. **Revoke.** Every session record naming the OLD `sub` is deleted, before
+   the new mapping is published -- so a crash between the two leaves the
+   mapping still on the old identity, and a retry of the same request
+   finishes the revoke rather than risk the reverse: a crash AFTER
+   publishing that leaves some of the old identity's sessions live under a
+   mapping that can no longer mint new ones but never had its existing ones
+   cut off.
+2. **Publish.** The new mapping is written to disk under the same session
+   state directory as §4's sessions and §2.1's key cache -- never to the
+   process environment -- and replaces the old one atomically. It is read
+   fresh on every request rather than cached at process start, which is
+   what makes it effective immediately: no unit restart, no `agentbox
+   apply`, and it is exactly as durable as every other record in that
+   directory, so it survives both a daemon restart and a host reboot.
+3. **Defense in depth.** `portal_session_ok` (§4's session check) also
+   verifies a session's `sub` against the CURRENT mapping on every use, not
+   only at mint time -- so a session that somehow survived step 1 (a
+   handoff racing the transfer in the instant between the revoke scan and
+   the publish) is still refused the next time it is presented, rather than
+   remaining valid until its natural expiry.
+
+### 9.5 Provisioning
+
+Nothing new to configure. This route exists whenever `portalIssuer` and the
+derived or configured JWKS URL are set (§5) -- independent of whether
+`portalUser` itself is declared, since bootstrapping the FIRST identity on a
+box provisioned for handover but not yet assigned one (`from` the empty
+string) is a legitimate use of this same operation. A box with no portal
+integration at all serves no `/auth/portal-user` route, exactly as it
+serves no `/auth/handoff` route.
