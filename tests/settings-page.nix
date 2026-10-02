@@ -908,10 +908,10 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     # A genuine, current, correctly-signed HANDOVER token is refused too --
     # the audience is what separates what a signature AUTHORIZES, and a
     # handoff token's aud is "agent-box", not this route's.
+    handoff_token = machine.succeed(mint).strip()
     client.succeed(
-        f"token=$({mint}); "
         f"{curl} -o /dev/null -w '%{{http_code}}' -X POST "
-        "-H \"Authorization: Bearer $token\" "
+        f"-H 'Authorization: Bearer {handoff_token}' "
         "https://box.test/agent/auth/portal-user | grep -x 401"
     )
     # Right audience, wrong action claim -- in case the portal ever signs a
