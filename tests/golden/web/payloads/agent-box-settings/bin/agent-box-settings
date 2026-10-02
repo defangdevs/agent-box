@@ -432,7 +432,7 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
     """
     try:
         limit = capacity_limit() if limit is None else limit
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
     live = capacity_live_checked() if live is None else set(live)
     pending = {name for name, entry in sessions.items()
