@@ -6312,7 +6312,14 @@ def portal_session_new(claims):
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as handle:
             json.dump(record, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
+        dfd = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -6368,9 +6375,9 @@ def portal_cookie_value(header):
 # --- Compare-and-swap the portalUser identity (issue #774) ------------
 # AGENT_BOX_PORTAL_USER is read once, at process start, from whatever the
 # unit's environment declared. That is fine for a box provisioned once for
-# one account, but a control plane that recycles a warm box — provision it
+# one account, but a control plane that recycles a warm box -- provision it
 # under an internal, non-login identity, then hand it to the first paying
-# customer — has no narrow way to change that mapping: today it would have
+# customer -- has no narrow way to change that mapping: today it would have
 # to rewrite host configuration and re-run `agentbox apply`, or redeploy.
 #
 # This section adds that lever, authenticated by the same portal signing
@@ -6378,7 +6385,7 @@ def portal_cookie_value(header):
 # so neither a handover token nor any other token the portal signs can
 # reach it. The new mapping lives in a small state file under
 # WEB_SESSION_DIR rather than in the process environment, so it takes
-# effect immediately — no unit restart, no `agentbox apply` — and survives
+# effect immediately -- no unit restart, no `agentbox apply` -- and survives
 # both a daemon restart and a host reboot, because it is read fresh on
 # every request rather than cached at import time.
 PORTAL_ADMIN_AUD = "agent-box-portal-user"
@@ -6394,7 +6401,7 @@ def portal_configured():
 
     Independent of the CURRENT portalUser, which portal_user_current() may
     report as empty on a box provisioned for handover but never yet
-    assigned an identity — deliberately so, since bootstrapping that first
+    assigned an identity -- deliberately so, since bootstrapping that first
     identity through this same compare-and-swap (from "" to the internal
     pool identity) is a legitimate use of it.
     """
@@ -6406,15 +6413,15 @@ def portal_identity_path():
 
 
 def portal_identity_read():
-    """The persisted compare-and-swap state, or {} if none was ever written."""
+    """{} if never written; None if present but unusable (fail closed)."""
     try:
         with open(portal_identity_path()) as handle:
             record = json.load(handle)
-        if isinstance(record, dict):
-            return record
+    except FileNotFoundError:
+        return {}
     except (OSError, ValueError):
-        pass
-    return {}
+        return None
+    return record if isinstance(record, dict) else None
 
 
 def portal_identity_write(sub, request_id):
@@ -6430,7 +6437,14 @@ def portal_identity_write(sub, request_id):
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as handle:
             json.dump(record, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
+        dfd = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -6445,7 +6459,10 @@ def portal_user_current():
     start; absent one, that declared value is the whole mapping, exactly
     as it was before issue #774.
     """
-    sub = portal_identity_read().get("sub")
+    record = portal_identity_read()
+    if record is None:
+        return ""
+    sub = record.get("sub")
     if isinstance(sub, str) and sub:
         return sub
     return PORTAL_USER
@@ -6464,7 +6481,7 @@ def portal_identity_lock():
     compare-and-swap that ran unlocked could let two concurrent transfer
     requests both read "current == from" and both believe they won, with
     the second write silently discarding the first's revocation. Fails
-    CLOSED — a lock that cannot be taken refuses the request rather than
+    CLOSED -- a lock that cannot be taken refuses the request rather than
     running it unlocked.
     """
     path = portal_identity_path() + ".lock"
@@ -6524,8 +6541,8 @@ def portal_admin_claims(token):
     """Verify a portalUser-transfer management token; see portal_claims.
 
     A separate audience from "agent-box" (used by handover tokens) means
-    an ordinary handover token — or any other token the portal signs with
-    the same key for a different purpose — cannot reach this route no
+    an ordinary handover token -- or any other token the portal signs with
+    the same key for a different purpose -- cannot reach this route no
     matter who holds it; the `act` claim narrows it further, in case the
     portal ever signs a second kind of token under this same audience.
     `from` is validated the same way portal_claims already validates
@@ -6533,7 +6550,7 @@ def portal_admin_claims(token):
     opaque string with no charset rule of its own.
 
     Returns the verified payload with `to` and `requestId` added as
-    aliases for `sub` and `jti` — the same claims a handover token
+    aliases for `sub` and `jti` -- the same claims a handover token
     carries, read here for a different purpose (the identity to move TO,
     and this request's own idempotency key).
     """
@@ -6541,7 +6558,7 @@ def portal_admin_claims(token):
     if payload.get("act") != "portal-user-transfer":
         raise ValueError("wrong action")
     from_sub = payload.get("from")
-    if not isinstance(from_sub, str) or not 1 <= len(from_sub) <= 256:
+    if not isinstance(from_sub, str) or len(from_sub) > 256:
         raise ValueError("missing or malformed from")
     payload["to"] = payload["sub"]
     payload["requestId"] = payload["jti"]
@@ -7345,17 +7362,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def _portal_user_transfer(self):
-        """POST /<user>/auth/portal-user — compare-and-swap the portal
+        """POST /<user>/auth/portal-user -- compare-and-swap the portal
         identity this linux user answers to (issue #774).
 
         Authenticated by a portal-signed management token in the
-        Authorization header, under its own audience and action claim —
+        Authorization header, under its own audience and action claim --
         never by the session cookie, the web password, or a handover
         token, all of which are bearer credentials for the CURRENT
         identity rather than for changing it. The request body carries no
         authority: every fact this operation acts on (from, to, its own
         idempotency key) comes out of the verified token, so nothing a
-        caller puts in the body — forged or not — can change what this
+        caller puts in the body -- forged or not -- can change what this
         does. It is read and discarded only to keep the connection
         well-behaved.
 
@@ -7401,10 +7418,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             with portal_identity_lock():
                 record = portal_identity_read()
+                if record is None:
+                    # Present but unreadable: refuse rather than guess.
+                    self._send_json(
+                        {"ok": False, "reason": "identity unavailable"},
+                        status=503)
+                    return
                 current_sub = record.get("sub") or PORTAL_USER
                 if (current_sub == to_sub
                         and record.get("requestId") == request_id):
-                    # Idempotent retry of a transfer already completed —
+                    # Idempotent retry of a transfer already completed --
                     # including one retried after a crash between the
                     # revoke below and this response, which is exactly
                     # when a caller that got no answer would retry.

@@ -976,6 +976,16 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     transfer(admin_token("usr_2Nk9x", "usr_next", "xfer-back"), "200")
     handoff(f"{mint} '{{\"jti\": \"post-restore\"}}'", "303")
 
+    # A damaged identity file fails CLOSED: the box does not fall back to
+    # the declared portalUser, and a transfer is refused with 503.
+    idfile = "/home/agent/.config/agent-box/web-sessions/identity/current.json"
+    machine.succeed(f"cp {idfile} /tmp/current.json.good")
+    machine.succeed(f"runuser -u agent -- sh -c 'printf \"{{trunc\" > {idfile}'")
+    transfer(admin_token("usr_next", "usr_2Nk9x", "xfer-corrupt"), "503")
+    machine.succeed(f"cp /tmp/current.json.good {idfile}")
+    machine.succeed(f"chown agent: {idfile}")
+    handoff(f"{mint} '{{\"jti\": \"post-corrupt-restore\"}}'", "303")
+
     # A forged session cookie is refused -- and the refusal CLEARS it and
     # asks for a password, so an expired session degrades to the normal
     # login instead of wedging the browser on a bare 401 it cannot act on.

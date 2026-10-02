@@ -414,8 +414,8 @@ it for this operation and no other:
   "iss": "https://station.example.com",
   "aud": "agent-box-portal-user",
   "act": "portal-user-transfer",
-  "sub": "usr_customer…",
-  "from": "usr_internal_pool…",
+  "sub": "usr_customer...",
+  "from": "usr_internal_pool...",
   "iat": 1788700000,
   "exp": 1788700060,
   "jti": "01JZ8Q0T5S6P7R8V9W0X1Y2Z3A"
@@ -427,9 +427,9 @@ it for this operation and no other:
 | `iss` | yes | Exact string match against the box's configured issuer -- same check as §2. |
 | `aud` | yes | MUST be the literal `agent-box-portal-user`. A handover token's `agent-box` is refused here, and this token is refused at `/auth/handoff`. |
 | `act` | yes | MUST be the literal `portal-user-transfer`, so a second kind of token the portal might one day sign under this same audience does not land here by accident. |
-| `sub` | yes | The portal user to transfer **to**. 1–256 chars. |
-| `from` | yes | The portal user this box must **currently** answer to for the swap to apply. 1–256 chars. |
-| `iat`, `exp`, `jti` | yes | Same rules as §2: ≤60 s clock skew, `exp - iat` ≤ 300 s, unique per logical request -- see idempotency below for what "unique" means here. |
+| `sub` | yes | The portal user to transfer **to**. 1-256 chars. |
+| `from` | yes | The portal user this box must **currently** answer to for the swap to apply. 0-256 chars (empty = a box with no identity yet). |
+| `iat`, `exp`, `jti` | yes | Same rules as §2: <=60 s clock skew, `exp - iat` <= 300 s, unique per logical request -- see idempotency below for what "unique" means here. |
 
 Any other claim, including `project`, is ignored: this operation changes an
 identity mapping, not a session, and it is not scoped to a project.
@@ -464,9 +464,9 @@ requests cannot both believe they won:
 
 | current mapping | this request's `from` | this request's `sub` + `jti` | answer |
 |---|---|---|---|
-| equals `from` | — | — | **200.** Swap to `sub`, revoke every session minted under `from` (§9.4), record this `jti`. |
-| equals `sub` already, same `jti` as the recorded one | — | matches the recorded transfer | **200, no change.** A safe retry of a request already completed -- including one retried because the caller never saw the first answer. |
-| anything else | — | — | **409.** The box is not in the state this request assumes. Nothing changes. |
+| equals `from` | -- | -- | **200.** Swap to `sub`, revoke every session minted under `from` (§9.4), record this `jti`. |
+| equals `sub` already, same `jti` as the recorded one | -- | matches the recorded transfer | **200, no change.** A safe retry of a request already completed -- including one retried because the caller never saw the first answer. |
+| anything else | -- | -- | **409.** The box is not in the state this request assumes. Nothing changes. |
 
 `from == sub` in the same request is refused with **400** before any of the
 above: it is not a meaningful no-op swap, and the box does not guess which
