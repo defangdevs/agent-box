@@ -239,8 +239,8 @@ BY_DESIGN = {
 }
 
 
-# One reason, cited by the four entries below, so it has one home rather
-# than four copies to keep in step. Box-wide only: the per-unit pass
+# One reason, cited by the three entries below, so it has one home rather
+# than three copies to keep in step. Box-wide only: the per-unit pass
 # subtracts everything already declared here, on the reasoning that a
 # one-sided name is one-sided in whatever unit carries it.
 CHECKOUT_GAP = (
@@ -249,19 +249,20 @@ CHECKOUT_GAP = (
     "Not for the reason an earlier draft of this entry gave - that a native "
     "box has no way to make a tree the running system - which stopped being "
     "true when the update became `git pull` on both backends (see "
-    "SRC_TREE_BINDING above). What is left is plumbing: these four are "
+    "SRC_TREE_BINDING above). What is left is plumbing: these three are "
     "PER-USER values, so the native side needs them in Spec, in config.yaml "
     "and in Renderer.user_env, and the one-spec-both-backends check (#451 PR "
     "1) requires the module to export them into the spec it generates "
     "tests/native/config.json from. That is the work; nothing about the "
-    "native model refuses it. Delete these entries when it lands")
+    "native model refuses it. The opt-in AGENT_BOX_CHECKOUT_FORK is absent "
+    "from the default golden config on both backends. Delete these entries "
+    "when it lands")
 
 # Divergences that are BUGS, each owned by an issue. This table must only ever
 # shrink: fixing a gap means deleting its line, and the staleness check below
 # makes that mandatory rather than optional.
 KNOWN_GAPS = {
     "AGENT_BOX_CHECKOUT_DIR": ("module", CHECKOUT_GAP),
-    "AGENT_BOX_CHECKOUT_FORK": ("module", CHECKOUT_GAP),
     "AGENT_BOX_CHECKOUT_REV": ("module", CHECKOUT_GAP),
     "AGENT_BOX_CHECKOUT_URL": ("module", CHECKOUT_GAP),
 }
