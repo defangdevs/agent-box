@@ -6243,7 +6243,7 @@ def portal_record_path(kind, value):
     return os.path.join(portal_dir(kind), digest + ".json")
 
 
-def portal_spend_jti(jti, exp):
+def portal_spend_jti(jti, exp, kind="spent"):
     """Record a token id as spent. False if it was already spent.
 
     O_EXCL is the whole mechanism: two concurrent posts of one token race
@@ -6255,7 +6255,7 @@ def portal_spend_jti(jti, exp):
     longer spent, and the same token could mint a SECOND session — the one
     thing single-use exists to stop.
     """
-    path = portal_record_path("spent", jti)
+    path = portal_record_path(kind, jti)
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
@@ -6275,7 +6275,7 @@ def portal_prune(now=None):
     when it is read, so this only bounds the directory.
     """
     now = int(time.time()) if now is None else now
-    for kind in ("sessions", "spent"):
+    for kind in ("sessions", "spent", "transfer-spent"):
         try:
             names = os.listdir(portal_dir(kind))
         except OSError:
@@ -7431,7 +7431,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # including one retried after a crash between the
                     # revoke below and this response, which is exactly
                     # when a caller that got no answer would retry.
+                    portal_spend_jti(request_id, int(claims["exp"]),
+                                     "transfer-spent")
                     self._send_json({"ok": True}, status=200)
+                    return
+                # A token whose transfer already happened is spent, even
+                # when the identity has since come back to its `from`
+                # (X->Y, Y->X, replay of the first): compare-and-swap
+                # alone cannot see that ABA.
+                if os.path.exists(portal_record_path(
+                        "transfer-spent", request_id)):
+                    self._send_json(
+                        {"ok": False, "reason": "conflict"}, status=409)
                     return
                 if current_sub != from_sub:
                     self._send_json(
@@ -7445,6 +7456,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # longer mint new ones but never had its old ones cut off.
                 portal_revoke_sessions(from_sub)
                 portal_identity_write(to_sub, request_id)
+                # Marked AFTER the write: a crash between the two leaves
+                # the idempotent branch above to finish the mark on retry,
+                # where marking first would strand that retry on 409.
+                portal_spend_jti(request_id, int(claims["exp"]),
+                                 "transfer-spent")
         except PortalTransferBusy:
             self._send_json({"ok": False, "reason": "busy"}, status=503)
             return

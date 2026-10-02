@@ -975,6 +975,11 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     # suite -- and a freshly deployed one -- assumes.
     transfer(admin_token("usr_2Nk9x", "usr_next", "xfer-back"), "200")
     handoff(f"{mint} '{{\"jti\": \"post-restore\"}}'", "303")
+    # ABA: the identity is back at usr_2Nk9x, so a replay of the FIRST
+    # transfer (same request id) matches its `from` again. It is spent,
+    # and must not move the identity back to usr_next.
+    transfer(admin_token("usr_next", "usr_2Nk9x", "xfer-1"), "409")
+    handoff(f"{mint} '{{\"jti\": \"post-replay\"}}'", "303")
 
     # A damaged identity file fails CLOSED: the box does not fall back to
     # the declared portalUser, and a transfer is refused with 503.
