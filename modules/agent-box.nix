@@ -698,6 +698,13 @@ let
     keys are stored in private files under `~/.local/state/local-whatsapp` on this
     box; WhatsApp's end-to-end encryption covers the chat transport.
 
+    Use **Unlink** on the WhatsApp connection card, or run
+    `agent-box-whatsapp unlink`, to stop the bridge and erase its linked-device
+    keys, queued messages and routing state from this box. The optional runtime
+    stays installed so pairing again does not need another download. WhatsApp may
+    continue to list the now-inactive device until it is also removed from the
+    primary phone's Linked devices screen.
+
     WhatsApp has one destination session at a time. From the phone, send
     `@agent /sessions` to list Claude and Codex sessions, then `@agent /target NAME`
     to choose one. `@agent /target auto` clears that choice, so the next message
@@ -5435,9 +5442,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.request import urlopen
 
 
@@ -5454,6 +5463,8 @@ STATE = HOME / ".local/state/local-whatsapp"
 READY = STATE / "ready"
 NODE = HOME / ".nix-profile/bin/node"
 NPM = HOME / ".nix-profile/bin/npm"
+UNLINK_SETTLE = 2.5
+UNLINK_TIMEOUT = 10
 
 
 def private_dir(path):
@@ -5587,6 +5598,45 @@ def activate():
     READY.touch(mode=0o600)
 
 
+def bridge_connected():
+    """Whether the supervised bridge still owns its control socket."""
+    peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        peer.settimeout(1)
+        peer.connect(str(STATE / "bridge.sock"))
+        return True
+    except OSError:
+        return False
+    finally:
+        peer.close()
+
+
+def unlink():
+    """Stop the user bridge and forget this box's linked-device state.
+
+    Removing the ready marker asks the supervisor to stop its child. Wait for
+    that managed process before deleting its credentials and queued messages,
+    or the still-live bridge could write either one back after this returns.
+    The optional runtime stays installed, as every other connection's CLI does
+    after logout, so pairing again does not require another download.
+    """
+    if STATE.is_symlink():
+        raise RuntimeError("WhatsApp state cannot be a symlink")
+    READY.unlink(missing_ok=True)
+    if not STATE.exists():
+        return
+    # The supervisor reconciles every two seconds. An absent socket before one
+    # full tick does not prove a bridge is stopped: it may still be installing
+    # the optional runtime on its way to execing bridge.mjs.
+    time.sleep(UNLINK_SETTLE)
+    deadline = time.monotonic() + UNLINK_TIMEOUT
+    while bridge_connected():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("WhatsApp bridge did not stop; try unlinking again")
+        time.sleep(0.1)
+    shutil.rmtree(STATE)
+
+
 def serve():
     """Refresh the optional runtime, then replace this process with its bridge."""
     if not paired():
@@ -5614,14 +5664,14 @@ def main():
         print(json.dumps({"profile": profile(sys.argv[2])}))
         return
     if len(sys.argv) != 2 or sys.argv[1] not in (
-            "install", "pair", "activate", "serve", "status", "profile"):
+            "install", "pair", "activate", "serve", "status", "profile", "unlink"):
         raise RuntimeError(
-            "usage: agent-box-whatsapp install|pair|activate|serve|status|profile [NAME|default]")
+            "usage: agent-box-whatsapp install|pair|activate|serve|status|profile|unlink [NAME|default]")
     if sys.argv[1] == "profile":
         print(json.dumps({"profile": profile()}))
         return
     {"install": install, "pair": pair, "activate": activate,
-     "serve": serve, "status": status}[sys.argv[1]]()
+     "serve": serve, "status": status, "unlink": unlink}[sys.argv[1]]()
 
 
 if __name__ == "__main__":
@@ -17346,6 +17396,11 @@ def delete_key(key):
     update(ENV_FILE, [], ENV_HEADER, drop=[key])
 
 
+def delete_keys(names):
+    """Remove a group of related secrets in one locked env-store update."""
+    update(ENV_FILE, [], ENV_HEADER, drop=list(names))
+
+
 def profile_path(name):
     return os.path.join(PROFILES_DIR, name + ".env")
 
@@ -19216,6 +19271,8 @@ CONNECT_DEFS = [
                 "Console account.",
         "start": ["auth", "login"],
         "status": ["auth", "status"],
+        "logout": ["auth", "logout"],
+        "remove": ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"),
         "parse": "claude",
         "hosts": ("claude.com", "claude.ai", "anthropic.com"),
         "needs_code": True,
@@ -19234,6 +19291,8 @@ CONNECT_DEFS = [
                 "enter the code shown here.",
         "start": ["login", "--device-auth"],
         "status": ["login", "status"],
+        "logout": ["logout"],
+        "remove": ("OPENAI_API_KEY",),
         "parse": "codex",
         "hosts": ("openai.com", "chatgpt.com"),
         "needs_code": False,
@@ -19257,6 +19316,8 @@ CONNECT_DEFS = [
                   "--git-protocol", "https", "--web",
                   "--scopes", "repo,read:org,workflow"],
         "status": ["auth", "status", "--hostname", "github.com"],
+        "logout": ["auth", "logout", "--hostname", "github.com"],
+        "remove": ("GH_TOKEN", "GITHUB_TOKEN"),
         "parse": "gh",
         "hosts": ("github.com",),
         "needs_code": False,
@@ -19292,6 +19353,8 @@ CONNECT_DEFS = [
         "note": "Opens Defang's secure sign-in page in your browser.",
         "start": ["login", "--non-interactive=false"],
         "status": ["whoami", "--json"],
+        "logout": ["logout", "--non-interactive"],
+        "remove": ("DEFANG_ACCESS_TOKEN",),
         "parse": "defang",
         "hosts": ("defang.io",),
         # The CLI polls the auth server on its own (auth.go's
@@ -19317,6 +19380,8 @@ CONNECT_DEFS = [
                 "also stored on this box for delivery.",
         "start": ["pair"],
         "status": ["status"],
+        "logout": ["unlink"],
+        "remove": ("LOCAL_WHATSAPP_PHONE",),
         "parse": "whatsapp",
         "hosts": (),
         "needs_code": False,
@@ -19335,8 +19400,10 @@ _defang_workspaces_cache = []
 # flow id -> wall-clock time the cached answer's probe STARTED, so an answer
 # can be compared with the sign-in completion marker's mtime (issue #751).
 _connect_probe_began = {}
+_connect_invalidated_at = {}
 _connect_probing = set()
 _connect_lock = threading.Lock()
+_connect_mutation_lock = threading.Lock()
 
 
 def connect_flows():
@@ -19433,7 +19500,7 @@ def connect_status_env(flow):
     return env
 
 
-def connect_run(flow, args, timeout=15):
+def connect_run(flow, args, timeout=15, unset=()):
     """Run one of the flow's own subcommands. None on any failure —
     a missing binary or a hung status call must not 500 the page."""
     # Not installed yet (issue #416): there is nothing to ask, and asking
@@ -19441,9 +19508,12 @@ def connect_run(flow, args, timeout=15):
     if not flow["bin"]:
         return None
     try:
+        env = connect_status_env(flow)
+        for key in unset:
+            env.pop(key, None)
         return subprocess.run(
             [flow["bin"]] + list(args),
-            env=connect_status_env(flow),
+            env=env,
             check=False,
             capture_output=True,
             text=True,
@@ -19577,12 +19647,16 @@ def connect_probe(flow):
                 )
                 value = (True, current)
         with _connect_lock:
-            _connect_status_cache[flow["id"]] = (time.monotonic(), value)
-            _connect_probe_began[flow["id"]] = began
-            if flow["id"] == "defang":
-                # A failed list must not leave another account's choices on
-                # screen after a re-login. The next status refresh retries.
-                _defang_workspaces_cache = workspaces or []
+            # A logout that finished after this probe began invalidated its
+            # answer. Do not let an in-flight pre-logout status overwrite the
+            # empty cache with the credential it saw before removal.
+            if began >= _connect_invalidated_at.get(flow["id"], 0.0):
+                _connect_status_cache[flow["id"]] = (time.monotonic(), value)
+                _connect_probe_began[flow["id"]] = began
+                if flow["id"] == "defang":
+                    # A failed list must not leave another account's choices on
+                    # screen after a re-login. The next status refresh retries.
+                    _defang_workspaces_cache = workspaces or []
     finally:
         with _connect_lock:
             _connect_probing.discard(flow["id"])
@@ -19600,6 +19674,110 @@ def connect_expire(flow_id):
         hit = _connect_status_cache.get(flow_id)
         if hit:
             _connect_status_cache[flow_id] = (0.0, hit[1])
+
+
+def connect_forget(flow_id):
+    """Drop a connection answer and reject probes that predate this call."""
+    with _connect_lock:
+        _connect_invalidated_at[flow_id] = time.time()
+        _connect_status_cache.pop(flow_id, None)
+        _connect_probe_began.pop(flow_id, None)
+
+
+def connect_logout_commands(flow):
+    """Native logout argv lists, or None when they cannot be determined.
+
+    GitHub may keep several accounts for one host, and `gh auth logout`
+    prompts when no user is named. Its structured status output lists every
+    local account without exposing a token, so remove each explicitly. Other
+    providers have one user-level credential store and one logout command.
+    """
+    if flow["id"] != "github":
+        return [flow["logout"]]
+    proc = connect_run(
+        flow, ["auth", "status", "--hostname", "github.com", "--json", "hosts"],
+        unset=flow["remove"])
+    if proc is None or proc.returncode != 0:
+        return None
+    try:
+        accounts = json.loads(proc.stdout or "{}").get("hosts", {}).get("github.com", [])
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(accounts, list):
+        return None
+    logins = []
+    for account in accounts:
+        login = account.get("login") if isinstance(account, dict) else None
+        if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,39}", login):
+            return None
+        if login not in logins:
+            logins.append(login)
+    return [flow["logout"] + ["--user", login] for login in logins]
+
+
+def connect_confirmed_disconnected(flow, proc):
+    """True only when a status answer explicitly says there is no login.
+
+    The normal card parsers intentionally collapse every error into "not
+    connected". That is the safe rendering default, but it is not enough to
+    justify deleting an agent-box API key after a failed logout: a network
+    error, malformed output, or a broken CLI must remain unknown here.
+    """
+    text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip().lower()
+    if flow["id"] == "claude":
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except ValueError:
+            return False
+        return isinstance(data, dict) and data.get("loggedIn") is False
+    if flow["id"] == "codex":
+        return "not logged in" in text
+    if flow["id"] == "github":
+        return "not logged into any github hosts" in text
+    if flow["id"] == "defang":
+        return "missing bearer token" in text
+    if flow["id"] == "whatsapp":
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except ValueError:
+            return False
+        return (proc.returncode == 0 and isinstance(data, dict)
+                and data.get("paired") is False)
+    return False
+
+
+def connect_logout(flow):
+    """Run the provider's logout and remove agent-box overrides.
+
+    Returns None on success or a short user-facing error. The operation is
+    idempotent: a native logout that says there was no stored credential is a
+    success when the provider's own status command agrees. Environment
+    overrides are removed only after that point, so a failed native logout
+    does not silently turn a partial mutation into a reported success.
+    """
+    with _connect_mutation_lock:
+        commands = connect_logout_commands(flow)
+        if commands is None:
+            return "Could not inspect the stored %s sign-in." % flow["label"]
+        for args in commands:
+            proc = connect_run(flow, args, unset=flow["remove"])
+            if proc is None:
+                return "Could not run the %s sign-out command." % flow["label"]
+            if proc.returncode != 0:
+                status = connect_run(flow, flow["status"], unset=flow["remove"])
+                if status is None:
+                    return ("Could not verify whether %s signed out. Try again."
+                            % flow["label"])
+                if not connect_confirmed_disconnected(flow, status):
+                    return ("%s may still be connected; its sign-out command failed."
+                            % flow["label"])
+        try:
+            delete_keys(flow["remove"])
+        except OSError:
+            return ("%s signed out, but its saved agent-box secret could not be "
+                    "removed." % flow["label"])
+        connect_forget(flow["id"])
+        return None
 
 
 def connect_fresh(flow_id):
@@ -20557,6 +20735,10 @@ def connect_state(flow, keys=None, tmux_state=None):
         "shadow": shadow,
         "workspaces": workspaces,
         "workspace_configured": workspace_configured,
+        # WhatsApp remains removable while its stored device is linked but
+        # the bridge is still reconnecting. Other providers expose removal
+        # once their own status command reports the connection live.
+        "removable": connected or (flow_id == "whatsapp" and bool(detail)),
     }
 
 
@@ -24859,10 +25041,26 @@ def render_connect_card(state):
             f'<input type="hidden" name="flow" value="{flow_id}">'
             f'<button type="submit" class="btn small">{label}</button></form>'
         )
+    logout = ""
+    if state.get("removable"):
+        logout_label = "Unlink" if flow_id == "whatsapp" else "Sign out"
+        if flow_id == "whatsapp":
+            question = ("Unlink WhatsApp from this box? This stops the bridge and "
+                        "deletes its linked-device keys, queued messages and routing state.")
+        else:
+            question = ("Sign out of %s on this box? This removes its stored sign-in "
+                        "and matching API keys. Running sessions may need a restart."
+                        % state["label"])
+        logout = (
+            f'<form class="inline" method="post" action="{base}/connect/logout" '
+            f'onsubmit="return confirm(\'{html.escape(question, quote=True)}\');">'
+            f'<input type="hidden" name="flow" value="{flow_id}">'
+            f'<button type="submit" class="btn small danger-btn">{logout_label}</button>'
+            '</form>')
     head = (
         f'<div class="conn-head"><strong>{html.escape(state["label"])}</strong>'
         f'<span class="acts"><span class="state" data-state="{pill[0]}">{pill[1]}</span>'
-        f'{action}</span></div>'
+        f'{action}{logout}</span></div>'
     )
     note = state["note"]
     if not state["installed"] and state["installable"]:
@@ -26853,6 +27051,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "connect_started": ("Sign-in started \u2014 follow the steps under Connections.", "ok"),
         "connect_cancelled": ("Sign-in cancelled.", "ok"),
         "connect_code": ("Code sent \u2014 waiting for the sign-in to finish.", "ok"),
+        "connect_logout": (("Connection removed from this box. Restart any running "
+                            "sessions that were using it."), "ok"),
         "profile_saved": ("Profile saved. Sessions started from now on use it.", "ok"),
         "profile_deleted": (("Profile deleted. Sessions already running keep "
                              "their current settings."), "ok"),
@@ -27522,8 +27722,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # that may already be gone.
             action = path[len(BASE + "/connect/"):]
             flow = connect_flow((form.get("flow", [""])[0]).strip())
-            if flow is None or action not in ("start", "code", "cancel", "configure"):
+            if flow is None or action not in (
+                    "start", "code", "cancel", "configure", "logout"):
                 self._send_html("<h1>404</h1>", status=404)
+                return
+            if action == "logout":
+                error = connect_logout(flow)
+                if error:
+                    self._send_html(render_page(error, kind="error"), status=409)
+                    return
+                self._redirect("ok=connect_logout")
                 return
             if action == "configure":
                 if flow["id"] == "defang":

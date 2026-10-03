@@ -30,11 +30,13 @@ article, and the golden-snapshot check fails if it stops matching.
 """
 import importlib.machinery
 import importlib.util
+import json
 import os
 import pathlib
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 DAEMON = (REPO / "tests" / "golden" / "web" / "payloads"
@@ -68,7 +70,7 @@ def base_state(**overrides):
         "state": "idle", "detail": "", "url": None, "code": None,
         "error": None, "needs_code": True, "installed": True,
         "installable": True, "blocked": False, "destructive": False,
-        "shadow": [],
+        "shadow": [], "removable": False,
     }
     state.update(overrides)
     return state
@@ -126,6 +128,18 @@ class ConnectCardCheckingTest(unittest.TestCase):
         self.assertIn('<button type="submit"', html)
         self.assertNotIn("onsubmit=", html)
 
+    def test_connected_card_offers_confirmed_native_logout(self):
+        page = self.daemon.render_connect_card(
+            base_state(state="connected", removable=True))
+        self.assertIn('action="/settings/connect/logout"', page)
+        self.assertIn("Sign out", page)
+        self.assertIn("danger-btn", page)
+        self.assertIn("Running sessions may need a restart", page)
+
+    def test_idle_card_has_no_logout_action(self):
+        page = self.daemon.render_connect_card(base_state(state="idle"))
+        self.assertNotIn("/connect/logout", page)
+
 
 class WhatsAppConnectTest(unittest.TestCase):
     def setUp(self):
@@ -156,6 +170,114 @@ class WhatsAppConnectTest(unittest.TestCase):
         Proc.stdout = '{"paired": true, "connected": true}'
         self.assertEqual((True, "linked device connected"),
                          self.daemon.parse_whatsapp_status(Proc()))
+
+    def test_linked_but_reconnecting_whatsapp_can_be_unlinked(self):
+        page = self.daemon.render_connect_card(base_state(
+            id="whatsapp", state="idle", detail="device linked; bridge is connecting",
+            removable=True))
+        self.assertIn('action="/settings/connect/logout"', page)
+        self.assertIn("Unlink", page)
+        self.assertIn("queued messages and routing state", page)
+
+
+class ConnectionLogoutTest(unittest.TestCase):
+    def setUp(self):
+        self.daemon = load_daemon()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.daemon.ENV_FILE = os.path.join(self.temp.name, "env")
+        self.daemon._connect_status_cache.clear()
+        self.daemon._connect_probe_began.clear()
+        self.daemon._connect_invalidated_at.clear()
+
+    def flow(self, name="claude"):
+        flow = dict(next(f for f in self.daemon.CONNECT_DEFS if f["id"] == name))
+        flow["bin"] = "/bin/" + flow["binary"]
+        return flow
+
+    def write_env(self, text):
+        with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_builtin_logout_commands_match_each_native_cli(self):
+        commands = {flow["id"]: flow["logout"] for flow in self.daemon.CONNECT_DEFS}
+        self.assertEqual(commands, {
+            "claude": ["auth", "logout"],
+            "codex": ["logout"],
+            "github": ["auth", "logout", "--hostname", "github.com"],
+            "defang": ["logout", "--non-interactive"],
+            "whatsapp": ["unlink"],
+        })
+
+    def test_logout_uses_native_command_without_environment_override(self):
+        self.write_env("ANTHROPIC_API_KEY=secret\nKEEP=yes\n")
+        flow = self.flow()
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs["env"]))
+            return self.daemon.subprocess.CompletedProcess(argv, 0, "", "")
+
+        self.daemon._connect_status_cache["claude"] = (1.0, (True, "account"))
+        with mock.patch.object(self.daemon.subprocess, "run", side_effect=run):
+            self.assertIsNone(self.daemon.connect_logout(flow))
+
+        self.assertEqual([["/bin/claude", "auth", "logout"]], [c[0] for c in calls])
+        self.assertNotIn("ANTHROPIC_API_KEY", calls[0][1])
+        self.assertEqual(["KEEP"], self.daemon.read_keys())
+        self.assertNotIn("claude", self.daemon._connect_status_cache)
+
+    def test_failed_logout_keeps_secret_when_provider_still_connected(self):
+        self.write_env("ANTHROPIC_API_KEY=secret\n")
+        flow = self.flow()
+        replies = [
+            self.daemon.subprocess.CompletedProcess([], 1, "", "logout failed"),
+            self.daemon.subprocess.CompletedProcess(
+                [], 0, '{"loggedIn":true,"email":"still@example.com"}', ""),
+        ]
+        with mock.patch.object(self.daemon.subprocess, "run", side_effect=replies):
+            error = self.daemon.connect_logout(flow)
+        self.assertIn("may still be connected", error)
+        self.assertEqual(["ANTHROPIC_API_KEY"], self.daemon.read_keys())
+
+    def test_failed_logout_keeps_secret_when_status_is_ambiguous(self):
+        self.write_env("ANTHROPIC_API_KEY=secret\n")
+        flow = self.flow()
+        replies = [
+            self.daemon.subprocess.CompletedProcess([], 1, "", "logout failed"),
+            self.daemon.subprocess.CompletedProcess([], 1, "", "network unavailable"),
+        ]
+        with mock.patch.object(self.daemon.subprocess, "run", side_effect=replies):
+            error = self.daemon.connect_logout(flow)
+        self.assertIn("may still be connected", error)
+        self.assertEqual(["ANTHROPIC_API_KEY"], self.daemon.read_keys())
+
+    def test_already_logged_out_is_idempotent_and_removes_override(self):
+        self.write_env("ANTHROPIC_API_KEY=secret\n")
+        flow = self.flow()
+        replies = [
+            self.daemon.subprocess.CompletedProcess([], 1, "", "not logged in"),
+            self.daemon.subprocess.CompletedProcess(
+                [], 0, '{"loggedIn":false,"authMethod":"none"}', ""),
+        ]
+        with mock.patch.object(self.daemon.subprocess, "run", side_effect=replies):
+            self.assertIsNone(self.daemon.connect_logout(flow))
+        self.assertEqual([], self.daemon.read_keys())
+
+    def test_github_logout_names_every_stored_account(self):
+        flow = self.flow("github")
+        answer = self.daemon.subprocess.CompletedProcess([], 0, json.dumps({
+            "hosts": {"github.com": [
+                {"login": "one", "active": True},
+                {"login": "two", "active": False},
+            ]}
+        }), "")
+        with mock.patch.object(self.daemon, "connect_run", return_value=answer):
+            commands = self.daemon.connect_logout_commands(flow)
+        self.assertEqual(commands, [
+            ["auth", "logout", "--hostname", "github.com", "--user", "one"],
+            ["auth", "logout", "--hostname", "github.com", "--user", "two"],
+        ])
 
 
 class ConnectStepOrderTest(unittest.TestCase):

@@ -61,6 +61,10 @@ in
               echo '{"loggedIn":false,"authMethod":"none"}'
             fi
             ;;
+          "auth logout")
+            rm -f ${stateDir}/claude-in
+            : > ${stateDir}/claude-logout
+            ;;
           *) echo "unexpected: $*" >&2; exit 64 ;;
         esac
       '';
@@ -108,6 +112,16 @@ in
             echo "! Failed opening a web browser at https://github.com/login/device"
             ;;
           "auth status")
+            case " $* " in
+              *" --json hosts "*)
+                if [ -e ${stateDir}/gh-in ]; then
+                  echo '{"hosts":{"github.com":[{"login":"stubuser","active":true,"state":"success"}]}}'
+                else
+                  echo '{"hosts":{}}'
+                fi
+                exit 0
+                ;;
+            esac
             # Same precedence the real gh reports: an environment token
             # wins over the stored credential, and the source is named.
             if [ -n "''${GH_TOKEN:-}" ]; then
@@ -118,6 +132,10 @@ in
               echo "You are not logged into any GitHub hosts." >&2
               exit 1
             fi
+            ;;
+          "auth logout")
+            printf '%s\n' "$*" > ${stateDir}/gh-logout
+            rm -f ${stateDir}/gh-in
             ;;
           *) echo "unexpected: $*" >&2; exit 64 ;;
         esac
@@ -159,6 +177,10 @@ in
           "workspace ls")
             [ -e ${stateDir}/defang-in ] || { echo "Error: missing bearer token" >&2; exit 16; }
             echo '[{"name":"Personal","id":"ws-personal","current":true},{"name":"Acme Team","id":"ws-team","current":false}]'
+            ;;
+          "logout --non-interactive")
+            rm -f ${stateDir}/defang-in
+            : > ${stateDir}/defang-logout
             ;;
           *) echo "unexpected: $*" >&2; exit 64 ;;
         esac
@@ -486,6 +508,16 @@ in
             "agent-box-session env rm DEFANG_ACCESS_TOKEN"
         ))
 
+    with subtest("programmatic logout invokes the provider command and is idempotent"):
+        body = get("/agent/settings/")
+        assert 'action="/agent/settings/connect/logout"' in body, body[:800]
+        assert post("/agent/settings/connect/logout", "flow=defang") == "303"
+        wait_state("defang", "idle")
+        machine.succeed("test -e ${stateDir}/defang-logout")
+        # A stale tab or API client can repeat removal after the account is
+        # already gone. The provider status agrees, so this is still success.
+        assert post("/agent/settings/connect/logout", "flow=defang") == "303"
+
     with subtest("sign-in again works on a card that reports signed in"):
         # The card says "Signed in", which is WHY the button is pressed. A
         # cached "connected" must not reap the pane the press just started.
@@ -589,6 +621,12 @@ in
         wait_state("claude", "idle")
 
     with subtest("a hand-set env key still wins, and the card says so"):
+        # Remove every locally stored gh account through non-interactive,
+        # explicitly named native logout calls before exercising env-only auth.
+        assert post("/agent/settings/connect/logout", "flow=github") == "303"
+        wait_state("github", "idle")
+        gh_logout = machine.succeed("cat ${stateDir}/gh-logout")
+        assert "--hostname github.com --user stubuser" in gh_logout, gh_logout
         assert post("/agent/settings/set", "key=GH_TOKEN&value=ghp_manual") == "303"
         body = get("/agent/settings/")
         assert "is set under API keys and secrets" in body
@@ -600,6 +638,11 @@ in
         # authenticate perfectly through this key. The stub reports the
         # source, so the card can be checked for it.
         wait_detail("github", "envuser (GH_TOKEN)")
+        # The same endpoint removes an env-only connection even though gh has
+        # no on-disk account left for its native logout to remove.
+        assert post("/agent/settings/connect/logout", "flow=github") == "303"
+        wait_state("github", "idle")
+        machine.fail("grep '^GH_TOKEN=' /home/agent/.config/agent-box/env")
 
     with subtest("rendering the page never waits on a CLI"):
         # The probes run in a background thread; a render that forked three
