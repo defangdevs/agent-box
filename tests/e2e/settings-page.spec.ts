@@ -185,6 +185,33 @@ test('session, profile and secret editors all collapse on load and open on click
   await expect(page.locator('#profile-editor')).toBeVisible();
 });
 
+test('armored public key pane toggles and copies the rendered key', async ({ browser }) => {
+  const page = await authedPage(browser);
+  await page.goto(SETTINGS_PATH);
+
+  const toggle = page.getByRole('button', { name: 'Show public key' });
+  const pane = page.locator('#gpg-key-pane');
+  const key = page.locator('#gpg-public-key');
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(pane).toBeHidden();
+
+  await toggle.click();
+  await expect(toggle).toHaveText('Hide public key');
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(pane).toBeVisible();
+  await expect(key).toContainText('-----BEGIN PGP PUBLIC KEY BLOCK-----');
+  await expect(key).toContainText('-----END PGP PUBLIC KEY BLOCK-----');
+
+  const copy = page.getByRole('button', { name: 'Copy armored public key' });
+  await copy.click();
+  await expect(copy).toHaveAttribute('data-copied', '1');
+
+  await toggle.click();
+  await expect(toggle).toHaveText('Show public key');
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(pane).toBeHidden();
+});
+
 test('update status reports available commits and links to the GitHub changes', async ({ browser }) => {
   const page = await authedPage(browser);
   const head = '1111111111111111111111111111111111111111';

@@ -75,6 +75,19 @@ a.sess:hover { text-decoration: underline; }
 .icopy[data-copied="1"] .co { display: inline-flex; }
 .icopy[data-copied="1"] { color: #3fb950; }
 .icopy[data-copied="0"] { color: #f85149; }
+/* The armored public key is long enough to deserve its own disclosure pane,
+   but its 64-column body should remain readable and selectable on a phone.
+   pre-wrap only affects display; the copy button reads the pre's textContent,
+   preserving the original armor exactly. */
+.gpg-key-pane { margin-top: 12px; border: 1px solid #30363d;
+                border-radius: 8px; background: #161b22; overflow: hidden; }
+.gpg-key-head { display: flex; align-items: center;
+                justify-content: space-between; gap: 12px;
+                padding: 8px 10px; border-bottom: 1px solid #30363d; }
+.gpg-key-pane pre { box-sizing: border-box; max-height: 320px; margin: 0;
+                    padding: 12px; overflow: auto; color: #e6edf3;
+                    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+                    white-space: pre-wrap; overflow-wrap: anywhere; }
 /* A session row folds open onto its own subscriptions (issue #227), so
    the <li> stops being the flex row and its <summary> becomes one. */
 .tbl li.foldrow { display: block; padding: 0; }

@@ -1320,6 +1320,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 echo "ok: bin/$1 == resolve(src/$2)"
               }
               check_payload agent-box-supervisor supervisor.sh
+              check_payload agent-box-gpg-init gpg-init.sh
               check_payload agent-box-attach attach.sh
               check_payload agent-box-mark-stopped mark-stopped.sh
               check_payload agent-box-spot-monitor spot-monitor.sh
@@ -2237,6 +2238,49 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 tests = ./tests/test-source-tree.sh;
               } ''
               bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # One persistent recipient per Linux-user trust boundary. This is a
+          # native check because the key shape, public export and interrupted
+          # marker recovery need GnuPG itself, not a VM or a mocked parser.
+          gpg-recipient =
+            pkgs.runCommand "agent-box-gpg-recipient"
+              {
+                nativeBuildInputs = [
+                  pkgs.bash pkgs.coreutils pkgs.gawk pkgs.gnupg
+                ];
+                script = ./modules/src/gpg-init.sh;
+                tests = ./tests/test-gpg-init.sh;
+              } ''
+              bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # The authenticated settings page's encrypted-handoff panel. The
+          # subject is the assembled golden daemon (env-store preamble and
+          # all), so this pins the file boundary and rendered controls the
+          # same way the other settings-panel checks below do.
+          gpg-key-panel =
+            pkgs.runCommand "agent-box-gpg-key-panel"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-gpg-key-panel.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-gpg-key-panel.py
+              python3 repo/tests/test-gpg-key-panel.py > log 2>&1 || {
                 cat log
                 exit 1
               }
