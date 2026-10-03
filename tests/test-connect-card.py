@@ -127,6 +127,37 @@ class ConnectCardCheckingTest(unittest.TestCase):
         self.assertNotIn("onsubmit=", html)
 
 
+class WhatsAppConnectTest(unittest.TestCase):
+    def setUp(self):
+        self.daemon = load_daemon()
+
+    def test_pairing_code_is_extracted_from_bridge_output(self):
+        text = "WhatsApp pairing code: 7JVT986A\nEnter it on your phone."
+        self.assertEqual("7JVT986A", self.daemon.connect_user_code(text, "whatsapp"))
+        self.assertIsNone(self.daemon.connect_user_code("no code yet", "whatsapp"))
+
+    def test_pairing_card_shows_phone_form_then_code(self):
+        idle = self.daemon.render_connect_card(base_state(id="whatsapp", state="idle"))
+        self.assertIn('name="phone"', idle)
+        self.assertIn("Pair device", idle)
+        waiting = self.daemon.render_connect_card(
+            base_state(id="whatsapp", state="waiting", code="7JVT986A"))
+        self.assertIn('data-copy="7JVT986A"', waiting)
+        self.assertIn("Linked devices", waiting)
+        self.assertNotIn('name="phone"', waiting)
+
+    def test_connected_status_requires_live_bridge(self):
+        class Proc:
+            returncode = 0
+            stdout = '{"paired": true, "connected": false}'
+
+        self.assertEqual((False, "device linked; bridge is connecting"),
+                         self.daemon.parse_whatsapp_status(Proc()))
+        Proc.stdout = '{"paired": true, "connected": true}'
+        self.assertEqual((True, "linked device connected"),
+                         self.daemon.parse_whatsapp_status(Proc()))
+
+
 class ConnectStepOrderTest(unittest.TestCase):
     """The order the wizard's steps are numbered in (the code first).
 

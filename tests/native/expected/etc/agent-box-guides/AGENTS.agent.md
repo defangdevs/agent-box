@@ -209,6 +209,35 @@ plainly rather than handing it back.
   unsets it, and deleting the default profile clears it too - the next
   session then asks which profile to start.
 
+## Personal WhatsApp connection
+
+The settings page's Connections section can link this user's WhatsApp as a
+device. Enter the account's phone number with country code, start pairing,
+and give the displayed code to WhatsApp's Linked devices screen on the
+primary phone. The bridge accepts only `@box ` messages from that account's
+Message Yourself chat. The device link belongs to the Linux user and
+survives agent session restarts. Node and the bridge are installed only when
+pairing is requested; they are not part of the base image. The supervisor
+runs the bridge without spending a session slot.
+
+Each destination session must opt in separately. The settings page has a
+WhatsApp switch on each Claude or Codex session, and a new-session checkbox;
+the CLI equivalent is `agent-box-session whatsapp NAME on|off|status` or
+`agent-box-session add NAME --whatsapp true`. Run
+`agent-box-session whatsapp ls` to list enabled sessions. Restart a running
+Claude session after enabling it so its channel loads. From the phone, send
+`@box /sessions` and `@box /target NAME`, then send `@box MESSAGE`. Disabling
+a session stops further delivery to it. A stopped session can remain a
+target; queued messages wait for it to return. Selecting a different target
+does not require pairing again.
+
+A Codex Remote Control task has its own thread ID, which the box's session
+name alone cannot identify. From inside the active Codex task, run
+`node ~/.local/share/local-whatsapp/bridge.mjs register codex` once to bind
+it to that session name. Repeat after a different task takes over the same
+session. A normal Codex TUI uses the session name directly. The bridge has
+no shell command target.
+
 ## Slash commands: type them into your own pane
 
 Slash commands are client-side: they never reach you as a tool call, so you

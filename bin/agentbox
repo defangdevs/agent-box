@@ -2974,7 +2974,8 @@ class Renderer:
                        # it — the card fetches it, see CONNECT_EXPRS below.
                        'Environment="AGENT_BOX_CONNECT_BINS=' + " ".join(
                            [f"{a}={self.bin}/{a}" for a in self.spec.agents]
-                           + [f"github={self.bin}/gh"]) + '"',
+                           + [f"github={self.bin}/gh",
+                              f"whatsapp={self.bin}/agent-box-whatsapp"]) + '"',
                        # The Defang card (issue #461). defang is not in
                        # nixpkgs, so AGENT_BOX_NIXPKGS below cannot reach
                        # it and the card used to be dropped here entirely —
