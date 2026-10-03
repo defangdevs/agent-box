@@ -1083,7 +1083,7 @@ case "$cmd" in
       registry_ensure
       registry_lock
       taken "$selected" || {
-        echo "no such session: '$selected' (send @box /sessions)" >&2; exit 2;
+        echo "no such session: '$selected' (send @$(id -un) /sessions)" >&2; exit 2;
       }
       harness="$("$JQ" -r --arg n "$selected" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
       if [ "$harness" != claude ] && [ "$harness" != codex ]; then

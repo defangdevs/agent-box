@@ -564,6 +564,7 @@ import http.server
 import json
 import mimetypes
 import os
+import pwd
 import re
 import secrets
 import select
@@ -8325,10 +8326,11 @@ def render_connect_step(state):
             return ('<div class="conn-step"><p class="note">Preparing the '
                     'WhatsApp device link&hellip;</p>' + cancel + '</div>')
         if state["state"] == "connected":
+            user = html.escape(pwd.getpwuid(os.getuid()).pw_name)
             return (
                 '<div class="conn-step"><p class="note">The linked device is '
-                'connected. Send <code>@box /sessions</code> from Message Yourself '
-                'to choose its one recipient, or <code>@box /target auto</code> to '
+                f'connected. Send <code>@{user} /sessions</code> from Message Yourself '
+                f'to choose its one recipient, or <code>@{user} /target auto</code> to '
                 'start a new one automatically.</p>'
                 f'<form method="post" action="{base}/connect/configure" class="row conn-form">'
                 f'<input type="hidden" name="flow" value="{flow_id}">'

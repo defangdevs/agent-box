@@ -688,8 +688,8 @@ let
     The settings page's Connections section can link this user's WhatsApp as a
     device. Enter the account's phone number with country code, start pairing,
     and give the displayed code to WhatsApp's Linked devices screen on the
-    primary phone. The bridge accepts only `@box ` messages from that account's
-    Message Yourself chat. The device link belongs to the Linux user and
+    primary phone. The bridge accepts only messages that start with `@agent `
+    (`@` plus this box's Linux user) from that account's Message Yourself chat. The device link belongs to the Linux user and
     survives agent session restarts. Node and the bridge are installed only when
     pairing is requested; they are not part of the base image. The supervisor
     runs the bridge without spending a session slot. Message text and linked-device
@@ -697,12 +697,12 @@ let
     box; WhatsApp's end-to-end encryption covers the chat transport.
 
     WhatsApp has one destination session at a time. From the phone, send
-    `@box /sessions` to list Claude and Codex sessions, then `@box /target NAME`
-    to choose one. `@box /target auto` clears that choice, so the next message
+    `@agent /sessions` to list Claude and Codex sessions, then `@agent /target NAME`
+    to choose one. `@agent /target auto` clears that choice, so the next message
     starts a new session with the profile selected in Connections; with no
-    selection, it uses the box's default profile. Send `@box /profile NAME` to
+    selection, it uses the box's default profile. Send `@agent /profile NAME` to
     change the profile and make the next message start fresh, or
-    `@box /profile default` to use the default profile. The CLI equivalents are
+    `@agent /profile default` to use the default profile. The CLI equivalents are
     `agent-box-session whatsapp candidates`, `select NAME`, `clear`, and
     `spawn PROFILE|default`. A stopped session can remain a target; queued
     messages wait for it to return. Selecting a different target does not require
@@ -4942,7 +4942,7 @@ case "$cmd" in
       registry_ensure
       registry_lock
       taken "$selected" || {
-        echo "no such session: '$selected' (send @box /sessions)" >&2; exit 2;
+        echo "no such session: '$selected' (send @$(id -un) /sessions)" >&2; exit 2;
       }
       harness="$("$JQ" -r --arg n "$selected" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
       if [ "$harness" != claude ] && [ "$harness" != codex ]; then
@@ -16861,6 +16861,7 @@ import http.server
 import json
 import mimetypes
 import os
+import pwd
 import re
 import secrets
 import select
@@ -24691,10 +24692,11 @@ def render_connect_step(state):
             return ('<div class="conn-step"><p class="note">Preparing the '
                     'WhatsApp device link&hellip;</p>' + cancel + '</div>')
         if state["state"] == "connected":
+            user = html.escape(pwd.getpwuid(os.getuid()).pw_name)
             return (
                 '<div class="conn-step"><p class="note">The linked device is '
-                'connected. Send <code>@box /sessions</code> from Message Yourself '
-                'to choose its one recipient, or <code>@box /target auto</code> to '
+                f'connected. Send <code>@{user} /sessions</code> from Message Yourself '
+                f'to choose its one recipient, or <code>@{user} /target auto</code> to '
                 'start a new one automatically.</p>'
                 f'<form method="post" action="{base}/connect/configure" class="row conn-form">'
                 f'<input type="hidden" name="flow" value="{flow_id}">'
