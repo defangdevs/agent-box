@@ -1284,6 +1284,22 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 check_payload agent-box-webhook-bare webhook-cli.sh
               fi
 
+              # Peer pairing is Python and is byte-identical on both
+              # backends. It deliberately sends into the existing generic
+              # local-webhook ingress rather than adding another receiver.
+              if [ -x "$profile/bin/agent-box-peer" ]; then
+                if ! diff -u "$srcDir/peer-cli.py" \
+                     <(tail -n +2 "$profile/bin/agent-box-peer") >/dev/null; then
+                  echo "DRIFT: bin/agent-box-peer is not src/peer-cli.py"
+                  diff -u "$srcDir/peer-cli.py" \
+                    <(tail -n +2 "$profile/bin/agent-box-peer") | head -20 || true
+                  fail=1
+                fi
+                python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' \
+                  "$profile/bin/agent-box-peer" \
+                  || { echo "SYNTAX: bin/agent-box-peer"; fail=1; }
+              fi
+
               # agent-box-env-exec is Python, not shell (issue #212), and it
               # is not src/env-exec.py verbatim: src/lib/envstore.py is
               # spliced in above it, exactly as the module's envExecWrapper
@@ -1990,6 +2006,27 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                   };
               } ''
               python3 "$tests" "$payload" "$cli" "$webhookPy" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # Explicit paired delivery is a pure local protocol test: two
+          # temporary Linux-user state dirs exchange the invitation and
+          # response, then the sender's HMAC is checked against the generic
+          # local-webhook source installed for the recipient. No public box
+          # or network service is needed to prove the protocol.
+          peer-cli =
+            pkgs.runCommand "agent-box-peer-cli-test"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                payload = ./modules/src/peer-cli.py;
+                tests = ./tests/test-peer-cli.py;
+                AGENT_BOX_PEER_CLI = "${./modules/src/peer-cli.py}";
+              } ''
+              python3 "$tests" > log 2>&1 || {
                 cat log
                 exit 1
               }
