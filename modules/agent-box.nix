@@ -29460,11 +29460,11 @@ if __name__ == "__main__":
           message = "services.agent-box.web.domain is an IPv4 address, which requires Caddy 2.11.4 or newer for ACME IP certificates.";
         }
         {
-          assertion = lib.length (lib.unique webAliases) == lib.length webAliases;
+          assertion = lib.length (lib.unique (map lib.toLower webAliases)) == lib.length webAliases;
           message = "services.agent-box.web.aliases must not contain duplicates (including the legacy web.alias).";
         }
         {
-          assertion = lib.all (alias: alias != cfg.web.domain) webAliases;
+          assertion = lib.all (alias: lib.toLower alias != lib.toLower cfg.web.domain) webAliases;
           message = "services.agent-box.web.aliases must differ from web.domain.";
         }
         {

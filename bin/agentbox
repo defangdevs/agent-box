@@ -755,6 +755,11 @@ class Spec:
         if not all(DOMAIN_SUFFIX_RE.fullmatch(value)
                    for value in self.domain_suffixes):
             raise ConfigError("domainSuffixes entries must be DNS suffixes")
+        # first_boot() prepends a dashed IPv4 (up to 15 chars) and a dot, and
+        # a hostname may be at most 253 characters.
+        if any(len(value) > 237 for value in self.domain_suffixes):
+            raise ConfigError(
+                "domainSuffixes entries must be at most 237 characters")
         self.domain_suffix = self.domain_suffixes[0]
         self.alias_domain_suffixes = self.domain_suffixes[1:]
         self.host_label = data.get("hostLabel") or self.domain or "agent-box"
@@ -5487,6 +5492,10 @@ def first_boot(spec, args):
         spec.domain = ip.replace(".", "-") + "." + spec.domain_suffix
         spec.web_aliases += [ip.replace(".", "-") + "." + suffix
                              for suffix in spec.alias_domain_suffixes]
+        if (len(set(spec.web_aliases)) != len(spec.web_aliases)
+                or spec.domain in spec.web_aliases):
+            raise ConfigError(
+                "web.aliases must be unique and differ from domain")
         if spec.host_label_from_domain:
             spec.host_label = spec.domain
         print(f"derived domain {spec.domain} from {ip}")

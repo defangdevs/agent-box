@@ -444,7 +444,10 @@ if len(suffixes) != len(set(suffixes)):
 if not all(pattern.fullmatch(value) for value in suffixes):
     sys.exit("sslipDomains entries must be DNS suffixes")
 dashed = os.environ["PUBLIC_IP"].replace(".", "-")
-print(json.dumps([f"{dashed}.{suffix}" for suffix in suffixes], separators=(",", ":")))
+aliases = [f"{dashed}.{suffix}" for suffix in suffixes]
+if any(len(alias) > 253 for alias in aliases):
+    sys.exit("sslipDomains entries make a hostname longer than 253 characters")
+print(json.dumps(aliases, separators=(",", ":")))
 PY
 )"; then
   exit 1
