@@ -247,9 +247,14 @@ that immediately fails cert validation.
 `sslip.io` is itself open source ([cunnie/sslip.io](https://github.com/cunnie/sslip.io))
 and self-hostable, so a deployment that does not want the third-party
 dependency at all can run its own copy under its own domain. The
-`SslipDomain` parameter (default `sslip.io`) is the suffix the hostname
-is derived under, on both templates - point it at a self-hosted instance
-to whitelabel the URL entirely (issue #647).
+`SslipDomains` parameter (default `sslip.io`) accepts a comma-separated list
+on both templates. The first suffix remains the primary hostname; later
+suffixes are on-demand certificate aliases that redirect to it. Keeping that
+primary shape preserves in-place CloudFormation updates and the IPv6-only EC2
+path, where a public IP certificate is unavailable. Add a self-hosted
+instance's suffix to accept both names (issue #647). The deprecated
+`SslipDomain` parameter remains a single-value override for existing launch
+integrations.
 
 ### CloudFormation quick-create requires an S3 template URL
 

@@ -99,7 +99,8 @@ SAMPLE = {
     "@@FLAKEREF@@": "github:defangdevs/agent-box/0123456789abcdef",
     "@@IMAGERUNTIME@@": "false",
     "@@USER@@": "agent",
-    "@@SSLIPDOMAINB64@@": base64.b64encode(b"sslip.example.com").decode(),
+    "@@SSLIPDOMAINSB64@@": base64.b64encode(
+        b'["sslip.io","defangstation.com"]').decode(),
     "@@AGENTSMDB64@@": base64.b64encode(HOSTILE_AGENTSMD.encode()).decode(),
     "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
     "@@PORTALISSUERB64@@": base64.b64encode(
@@ -116,13 +117,13 @@ SAMPLE = {
 # webPassword has no default: it is the one field the form always demands.
 # A `...B64@@` marker's default is base64-encoded by defaults_render below,
 # matching what the template's own base64(...) call does at deploy time --
-# sslipDomain's empty default means the primary IP URL has no DNS alias.
+# sslipDomains is JSON before it is base64-encoded by the template.
 DEFAULT_OF = {
     "@@NIXINSTALLER@@": "nixInstallerUrl",
     "@@FLAKEREF@@": "agentBoxFlakeRef",
     "@@IMAGERUNTIME@@": "imageIncludesRuntime",
     "@@USER@@": "userName",
-    "@@SSLIPDOMAINB64@@": "sslipDomain",
+    "@@SSLIPDOMAINSB64@@": "sslipDomains",
     "@@AGENTSMDB64@@": "agentsMd",
     # Both default to '' -- handover off, which is the default box.
     "@@PORTALISSUERB64@@": "portalIssuer",
@@ -278,9 +279,11 @@ def check_static_domain(template: dict) -> int:
     script = template.get("variables", {}).get("bootstrapTemplate", "")
     chain = bootstrap_chain(template)
     web_url = template.get("outputs", {}).get("webUrl", {}).get("value", "")
-    sslip_url = template.get("outputs", {}).get("sslipUrl", {}).get("value", "")
+    alias_urls = template.get("outputs", {}).get("aliasUrls", {}).get("value", "")
     sslip_default = (template.get("parameters", {}).get("sslipDomain", {})
                      .get("defaultValue"))
+    domains_default = (template.get("parameters", {}).get("sslipDomains", {})
+                       .get("defaultValue"))
     public_ip_ref = "reference(resourceId('Microsoft.Network/publicIPAddresses'"
     failures = []
     if "--settle-delay" in script:
@@ -295,10 +298,12 @@ def check_static_domain(template: dict) -> int:
         failures.append("webUrl is not derived from Azure's allocated Public IP")
     if "parameters('sslipDomain')" in web_url:
         failures.append("webUrl still depends on the optional DNS alias")
-    if "if(empty(parameters('sslipDomain'))" not in sslip_url:
-        failures.append("sslipUrl is not empty when no alias is configured")
+    if "variables('effectiveSslipDomains')" not in alias_urls:
+        failures.append("aliasUrls is not derived from the effective suffix list")
     if sslip_default != "":
-        failures.append("sslipDomain must default to no DNS alias")
+        failures.append("legacy sslipDomain must default to empty")
+    if domains_default != ["sslip.io"]:
+        failures.append("sslipDomains must default to [sslip.io]")
     if failures:
         print("FAIL: static Azure domain wiring:\n       "
               + "\n       ".join(failures), file=sys.stderr)
@@ -321,7 +326,9 @@ def defaults_render(template: dict) -> dict:
         if "defaultValue" in params[name]:
             default = params[name]["defaultValue"]
             if marker.endswith("B64@@"):
-                values[marker] = base64.b64encode(default.encode()).decode()
+                raw = (json.dumps(default, separators=(",", ":"))
+                       if isinstance(default, list) else default)
+                values[marker] = base64.b64encode(raw.encode()).decode()
             elif isinstance(default, bool):
                 # ARM's string(bool) replacement emits lowercase shell booleans.
                 values[marker] = str(default).lower()
@@ -460,7 +467,7 @@ def run_portal_block(
 ) -> subprocess.CompletedProcess:
     text = block.replace("@@PORTALISSUERB64@@", issuer_b64)
     text = text.replace("@@PORTALUSERIDB64@@", user_b64)
-    text = text.replace("@@SSLIPDOMAINB64@@", sslip_b64)
+    text = text.replace("@@SSLIPDOMAINSB64@@", sslip_b64)
     text = text.replace("@@PUBLICIPB64@@", b64(public_ip))
     text = text.replace("/etc/agent-box", str(workdir))
     return subprocess.run(
@@ -471,7 +478,7 @@ def b64(value: str) -> str:
     return base64.b64encode(value.encode()).decode()
 
 
-SSLIP_DOMAIN_SAMPLE = "sslip.example.com"
+SSLIP_DOMAINS_SAMPLE = ["sslip.io", "defangstation.com"]
 
 
 def check_written_config(template: dict) -> int:
@@ -499,25 +506,25 @@ def check_written_config(template: dict) -> int:
     rc = 0
     cases = {
         "handover on": (
-            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAIN_SAMPLE,
+            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAINS_SAMPLE,
             PUBLIC_IP_SAMPLE, True),
         "handover off": (
-            "", "", "", PUBLIC_IP_SAMPLE, True),
+            "", "", [], PUBLIC_IP_SAMPLE, True),
         # '&' is IN portalIssuer's allowed character class (a query string
         # may have one) but is sed replacement-text magic -- unescaped, this
         # is exactly the input that used to splice the placeholder into
         # config.yaml instead of the URL.
         "handover on, ampersand": (
             "https://station.example.com/cb?a=1&b=2", PORTAL_USER_SAMPLE,
-            SSLIP_DOMAIN_SAMPLE, PUBLIC_IP_SAMPLE, True),
+            SSLIP_DOMAINS_SAMPLE, PUBLIC_IP_SAMPLE, True),
         "invalid issuer (not https)": (
             "http://station.example.com", PORTAL_USER_SAMPLE,
-            SSLIP_DOMAIN_SAMPLE, PUBLIC_IP_SAMPLE, False),
+            SSLIP_DOMAINS_SAMPLE, PUBLIC_IP_SAMPLE, False),
         "invalid user (space)": (
-            PORTAL_ISSUER_SAMPLE, "usr with space", SSLIP_DOMAIN_SAMPLE,
+            PORTAL_ISSUER_SAMPLE, "usr with space", SSLIP_DOMAINS_SAMPLE,
             PUBLIC_IP_SAMPLE, False),
         "invalid sslip domain (space)": (
-            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, "not a domain",
+            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, ["not a domain"],
             PUBLIC_IP_SAMPLE, False),
         # The value a raw (non-base64) substitution used to let close the
         # quoted heredoc: a newline plus the literal delimiter, followed by a
@@ -527,17 +534,18 @@ def check_written_config(template: dict) -> int:
         # reach the shell at all, not merely that this one payload fails.
         "sslip domain injection (newline closes heredoc)": (
             PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE,
-            "evil.example.com\nAGENTBOX_CONFIG\ntouch /tmp/pwned\ncat <<EOF",
+            ["evil.example.com\nAGENTBOX_CONFIG\ntouch /tmp/pwned\ncat <<EOF"],
             PUBLIC_IP_SAMPLE, False),
         "invalid public IP (shell syntax)": (
-            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAIN_SAMPLE,
+            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAINS_SAMPLE,
             "203.0.113.7; touch /tmp/pwned", False),
     }
     for label, (issuer, user, sslip, public_ip, should_succeed) in cases.items():
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
             done = run_portal_block(
-                block, workdir, b64(issuer), b64(user), b64(sslip), public_ip)
+                block, workdir, b64(issuer), b64(user),
+                b64(json.dumps(sslip, separators=(",", ":"))), public_ip)
             if should_succeed and done.returncode != 0:
                 print("FAIL: %s: the portal block refused a valid value:\n%s"
                       % (label, done.stderr), file=sys.stderr)
@@ -572,11 +580,11 @@ def check_written_config(template: dict) -> int:
                       % (label, data), file=sys.stderr)
                 rc = 1
                 continue
-            alias = (public_ip.replace(".", "-") + "." + sslip
-                     if sslip else "")
-            if web.get("alias") != alias:
-                print("FAIL: %s: web.alias landed as %r, wanted %r"
-                      % (label, web.get("alias"), alias),
+            aliases = [public_ip.replace(".", "-") + "." + suffix
+                       for suffix in sslip]
+            if web.get("aliases") != aliases:
+                print("FAIL: %s: web.aliases landed as %r, wanted %r"
+                      % (label, web.get("aliases"), aliases),
                       file=sys.stderr)
                 rc = 1
                 continue
