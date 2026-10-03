@@ -692,7 +692,9 @@ let
     Message Yourself chat. The device link belongs to the Linux user and
     survives agent session restarts. Node and the bridge are installed only when
     pairing is requested; they are not part of the base image. The supervisor
-    runs the bridge without spending a session slot.
+    runs the bridge without spending a session slot. Message text and linked-device
+    keys are stored in private files under `~/.local/state/local-whatsapp` on this
+    box; WhatsApp's end-to-end encryption covers the chat transport.
 
     Each destination session must opt in separately. The settings page has a
     WhatsApp switch on each Claude or Codex session, and a new-session checkbox;
@@ -19001,7 +19003,8 @@ CONNECT_DEFS = [
         "attr": None,
         "label": "WhatsApp",
         "note": "Link your personal WhatsApp account by phone-number code. "
-                "Messages stay in your end-to-end encrypted Message Yourself chat.",
+                "The WhatsApp chat is end-to-end encrypted; message text is "
+                "also stored on this box for delivery.",
         "start": ["pair"],
         "status": ["status"],
         "parse": "whatsapp",

@@ -2856,7 +2856,8 @@ CONNECT_DEFS = [
         "attr": None,
         "label": "WhatsApp",
         "note": "Link your personal WhatsApp account by phone-number code. "
-                "Messages stay in your end-to-end encrypted Message Yourself chat.",
+                "The WhatsApp chat is end-to-end encrypted; message text is "
+                "also stored on this box for delivery.",
         "start": ["pair"],
         "status": ["status"],
         "parse": "whatsapp",

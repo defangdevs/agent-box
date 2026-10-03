@@ -166,7 +166,9 @@ primary phone. The bridge accepts only `@box ` messages from that account's
 Message Yourself chat. The device link belongs to the Linux user and
 survives agent session restarts. Node and the bridge are installed only when
 pairing is requested; they are not part of the base image. The supervisor
-runs the bridge without spending a session slot.
+runs the bridge without spending a session slot. Message text and linked-device
+keys are stored in private files under `~/.local/state/local-whatsapp` on this
+box; WhatsApp's end-to-end encryption covers the chat transport.
 
 Each destination session must opt in separately. The settings page has a
 WhatsApp switch on each Claude or Codex session, and a new-session checkbox;
