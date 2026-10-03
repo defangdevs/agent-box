@@ -103,6 +103,16 @@ class PeerCliTest(unittest.TestCase):
         self.assertEqual(payload["body"], "hello from A")
         self.assertEqual(payload["from"], "claude")
 
+        with mock.patch.dict(os.environ, {"USER": "agent"}):
+            who = self.capture(peer.cmd_whoami, argparse.Namespace())
+            self.assertIn("address\tagent@a.example", who)
+            self.assertIn("inbox\tB\t" + peer.safe_name(
+                next(iter(peer.load_peers()["peers"]))) + ":default", who)
+            with mock.patch("urllib.request.urlopen", deliver):
+                self.capture(peer.cmd_send, argparse.Namespace(
+                    label="B", inbox="ops", message="x", from_name="", timeout=5))
+            self.assertEqual(json.loads(sent[-1][0].data)["from"], "agent@a.example")
+
     def test_revoke_leaves_a_manual_collision_alone(self):
         self.box("a", "https://a.example/claude/webhook")
         invitation = self.capture(peer.cmd_invite,
