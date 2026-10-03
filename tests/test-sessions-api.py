@@ -90,6 +90,7 @@ class SessionsApi(unittest.TestCase):
         m.capacity_limit = lambda: self.limit
         m.kill_session = self.kill
         self.killed = []
+        self.kill_ok = True
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
@@ -100,6 +101,7 @@ class SessionsApi(unittest.TestCase):
     def kill(self, name):
         self.killed.append(name)
         self.live.discard(name)
+        return self.kill_ok
 
     def write(self, sessions):
         with open(self.sessions_file, "w") as handle:
@@ -221,6 +223,14 @@ class SessionsApi(unittest.TestCase):
         data, _ = self.listing()
         self.assertEqual(data["sessions"][0]["state"], "stopped")
         self.assertEqual(data["capacity"]["used"], 0)
+
+    def test_stop_is_500_when_tmux_kill_fails(self):
+        self.write({"claude": entry()})
+        self.kill_ok = False
+        status, body, _ = self.request("/sessions/stop", "POST",
+                                       json_accept=True, name="claude")
+        self.assertEqual(status, 500)
+        self.assertFalse(json.loads(body)["ok"])
 
     def test_stop_unknown_name_is_404_and_creates_no_stub(self):
         self.write({"claude": entry()})
