@@ -361,10 +361,20 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     client.succeed("grep -q 'Agent Box' /tmp/auth-error")
     client.succeed("grep -q 'background:#0d1117' /tmp/auth-error")
 
-    # Authenticated GET renders the page.
-    auth_page = client.succeed(
-        f"{curl} -u agent:testpassword https://box.test/agent/settings/"
+    # Authenticated GET renders the page and sets a HOST-ONLY cookie. Both
+    # common box address forms put unrelated boxes below a shared DNS suffix
+    # (*.ip.sslip.io or *.ip.domainstation.com), so adding Domain would send
+    # this credential to sibling boxes. The __Host- prefix makes browsers
+    # enforce the no-Domain invariant too.
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /tmp/auth-page "
+        "-D /tmp/auth-headers https://box.test/agent/settings/"
     )
+    client.succeed(
+        "grep -qi '^Set-Cookie: __Host-agent_box_auth_agent=' /tmp/auth-headers"
+    )
+    client.fail("grep -i '^Set-Cookie:.*Domain=' /tmp/auth-headers")
+    auth_page = client.succeed("cat /tmp/auth-page")
     assert '<span class="mark">' in auth_page
     assert "Settings</h1>" in auth_page
 
@@ -789,6 +799,7 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     client.succeed("grep -qi 'Max-Age=86400' /tmp/handh")
     client.succeed("grep -qi 'SameSite=Lax' /tmp/handh")
     client.succeed("grep -qi 'HttpOnly' /tmp/handh")
+    client.fail("grep -i '^Set-Cookie:.*Domain=' /tmp/handh")
 
     # That cookie now reaches the box, through forward_auth, with no password.
     session = client.succeed(
@@ -1003,6 +1014,7 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     )
     client.succeed(
         "grep -qi 'Set-Cookie: __Host-agent_box_session_agent=;' /tmp/refused")
+    client.fail("grep -i '^Set-Cookie:.*Domain=' /tmp/refused")
     client.succeed("grep -qi 'WWW-Authenticate: Basic' /tmp/refused")
     client.succeed("grep -qi '^Content-Type: text/html; charset=utf-8' /tmp/refused")
     client.succeed("grep -q 'Sign in required' /tmp/refused-body")

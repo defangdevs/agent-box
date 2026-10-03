@@ -10767,7 +10767,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # basic-auth prompt and the handover would look like it did
         # nothing. Lax is sent on top-level navigations, which is what this
         # is. Max-Age is the browser's hint only: portal_session_ok decides
-        # expiry from the stored record.
+        # expiry from the stored record. The __Host- prefix, Path=/, Secure,
+        # and NO Domain attribute make this cookie host-only. Never add
+        # Domain: sibling boxes commonly share ip.sslip.io or
+        # ip.domainstation.com.
         self.send_header(
             "Set-Cookie",
             "%s=%s; Path=/; Max-Age=%d; HttpOnly; Secure; SameSite=Lax"
