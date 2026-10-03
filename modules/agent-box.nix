@@ -5402,9 +5402,9 @@ import tempfile
 from urllib.request import urlopen
 
 
-REV = "135e7e977e2cf40d71979fa87e8549b49ccedbf6"
+REV = "52059e30642be1b0ee04c8f4401d21c7d932fc67"
 FILES = {
-    "bridge.mjs": "89b9ced50786c602a476e92460c101e630a26ceb8cb531fea2a0062b48600b62",
+    "bridge.mjs": "1526b8e2b4784edb95a6a5f3a9337d5e19e0821c83ae522353965023d1e90d9a",
     "state.mjs": "4f5125000fbb44b43c9dc7909ee293c61b5c3a6ae44f83620bd506470344e81b",
     "package.json": "2ee16b0da02a289bf68d71811c39f51e27a2f16e9a810690b69c3091fab28df1",
     "package-lock.json": "d030965125393662c5effbea6e25c98512e9fd29e470343010096ec413096110",
