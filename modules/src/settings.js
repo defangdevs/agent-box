@@ -992,7 +992,8 @@
     if (target) {
       var source = document.getElementById(target);
       copyText(source ? source.textContent : "")
-        .then(function (ok) { flashCopy(b, ok); });
+        .then(function (ok) { flashCopy(b, ok); })
+        .catch(function () { flashCopy(b, false); });
       return;
     }
     var url = b.getAttribute("data-secret-url");
