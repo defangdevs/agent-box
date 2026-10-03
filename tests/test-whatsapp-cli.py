@@ -97,6 +97,24 @@ class WhatsAppInstallTest(unittest.TestCase):
         self.assertEqual("old bridge", (self.cli.RUNTIME / "bridge.mjs").read_text())
         self.assertFalse(pending.exists())
 
+    def test_profile_is_private_and_defaults_when_cleared(self):
+        self.assertIsNone(self.cli.profile())
+        self.assertEqual("phone-agent", self.cli.profile("phone-agent"))
+        config = self.cli.STATE / "config.json"
+        self.assertEqual(0o600, config.stat().st_mode & 0o777)
+        self.assertEqual("phone-agent", self.cli.profile())
+        self.assertIsNone(self.cli.profile("default"))
+        with self.assertRaisesRegex(RuntimeError, "profile"):
+            self.cli.profile("not a profile")
+        with self.assertRaisesRegex(RuntimeError, "profile"):
+            self.cli.profile("dotted.name")
+
+    def test_pair_rejects_non_ascii_digits(self):
+        for phone in ("+1 415 555 1234\u0663", "\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668", "12345abc678"):
+            with mock.patch.dict("os.environ", {"LOCAL_WHATSAPP_PHONE": phone}):
+                with self.assertRaisesRegex(RuntimeError, "LOCAL_WHATSAPP_PHONE"):
+                    self.cli.pair()
+
 
 if __name__ == "__main__":
     unittest.main()

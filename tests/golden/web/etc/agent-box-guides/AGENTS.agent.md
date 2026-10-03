@@ -177,24 +177,26 @@ plainly rather than handing it back.
 The settings page's Connections section can link this user's WhatsApp as a
 device. Enter the account's phone number with country code, start pairing,
 and give the displayed code to WhatsApp's Linked devices screen on the
-primary phone. The bridge accepts only `@box ` messages from that account's
-Message Yourself chat. The device link belongs to the Linux user and
+primary phone. The bridge accepts only messages that start with `@agent `
+(`@` plus this box's Linux user) from that account's Message Yourself chat. The device link belongs to the Linux user and
 survives agent session restarts. Node and the bridge are installed only when
 pairing is requested; they are not part of the base image. The supervisor
 runs the bridge without spending a session slot. Message text and linked-device
 keys are stored in private files under `~/.local/state/local-whatsapp` on this
 box; WhatsApp's end-to-end encryption covers the chat transport.
 
-Each destination session must opt in separately. The settings page has a
-WhatsApp switch on each Claude or Codex session, and a new-session checkbox;
-the CLI equivalent is `agent-box-session whatsapp NAME on|off|status` or
-`agent-box-session add NAME --whatsapp true`. Run
-`agent-box-session whatsapp ls` to list enabled sessions. Restart a running
-Claude session after enabling it so its channel loads. From the phone, send
-`@box /sessions` and `@box /target NAME`, then send `@box MESSAGE`. Disabling
-a session stops further delivery to it. A stopped session can remain a
-target; queued messages wait for it to return. Selecting a different target
-does not require pairing again.
+WhatsApp has one destination session at a time. From the phone, send
+`@agent /sessions` to list Claude and Codex sessions, then `@agent /target NAME`
+to choose one. `@agent /target auto` clears that choice, so the next message
+starts a new session with the profile selected in Connections; with no
+selection, it uses the box's default profile. Send `@agent /profile NAME` to
+change the profile and make the next message start fresh, or
+`@agent /profile default` to use the default profile. The CLI equivalents are
+`agent-box-session whatsapp candidates`, `select NAME`, `clear`, and
+`spawn PROFILE|default`. A stopped session can remain a target; queued
+messages wait for it to return. Selecting a different target does not require
+pairing again. Restart a running Claude session after selecting it so it loads
+the WhatsApp channel.
 
 A Codex Remote Control task has its own thread ID, which the box's session
 name alone cannot identify. From inside the active Codex task, run

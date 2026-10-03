@@ -664,7 +664,8 @@ usage() {
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
-  echo "       agent-box-session whatsapp ls | NAME on|off|status"
+  echo "       agent-box-session whatsapp candidates | ls | select NAME | clear"
+  echo "                             | spawn PROFILE|default | NAME on|off|status"
   echo "       agent-box-session env ls | set KEY VALUE | set KEY --stdin | rm KEY"
   echo "         (--stdin reads the value from stdin: for a multi-line secret"
   echo "          such as a PEM, and to keep any secret out of the command line)"
@@ -1053,6 +1054,18 @@ case "$cmd" in
     ;;
   whatsapp)
     name="${1:-}"
+    if [ "$name" = candidates ]; then
+      [ $# -eq 1 ] || { usage >&2; exit 2; }
+      if [ -s "$REGISTRY_FILE" ]; then
+        "$JQ" -c '[.sessions | to_entries[] |
+          select(.value.agent == "claude" or .value.agent == "codex") |
+          {name: .key, harness: .value.agent, stopped: (.value.stopped == true),
+           selected: (.value.whatsapp == true)}]' "$REGISTRY_FILE"
+      else
+        echo '[]'
+      fi
+      exit 0
+    fi
     if [ "$name" = ls ]; then
       [ $# -eq 1 ] || { usage >&2; exit 2; }
       if [ -s "$REGISTRY_FILE" ]; then
@@ -1062,6 +1075,52 @@ case "$cmd" in
       else
         echo '[]'
       fi
+      exit 0
+    fi
+    if [ "$name" = select ]; then
+      selected="${2:-}"
+      [ $# -eq 2 ] && valid_name "$selected" || { usage >&2; exit 2; }
+      registry_ensure
+      registry_lock
+      taken "$selected" || {
+        echo "no such session: '$selected' (send @$(id -un) /sessions)" >&2; exit 2;
+      }
+      harness="$("$JQ" -r --arg n "$selected" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
+      if [ "$harness" != claude ] && [ "$harness" != codex ]; then
+        echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+        exit 2
+      fi
+      registry_edit --arg n "$selected" \
+        '.sessions |= with_entries(.value.whatsapp = (.key == $n))'
+      "$JQ" -cn --arg name "$selected" --arg harness "$harness" \
+        --argjson stopped "$("$JQ" -r --arg n "$selected" '.sessions[$n].stopped == true' "$REGISTRY_FILE")" \
+        '{name: $name, harness: $harness, stopped: $stopped}'
+      registry_unlock
+      exit 0
+    fi
+    if [ "$name" = clear ]; then
+      [ $# -eq 1 ] || { usage >&2; exit 2; }
+      registry_ensure
+      registry_edit '.sessions |= with_entries(.value.whatsapp = false)'
+      echo '{}'
+      exit 0
+    fi
+    if [ "$name" = spawn ]; then
+      profile="${2:-}"
+      [ $# -eq 2 ] || { usage >&2; exit 2; }
+      if [ "$profile" = default ]; then
+        profile="$("${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" default 2>/dev/null)" || profile=""
+      fi
+      if [ -z "$profile" ]; then
+        echo "No WhatsApp profile is selected and this box has no default profile." >&2
+        exit 2
+      fi
+      "$0" add --profile "$profile" --whatsapp true \
+        --prompt "WhatsApp is connected to this session. Reply to incoming messages with the WhatsApp reply tool." >&2
+      "$JQ" -ce '[.sessions | to_entries[] |
+        select(.value.whatsapp == true and (.value.agent == "claude" or .value.agent == "codex")) |
+        {name: .key, harness: .value.agent, stopped: (.value.stopped == true)}] | if length == 1 then .[0] else error("expected one WhatsApp session") end' \
+        "$REGISTRY_FILE"
       exit 0
     fi
     valid_name "$name" || { usage >&2; exit 2; }
@@ -1085,9 +1144,12 @@ case "$cmd" in
           echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
           exit 2
         fi
-        enabled=false
-        [ "$action" = on ] && enabled=true
-        registry_edit --arg n "$name" --argjson enabled "$enabled" '.sessions[$n].whatsapp = $enabled'
+        if [ "$action" = on ]; then
+          registry_edit --arg n "$name" \
+            '.sessions |= with_entries(.value.whatsapp = (.key == $n))'
+        else
+          registry_edit --arg n "$name" '.sessions[$n].whatsapp = false'
+        fi
         registry_unlock
         echo "WhatsApp $action for session '$name'"
         [ "$harness" != claude ] || echo "Restart the Claude session to apply its channel setting."
@@ -1292,7 +1354,8 @@ case "$cmd" in
       --arg prof "$profile" --arg eph "$ephemeral" --argjson rc "$remote_control" \
       --argjson whatsapp "$whatsapp" \
       --arg origin "$origin" --arg hsrc "$hook_source" --arg hrepo "$hook_repo" \
-      '.sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
+      '(if $whatsapp then .sessions |= with_entries(.value.whatsapp = false) else . end)
+       | .sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
                         whatsapp: $whatsapp,
                         remoteControlName: null,
                         workingDirectory: (if $c == "" then null else $c end),
