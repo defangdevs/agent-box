@@ -30,12 +30,17 @@ article, and the golden-snapshot check fails if it stops matching.
 """
 import importlib.machinery
 import importlib.util
+import http.server
 import json
 import os
 import pathlib
 import re
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -144,6 +149,42 @@ class ConnectCardCheckingTest(unittest.TestCase):
 class WhatsAppConnectTest(unittest.TestCase):
     def setUp(self):
         self.daemon = load_daemon()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.daemon.ENV_FILE = os.path.join(self.temp.name, "env")
+
+    def serve(self):
+        original_connect_flow = self.daemon.connect_flow
+        self.daemon.connect_flow = lambda flow_id: (
+            {"id": "whatsapp", "bin": None}
+            if flow_id == "whatsapp" else original_connect_flow(flow_id)
+        )
+        self.daemon.Handler.log_message = lambda self, fmt, *args: None
+        server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), self.daemon.Handler)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return "http://127.0.0.1:%d/settings" % server.server_address[1]
+
+    def post_start(self, base, phone):
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+
+        request = urllib.request.Request(
+            base + "/connect/start",
+            data=urllib.parse.urlencode({
+                "flow": "whatsapp", "phone": phone, "profile": "",
+            }).encode(),
+            method="POST",
+        )
+        try:
+            with urllib.request.build_opener(NoRedirect).open(request) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, exc.read().decode()
 
     def test_pairing_code_is_extracted_from_bridge_output(self):
         text = "WhatsApp pairing code: 7JVT986A\nEnter it on your phone."
@@ -153,12 +194,36 @@ class WhatsAppConnectTest(unittest.TestCase):
     def test_pairing_card_shows_phone_form_then_code(self):
         idle = self.daemon.render_connect_card(base_state(id="whatsapp", state="idle"))
         self.assertIn('name="phone"', idle)
+        self.assertIn('type="tel"', idle)
+        self.assertIn('inputmode="tel"', idle)
+        self.assertIn('autocomplete="off"', idle)
+        self.assertNotIn('autocomplete="tel"', idle)
+        self.assertIn("starting with + and country code", idle)
         self.assertIn("Pair device", idle)
         waiting = self.daemon.render_connect_card(
             base_state(id="whatsapp", state="waiting", code="7JVT986A"))
         self.assertIn('data-copy="7JVT986A"', waiting)
         self.assertIn("Linked devices", waiting)
         self.assertNotIn('name="phone"', waiting)
+
+    def test_national_phone_number_is_rejected_without_replacing_saved_number(self):
+        with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+            handle.write("LOCAL_WHATSAPP_PHONE=14155550100\n")
+        status, body = self.post_start(self.serve(), "(415) 555-0123")
+        self.assertEqual(400, status)
+        self.assertIn("starting with + and country code", body)
+        with open(self.daemon.ENV_FILE, encoding="utf-8") as handle:
+            self.assertEqual("LOCAL_WHATSAPP_PHONE=14155550100\n", handle.read())
+
+    def test_international_phone_number_is_saved_as_digits(self):
+        self.daemon.whatsapp_profile = lambda profile: ""
+        self.daemon.connect_start = lambda flow: {
+            "state": "waiting", "error": None,
+        }
+        status, _ = self.post_start(self.serve(), "+1 (415) 555-0123")
+        self.assertEqual(303, status)
+        saved = self.daemon.as_dict(self.daemon.load(self.daemon.ENV_FILE))
+        self.assertEqual("14155550123", saved["LOCAL_WHATSAPP_PHONE"])
 
     def test_connected_status_requires_live_bridge(self):
         class Proc:
