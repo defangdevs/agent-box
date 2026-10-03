@@ -632,6 +632,24 @@ let
       the value out of the command line, the shell history and `ps`). Such a
       value is stored double-quoted, which is the one thing to preserve if you
       ever hand-edit the file.
+    - Each Linux user has an OpenPGP recipient for handing over a secret without
+      putting its plaintext in chat. Its Ed25519 primary key certifies a cv25519
+      encryption subkey; the armored public key is at
+      ~/.config/agent-box/gpg-public-key.asc and, on a web-enabled box, at
+      ''${AGENT_BOX_URL}downloads/agent-box-public-key.asc. The private key has no
+      passphrase so a headless session can decrypt; its 0700 keyring is protected
+      by the Linux-user boundary. Ask the user to encrypt to the public key and
+      attach the ciphertext. To put a decrypted value straight into the
+      persistent env store without printing it, run:
+
+          gpg --homedir ~/.config/agent-box/gnupg --batch --quiet \
+            --decrypt secret.gpg |
+            agent-box-session env set KEY --stdin
+
+      This keeps plaintext out of the transcript, command line and shell output.
+      It does not isolate sibling sessions: every session of this Linux user can
+      read the same private key and env store. Use a separate Linux user when
+      that would be a problem.
     - Agent session starts share one limit across the CLI, settings page and
       webhooks. Shell panes are operator terminals and do not use a slot. The
       limit defaults to about one session per GiB of physical RAM and can be
@@ -3811,7 +3829,7 @@ done
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
     ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli whatsappCli uploadCli
-         harnessCli ]
+         harnessCli gpgInit ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli ]
@@ -9344,6 +9362,122 @@ else
 fi
   '';
 
+  # One OpenPGP recipient per Linux user. The supervisor runs this before it
+  # starts tmux, so every session in the user's trust boundary shares the same
+  # cv25519 decryption key and an encrypted handoff never needs plaintext in
+  # chat. Native ships the same payload from nix/runtime.nix.
+  gpgInit = pkgs.writeShellScriptBin "agent-box-gpg-init" ''
+set -eu
+
+# Provision one OpenPGP recipient for this Linux user. The primary key only
+# certifies the cv25519 encryption subkey: agent-box needs a recipient for
+# secret handoff, not another signing identity. The secret key is deliberately
+# unpassphrased so a headless session can decrypt into the env store without a
+# pinentry prompt. The Linux user and this dedicated keyring's permissions are
+# the boundary.
+GPG="''${AGENT_BOX_GPG_BIN:-gpg}"
+host_label=''${1:-''${AGENT_BOX_HOST_LABEL:-agent-box}}
+owner=''${USER:-$(id -un)}
+uid="Agent Box recipient for ''${owner}@''${host_label}"
+state_dir="$HOME/.config/agent-box"
+gpg_home="$state_dir/gnupg"
+fingerprint_file="$state_dir/gpg-fingerprint"
+public_key="$state_dir/gpg-public-key.asc"
+download_key="$HOME/downloads/agent-box-public-key.asc"
+
+umask 077
+mkdir -p "$state_dir"
+mkdir -m 0700 -p "$gpg_home"
+
+gpg_cmd() {
+  "$GPG" --homedir "$gpg_home" "$@"
+}
+
+fingerprint=
+if [ -r "$fingerprint_file" ]; then
+  IFS= read -r fingerprint < "$fingerprint_file" || fingerprint=
+fi
+
+secret_key_exists() {
+  [ -n "$1" ] &&
+    gpg_cmd --batch --with-colons --list-secret-keys "$1" \
+      >/dev/null 2>&1
+}
+
+find_existing_key() {
+  gpg_cmd --batch --with-colons --list-secret-keys "$uid" 2>/dev/null |
+    awk -F: '$1 == "fpr" { print $10; exit }'
+}
+
+has_encryption_subkey() {
+  gpg_cmd --batch --with-colons --list-secret-keys "$1" 2>/dev/null |
+    awk -F: '
+      $1 == "ssb" && $4 == "18" && $12 ~ /e/ && $17 == "cv25519" {
+        found = 1
+      }
+      END { exit(found ? 0 : 1) }
+    '
+}
+
+# A crash after primary-key creation but before the marker is published must
+# resume that key rather than accumulate another key with the same user ID.
+if ! secret_key_exists "$fingerprint"; then
+  fingerprint=$(find_existing_key || :)
+fi
+
+if ! secret_key_exists "$fingerprint"; then
+  gpg_cmd --batch --quiet --pinentry-mode loopback --passphrase ''' \
+    --quick-generate-key "$uid" ed25519 cert never
+  fingerprint=$(find_existing_key || :)
+  if ! secret_key_exists "$fingerprint"; then
+    echo "agent-box-gpg-init: generated key could not be found" >&2
+    exit 1
+  fi
+fi
+
+if ! has_encryption_subkey "$fingerprint"; then
+  gpg_cmd --batch --quiet --pinentry-mode loopback --passphrase ''' \
+    --quick-add-key "$fingerprint" cv25519 encr never
+fi
+if ! has_encryption_subkey "$fingerprint"; then
+  echo "agent-box-gpg-init: cv25519 encryption subkey is missing" >&2
+  exit 1
+fi
+
+public_tmp=$(mktemp "$state_dir/.gpg-public-key.asc.XXXXXX")
+fingerprint_tmp=$(mktemp "$state_dir/.gpg-fingerprint.XXXXXX")
+download_tmp=
+cleanup() {
+  rm -f -- "$public_tmp" "$fingerprint_tmp"
+  [ -z "$download_tmp" ] || rm -f -- "$download_tmp"
+}
+trap cleanup EXIT HUP INT TERM
+
+gpg_cmd --batch --armor --export "$fingerprint" > "$public_tmp"
+if [ ! -s "$public_tmp" ]; then
+  echo "agent-box-gpg-init: public-key export is empty" >&2
+  exit 1
+fi
+printf '%s\n' "$fingerprint" > "$fingerprint_tmp"
+chmod 0644 "$public_tmp" "$fingerprint_tmp"
+mv -f -- "$public_tmp" "$public_key"
+mv -f -- "$fingerprint_tmp" "$fingerprint_file"
+
+# A web-enabled box creates ~/downloads before this supervisor starts. Keep a
+# public-only copy there so the human can fetch it through the authenticated
+# download route without asking an agent to paste key material into chat.
+if [ -d "$HOME/downloads" ]; then
+  download_tmp=$(mktemp "$HOME/downloads/.agent-box-public-key.asc.XXXXXX")
+  cp -- "$public_key" "$download_tmp"
+  chmod 0644 "$download_tmp"
+  mv -f -- "$download_tmp" "$download_key"
+  download_tmp=
+fi
+
+trap - EXIT HUP INT TERM
+printf 'agent-box gpg recipient ready: %s\n' "$fingerprint"
+  '';
+
   # Bootstraps and re-aligns the shipped checkout (issue #242). On the
   # agent's PATH as well as the supervisor's, because "my checkout is gone"
   # and "the box updated past my tree" both want the same idempotent run,
@@ -10888,6 +11022,8 @@ esac
     { "name": "AGENT_BOX_FIND_BIN", "kind": "bin", "program": "find" },
     { "name": "AGENT_BOX_FLOCK_BIN", "kind": "bin", "program": "flock" },
     { "name": "AGENT_BOX_HOSTNAME_BIN", "kind": "bin", "program": "hostname" },
+    { "name": "AGENT_BOX_GPG_BIN", "kind": "bin", "program": "gpg" },
+    { "name": "AGENT_BOX_GPG_INIT", "kind": "bin", "program": "agent-box-gpg-init" },
     { "name": "AGENT_BOX_ENV_EXEC", "kind": "bin", "program": "agent-box-env-exec" },
     { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" },
     { "name": "AGENT_BOX_CAPACITY_BIN", "kind": "bin", "program": "agent-box-session-capacity" },
@@ -11191,11 +11327,13 @@ esac
     # /usr/local/bin/agent-box-session, the wrapper it generates there.
     "agent-box-session" = "${sessionCli}/bin/agent-box-session";
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
+    "agent-box-gpg-init" = "${gpgInit}/bin/agent-box-gpg-init";
     "agent-box-session-capacity" = "${capacityCli}/bin/agent-box-session-capacity";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     "agent-box-whatsapp" = "${whatsappCli}/bin/agent-box-whatsapp";
     "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
+    gpg = "${pkgs.gnupg}/bin/gpg";
     "agent-box-env-exec" = "${envExecWrapper}";
     "agent-box-supervisor" = "${supervisorScript}/bin/agent-box-supervisor";
     python3 = webhookPython;
@@ -12334,6 +12472,14 @@ esac
     # of it to decide whether a respawn is worth a turn (issue #548).
     WEBHOOK_STATE_DIR="$HOME/.local/state/local-webhook"
     CODEX_WAKE_DIR="$HOME/.local/state/agent-box/codex-wake"
+
+    # Each Linux user is one trust boundary, so it gets one persistent OpenPGP
+    # recipient shared by all of its sessions. Provision it before tmux starts:
+    # the public key is then ready for an encrypted handoff before any harness is
+    # signed in, and a provisioning failure is visible as a failed/retrying agent
+    # unit rather than a box that quietly advertises a key it does not have.
+    "''${AGENT_BOX_GPG_INIT:-agent-box-gpg-init}" \
+      "''${AGENT_BOX_HOST_LABEL:-agent-box}"
 
     # Bring the tmux server up, unconditionally -- see ensure_tmux_server below.
     # One-shot at startup is not enough: a transient failure right here (the

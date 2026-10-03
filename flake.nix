@@ -1267,6 +1267,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 echo "ok: bin/$1 == resolve(src/$2)"
               }
               check_payload agent-box-supervisor supervisor.sh
+              check_payload agent-box-gpg-init gpg-init.sh
               check_payload agent-box-attach attach.sh
               check_payload agent-box-mark-stopped mark-stopped.sh
               check_payload agent-box-spot-monitor spot-monitor.sh
@@ -2182,6 +2183,26 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.git pkgs.gnugrep ];
                 script = ./modules/src/source-tree.sh;
                 tests = ./tests/test-source-tree.sh;
+              } ''
+              bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # One persistent recipient per Linux-user trust boundary. This is a
+          # native check because the key shape, public export and interrupted
+          # marker recovery need GnuPG itself, not a VM or a mocked parser.
+          gpg-recipient =
+            pkgs.runCommand "agent-box-gpg-recipient"
+              {
+                nativeBuildInputs = [
+                  pkgs.bash pkgs.coreutils pkgs.gawk pkgs.gnupg
+                ];
+                script = ./modules/src/gpg-init.sh;
+                tests = ./tests/test-gpg-init.sh;
               } ''
               bash "$tests" "$script" > log 2>&1 || {
                 cat log

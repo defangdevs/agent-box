@@ -120,6 +120,24 @@ plainly rather than handing it back.
   the value out of the command line, the shell history and `ps`). Such a
   value is stored double-quoted, which is the one thing to preserve if you
   ever hand-edit the file.
+- Each Linux user has an OpenPGP recipient for handing over a secret without
+  putting its plaintext in chat. Its Ed25519 primary key certifies a cv25519
+  encryption subkey; the armored public key is at
+  ~/.config/agent-box/gpg-public-key.asc and, on a web-enabled box, at
+  ${AGENT_BOX_URL}downloads/agent-box-public-key.asc. The private key has no
+  passphrase so a headless session can decrypt; its 0700 keyring is protected
+  by the Linux-user boundary. Ask the user to encrypt to the public key and
+  attach the ciphertext. To put a decrypted value straight into the
+  persistent env store without printing it, run:
+
+      gpg --homedir ~/.config/agent-box/gnupg --batch --quiet \
+        --decrypt secret.gpg |
+        agent-box-session env set KEY --stdin
+
+  This keeps plaintext out of the transcript, command line and shell output.
+  It does not isolate sibling sessions: every session of this Linux user can
+  read the same private key and env store. Use a separate Linux user when
+  that would be a problem.
 - Agent session starts share one limit across the CLI, settings page and
   webhooks. Shell panes are operator terminals and do not use a slot. The
   limit defaults to about one session per GiB of physical RAM and can be
