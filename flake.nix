@@ -736,7 +736,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                       web = {
                         enable = true;
                         domain = "203.0.113.7";
-                        alias = "203-0-113-7.sslip.io";
+                        aliases = [
+                          "203-0-113-7.sslip.io"
+                          "203-0-113-7.defangstation.com"
+                        ];
                         user = "agent";
                       };
                     };
@@ -760,12 +763,15 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                          for name in policy["subjects"]}
               ip = by_name["203.0.113.7"]
               alias = by_name["203-0-113-7.sslip.io"]
+              second_alias = by_name["203-0-113-7.defangstation.com"]
               assert not ip.get("on_demand"), ip
               assert ip["issuers"][0]["profile"] == "shortlived", ip
               assert ip["issuers"][0]["ca"] == "https://acme-v02.api.letsencrypt.org/directory", ip
               assert ip["issuers"][0]["challenges"]["http"]["disabled"], ip
               assert alias["on_demand"] is True, alias
               assert "profile" not in alias["issuers"][0], alias
+              assert second_alias["on_demand"] is True, second_alias
+              assert "profile" not in second_alias["issuers"][0], second_alias
               servers = data["apps"]["http"]["servers"]
               assert any(policy.get("default_sni") == "203.0.113.7"
                          for server in servers.values()

@@ -132,12 +132,19 @@ param imageIncludesRuntime bool = false
 @description('Source range allowed to reach the terminal (and SSH). A CIDR, or an Azure service tag such as Internet.')
 param allowCidr string = '0.0.0.0/0'
 
-// Optional sslip.io-compatible alias. The public IPv4 remains the primary
-// URL; an alias is redirected to it and its cert is obtained on first use.
-// Bicep has no pattern constraint for strings, so the bootstrap decodes and
-// validates this suffix before putting it in the Caddyfile.
-@description('Optional DNS alias suffix. Set sslip.io (or a compatible resolver suffix) to expose a second URL; its certificate is requested only on first use. Empty leaves the public IPv4 as the sole URL.')
+// DNS aliases never replace the public IPv4 as the primary URL. Each alias
+// redirects to it and receives a certificate only after its first use.
+// Bicep cannot constrain array members, so the bootstrap validates every
+// suffix before writing the derived names into config.yaml.
+@description('DNS alias suffixes for the static public IPv4. Each alias certificate is requested only on first use. The direct-IP URL remains primary.')
+param sslipDomains array = [
+  'sslip.io'
+]
+
+@description('Deprecated single DNS alias suffix. When non-empty it replaces sslipDomains, preserving deployments that still pass the old parameter.')
 param sslipDomain string = ''
+
+var effectiveSslipDomains = !empty(sslipDomain) ? [sslipDomain] : sslipDomains
 
 // Default false, where the AWS templates default their DebugSsh to true. Not
 // caution for its own sake: on Lightsail, SSH is the only way to read
@@ -391,7 +398,7 @@ fi
 install -d -m 0755 /etc/agent-box
 
 # Bicep has no character constraint for a string parameter -- only length --
-# so a raw portalIssuer/portalUser/sslipDomain could close the single-quoted
+# so a raw portalIssuer/portalUser/sslipDomains value could close the single-quoted
 # YAML scalar below, or worse, a newline plus the literal text
 # "AGENTBOX_CONFIG" closes the heredoc itself and everything after runs
 # as a shell command instead of landing in config.yaml (same class of bug
@@ -414,22 +421,33 @@ if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
     exit 1
   fi
 fi
-# Same DNS-suffix shape the AWS template's DomainSuffix parameter enforces
-# with its AllowedPattern (deploy/aws/template.yaml) and BOX_SCHEMA enforces
-# for a native config.yaml (bin/agentbox) -- kept in sync across all three.
-sslip_domain="$(printf %s '@@SSLIPDOMAINB64@@' | base64 -d)"
-if [ -n "$sslip_domain" ] && ! [[ "$sslip_domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]; then
-  echo "sslipDomain is not a DNS suffix" >&2
-  exit 1
-fi
 public_ip="$(printf %s '@@PUBLICIPB64@@' | base64 -d)"
 if ! [[ "$public_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
   echo "Azure public IP is not a plain IPv4 address" >&2
   exit 1
 fi
-box_alias=""
-if [ -n "$sslip_domain" ]; then
-  box_alias="${public_ip//./-}.${sslip_domain}"
+# Decode the array as JSON, validate the same DNS-suffix grammar the runtime
+# uses, reject duplicates, and emit a compact JSON array. JSON is valid YAML,
+# so it can be inserted as one safely bounded scalar below.
+if ! box_aliases="$(SSLIP_DOMAINS_JSON="$(printf %s '@@SSLIPDOMAINSB64@@' | base64 -d)" PUBLIC_IP="$public_ip" python3 - <<'PY'
+import json
+import os
+import re
+import sys
+
+suffixes = json.loads(os.environ["SSLIP_DOMAINS_JSON"])
+pattern = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$")
+if not isinstance(suffixes, list) or not all(isinstance(value, str) for value in suffixes):
+    sys.exit("sslipDomains must be an array of DNS suffix strings")
+if len(suffixes) != len(set(suffixes)):
+    sys.exit("sslipDomains must not contain duplicates")
+if not all(pattern.fullmatch(value) for value in suffixes):
+    sys.exit("sslipDomains entries must be DNS suffixes")
+dashed = os.environ["PUBLIC_IP"].replace(".", "-")
+print(json.dumps([f"{dashed}.{suffix}" for suffix in suffixes], separators=(",", ":")))
+PY
+)"; then
+  exit 1
 fi
 
 cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
@@ -437,7 +455,7 @@ domain: '@DOMAIN@'
 agents: [claude, codex]
 web:
   enable: true
-  alias: '@ALIAS@'
+  aliases: @ALIASES@
   # Portal handover (issue #593). Empty is off, which is the module's own
   # default: a box deployed without the two portal parameters serves no
   # handover route and no unauthenticated endpoint. No key is configured --
@@ -455,12 +473,12 @@ AGENTBOX_CONFIG
 # written, or an issuer URL containing one would splice the placeholder
 # into config.yaml instead of the URL (same bug as the CFN twin, before its
 # own fix). box_alias and public_ip already exclude both, but escaping
-# them too costs nothing and keeps all substitutions uniform.
+# them too costs nothing and keeps all substitutions uniform. box_aliases is
+# already JSON made from validated DNS suffixes and the validated public IP.
 esc_issuer=$(printf '%s' "$portal_issuer" | sed -e 's/[&\]/\\&/g')
 esc_user=$(printf '%s' "$portal_user" | sed -e 's/[&\]/\\&/g')
-esc_alias=$(printf '%s' "$box_alias" | sed -e 's/[&\]/\\&/g')
 esc_domain=$(printf '%s' "$public_ip" | sed -e 's/[&\]/\\&/g')
-sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@ALIAS@|$esc_alias|; s|@DOMAIN@|$esc_domain|" \
+sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@ALIASES@|$box_aliases|; s|@DOMAIN@|$esc_domain|" \
   /etc/agent-box/config.yaml
 
 # Extra standing instructions for the agent, if the deployment gave any.
@@ -516,7 +534,7 @@ var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
   // and check_secrets() in scripts/check_azure_template.py, which fails if
   // this ever goes back to a raw substitution.
   '@@AGENTSMDB64@@', base64(agentsMd)),
-  '@@SSLIPDOMAINB64@@', base64(sslipDomain)),
+  '@@SSLIPDOMAINSB64@@', base64(string(effectiveSslipDomains))),
   '@@WEBPASSWORD@@', base64(webPassword)),
   '@@PORTALISSUERB64@@', base64(portalIssuerYaml)),
   '@@PORTALUSERIDB64@@', base64(portalUserYaml)),
@@ -668,16 +686,19 @@ resource bootstrapExtension 'Microsoft.Compute/virtualMachines/extensions@2024-0
 
 // ---------------------------------------------------------------------------
 
-// The public IPv4 is primary. A configured sslipDomain creates a dashed-IP
-// DNS alias; the dotted spelling is never included in its certificate.
+// The public IPv4 is primary. Each configured suffix creates a dashed-IP DNS
+// alias; the dotted spelling is never included in an alias certificate.
 var host = publicIp.properties.ipAddress
-var sslipHost = '${replace(host, '.', '-')}.${sslipDomain}'
+var aliasUrlValues = map(effectiveSslipDomains, suffix => 'https://${replace(host, '.', '-')}.${suffix}/${userName}/')
 
 @description('Browser terminal. Sign in with the userName and the webPassword chosen at deployment time. The first load waits on Caddy\'s ACME certificate. (The URL deliberately carries no user@ prefix: Chrome answers the auth challenge with URL userinfo plus an EMPTY password, and credentials typed into the prompt cannot override the URL-embedded identity.)')
 output webUrl string = 'https://${host}/${userName}/'
 
-@description('Optional sslip.io-compatible alias URL. Empty when sslipDomain is unset. Caddy obtains its certificate on first use.')
-output sslipUrl string = empty(sslipDomain) ? '' : 'https://${sslipHost}/${userName}/'
+@description('DNS alias URLs. Caddy obtains each certificate on first use.')
+output aliasUrls array = aliasUrlValues
+
+@description('First DNS alias URL, retained for clients of the former single-value output. Empty when sslipDomains is empty.')
+output sslipUrl string = length(aliasUrlValues) == 0 ? '' : aliasUrlValues[0]
 
 @description('Claude Remote Control session name. Only meaningful if the session started from the settings page\'s install+sign-in cards is a claude one: after finishing `claude login` once in the browser terminal, the Claude desktop and mobile apps can drive it.')
 output remoteControlSession string = '${userName}-main@${host}'
