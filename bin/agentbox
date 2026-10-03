@@ -4573,10 +4573,9 @@ def verify_units(units, advisory, act, skip=()):
                    required)
 
 
-def unit_properties(unit):
+def unit_properties(unit, names=("LoadState", "ActiveState", "SubState",
+                                 "Type", "RemainAfterExit")):
     """The handful of `systemctl show` properties verify_units reads."""
-    names = ["LoadState", "ActiveState", "SubState", "Type",
-             "RemainAfterExit"]
     try:
         out = run(["systemctl", "show", unit,
                    *(f"--property={n}" for n in names)],
@@ -4829,6 +4828,19 @@ def active_units(pattern):
     return [line.split()[0] for line in (out or "").splitlines() if line.strip()]
 
 
+def started_since(unit, mark):
+    """True when `unit` entered the active state after `mark`.
+
+    `mark` is a time.monotonic() reading: systemd's
+    ActiveEnterTimestampMonotonic is CLOCK_MONOTONIC in microseconds, the
+    same clock. A restart of one unit restarts what is RequiredBy/PartOf it,
+    so a later explicit restart of that dependant is a second outage.
+    """
+    stamp = unit_properties(unit, ("ActiveEnterTimestampMonotonic",)).get(
+        "ActiveEnterTimestampMonotonic", "")
+    return stamp.isdigit() and int(stamp) / 1e6 >= mark
+
+
 def restart_units(restart_sessions=True):
     """Restart what a profile swap invalidated but left looking unchanged.
 
@@ -4848,8 +4860,16 @@ def restart_units(restart_sessions=True):
     patterns = RESTART_PATTERNS + ([SESSION_PATTERN] if restart_sessions
                                    else [])
     restarted = []
+    mark = time.monotonic()
     for pattern in patterns:
         for unit in active_units(pattern):
+            if started_since(unit, mark):
+                # agent-web-auth-secrets is RequiredBy caddy, and fail2ban
+                # is PartOf it: restarting the first already restarted the
+                # rest. Restarting caddy again stopped fail2ban mid-start
+                # and cost a 3-minute outage (issue #809).
+                print(f"{unit} already restarted by a dependency")
+                continue
             run([SYSTEMCTL, "restart", unit], check=False)
             restarted.append(unit)
             print(f"restarted {unit}")

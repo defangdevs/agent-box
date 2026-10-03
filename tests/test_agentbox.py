@@ -3496,6 +3496,25 @@ class SelfUpdateLogicTest(unittest.TestCase):
             skipped = self.mod.restart_units(restart_sessions=False)
         self.assertNotIn("agent-box@agent.service", skipped)
 
+    def test_restart_skips_a_unit_a_dependency_already_restarted(self):
+        """Restarting auth-secrets restarts caddy; a second restart is an outage.
+
+        Issue #809: caddy is RequiredBy agent-web-auth-secrets, so the first
+        restart already bounced it (and fail2ban, PartOf caddy). The explicit
+        restart that followed stopped fail2ban mid-start and hung for 3 min.
+        """
+        live = {p: [] for p in self.mod.RESTART_PATTERNS}
+        live["agent-web-auth-secrets.service"] = [
+            "agent-web-auth-secrets.service"]
+        live["caddy.service"] = ["caddy.service"]
+        live["agent-box@*.service"] = []
+        self.mod.active_units = lambda pattern: live[pattern]
+        self.mod.started_since = (
+            lambda unit, mark: unit == "caddy.service")
+        with self.quiet():
+            restarted = self.mod.restart_units()
+        self.assertEqual(restarted, ["agent-web-auth-secrets.service"])
+
     def test_a_profile_with_no_generation_still_recovers(self):
         """`--from-generation None` must not reach phase two.
 
