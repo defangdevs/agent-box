@@ -290,13 +290,15 @@ class Watches(unittest.TestCase):
         launches = []
         while time.monotonic() < deadline:
             if output.exists():
-                launches = [json.loads(s)['profile'] for s in output.read_text().splitlines()]
+                launches = [json.loads(s) for s in output.read_text().splitlines()]
             if len(launches) == 2:
                 break
             time.sleep(.1)
         log.flush()
-        self.assertCountEqual(launches, ['triage', 'debugger'],
-                              (self.root / 'receiver.log').read_text())
+        self.assertCountEqual(
+            [(launch['profile'], launch['authMode']) for launch in launches],
+            [('triage', 'saved-login'), ('debugger', 'saved-login')],
+            (self.root / 'receiver.log').read_text())
 
     def test_api_key_watch_rejects_missing_key_and_never_falls_back(self):
         rule = json.dumps(self.d.WATCH_EVENTS['issues'][1])
@@ -373,6 +375,18 @@ class Watches(unittest.TestCase):
                                 'OPENAI_API_KEY': 'secret-fixture'})
         self.assertFalse((self.root / '.codex/auth.json').exists())
         self.assertNotIn('secret-fixture', json.dumps(self.entries()))
+        lock_args = self.root / 'lock-args'
+        busy_lock = fake_dir / 'busy-flock'
+        busy_lock.write_text('#!' + sys.executable + '\nimport pathlib, sys\n'
+                             f'pathlib.Path({str(lock_args)!r}).write_text(" ".join(sys.argv[1:]))\n'
+                             'sys.exit(1)\n')
+        busy_lock.chmod(0o700)
+        p = subprocess.run([str(self.spawn), '--prepare-auth', 'github:owner/repo',
+                            '', 'codex'], env=dict(self.env, AGENT_BOX_FLOCK_BIN=str(busy_lock)),
+                           capture_output=True, text=True, timeout=3)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertEqual(lock_args.read_text(), '-w 5 9')
+        self.assertIn('CODEX_HOME is busy', p.stdout)
         default_home = self.root / '.codex'
         default_home.mkdir()
         default_auth = default_home / 'auth.json'
@@ -390,6 +404,13 @@ class Watches(unittest.TestCase):
     def test_settings_requires_api_profile_and_labels_auth_mode(self):
         fields = dict(mode='create', topic='owner/repo', watch_name='keyed',
                       profile='triage', events='issues')
+        editor = self.d.render_watch_editor()
+        auth_select = re.search(r'Authentication<select name="auth">(.*?)</select>', editor)
+        self.assertIsNotNone(auth_select)
+        selected = re.search(r'<option value="([^"]+)" selected>', auth_select[1])
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected[1], 'api-key')
+        fields['auth'] = selected[1]
         with patch.dict(os.environ, self.env, clear=True):
             self.assertIn('webhook_auth', self.post('save', **fields))
         self.assertFalse((self.state / 'filter.dispatch.json').exists())
@@ -404,6 +425,14 @@ class Watches(unittest.TestCase):
         self.assertNotIn('secret-fixture', markup)
         editor = self.d.render_watch_editor(self.entries()[0])
         self.assertIn('value="api-key" selected', editor)
+
+        p = self.cli('auth-status', 'OWNER/REPO', '--name', 'keyed')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)['mode'], 'api-key')
+        p = subprocess.run([str(self.spawn), '--auth-status', 'github:OWNER/REPO',
+                            '', 'keyed'], env=self.env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)['mode'], 'api-key')
 
     def test_legacy_watch_keeps_its_auth_choice_on_renewal(self):
         self.subscribe('old', 'triage', self.d.WATCH_EVENTS['issues'][1])

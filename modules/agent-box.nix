@@ -7698,13 +7698,14 @@ _hc_main "$@"
         done
         [ -n "$auth_topic" ] || { echo "agent-box-webhook: auth-status needs TOPIC" >&2; exit 2; }
         case "$auth_topic" in (*:*) ;; (*) auth_topic="github:$auth_topic" ;; esac
-        if ! "$JQ" -e --arg t "$auth_topic" --arg n "$auth_name" \
-          'any((.topics // [])[]; (.topic | ascii_downcase) == ($t | ascii_downcase)
-            and (.name // "") == $n)' "$STATE_DIR/filter.dispatch.json" >/dev/null 2>&1; then
+        auth_config=$("$JQ" -ec --arg t "$auth_topic" --arg n "$auth_name" \
+          '[(.topics // [])[] | select(type == "object" and ((.topic // "") | ascii_downcase) == ($t | ascii_downcase)
+            and (.name // "") == $n)][0] | select(type == "object") | (.spawnConfig // {})' \
+          "$STATE_DIR/filter.dispatch.json" 2>/dev/null) || {
           echo "agent-box-webhook: no standing watch '$auth_topic' / '$auth_name'" >&2
           exit 2
-        fi
-        LOCAL_WEBHOOK_SPAWN_CONFIG=''' "''${AGENT_BOX_HOOK_SPAWN_CMD:-agent-box-webhook-spawn}" \
+        }
+        LOCAL_WEBHOOK_SPAWN_CONFIG="$auth_config" "''${AGENT_BOX_HOOK_SPAWN_CMD:-agent-box-webhook-spawn}" \
           --auth-status "$auth_topic" "" "$auth_name"
         ;;
       subscribe)
@@ -10074,7 +10075,7 @@ elif { [ "''${1:-}" = "--preamble" ] || [ "''${1:-}" = "--resolved-profile" ] \
   # Best effort, like every other read here: no file, bad JSON or no such topic
   # all mean "this watch names no profile", never a failed render.
   watch_config=$("$JQ" -r --arg t "$2" --arg n "''${4:-}" \
-    '[(.topics // [])[] | select(type == "object" and (.topic // "") == $t and (.name // "") == $n)][0]
+    '[(.topics // [])[] | select(type == "object" and ((.topic // "") | ascii_downcase) == ($t | ascii_downcase) and (.name // "") == $n)][0]
      | (if type == "object" then (.spawnConfig // {}) else {} end) | tojson' \
     "$LOCAL_WEBHOOK_STATE_DIR/filter.dispatch.json" 2>/dev/null) || watch_config=""
 fi
@@ -10181,13 +10182,18 @@ watch_auth_prepare() {
     # A changed profile key rotates the CLI login. Never put it in argv,
     # stdout, stderr, or the saved watch configuration.
     exec 9>"$watch_auth_home/.agent-box-auth.lock"
-    "''${AGENT_BOX_FLOCK_BIN:-flock}" 9
+    if ! "''${AGENT_BOX_FLOCK_BIN:-flock}" -w 5 9; then
+      exec 9>&-
+      watch_auth_reason="Codex CODEX_HOME is busy for profile $watch_profile"
+      return 1
+    fi
     if ! WATCH_AUTH_KEY="$watch_auth_key" "$JQ" -e \
       '.auth_mode == "apikey" and .OPENAI_API_KEY == env.WATCH_AUTH_KEY' \
       "$watch_auth_home/auth.json" >/dev/null 2>&1; then
       if ! printf '%s' "$watch_auth_key" \
            | CODEX_HOME="$watch_auth_home" "$watch_auth_codex_bin" login --with-api-key >/dev/null 2>&1; then
         watch_auth_reason="Codex could not store the API-key login"
+        exec 9>&-
         return 1
       fi
     fi
@@ -10195,12 +10201,15 @@ watch_auth_prepare() {
       '.auth_mode == "apikey" and .OPENAI_API_KEY == env.WATCH_AUTH_KEY' \
       "$watch_auth_home/auth.json" >/dev/null 2>&1; then
       watch_auth_reason="Codex API-key login did not save the selected key"
+      exec 9>&-
       return 1
     fi
     if ! chmod 600 "$watch_auth_home/auth.json"; then
       watch_auth_reason="Codex cannot protect auth.json for profile $watch_profile"
+      exec 9>&-
       return 1
     fi
+    exec 9>&-
   fi
   return 0
 }
@@ -19063,7 +19072,8 @@ def render_watch_editor(entry=None):
     mode = "create" if creating else "edit" if name else "profile"
     esc = html.escape
     profile = (entry.get("spawnConfig") or {}).get("profile", "")
-    auth = (entry.get("spawnConfig") or {}).get("authMode", "legacy")
+    auth = (entry.get("spawnConfig") or {}).get(
+        "authMode", "api-key" if creating else "legacy")
     profiles = read_profiles()
     choices = ["", *profiles]
     if profile and profile not in profiles:

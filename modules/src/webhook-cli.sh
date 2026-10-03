@@ -888,13 +888,14 @@ case "$cmd" in
     done
     [ -n "$auth_topic" ] || { echo "agent-box-webhook: auth-status needs TOPIC" >&2; exit 2; }
     case "$auth_topic" in (*:*) ;; (*) auth_topic="github:$auth_topic" ;; esac
-    if ! "$JQ" -e --arg t "$auth_topic" --arg n "$auth_name" \
-      'any((.topics // [])[]; (.topic | ascii_downcase) == ($t | ascii_downcase)
-        and (.name // "") == $n)' "$STATE_DIR/filter.dispatch.json" >/dev/null 2>&1; then
+    auth_config=$("$JQ" -ec --arg t "$auth_topic" --arg n "$auth_name" \
+      '[(.topics // [])[] | select(type == "object" and ((.topic // "") | ascii_downcase) == ($t | ascii_downcase)
+        and (.name // "") == $n)][0] | select(type == "object") | (.spawnConfig // {})' \
+      "$STATE_DIR/filter.dispatch.json" 2>/dev/null) || {
       echo "agent-box-webhook: no standing watch '$auth_topic' / '$auth_name'" >&2
       exit 2
-    fi
-    LOCAL_WEBHOOK_SPAWN_CONFIG='' "${AGENT_BOX_HOOK_SPAWN_CMD:-agent-box-webhook-spawn}" \
+    }
+    LOCAL_WEBHOOK_SPAWN_CONFIG="$auth_config" "${AGENT_BOX_HOOK_SPAWN_CMD:-agent-box-webhook-spawn}" \
       --auth-status "$auth_topic" "" "$auth_name"
     ;;
   subscribe)

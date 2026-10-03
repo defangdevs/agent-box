@@ -1890,7 +1890,8 @@ def render_watch_editor(entry=None):
     mode = "create" if creating else "edit" if name else "profile"
     esc = html.escape
     profile = (entry.get("spawnConfig") or {}).get("profile", "")
-    auth = (entry.get("spawnConfig") or {}).get("authMode", "legacy")
+    auth = (entry.get("spawnConfig") or {}).get(
+        "authMode", "api-key" if creating else "legacy")
     profiles = read_profiles()
     choices = ["", *profiles]
     if profile and profile not in profiles:
