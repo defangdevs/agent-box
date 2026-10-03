@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -30,6 +31,7 @@ class WhatsAppInstallTest(unittest.TestCase):
         self.cli.HOME = self.root
         self.cli.RUNTIME = self.root / ".local/share/local-whatsapp"
         self.cli.STATE = self.root / ".local/state/local-whatsapp"
+        self.cli.READY = self.cli.STATE / "ready"
         self.cli.NODE = self.root / ".nix-profile/bin/node"
         self.cli.NPM = self.root / ".nix-profile/bin/npm"
         self.cli.NODE.parent.mkdir(parents=True)
@@ -144,6 +146,41 @@ class WhatsAppInstallTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not linked"):
                 self.cli.serve()
         install.assert_not_called()
+
+    def test_unlink_stops_bridge_and_removes_all_state_but_keeps_runtime(self):
+        auth = self.cli.STATE / "auth"
+        auth.mkdir()
+        (auth / "creds.json").write_text(json.dumps({"me": {"id": "linked"}}))
+        (self.cli.STATE / "ready").touch()
+        (self.cli.STATE / "messages.json").write_text("queued message")
+
+        with mock.patch.object(self.cli.time, "sleep"), \
+                mock.patch.object(self.cli, "bridge_connected", return_value=False):
+            self.cli.unlink()
+
+        self.assertFalse(self.cli.STATE.exists())
+        self.assertTrue(self.cli.RUNTIME.exists())
+
+    def test_unlink_refuses_to_delete_live_bridge_state(self):
+        auth = self.cli.STATE / "auth"
+        auth.mkdir()
+        (auth / "creds.json").write_text(json.dumps({"me": {"id": "linked"}}))
+        (self.cli.STATE / "ready").touch()
+        self.cli.UNLINK_TIMEOUT = 0
+
+        with mock.patch.object(self.cli.time, "sleep"), \
+                mock.patch.object(self.cli, "bridge_connected", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "did not stop"):
+                self.cli.unlink()
+
+        self.assertFalse((self.cli.STATE / "ready").exists())
+        self.assertTrue((auth / "creds.json").exists())
+
+    def test_unlink_is_idempotent_without_state(self):
+        shutil.rmtree(self.cli.STATE)
+        with mock.patch.object(self.cli.time, "sleep") as sleep:
+            self.cli.unlink()
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":

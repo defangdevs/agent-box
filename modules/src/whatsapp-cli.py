@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.request import urlopen
 
 
@@ -25,6 +27,8 @@ STATE = HOME / ".local/state/local-whatsapp"
 READY = STATE / "ready"
 NODE = HOME / ".nix-profile/bin/node"
 NPM = HOME / ".nix-profile/bin/npm"
+UNLINK_SETTLE = 2.5
+UNLINK_TIMEOUT = 10
 
 
 def private_dir(path):
@@ -158,6 +162,45 @@ def activate():
     READY.touch(mode=0o600)
 
 
+def bridge_connected():
+    """Whether the supervised bridge still owns its control socket."""
+    peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        peer.settimeout(1)
+        peer.connect(str(STATE / "bridge.sock"))
+        return True
+    except OSError:
+        return False
+    finally:
+        peer.close()
+
+
+def unlink():
+    """Stop the user bridge and forget this box's linked-device state.
+
+    Removing the ready marker asks the supervisor to stop its child. Wait for
+    that managed process before deleting its credentials and queued messages,
+    or the still-live bridge could write either one back after this returns.
+    The optional runtime stays installed, as every other connection's CLI does
+    after logout, so pairing again does not require another download.
+    """
+    if STATE.is_symlink():
+        raise RuntimeError("WhatsApp state cannot be a symlink")
+    READY.unlink(missing_ok=True)
+    if not STATE.exists():
+        return
+    # The supervisor reconciles every two seconds. An absent socket before one
+    # full tick does not prove a bridge is stopped: it may still be installing
+    # the optional runtime on its way to execing bridge.mjs.
+    time.sleep(UNLINK_SETTLE)
+    deadline = time.monotonic() + UNLINK_TIMEOUT
+    while bridge_connected():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("WhatsApp bridge did not stop; try unlinking again")
+        time.sleep(0.1)
+    shutil.rmtree(STATE)
+
+
 def serve():
     """Refresh the optional runtime, then replace this process with its bridge."""
     if not paired():
@@ -185,14 +228,14 @@ def main():
         print(json.dumps({"profile": profile(sys.argv[2])}))
         return
     if len(sys.argv) != 2 or sys.argv[1] not in (
-            "install", "pair", "activate", "serve", "status", "profile"):
+            "install", "pair", "activate", "serve", "status", "profile", "unlink"):
         raise RuntimeError(
-            "usage: agent-box-whatsapp install|pair|activate|serve|status|profile [NAME|default]")
+            "usage: agent-box-whatsapp install|pair|activate|serve|status|profile|unlink [NAME|default]")
     if sys.argv[1] == "profile":
         print(json.dumps({"profile": profile()}))
         return
     {"install": install, "pair": pair, "activate": activate,
-     "serve": serve, "status": status}[sys.argv[1]]()
+     "serve": serve, "status": status, "unlink": unlink}[sys.argv[1]]()
 
 
 if __name__ == "__main__":
