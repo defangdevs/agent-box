@@ -165,7 +165,10 @@ device. Enter the account's phone number with country code, start pairing,
 and give the displayed code to WhatsApp's Linked devices screen on the
 primary phone. The bridge accepts only messages that start with `@agent `
 (`@` plus this box's Linux user) from that account's Message Yourself chat. The device link belongs to the Linux user and
-survives agent session restarts. Node and the bridge are installed only when
+survives agent session restarts. Automatic message receipts are off by default;
+set `LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable
+diagnostic receipts. Agent replies and explicit command responses stay enabled.
+Node and the bridge are installed only when
 pairing is requested; they are not part of the base image. The supervisor
 runs the bridge without spending a session slot. Message text and linked-device
 keys are stored in private files under `~/.local/state/local-whatsapp` on this
