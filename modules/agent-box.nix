@@ -993,9 +993,16 @@ let
       After=network-online.target agent-box-settings@%i.socket agent-box@%i.service
       Requires=agent-box-settings@%i.socket
       Wants=network-online.target
+      # Share the supervisor's PrivateTmp (issue #800). Codex makes
+      # ~/.codex/app-server-control/app-server-control.sock a symlink into
+      # /tmp/codex-daemon-<uid>/, and the daemon creates the real socket in the
+      # supervisor's private /tmp. Without the same /tmp here the symlink dangles
+      # and Codex pairing always reports "did not start".
+      JoinsNamespaceOf=agent-box@%i.service
 
       [Service]
       User=%i
+      PrivateTmp=true
       Restart=always
       RestartSec=5s
       Environment=TMUX_TMPDIR=/run/agent-box-%i
