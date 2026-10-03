@@ -64,10 +64,12 @@ usage() {
   echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
   echo "                             [--cwd DIR] [--remote-control true|false]"
   echo "                             [--prompt TEXT] [--resume-prompt TEXT] [--ephemeral]"
+  echo "                             [--whatsapp true|false]"
   echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
+  echo "       agent-box-session whatsapp ls | NAME on|off|status"
   echo "       agent-box-session env ls | set KEY VALUE | set KEY --stdin | rm KEY"
   echo "         (--stdin reads the value from stdin: for a multi-line secret"
   echo "          such as a PEM, and to keep any secret out of the command line)"
@@ -454,6 +456,50 @@ case "$cmd" in
       echo "(tmux -L agent-box capture-pane -pt NAME | tail -40) or ask it."
     fi
     ;;
+  whatsapp)
+    name="${1:-}"
+    if [ "$name" = ls ]; then
+      [ $# -eq 1 ] || { usage >&2; exit 2; }
+      if [ -s "$REGISTRY_FILE" ]; then
+        "$JQ" -c '[.sessions | to_entries[] |
+          select(.value.whatsapp == true and (.value.agent == "claude" or .value.agent == "codex")) |
+          {name: .key, harness: .value.agent, stopped: (.value.stopped == true)}]' "$REGISTRY_FILE"
+      else
+        echo '[]'
+      fi
+      exit 0
+    fi
+    valid_name "$name" || { usage >&2; exit 2; }
+    action="${2:-}"
+    [ $# -eq 2 ] || { usage >&2; exit 2; }
+    case "$action" in
+      status)
+        [ -s "$REGISTRY_FILE" ] && taken "$name" || {
+          echo "no such session: '$name' (see agent-box-session ls)" >&2; exit 2;
+        }
+        "$JQ" -r --arg n "$name" 'if .sessions[$n].whatsapp == true then "on" else "off" end' "$REGISTRY_FILE"
+        ;;
+      on|off)
+        registry_ensure
+        registry_lock
+        taken "$name" || {
+          echo "no such session: '$name' (see agent-box-session ls)" >&2; exit 2;
+        }
+        harness="$("$JQ" -r --arg n "$name" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
+        if [ "$action" = on ] && [ "$harness" != claude ] && [ "$harness" != codex ]; then
+          echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+          exit 2
+        fi
+        enabled=false
+        [ "$action" = on ] && enabled=true
+        registry_edit --arg n "$name" --argjson enabled "$enabled" '.sessions[$n].whatsapp = $enabled'
+        registry_unlock
+        echo "WhatsApp $action for session '$name'"
+        [ "$harness" != claude ] || echo "Restart the Claude session to apply its channel setting."
+        ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    ;;
   add)
     # NAME is optional and positional: a leading non-flag arg is the name,
     # otherwise the name is auto-derived from the agent below.
@@ -463,7 +509,7 @@ case "$cmd" in
       *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
     harness="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
-    profile=""; has_harness=0; ephemeral=0; remote_control=""
+    profile=""; has_harness=0; ephemeral=0; remote_control=""; whatsapp=false
     while [ $# -gt 0 ]; do
       case "$1" in
         --harness) harness="${2:?--harness needs a value}"; has_harness=1; shift 2 ;;
@@ -484,6 +530,12 @@ case "$cmd" in
             (true|false) remote_control="$2" ;;
             (*) echo "agent-box-session: --remote-control must be 'true' or 'false'" >&2
                 exit 2 ;;
+          esac
+          shift 2 ;;
+        --whatsapp)
+          case "${2:?--whatsapp needs 'true' or 'false'}" in
+            (true|false) whatsapp="$2" ;;
+            (*) echo "agent-box-session: --whatsapp must be 'true' or 'false'" >&2; exit 2 ;;
           esac
           shift 2 ;;
         --prompt) prompt="${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
@@ -595,6 +647,10 @@ case "$cmd" in
       (*" $harness "*) ;;
       (*) echo "harness '$harness' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
+    if [ "$whatsapp" = true ] && [ "$harness" != claude ] && [ "$harness" != codex ]; then
+      echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+      exit 2
+    fi
     registry_ensure
     # Name choice and write are one critical section (issue #254): gen_name
     # and taken() both decide from a READ of the file, so two concurrent adds
@@ -628,7 +684,9 @@ case "$cmd" in
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
       --arg prof "$profile" --arg eph "$ephemeral" --argjson rc "$remote_control" \
+      --argjson whatsapp "$whatsapp" \
       '.sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
+                        whatsapp: $whatsapp,
                         remoteControlName: null,
                         workingDirectory: (if $c == "" then null else $c end),
                         extraArgs: $ARGS.positional,

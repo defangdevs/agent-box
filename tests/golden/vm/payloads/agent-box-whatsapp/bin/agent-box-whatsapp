@@ -1,0 +1,163 @@
+#! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.7/bin/python3.14
+"""Optional per-user WhatsApp linked-device runtime for agent-box."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+from urllib.request import urlopen
+
+
+REV = "f8c052ec5350c99d9029c2b2af2d2394d8445594"
+FILES = {
+    "bridge.mjs": "c3745917cc0982c8197214a1f64c0be97caadb6933a2bcd209895eaab849cac0",
+    "state.mjs": "4f5125000fbb44b43c9dc7909ee293c61b5c3a6ae44f83620bd506470344e81b",
+    "package.json": "fa002e046ea1c39dc12d1651023d370d2cef512ac990427794266b69e0c2db0a",
+    "package-lock.json": "bf76fd9c4f6932fb7cb5f8f642973446b51591bc4ad45ae678fdeb97b0af90e4",
+}
+HOME = Path.home()
+RUNTIME = HOME / ".local/share/local-whatsapp"
+STATE = HOME / ".local/state/local-whatsapp"
+READY = STATE / "ready"
+NODE = HOME / ".nix-profile/bin/node"
+NPM = HOME / ".nix-profile/bin/npm"
+
+
+def private_dir(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError("WhatsApp directory cannot be a symlink")
+    path.chmod(0o700)
+
+
+def ensure_node():
+    if NODE.is_file() and NPM.is_file():
+        return
+    nix = (shutil.which("nix") or "/nix/var/nix/profiles/default/bin/nix")
+    if not Path(nix).is_file():
+        raise RuntimeError("Nix is unavailable; cannot install optional Node runtime")
+    print("Installing optional Node runtime for WhatsApp; this may take a few minutes.", flush=True)
+    subprocess.run([nix, "profile", "add", "--profile", str(HOME / ".nix-profile"),
+                    "nixpkgs#nodejs_22"], check=True, timeout=900)
+    if not NODE.is_file() or not NPM.is_file():
+        raise RuntimeError("Node installation finished without node and npm")
+
+
+def runtime_matches():
+    if not (RUNTIME / "node_modules").is_dir():
+        return False
+    for name, expected in FILES.items():
+        source = RUNTIME / name
+        if not source.is_file():
+            return False
+        if hashlib.sha256(source.read_bytes()).hexdigest() != expected:
+            return False
+    return True
+
+
+def install():
+    ensure_node()
+    backup = RUNTIME.with_name(RUNTIME.name + ".previous")
+    pending = RUNTIME.with_name(RUNTIME.name + ".pending")
+    if any(path.is_symlink() for path in (RUNTIME, backup, pending)):
+        raise RuntimeError("WhatsApp runtime cannot be a symlink")
+    if not RUNTIME.exists():
+        for candidate in (pending, backup):
+            if candidate.exists():
+                candidate.rename(RUNTIME)
+                break
+    if runtime_matches():
+        for old in (pending, backup):
+            if old.exists():
+                shutil.rmtree(old)
+        return
+    private_dir(RUNTIME.parent)
+    with tempfile.TemporaryDirectory(prefix="local-whatsapp-", dir=RUNTIME.parent) as raw:
+        stage = Path(raw)
+        for name, expected in FILES.items():
+            url = (f"https://raw.githubusercontent.com/defangdevs/local-channels/"
+                   f"{REV}/local-whatsapp/{name}")
+            with urlopen(url, timeout=30) as response:
+                content = response.read(2_000_001)
+            if len(content) > 2_000_000 or hashlib.sha256(content).hexdigest() != expected:
+                raise RuntimeError("WhatsApp source integrity check failed for " + name)
+            (stage / name).write_bytes(content)
+        print("Installing pinned WhatsApp dependencies.", flush=True)
+        env = dict(os.environ)
+        env["PATH"] = str(NODE.parent) + os.pathsep + env.get("PATH", "")
+        subprocess.run([str(NPM), "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+                       cwd=stage, env=env, check=True, timeout=900)
+        if any(path.is_symlink() for path in (RUNTIME, backup, pending)):
+            raise RuntimeError("WhatsApp runtime cannot be a symlink")
+        if pending.exists() and RUNTIME.exists():
+            shutil.rmtree(pending)
+        if RUNTIME.exists():
+            RUNTIME.rename(pending)
+        try:
+            stage.rename(RUNTIME)
+        except OSError:
+            if pending.exists() and not RUNTIME.exists():
+                pending.rename(RUNTIME)
+            raise
+        for old in (pending, backup):
+            if old.exists():
+                shutil.rmtree(old)
+    RUNTIME.chmod(0o700)
+
+
+def paired():
+    path = STATE / "auth/creds.json"
+    try:
+        return bool(json.loads(path.read_text()).get("me"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def status():
+    connected = False
+    if NODE.is_file() and (RUNTIME / "bridge.mjs").is_file():
+        try:
+            result = subprocess.run([str(NODE), str(RUNTIME / "bridge.mjs"), "status"],
+                                    capture_output=True, text=True, timeout=5, check=False)
+            connected = result.returncode == 0 and json.loads(result.stdout).get("connected") is True
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    print(json.dumps({"connected": connected, "paired": paired(),
+                      "enabled": READY.is_file()}))
+
+
+def activate():
+    if not paired():
+        raise RuntimeError("WhatsApp is not linked; pair the device first")
+    private_dir(STATE)
+    READY.touch(mode=0o600)
+
+
+def pair():
+    phone = os.environ.get("LOCAL_WHATSAPP_PHONE", "").strip()
+    if not phone.isdigit() or not 7 <= len(phone) <= 15:
+        raise RuntimeError("Set LOCAL_WHATSAPP_PHONE to international digits before pairing")
+    install()
+    private_dir(STATE)
+    subprocess.run([str(NODE), str(RUNTIME / "bridge.mjs"), "pair"], check=True,
+                   timeout=240, env=dict(os.environ, LOCAL_WHATSAPP_PHONE=phone))
+    activate()
+    print("WhatsApp linked. The agent-box supervisor is starting the bridge.", flush=True)
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ("install", "pair", "activate", "status"):
+        raise RuntimeError("usage: agent-box-whatsapp install|pair|activate|status")
+    {"install": install, "pair": pair, "activate": activate, "status": status}[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print("agent-box-whatsapp: " + str(error), file=sys.stderr)
+        sys.exit(1)

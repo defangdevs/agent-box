@@ -2353,17 +2353,53 @@ def parse_defang_status(proc):
     return (True, "%s (%s)" % (who, tier) if tier else who)
 
 
+def parse_whatsapp_status(proc):
+    if proc.returncode != 0:
+        return (False, "")
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return (False, "")
+    if not isinstance(data, dict):
+        return (False, "")
+    if data.get("connected") is True:
+        return (True, "linked device connected")
+    if data.get("paired") is True:
+        return (False, "device linked; bridge is connecting")
+    return (False, "")
+
+
 CONNECT_PARSERS = {
     "claude": parse_claude_status,
     "codex": parse_codex_status,
     "gh": parse_gh_status,
     "defang": parse_defang_status,
+    "whatsapp": parse_whatsapp_status,
 }
 
 # One row per flow, in render order. `start` and `status` are argv tails
 # appended to the flow's binary; nothing is passed through a shell except
 # the pane wrapper built in connect_start (via shlex.quote).
 CONNECT_DEFS = [
+    {
+        "id": "whatsapp",
+        "binary": "agent-box-whatsapp",
+        "attr": None,
+        "label": "WhatsApp",
+        "note": "Link your personal WhatsApp account by phone-number code. "
+                "The WhatsApp chat is end-to-end encrypted; message text is "
+                "also stored on this box for delivery.",
+        "start": ["pair"],
+        "status": ["status"],
+        "parse": "whatsapp",
+        "hosts": (),
+        "needs_code": False,
+        "show_code": True,
+        "unset": (),
+        "shadow": (),
+        "prompt_re": None,
+        "destructive": False,
+    },
     {
         "id": "claude",
         "binary": "claude",
@@ -2712,9 +2748,12 @@ def connect_trusted_url(text, hosts):
     return None
 
 
-def connect_user_code(text):
+def connect_user_code(text, flow_id=None):
     """The one-time code a device flow prints in the pane. Searched with
     URLs removed, so a `code=` query parameter cannot pose as one."""
+    if flow_id == "whatsapp":
+        match = re.search(r"WhatsApp pairing code: ([A-Z0-9]{8})\b", text or "")
+        return match.group(1) if match else None
     stripped = CONNECT_URL_RE.sub(" ", text or "")
     for match in CONNECT_CODE_RE.finditer(stripped):
         code = match.group(1).upper()
@@ -3425,8 +3464,8 @@ def connect_state(flow, keys=None, tmux_state=None):
             if flow["prompt_re"] is not None:
                 connect_answer_prompt(flow, text)
             url = connect_trusted_url(text, flow["hosts"])
-            code = connect_user_code(text) if flow["show_code"] else None
-            state = "waiting" if url else "starting"
+            code = connect_user_code(text, flow_id) if flow["show_code"] else None
+            state = "waiting" if url or code else "starting"
     elif os.path.exists(connect_done_path(flow_id)):
         # The pane already closed on a sign-in no render saw finish (issue
         # #751): finish it now, on a fresh probe that STARTED after the
@@ -3664,6 +3703,14 @@ def connect_start(flow):
                                          ".nix-profile")),
                 " ".join(shlex.quote(a) for a in source)))
     inner = " ".join(shlex.quote(a) for a in [binary] + flow["start"])
+    if flow_id == "whatsapp":
+        phone = as_dict(load(ENV_FILE)).get("LOCAL_WHATSAPP_PHONE", "")
+        if not re.fullmatch(r"[0-9]{7,15}", phone):
+            state = connect_state(flow)
+            state["state"] = "failed"
+            state["error"] = "Enter an international phone number to pair WhatsApp."
+            return state
+        inner = "LOCAL_WHATSAPP_PHONE=" + shlex.quote(phone) + " " + inner
     if flow["unset"]:
         inner = ("env " + " ".join("-u " + k for k in flow["unset"]) + " " + inner)
     inner = prelude + inner
@@ -4106,6 +4153,8 @@ NEW_SESSION_FIELDS_TPL = """<div class="row new-session-row">
 <p class="note">The profile decides which assistant runs, and its model,
 reasoning level and instructions. Choose where the session starts too: the
 default is your home folder (<code>~</code>).</p>
+<label class="row"><input type="checkbox" name="whatsapp" value="on">
+  Allow WhatsApp messages to this session</label>
 <div class="row prompt-row">
   <textarea name="prompt" rows="2"
             placeholder="starting task (optional) &mdash; what this session should work on first"></textarea>
@@ -5303,6 +5352,21 @@ def render_sessions(subs=None):
                 )
             else:
                 download = ""
+            whatsapp = ""
+            if entries[name].get("agent") in ("claude", "codex"):
+                enabled = entries[name].get("whatsapp") is True
+                next_state = "off" if enabled else "on"
+                whatsapp = (
+                    f'<form class="inline" method="post" '
+                    f'action="{base}/sessions/whatsapp">'
+                    f'<input type="hidden" name="name" value="{safe}">'
+                    f'<input type="hidden" name="state" value="{next_state}">'
+                    f'<input type="hidden" name="back" value="settings">'
+                    f'<button type="submit" class="btn small" '
+                    f'aria-pressed="{"true" if enabled else "false"}" '
+                    f'title="Allow WhatsApp messages to {safe}">'
+                    f'WhatsApp: {"On" if enabled else "Off"}</button></form>'
+                )
             # The same answer on the row itself, so choosing does not need a
             # hover: CSS ellipsizes it rather than pushing the actions out.
             if topic:
@@ -5324,6 +5388,7 @@ def render_sessions(subs=None):
                 f'{render_subs_chip(subs, name)}</span>'
                 f'<span class="acts">'
                 f'{download}'
+                f'{whatsapp}'
                 f'<form class="inline" method="post" '
                 f'action="{base}/sessions/restart"{guard}>'
                 f'<input type="hidden" name="name" value="{safe}">'
@@ -5351,7 +5416,7 @@ def render_sessions(subs=None):
                     f'</details></li>'
                 )
         body = "".join(items)
-    return '<ul class="tbl"><li class="tbl-head">Session</li>' + body + "</ul>"
+    return '<ul class="tbl sessions"><li class="tbl-head">Session</li>' + body + "</ul>"
 
 
 WEBHOOK_STATES = {
@@ -5750,6 +5815,11 @@ def render_connect_card(state):
         "idle": ("stopped", "Not signed in"),
         "checking": ("stopped", "Checking&hellip;"),
     }[state["state"]]
+    if flow_id == "whatsapp":
+        if state["state"] == "connected":
+            pill = ("live", "Connected")
+        elif state["state"] in ("idle", "failed"):
+            pill = ("stopped", "Not linked" if not state["detail"] else "Connecting")
     if not state["installed"] and state["state"] in ("idle", "checking",
                                                      "failed"):
         # "Not signed in" would be a half-truth for a CLI that is not even
@@ -5797,6 +5867,8 @@ def render_connect_card(state):
         # destructive flow's confirmation on the strength of a guess, so
         # that guard stays armed until the probe actually clears it.
         label, confirm = "Sign in", (state["state"] == "checking" and state["destructive"])
+    if flow_id == "whatsapp":
+        label = None  # The pairing form needs a phone field inside the card.
     action = ""
     if label:
         guard = ""
@@ -5835,7 +5907,8 @@ def render_connect_card(state):
     # closed card would hide it). Idle and connected cards with nothing
     # else to say stay closed (issue #449).
     open_now = (
-        state["state"] in ("waiting", "starting", "checking", "exchanging")
+        (flow_id == "whatsapp" and state["state"] != "connected")
+        or state["state"] in ("waiting", "starting", "checking", "exchanging")
         or (state["state"] in ("failed", "expired", "connected") and state["error"])
         or (state["state"] == "connected" and state.get("notice"))
         or state["blocked"]
@@ -5858,6 +5931,38 @@ def render_connect_step(state):
         f'<input type="hidden" name="flow" value="{flow_id}">'
         f'<button type="submit" class="btn small">Cancel</button></form>'
     )
+    if flow_id == "whatsapp":
+        if state["state"] == "waiting" and state["code"]:
+            return (
+                '<div class="conn-step"><p class="note">On your phone, open '
+                'WhatsApp &rarr; Linked devices &rarr; Link a device &rarr; '
+                'Link with phone number instead. Enter this code:</p>'
+                f'<p><code class="conn-code">{html.escape(state["code"])}</code>'
+                f'{copy_button("the pairing code", value=state["code"])}</p>'
+                f'{cancel}</div>'
+            )
+        if state["state"] in ("starting", "exchanging", "waiting"):
+            return ('<div class="conn-step"><p class="note">Preparing the '
+                    'WhatsApp device link&hellip;</p>' + cancel + '</div>')
+        if state["state"] == "connected":
+            return ('<div class="conn-step"><p class="note">The linked device '
+                    'is connected. Enable WhatsApp on a Claude or Codex session '
+                    'above to receive messages.</p></div>')
+        if state["detail"]:
+            return ('<div class="conn-step"><p class="note">'
+                    + html.escape(state["detail"]) + '</p></div>')
+        return (
+            f'<div class="conn-step"><form method="post" action="{base}/connect/start" '
+            'class="row conn-form">'
+            f'<input type="hidden" name="flow" value="{flow_id}">'
+            '<label class="field conn-field"><span class="note">Your WhatsApp '
+            'number with country code</span><input type="tel" name="phone" '
+            'autocomplete="tel" inputmode="tel" placeholder="+1..." '
+            'aria-label="WhatsApp phone number"></label>'
+            '<button type="submit" class="btn">Pair device</button></form>'
+            '<p class="note">Leave the number blank to use '
+            '<code>LOCAL_WHATSAPP_PHONE</code> saved under Secrets.</p></div>'
+        )
     if state["state"] == "starting":
         verb = ("Installing" if not state["installed"]
                 else "Starting the sign-in")
@@ -7704,6 +7809,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "session_added": ("Session added \u2014 it starts within a few seconds.", "ok"),
         "session_deleted": ("Session deleted.", "ok"),
         "session_restarted": ("Session restart requested.", "ok"),
+        "whatsapp_saved": ("WhatsApp setting saved. Restart a running Claude session to load its channel.", "ok"),
         "session_started": ("Session started \u2014 it comes up within a few seconds.", "ok"),
         "session_registry_unreadable": (
             "The session list could not be read, so nothing was changed. "
@@ -8398,6 +8504,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_html("<h1>404</h1>", status=404)
                 return
             if action == "start":
+                if flow["id"] == "whatsapp":
+                    phone = form.get("phone", [""])[0].strip()
+                    if phone:
+                        phone = phone.removeprefix("+")
+                        if not re.fullmatch(r"[0-9]{7,15}", phone):
+                            self._send_html(render_page(
+                                "Enter your WhatsApp number with country code, using digits only.",
+                                kind="error"), status=400)
+                            return
+                        try:
+                            set_key("LOCAL_WHATSAPP_PHONE", phone)
+                        except EnvStoreError as exc:
+                            self._send_html(render_page(str(exc), kind="error"), status=400)
+                            return
                 result = connect_start(flow)
                 # A start that could not begin has something to say, and
                 # the card is rebuilt from the pane on the next GET — so
@@ -8781,6 +8901,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # own remote control is just a flag on its ordinary
                         # TUI and keeps the old default.
                         "remoteControl": codex_daemon or agent != "codex",
+                        "whatsapp": (form.get("whatsapp", [""])[0] == "on"
+                                     and agent in ("claude", "codex")),
                         "remoteControlName": None,
                         "workingDirectory": cwd,
                         "extraArgs": pargs,
@@ -8820,6 +8942,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if back_page == TERM_HOME:
                 query += "&tab=" + name
             self._redirect(query, back_page)
+        elif path == SESS_BASE + "/sessions/whatsapp":
+            name = (form.get("name", [""])[0]).strip()
+            state = form.get("state", [""])[0]
+            if not SESSION_RE.match(name) or state not in ("on", "off"):
+                self._send_html(render_page("Invalid WhatsApp session setting.",
+                                            kind="error"), status=400)
+                return
+            try:
+                with sessions_lock():
+                    sessions, version = load_sessions()
+                    entry = sessions.get(name)
+                    if not isinstance(entry, dict):
+                        self._send_html(render_page("Session no longer exists.",
+                                                    kind="error"), status=404)
+                        return
+                    if state == "on" and entry.get("agent") not in ("claude", "codex"):
+                        self._send_html(render_page("WhatsApp supports Claude and Codex sessions.",
+                                                    kind="error"), status=400)
+                        return
+                    entry["whatsapp"] = state == "on"
+                    write_sessions(sessions, version)
+            except RegistryBusy as exc:
+                self._registry_busy("change WhatsApp setting", exc, self._sess_page(form))
+                return
+            except RegistryUnreadable as exc:
+                self._registry_refusal("change WhatsApp setting", exc, self._sess_page(form))
+                return
+            self._redirect("ok=whatsapp_saved", self._sess_page(form))
         elif path == SESS_BASE + "/sessions/delete":
             name = (form.get("name", [""])[0]).strip()
             if SESSION_RE.match(name):

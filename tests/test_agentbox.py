@@ -2584,6 +2584,7 @@ class RenderTest(unittest.TestCase):
         # that fails the moment it is clicked.
         want = {a: f"@PROFILE@/bin/{a}" for a in agents}
         want["github"] = "@PROFILE@/bin/gh"
+        want["whatsapp"] = "@PROFILE@/bin/agent-box-whatsapp"
         self.assertEqual(want, cards)
 
     def test_ttyd_override_keeps_every_flag_the_template_sets(self):

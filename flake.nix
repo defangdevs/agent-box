@@ -2349,6 +2349,42 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          whatsapp-cli =
+            pkgs.runCommand "agent-box-whatsapp-cli"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                cli = ./modules/src/whatsapp-cli.py;
+                tests = ./tests/test-whatsapp-cli.py;
+              } ''
+              install -d repo/modules/src repo/tests
+              cp "$cli" repo/modules/src/whatsapp-cli.py
+              cp "$tests" repo/tests/test-whatsapp-cli.py
+              python3 repo/tests/test-whatsapp-cli.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          whatsapp-session =
+            pkgs.runCommand "agent-box-whatsapp-session"
+              {
+                nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.jq pkgs.util-linux ];
+                cli = ./tests/golden/vm/payloads/agent-box-session/bin/agent-box-session;
+                tests = ./tests/test-whatsapp-session.py;
+              } ''
+              install -d repo/tests/golden/vm/payloads/agent-box-session/bin repo/tests
+              cp "$cli" repo/tests/golden/vm/payloads/agent-box-session/bin/agent-box-session
+              cp "$tests" repo/tests/test-whatsapp-session.py
+              python3 repo/tests/test-whatsapp-session.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # The two machine-readable reads a portal drives this daemon
           # through (issue #642): the env store's key NAMES and every
           # connect card in one answer. Same shape and same subject as

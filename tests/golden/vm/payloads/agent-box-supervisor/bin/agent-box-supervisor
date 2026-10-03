@@ -598,6 +598,8 @@ lease_outcome() {
 # marketplace is CLONED from, e.g. defangdevs/local-channels).
 WEBHOOK_MARKETPLACE=local-channels
 WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
+WHATSAPP_PLUGIN_REF="local-whatsapp@$WEBHOOK_MARKETPLACE"
+WHATSAPP_PLUGIN_REPO="${AGENT_BOX_WEBHOOK_REPO:-defangdevs/local-channels}"
 # Where local-webhook keeps its per-session subscription filters. Spelled once
 # because two callers need to agree on it: the spawn below exports it as
 # LOCAL_WEBHOOK_STATE_DIR, and session_watches_events reads a filter file out
@@ -985,6 +987,34 @@ seed_claude_state() {
          + {($mkt): {source: {source: "github", repo: $whrepo}}})
        | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
     sync_webhook_plugin
+  fi
+  if [ "${3:-false}" = true ]; then
+    seed_json "$HOME"/.claude/settings.json \
+      --arg repo "$WHATSAPP_PLUGIN_REPO" \
+      --arg mkt "$WEBHOOK_MARKETPLACE" --arg ref "$WHATSAPP_PLUGIN_REF" \
+      '.extraKnownMarketplaces = ((.extraKnownMarketplaces // {})
+         + {($mkt): {source: {source: "github", repo: $repo}}})
+       | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
+    installed="$HOME/.claude/plugins/installed_plugins.json"
+    if ! [ -s "$installed" ] || ! "$JQ" -e --arg ref "$WHATSAPP_PLUGIN_REF" \
+         '.plugins[$ref] // [] | length > 0' "$installed" >/dev/null 2>&1; then
+      wa_marker="$HOME/.claude/plugins/.agent-box-whatsapp-install"
+      wa_now="$(date +%s)"
+      wa_last=0
+      [ -s "$wa_marker" ] && read -r wa_last < "$wa_marker" || true
+      case "$wa_last" in (""|*[!0-9]*) wa_last=0 ;; esac
+      if [ $((wa_now - wa_last)) -ge 3600 ]; then
+        cbin="$(agent_bin claude)" || cbin=""
+        if [ -n "$cbin" ]; then
+          mkdir -p "$HOME/.claude/plugins"
+          printf '%s\n' "$wa_now" > "$wa_marker"
+          timeout 90 "$cbin" plugin marketplace update "$WEBHOOK_MARKETPLACE" >/dev/null 2>&1 || true
+          if ! timeout 90 "$cbin" plugin install "$WHATSAPP_PLUGIN_REF" >/dev/null 2>&1; then
+            echo "local-whatsapp plugin: install failed; will retry after the cooldown" >&2
+          fi
+        fi
+      fi
+    fi
   fi
 }
 
@@ -2168,8 +2198,13 @@ start_session() {
       # plugin:<plugin>:<server> id the skip message prints. Placed before
       # append_extra so a session that names its own channels appends to (or
       # overrides) ours rather than the other way round.
-      [ -n "${AGENT_BOX_WEBHOOK_REPO:-}" ] \
-        && cmd="$cmd --channels plugin:$WEBHOOK_PLUGIN_REF"
+      channels=""
+      [ -z "${AGENT_BOX_WEBHOOK_REPO:-}" ] \
+        || channels="plugin:$WEBHOOK_PLUGIN_REF"
+      if "$JQ" -e '.whatsapp == true' <<<"$sjson" >/dev/null; then
+        channels="$channels plugin:$WHATSAPP_PLUGIN_REF"
+      fi
+      [ -z "$channels" ] || cmd="$cmd --channels $channels"
       # Our own id: --resume it on respawn (exact, so concurrent sessions
       # never cross), but only when a transcript actually exists — else
       # reuse it as a fresh --session-id rather than erroring on resume.
@@ -2299,7 +2334,8 @@ start_session() {
     # cache and silently drops every channel notification. Clearing
     # the cache before each claude launch forces a full policy fetch.
     rm -f "$HOME"/.claude/remote-settings.json
-    seed_claude_state "$wd" "$skip"
+    whatsapp_enabled="$($JQ -r '.whatsapp == true' <<<"$sjson")"
+    seed_claude_state "$wd" "$skip" "$whatsapp_enabled"
   elif [ "$agent" = codex ]; then
     seed_codex_state "$wd" "$sprofile" "$bin"
   fi
@@ -2537,6 +2573,42 @@ sweep_orphan_filters() {
 }
 sweep_orphan_filters
 
+# The personal WhatsApp transport belongs to the user, not a tmux session.
+# Run it inside this unit's cgroup so a host restart stops and revives it
+# without consuming one of the interactive session slots. Pairing writes the
+# ready marker only after credentials have been saved; removing it stops the
+# child. Node and the bridge are installed in the user's profile on demand.
+whatsapp_pid=""
+whatsapp_last_start=0
+supervise_whatsapp() {
+  ready="$HOME/.local/state/local-whatsapp/ready"
+  bridge="$HOME/.local/share/local-whatsapp/bridge.mjs"
+  node="$HOME/.nix-profile/bin/node"
+  if [ ! -f "$ready" ]; then
+    if [ -n "$whatsapp_pid" ]; then
+      kill "$whatsapp_pid" 2>/dev/null || true
+      whatsapp_pid=""
+    fi
+    return
+  fi
+  [ -r "$bridge" ] && [ -x "$node" ] || return
+  if [ -n "$whatsapp_pid" ] && kill -0 "$whatsapp_pid" 2>/dev/null; then
+    return
+  fi
+  now="$(date +%s)"
+  [ "$((now - whatsapp_last_start))" -ge 10 ] || return
+  whatsapp_last_start="$now"
+  session_cli="$(command -v agent-box-session)" || return
+  codex_cli="$(agent_bin codex 2>/dev/null)" || codex_cli=""
+  if [ -n "$codex_cli" ]; then
+    LOCAL_WHATSAPP_SESSION_BIN="$session_cli" \
+      LOCAL_WHATSAPP_CODEX_BIN="$codex_cli" "$node" "$bridge" serve &
+  else
+    LOCAL_WHATSAPP_SESSION_BIN="$session_cli" "$node" "$bridge" serve &
+  fi
+  whatsapp_pid=$!
+}
+
 # Reclaim the supervisor's own per-session state for names the registry no
 # longer lists (issue #282).
 #
@@ -2683,6 +2755,7 @@ while true; do
     esac
     $TMUX has-session -t "=$sname" 2>/dev/null || start_session "$sname"
   done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$REGISTRY_FILE" 2>/dev/null)
+  supervise_whatsapp
   sleep 2
 done
 

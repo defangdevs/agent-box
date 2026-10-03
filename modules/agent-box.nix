@@ -683,6 +683,37 @@ let
       unsets it, and deleting the default profile clears it too - the next
       session then asks which profile to start.
 
+    ## Personal WhatsApp connection
+
+    The settings page's Connections section can link this user's WhatsApp as a
+    device. Enter the account's phone number with country code, start pairing,
+    and give the displayed code to WhatsApp's Linked devices screen on the
+    primary phone. The bridge accepts only `@box ` messages from that account's
+    Message Yourself chat. The device link belongs to the Linux user and
+    survives agent session restarts. Node and the bridge are installed only when
+    pairing is requested; they are not part of the base image. The supervisor
+    runs the bridge without spending a session slot. Message text and linked-device
+    keys are stored in private files under `~/.local/state/local-whatsapp` on this
+    box; WhatsApp's end-to-end encryption covers the chat transport.
+
+    Each destination session must opt in separately. The settings page has a
+    WhatsApp switch on each Claude or Codex session, and a new-session checkbox;
+    the CLI equivalent is `agent-box-session whatsapp NAME on|off|status` or
+    `agent-box-session add NAME --whatsapp true`. Run
+    `agent-box-session whatsapp ls` to list enabled sessions. Restart a running
+    Claude session after enabling it so its channel loads. From the phone, send
+    `@box /sessions` and `@box /target NAME`, then send `@box MESSAGE`. Disabling
+    a session stops further delivery to it. A stopped session can remain a
+    target; queued messages wait for it to return. Selecting a different target
+    does not require pairing again.
+
+    A Codex Remote Control task has its own thread ID, which the box's session
+    name alone cannot identify. From inside the active Codex task, run
+    `node ~/.local/share/local-whatsapp/bridge.mjs register codex` once to bind
+    it to that session name. Repeat after a different task takes over the same
+    session. A normal Codex TUI uses the session name directly. The bridge has
+    no shell command target.
+
     ## Slash commands: type them into your own pane
 
     Slash commands are client-side: they never reach you as a tool call, so you
@@ -3719,7 +3750,7 @@ done
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli uploadCli
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli whatsappCli uploadCli
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
@@ -4469,10 +4500,12 @@ usage() {
   echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
   echo "                             [--cwd DIR] [--remote-control true|false]"
   echo "                             [--prompt TEXT] [--resume-prompt TEXT] [--ephemeral]"
+  echo "                             [--whatsapp true|false]"
   echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
+  echo "       agent-box-session whatsapp ls | NAME on|off|status"
   echo "       agent-box-session env ls | set KEY VALUE | set KEY --stdin | rm KEY"
   echo "         (--stdin reads the value from stdin: for a multi-line secret"
   echo "          such as a PEM, and to keep any secret out of the command line)"
@@ -4859,6 +4892,50 @@ case "$cmd" in
       echo "(tmux -L agent-box capture-pane -pt NAME | tail -40) or ask it."
     fi
     ;;
+  whatsapp)
+    name="''${1:-}"
+    if [ "$name" = ls ]; then
+      [ $# -eq 1 ] || { usage >&2; exit 2; }
+      if [ -s "$REGISTRY_FILE" ]; then
+        "$JQ" -c '[.sessions | to_entries[] |
+          select(.value.whatsapp == true and (.value.agent == "claude" or .value.agent == "codex")) |
+          {name: .key, harness: .value.agent, stopped: (.value.stopped == true)}]' "$REGISTRY_FILE"
+      else
+        echo '[]'
+      fi
+      exit 0
+    fi
+    valid_name "$name" || { usage >&2; exit 2; }
+    action="''${2:-}"
+    [ $# -eq 2 ] || { usage >&2; exit 2; }
+    case "$action" in
+      status)
+        [ -s "$REGISTRY_FILE" ] && taken "$name" || {
+          echo "no such session: '$name' (see agent-box-session ls)" >&2; exit 2;
+        }
+        "$JQ" -r --arg n "$name" 'if .sessions[$n].whatsapp == true then "on" else "off" end' "$REGISTRY_FILE"
+        ;;
+      on|off)
+        registry_ensure
+        registry_lock
+        taken "$name" || {
+          echo "no such session: '$name' (see agent-box-session ls)" >&2; exit 2;
+        }
+        harness="$("$JQ" -r --arg n "$name" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
+        if [ "$action" = on ] && [ "$harness" != claude ] && [ "$harness" != codex ]; then
+          echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+          exit 2
+        fi
+        enabled=false
+        [ "$action" = on ] && enabled=true
+        registry_edit --arg n "$name" --argjson enabled "$enabled" '.sessions[$n].whatsapp = $enabled'
+        registry_unlock
+        echo "WhatsApp $action for session '$name'"
+        [ "$harness" != claude ] || echo "Restart the Claude session to apply its channel setting."
+        ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    ;;
   add)
     # NAME is optional and positional: a leading non-flag arg is the name,
     # otherwise the name is auto-derived from the agent below.
@@ -4868,7 +4945,7 @@ case "$cmd" in
       *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
     harness="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
-    profile=""; has_harness=0; ephemeral=0; remote_control=""
+    profile=""; has_harness=0; ephemeral=0; remote_control=""; whatsapp=false
     while [ $# -gt 0 ]; do
       case "$1" in
         --harness) harness="''${2:?--harness needs a value}"; has_harness=1; shift 2 ;;
@@ -4889,6 +4966,12 @@ case "$cmd" in
             (true|false) remote_control="$2" ;;
             (*) echo "agent-box-session: --remote-control must be 'true' or 'false'" >&2
                 exit 2 ;;
+          esac
+          shift 2 ;;
+        --whatsapp)
+          case "''${2:?--whatsapp needs 'true' or 'false'}" in
+            (true|false) whatsapp="$2" ;;
+            (*) echo "agent-box-session: --whatsapp must be 'true' or 'false'" >&2; exit 2 ;;
           esac
           shift 2 ;;
         --prompt) prompt="''${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
@@ -5000,6 +5083,10 @@ case "$cmd" in
       (*" $harness "*) ;;
       (*) echo "harness '$harness' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
+    if [ "$whatsapp" = true ] && [ "$harness" != claude ] && [ "$harness" != codex ]; then
+      echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+      exit 2
+    fi
     registry_ensure
     # Name choice and write are one critical section (issue #254): gen_name
     # and taken() both decide from a READ of the file, so two concurrent adds
@@ -5033,7 +5120,9 @@ case "$cmd" in
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
       --arg prof "$profile" --arg eph "$ephemeral" --argjson rc "$remote_control" \
+      --argjson whatsapp "$whatsapp" \
       '.sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
+                        whatsapp: $whatsapp,
                         remoteControlName: null,
                         workingDirectory: (if $c == "" then null else $c end),
                         extraArgs: $ARGS.positional,
@@ -5192,6 +5281,176 @@ case "$cmd" in
     ;;
 esac
   '');
+
+  # The WhatsApp protocol client and Node dependencies are installed only
+  # when this per-user CLI pairs a device. The CLI itself is Python stdlib,
+  # so the base image gains no Node closure.
+  whatsappCli = pkgs.writers.writePython3Bin "agent-box-whatsapp" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+"""Optional per-user WhatsApp linked-device runtime for agent-box."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+from urllib.request import urlopen
+
+
+REV = "f8c052ec5350c99d9029c2b2af2d2394d8445594"
+FILES = {
+    "bridge.mjs": "c3745917cc0982c8197214a1f64c0be97caadb6933a2bcd209895eaab849cac0",
+    "state.mjs": "4f5125000fbb44b43c9dc7909ee293c61b5c3a6ae44f83620bd506470344e81b",
+    "package.json": "fa002e046ea1c39dc12d1651023d370d2cef512ac990427794266b69e0c2db0a",
+    "package-lock.json": "bf76fd9c4f6932fb7cb5f8f642973446b51591bc4ad45ae678fdeb97b0af90e4",
+}
+HOME = Path.home()
+RUNTIME = HOME / ".local/share/local-whatsapp"
+STATE = HOME / ".local/state/local-whatsapp"
+READY = STATE / "ready"
+NODE = HOME / ".nix-profile/bin/node"
+NPM = HOME / ".nix-profile/bin/npm"
+
+
+def private_dir(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError("WhatsApp directory cannot be a symlink")
+    path.chmod(0o700)
+
+
+def ensure_node():
+    if NODE.is_file() and NPM.is_file():
+        return
+    nix = (shutil.which("nix") or "/nix/var/nix/profiles/default/bin/nix")
+    if not Path(nix).is_file():
+        raise RuntimeError("Nix is unavailable; cannot install optional Node runtime")
+    print("Installing optional Node runtime for WhatsApp; this may take a few minutes.", flush=True)
+    subprocess.run([nix, "profile", "add", "--profile", str(HOME / ".nix-profile"),
+                    "nixpkgs#nodejs_22"], check=True, timeout=900)
+    if not NODE.is_file() or not NPM.is_file():
+        raise RuntimeError("Node installation finished without node and npm")
+
+
+def runtime_matches():
+    if not (RUNTIME / "node_modules").is_dir():
+        return False
+    for name, expected in FILES.items():
+        source = RUNTIME / name
+        if not source.is_file():
+            return False
+        if hashlib.sha256(source.read_bytes()).hexdigest() != expected:
+            return False
+    return True
+
+
+def install():
+    ensure_node()
+    backup = RUNTIME.with_name(RUNTIME.name + ".previous")
+    pending = RUNTIME.with_name(RUNTIME.name + ".pending")
+    if any(path.is_symlink() for path in (RUNTIME, backup, pending)):
+        raise RuntimeError("WhatsApp runtime cannot be a symlink")
+    if not RUNTIME.exists():
+        for candidate in (pending, backup):
+            if candidate.exists():
+                candidate.rename(RUNTIME)
+                break
+    if runtime_matches():
+        for old in (pending, backup):
+            if old.exists():
+                shutil.rmtree(old)
+        return
+    private_dir(RUNTIME.parent)
+    with tempfile.TemporaryDirectory(prefix="local-whatsapp-", dir=RUNTIME.parent) as raw:
+        stage = Path(raw)
+        for name, expected in FILES.items():
+            url = (f"https://raw.githubusercontent.com/defangdevs/local-channels/"
+                   f"{REV}/local-whatsapp/{name}")
+            with urlopen(url, timeout=30) as response:
+                content = response.read(2_000_001)
+            if len(content) > 2_000_000 or hashlib.sha256(content).hexdigest() != expected:
+                raise RuntimeError("WhatsApp source integrity check failed for " + name)
+            (stage / name).write_bytes(content)
+        print("Installing pinned WhatsApp dependencies.", flush=True)
+        env = dict(os.environ)
+        env["PATH"] = str(NODE.parent) + os.pathsep + env.get("PATH", "")
+        subprocess.run([str(NPM), "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+                       cwd=stage, env=env, check=True, timeout=900)
+        if any(path.is_symlink() for path in (RUNTIME, backup, pending)):
+            raise RuntimeError("WhatsApp runtime cannot be a symlink")
+        if pending.exists() and RUNTIME.exists():
+            shutil.rmtree(pending)
+        if RUNTIME.exists():
+            RUNTIME.rename(pending)
+        try:
+            stage.rename(RUNTIME)
+        except OSError:
+            if pending.exists() and not RUNTIME.exists():
+                pending.rename(RUNTIME)
+            raise
+        for old in (pending, backup):
+            if old.exists():
+                shutil.rmtree(old)
+    RUNTIME.chmod(0o700)
+
+
+def paired():
+    path = STATE / "auth/creds.json"
+    try:
+        return bool(json.loads(path.read_text()).get("me"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def status():
+    connected = False
+    if NODE.is_file() and (RUNTIME / "bridge.mjs").is_file():
+        try:
+            result = subprocess.run([str(NODE), str(RUNTIME / "bridge.mjs"), "status"],
+                                    capture_output=True, text=True, timeout=5, check=False)
+            connected = result.returncode == 0 and json.loads(result.stdout).get("connected") is True
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    print(json.dumps({"connected": connected, "paired": paired(),
+                      "enabled": READY.is_file()}))
+
+
+def activate():
+    if not paired():
+        raise RuntimeError("WhatsApp is not linked; pair the device first")
+    private_dir(STATE)
+    READY.touch(mode=0o600)
+
+
+def pair():
+    phone = os.environ.get("LOCAL_WHATSAPP_PHONE", "").strip()
+    if not phone.isdigit() or not 7 <= len(phone) <= 15:
+        raise RuntimeError("Set LOCAL_WHATSAPP_PHONE to international digits before pairing")
+    install()
+    private_dir(STATE)
+    subprocess.run([str(NODE), str(RUNTIME / "bridge.mjs"), "pair"], check=True,
+                   timeout=240, env=dict(os.environ, LOCAL_WHATSAPP_PHONE=phone))
+    activate()
+    print("WhatsApp linked. The agent-box supervisor is starting the bridge.", flush=True)
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ("install", "pair", "activate", "status"):
+        raise RuntimeError("usage: agent-box-whatsapp install|pair|activate|status")
+    {"install": install, "pair": pair, "activate": activate, "status": status}[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print("agent-box-whatsapp: " + str(error), file=sys.stderr)
+        sys.exit(1)
+  '';
 
   # Agent profiles (issue #321): the WORKER, as opposed to the harness that
   # `--harness` selects — a harness plus the model, effort, appended system
@@ -11167,6 +11426,7 @@ esac
     ++ [
       "github=${pkgs.gh}/bin/gh"
       "defang=${defangCliBinDir}/defang"
+      "whatsapp=${whatsappCli}/bin/agent-box-whatsapp"
     ]
   );
 
@@ -11833,6 +12093,8 @@ esac
     # marketplace is CLONED from, e.g. defangdevs/local-channels).
     WEBHOOK_MARKETPLACE=local-channels
     WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
+    WHATSAPP_PLUGIN_REF="local-whatsapp@$WEBHOOK_MARKETPLACE"
+    WHATSAPP_PLUGIN_REPO="''${AGENT_BOX_WEBHOOK_REPO:-defangdevs/local-channels}"
     # Where local-webhook keeps its per-session subscription filters. Spelled once
     # because two callers need to agree on it: the spawn below exports it as
     # LOCAL_WEBHOOK_STATE_DIR, and session_watches_events reads a filter file out
@@ -12220,6 +12482,34 @@ esac
              + {($mkt): {source: {source: "github", repo: $whrepo}}})
            | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
         sync_webhook_plugin
+      fi
+      if [ "''${3:-false}" = true ]; then
+        seed_json "$HOME"/.claude/settings.json \
+          --arg repo "$WHATSAPP_PLUGIN_REPO" \
+          --arg mkt "$WEBHOOK_MARKETPLACE" --arg ref "$WHATSAPP_PLUGIN_REF" \
+          '.extraKnownMarketplaces = ((.extraKnownMarketplaces // {})
+             + {($mkt): {source: {source: "github", repo: $repo}}})
+           | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
+        installed="$HOME/.claude/plugins/installed_plugins.json"
+        if ! [ -s "$installed" ] || ! "$JQ" -e --arg ref "$WHATSAPP_PLUGIN_REF" \
+             '.plugins[$ref] // [] | length > 0' "$installed" >/dev/null 2>&1; then
+          wa_marker="$HOME/.claude/plugins/.agent-box-whatsapp-install"
+          wa_now="$(date +%s)"
+          wa_last=0
+          [ -s "$wa_marker" ] && read -r wa_last < "$wa_marker" || true
+          case "$wa_last" in (""|*[!0-9]*) wa_last=0 ;; esac
+          if [ $((wa_now - wa_last)) -ge 3600 ]; then
+            cbin="$(agent_bin claude)" || cbin=""
+            if [ -n "$cbin" ]; then
+              mkdir -p "$HOME/.claude/plugins"
+              printf '%s\n' "$wa_now" > "$wa_marker"
+              timeout 90 "$cbin" plugin marketplace update "$WEBHOOK_MARKETPLACE" >/dev/null 2>&1 || true
+              if ! timeout 90 "$cbin" plugin install "$WHATSAPP_PLUGIN_REF" >/dev/null 2>&1; then
+                echo "local-whatsapp plugin: install failed; will retry after the cooldown" >&2
+              fi
+            fi
+          fi
+        fi
       fi
     }
 
@@ -13403,8 +13693,13 @@ esac
           # plugin:<plugin>:<server> id the skip message prints. Placed before
           # append_extra so a session that names its own channels appends to (or
           # overrides) ours rather than the other way round.
-          [ -n "''${AGENT_BOX_WEBHOOK_REPO:-}" ] \
-            && cmd="$cmd --channels plugin:$WEBHOOK_PLUGIN_REF"
+          channels=""
+          [ -z "''${AGENT_BOX_WEBHOOK_REPO:-}" ] \
+            || channels="plugin:$WEBHOOK_PLUGIN_REF"
+          if "$JQ" -e '.whatsapp == true' <<<"$sjson" >/dev/null; then
+            channels="$channels plugin:$WHATSAPP_PLUGIN_REF"
+          fi
+          [ -z "$channels" ] || cmd="$cmd --channels $channels"
           # Our own id: --resume it on respawn (exact, so concurrent sessions
           # never cross), but only when a transcript actually exists — else
           # reuse it as a fresh --session-id rather than erroring on resume.
@@ -13534,7 +13829,8 @@ esac
         # cache and silently drops every channel notification. Clearing
         # the cache before each claude launch forces a full policy fetch.
         rm -f "$HOME"/.claude/remote-settings.json
-        seed_claude_state "$wd" "$skip"
+        whatsapp_enabled="$($JQ -r '.whatsapp == true' <<<"$sjson")"
+        seed_claude_state "$wd" "$skip" "$whatsapp_enabled"
       elif [ "$agent" = codex ]; then
         seed_codex_state "$wd" "$sprofile" "$bin"
       fi
@@ -13772,6 +14068,42 @@ esac
     }
     sweep_orphan_filters
 
+    # The personal WhatsApp transport belongs to the user, not a tmux session.
+    # Run it inside this unit's cgroup so a host restart stops and revives it
+    # without consuming one of the interactive session slots. Pairing writes the
+    # ready marker only after credentials have been saved; removing it stops the
+    # child. Node and the bridge are installed in the user's profile on demand.
+    whatsapp_pid=""
+    whatsapp_last_start=0
+    supervise_whatsapp() {
+      ready="$HOME/.local/state/local-whatsapp/ready"
+      bridge="$HOME/.local/share/local-whatsapp/bridge.mjs"
+      node="$HOME/.nix-profile/bin/node"
+      if [ ! -f "$ready" ]; then
+        if [ -n "$whatsapp_pid" ]; then
+          kill "$whatsapp_pid" 2>/dev/null || true
+          whatsapp_pid=""
+        fi
+        return
+      fi
+      [ -r "$bridge" ] && [ -x "$node" ] || return
+      if [ -n "$whatsapp_pid" ] && kill -0 "$whatsapp_pid" 2>/dev/null; then
+        return
+      fi
+      now="$(date +%s)"
+      [ "$((now - whatsapp_last_start))" -ge 10 ] || return
+      whatsapp_last_start="$now"
+      session_cli="$(command -v agent-box-session)" || return
+      codex_cli="$(agent_bin codex 2>/dev/null)" || codex_cli=""
+      if [ -n "$codex_cli" ]; then
+        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" \
+          LOCAL_WHATSAPP_CODEX_BIN="$codex_cli" "$node" "$bridge" serve &
+      else
+        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" "$node" "$bridge" serve &
+      fi
+      whatsapp_pid=$!
+    }
+
     # Reclaim the supervisor's own per-session state for names the registry no
     # longer lists (issue #282).
     #
@@ -13918,6 +14250,7 @@ esac
         esac
         $TMUX has-session -t "=$sname" 2>/dev/null || start_session "$sname"
       done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$REGISTRY_FILE" 2>/dev/null)
+      supervise_whatsapp
       sleep 2
     done
   '';
@@ -18657,17 +18990,53 @@ def parse_defang_status(proc):
     return (True, "%s (%s)" % (who, tier) if tier else who)
 
 
+def parse_whatsapp_status(proc):
+    if proc.returncode != 0:
+        return (False, "")
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return (False, "")
+    if not isinstance(data, dict):
+        return (False, "")
+    if data.get("connected") is True:
+        return (True, "linked device connected")
+    if data.get("paired") is True:
+        return (False, "device linked; bridge is connecting")
+    return (False, "")
+
+
 CONNECT_PARSERS = {
     "claude": parse_claude_status,
     "codex": parse_codex_status,
     "gh": parse_gh_status,
     "defang": parse_defang_status,
+    "whatsapp": parse_whatsapp_status,
 }
 
 # One row per flow, in render order. `start` and `status` are argv tails
 # appended to the flow's binary; nothing is passed through a shell except
 # the pane wrapper built in connect_start (via shlex.quote).
 CONNECT_DEFS = [
+    {
+        "id": "whatsapp",
+        "binary": "agent-box-whatsapp",
+        "attr": None,
+        "label": "WhatsApp",
+        "note": "Link your personal WhatsApp account by phone-number code. "
+                "The WhatsApp chat is end-to-end encrypted; message text is "
+                "also stored on this box for delivery.",
+        "start": ["pair"],
+        "status": ["status"],
+        "parse": "whatsapp",
+        "hosts": (),
+        "needs_code": False,
+        "show_code": True,
+        "unset": (),
+        "shadow": (),
+        "prompt_re": None,
+        "destructive": False,
+    },
     {
         "id": "claude",
         "binary": "claude",
@@ -19016,9 +19385,12 @@ def connect_trusted_url(text, hosts):
     return None
 
 
-def connect_user_code(text):
+def connect_user_code(text, flow_id=None):
     """The one-time code a device flow prints in the pane. Searched with
     URLs removed, so a `code=` query parameter cannot pose as one."""
+    if flow_id == "whatsapp":
+        match = re.search(r"WhatsApp pairing code: ([A-Z0-9]{8})\b", text or "")
+        return match.group(1) if match else None
     stripped = CONNECT_URL_RE.sub(" ", text or "")
     for match in CONNECT_CODE_RE.finditer(stripped):
         code = match.group(1).upper()
@@ -19729,8 +20101,8 @@ def connect_state(flow, keys=None, tmux_state=None):
             if flow["prompt_re"] is not None:
                 connect_answer_prompt(flow, text)
             url = connect_trusted_url(text, flow["hosts"])
-            code = connect_user_code(text) if flow["show_code"] else None
-            state = "waiting" if url else "starting"
+            code = connect_user_code(text, flow_id) if flow["show_code"] else None
+            state = "waiting" if url or code else "starting"
     elif os.path.exists(connect_done_path(flow_id)):
         # The pane already closed on a sign-in no render saw finish (issue
         # #751): finish it now, on a fresh probe that STARTED after the
@@ -19968,6 +20340,14 @@ def connect_start(flow):
                                          ".nix-profile")),
                 " ".join(shlex.quote(a) for a in source)))
     inner = " ".join(shlex.quote(a) for a in [binary] + flow["start"])
+    if flow_id == "whatsapp":
+        phone = as_dict(load(ENV_FILE)).get("LOCAL_WHATSAPP_PHONE", "")
+        if not re.fullmatch(r"[0-9]{7,15}", phone):
+            state = connect_state(flow)
+            state["state"] = "failed"
+            state["error"] = "Enter an international phone number to pair WhatsApp."
+            return state
+        inner = "LOCAL_WHATSAPP_PHONE=" + shlex.quote(phone) + " " + inner
     if flow["unset"]:
         inner = ("env " + " ".join("-u " + k for k in flow["unset"]) + " " + inner)
     inner = prelude + inner
@@ -20449,6 +20829,13 @@ STYLE = """<style>
   a.sess { color: #58a6ff; text-decoration: none; }
   a.sess:hover { text-decoration: underline; }
   .acts { display: flex; align-items: center; gap: 4px; flex: none; }
+  @media (max-width: 540px) {
+    .tbl.sessions > li:not(.tbl-head),
+    .tbl.sessions > li.foldrow summary { flex-wrap: wrap; }
+    .tbl.sessions > li:not(.tbl-head) > .nm,
+    .tbl.sessions > li.foldrow summary > .nm { flex-basis: 100%; }
+    .tbl.sessions .acts { margin-left: auto; }
+  }
   /* Subscription rows (issue #227) wrap: a topic carries an expiry and the
      note saying why it exists, which does not fit one line on a phone. */
   .nm.wh { flex-wrap: wrap; row-gap: 2px; }
@@ -20911,6 +21298,8 @@ NEW_SESSION_FIELDS_TPL = """<div class="row new-session-row">
 <p class="note">The profile decides which assistant runs, and its model,
 reasoning level and instructions. Choose where the session starts too: the
 default is your home folder (<code>~</code>).</p>
+<label class="row"><input type="checkbox" name="whatsapp" value="on">
+  Allow WhatsApp messages to this session</label>
 <div class="row prompt-row">
   <textarea name="prompt" rows="2"
             placeholder="starting task (optional) &mdash; what this session should work on first"></textarea>
@@ -23492,6 +23881,21 @@ def render_sessions(subs=None):
                 )
             else:
                 download = ""
+            whatsapp = ""
+            if entries[name].get("agent") in ("claude", "codex"):
+                enabled = entries[name].get("whatsapp") is True
+                next_state = "off" if enabled else "on"
+                whatsapp = (
+                    f'<form class="inline" method="post" '
+                    f'action="{base}/sessions/whatsapp">'
+                    f'<input type="hidden" name="name" value="{safe}">'
+                    f'<input type="hidden" name="state" value="{next_state}">'
+                    f'<input type="hidden" name="back" value="settings">'
+                    f'<button type="submit" class="btn small" '
+                    f'aria-pressed="{"true" if enabled else "false"}" '
+                    f'title="Allow WhatsApp messages to {safe}">'
+                    f'WhatsApp: {"On" if enabled else "Off"}</button></form>'
+                )
             # The same answer on the row itself, so choosing does not need a
             # hover: CSS ellipsizes it rather than pushing the actions out.
             if topic:
@@ -23513,6 +23917,7 @@ def render_sessions(subs=None):
                 f'{render_subs_chip(subs, name)}</span>'
                 f'<span class="acts">'
                 f'{download}'
+                f'{whatsapp}'
                 f'<form class="inline" method="post" '
                 f'action="{base}/sessions/restart"{guard}>'
                 f'<input type="hidden" name="name" value="{safe}">'
@@ -23540,7 +23945,7 @@ def render_sessions(subs=None):
                     f'</details></li>'
                 )
         body = "".join(items)
-    return '<ul class="tbl"><li class="tbl-head">Session</li>' + body + "</ul>"
+    return '<ul class="tbl sessions"><li class="tbl-head">Session</li>' + body + "</ul>"
 
 
 WEBHOOK_STATES = {
@@ -23939,6 +24344,11 @@ def render_connect_card(state):
         "idle": ("stopped", "Not signed in"),
         "checking": ("stopped", "Checking&hellip;"),
     }[state["state"]]
+    if flow_id == "whatsapp":
+        if state["state"] == "connected":
+            pill = ("live", "Connected")
+        elif state["state"] in ("idle", "failed"):
+            pill = ("stopped", "Not linked" if not state["detail"] else "Connecting")
     if not state["installed"] and state["state"] in ("idle", "checking",
                                                      "failed"):
         # "Not signed in" would be a half-truth for a CLI that is not even
@@ -23986,6 +24396,8 @@ def render_connect_card(state):
         # destructive flow's confirmation on the strength of a guess, so
         # that guard stays armed until the probe actually clears it.
         label, confirm = "Sign in", (state["state"] == "checking" and state["destructive"])
+    if flow_id == "whatsapp":
+        label = None  # The pairing form needs a phone field inside the card.
     action = ""
     if label:
         guard = ""
@@ -24024,7 +24436,8 @@ def render_connect_card(state):
     # closed card would hide it). Idle and connected cards with nothing
     # else to say stay closed (issue #449).
     open_now = (
-        state["state"] in ("waiting", "starting", "checking", "exchanging")
+        (flow_id == "whatsapp" and state["state"] != "connected")
+        or state["state"] in ("waiting", "starting", "checking", "exchanging")
         or (state["state"] in ("failed", "expired", "connected") and state["error"])
         or (state["state"] == "connected" and state.get("notice"))
         or state["blocked"]
@@ -24047,6 +24460,38 @@ def render_connect_step(state):
         f'<input type="hidden" name="flow" value="{flow_id}">'
         f'<button type="submit" class="btn small">Cancel</button></form>'
     )
+    if flow_id == "whatsapp":
+        if state["state"] == "waiting" and state["code"]:
+            return (
+                '<div class="conn-step"><p class="note">On your phone, open '
+                'WhatsApp &rarr; Linked devices &rarr; Link a device &rarr; '
+                'Link with phone number instead. Enter this code:</p>'
+                f'<p><code class="conn-code">{html.escape(state["code"])}</code>'
+                f'{copy_button("the pairing code", value=state["code"])}</p>'
+                f'{cancel}</div>'
+            )
+        if state["state"] in ("starting", "exchanging", "waiting"):
+            return ('<div class="conn-step"><p class="note">Preparing the '
+                    'WhatsApp device link&hellip;</p>' + cancel + '</div>')
+        if state["state"] == "connected":
+            return ('<div class="conn-step"><p class="note">The linked device '
+                    'is connected. Enable WhatsApp on a Claude or Codex session '
+                    'above to receive messages.</p></div>')
+        if state["detail"]:
+            return ('<div class="conn-step"><p class="note">'
+                    + html.escape(state["detail"]) + '</p></div>')
+        return (
+            f'<div class="conn-step"><form method="post" action="{base}/connect/start" '
+            'class="row conn-form">'
+            f'<input type="hidden" name="flow" value="{flow_id}">'
+            '<label class="field conn-field"><span class="note">Your WhatsApp '
+            'number with country code</span><input type="tel" name="phone" '
+            'autocomplete="tel" inputmode="tel" placeholder="+1..." '
+            'aria-label="WhatsApp phone number"></label>'
+            '<button type="submit" class="btn">Pair device</button></form>'
+            '<p class="note">Leave the number blank to use '
+            '<code>LOCAL_WHATSAPP_PHONE</code> saved under Secrets.</p></div>'
+        )
     if state["state"] == "starting":
         verb = ("Installing" if not state["installed"]
                 else "Starting the sign-in")
@@ -25893,6 +26338,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "session_added": ("Session added \u2014 it starts within a few seconds.", "ok"),
         "session_deleted": ("Session deleted.", "ok"),
         "session_restarted": ("Session restart requested.", "ok"),
+        "whatsapp_saved": ("WhatsApp setting saved. Restart a running Claude session to load its channel.", "ok"),
         "session_started": ("Session started \u2014 it comes up within a few seconds.", "ok"),
         "session_registry_unreadable": (
             "The session list could not be read, so nothing was changed. "
@@ -26587,6 +27033,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_html("<h1>404</h1>", status=404)
                 return
             if action == "start":
+                if flow["id"] == "whatsapp":
+                    phone = form.get("phone", [""])[0].strip()
+                    if phone:
+                        phone = phone.removeprefix("+")
+                        if not re.fullmatch(r"[0-9]{7,15}", phone):
+                            self._send_html(render_page(
+                                "Enter your WhatsApp number with country code, using digits only.",
+                                kind="error"), status=400)
+                            return
+                        try:
+                            set_key("LOCAL_WHATSAPP_PHONE", phone)
+                        except EnvStoreError as exc:
+                            self._send_html(render_page(str(exc), kind="error"), status=400)
+                            return
                 result = connect_start(flow)
                 # A start that could not begin has something to say, and
                 # the card is rebuilt from the pane on the next GET — so
@@ -26970,6 +27430,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # own remote control is just a flag on its ordinary
                         # TUI and keeps the old default.
                         "remoteControl": codex_daemon or agent != "codex",
+                        "whatsapp": (form.get("whatsapp", [""])[0] == "on"
+                                     and agent in ("claude", "codex")),
                         "remoteControlName": None,
                         "workingDirectory": cwd,
                         "extraArgs": pargs,
@@ -27009,6 +27471,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if back_page == TERM_HOME:
                 query += "&tab=" + name
             self._redirect(query, back_page)
+        elif path == SESS_BASE + "/sessions/whatsapp":
+            name = (form.get("name", [""])[0]).strip()
+            state = form.get("state", [""])[0]
+            if not SESSION_RE.match(name) or state not in ("on", "off"):
+                self._send_html(render_page("Invalid WhatsApp session setting.",
+                                            kind="error"), status=400)
+                return
+            try:
+                with sessions_lock():
+                    sessions, version = load_sessions()
+                    entry = sessions.get(name)
+                    if not isinstance(entry, dict):
+                        self._send_html(render_page("Session no longer exists.",
+                                                    kind="error"), status=404)
+                        return
+                    if state == "on" and entry.get("agent") not in ("claude", "codex"):
+                        self._send_html(render_page("WhatsApp supports Claude and Codex sessions.",
+                                                    kind="error"), status=400)
+                        return
+                    entry["whatsapp"] = state == "on"
+                    write_sessions(sessions, version)
+            except RegistryBusy as exc:
+                self._registry_busy("change WhatsApp setting", exc, self._sess_page(form))
+                return
+            except RegistryUnreadable as exc:
+                self._registry_refusal("change WhatsApp setting", exc, self._sess_page(form))
+                return
+            self._redirect("ok=whatsapp_saved", self._sess_page(form))
         elif path == SESS_BASE + "/sessions/delete":
             name = (form.get("name", [""])[0]).strip()
             if SESSION_RE.match(name):

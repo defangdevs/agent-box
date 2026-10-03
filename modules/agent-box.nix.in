@@ -732,7 +732,7 @@ let
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli uploadCli
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli whatsappCli uploadCli
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
@@ -844,6 +844,15 @@ let
   '' + ''
 @@include:src/session-cli.sh@@
   '');
+
+  # The WhatsApp protocol client and Node dependencies are installed only
+  # when this per-user CLI pairs a device. The CLI itself is Python stdlib,
+  # so the base image gains no Node closure.
+  whatsappCli = pkgs.writers.writePython3Bin "agent-box-whatsapp" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+@@include:src/whatsapp-cli.py@@
+  '';
 
   # Agent profiles (issue #321): the WORKER, as opposed to the harness that
   # `--harness` selects — a harness plus the model, effort, appended system
@@ -1556,6 +1565,7 @@ let
     ++ [
       "github=${pkgs.gh}/bin/gh"
       "defang=${defangCliBinDir}/defang"
+      "whatsapp=${whatsappCli}/bin/agent-box-whatsapp"
     ]
   );
 
