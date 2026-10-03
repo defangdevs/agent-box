@@ -5415,7 +5415,7 @@ def render_sessions(subs=None):
                     f'</details></li>'
                 )
         body = "".join(items)
-    return '<ul class="tbl"><li class="tbl-head">Session</li>' + body + "</ul>"
+    return '<ul class="tbl sessions"><li class="tbl-head">Session</li>' + body + "</ul>"
 
 
 WEBHOOK_STATES = {

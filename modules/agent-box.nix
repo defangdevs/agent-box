@@ -20805,6 +20805,13 @@ STYLE = """<style>
   a.sess { color: #58a6ff; text-decoration: none; }
   a.sess:hover { text-decoration: underline; }
   .acts { display: flex; align-items: center; gap: 4px; flex: none; }
+  @media (max-width: 540px) {
+    .tbl.sessions > li:not(.tbl-head),
+    .tbl.sessions > li.foldrow summary { flex-wrap: wrap; }
+    .tbl.sessions > li:not(.tbl-head) > .nm,
+    .tbl.sessions > li.foldrow summary > .nm { flex-basis: 100%; }
+    .tbl.sessions .acts { margin-left: auto; }
+  }
   /* Subscription rows (issue #227) wrap: a topic carries an expiry and the
      note saying why it exists, which does not fit one line on a phone. */
   .nm.wh { flex-wrap: wrap; row-gap: 2px; }
@@ -23914,7 +23921,7 @@ def render_sessions(subs=None):
                     f'</details></li>'
                 )
         body = "".join(items)
-    return '<ul class="tbl"><li class="tbl-head">Session</li>' + body + "</ul>"
+    return '<ul class="tbl sessions"><li class="tbl-head">Session</li>' + body + "</ul>"
 
 
 WEBHOOK_STATES = {
