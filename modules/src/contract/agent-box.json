@@ -9,7 +9,8 @@
     { "name": "AGENT_BOX_ENV_EXEC", "kind": "bin", "program": "agent-box-env-exec" },
     { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" },
     { "name": "AGENT_BOX_CAPACITY_BIN", "kind": "bin", "program": "agent-box-session-capacity" },
-    { "name": "AGENT_BOX_ENVSTORE_BIN", "kind": "bin", "program": "agent-box-envstore" }
+    { "name": "AGENT_BOX_ENVSTORE_BIN", "kind": "bin", "program": "agent-box-envstore" },
+    { "name": "AGENT_BOX_WHATSAPP_BIN", "kind": "bin", "program": "agent-box-whatsapp" }
   ],
   "execStart": [
     { "kind": "bin", "program": "agent-box-supervisor" }

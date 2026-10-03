@@ -1487,13 +1487,13 @@ sweep_orphan_filters
 # Run it inside this unit's cgroup so a host restart stops and revives it
 # without consuming one of the interactive session slots. Pairing writes the
 # ready marker only after credentials have been saved; removing it stops the
-# child. Node and the bridge are installed in the user's profile on demand.
+# child. The pinned helper refreshes the optional runtime before every start,
+# so a box update cannot leave an older home-directory bridge running until
+# the user pairs again (issue #804).
 whatsapp_pid=""
 whatsapp_last_start=0
 supervise_whatsapp() {
   ready="$HOME/.local/state/local-whatsapp/ready"
-  bridge="$HOME/.local/share/local-whatsapp/bridge.mjs"
-  node="$HOME/.nix-profile/bin/node"
   if [ ! -f "$ready" ]; then
     if [ -n "$whatsapp_pid" ]; then
       kill "$whatsapp_pid" 2>/dev/null || true
@@ -1501,7 +1501,8 @@ supervise_whatsapp() {
     fi
     return
   fi
-  [ -r "$bridge" ] && [ -x "$node" ] || return
+  whatsapp="${AGENT_BOX_WHATSAPP_BIN:-}"
+  [ -x "$whatsapp" ] || return
   if [ -n "$whatsapp_pid" ] && kill -0 "$whatsapp_pid" 2>/dev/null; then
     return
   fi
@@ -1512,9 +1513,9 @@ supervise_whatsapp() {
   codex_cli="$(agent_bin codex 2>/dev/null)" || codex_cli=""
   if [ -n "$codex_cli" ]; then
     LOCAL_WHATSAPP_SESSION_BIN="$session_cli" \
-      LOCAL_WHATSAPP_CODEX_BIN="$codex_cli" "$node" "$bridge" serve &
+      LOCAL_WHATSAPP_CODEX_BIN="$codex_cli" "$whatsapp" serve &
   else
-    LOCAL_WHATSAPP_SESSION_BIN="$session_cli" "$node" "$bridge" serve &
+    LOCAL_WHATSAPP_SESSION_BIN="$session_cli" "$whatsapp" serve &
   fi
   whatsapp_pid=$!
 }

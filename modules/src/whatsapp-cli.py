@@ -158,6 +158,15 @@ def activate():
     READY.touch(mode=0o600)
 
 
+def serve():
+    """Refresh the optional runtime, then replace this process with its bridge."""
+    if not paired():
+        raise RuntimeError("WhatsApp is not linked; pair the device first")
+    install()
+    os.execve(str(NODE), [str(NODE), str(RUNTIME / "bridge.mjs"), "serve"],
+              dict(os.environ))
+
+
 def pair():
     raw = os.environ.get("LOCAL_WHATSAPP_PHONE", "")
     phone = re.sub(r"[ ()+.-]", "", raw)
@@ -175,12 +184,15 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == "profile":
         print(json.dumps({"profile": profile(sys.argv[2])}))
         return
-    if len(sys.argv) != 2 or sys.argv[1] not in ("install", "pair", "activate", "status", "profile"):
-        raise RuntimeError("usage: agent-box-whatsapp install|pair|activate|status|profile [NAME|default]")
+    if len(sys.argv) != 2 or sys.argv[1] not in (
+            "install", "pair", "activate", "serve", "status", "profile"):
+        raise RuntimeError(
+            "usage: agent-box-whatsapp install|pair|activate|serve|status|profile [NAME|default]")
     if sys.argv[1] == "profile":
         print(json.dumps({"profile": profile()}))
         return
-    {"install": install, "pair": pair, "activate": activate, "status": status}[sys.argv[1]]()
+    {"install": install, "pair": pair, "activate": activate,
+     "serve": serve, "status": status}[sys.argv[1]]()
 
 
 if __name__ == "__main__":
