@@ -17470,8 +17470,7 @@ def profile_remove(name):
         # The lock itself is unavailable (the directory is gone, say). There
         # is then nothing to delete either.
         pass
-    if read_default_pointer() == name:
-        set_default_profile("")
+    clear_default_profile(name)
 
 
 # The default profile: ONE pointer file naming it, the same one
@@ -17499,9 +17498,8 @@ def default_profile(profiles):
     return name if name in profiles else ""
 
 
-def set_default_profile(name):
-    """Point the default at `name`, or clear it for "". Written to a temp
-    file and renamed, so a reader never sees half a name."""
+def _set_default_profile(name):
+    """Write `name` while the caller holds DEFAULT_PROFILE_FILE's lock."""
     if not name:
         try:
             os.unlink(DEFAULT_PROFILE_FILE)
@@ -17520,6 +17518,36 @@ def set_default_profile(name):
         except OSError:
             pass
         raise
+
+
+def set_default_profile(name):
+    """Point the default at `name`, or clear it for "".
+
+    The sidecar lock makes an explicit choice atomic with the post-login
+    fill below. The pointer itself is still written by temp file + rename,
+    so an unlocked reader never sees half a name.
+    """
+    with locked(DEFAULT_PROFILE_FILE):
+        _set_default_profile(name)
+
+
+def clear_default_profile(name):
+    """Clear only if `name` is still the default.
+
+    Used by profile deletion and the star toggle's stale-tab guard. The
+    comparison belongs under the same lock as the unlink, or a choice made
+    between those two operations would be erased.
+    """
+    with locked(DEFAULT_PROFILE_FILE):
+        if read_default_pointer() == name:
+            _set_default_profile("")
+
+
+def ensure_default_profile(name):
+    """Fill an empty/dangling default without replacing a user choice."""
+    with locked(DEFAULT_PROFILE_FILE):
+        if not default_profile(read_profiles()):
+            _set_default_profile(name)
 
 
 def profile_launch(name, harness=""):
@@ -17832,8 +17860,7 @@ def ensure_harness_profile(agent):
         if data.get("HARNESS") == agent:
             resolved = profile_launch(name)
             if resolved and resolved.get("harness") == agent:
-                if not default_profile(read_profiles()):
-                    set_default_profile(name)
+                ensure_default_profile(name)
                 return name, [str(a) for a in (resolved.get("args") or [])]
             return None, []
         index += 1
@@ -27859,8 +27886,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     # Only clear the default this row showed: a stale tab
                     # must not unset a default somebody moved elsewhere.
-                    if read_default_pointer() == name:
-                        set_default_profile("")
+                    clear_default_profile(name)
                     self._redirect("ok=profile_default_cleared")
                 return
             if action == "delkey":

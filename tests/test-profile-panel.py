@@ -317,6 +317,24 @@ class LoginProfile(ProfileFixture):
         module.ensure_harness_session("codex", False)
         self.assertEqual(module.default_profile(module.read_profiles()), "triage")
 
+    def test_login_waits_for_and_preserves_a_concurrent_user_choice(self):
+        self.write_profile("triage", "HARNESS=claude\n")
+        module = self.daemon()
+        done = threading.Event()
+        with module.locked(module.DEFAULT_PROFILE_FILE):
+            thread = threading.Thread(
+                target=lambda: (
+                    module.ensure_harness_session("codex", False), done.set()))
+            thread.start()
+            self.assertFalse(done.wait(0.5))
+            # A user choice that lands while login is preparing its default.
+            # Write under the lock already held by this test; the public
+            # setter would correctly wait for the same lock.
+            module._set_default_profile("triage")
+        thread.join(5)
+        self.assertTrue(done.is_set(), "the login worker never finished")
+        self.assertEqual(module.default_profile(module.read_profiles()), "triage")
+
     def test_no_resolver_retains_the_login_worker(self):
         module = self.daemon(AGENT_BOX_PROFILE_BIN="")
         module.ensure_harness_session("claude", True)
