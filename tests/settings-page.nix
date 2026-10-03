@@ -207,7 +207,7 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
           @auth_error expression {http.error.status_code} == 401
           handle @auth_error {
             header Content-Type "text/html; charset=utf-8"
-            respond "<!doctype html><title>Sign in required</title><h1>Sign in required</h1><p>Reload this page to sign in.</p>" 401
+            respond "<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='noindex'><title>Sign in required - Agent Box</title><body style='margin:0;min-height:100vh;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif'><main style='max-width:720px;margin:0 auto;padding:32px 20px 48px'><section style='margin:28px 0;padding:20px;border:1px solid #30363d;border-radius:8px;background:#161b22'><p style='margin:0 0 4px;color:#8b949e;font-size:13px'>Agent Box</p><h1 style='margin:0 0 4px;font-size:24px;font-weight:600'>Sign in required</h1><p style='margin:0;color:#8b949e;font-size:13px'>Reload this page to sign in.</p></section></main></body></html>" 401
           }
         }
         # The portal's published key set. Unauthenticated on purpose --
@@ -358,6 +358,8 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     client.succeed("grep -qi '^Content-Type: text/html; charset=utf-8' /tmp/auth-error-headers")
     client.succeed("grep -qi '^WWW-Authenticate: Basic' /tmp/auth-error-headers")
     client.succeed("grep -q 'Sign in required' /tmp/auth-error")
+    client.succeed("grep -q 'Agent Box' /tmp/auth-error")
+    client.succeed("grep -q 'background:#0d1117' /tmp/auth-error")
 
     # Authenticated GET renders the page.
     auth_page = client.succeed(
@@ -1004,6 +1006,8 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     client.succeed("grep -qi 'WWW-Authenticate: Basic' /tmp/refused")
     client.succeed("grep -qi '^Content-Type: text/html; charset=utf-8' /tmp/refused")
     client.succeed("grep -q 'Sign in required' /tmp/refused-body")
+    client.succeed("grep -q 'Agent Box' /tmp/refused-body")
+    client.succeed("grep -q 'background:#0d1117' /tmp/refused-body")
 
     # The session store keeps no live cookie: records are named by the
     # SHA-256 of the secret, so reading the store back yields nothing that

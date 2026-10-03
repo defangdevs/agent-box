@@ -21549,6 +21549,12 @@ STYLE = """<style>
 </style>
 """
 
+# This page is deliberately self-contained: it is the response after a
+# browser cancels a Basic-auth prompt, so no authenticated asset can be
+# assumed to load. Keep its palette and type scale aligned with the settings
+# and workspace pages without making a second request.
+AUTH_REQUIRED_BODY = """<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='noindex'><title>Sign in required - Agent Box</title><body style='margin:0;min-height:100vh;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif'><main style='max-width:720px;margin:0 auto;padding:32px 20px 48px'><section style='margin:28px 0;padding:20px;border:1px solid #30363d;border-radius:8px;background:#161b22'><p style='margin:0 0 4px;color:#8b949e;font-size:13px'>Agent Box</p><h1 style='margin:0 0 4px;font-size:24px;font-weight:600'>Sign in required</h1><p style='margin:0;color:#8b949e;font-size:13px'>Reload this page to sign in.</p></section></main></body></html>"""
+
 # Shared by the settings-page and workspace add forms so their layout,
 # accessibility, and autocomplete behaviour cannot drift apart.
 NEW_SESSION_FIELDS_TPL = """<div class="row new-session-row">
@@ -26897,9 +26903,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        body = ("<!doctype html><title>Sign in required</title>"
-                "<h1>Sign in required</h1><p>Reload this page to sign in.</p>")
-        data = body.encode("utf-8")
+        data = AUTH_REQUIRED_BODY.encode("utf-8")
         self.send_response(401)
         # Max-Age=0 with the same Path and flags the cookie was set with,
         # which is what a browser needs to actually drop it.
@@ -28846,7 +28850,7 @@ if __name__ == "__main__":
             @auth_error expression {http.error.status_code} == 401
             handle @auth_error {
               header Content-Type "text/html; charset=utf-8"
-              respond "<!doctype html><title>Sign in required</title><h1>Sign in required</h1><p>Reload this page to sign in.</p>" 401
+              respond "<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='noindex'><title>Sign in required - Agent Box</title><body style='margin:0;min-height:100vh;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif'><main style='max-width:720px;margin:0 auto;padding:32px 20px 48px'><section style='margin:28px 0;padding:20px;border:1px solid #30363d;border-radius:8px;background:#161b22'><p style='margin:0 0 4px;color:#8b949e;font-size:13px'>Agent Box</p><h1 style='margin:0 0 4px;font-size:24px;font-weight:600'>Sign in required</h1><p style='margin:0;color:#8b949e;font-size:13px'>Reload this page to sign in.</p></section></main></body></html>" 401
             }
           }
           # This fragment ends INSIDE the block on purpose: the module appends one
