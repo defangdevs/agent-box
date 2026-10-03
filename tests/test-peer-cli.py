@@ -10,6 +10,7 @@ import io
 import json
 import os
 import tempfile
+import socketserver
 import threading
 import types
 import http.server
@@ -108,7 +109,8 @@ class PeerCliTest(unittest.TestCase):
             self.assertIn("address\tagent@a.example", who)
             self.assertIn("inbox\tB\t" + peer.safe_name(
                 next(iter(peer.load_peers()["peers"]))) + ":default", who)
-            with mock.patch("urllib.request.urlopen", deliver):
+            with mock.patch("urllib.request.build_opener",
+                            lambda *_h: types.SimpleNamespace(open=deliver)):
                 self.capture(peer.cmd_send, argparse.Namespace(
                     label="B", inbox="ops", message="x", from_name="", timeout=5))
             self.assertEqual(json.loads(sent[-1][0].data)["from"], "agent@a.example")
@@ -173,18 +175,19 @@ class PeerCliTest(unittest.TestCase):
             def log_message(self, *_args):
                 pass
 
-        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        # TCPServer, not HTTPServer: its bind calls getfqdn, which fails in the Nix sandbox.
+        server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         path = self.root / "a/peers/peers.json"
         state = json.loads(path.read_text())
         for entry in state["peers"].values():
-            entry["endpoint"] = "http://127.0.0.1:%d" % server.server_port
+            entry["endpoint"] = "http://127.0.0.1:%d" % server.server_address[1]
         path.write_text(json.dumps(state))
         with self.assertRaises(SystemExit):
             self.capture(peer.cmd_send, argparse.Namespace(
-                label="B", inbox="ops", message="hi", from_name="", timeout=5))
+                label="B", inbox="ops", message="hi", from_name="tester", timeout=5))
         self.assertEqual(hits, [])
 
     def test_peers_lock_is_exclusive_across_processes(self):

@@ -9588,6 +9588,20 @@ def cmd_list(_args):
             "default", endpoint))
 
 
+def own_address():
+    host = urllib.parse.urlsplit(local_endpoint()).netloc
+    return "%s@%s" % (os.environ.get("USER") or os.getlogin(), host)
+
+
+def cmd_whoami(_args):
+    """Say how other boxes address this user, and where their messages land."""
+    print("address\t" + own_address())
+    for pair_id, peer in sorted(load_peers()["peers"].items(),
+                                key=lambda item: item[1].get("label", "")):
+        if isinstance(peer, dict) and peer.get("state") == "active":
+            print("inbox\t%s\t%s:default" % (peer.get("label", "?"), safe_name(pair_id)))
+
+
 def cmd_revoke(args):
     with peers_lock():
         _revoke(args)
@@ -9640,7 +9654,7 @@ def cmd_send(args):
         fail("outbound pair key is invalid")
     delivery = str(uuid.uuid4())
     payload = {"version": VERSION, "messageId": delivery, "sentAt": timestamp(),
-               "inbox": inbox, "from": args.from_name or "", "body": body}
+               "inbox": inbox, "from": args.from_name or own_address(), "body": body}
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     source = safe_name(pair_id)
     target = validate_endpoint(peer.get("endpoint")) + "/" + source
@@ -9676,6 +9690,8 @@ def parser():
     accept.set_defaults(run=cmd_accept)
     confirm = sub.add_parser("confirm", help="confirm an acceptance response read from stdin")
     confirm.set_defaults(run=cmd_confirm)
+    sub.add_parser("whoami", help="show this user's address and inbound topics").set_defaults(
+        run=cmd_whoami)
     sub.add_parser("list", help="list paired inboxes").set_defaults(run=cmd_list)
     revoke = sub.add_parser("revoke", help="remove a local pair and its inbound source")
     revoke.add_argument("label")
