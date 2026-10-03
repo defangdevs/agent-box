@@ -75,6 +75,12 @@ BASHISMS = (
 # plaintext never appears in the rendered script.
 HOSTILE_PASSWORD = "p'; touch /tmp/pwned; '$x `id` \"q\""
 
+# Free text that would close the AGENTS.stack.md heredoc early and run what
+# follows as root, and that names a later marker so a dumb whole-string
+# replace() would splice a secret into the file (issue #777). Like the
+# password, the template must substitute it base64-encoded.
+HOSTILE_AGENTSMD = "x\nAGENTBOX_AGENTSMD\ntouch /tmp/pwned\n@@WEBPASSWORD@@\n"
+
 # Portal handover (issue #593). Plain values for readability; SAMPLE below
 # carries their base64 form, matching what the template's replace() chain
 # now substitutes (see the comment on PORTALISSUERB64 there for why: Bicep
@@ -82,8 +88,8 @@ HOSTILE_PASSWORD = "p'; touch /tmp/pwned; '$x `id` \"q\""
 # validated and decoded by the bootstrap itself rather than the template).
 PORTAL_ISSUER_SAMPLE = "https://station.example.com"
 PORTAL_USER_SAMPLE = "usr_2Nk9x"
-DOMAIN_SAMPLE = "203-0-113-7.sslip.example.com"
 PUBLIC_IP_SAMPLE = "203.0.113.7"
+DOMAIN_SAMPLE = PUBLIC_IP_SAMPLE
 
 # Values only need to be representative: this renders the script, it does not
 # deploy it. They deliberately carry the punctuation a real parameter can, so a
@@ -94,7 +100,7 @@ SAMPLE = {
     "@@IMAGERUNTIME@@": "false",
     "@@USER@@": "agent",
     "@@SSLIPDOMAINB64@@": base64.b64encode(b"sslip.example.com").decode(),
-    "@@AGENTSMD@@": "## This box\n\n- A line with 'quotes' and $dollars.\n",
+    "@@AGENTSMDB64@@": base64.b64encode(HOSTILE_AGENTSMD.encode()).decode(),
     "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
     "@@PORTALISSUERB64@@": base64.b64encode(
         PORTAL_ISSUER_SAMPLE.encode()).decode(),
@@ -110,16 +116,14 @@ SAMPLE = {
 # webPassword has no default: it is the one field the form always demands.
 # A `...B64@@` marker's default is base64-encoded by defaults_render below,
 # matching what the template's own base64(...) call does at deploy time --
-# sslipDomain's default ('sslip.io') is not empty, so unlike the portal
-# markers this cannot be papered over by "base64 of the empty string is the
-# empty string too".
+# sslipDomain's empty default means the primary IP URL has no DNS alias.
 DEFAULT_OF = {
     "@@NIXINSTALLER@@": "nixInstallerUrl",
     "@@FLAKEREF@@": "agentBoxFlakeRef",
     "@@IMAGERUNTIME@@": "imageIncludesRuntime",
     "@@USER@@": "userName",
     "@@SSLIPDOMAINB64@@": "sslipDomain",
-    "@@AGENTSMD@@": "agentsMd",
+    "@@AGENTSMDB64@@": "agentsMd",
     # Both default to '' -- handover off, which is the default box.
     "@@PORTALISSUERB64@@": "portalIssuer",
     "@@PORTALUSERIDB64@@": "portalUser",
@@ -274,6 +278,9 @@ def check_static_domain(template: dict) -> int:
     script = template.get("variables", {}).get("bootstrapTemplate", "")
     chain = bootstrap_chain(template)
     web_url = template.get("outputs", {}).get("webUrl", {}).get("value", "")
+    sslip_url = template.get("outputs", {}).get("sslipUrl", {}).get("value", "")
+    sslip_default = (template.get("parameters", {}).get("sslipDomain", {})
+                     .get("defaultValue"))
     public_ip_ref = "reference(resourceId('Microsoft.Network/publicIPAddresses'"
     failures = []
     if "--settle-delay" in script:
@@ -286,6 +293,12 @@ def check_static_domain(template: dict) -> int:
         failures.append("Azure's Public IP is not encoded before shell insertion")
     if public_ip_ref not in web_url:
         failures.append("webUrl is not derived from Azure's allocated Public IP")
+    if "parameters('sslipDomain')" in web_url:
+        failures.append("webUrl still depends on the optional DNS alias")
+    if "if(empty(parameters('sslipDomain'))" not in sslip_url:
+        failures.append("sslipUrl is not empty when no alias is configured")
+    if sslip_default != "":
+        failures.append("sslipDomain must default to no DNS alias")
     if failures:
         print("FAIL: static Azure domain wiring:\n       "
               + "\n       ".join(failures), file=sys.stderr)
@@ -327,6 +340,14 @@ def check_bootstrap(template: dict, values: dict, label: str) -> int:
             f"FAIL: placeholder(s) {sorted(set(left))} survive substitution — the "
             "Bicep replace() chain and the script have drifted apart, so the VM "
             "would run a literal marker.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if "AGENTBOX_AGENTSMD" in script or "touch /tmp/pwned\n@@" in script:
+        print(
+            f"FAIL: the rendered bootstrap ({label}) carries agentsMd in the "
+            "clear (issue #777). It must travel base64-encoded.",
             file=sys.stderr,
         )
         return 1
@@ -481,7 +502,7 @@ def check_written_config(template: dict) -> int:
             PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAIN_SAMPLE,
             PUBLIC_IP_SAMPLE, True),
         "handover off": (
-            "", "", SSLIP_DOMAIN_SAMPLE, PUBLIC_IP_SAMPLE, True),
+            "", "", "", PUBLIC_IP_SAMPLE, True),
         # '&' is IN portalIssuer's allowed character class (a query string
         # may have one) but is sed replacement-text magic -- unescaped, this
         # is exactly the input that used to splice the placeholder into
@@ -551,9 +572,11 @@ def check_written_config(template: dict) -> int:
                       % (label, data), file=sys.stderr)
                 rc = 1
                 continue
-            if data.get("domainSuffix") != sslip:
-                print("FAIL: %s: domainSuffix landed as %r, wanted %r"
-                      % (label, data.get("domainSuffix"), sslip),
+            alias = (public_ip.replace(".", "-") + "." + sslip
+                     if sslip else "")
+            if web.get("alias") != alias:
+                print("FAIL: %s: web.alias landed as %r, wanted %r"
+                      % (label, web.get("alias"), alias),
                       file=sys.stderr)
                 rc = 1
                 continue
@@ -595,6 +618,16 @@ def check_secrets(template: dict) -> int:
             "base64(parameters('webPassword')). A raw substitution puts the "
             "password inside a shell literal it can close - see "
             "HOSTILE_PASSWORD above.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if "base64(parameters('agentsMd'))" not in chain:
+        print(
+            "FAIL: the replace() chain does not substitute "
+            "base64(parameters('agentsMd')). A raw substitution lets free text "
+            "close the AGENTS.stack.md heredoc, or carry a later marker such "
+            "as @@WEBPASSWORD@@ into the file - see HOSTILE_AGENTSMD above.",
             file=sys.stderr,
         )
         return 1

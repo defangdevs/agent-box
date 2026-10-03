@@ -732,7 +732,7 @@ let
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli uploadCli
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli whatsappCli uploadCli
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
@@ -844,6 +844,15 @@ let
   '' + ''
 @@include:src/session-cli.sh@@
   '');
+
+  # The WhatsApp protocol client and Node dependencies are installed only
+  # when this per-user CLI pairs a device. The CLI itself is Python stdlib,
+  # so the base image gains no Node closure.
+  whatsappCli = pkgs.writers.writePython3Bin "agent-box-whatsapp" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+@@include:src/whatsapp-cli.py@@
+  '';
 
   # Agent profiles (issue #321): the WORKER, as opposed to the harness that
   # `--harness` selects — a harness plus the model, effort, appended system
@@ -1569,6 +1578,7 @@ let
     ++ [
       "github=${pkgs.gh}/bin/gh"
       "defang=${defangCliBinDir}/defang"
+      "whatsapp=${whatsappCli}/bin/agent-box-whatsapp"
     ]
   );
 
@@ -2012,12 +2022,24 @@ in
 
       domain = lib.mkOption {
         type = lib.types.str;
+        example = "203.0.113.7";
+        description = ''
+          Public IPv4 address or DNS name for the browser terminal. An IPv4
+          address uses a Let's Encrypt shortlived certificate; a DNS name uses
+          the normal ACME profile. Caddy renews certificates in its persistent
+          /var/lib/caddy state directory.
+        '';
+      };
+
+      alias = lib.mkOption {
+        type = lib.types.str;
+        default = "";
         example = "1-2-3-4.sslip.io";
         description = ''
-          Public hostname for the browser terminal. Used to seed
-          /var/lib/caddy/Caddyfile the first time only — subsequent edits are
-          preserved. Set this to whatever DNS name resolves to the host
-          (sslip.io on AWS, a custom domain on bare metal, etc).
+          Optional DNS alias for the primary web.domain. Caddy redirects it to
+          the primary URL and obtains its certificate on demand, only if a
+          client actually visits the alias. Leave empty to request no DNS
+          alias certificate.
         '';
       };
 
@@ -2292,16 +2314,12 @@ in
         '';
       };
 
-      # Issue #242: "agent-box should ship with its own fork". The box
-      # fetches one generated file and never saw its own sources, so it
-      # could not answer for itself and an agent could not fix it. The
-      # checkout is the agent's WORKING COPY — the source ships, the agent
-      # edits it, pushes to a fork, opens a PR. It is not the tree the box
-      # BUILDS from: that is `srcDir`, root-owned, and the two are separate
-      # on purpose. A rebuild from an agent-writable path would make that
-      # user root-equivalent (issue #127 — users are the trust boundary), so
-      # a fix reaches the running box the way any other change does: through
-      # the repo, and the next `git pull`.
+      # Issue #242: ship the box's own sources at the running rev so agents
+      # can inspect them and iterate locally. Fork creation is separate and
+      # opt-in. This is the agent's working copy, not the tree the box builds
+      # from: `srcDir` is root-owned. Rebuilding from an agent-writable path
+      # would make that user root-equivalent (issue #127), so a local change
+      # reaches the running box only through the configured repo and updater.
       checkout = {
         enable = lib.mkOption {
           type = lib.types.bool;
@@ -2372,12 +2390,13 @@ in
 
         fork = lib.mkOption {
           type = lib.types.bool;
-          default = true;
-          example = false;
+          default = false;
+          example = true;
           description = ''
-            Also add a `fork` remote to the checkout, forking `repo` into
-            the account the box's `GH_TOKEN` belongs to, so an agent can
-            push a branch and open a PR without write access upstream.
+            Opt in to creating a fork of `repo` in the account the box's
+            `GH_TOKEN` belongs to, then add it as the checkout's `fork`
+            remote. The source checkout is available without creating a
+            repository in that account.
 
             Attempted on the first supervisor start that finds a token and
             no `fork` remote — so a box that gets its token later still
@@ -2385,7 +2404,6 @@ in
             checkout. `origin` is never renamed: it stays the repo this box
             is built from, which is what `rev` is a rev OF.
 
-            Set false on a box whose token must not create repositories.
             Note that pushing to the fork does not make the box run it: the
             updater fetches from `repo`, chosen at deploy time. A box that
             should update from its own fork sets `repo` to that fork.
@@ -2969,14 +2987,14 @@ in
       };
     };
 
-    # Without this, a mouse wheel scroll is forwarded to the foreground
-    # program as arrow-key presses instead of scrolling tmux's own pane
-    # history — tmux's default fallback for apps that don't handle the
-    # mouse themselves. System-wide /etc/tmux.conf so every user's tmux
-    # server picks it up without touching each ~/.tmux.conf.
+    # System-wide /etc/tmux.conf so every user's tmux server picks it up
+    # without touching each ~/.tmux.conf. The body is shared with the
+    # native renderer (share/agent-box/tmux.conf).
     programs.tmux = {
       enable = true;
-      extraConfig = "set -g mouse on";
+      extraConfig = ''
+        @@include:src/tmux.conf@@
+      '';
     };
 
     users.users = lib.mapAttrs (name: u: {
@@ -3684,6 +3702,9 @@ in
       # Per-user env var suffix for the Caddyfile placeholders; linux user
       # names may contain chars that are invalid in env var names.
       envName = n: lib.toUpper (lib.stringAsChars (c: if builtins.match "[a-zA-Z0-9]" c != null then c else "_") n);
+      ipv4Octet = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
+      isIpv4 = value: builtins.match "${ipv4Octet}(\\.${ipv4Octet}){3}" value != null;
+      webDomainIsIpv4 = isIpv4 cfg.web.domain;
 
       # Prefix every non-blank line — Nix indented strings strip the common
       # leading whitespace, so composed fragments need explicit re-indenting.
@@ -3778,9 +3799,11 @@ in
       # can't read /home. See the comment block at the top of the rendered
       # file below (agents will read that from the running box).
       managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
-      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" ]
+      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@TLS_POLICY@" "@DEFAULT_SNI@" ]
         [ cfg.web.domain "services.agent-box" "nixos-rebuild switch"
-          caddyReloadCmd ] ''
+          caddyReloadCmd
+          (if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only")
+          (if webDomainIsIpv4 then "  default_sni ${cfg.web.domain}" else "") ] ''
         @@include:src/caddyfile-header.caddy@@
       ''
       + lib.concatMapStringsSep "\n"
@@ -3789,6 +3812,11 @@ in
       + "\n"
       + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
       + "}\n\n"
+      + lib.optionalString (cfg.web.alias != "") (
+        lib.replaceStrings [ "@ALIAS@" "@DOMAIN@" ]
+          [ cfg.web.alias cfg.web.domain ] ''
+          @@include:src/caddyfile-alias.caddy@@
+        '' + "\n")
       # The same fragment the native renderer binds (issue #154 Phase 2), so
       # both backends document — and wire — this extension point identically.
       + lib.replaceStrings [ "@APPLY_CMD@" "@RELOAD_CMD@" ]
@@ -3933,6 +3961,24 @@ in
     in
     {
       assertions = [
+        {
+          assertion = !webDomainIsIpv4 || lib.versionAtLeast pkgs.caddy.version "2.11.4";
+          message = "services.agent-box.web.domain is an IPv4 address, which requires Caddy 2.11.4 or newer for ACME IP certificates.";
+        }
+        {
+          assertion = cfg.web.alias == "" || cfg.web.alias != cfg.web.domain;
+          message = "services.agent-box.web.alias must differ from web.domain.";
+        }
+        {
+          assertion = cfg.web.alias == "" || !isIpv4 cfg.web.alias;
+          message = "services.agent-box.web.alias must be a DNS name, not an IPv4 address.";
+        }
+        {
+          assertion = cfg.web.alias == "" || builtins.match
+            "[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+"
+            cfg.web.alias != null;
+          message = "services.agent-box.web.alias must be a DNS name with at least two labels.";
+        }
         {
           assertion = cfg.users ? ${webUser};
           message =

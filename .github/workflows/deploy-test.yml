@@ -121,6 +121,10 @@ jobs:
 
       - name: Generate WebPassword
         id: pw
+        env:
+          # workflow_dispatch inputs are untrusted text. Route the override
+          # through the environment so its contents are data, not shell source.
+          WEB_PASSWORD_OVERRIDE: ${{ inputs.web_password }}
         run: |
           # 48 hex chars by default. Dispatch runs may override the plaintext
           # to reproduce shape-specific auth bugs; the override is
@@ -131,8 +135,8 @@ jobs:
           # plaintext itself for its later login smoke tests, so both outputs
           # are kept. Caddy's own image computes the hash so this step needs
           # no new toolchain beyond the Docker the runner already has.
-          if [ -n '${{ inputs.web_password }}' ]; then
-            pw='${{ inputs.web_password }}'
+          if [ -n "$WEB_PASSWORD_OVERRIDE" ]; then
+            pw="$WEB_PASSWORD_OVERRIDE"
             echo "::notice::Using dispatch-provided WebPassword override."
           else
             pw="$(openssl rand -hex 24)"

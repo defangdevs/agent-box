@@ -719,6 +719,61 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 printf 'no phantom systemd unit overrides in tests/ or hosts/\n' > "$out"
               '';
 
+          # An IP site must select Let's Encrypt's shortlived profile. A DNS
+          # alias has its own policy and must wait until a client uses it.
+          web-ip-cert =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "203.0.113.7";
+                        alias = "203-0-113-7.sslip.io";
+                        user = "agent";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-web-ip-cert-ok"
+              { caddyfile = sys.config.services.caddy.configFile;
+                nativeBuildInputs = [ pkgs.caddy pkgs.python3 ]; } ''
+              export WEB_PASSWORD_ALGORITHM_AGENT=argon2id
+              export WEB_PASSWORD_HASH_AGENT='$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$YWJj'
+              export WEB_COOKIE_SECRET_AGENT=abc
+              caddy adapt --validate --config "$caddyfile" --adapter caddyfile > adapted.json
+              python3 - <<'PY'
+              import json
+              data = json.load(open("adapted.json"))
+              policies = data["apps"]["tls"]["automation"]["policies"]
+              by_name = {name: policy for policy in policies
+                         for name in policy["subjects"]}
+              ip = by_name["203.0.113.7"]
+              alias = by_name["203-0-113-7.sslip.io"]
+              assert not ip.get("on_demand"), ip
+              assert ip["issuers"][0]["profile"] == "shortlived", ip
+              assert ip["issuers"][0]["ca"] == "https://acme-v02.api.letsencrypt.org/directory", ip
+              assert ip["issuers"][0]["challenges"]["http"]["disabled"], ip
+              assert alias["on_demand"] is True, alias
+              assert "profile" not in alias["issuers"][0], alias
+              servers = data["apps"]["http"]["servers"]
+              assert any(policy.get("default_sni") == "203.0.113.7"
+                         for server in servers.values()
+                         for policy in server.get("tls_connection_policies", []))
+              PY
+              touch "$out"
+            '';
+
           # Guard (issue #132): the module's REAL generated Caddyfile (the VM
           # test below swaps in a `tls internal` stand-in) must carry the
           # authenticated downloads route for a web user — the handle, the
@@ -2029,10 +2084,12 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
-          # seed_json, the supervisor's in-place edit of ~/.claude.json
-          # (issue #749): a half-written file is retried before it is
-          # believed, and giving up is reported rather than silent. Cut out
-          # of supervisor.sh by name, so it runs natively in a second.
+          # seed_json and seed_json_settled, the supervisor's in-place edit
+          # of ~/.claude.json (issue #749): it takes claude's own lock, puts
+          # back an edit an unlocked writer renamed away, retries a file
+          # that does not parse, and reports giving up rather than going
+          # silent. Cut out of supervisor.sh by name, so it runs natively in
+          # seconds.
           seed-json =
             pkgs.runCommand "agent-box-seed-json"
               {
@@ -2048,11 +2105,11 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
-          # Eval regression for selfUpdate.checkout's two assertions
-          # (issue #242, PR #478 review). Both guard a value whose only
-          # other feedback is a background job failing with EROFS in a
-          # journal nobody reads, so what matters is that the REFUSAL
-          # happens at eval — and `..`, `.` and the empty component are
+          # Eval regression for selfUpdate.checkout's assertions and fork
+          # opt-in (issue #242, PR #478 review). The path assertion guards
+          # a value whose only other feedback is a background job failing
+          # with EROFS in a journal nobody reads, so the REFUSAL must
+          # happen at eval - and `..`, `.` and the empty component are
           # exactly the inputs a first pass at "must be relative" lets
           # through.
           #
@@ -2061,7 +2118,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # a failed build would only say that something did.
           checkout-options =
             let
-              evalWith = extra: (nixpkgs.lib.nixosSystem {
+              evalConfig = extra: (nixpkgs.lib.nixosSystem {
                 inherit system;
                 modules = [
                   self.nixosModules.agent-box
@@ -2080,7 +2137,9 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                     system.stateVersion = "25.05";
                   }
                 ];
-              }).config.assertions;
+              }).config;
+              evalWith = extra: (evalConfig extra).assertions;
+              checkoutEnv = extra: (evalConfig extra).systemd.services."agent-box@agent".environment;
               failed = extra:
                 builtins.filter (a: !a.assertion) (evalWith extra);
               # Does SOME assertion fire, and does its message name the
@@ -2120,6 +2179,12 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                   { label = "accepts a null maintainer";
                     ok = !(rejects "checkout.maintainer"
                       { selfUpdate.checkout.maintainer = null; }); }
+                  { label = "checkout defaults on without creating a fork";
+                    ok = builtins.hasAttr "AGENT_BOX_CHECKOUT_DIR" (checkoutEnv { })
+                      && !(builtins.hasAttr "AGENT_BOX_CHECKOUT_FORK" (checkoutEnv { })); }
+                  { label = "fork creation requires an explicit opt-in";
+                    ok = builtins.hasAttr "AGENT_BOX_CHECKOUT_FORK"
+                      (checkoutEnv { selfUpdate.checkout.fork = true; }); }
                 ];
               bad = builtins.filter (c: !c.ok) cases;
             in
@@ -2171,6 +2236,26 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 tests = ./tests/test-checkout-bootstrap.sh;
               } ''
               bash "$tests" "$script" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # `agent-box-profile rm` names what still stores the deleted name
+          # (standing watches, AGENT_BOX_HOOK_PROFILE, listed sessions) and
+          # never fails because of it. Real env store, no network.
+          profile-rm-references =
+            pkgs.runCommand "agent-box-profile-rm-references"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.jq pkgs.python3 ];
+                script = ./modules/src/profile-cli.sh;
+                lib = ./modules/src/lib/envstore.py;
+                cli = ./modules/src/envstore-cli.py;
+                tests = ./tests/test-profile-rm-references.sh;
+              } ''
+              bash "$tests" "$script" "$lib" "$cli" > log 2>&1 || {
                 cat log
                 exit 1
               }
@@ -2251,6 +2336,53 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The settings daemon's Codex pairing API (issue #780): the JSON
+          # a portal pairs the Codex apps with. Same subject as the checks
+          # above (the GOLDEN PAYLOAD), plus a fake codex app-server on a
+          # real Unix socket, so the daemon's WebSocket client runs for real.
+          # Pins that the code never leaves memory, that `claimed` is sticky
+          # and which status codes Station keys on.
+          codex-pairing =
+            pkgs.runCommand "agent-box-codex-pairing"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-codex-pairing.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-codex-pairing.py
+              python3 repo/tests/test-codex-pairing.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # The settings daemon's session API for portals (issue #787): the
+          # JSON list, web stop, and the JSON answers of restart/delete.
+          # Same subject (the GOLDEN PAYLOAD) as the pairing check above.
+          sessions-api =
+            pkgs.runCommand "agent-box-sessions-api"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-sessions-api.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-sessions-api.py
+              python3 repo/tests/test-sessions-api.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # render_connect_card()'s "checking" window: the status probe
           # never blocks a render, so every card starts "checking" on a
           # cold cache and the Sign-in button must exist there — while a
@@ -2269,6 +2401,42 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
               cp "$tests" repo/tests/test-connect-card.py
               python3 repo/tests/test-connect-card.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          whatsapp-cli =
+            pkgs.runCommand "agent-box-whatsapp-cli"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                cli = ./modules/src/whatsapp-cli.py;
+                tests = ./tests/test-whatsapp-cli.py;
+              } ''
+              install -d repo/modules/src repo/tests
+              cp "$cli" repo/modules/src/whatsapp-cli.py
+              cp "$tests" repo/tests/test-whatsapp-cli.py
+              python3 repo/tests/test-whatsapp-cli.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          whatsapp-session =
+            pkgs.runCommand "agent-box-whatsapp-session"
+              {
+                nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.jq pkgs.util-linux ];
+                cli = ./tests/golden/vm/payloads/agent-box-session/bin/agent-box-session;
+                tests = ./tests/test-whatsapp-session.py;
+              } ''
+              install -d repo/tests/golden/vm/payloads/agent-box-session/bin repo/tests
+              cp "$cli" repo/tests/golden/vm/payloads/agent-box-session/bin/agent-box-session
+              cp "$tests" repo/tests/test-whatsapp-session.py
+              python3 repo/tests/test-whatsapp-session.py > log 2>&1 || {
                 cat log
                 exit 1
               }

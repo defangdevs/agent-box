@@ -290,6 +290,9 @@ let
   # env-setting wrapper, which is the native counterpart of the module's
   # generated wrapper prelude.
   cliPayloads = [
+    (pkgs.writers.writePython3Bin "agent-box-whatsapp" {
+      flakeIgnore = [ "E501" "E302" "E305" ];
+    } (readSrc "whatsapp-cli.py"))
     (payload "agent-box-session-bare" "session-cli.sh")
     # Agent profiles (issue #321): the worker `--profile` selects. Bare, so
     # `agentbox apply` can pin the env store and the harness list into the
@@ -381,6 +384,7 @@ let
     # module splices into agent-box-defang-cli-expr.nix, so both backends
     # resolve to one output path and share one binary cache hit.
     install -m444 ${src}/defang-cli.nix $out/share/agent-box/
+    install -m444 ${src}/tmux.conf $out/share/agent-box/
     # The password helper is generated per user by `agentbox apply` (it
     # crosses sudo, so its paths must not come from env); the template it
     # renders from lives here.

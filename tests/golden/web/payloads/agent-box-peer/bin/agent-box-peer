@@ -14,6 +14,7 @@ lists or shell history.
 
 import argparse
 import base64
+import contextlib
 import datetime as dt
 import fcntl
 import hashlib
@@ -228,6 +229,16 @@ def load_peers():
     return value
 
 
+@contextlib.contextmanager
+def peers_lock():
+    """Serialise whole load-modify-save sequences on peers.json."""
+    path, _ = peer_paths()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path) + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def save_peers(value):
     path, _ = peer_paths()
     value["version"] = VERSION
@@ -341,6 +352,11 @@ def check_invite(invite):
 
 
 def cmd_invite(args):
+    with peers_lock():
+        _invite(args)
+
+
+def _invite(args):
     endpoint = local_endpoint()
     label = validate_label(args.label)
     expires = utcnow() + dt.timedelta(hours=args.expires_hours)
@@ -365,6 +381,11 @@ def cmd_invite(args):
 
 
 def cmd_accept(args):
+    with peers_lock():
+        _accept(args)
+
+
+def _accept(args):
     invite = read_token("invitation")
     pair_id, endpoint, root, _ = check_invite(invite)
     label = validate_label(args.label)
@@ -393,6 +414,11 @@ def cmd_accept(args):
 
 
 def cmd_confirm(args):
+    with peers_lock():
+        _confirm(args)
+
+
+def _confirm(args):
     response = read_token("acceptance response")
     if response.get("version") != VERSION or response.get("kind") != "accept":
         fail("response is not an agent-box peer v1 acceptance", 2)
@@ -402,6 +428,8 @@ def cmd_confirm(args):
     peer = peers["peers"].get(pair_id)
     if not isinstance(peer, dict) or peer.get("state") != "invited":
         fail("no pending invitation matches this response", 2)
+    if parse_timestamp(peer.get("expiresAt"), "pending invitation expiry") <= utcnow():
+        fail("invitation expired; revoke %s and invite again" % peer.get("label"), 2)
     root_path = key_path(pair_id, "root")
     try:
         root = b64decode(root_path.read_text(encoding="ascii").strip(),
@@ -437,6 +465,11 @@ def cmd_list(_args):
 
 
 def cmd_revoke(args):
+    with peers_lock():
+        _revoke(args)
+
+
+def _revoke(args):
     peers = load_peers()
     pair_id, peer = peer_by_label(peers, args.label)
     remove_inbound_source(pair_id)
@@ -445,6 +478,12 @@ def cmd_revoke(args):
     del peers["peers"][pair_id]
     save_peers(peers)
     print("Revoked pair %s. The other box must revoke it separately." % peer["label"])
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # A redirected POST becomes a body-less GET; never report that as delivery.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def cmd_send(args):
@@ -488,8 +527,9 @@ def cmd_send(args):
         "x-agent-box-delivery": delivery,
     }
     request = urllib.request.Request(target, data=raw, headers=headers, method="POST")
+    opener = urllib.request.build_opener(_NoRedirect)
     try:
-        with urllib.request.urlopen(request, timeout=args.timeout) as response:
+        with opener.open(request, timeout=args.timeout) as response:
             if response.status < 200 or response.status >= 300:
                 fail("peer ingress returned HTTP %d" % response.status)
     except urllib.error.HTTPError as exc:

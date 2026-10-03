@@ -75,20 +75,43 @@ def capacity_live():
     return {s for s in proc.stdout.splitlines() if not s.startswith("_connect-")}
 
 
-def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
+def capacity_live_checked():
+    """Like capacity_live(), but wraps a failure as SessionCapacityError.
+
+    A caller that will pass the result into capacity_check() under
+    sessions_lock() should call this FIRST, outside the lock: capacity_live()
+    shells out to a real tmux subprocess (timeout=5), and that spawn must not
+    run while holding the sessions.json lock -- a slow or contended runner
+    can then starve every other writer waiting on the same lock for up to
+    5 seconds per add/restart (issue #748).
+    """
+    try:
+        return capacity_live()
+    except (OSError, capacity_subprocess.TimeoutExpired) as exc:
+        raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
+
+
+def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
+                   exempt=()):
     """Admit new/revived targets, or one supervisor spawn.
 
     On boot or after a limit reduction, an overfull registry is a queue:
     keep live panes and admit pending names in sorted order up to the limit.
     Existing panes are never killed. Ordinary adds cannot jump that queue.
+    `exempt` is for an unmetered target that is not in the registry yet.
     """
     try:
         limit = capacity_limit() if limit is None else limit
-        live = capacity_live() if live is None else set(live)
-    except (OSError, ValueError, capacity_subprocess.TimeoutExpired) as exc:
+    except (OSError, ValueError) as exc:
         raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
+    live = capacity_live_checked() if live is None else set(live)
     pending = {name for name, entry in sessions.items()
                if isinstance(entry, dict) and entry.get("stopped") is not True}
+    # A shell pane is an operator terminal rather than an agent worker. It
+    # shares the registry so it can be listed, stopped and resumed like other
+    # sessions, but must not consume an agent worker slot (issue #795).
+    shells = {name for name, entry in sessions.items()
+              if isinstance(entry, dict) and entry.get("agent") == "shell"}
     # A crash is flagged `died`, not `stopped` (issue #516), so a died entry
     # stays in `pending` -- it must remain its own candidate for revival by
     # `agent-box-session restart`, or a stale flag on a session that already
@@ -99,19 +122,31 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
     # died session's pane counted as real, running capacity forever, and
     # enough of them stalled every OTHER pending session too, with nothing to
     # clear it but `agent-box-session rm` (issue #523).
-    died = {name for name, entry in sessions.items()
-            if isinstance(entry, dict) and entry.get("died") is not None}
-    used = (live | pending) - died
+    # Same rule as the settings daemon's crashed_status(): True or an int
+    # exit status is a crash, anything else (False, null) is not.
+
+    def crashed(entry):
+        value = entry.get("died") if isinstance(entry, dict) else None
+        if isinstance(value, bool):
+            return value
+        return isinstance(value, int)
+
+    died = {name for name, entry in sessions.items() if crashed(entry)}
+    exempt = set(exempt)
+    unmetered = died | shells | exempt
+    used = (live | pending) - unmetered
     targets = set(targets)
     if spawning:
-        available = max(0, limit - len(live - died))
-        admitted = live | set(sorted(pending - live)[:available])
+        available = max(0, limit - len(live - unmetered))
+        admitted = live | unmetered | set(
+            sorted(pending - live - unmetered)[:available])
         allowed = targets <= admitted
     else:
         # An already-admitted session retains its slot during restart, even
         # if an operator has since lowered the limit below the running count.
-        added = targets - used
-        allowed = not added or len(used | targets) <= limit
+        counted_targets = targets - unmetered
+        added = counted_targets - used
+        allowed = not added or len(used | counted_targets) <= limit
     if not allowed:
         raise SessionCapacityError(
             "Session limit reached (%d running or queued, limit %d). "

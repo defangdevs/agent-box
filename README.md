@@ -357,6 +357,25 @@ pairing code for the Codex desktop/mobile app. Pairing codes are short-lived -
 was abandoned. Those two keys are all the pane's keyboard does; it is not a
 codex prompt.
 
+**Pairing from a portal (JSON API):** a portal that renders its own UI (Defang
+Station) pairs the Codex apps without opening the pane. On the settings daemon,
+under `/<user>/settings` and admitted like `/connect`:
+`GET /codex/pairing` answers `{"ok": true, "pairing": {state, server_name, code,
+expires_at, error, devices, devices_error}}` (`state` is `signed_out`,
+`starting`, `ready`, `waiting`, `claimed`, `expired` or `failed`; `claimed` is
+sticky until the next start or cancel). `POST /codex/pairing/start` makes sure
+one remote-control Codex session exists and mints a manual code (409 signed
+out, 429 within 5 s of the last start, 503 at the session limit, else 303),
+`POST /codex/pairing/cancel` forgets it, and `POST /codex/devices/revoke`
+(`client_id`) unpairs a device. The code is held in memory only: never logged,
+never written to disk, never in the pane, and only the manual code is exposed.
+Codex's own control socket carries the calls, and those methods are
+experimental upstream. The Connections card only SIGNS IN; it pairs nothing.
+To have a finished Codex sign-in start the remote-control session instead of a
+TUI, and to stop the pane minting a second code at startup, run
+`agent-box-session env set AGENT_BOX_CODEX_SESSION_DEFAULT remote-control`
+(takes effect for new sign-ins and the next session start).
+
 Credentials the ChatGPT backend has invalidated (password change, revoked
 session, expired refresh token) need no keys at all: `codex login status` is a
 local check and keeps reporting "logged in", so pairing is what discovers the
@@ -903,6 +922,10 @@ arbitrary command execution as the agent user.
   Cmd+C). Mac's browsers ignore Shift for this — xterm.js only offers
   Option there, and only because ttyd now turns on its
   `macOptionClickForcesSelection` client option (off by default).
+- Each web tab shows one session, so `/etc/tmux.conf` removes tmux's
+  stock ways to move a client to another session (prefix `(` `)` `L` `s`
+  `w` `f`, and the session menu on the status bar). Without this, the tab
+  kept its name but showed a different session's pane.
 
 ## Docs
 

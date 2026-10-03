@@ -105,7 +105,7 @@ param agentsMd string = '''
   deallocate/start loses the live tmux session, so save working context to
   disk under your home. The public IP is a Standard SKU static address, so
   the public address (and your URL) survives a stop/start.
-- Your URL is derived from that static IP via sslip.io. It is stable, but
+- Your URL uses that static IP directly with a Let's Encrypt certificate. It is stable, but
   always read $AGENT_BOX_URL rather than hard-coding it.
 - The base OS is ordinary Ubuntu: apt and unattended-upgrades own it, and
   the Azure portal's serial console works (boot diagnostics are on).
@@ -132,21 +132,12 @@ param imageIncludesRuntime bool = false
 @description('Source range allowed to reach the terminal (and SSH). A CIDR, or an Azure service tag such as Internet.')
 param allowCidr string = '0.0.0.0/0'
 
-// Whitelabel sslip.io (issue #647). sslip.io is open source
-// (github.com/cunnie/sslip.io) and self-hostable, so a deployment that runs
-// its own copy under its own domain can point the auto-derived hostname
-// there instead of the public sslip.io - same dashed-IP encoding, different
-// suffix. The default reproduces exactly the hostname this template always
-// derived, so a deployment that leaves this blank behaves exactly as it did
-// before the parameter existed. Bicep has no pattern constraint for a
-// parameter -- unlike the CFN twin's DomainSuffix, which has an
-// AllowedPattern -- so this travels through the bootstrap base64-encoded
-// and is decoded and checked against the same DNS-suffix shape at runtime
-// (see the validation block above the config.yaml heredoc): a bad value
-// fails the boot rather than landing in config.yaml, or the Caddyfile
-// derived from it, unvetted.
-@description('Domain suffix for the auto-derived hostname. Self-host sslip.io (github.com/cunnie/sslip.io) under your own domain and set that domain here to whitelabel the URL; the default (sslip.io) is the public service.')
-param sslipDomain string = 'sslip.io'
+// Optional sslip.io-compatible alias. The public IPv4 remains the primary
+// URL; an alias is redirected to it and its cert is obtained on first use.
+// Bicep has no pattern constraint for strings, so the bootstrap decodes and
+// validates this suffix before putting it in the Caddyfile.
+@description('Optional DNS alias suffix. Set sslip.io (or a compatible resolver suffix) to expose a second URL; its certificate is requested only on first use. Empty leaves the public IPv4 as the sole URL.')
+param sslipDomain string = ''
 
 // Default false, where the AWS templates default their DebugSsh to true. Not
 // caution for its own sake: on Lightsail, SSH is the only way to read
@@ -401,9 +392,8 @@ install -d -m 0755 /etc/agent-box
 
 # Bicep has no character constraint for a string parameter -- only length --
 # so a raw portalIssuer/portalUser/sslipDomain could close the single-quoted
-# YAML scalar below, or worse -- for sslipDomain, whose line sits inside the
-# quoted heredoc rather than inside a YAML scalar, a newline plus the literal
-# text "AGENTBOX_CONFIG" closes the heredoc itself, and everything after runs
+# YAML scalar below, or worse, a newline plus the literal text
+# "AGENTBOX_CONFIG" closes the heredoc itself and everything after runs
 # as a shell command instead of landing in config.yaml (same class of bug
 # base64(webPassword) above exists for, applied here because none of these
 # three are secrets and so were substituted raw until now). Those values and
@@ -428,8 +418,8 @@ fi
 # with its AllowedPattern (deploy/aws/template.yaml) and BOX_SCHEMA enforces
 # for a native config.yaml (bin/agentbox) -- kept in sync across all three.
 sslip_domain="$(printf %s '@@SSLIPDOMAINB64@@' | base64 -d)"
-if ! [[ "$sslip_domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]; then
-  echo "domainSuffix is not a DNS suffix" >&2
+if [ -n "$sslip_domain" ] && ! [[ "$sslip_domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]; then
+  echo "sslipDomain is not a DNS suffix" >&2
   exit 1
 fi
 public_ip="$(printf %s '@@PUBLICIPB64@@' | base64 -d)"
@@ -437,14 +427,17 @@ if ! [[ "$public_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
   echo "Azure public IP is not a plain IPv4 address" >&2
   exit 1
 fi
-box_domain="${public_ip//./-}.${sslip_domain}"
+box_alias=""
+if [ -n "$sslip_domain" ]; then
+  box_alias="${public_ip//./-}.${sslip_domain}"
+fi
 
 cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
 domain: '@DOMAIN@'
-domainSuffix: '@SSLIPDOMAIN@'
 agents: [claude, codex]
 web:
   enable: true
+  alias: '@ALIAS@'
   # Portal handover (issue #593). Empty is off, which is the module's own
   # default: a box deployed without the two portal parameters serves no
   # handover route and no unauthenticated endpoint. No key is configured --
@@ -461,20 +454,21 @@ AGENTBOX_CONFIG
 # backslash, for good measure) before substituting into the heredoc just
 # written, or an issuer URL containing one would splice the placeholder
 # into config.yaml instead of the URL (same bug as the CFN twin, before its
-# own fix). sslip_domain and box_domain already exclude both, but escaping
+# own fix). box_alias and public_ip already exclude both, but escaping
 # them too costs nothing and keeps all substitutions uniform.
 esc_issuer=$(printf '%s' "$portal_issuer" | sed -e 's/[&\]/\\&/g')
 esc_user=$(printf '%s' "$portal_user" | sed -e 's/[&\]/\\&/g')
-esc_sslip=$(printf '%s' "$sslip_domain" | sed -e 's/[&\]/\\&/g')
-esc_domain=$(printf '%s' "$box_domain" | sed -e 's/[&\]/\\&/g')
-sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@SSLIPDOMAIN@|$esc_sslip|; s|@DOMAIN@|$esc_domain|" \
+esc_alias=$(printf '%s' "$box_alias" | sed -e 's/[&\]/\\&/g')
+esc_domain=$(printf '%s' "$public_ip" | sed -e 's/[&\]/\\&/g')
+sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@ALIAS@|$esc_alias|; s|@DOMAIN@|$esc_domain|" \
   /etc/agent-box/config.yaml
 
 # Extra standing instructions for the agent, if the deployment gave any.
 install -d -m 0755 /etc/agent-box-guides
-cat > /etc/agent-box-guides/AGENTS.stack.md <<'AGENTBOX_AGENTSMD'
-@@AGENTSMD@@
-AGENTBOX_AGENTSMD
+# base64, like every other free-text parameter: a quoted heredoc still ends at
+# a line reading its own terminator, and a raw value could also carry a later
+# marker (such as the web password's) into this file (issue #777).
+printf %s '@@AGENTSMDB64@@' | base64 -d > /etc/agent-box-guides/AGENTS.stack.md
 
 # Render and start everything. The password reaches the renderer through the
 # environment and is hashed with argon2id, so it is never written to the box's
@@ -518,10 +512,10 @@ var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
   '@@USER@@', userName),
-  '@@AGENTSMD@@', agentsMd),
   // base64, not the plaintext: see the comment above the validation block,
   // and check_secrets() in scripts/check_azure_template.py, which fails if
   // this ever goes back to a raw substitution.
+  '@@AGENTSMDB64@@', base64(agentsMd)),
   '@@SSLIPDOMAINB64@@', base64(sslipDomain)),
   '@@WEBPASSWORD@@', base64(webPassword)),
   '@@PORTALISSUERB64@@', base64(portalIssuerYaml)),
@@ -533,7 +527,7 @@ var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
 
 // ---------------------------------------------------------------------------
 
-// Static, so the derived sslip.io hostname keeps resolving across a
+// Static, so the IP URL and its certificate remain valid across a
 // stop/start. A Standard-SKU public IP has no dynamic option anyway.
 resource publicIp 'Microsoft.Network/publicIPAddresses@2024-05-01' = {
   name: '${namePrefix}-pip'
@@ -674,16 +668,16 @@ resource bootstrapExtension 'Microsoft.Compute/virtualMachines/extensions@2024-0
 
 // ---------------------------------------------------------------------------
 
-// sslip.io resolves both 4.236.84.197.sslip.io and 4-236-84-197.sslip.io, but
-// only the dashed spelling is what `agentbox apply` derives and therefore the
-// only one in the issued certificate - the dotted one fails TLS rather than
-// simply not existing (issue #359). sslipDomain (issue #647) is the same
-// suffix the bootstrap's config.yaml carries as domainSuffix, so this stays
-// in sync with whatever `agentbox apply --first-boot` actually derives.
-var host = '${replace(publicIp.properties.ipAddress, '.', '-')}.${sslipDomain}'
+// The public IPv4 is primary. A configured sslipDomain creates a dashed-IP
+// DNS alias; the dotted spelling is never included in its certificate.
+var host = publicIp.properties.ipAddress
+var sslipHost = '${replace(host, '.', '-')}.${sslipDomain}'
 
 @description('Browser terminal. Sign in with the userName and the webPassword chosen at deployment time. The first load waits on Caddy\'s ACME certificate. (The URL deliberately carries no user@ prefix: Chrome answers the auth challenge with URL userinfo plus an EMPTY password, and credentials typed into the prompt cannot override the URL-embedded identity.)')
 output webUrl string = 'https://${host}/${userName}/'
+
+@description('Optional sslip.io-compatible alias URL. Empty when sslipDomain is unset. Caddy obtains its certificate on first use.')
+output sslipUrl string = empty(sslipDomain) ? '' : 'https://${sslipHost}/${userName}/'
 
 @description('Claude Remote Control session name. Only meaningful if the session started from the settings page\'s install+sign-in cards is a claude one: after finishing `claude login` once in the browser terminal, the Claude desktop and mobile apps can drive it.')
 output remoteControlSession string = '${userName}-main@${host}'

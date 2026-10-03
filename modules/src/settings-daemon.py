@@ -72,6 +72,11 @@
 #                                 keys; defaults to the issuer's
 #                                 /.well-known/jwks.json
 #   AGENT_BOX_PORTAL_USER        the portal user id this linux user is
+#                                 provisioned for. A completed portalUser
+#                                 transfer (issue #774) overrides this at
+#                                 runtime from WEB_SESSION_DIR/identity/,
+#                                 without needing this variable, or the
+#                                 unit's environment, to change at all.
 #   AGENT_BOX_PORTAL_PROJECT     the portal project id this linux user is
 #   AGENT_BOX_WEB_SESSION_DIR    where minted sessions and spent token
 #                                 ids live (default: beside the env file)
@@ -90,6 +95,7 @@ import http.server
 import json
 import mimetypes
 import os
+import pwd
 import re
 import secrets
 import select
@@ -325,14 +331,14 @@ TOKEN_MAX_BYTES = 16384
 # bound is not a token anybody sends by mistake, so it is refused unread,
 # 502 race and all.
 HANDOFF_DRAIN_MAX_BYTES = 1 << 20
-# The handover mapping is only usable when every piece is present. A box
-# with no portal keys serves no handover route at all, which keeps the
-# unauthenticated endpoint off boxes that were never provisioned for it.
-# PORTAL_PROJECT is deliberately NOT required: it narrows an already-valid
-# mapping, it does not create one. `portalUser` is a specific portal account,
-# so a box declaring only that admits exactly that account and nobody else.
-PORTAL_HANDOFF = bool(
-    PORTAL_ISSUER and PORTAL_JWKS_URL and PORTAL_USER and WEB_SESSION_DIR)
+# Whether the handover route is usable at all is decided by
+# portal_handoff_enabled() (issue #774): a box with no portal keys, or with
+# no CURRENT portal user (nothing declared and no transfer has ever set
+# one), serves no handover route, which keeps the unauthenticated endpoint
+# off boxes that were never provisioned for it. It is a function rather
+# than a constant because a portalUser transfer can change the answer
+# without a daemon restart. PORTAL_PROJECT is deliberately never part of
+# that gate: it narrows an already-valid mapping, it does not create one.
 
 
 def webhook_unavailable():
@@ -570,7 +576,10 @@ def profile_write(name, assignments, drop=(), must_exist=False):
 def profile_remove(name):
     """Delete under the SAME lock profile_write takes. Without it a save can
     read the file, this can unlink it, and the save can then write it back —
-    a profile the operator deleted, quietly recreated."""
+    a profile the operator deleted, quietly recreated.
+
+    Deleting the default profile clears the default rather than promoting
+    another one, so the next session asks which worker to start."""
     path = profile_path(name)
     try:
         with locked(path):
@@ -582,6 +591,56 @@ def profile_remove(name):
         # The lock itself is unavailable (the directory is gone, say). There
         # is then nothing to delete either.
         pass
+    if read_default_pointer() == name:
+        set_default_profile("")
+
+
+# The default profile: ONE pointer file naming it, the same one
+# `agent-box-profile default` writes. A pointer is at most one default by
+# construction, where a DEFAULT=true key could be set in two profiles at once.
+DEFAULT_PROFILE_FILE = os.path.join(PROFILES_DIR, ".default")
+
+
+def read_default_pointer():
+    """The name the pointer holds, "" when none or not a profile name. Not
+    checked against the profiles on disk: callers that offer it compare
+    against the list they already read."""
+    try:
+        with open(DEFAULT_PROFILE_FILE, encoding="utf-8") as fh:
+            name = fh.readline().strip()
+    except OSError:
+        return ""
+    return name if PROFILE_NAME_RE.match(name) else ""
+
+
+def default_profile(profiles):
+    """The default profile when it still exists, else "" - a pointer at a
+    profile deleted by hand reads as no default, as it does in the CLI."""
+    name = read_default_pointer()
+    return name if name in profiles else ""
+
+
+def set_default_profile(name):
+    """Point the default at `name`, or clear it for "". Written to a temp
+    file and renamed, so a reader never sees half a name."""
+    if not name:
+        try:
+            os.unlink(DEFAULT_PROFILE_FILE)
+        except OSError:
+            pass
+        return
+    os.makedirs(PROFILES_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".default.", dir=PROFILES_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(name + "\n")
+        os.replace(tmp, DEFAULT_PROFILE_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def profile_launch(name, harness=""):
@@ -896,7 +955,8 @@ def ensure_claude_profile():
         index += 1
 
 
-def ensure_harness_session(agent, remote_control):
+def ensure_harness_session(agent, remote_control, only_rc=False,
+                           raise_capacity=False):
     """Auto-start one session for `agent` the moment its connect card
     signs in (issue #504), so install+login leaves an actual running
     session behind rather than just a signed-in CLI nobody has started yet.
@@ -917,13 +977,21 @@ def ensure_harness_session(agent, remote_control):
     is a flag on the ordinary TUI (supervisor.sh appends --remote-control),
     so this session is both a normal worker AND immediately visible to
     desktop/mobile. codex's rc replaces the process outright with the
-    app-server pairing daemon (codex-remote-control.sh) -- pairing already
-    happened in the connect card's own pane, so what closes issue #504's
-    "a codex session running" is a real interactive session, which only
-    remoteControl: false ever produces. Written directly here rather than
+    app-server pairing daemon (codex-remote-control.sh). The connect card
+    only SIGNS IN (`codex login --device-auth`); it pairs nothing. Pairing
+    is the /codex/pairing API below, or Enter in an rc session's pane. So
+    by default what closes issue #504's "a codex session running" is a real
+    interactive session (remoteControl: false), and a box configured with
+    AGENT_BOX_CODEX_SESSION_DEFAULT=remote-control gets the daemon instead
+    (issue #780). Written directly here rather than
     through session-cli.sh/`/sessions/add`, both of which still hardcode
     remoteControl: true unconditionally -- neither writer offers a way to
     ask for false today.
+
+    `only_rc` narrows "already has a session" to "already has a REMOTE-CONTROL
+    one", for the pairing API (issue #780): a TUI codex session cannot be
+    paired, so it does not count there. `raise_capacity` lets that caller
+    answer 503 itself instead of getting the card's notice string.
     """
     if agent not in AGENTS:
         return
@@ -935,16 +1003,36 @@ def ensure_harness_session(agent, remote_control):
             # Profile storage failure must not undo a successful login or
             # prevent its worker from starting.
             pass
-    elif os.path.exists(profile_path(agent)):
+    elif os.path.exists(profile_path(agent)) and not remote_control:
+        # A remote-control codex session is the pairing daemon, which has no
+        # model, effort or profile of its own.
         profile = agent
     try:
+        # Read before the lock (issue #748): capacity_check's tmux spawn must
+        # not run while holding sessions_lock(), or a slow/contended tmux
+        # starves every other writer waiting on the same lock.
+        live = capacity_live_checked()
         with sessions_lock():
             sessions, version = load_sessions()
-            if any(isinstance(s, dict) and s.get("agent") == agent
-                   for s in sessions.values()):
+            if only_rc:
+                # A stopped rc session is parked, not running, and the
+                # supervisor never starts it by itself: reviving it is what
+                # `agent-box-session restart` does (clear the flag), so do
+                # that rather than wait on a daemon nobody will start.
+                rc = [s for s in sessions.values()
+                      if isinstance(s, dict) and s.get("agent") == agent
+                      and s.get("remoteControl") is not False]
+                if rc and all(s.get("stopped") for s in rc):
+                    rc[0].pop("stopped", None)
+                    write_sessions(sessions, version)
+                if rc:
+                    return
+            elif any(isinstance(s, dict) and s.get("agent") == agent
+                     for s in sessions.values()):
                 return
             name = gen_session_name(agent, sessions)
-            capacity_check(sessions, [name])
+            capacity_check(sessions, [name], live=live,
+                           exempt=[name] if agent == "shell" else ())
             sessions[name] = {
                 "agent": agent,
                 "skipPermissions": True,
@@ -957,10 +1045,14 @@ def ensure_harness_session(agent, remote_control):
                 "resumePrompt": None,
                 "boxSessionId": None,
                 "hasRun": False,
+                "origin": "pairing" if only_rc else "sign_in",
+                "createdAt": int(time.time()),
             }
             write_sessions(sessions, version)
             _session_start_notices.pop(agent, None)
     except SessionCapacityError as exc:
+        if raise_capacity:
+            raise
         _session_start_notices[agent] = "Signed in; session not started. " + str(exc)
         return _session_start_notices[agent]
     except (RegistryUnreadable, RegistryBusy, OSError):
@@ -1037,10 +1129,11 @@ def crashed_status(entry):
 
 
 def kill_session(name):
-    """Kill one tmux session. The supervisor recreates it if it is still
-    listed in sessions.json (= restart); delisting first makes it stay
-    gone (= destroy)."""
-    tmux("kill-session", "-t", "=" + name)
+    """Kill one tmux session and say whether tmux reported success. The
+    supervisor recreates it if it is still listed in sessions.json
+    (= restart); delisting first makes it stay gone (= destroy)."""
+    proc = tmux("kill-session", "-t", "=" + name)
+    return proc is not None and proc.returncode == 0
 
 
 # --- Session transcripts (issue #248) --------------------------------
@@ -2265,11 +2358,28 @@ def parse_defang_status(proc):
     return (True, "%s (%s)" % (who, tier) if tier else who)
 
 
+def parse_whatsapp_status(proc):
+    if proc.returncode != 0:
+        return (False, "")
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return (False, "")
+    if not isinstance(data, dict):
+        return (False, "")
+    if data.get("connected") is True:
+        return (True, "linked device connected")
+    if data.get("paired") is True:
+        return (False, "device linked; bridge is connecting")
+    return (False, "")
+
+
 CONNECT_PARSERS = {
     "claude": parse_claude_status,
     "codex": parse_codex_status,
     "gh": parse_gh_status,
     "defang": parse_defang_status,
+    "whatsapp": parse_whatsapp_status,
 }
 
 # One row per flow, in render order. `start` and `status` are argv tails
@@ -2370,6 +2480,25 @@ CONNECT_DEFS = [
         "show_code": False,
         "unset": ("DEFANG_ACCESS_TOKEN",),
         "shadow": ("DEFANG_ACCESS_TOKEN",),
+        "prompt_re": None,
+        "destructive": False,
+    },
+    {
+        "id": "whatsapp",
+        "binary": "agent-box-whatsapp",
+        "attr": None,
+        "label": "WhatsApp",
+        "note": "Link your personal WhatsApp account by phone-number code. "
+                "The WhatsApp chat is end-to-end encrypted; message text is "
+                "also stored on this box for delivery.",
+        "start": ["pair"],
+        "status": ["status"],
+        "parse": "whatsapp",
+        "hosts": (),
+        "needs_code": False,
+        "show_code": True,
+        "unset": (),
+        "shadow": (),
         "prompt_re": None,
         "destructive": False,
     },
@@ -2495,6 +2624,46 @@ def connect_run(flow, args, timeout=15):
         )
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def whatsapp_profile(value=None):
+    """Read or set the optional profile used by an untargeted bridge.
+
+    The bridge owns this private, per-user setting so a WhatsApp command and
+    this card update the same state. The page only ever sends a profile NAME;
+    the helper validates and writes it without exposing any other bridge data.
+    """
+    flow = connect_flow("whatsapp")
+    if flow is None:
+        return None
+    args = ["profile"] + ([value or "default"] if value is not None else [])
+    proc = connect_run(flow, args)
+    if proc is None or proc.returncode != 0:
+        return None
+    try:
+        profile = json.loads(proc.stdout or "{}").get("profile")
+    except (ValueError, AttributeError):
+        return None
+    return profile if isinstance(profile, str) and PROFILE_NAME_RE.match(profile) else ""
+
+
+def render_whatsapp_profile_field():
+    current = whatsapp_profile()
+    # "default" is the CLI's word for "no selection", so a profile with that
+    # name cannot be chosen here.
+    profiles = {n: v for n, v in read_profiles().items() if n != "default"}
+    choices = [""] + sorted(profiles)
+    if current and current not in profiles:
+        choices.append(current)
+    options = "".join(
+        '<option value="%s"%s>%s</option>' % (
+            html.escape(name), " selected" if name == current else "",
+            html.escape(name + (" (missing)" if name and name not in profiles else ""))
+            if name else "Use box default profile")
+        for name in choices)
+    return ('<label class="field conn-field"><span class="note">Profile for a '
+            'new WhatsApp session</span><select name="profile">%s</select></label>'
+            % options)
 
 
 def connect_probe(flow):
@@ -2624,9 +2793,12 @@ def connect_trusted_url(text, hosts):
     return None
 
 
-def connect_user_code(text):
+def connect_user_code(text, flow_id=None):
     """The one-time code a device flow prints in the pane. Searched with
     URLs removed, so a `code=` query parameter cannot pose as one."""
+    if flow_id == "whatsapp":
+        match = re.search(r"WhatsApp pairing code: ([A-Z0-9]{8})\b", text or "")
+        return match.group(1) if match else None
     stripped = CONNECT_URL_RE.sub(" ", text or "")
     for match in CONNECT_CODE_RE.finditer(stripped):
         code = match.group(1).upper()
@@ -2819,16 +2991,470 @@ def connect_signed_in(flow):
     if signed_in_at is not None and flow_id in RELOGIN_CONFIG_DIRS:
         restart_login_sessions(flow, signed_in_at)
     # One session per harness, started the moment sign-in lands (issue
-    # #504) -- codex gets an interactive worker session
-    # (remote_control=False) since pairing for phone/desktop already
-    # happened in this flow's own pane; claude's rc is a flag on the same
-    # worker session, so one session covers both being usable AND
-    # remote-visible.
+    # #504). The sign-in pane only signs in; it never paired anything. So
+    # codex gets an interactive worker session (remote_control=False) unless
+    # the box asks for remote control (issue #780), whose daemon is what the
+    # Codex apps can see. claude's rc is a flag on the same worker session,
+    # so one session covers both being usable AND remote-visible.
     if flow_id == "claude":
         return ensure_harness_session("claude", remote_control=True)
     if flow_id == "codex":
-        return ensure_harness_session("codex", remote_control=False)
+        return ensure_harness_session(
+            "codex", remote_control=codex_session_default() == "remote-control")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Codex pairing API (issue #780)
+#
+# Defang Station pairs the Codex desktop and ChatGPT mobile apps from its own
+# page, so the manual pairing code has to reach it as JSON instead of as text
+# in a tmux pane. Codex's app-server exposes the primitives as experimental
+# JSON-RPC over a WebSocket on a Unix socket; codex_rc_rpc() is the smallest
+# client that speaks it (stdlib only: one HTTP/1.1 Upgrade, masked text
+# frames).
+#
+# The code is a credential: whoever claims it controls this box's Codex. It
+# lives in _codex_pairing in memory and is never logged, written to disk,
+# put in an error string, or echoed to the pane.
+
+CODEX_SESSION_DEFAULT_KEY = "AGENT_BOX_CODEX_SESSION_DEFAULT"
+CODEX_START_MIN_INTERVAL = 5.0
+CODEX_CACHE_TTL = 2.0
+CODEX_DAEMON_WAIT = 10.0
+# How long a start may stay "starting" (no daemon yet) before it is "failed".
+CODEX_STARTING_GRACE = 90.0
+CODEX_DEVICE_LIMIT = 50
+CODEX_ERROR_MAX = 200
+CODEX_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+# A URL, a request id or a cf-ray in a server message is transport detail
+# that belongs in a bug report, not on a card -- and a URL may carry a code.
+CODEX_REDACT_RES = (
+    re.compile(r"https?://\S+"),
+    re.compile(r"(request-id|cf-ray)[:= ]+\S+", re.IGNORECASE),
+    re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4}\b"),
+)
+
+
+def codex_session_default():
+    """"remote-control" or "tui": what a finished Codex sign-in starts.
+
+    A runtime setting read from the env store (the module deliberately has no
+    option for it: `agent-box-session env set` needs no root and no rebuild).
+    The value is not a secret, so reading the one key is fine; nothing else
+    in the store is looked at.
+    """
+    value = ""
+    try:
+        value = as_dict(load(ENV_FILE)).get(CODEX_SESSION_DEFAULT_KEY, "")
+    except (OSError, ValueError):
+        pass
+    return "remote-control" if value.strip() == "remote-control" else "tui"
+
+
+def codex_redact(text):
+    """One short line from a Codex error: its own message, no URLs, ids or
+    anything shaped like a pairing code."""
+    text = " ".join(str(text or "").split())
+    # `... failed at `https://...`: HTTP 404 Not Found, request-id: ...,
+    # body: {"detail":"..."}` -> keep the detail when there is one.
+    found = re.search(r'"(?:detail|message)"\s*:\s*"([^"]+)"', text)
+    if found:
+        text = found.group(1)
+    for rx in CODEX_REDACT_RES:
+        text = rx.sub("[redacted]", text)
+    return CONNECT_SECRET_RE.sub("[redacted]", text)[:CODEX_ERROR_MAX]
+
+
+class CodexRpcError(Exception):
+    """A control-socket call that failed. str() is already redacted."""
+
+
+def _codex_recv_exact(sock, count):
+    buf = b""
+    while len(buf) < count:
+        chunk = sock.recv(count - len(buf))
+        if not chunk:
+            raise CodexRpcError("control socket closed")
+        buf += chunk
+    return buf
+
+
+def _codex_ws_send(sock, data, opcode=1):
+    data = data.encode("utf-8") if isinstance(data, str) else data
+    size = len(data)
+    head = bytes([0x80 | opcode])
+    if size < 126:
+        head += bytes([0x80 | size])
+    elif size < 65536:
+        head += bytes([0x80 | 126]) + size.to_bytes(2, "big")
+    else:
+        head += bytes([0x80 | 127]) + size.to_bytes(8, "big")
+    mask = secrets.token_bytes(4)
+    sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+
+def _codex_ws_recv(sock):
+    """One complete text message; ping/pong/close handled on the way."""
+    message = b""
+    while True:
+        b0, b1 = _codex_recv_exact(sock, 2)
+        opcode, fin, size = b0 & 0x0F, b0 & 0x80, b1 & 0x7F
+        if b1 & 0x80:
+            raise CodexRpcError("control socket sent a masked frame")
+        if size == 126:
+            size = int.from_bytes(_codex_recv_exact(sock, 2), "big")
+        elif size == 127:
+            size = int.from_bytes(_codex_recv_exact(sock, 8), "big")
+        if size > 4 * 1024 * 1024:
+            raise CodexRpcError("control socket frame too large")
+        data = _codex_recv_exact(sock, size)
+        if opcode == 8:
+            raise CodexRpcError("control socket closed")
+        if opcode == 9:
+            _codex_ws_send(sock, data, opcode=10)
+            continue
+        if opcode == 10:
+            continue
+        message += data
+        if fin:
+            return message.decode("utf-8", "replace")
+
+
+def codex_rc_rpc(socket_path, method, params=None, timeout=10):
+    """Call one experimental app-server method and return its result.
+
+    Raises CodexRpcError with a redacted message. Handshake as the daemon's
+    own client does it: initialize with experimentalApi, `initialized`, then
+    the request. One connection per call keeps this stateless; callers cache.
+    """
+    deadline = time.monotonic() + timeout
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(timeout)
+    try:
+        conn.connect(socket_path)
+        key = base64.b64encode(secrets.token_bytes(16)).decode()
+        conn.sendall((
+            "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+            "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n" % key).encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(1024)
+            if not chunk or len(buf) > 8192:
+                raise CodexRpcError("control socket refused the upgrade")
+            buf += chunk
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        if b" 101" not in head.split(b"\r\n")[0] or rest:
+            raise CodexRpcError("control socket refused the upgrade")
+
+        def call(ident, name, args=None):
+            request = {"jsonrpc": "2.0", "id": ident, "method": name}
+            if args is not None:
+                request["params"] = args
+            _codex_ws_send(conn, json.dumps(request))
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise CodexRpcError("timed out waiting for " + name)
+                conn.settimeout(left)
+                reply = json.loads(_codex_ws_recv(conn))
+                if not isinstance(reply, dict) or reply.get("id") != ident:
+                    continue    # a notification, not our answer
+                if "error" in reply:
+                    detail = reply["error"]
+                    raise CodexRpcError(codex_redact(
+                        detail.get("message") if isinstance(detail, dict)
+                        else detail) or "request failed")
+                return reply.get("result")
+
+        call(1, "initialize", {
+            "clientInfo": {"name": "agent-box-settings", "version": "1"},
+            "capabilities": {"experimentalApi": True}})
+        _codex_ws_send(conn, json.dumps(
+            {"jsonrpc": "2.0", "method": "initialized"}))
+        return call(2, method, params)
+    except (OSError, ValueError) as exc:
+        raise CodexRpcError(
+            "control socket unavailable (%s)" % exc.__class__.__name__)
+    finally:
+        conn.close()
+
+
+# Everything below is guarded by _codex_lock. `rec` is the outstanding code,
+# if any; the two caches keep a polling client from costing a WebSocket
+# connection per request.
+_codex_lock = threading.Lock()
+_codex_pairing = {
+    "manual_code": None, "environment_id": None, "expires_at": None,
+    "claimed": False, "error": None, "started_at": None,
+    "last_start": 0.0, "last_poll": 0.0,
+    # Bumped by every start and cancel. A start holds no lock while it waits
+    # for the daemon, so it only writes its result if nothing superseded it:
+    # otherwise a cancel in that window would be undone and the cancelled
+    # credential would reappear.
+    "gen": 0,
+}
+_codex_cache = {"status": None, "devices": None}
+
+
+def codex_control_socket(flow):
+    """The running daemon's control socket, or None. Starts nothing."""
+    proc = connect_run(flow, ["app-server", "daemon", "version"], timeout=10)
+    if proc is None or proc.returncode != 0:
+        return None
+    try:
+        info = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+    path = info.get("socketPath") if isinstance(info, dict) else None
+    if (isinstance(path, str) and info.get("status") == "running"
+            and os.path.exists(path)):
+        return path
+    return None
+
+
+def codex_cached(slot, fetch):
+    """fetch() at most once per CODEX_CACHE_TTL; errors are cached too."""
+    now = time.monotonic()
+    with _codex_lock:
+        hit = _codex_cache.get(slot)
+    if hit and now - hit[0] < CODEX_CACHE_TTL:
+        return hit[1]
+    value = fetch()
+    with _codex_lock:
+        _codex_cache[slot] = (now, value)
+    return value
+
+
+def codex_status(flow):
+    """("ok", status dict) | ("down", None) | ("error", message)."""
+    def fetch():
+        sock = codex_control_socket(flow)
+        if sock is None:
+            return ("down", None, None)
+        try:
+            return ("ok", codex_rc_rpc(sock, "remoteControl/status/read"), sock)
+        except CodexRpcError as exc:
+            return ("error", str(exc), sock)
+    return codex_cached("status", fetch)
+
+
+def codex_devices(sock, environment_id):
+    def fetch():
+        try:
+            result = codex_rc_rpc(sock, "remoteControl/client/list", {
+                "environmentId": environment_id,
+                "limit": CODEX_DEVICE_LIMIT, "order": "desc"})
+        except CodexRpcError as exc:
+            return ([], str(exc))
+        devices = []
+        for item in (result or {}).get("data") or []:
+            if not isinstance(item, dict) or not item.get("clientId"):
+                continue
+            devices.append({
+                "client_id": item.get("clientId"),
+                "display_name": item.get("displayName"),
+                "device_type": item.get("deviceType"),
+                "platform": item.get("platform"),
+                "device_model": item.get("deviceModel"),
+                "app_version": item.get("appVersion"),
+                "last_seen_at": item.get("lastSeenAt"),
+            })
+        return (devices[:CODEX_DEVICE_LIMIT], None)
+    return codex_cached("devices", fetch)
+
+
+def codex_pairing_state(flow):
+    """The GET body. Starts nothing: a box with no daemon and nothing
+    outstanding costs one `codex login status` (cached) and one
+    `daemon version`."""
+    status = connect_status(flow) if flow["bin"] else (False, "")
+    signed_in = bool(status and status[0])
+    out = {"state": "signed_out", "server_name": None, "code": None,
+           "expires_at": None, "error": None, "devices": [],
+           "devices_error": None}
+    if status is None:
+        out["state"] = "starting"
+        return out
+    if not signed_in:
+        return out
+    kind, info, sock = codex_status(flow)
+    with _codex_lock:
+        rec = dict(_codex_pairing)
+    if kind == "ok":
+        out["server_name"] = info.get("serverName")
+        env_id = info.get("environmentId")
+        if env_id:
+            out["devices"], out["devices_error"] = codex_devices(sock, env_id)
+    now = time.time()
+    if rec["error"]:
+        out.update(state="failed", error=rec["error"])
+    elif kind == "error":
+        out.update(state="failed", error=info)
+    elif kind == "down":
+        began = rec["started_at"]
+        if began is not None and time.monotonic() - began > CODEX_STARTING_GRACE:
+            out.update(state="failed",
+                       error="Codex remote control did not start")
+        elif began is not None:
+            out["state"] = "starting"
+        else:
+            out["state"] = "ready"
+    elif info.get("status") == "errored":
+        out.update(state="failed", error="Codex remote control reported an error")
+    elif info.get("status") == "connecting":
+        out["state"] = "starting"
+    elif rec["claimed"]:
+        out["state"] = "claimed"
+    elif rec["manual_code"] is None:
+        out["state"] = "ready"
+    elif now >= (rec["expires_at"] or 0):
+        out["state"] = "expired"
+    else:
+        # At most one pairing/status per CODEX_CACHE_TTL, and only here.
+        claimed = False
+        with _codex_lock:
+            due = time.monotonic() - _codex_pairing["last_poll"] >= CODEX_CACHE_TTL
+            if due:
+                _codex_pairing["last_poll"] = time.monotonic()
+        if due:
+            try:
+                answer = codex_rc_rpc(sock, "remoteControl/pairing/status",
+                                      {"manualPairingCode": rec["manual_code"]})
+                claimed = bool((answer or {}).get("claimed"))
+            except CodexRpcError:
+                claimed = False
+        if claimed:
+            with _codex_lock:
+                if _codex_pairing["manual_code"] == rec["manual_code"]:
+                    _codex_pairing.update(claimed=True, manual_code=None,
+                                          expires_at=None)
+                    _codex_cache["devices"] = None
+            out["state"] = "claimed"
+        else:
+            with _codex_lock:
+                now_claimed = _codex_pairing["claimed"]
+            if now_claimed:
+                out["state"] = "claimed"
+            else:
+                out.update(state="waiting", code=rec["manual_code"],
+                           expires_at=rec["expires_at"])
+    return out
+
+
+def codex_pairing_start(flow):
+    """POST .../pairing/start. Returns (http status, text)."""
+    status = connect_status(flow)
+    if not (status and status[0]):
+        return 409, "Codex is not signed in."
+    with _codex_lock:
+        if time.monotonic() - _codex_pairing["last_start"] < CODEX_START_MIN_INTERVAL:
+            return 429, "A pairing code was just requested. Wait a few seconds."
+        _codex_pairing["last_start"] = time.monotonic()
+        _codex_pairing.update(manual_code=None, environment_id=None,
+                              expires_at=None, claimed=False, error=None,
+                              started_at=time.monotonic())
+        _codex_pairing["gen"] += 1
+        gen = _codex_pairing["gen"]
+        _codex_cache["status"] = _codex_cache["devices"] = None
+    try:
+        # One rc session owns the daemon; the supervisor starts it within a
+        # few seconds. Two would kill each other's daemon (issue #159).
+        ensure_harness_session("codex", remote_control=True, only_rc=True,
+                               raise_capacity=True)
+    except SessionCapacityError as exc:
+        with _codex_lock:
+            if _codex_pairing["gen"] == gen:
+                _codex_pairing["started_at"] = None
+        return 503, str(exc)
+    if codex_rc_session_crashed():
+        # Its pane is a post-mortem shell, and nothing restarts that by
+        # itself (issue #516): say so rather than time out on a daemon that
+        # is not coming.
+        with _codex_lock:
+            if _codex_pairing["gen"] == gen:
+                _codex_pairing["error"] = (
+                    "The Codex remote control session crashed. Restart it "
+                    "from the sessions list, then try again.")
+        return 303, ""
+    deadline = time.monotonic() + CODEX_DAEMON_WAIT
+    while True:
+        with _codex_lock:
+            _codex_cache["status"] = None
+        kind, info, sock = codex_status(flow)
+        if kind == "ok" and info.get("status") == "connected":
+            break
+        if kind == "ok" and info.get("status") == "disabled":
+            try:
+                codex_rc_rpc(sock, "remoteControl/enable")
+            except CodexRpcError:
+                pass
+        if time.monotonic() >= deadline:
+            return 303, ""      # the GET says starting, then failed
+        with _codex_lock:
+            if _codex_pairing["gen"] != gen:
+                return 303, ""  # cancelled or superseded while waiting
+        time.sleep(0.5)
+    try:
+        result = codex_rc_rpc(sock, "remoteControl/pairing/start",
+                              {"manualCode": True})
+    except CodexRpcError as exc:
+        with _codex_lock:
+            if _codex_pairing["gen"] == gen:
+                _codex_pairing["error"] = str(exc)
+        return 303, ""
+    code = (result or {}).get("manualPairingCode")
+    with _codex_lock:
+        if _codex_pairing["gen"] != gen:
+            return 303, ""      # cancelled meanwhile: keep the code unseen
+        if code:
+            _codex_pairing.update(
+                manual_code=code, expires_at=(result or {}).get("expiresAt"),
+                environment_id=(result or {}).get("environmentId"))
+        else:
+            _codex_pairing["error"] = "Codex returned no manual pairing code"
+    return 303, ""
+
+
+def codex_rc_session_crashed():
+    """True when every remote-control codex session is a post-mortem shell."""
+    try:
+        sessions, _ = load_sessions()
+    except (RegistryUnreadable, RegistryBusy, OSError):
+        return False
+    rc = [s for s in sessions.values()
+          if isinstance(s, dict) and s.get("agent") == "codex"
+          and s.get("remoteControl") is not False]
+    return bool(rc) and all(crashed_status(s) is not None for s in rc)
+
+
+def codex_pairing_cancel():
+    with _codex_lock:
+        _codex_pairing["gen"] += 1
+        _codex_pairing.update(manual_code=None, environment_id=None,
+                              expires_at=None, claimed=False, error=None,
+                              started_at=None)
+
+
+def codex_device_revoke(flow, client_id):
+    """Returns (http status, text)."""
+    kind, info, sock = codex_status(flow)
+    if kind != "ok" or not info.get("environmentId"):
+        return 404, "Codex remote control is not running."
+    with _codex_lock:
+        _codex_cache["devices"] = None
+    devices, _ = codex_devices(sock, info["environmentId"])
+    if client_id not in {d["client_id"] for d in devices}:
+        return 404, "No such device."
+    try:
+        codex_rc_rpc(sock, "remoteControl/client/revoke", {
+            "environmentId": info["environmentId"], "clientId": client_id})
+    except CodexRpcError as exc:
+        return 502, str(exc)
+    with _codex_lock:
+        _codex_cache["devices"] = None
+    return 303, ""
 
 
 def relogin_notice(flow_id):
@@ -2883,8 +3509,8 @@ def connect_state(flow, keys=None, tmux_state=None):
             if flow["prompt_re"] is not None:
                 connect_answer_prompt(flow, text)
             url = connect_trusted_url(text, flow["hosts"])
-            code = connect_user_code(text) if flow["show_code"] else None
-            state = "waiting" if url else "starting"
+            code = connect_user_code(text, flow_id) if flow["show_code"] else None
+            state = "waiting" if url or code else "starting"
     elif os.path.exists(connect_done_path(flow_id)):
         # The pane already closed on a sign-in no render saw finish (issue
         # #751): finish it now, on a fresh probe that STARTED after the
@@ -3122,6 +3748,14 @@ def connect_start(flow):
                                          ".nix-profile")),
                 " ".join(shlex.quote(a) for a in source)))
     inner = " ".join(shlex.quote(a) for a in [binary] + flow["start"])
+    if flow_id == "whatsapp":
+        phone = re.sub(r"\D", "", as_dict(load(ENV_FILE)).get("LOCAL_WHATSAPP_PHONE", ""))
+        if not 7 <= len(phone) <= 15:
+            state = connect_state(flow)
+            state["state"] = "failed"
+            state["error"] = "Enter an international phone number to pair WhatsApp."
+            return state
+        inner = "LOCAL_WHATSAPP_PHONE=" + shlex.quote(phone) + " " + inner
     if flow["unset"]:
         inner = ("env " + " ".join("-u " + k for k in flow["unset"]) + " " + inner)
     inner = prelude + inner
@@ -3408,6 +4042,76 @@ def session_view():
     ]
 
 
+SESSION_ORIGINS = ("user", "sign_in", "pairing", "webhook", "agent")
+
+
+def session_list_payload():
+    """The GET {SESS_BASE}/sessions/list answer (issue #787): every listed
+    session as metadata a portal can show, plus the box's own capacity
+    arithmetic.
+
+    An allow-list, not a filter: each row is built field by field, so a
+    field added to sessions.json later (argv, env, prompts, transcript ids)
+    cannot leak here by being there. Same line /sessions/events draws.
+    Raises SessionCapacityError when the limit cannot be read and
+    RegistryUnreadable when the registry cannot.
+    """
+    # load_sessions, not read_sessions: an unreadable registry is an error
+    # for a portal, not an empty list (RegistryUnreadable is the caller's 503).
+    sessions = {n: v for n, v in load_sessions()[0].items()
+                if SESSION_RE.match(n) and isinstance(v, dict)}
+    live = capacity_live_checked()
+    capacity = capacity_check(sessions, [], live=live)
+    limit = capacity["max"]
+    pending = {n for n, e in sessions.items() if e.get("stopped") is not True}
+    died = {n for n, e in sessions.items() if crashed_status(e) is not None}
+    shells = {n for n, e in sessions.items() if e.get("agent") == "shell"}
+    # The same admission order capacity_check's spawn branch uses: a pending
+    # name past the free slots is queued, not starting.
+    unmetered = died | shells
+    admitted = live | unmetered | set(
+        sorted(pending - live - unmetered)[
+            :max(0, limit - len(live - unmetered))])
+    rows = []
+    for name, entry in sessions.items():
+        if entry.get("stopped") is True:
+            state = "stopped"
+        elif name in died and name in live:
+            state = "died"
+        elif name in live:
+            state = "running"
+        elif name in admitted:
+            state = "starting"
+        else:
+            state = "queued"
+        origin = entry.get("origin")
+        hook = entry.get("hook")
+        if not (isinstance(hook, dict) and isinstance(hook.get("source"), str)
+                and isinstance(hook.get("repository"), str)):
+            hook = None
+        rc_name = entry.get("remoteControlName")
+        cwd = entry.get("workingDirectory")
+        created = entry.get("createdAt")
+        rows.append({
+            "name": name,
+            "agent": str(entry.get("agent") or "?"),
+            "profile": entry["profile"] if isinstance(entry.get("profile"), str) else None,
+            "state": state,
+            "exit_status": crashed_status(entry) if state == "died" else None,
+            "origin": origin if origin in SESSION_ORIGINS else None,
+            "remote_control": entry.get("remoteControl") is not False,
+            "remote_control_name": rc_name if isinstance(rc_name, str) else None,
+            "working_directory": cwd if isinstance(cwd, str) and cwd else os.path.expanduser("~"),
+            "ephemeral": entry.get("ephemeral") is True,
+            "created_at": created if isinstance(created, int) and not isinstance(created, bool) else None,
+            "hook": ({"source": hook["source"], "repository": hook["repository"]}
+                     if hook else None),
+        })
+    return {"ok": True,
+            "capacity": {"used": capacity["used"], "limit": limit},
+            "sessions": rows}
+
+
 def session_fingerprint():
     """Short digest of session_view(): the token the feed pushes and the
     page compares against the state it was rendered from."""
@@ -3541,6 +4245,12 @@ STYLE = """<style>
   @@include:settings.css@@
 </style>
 """
+
+# This page is deliberately self-contained: it is the response after a
+# browser cancels a Basic-auth prompt, so no authenticated asset can be
+# assumed to load. Keep its palette and type scale aligned with the settings
+# and workspace pages without making a second request.
+AUTH_REQUIRED_BODY = """<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='noindex'><title>Sign in required - Agent Box</title><body style='margin:0;min-height:100vh;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif'><main style='max-width:720px;margin:0 auto;padding:32px 20px 48px'><section style='margin:28px 0;padding:20px;border:1px solid #30363d;border-radius:8px;background:#161b22'><p style='margin:0 0 4px;color:#8b949e;font-size:13px'>Agent Box</p><h1 style='margin:0 0 4px;font-size:24px;font-weight:600'>Sign in required</h1><p style='margin:0;color:#8b949e;font-size:13px'>Reload this page to sign in.</p></section></main></body></html>"""
 
 # Shared by the settings-page and workspace add forms so their layout,
 # accessibility, and autocomplete behaviour cannot drift apart.
@@ -4057,6 +4767,21 @@ ICON_CHECK = (
     '<path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L1.72 9.78a.751.751 '
     '0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 11.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"/></svg>'
 )
+ICON_STAR = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 '
+    '2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72'
+    '-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Zm0 2.445'
+    'L6.615 5.5a.75.75 0 0 1-.564.41l-3.097.45 2.24 2.184a.75.75 0 0 1 .216.664l-.528 3.084 '
+    '2.769-1.456a.75.75 0 0 1 .698 0l2.77 1.456-.53-3.084a.75.75 0 0 1 .216-.664l2.24-2.183'
+    '-3.096-.45a.75.75 0 0 1-.564-.41L8 2.694Z"/></svg>'
+)
+ICON_STAR_FILL = (
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
+    '<path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 '
+    '2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72'
+    '-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z"/></svg>'
+)
 ICON_TRASH = (
     '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'
     '<path d="M11 1.75V3h2.25a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5H5V1.75C5 .784 5.784 '
@@ -4146,9 +4871,10 @@ def render_profile_options(profiles):
     or instructions to save, which is the same reason agent-box-profile
     refuses it as a HARNESS.
 
-    Nothing is preselected. The box no longer has a default assistant, so
-    the page asks rather than guessing - the rule the profile editor's own
-    picker already follows.
+    Nothing is preselected unless the user marked a DEFAULT profile
+    (issue #753). The box has no default assistant of its own, so without
+    that choice the page asks rather than guessing - the rule the profile
+    editor's own picker already follows.
 
     Without a resolver there is no picker at all. The settings unit is
     socket activated with stopIfChanged = false, so a daemon that survived
@@ -4162,12 +4888,17 @@ def render_profile_options(profiles):
     if not PROFILE_BIN:
         return ('<option value="" disabled selected>Restart the settings '
                 'service to list profiles</option>' + shell_opt)
-    items = ['<option value="" disabled selected>Choose a profile</option>']
+    default = default_profile(profiles)
+    items = ['<option value="" disabled%s>Choose a profile</option>'
+             % ("" if default else " selected")]
     for name in sorted(profiles):
         safe = html.escape(name)
         harness = html.escape(profiles[name]["reserved"].get("HARNESS") or "")
         label = f"{safe} ({harness})" if harness else safe
-        items.append(f'<option value="{safe}">{label}</option>')
+        if name == default:
+            label += ", default"
+        sel = " selected" if name == default else ""
+        items.append(f'<option value="{safe}"{sel}>{label}</option>')
     if "codex" in AGENTS:
         # A real codex profile always opens the interactive TUI now (issue
         # #623); the daemon is offered here instead, as its own entry.
@@ -4462,13 +5193,15 @@ def render_profiles(profiles, usage=None):
     hand and does not care."""
     usage = usage or {}
     base = html.escape(BASE)
+    default = default_profile(profiles)
     rows = []
     for name in sorted(profiles):
         safe = html.escape(name)
         res = profiles[name]["reserved"]
+        is_default = name == default
         # The summary line answers "what worker is this" without a click:
         # the harness, then whatever narrows it.
-        bits = []
+        bits = ["default"] if is_default else []
         for key in ("HARNESS", "MODEL", "EFFORT"):
             if res.get(key):
                 bits.append(html.escape(res[key]))
@@ -4536,16 +5269,37 @@ def render_profiles(profiles, usage=None):
         # hope, and a topic holding an apostrophe broke out of it.
         confirm_js = html.escape(
             json.dumps(
-                "Delete profile %s?%s Sessions already running keep what "
-                "they started with." % (name, watch_warn)
+                "Delete profile %s?%s%s Sessions already running keep what "
+                "they started with." % (
+                    name, watch_warn,
+                    " It is the default profile: new sessions will ask "
+                    "which profile to start." if is_default else "")
             ),
             quote=True,
         )
+        # A star toggles the default (issue #753): filled on the default,
+        # outline on the rest. One button, the same form either way - `on`
+        # says which direction it goes.
+        if is_default:
+            star = (f'<input type="hidden" name="on" value="0">'
+                    f'<button type="submit" class="icon idefault on" '
+                    f'aria-label="Default profile" aria-pressed="true" '
+                    f'title="{safe} is the default profile - click to unset">'
+                    f'{ICON_STAR_FILL}</button>')
+        else:
+            star = (f'<input type="hidden" name="on" value="1">'
+                    f'<button type="submit" class="icon idefault" '
+                    f'aria-label="Make default" aria-pressed="false" '
+                    f'title="Make {safe} the default profile for new sessions">'
+                    f'{ICON_STAR}</button>')
         rows.append(
             f'<li class="foldrow prof-row"><details><summary>'
             f'<span class="nm"><code>{safe}</code></span>'
             f'<span class="meta">{meta}</span>'
             f'<span class="acts"><form class="inline" method="post" '
+            f'action="{base}/profiles/default">'
+            f'<input type="hidden" name="name" value="{safe}">{star}</form>'
+            f'<form class="inline" method="post" '
             f'action="{base}/profiles/delete" '
             f'onsubmit="return confirm({confirm_js});">'
             f'<input type="hidden" name="name" value="{safe}">'
@@ -4765,7 +5519,7 @@ def render_sessions(subs=None):
                     f'</details></li>'
                 )
         body = "".join(items)
-    return '<ul class="tbl"><li class="tbl-head">Session</li>' + body + "</ul>"
+    return '<ul class="tbl sessions"><li class="tbl-head">Session</li>' + body + "</ul>"
 
 
 WEBHOOK_STATES = {
@@ -5164,6 +5918,11 @@ def render_connect_card(state):
         "idle": ("stopped", "Not signed in"),
         "checking": ("stopped", "Checking&hellip;"),
     }[state["state"]]
+    if flow_id == "whatsapp":
+        if state["state"] == "connected":
+            pill = ("live", "Connected")
+        elif state["state"] in ("idle", "failed"):
+            pill = ("stopped", "Not linked" if not state["detail"] else "Connecting")
     if not state["installed"] and state["state"] in ("idle", "checking",
                                                      "failed"):
         # "Not signed in" would be a half-truth for a CLI that is not even
@@ -5211,6 +5970,8 @@ def render_connect_card(state):
         # destructive flow's confirmation on the strength of a guess, so
         # that guard stays armed until the probe actually clears it.
         label, confirm = "Sign in", (state["state"] == "checking" and state["destructive"])
+    if flow_id == "whatsapp":
+        label = None  # The pairing form needs a phone field inside the card.
     action = ""
     if label:
         guard = ""
@@ -5272,6 +6033,46 @@ def render_connect_step(state):
         f'<input type="hidden" name="flow" value="{flow_id}">'
         f'<button type="submit" class="btn small">Cancel</button></form>'
     )
+    if flow_id == "whatsapp":
+        if state["state"] == "waiting" and state["code"]:
+            return (
+                '<div class="conn-step"><p class="note">On your phone, open '
+                'WhatsApp &rarr; Linked devices &rarr; Link a device &rarr; '
+                'Link with phone number instead. Enter this code:</p>'
+                f'<p><code class="conn-code">{html.escape(state["code"])}</code>'
+                f'{copy_button("the pairing code", value=state["code"])}</p>'
+                f'{cancel}</div>'
+            )
+        if state["state"] in ("starting", "exchanging", "waiting"):
+            return ('<div class="conn-step"><p class="note">Preparing the '
+                    'WhatsApp device link&hellip;</p>' + cancel + '</div>')
+        if state["state"] == "connected":
+            user = html.escape(pwd.getpwuid(os.getuid()).pw_name)
+            return (
+                '<div class="conn-step"><p class="note">The linked device is '
+                f'connected. Send <code>@{user} /sessions</code> from Message Yourself '
+                f'to choose its one recipient, or <code>@{user} /target auto</code> to '
+                'start a new one automatically.</p>'
+                f'<form method="post" action="{base}/connect/configure" class="row conn-form">'
+                f'<input type="hidden" name="flow" value="{flow_id}">'
+                f'{render_whatsapp_profile_field()}'
+                '<button type="submit" class="btn">Save routing</button></form></div>')
+        if state["detail"]:
+            return ('<div class="conn-step"><p class="note">'
+                    + html.escape(state["detail"]) + '</p></div>')
+        return (
+            f'<div class="conn-step"><form method="post" action="{base}/connect/start" '
+            'class="row conn-form">'
+            f'<input type="hidden" name="flow" value="{flow_id}">'
+            '<label class="field conn-field"><span class="note">Your WhatsApp '
+            'number with country code</span><input type="tel" name="phone" '
+            'autocomplete="tel" inputmode="numeric" enterkeyhint="go" '
+            'placeholder="+1 (555) 123-2435" aria-label="WhatsApp phone number"></label>'
+            f'{render_whatsapp_profile_field()}'
+            '<button type="submit" class="btn">Pair device</button></form>'
+            '<p class="note">Phone punctuation is accepted. Leave the number blank to use '
+            '<code>LOCAL_WHATSAPP_PHONE</code> saved under Secrets.</p></div>'
+        )
     if state["state"] == "starting":
         verb = ("Installing" if not state["installed"]
                 else "Starting the sign-in")
@@ -6039,8 +6840,16 @@ def portal_jwks_pems(keys, kid=""):
     return [pem for pem in pems if pem]
 
 
-def portal_claims(token):
-    """Verify a handover token and return its claims, or raise ValueError.
+def portal_claims(token, expected_aud="agent-box"):
+    """Verify a portal-signed token and return its claims, or raise
+    ValueError.
+
+    `expected_aud` separates what this signature is FOR: a handover token
+    (the default, "agent-box") authorizes establishing a session for the
+    `sub` it names, where a portal-user-transfer token (see
+    portal_admin_claims) authorizes changing WHICH portal user this linux
+    user answers to. Both are signed with the same key, so the audience is
+    the only thing stopping one from being replayed as the other.
 
     The message is deliberately coarse. A caller on this route is
     unauthenticated, so telling it WHICH check failed would let it tune a
@@ -6078,7 +6887,7 @@ def portal_claims(token):
     aud = payload.get("aud")
     if isinstance(aud, list):
         aud = aud[0] if len(aud) == 1 else None
-    if aud != "agent-box":
+    if aud != expected_aud:
         # A constant audience, not this box's hostname — the token is scoped
         # to a user and a project, not to a box (#541). What it separates is
         # a HANDOVER token from every other token the portal signs with the
@@ -6133,7 +6942,7 @@ def portal_record_path(kind, value):
     return os.path.join(portal_dir(kind), digest + ".json")
 
 
-def portal_spend_jti(jti, exp):
+def portal_spend_jti(jti, exp, kind="spent"):
     """Record a token id as spent. False if it was already spent.
 
     O_EXCL is the whole mechanism: two concurrent posts of one token race
@@ -6145,7 +6954,7 @@ def portal_spend_jti(jti, exp):
     longer spent, and the same token could mint a SECOND session — the one
     thing single-use exists to stop.
     """
-    path = portal_record_path("spent", jti)
+    path = portal_record_path(kind, jti)
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
@@ -6165,7 +6974,7 @@ def portal_prune(now=None):
     when it is read, so this only bounds the directory.
     """
     now = int(time.time()) if now is None else now
-    for kind in ("sessions", "spent"):
+    for kind in ("sessions", "spent", "transfer-spent"):
         try:
             names = os.listdir(portal_dir(kind))
         except OSError:
@@ -6184,6 +6993,28 @@ def portal_prune(now=None):
                     os.unlink(path)
 
 
+def portal_write_json_atomic(path, record, prefix):
+    """Write `record` to `path` 0600: a reader sees the whole old document
+    or the whole new one, and both file and directory are fsynced."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=prefix)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(record, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        dfd = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def portal_session_new(claims):
     """Mint a box session for verified claims and return its cookie value."""
     value = secrets.token_urlsafe(32)
@@ -6197,16 +7028,7 @@ def portal_session_new(claims):
         "expires": now + SESSION_TTL,
     }
     path = portal_record_path("sessions", value)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".session.")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            json.dump(record, handle)
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
+    portal_write_json_atomic(path, record, ".session.")
     return value
 
 
@@ -6215,6 +7037,14 @@ def portal_session_ok(value):
 
     The browser's Max-Age is a hint it is free to ignore; this record is
     what a session actually is, so a cookie that outlives it is refused.
+
+    Also decided here (issue #774): a session is only live for the portal
+    user this box CURRENTLY answers to. A completed transfer's
+    portal_revoke_sessions already deletes the old identity's records up
+    front, but a handoff racing that same transfer could mint one in the
+    narrow window between that scan and the new mapping being published --
+    this per-use check is what catches that one too, rather than relying
+    on the one-time scan alone.
     """
     if not value or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", value):
         return False
@@ -6222,9 +7052,10 @@ def portal_session_ok(value):
         with open(portal_record_path("sessions", value)) as handle:
             record = json.load(handle)
         expires = int(record.get("expires", 0))
+        sub = record.get("sub")
     except (OSError, ValueError, TypeError, AttributeError):
         return False
-    if expires <= int(time.time()):
+    if expires <= int(time.time()) or sub != portal_user_current():
         with contextlib.suppress(OSError):
             os.unlink(portal_record_path("sessions", value))
         return False
@@ -6244,6 +7075,183 @@ def portal_cookie_value(header):
         if key == name:
             return value
     return ""
+
+
+# --- Compare-and-swap the portalUser identity (issue #774) ------------
+# AGENT_BOX_PORTAL_USER is read once, at process start, from whatever the
+# unit's environment declared. That is fine for a box provisioned once for
+# one account, but a control plane that recycles a warm box -- provision it
+# under an internal, non-login identity, then hand it to the first paying
+# customer -- has no narrow way to change that mapping: today it would have
+# to rewrite host configuration and re-run `agentbox apply`, or redeploy.
+#
+# This section adds that lever, authenticated by the same portal signing
+# key as a handover token but under a DIFFERENT audience and action claim,
+# so neither a handover token nor any other token the portal signs can
+# reach it. The new mapping lives in a small state file under
+# WEB_SESSION_DIR rather than in the process environment, so it takes
+# effect immediately -- no unit restart, no `agentbox apply` -- and survives
+# both a daemon restart and a host reboot, because it is read fresh on
+# every request rather than cached at import time.
+PORTAL_ADMIN_AUD = "agent-box-portal-user"
+PORTAL_IDENTITY_LOCK_WAIT = 10
+
+
+class PortalTransferBusy(Exception):
+    """Raised by portal_identity_lock instead of running the body."""
+
+
+def portal_configured():
+    """True once this box has portal integration set up at all.
+
+    Independent of the CURRENT portalUser, which portal_user_current() may
+    report as empty on a box provisioned for handover but never yet
+    assigned an identity -- deliberately so, since bootstrapping that first
+    identity through this same compare-and-swap (from "" to the internal
+    pool identity) is a legitimate use of it.
+    """
+    return bool(PORTAL_ISSUER and PORTAL_JWKS_URL and WEB_SESSION_DIR)
+
+
+def portal_identity_path():
+    return os.path.join(portal_dir("identity"), "current.json")
+
+
+def portal_identity_read():
+    """{} if never written; None if present but unusable (fail closed)."""
+    try:
+        with open(portal_identity_path()) as handle:
+            record = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def portal_identity_write(sub, request_id):
+    """Atomically replace the persisted identity mapping.
+
+    Same tempfile-in-directory + os.replace dance as portal_session_new:
+    a reader either sees the whole old document or the whole new one.
+    """
+    path = portal_identity_path()
+    record = {"sub": sub, "requestId": request_id, "updated": int(time.time())}
+    portal_write_json_atomic(path, record, ".identity.")
+
+
+def portal_user_current():
+    """The portalUser this box currently answers to.
+
+    A completed transfer (see _portal_user_transfer) overrides whatever
+    AGENT_BOX_PORTAL_USER the unit's environment declared at process
+    start; absent one, that declared value is the whole mapping, exactly
+    as it was before issue #774.
+    """
+    record = portal_identity_read()
+    if record is None:
+        return ""
+    sub = record.get("sub")
+    if isinstance(sub, str) and sub:
+        return sub
+    return PORTAL_USER
+
+
+def portal_handoff_enabled():
+    """Whether /auth/handoff and /auth/verify serve this user at all."""
+    return bool(portal_configured() and portal_user_current())
+
+
+@contextlib.contextmanager
+def portal_identity_lock():
+    """Serialize one read-decide-write of the identity mapping.
+
+    Same shape as sessions_lock (issue #254), for the same reason: a
+    compare-and-swap that ran unlocked could let two concurrent transfer
+    requests both read "current == from" and both believe they won, with
+    the second write silently discarding the first's revocation. Fails
+    CLOSED -- a lock that cannot be taken refuses the request rather than
+    running it unlocked.
+    """
+    path = portal_identity_path() + ".lock"
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        lock = open(path, "a", encoding="utf-8")
+    except OSError as exc:
+        raise PortalTransferBusy(
+            "cannot open %s: %s" % (path, exc.strerror or exc))
+    try:
+        deadline = time.monotonic() + PORTAL_IDENTITY_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise PortalTransferBusy(
+                        "timed out after %ss waiting for %s: %s"
+                        % (PORTAL_IDENTITY_LOCK_WAIT, path,
+                           exc.strerror or exc))
+                time.sleep(0.05)
+    except BaseException:
+        lock.close()
+        raise
+    try:
+        yield
+    finally:
+        lock.close()
+
+
+def portal_revoke_sessions(sub):
+    """Unlink every live session record minted for `sub`.
+
+    Same directory portal_prune already scans, the same way: there is no
+    index from a portal user id to its sessions, and adding one is more
+    state to keep consistent for a path this rare. Missing or unreadable
+    records are left for portal_prune, same as there.
+    """
+    try:
+        names = os.listdir(portal_dir("sessions"))
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(portal_dir("sessions"), name)
+        try:
+            with open(path) as handle:
+                record = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if record.get("sub") == sub:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+
+
+def portal_admin_claims(token):
+    """Verify a portalUser-transfer management token; see portal_claims.
+
+    A separate audience from "agent-box" (used by handover tokens) means
+    an ordinary handover token -- or any other token the portal signs with
+    the same key for a different purpose -- cannot reach this route no
+    matter who holds it; the `act` claim narrows it further, in case the
+    portal ever signs a second kind of token under this same audience.
+    `from` is validated the same way portal_claims already validates
+    `sub`: a length bound only, matching web.portalUser, which is an
+    opaque string with no charset rule of its own.
+
+    Returns the verified payload with `to` and `requestId` added as
+    aliases for `sub` and `jti` -- the same claims a handover token
+    carries, read here for a different purpose (the identity to move TO,
+    and this request's own idempotency key).
+    """
+    payload = portal_claims(token, expected_aud=PORTAL_ADMIN_AUD)
+    if payload.get("act") != "portal-user-transfer":
+        raise ValueError("wrong action")
+    from_sub = payload.get("from")
+    if not isinstance(from_sub, str) or len(from_sub) > 256:
+        raise ValueError("missing or malformed from")
+    payload["to"] = payload["sub"]
+    payload["requestId"] = payload["jti"]
+    return payload
 
 
 # --- The file drop at /<user>/downloads/ (issues #132, #630) ----------
@@ -6848,6 +7856,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             WATCHER.release()
 
+    def _wants_json(self):
+        """A portal caller (issue #787): it asks for JSON, so a refusal
+        carries {"ok": false, "reason": ...} instead of a page to scrape."""
+        return "application/json" in self.headers.get("Accept", "").lower()
+
+    def _sess_error(self, form, text, status):
+        """Refuse a /sessions/* POST: JSON for a portal, the page the form
+        came from for a browser."""
+        if self._wants_json():
+            self._send_json({"ok": False, "reason": text}, status=status)
+            return
+        render = render_home if self._sess_page(form) == TERM_HOME else render_page
+        self._send_html(render(text, kind="error"), status=status)
+
     def _registry_refusal(self, verb, exc, page):
         """Answer a mutation route that could not read the registry
         (issue #279): say so in the journal, where the detail belongs, and
@@ -6858,6 +7880,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         just republished no longer mentioned any of the other sessions.
         """
         sys.stderr.write("sessions/%s refused: %s\n" % (verb, exc))
+        if self._wants_json():
+            self._send_json({"ok": False, "reason": "The session list could "
+                             "not be read. It clears within a few seconds."},
+                            status=503)
+            return
         self._redirect("ok=session_registry_unreadable", page)
 
     def _registry_busy(self, verb, exc, page):
@@ -6875,6 +7902,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         no shell and a bare 503 tells them nothing.
         """
         sys.stderr.write("sessions/%s refused: %s\n" % (verb, exc))
+        if self._wants_json():
+            self._send_json({"ok": False, "reason": "The session list is "
+                             "being changed by something else, so nothing "
+                             "was done. Try again in a few seconds."},
+                            status=503)
+            return
         # TERM_HOME and not (HOME and SESS_PAGE): /<user>/ is EVERY user's
         # landing page, not only the one whose daemon also serves the vhost
         # root, so a form carrying back=workspace resolves to TERM_HOME for
@@ -6911,6 +7944,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "session_added": ("Session added \u2014 it starts within a few seconds.", "ok"),
         "session_deleted": ("Session deleted.", "ok"),
         "session_restarted": ("Session restart requested.", "ok"),
+        "whatsapp_saved": ("WhatsApp recipient saved. Restart a running Claude session to load its channel.", "ok"),
+        "whatsapp_profile_saved": ("WhatsApp routing profile saved. It is used when WhatsApp starts a new session.", "ok"),
+        "session_stopped": ("Session stopped \u2014 it keeps its place in the list.", "ok"),
         "session_started": ("Session started \u2014 it comes up within a few seconds.", "ok"),
         "session_registry_unreadable": (
             "The session list could not be read, so nothing was changed. "
@@ -6940,6 +7976,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "profile_saved": ("Profile saved. Sessions started from now on use it.", "ok"),
         "profile_deleted": (("Profile deleted. Sessions already running keep "
                              "their current settings."), "ok"),
+        "profile_default_set": (("Default profile set. New sessions start with "
+                                 "it preselected."), "ok"),
+        "profile_default_cleared": (("No default profile. New sessions ask "
+                                     "which profile to start."), "ok"),
         "profile_key_saved": (("Setting added to the profile. Sessions on it pick "
                                "it up at their next start."), "ok"),
         "profile_key_deleted": (("Setting removed from the profile. Sessions on it "
@@ -6997,7 +8037,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # and each user's daemon serves its own, so the URL has already named
         # the linux user before any claim is read. That is what lets `project`
         # be optional without becoming ambiguous.
-        if claims["sub"] != PORTAL_USER:
+        if claims["sub"] != portal_user_current():
             self._send_html(
                 "<h1>403</h1><p>This box does not host that account.</p>",
                 status=403)
@@ -7023,7 +8063,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         value = portal_session_new(claims)
         self.send_response(303)
         self.send_header("Location", TERM_HOME)
-        # SameSite=Lax, where the basic-auth cookie is Strict. The
+        # SameSite=Lax, like the basic-auth cookie. The
         # navigation right after this response is initiated CROSS-SITE, by
         # the portal that posted here, and a Strict cookie is withheld on
         # exactly that navigation — the user would land back on a
@@ -7037,6 +8077,117 @@ class Handler(http.server.BaseHTTPRequestHandler):
             % (portal_cookie_name(), value, SESSION_TTL))
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _portal_user_transfer(self):
+        """POST /<user>/auth/portal-user -- compare-and-swap the portal
+        identity this linux user answers to (issue #774).
+
+        Authenticated by a portal-signed management token in the
+        Authorization header, under its own audience and action claim --
+        never by the session cookie, the web password, or a handover
+        token, all of which are bearer credentials for the CURRENT
+        identity rather than for changing it. The request body carries no
+        authority: every fact this operation acts on (from, to, its own
+        idempotency key) comes out of the verified token, so nothing a
+        caller puts in the body -- forged or not -- can change what this
+        does. It is read and discarded only to keep the connection
+        well-behaved.
+
+        One message for every authentication failure, as in
+        _portal_handoff and for the same reason: the caller here presents
+        its own credential rather than riding a browser's, but it is still
+        a caller that must not be able to tune a token against the box one
+        check at a time.
+        """
+        declared = int(self.headers.get("Content-Length", "0") or "0")
+        if declared > TOKEN_MAX_BYTES:
+            if declared <= HANDOFF_DRAIN_MAX_BYTES:
+                self.rfile.read(declared)
+            else:
+                self.close_connection = True
+            self._send_json({"ok": False, "reason": "too large"}, status=413)
+            return
+        if declared:
+            self.rfile.read(declared)
+        if not portal_configured():
+            self._send_json({"ok": False, "reason": "not found"}, status=404)
+            return
+        scheme, _, token = self.headers.get(
+            "Authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            self._send_json(
+                {"ok": False, "reason": "unauthorized"}, status=401)
+            return
+        try:
+            claims = portal_admin_claims(token)
+        except ValueError:
+            self._send_json(
+                {"ok": False, "reason": "unauthorized"}, status=401)
+            return
+        from_sub = claims["from"]
+        to_sub = claims["to"]
+        request_id = claims["requestId"]
+        if from_sub == to_sub:
+            self._send_json(
+                {"ok": False, "reason": "from and to must differ"},
+                status=400)
+            return
+        try:
+            with portal_identity_lock():
+                record = portal_identity_read()
+                if record is None:
+                    # Present but unreadable: refuse rather than guess.
+                    self._send_json(
+                        {"ok": False, "reason": "identity unavailable"},
+                        status=503)
+                    return
+                current_sub = record.get("sub") or PORTAL_USER
+                if (current_sub == to_sub
+                        and record.get("requestId") == request_id):
+                    # Idempotent retry of a transfer already completed --
+                    # including one retried after a crash between the
+                    # revoke below and this response, which is exactly
+                    # when a caller that got no answer would retry.
+                    portal_spend_jti(request_id, int(claims["exp"]),
+                                     "transfer-spent")
+                    self._send_json({"ok": True}, status=200)
+                    return
+                # A token whose transfer already happened is spent, even
+                # when the identity has since come back to its `from`
+                # (X->Y, Y->X, replay of the first): compare-and-swap
+                # alone cannot see that ABA.
+                if os.path.exists(portal_record_path(
+                        "transfer-spent", request_id)):
+                    self._send_json(
+                        {"ok": False, "reason": "conflict"}, status=409)
+                    return
+                if current_sub != from_sub:
+                    self._send_json(
+                        {"ok": False, "reason": "conflict"}, status=409)
+                    return
+                # Revoke BEFORE the mapping is published: a crash in
+                # between leaves the mapping still `from`, so a retry of
+                # this same request re-enters this branch and finishes the
+                # revoke, rather than a crash AFTER the swap leaving some
+                # of `from`'s sessions live under an identity that can no
+                # longer mint new ones but never had its old ones cut off.
+                portal_revoke_sessions(from_sub)
+                portal_identity_write(to_sub, request_id)
+                # Marked AFTER the write: a crash between the two leaves
+                # the idempotent branch above to finish the mark on retry,
+                # where marking first would strand that retry on 409.
+                portal_spend_jti(request_id, int(claims["exp"]),
+                                 "transfer-spent")
+        except PortalTransferBusy:
+            self._send_json({"ok": False, "reason": "busy"}, status=503)
+            return
+        # Non-secret context only: never the bearer token, never a session
+        # value (see portal_session_new / portal_record_path for why those
+        # are never logged either).
+        sys.stderr.write(
+            "agent-box-settings: portal-user transfer %s -> %s "
+            "(request %s)\n" % (from_sub, to_sub, request_id))
+        self._send_json({"ok": True}, status=200)
 
     def _portal_verify(self):
         """Answer caddy's forward_auth subrequest for a session cookie.
@@ -7059,12 +8210,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         HttpOnly cookie it already holds is live, which any other route
         would have told it too.
         """
-        if PORTAL_HANDOFF and portal_session_ok(
+        if portal_handoff_enabled() and portal_session_ok(
                 portal_cookie_value(self.headers.get("Cookie", ""))):
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        data = AUTH_REQUIRED_BODY.encode("utf-8")
         self.send_response(401)
         # Max-Age=0 with the same Path and flags the cookie was set with,
         # which is what a browser needs to actually drop it.
@@ -7078,8 +8230,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "WWW-Authenticate",
             'Basic realm="%s"' % os.environ.get(
                 "AGENT_BOX_SETTINGS_USER", "agent"))
-        self.send_header("Content-Length", "0")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
+        self.wfile.write(data)
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -7135,6 +8289,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # and in HOME mode SESS_BASE is "" so the path is not under BASE.
         if parsed.path.rstrip("/") == SESS_BASE + "/sessions/transcript":
             self._send_transcript((params.get("name", [""])[0]).strip())
+            return
+        if parsed.path.rstrip("/") == SESS_BASE + "/sessions/list":
+            # Session metadata as JSON for a portal (issue #787).
+            try:
+                self._send_json(session_list_payload())
+            except (SessionCapacityError, RegistryUnreadable) as exc:
+                self._send_json({"ok": False, "reason": str(exc)}, status=503)
             return
         if parsed.path.rstrip("/") == SESS_BASE + "/sessions/events":
             if params.get("poll"):
@@ -7210,6 +8371,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self._send_json({"ok": True, "source": source, "secret": secret})
             return
+        # Codex pairing state as JSON (issue #780): the manual code, whether
+        # it was claimed, and the paired devices. The code is a credential
+        # for this box's Codex, so it is only ever in this response (and
+        # _send_json says no-store), never in a log or a file. 404 where the
+        # Connections card for codex would not exist either.
+        if parsed.path.rstrip("/") == BASE + "/codex/pairing":
+            flow = connect_flow("codex")
+            if flow is None:
+                self._send_json({"ok": False}, status=404)
+            else:
+                self._send_json({"ok": True, "pairing": codex_pairing_state(flow)})
+            return
         if parsed.path.rstrip("/") == BASE + "/connect":
             wanted = (params.get("flow", [""])[0]).strip()
             if not wanted:
@@ -7274,10 +8447,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         Every POST route here mutates state (secrets, sessions, the
         box update). Auth alone does not stop CSRF: the __Host- cookie
-        is SameSite=Strict, but the basic-auth fallback has no SameSite
-        equivalent, and browsers reattach cached basic credentials to
-        cross-site requests — so a lured, basic-authenticated operator
-        could be forced to e.g. inject a GH_TOKEN via /set.
+        is SameSite=Lax (which withholds it from cross-site POSTs), but the
+        basic-auth fallback has no SameSite equivalent, and browsers
+        reattach cached basic credentials to cross-site requests. A lured,
+        basic-authenticated operator could be forced to inject a GH_TOKEN
+        via /set.
 
         Browsers always send Sec-Fetch-Site; a genuine form post from
         our own page is "same-origin". Anything a browser labels
@@ -7323,7 +8497,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # exist at all unless the box was provisioned for handover, so an
         # unprovisioned box exposes no unauthenticated endpoint.
         if path == TERM_BASE + "/auth/handoff":
-            if not PORTAL_HANDOFF:
+            if not portal_handoff_enabled():
                 self._read_form()
                 self._send_html("<h1>404</h1>", status=404)
                 return
@@ -7343,6 +8517,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     status=413)
                 return
             self._portal_handoff(self._read_form())
+            return
+        # portalUser compare-and-swap (issue #774), ahead of the CSRF guard
+        # for the same reason as the handoff route above: the caller here
+        # is a control plane presenting its own bearer token, never a
+        # browser carrying this daemon's cookie, so there is no ambient
+        # credential for a cross-site request to ride on.
+        if path == TERM_BASE + "/auth/portal-user":
+            self._portal_user_transfer()
             return
         if not self._same_origin():
             # Drain the request body BEFORE answering: replying 403 and
@@ -7424,6 +8606,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             self._redirect("ok=saved")
+        elif path in (BASE + "/codex/pairing/start",
+                      BASE + "/codex/pairing/cancel",
+                      BASE + "/codex/devices/revoke"):
+            # Codex pairing from a portal (issue #780). Same admission as
+            # /connect, and the same answer shape: 303 on success so the
+            # caller re-reads the GET, a short free-text reason otherwise.
+            flow = connect_flow("codex")
+            if flow is None or not flow["bin"]:
+                self._send_json({"ok": False, "error": "Codex is not installed."},
+                                status=404 if flow is None else 409)
+                return
+            if path.endswith("/pairing/cancel"):
+                codex_pairing_cancel()
+                self._redirect()
+                return
+            if path.endswith("/pairing/start"):
+                code, text = codex_pairing_start(flow)
+            else:
+                client_id = (form.get("client_id", [""])[0]).strip()
+                if not CODEX_CLIENT_ID_RE.match(client_id):
+                    self._send_json({"ok": False, "error": "No such device."},
+                                    status=404)
+                    return
+                code, text = codex_device_revoke(flow, client_id)
+            if code == 303:
+                self._redirect()
+            else:
+                self._send_json({"ok": False, "error": text}, status=code)
         elif path.startswith(BASE + "/connect/"):
             # Guided sign-in (issues #207, #208, #313). All three verbs
             # act on ONE tmux session per flow and store nothing here, so
@@ -7432,10 +8642,56 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # that may already be gone.
             action = path[len(BASE + "/connect/"):]
             flow = connect_flow((form.get("flow", [""])[0]).strip())
-            if flow is None or action not in ("start", "code", "cancel"):
+            if flow is None or action not in ("start", "code", "cancel", "configure"):
                 self._send_html("<h1>404</h1>", status=404)
                 return
+            if action == "configure":
+                if flow["id"] != "whatsapp":
+                    self._send_html("<h1>404</h1>", status=404)
+                    return
+                profile = form.get("profile", [""])[0].strip()
+                if profile and (profile == "default"
+                                or not PROFILE_NAME_RE.match(profile)
+                                or profile not in read_profiles()):
+                    self._send_html(render_page("Choose an existing WhatsApp profile.",
+                                                kind="error"), status=400)
+                    return
+                if whatsapp_profile(profile) is None:
+                    self._send_html(render_page("Could not save the WhatsApp profile.",
+                                                kind="error"), status=503)
+                    return
+                self._redirect("ok=whatsapp_profile_saved")
+                return
             if action == "start":
+                if flow["id"] == "whatsapp":
+                    raw_phone = form.get("phone", [""])[0].strip()
+                    phone = ""
+                    if raw_phone:
+                        # ASCII only: \D would keep Unicode digits the bridge drops.
+                        phone = re.sub(r"[ ()+.-]", "", raw_phone)
+                        if not (phone.isascii() and phone.isdigit()
+                                and 7 <= len(phone) <= 15):
+                            self._send_html(render_page(
+                                "Enter a valid WhatsApp number with country code.",
+                                kind="error"), status=400)
+                            return
+                    profile = form.get("profile", [""])[0].strip()
+                    if profile and (profile == "default"
+                                    or not PROFILE_NAME_RE.match(profile)
+                                    or profile not in read_profiles()):
+                        self._send_html(render_page("Choose an existing WhatsApp profile.",
+                                                    kind="error"), status=400)
+                        return
+                    if phone:
+                        try:
+                            set_key("LOCAL_WHATSAPP_PHONE", phone)
+                        except EnvStoreError as exc:
+                            self._send_html(render_page(str(exc), kind="error"), status=400)
+                            return
+                    if whatsapp_profile(profile) is None:
+                        self._send_html(render_page("Could not save the WhatsApp profile.",
+                                                    kind="error"), status=503)
+                        return
                 result = connect_start(flow)
                 # A start that could not begin has something to say, and
                 # the card is rebuilt from the pane on the next GET — so
@@ -7467,7 +8723,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # every message below says "from now on" rather than "applied".
             action = path[len(BASE + "/profiles/"):]
             name = (form.get("name", [""])[0]).strip()
-            if action not in ("set", "delete", "setkey", "delkey"):
+            if action not in ("set", "delete", "setkey", "delkey", "default"):
                 self._send_html("<h1>404</h1>", status=404)
                 return
             if not PROFILE_NAME_RE.match(name):
@@ -7480,6 +8736,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if action == "delete":
                 profile_remove(name)
                 self._redirect("ok=profile_deleted")
+                return
+            if action == "default":
+                on = form.get("on", ["1"])[0] != "0"
+                if on:
+                    if name not in read_profiles():
+                        self._send_html(
+                            render_page("No profile named '%s' \u2014 it may "
+                                        "have just been deleted." % name,
+                                        kind="error"),
+                            status=404)
+                        return
+                    set_default_profile(name)
+                    self._redirect("ok=profile_default_set")
+                else:
+                    # Only clear the default this row showed: a stale tab
+                    # must not unset a default somebody moved elsewhere.
+                    if read_default_pointer() == name:
+                        set_default_profile("")
+                    self._redirect("ok=profile_default_cleared")
                 return
             if action == "delkey":
                 key = (form.get("key", [""])[0]).strip()
@@ -7772,6 +9047,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # second thread, or the CLI — could pick the same free name, and
             # the later rename would drop the earlier session outright.
             try:
+                # Read before the lock (issue #748): capacity_check's tmux
+                # spawn must not run while holding sessions_lock(), or a
+                # slow/contended tmux starves every other writer waiting on
+                # the same lock.
+                live = capacity_live_checked()
                 with sessions_lock():
                     sessions, version = load_sessions()
                     # The name is always auto-derived: there is no name field
@@ -7782,7 +9062,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # inventing one AND guarantees a unique key, so no collision
                     # or accidental-overwrite (issue 100) is possible.
                     name = gen_session_name(profile or agent, sessions, cwd)
-                    capacity_check(sessions, [name])
+                    capacity_check(sessions, [name], live=live,
+                                   exempt=[name] if agent == "shell" else ())
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,
@@ -7795,6 +9076,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # own remote control is just a flag on its ordinary
                         # TUI and keeps the old default.
                         "remoteControl": codex_daemon or agent != "codex",
+                        "whatsapp": (form.get("whatsapp", [""])[0] == "on"
+                                     and agent in ("claude", "codex")),
                         "remoteControlName": None,
                         "workingDirectory": cwd,
                         "extraArgs": pargs,
@@ -7808,6 +9091,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "resumePrompt": None,
                         "boxSessionId": None,
                         "hasRun": False,
+                        "origin": "user",
+                        "createdAt": int(time.time()),
                     }
                     write_sessions(sessions, version)
             except SessionCapacityError as exc:
@@ -7834,6 +9119,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if back_page == TERM_HOME:
                 query += "&tab=" + name
             self._redirect(query, back_page)
+        elif path == SESS_BASE + "/sessions/whatsapp":
+            name = (form.get("name", [""])[0]).strip()
+            state = form.get("state", [""])[0]
+            if not SESSION_RE.match(name) or state not in ("on", "off"):
+                self._send_html(render_page("Invalid WhatsApp session setting.",
+                                            kind="error"), status=400)
+                return
+            try:
+                with sessions_lock():
+                    sessions, version = load_sessions()
+                    entry = sessions.get(name)
+                    if not isinstance(entry, dict):
+                        self._send_html(render_page("Session no longer exists.",
+                                                    kind="error"), status=404)
+                        return
+                    if state == "on" and entry.get("agent") not in ("claude", "codex"):
+                        self._send_html(render_page("WhatsApp supports Claude and Codex sessions.",
+                                                    kind="error"), status=400)
+                        return
+                    if state == "on":
+                        for other in sessions.values():
+                            if isinstance(other, dict):
+                                other["whatsapp"] = False
+                    entry["whatsapp"] = state == "on"
+                    write_sessions(sessions, version)
+            except RegistryBusy as exc:
+                self._registry_busy("change WhatsApp setting", exc, self._sess_page(form))
+                return
+            except RegistryUnreadable as exc:
+                self._registry_refusal("change WhatsApp setting", exc, self._sess_page(form))
+                return
+            self._redirect("ok=whatsapp_saved", self._sess_page(form))
         elif path == SESS_BASE + "/sessions/delete":
             name = (form.get("name", [""])[0]).strip()
             if SESSION_RE.match(name):
@@ -7842,10 +9159,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # resurrected entry is a session the supervisor starts and no
                 # delete path knows about. The kill stays OUTSIDE: tmux is not
                 # this file, and nothing may hold the lock across a subprocess.
+                known = True
                 try:
                     with sessions_lock():
                         sessions, version = load_sessions()
-                        sessions.pop(name, None)
+                        known = sessions.pop(name, None) is not None
                         write_sessions(sessions, version)
                 except RegistryBusy as exc:
                     self._registry_busy("delete", exc, self._sess_page(form))
@@ -7855,6 +9173,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # publish an empty one: the named session went, and so did
                     # every other (issue #279).
                     self._registry_refusal("delete", exc, self._sess_page(form))
+                    return
+                if not known and self._wants_json():
+                    # A portal asked to delete something we do not list: say
+                    # so without touching a tmux session that merely shares
+                    # the name. The browser path keeps cleaning one up.
+                    self._send_json({"ok": False, "reason": "No such session."},
+                                    status=404)
                     return
                 kill_session(name)
                 # Delisted and killed, so its filter file routes nothing —
@@ -7873,7 +9198,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         os.remove(state_path)
                     except OSError:
                         pass
+            elif self._wants_json():
+                self._send_json({"ok": False, "reason": "No such session."},
+                                status=404)
+                return
             self._redirect("ok=session_deleted", self._sess_page(form))
+        elif path == SESS_BASE + "/sessions/stop":
+            # The web twin of `agent-box-session stop` (issue #787): park the
+            # session so it frees its slot and keeps its entry. Flag first,
+            # then kill, so the supervisor's post-spawn re-check sees a spawn
+            # that raced the kill (session-cli.sh, issue #167).
+            name = (form.get("name", [""])[0]).strip()
+            try:
+                with sessions_lock():
+                    sessions, version = load_sessions()
+                    entry = sessions.get(name) if SESSION_RE.match(name) else None
+                    # Existence and flag in one step, and no stub entry for a
+                    # name that is not there (issue #254).
+                    if isinstance(entry, dict):
+                        entry["stopped"] = True
+                        write_sessions(sessions, version)
+            except RegistryBusy as exc:
+                self._registry_busy("stop", exc, self._sess_page(form))
+                return
+            except RegistryUnreadable as exc:
+                self._registry_refusal("stop", exc, self._sess_page(form))
+                return
+            if not isinstance(entry, dict):
+                self._sess_error(form, "No such session.", 404)
+                return
+            if not kill_session(name):
+                self._sess_error(form, "Could not stop session.", 500)
+                return
+            self._redirect("ok=session_stopped", self._sess_page(form))
         elif path == SESS_BASE + "/sessions/restart":
             name = (form.get("name", [""])[0]).strip()
             # The row calls this route Start on a stopped session, so say
@@ -7892,6 +9249,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # initialPrompt, and the supervisor then re-fired the kickoff
                 # prompt under a new id the next time that session died.
                 try:
+                    # Read before the lock (issue #748): capacity_check's
+                    # tmux spawn must not run while holding sessions_lock(),
+                    # or a slow/contended tmux starves every other writer
+                    # waiting on the same lock. Paid even when the name turns
+                    # out not to be a live entry below -- cheap next to a
+                    # lock held across a tmux subprocess.
+                    live = capacity_live_checked()
                     with sessions_lock():
                         sessions, version = load_sessions()
                         entry = sessions.get(name)
@@ -7900,13 +9264,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # dropping it (see its docstring), so the .pop below
                         # has to ask rather than assume.
                         if isinstance(entry, dict):
-                            capacity_check(sessions, [name])
+                            capacity_check(sessions, [name], live=live)
+                        elif self._wants_json():
+                            self._send_json({"ok": False, "reason": "No such session."},
+                                            status=404)
+                            return
                         if isinstance(entry, dict) and entry.pop("stopped", None) is not None:
                             write_sessions(sessions, version)
                             ok = "ok=session_started"
                 except SessionCapacityError as exc:
-                    render = render_home if self._sess_page(form) == TERM_HOME else render_page
-                    self._send_html(render(str(exc), kind="error"), status=503)
+                    self._sess_error(form, str(exc), 503)
                     return
                 except RegistryBusy as exc:
                     self._registry_busy("restart", exc, self._sess_page(form))
@@ -7919,6 +9286,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._registry_refusal("restart", exc, self._sess_page(form))
                     return
                 kill_session(name)
+            elif self._wants_json():
+                self._send_json({"ok": False, "reason": "No such session."},
+                                status=404)
+                return
             back_page = self._sess_page(form)
             # On the workspace, land on the tab of the session just started —
             # the pane's own Start button posts here, and dropping the operator

@@ -141,6 +141,7 @@ def build_fake_profile(root):
     (share / "contract").mkdir()
     for j in (SRC / "contract").glob("*.json"):
         shutil.copy(j, share / "contract" / j.name)
+    shutil.copy(SRC / "tmux.conf", share / "tmux.conf")
     # The pinned local-webhook the profile ships (issue #425), and the pin it
     # came from. A box needs no webhook config because these are here — so a
     # fake profile without them would test the pre-#425 world.
@@ -229,6 +230,34 @@ def tree_modes(root):
 
 
 class RenderTest(unittest.TestCase):
+    def test_ip_certificate_and_optional_dns_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps({
+                "domain": "203.0.113.7",
+                "web": {"enable": True, "alias": "203-0-113-7.sslip.io"},
+                "users": {"agent": {"root": True}},
+            }))
+            caddyfile = (render(tmp, cfg) / "etc/agent-box/Caddyfile").read_text()
+            self.assertIn("default_sni 203.0.113.7", caddyfile)
+            self.assertIn("203.0.113.7 {", caddyfile)
+            self.assertIn("import acme_ip_shortlived", caddyfile)
+            self.assertIn("profile shortlived", caddyfile)
+            self.assertIn("203-0-113-7.sslip.io {", caddyfile)
+            self.assertIn("on_demand", caddyfile)
+            self.assertIn("redir https://203.0.113.7{uri} permanent", caddyfile)
+
+            no_alias = Path(tmp) / "no-alias"
+            no_alias.mkdir()
+            cfg = no_alias / "config.json"
+            cfg.write_text(json.dumps({
+                "domain": "203.0.113.7",
+                "web": {"enable": True},
+                "users": {"agent": {"root": True}},
+            }))
+            without_alias = (render(no_alias, cfg) / "etc/agent-box/Caddyfile").read_text()
+            self.assertNotIn("203-0-113-7.sslip.io", without_alias)
+
     def test_matches_committed_fixture(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = render(tmp, CONFIG_JSON)
@@ -398,6 +427,12 @@ class RenderTest(unittest.TestCase):
             ({"users": {"Bad Name": {}}}, "invalid user name"),
             ({"domainSuffix": "not a domain", "users": {"a": {}}},
              "must be empty/null or a DNS suffix"),
+            ({"domain": "203.0.113.7", "web": {"alias": "203.0.113.9"},
+              "users": {"a": {}}}, "web.alias must be a DNS name"),
+            ({"web": {"alias": True}, "users": {"a": {}}},
+             "web.alias must be empty/null or a DNS suffix"),
+            ({"web": {"alias": 42}, "users": {"a": {}}},
+             "web.alias must be empty/null or a DNS suffix"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
@@ -905,7 +940,11 @@ class RenderTest(unittest.TestCase):
             spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
             rend = mod.Renderer(spec_obj, prof, root=out)
             written = rend.render().files[str(conf)][0]
-            self.assertEqual(mod.GENERATED_HEADER + "set -g mouse on\n", written)
+            self.assertEqual(
+                mod.GENERATED_HEADER + (SRC / "tmux.conf").read_text(),
+                written)
+            self.assertIn("unbind-key -T prefix s", written,
+                          "web clients can still switch session (choose-tree)")
 
     def test_a_foreign_gitconfig_is_left_alone(self):
         """/etc/gitconfig is a general system file, not one of agentbox's
@@ -2545,6 +2584,7 @@ class RenderTest(unittest.TestCase):
         # that fails the moment it is clicked.
         want = {a: f"@PROFILE@/bin/{a}" for a in agents}
         want["github"] = "@PROFILE@/bin/gh"
+        want["whatsapp"] = "@PROFILE@/bin/agent-box-whatsapp"
         self.assertEqual(want, cards)
 
     def test_ttyd_override_keeps_every_flag_the_template_sets(self):

@@ -10,6 +10,9 @@ import io
 import json
 import os
 import tempfile
+import threading
+import types
+import http.server
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -81,7 +84,8 @@ class PeerCliTest(unittest.TestCase):
             sent.append((request, timeout))
             return Response()
 
-        with mock.patch("urllib.request.urlopen", deliver):
+        with mock.patch("urllib.request.build_opener",
+                        lambda *_h: types.SimpleNamespace(open=deliver)):
             result = self.capture(peer.cmd_send, argparse.Namespace(
                 label="B", inbox="ops", message="hello from A", from_name="claude",
                 timeout=5))
@@ -114,6 +118,72 @@ class PeerCliTest(unittest.TestCase):
         self.capture(peer.cmd_revoke, argparse.Namespace(label="A"))
         self.assertIn(name, json.loads(sources_path.read_text())["sources"])
         self.assertTrue(Path(config["sources"][name]["secretFile"]).exists())
+
+
+    def pair(self):
+        self.box("a", "https://a.example/claude/webhook")
+        invitation = self.capture(peer.cmd_invite,
+                                  argparse.Namespace(label="B", expires_hours=24))
+        self.box("b", "https://b.example/other/webhook")
+        with mock.patch("sys.stdin", io.StringIO(invitation)):
+            response = self.capture(peer.cmd_accept, argparse.Namespace(label="A"))
+        self.box("a", "https://a.example/claude/webhook")
+        return response
+
+    def test_confirm_rejects_an_expired_invitation(self):
+        response = self.pair()
+        path = self.root / "a/peers/peers.json"
+        state = json.loads(path.read_text())
+        for entry in state["peers"].values():
+            entry["expiresAt"] = "2000-01-01T00:00:00Z"
+        path.write_text(json.dumps(state))
+        with mock.patch("sys.stdin", io.StringIO(response)):
+            with self.assertRaises(SystemExit):
+                self.capture(peer.cmd_confirm, argparse.Namespace())
+        self.assertEqual(next(iter(json.loads(path.read_text())["peers"].values()))["state"],
+                         "invited")
+
+    def test_send_treats_a_redirect_as_a_failure(self):
+        response = self.pair()
+        with mock.patch("sys.stdin", io.StringIO(response)):
+            self.capture(peer.cmd_confirm, argparse.Namespace())
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", "/elsewhere")
+                self.end_headers()
+
+            def do_GET(self):
+                hits.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        path = self.root / "a/peers/peers.json"
+        state = json.loads(path.read_text())
+        for entry in state["peers"].values():
+            entry["endpoint"] = "http://127.0.0.1:%d" % server.server_port
+        path.write_text(json.dumps(state))
+        with self.assertRaises(SystemExit):
+            self.capture(peer.cmd_send, argparse.Namespace(
+                label="B", inbox="ops", message="hi", from_name="", timeout=5))
+        self.assertEqual(hits, [])
+
+    def test_peers_lock_is_exclusive_across_processes(self):
+        self.box("a", "https://a.example/claude/webhook")
+        import fcntl
+        with peer.peers_lock():
+            with open(str(self.root / "a/peers/peers.json") + ".lock", "a") as other:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 if __name__ == "__main__":

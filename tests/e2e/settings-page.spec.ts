@@ -97,6 +97,9 @@ function tmuxSessionAlive(): boolean {
 test('unauthenticated request is rejected with 401', async ({ request }) => {
   const res = await request.get(SETTINGS_PATH);
   expect(res.status()).toBe(401);
+  expect(res.headers()['www-authenticate']).toMatch(/^Basic /);
+  expect(res.headers()['content-type']).toContain('text/html');
+  expect(await res.text()).toContain('Sign in required');
 });
 
 test('basic auth renders the page and sets the auth cookie; cookie alone then suffices', async ({ browser }) => {
@@ -111,17 +114,52 @@ test('basic auth renders the page and sets the auth cookie; cookie alone then su
     c.name.startsWith('__Host-agent_box_auth_')
   );
   expect(cookie, 'first authenticated response should set the __Host- auth cookie').toBeTruthy();
+  expect(cookie!.sameSite).toBe('Lax');
 
   // A fresh context with ONLY the cookie (no basic-auth credentials) must get
   // through — this is the leg the VM test cannot cover.
   const cookieCtx = await browser.newContext();
   await cookieCtx.addCookies([
-    { name: cookie!.name, value: cookie!.value, url: process.env.E2E_BASE_URL! },
+    {
+      name: cookie!.name,
+      value: cookie!.value,
+      url: process.env.E2E_BASE_URL!,
+      sameSite: cookie!.sameSite,
+      secure: cookie!.secure,
+      httpOnly: cookie!.httpOnly,
+    },
   ]);
   const cookiePage = await cookieCtx.newPage();
   const res = await cookiePage.goto(SETTINGS_PATH);
   expect(res!.status()).toBe(200);
   await expect(cookiePage.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
+
+  // Returning from an external page is a cross-site top-level navigation.
+  // Strict withholds the cookie here, even though the same cookie passed
+  // the direct-navigation assertion above. The context has no Basic auth.
+  const target = new URL(`/${USER}/main/`, process.env.E2E_BASE_URL!).href;
+  await cookiePage.route('https://outside.example/', (route) => route.fulfill({
+    contentType: 'text/html',
+    body: `<a href="${target}">Return to box</a>`,
+  }));
+  await cookiePage.goto('https://outside.example/');
+  const navigation = cookiePage.waitForResponse((response) =>
+    response.url() === target && response.request().isNavigationRequest()
+  );
+  await cookiePage.getByRole('link', { name: 'Return to box' }).click();
+  const returned = await navigation;
+  expect(returned.status()).toBe(200);
+  const headers = await returned.request().allHeaders();
+  expect((headers.cookie || '').split('; ').some((part) =>
+    part.startsWith(`${cookie!.name}=`)
+  )).toBe(true);
+  await expect(cookiePage).toHaveURL(target);
+
+  await cookiePage.goto('https://outside.example/');
+  const back = await cookiePage.goBack({ waitUntil: 'domcontentloaded' });
+  expect(back?.status()).toBe(200);
+  await expect(cookiePage).toHaveURL(target);
+  await expect(cookiePage).toHaveTitle(/ttyd/i);
 });
 
 // Regression for the bug where settings.js's init-time collapse list

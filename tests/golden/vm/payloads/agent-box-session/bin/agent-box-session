@@ -659,10 +659,13 @@ usage() {
   echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
   echo "                             [--cwd DIR] [--remote-control true|false]"
   echo "                             [--prompt TEXT] [--resume-prompt TEXT] [--ephemeral]"
+  echo "                             [--whatsapp true|false]"
   echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
+  echo "       agent-box-session whatsapp candidates | ls | select NAME | clear"
+  echo "                             | spawn PROFILE|default | NAME on|off|status"
   echo "       agent-box-session env ls | set KEY VALUE | set KEY --stdin | rm KEY"
   echo "         (--stdin reads the value from stdin: for a multi-line secret"
   echo "          such as a PEM, and to keep any secret out of the command line)"
@@ -673,6 +676,8 @@ usage() {
   echo "--profile names an agent profile (agent-box-profile ls): a harness plus"
   echo "a model, an effort level, an appended system prompt and session env."
   echo "--harness and a '-- EXTRA_ARGS' tail override what the profile resolved."
+  echo "With neither --profile nor --harness, the default profile is used when"
+  echo "one is set (agent-box-profile default)."
   echo "(--agent is the old name for --harness and still works. It is"
   echo "deprecated: claude and opencode both spell --agent for the PROFILE,"
   echo "which is this box's --profile, so the two meanings collided.)"
@@ -1047,6 +1052,111 @@ case "$cmd" in
       echo "(tmux -L agent-box capture-pane -pt NAME | tail -40) or ask it."
     fi
     ;;
+  whatsapp)
+    name="${1:-}"
+    if [ "$name" = candidates ]; then
+      [ $# -eq 1 ] || { usage >&2; exit 2; }
+      if [ -s "$REGISTRY_FILE" ]; then
+        "$JQ" -c '[.sessions | to_entries[] |
+          select(.value.agent == "claude" or .value.agent == "codex") |
+          {name: .key, harness: .value.agent, stopped: (.value.stopped == true),
+           selected: (.value.whatsapp == true)}]' "$REGISTRY_FILE"
+      else
+        echo '[]'
+      fi
+      exit 0
+    fi
+    if [ "$name" = ls ]; then
+      [ $# -eq 1 ] || { usage >&2; exit 2; }
+      if [ -s "$REGISTRY_FILE" ]; then
+        "$JQ" -c '[.sessions | to_entries[] |
+          select(.value.whatsapp == true and (.value.agent == "claude" or .value.agent == "codex")) |
+          {name: .key, harness: .value.agent, stopped: (.value.stopped == true)}]' "$REGISTRY_FILE"
+      else
+        echo '[]'
+      fi
+      exit 0
+    fi
+    if [ "$name" = select ]; then
+      selected="${2:-}"
+      [ $# -eq 2 ] && valid_name "$selected" || { usage >&2; exit 2; }
+      registry_ensure
+      registry_lock
+      taken "$selected" || {
+        echo "no such session: '$selected' (send @$(id -un) /sessions)" >&2; exit 2;
+      }
+      harness="$("$JQ" -r --arg n "$selected" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
+      if [ "$harness" != claude ] && [ "$harness" != codex ]; then
+        echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+        exit 2
+      fi
+      registry_edit --arg n "$selected" \
+        '.sessions |= with_entries(.value.whatsapp = (.key == $n))'
+      "$JQ" -cn --arg name "$selected" --arg harness "$harness" \
+        --argjson stopped "$("$JQ" -r --arg n "$selected" '.sessions[$n].stopped == true' "$REGISTRY_FILE")" \
+        '{name: $name, harness: $harness, stopped: $stopped}'
+      registry_unlock
+      exit 0
+    fi
+    if [ "$name" = clear ]; then
+      [ $# -eq 1 ] || { usage >&2; exit 2; }
+      registry_ensure
+      registry_edit '.sessions |= with_entries(.value.whatsapp = false)'
+      echo '{}'
+      exit 0
+    fi
+    if [ "$name" = spawn ]; then
+      profile="${2:-}"
+      [ $# -eq 2 ] || { usage >&2; exit 2; }
+      if [ "$profile" = default ]; then
+        profile="$("${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" default 2>/dev/null)" || profile=""
+      fi
+      if [ -z "$profile" ]; then
+        echo "No WhatsApp profile is selected and this box has no default profile." >&2
+        exit 2
+      fi
+      "$0" add --profile "$profile" --whatsapp true \
+        --prompt "WhatsApp is connected to this session. Reply to incoming messages with the WhatsApp reply tool." >&2
+      "$JQ" -ce '[.sessions | to_entries[] |
+        select(.value.whatsapp == true and (.value.agent == "claude" or .value.agent == "codex")) |
+        {name: .key, harness: .value.agent, stopped: (.value.stopped == true)}] | if length == 1 then .[0] else error("expected one WhatsApp session") end' \
+        "$REGISTRY_FILE"
+      exit 0
+    fi
+    valid_name "$name" || { usage >&2; exit 2; }
+    action="${2:-}"
+    [ $# -eq 2 ] || { usage >&2; exit 2; }
+    case "$action" in
+      status)
+        [ -s "$REGISTRY_FILE" ] && taken "$name" || {
+          echo "no such session: '$name' (see agent-box-session ls)" >&2; exit 2;
+        }
+        "$JQ" -r --arg n "$name" 'if .sessions[$n].whatsapp == true then "on" else "off" end' "$REGISTRY_FILE"
+        ;;
+      on|off)
+        registry_ensure
+        registry_lock
+        taken "$name" || {
+          echo "no such session: '$name' (see agent-box-session ls)" >&2; exit 2;
+        }
+        harness="$("$JQ" -r --arg n "$name" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
+        if [ "$action" = on ] && [ "$harness" != claude ] && [ "$harness" != codex ]; then
+          echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+          exit 2
+        fi
+        if [ "$action" = on ]; then
+          registry_edit --arg n "$name" \
+            '.sessions |= with_entries(.value.whatsapp = (.key == $n))'
+        else
+          registry_edit --arg n "$name" '.sessions[$n].whatsapp = false'
+        fi
+        registry_unlock
+        echo "WhatsApp $action for session '$name'"
+        [ "$harness" != claude ] || echo "Restart the Claude session to apply its channel setting."
+        ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    ;;
   add)
     # NAME is optional and positional: a leading non-flag arg is the name,
     # otherwise the name is auto-derived from the agent below.
@@ -1056,7 +1166,8 @@ case "$cmd" in
       *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
     harness="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
-    profile=""; has_harness=0; ephemeral=0; remote_control=""
+    profile=""; has_harness=0; ephemeral=0; remote_control=""; whatsapp=false
+    origin="user"; hook_source=""; hook_repo=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --harness) harness="${2:?--harness needs a value}"; has_harness=1; shift 2 ;;
@@ -1079,9 +1190,25 @@ case "$cmd" in
                 exit 2 ;;
           esac
           shift 2 ;;
+        --whatsapp)
+          case "${2:?--whatsapp needs 'true' or 'false'}" in
+            (true|false) whatsapp="$2" ;;
+            (*) echo "agent-box-session: --whatsapp must be 'true' or 'false'" >&2; exit 2 ;;
+          esac
+          shift 2 ;;
         --prompt) prompt="${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
         --resume-prompt) rprompt="${2?--resume-prompt needs a value}"; has_rprompt=1; shift 2 ;;
         --ephemeral) ephemeral=1; shift ;;
+        # Recorded for the web session list (issue #787); the webhook
+        # spawner passes both. --hook is SOURCE then REPOSITORY.
+        --origin)
+          case "${2:?--origin needs a value}" in
+            (user|agent|webhook) origin="$2" ;;
+            (*) echo "agent-box-session: --origin must be user, agent or webhook" >&2
+                exit 2 ;;
+          esac
+          shift 2 ;;
+        --hook) hook_source="${2:?--hook needs SOURCE REPOSITORY}"; hook_repo="${3?--hook needs SOURCE REPOSITORY}"; shift 3 ;;
         --) shift; break ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
@@ -1142,6 +1269,12 @@ case "$cmd" in
     # this CLI also runs from the webhook receiver unit's PATH, which carries
     # jq, coreutils and this script and nothing else.
     pargs=()
+    # Neither --profile nor --harness: the DEFAULT profile, when one is set
+    # (agent-box-profile default). An explicit --harness still means that bare
+    # harness, so a script that names one keeps getting exactly it.
+    if [ -z "$profile" ] && [ "$has_harness" = 0 ]; then
+      profile="$("${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" default 2>/dev/null)" || profile=""
+    fi
     if [ -n "$profile" ]; then
       # --harness on the command line wins over the profile's harness, the same
       # override order the env file has over the NixOS option elsewhere here —
@@ -1182,6 +1315,10 @@ case "$cmd" in
       (*" $harness "*) ;;
       (*) echo "harness '$harness' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
+    if [ "$whatsapp" = true ] && [ "$harness" != claude ] && [ "$harness" != codex ]; then
+      echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+      exit 2
+    fi
     registry_ensure
     # Name choice and write are one critical section (issue #254): gen_name
     # and taken() both decide from a READ of the file, so two concurrent adds
@@ -1196,7 +1333,11 @@ case "$cmd" in
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
     fi
-    "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
+    # Shell panes are operator terminals, not agent workers, so only worker
+    # harnesses go through the shared agent-session admission cap (issue #795).
+    if [ "$harness" != shell ]; then
+      "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
+    fi
     # The id this session's FIRST spawn is launched with (Claude
     # --session-id / --resume; Codex transcript marker). Not a stable handle
     # on the conversation: a clear, a compact or a resume rotates the agent
@@ -1215,7 +1356,11 @@ case "$cmd" in
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
       --arg prof "$profile" --arg eph "$ephemeral" --argjson rc "$remote_control" \
-      '.sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
+      --argjson whatsapp "$whatsapp" \
+      --arg origin "$origin" --arg hsrc "$hook_source" --arg hrepo "$hook_repo" \
+      '(if $whatsapp then .sessions |= with_entries(.value.whatsapp = false) else . end)
+       | .sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
+                        whatsapp: $whatsapp,
                         remoteControlName: null,
                         workingDirectory: (if $c == "" then null else $c end),
                         extraArgs: $ARGS.positional,
@@ -1223,7 +1368,14 @@ case "$cmd" in
                         initialPrompt: (if $pp == "1" then $p else null end),
                         resumePrompt: (if $rpp == "1" then $rp else null end),
                         boxSessionId: (if $bid == "" then null else $bid end),
-                        hasRun: false}
+                        hasRun: false,
+                        origin: $origin,
+                        createdAt: (now | floor)}
+                       # Who started it, for the web list (issue #787); the
+                       # webhook spawner says which event source and repo.
+                       + (if $hsrc != "" and $hrepo != "" then
+                            {hook: {source: $hsrc, repository: $hrepo}}
+                          else {} end)
                        # Added only when set, so every session that is NOT
                        # one-shot keeps the entry shape it has always had.
                        + (if $eph == "1" then {ephemeral: true} else {} end))' \

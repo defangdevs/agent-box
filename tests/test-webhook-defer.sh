@@ -85,7 +85,7 @@ chmod +x "$work/bin/tmux"
 export AGENT_BOX_TMUX_BIN="$work/bin/tmux"
 export AGENT_BOX_CAPACITY_BIN="$work/capacity"
 export AGENT_BOX_SESSION_LIMIT_FILE="$work/limit"
-export AGENT_BOX_AGENTS=shell AGENT_BOX_DEFAULT_AGENT=shell
+export AGENT_BOX_AGENTS=claude AGENT_BOX_DEFAULT_AGENT=claude
 export AGENT_BOX_FLOCK_BIN="$(command -v flock)"
 
 fails=0
@@ -157,6 +157,23 @@ else
   fail "a slot below the cap spawns — exit $rc"
   sed 's/^/     /' "$work/spawn.out"
 fi
+# A watch that names no profile starts the box default HARNESS, named outright
+# (issue #753): a bare `add` would start the user's DEFAULT profile, and a
+# watch's worker must never follow what is preselected for interactive use.
+mkdir -p "$HOME/.config/agent-box/profiles"
+printf 'HARNESS=claude\n' > "$HOME/.config/agent-box/profiles/picked.env"
+printf 'picked\n' > "$HOME/.config/agent-box/profiles/.default"
+: > "$work/session.log"
+hook_registry 1
+rc=$(spawn defangdevs/nodefault 2)
+if [ "$rc" = 0 ] && grep -q -- '--harness claude' "$work/session.log" \
+   && ! grep -q -- '--profile' "$work/session.log"; then
+  ok "a watch with no profile names the box harness, never the default profile"
+else
+  fail "a watch with no profile names the box harness, never the default profile — exit $rc"
+  sed 's/^/     /' "$work/session.log" "$work/spawn.out"
+fi
+rm -rf "$HOME/.config/agent-box/profiles"
 # Invalid configuration is a retryable refusal, never an uncapped start.
 : > "$work/session.log"
 hook_registry 2

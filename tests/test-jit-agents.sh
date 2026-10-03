@@ -247,6 +247,17 @@ is "current/codex resolves to the binary it was handed" \
    "$(readlink -f "$HOME/.nix-profile/bin/codex")" \
    "$(readlink -f "$HOME/.codex/packages/standalone/current/codex")"
 
+# issue #788: a current daemon on a fresh box reads app-server-daemon/, not
+# standalone/, and needs current/bin/codex to be a file.
+is "the app-server-daemon layout resolves to the binary it was handed" \
+   "$(readlink -f "$HOME/.nix-profile/bin/codex")" \
+   "$(readlink -f "$HOME/.codex/packages/app-server-daemon/current/bin/codex")"
+if [ -f "$HOME/.codex/packages/app-server-daemon/current/bin/codex" ]; then
+  ok "app-server-daemon/current/bin/codex passes is_file()"
+else
+  no "app-server-daemon/current/bin/codex passes is_file()" "not a file"
+fi
+
 # --- a codex nothing on the box can RESOLVE is still mirrored ----------
 # The bug in issue #572: the settings page's Connections card runs its own
 # `nix profile add` and the eager table names a path the runtime profile

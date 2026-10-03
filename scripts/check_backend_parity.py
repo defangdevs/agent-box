@@ -223,6 +223,14 @@ BY_DESIGN = {
         "Python only and never builds this Nix "
         "payload, while the golden snapshot "
         "captures the real store-built one"),
+    "AGENT_BOX_CODEX_SESSION_DEFAULT": (
+        "module",
+        "a runtime setting, not configuration (issue #780): the settings "
+        "daemon and codex-remote-control.sh read it from the env store "
+        "(`agent-box-session env set`), so neither backend supplies it - "
+        "the module's golden payloads are only where the check's regex "
+        "sees the assignment in the shared payload text, the same shape "
+        "as AGENT_BOX_HOOK_SESSION_ARGS above"),
     "AGENT_BOX_SRC_DIR": ("module", SRC_TREE_BINDING),
     "AGENT_BOX_SRC_URL": ("module", SRC_TREE_BINDING),
     "AGENT_BOX_SRC_REV": ("module", SRC_TREE_BINDING),
@@ -231,8 +239,8 @@ BY_DESIGN = {
 }
 
 
-# One reason, cited by the four entries below, so it has one home rather
-# than four copies to keep in step. Box-wide only: the per-unit pass
+# One reason, cited by the three entries below, so it has one home rather
+# than three copies to keep in step. Box-wide only: the per-unit pass
 # subtracts everything already declared here, on the reasoning that a
 # one-sided name is one-sided in whatever unit carries it.
 CHECKOUT_GAP = (
@@ -241,19 +249,20 @@ CHECKOUT_GAP = (
     "Not for the reason an earlier draft of this entry gave - that a native "
     "box has no way to make a tree the running system - which stopped being "
     "true when the update became `git pull` on both backends (see "
-    "SRC_TREE_BINDING above). What is left is plumbing: these four are "
+    "SRC_TREE_BINDING above). What is left is plumbing: these three are "
     "PER-USER values, so the native side needs them in Spec, in config.yaml "
     "and in Renderer.user_env, and the one-spec-both-backends check (#451 PR "
     "1) requires the module to export them into the spec it generates "
     "tests/native/config.json from. That is the work; nothing about the "
-    "native model refuses it. Delete these entries when it lands")
+    "native model refuses it. The opt-in AGENT_BOX_CHECKOUT_FORK is absent "
+    "from the default golden config on both backends. Delete these entries "
+    "when it lands")
 
 # Divergences that are BUGS, each owned by an issue. This table must only ever
 # shrink: fixing a gap means deleting its line, and the staleness check below
 # makes that mandatory rather than optional.
 KNOWN_GAPS = {
     "AGENT_BOX_CHECKOUT_DIR": ("module", CHECKOUT_GAP),
-    "AGENT_BOX_CHECKOUT_FORK": ("module", CHECKOUT_GAP),
     "AGENT_BOX_CHECKOUT_REV": ("module", CHECKOUT_GAP),
     "AGENT_BOX_CHECKOUT_URL": ("module", CHECKOUT_GAP),
 }
