@@ -83,6 +83,20 @@ class WhatsAppInstallTest(unittest.TestCase):
         self.assertEqual("old bridge", (self.cli.RUNTIME / "bridge.mjs").read_text())
         self.assertEqual("linked", (self.cli.STATE / "auth-marker").read_text())
 
+    def test_interrupted_upgrade_restores_legacy_backup_before_download(self):
+        backup = self.cli.RUNTIME.with_name("local-whatsapp.previous")
+        self.cli.RUNTIME.rename(backup)
+        self.run_install(corrupt=True)
+        self.assertEqual("old bridge", (self.cli.RUNTIME / "bridge.mjs").read_text())
+        self.assertFalse(backup.exists())
+
+    def test_interrupted_upgrade_restores_pending_runtime(self):
+        pending = self.cli.RUNTIME.with_name("local-whatsapp.pending")
+        self.cli.RUNTIME.rename(pending)
+        self.run_install(corrupt=True)
+        self.assertEqual("old bridge", (self.cli.RUNTIME / "bridge.mjs").read_text())
+        self.assertFalse(pending.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

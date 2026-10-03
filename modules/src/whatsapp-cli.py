@@ -60,9 +60,19 @@ def runtime_matches():
 
 def install():
     ensure_node()
-    if RUNTIME.is_symlink():
+    backup = RUNTIME.with_name(RUNTIME.name + ".previous")
+    pending = RUNTIME.with_name(RUNTIME.name + ".pending")
+    if any(path.is_symlink() for path in (RUNTIME, backup, pending)):
         raise RuntimeError("WhatsApp runtime cannot be a symlink")
+    if not RUNTIME.exists():
+        for candidate in (pending, backup):
+            if candidate.exists():
+                candidate.rename(RUNTIME)
+                break
     if runtime_matches():
+        for old in (pending, backup):
+            if old.exists():
+                shutil.rmtree(old)
         return
     private_dir(RUNTIME.parent)
     with tempfile.TemporaryDirectory(prefix="local-whatsapp-", dir=RUNTIME.parent) as raw:
@@ -80,21 +90,21 @@ def install():
         env["PATH"] = str(NODE.parent) + os.pathsep + env.get("PATH", "")
         subprocess.run([str(NPM), "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
                        cwd=stage, env=env, check=True, timeout=900)
-        backup = RUNTIME.with_name(RUNTIME.name + ".previous")
-        if RUNTIME.is_symlink() or backup.is_symlink():
+        if any(path.is_symlink() for path in (RUNTIME, backup, pending)):
             raise RuntimeError("WhatsApp runtime cannot be a symlink")
-        if backup.exists():
-            shutil.rmtree(backup)
+        if pending.exists() and RUNTIME.exists():
+            shutil.rmtree(pending)
         if RUNTIME.exists():
-            RUNTIME.rename(backup)
+            RUNTIME.rename(pending)
         try:
             stage.rename(RUNTIME)
         except OSError:
-            if backup.exists():
-                backup.rename(RUNTIME)
+            if pending.exists() and not RUNTIME.exists():
+                pending.rename(RUNTIME)
             raise
-        if backup.exists():
-            shutil.rmtree(backup)
+        for old in (pending, backup):
+            if old.exists():
+                shutil.rmtree(old)
     RUNTIME.chmod(0o700)
 
 

@@ -5350,9 +5350,19 @@ def runtime_matches():
 
 def install():
     ensure_node()
-    if RUNTIME.is_symlink():
+    backup = RUNTIME.with_name(RUNTIME.name + ".previous")
+    pending = RUNTIME.with_name(RUNTIME.name + ".pending")
+    if any(path.is_symlink() for path in (RUNTIME, backup, pending)):
         raise RuntimeError("WhatsApp runtime cannot be a symlink")
+    if not RUNTIME.exists():
+        for candidate in (pending, backup):
+            if candidate.exists():
+                candidate.rename(RUNTIME)
+                break
     if runtime_matches():
+        for old in (pending, backup):
+            if old.exists():
+                shutil.rmtree(old)
         return
     private_dir(RUNTIME.parent)
     with tempfile.TemporaryDirectory(prefix="local-whatsapp-", dir=RUNTIME.parent) as raw:
@@ -5370,21 +5380,21 @@ def install():
         env["PATH"] = str(NODE.parent) + os.pathsep + env.get("PATH", "")
         subprocess.run([str(NPM), "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
                        cwd=stage, env=env, check=True, timeout=900)
-        backup = RUNTIME.with_name(RUNTIME.name + ".previous")
-        if RUNTIME.is_symlink() or backup.is_symlink():
+        if any(path.is_symlink() for path in (RUNTIME, backup, pending)):
             raise RuntimeError("WhatsApp runtime cannot be a symlink")
-        if backup.exists():
-            shutil.rmtree(backup)
+        if pending.exists() and RUNTIME.exists():
+            shutil.rmtree(pending)
         if RUNTIME.exists():
-            RUNTIME.rename(backup)
+            RUNTIME.rename(pending)
         try:
             stage.rename(RUNTIME)
         except OSError:
-            if backup.exists():
-                backup.rename(RUNTIME)
+            if pending.exists() and not RUNTIME.exists():
+                pending.rename(RUNTIME)
             raise
-        if backup.exists():
-            shutil.rmtree(backup)
+        for old in (pending, backup):
+            if old.exists():
+                shutil.rmtree(old)
     RUNTIME.chmod(0o700)
 
 
@@ -12483,10 +12493,21 @@ esac
         installed="$HOME/.claude/plugins/installed_plugins.json"
         if ! [ -s "$installed" ] || ! "$JQ" -e --arg ref "$WHATSAPP_PLUGIN_REF" \
              '.plugins[$ref] // [] | length > 0' "$installed" >/dev/null 2>&1; then
-          cbin="$(agent_bin claude)" || cbin=""
-          if [ -n "$cbin" ]; then
-            "$cbin" plugin marketplace update "$WEBHOOK_MARKETPLACE" >/dev/null 2>&1 || true
-            "$cbin" plugin install "$WHATSAPP_PLUGIN_REF" >/dev/null 2>&1 || true
+          wa_marker="$HOME/.claude/plugins/.agent-box-whatsapp-install"
+          wa_now="$(date +%s)"
+          wa_last=0
+          [ -s "$wa_marker" ] && read -r wa_last < "$wa_marker" || true
+          case "$wa_last" in (""|*[!0-9]*) wa_last=0 ;; esac
+          if [ $((wa_now - wa_last)) -ge 3600 ]; then
+            cbin="$(agent_bin claude)" || cbin=""
+            if [ -n "$cbin" ]; then
+              mkdir -p "$HOME/.claude/plugins"
+              printf '%s\n' "$wa_now" > "$wa_marker"
+              timeout 90 "$cbin" plugin marketplace update "$WEBHOOK_MARKETPLACE" >/dev/null 2>&1 || true
+              if ! timeout 90 "$cbin" plugin install "$WHATSAPP_PLUGIN_REF" >/dev/null 2>&1; then
+                echo "local-whatsapp plugin: install failed; will retry after the cooldown" >&2
+              fi
+            fi
           fi
         fi
       fi

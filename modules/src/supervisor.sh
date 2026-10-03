@@ -423,10 +423,21 @@ seed_claude_state() {
     installed="$HOME/.claude/plugins/installed_plugins.json"
     if ! [ -s "$installed" ] || ! "$JQ" -e --arg ref "$WHATSAPP_PLUGIN_REF" \
          '.plugins[$ref] // [] | length > 0' "$installed" >/dev/null 2>&1; then
-      cbin="$(agent_bin claude)" || cbin=""
-      if [ -n "$cbin" ]; then
-        "$cbin" plugin marketplace update "$WEBHOOK_MARKETPLACE" >/dev/null 2>&1 || true
-        "$cbin" plugin install "$WHATSAPP_PLUGIN_REF" >/dev/null 2>&1 || true
+      wa_marker="$HOME/.claude/plugins/.agent-box-whatsapp-install"
+      wa_now="$(date +%s)"
+      wa_last=0
+      [ -s "$wa_marker" ] && read -r wa_last < "$wa_marker" || true
+      case "$wa_last" in (""|*[!0-9]*) wa_last=0 ;; esac
+      if [ $((wa_now - wa_last)) -ge 3600 ]; then
+        cbin="$(agent_bin claude)" || cbin=""
+        if [ -n "$cbin" ]; then
+          mkdir -p "$HOME/.claude/plugins"
+          printf '%s\n' "$wa_now" > "$wa_marker"
+          timeout 90 "$cbin" plugin marketplace update "$WEBHOOK_MARKETPLACE" >/dev/null 2>&1 || true
+          if ! timeout 90 "$cbin" plugin install "$WHATSAPP_PLUGIN_REF" >/dev/null 2>&1; then
+            echo "local-whatsapp plugin: install failed; will retry after the cooldown" >&2
+          fi
+        fi
       fi
     fi
   fi
