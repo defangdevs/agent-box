@@ -19715,6 +19715,37 @@ def connect_logout_commands(flow):
     return [flow["logout"] + ["--user", login] for login in logins]
 
 
+def connect_confirmed_disconnected(flow, proc):
+    """True only when a status answer explicitly says there is no login.
+
+    The normal card parsers intentionally collapse every error into "not
+    connected". That is the safe rendering default, but it is not enough to
+    justify deleting an agent-box API key after a failed logout: a network
+    error, malformed output, or a broken CLI must remain unknown here.
+    """
+    text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip().lower()
+    if flow["id"] == "claude":
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except ValueError:
+            return False
+        return isinstance(data, dict) and data.get("loggedIn") is False
+    if flow["id"] == "codex":
+        return "not logged in" in text
+    if flow["id"] == "github":
+        return "not logged into any github hosts" in text
+    if flow["id"] == "defang":
+        return "missing bearer token" in text
+    if flow["id"] == "whatsapp":
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except ValueError:
+            return False
+        return (proc.returncode == 0 and isinstance(data, dict)
+                and data.get("paired") is False)
+    return False
+
+
 def connect_logout(flow):
     """Run the provider's logout and remove agent-box overrides.
 
@@ -19737,9 +19768,9 @@ def connect_logout(flow):
                 if status is None:
                     return ("Could not verify whether %s signed out. Try again."
                             % flow["label"])
-                connected = CONNECT_PARSERS[flow["parse"]](status)[0]
-                if connected:
-                    return "%s is still connected; its sign-out command failed." % flow["label"]
+                if not connect_confirmed_disconnected(flow, status):
+                    return ("%s may still be connected; its sign-out command failed."
+                            % flow["label"])
         try:
             delete_keys(flow["remove"])
         except OSError:

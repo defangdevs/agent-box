@@ -237,7 +237,19 @@ class ConnectionLogoutTest(unittest.TestCase):
         ]
         with mock.patch.object(self.daemon.subprocess, "run", side_effect=replies):
             error = self.daemon.connect_logout(flow)
-        self.assertIn("still connected", error)
+        self.assertIn("may still be connected", error)
+        self.assertEqual(["ANTHROPIC_API_KEY"], self.daemon.read_keys())
+
+    def test_failed_logout_keeps_secret_when_status_is_ambiguous(self):
+        self.write_env("ANTHROPIC_API_KEY=secret\n")
+        flow = self.flow()
+        replies = [
+            self.daemon.subprocess.CompletedProcess([], 1, "", "logout failed"),
+            self.daemon.subprocess.CompletedProcess([], 1, "", "network unavailable"),
+        ]
+        with mock.patch.object(self.daemon.subprocess, "run", side_effect=replies):
+            error = self.daemon.connect_logout(flow)
+        self.assertIn("may still be connected", error)
         self.assertEqual(["ANTHROPIC_API_KEY"], self.daemon.read_keys())
 
     def test_already_logged_out_is_idempotent_and_removes_override(self):
