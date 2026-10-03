@@ -34,13 +34,20 @@ class Watches(unittest.TestCase):
         self.state.mkdir()
         self.profiles = self.root / '.config/agent-box/profiles'
         self.profiles.mkdir(parents=True)
+        src = REPO / 'modules/src'
+        envstore = self.root / 'envstore'
+        envstore.write_text('#!' + sys.executable + '\n'
+                            + (src / 'lib/envstore.py').read_text() + '\n'
+                            + (src / 'envstore-cli.py').read_text())
+        envstore.chmod(0o700)
         for name in ('triage', 'debugger'):
             (self.profiles / (name + '.env')).write_text('HARNESS=claude\n')
         self.env = dict(os.environ, HOME=str(self.root),
                         LOCAL_WEBHOOK_STATE_DIR=str(self.state),
                         LOCAL_WEBHOOK_SESSION='test', LOCAL_WEBHOOK_PORT='0',
                         AGENT_BOX_WEBHOOK_SCRIPT=str(WEBHOOK),
-                        AGENT_BOX_ENVSTORE_BIN='false',
+                        AGENT_BOX_ENVSTORE_BIN=str(envstore),
+                        AGENT_BOX_JQ_BIN=shutil.which('jq'),
                         AGENT_BOX_SESSION_BIN='false',
                         AGENT_BOX_SETTINGS_ENV_FILE=str(self.root / 'env'),
                         AGENT_BOX_SETTINGS_USER='agent',
@@ -51,7 +58,6 @@ class Watches(unittest.TestCase):
         for key in ('CODEX_THREAD_ID', 'LOCAL_WEBHOOK_SPAWN_CONFIG',
                     'AGENT_BOX_HOOK_PROFILE', 'LOCAL_WEBHOOK_SELF'):
             self.env.pop(key, None)
-        src = REPO / 'modules/src'
         spawn = (src / 'webhook-spawn.sh').read_text()
         spawn = re.sub(r'@@include:([^@]+)@@',
                        lambda m: (src / m[1]).read_text(), spawn)
@@ -91,7 +97,8 @@ class Watches(unittest.TestCase):
     def subscribe(self, name, profile, events):
         # Name before topic catches the wrapper mistaking its value for a topic.
         p = self.cli('subscribe', '--name', name, 'owner/repo', '--deliver-to',
-                     'subagent', '--profile', profile, '--when', json.dumps(events))
+                     'subagent', '--profile', profile, '--auth', 'saved-login',
+                     '--when', json.dumps(events))
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
 
     def entries(self):
@@ -154,7 +161,7 @@ class Watches(unittest.TestCase):
                                       ('ci', 'ci', 'debugger')]:
             self.assertIn('webhook_saved', self.post(
                 'save', mode='create', topic='owner/repo', watch_name=name,
-                profile=profile, events=events))
+                profile=profile, auth='saved-login', events=events))
         first = self.entries()[0]
         self.assertIn('webhook_saved', self.post(
             'save', mode='edit', topic='owner/repo', watch_name='ci',
@@ -188,10 +195,12 @@ class Watches(unittest.TestCase):
             'save', mode='profile', topic='owner/repo', watch_name='', profile='debugger'))
         entry = self.entries()[0]
         self.assertEqual(entry['include'], before['include'])
-        self.assertEqual(entry['spawnConfig'], {'profile': 'debugger', 'extra': 'keep'})
+        self.assertEqual(entry['spawnConfig'], {'profile': 'debugger', 'extra': 'keep',
+                                                'authMode': 'saved-login'})
         self.assertIn('webhook_saved', self.post(
             'save', mode='profile', topic='owner/repo', watch_name='', profile=''))
-        self.assertEqual(self.entries()[0]['spawnConfig'], {'extra': 'keep'})
+        self.assertEqual(self.entries()[0]['spawnConfig'],
+                         {'extra': 'keep', 'authMode': 'saved-login'})
 
     def test_cross_origin_save_is_rejected(self):
         c = http.client.HTTPConnection(*self.server.server_address, timeout=15)
@@ -288,6 +297,127 @@ class Watches(unittest.TestCase):
         log.flush()
         self.assertCountEqual(launches, ['triage', 'debugger'],
                               (self.root / 'receiver.log').read_text())
+
+    def test_api_key_watch_rejects_missing_key_and_never_falls_back(self):
+        rule = json.dumps(self.d.WATCH_EVENTS['issues'][1])
+        args = ('subscribe', 'owner/repo', '--deliver-to', 'subagent',
+                '--name', 'keyed', '--profile', 'triage', '--when', rule)
+        p = self.cli(*args)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn('ANTHROPIC_API_KEY', p.stderr)
+        self.assertFalse((self.state / 'filter.dispatch.json').exists())
+
+        (self.profiles / 'triage.env').write_text(
+            'HARNESS=claude\nANTHROPIC_API_KEY=secret-fixture\n')
+        global_env = self.root / '.config/agent-box/env'
+        global_env.write_text('ANTHROPIC_AUTH_TOKEN=conflicting-token\n')
+        p = self.cli(*args)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn('ANTHROPIC_AUTH_TOKEN', p.stderr)
+        global_env.unlink()
+        p = self.cli(*args)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        entry = self.entries()[0]
+        self.assertEqual(entry['spawnConfig'],
+                         {'profile': 'triage', 'authMode': 'api-key'})
+        self.assertNotIn('secret-fixture', json.dumps(entry))
+        status = self.cli('auth-status', 'owner/repo', '--name', 'keyed')
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)['ready'], True)
+        p = self.cli('subscribe', 'owner/repo', '--deliver-to', 'subagent',
+                     '--name', 'keyed', '--note', 'updated', '--when', rule)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.entries()[0]['spawnConfig'], entry['spawnConfig'])
+        p = self.cli('subscribe', 'owner/repo', '--deliver-to', 'subagent',
+                     '--name', 'keyed', '--profile', '', '--when', rule)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertEqual(self.entries()[0]['spawnConfig'], entry['spawnConfig'])
+        p = self.cli('subscribe', 'owner/repo', '--deliver-to', 'subagent',
+                     '--name', 'keyed', '--no-spawn-config', '--when', rule)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertEqual(self.entries()[0]['spawnConfig'], entry['spawnConfig'])
+
+        (self.profiles / 'triage.env').write_text('HARNESS=claude\n')
+        status = self.cli('auth-status', 'owner/repo', '--name', 'keyed')
+        self.assertEqual(status.returncode, 1, status.stderr)
+        self.assertIn('ANTHROPIC_API_KEY', status.stdout)
+        p = subprocess.run([str(self.spawn)], env=dict(
+            self.env, LOCAL_WEBHOOK_SPAWN_CONFIG=json.dumps(entry['spawnConfig'])),
+            input='event prompt', capture_output=True, text=True, timeout=10)
+        self.assertEqual(p.returncode, 75, p.stderr)
+        self.assertIn('ANTHROPIC_API_KEY', p.stderr)
+        self.assertNotIn('secret-fixture', p.stderr)
+
+    def test_codex_api_key_uses_isolated_login(self):
+        fake_dir = self.root / 'bin'
+        fake_dir.mkdir()
+        fake = fake_dir / 'codex'
+        fake.write_text('#!' + sys.executable + '\n'
+                        'import json, os, pathlib, sys\n'
+                        'assert sys.argv[1:] == ["login", "--with-api-key"]\n'
+                        'key = sys.stdin.read()\n'
+                        'pathlib.Path(os.environ["CODEX_HOME"], "auth.json").write_text('
+                        'json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": key}))\n')
+        fake.chmod(0o700)
+        self.env['PATH'] = str(fake_dir) + os.pathsep + os.environ['PATH']
+        private_home = self.root / 'codex-watch'
+        (self.profiles / 'triage.env').write_text(
+            'HARNESS=codex\nOPENAI_API_KEY=secret-fixture\n'
+            f'CODEX_HOME={private_home}\n')
+        p = self.cli('subscribe', 'owner/repo', '--deliver-to', 'subagent',
+                     '--name', 'codex', '--profile', 'triage',
+                     '--when', json.dumps(self.d.WATCH_EVENTS['issues'][1]))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        auth = json.loads((private_home / 'auth.json').read_text())
+        self.assertEqual(auth, {'auth_mode': 'apikey',
+                                'OPENAI_API_KEY': 'secret-fixture'})
+        self.assertFalse((self.root / '.codex/auth.json').exists())
+        self.assertNotIn('secret-fixture', json.dumps(self.entries()))
+        default_home = self.root / '.codex'
+        default_home.mkdir()
+        default_auth = default_home / 'auth.json'
+        default_auth.write_text('{"auth_mode":"chatgpt"}')
+        (private_home / 'auth.json').unlink()
+        (private_home / 'auth.json').symlink_to(default_auth)
+        p = self.cli('auth-status', 'owner/repo', '--name', 'codex')
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn('must not link', p.stdout)
+        p = self.cli('subscribe', 'owner/repo', '--deliver-to', 'subagent',
+                     '--name', 'codex', '--auth', 'api-key')
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertEqual(default_auth.read_text(), '{"auth_mode":"chatgpt"}')
+
+    def test_settings_requires_api_profile_and_labels_auth_mode(self):
+        fields = dict(mode='create', topic='owner/repo', watch_name='keyed',
+                      profile='triage', events='issues')
+        with patch.dict(os.environ, self.env, clear=True):
+            self.assertIn('webhook_auth', self.post('save', **fields))
+        self.assertFalse((self.state / 'filter.dispatch.json').exists())
+        (self.profiles / 'triage.env').write_text(
+            'HARNESS=claude\nANTHROPIC_API_KEY=secret-fixture\n')
+        with patch.dict(os.environ, self.env, clear=True):
+            self.assertIn('webhook_saved', self.post('save', **fields))
+        self.assertEqual(self.entries()[0]['spawnConfig']['authMode'], 'api-key')
+        with patch.dict(os.environ, self.env, clear=True):
+            markup = self.d.render_webhooks(self.entries())
+        self.assertIn('Auth: API key', markup)
+        self.assertNotIn('secret-fixture', markup)
+        editor = self.d.render_watch_editor(self.entries()[0])
+        self.assertIn('value="api-key" selected', editor)
+
+    def test_legacy_watch_keeps_its_auth_choice_on_renewal(self):
+        self.subscribe('old', 'triage', self.d.WATCH_EVENTS['issues'][1])
+        dispatch = self.state / 'filter.dispatch.json'
+        data = json.loads(dispatch.read_text())
+        del data['topics'][0]['spawnConfig']['authMode']
+        dispatch.write_text(json.dumps(data))
+        p = self.cli('subscribe', 'owner/repo', '--deliver-to', 'subagent',
+                     '--name', 'old', '--profile', 'debugger',
+                     '--when', json.dumps(self.d.WATCH_EVENTS['issues'][1]))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.entries()[0]['spawnConfig'], {'profile': 'debugger'})
+        markup = self.d.render_webhooks(self.entries())
+        self.assertIn('Auth: existing behavior (review)', markup)
 
 
 if __name__ == '__main__':

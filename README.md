@@ -532,8 +532,8 @@ agent-box-session env set AGENT_BOX_HOOK_PROFILE triage
 Every later dispatched `hook-*` session then starts as that worker, and the
 webhook panel on the settings page names it under the watch (that panel prints
 the spawn wrapper's own `--preamble`, so there is one copy of the answer). A
-renamed or deleted profile is reported and ignored — a delivery is never
-dropped over it.
+renamed or deleted profile is reported and ignored for existing and
+saved-login watches. API-key watches require the profile they name.
 
 That setting is box-wide. A single watch names its own worker, which beats it:
 
@@ -547,6 +547,19 @@ So one repo can triage new issues cheaply and put something stronger on a red
 build. The choice is stored on the subscription itself (`spawnConfig.profile`,
 local-webhook 0.25.0) and shown by `agent-box-webhook ls`; `--profile ''`
 clears it.
+
+New standing watches default to `--auth api-key`. The selected profile must
+have `ANTHROPIC_API_KEY` for Claude, or `OPENAI_API_KEY` plus a separate
+absolute `CODEX_HOME` under HOME for Codex.
+Add the key in the settings page's profile editor so it stays out of command
+arguments and the watch rule. Codex's interactive CLI is logged into that
+`CODEX_HOME` through `codex login --with-api-key` on stdin. Claude may ask for
+one-time approval of the key. The CLI and
+settings page refuse an API-key watch until its profile is ready; dispatch
+defers an event if its key or profile disappears. They cannot establish that
+a provider will accept the key later. `--auth saved-login` explicitly opts a
+watch into the Connections login. Watches made before this setting existed
+retain their previous behavior and appear as such in the settings page.
 
 **New user or new session?** A user is the trust boundary; a session is a
 unit of work, and sessions of one user are *not* isolated from each other.

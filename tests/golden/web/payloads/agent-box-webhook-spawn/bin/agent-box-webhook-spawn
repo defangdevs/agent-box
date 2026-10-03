@@ -383,7 +383,8 @@ watch_profile=""
 watch_config=""
 if [ -n "${LOCAL_WEBHOOK_SPAWN_CONFIG:-}" ]; then
   watch_config="$LOCAL_WEBHOOK_SPAWN_CONFIG"
-elif { [ "${1:-}" = "--preamble" ] || [ "${1:-}" = "--resolved-profile" ]; } \
+elif { [ "${1:-}" = "--preamble" ] || [ "${1:-}" = "--resolved-profile" ] \
+       || [ "${1:-}" = "--auth-status" ] || [ "${1:-}" = "--prepare-auth" ]; } \
      && [ -n "${2:-}" ] && [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ]; then
   # Best effort, like every other read here: no file, bad JSON or no such topic
   # all mean "this watch names no profile", never a failed render.
@@ -401,6 +402,134 @@ if [ -n "$watch_config" ]; then
     'if type == "object" and (.profile | type) == "string" then .profile else empty end' \
     <<<"$watch_config" 2>/dev/null) || watch_profile=""
 fi
+
+# Authentication belongs to the watch, not to the worker profile. A profile
+# supplies a key; Codex also needs an isolated CLI state directory. A legacy
+# watch has no authMode and keeps its old launch path.
+[ -n "$watch_config" ] || watch_config='{}'
+watch_auth_mode=$("$JQ" -r 'if type == "object" then .authMode // "legacy" else "legacy" end' \
+  <<<"$watch_config" 2>/dev/null) || watch_auth_mode=invalid
+watch_auth_reason=""
+watch_auth_harness=""
+watch_auth_home=""
+watch_auth_key=""
+watch_auth_codex_bin=""
+watch_auth_get() {
+  "$ENVSTORE" --profile "$watch_profile" get "$1" 2>/dev/null || true
+}
+watch_auth_check() {
+  case "$watch_auth_mode" in
+    (legacy|saved-login) return 0 ;;
+    (api-key) ;;
+    (*) watch_auth_reason="invalid watch authMode"; return 1 ;;
+  esac
+  if [ -z "$watch_profile" ] || [ -n "$(profile_problem "$watch_profile")" ]; then
+    watch_auth_reason="API-key watches need an existing explicit profile"
+    return 1
+  fi
+  watch_auth_harness=$(watch_auth_get HARNESS)
+  case "$watch_auth_harness" in
+    (claude)
+      watch_auth_key=$(watch_auth_get ANTHROPIC_API_KEY)
+      if [ -z "$watch_auth_key" ]; then
+        watch_auth_reason="profile $watch_profile needs ANTHROPIC_API_KEY"
+        return 1
+      fi
+      for key in ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN \
+                 CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY; do
+        if [ -n "$(watch_auth_get "$key")" ] || [ -n "$("$ENVSTORE" get "$key" 2>/dev/null || true)" ]; then
+          watch_auth_reason="$key conflicts with Claude API-key authentication"
+          return 1
+        fi
+      done ;;
+    (codex)
+      watch_auth_key=$(watch_auth_get OPENAI_API_KEY)
+      watch_auth_home=$(watch_auth_get CODEX_HOME)
+      if [ -z "$watch_auth_key" ]; then
+        watch_auth_reason="profile $watch_profile needs OPENAI_API_KEY"
+        return 1
+      fi
+      if [ -z "$watch_auth_home" ] || [ "${watch_auth_home#/}" = "$watch_auth_home" ] \
+         || [ "$(realpath -m "$watch_auth_home")" = "$(realpath -m "$HOME/.codex")" ]; then
+        watch_auth_reason="profile $watch_profile needs a separate absolute CODEX_HOME"
+        return 1
+      fi
+      watch_auth_codex_bin="$HOME/.nix-profile/bin/codex"
+      if [ ! -x "$watch_auth_codex_bin" ]; then
+        watch_auth_codex_bin=$(command -v codex 2>/dev/null) || watch_auth_codex_bin=""
+      fi
+      if [ -z "$watch_auth_codex_bin" ]; then
+        watch_auth_reason="Codex is not installed; start a Codex session to install it first"
+        return 1
+      fi ;;
+    (*) watch_auth_reason="profile $watch_profile needs HARNESS=claude or HARNESS=codex"
+        return 1 ;;
+  esac
+  if [ "$watch_auth_harness" = codex ]; then
+    case "$(realpath -m "$watch_auth_home")" in
+      ("$(realpath -m "$HOME")"/*) ;;
+      (*) watch_auth_reason="profile $watch_profile needs CODEX_HOME under HOME"
+          return 1 ;;
+    esac
+    if [ -L "$watch_auth_home/auth.json" ]; then
+      watch_auth_reason="CODEX_HOME/auth.json must not link to another login"
+      return 1
+    fi
+    if [ -e "$watch_auth_home/auth.json" ]; then
+      links=$(stat -c %h "$watch_auth_home/auth.json" 2>/dev/null) || links=0
+      if [ "$links" != 1 ]; then
+        watch_auth_reason="CODEX_HOME/auth.json must be a private file"
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+watch_auth_prepare() {
+  watch_auth_check || return 1
+  [ "$watch_auth_mode" = api-key ] || return 0
+  if [ "$watch_auth_harness" = codex ]; then
+    if ! mkdir -p "$watch_auth_home" || ! chmod 700 "$watch_auth_home"; then
+      watch_auth_reason="Codex cannot prepare CODEX_HOME for profile $watch_profile"
+      return 1
+    fi
+    # A changed profile key rotates the CLI login. Never put it in argv,
+    # stdout, stderr, or the saved watch configuration.
+    exec 9>"$watch_auth_home/.agent-box-auth.lock"
+    "${AGENT_BOX_FLOCK_BIN:-flock}" 9
+    if ! WATCH_AUTH_KEY="$watch_auth_key" "$JQ" -e \
+      '.auth_mode == "apikey" and .OPENAI_API_KEY == env.WATCH_AUTH_KEY' \
+      "$watch_auth_home/auth.json" >/dev/null 2>&1; then
+      if ! printf '%s' "$watch_auth_key" \
+           | CODEX_HOME="$watch_auth_home" "$watch_auth_codex_bin" login --with-api-key >/dev/null 2>&1; then
+        watch_auth_reason="Codex could not store the API-key login"
+        return 1
+      fi
+    fi
+    if ! WATCH_AUTH_KEY="$watch_auth_key" "$JQ" -e \
+      '.auth_mode == "apikey" and .OPENAI_API_KEY == env.WATCH_AUTH_KEY' \
+      "$watch_auth_home/auth.json" >/dev/null 2>&1; then
+      watch_auth_reason="Codex API-key login did not save the selected key"
+      return 1
+    fi
+    if ! chmod 600 "$watch_auth_home/auth.json"; then
+      watch_auth_reason="Codex cannot protect auth.json for profile $watch_profile"
+      return 1
+    fi
+  fi
+  return 0
+}
+watch_auth_report() {
+  local ready=false
+  if [ "$1" = --prepare-auth ]; then
+    watch_auth_prepare && ready=true
+  else
+    watch_auth_check && ready=true
+  fi
+  "$JQ" -n --arg mode "$watch_auth_mode" --arg reason "$watch_auth_reason" \
+    --argjson ready "$ready" '{mode:$mode,ready:$ready,reason:$reason}'
+  [ "$ready" = true ]
+}
 
 # '' when NAME can be launched, else why not. Checked HERE, not left to
 # `agent-box-session add --profile`, which exits 2 on an unknown profile: that
@@ -506,6 +635,12 @@ render_launch() {
   fi
   if [ "${#extra[@]}" -gt 0 ]; then printf ' %s' "${extra[@]}"; fi
   printf '\n'
+  case "$watch_auth_mode" in
+    (api-key) printf 'Authentication: API key from profile %s.\n' "$watch_profile" ;;
+    (saved-login) printf '%s\n' 'Authentication: saved CLI login allowed.' ;;
+    (legacy) printf '%s\n' 'Authentication: existing behavior, review this watch.' ;;
+    (*) printf '%s\n' 'Authentication: invalid mode; dispatch is deferred.' ;;
+  esac
   if [ -n "$hook_profile" ]; then
     printf '%s\n' "The harness, model, effort, appended system prompt and \
 environment come from that profile ($hook_profile_source) — read it back with \
@@ -545,6 +680,10 @@ fallback."
 # profile that was tried and passed over, most specific (the watch's own)
 # first — empty when nothing was named, distinct from `profile` being null
 # for "nothing resolved, so the box default harness starts".
+if [ "${1:-}" = "--auth-status" ] || [ "${1:-}" = "--prepare-auth" ]; then
+  watch_auth_report "$1"
+  exit $?
+fi
 if [ "${1:-}" = "--resolved-profile" ]; then
   "$JQ" -n --arg p "$hook_profile" --arg m "$hook_profile_ignored_names" \
     '{profile: (if $p == "" then null else $p end),
@@ -579,6 +718,10 @@ fi
 
 PROMPT="$(cat)"
 [ -n "$PROMPT" ] || exit 0
+if ! watch_auth_prepare; then
+  echo "agent-box-webhook-spawn: $watch_auth_reason; deferring this batch" >&2
+  exit 75
+fi
 
 # Admission belongs to agent-box-session, shared with interactive starts.
 # The wrapper only records retryable refusals for webhook status.

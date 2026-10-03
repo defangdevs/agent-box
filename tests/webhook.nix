@@ -594,7 +594,7 @@
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
-        " agent-box-webhook subscribe defangdevs/agent-box --deliver-to subagent"
+        " agent-box-webhook subscribe defangdevs/agent-box --deliver-to subagent --auth saved-login"
         " --note 'standing watch: triage'"
     )
     machine.succeed(
@@ -1288,7 +1288,7 @@
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
         " agent-box-webhook subscribe defangdevs/watch-profile"
-        " --deliver-to subagent --profile watchbot"
+        " --deliver-to subagent --profile watchbot --auth saved-login"
         " --note 'standing watch: its own worker'"
     )
     machine.succeed(
@@ -1463,7 +1463,8 @@
     )
     machine.succeed(
         "jq -e '[.topics[] | select(.topic =="
-        " \"github:defangdevs/watch-profile\")][0] | has(\"spawnConfig\") | not'"
+        " \"github:defangdevs/watch-profile\")][0].spawnConfig"
+        " == {\"authMode\":\"saved-login\"}'"
         " /home/agent/.local/state/local-webhook/filter.dispatch.json"
     )
 
@@ -1623,21 +1624,21 @@
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
-        " agent-box-webhook subscribe defangdevs/local-channels --deliver-to subagent"
+        " agent-box-webhook subscribe defangdevs/local-channels --deliver-to subagent --auth saved-login"
         " --note 'to be governed' --ignore-sender human"
     )
     machine.succeed(
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
-        " agent-box-webhook subscribe defangdevs/mention-demo --deliver-to subagent"
+        " agent-box-webhook subscribe defangdevs/mention-demo --deliver-to subagent --auth saved-login"
         " --note 'to be governed too'"
     )
     machine.succeed(
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
-        " agent-box-webhook subscribe defangdevs/review-demo --deliver-to subagent"
+        " agent-box-webhook subscribe defangdevs/review-demo --deliver-to subagent --auth saved-login"
         " --note 'to be governed as well'"
     )
     machine.succeed("systemctl restart agent-box-webhook@agent.service")
@@ -1931,7 +1932,7 @@
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SESSION=agent-main"
         " agent-box-webhook subscribe defangdevs/panel-profile"
-        " --deliver-to subagent --profile panelbot"
+        " --deliver-to subagent --profile panelbot --auth saved-login"
     )
     page = machine.succeed(f"{settings_curl} {settings_page}")
     for want in [
