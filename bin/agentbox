@@ -748,8 +748,8 @@ class Spec:
         legacy_domain_suffix = data.get("domainSuffix") or ""
         self.domain_suffixes = ([legacy_domain_suffix]
                                 if legacy_domain_suffix
-                                else list(data.get("domainSuffixes") or
-                                          ["sslip.io"]))
+                                else list(data.get("domainSuffixes")
+                                          or ["sslip.io"]))
         if len(set(self.domain_suffixes)) != len(self.domain_suffixes):
             raise ConfigError("domainSuffixes must not contain duplicates")
         if not all(DOMAIN_SUFFIX_RE.fullmatch(value)
