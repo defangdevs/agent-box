@@ -1105,6 +1105,7 @@ case "$cmd" in
     esac
     harness="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
     profile=""; has_harness=0; ephemeral=0; remote_control=""; whatsapp=false
+    origin="user"; hook_source=""; hook_repo=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --harness) harness="${2:?--harness needs a value}"; has_harness=1; shift 2 ;;
@@ -1136,6 +1137,16 @@ case "$cmd" in
         --prompt) prompt="${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
         --resume-prompt) rprompt="${2?--resume-prompt needs a value}"; has_rprompt=1; shift 2 ;;
         --ephemeral) ephemeral=1; shift ;;
+        # Recorded for the web session list (issue #787); the webhook
+        # spawner passes both. --hook is SOURCE then REPOSITORY.
+        --origin)
+          case "${2:?--origin needs a value}" in
+            (user|agent|webhook) origin="$2" ;;
+            (*) echo "agent-box-session: --origin must be user, agent or webhook" >&2
+                exit 2 ;;
+          esac
+          shift 2 ;;
+        --hook) hook_source="${2:?--hook needs SOURCE REPOSITORY}"; hook_repo="${3?--hook needs SOURCE REPOSITORY}"; shift 3 ;;
         --) shift; break ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
@@ -1280,6 +1291,7 @@ case "$cmd" in
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
       --arg prof "$profile" --arg eph "$ephemeral" --argjson rc "$remote_control" \
       --argjson whatsapp "$whatsapp" \
+      --arg origin "$origin" --arg hsrc "$hook_source" --arg hrepo "$hook_repo" \
       '.sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
                         whatsapp: $whatsapp,
                         remoteControlName: null,
@@ -1289,7 +1301,14 @@ case "$cmd" in
                         initialPrompt: (if $pp == "1" then $p else null end),
                         resumePrompt: (if $rpp == "1" then $rp else null end),
                         boxSessionId: (if $bid == "" then null else $bid end),
-                        hasRun: false}
+                        hasRun: false,
+                        origin: $origin,
+                        createdAt: (now | floor)}
+                       # Who started it, for the web list (issue #787); the
+                       # webhook spawner says which event source and repo.
+                       + (if $hsrc != "" and $hrepo != "" then
+                            {hook: {source: $hsrc, repository: $hrepo}}
+                          else {} end)
                        # Added only when set, so every session that is NOT
                        # one-shot keeps the entry shape it has always had.
                        + (if $eph == "1" then {ephemeral: true} else {} end))' \

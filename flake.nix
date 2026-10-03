@@ -2324,6 +2324,28 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The settings daemon's session API for portals (issue #787): the
+          # JSON list, web stop, and the JSON answers of restart/delete.
+          # Same subject (the GOLDEN PAYLOAD) as the pairing check above.
+          sessions-api =
+            pkgs.runCommand "agent-box-sessions-api"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-sessions-api.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-sessions-api.py
+              python3 repo/tests/test-sessions-api.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # render_connect_card()'s "checking" window: the status probe
           # never blocks a render, so every card starts "checking" on a
           # cold cache and the Sign-in button must exist there — while a
