@@ -143,6 +143,13 @@ in
             ;;
           "whoami --json")
             if [ -e ${stateDir}/defang-in ]; then
+              if [ "''${DEFANG_WORKSPACE:-}" = "ws-gone" ] \
+                  || { [ -n "''${DEFANG_ACCESS_TOKEN:-}" ] \
+                       && [ -n "''${DEFANG_WORKSPACE:-}" ] \
+                       && [ "''${DEFANG_WORKSPACE:-}" != "ws-personal" ]; }; then
+                echo "Error: requested workspace does not match the active credential" >&2
+                exit 16
+              fi
               echo '{"workspace":"stub-ws","subscriberTier":"pro","provider":"aws","region":"us-east-1"}'
             else
               echo "Error: missing bearer token" >&2
@@ -445,6 +452,39 @@ in
         assert [row["id"] for row in got["workspaces"] if row["current"]] == [
             "ws-team"
         ], got
+
+    with subtest("a stale defang workspace still exposes replacement choices"):
+        machine.succeed(as_agent(
+            "agent-box-session env set DEFANG_WORKSPACE ws-gone"
+        ))
+        machine.sleep(6)
+        got = wait_state("defang", "connected")
+        assert got["workspace_configured"] is False, got
+        assert [row["id"] for row in got["workspaces"]] == [
+            "ws-personal", "ws-team"
+        ], got
+        assert post(
+            "/agent/settings/connect/configure",
+            "flow=defang&workspace=ws-personal",
+        ) == "303"
+
+    with subtest("a fixed defang access token cannot select another workspace"):
+        machine.succeed(as_agent(
+            "agent-box-session env set DEFANG_ACCESS_TOKEN fixed-stub-token"
+        ))
+        machine.sleep(6)
+        got = wait_state("defang", "connected")
+        assert got["workspaces"] == [
+            {"name": "Personal", "id": "ws-personal", "current": True},
+        ], got
+        assert got["workspace_configured"] is False, got
+        assert post(
+            "/agent/settings/connect/configure",
+            "flow=defang&workspace=ws-team",
+        ) == "400"
+        machine.succeed(as_agent(
+            "agent-box-session env rm DEFANG_ACCESS_TOKEN"
+        ))
 
     with subtest("sign-in again works on a card that reports signed in"):
         # The card says "Signed in", which is WHY the button is pressed. A

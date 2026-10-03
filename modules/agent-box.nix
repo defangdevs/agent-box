@@ -1561,6 +1561,13 @@ def main(argv):
             skip=PROFILE_RESERVED,
         )
 
+    # A Defang access token is minted for one fixed workspace. v3.15.5
+    # rejects a conflicting DEFANG_WORKSPACE instead of silently deploying
+    # elsewhere, so let the token carry its own workspace whenever both a
+    # box-wide setting and a profile overlay leave the two keys present.
+    if os.environ.get("DEFANG_ACCESS_TOKEN"):
+        os.environ.pop("DEFANG_WORKSPACE", None)
+
     # The GitHub login this box acts as, for local-webhook's "@self" sender
     # mute (issue #261). Resolved HERE because this is the one process that
     # holds the token: the loop above just set it, and the identity is a
@@ -19540,10 +19547,20 @@ def connect_probe(flow):
         proc = connect_run(flow, flow["status"])
         value = (False, "") if proc is None else CONNECT_PARSERS[flow["parse"]](proc)
         workspaces = None
-        if flow["id"] == "defang" and value[0]:
+        if flow["id"] == "defang":
             workspaces = parse_defang_workspaces(
                 connect_run(flow, ["workspace", "ls", "--json"])
             )
+            # `workspace ls` deliberately remains usable when a saved
+            # DEFANG_WORKSPACE is stale. Treat a successful authenticated
+            # list as signed in even when `whoami` rejected that selection,
+            # so the picker can offer a workspace that still exists.
+            if workspaces is not None and not value[0]:
+                current = next(
+                    (row["name"] for row in workspaces if row["current"]),
+                    "signed in",
+                )
+                value = (True, current)
         with _connect_lock:
             _connect_status_cache[flow["id"]] = (time.monotonic(), value)
             _connect_probe_began[flow["id"]] = began
@@ -19600,7 +19617,20 @@ def connect_status(flow):
     return hit[1] if hit else None
 
 
+DEFANG_ACCESS_TOKEN_KEY = "DEFANG_ACCESS_TOKEN"
 DEFANG_WORKSPACE_KEY = "DEFANG_WORKSPACE"
+
+
+def defang_stored_env():
+    """The two Defang settings whose interaction changes the picker."""
+    try:
+        stored = as_dict(load(ENV_FILE))
+    except (OSError, ValueError):
+        return {}
+    return {
+        key: stored.get(key, "")
+        for key in (DEFANG_ACCESS_TOKEN_KEY, DEFANG_WORKSPACE_KEY)
+    }
 
 
 def defang_workspaces():
@@ -19613,11 +19643,14 @@ def defang_workspaces():
     """
     with _connect_lock:
         rows = [dict(row) for row in _defang_workspaces_cache]
-    selected = ""
-    try:
-        selected = as_dict(load(ENV_FILE)).get(DEFANG_WORKSPACE_KEY, "")
-    except (OSError, ValueError):
-        pass
+    stored = defang_stored_env()
+    selected = stored.get(DEFANG_WORKSPACE_KEY, "")
+    # An access token is minted for one fixed workspace. The CLI identifies
+    # that row as current; other rows are informational and cannot be chosen
+    # without making ordinary commands reject the token/workspace mismatch.
+    if stored.get(DEFANG_ACCESS_TOKEN_KEY):
+        rows = [row for row in rows if row["current"]]
+        selected = ""
     match = next(
         (row for row in rows
          if selected and selected in (row["id"], row["name"])),
@@ -19640,6 +19673,12 @@ def set_defang_workspace(flow, workspace_id):
     chosen = next((row for row in rows if row["id"] == workspace_id), None)
     if chosen is None:
         return (400, "Choose a workspace from the list.")
+    if (defang_stored_env().get(DEFANG_ACCESS_TOKEN_KEY)
+            and not chosen["current"]):
+        return (
+            400,
+            "The configured DEFANG_ACCESS_TOKEN is limited to its current workspace.",
+        )
     set_key(DEFANG_WORKSPACE_KEY, chosen["id"])
     with _connect_lock:
         _defang_workspaces_cache = rows

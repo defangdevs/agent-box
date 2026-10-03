@@ -65,6 +65,13 @@ def main(argv):
             skip=PROFILE_RESERVED,
         )
 
+    # A Defang access token is minted for one fixed workspace. v3.15.5
+    # rejects a conflicting DEFANG_WORKSPACE instead of silently deploying
+    # elsewhere, so let the token carry its own workspace whenever both a
+    # box-wide setting and a profile overlay leave the two keys present.
+    if os.environ.get("DEFANG_ACCESS_TOKEN"):
+        os.environ.pop("DEFANG_WORKSPACE", None)
+
     # The GitHub login this box acts as, for local-webhook's "@self" sender
     # mute (issue #261). Resolved HERE because this is the one process that
     # holds the token: the loop above just set it, and the identity is a
