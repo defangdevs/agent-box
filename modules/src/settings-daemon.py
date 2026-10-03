@@ -1030,7 +1030,8 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
                      for s in sessions.values()):
                 return
             name = gen_session_name(agent, sessions)
-            capacity_check(sessions, [name], live=live)
+            capacity_check(sessions, [name], live=live,
+                           exempt=[name] if agent == "shell" else ())
             sessions[name] = {
                 "agent": agent,
                 "skipPermissions": True,
@@ -4023,9 +4024,13 @@ def session_list_payload():
     limit = capacity["max"]
     pending = {n for n, e in sessions.items() if e.get("stopped") is not True}
     died = {n for n, e in sessions.items() if crashed_status(e) is not None}
+    shells = {n for n, e in sessions.items() if e.get("agent") == "shell"}
     # The same admission order capacity_check's spawn branch uses: a pending
     # name past the free slots is queued, not starting.
-    admitted = live | set(sorted(pending - live)[:max(0, limit - len(live - died))])
+    unmetered = died | shells
+    admitted = live | unmetered | set(
+        sorted(pending - live - unmetered)[
+            :max(0, limit - len(live - unmetered))])
     rows = []
     for name, entry in sessions.items():
         if entry.get("stopped") is True:
@@ -8990,7 +8995,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # inventing one AND guarantees a unique key, so no collision
                     # or accidental-overwrite (issue 100) is possible.
                     name = gen_session_name(profile or agent, sessions, cwd)
-                    capacity_check(sessions, [name], live=live)
+                    capacity_check(sessions, [name], live=live,
+                                   exempt=[name] if agent == "shell" else ())
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,

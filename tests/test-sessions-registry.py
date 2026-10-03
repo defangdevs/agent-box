@@ -481,7 +481,7 @@ class CapacityRoutes(RouteCase):
         module, _ = self.serve()
         module.capacity_limit = lambda: 2
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            results = list(pool.map(lambda _: self.post("/sessions/add", agent="shell")[0], range(6)))
+            results = list(pool.map(lambda _: self.post("/sessions/add", agent="claude")[0], range(6)))
         self.assertEqual(sorted(results), [303, 303, 503, 503, 503, 503])
         self.assertEqual(len(self.document()["sessions"]), 2)
 
@@ -491,9 +491,20 @@ class CapacityRoutes(RouteCase):
         module, _ = self.serve()
         module.capacity_limit = lambda: 1
         before = self.raw()
-        status, _ = self.post("/sessions/add", agent="shell")
+        status, _ = self.post("/sessions/add", agent="claude")
         self.assertEqual(status, 503)
         self.assertEqual(self.raw(), before)
+
+    def test_shell_add_bypasses_a_full_agent_capacity(self):
+        self.write_raw(json.dumps({"version": 1, "sessions": {
+            "worker": {"agent": "claude"}}}))
+        module, _ = self.serve()
+        module.capacity_limit = lambda: 1
+        status, _ = self.post("/sessions/add", agent="shell")
+        self.assertEqual(status, 303)
+        self.assertEqual(self.document()["sessions"]["shell"]["agent"], "shell")
+        status, _ = self.post("/sessions/add", agent="claude")
+        self.assertEqual(status, 503)
 
     def test_restart_stopped_refuses_but_running_restart_succeeds(self):
         self.write_raw(json.dumps({"version": 1, "sessions": {
@@ -509,7 +520,7 @@ class CapacityRoutes(RouteCase):
         self.assertEqual(status, 303)
 
     def test_signin_stays_successful_and_records_autostart_notice(self):
-        self.write_raw(json.dumps({"version": 1, "sessions": {"a": {"agent": "shell"}}}))
+        self.write_raw(json.dumps({"version": 1, "sessions": {"a": {"agent": "codex"}}}))
         module, _ = self.serve()
         module.capacity_limit = lambda: 1
         before = self.raw()
