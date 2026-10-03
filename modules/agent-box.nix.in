@@ -736,7 +736,7 @@ let
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
-    ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli ]
+    ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli peerCli ]
     # Same "presence tells an agent the feature is live" reasoning as the
     # two above: a box with no shipped checkout has no agent-box-checkout.
     ++ lib.optional checkoutEnabled checkoutCli
@@ -917,6 +917,19 @@ let
     # W503/W504 on (the trap #472's local rig documented).
   } ''
 @@include:src/webhook-backfill.py@@
+  '';
+
+  # Explicit peer pairing (issue #699) deliberately reuses local-webhook as
+  # the receiving event bus. This command owns only the user-to-user pairing
+  # record and signed outbound HTTPS; source registration makes an incoming
+  # peer message a normal ``peer-<id>:<inbox>`` event for subscriptions and
+  # standing watches to route. It reads AGENT_BOX_WEBHOOK_URL from the agent
+  # session environment, so there is no second public listener or control
+  # plane and no GitHub identity requirement.
+  peerCli = pkgs.writers.writePython3Bin "agent-box-peer" {
+    flakeIgnore = [ "E501" ];
+  } ''
+@@include:src/peer-cli.py@@
   '';
 
   # Put a screenshot into an issue or PR without committing it (issue #368).
