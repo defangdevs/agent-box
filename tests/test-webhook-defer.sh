@@ -85,7 +85,7 @@ chmod +x "$work/bin/tmux"
 export AGENT_BOX_TMUX_BIN="$work/bin/tmux"
 export AGENT_BOX_CAPACITY_BIN="$work/capacity"
 export AGENT_BOX_SESSION_LIMIT_FILE="$work/limit"
-export AGENT_BOX_AGENTS=shell AGENT_BOX_DEFAULT_AGENT=shell
+export AGENT_BOX_AGENTS=claude AGENT_BOX_DEFAULT_AGENT=claude
 export AGENT_BOX_FLOCK_BIN="$(command -v flock)"
 
 fails=0
@@ -166,7 +166,7 @@ printf 'picked\n' > "$HOME/.config/agent-box/profiles/.default"
 : > "$work/session.log"
 hook_registry 1
 rc=$(spawn defangdevs/nodefault 2)
-if [ "$rc" = 0 ] && grep -q -- '--harness shell' "$work/session.log" \
+if [ "$rc" = 0 ] && grep -q -- '--harness claude' "$work/session.log" \
    && ! grep -q -- '--profile' "$work/session.log"; then
   ok "a watch with no profile names the box harness, never the default profile"
 else
