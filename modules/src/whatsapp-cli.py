@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -11,12 +12,12 @@ import tempfile
 from urllib.request import urlopen
 
 
-REV = "f8c052ec5350c99d9029c2b2af2d2394d8445594"
+REV = "135e7e977e2cf40d71979fa87e8549b49ccedbf6"
 FILES = {
-    "bridge.mjs": "c3745917cc0982c8197214a1f64c0be97caadb6933a2bcd209895eaab849cac0",
+    "bridge.mjs": "89b9ced50786c602a476e92460c101e630a26ceb8cb531fea2a0062b48600b62",
     "state.mjs": "4f5125000fbb44b43c9dc7909ee293c61b5c3a6ae44f83620bd506470344e81b",
-    "package.json": "fa002e046ea1c39dc12d1651023d370d2cef512ac990427794266b69e0c2db0a",
-    "package-lock.json": "bf76fd9c4f6932fb7cb5f8f642973446b51591bc4ad45ae678fdeb97b0af90e4",
+    "package.json": "2ee16b0da02a289bf68d71811c39f51e27a2f16e9a810690b69c3091fab28df1",
+    "package-lock.json": "d030965125393662c5effbea6e25c98512e9fd29e470343010096ec413096110",
 }
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"
@@ -116,6 +117,27 @@ def paired():
         return False
 
 
+def profile(value=None):
+    config = STATE / "config.json"
+    if value is None:
+        try:
+            data = json.loads(config.read_text())
+            value = data.get("profile") if isinstance(data, dict) else None
+        except (OSError, ValueError, AttributeError):
+            value = None
+        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value) else None
+    if value != "default" and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value):
+        raise RuntimeError("WhatsApp profile must be a profile name or 'default'")
+    private_dir(STATE)
+    if config.is_symlink():
+        raise RuntimeError("WhatsApp configuration cannot be a symlink")
+    pending = config.with_name(config.name + ".pending")
+    pending.write_text(json.dumps({"profile": None if value == "default" else value}))
+    pending.chmod(0o600)
+    pending.replace(config)
+    return profile()
+
+
 def status():
     connected = False
     if NODE.is_file() and (RUNTIME / "bridge.mjs").is_file():
@@ -126,7 +148,7 @@ def status():
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
     print(json.dumps({"connected": connected, "paired": paired(),
-                      "enabled": READY.is_file()}))
+                      "enabled": READY.is_file(), "profile": profile()}))
 
 
 def activate():
@@ -137,8 +159,8 @@ def activate():
 
 
 def pair():
-    phone = os.environ.get("LOCAL_WHATSAPP_PHONE", "").strip()
-    if not phone.isdigit() or not 7 <= len(phone) <= 15:
+    phone = re.sub(r"\D", "", os.environ.get("LOCAL_WHATSAPP_PHONE", ""))
+    if not 7 <= len(phone) <= 15:
         raise RuntimeError("Set LOCAL_WHATSAPP_PHONE to international digits before pairing")
     install()
     private_dir(STATE)
@@ -149,8 +171,14 @@ def pair():
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ("install", "pair", "activate", "status"):
-        raise RuntimeError("usage: agent-box-whatsapp install|pair|activate|status")
+    if len(sys.argv) == 3 and sys.argv[1] == "profile":
+        print(json.dumps({"profile": profile(sys.argv[2])}))
+        return
+    if len(sys.argv) != 2 or sys.argv[1] not in ("install", "pair", "activate", "status", "profile"):
+        raise RuntimeError("usage: agent-box-whatsapp install|pair|activate|status|profile [NAME|default]")
+    if sys.argv[1] == "profile":
+        print(json.dumps({"profile": profile()}))
+        return
     {"install": install, "pair": pair, "activate": activate, "status": status}[sys.argv[1]]()
 
 
