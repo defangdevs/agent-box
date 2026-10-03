@@ -115,10 +115,9 @@ test('basic auth renders the page and sets the auth cookie; cookie alone then su
   );
   expect(cookie, 'first authenticated response should set the __Host- auth cookie').toBeTruthy();
   expect(cookie!.sameSite).toBe('Lax');
-  // __Host- cookies must have no Domain attribute. Chromium represents such
-  // a host-only cookie with the exact request hostname (a Domain cookie is
-  // dot-prefixed), so it must never collapse to a shared sslip.io or
-  // domainstation.com suffix.
+  // __Host- cookies must have no Domain attribute. Chromium exposes this
+  // host-only cookie with the exact request hostname, so it must never
+  // collapse to a shared sslip.io or domainstation.com suffix.
   expect(cookie!.domain).toBe(new URL(process.env.E2E_BASE_URL!).hostname);
 
   // A fresh context with ONLY the cookie (no basic-auth credentials) must get

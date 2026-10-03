@@ -898,7 +898,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               grep 'header >Set-Cookie' "$caddyfile" > cookies
               # Settings, downloads, workspace, terminal, and vhost root.
               [ "$(wc -l < cookies)" = 5 ]
-              if grep -iv '__Host-agent_box_auth_agent=' cookies >/dev/null; then
+              if grep -vF '__Host-agent_box_auth_agent=' cookies >/dev/null; then
                 echo "every auth cookie must use the browser-enforced __Host- prefix:" >&2
                 cat cookies >&2
                 exit 1
