@@ -938,10 +938,11 @@ let
 @@include:src/upload-cli.sh@@
   '';
 
-  # One OpenPGP recipient per Linux user. The supervisor runs this before it
-  # starts tmux, so every session in the user's trust boundary shares the same
-  # cv25519 decryption key and an encrypted handoff never needs plaintext in
-  # chat. Native ships the same payload from nix/runtime.nix.
+  # One OpenPGP recipient per Linux user. agent-box@ runs this as ExecStartPre,
+  # so every session in the user's trust boundary shares the same cv25519
+  # decryption key and the settings page can rely on the public export before
+  # its After=agent-box@ ordering lets it start. Native ships the same payload
+  # from nix/runtime.nix.
   gpgInit = pkgs.writeShellScriptBin "agent-box-gpg-init" ''
 @@include:src/gpg-init.sh@@
   '';

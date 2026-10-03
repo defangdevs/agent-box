@@ -32,14 +32,6 @@ WHATSAPP_PLUGIN_REPO="${AGENT_BOX_WEBHOOK_REPO:-defangdevs/local-channels}"
 WEBHOOK_STATE_DIR="$HOME/.local/state/local-webhook"
 CODEX_WAKE_DIR="$HOME/.local/state/agent-box/codex-wake"
 
-# Each Linux user is one trust boundary, so it gets one persistent OpenPGP
-# recipient shared by all of its sessions. Provision it before tmux starts:
-# the public key is then ready for an encrypted handoff before any harness is
-# signed in, and a provisioning failure is visible as a failed/retrying agent
-# unit rather than a box that quietly advertises a key it does not have.
-"${AGENT_BOX_GPG_INIT:-agent-box-gpg-init}" \
-  "${AGENT_BOX_HOST_LABEL:-agent-box}"
-
 # Bring the tmux server up, unconditionally -- see ensure_tmux_server below.
 # One-shot at startup is not enough: a transient failure right here (the
 # runtime directory not mounted yet, tmux itself briefly unavailable) would

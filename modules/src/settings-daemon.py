@@ -127,6 +127,14 @@ import urllib.request
 
 USER = os.environ.get("AGENT_BOX_SETTINGS_USER", "agent")
 ENV_FILE = os.environ["AGENT_BOX_SETTINGS_ENV_FILE"]
+# The managed OpenPGP recipient is provisioned by agent-box@'s ExecStartPre
+# in the same private state directory as the env store. The settings unit is
+# ordered after that service, so a normal render finds the atomic public
+# export ready. Keeping the path derived from ENV_FILE avoids a third copy of
+# the per-user state directory in the two backend renderers.
+GPG_PUBLIC_KEY_FILE = os.path.join(
+    os.path.dirname(ENV_FILE), "gpg-public-key.asc")
+GPG_PUBLIC_KEY_MAX = 64 * 1024
 # Agent profiles (issue #321) live beside the env store, one file per profile.
 # The preamble cache key reads this too: a watch's launch report names the
 # profile AGENT_BOX_HOOK_PROFILE picks and whether it still exists, so
@@ -4869,6 +4877,7 @@ BODY = """<main>
     </div>
     <div id="secrets-list">{keys}</div>
   </section>
+  {gpg_section}
   {password_section}
   <section>
     <h2 id="maintenance">Maintenance<a class="heading-anchor" href="#maintenance" aria-label="Copy link to Maintenance" title="Copy link to Maintenance"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
@@ -5976,12 +5985,15 @@ def render_webhook_row(topic, meta, note, key, dispatch, fold="", watch_name="",
     )
 
 
-def copy_button(what, value=None, secret_url=None):
+def copy_button(what, value=None, secret_url=None, target=None):
     """A one-click copy for a value the operator has to paste elsewhere.
 
-    Either `value` — text already in the page, copied straight from the
-    attribute — or `secret_url`, a route the button fetches on the click
-    (which is how a secret gets copied without being rendered).
+    Either `value` - text already in the page, copied straight from the
+    attribute - `secret_url`, a route the button fetches on the click
+    (which is how a secret gets copied without being rendered), or `target`,
+    the id of a rendered text element. The target form keeps a multi-line
+    armored key out of an HTML attribute while still copying exactly what the
+    operator can see.
 
     Takes VALUES and escapes them here, rather than an `attrs` fragment
     the caller assembles: a parameter that is raw markup makes escaping
@@ -5989,14 +6001,82 @@ def copy_button(what, value=None, secret_url=None):
     purpose is handling credentials (#421 review). Both icons ship inside
     it and CSS picks which one shows, so the "copied" tick needs no icon
     markup in the script."""
-    attr = ('data-copy="%s"' % html.escape(value, quote=True) if value
-            else 'data-secret-url="%s"' % html.escape(secret_url or "", quote=True))
+    if value:
+        attr = 'data-copy="%s"' % html.escape(value, quote=True)
+    elif secret_url:
+        attr = 'data-secret-url="%s"' % html.escape(secret_url, quote=True)
+    else:
+        attr = 'data-copy-target="%s"' % html.escape(target or "", quote=True)
     return (
         '<button type="button" class="icon icopy" %s '
         'aria-label="Copy %s" title="Copy to clipboard">'
         '<span class="ci">%s</span><span class="co">%s</span></button>'
         % (attr, html.escape(what, quote=True), ICON_COPY, ICON_CHECK)
     )
+
+
+def read_gpg_public_key():
+    """The bounded, armored public export, or an empty string if unavailable.
+
+    This file is public by design, but it is still escaped before it reaches
+    HTML. Checking the armor prevents an accidentally replaced state file from
+    being presented as the key a sender should trust, and the bound keeps one
+    damaged file from turning every settings response into a multi-megabyte
+    page.
+    """
+    try:
+        with open(GPG_PUBLIC_KEY_FILE, "rb") as fh:
+            raw = fh.read(GPG_PUBLIC_KEY_MAX + 1)
+    except OSError:
+        return ""
+    if not raw or len(raw) > GPG_PUBLIC_KEY_MAX:
+        return ""
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return ""
+    lines = text.splitlines()
+    if (not lines
+            or lines[0] != "-----BEGIN PGP PUBLIC KEY BLOCK-----"
+            or lines[-1] != "-----END PGP PUBLIC KEY BLOCK-----"):
+        return ""
+    return text
+
+
+def render_gpg_section():
+    """The encrypted-handoff key, collapsed in a JS-capable browser."""
+    key = read_gpg_public_key()
+    heading = (
+        '<h2 id="encrypted-handoff">Encrypted handoff'
+        '<a class="heading-anchor" href="#encrypted-handoff" '
+        'aria-label="Copy link to Encrypted handoff" '
+        'title="Copy link to Encrypted handoff">'
+        '<svg viewBox="0 0 16 16" aria-hidden="true"><path '
+        'd="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/>'
+        '</svg></a></h2>')
+    note = (
+        '<p class="note">Encrypt a sensitive file to this Linux user before '
+        'attaching it to a chat. The private key stays on the box; every '
+        'session belonging to this user can decrypt the result.</p>')
+    if not key:
+        return ('<section><div class="sec-head">%s</div>%s'
+                '<p class="note conn-warn">The public key is not ready. '
+                'Reload after the agent service starts.</p></section>'
+                % (heading, note))
+    toggle = (
+        '<button type="button" class="btn" data-toggle="gpg-key-pane" '
+        'data-open-label="Show public key" data-close-label="Hide public key" '
+        'aria-controls="gpg-key-pane" aria-expanded="true">'
+        'Hide public key</button>')
+    pane = (
+        '<div id="gpg-key-pane" class="gpg-key-pane">'
+        '<div class="gpg-key-head"><span class="meta">Armored OpenPGP '
+        'public key</span>%s</div>'
+        '<pre id="gpg-public-key" tabindex="0">%s</pre></div>'
+        % (copy_button("armored public key", target="gpg-public-key"),
+           html.escape(key)))
+    return ('<section><div class="sec-head">%s%s</div>%s%s</section>'
+            % (heading, toggle, note, pane))
 
 
 def rotate_form(source):
@@ -6818,6 +6898,7 @@ def render_page(message="", kind="ok"):
             term_home=html.escape(TERM_HOME),
             mark=POTATO_SVG,
             keys=render_keys(read_keys()),
+            gpg_section=render_gpg_section(),
             # Every user, primary included: the HOME root page is the
             # terminal workspace, so session CRUD lives here.
             sessions_section=render_sessions_section(subs, profiles),

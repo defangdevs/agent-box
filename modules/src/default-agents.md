@@ -109,11 +109,12 @@ plainly rather than handing it back.
   putting its plaintext in chat. Its Ed25519 primary key certifies a cv25519
   encryption subkey; the armored public key is at
   ~/.config/agent-box/gpg-public-key.asc and, on a web-enabled box, at
-  ${AGENT_BOX_URL}downloads/agent-box-public-key.asc. The private key has no
-  passphrase so a headless session can decrypt; its 0700 keyring is protected
-  by the Linux-user boundary. Ask the user to encrypt to the public key and
-  attach the ciphertext. To put a decrypted value straight into the
-  persistent env store without printing it, run:
+  ${AGENT_BOX_URL}downloads/agent-box-public-key.asc. The settings page's
+  Encrypted handoff section also shows it behind a toggle with a copy button.
+  The private key has no passphrase so a headless session can decrypt; its
+  0700 keyring is protected by the Linux-user boundary. Ask the user to
+  encrypt to the public key and attach the ciphertext. To put a decrypted
+  value straight into the persistent env store without printing it, run:
 
       gpg --homedir ~/.config/agent-box/gnupg --batch --quiet \
         --decrypt secret.gpg |

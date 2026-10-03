@@ -2212,6 +2212,29 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The authenticated settings page's encrypted-handoff panel. The
+          # subject is the assembled golden daemon (env-store preamble and
+          # all), so this pins the file boundary and rendered controls the
+          # same way the other settings-panel checks below do.
+          gpg-key-panel =
+            pkgs.runCommand "agent-box-gpg-key-panel"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-gpg-key-panel.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-gpg-key-panel.py
+              python3 repo/tests/test-gpg-key-panel.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           checkout-bootstrap =
             pkgs.runCommand "agent-box-checkout-bootstrap"
               {
