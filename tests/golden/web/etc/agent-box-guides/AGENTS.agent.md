@@ -186,6 +186,13 @@ runs the bridge without spending a session slot. Message text and linked-device
 keys are stored in private files under `~/.local/state/local-whatsapp` on this
 box; WhatsApp's end-to-end encryption covers the chat transport.
 
+Use **Unlink** on the WhatsApp connection card, or run
+`agent-box-whatsapp unlink`, to stop the bridge and erase its linked-device
+keys, queued messages and routing state from this box. The optional runtime
+stays installed so pairing again does not need another download. WhatsApp may
+continue to list the now-inactive device until it is also removed from the
+primary phone's Linked devices screen.
+
 WhatsApp has one destination session at a time. From the phone, send
 `@agent /sessions` to list Claude and Codex sessions, then `@agent /target NAME`
 to choose one. `@agent /target auto` clears that choice, so the next message
