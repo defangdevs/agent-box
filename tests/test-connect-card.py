@@ -225,6 +225,18 @@ class WhatsAppConnectTest(unittest.TestCase):
         saved = self.daemon.as_dict(self.daemon.load(self.daemon.ENV_FILE))
         self.assertEqual("14155550123", saved["LOCAL_WHATSAPP_PHONE"])
 
+    def test_blank_phone_keeps_the_saved_secret_fallback(self):
+        with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+            handle.write("LOCAL_WHATSAPP_PHONE=14155550100\n")
+        self.daemon.whatsapp_profile = lambda profile: ""
+        self.daemon.connect_start = lambda flow: {
+            "state": "waiting", "error": None,
+        }
+        status, _ = self.post_start(self.serve(), "")
+        self.assertEqual(303, status)
+        saved = self.daemon.as_dict(self.daemon.load(self.daemon.ENV_FILE))
+        self.assertEqual("14155550100", saved["LOCAL_WHATSAPP_PHONE"])
+
     def test_connected_status_requires_live_bridge(self):
         class Proc:
             returncode = 0
