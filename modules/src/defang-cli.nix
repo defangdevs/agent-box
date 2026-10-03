@@ -25,12 +25,9 @@
 # #373. Going through the flake gets the repo's own locked nixpkgs by
 # construction rather than by a hash somebody has to remember to move.
 #
-# Verified 2026-09-09, aarch64-linux: this expression and the hand-written
-# one it replaces evaluate to the SAME store path,
-# /nix/store/yayqldvzrg66lpajmcpnf9h5jvgvlxyd-defang-cli-git - the one the
-# previous version of this file recorded as cache-warm at
-# https://defanglabs.cachix.org. So the substituter still hits and no box
-# starts compiling Go because of this change.
+# The release flake is also what Defang's Cachix publisher builds, so using
+# it keeps both architectures on the published binary cache rather than
+# compiling the CLI on a Station.
 #
 # getFlake, not fetchTarball + callPackage: both backends already enable the
 # flakes feature box-wide (nix.settings.experimental-features on NixOS,
@@ -40,5 +37,5 @@
 # version used it too.
 #
 # To move to a new defang release, change the tag. That is the whole edit.
-(builtins.getFlake "github:DefangLabs/defang/v3.15.0")
+(builtins.getFlake "github:DefangLabs/defang/v3.15.5")
   .packages.${builtins.currentSystem}.defang-cli

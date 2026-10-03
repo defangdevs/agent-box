@@ -1561,6 +1561,13 @@ def main(argv):
             skip=PROFILE_RESERVED,
         )
 
+    # A Defang access token is minted for one fixed workspace. v3.15.5
+    # rejects a conflicting DEFANG_WORKSPACE instead of silently deploying
+    # elsewhere, so let the token carry its own workspace whenever both a
+    # box-wide setting and a profile overlay leave the two keys present.
+    if os.environ.get("DEFANG_ACCESS_TOKEN"):
+        os.environ.pop("DEFANG_WORKSPACE", None)
+
     # The GitHub login this box acts as, for local-webhook's "@self" sender
     # mute (issue #261). Resolved HERE because this is the one process that
     # holds the token: the loop above just set it, and the identity is a
@@ -3722,12 +3729,9 @@ done
     # #373. Going through the flake gets the repo's own locked nixpkgs by
     # construction rather than by a hash somebody has to remember to move.
     #
-    # Verified 2026-09-09, aarch64-linux: this expression and the hand-written
-    # one it replaces evaluate to the SAME store path,
-    # /nix/store/yayqldvzrg66lpajmcpnf9h5jvgvlxyd-defang-cli-git - the one the
-    # previous version of this file recorded as cache-warm at
-    # https://defanglabs.cachix.org. So the substituter still hits and no box
-    # starts compiling Go because of this change.
+    # The release flake is also what Defang's Cachix publisher builds, so using
+    # it keeps both architectures on the published binary cache rather than
+    # compiling the CLI on a Station.
     #
     # getFlake, not fetchTarball + callPackage: both backends already enable the
     # flakes feature box-wide (nix.settings.experimental-features on NixOS,
@@ -3737,7 +3741,7 @@ done
     # version used it too.
     #
     # To move to a new defang release, change the tag. That is the whole edit.
-    (builtins.getFlake "github:DefangLabs/defang/v3.15.0")
+    (builtins.getFlake "github:DefangLabs/defang/v3.15.5")
       .packages.''${builtins.currentSystem}.defang-cli
   '';
   # Where the background service installs it (outside the Nix profile, since
@@ -19295,8 +19299,11 @@ CONNECT_DEFS = [
         # claude, nothing is ever shown for the user to type back here.
         "needs_code": False,
         "show_code": False,
-        "unset": ("DEFANG_ACCESS_TOKEN",),
+        "unset": ("DEFANG_ACCESS_TOKEN", "DEFANG_WORKSPACE"),
         "shadow": ("DEFANG_ACCESS_TOKEN",),
+        # Unlike `shadow`, DEFANG_WORKSPACE is not a credential override.
+        # It still belongs in probes because it is what sessions use.
+        "session_env": ("DEFANG_ACCESS_TOKEN", "DEFANG_WORKSPACE"),
         "prompt_re": None,
         "destructive": False,
     },
@@ -19322,6 +19329,9 @@ CONNECT_DEFS = [
 ]
 
 _connect_status_cache = {}
+# The Defang CLI's structured workspace list, populated beside its status
+# probe. It contains names and ids only; no token or env value is cached.
+_defang_workspaces_cache = []
 # flow id -> wall-clock time the cached answer's probe STARTED, so an answer
 # can be compared with the sign-in completion marker's mtime (issue #751).
 _connect_probe_began = {}
@@ -19417,7 +19427,7 @@ def connect_status_env(flow):
     """
     env = dict(os.environ)
     stored = as_dict(load(ENV_FILE))
-    for key in flow["shadow"]:
+    for key in flow.get("session_env", flow["shadow"]):
         if key in stored:
             env[key] = stored[key]
     return env
@@ -19483,15 +19493,96 @@ def render_whatsapp_profile_field():
             % options)
 
 
+def render_defang_workspace_field(state):
+    """The Defang workspace picker, only when there is a real choice."""
+    workspaces = state.get("workspaces") or []
+    if state["state"] != "connected" or len(workspaces) <= 1:
+        return ""
+    options = "".join(
+        '<option value="%s"%s>%s</option>' % (
+            html.escape(row["id"], quote=True),
+            " selected" if row.get("current") else "",
+            html.escape(row["name"]),
+        )
+        for row in workspaces
+    )
+    return (
+        '<div class="conn-step"><form method="post" action="%s/connect/configure" '
+        'class="row conn-form"><input type="hidden" name="flow" value="defang">'
+        '<label class="field conn-field"><span class="note">Workspace for deployments'
+        '</span><select name="workspace" required>%s</select></label>'
+        '<button type="submit" class="btn">Save workspace</button></form></div>'
+        % (html.escape(BASE), options)
+    )
+
+
+def parse_defang_workspaces(proc):
+    """The stable rows from `defang workspace ls --json`, or None.
+
+    IDs are what a later selection writes. Refuse a malformed row instead of
+    giving an arbitrary CLI string a path into the env store; keep the valid
+    rows when one sibling is bad so one provider-managed workspace cannot
+    hide the rest.
+    """
+    if proc is None or proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return None
+    if not isinstance(data, list):
+        return None
+    rows = []
+    seen = set()
+    for raw in data[:100]:
+        if not isinstance(raw, dict):
+            continue
+        workspace_id = raw.get("id")
+        name = raw.get("name")
+        if (not isinstance(workspace_id, str)
+                or not isinstance(name, str)
+                or not workspace_id or not name
+                or len(workspace_id) > 200 or len(name) > 200
+                or workspace_id in seen):
+            continue
+        seen.add(workspace_id)
+        rows.append({
+            "id": workspace_id,
+            "name": name,
+            "current": raw.get("current") is True,
+        })
+    return rows
+
+
 def connect_probe(flow):
     """Ask one CLI whether it is signed in, off the request path."""
+    global _defang_workspaces_cache
     try:
         began = time.time()
         proc = connect_run(flow, flow["status"])
         value = (False, "") if proc is None else CONNECT_PARSERS[flow["parse"]](proc)
+        workspaces = None
+        if flow["id"] == "defang":
+            workspaces = parse_defang_workspaces(
+                connect_run(flow, ["workspace", "ls", "--json"])
+            )
+            # `workspace ls` deliberately remains usable when a saved
+            # DEFANG_WORKSPACE is stale. Treat a successful authenticated
+            # list as signed in even when `whoami` rejected that selection,
+            # so the picker can offer a workspace that still exists.
+            if workspaces is not None and not value[0]:
+                current = next(
+                    (row["name"] for row in workspaces if row["current"]),
+                    "signed in",
+                )
+                value = (True, current)
         with _connect_lock:
             _connect_status_cache[flow["id"]] = (time.monotonic(), value)
             _connect_probe_began[flow["id"]] = began
+            if flow["id"] == "defang":
+                # A failed list must not leave another account's choices on
+                # screen after a re-login. The next status refresh retries.
+                _defang_workspaces_cache = workspaces or []
     finally:
         with _connect_lock:
             _connect_probing.discard(flow["id"])
@@ -19539,6 +19630,75 @@ def connect_status(flow):
                 target=connect_probe, args=(flow,), daemon=True
             ).start()
     return hit[1] if hit else None
+
+
+DEFANG_ACCESS_TOKEN_KEY = "DEFANG_ACCESS_TOKEN"
+DEFANG_WORKSPACE_KEY = "DEFANG_WORKSPACE"
+
+
+def defang_stored_env():
+    """The two Defang settings whose interaction changes the picker."""
+    try:
+        stored = as_dict(load(ENV_FILE))
+    except (OSError, ValueError):
+        return {}
+    return {
+        key: stored.get(key, "")
+        for key in (DEFANG_ACCESS_TOKEN_KEY, DEFANG_WORKSPACE_KEY)
+    }
+
+
+def defang_workspaces():
+    """Workspace rows with the Station's explicit selection marked current.
+
+    The env store remains write-only for secrets. This reads one documented,
+    non-secret setting and only reflects it when it exactly matches a
+    workspace the CLI just returned; an arbitrary stored value is never sent
+    to a caller.
+    """
+    with _connect_lock:
+        rows = [dict(row) for row in _defang_workspaces_cache]
+    stored = defang_stored_env()
+    selected = stored.get(DEFANG_WORKSPACE_KEY, "")
+    # An access token is minted for one fixed workspace. The CLI identifies
+    # that row as current; other rows are informational and cannot be chosen
+    # without making ordinary commands reject the token/workspace mismatch.
+    if stored.get(DEFANG_ACCESS_TOKEN_KEY):
+        rows = [row for row in rows if row["current"]]
+        selected = ""
+    match = next(
+        (row for row in rows
+         if selected and selected in (row["id"], row["name"])),
+        None,
+    )
+    if match:
+        for row in rows:
+            row["current"] = row is match
+    return rows, bool(match)
+
+
+def set_defang_workspace(flow, workspace_id):
+    """Validate then persist an id; return (status, message) on refusal."""
+    global _defang_workspaces_cache
+    rows = parse_defang_workspaces(
+        connect_run(flow, ["workspace", "ls", "--json"])
+    )
+    if rows is None:
+        return (503, "Could not list Defang workspaces. Try again.")
+    chosen = next((row for row in rows if row["id"] == workspace_id), None)
+    if chosen is None:
+        return (400, "Choose a workspace from the list.")
+    if (defang_stored_env().get(DEFANG_ACCESS_TOKEN_KEY)
+            and not chosen["current"]):
+        return (
+            400,
+            "The configured DEFANG_ACCESS_TOKEN is limited to its current workspace.",
+        )
+    set_key(DEFANG_WORKSPACE_KEY, chosen["id"])
+    with _connect_lock:
+        _defang_workspaces_cache = rows
+    connect_expire("defang")
+    return None
 
 
 def tmux_sessions():
@@ -20365,6 +20525,11 @@ def connect_state(flow, keys=None, tmux_state=None):
             error = notice
     keys = read_keys() if keys is None else keys
     shadow = [k for k in flow["shadow"] if k in keys]
+    workspaces, workspace_configured = (
+        defang_workspaces()
+        if flow_id == "defang" and state == "connected"
+        else ([], False)
+    )
     return {
         "id": flow_id,
         "label": flow["label"],
@@ -20390,6 +20555,8 @@ def connect_state(flow, keys=None, tmux_state=None):
         "blocked": not server_up,
         "destructive": flow["destructive"],
         "shadow": shadow,
+        "workspaces": workspaces,
+        "workspace_configured": workspace_configured,
     }
 
 
@@ -24713,6 +24880,7 @@ def render_connect_card(state):
             f'under API keys and secrets. Sessions will use that value instead '
             f'of the account shown here.</p></div>'
         )
+    workspace = render_defang_workspace_field(state)
     # Open on anything the operator has to act on or read right now: a flow
     # mid-run, a fresh error, the "no session to sign in from" note, or a
     # shadow-env warning (it renders inside this same <details>, so a
@@ -24724,11 +24892,13 @@ def render_connect_card(state):
         or (state["state"] == "connected" and state.get("notice"))
         or state["blocked"]
         or state["shadow"]
+        or (len(state.get("workspaces") or []) > 1
+            and not state.get("workspace_configured"))
     )
     return (
         f'<li class="foldrow conn-row">'
         f'<details data-fold="conn-{flow_id}"{" open" if open_now else ""}>'
-        f'<summary>{head}</summary><p class="note">{note}</p>{step}{warn}'
+        f'<summary>{head}</summary><p class="note">{note}</p>{step}{workspace}{warn}'
         f'</details></li>'
     )
 
@@ -26655,6 +26825,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "session_restarted": ("Session restart requested.", "ok"),
         "whatsapp_saved": ("WhatsApp recipient saved. Restart a running Claude session to load its channel.", "ok"),
         "whatsapp_profile_saved": ("WhatsApp routing profile saved. It is used when WhatsApp starts a new session.", "ok"),
+        "defang_workspace_saved": ("Defang workspace saved. Restart sessions to apply it.", "ok"),
         "session_stopped": ("Session stopped \u2014 it keeps its place in the list.", "ok"),
         "session_started": ("Session started \u2014 it comes up within a few seconds.", "ok"),
         "session_registry_unreadable": (
@@ -27355,6 +27526,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_html("<h1>404</h1>", status=404)
                 return
             if action == "configure":
+                if flow["id"] == "defang":
+                    workspace = form.get("workspace", [""])[0].strip()
+                    refused = set_defang_workspace(flow, workspace)
+                    if refused is not None:
+                        status, message = refused
+                        self._send_html(
+                            render_page(message, kind="error"), status=status)
+                        return
+                    self._redirect("ok=defang_workspace_saved")
+                    return
                 if flow["id"] != "whatsapp":
                     self._send_html("<h1>404</h1>", status=404)
                     return
