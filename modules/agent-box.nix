@@ -668,7 +668,10 @@ let
       HARNESS=claude MODEL=sonnet EFFORT=low KEY=value`, read it back with
       `agent-box-profile show NAME`, and start it with `agent-box-session add
       [NAME] --profile PROFILE`. A `-- EXTRA_ARGS` tail still wins over the
-      profile. Profile env is convenience, not isolation: every session of this
+      profile. Signing in to Claude or Codex creates that harness's starter
+      profile if needed and, when no valid default exists, makes it the default.
+      A later sign-in never replaces an existing default. Profile env is
+      convenience, not isolation: every session of this
       user can read it out of /proc. A standing webhook watch hands its work to
       a profile through `agent-box-session env set AGENT_BOX_HOOK_PROFILE NAME`,
       which is how the harness a dispatched hook-* session runs gets picked at
@@ -17806,26 +17809,31 @@ def write_sessions(sessions, version=REGISTRY_VERSION):
 _session_start_notices = {}
 
 
-def ensure_claude_profile():
-    """Offer the login worker in Add session, preserving existing profiles.
+def ensure_harness_profile(agent):
+    """Offer the signed-in worker in Add session, preserving user choices.
 
     An explicit successful login can recreate a deleted starter profile;
     ordinary supervisor seeding still respects its once-per-name stamp.
-    A name already used for another harness belongs to the user.
+    A name already used for another harness belongs to the user. When the
+    box has no valid default, make this starter profile the default so
+    profile-driven entry points such as WhatsApp can start a worker. A later
+    sign-in never replaces an existing default.
     """
     if not PROFILE_BIN:
         return None, []
     index = 1
     while True:
-        name = "claude" if index == 1 else "claude-%d" % index
+        name = agent if index == 1 else "%s-%d" % (agent, index)
         path = profile_path(name)
         with locked(path):
             if not os.path.lexists(path):
-                save(path, [("HARNESS", "claude")], profile_header(name))
+                save(path, [("HARNESS", agent)], profile_header(name))
             data = as_dict(load(path))
-        if data.get("HARNESS") == "claude":
+        if data.get("HARNESS") == agent:
             resolved = profile_launch(name)
-            if resolved and resolved.get("harness") == "claude":
+            if resolved and resolved.get("harness") == agent:
+                if not default_profile(read_profiles()):
+                    set_default_profile(name)
                 return name, [str(a) for a in (resolved.get("args") or [])]
             return None, []
         index += 1
@@ -17839,15 +17847,13 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
 
     Skipped if the user already has ANY session on that harness -- a repeat
     sign-in (a token refresh, "Sign in again") must not mint a second one
-    every time the card cycles through "connected". Claude gets a reusable
-    starter profile, with its launch arguments resolved just like Add
-    session. Every other harness (codex included) gets a PROFILE only when
-    one already exists (agent-box-profile seed creates one per installed
-    harness, named after it, at every supervisor start -- issue #508):
-    referencing it here is what leaves the add-session picker something to
-    pick for a SECOND session afterwards (issue #623). A box whose
-    supervisor has not restarted since #508 landed has no such profile yet,
-    so this falls back to none rather than naming a file that is not there.
+    every time the card cycles through "connected". Every harness gets a
+    reusable starter profile, with its launch arguments resolved just like
+    Add session. This happens here rather than waiting for the supervisor's
+    next `agent-box-profile seed`, so a lazily installed harness is usable by
+    profile-driven entry points immediately (issue #818). When no valid
+    default exists, the starter becomes it; an existing default is a user
+    choice and is never replaced.
 
     `remote_control` is the one thing that differs by harness. claude's rc
     is a flag on the ordinary TUI (supervisor.sh appends --remote-control),
@@ -17872,17 +17878,17 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
     if agent not in AGENTS:
         return
     profile, args = None, []
-    if agent == "claude":
-        try:
-            profile, args = ensure_claude_profile()
-        except OSError:
-            # Profile storage failure must not undo a successful login or
-            # prevent its worker from starting.
-            pass
-    elif os.path.exists(profile_path(agent)) and not remote_control:
+    try:
+        profile, args = ensure_harness_profile(agent)
+    except OSError:
+        # Profile storage failure must not undo a successful login or
+        # prevent its worker from starting.
+        pass
+    if agent == "codex" and remote_control:
         # A remote-control codex session is the pairing daemon, which has no
-        # model, effort or profile of its own.
-        profile = agent
+        # model, effort or profile of its own. The ensured profile still
+        # remains available (and can be the default) for worker sessions.
+        profile, args = None, []
     try:
         # Read before the lock (issue #748): capacity_check's tmux spawn must
         # not run while holding sessions_lock(), or a slow/contended tmux
