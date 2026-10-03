@@ -1100,6 +1100,7 @@ let
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
     "agent-box-session-capacity" = "${capacityCli}/bin/agent-box-session-capacity";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
+    "agent-box-whatsapp" = "${whatsappCli}/bin/agent-box-whatsapp";
     "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";

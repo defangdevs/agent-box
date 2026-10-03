@@ -5583,6 +5583,15 @@ def activate():
     READY.touch(mode=0o600)
 
 
+def serve():
+    """Refresh the optional runtime, then replace this process with its bridge."""
+    if not paired():
+        raise RuntimeError("WhatsApp is not linked; pair the device first")
+    install()
+    os.execve(str(NODE), [str(NODE), str(RUNTIME / "bridge.mjs"), "serve"],
+              dict(os.environ))
+
+
 def pair():
     raw = os.environ.get("LOCAL_WHATSAPP_PHONE", "")
     phone = re.sub(r"[ ()+.-]", "", raw)
@@ -5600,12 +5609,15 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == "profile":
         print(json.dumps({"profile": profile(sys.argv[2])}))
         return
-    if len(sys.argv) != 2 or sys.argv[1] not in ("install", "pair", "activate", "status", "profile"):
-        raise RuntimeError("usage: agent-box-whatsapp install|pair|activate|status|profile [NAME|default]")
+    if len(sys.argv) != 2 or sys.argv[1] not in (
+            "install", "pair", "activate", "serve", "status", "profile"):
+        raise RuntimeError(
+            "usage: agent-box-whatsapp install|pair|activate|serve|status|profile [NAME|default]")
     if sys.argv[1] == "profile":
         print(json.dumps({"profile": profile()}))
         return
-    {"install": install, "pair": pair, "activate": activate, "status": status}[sys.argv[1]]()
+    {"install": install, "pair": pair, "activate": activate,
+     "serve": serve, "status": status}[sys.argv[1]]()
 
 
 if __name__ == "__main__":
@@ -10825,7 +10837,8 @@ esac
     { "name": "AGENT_BOX_ENV_EXEC", "kind": "bin", "program": "agent-box-env-exec" },
     { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" },
     { "name": "AGENT_BOX_CAPACITY_BIN", "kind": "bin", "program": "agent-box-session-capacity" },
-    { "name": "AGENT_BOX_ENVSTORE_BIN", "kind": "bin", "program": "agent-box-envstore" }
+    { "name": "AGENT_BOX_ENVSTORE_BIN", "kind": "bin", "program": "agent-box-envstore" },
+    { "name": "AGENT_BOX_WHATSAPP_BIN", "kind": "bin", "program": "agent-box-whatsapp" }
   ],
   "execStart": [
     { "kind": "bin", "program": "agent-box-supervisor" }
@@ -11126,6 +11139,7 @@ esac
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
     "agent-box-session-capacity" = "${capacityCli}/bin/agent-box-session-capacity";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
+    "agent-box-whatsapp" = "${whatsappCli}/bin/agent-box-whatsapp";
     "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";
@@ -14237,13 +14251,13 @@ esac
     # Run it inside this unit's cgroup so a host restart stops and revives it
     # without consuming one of the interactive session slots. Pairing writes the
     # ready marker only after credentials have been saved; removing it stops the
-    # child. Node and the bridge are installed in the user's profile on demand.
+    # child. The pinned helper refreshes the optional runtime before every start,
+    # so a box update cannot leave an older home-directory bridge running until
+    # the user pairs again (issue #804).
     whatsapp_pid=""
     whatsapp_last_start=0
     supervise_whatsapp() {
       ready="$HOME/.local/state/local-whatsapp/ready"
-      bridge="$HOME/.local/share/local-whatsapp/bridge.mjs"
-      node="$HOME/.nix-profile/bin/node"
       if [ ! -f "$ready" ]; then
         if [ -n "$whatsapp_pid" ]; then
           kill "$whatsapp_pid" 2>/dev/null || true
@@ -14251,7 +14265,8 @@ esac
         fi
         return
       fi
-      [ -r "$bridge" ] && [ -x "$node" ] || return
+      whatsapp="''${AGENT_BOX_WHATSAPP_BIN:-}"
+      [ -x "$whatsapp" ] || return
       if [ -n "$whatsapp_pid" ] && kill -0 "$whatsapp_pid" 2>/dev/null; then
         return
       fi
@@ -14262,9 +14277,9 @@ esac
       codex_cli="$(agent_bin codex 2>/dev/null)" || codex_cli=""
       if [ -n "$codex_cli" ]; then
         LOCAL_WHATSAPP_SESSION_BIN="$session_cli" \
-          LOCAL_WHATSAPP_CODEX_BIN="$codex_cli" "$node" "$bridge" serve &
+          LOCAL_WHATSAPP_CODEX_BIN="$codex_cli" "$whatsapp" serve &
       else
-        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" "$node" "$bridge" serve &
+        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" "$whatsapp" serve &
       fi
       whatsapp_pid=$!
     }

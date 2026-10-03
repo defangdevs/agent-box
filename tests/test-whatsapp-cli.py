@@ -4,6 +4,7 @@
 import hashlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -114,6 +115,35 @@ class WhatsAppInstallTest(unittest.TestCase):
             with mock.patch.dict("os.environ", {"LOCAL_WHATSAPP_PHONE": phone}):
                 with self.assertRaisesRegex(RuntimeError, "LOCAL_WHATSAPP_PHONE"):
                     self.cli.pair()
+
+    def test_serve_refreshes_runtime_before_execing_bridge(self):
+        auth = self.cli.STATE / "auth"
+        auth.mkdir()
+        (auth / "creds.json").write_text(json.dumps({"me": {"id": "linked"}}))
+        calls = []
+
+        def install():
+            calls.append("install")
+
+        def execve(path, argv, env):
+            calls.append("exec")
+            self.assertEqual(str(self.cli.NODE), path)
+            self.assertEqual([
+                str(self.cli.NODE), str(self.cli.RUNTIME / "bridge.mjs"), "serve",
+            ], argv)
+            self.assertEqual("session-helper", env["LOCAL_WHATSAPP_SESSION_BIN"])
+
+        with mock.patch.object(self.cli, "install", side_effect=install), \
+                mock.patch.object(self.cli.os, "execve", side_effect=execve), \
+                mock.patch.dict("os.environ", {"LOCAL_WHATSAPP_SESSION_BIN": "session-helper"}):
+            self.cli.serve()
+        self.assertEqual(["install", "exec"], calls)
+
+    def test_serve_refuses_unpaired_state_before_install(self):
+        with mock.patch.object(self.cli, "install") as install:
+            with self.assertRaisesRegex(RuntimeError, "not linked"):
+                self.cli.serve()
+        install.assert_not_called()
 
 
 if __name__ == "__main__":
