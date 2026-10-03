@@ -1127,10 +1127,11 @@ def crashed_status(entry):
 
 
 def kill_session(name):
-    """Kill one tmux session. The supervisor recreates it if it is still
-    listed in sessions.json (= restart); delisting first makes it stay
-    gone (= destroy)."""
-    tmux("kill-session", "-t", "=" + name)
+    """Kill one tmux session and say whether tmux reported success. The
+    supervisor recreates it if it is still listed in sessions.json
+    (= restart); delisting first makes it stay gone (= destroy)."""
+    proc = tmux("kill-session", "-t", "=" + name)
+    return proc is not None and proc.returncode == 0
 
 
 # --- Session transcripts (issue #248) --------------------------------
@@ -4021,7 +4022,7 @@ def session_list_payload():
     capacity = capacity_check(sessions, [], live=live)
     limit = capacity["max"]
     pending = {n for n, e in sessions.items() if e.get("stopped") is not True}
-    died = {n for n, e in sessions.items() if e.get("died") is not None}
+    died = {n for n, e in sessions.items() if crashed_status(e) is not None}
     # The same admission order capacity_check's spawn branch uses: a pending
     # name past the free slots is queued, not starting.
     admitted = live | set(sorted(pending - live)[:max(0, limit - len(live - died))])
@@ -9149,7 +9150,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not isinstance(entry, dict):
                 self._sess_error(form, "No such session.", 404)
                 return
-            kill_session(name)
+            if not kill_session(name):
+                self._sess_error(form, "Could not stop session.", 500)
+                return
             self._redirect("ok=session_stopped", self._sess_page(form))
         elif path == SESS_BASE + "/sessions/restart":
             name = (form.get("name", [""])[0]).strip()

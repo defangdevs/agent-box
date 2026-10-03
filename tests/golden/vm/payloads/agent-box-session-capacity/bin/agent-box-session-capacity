@@ -116,8 +116,16 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
     # died session's pane counted as real, running capacity forever, and
     # enough of them stalled every OTHER pending session too, with nothing to
     # clear it but `agent-box-session rm` (issue #523).
-    died = {name for name, entry in sessions.items()
-            if isinstance(entry, dict) and entry.get("died") is not None}
+    # Same rule as the settings daemon's crashed_status(): True or an int
+    # exit status is a crash, anything else (False, null) is not.
+
+    def crashed(entry):
+        value = entry.get("died") if isinstance(entry, dict) else None
+        if isinstance(value, bool):
+            return value
+        return isinstance(value, int)
+
+    died = {name for name, entry in sessions.items() if crashed(entry)}
     used = (live | pending) - died
     targets = set(targets)
     if spawning:
