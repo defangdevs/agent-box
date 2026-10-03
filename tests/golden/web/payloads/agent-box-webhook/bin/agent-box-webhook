@@ -1,4 +1,8 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
+# The CLI prepares an API-key watch through the same authentication
+# check the dispatcher runs. Pin the generated spawn wrapper so a
+# login shell and the receiver use identical code and dependencies.
+export AGENT_BOX_HOOK_SPAWN_CMD=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook-spawn/bin/agent-box-webhook-spawn
 # The pinned webhook.py this box RUNS. The wrapper carries the path
 # so the body stays backend-neutral (issue #154, Phase 2).
 export AGENT_BOX_WEBHOOK_SCRIPT=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-webhook.py
@@ -104,10 +108,11 @@ usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
                                          [--deliver-to session|subagent]
                                          [--renew-on-event] [--ignore-sender LOGIN]...
                                          [--when JSON] [--drop JSON]
-                                         [--claim SPEC]... [--profile NAME] [--name NAME]
+                                         [--claim SPEC]... [--profile NAME] [--auth api-key|saved-login] [--name NAME]
                                          [--events POLICY | --all-events]
        agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent] [--name NAME]
        agent-box-webhook ls
+       agent-box-webhook auth-status TOPIC [--name NAME]
        agent-box-webhook status
        agent-box-webhook backfill [OWNER/REPO]... [--dry-run] [--hours N]
        agent-box-webhook url
@@ -270,8 +275,19 @@ something stronger on a red build:
 It is stored on the subscription as spawnConfig.profile (webhook.py's
 --spawn-config), so `agent-box-webhook ls` shows it. --profile '' clears it.
 A profile that does not exist when an event arrives is reported and ignored,
-and the session starts on the box default — a delivery is never dropped for
-a renamed profile.
+and a saved-login watch starts on the box default. An API-key watch instead
+defers the event until its named profile is available.
+
+New watches default to --auth api-key. The named profile must contain
+ANTHROPIC_API_KEY for Claude, or OPENAI_API_KEY and a separate absolute
+CODEX_HOME under HOME for Codex. The key is saved with the profile, never
+the watch. Codex is logged into that CODEX_HOME with
+the API key through stdin. A missing key or profile defers a matching event;
+it never falls back to the Connections login. Use --auth saved-login only
+when that login is permitted for unattended work. Existing watches without
+an auth mode retain their previous behavior until explicitly changed.
+Run `agent-box-webhook auth-status TOPIC [--name NAME]` for the current
+mode and readiness without printing any key.
 
 --when / --drop attach payload rules to the subscription: deliver (or
 spawn) ONLY events matching --when, never those matching --drop. Rules are
@@ -873,12 +889,37 @@ claim_clauses() {
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
+  auth-status)
+    auth_topic="${1:-}"; shift || true
+    auth_name=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        (--name) [ "$#" -ge 2 ] || { echo "agent-box-webhook: --name needs a value" >&2; exit 2; }
+                 auth_name="$2"; shift 2 ;;
+        (--name=*) auth_name="${1#--name=}"; shift ;;
+        (*) echo "agent-box-webhook: auth-status accepts TOPIC and --name NAME" >&2; exit 2 ;;
+      esac
+    done
+    [ -n "$auth_topic" ] || { echo "agent-box-webhook: auth-status needs TOPIC" >&2; exit 2; }
+    case "$auth_topic" in (*:*) ;; (*) auth_topic="github:$auth_topic" ;; esac
+    auth_config=$("$JQ" -ec --arg t "$auth_topic" --arg n "$auth_name" \
+      '[(.topics // [])[] | select(type == "object" and ((.topic // "") | ascii_downcase) == ($t | ascii_downcase)
+        and (.name // "") == $n)][0] | select(type == "object") | (.spawnConfig // {})' \
+      "$STATE_DIR/filter.dispatch.json" 2>/dev/null) || {
+      echo "agent-box-webhook: no standing watch '$auth_topic' / '$auth_name'" >&2
+      exit 2
+    }
+    LOCAL_WEBHOOK_SPAWN_CONFIG="$auth_config" "${AGENT_BOX_HOOK_SPAWN_CMD:-agent-box-webhook-spawn}" \
+      --auth-status "$auth_topic" "" "$auth_name"
+    ;;
   subscribe)
     deliver_to=session
     ensure_state
     if [ "${1:-}" != "-h" ] && [ "${1:-}" != "--help" ]; then
       have_when=0; have_drop=0; topic=""; want=""
       have_include=0; have_exclude=0; claims=""; profile=""; have_profile=0
+      watch_name=""; auth_mode=""; have_auth=0; reset_spawn=0
+      spawn_assignments=()
       # Issue #706: the event-relevance dimension, and the two arguments that
       # have to be CAPTURED rather than forwarded because this script now
       # rewrites them — the caller's own predicate (ANDed with the claim
@@ -918,6 +959,9 @@ case "$cmd" in
               fi
               claims="$claims $a"; want=""; continue ;;
             (profile) profile="$a"; have_profile=1; want=""; continue ;;
+            (auth) auth_mode="$a"; have_auth=1; want=""; continue ;;
+            (spawn-config) spawn_assignments+=("$a"); want=""; continue ;;
+            (name) watch_name="$a" ;;
             (events) events_policy="$a"; have_events=1; want=""; continue ;;
             (uinclude) user_include="$a"; want=""; continue ;;
             (note) note="$a"; have_note=1; want=""; continue ;;
@@ -928,7 +972,11 @@ case "$cmd" in
         case "$a" in
           --deliver-to) want=deliver-to ;;
           --name) want=name ;;
+          --name=*) watch_name="${a#--name=}" ;;
           --deliver-to=*) deliver_to="${a#--deliver-to=}" ;;
+          --spawn-config) want=spawn-config; continue ;;
+          --spawn-config=*) spawn_assignments+=("${a#--spawn-config=}"); continue ;;
+          --no-spawn-config) reset_spawn=1; continue ;;
           --drop|--drop=*) have_drop=1 ;;
           --exclude|--exclude=*) have_exclude=1 ;;
           # --include and its old name --when are captured, not forwarded:
@@ -967,6 +1015,8 @@ case "$cmd" in
           # VALUE is an error.
           --profile) want=profile; continue ;;
           --profile=*) profile="${a#--profile=}"; have_profile=1; continue ;;
+          --auth) want=auth; continue ;;
+          --auth=*) auth_mode="${a#--auth=}"; have_auth=1; continue ;;
           --*) ;;
           *) [ -n "$topic" ] || topic="$a" ;;
         esac
@@ -993,23 +1043,107 @@ case "$cmd" in
           exit 2
         fi
         case "$profile" in
-          ("") set -- "$@" --no-spawn-config ;;
+          ("") ;;
           (*[!A-Za-z0-9_-]*)
             echo "agent-box-webhook: --profile '$profile' is not a valid profile" \
                  "name (A-Za-z0-9_-)" >&2
             exit 2 ;;
           (*)
-            # A warning, never a refusal: profiles are runtime data, and
-            # subscribing a watch before creating its profile is a legitimate
-            # order to do things in. The spawn falls back to the box default
-            # and says so if the profile is still missing when an event lands.
+            # A saved-login watch can fall back to the box default. An API-key
+            # watch fails its preparation below rather than changing identity.
             if [ ! -r "$HOME/.config/agent-box/profiles/$profile.env" ]; then
               echo "agent-box-webhook: no profile '$profile' on this box yet" \
-                   "(agent-box-profile ls) — subscribing anyway; a match starts" \
-                   "the box default until you create it" >&2
+                   "(agent-box-profile ls); API-key watches require it" >&2
             fi
-            set -- "$@" --spawn-config "profile=$profile" ;;
+            ;;
         esac
+      fi
+      if [ "$have_auth" = 1 ]; then
+        if [ "$deliver_to" != subagent ]; then
+          echo "agent-box-webhook: --auth only applies to a standing watch" >&2
+          exit 2
+        fi
+        case "$auth_mode" in
+          (api-key|saved-login) ;;
+          (*) echo "agent-box-webhook: --auth must be api-key or saved-login" >&2; exit 2 ;;
+        esac
+      fi
+      if [ "$deliver_to" = subagent ]; then
+        stored_topic="$topic"
+        case "$stored_topic" in (*:*) ;; (*) stored_topic="github:$stored_topic" ;; esac
+        existing_config=null
+        if [ -r "$STATE_DIR/filter.dispatch.json" ]; then
+          existing_config=$("$JQ" -c --arg t "$stored_topic" --arg n "$watch_name" \
+            '[(.topics // [])[] | select((.topic | ascii_downcase) == ($t | ascii_downcase)
+              and (.name // "") == $n)][0] | if type == "object" then .spawnConfig // {} else null end' \
+            "$STATE_DIR/filter.dispatch.json" 2>/dev/null) || existing_config=null
+        fi
+        if [ "$reset_spawn" = 1 ] || [ "$existing_config" = null ]; then
+          spawn_config='{}'
+        else
+          spawn_config="$existing_config"
+        fi
+        for assignment in "${spawn_assignments[@]}"; do
+          case "$assignment" in
+            (*=*) key="${assignment%%=*}"; value="${assignment#*=}" ;;
+            (*) echo "agent-box-webhook: --spawn-config needs KEY=VALUE" >&2; exit 2 ;;
+          esac
+          if [ "$key" = authMode ]; then
+            echo "agent-box-webhook: use --auth to change a watch's authentication" >&2
+            exit 2
+          fi
+          spawn_config=$("$JQ" -cn --argjson c "$spawn_config" --arg k "$key" \
+            --arg v "$value" '$c + {($k):$v}') || exit 2
+        done
+        if [ "$have_profile" = 1 ]; then
+          if [ -n "$profile" ]; then
+            spawn_config=$("$JQ" -cn --argjson c "$spawn_config" --arg p "$profile" \
+              '$c + {profile:$p}') || exit 2
+          else
+            spawn_config=$("$JQ" -cn --argjson c "$spawn_config" \
+              '$c | del(.profile)') || exit 2
+          fi
+        fi
+        if [ "$have_auth" = 1 ]; then
+          spawn_config=$("$JQ" -cn --argjson c "$spawn_config" --arg a "$auth_mode" \
+            '$c + {authMode:$a}') || exit 2
+        elif [ "$existing_config" != null ]; then
+          spawn_config=$("$JQ" -cn --argjson c "$spawn_config" \
+            --argjson old "$existing_config" \
+            '$c + (if $old.authMode then {authMode:$old.authMode} else {} end)') || exit 2
+        elif [ "$existing_config" = null ] && [ "$reset_spawn" = 0 ]; then
+          spawn_config=$("$JQ" -cn --argjson c "$spawn_config" \
+            '$c + {authMode:($c.authMode // "api-key")}') || exit 2
+        fi
+        auth_choice=$("$JQ" -r '.authMode // "legacy"' <<<"$spawn_config")
+        case "$auth_choice" in
+          (api-key|saved-login) ;;
+          (legacy) if [ "$existing_config" = null ]; then
+                      echo "agent-box-webhook: new watches need --auth api-key or --auth saved-login" >&2
+                      exit 2
+                    fi ;;
+          (*) echo "agent-box-webhook: invalid watch authMode '$auth_choice'" >&2; exit 2 ;;
+        esac
+        # The same check runs at dispatch. Doing it before the writer means a
+        # programmatic request cannot leave behind an active unusable watch.
+        if [ "$auth_choice" = api-key ]; then
+          auth_cmd="${AGENT_BOX_HOOK_SPAWN_CMD:-agent-box-webhook-spawn}"
+          auth_result=$(LOCAL_WEBHOOK_SPAWN_CONFIG="$spawn_config" \
+            "$auth_cmd" --prepare-auth 2>/dev/null) || {
+              reason=$("$JQ" -r '.reason // "API-key setup failed"' <<<"$auth_result" 2>/dev/null) \
+                || reason="API-key setup failed"
+              echo "agent-box-webhook: $reason" >&2
+              exit 2
+            }
+        fi
+        set -- "$@" --no-spawn-config
+        while IFS= read -r -d '' assignment; do
+          set -- "$@" --spawn-config "$assignment"
+        done < <("$JQ" -j 'to_entries[] | .key + "=" + .value + "\u0000"' \
+          <<<"$spawn_config")
+      elif [ "${#spawn_assignments[@]}" -gt 0 ] || [ "$reset_spawn" = 1 ]; then
+        echo "agent-box-webhook: spawn config only applies to a standing watch" >&2
+        exit 2
       fi
       # The relevance dimension, resolved once: a named policy or the
       # caller's own predicate, never both — they are two spellings of the

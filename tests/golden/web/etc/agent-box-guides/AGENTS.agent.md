@@ -485,11 +485,30 @@ working on - don't pin a session subscription; it would interrupt whatever
 session is active, indefinitely. Add a standing watch instead:
 
     agent-box-webhook subscribe OWNER/REPO --deliver-to subagent \
+      --profile triage \
       --note "standing watch: triage new issues and PRs"
 
 Matching events spawn a FRESH `hook-*` session primed with the event text,
 and bursts coalesce into one. Watches are SHARED, never expire by default,
 and `agent-box-webhook ls` lists them under `dispatch`.
+
+New watches use API-key authentication by default. Put the provider key in
+the worker profile through the settings page's Profiles editor, not in a
+command or webhook rule. A Claude profile needs `ANTHROPIC_API_KEY`; Claude
+may require a one-time approval of that key. A Codex profile needs
+`OPENAI_API_KEY` and an absolute `CODEX_HOME` under HOME, separate from
+`~/.codex`;
+agent-box runs `codex login --with-api-key` through stdin in that home. The
+CLI refuses to create an API-key watch until its profile is ready. At dispatch,
+a missing key or profile defers the event instead of using a saved login. A
+key that the provider later rejects still requires replacement in the profile.
+`agent-box-webhook auth-status OWNER/REPO --name NAME` reports the current
+mode and setup state without showing the key.
+When unattended use of a saved Connections login is allowed, pass
+`--auth saved-login` explicitly. Watches created before this choice existed
+keep their prior behavior until edited; the settings page labels them for
+review. This is a per-watch choice, not a session security boundary: other
+sessions of the same Linux user can read profile keys.
 
 Use `--name NAME` to give different event rules on the same topic their own
 profiles. For example, subscribe an `issues` rule with `--profile triage` and
@@ -504,7 +523,8 @@ The earliest-subscribed matching watch wins an event. Make rules disjoint,
 including any older wildcard or unnamed watch, or it can take the event
 before a new named rule. Named watches keep their event rules across
 receiver restarts: the topic-based declared watch policy governs only
-unnamed watches. Profiles still fall back to the box default if unavailable.
+unnamed watches. Saved-login watches still fall back to the box default if a
+profile is unavailable. API-key watches require the profile they name.
 
 A watch tries not to double up on work you own, and how well it manages
 depends on what you told it. local-webhook >= 0.23.0 has no built-in policy left: a subagent watch
