@@ -406,8 +406,9 @@ agent_upgrade() {
   return 1
 }
 
-# Codex remote-control pairing currently requires the standalone
-# installer layout at ~/.codex/packages/standalone/current/codex.
+# Codex remote-control pairing requires a managed install under
+# ~/.codex/packages: standalone/current/codex (older daemons) and
+# app-server-daemon/current/bin/codex (current ones, issue #788).
 # Mirror that fixed path to the provided Codex so pairing works
 # without a curl-installed second copy.
 #
@@ -443,35 +444,50 @@ mirror_codex_standalone() {
     cbin="$(agent_bin codex)" || return 0
   fi
   cxhome="${2:-${CODEX_HOME:-$HOME/.codex}}"
-  mkdir -p "$cxhome/packages/standalone/agent-box-current"
-  ln -sfn "$cbin" "$cxhome/packages/standalone/agent-box-current/codex"
-  # `ln -sfn` only replaces `current` when it is already a symlink or a
-  # plain file (issue #95). If a curl-installed Codex ever leaves `current`
-  # as a REAL directory — an unusual manual layout, but a possible one —
-  # `-sfn` can't unlink a non-empty directory, so it silently creates
-  # `current/agent-box-current` INSIDE it instead of replacing it, and
-  # remote-control pairing keeps resolving the stale copy underneath.
-  #
-  # Clear a real directory first (the `-L` check excludes a
-  # symlink-to-a-directory, which `-sfn` already replaces correctly, so
-  # this only ever fires on the broken layout). `rename()` cannot swap a
-  # symlink over a non-empty directory in one step, so this branch is not
-  # atomic: a session reading `current` between the `rm -rf` and the `mv`
-  # below sees it briefly missing. That is an acceptable one-time cost to
-  # repair the broken layout, and every run after this one takes the
-  # atomic path below, because `current` is a symlink from here on.
-  #
-  # Build the new symlink under a temp name in the same directory and
-  # rename it over `current` — `rename()` is atomic, so a session reading
-  # `current` mid-update here sees either the old or the new target, never
-  # a missing path (except immediately following the repair above).
-  _mcs_current="$cxhome/packages/standalone/current"
+  # Two layouts, one binary. The legacy `packages/standalone` root is what
+  # an older daemon reads. A current daemon reads `packages/app-server-daemon`
+  # instead whenever that root has a `current`, or when no prior launch left
+  # artifacts under app-server-daemon/ — which is every fresh box (issue
+  # #788). Without it the daemon tries to copy the running CLI's own package,
+  # finds no codex-package.json beside a nixpkgs binary, and dies with "this
+  # CLI has no complete local package". With `current/bin/codex` present it
+  # uses that file in place and copies nothing.
+  _mcs_swap "$cxhome/packages/standalone" agent-box-current "$cbin" codex
+  _mcs_swap "$cxhome/packages/app-server-daemon" agent-box-current "$cbin" bin/codex
+}
+
+# Point $1/$2/$4 at $3 and swap $1/current to $2.
+# `ln -sfn` only replaces `current` when it is already a symlink or a
+# plain file (issue #95). If a curl-installed Codex ever leaves `current`
+# as a REAL directory — an unusual manual layout, but a possible one —
+# `-sfn` can't unlink a non-empty directory, so it silently creates
+# `current/agent-box-current` INSIDE it instead of replacing it, and
+# remote-control pairing keeps resolving the stale copy underneath.
+#
+# Clear a real directory first (the `-L` check excludes a
+# symlink-to-a-directory, which `-sfn` already replaces correctly, so
+# this only ever fires on the broken layout). `rename()` cannot swap a
+# symlink over a non-empty directory in one step, so this branch is not
+# atomic: a session reading `current` between the `rm -rf` and the `mv`
+# below sees it briefly missing. That is an acceptable one-time cost to
+# repair the broken layout, and every run after this one takes the
+# atomic path below, because `current` is a symlink from here on.
+#
+# Build the new symlink under a temp name in the same directory and
+# rename it over `current` — `rename()` is atomic, so a session reading
+# `current` mid-update here sees either the old or the new target, never
+# a missing path (except immediately following the repair above).
+_mcs_swap() {
+  _mcs_root=$1 _mcs_dir=$2 _mcs_target=$3 _mcs_rel=$4
+  mkdir -p "$_mcs_root/$_mcs_dir/$(dirname "$_mcs_rel")"
+  ln -sfn "$_mcs_target" "$_mcs_root/$_mcs_dir/$_mcs_rel"
+  _mcs_current="$_mcs_root/current"
   if [ -d "$_mcs_current" ] && [ ! -L "$_mcs_current" ]; then
     rm -rf "$_mcs_current"
   fi
   _mcs_tmp="$_mcs_current.tmp.$$"
   rm -f "$_mcs_tmp"
-  ln -sfn agent-box-current "$_mcs_tmp"
+  ln -sfn "$_mcs_dir" "$_mcs_tmp"
   mv -T "$_mcs_tmp" "$_mcs_current"
 }
 
