@@ -106,6 +106,14 @@ class WhatsAppInstallTest(unittest.TestCase):
         self.assertIsNone(self.cli.profile("default"))
         with self.assertRaisesRegex(RuntimeError, "profile"):
             self.cli.profile("not a profile")
+        with self.assertRaisesRegex(RuntimeError, "profile"):
+            self.cli.profile("dotted.name")
+
+    def test_pair_rejects_non_ascii_digits(self):
+        for phone in ("+1 415 555 1234\u0663", "\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668", "12345abc678"):
+            with mock.patch.dict("os.environ", {"LOCAL_WHATSAPP_PHONE": phone}):
+                with self.assertRaisesRegex(RuntimeError, "LOCAL_WHATSAPP_PHONE"):
+                    self.cli.pair()
 
 
 if __name__ == "__main__":

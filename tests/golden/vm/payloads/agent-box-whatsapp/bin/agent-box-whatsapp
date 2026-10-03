@@ -126,8 +126,8 @@ def profile(value=None):
             value = data.get("profile") if isinstance(data, dict) else None
         except (OSError, ValueError, AttributeError):
             value = None
-        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value) else None
-    if value != "default" and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value):
+        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) else None
+    if value != "default" and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
         raise RuntimeError("WhatsApp profile must be a profile name or 'default'")
     private_dir(STATE)
     if config.is_symlink():
@@ -160,8 +160,9 @@ def activate():
 
 
 def pair():
-    phone = re.sub(r"\D", "", os.environ.get("LOCAL_WHATSAPP_PHONE", ""))
-    if not 7 <= len(phone) <= 15:
+    raw = os.environ.get("LOCAL_WHATSAPP_PHONE", "")
+    phone = re.sub(r"[ ()+.-]", "", raw)
+    if not (phone.isascii() and phone.isdigit()) or not 7 <= len(phone) <= 15:
         raise RuntimeError("Set LOCAL_WHATSAPP_PHONE to international digits before pairing")
     install()
     private_dir(STATE)

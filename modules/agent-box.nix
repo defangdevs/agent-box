@@ -5515,8 +5515,8 @@ def profile(value=None):
             value = data.get("profile") if isinstance(data, dict) else None
         except (OSError, ValueError, AttributeError):
             value = None
-        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value) else None
-    if value != "default" and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value):
+        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) else None
+    if value != "default" and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
         raise RuntimeError("WhatsApp profile must be a profile name or 'default'")
     private_dir(STATE)
     if config.is_symlink():
@@ -5549,8 +5549,9 @@ def activate():
 
 
 def pair():
-    phone = re.sub(r"\D", "", os.environ.get("LOCAL_WHATSAPP_PHONE", ""))
-    if not 7 <= len(phone) <= 15:
+    raw = os.environ.get("LOCAL_WHATSAPP_PHONE", "")
+    phone = re.sub(r"[ ()+.-]", "", raw)
+    if not (phone.isascii() and phone.isdigit()) or not 7 <= len(phone) <= 15:
         raise RuntimeError("Set LOCAL_WHATSAPP_PHONE to international digits before pairing")
     install()
     private_dir(STATE)
@@ -19414,7 +19415,9 @@ def whatsapp_profile(value=None):
 
 def render_whatsapp_profile_field():
     current = whatsapp_profile()
-    profiles = read_profiles()
+    # "default" is the CLI's word for "no selection", so a profile with that
+    # name cannot be chosen here.
+    profiles = {n: v for n, v in read_profiles().items() if n != "default"}
     choices = [""] + sorted(profiles)
     if current and current not in profiles:
         choices.append(current)
@@ -27297,7 +27300,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._send_html("<h1>404</h1>", status=404)
                     return
                 profile = form.get("profile", [""])[0].strip()
-                if profile and (not PROFILE_NAME_RE.match(profile)
+                if profile and (profile == "default"
+                                or not PROFILE_NAME_RE.match(profile)
                                 or profile not in read_profiles()):
                     self._send_html(render_page("Choose an existing WhatsApp profile.",
                                                 kind="error"), status=400)
@@ -27310,24 +27314,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             if action == "start":
                 if flow["id"] == "whatsapp":
-                    phone = re.sub(r"\D", "", form.get("phone", [""])[0])
-                    if phone:
-                        if not 7 <= len(phone) <= 15:
+                    raw_phone = form.get("phone", [""])[0].strip()
+                    phone = ""
+                    if raw_phone:
+                        # ASCII only: \D would keep Unicode digits the bridge drops.
+                        phone = re.sub(r"[ ()+.-]", "", raw_phone)
+                        if not (phone.isascii() and phone.isdigit()
+                                and 7 <= len(phone) <= 15):
                             self._send_html(render_page(
                                 "Enter a valid WhatsApp number with country code.",
                                 kind="error"), status=400)
                             return
+                    profile = form.get("profile", [""])[0].strip()
+                    if profile and (profile == "default"
+                                    or not PROFILE_NAME_RE.match(profile)
+                                    or profile not in read_profiles()):
+                        self._send_html(render_page("Choose an existing WhatsApp profile.",
+                                                    kind="error"), status=400)
+                        return
+                    if phone:
                         try:
                             set_key("LOCAL_WHATSAPP_PHONE", phone)
                         except EnvStoreError as exc:
                             self._send_html(render_page(str(exc), kind="error"), status=400)
                             return
-                    profile = form.get("profile", [""])[0].strip()
-                    if profile and (not PROFILE_NAME_RE.match(profile)
-                                    or profile not in read_profiles()):
-                        self._send_html(render_page("Choose an existing WhatsApp profile.",
-                                                    kind="error"), status=400)
-                        return
                     if whatsapp_profile(profile) is None:
                         self._send_html(render_page("Could not save the WhatsApp profile.",
                                                     kind="error"), status=503)
