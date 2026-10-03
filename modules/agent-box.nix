@@ -280,8 +280,9 @@ let
       sooner. What is NOT reaped is a hook session that CRASHED: a non-zero exit is
       never parked, so it stays listed and attachable for you to read - `rm` it once
       you have. That cleanup is load-bearing: one RAM-sized limit (about one session
-      per GiB by default, overridable with `sessionLimit`) bounds ALL sessions running
-      or queued to start, including CLI/UI sessions, and once that ceiling is reached EVERY
+      per GiB by default, overridable with `sessionLimit`) bounds all agent sessions
+      running or queued to start, including CLI/UI sessions but not operator shell panes,
+      and once that ceiling is reached EVERY
       watch on the box is stalled - a matching batch starts nothing until a slot
       frees. It is no longer LOST while it waits: the wrapper declines it and the
       receiver keeps it, re-offers it as slots free, and drops it only after an hour
@@ -631,8 +632,9 @@ let
       the value out of the command line, the shell history and `ps`). Such a
       value is stored double-quoted, which is the one thing to preserve if you
       ever hand-edit the file.
-    - Session starts share one limit across the CLI, settings page and webhooks.
-      It defaults to about one session per GiB of physical RAM and can be
+    - Agent session starts share one limit across the CLI, settings page and
+      webhooks. Shell panes are operator terminals and do not use a slot. The
+      limit defaults to about one session per GiB of physical RAM and can be
       overridden by `sessionLimit` in the box configuration. Pending starts reserve
       slots too. Stop a session to free capacity; restarting a stopped session
       needs a free slot. `restart --all` refuses without changing anything if it
@@ -2232,12 +2234,14 @@ def capacity_live_checked():
         raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
 
 
-def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
+def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
+                   exempt=()):
     """Admit new/revived targets, or one supervisor spawn.
 
     On boot or after a limit reduction, an overfull registry is a queue:
     keep live panes and admit pending names in sorted order up to the limit.
     Existing panes are never killed. Ordinary adds cannot jump that queue.
+    `exempt` is for an unmetered target that is not in the registry yet.
     """
     try:
         limit = capacity_limit() if limit is None else limit
@@ -2246,6 +2250,11 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
     live = capacity_live_checked() if live is None else set(live)
     pending = {name for name, entry in sessions.items()
                if isinstance(entry, dict) and entry.get("stopped") is not True}
+    # A shell pane is an operator terminal rather than an agent worker. It
+    # shares the registry so it can be listed, stopped and resumed like other
+    # sessions, but must not consume an agent worker slot (issue #795).
+    shells = {name for name, entry in sessions.items()
+              if isinstance(entry, dict) and entry.get("agent") == "shell"}
     # A crash is flagged `died`, not `stopped` (issue #516), so a died entry
     # stays in `pending` -- it must remain its own candidate for revival by
     # `agent-box-session restart`, or a stale flag on a session that already
@@ -2266,17 +2275,21 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
         return isinstance(value, int)
 
     died = {name for name, entry in sessions.items() if crashed(entry)}
-    used = (live | pending) - died
+    exempt = set(exempt)
+    unmetered = died | shells | exempt
+    used = (live | pending) - unmetered
     targets = set(targets)
     if spawning:
-        available = max(0, limit - len(live - died))
-        admitted = live | set(sorted(pending - live)[:available])
+        available = max(0, limit - len(live - unmetered))
+        admitted = live | unmetered | set(
+            sorted(pending - live - unmetered)[:available])
         allowed = targets <= admitted
     else:
         # An already-admitted session retains its slot during restart, even
         # if an operator has since lowered the limit below the running count.
-        added = targets - used
-        allowed = not added or len(used | targets) <= limit
+        counted_targets = targets - unmetered
+        added = counted_targets - used
+        allowed = not added or len(used | counted_targets) <= limit
     if not allowed:
         raise SessionCapacityError(
             "Session limit reached (%d running or queued, limit %d). "
@@ -2380,12 +2393,14 @@ def capacity_live_checked():
         raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
 
 
-def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
+def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
+                   exempt=()):
     """Admit new/revived targets, or one supervisor spawn.
 
     On boot or after a limit reduction, an overfull registry is a queue:
     keep live panes and admit pending names in sorted order up to the limit.
     Existing panes are never killed. Ordinary adds cannot jump that queue.
+    `exempt` is for an unmetered target that is not in the registry yet.
     """
     try:
         limit = capacity_limit() if limit is None else limit
@@ -2394,6 +2409,11 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
     live = capacity_live_checked() if live is None else set(live)
     pending = {name for name, entry in sessions.items()
                if isinstance(entry, dict) and entry.get("stopped") is not True}
+    # A shell pane is an operator terminal rather than an agent worker. It
+    # shares the registry so it can be listed, stopped and resumed like other
+    # sessions, but must not consume an agent worker slot (issue #795).
+    shells = {name for name, entry in sessions.items()
+              if isinstance(entry, dict) and entry.get("agent") == "shell"}
     # A crash is flagged `died`, not `stopped` (issue #516), so a died entry
     # stays in `pending` -- it must remain its own candidate for revival by
     # `agent-box-session restart`, or a stale flag on a session that already
@@ -2414,17 +2434,21 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None):
         return isinstance(value, int)
 
     died = {name for name, entry in sessions.items() if crashed(entry)}
-    used = (live | pending) - died
+    exempt = set(exempt)
+    unmetered = died | shells | exempt
+    used = (live | pending) - unmetered
     targets = set(targets)
     if spawning:
-        available = max(0, limit - len(live - died))
-        admitted = live | set(sorted(pending - live)[:available])
+        available = max(0, limit - len(live - unmetered))
+        admitted = live | unmetered | set(
+            sorted(pending - live - unmetered)[:available])
         allowed = targets <= admitted
     else:
         # An already-admitted session retains its slot during restart, even
         # if an operator has since lowered the limit below the running count.
-        added = targets - used
-        allowed = not added or len(used | targets) <= limit
+        counted_targets = targets - unmetered
+        added = counted_targets - used
+        allowed = not added or len(used | counted_targets) <= limit
     if not allowed:
         raise SessionCapacityError(
             "Session limit reached (%d running or queued, limit %d). "
@@ -5192,7 +5216,11 @@ case "$cmd" in
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
     fi
-    "''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
+    # Shell panes are operator terminals, not agent workers, so only worker
+    # harnesses go through the shared agent-session admission cap (issue #795).
+    if [ "$harness" != shell ]; then
+      "''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
+    fi
     # The id this session's FIRST spawn is launched with (Claude
     # --session-id / --resume; Codex transcript marker). Not a stable handle
     # on the conversation: a clear, a compact or a resume rotates the agent
@@ -17798,7 +17826,8 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
                      for s in sessions.values()):
                 return
             name = gen_session_name(agent, sessions)
-            capacity_check(sessions, [name], live=live)
+            capacity_check(sessions, [name], live=live,
+                           exempt=[name] if agent == "shell" else ())
             sessions[name] = {
                 "agent": agent,
                 "skipPermissions": True,
@@ -20831,9 +20860,13 @@ def session_list_payload():
     limit = capacity["max"]
     pending = {n for n, e in sessions.items() if e.get("stopped") is not True}
     died = {n for n, e in sessions.items() if crashed_status(e) is not None}
+    shells = {n for n, e in sessions.items() if e.get("agent") == "shell"}
     # The same admission order capacity_check's spawn branch uses: a pending
     # name past the free slots is queued, not starting.
-    admitted = live | set(sorted(pending - live)[:max(0, limit - len(live - died))])
+    unmetered = died | shells
+    admitted = live | unmetered | set(
+        sorted(pending - live - unmetered)[
+            :max(0, limit - len(live - unmetered))])
     rows = []
     for name, entry in sessions.items():
         if entry.get("stopped") is True:
@@ -27712,7 +27745,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # inventing one AND guarantees a unique key, so no collision
                     # or accidental-overwrite (issue 100) is possible.
                     name = gen_session_name(profile or agent, sessions, cwd)
-                    capacity_check(sessions, [name], live=live)
+                    capacity_check(sessions, [name], live=live,
+                                   exempt=[name] if agent == "shell" else ())
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,

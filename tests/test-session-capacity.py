@@ -98,6 +98,20 @@ class Policy(unittest.TestCase):
         capacity.capacity_check(sessions, ["revived"], spawning=True,
                                 live=set(), limit=1)
 
+    def test_shell_entries_are_unmetered(self):
+        sessions = {"terminal": {"agent": "shell"}}
+        result = capacity.capacity_check(sessions, ["worker"],
+                                         live={"terminal"}, limit=1)
+        self.assertEqual(result["used"], 0)
+
+        capacity.capacity_check({"worker": {}, **sessions}, ["terminal"],
+                                spawning=True, live={"worker"}, limit=1)
+
+    def test_new_shell_is_exempt_before_its_registry_entry_exists(self):
+        capacity.capacity_check({"worker": {}}, ["terminal"],
+                                live={"worker"}, limit=1,
+                                exempt={"terminal"})
+
     def test_restart_does_not_need_a_second_slot(self):
         capacity.capacity_check({"a": {}, "b": {}}, ["a"], live={"a"}, limit=1)
 
@@ -146,8 +160,8 @@ class Cli(unittest.TestCase):
                         "echo 'no server running' >&2\nexit 1\n")
         tmux.chmod(0o755)
         self.env = {"PATH": os.environ["PATH"], "HOME": str(self.work),
-                    "USER": "capacity-test", "AGENT_BOX_AGENTS": "shell",
-                    "AGENT_BOX_DEFAULT_AGENT": "shell",
+                    "USER": "capacity-test", "AGENT_BOX_AGENTS": "claude shell",
+                    "AGENT_BOX_DEFAULT_AGENT": "claude",
                     "AGENT_BOX_SESSIONS_FILE": str(self.registry),
                     "AGENT_BOX_SESSION_LIMIT_FILE": str(self.limit),
                     "AGENT_BOX_CAPACITY_BIN": str(helper),
@@ -165,6 +179,15 @@ class Cli(unittest.TestCase):
         self.assertEqual(sorted(r.returncode for r in results), [0, 0] + [75] * 6,
                          [(r.returncode, r.stderr) for r in results])
         self.assertEqual(len(json.loads(self.registry.read_text())["sessions"]), 2)
+
+    def test_shell_add_does_not_consume_or_need_capacity(self):
+        for name in ["a", "b"]:
+            self.assertEqual(self.run_cli("add", name).returncode, 0)
+        result = self.run_cli("add", "terminal", "--harness", "shell")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_cli("add", "worker").returncode, 75)
+        self.assertEqual(json.loads(self.registry.read_text())["sessions"]["terminal"]["agent"],
+                         "shell")
 
     def test_restart_all_refuses_without_partial_mutation(self):
         self.registry.write_text(json.dumps({"version": 1, "sessions": {

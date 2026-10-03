@@ -209,6 +209,15 @@ class SessionsApi(unittest.TestCase):
         self.live = set()
         self.assertEqual(self.by_name()["gone"]["state"], "starting")
 
+    def test_shell_pane_is_unmetered_and_not_queued(self):
+        self.limit = 1
+        self.write({"worker": entry(), "terminal": entry(agent="shell")})
+        self.live = {"worker"}
+        data, _ = self.listing()
+        states = {s["name"]: s["state"] for s in data["sessions"]}
+        self.assertEqual(states, {"worker": "running", "terminal": "starting"})
+        self.assertEqual(data["capacity"], {"used": 1, "limit": 1})
+
     # --- POST /sessions/stop --------------------------------------------
 
     def test_stop_parks_frees_the_slot_and_keeps_the_entry(self):

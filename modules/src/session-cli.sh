@@ -738,7 +738,11 @@ case "$cmd" in
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
     fi
-    "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
+    # Shell panes are operator terminals, not agent workers, so only worker
+    # harnesses go through the shared agent-session admission cap (issue #795).
+    if [ "$harness" != shell ]; then
+      "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
+    fi
     # The id this session's FIRST spawn is launched with (Claude
     # --session-id / --resume; Codex transcript marker). Not a stable handle
     # on the conversation: a clear, a compact or a resume rotates the agent
