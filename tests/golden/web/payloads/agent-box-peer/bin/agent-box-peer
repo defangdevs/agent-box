@@ -1,0 +1,539 @@
+#! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.7/bin/python3.14
+"""Explicit, user-scoped peer pairing for agent-box local-channels.
+
+This command deliberately owns only discovery, pairing, and outbound HTTPS.
+The receiving box's existing local-webhook receiver remains the one event bus:
+sessions subscribe to ``peer-<id>:<inbox>`` or a standing watch dispatches it
+to a new subagent.  Pairing is between Linux users, not between sessions.
+
+The invitation/response strings are bearer secrets.  They are intended for a
+human-mediated, out-of-band exchange (copy/paste, QR, password manager), and
+are never accepted as command-line arguments so they do not land in process
+lists or shell history.
+"""
+
+import argparse
+import base64
+import datetime as dt
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+
+
+VERSION = 1
+MAX_MESSAGE_BYTES = 64 * 1024
+PAIR_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+INBOX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def fail(message, status=1):
+    print("agent-box-peer: " + message, file=sys.stderr)
+    raise SystemExit(status)
+
+
+def state_dir():
+    return Path(os.environ.get("AGENT_BOX_PEER_STATE_DIR",
+                               os.path.expanduser("~/.config/agent-box/peers")))
+
+
+def webhook_state_dir():
+    return Path(os.environ.get("LOCAL_WEBHOOK_STATE_DIR",
+                               os.path.expanduser("~/.local/state/local-webhook")))
+
+
+def utcnow():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def timestamp(value=None):
+    value = value or utcnow()
+    return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_timestamp(value, field):
+    if not isinstance(value, str):
+        fail("%s must be an RFC3339 timestamp" % field, 2)
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        fail("%s must be an RFC3339 timestamp" % field, 2)
+    if parsed.tzinfo is None:
+        fail("%s must include a timezone" % field, 2)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def b64encode(value):
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def b64decode(value, name):
+    if not isinstance(value, str) or not value:
+        fail("%s is missing" % name, 2)
+    try:
+        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (ValueError, UnicodeError):
+        fail("%s is not valid base64url" % name, 2)
+
+
+def token_encode(value):
+    return b64encode(json.dumps(value, sort_keys=True,
+                                separators=(",", ":")).encode("utf-8"))
+
+
+def token_decode(raw, name):
+    try:
+        value = json.loads(b64decode(raw.strip(), name).decode("utf-8"))
+    except (ValueError, UnicodeError):
+        fail("%s is not a valid pairing token" % name, 2)
+    if not isinstance(value, dict):
+        fail("%s must encode an object" % name, 2)
+    return value
+
+
+def read_token(name):
+    if sys.stdin.isatty():
+        fail("paste the %s on standard input" % name, 2)
+    raw = sys.stdin.read().strip()
+    if not raw or "\n" in raw:
+        fail("%s must be one token on standard input" % name, 2)
+    return token_decode(raw, name)
+
+
+def validate_pair_id(value):
+    if not isinstance(value, str) or not PAIR_ID_RE.fullmatch(value):
+        fail("pair id is invalid", 2)
+    return value
+
+
+def validate_endpoint(value):
+    if not isinstance(value, str):
+        fail("webhook endpoint is missing", 2)
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+        fail("webhook endpoint must be an absolute https URL without query or fragment", 2)
+    if parsed.username or parsed.password:
+        fail("webhook endpoint must not include credentials", 2)
+    return value.rstrip("/")
+
+
+def local_endpoint():
+    return validate_endpoint(os.environ.get("AGENT_BOX_WEBHOOK_URL", ""))
+
+
+def validate_label(value):
+    if not isinstance(value, str) or not value.strip() or len(value) > 128:
+        fail("label must contain 1-128 characters", 2)
+    return value.strip()
+
+
+def validate_inbox(value):
+    if not isinstance(value, str) or not INBOX_RE.fullmatch(value):
+        fail("inbox must be 1-64 letters, digits, dot, underscore, or dash", 2)
+    return value
+
+
+def hkdf(root, info):
+    # RFC 5869 HKDF-SHA256, with a fixed protocol salt.  Separating directions
+    # means compromise of one receiver source key does not forge reverse mail.
+    salt = b"agent-box-peer/v1"
+    prk = hmac.new(salt, root, hashlib.sha256).digest()
+    return hmac.new(prk, info.encode("ascii") + b"\x01", hashlib.sha256).digest()
+
+
+def confirmation(root, pair_id, responder_endpoint):
+    data = ("agent-box-peer-confirm/v1\0" + pair_id + "\0" + responder_endpoint).encode("utf-8")
+    return b64encode(hmac.new(hkdf(root, "confirm"), data, hashlib.sha256).digest())
+
+
+def safe_name(pair_id):
+    return "peer-" + validate_pair_id(pair_id)
+
+
+def ensure_dir(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def atomic_json(path, value):
+    ensure_dir(path.parent)
+    fd, temp = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(value, out, sort_keys=True, indent=2)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, path)
+    finally:
+        try:
+            os.unlink(temp)
+        except FileNotFoundError:
+            pass
+
+
+def atomic_secret(path, value):
+    ensure_dir(path.parent)
+    fd, temp = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(value)
+            out.write(b"\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, path)
+    finally:
+        try:
+            os.unlink(temp)
+        except FileNotFoundError:
+            pass
+
+
+def load_json(path, default):
+    try:
+        with path.open(encoding="utf-8") as source:
+            value = json.load(source)
+    except FileNotFoundError:
+        return default
+    except (OSError, ValueError) as exc:
+        fail("cannot read %s: %s" % (path, exc))
+    return value
+
+
+def peer_paths():
+    root = state_dir()
+    return root / "peers.json", root / "keys"
+
+
+def load_peers():
+    path, _ = peer_paths()
+    value = load_json(path, {"version": VERSION, "peers": {}})
+    if not isinstance(value, dict) or not isinstance(value.get("peers"), dict):
+        fail("peer state is invalid; move %s aside and pair again" % path)
+    return value
+
+
+def save_peers(value):
+    path, _ = peer_paths()
+    value["version"] = VERSION
+    atomic_json(path, value)
+
+
+def key_path(pair_id, direction):
+    _, keys = peer_paths()
+    return keys / (safe_name(pair_id) + "." + direction + ".secret")
+
+
+def source_path(pair_id):
+    return webhook_state_dir() / (safe_name(pair_id) + ".secret")
+
+
+def write_inbound_source(pair_id, key):
+    """Install the receiver source and its secret atomically enough for reload.
+
+    ``agentBoxPeer`` is private metadata. local-webhook ignores unknown source
+    keys; we use it to ensure revoke never removes a similarly named manual
+    source.
+    """
+    secret_file = source_path(pair_id)
+    state = webhook_state_dir()
+    ensure_dir(state)
+    lock_path = state / "sources.json.lock"
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        sources_path = state / "sources.json"
+        config = load_json(sources_path, {"defaultSource": "github", "sources": {}})
+        if not isinstance(config, dict):
+            fail("local-webhook sources state is invalid")
+        sources = config.setdefault("sources", {})
+        if not isinstance(sources, dict):
+            fail("local-webhook sources state is invalid")
+        name = safe_name(pair_id)
+        old = sources.get(name)
+        if old is not None and (not isinstance(old, dict) or not old.get("agentBoxPeer")):
+            fail("local-webhook source %s already exists and is not owned by agent-box-peer" % name)
+        # local-webhook reads source secrets as UTF-8 text and HMACs their
+        # UTF-8 bytes. Store the derived binary key as base64url text so the
+        # sender and receiver feed the same stable bytes to HMAC (and never
+        # write a random newline into a one-line secret file). Do this only
+        # after proving we own the source: accepting a collision must never
+        # overwrite a manually-managed source's secret.
+        atomic_secret(secret_file, b64encode(key).encode("ascii"))
+        sources[name] = {
+            "format": "generic",
+            "secretFile": str(secret_file),
+            "signatureHeader": "x-agent-box-signature-256",
+            "eventHeader": "x-agent-box-event",
+            "deliveryHeader": "x-agent-box-delivery",
+            "keyPath": "inbox",
+            "senderPath": "from",
+            "agentBoxPeer": True,
+        }
+        atomic_json(sources_path, config)
+
+
+def remove_inbound_source(pair_id):
+    state = webhook_state_dir()
+    lock_path = state / "sources.json.lock"
+    remove_secret = not state.exists()
+    if state.exists():
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            path = state / "sources.json"
+            config = load_json(path, {"defaultSource": "github", "sources": {}})
+            sources = config.get("sources") if isinstance(config, dict) else None
+            name = safe_name(pair_id)
+            source = sources.get(name) if isinstance(sources, dict) else None
+            if isinstance(source, dict) and source.get("agentBoxPeer") is True and \
+                    source.get("secretFile") == str(source_path(pair_id)):
+                del sources[name]
+                atomic_json(path, config)
+                remove_secret = True
+            elif source is None:
+                # No configured reader remains, so this peer-owned orphan is
+                # safe to remove. Any other source is deliberately untouched.
+                remove_secret = True
+    if remove_secret:
+        try:
+            source_path(pair_id).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def peer_by_label(peers, label):
+    label = validate_label(label)
+    found = [(pid, entry) for pid, entry in peers["peers"].items()
+             if isinstance(entry, dict) and entry.get("label") == label]
+    if not found:
+        fail("no paired peer named %r" % label, 2)
+    if len(found) > 1:
+        fail("more than one peer is named %r; revoke one before sending" % label, 2)
+    return found[0]
+
+
+def check_invite(invite):
+    if invite.get("version") != VERSION or invite.get("kind") != "invite":
+        fail("invite is not an agent-box peer v1 invitation", 2)
+    pair_id = validate_pair_id(invite.get("pairId"))
+    endpoint = validate_endpoint(invite.get("endpoint"))
+    expires = parse_timestamp(invite.get("expiresAt"), "invite expiry")
+    if expires <= utcnow():
+        fail("invite expired", 2)
+    root = b64decode(invite.get("secret"), "invite secret")
+    if len(root) != 32:
+        fail("invite secret has the wrong length", 2)
+    return pair_id, endpoint, root, expires
+
+
+def cmd_invite(args):
+    endpoint = local_endpoint()
+    label = validate_label(args.label)
+    expires = utcnow() + dt.timedelta(hours=args.expires_hours)
+    pair_id = secrets.token_hex(16)
+    root = secrets.token_bytes(32)
+    peers = load_peers()
+    if any(isinstance(p, dict) and p.get("label") == label for p in peers["peers"].values()):
+        fail("a peer named %r already exists" % label, 2)
+    # This is a one-line secret file, so store binary material as base64url;
+    # stripping its terminating newline must never strip a valid random byte.
+    atomic_secret(key_path(pair_id, "root"), b64encode(root).encode("ascii"))
+    peers["peers"][pair_id] = {
+        "label": label, "state": "invited", "endpoint": endpoint,
+        "createdAt": timestamp(), "expiresAt": timestamp(expires),
+    }
+    save_peers(peers)
+    print(token_encode({"version": VERSION, "kind": "invite", "pairId": pair_id,
+                        "endpoint": endpoint, "expiresAt": timestamp(expires),
+                        "secret": b64encode(root)}))
+    print("Invitation created for %s. Treat the token as a secret; send it out of band." % label,
+          file=sys.stderr)
+
+
+def cmd_accept(args):
+    invite = read_token("invitation")
+    pair_id, endpoint, root, _ = check_invite(invite)
+    label = validate_label(args.label)
+    peers = load_peers()
+    existing = peers["peers"].get(pair_id)
+    if existing is not None:
+        fail("this invitation was already accepted or paired", 2)
+    if any(isinstance(p, dict) and p.get("label") == label for p in peers["peers"].values()):
+        fail("a peer named %r already exists" % label, 2)
+    own_endpoint = local_endpoint()
+    inbound = hkdf(root, "A-to-B:" + pair_id)
+    outbound = hkdf(root, "B-to-A:" + pair_id)
+    write_inbound_source(pair_id, inbound)
+    atomic_secret(key_path(pair_id, "outbound"), b64encode(outbound).encode("ascii"))
+    peers["peers"][pair_id] = {
+        "label": label, "state": "active", "endpoint": endpoint,
+        "createdAt": timestamp(), "pairedAt": timestamp(),
+    }
+    save_peers(peers)
+    print(token_encode({"version": VERSION, "kind": "accept", "pairId": pair_id,
+                        "endpoint": own_endpoint,
+                        "confirmation": confirmation(root, pair_id, own_endpoint)}))
+    print("Pair accepted. Send the response token back to the inviter out of band. "
+          "Incoming messages use topic %s:default; subscribe it with "
+          "agent-box-webhook to receive them." % safe_name(pair_id), file=sys.stderr)
+
+
+def cmd_confirm(args):
+    response = read_token("acceptance response")
+    if response.get("version") != VERSION or response.get("kind") != "accept":
+        fail("response is not an agent-box peer v1 acceptance", 2)
+    pair_id = validate_pair_id(response.get("pairId"))
+    endpoint = validate_endpoint(response.get("endpoint"))
+    peers = load_peers()
+    peer = peers["peers"].get(pair_id)
+    if not isinstance(peer, dict) or peer.get("state") != "invited":
+        fail("no pending invitation matches this response", 2)
+    root_path = key_path(pair_id, "root")
+    try:
+        root = b64decode(root_path.read_text(encoding="ascii").strip(),
+                         "pending invitation secret")
+    except OSError:
+        fail("pending invitation secret is unavailable")
+    if len(root) != 32:
+        fail("pending invitation secret is invalid")
+    expected = confirmation(root, pair_id, endpoint)
+    if not hmac.compare_digest(str(response.get("confirmation", "")), expected):
+        fail("acceptance response does not authenticate this invitation", 2)
+    inbound = hkdf(root, "B-to-A:" + pair_id)
+    outbound = hkdf(root, "A-to-B:" + pair_id)
+    write_inbound_source(pair_id, inbound)
+    atomic_secret(key_path(pair_id, "outbound"), b64encode(outbound).encode("ascii"))
+    peer.update({"state": "active", "endpoint": endpoint, "pairedAt": timestamp()})
+    peer.pop("expiresAt", None)
+    save_peers(peers)
+    root_path.unlink(missing_ok=True)
+    print("Pair %s is active. Incoming messages use topic %s:default; subscribe it "
+          "with agent-box-webhook to receive them." % (peer["label"], safe_name(pair_id)))
+
+
+def cmd_list(_args):
+    peers = load_peers()
+    for pair_id, peer in sorted(peers["peers"].items(), key=lambda item: item[1].get("label", "")):
+        if not isinstance(peer, dict):
+            continue
+        endpoint = peer.get("endpoint", "")
+        print("%s\t%s\t%s:%s\t%s" % (
+            peer.get("label", "?"), peer.get("state", "?"), safe_name(pair_id),
+            "default", endpoint))
+
+
+def cmd_revoke(args):
+    peers = load_peers()
+    pair_id, peer = peer_by_label(peers, args.label)
+    remove_inbound_source(pair_id)
+    for direction in ("root", "outbound"):
+        key_path(pair_id, direction).unlink(missing_ok=True)
+    del peers["peers"][pair_id]
+    save_peers(peers)
+    print("Revoked pair %s. The other box must revoke it separately." % peer["label"])
+
+
+def cmd_send(args):
+    peers = load_peers()
+    pair_id, peer = peer_by_label(peers, args.label)
+    if peer.get("state") != "active":
+        fail("pair %s is not active" % peer["label"], 2)
+    inbox = validate_inbox(args.inbox)
+    if args.message is None:
+        if sys.stdin.isatty():
+            fail("provide --message TEXT or pipe a message on standard input", 2)
+        body = sys.stdin.read()
+    else:
+        body = args.message
+    encoded_body = body.encode("utf-8")
+    if not body or len(encoded_body) > MAX_MESSAGE_BYTES:
+        fail("message must contain 1-%d UTF-8 bytes" % MAX_MESSAGE_BYTES, 2)
+    try:
+        secret = key_path(pair_id, "outbound").read_bytes().strip()
+    except OSError:
+        fail("outbound pair key is unavailable")
+    # Stored as base64url text because local-webhook uses a UTF-8 source
+    # secret. Validate the decoded form but sign with the stored text, exactly
+    # as the receiver's source_secret(...).encode('utf-8') does.
+    try:
+        valid_secret = b64decode(secret.decode("ascii"), "outbound pair key")
+    except UnicodeDecodeError:
+        fail("outbound pair key is invalid")
+    if len(valid_secret) != 32:
+        fail("outbound pair key is invalid")
+    delivery = str(uuid.uuid4())
+    payload = {"version": VERSION, "messageId": delivery, "sentAt": timestamp(),
+               "inbox": inbox, "from": args.from_name or "", "body": body}
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    source = safe_name(pair_id)
+    target = validate_endpoint(peer.get("endpoint")) + "/" + source
+    headers = {
+        "Content-Type": "application/json",
+        "x-agent-box-signature-256": "sha256=" + hmac.new(secret, raw, hashlib.sha256).hexdigest(),
+        "x-agent-box-event": "agent.message",
+        "x-agent-box-delivery": delivery,
+    }
+    request = urllib.request.Request(target, data=raw, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=args.timeout) as response:
+            if response.status < 200 or response.status >= 300:
+                fail("peer ingress returned HTTP %d" % response.status)
+    except urllib.error.HTTPError as exc:
+        fail("peer ingress rejected the message (HTTP %d)" % exc.code)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        fail("peer ingress is unavailable; message was not queued locally: %s" % exc)
+    print("Accepted by %s as %s (topic %s:%s)." % (peer["label"], delivery, source, inbox))
+
+
+def parser():
+    p = argparse.ArgumentParser(
+        description="Explicitly pair agent-box Linux-user inboxes and send signed messages.")
+    sub = p.add_subparsers(dest="command", required=True)
+    invite = sub.add_parser("invite", help="create an out-of-band invitation")
+    invite.add_argument("--label", required=True)
+    invite.add_argument("--expires-hours", type=float, default=24)
+    invite.set_defaults(run=cmd_invite)
+    accept = sub.add_parser("accept", help="accept an invitation read from stdin")
+    accept.add_argument("--label", required=True)
+    accept.set_defaults(run=cmd_accept)
+    confirm = sub.add_parser("confirm", help="confirm an acceptance response read from stdin")
+    confirm.set_defaults(run=cmd_confirm)
+    sub.add_parser("list", help="list paired inboxes").set_defaults(run=cmd_list)
+    revoke = sub.add_parser("revoke", help="remove a local pair and its inbound source")
+    revoke.add_argument("label")
+    revoke.set_defaults(run=cmd_revoke)
+    send = sub.add_parser("send", help="send to a paired inbox")
+    send.add_argument("label")
+    send.add_argument("--inbox", default="default")
+    send.add_argument("--message")
+    send.add_argument("--from", dest="from_name", default="")
+    send.add_argument("--timeout", type=float, default=15)
+    send.set_defaults(run=cmd_send)
+    return p
+
+
+def main():
+    args = parser().parse_args()
+    if getattr(args, "expires_hours", 1) <= 0 or getattr(args, "expires_hours", 1) > 24 * 30:
+        fail("--expires-hours must be greater than zero and at most 720", 2)
+    if getattr(args, "timeout", 1) <= 0 or getattr(args, "timeout", 1) > 120:
+        fail("--timeout must be greater than zero and at most 120", 2)
+    args.run(args)
+
+
+if __name__ == "__main__":
+    main()
