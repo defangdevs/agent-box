@@ -268,7 +268,7 @@ def write_inbound_source(pair_id, key):
     with lock_path.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         sources_path = state / "sources.json"
-        config = load_json(sources_path, {"defaultSource": "github", "sources": {}})
+        config = load_json(sources_path, {"sources": {}})
         if not isinstance(config, dict):
             fail("local-webhook sources state is invalid")
         sources = config.setdefault("sources", {})
@@ -306,7 +306,7 @@ def remove_inbound_source(pair_id):
         with lock_path.open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             path = state / "sources.json"
-            config = load_json(path, {"defaultSource": "github", "sources": {}})
+            config = load_json(path, {"sources": {}})
             sources = config.get("sources") if isinstance(config, dict) else None
             name = safe_name(pair_id)
             source = sources.get(name) if isinstance(sources, dict) else None

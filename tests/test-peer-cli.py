@@ -70,6 +70,7 @@ class PeerCliTest(unittest.TestCase):
             response = self.capture(peer.cmd_accept, argparse.Namespace(label="A"))
         b_sources = json.loads((self.root / "b/local-webhook/sources.json").read_text())
         source_name, source = next(iter(b_sources["sources"].items()))
+        self.assertNotIn("defaultSource", b_sources)
         self.assertTrue(source["agentBoxPeer"])
         self.assertEqual(source["format"], "generic")
         self.assertEqual(source["keyPath"], "inbox")
