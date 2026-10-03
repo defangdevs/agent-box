@@ -865,6 +865,59 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               printf 'downloads route present, served by the daemon, and isolated\n' > "$out"
             '';
 
+          # Every Basic-auth bypass cookie must be host-only (issue #813).
+          # Boxes commonly sit below shared sslip.io or domainstation.com
+          # suffixes, so a Domain attribute would send one box's credential
+          # to sibling boxes. __Host- makes browsers enforce the same rule:
+          # Secure, Path=/, and no Domain attribute.
+          auth-cookie-scope =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "cookies.test";
+                        user = "agent";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-auth-cookie-scope-ok"
+              { caddyfile = sys.config.services.caddy.configFile; } ''
+              grep 'header >Set-Cookie' "$caddyfile" > cookies
+              # Settings, downloads, workspace, terminal, and vhost root.
+              [ "$(wc -l < cookies)" = 5 ]
+              if grep -vF '__Host-agent_box_auth_agent=' cookies >/dev/null; then
+                echo "every auth cookie must use the browser-enforced __Host- prefix:" >&2
+                cat cookies >&2
+                exit 1
+              fi
+              for attribute in 'Path=/' 'Secure'; do
+                if grep -v "$attribute" cookies >/dev/null; then
+                  echo "every auth cookie must include $attribute:" >&2
+                  cat cookies >&2
+                  exit 1
+                fi
+              done
+              if grep -i 'Domain=' cookies >/dev/null; then
+                echo "auth cookies must be scoped to the exact box hostname:" >&2
+                cat cookies >&2
+                exit 1
+              fi
+              printf 'all auth cookies are host-only\n' > "$out"
+            '';
+
           # Guard: the module's REAL generated Caddyfile (every VM test swaps
           # in a `tls internal` stand-in) must give each session a path of
           # its own — /<user>/<session>/ rewritten onto ttyd's own path with

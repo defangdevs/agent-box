@@ -4,7 +4,9 @@
 # The shared __Host- cookie uses SameSite=Lax so a top-level return from
 # another site carries it. Cross-site POSTs still omit it; the settings
 # daemon also checks request origin because Basic auth has no SameSite
-# protection (issue #117).
+# protection (issue #117). __Host- plus Path=/, Secure, and NO Domain
+# attribute makes browsers scope it to this box's exact hostname. Never add
+# Domain: boxes share suffixes such as ip.sslip.io and ip.domainstation.com.
 redir /@USER@ /@USER@/
 # @USER@'s settings page (issue #36). Same auth surface as the
 # terminal (cookie-or-basic-auth, same user name), just a different

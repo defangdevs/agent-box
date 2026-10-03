@@ -27150,7 +27150,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # basic-auth prompt and the handover would look like it did
         # nothing. Lax is sent on top-level navigations, which is what this
         # is. Max-Age is the browser's hint only: portal_session_ok decides
-        # expiry from the stored record.
+        # expiry from the stored record. The __Host- prefix, Path=/, Secure,
+        # and NO Domain attribute make this cookie host-only. Never add
+        # Domain: sibling boxes commonly share ip.sslip.io or
+        # ip.domainstation.com.
         self.send_header(
             "Set-Cookie",
             "%s=%s; Path=/; Max-Age=%d; HttpOnly; Secure; SameSite=Lax"
@@ -28839,7 +28842,9 @@ if __name__ == "__main__":
         # The shared __Host- cookie uses SameSite=Lax so a top-level return from
         # another site carries it. Cross-site POSTs still omit it; the settings
         # daemon also checks request origin because Basic auth has no SameSite
-        # protection (issue #117).
+        # protection (issue #117). __Host- plus Path=/, Secure, and NO Domain
+        # attribute makes browsers scope it to this box's exact hostname. Never add
+        # Domain: boxes share suffixes such as ip.sslip.io and ip.domainstation.com.
         redir /@USER@ /@USER@/
         # @USER@'s settings page (issue #36). Same auth surface as the
         # terminal (cookie-or-basic-auth, same user name), just a different
@@ -29082,6 +29087,9 @@ if __name__ == "__main__":
         # href (issue 56): Chrome answers the basic-auth challenge with URL
         # userinfo + an EMPTY password, and credentials typed into the
         # prompt cannot override the URL-embedded identity.
+        # The __Host- auth cookie uses Path=/, Secure, and NO Domain attribute so
+        # browsers scope it to this exact box hostname. Never add Domain: sibling
+        # boxes commonly share a DNS suffix.
         handle {
           # A live portal session (issue #541) reaches this exactly as a
           # basic-auth login does. forward_auth is stock caddy -- part of
