@@ -1103,7 +1103,7 @@ start_session() {
       if "$JQ" -e '.whatsapp == true' <<<"$sjson" >/dev/null; then
         channels="$channels plugin:$WHATSAPP_PLUGIN_REF"
       fi
-      [ -z "$channels" ] || cmd="$cmd --channels$channels"
+      [ -z "$channels" ] || cmd="$cmd --channels $channels"
       # Our own id: --resume it on respawn (exact, so concurrent sessions
       # never cross), but only when a transcript actually exists — else
       # reuse it as a fresh --session-id rather than erroring on resume.
