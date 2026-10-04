@@ -217,7 +217,10 @@ device. Enter the account's phone number with country code, start pairing,
 and give the displayed code to WhatsApp's Linked devices screen on the
 primary phone. The bridge accepts only messages that start with `@agent `
 (`@` plus this box's Linux user) from that account's Message Yourself chat. The device link belongs to the Linux user and
-survives agent session restarts. Node and the bridge are installed only when
+survives agent session restarts. Automatic message receipts are off by default;
+set `LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable
+diagnostic receipts. Agent replies and explicit command responses stay enabled.
+Node and the bridge are installed only when
 pairing is requested; they are not part of the base image. The supervisor
 runs the bridge without spending a session slot. Message text and linked-device
 keys are stored in private files under `~/.local/state/local-whatsapp` on this
@@ -247,7 +250,13 @@ A Codex Remote Control task has its own thread ID, which the box's session
 name alone cannot identify. From inside the active Codex task, run
 `node ~/.local/share/local-whatsapp/bridge.mjs register codex` once to bind
 it to that session name. Repeat after a different task takes over the same
-session. A normal Codex TUI uses the session name directly. The bridge has
+session. A normal Codex TUI uses the session name directly. For a native image reply,
+run `node ~/.local/share/local-whatsapp/bridge.mjs reply-image MESSAGE_ID /absolute/path/picture.png "caption"`. Claude uses
+`whatsapp_reply_image` with the message ID, absolute image path, and optional
+caption. PNG, JPEG, and WebP files are supported, up to 10 MiB, with at most
+20 queued images. The bridge keeps private copies for retries and removes them
+after sending. No download link or re-pairing is needed. Inbound images and
+documents are not forwarded yet. The bridge has
 no shell command target.
 
 ## Slash commands: type them into your own pane

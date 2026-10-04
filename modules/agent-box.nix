@@ -692,7 +692,10 @@ let
     and give the displayed code to WhatsApp's Linked devices screen on the
     primary phone. The bridge accepts only messages that start with `@agent `
     (`@` plus this box's Linux user) from that account's Message Yourself chat. The device link belongs to the Linux user and
-    survives agent session restarts. Node and the bridge are installed only when
+    survives agent session restarts. Automatic message receipts are off by default;
+    set `LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable
+    diagnostic receipts. Agent replies and explicit command responses stay enabled.
+    Node and the bridge are installed only when
     pairing is requested; they are not part of the base image. The supervisor
     runs the bridge without spending a session slot. Message text and linked-device
     keys are stored in private files under `~/.local/state/local-whatsapp` on this
@@ -722,7 +725,13 @@ let
     name alone cannot identify. From inside the active Codex task, run
     `node ~/.local/share/local-whatsapp/bridge.mjs register codex` once to bind
     it to that session name. Repeat after a different task takes over the same
-    session. A normal Codex TUI uses the session name directly. The bridge has
+    session. A normal Codex TUI uses the session name directly. For a native image reply,
+    run `node ~/.local/share/local-whatsapp/bridge.mjs reply-image MESSAGE_ID /absolute/path/picture.png "caption"`. Claude uses
+    `whatsapp_reply_image` with the message ID, absolute image path, and optional
+    caption. PNG, JPEG, and WebP files are supported, up to 10 MiB, with at most
+    20 queued images. The bridge keeps private copies for retries and removes them
+    after sending. No download link or re-pairing is needed. Inbound images and
+    documents are not forwarded yet. The bridge has
     no shell command target.
 
     ## Slash commands: type them into your own pane
@@ -5450,12 +5459,12 @@ import time
 from urllib.request import urlopen
 
 
-REV = "52059e30642be1b0ee04c8f4401d21c7d932fc67"
+REV = "e4cb0985e26f2b0dacb92a44660aa6aba5ec28f4"
 FILES = {
-    "bridge.mjs": "1526b8e2b4784edb95a6a5f3a9337d5e19e0821c83ae522353965023d1e90d9a",
-    "state.mjs": "4f5125000fbb44b43c9dc7909ee293c61b5c3a6ae44f83620bd506470344e81b",
-    "package.json": "2ee16b0da02a289bf68d71811c39f51e27a2f16e9a810690b69c3091fab28df1",
-    "package-lock.json": "d030965125393662c5effbea6e25c98512e9fd29e470343010096ec413096110",
+    "bridge.mjs": "e4a76c798e7864c7f3b16c1f08a0a4e38189c04922c57b668bc362ad5819c8a4",
+    "state.mjs": "389fd7573169edf73744991cd05c9a18731f810effa64754dd0b2aeba3b8d787",
+    "package.json": "216587200066b8e5436c8535a8655c13b551bcc5076ff5d1684d680ba4c6160c",
+    "package-lock.json": "45c729a5414bf0cb1421426c75e183f1381dad07f5add6bf049dea31cf9a3cd4",
 }
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"
