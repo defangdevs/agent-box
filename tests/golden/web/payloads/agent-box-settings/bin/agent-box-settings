@@ -8759,8 +8759,9 @@ def render_connect_step(state):
             'class="row conn-form">'
             f'<input type="hidden" name="flow" value="{flow_id}">'
             '<label class="field conn-field"><span class="note">Your WhatsApp '
-            'number with country code</span><input type="tel" name="phone" '
-            'autocomplete="tel" inputmode="numeric" enterkeyhint="go" '
+            'number, starting with + and country code</span>'
+            '<input type="tel" name="phone" autocomplete="off" '
+            'inputmode="tel" enterkeyhint="go" '
             'placeholder="+1 (555) 123-2435" aria-label="WhatsApp phone number"></label>'
             f'{render_whatsapp_profile_field()}'
             '<button type="submit" class="btn">Pair device</button></form>'
@@ -11385,12 +11386,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raw_phone = form.get("phone", [""])[0].strip()
                     phone = ""
                     if raw_phone:
-                        # ASCII only: \D would keep Unicode digits the bridge drops.
+                        # `autocomplete="tel"` let Mobile Safari replace a
+                        # +1 contact number with its national form. The bridge
+                        # cannot infer the missing country code, so make the
+                        # international marker explicit and reject that lossy
+                        # substitution (issue #820). ASCII only: \D would keep
+                        # Unicode digits the bridge drops.
                         phone = re.sub(r"[ ()+.-]", "", raw_phone)
-                        if not (phone.isascii() and phone.isdigit()
+                        if not (raw_phone.startswith("+")
+                                and re.fullmatch(r"\+[0-9 ().-]+", raw_phone)
+                                and phone.isascii() and phone.isdigit()
                                 and 7 <= len(phone) <= 15):
                             self._send_html(render_page(
-                                "Enter a valid WhatsApp number with country code.",
+                                "Enter a valid WhatsApp number starting with + "
+                                "and country code.",
                                 kind="error"), status=400)
                             return
                     profile = form.get("profile", [""])[0].strip()
