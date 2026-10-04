@@ -2433,11 +2433,12 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           whatsapp-cli =
             pkgs.runCommand "agent-box-whatsapp-cli"
               {
-                nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.coreutils pkgs.gnugrep ];
+                nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.findutils pkgs.jq ];
                 cli = ./modules/src/whatsapp-cli.py;
                 supervisor = ./modules/src/supervisor.sh;
                 tests = ./tests/test-whatsapp-cli.py;
                 supervisorTests = ./tests/test-whatsapp-supervisor.sh;
+                codexResumeTests = ./tests/test-codex-registered-thread.sh;
               } ''
               install -d repo/modules/src repo/tests
               cp "$cli" repo/modules/src/whatsapp-cli.py
@@ -2447,6 +2448,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 exit 1
               }
               bash "$supervisorTests" "$supervisor" >> log 2>&1 || {
+                cat log
+                exit 1
+              }
+              bash "$codexResumeTests" "$supervisor" >> log 2>&1 || {
                 cat log
                 exit 1
               }
