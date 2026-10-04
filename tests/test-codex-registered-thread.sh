@@ -41,6 +41,15 @@ expect short ""
 expect other ""               # unregistered session
 expect "" ""
 
+# A profile's CODEX_HOME: the rollout is looked for there, not in ~/.codex.
+cxhome="$TEST_ROOT/cxhome"
+mkdir -p "$cxhome/sessions/2026/10/03"
+touch "$cxhome/sessions/2026/10/03/rollout-2026-10-03T21-00-00-$gone.jsonl"
+[ "$(codex_registered_thread stale "$cxhome")" = "$gone" ] \
+  || { echo "FAIL: rollout under the session's CODEX_HOME not found" >&2; exit 1; }
+[ -z "$(codex_registered_thread codex "$cxhome")" ] \
+  || { echo "FAIL: ~/.codex rollout must not satisfy a different CODEX_HOME" >&2; exit 1; }
+
 printf 'not json' > "$state/codex-threads.json"
 expect codex ""
 
@@ -70,7 +79,7 @@ printf 'agent-box session boxid-marked\n' \
   || { echo "FAIL: marker must win over registration" >&2; exit 1; }
 
 # The fallback itself must stay wired into start_session's non-RC branch.
-grep -qF '[ -n "$codex_target" ] || codex_target="$(codex_registered_thread "$sname")"' "$SUPERVISOR" \
+grep -qF '|| codex_target="$(codex_registered_thread "$sname" "$(resolve_codex_home "$sprofile")")"' "$SUPERVISOR" \
   || { echo "FAIL: start_session no longer falls back to codex_registered_thread" >&2; exit 1; }
 
 echo "codex_registered_thread: ok"

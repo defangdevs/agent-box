@@ -13670,6 +13670,9 @@ esac
       # no "[agent-box session <id>]" marker for codex_rollout_uuid to find, so
       # without this a respawn or box update starts it on a FRESH thread and
       # leaves the registration pointing at one nothing hosts (issue #825).
+      # $2 is the session's resolved CODEX_HOME (resolve_codex_home), where its
+      # codex writes rollouts. The registration file stays at the default state
+      # dir: that is the only one the box's own bridge daemon reads.
       [ -n "$1" ] || return 0
       _f="$HOME/.local/state/local-whatsapp/codex-threads.json"
       [ -r "$_f" ] || return 0
@@ -13679,7 +13682,7 @@ esac
         (????????-????-????-????-????????????) ;;
         (*) return 0 ;;
       esac
-      [ -n "$($FIND "$HOME"/.codex/sessions -name "rollout-*-$_thread.jsonl" 2>/dev/null | head -n1)" ] \
+      [ -n "$($FIND "''${2:-$HOME/.codex}"/sessions -name "rollout-*-$_thread.jsonl" 2>/dev/null | head -n1)" ] \
         || return 0
       printf '%s' "$_thread"
     }
@@ -13839,7 +13842,8 @@ esac
           fi
         else
           codex_target="$(codex_rollout_uuid "$bid")"
-          [ -n "$codex_target" ] || codex_target="$(codex_registered_thread "$sname")"
+          [ -n "$codex_target" ] \
+            || codex_target="$(codex_registered_thread "$sname" "$(resolve_codex_home "$sprofile")")"
         fi
       fi
 
