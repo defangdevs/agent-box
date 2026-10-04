@@ -13662,8 +13662,10 @@ esac
       # forked the rollout). Empty when none match — the caller then starts a
       # FRESH codex session rather than risk `resume --last` grabbing a
       # sibling session's transcript in a shared working directory.
+      # $2 is the session's resolved CODEX_HOME (resolve_codex_home): a profile
+      # that sets one makes its codex write rollouts there, not in ~/.codex.
       [ -n "$1" ] || return 0
-      d="$HOME"/.codex/sessions
+      d="''${2:-$HOME/.codex}"/sessions
       [ -d "$d" ] || return 0
       f="$($GREP -rlF "agent-box session $1" "$d" 2>/dev/null \
             | while IFS= read -r p; do printf '%s\t%s\n' "$(stat -c %Y "$p" 2>/dev/null)" "$p"; done \
@@ -13853,9 +13855,10 @@ esac
             codex_target="$(codex_wake_thread "$sname")"
           fi
         else
-          codex_target="$(codex_rollout_uuid "$bid")"
+          cxhome="$(resolve_codex_home "$sprofile")"
+          codex_target="$(codex_rollout_uuid "$bid" "$cxhome")"
           [ -n "$codex_target" ] \
-            || codex_target="$(codex_registered_thread "$sname" "$(resolve_codex_home "$sprofile")")"
+            || codex_target="$(codex_registered_thread "$sname" "$cxhome")"
         fi
       fi
 
