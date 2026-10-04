@@ -156,7 +156,10 @@ plainly rather than handing it back.
   HARNESS=claude MODEL=sonnet EFFORT=low KEY=value`, read it back with
   `agent-box-profile show NAME`, and start it with `agent-box-session add
   [NAME] --profile PROFILE`. A `-- EXTRA_ARGS` tail still wins over the
-  profile. Profile env is convenience, not isolation: every session of this
+  profile. Signing in to Claude or Codex creates that harness's starter
+  profile if needed and, when no valid default exists, makes it the default.
+  A later sign-in never replaces an existing default. Profile env is
+  convenience, not isolation: every session of this
   user can read it out of /proc. A standing webhook watch hands its work to
   a profile through `agent-box-session env set AGENT_BOX_HOOK_PROFILE NAME`,
   which is how the harness a dispatched hook-* session runs gets picked at
