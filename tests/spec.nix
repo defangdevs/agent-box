@@ -74,6 +74,7 @@ in
   sudoAllowlist = cfg.sudoAllowlist;
   web = { enable = cfg.web.enable; }
     // lib.optionalAttrs (cfg.web.alias != "") { alias = cfg.web.alias; }
+    // lib.optionalAttrs (cfg.web.aliases != [ ]) { aliases = cfg.web.aliases; }
     # Only when turned OFF, for the reason `session` above emits only
     # non-defaults: both backends default the reboot button on, and writing
     # that default out would hide a divergence in either default behind an

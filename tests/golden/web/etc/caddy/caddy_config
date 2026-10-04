@@ -140,7 +140,9 @@ golden.example.org {
   # The shared __Host- cookie uses SameSite=Lax so a top-level return from
   # another site carries it. Cross-site POSTs still omit it; the settings
   # daemon also checks request origin because Basic auth has no SameSite
-  # protection (issue #117).
+  # protection (issue #117). __Host- plus Path=/, Secure, and NO Domain
+  # attribute makes browsers scope it to this box's exact hostname. Never add
+  # Domain: boxes share suffixes such as ip.sslip.io and ip.domainstation.com.
   redir /agent /agent/
   # agent's settings page (issue #36). Same auth surface as the
   # terminal (cookie-or-basic-auth, same user name), just a different
@@ -375,7 +377,9 @@ golden.example.org {
   # The shared __Host- cookie uses SameSite=Lax so a top-level return from
   # another site carries it. Cross-site POSTs still omit it; the settings
   # daemon also checks request origin because Basic auth has no SameSite
-  # protection (issue #117).
+  # protection (issue #117). __Host- plus Path=/, Secure, and NO Domain
+  # attribute makes browsers scope it to this box's exact hostname. Never add
+  # Domain: boxes share suffixes such as ip.sslip.io and ip.domainstation.com.
   redir /robot /robot/
   # robot's settings page (issue #36). Same auth surface as the
   # terminal (cookie-or-basic-auth, same user name), just a different
@@ -613,6 +617,9 @@ golden.example.org {
   # href (issue 56): Chrome answers the basic-auth challenge with URL
   # userinfo + an EMPTY password, and credentials typed into the
   # prompt cannot override the URL-embedded identity.
+  # The __Host- auth cookie uses Path=/, Secure, and NO Domain attribute so
+  # browsers scope it to this exact box hostname. Never add Domain: sibling
+  # boxes commonly share a DNS suffix.
   handle {
     # A live portal session (issue #541) reaches this exactly as a
     # basic-auth login does. forward_auth is stock caddy -- part of

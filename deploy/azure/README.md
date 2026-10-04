@@ -50,8 +50,9 @@ user choose Claude Code or Codex.
   upgrades authenticate with that cookie. ttyd binds only to localhost.
 - Outputs `https://<public-ip>/<userName>/`. Caddy obtains a Let's Encrypt
   `shortlived` IP certificate and renews it from persistent storage.
-  `sslipDomain` optionally adds a dashed-IP DNS alias, whose certificate is
-  requested only on the first visit. The alias redirects to the IP URL.
+  `sslipDomains` adds dashed-IP DNS aliases (default `["sslip.io"]`), whose
+  certificates are requested only on first visit. Every alias redirects to
+  the IP URL.
 - No port 80 is opened. Caddy is configured for TLS-ALPN-01 only.
 - Outbound TCP port 25 (raw SMTP) is denied at the NSG, so a box cannot be
   used as a spam relay. Authenticated mail submission (587/465) through a
@@ -150,12 +151,14 @@ reboot. Read the URL and the address from `properties.outputs`; its
 `remoteControlSession` is only meaningful once you have started a claude
 session from the settings page's install+sign-in cards.
 
-`sslipDomain` defaults to empty. Set it to `sslip.io` or a compatible
-self-hosted suffix to add an optional DNS alias. `sslip.io` is open source
+`sslipDomains` defaults to `["sslip.io"]`. Add compatible self-hosted
+suffixes to expose more optional DNS aliases. `sslip.io` is open source
 ([cunnie/sslip.io](https://github.com/cunnie/sslip.io)) and self-hostable,
 so a deployment that runs its own copy under its own domain can use that
-suffix for the alias (issue #647). Caddy obtains its certificate on demand
+suffix as another alias (issue #647). Caddy obtains each certificate on demand
 when someone visits that address; an unused alias requests no certificate.
+The deprecated `sslipDomain` parameter remains as a single-value override for
+existing deployment integrations.
 
 `webPassword` is 16-64 characters, and any character is safe. Bicep has no
 `AllowedPattern` equivalent — a parameter can be constrained by length and by a

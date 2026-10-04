@@ -736,7 +736,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                       web = {
                         enable = true;
                         domain = "203.0.113.7";
-                        alias = "203-0-113-7.sslip.io";
+                        aliases = [
+                          "203-0-113-7.sslip.io"
+                          "203-0-113-7.defangstation.com"
+                        ];
                         user = "agent";
                       };
                     };
@@ -760,12 +763,15 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                          for name in policy["subjects"]}
               ip = by_name["203.0.113.7"]
               alias = by_name["203-0-113-7.sslip.io"]
+              second_alias = by_name["203-0-113-7.defangstation.com"]
               assert not ip.get("on_demand"), ip
               assert ip["issuers"][0]["profile"] == "shortlived", ip
               assert ip["issuers"][0]["ca"] == "https://acme-v02.api.letsencrypt.org/directory", ip
               assert ip["issuers"][0]["challenges"]["http"]["disabled"], ip
               assert alias["on_demand"] is True, alias
               assert "profile" not in alias["issuers"][0], alias
+              assert second_alias["on_demand"] is True, second_alias
+              assert "profile" not in second_alias["issuers"][0], second_alias
               servers = data["apps"]["http"]["servers"]
               assert any(policy.get("default_sni") == "203.0.113.7"
                          for server in servers.values()
@@ -863,6 +869,59 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 "Content-Security-Policy \"frame-ancestors 'self'\"" \
                 "$caddyfile"
               printf 'downloads route present, served by the daemon, and isolated\n' > "$out"
+            '';
+
+          # Every Basic-auth bypass cookie must be host-only (issue #813).
+          # Boxes commonly sit below shared sslip.io or domainstation.com
+          # suffixes, so a Domain attribute would send one box's credential
+          # to sibling boxes. __Host- makes browsers enforce the same rule:
+          # Secure, Path=/, and no Domain attribute.
+          auth-cookie-scope =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "cookies.test";
+                        user = "agent";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-auth-cookie-scope-ok"
+              { caddyfile = sys.config.services.caddy.configFile; } ''
+              grep 'header >Set-Cookie' "$caddyfile" > cookies
+              # Settings, downloads, workspace, terminal, and vhost root.
+              [ "$(wc -l < cookies)" = 5 ]
+              if grep -vF '__Host-agent_box_auth_agent=' cookies >/dev/null; then
+                echo "every auth cookie must use the browser-enforced __Host- prefix:" >&2
+                cat cookies >&2
+                exit 1
+              fi
+              for attribute in 'Path=/' 'Secure'; do
+                if grep -v "$attribute" cookies >/dev/null; then
+                  echo "every auth cookie must include $attribute:" >&2
+                  cat cookies >&2
+                  exit 1
+                fi
+              done
+              if grep -i 'Domain=' cookies >/dev/null; then
+                echo "auth cookies must be scoped to the exact box hostname:" >&2
+                cat cookies >&2
+                exit 1
+              fi
+              printf 'all auth cookies are host-only\n' > "$out"
             '';
 
           # Guard: the module's REAL generated Caddyfile (every VM test swaps
@@ -2374,11 +2433,12 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           whatsapp-cli =
             pkgs.runCommand "agent-box-whatsapp-cli"
               {
-                nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.coreutils pkgs.gnugrep ];
+                nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.findutils pkgs.jq ];
                 cli = ./modules/src/whatsapp-cli.py;
                 supervisor = ./modules/src/supervisor.sh;
                 tests = ./tests/test-whatsapp-cli.py;
                 supervisorTests = ./tests/test-whatsapp-supervisor.sh;
+                codexResumeTests = ./tests/test-codex-registered-thread.sh;
               } ''
               install -d repo/modules/src repo/tests
               cp "$cli" repo/modules/src/whatsapp-cli.py
@@ -2388,6 +2448,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 exit 1
               }
               bash "$supervisorTests" "$supervisor" >> log 2>&1 || {
+                cat log
+                exit 1
+              }
+              bash "$codexResumeTests" "$supervisor" >> log 2>&1 || {
                 cat log
                 exit 1
               }

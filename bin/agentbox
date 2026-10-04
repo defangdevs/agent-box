@@ -666,6 +666,7 @@ BOX_SCHEMA = _Obj({
     # reaches the renderer - first_boot() consumes it and resolves `domain`
     # to a concrete value before Spec is ever handed to Renderer.
     "domainSuffix": DOMAIN_SUFFIX,
+    "domainSuffixes": STR_LIST,
     "hostLabel": STR,
     "agents": STR_LIST,
     "defaultAgent": STR,
@@ -683,7 +684,7 @@ BOX_SCHEMA = _Obj({
     # touches a box and no public key is committed anywhere; portalJwksUrl
     # only overrides that path.
     "web": _Obj({"enable": BOOL, "rebootButton": BOOL,
-                 "alias": DOMAIN_SUFFIX,
+                 "alias": DOMAIN_SUFFIX, "aliases": STR_LIST,
                  "portalIssuer": STR, "portalJwksUrl": STR}),
     "webhook": _Obj({
         "enable": BOOL,
@@ -744,7 +745,23 @@ class Spec:
         # (issue #647): an unset domainSuffix derives exactly the sslip.io
         # hostname a box always has, so this is additive, not a behavior
         # change for anyone who never sets it.
-        self.domain_suffix = data.get("domainSuffix") or "sslip.io"
+        legacy_domain_suffix = data.get("domainSuffix") or ""
+        self.domain_suffixes = ([legacy_domain_suffix]
+                                if legacy_domain_suffix
+                                else list(data.get("domainSuffixes")
+                                          or ["sslip.io"]))
+        if len(set(self.domain_suffixes)) != len(self.domain_suffixes):
+            raise ConfigError("domainSuffixes must not contain duplicates")
+        if not all(DOMAIN_SUFFIX_RE.fullmatch(value)
+                   for value in self.domain_suffixes):
+            raise ConfigError("domainSuffixes entries must be DNS suffixes")
+        # first_boot() prepends a dashed IPv4 (up to 15 chars) and a dot, and
+        # a hostname may be at most 253 characters.
+        if any(len(value) > 237 for value in self.domain_suffixes):
+            raise ConfigError(
+                "domainSuffixes entries must be at most 237 characters")
+        self.domain_suffix = self.domain_suffixes[0]
+        self.alias_domain_suffixes = self.domain_suffixes[1:]
         self.host_label = data.get("hostLabel") or self.domain or "agent-box"
         # Whether the label was pinned in config, or fell back to the domain
         # above. first_boot resolves an "auto"/"" domain AFTER the spec is
@@ -788,16 +805,31 @@ class Spec:
         # web.enable gates webhook_enable too, so a quoted "false" here
         # would turn webhooks loose as well. null still means off.
         self.web_enable = bool(web.get("enable", True))
-        self.web_alias = web.get("alias") or ""
-        if self.web_alias and self.web_alias == self.domain:
-            raise ConfigError("web.alias must differ from domain")
-        if self.web_alias:
+        # `alias` is the released single-value spelling. Keep reading it so
+        # existing root-owned config.yaml files continue to apply, and fold it
+        # into the list contract templates use now.
+        legacy_alias = web.get("alias") or ""
+        self.web_aliases = ([legacy_alias] if legacy_alias else []) + list(
+            web.get("aliases") or [])
+        if (self.domain not in ("", "auto", self.domain_suffix)
+                and self.domain.endswith("." + self.domain_suffix)):
+            prefix = self.domain[:-(len(self.domain_suffix) + 1)]
+            self.web_aliases += [f"{prefix}.{suffix}"
+                                 for suffix in self.alias_domain_suffixes]
+        if len(set(self.web_aliases)) != len(self.web_aliases):
+            raise ConfigError("web.aliases must not contain duplicates")
+        for alias in self.web_aliases:
+            if not DOMAIN_SUFFIX_RE.fullmatch(alias):
+                raise ConfigError(
+                    "web.aliases entries must be DNS names with at least two labels")
+            if alias == self.domain:
+                raise ConfigError("web.aliases must differ from domain")
             try:
-                ipaddress.ip_address(self.web_alias)
+                ipaddress.ip_address(alias)
             except ValueError:
                 pass
             else:
-                raise ConfigError("web.alias must be a DNS name")
+                raise ConfigError("web.aliases entries must be DNS names")
         # "Reboot box" in the settings page's Danger zone (the module's
         # web.rebootButton). Default on: a kernel or libc patch installs on
         # disk and takes effect at a boot, unattended patching deliberately
@@ -3530,10 +3562,11 @@ class Renderer:
         frag = self.share / "caddy"
         root_user = self.spec.root_user
 
-        def bind(name, user=None):
+        def bind(name, user=None, alias=None):
             text = (frag / f"caddyfile-{name}.caddy").read_text()
             text = text.replace("@DOMAIN@", self.spec.domain)
-            text = text.replace("@ALIAS@", self.spec.web_alias)
+            if alias is not None:
+                text = text.replace("@ALIAS@", alias)
             if "@TLS_POLICY@" in text:
                 try:
                     ip = ipaddress.ip_address(self.spec.domain)
@@ -3593,8 +3626,8 @@ class Renderer:
             parts.append(bind("terminal", u))
         parts.append(bind("root", root_user))
         parts.append("}\n")
-        if self.spec.web_alias:
-            parts.append(bind("alias"))
+        for alias in self.spec.web_aliases:
+            parts.append(bind("alias", alias=alias))
         # The self-serve extension point the header fragment documents, and
         # the reason caddy_reload_policy() permits `systemctl reload
         # caddy.service`: one `import` per user, since Caddyfile's `import`
@@ -5477,6 +5510,12 @@ def first_boot(spec, args):
     if spec.domain in ("", "auto", spec.domain_suffix):
         ip = settle_public_ip(initial=args.settle_delay)
         spec.domain = ip.replace(".", "-") + "." + spec.domain_suffix
+        spec.web_aliases += [ip.replace(".", "-") + "." + suffix
+                             for suffix in spec.alias_domain_suffixes]
+        if (len(set(spec.web_aliases)) != len(spec.web_aliases)
+                or spec.domain in spec.web_aliases):
+            raise ConfigError(
+                "web.aliases must be unique and differ from domain")
         if spec.host_label_from_domain:
             spec.host_label = spec.domain
         print(f"derived domain {spec.domain} from {ip}")

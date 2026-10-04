@@ -244,7 +244,11 @@ class LoginProfile(ProfileFixture):
         self.assertTrue(session["remoteControl"])
         self.assertEqual(session["extraArgs"], [])
         self.assertEqual(module.profile_launch("claude")["harness"], "claude")
-        self.assertIn('value="claude"', module.render_profile_options(module.read_profiles()))
+        self.assertEqual(
+            module.default_profile(module.read_profiles()), "claude")
+        self.assertIn(
+            'value="claude"',
+            module.render_profile_options(module.read_profiles()))
 
     def test_login_preserves_custom_settings_and_resolves_them(self):
         self.write_profile("claude", "HARNESS=claude\nMODEL=sonnet\nTOKEN=private\n")
@@ -260,6 +264,7 @@ class LoginProfile(ProfileFixture):
         module.ensure_harness_session("claude", True)
         self.assertEqual(list(self.read_sessions()), ["existing"])
         self.assertEqual(list(module.read_profiles()), ["claude"])
+        self.assertEqual(module.default_profile(module.read_profiles()), "claude")
 
     def test_another_harness_profile_is_not_overwritten(self):
         self.write_profile("claude", "HARNESS=codex\n")
@@ -267,6 +272,7 @@ class LoginProfile(ProfileFixture):
         module.ensure_harness_session("claude", True)
         self.assertEqual(self.read_sessions()["claude"]["profile"], "claude-2")
         self.assertEqual(module.profile_launch("claude")["harness"], "codex")
+        self.assertEqual(module.default_profile(module.read_profiles()), "claude-2")
 
     def test_profile_storage_failure_still_starts_the_worker(self):
         module = self.daemon()
@@ -274,17 +280,66 @@ class LoginProfile(ProfileFixture):
         module.ensure_harness_session("claude", True)
         self.assertIsNone(self.read_sessions()["claude"]["profile"])
 
-    def test_codex_login_keeps_its_existing_behavior(self):
+    def test_codex_login_creates_and_uses_a_default_profile(self):
         module = self.daemon()
         module.ensure_harness_session("codex", False)
-        self.assertIsNone(self.read_sessions()["codex"]["profile"])
+        self.assertEqual(self.read_sessions()["codex"]["profile"], "codex")
         self.assertFalse(self.read_sessions()["codex"]["remoteControl"])
-        self.assertEqual(module.read_profiles(), {})
+        self.assertEqual(module.profile_launch("codex")["harness"], "codex")
+        self.assertEqual(
+            module.default_profile(module.read_profiles()), "codex")
+
+    def test_remote_control_codex_keeps_the_worker_profile_as_the_default(self):
+        module = self.daemon()
+        module.ensure_harness_session("codex", True)
+        self.assertIsNone(self.read_sessions()["codex"]["profile"])
+        self.assertEqual(module.profile_launch("codex")["harness"], "codex")
+        self.assertEqual(
+            module.default_profile(module.read_profiles()), "codex")
+
+    def test_later_harness_login_never_replaces_the_default(self):
+        module = self.daemon()
+        module.ensure_harness_session("claude", True)
+        module.ensure_harness_session("codex", False)
+        self.assertEqual(sorted(module.read_profiles()), ["claude", "codex"])
+        self.assertEqual(module.default_profile(module.read_profiles()), "claude")
+
+    def test_login_replaces_a_dangling_default_pointer(self):
+        module = self.daemon()
+        module.set_default_profile("gone")
+        module.ensure_harness_session("codex", False)
+        self.assertEqual(module.default_profile(module.read_profiles()), "codex")
+
+    def test_login_preserves_an_existing_custom_default(self):
+        self.write_profile("triage", "HARNESS=claude\n")
+        module = self.daemon()
+        module.set_default_profile("triage")
+        module.ensure_harness_session("codex", False)
+        self.assertEqual(module.default_profile(module.read_profiles()), "triage")
+
+    def test_login_waits_for_and_preserves_a_concurrent_user_choice(self):
+        self.write_profile("triage", "HARNESS=claude\n")
+        module = self.daemon()
+        done = threading.Event()
+        with module.locked(module.DEFAULT_PROFILE_FILE):
+            thread = threading.Thread(
+                target=lambda: (
+                    module.ensure_harness_session("codex", False), done.set()))
+            thread.start()
+            self.assertFalse(done.wait(0.5))
+            # A user choice that lands while login is preparing its default.
+            # Write under the lock already held by this test; the public
+            # setter would correctly wait for the same lock.
+            module._set_default_profile("triage")
+        thread.join(5)
+        self.assertTrue(done.is_set(), "the login worker never finished")
+        self.assertEqual(module.default_profile(module.read_profiles()), "triage")
 
     def test_no_resolver_retains_the_login_worker(self):
         module = self.daemon(AGENT_BOX_PROFILE_BIN="")
         module.ensure_harness_session("claude", True)
         self.assertIsNone(self.read_sessions()["claude"]["profile"])
+        self.assertEqual(module.default_profile(module.read_profiles()), "")
 
 
 class ProfilePanel(ProfileFixture):

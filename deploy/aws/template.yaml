@@ -32,6 +32,7 @@ Metadata:
           - AllowCidr
           - EnableSsm
           - SeedMainSession
+          - SslipDomains
           - SslipDomain
           - AgentBoxRev
           - AgentBoxSha256
@@ -65,7 +66,9 @@ Metadata:
       SeedMainSession:
         default: Seed a running "main" session on first boot
       SslipDomain:
-        default: Whitelabel domain (self-hosted sslip.io clone; default is the public one)
+        default: Deprecated single alias suffix override
+      SslipDomains:
+        default: DNS alias suffixes
       AgentsMd:
         default: AGENTS.md seeded on first agent start
       AgentBoxRev:
@@ -348,15 +351,22 @@ Parameters:
   # STACK-CREATE time from the Elastic IP CFN already allocated, so
   # SslipDomain is spliced straight into WebHostname/WebURL/
   # RemoteControlSession below rather than into config.yaml.
-  SslipDomain:
-    Type: String
+  SslipDomains:
+    Type: CommaDelimitedList
     Default: sslip.io
     AllowedPattern: '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+'
     Description: >-
-      Domain suffix for the auto-derived hostname. Self-host sslip.io
-      (github.com/cunnie/sslip.io) under your own domain and set that
-      domain here to whitelabel the URL; the default (sslip.io) is the
-      public service.
+      DNS suffixes for the auto-derived hostname. The first is the primary
+      URL; remaining values are on-demand certificate aliases that redirect
+      to it. The default exposes only the public sslip.io name.
+
+  SslipDomain:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+'
+    Description: >-
+      Deprecated single-value override. When non-empty it replaces
+      SslipDomains so existing launch integrations keep their former URL.
 
   AgentBoxRev:
     Type: String
@@ -401,6 +411,7 @@ Parameters:
       AgentNixpkgsUrl exactly; leave empty when AgentNixpkgsUrl is empty.
 
 Conditions:
+  UseLegacySslipDomain: !Not [!Equals [!Ref SslipDomain, '']]
   UseIpv4: !Equals [!Ref PublicIpv4, 'true']
   UseSpotCond: !Equals [!Ref UseSpot, 'true']
   UseNat64: !And
@@ -795,6 +806,9 @@ Resources:
                     sha256 = pin.sha256;
                   };
                 hostname = "${WebHostname}";
+                domainSuffixes = lib.splitString "," "${SslipDomainsCsv}";
+                aliasSuffixes = builtins.tail domainSuffixes;
+                hostLabel = builtins.head (lib.splitString "." hostname);
                 # Fn::Sub receives a base64 projection of WebPasswordHash so
                 # its '$' and '/' characters remain inert Nix source. The
                 # activation script only decodes and writes it - the hash
@@ -852,6 +866,7 @@ Resources:
                   web = {
                     enable = true;
                     domain = hostname;
+                    aliases = map (suffix: hostLabel + "." + suffix) aliasSuffixes;
                     user = "${UserName}";
                     # Portal handover (issue #593). No key here: the box
                     # fetches the portal's published key set from this
@@ -935,13 +950,21 @@ Resources:
             # a cert), and stays a single DNS label if anything ever wants
             # a *.sslip.io wildcard.
             - WebHostname: !Sub
-                - "${HostDashed}.${SslipDomain}"
+                - "${HostDashed}.${Suffix}"
                 - HostDashed: !If
                     - UseIpv4
                     - !Join ['-', !Split ['.', !Ref EIP]]
                     - !Join
                         - '-'
                         - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
+                  Suffix: !If
+                    - UseLegacySslipDomain
+                    - !Ref SslipDomain
+                    - !Select [0, !Ref SslipDomains]
+              SslipDomainsCsv: !If
+                - UseLegacySslipDomain
+                - !Ref SslipDomain
+                - !Join [',', !Ref SslipDomains]
               WebPasswordHashBase64:
                 Fn::Base64: !Ref WebPasswordHash
               # First-boot health signal (issue 106): tell CloudFormation the
@@ -1001,13 +1024,17 @@ Outputs:
       and credentials typed into the prompt cannot override the URL-embedded
       identity - issue 56.)
     Value: !Sub
-      - "https://${Host}.${SslipDomain}/${UserName}/"
+      - "https://${Host}.${Suffix}/${UserName}/"
       - Host: !If
           - UseIpv4
           - !Join ['-', !Split ['.', !Ref EIP]]
           - !Join
               - '-'
               - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
+        Suffix: !If
+          - UseLegacySslipDomain
+          - !Ref SslipDomain
+          - !Select [0, !Ref SslipDomains]
 
   RemoteControlSession:
     Description: >-
@@ -1019,13 +1046,17 @@ Outputs:
       names itself from the hostname; its session tab signs the box in and
       prints the pairing code for the Codex apps.
     Value: !Sub
-      - "${UserName}-main@${Host}.${SslipDomain}"
+      - "${UserName}-main@${Host}.${Suffix}"
       - Host: !If
           - UseIpv4
           - !Join ['-', !Split ['.', !Ref EIP]]
           - !Join
               - '-'
               - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
+        Suffix: !If
+          - UseLegacySslipDomain
+          - !Ref SslipDomain
+          - !Select [0, !Ref SslipDomains]
 
   PublicAddress:
     Description: Elastic IP (IPv4 mode) or primary IPv6 (IPv6 mode).

@@ -235,7 +235,13 @@ class RenderTest(unittest.TestCase):
             cfg = Path(tmp) / "config.json"
             cfg.write_text(json.dumps({
                 "domain": "203.0.113.7",
-                "web": {"enable": True, "alias": "203-0-113-7.sslip.io"},
+                "web": {
+                    "enable": True,
+                    "aliases": [
+                        "203-0-113-7.sslip.io",
+                        "203-0-113-7.defangstation.com",
+                    ],
+                },
                 "users": {"agent": {"root": True}},
             }))
             caddyfile = (render(tmp, cfg) / "etc/agent-box/Caddyfile").read_text()
@@ -244,6 +250,7 @@ class RenderTest(unittest.TestCase):
             self.assertIn("import acme_ip_shortlived", caddyfile)
             self.assertIn("profile shortlived", caddyfile)
             self.assertIn("203-0-113-7.sslip.io {", caddyfile)
+            self.assertIn("203-0-113-7.defangstation.com {", caddyfile)
             self.assertIn("on_demand", caddyfile)
             self.assertIn("redir https://203.0.113.7{uri} permanent", caddyfile)
 
@@ -382,6 +389,34 @@ class RenderTest(unittest.TestCase):
             self.assertEqual("203-0-113-7.sslip.example.com",
                              json.loads(cfg.read_text())["domain"])
 
+    def test_first_boot_derives_domain_aliases_from_suffix_list(self):
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps({
+                "domain": "auto",
+                "domainSuffixes": ["sslip.io", "defangstation.com"],
+                "users": {"agent": {}},
+            }))
+            spec = mod.Spec(json.loads(cfg.read_text()), prof)
+            args = type("A", (), {"settle_delay": 0, "config": str(cfg)})()
+            orig = mod.settle_public_ip
+            mod.settle_public_ip = lambda **k: "203.0.113.7"
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mod.first_boot(spec, args)
+            finally:
+                mod.settle_public_ip = orig
+            self.assertEqual("203-0-113-7.sslip.io", spec.domain)
+            self.assertEqual(
+                ["203-0-113-7.defangstation.com"], spec.web_aliases)
+
+            # A later ordinary apply reconstructs the aliases from the
+            # persisted primary name and the retained suffix list.
+            reapplied = mod.Spec(json.loads(cfg.read_text()), prof)
+            self.assertEqual(spec.web_aliases, reapplied.web_aliases)
+
     def test_domain_suffix_defaults_to_sslip_io(self):
         """No domainSuffix in config.yaml must behave exactly as before."""
         mod = load_agentbox()
@@ -427,12 +462,26 @@ class RenderTest(unittest.TestCase):
             ({"users": {"Bad Name": {}}}, "invalid user name"),
             ({"domainSuffix": "not a domain", "users": {"a": {}}},
              "must be empty/null or a DNS suffix"),
+            ({"domainSuffixes": ["not a domain"], "users": {"a": {}}},
+             "domainSuffixes entries must be DNS suffixes"),
+            ({"domainSuffixes": ["sslip.io", "sslip.io"],
+              "users": {"a": {}}},
+             "domainSuffixes must not contain duplicates"),
             ({"domain": "203.0.113.7", "web": {"alias": "203.0.113.9"},
-              "users": {"a": {}}}, "web.alias must be a DNS name"),
+              "users": {"a": {}}}, "web.aliases entries must be DNS names"),
             ({"web": {"alias": True}, "users": {"a": {}}},
              "web.alias must be empty/null or a DNS suffix"),
             ({"web": {"alias": 42}, "users": {"a": {}}},
              "web.alias must be empty/null or a DNS suffix"),
+            ({"web": {"aliases": "example.com"}, "users": {"a": {}}},
+             "web.aliases must be a list of strings"),
+            ({"web": {"aliases": ["not a domain"]}, "users": {"a": {}}},
+             "web.aliases entries must be DNS names with at least two labels"),
+            ({"domain": "example.com", "web": {"aliases": ["example.com"]},
+              "users": {"a": {}}}, "web.aliases must differ from domain"),
+            ({"web": {"alias": "one.example.com",
+                       "aliases": ["one.example.com"]},
+              "users": {"a": {}}}, "web.aliases must not contain duplicates"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)

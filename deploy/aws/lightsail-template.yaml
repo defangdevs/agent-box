@@ -41,6 +41,7 @@ Metadata:
           - NixInstallerUrl
           - AllowCidr
           - DebugSsh
+          - SslipDomains
           - SslipDomain
     # The console renders these instead of the raw parameter names on the
     # 1-click form, which is the only UI most launches ever see.
@@ -64,7 +65,9 @@ Metadata:
       DebugSsh:
         default: Open port 22 for SSH as "ubuntu" with the Lightsail default key
       SslipDomain:
-        default: Whitelabel domain (self-hosted sslip.io clone; default is the public one)
+        default: Deprecated single alias suffix override
+      SslipDomains:
+        default: DNS alias suffixes
 
 Parameters:
   UserName:
@@ -234,17 +237,25 @@ Parameters:
   # encoding, different suffix. The default reproduces exactly the
   # hostname this template always derived, so a launch that leaves this
   # blank behaves exactly as it did before the parameter existed.
-  SslipDomain:
-    Type: String
+  SslipDomains:
+    Type: CommaDelimitedList
     Default: sslip.io
     AllowedPattern: '[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+'
     Description: >-
-      Domain suffix for the auto-derived hostname. Self-host sslip.io
-      (github.com/cunnie/sslip.io) under your own domain and set that
-      domain here to whitelabel the URL; the default (sslip.io) is the
-      public service.
+      DNS suffixes for the auto-derived hostname. The first is the primary
+      URL; remaining values receive on-demand certificates and redirect to
+      it. The default exposes only the public sslip.io name.
+
+  SslipDomain:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+'
+    Description: >-
+      Deprecated single-value override. When non-empty it replaces
+      SslipDomains so existing launch integrations keep their former URL.
 
 Conditions:
+  UseLegacySslipDomain: !Not [!Equals [!Ref SslipDomain, '']]
   OpenSsh: !Equals [!Ref DebugSsh, 'true']
 
 Resources:
@@ -357,7 +368,7 @@ Resources:
             install -d -m 0755 /etc/agent-box
             cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
             domain: auto
-            domainSuffix: @SSLIPDOMAIN@
+            domainSuffixes: [@SSLIPDOMAINS@]
             agents: [claude, codex]
             defaultAgent: @AGENT@
             web:
@@ -386,7 +397,7 @@ Resources:
             esc_issuer=$(printf '%s' "$portal_issuer_plain" | sed -e 's/[&\]/\\&/g')
             esc_user=$(printf '%s' "$portal_user_plain" | sed -e 's/[&\]/\\&/g')
             sed -i "s|@AGENT@|${Agent}|g; s|@USER@|${UserName}|g; \
-                    s|@SSLIPDOMAIN@|${SslipDomain}|g; \
+                    s|@SSLIPDOMAINS@|${SslipDomainsCsv}|g; \
                     s|@PORTALISSUER@|${!esc_issuer}|g; \
                     s|@PORTALUSERID@|${!esc_user}|g" \
               /etc/agent-box/config.yaml
@@ -425,6 +436,10 @@ Resources:
               Fn::Base64: !Ref WebPasswordHash
             PortalUserPlain: !Ref PortalUser
             PortalIssuerPlain: !Ref PortalIssuer
+            SslipDomainsCsv: !If
+              - UseLegacySslipDomain
+              - !Ref SslipDomain
+              - !Join [',', !Ref SslipDomains]
             FirstBootHandle: !Ref FirstBootHandle
 
   # Static IPv4 - free while attached, and stable across a stop/start, so the
@@ -462,8 +477,12 @@ Outputs:
       challenge with URL userinfo plus an EMPTY password, and credentials
       typed into the prompt cannot override the URL-embedded identity.)
     Value: !Sub
-      - 'https://${Host}.${SslipDomain}/${UserName}/'
+      - 'https://${Host}.${Suffix}/${UserName}/'
       - Host: !Join ['-', !Split ['.', !GetAtt StaticIp.IpAddress]]
+        Suffix: !If
+          - UseLegacySslipDomain
+          - !Ref SslipDomain
+          - !Select [0, !Ref SslipDomains]
 
   RemoteControlSession:
     Description: >-
@@ -471,8 +490,12 @@ Outputs:
       in the browser terminal, the Claude desktop and mobile apps can drive
       this session. Only meaningful when Agent=claude.
     Value: !Sub
-      - '${UserName}-main@${Host}.${SslipDomain}'
+      - '${UserName}-main@${Host}.${Suffix}'
       - Host: !Join ['-', !Split ['.', !GetAtt StaticIp.IpAddress]]
+        Suffix: !If
+          - UseLegacySslipDomain
+          - !Ref SslipDomain
+          - !Select [0, !Ref SslipDomains]
 
   PublicAddress:
     Description: Attached static IPv4 address.

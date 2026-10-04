@@ -688,7 +688,10 @@ let
       HARNESS=claude MODEL=sonnet EFFORT=low KEY=value`, read it back with
       `agent-box-profile show NAME`, and start it with `agent-box-session add
       [NAME] --profile PROFILE`. A `-- EXTRA_ARGS` tail still wins over the
-      profile. Profile env is convenience, not isolation: every session of this
+      profile. Signing in to Claude or Codex creates that harness's starter
+      profile if needed and, when no valid default exists, makes it the default.
+      A later sign-in never replaces an existing default. Profile env is
+      convenience, not isolation: every session of this
       user can read it out of /proc. A standing webhook watch hands its work to
       a profile through `agent-box-session env set AGENT_BOX_HOOK_PROFILE NAME`,
       which is how the harness a dispatched hook-* session runs gets picked at
@@ -712,7 +715,10 @@ let
     and give the displayed code to WhatsApp's Linked devices screen on the
     primary phone. The bridge accepts only messages that start with `@agent `
     (`@` plus this box's Linux user) from that account's Message Yourself chat. The device link belongs to the Linux user and
-    survives agent session restarts. Node and the bridge are installed only when
+    survives agent session restarts. Automatic message receipts are off by default;
+    set `LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable
+    diagnostic receipts. Agent replies and explicit command responses stay enabled.
+    Node and the bridge are installed only when
     pairing is requested; they are not part of the base image. The supervisor
     runs the bridge without spending a session slot. Message text and linked-device
     keys are stored in private files under `~/.local/state/local-whatsapp` on this
@@ -742,7 +748,13 @@ let
     name alone cannot identify. From inside the active Codex task, run
     `node ~/.local/share/local-whatsapp/bridge.mjs register codex` once to bind
     it to that session name. Repeat after a different task takes over the same
-    session. A normal Codex TUI uses the session name directly. The bridge has
+    session. A normal Codex TUI uses the session name directly. For a native image reply,
+    run `node ~/.local/share/local-whatsapp/bridge.mjs reply-image MESSAGE_ID /absolute/path/picture.png "caption"`. Claude uses
+    `whatsapp_reply_image` with the message ID, absolute image path, and optional
+    caption. PNG, JPEG, and WebP files are supported, up to 10 MiB, with at most
+    20 queued images. The bridge keeps private copies for retries and removes them
+    after sending. No download link or re-pairing is needed. Inbound images and
+    documents are not forwarded yet. The bridge has
     no shell command target.
 
     ## Slash commands: type them into your own pane
@@ -5470,12 +5482,12 @@ import time
 from urllib.request import urlopen
 
 
-REV = "52059e30642be1b0ee04c8f4401d21c7d932fc67"
+REV = "e4cb0985e26f2b0dacb92a44660aa6aba5ec28f4"
 FILES = {
-    "bridge.mjs": "1526b8e2b4784edb95a6a5f3a9337d5e19e0821c83ae522353965023d1e90d9a",
-    "state.mjs": "4f5125000fbb44b43c9dc7909ee293c61b5c3a6ae44f83620bd506470344e81b",
-    "package.json": "2ee16b0da02a289bf68d71811c39f51e27a2f16e9a810690b69c3091fab28df1",
-    "package-lock.json": "d030965125393662c5effbea6e25c98512e9fd29e470343010096ec413096110",
+    "bridge.mjs": "e4a76c798e7864c7f3b16c1f08a0a4e38189c04922c57b668bc362ad5819c8a4",
+    "state.mjs": "389fd7573169edf73744991cd05c9a18731f810effa64754dd0b2aeba3b8d787",
+    "package.json": "216587200066b8e5436c8535a8655c13b551bcc5076ff5d1684d680ba4c6160c",
+    "package-lock.json": "45c729a5414bf0cb1421426c75e183f1381dad07f5add6bf049dea31cf9a3cd4",
 }
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"
@@ -13974,6 +13986,30 @@ esac
       printf '%s' "''${b: -36}"
     }
 
+    codex_registered_thread() {
+      # The Codex thread a WhatsApp registration binds to session $1
+      # (local-whatsapp's codex-threads.json, keyed by session name), if its
+      # rollout is still on disk. A session started without a kickoff prompt has
+      # no "[agent-box session <id>]" marker for codex_rollout_uuid to find, so
+      # without this a respawn or box update starts it on a FRESH thread and
+      # leaves the registration pointing at one nothing hosts (issue #825).
+      # $2 is the session's resolved CODEX_HOME (resolve_codex_home), where its
+      # codex writes rollouts. The registration file stays at the default state
+      # dir: that is the only one the box's own bridge daemon reads.
+      [ -n "$1" ] || return 0
+      _f="$HOME/.local/state/local-whatsapp/codex-threads.json"
+      [ -r "$_f" ] || return 0
+      _thread="$($JQ -r --arg s "$1" '.[$s].thread // empty' "$_f" 2>/dev/null)" || return 0
+      case "$_thread" in
+        (*[!0-9a-fA-F-]*) return 0 ;;
+        (????????-????-????-????-????????????) ;;
+        (*) return 0 ;;
+      esac
+      [ -n "$($FIND "''${2:-$HOME/.codex}"/sessions -name "rollout-*-$_thread.jsonl" 2>/dev/null | head -n1)" ] \
+        || return 0
+      printf '%s' "$_thread"
+    }
+
     codex_wake_thread() {
       # A remote-controlled Codex task has no rollout owned by this pane. Its
       # durable wake target is the last task in this agent-box session that
@@ -14129,6 +14165,8 @@ esac
           fi
         else
           codex_target="$(codex_rollout_uuid "$bid")"
+          [ -n "$codex_target" ] \
+            || codex_target="$(codex_registered_thread "$sname" "$(resolve_codex_home "$sprofile")")"
         fi
       fi
 
@@ -15227,10 +15265,21 @@ in
         default = "";
         example = "1-2-3-4.sslip.io";
         description = ''
-          Optional DNS alias for the primary web.domain. Caddy redirects it to
-          the primary URL and obtains its certificate on demand, only if a
-          client actually visits the alias. Leave empty to request no DNS
-          alias certificate.
+          Legacy single DNS alias for the primary web.domain. New
+          configurations should use aliases. Caddy redirects it to the primary
+          URL and obtains its certificate on demand, only if a client actually
+          visits the alias.
+        '';
+      };
+
+      aliases = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "1-2-3-4.sslip.io" "1-2-3-4.example.com" ];
+        description = ''
+          Optional DNS aliases for the primary web.domain. Caddy redirects
+          each exact name to the primary URL and obtains that alias's
+          certificate only on its first TLS handshake.
         '';
       };
 
@@ -17778,8 +17827,7 @@ def profile_remove(name):
         # The lock itself is unavailable (the directory is gone, say). There
         # is then nothing to delete either.
         pass
-    if read_default_pointer() == name:
-        set_default_profile("")
+    clear_default_profile(name)
 
 
 # The default profile: ONE pointer file naming it, the same one
@@ -17807,9 +17855,8 @@ def default_profile(profiles):
     return name if name in profiles else ""
 
 
-def set_default_profile(name):
-    """Point the default at `name`, or clear it for "". Written to a temp
-    file and renamed, so a reader never sees half a name."""
+def _set_default_profile(name):
+    """Write `name` while the caller holds DEFAULT_PROFILE_FILE's lock."""
     if not name:
         try:
             os.unlink(DEFAULT_PROFILE_FILE)
@@ -17828,6 +17875,36 @@ def set_default_profile(name):
         except OSError:
             pass
         raise
+
+
+def set_default_profile(name):
+    """Point the default at `name`, or clear it for "".
+
+    The sidecar lock makes an explicit choice atomic with the post-login
+    fill below. The pointer itself is still written by temp file + rename,
+    so an unlocked reader never sees half a name.
+    """
+    with locked(DEFAULT_PROFILE_FILE):
+        _set_default_profile(name)
+
+
+def clear_default_profile(name):
+    """Clear only if `name` is still the default.
+
+    Used by profile deletion and the star toggle's stale-tab guard. The
+    comparison belongs under the same lock as the unlink, or a choice made
+    between those two operations would be erased.
+    """
+    with locked(DEFAULT_PROFILE_FILE):
+        if read_default_pointer() == name:
+            _set_default_profile("")
+
+
+def ensure_default_profile(name):
+    """Fill an empty/dangling default without replacing a user choice."""
+    with locked(DEFAULT_PROFILE_FILE):
+        if not default_profile(read_profiles()):
+            _set_default_profile(name)
 
 
 def profile_launch(name, harness=""):
@@ -18117,26 +18194,30 @@ def write_sessions(sessions, version=REGISTRY_VERSION):
 _session_start_notices = {}
 
 
-def ensure_claude_profile():
-    """Offer the login worker in Add session, preserving existing profiles.
+def ensure_harness_profile(agent):
+    """Offer the signed-in worker in Add session, preserving user choices.
 
     An explicit successful login can recreate a deleted starter profile;
     ordinary supervisor seeding still respects its once-per-name stamp.
-    A name already used for another harness belongs to the user.
+    A name already used for another harness belongs to the user. When the
+    box has no valid default, make this starter profile the default so
+    profile-driven entry points such as WhatsApp can start a worker. A later
+    sign-in never replaces an existing default.
     """
     if not PROFILE_BIN:
         return None, []
     index = 1
     while True:
-        name = "claude" if index == 1 else "claude-%d" % index
+        name = agent if index == 1 else "%s-%d" % (agent, index)
         path = profile_path(name)
         with locked(path):
             if not os.path.lexists(path):
-                save(path, [("HARNESS", "claude")], profile_header(name))
+                save(path, [("HARNESS", agent)], profile_header(name))
             data = as_dict(load(path))
-        if data.get("HARNESS") == "claude":
+        if data.get("HARNESS") == agent:
             resolved = profile_launch(name)
-            if resolved and resolved.get("harness") == "claude":
+            if resolved and resolved.get("harness") == agent:
+                ensure_default_profile(name)
                 return name, [str(a) for a in (resolved.get("args") or [])]
             return None, []
         index += 1
@@ -18150,15 +18231,13 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
 
     Skipped if the user already has ANY session on that harness -- a repeat
     sign-in (a token refresh, "Sign in again") must not mint a second one
-    every time the card cycles through "connected". Claude gets a reusable
-    starter profile, with its launch arguments resolved just like Add
-    session. Every other harness (codex included) gets a PROFILE only when
-    one already exists (agent-box-profile seed creates one per installed
-    harness, named after it, at every supervisor start -- issue #508):
-    referencing it here is what leaves the add-session picker something to
-    pick for a SECOND session afterwards (issue #623). A box whose
-    supervisor has not restarted since #508 landed has no such profile yet,
-    so this falls back to none rather than naming a file that is not there.
+    every time the card cycles through "connected". Every harness gets a
+    reusable starter profile, with its launch arguments resolved just like
+    Add session. This happens here rather than waiting for the supervisor's
+    next `agent-box-profile seed`, so a lazily installed harness is usable by
+    profile-driven entry points immediately (issue #818). When no valid
+    default exists, the starter becomes it; an existing default is a user
+    choice and is never replaced.
 
     `remote_control` is the one thing that differs by harness. claude's rc
     is a flag on the ordinary TUI (supervisor.sh appends --remote-control),
@@ -18183,17 +18262,17 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
     if agent not in AGENTS:
         return
     profile, args = None, []
-    if agent == "claude":
-        try:
-            profile, args = ensure_claude_profile()
-        except OSError:
-            # Profile storage failure must not undo a successful login or
-            # prevent its worker from starting.
-            pass
-    elif os.path.exists(profile_path(agent)) and not remote_control:
+    try:
+        profile, args = ensure_harness_profile(agent)
+    except OSError:
+        # Profile storage failure must not undo a successful login or
+        # prevent its worker from starting.
+        pass
+    if agent == "codex" and remote_control:
         # A remote-control codex session is the pairing daemon, which has no
-        # model, effort or profile of its own.
-        profile = agent
+        # model, effort or profile of its own. The ensured profile still
+        # remains available (and can be the default) for worker sessions.
+        profile, args = None, []
     try:
         # Read before the lock (issue #748): capacity_check's tmux spawn must
         # not run while holding sessions_lock(), or a slow/contended tmux
@@ -25516,8 +25595,9 @@ def render_connect_step(state):
             'class="row conn-form">'
             f'<input type="hidden" name="flow" value="{flow_id}">'
             '<label class="field conn-field"><span class="note">Your WhatsApp '
-            'number with country code</span><input type="tel" name="phone" '
-            'autocomplete="tel" inputmode="numeric" enterkeyhint="go" '
+            'number, starting with + and country code</span>'
+            '<input type="tel" name="phone" autocomplete="off" '
+            'inputmode="tel" enterkeyhint="go" '
             'placeholder="+1 (555) 123-2435" aria-label="WhatsApp phone number"></label>'
             f'{render_whatsapp_profile_field()}'
             '<button type="submit" class="btn">Pair device</button></form>'
@@ -27526,7 +27606,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # basic-auth prompt and the handover would look like it did
         # nothing. Lax is sent on top-level navigations, which is what this
         # is. Max-Age is the browser's hint only: portal_session_ok decides
-        # expiry from the stored record.
+        # expiry from the stored record. The __Host- prefix, Path=/, Secure,
+        # and NO Domain attribute make this cookie host-only. Never add
+        # Domain: sibling boxes commonly share ip.sslip.io or
+        # ip.domainstation.com.
         self.send_header(
             "Set-Cookie",
             "%s=%s; Path=/; Max-Age=%d; HttpOnly; Secure; SameSite=Lax"
@@ -28141,12 +28224,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raw_phone = form.get("phone", [""])[0].strip()
                     phone = ""
                     if raw_phone:
-                        # ASCII only: \D would keep Unicode digits the bridge drops.
+                        # `autocomplete="tel"` let Mobile Safari replace a
+                        # +1 contact number with its national form. The bridge
+                        # cannot infer the missing country code, so make the
+                        # international marker explicit and reject that lossy
+                        # substitution (issue #820). ASCII only: \D would keep
+                        # Unicode digits the bridge drops.
                         phone = re.sub(r"[ ()+.-]", "", raw_phone)
-                        if not (phone.isascii() and phone.isdigit()
+                        if not (raw_phone.startswith("+")
+                                and re.fullmatch(r"\+[0-9 ().-]+", raw_phone)
+                                and phone.isascii() and phone.isdigit()
                                 and 7 <= len(phone) <= 15):
                             self._send_html(render_page(
-                                "Enter a valid WhatsApp number with country code.",
+                                "Enter a valid WhatsApp number starting with + "
+                                "and country code.",
                                 kind="error"), status=400)
                             return
                     profile = form.get("profile", [""])[0].strip()
@@ -28226,8 +28317,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     # Only clear the default this row showed: a stale tab
                     # must not unset a default somebody moved elsewhere.
-                    if read_default_pointer() == name:
-                        set_default_profile("")
+                    clear_default_profile(name)
                     self._redirect("ok=profile_default_cleared")
                 return
             if action == "delkey":
@@ -29125,6 +29215,7 @@ if __name__ == "__main__":
       ipv4Octet = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
       isIpv4 = value: builtins.match "${ipv4Octet}(\\.${ipv4Octet}){3}" value != null;
       webDomainIsIpv4 = isIpv4 cfg.web.domain;
+      webAliases = lib.optional (cfg.web.alias != "") cfg.web.alias ++ cfg.web.aliases;
 
       # Prefix every non-blank line — Nix indented strings strip the common
       # leading whitespace, so composed fragments need explicit re-indenting.
@@ -29216,7 +29307,9 @@ if __name__ == "__main__":
         # The shared __Host- cookie uses SameSite=Lax so a top-level return from
         # another site carries it. Cross-site POSTs still omit it; the settings
         # daemon also checks request origin because Basic auth has no SameSite
-        # protection (issue #117).
+        # protection (issue #117). __Host- plus Path=/, Secure, and NO Domain
+        # attribute makes browsers scope it to this box's exact hostname. Never add
+        # Domain: boxes share suffixes such as ip.sslip.io and ip.domainstation.com.
         redir /@USER@ /@USER@/
         # @USER@'s settings page (issue #36). Same auth surface as the
         # terminal (cookie-or-basic-auth, same user name), just a different
@@ -29459,6 +29552,9 @@ if __name__ == "__main__":
         # href (issue 56): Chrome answers the basic-auth challenge with URL
         # userinfo + an EMPTY password, and credentials typed into the
         # prompt cannot override the URL-embedded identity.
+        # The __Host- auth cookie uses Path=/, Secure, and NO Domain attribute so
+        # browsers scope it to this exact box hostname. Never add Domain: sibling
+        # boxes commonly share a DNS suffix.
         handle {
           # A live portal session (issue #541) reaches this exactly as a
           # basic-auth login does. forward_auth is stock caddy -- part of
@@ -29651,9 +29747,9 @@ if __name__ == "__main__":
       + "\n"
       + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
       + "}\n\n"
-      + lib.optionalString (cfg.web.alias != "") (
+      + lib.concatMapStrings (alias:
         lib.replaceStrings [ "@ALIAS@" "@DOMAIN@" ]
-          [ cfg.web.alias cfg.web.domain ] ''
+          [ alias cfg.web.domain ] ''
           # A DNS alias is served only when configured. Its certificate is requested
           # on the first TLS handshake, so an unused sslip.io name consumes no quota.
           @ALIAS@ {
@@ -29665,7 +29761,7 @@ if __name__ == "__main__":
             }
             redir https://@DOMAIN@{uri} permanent
           }
-        '' + "\n")
+        '' + "\n") webAliases
       # The same fragment the native renderer binds (issue #154 Phase 2), so
       # both backends document — and wire — this extension point identically.
       + lib.replaceStrings [ "@APPLY_CMD@" "@RELOAD_CMD@" ]
@@ -29825,18 +29921,22 @@ if __name__ == "__main__":
           message = "services.agent-box.web.domain is an IPv4 address, which requires Caddy 2.11.4 or newer for ACME IP certificates.";
         }
         {
-          assertion = cfg.web.alias == "" || cfg.web.alias != cfg.web.domain;
-          message = "services.agent-box.web.alias must differ from web.domain.";
+          assertion = lib.length (lib.unique (map lib.toLower webAliases)) == lib.length webAliases;
+          message = "services.agent-box.web.aliases must not contain duplicates (including the legacy web.alias).";
         }
         {
-          assertion = cfg.web.alias == "" || !isIpv4 cfg.web.alias;
-          message = "services.agent-box.web.alias must be a DNS name, not an IPv4 address.";
+          assertion = lib.all (alias: lib.toLower alias != lib.toLower cfg.web.domain) webAliases;
+          message = "services.agent-box.web.aliases must differ from web.domain.";
         }
         {
-          assertion = cfg.web.alias == "" || builtins.match
+          assertion = lib.all (alias: !isIpv4 alias) webAliases;
+          message = "services.agent-box.web.aliases must be DNS names, not IPv4 addresses.";
+        }
+        {
+          assertion = lib.all (alias: builtins.match
             "[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+"
-            cfg.web.alias != null;
-          message = "services.agent-box.web.alias must be a DNS name with at least two labels.";
+            alias != null) webAliases;
+          message = "services.agent-box.web.aliases entries must be DNS names with at least two labels.";
         }
         {
           assertion = cfg.users ? ${webUser};
