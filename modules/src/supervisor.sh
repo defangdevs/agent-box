@@ -845,6 +845,27 @@ codex_rollout_uuid() {
   printf '%s' "${b: -36}"
 }
 
+codex_registered_thread() {
+  # The Codex thread a WhatsApp registration binds to session $1
+  # (local-whatsapp's codex-threads.json, keyed by session name), if its
+  # rollout is still on disk. A session started without a kickoff prompt has
+  # no "[agent-box session <id>]" marker for codex_rollout_uuid to find, so
+  # without this a respawn or box update starts it on a FRESH thread and
+  # leaves the registration pointing at one nothing hosts (issue #825).
+  [ -n "$1" ] || return 0
+  _f="$HOME/.local/state/local-whatsapp/codex-threads.json"
+  [ -r "$_f" ] || return 0
+  _thread="$($JQ -r --arg s "$1" '.[$s].thread // empty' "$_f" 2>/dev/null)" || return 0
+  case "$_thread" in
+    (*[!0-9a-fA-F-]*) return 0 ;;
+    (????????-????-????-????-????????????) ;;
+    (*) return 0 ;;
+  esac
+  [ -n "$($FIND "$HOME"/.codex/sessions -name "rollout-*-$_thread.jsonl" 2>/dev/null | head -n1)" ] \
+    || return 0
+  printf '%s' "$_thread"
+}
+
 codex_wake_thread() {
   # A remote-controlled Codex task has no rollout owned by this pane. Its
   # durable wake target is the last task in this agent-box session that
@@ -1000,6 +1021,7 @@ start_session() {
       fi
     else
       codex_target="$(codex_rollout_uuid "$bid")"
+      [ -n "$codex_target" ] || codex_target="$(codex_registered_thread "$sname")"
     fi
   fi
 
