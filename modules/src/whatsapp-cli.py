@@ -14,7 +14,7 @@ import time
 from urllib.request import urlopen
 
 
-REV = "41a36bd8a2a848dc88bc7296bf340fd722b63f34"
+REV = "e4cb0985e26f2b0dacb92a44660aa6aba5ec28f4"
 FILES = {
     "bridge.mjs": "e4a76c798e7864c7f3b16c1f08a0a4e38189c04922c57b668bc362ad5819c8a4",
     "state.mjs": "389fd7573169edf73744991cd05c9a18731f810effa64754dd0b2aeba3b8d787",
