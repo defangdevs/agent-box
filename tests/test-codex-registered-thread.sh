@@ -78,8 +78,21 @@ printf 'agent-box session boxid-marked\n' \
 [ "$(target_for boxid-marked codex)" = "$marked" ] \
   || { echo "FAIL: marker must win over registration" >&2; exit 1; }
 
+# The marker is looked for under the session's CODEX_HOME too.
+pmarked=01a10361-0000-7000-8000-000000000002
+printf 'agent-box session boxid-profile\n' \
+  > "$cxhome/sessions/2026/10/03/rollout-2026-10-03T22-00-00-$pmarked.jsonl"
+[ "$(codex_rollout_uuid boxid-profile "$cxhome")" = "$pmarked" ] \
+  || { echo "FAIL: marker under the session's CODEX_HOME not found" >&2; exit 1; }
+[ -z "$(codex_rollout_uuid boxid-profile)" ] \
+  || { echo "FAIL: a CODEX_HOME marker must not match ~/.codex" >&2; exit 1; }
+[ "$(codex_rollout_uuid boxid-marked)" = "$marked" ] \
+  || { echo "FAIL: no CODEX_HOME must still default to ~/.codex" >&2; exit 1; }
+
 # The fallback itself must stay wired into start_session's non-RC branch.
-grep -qF '|| codex_target="$(codex_registered_thread "$sname" "$(resolve_codex_home "$sprofile")")"' "$SUPERVISOR" \
+grep -qF 'codex_target="$(codex_rollout_uuid "$bid" "$cxhome")"' "$SUPERVISOR" \
+  || { echo "FAIL: start_session no longer passes CODEX_HOME to codex_rollout_uuid" >&2; exit 1; }
+grep -qF '|| codex_target="$(codex_registered_thread "$sname" "$cxhome")"' "$SUPERVISOR" \
   || { echo "FAIL: start_session no longer falls back to codex_registered_thread" >&2; exit 1; }
 
 echo "codex_registered_thread: ok"
