@@ -1043,7 +1043,7 @@ def read_profiles():
         if not entry.endswith(".env"):
             continue
         name = entry[:-len(".env")]
-        if not PROFILE_NAME_RE.match(name):
+        if not PROFILE_NAME_RE.fullmatch(name):
             continue
         data = as_dict(load(profile_path(name)))
         out[name] = {
@@ -1102,7 +1102,7 @@ def read_default_pointer():
             name = fh.readline().strip()
     except OSError:
         return ""
-    return name if PROFILE_NAME_RE.match(name) else ""
+    return name if PROFILE_NAME_RE.fullmatch(name) else ""
 
 
 def default_profile(profiles):
@@ -3188,7 +3188,7 @@ def whatsapp_profile(value=None):
         profile = json.loads(proc.stdout or "{}").get("profile")
     except (ValueError, AttributeError):
         return None
-    return profile if isinstance(profile, str) and PROFILE_NAME_RE.match(profile) else ""
+    return profile if isinstance(profile, str) and PROFILE_NAME_RE.fullmatch(profile) else ""
 
 
 def render_whatsapp_profile_field():
@@ -3708,7 +3708,7 @@ def relogin_reason(flow, entry, stored, base):
     env = dict(base)
     env.update(stored)
     profile = entry.get("profile")
-    if isinstance(profile, str) and PROFILE_NAME_RE.match(profile):
+    if isinstance(profile, str) and PROFILE_NAME_RE.fullmatch(profile):
         for key, value in as_dict(load(profile_path(profile))).items():
             if key not in PROFILE_RESERVED:
                 env[key] = value
@@ -5643,7 +5643,7 @@ PROFILES_SECTION_TPL = """<section>
       <form method="post" action="{base}/profiles/set">
         <div class="row profile-row">
           <input type="text" name="name" placeholder="profile name" class="pname"
-                 pattern="[A-Za-z0-9_-]{{1,64}}" required autocomplete="off"
+                 pattern="[A-Za-z0-9_-]{{1,64}}" maxlength="64" required autocomplete="off"
                  aria-label="Profile name"
                  title="Letters, digits, underscore and hyphen; at most 64 characters">
           <select name="HARNESS" aria-label="Assistant" required>{harnesses}</select>
@@ -7449,6 +7449,14 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     input.focus();
     acFetch(input); // reveal the next level
   }
+  // Profile names are [A-Za-z0-9_-] (PROFILE_NAME_RE): drop anything else
+  // as it is typed or pasted, instead of only refusing it on submit.
+  document.addEventListener("input", function (e) {
+    var input = e.target;
+    if (!input.classList || !input.classList.contains("pname")) { return; }
+    var clean = input.value.replace(/[^A-Za-z0-9_-]/g, "");
+    if (clean !== input.value) { input.value = clean; }
+  });
   var acTimer = null;
   document.addEventListener("input", function (e) {
     var input = e.target;
@@ -11400,7 +11408,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 profile = form.get("profile", [""])[0].strip()
                 if profile and (profile == "default"
-                                or not PROFILE_NAME_RE.match(profile)
+                                or not PROFILE_NAME_RE.fullmatch(profile)
                                 or profile not in read_profiles()):
                     self._send_html(render_page("Choose an existing WhatsApp profile.",
                                                 kind="error"), status=400)
@@ -11434,7 +11442,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             return
                     profile = form.get("profile", [""])[0].strip()
                     if profile and (profile == "default"
-                                    or not PROFILE_NAME_RE.match(profile)
+                                    or not PROFILE_NAME_RE.fullmatch(profile)
                                     or profile not in read_profiles()):
                         self._send_html(render_page("Choose an existing WhatsApp profile.",
                                                     kind="error"), status=400)
@@ -11483,7 +11491,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if action not in ("set", "delete", "setkey", "delkey", "default"):
                 self._send_html("<h1>404</h1>", status=404)
                 return
-            if not PROFILE_NAME_RE.match(name):
+            if not PROFILE_NAME_RE.fullmatch(name):
                 self._send_html(
                     render_page("Invalid profile name. Use letters, digits, "
                                 "'_' and '-', at most 64 characters.", kind="error"),
@@ -11742,7 +11750,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             if profile:
-                if not PROFILE_NAME_RE.match(profile):
+                if not PROFILE_NAME_RE.fullmatch(profile):
                     self._send_html(
                         render("Invalid profile name.", kind="error"), status=400)
                     return

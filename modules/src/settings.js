@@ -1314,6 +1314,14 @@
     input.focus();
     acFetch(input); // reveal the next level
   }
+  // Profile names are [A-Za-z0-9_-] (PROFILE_NAME_RE): drop anything else
+  // as it is typed or pasted, instead of only refusing it on submit.
+  document.addEventListener("input", function (e) {
+    var input = e.target;
+    if (!input.classList || !input.classList.contains("pname")) { return; }
+    var clean = input.value.replace(/[^A-Za-z0-9_-]/g, "");
+    if (clean !== input.value) { input.value = clean; }
+  });
   var acTimer = null;
   document.addEventListener("input", function (e) {
     var input = e.target;
