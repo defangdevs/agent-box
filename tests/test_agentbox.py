@@ -264,6 +264,19 @@ class RenderTest(unittest.TestCase):
                 self.assertIn("reverse_proxy unix//run/agent-box-webhook/",
                               block)
                 self.assertIn("  handle {\n    redir", block)
+                # An alias must never serve a route that reads or sets the
+                # login cookie: one cookie, one origin (#815). Only the
+                # unauthenticated webhook proxy and the redirect may live
+                # here, so no auth directive, no cookie, and no proxy to any
+                # socket but the webhook receiver's.
+                code = "\n".join(line for line in block.splitlines()
+                                 if not line.lstrip().startswith("#"))
+                for banned in ("cookie", "basic_auth", "forward_auth",
+                               "@sess", "settings", "ttyd", "downloads"):
+                    self.assertNotIn(banned, code.lower())
+                for line in code.splitlines():
+                    if "reverse_proxy" in line:
+                        self.assertIn("unix//run/agent-box-webhook/", line)
 
             no_alias = Path(tmp) / "no-alias"
             no_alias.mkdir()
