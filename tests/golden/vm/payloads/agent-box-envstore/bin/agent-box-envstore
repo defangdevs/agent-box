@@ -69,7 +69,7 @@ import tempfile
 
 # The key charset every reader already agreed on (the settings daemon's
 # KEY_RE, the shell CLIs' valid_key).
-KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 
 ENV_HEADER = (
     "# Managed by agent-box settings page. KEY=value, one per line.\n"

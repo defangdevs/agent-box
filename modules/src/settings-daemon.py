@@ -143,7 +143,7 @@ PROFILES_DIR = os.path.join(os.path.dirname(ENV_FILE), "profiles")
 PROFILE_BIN = os.environ.get("AGENT_BOX_PROFILE_BIN", "")
 # Same charset and length the CLI's valid_name() enforces (profile-cli.sh):
 # one file per profile, so the name is also a path component.
-PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 PROFILE_RESERVED_LABELS = {
     "HARNESS": "Assistant",
     "MODEL": "Model",
@@ -403,7 +403,7 @@ def webhook_unavailable():
 # Mirrored by the CLI's NAME_MAX and the module's session-name assertion;
 # it stays far below what a filter.<user>-<session>.json filename allows.
 NAME_MAX = 150
-SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,%d}$" % NAME_MAX)
+SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,%d}\Z" % NAME_MAX)
 # Names a session may never take: each already means something else under
 # TERM_BASE, and a session path is what the vhost sends everything ELSE
 # there to. A session called "settings" would shadow the settings page —
@@ -420,11 +420,11 @@ RESERVED_NAMES = frozenset(("settings", "downloads", "webhook", "sessions",
 # exec'd as an argv list with no shell, so this is a sanity bound rather
 # than a quoting defence — it keeps a malformed form value from reaching
 # the subscription file at all.
-TOPIC_RE = re.compile(r"^[A-Za-z0-9_.:/*-]{1,128}$")
+TOPIC_RE = re.compile(r"^[A-Za-z0-9_.:/*-]{1,128}\Z")
 # A webhook source name, as `agent-box-webhook setup` validates it
 # (letters, digits, _ and -). The secret route resolves a name to a file
 # inside the state dir, so this is the check that keeps a path out of it.
-SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 
 # The agent user's home. A session's working directory defaults to it
 # and the working-directory picker (below) browses within it: the
@@ -1211,7 +1211,7 @@ CODEX_WAKE_DIR = os.path.join(
 # the path-safety check on a value read out of sessions.json.
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
-    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
 )
 # Codex rollout scan bounds. The marker sits in the first user turn, so the
 # head of the file is enough; the file cap keeps one page render off a box
@@ -3340,7 +3340,7 @@ CODEX_DAEMON_WAIT = 10.0
 CODEX_STARTING_GRACE = 90.0
 CODEX_DEVICE_LIMIT = 50
 CODEX_ERROR_MAX = 200
-CODEX_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+CODEX_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
 # A URL, a request id or a cf-ray in a server message is transport detail
 # that belongs in a bug report, not on a card -- and a URL may carry a code.
 CODEX_REDACT_RES = (
