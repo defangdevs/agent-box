@@ -29374,10 +29374,16 @@ if __name__ == "__main__":
       + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
       + "}\n\n"
       + lib.concatMapStrings (alias:
-        lib.replaceStrings [ "@ALIAS@" "@DOMAIN@" ]
-          [ alias cfg.web.domain ] ''
+        lib.replaceStrings [ "@ALIAS@" "@DOMAIN@" "@WEBHOOK_ROUTES@" ]
+          [ alias cfg.web.domain
+            (lib.concatMapStrings (name: indent "  " (webhookCaddyBlock name))
+              terminalUsers) ] ''
           # A DNS alias is served only when configured. Its certificate is requested
           # on the first TLS handshake, so an unused sslip.io name consumes no quota.
+          # Webhook routes are served here, not redirected: a sender such as GitHub
+          # does not follow a redirect, so a hook registered under the alias would
+          # otherwise fail with a 301 the moment the IP became the primary address.
+          # Everything else redirects, which keeps browser cookies on one origin.
           @ALIAS@ {
             tls {
               issuer acme {
@@ -29385,7 +29391,11 @@ if __name__ == "__main__":
               }
               on_demand
             }
-            redir https://@DOMAIN@{uri} permanent
+          @WEBHOOK_ROUTES@  # Caddy runs `redir` before `handle`, so the redirect must be a handle of
+            # its own or it would shadow the routes above.
+            handle {
+              redir https://@DOMAIN@{uri} permanent
+            }
           }
         '' + "\n") webAliases
       # The same fragment the native renderer binds (issue #154 Phase 2), so
