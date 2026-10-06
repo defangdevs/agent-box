@@ -1,5 +1,9 @@
 # A DNS alias is served only when configured. Its certificate is requested
 # on the first TLS handshake, so an unused sslip.io name consumes no quota.
+# Webhook routes are served here, not redirected: a sender such as GitHub
+# does not follow a redirect, so a hook registered under the alias would
+# otherwise fail with a 301 the moment the IP became the primary address.
+# Everything else redirects, which keeps browser cookies on one origin.
 @ALIAS@ {
   tls {
     issuer acme {
@@ -7,5 +11,9 @@
     }
     on_demand
   }
-  redir https://@DOMAIN@{uri} permanent
+@WEBHOOK_ROUTES@  # Caddy runs `redir` before `handle`, so the redirect must be a handle of
+  # its own or it would shadow the routes above.
+  handle {
+    redir https://@DOMAIN@{uri} permanent
+  }
 }

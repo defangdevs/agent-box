@@ -253,6 +253,17 @@ class RenderTest(unittest.TestCase):
             self.assertIn("203-0-113-7.defangstation.com {", caddyfile)
             self.assertIn("on_demand", caddyfile)
             self.assertIn("redir https://203.0.113.7{uri} permanent", caddyfile)
+            # A sender does not follow a redirect, so every alias serves the
+            # webhook route itself; only the rest redirects, and that
+            # redirect is its own `handle` because `redir` outranks `handle`.
+            for alias in ("203-0-113-7.sslip.io",
+                          "203-0-113-7.defangstation.com"):
+                block = caddyfile.split(f"\n{alias} {{", 1)[1].split("\n}", 1)[0]
+                self.assertLess(block.index("handle /agent/webhook/*"),
+                                block.index("redir https://203.0.113.7"))
+                self.assertIn("reverse_proxy unix//run/agent-box-webhook/",
+                              block)
+                self.assertIn("  handle {\n    redir", block)
 
             no_alias = Path(tmp) / "no-alias"
             no_alias.mkdir()

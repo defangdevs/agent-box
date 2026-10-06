@@ -3607,7 +3607,8 @@ class Renderer:
                     ("@USER@", user.name),
                 ]:
                     text = text.replace(token, value)
-            left = re.findall(r"@[A-Z_]+@", text)
+            left = re.findall(r"@[A-Z_]+@", text.replace(
+                "@WEBHOOK_ROUTES@", ""))
             if left:
                 raise ConfigError(
                     f"caddyfile-{name}.caddy has unbound token(s) "
@@ -3626,8 +3627,13 @@ class Renderer:
             parts.append(bind("terminal", u))
         parts.append(bind("root", root_user))
         parts.append("}\n")
+        routes = "".join(
+            "".join(f"  {line}\n" if line else "\n"
+                    for line in bind("webhook", u).splitlines())
+            for u in self.spec.users if self.spec.webhook_enable)
         for alias in self.spec.web_aliases:
-            parts.append(bind("alias", alias=alias))
+            parts.append(bind("alias", alias=alias).replace(
+                "@WEBHOOK_ROUTES@", routes))
         # The self-serve extension point the header fragment documents, and
         # the reason caddy_reload_policy() permits `systemctl reload
         # caddy.service`: one `import` per user, since Caddyfile's `import`

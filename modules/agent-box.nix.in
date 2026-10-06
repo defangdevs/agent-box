@@ -3813,8 +3813,10 @@ in
       + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
       + "}\n\n"
       + lib.concatMapStrings (alias:
-        lib.replaceStrings [ "@ALIAS@" "@DOMAIN@" ]
-          [ alias cfg.web.domain ] ''
+        lib.replaceStrings [ "@ALIAS@" "@DOMAIN@" "@WEBHOOK_ROUTES@" ]
+          [ alias cfg.web.domain
+            (lib.concatMapStrings (name: indent "  " (webhookCaddyBlock name))
+              terminalUsers) ] ''
           @@include:src/caddyfile-alias.caddy@@
         '' + "\n") webAliases
       # The same fragment the native renderer binds (issue #154 Phase 2), so

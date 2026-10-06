@@ -130,7 +130,14 @@ golden.example.org {
   # This fragment ends INSIDE the block on purpose: the module appends one
   # webhook + terminal block per user (and the root block), then the closing
   # brace. Nothing is missing here.
-  handle /agent/webhook* {
+  # Two handles, not `/agent/webhook*`: that glob also matches
+  # /agent/webhookish, which would reach the receiver as an unknown source and
+  # 404 instead of falling through to whatever else this vhost serves.
+  handle /agent/webhook {
+    uri strip_prefix /agent/webhook
+    reverse_proxy unix//run/agent-box-webhook/agent.sock
+  }
+  handle /agent/webhook/* {
     uri strip_prefix /agent/webhook
     reverse_proxy unix//run/agent-box-webhook/agent.sock
   }
@@ -367,7 +374,14 @@ golden.example.org {
     }
   }
 
-  handle /robot/webhook* {
+  # Two handles, not `/robot/webhook*`: that glob also matches
+  # /robot/webhookish, which would reach the receiver as an unknown source and
+  # 404 instead of falling through to whatever else this vhost serves.
+  handle /robot/webhook {
+    uri strip_prefix /robot/webhook
+    reverse_proxy unix//run/agent-box-webhook/robot.sock
+  }
+  handle /robot/webhook/* {
     uri strip_prefix /robot/webhook
     reverse_proxy unix//run/agent-box-webhook/robot.sock
   }
