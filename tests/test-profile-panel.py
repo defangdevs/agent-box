@@ -1225,5 +1225,21 @@ class ProfilesAreNotBuiltAroundABoxDefault(ProfileFixture):
         self.assertEqual(os.listdir(self.profiles), [])
 
 
+class TrailingNewlineIsNotAName(unittest.TestCase):
+    """`$` also matches before a final newline, so `^...$` with re.match let
+    "name\n" through. The validators end in \\Z; pin every one."""
+
+    def test_validators_refuse_a_trailing_newline(self):
+        mod = daemon_with(AGENT_BOX_SETTINGS_ENV_FILE=os.devnull,
+                          AGENT_BOX_SESSIONS_FILE=os.devnull)
+        for rx, ok in ((mod.PROFILE_NAME_RE, "a-b_1"), (mod.SESSION_RE, "a-b_1"),
+                       (mod.SOURCE_RE, "github"), (mod.KEY_RE, "A_1"),
+                       (mod.TOPIC_RE, "o/r"), (mod.CODEX_CLIENT_ID_RE, "id.1"),
+                       (mod.UUID_RE, "0" * 8 + "-" + "0" * 4 + "-" + "0" * 4
+                        + "-" + "0" * 4 + "-" + "0" * 12)):
+            self.assertTrue(rx.match(ok), (rx.pattern, ok))
+            self.assertFalse(rx.match(ok + "\n"), (rx.pattern, ok))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

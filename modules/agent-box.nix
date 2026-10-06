@@ -1746,7 +1746,7 @@ import tempfile
 
 # The key charset every reader already agreed on (the settings daemon's
 # KEY_RE, the shell CLIs' valid_key).
-KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 
 ENV_HEADER = (
     "# Managed by agent-box settings page. KEY=value, one per line.\n"
@@ -17066,7 +17066,7 @@ PROFILES_DIR = os.path.join(os.path.dirname(ENV_FILE), "profiles")
 PROFILE_BIN = os.environ.get("AGENT_BOX_PROFILE_BIN", "")
 # Same charset and length the CLI's valid_name() enforces (profile-cli.sh):
 # one file per profile, so the name is also a path component.
-PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 PROFILE_RESERVED_LABELS = {
     "HARNESS": "Assistant",
     "MODEL": "Model",
@@ -17326,7 +17326,7 @@ def webhook_unavailable():
 # Mirrored by the CLI's NAME_MAX and the module's session-name assertion;
 # it stays far below what a filter.<user>-<session>.json filename allows.
 NAME_MAX = 150
-SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,%d}$" % NAME_MAX)
+SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,%d}\Z" % NAME_MAX)
 # Names a session may never take: each already means something else under
 # TERM_BASE, and a session path is what the vhost sends everything ELSE
 # there to. A session called "settings" would shadow the settings page —
@@ -17343,11 +17343,11 @@ RESERVED_NAMES = frozenset(("settings", "downloads", "webhook", "sessions",
 # exec'd as an argv list with no shell, so this is a sanity bound rather
 # than a quoting defence — it keeps a malformed form value from reaching
 # the subscription file at all.
-TOPIC_RE = re.compile(r"^[A-Za-z0-9_.:/*-]{1,128}$")
+TOPIC_RE = re.compile(r"^[A-Za-z0-9_.:/*-]{1,128}\Z")
 # A webhook source name, as `agent-box-webhook setup` validates it
 # (letters, digits, _ and -). The secret route resolves a name to a file
 # inside the state dir, so this is the check that keeps a path out of it.
-SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 
 # The agent user's home. A session's working directory defaults to it
 # and the working-directory picker (below) browses within it: the
@@ -17478,7 +17478,7 @@ def read_profiles():
         if not entry.endswith(".env"):
             continue
         name = entry[:-len(".env")]
-        if not PROFILE_NAME_RE.match(name):
+        if not PROFILE_NAME_RE.fullmatch(name):
             continue
         data = as_dict(load(profile_path(name)))
         out[name] = {
@@ -17537,7 +17537,7 @@ def read_default_pointer():
             name = fh.readline().strip()
     except OSError:
         return ""
-    return name if PROFILE_NAME_RE.match(name) else ""
+    return name if PROFILE_NAME_RE.fullmatch(name) else ""
 
 
 def default_profile(profiles):
@@ -18134,7 +18134,7 @@ CODEX_WAKE_DIR = os.path.join(
 # the path-safety check on a value read out of sessions.json.
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
-    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
 )
 # Codex rollout scan bounds. The marker sits in the first user turn, so the
 # head of the file is enough; the file cap keeps one page render off a box
@@ -19623,7 +19623,7 @@ def whatsapp_profile(value=None):
         profile = json.loads(proc.stdout or "{}").get("profile")
     except (ValueError, AttributeError):
         return None
-    return profile if isinstance(profile, str) and PROFILE_NAME_RE.match(profile) else ""
+    return profile if isinstance(profile, str) and PROFILE_NAME_RE.fullmatch(profile) else ""
 
 
 def render_whatsapp_profile_field():
@@ -20143,7 +20143,7 @@ def relogin_reason(flow, entry, stored, base):
     env = dict(base)
     env.update(stored)
     profile = entry.get("profile")
-    if isinstance(profile, str) and PROFILE_NAME_RE.match(profile):
+    if isinstance(profile, str) and PROFILE_NAME_RE.fullmatch(profile):
         for key, value in as_dict(load(profile_path(profile))).items():
             if key not in PROFILE_RESERVED:
                 env[key] = value
@@ -20263,7 +20263,7 @@ CODEX_DAEMON_WAIT = 10.0
 CODEX_STARTING_GRACE = 90.0
 CODEX_DEVICE_LIMIT = 50
 CODEX_ERROR_MAX = 200
-CODEX_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+CODEX_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
 # A URL, a request id or a cf-ray in a server message is transport detail
 # that belongs in a bug report, not on a card -- and a URL may carry a code.
 CODEX_REDACT_RES = (
@@ -21974,6 +21974,8 @@ STYLE = """<style>
      own now that Save has moved below the prompt and the starting setting
      (issue #493). */
   input.pname { width: 150px; }
+  /* pattern= cannot stop a keystroke, so show the refusal while typing. */
+  input.pname:invalid:not(:placeholder-shown) { outline: 2px solid #d1242f; }
   /* Model is an OPEN picker (issue #493): free text over the SAME combobox
      the working-directory field uses, because a model ID this box has never
      heard of still has to be typeable. It began as a <datalist> and the
@@ -22078,7 +22080,7 @@ PROFILES_SECTION_TPL = """<section>
       <form method="post" action="{base}/profiles/set">
         <div class="row profile-row">
           <input type="text" name="name" placeholder="profile name" class="pname"
-                 pattern="[A-Za-z0-9_-]{{1,64}}" required autocomplete="off"
+                 pattern="[A-Za-z0-9_-]{{1,64}}" maxlength="64" required autocomplete="off"
                  aria-label="Profile name"
                  title="Letters, digits, underscore and hyphen; at most 64 characters">
           <select name="HARNESS" aria-label="Assistant" required>{harnesses}</select>
@@ -27835,7 +27837,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 profile = form.get("profile", [""])[0].strip()
                 if profile and (profile == "default"
-                                or not PROFILE_NAME_RE.match(profile)
+                                or not PROFILE_NAME_RE.fullmatch(profile)
                                 or profile not in read_profiles()):
                     self._send_html(render_page("Choose an existing WhatsApp profile.",
                                                 kind="error"), status=400)
@@ -27869,7 +27871,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             return
                     profile = form.get("profile", [""])[0].strip()
                     if profile and (profile == "default"
-                                    or not PROFILE_NAME_RE.match(profile)
+                                    or not PROFILE_NAME_RE.fullmatch(profile)
                                     or profile not in read_profiles()):
                         self._send_html(render_page("Choose an existing WhatsApp profile.",
                                                     kind="error"), status=400)
@@ -27918,7 +27920,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if action not in ("set", "delete", "setkey", "delkey", "default"):
                 self._send_html("<h1>404</h1>", status=404)
                 return
-            if not PROFILE_NAME_RE.match(name):
+            if not PROFILE_NAME_RE.fullmatch(name):
                 self._send_html(
                     render_page("Invalid profile name. Use letters, digits, "
                                 "'_' and '-', at most 64 characters.", kind="error"),
@@ -28177,7 +28179,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             if profile:
-                if not PROFILE_NAME_RE.match(profile):
+                if not PROFILE_NAME_RE.fullmatch(profile):
                     self._send_html(
                         render("Invalid profile name.", kind="error"), status=400)
                     return

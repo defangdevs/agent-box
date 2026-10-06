@@ -461,6 +461,8 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
    own now that Save has moved below the prompt and the starting setting
    (issue #493). */
 input.pname { width: 150px; }
+/* pattern= cannot stop a keystroke, so show the refusal while typing. */
+input.pname:invalid:not(:placeholder-shown) { outline: 2px solid #d1242f; }
 /* Model is an OPEN picker (issue #493): free text over the SAME combobox
    the working-directory field uses, because a model ID this box has never
    heard of still has to be typeable. It began as a <datalist> and the
