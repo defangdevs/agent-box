@@ -1176,20 +1176,23 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             in
             pkgs.runCommand "agent-box-webhook-route-ok"
               { caddyfile = sys.config.services.caddy.configFile; } ''
-              # The handle and its ENTIRE body — three lines, then the closing
+              # Each handle and its ENTIRE body — three lines, then the closing
               # brace at the handle's own indentation. Asserting the whole body
               # is what makes "no basic_auth in here" meaningful: grepping the
               # file at large would hit the terminal/settings blocks, which are
-              # supposed to have one.
-              grep -A3 -F 'handle /agent/webhook* {' "$caddyfile" > block
-              grep -qF 'uri strip_prefix /agent/webhook' block
-              grep -qF 'reverse_proxy unix//run/agent-box-webhook/agent.sock' block
-              grep -qxF '  }' block
-              ! grep -q basic_auth block
+              # supposed to have one. Two handles (the bare path and its
+              # subpaths), so /agent/webhookish never reaches the receiver.
+              for h in 'handle /agent/webhook {' 'handle /agent/webhook/* {'; do
+                grep -m1 -A3 -F "$h" "$caddyfile" > block
+                grep -qF 'uri strip_prefix /agent/webhook' block
+                grep -qF 'reverse_proxy unix//run/agent-box-webhook/agent.sock' block
+                grep -qxF '  }' block
+                ! grep -q basic_auth block
+              done
               # Ordering: Caddy prefers the more specific matcher, but keep the
-              # emitted order honest too — the webhook handle must come first.
-              wh=$(grep -n 'handle /agent/webhook\*' "$caddyfile" | cut -d: -f1)
-              catchall=$(grep -n 'handle /agent/\* {' "$caddyfile" | cut -d: -f1)
+              # emitted order honest too — the webhook handles must come first.
+              wh=$(grep -n 'handle /agent/webhook/\* {' "$caddyfile" | cut -d: -f1 | head -1)
+              catchall=$(grep -n 'handle /agent/\* {' "$caddyfile" | cut -d: -f1 | head -1)
               [ "$wh" -lt "$catchall" ]
               printf 'unauthenticated webhook route present in generated Caddyfile\n' > "$out"
             '';
