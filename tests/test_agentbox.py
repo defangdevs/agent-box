@@ -259,7 +259,7 @@ class RenderTest(unittest.TestCase):
             for alias in ("203-0-113-7.sslip.io",
                           "203-0-113-7.defangstation.com"):
                 block = caddyfile.split(f"\n{alias} {{", 1)[1].split("\n}", 1)[0]
-                self.assertLess(block.index("handle /agent/webhook*"),
+                self.assertLess(block.index("handle /agent/webhook/*"),
                                 block.index("redir https://203.0.113.7"))
                 self.assertIn("reverse_proxy unix//run/agent-box-webhook/",
                               block)

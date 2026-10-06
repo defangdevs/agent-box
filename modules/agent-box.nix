@@ -28873,7 +28873,14 @@ if __name__ == "__main__":
         (lib.replaceStrings
           [ "@WEBHOOK_PATH@" "@WEBHOOK_SOCKET@" ]
           [ (webhookPathOf name) (webhookSocketOf name) ] ''
-        handle @WEBHOOK_PATH@* {
+        # Two handles, not `@WEBHOOK_PATH@*`: that glob also matches
+        # @WEBHOOK_PATH@ish, which would reach the receiver as an unknown source and
+        # 404 instead of falling through to whatever else this vhost serves.
+        handle @WEBHOOK_PATH@ {
+          uri strip_prefix @WEBHOOK_PATH@
+          reverse_proxy unix/@WEBHOOK_SOCKET@
+        }
+        handle @WEBHOOK_PATH@/* {
           uri strip_prefix @WEBHOOK_PATH@
           reverse_proxy unix/@WEBHOOK_SOCKET@
         }
