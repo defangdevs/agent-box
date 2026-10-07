@@ -365,7 +365,13 @@
           if (!fp || fp === el.getAttribute("data-fp")) { return null; }
           return fetchPage();
         })
-        .then(function (t) { if (t) { applyDoc(parseHTML(t), ["connect-list"]); } })
+        // A settled connection can produce page-level feedback (for
+        // example, which sessions a fresh sign-in restarted). Morph the
+        // banner slot with the card state so that result appears where every
+        // other transient action message lives (issue #835).
+        .then(function (t) {
+          if (t) { applyDoc(parseHTML(t), ["msg-slot", "connect-list"]); }
+        })
         .catch(function () {})
         .then(function () { connectPoll(); });
     }, 2500);
