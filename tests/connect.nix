@@ -584,12 +584,13 @@ in
         assert "keyed (uses ANTHROPIC_API_KEY)" in notice, notice
         # The browser keeps the start redirect's query while connectPoll runs;
         # the completion feedback must replace that stale acknowledgement.
-        page = get("/agent/settings/?ok=connect_started")
+        settings_html = get("/agent/settings/?ok=connect_started")
         banner = "Restarted 1 session so it uses the new sign-in: claude."
         visible_banner = f'<span class="msg-text">{banner}'
-        assert page.count(visible_banner) == 1, page
-        assert page.index(banner) < page.index('id="connections"'), page
-        assert banner not in page[page.index('id="connections"'):], page
+        assert settings_html.count(visible_banner) == 1, settings_html
+        connections_at = settings_html.index('id="connections"')
+        assert settings_html.index(banner) < connections_at, settings_html
+        assert banner not in settings_html[connections_at:], settings_html
         # It is flash feedback, not durable panel state: after one page
         # render has surfaced it, a later live morph must not resurrect a
         # banner the operator already dismissed.
