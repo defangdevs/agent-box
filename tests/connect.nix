@@ -584,9 +584,10 @@ in
         assert "keyed (uses ANTHROPIC_API_KEY)" in notice, notice
         page = get("/agent/settings/")
         banner = "Restarted 1 session so it uses the new sign-in: claude."
-        assert f'<span class="msg-text">{banner}' in page, page
+        visible_banner = f'<span class="msg-text">{banner}'
+        assert page.count(visible_banner) == 1, page
         assert page.index(banner) < page.index('id="connections"'), page
-        assert page.count(banner) == 1, page
+        assert banner not in page[page.index('id="connections"'):], page
         # It is flash feedback, not durable panel state: after one page
         # render has surfaced it, a later live morph must not resurrect a
         # banner the operator already dismissed.
