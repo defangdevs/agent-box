@@ -1,5 +1,9 @@
 (function () {
   "use strict";
+  // Server-driven folds (a sign-in wizard) may close again when their state
+  // settles. Only folds the operator opened themselves survive a morph whose
+  // incoming HTML renders them closed.
+  var manuallyOpenFolds = new WeakSet();
   // Patch the live DOM toward a freshly-rendered document, one region at a
   // time. Rendering stays entirely server-side; this only decides how the
   // new HTML replaces the old.
@@ -47,7 +51,8 @@
           // would leave that wizard collapsed with the code inside it.
           beforeAttributeUpdated: function (name, node, type) {
             if (name === "open" && type === "remove"
-                && node.matches("details[data-fold]")) {
+                && node.matches("details[data-fold]")
+                && manuallyOpenFolds.has(node)) {
               return false;
             }
           }
@@ -58,6 +63,23 @@
   function parseHTML(text) {
     return new DOMParser().parseFromString(text, "text/html");
   }
+  // A background refresh must not erase an action banner the operator has not
+  // dismissed. It may replace it with newer feedback when the fetched page
+  // actually carries one.
+  function applyRefreshDoc(doc, ids) {
+    var regions = ids.slice();
+    if (doc.querySelector("#msg-slot .msg")) { regions.unshift("msg-slot"); }
+    applyDoc(doc, regions);
+  }
+
+  document.addEventListener("click", function (e) {
+    var summary = e.target.closest("summary");
+    if (!summary || e.target.closest("a,button,input,select,textarea,form")) { return; }
+    var fold = summary.parentElement;
+    if (!fold || !fold.matches("details[data-fold]")) { return; }
+    if (fold.open) { manuallyOpenFolds.delete(fold); }
+    else { manuallyOpenFolds.add(fold); }
+  });
 
   // Heading links remain ordinary fragment links; copy their absolute URL
   // as a convenience for sharing a direct route to a settings section.
@@ -124,7 +146,7 @@
     return fetchPage()
       .then(function (t) {
         if (t === null) { return; }
-        applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+        applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
         wsSync();
       })
       .catch(function () {});
@@ -324,7 +346,7 @@
       fetchPage()
         .then(function (t) {
           if (t === null) { return; }
-          applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+          applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
           wsSync();
           schedulePoll();
         });
@@ -370,7 +392,7 @@
         // banner slot with the card state so that result appears where every
         // other transient action message lives (issue #835).
         .then(function (t) {
-          if (t) { applyDoc(parseHTML(t), ["msg-slot", "connect-list"]); }
+          if (t) { applyRefreshDoc(parseHTML(t), ["connect-list"]); }
         })
         .catch(function () {})
         .then(function () { connectPoll(); });

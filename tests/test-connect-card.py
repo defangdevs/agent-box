@@ -631,9 +631,20 @@ class ReloginRestartTest(unittest.TestCase):
 
     def test_connection_poll_morphs_page_feedback_with_the_card(self):
         self.assertIn(
-            'applyDoc(parseHTML(t), ["msg-slot", "connect-list"])',
+            'applyRefreshDoc(parseHTML(t), ["connect-list"])',
             self.daemon.SCRIPT,
         )
+        self.assertEqual(
+            self.daemon.SCRIPT.count(
+                'applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"])'),
+            2,
+        )
+        self.assertIn('doc.querySelector("#msg-slot .msg")', self.daemon.SCRIPT)
+
+    def test_only_manually_opened_folds_veto_server_close(self):
+        self.assertIn("var manuallyOpenFolds = new WeakSet();", self.daemon.SCRIPT)
+        self.assertIn("manuallyOpenFolds.has(node)", self.daemon.SCRIPT)
+        self.assertIn("manuallyOpenFolds.add(fold)", self.daemon.SCRIPT)
 
 if __name__ == "__main__":
     unittest.main()

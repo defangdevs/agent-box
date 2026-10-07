@@ -582,7 +582,9 @@ in
         notice = state("claude")["notice"] or ""
         assert "Restarted 1 session" in notice and "claude" in notice, got
         assert "keyed (uses ANTHROPIC_API_KEY)" in notice, notice
-        page = get("/agent/settings/")
+        # The browser keeps the start redirect's query while connectPoll runs;
+        # the completion feedback must replace that stale acknowledgement.
+        page = get("/agent/settings/?ok=connect_started")
         banner = "Restarted 1 session so it uses the new sign-in: claude."
         visible_banner = f'<span class="msg-text">{banner}'
         assert page.count(visible_banner) == 1, page

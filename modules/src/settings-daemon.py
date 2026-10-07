@@ -6847,13 +6847,21 @@ def render_head(title):
     )
 
 
-def render_page(message="", kind="ok"):
+def render_page(message="", kind="ok", prefer_connect_feedback=False):
+    """Render settings, promoting any completed connection action to feedback.
+
+    An explicit action message normally wins so an unrelated render cannot
+    discard connection feedback. The sign-in-started acknowledgement is the
+    exception: its URL remains in place while the connection poll runs, so the
+    later completion result must replace it rather than stay hidden behind it.
+    """
     flows = connect_flows()
     connect_section, connect_feedback = (
         render_connect(flows) if flows else ("", [])
     )
-    if not message and connect_feedback:
+    if connect_feedback and (not message or prefer_connect_feedback):
         message = take_connect_feedback(connect_feedback)
+        kind = "ok"
     msg_html = render_msg(message, BASE + "/", kind)
     # One pass over the subscription state per render, feeding both
     # panels: it forks the pinned CLI once per session, so the Sessions
@@ -8804,7 +8812,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if parsed.path.rstrip("/") == BASE + "/env":
             self._send_json({"ok": True, "keys": read_keys()})
             return
-        self._send_html(render_page(message, kind))
+        self._send_html(render_page(
+            message, kind,
+            prefer_connect_feedback=(params.get("ok", [""])[0]
+                                     == "connect_started")))
 
     def do_HEAD(self):
         """HEAD on the file drop, which caddy's file_server used to answer

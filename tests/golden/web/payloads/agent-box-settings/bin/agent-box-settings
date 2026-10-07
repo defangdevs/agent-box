@@ -6137,6 +6137,10 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
 <script>
 (function () {
   "use strict";
+  // Server-driven folds (a sign-in wizard) may close again when their state
+  // settles. Only folds the operator opened themselves survive a morph whose
+  // incoming HTML renders them closed.
+  var manuallyOpenFolds = new WeakSet();
   // Patch the live DOM toward a freshly-rendered document, one region at a
   // time. Rendering stays entirely server-side; this only decides how the
   // new HTML replaces the old.
@@ -6184,7 +6188,8 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
           // would leave that wizard collapsed with the code inside it.
           beforeAttributeUpdated: function (name, node, type) {
             if (name === "open" && type === "remove"
-                && node.matches("details[data-fold]")) {
+                && node.matches("details[data-fold]")
+                && manuallyOpenFolds.has(node)) {
               return false;
             }
           }
@@ -6195,6 +6200,23 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   function parseHTML(text) {
     return new DOMParser().parseFromString(text, "text/html");
   }
+  // A background refresh must not erase an action banner the operator has not
+  // dismissed. It may replace it with newer feedback when the fetched page
+  // actually carries one.
+  function applyRefreshDoc(doc, ids) {
+    var regions = ids.slice();
+    if (doc.querySelector("#msg-slot .msg")) { regions.unshift("msg-slot"); }
+    applyDoc(doc, regions);
+  }
+
+  document.addEventListener("click", function (e) {
+    var summary = e.target.closest("summary");
+    if (!summary || e.target.closest("a,button,input,select,textarea,form")) { return; }
+    var fold = summary.parentElement;
+    if (!fold || !fold.matches("details[data-fold]")) { return; }
+    if (fold.open) { manuallyOpenFolds.delete(fold); }
+    else { manuallyOpenFolds.add(fold); }
+  });
 
   // Heading links remain ordinary fragment links; copy their absolute URL
   // as a convenience for sharing a direct route to a settings section.
@@ -6261,7 +6283,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     return fetchPage()
       .then(function (t) {
         if (t === null) { return; }
-        applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+        applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
         wsSync();
       })
       .catch(function () {});
@@ -6461,7 +6483,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       fetchPage()
         .then(function (t) {
           if (t === null) { return; }
-          applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+          applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
           wsSync();
           schedulePoll();
         });
@@ -6507,7 +6529,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
         // banner slot with the card state so that result appears where every
         // other transient action message lives (issue #835).
         .then(function (t) {
-          if (t) { applyDoc(parseHTML(t), ["msg-slot", "connect-list"]); }
+          if (t) { applyRefreshDoc(parseHTML(t), ["connect-list"]); }
         })
         .catch(function () {})
         .then(function () { connectPoll(); });
@@ -9233,13 +9255,21 @@ def render_head(title):
     )
 
 
-def render_page(message="", kind="ok"):
+def render_page(message="", kind="ok", prefer_connect_feedback=False):
+    """Render settings, promoting any completed connection action to feedback.
+
+    An explicit action message normally wins so an unrelated render cannot
+    discard connection feedback. The sign-in-started acknowledgement is the
+    exception: its URL remains in place while the connection poll runs, so the
+    later completion result must replace it rather than stay hidden behind it.
+    """
     flows = connect_flows()
     connect_section, connect_feedback = (
         render_connect(flows) if flows else ("", [])
     )
-    if not message and connect_feedback:
+    if connect_feedback and (not message or prefer_connect_feedback):
         message = take_connect_feedback(connect_feedback)
+        kind = "ok"
     msg_html = render_msg(message, BASE + "/", kind)
     # One pass over the subscription state per render, feeding both
     # panels: it forks the pinned CLI once per session, so the Sessions
@@ -11190,7 +11220,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if parsed.path.rstrip("/") == BASE + "/env":
             self._send_json({"ok": True, "keys": read_keys()})
             return
-        self._send_html(render_page(message, kind))
+        self._send_html(render_page(
+            message, kind,
+            prefer_connect_feedback=(params.get("ok", [""])[0]
+                                     == "connect_started")))
 
     def do_HEAD(self):
         """HEAD on the file drop, which caddy's file_server used to answer
