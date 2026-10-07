@@ -20071,7 +20071,7 @@ RELOGIN_CONFIG_DIRS = {
     "claude": ("CLAUDE_CONFIG_DIR", "~/.claude"),
     "codex": ("CODEX_HOME", "~/.codex"),
 }
-# How long the card keeps saying which sessions a sign-in restarted.
+# How long the page can surface which sessions a sign-in restarted.
 RELOGIN_NOTICE_TTL = 600
 # Where a harness's sign-in pane records that its CLI exited 0 (issue #751).
 # Written by the PANE, not by a render: the pane closes itself
@@ -20079,7 +20079,7 @@ RELOGIN_NOTICE_TTL = 600
 # a browser on another device, so no render need land inside that window.
 # The marker is what lets the next one, however late, finish the sign-in.
 CONNECT_DONE_DIR = os.path.join(HOME_DIR, ".local", "state", "agent-box")
-# flow id -> (monotonic stamp, text) for the card.
+# flow id -> (monotonic stamp, text) for page-level feedback.
 _relogin_notices = {}
 
 
@@ -20177,7 +20177,7 @@ def restart_login_sessions(flow, signed_in_at):
     login. Left alone: stopped sessions (they read the new login when
     started), died ones (the post-mortem pane is kept for reading), and any
     whose environment means a restart would not change its credential
-    (relogin_reason). Returns the card's notice, or None when there was
+    (relogin_reason). Returns the page feedback, or None when there was
     nothing to say.
     """
     flow_id = flow["id"]
@@ -20800,7 +20800,9 @@ def connect_state(flow, keys=None, tmux_state=None):
         "code": code,
         "error": error,
         # What the last completed sign-in did to the sessions already
-        # running on it (issue #751), shown on a signed-in card only.
+        # running on it (issue #751). The settings page promotes this
+        # transient result to its page-level banner; JSON clients get the
+        # same feedback here.
         "notice": relogin_notice(flow_id) if state == "connected" else None,
         "needs_code": flow["needs_code"],
         # False means the CLI is not on this box yet, so the button offers
@@ -22572,6 +22574,10 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
 <script>
 (function () {
   "use strict";
+  // Server-driven folds (a sign-in wizard) may close again when their state
+  // settles. Only folds the operator opened themselves survive a morph whose
+  // incoming HTML renders them closed.
+  var manuallyOpenFolds = new WeakSet();
   // Patch the live DOM toward a freshly-rendered document, one region at a
   // time. Rendering stays entirely server-side; this only decides how the
   // new HTML replaces the old.
@@ -22619,7 +22625,8 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
           // would leave that wizard collapsed with the code inside it.
           beforeAttributeUpdated: function (name, node, type) {
             if (name === "open" && type === "remove"
-                && node.matches("details[data-fold]")) {
+                && node.matches("details[data-fold]")
+                && manuallyOpenFolds.has(node)) {
               return false;
             }
           }
@@ -22630,6 +22637,23 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   function parseHTML(text) {
     return new DOMParser().parseFromString(text, "text/html");
   }
+  // A background refresh must not erase an action banner the operator has not
+  // dismissed. It may replace it with newer feedback when the fetched page
+  // actually carries one.
+  function applyRefreshDoc(doc, ids) {
+    var regions = ids.slice();
+    if (doc.querySelector("#msg-slot .msg")) { regions.unshift("msg-slot"); }
+    applyDoc(doc, regions);
+  }
+
+  document.addEventListener("click", function (e) {
+    var summary = e.target.closest("summary");
+    if (!summary || e.target.closest("a,button,input,select,textarea,form")) { return; }
+    var fold = summary.parentElement;
+    if (!fold || !fold.matches("details[data-fold]")) { return; }
+    if (fold.open) { manuallyOpenFolds.delete(fold); }
+    else { manuallyOpenFolds.add(fold); }
+  });
 
   // Heading links remain ordinary fragment links; copy their absolute URL
   // as a convenience for sharing a direct route to a settings section.
@@ -22696,7 +22720,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     return fetchPage()
       .then(function (t) {
         if (t === null) { return; }
-        applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+        applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
         wsSync();
       })
       .catch(function () {});
@@ -22896,7 +22920,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       fetchPage()
         .then(function (t) {
           if (t === null) { return; }
-          applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+          applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
           wsSync();
           schedulePoll();
         });
@@ -22937,7 +22961,13 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
           if (!fp || fp === el.getAttribute("data-fp")) { return null; }
           return fetchPage();
         })
-        .then(function (t) { if (t) { applyDoc(parseHTML(t), ["connect-list"]); } })
+        // A settled connection can produce page-level feedback (for
+        // example, which sessions a fresh sign-in restarted). Morph the
+        // banner slot with the card state so that result appears where every
+        // other transient action message lives (issue #835).
+        .then(function (t) {
+          if (t) { applyRefreshDoc(parseHTML(t), ["connect-list"]); }
+        })
         .catch(function () {})
         .then(function () { connectPoll(); });
     }, 2500);
@@ -25171,7 +25201,6 @@ def render_connect_card(state):
     open_now = (
         state["state"] in ("waiting", "starting", "checking", "exchanging")
         or (state["state"] in ("failed", "expired", "connected") and state["error"])
-        or (state["state"] == "connected" and state.get("notice"))
         or state["blocked"]
         or state["shadow"]
         or (len(state.get("workspaces") or []) > 1
@@ -25246,9 +25275,6 @@ def render_connect_step(state):
     if state["state"] in ("failed", "expired", "connected") and state["error"]:
         return (f'<div class="conn-step"><p class="note conn-error">'
                 f'{html.escape(state["error"])}</p></div>')
-    if state["state"] == "connected" and state.get("notice"):
-        return (f'<div class="conn-step"><p class="note">'
-                f'{html.escape(state["notice"])}</p></div>')
     if state["state"] != "waiting":
         return ""
     url = html.escape(state["url"], quote=True)
@@ -25312,21 +25338,46 @@ def connect_fingerprint(states=None):
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
-def render_connect():
-    """Every card, plus the busy flag and fingerprint the page polls on."""
+def render_connect(flows=None):
+    """Every card, its polling state, and transient page feedback.
+
+    A connection notice reports the result of a completed action; it is not
+    durable connection state. Return it separately so render_page() can put
+    it in the same page-level banner as every other action result instead of
+    making it look like content owned by one Connections card (issue #835).
+    """
+    flows = connect_flows() if flows is None else flows
     keys = read_keys()
     tmux_state = tmux_sessions()
     states = [connect_state(flow, keys=keys, tmux_state=tmux_state)
-              for flow in connect_flows()]
+              for flow in flows]
     busy = "1" if any(
         s["state"] in ("starting", "waiting", "checking", "exchanging")
         for s in states
     ) else "0"
     cards = "".join(render_connect_card(s) for s in states)
-    return CONNECT_SECTION_TPL.format(
+    section = CONNECT_SECTION_TPL.format(
         cards='<ul class="tbl">' + cards + "</ul>", busy=busy,
         status_url=html.escape(BASE) + "/status",
         fp=connect_fingerprint(states))
+    feedback = [(state["id"], state["notice"])
+                for state in states if state.get("notice")]
+    return section, feedback
+
+
+def take_connect_feedback(feedback):
+    """Join rendered connection notices and consume the matching entries.
+
+    Consumption happens only when the notice is actually promoted to the
+    banner. An unrelated explicit banner therefore does not silently discard
+    this feedback. Compare the text before removing it so a newer completion
+    for the same flow cannot be consumed by an older render.
+    """
+    for flow_id, notice in feedback:
+        hit = _relogin_notices.get(flow_id)
+        if hit and hit[1] == notice:
+            _relogin_notices.pop(flow_id, None)
+    return " ".join(notice for _, notice in feedback)
 
 
 def render_sessions_section(subs=None, profiles=None):
@@ -25641,7 +25692,21 @@ def render_head(title):
     )
 
 
-def render_page(message="", kind="ok"):
+def render_page(message="", kind="ok", prefer_connect_feedback=False):
+    """Render settings, promoting any completed connection action to feedback.
+
+    An explicit action message normally wins so an unrelated render cannot
+    discard connection feedback. The sign-in-started acknowledgement is the
+    exception: its URL remains in place while the connection poll runs, so the
+    later completion result must replace it rather than stay hidden behind it.
+    """
+    flows = connect_flows()
+    connect_section, connect_feedback = (
+        render_connect(flows) if flows else ("", [])
+    )
+    if connect_feedback and (not message or prefer_connect_feedback):
+        message = take_connect_feedback(connect_feedback)
+        kind = "ok"
     msg_html = render_msg(message, BASE + "/", kind)
     # One pass over the subscription state per render, feeding both
     # panels: it forks the pinned CLI once per session, so the Sessions
@@ -25683,7 +25748,7 @@ def render_page(message="", kind="ok"):
                     endpoint=render_webhook_endpoint(),
                     webhooks=render_webhooks(watches))
             ),
-            connect_section=render_connect() if connect_flows() else "",
+            connect_section=connect_section,
             message=msg_html,
             password_section=(
                 PASSWORD_SECTION.format(base=html.escape(BASE))
@@ -27592,7 +27657,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if parsed.path.rstrip("/") == BASE + "/env":
             self._send_json({"ok": True, "keys": read_keys()})
             return
-        self._send_html(render_page(message, kind))
+        self._send_html(render_page(
+            message, kind,
+            prefer_connect_feedback=(params.get("ok", [""])[0]
+                                     == "connect_started")))
 
     def do_HEAD(self):
         """HEAD on the file drop, which caddy's file_server used to answer

@@ -379,6 +379,39 @@ test('morph: a row the server renders open is allowed to open', async ({ browser
   await page.unrouteAll({ behavior: 'ignoreErrors' });
 });
 
+test('morph: a server-opened connection row closes when its state settles', async ({ browser }) => {
+  const page = await authedPage(browser);
+  let forceOpen = true;
+  await page.route('**/settings/**', async (route, request) => {
+    if (request.url().includes('/events')) return route.continue();
+    try {
+      const res = await route.fetch();
+      const body = await res.text();
+      if (!forceOpen || !body.includes('data-fold="conn-')) {
+        return route.fulfill({ response: res, body });
+      }
+      return route.fulfill({
+        response: res,
+        body: body.replace(/(<details data-fold="conn-[^"]*")/, '$1 open'),
+      });
+    } catch {
+      // A poll still in flight when the test ends; nothing to assert on it.
+    }
+  });
+
+  await page.goto(SETTINGS_PATH);
+  const row = page.locator('details[data-fold^="conn-"]').first();
+  await row.waitFor();
+  expect(await row.evaluate((el: HTMLDetailsElement) => el.open)).toBe(true);
+
+  forceOpen = false;
+  const key = uniqueKey();
+  await saveKey(page, key, 'server-close-check');
+  expect(await row.evaluate((el: HTMLDetailsElement) => el.open)).toBe(false);
+  await deleteKey(page, key);
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
+});
+
 test('dismissing the delete confirm keeps the key; accepting removes it', async ({ browser }) => {
   const key = uniqueKey();
   const page = await authedPage(browser);

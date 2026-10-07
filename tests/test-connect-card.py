@@ -611,14 +611,40 @@ class ReloginRestartTest(unittest.TestCase):
         self.daemon.connect_signed_in(gh)
         self.assertEqual(self.killed, [])
 
-    def test_notice_shows_on_the_signed_in_card(self):
+    def test_notice_is_page_feedback_not_card_content(self):
         self.add("main")
         notice = self.restart()
         self.assertEqual(self.daemon.relogin_notice("claude"), notice)
-        page = self.daemon.render_connect_card(
-            base_state(state="connected", notice=notice))
-        self.assertIn("Restarted 1 session so it uses the new sign-in: main.", page)
-        self.assertIn(" open", page)
+        state = base_state(state="connected", notice=notice)
+        page = self.daemon.render_connect_card(state)
+        self.assertNotIn(notice, page)
+        self.assertNotIn(" open", page)
+
+        self.daemon.read_keys = lambda: set()
+        self.daemon.tmux_sessions = lambda: (True, set())
+        self.daemon.connect_state = lambda *_args, **_kwargs: state
+        section, feedback = self.daemon.render_connect([self.flow])
+        self.assertNotIn(notice, section)
+        self.assertEqual(feedback, [("claude", notice)])
+        self.assertEqual(self.daemon.take_connect_feedback(feedback), notice)
+        self.assertIsNone(self.daemon.relogin_notice("claude"))
+
+    def test_connection_poll_morphs_page_feedback_with_the_card(self):
+        self.assertIn(
+            'applyRefreshDoc(parseHTML(t), ["connect-list"])',
+            self.daemon.SCRIPT,
+        )
+        self.assertEqual(
+            self.daemon.SCRIPT.count(
+                'applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"])'),
+            2,
+        )
+        self.assertIn('doc.querySelector("#msg-slot .msg")', self.daemon.SCRIPT)
+
+    def test_only_manually_opened_folds_veto_server_close(self):
+        self.assertIn("var manuallyOpenFolds = new WeakSet();", self.daemon.SCRIPT)
+        self.assertIn("manuallyOpenFolds.has(node)", self.daemon.SCRIPT)
+        self.assertIn("manuallyOpenFolds.add(fold)", self.daemon.SCRIPT)
 
 if __name__ == "__main__":
     unittest.main()
