@@ -749,7 +749,7 @@ is not a descendant of the rev the box is running. The first update
 clones it (so a box that has never updated does not have it yet); every
 later one moves it. The tree is root-owned and you cannot write it:
 that is deliberate, since whatever writes it decides what root builds.
-Read it freely - `git -C /var/lib/agent-box/src log -1` names the rev
+Read it freely - `git -c safe.directory=/var/lib/agent-box/src -C /var/lib/agent-box/src log -1` names the rev
 the box runs. The one exception is an update in flight: the tree moves
 FIRST and the rebuild follows it, so between the two - and after a
 rebuild that failed and could not put the tree back, which the wall
@@ -762,7 +762,7 @@ for you: an agent user is in neither `adm` nor `systemd-journal`. A
 failed update rolls back and leaves the box healthy, so the other sign
 is the rev of the RUNNING system not moving. Not the source tree's rev:
 the tree is fast-forwarded FIRST and a rollback leaves it ahead, so
-`git -C /var/lib/agent-box/src log -1` after a failed update names a
+`git -c safe.directory=/var/lib/agent-box/src -C /var/lib/agent-box/src log -1` after a failed update names a
 rev this box is not running.
 
 ## This box ships its own sources

@@ -3123,7 +3123,7 @@ class Renderer:
             "root-owned and you cannot write it: that is deliberate, since "
             "whatever\n"
             "writes it decides what root installs. Read it freely - "
-            f"`git -C {SRC_DIR} log -1`\n"
+            f"`git -c safe.directory={SRC_DIR} -C {SRC_DIR} log -1`\n"
             "names the rev the box runs. The one exception is an update in "
             "flight: the\n"
             "tree moves FIRST and the profile swap follows it, so between "
@@ -3153,7 +3153,7 @@ class Renderer:
             "moving. Not the source tree's rev: the tree is fast-forwarded "
             "FIRST\n"
             "and a rollback leaves it ahead: after a failed update\n"
-            f"`git -C {SRC_DIR} log -1` names a rev this box is not\n"
+            f"`git -c safe.directory={SRC_DIR} -C {SRC_DIR} log -1` names a rev this box is not\n"
             "running.\n\n"
         )
         # Which HOST this guide is describing. The module binds the NixOS
