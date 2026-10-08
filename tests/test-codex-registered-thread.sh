@@ -95,10 +95,39 @@ grep -qF 'codex_target="$(codex_rollout_uuid "$bid" "$cxhome")"' "$SUPERVISOR" \
 grep -qF '|| codex_target="$(codex_registered_thread "$sname" "$cxhome")"' "$SUPERVISOR" \
   || { echo "FAIL: start_session no longer falls back to codex_registered_thread" >&2; exit 1; }
 
-# The resume arm must not append a persisted `resume ID` after its own (#845).
+# The resume arm must use the filtering helper rather than appending a
+# persisted `resume ID` after its own (#845).
 grep -qF 'cmd="$cmd resume"
           codex_autonomy
           append_extra_sans_resume' "$SUPERVISOR" \
   || { echo "FAIL: the codex resume arm must drop a persisted resume from extraArgs" >&2; exit 1; }
+
+# Exercise the helper too: a wiring grep alone would stay green if its jq
+# filter kept the duplicate resume or discarded unrelated options. Extract
+# the nested function from start_session and run it against complete argv
+# shapes, including the final supervisor-owned target.
+sed -n '/^  append_extra_sans_resume() {$/,/^  }$/p' "$SUPERVISOR" \
+  | sed 's/^  //' > "$TEST_ROOT/append-extra-sans-resume.sh"
+[ -s "$TEST_ROOT/append-extra-sans-resume.sh" ] \
+  || { echo "append_extra_sans_resume not found" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$TEST_ROOT/append-extra-sans-resume.sh"
+
+expect_resume_command() {
+  want=$1
+  shift
+  sjson="$($JQ -cn --args '{extraArgs: $ARGS.positional}' -- "$@")"
+  cmd="codex resume"
+  append_extra_sans_resume
+  cmd="$cmd -- $live"
+  [ "$cmd" = "$want" ] \
+    || { echo "FAIL: extraArgs $sjson -> '$cmd', want '$want'" >&2; exit 1; }
+}
+
+expect_resume_command "codex resume -- $live" resume "$live"
+expect_resume_command "codex resume --model gpt-5 -- $live" \
+  resume "$live" --model gpt-5
+expect_resume_command "codex resume --model gpt-5 -- $live" --model gpt-5
+expect_resume_command "codex resume -- $live"
 
 echo "codex_registered_thread: ok"
