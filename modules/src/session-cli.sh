@@ -809,6 +809,7 @@ case "$cmd" in
     kill_session "$name" || exit 1
     prune_filter "$name"
     prune_session_state "$name"
+    hooklog_end "$name" rm
     lease_clear "$name"
     echo "session '$name' removed"
     ;;

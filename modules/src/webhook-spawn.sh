@@ -697,6 +697,7 @@ if [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "${LOCAL_WEBHOOK_SPAWN_KEY:-}" 
     '(($meta.number // "" | tostring) | if test("^[0-9]+$") then . else "" end)' \
     2>/dev/null)" || lease_object=""
   lease_create "$name" "$own" "$lease_object"
+  hooklog_spawn "$name" "$own" "${LOCAL_WEBHOOK_SPAWN_EVENT:-}" "$lease_object" "${LOCAL_WEBHOOK_SPAWN_COUNT:-}"
 fi
 
 # An assignment is a work request, not a triage request (#253), and the

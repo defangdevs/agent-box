@@ -292,7 +292,12 @@ let
       `dispatch` object has the live count against the ceiling and the last batch the
       ceiling turned away. `lastRefusal.deferred` records the ANSWER that batch got -
       declined for retry rather than dropped - and stays true afterwards, so it is
-      history and never a list of what is waiting now.
+      history and never a list of what is waiting now. `dispatch.recentHookSessions`
+      is the other half: the last ten hook-* spawns and endings, read from
+      `~/.local/state/agent-box/hook-sessions.jsonl`. A session that yields to an
+      interactive one delists itself within seconds, so "nothing is listed" does not
+      mean "nothing spawned" - an `end` line with a small `lifeSeconds` and `how: rm`
+      is exactly that.
 
       Payload rules (`--when` / `--drop`, JSON predicates over payload paths) ARE a
       watch's spawn policy - see `agent-box-webhook --help`. This box's watches on
@@ -3142,6 +3147,67 @@ if __name__ == "__main__":
       [ -s "$_lf" ] || return 0
       "$LEASE_JQ" -r '.outcome // empty' "$_lf" 2>/dev/null || true
     }
+
+    # A durable, readable trail of hook-* sessions, so a spawn that a session then
+    # yielded is not indistinguishable from a spawn that never happened. An
+    # ephemeral hook session delists itself within seconds when it yields to an
+    # interactive one, the receiver logs nothing on a successful spawn, and the
+    # journal is unreadable to the agent user -- so "did that event start a
+    # session?" had no answer left on the box once the session was gone.
+    #
+    # One JSON object per line, append-only, trimmed to the newest lines when it
+    # grows. Best effort throughout, like every other write in this file: a log
+    # that cannot be written must never stop a spawn, an rm or a reap.
+    HOOKLOG="''${HOOKLOG:-$HOME/.local/state/agent-box/hook-sessions.jsonl}"
+    HOOKLOG_KEEP=200
+
+    hooklog_append() {
+      # hooklog_append JSON_OBJECT -- one line, trimmed in place past 2x HOOKLOG_KEEP.
+      mkdir -p "$(dirname "$HOOKLOG")" 2>/dev/null || return 0
+      printf '%s\n' "$1" >> "$HOOKLOG" 2>/dev/null || return 0
+      _hn="$(wc -l < "$HOOKLOG" 2>/dev/null)" || return 0
+      case "$_hn" in (""|*[!0-9]*) return 0 ;; esac
+      if [ "$_hn" -gt $((HOOKLOG_KEEP * 2)) ]; then
+        _ht="$(mktemp "$HOOKLOG.XXXXXX" 2>/dev/null)" || return 0
+        if tail -n "$HOOKLOG_KEEP" "$HOOKLOG" > "$_ht" 2>/dev/null; then
+          mv -f "$_ht" "$HOOKLOG" 2>/dev/null || rm -f "$_ht"
+        else
+          rm -f "$_ht"
+        fi
+      fi
+    }
+
+    hooklog_spawn() {
+      # hooklog_spawn NAME TOPIC EVENT OBJECT COUNT -- called by
+      # agent-box-webhook-spawn once the session is being added.
+      "$LEASE_JQ" -cn --arg n "$1" --arg topic "$2" --arg event "$3" --arg object "$4" \
+        --arg count "$5" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '{at: $at, what: "spawn", name: $n, topic: $topic, event: $event,
+          object: (if $object == "" then null else $object end),
+          count: (if $count | test("^[0-9]+$") then ($count | tonumber) else null end)}' \
+        2>/dev/null | { read -r _hl && hooklog_append "$_hl"; } || true
+    }
+
+    hooklog_end() {
+      # hooklog_end NAME HOW -- a hook-* session leaving the registry. HOW says by
+      # whom: "rm" (agent-box-session rm, which is what a yielding session runs)
+      # or "reaped" (the supervisor delisting a finished ephemeral). Call BEFORE
+      # lease_clear: the lease is where the spawn time and claim live. Any other
+      # name is ignored, so the log stays about dispatched work.
+      case "$1" in (hook-*) ;; (*) return 0 ;; esac
+      _lf="$(lease_file "$1")"
+      _claimed=""
+      [ -s "$_lf" ] && _claimed="$("$LEASE_JQ" -r '.claimedAt // empty' "$_lf" 2>/dev/null)"
+      _out=""
+      [ -s "$_lf" ] && _out="$("$LEASE_JQ" -r '.outcome // empty' "$_lf" 2>/dev/null)"
+      "$LEASE_JQ" -cn --arg n "$1" --arg how "$2" --arg claimed "$_claimed" --arg outcome "$_out" \
+        --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '(($claimed | fromdateiso8601?) // null) as $c
+         | {at: $at, what: "end", name: $n, how: $how,
+            lifeSeconds: (if $c == null then null else ((now | floor) - $c) end),
+            outcome: (if $outcome == "" then null else $outcome end)}' \
+        2>/dev/null | { read -r _hl && hooklog_append "$_hl"; } || true
+    }
     [ -n "''${1:-}" ] && [ -s "$REGISTRY_FILE" ] || exit 0
     # The status arrives from the pane's own shell as `$?`, so it is a small
     # non-negative integer or nothing. Anything else is still an ending that was
@@ -4528,6 +4594,67 @@ lease_outcome() {
   [ -s "$_lf" ] || return 0
   "$LEASE_JQ" -r '.outcome // empty' "$_lf" 2>/dev/null || true
 }
+
+# A durable, readable trail of hook-* sessions, so a spawn that a session then
+# yielded is not indistinguishable from a spawn that never happened. An
+# ephemeral hook session delists itself within seconds when it yields to an
+# interactive one, the receiver logs nothing on a successful spawn, and the
+# journal is unreadable to the agent user -- so "did that event start a
+# session?" had no answer left on the box once the session was gone.
+#
+# One JSON object per line, append-only, trimmed to the newest lines when it
+# grows. Best effort throughout, like every other write in this file: a log
+# that cannot be written must never stop a spawn, an rm or a reap.
+HOOKLOG="''${HOOKLOG:-$HOME/.local/state/agent-box/hook-sessions.jsonl}"
+HOOKLOG_KEEP=200
+
+hooklog_append() {
+  # hooklog_append JSON_OBJECT -- one line, trimmed in place past 2x HOOKLOG_KEEP.
+  mkdir -p "$(dirname "$HOOKLOG")" 2>/dev/null || return 0
+  printf '%s\n' "$1" >> "$HOOKLOG" 2>/dev/null || return 0
+  _hn="$(wc -l < "$HOOKLOG" 2>/dev/null)" || return 0
+  case "$_hn" in (""|*[!0-9]*) return 0 ;; esac
+  if [ "$_hn" -gt $((HOOKLOG_KEEP * 2)) ]; then
+    _ht="$(mktemp "$HOOKLOG.XXXXXX" 2>/dev/null)" || return 0
+    if tail -n "$HOOKLOG_KEEP" "$HOOKLOG" > "$_ht" 2>/dev/null; then
+      mv -f "$_ht" "$HOOKLOG" 2>/dev/null || rm -f "$_ht"
+    else
+      rm -f "$_ht"
+    fi
+  fi
+}
+
+hooklog_spawn() {
+  # hooklog_spawn NAME TOPIC EVENT OBJECT COUNT -- called by
+  # agent-box-webhook-spawn once the session is being added.
+  "$LEASE_JQ" -cn --arg n "$1" --arg topic "$2" --arg event "$3" --arg object "$4" \
+    --arg count "$5" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{at: $at, what: "spawn", name: $n, topic: $topic, event: $event,
+      object: (if $object == "" then null else $object end),
+      count: (if $count | test("^[0-9]+$") then ($count | tonumber) else null end)}' \
+    2>/dev/null | { read -r _hl && hooklog_append "$_hl"; } || true
+}
+
+hooklog_end() {
+  # hooklog_end NAME HOW -- a hook-* session leaving the registry. HOW says by
+  # whom: "rm" (agent-box-session rm, which is what a yielding session runs)
+  # or "reaped" (the supervisor delisting a finished ephemeral). Call BEFORE
+  # lease_clear: the lease is where the spawn time and claim live. Any other
+  # name is ignored, so the log stays about dispatched work.
+  case "$1" in (hook-*) ;; (*) return 0 ;; esac
+  _lf="$(lease_file "$1")"
+  _claimed=""
+  [ -s "$_lf" ] && _claimed="$("$LEASE_JQ" -r '.claimedAt // empty' "$_lf" 2>/dev/null)"
+  _out=""
+  [ -s "$_lf" ] && _out="$("$LEASE_JQ" -r '.outcome // empty' "$_lf" 2>/dev/null)"
+  "$LEASE_JQ" -cn --arg n "$1" --arg how "$2" --arg claimed "$_claimed" --arg outcome "$_out" \
+    --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '(($claimed | fromdateiso8601?) // null) as $c
+     | {at: $at, what: "end", name: $n, how: $how,
+        lifeSeconds: (if $c == null then null else ((now | floor) - $c) end),
+        outcome: (if $outcome == "" then null else $outcome end)}' \
+    2>/dev/null | { read -r _hl && hooklog_append "$_hl"; } || true
+}
 AGENTS="''${AGENT_BOX_AGENTS:?}"
 DEFAULT_AGENT="''${AGENT_BOX_DEFAULT_AGENT:?}"
 # NOT ''${TMUX_TMPDIR:-...}: the socket dir is the agent unit's
@@ -5317,6 +5444,7 @@ case "$cmd" in
     kill_session "$name" || exit 1
     prune_filter "$name"
     prune_session_state "$name"
+    hooklog_end "$name" rm
     lease_clear "$name"
     echo "session '$name' removed"
     ;;
@@ -6819,6 +6947,7 @@ _hc_main "$@"
     # batch it refused (issue #170). Both are read-only here.
     SESSIONS="$HOME/.config/agent-box/sessions.json"
     HOOK_REFUSED="$HOME/.local/state/agent-box/webhook-spawn-refused.json"
+    HOOK_LOG="$HOME/.local/state/agent-box/hook-sessions.jsonl"
     # ...and what the last ingress sweep found (issue #605): whether the SENDER
     # has managed to reach this box lately, which is the one question a session
     # waiting on events cannot answer from anything local. Written by
@@ -8133,6 +8262,14 @@ _hc_main "$@"
           refusal="$("$JQ" -c . "$HOOK_REFUSED" 2>/dev/null)" || refusal=null
           [ -n "$refusal" ] || refusal=null
         fi
+        # The newest hook-* spawns and endings (lib/lease.sh hooklog_*). A session
+        # that yields delists itself within seconds, so without this a spawn that
+        # happened reads the same as one that never did.
+        hlog=null
+        if [ -s "$HOOK_LOG" ]; then
+          hlog="$(tail -n 10 "$HOOK_LOG" 2>/dev/null | "$JQ" -cs '.' 2>/dev/null)" || hlog=null
+          [ -n "$hlog" ] || hlog=null
+        fi
         # ONE field answers one question — "would a match spawn a session right
         # now?" — so there is a single place to look. webhook.py already sets
         # dispatch.warning in the `ls` listing for the no-spawn-command case, so
@@ -8193,7 +8330,7 @@ _hc_main "$@"
         printf '%s' "$out" | "$JQ" \
           --arg installed "$installed" --arg pf "$PLUGINS" --arg skew "$skew" \
           --argjson keyed "$keyed" --argjson shared "$shared" --argjson legacy "$legacy" \
-          --argjson hlive "$hlive" --argjson hmax "$hmax" --argjson refusal "$refusal" \
+          --argjson hlive "$hlive" --argjson hmax "$hmax" --argjson refusal "$refusal" --argjson hlog "$hlog" \
           --argjson ingress "$ingress" \
           --arg dwarn "$dwarn" '
             .plugin = {sessionVersions: ($installed | if . == "" then [] else split(" ") end),
@@ -8205,7 +8342,7 @@ _hc_main "$@"
                                            else .receiver.spawn == true end),
                             hookSessions: {live: $hlive, max: $hmax,
                                            atCapacity: ($hlive >= $hmax)},
-                            lastRefusal: $refusal}
+                            lastRefusal: $refusal, recentHookSessions: $hlog}
                            + (if $dwarn == "" then {} else {warning: $dwarn} end))
             | .ingress = $ingress'
         # Warnings on stderr only, and only when something is wrong: status stays
@@ -9725,6 +9862,67 @@ lease_outcome() {
   "$LEASE_JQ" -r '.outcome // empty' "$_lf" 2>/dev/null || true
 }
 
+# A durable, readable trail of hook-* sessions, so a spawn that a session then
+# yielded is not indistinguishable from a spawn that never happened. An
+# ephemeral hook session delists itself within seconds when it yields to an
+# interactive one, the receiver logs nothing on a successful spawn, and the
+# journal is unreadable to the agent user -- so "did that event start a
+# session?" had no answer left on the box once the session was gone.
+#
+# One JSON object per line, append-only, trimmed to the newest lines when it
+# grows. Best effort throughout, like every other write in this file: a log
+# that cannot be written must never stop a spawn, an rm or a reap.
+HOOKLOG="''${HOOKLOG:-$HOME/.local/state/agent-box/hook-sessions.jsonl}"
+HOOKLOG_KEEP=200
+
+hooklog_append() {
+  # hooklog_append JSON_OBJECT -- one line, trimmed in place past 2x HOOKLOG_KEEP.
+  mkdir -p "$(dirname "$HOOKLOG")" 2>/dev/null || return 0
+  printf '%s\n' "$1" >> "$HOOKLOG" 2>/dev/null || return 0
+  _hn="$(wc -l < "$HOOKLOG" 2>/dev/null)" || return 0
+  case "$_hn" in (""|*[!0-9]*) return 0 ;; esac
+  if [ "$_hn" -gt $((HOOKLOG_KEEP * 2)) ]; then
+    _ht="$(mktemp "$HOOKLOG.XXXXXX" 2>/dev/null)" || return 0
+    if tail -n "$HOOKLOG_KEEP" "$HOOKLOG" > "$_ht" 2>/dev/null; then
+      mv -f "$_ht" "$HOOKLOG" 2>/dev/null || rm -f "$_ht"
+    else
+      rm -f "$_ht"
+    fi
+  fi
+}
+
+hooklog_spawn() {
+  # hooklog_spawn NAME TOPIC EVENT OBJECT COUNT -- called by
+  # agent-box-webhook-spawn once the session is being added.
+  "$LEASE_JQ" -cn --arg n "$1" --arg topic "$2" --arg event "$3" --arg object "$4" \
+    --arg count "$5" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{at: $at, what: "spawn", name: $n, topic: $topic, event: $event,
+      object: (if $object == "" then null else $object end),
+      count: (if $count | test("^[0-9]+$") then ($count | tonumber) else null end)}' \
+    2>/dev/null | { read -r _hl && hooklog_append "$_hl"; } || true
+}
+
+hooklog_end() {
+  # hooklog_end NAME HOW -- a hook-* session leaving the registry. HOW says by
+  # whom: "rm" (agent-box-session rm, which is what a yielding session runs)
+  # or "reaped" (the supervisor delisting a finished ephemeral). Call BEFORE
+  # lease_clear: the lease is where the spawn time and claim live. Any other
+  # name is ignored, so the log stays about dispatched work.
+  case "$1" in (hook-*) ;; (*) return 0 ;; esac
+  _lf="$(lease_file "$1")"
+  _claimed=""
+  [ -s "$_lf" ] && _claimed="$("$LEASE_JQ" -r '.claimedAt // empty' "$_lf" 2>/dev/null)"
+  _out=""
+  [ -s "$_lf" ] && _out="$("$LEASE_JQ" -r '.outcome // empty' "$_lf" 2>/dev/null)"
+  "$LEASE_JQ" -cn --arg n "$1" --arg how "$2" --arg claimed "$_claimed" --arg outcome "$_out" \
+    --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '(($claimed | fromdateiso8601?) // null) as $c
+     | {at: $at, what: "end", name: $n, how: $how,
+        lifeSeconds: (if $c == null then null else ((now | floor) - $c) end),
+        outcome: (if $outcome == "" then null else $outcome end)}' \
+    2>/dev/null | { read -r _hl && hooklog_append "$_hl"; } || true
+}
+
 # The assignment sentence (#253) and the preamble below are written once and
 # read twice: the receiver builds a prompt with them, and the settings page
 # prints the same text under each standing watch (#259) by running this script
@@ -10409,6 +10607,7 @@ if [ -n "''${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "''${LOCAL_WEBHOOK_SPAWN_KEY:
     '(($meta.number // "" | tostring) | if test("^[0-9]+$") then . else "" end)' \
     2>/dev/null)" || lease_object=""
   lease_create "$name" "$own" "$lease_object"
+  hooklog_spawn "$name" "$own" "''${LOCAL_WEBHOOK_SPAWN_EVENT:-}" "$lease_object" "''${LOCAL_WEBHOOK_SPAWN_COUNT:-}"
 fi
 
 # An assignment is a work request, not a triage request (#253), and the
@@ -12329,6 +12528,67 @@ esac
       _lf="$(lease_file "$1")"
       [ -s "$_lf" ] || return 0
       "$LEASE_JQ" -r '.outcome // empty' "$_lf" 2>/dev/null || true
+    }
+
+    # A durable, readable trail of hook-* sessions, so a spawn that a session then
+    # yielded is not indistinguishable from a spawn that never happened. An
+    # ephemeral hook session delists itself within seconds when it yields to an
+    # interactive one, the receiver logs nothing on a successful spawn, and the
+    # journal is unreadable to the agent user -- so "did that event start a
+    # session?" had no answer left on the box once the session was gone.
+    #
+    # One JSON object per line, append-only, trimmed to the newest lines when it
+    # grows. Best effort throughout, like every other write in this file: a log
+    # that cannot be written must never stop a spawn, an rm or a reap.
+    HOOKLOG="''${HOOKLOG:-$HOME/.local/state/agent-box/hook-sessions.jsonl}"
+    HOOKLOG_KEEP=200
+
+    hooklog_append() {
+      # hooklog_append JSON_OBJECT -- one line, trimmed in place past 2x HOOKLOG_KEEP.
+      mkdir -p "$(dirname "$HOOKLOG")" 2>/dev/null || return 0
+      printf '%s\n' "$1" >> "$HOOKLOG" 2>/dev/null || return 0
+      _hn="$(wc -l < "$HOOKLOG" 2>/dev/null)" || return 0
+      case "$_hn" in (""|*[!0-9]*) return 0 ;; esac
+      if [ "$_hn" -gt $((HOOKLOG_KEEP * 2)) ]; then
+        _ht="$(mktemp "$HOOKLOG.XXXXXX" 2>/dev/null)" || return 0
+        if tail -n "$HOOKLOG_KEEP" "$HOOKLOG" > "$_ht" 2>/dev/null; then
+          mv -f "$_ht" "$HOOKLOG" 2>/dev/null || rm -f "$_ht"
+        else
+          rm -f "$_ht"
+        fi
+      fi
+    }
+
+    hooklog_spawn() {
+      # hooklog_spawn NAME TOPIC EVENT OBJECT COUNT -- called by
+      # agent-box-webhook-spawn once the session is being added.
+      "$LEASE_JQ" -cn --arg n "$1" --arg topic "$2" --arg event "$3" --arg object "$4" \
+        --arg count "$5" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '{at: $at, what: "spawn", name: $n, topic: $topic, event: $event,
+          object: (if $object == "" then null else $object end),
+          count: (if $count | test("^[0-9]+$") then ($count | tonumber) else null end)}' \
+        2>/dev/null | { read -r _hl && hooklog_append "$_hl"; } || true
+    }
+
+    hooklog_end() {
+      # hooklog_end NAME HOW -- a hook-* session leaving the registry. HOW says by
+      # whom: "rm" (agent-box-session rm, which is what a yielding session runs)
+      # or "reaped" (the supervisor delisting a finished ephemeral). Call BEFORE
+      # lease_clear: the lease is where the spawn time and claim live. Any other
+      # name is ignored, so the log stays about dispatched work.
+      case "$1" in (hook-*) ;; (*) return 0 ;; esac
+      _lf="$(lease_file "$1")"
+      _claimed=""
+      [ -s "$_lf" ] && _claimed="$("$LEASE_JQ" -r '.claimedAt // empty' "$_lf" 2>/dev/null)"
+      _out=""
+      [ -s "$_lf" ] && _out="$("$LEASE_JQ" -r '.outcome // empty' "$_lf" 2>/dev/null)"
+      "$LEASE_JQ" -cn --arg n "$1" --arg how "$2" --arg claimed "$_claimed" --arg outcome "$_out" \
+        --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '(($claimed | fromdateiso8601?) // null) as $c
+         | {at: $at, what: "end", name: $n, how: $how,
+            lifeSeconds: (if $c == null then null else ((now | floor) - $c) end),
+            outcome: (if $outcome == "" then null else $outcome end)}' \
+        2>/dev/null | { read -r _hl && hooklog_append "$_hl"; } || true
     }
     # The webhook channel plugin, spelled once (issue #257): three places have to
     # agree on it — the settings seed (an enabledPlugins key), the plugin-cache
@@ -14489,6 +14749,7 @@ esac
           '.sessions[$s].ephemeral == true and .sessions[$s].stopped == true' \
           "$REGISTRY_FILE" >/dev/null 2>&1 || continue
         registry_edit --arg s "$_n" 'del(.sessions[$s])'
+        hooklog_end "$_n" reaped
         _gone=1
       done < <(printf '%s\n' "$_cand")
       registry_unlock
