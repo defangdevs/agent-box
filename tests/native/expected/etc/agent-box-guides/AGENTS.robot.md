@@ -782,7 +782,7 @@ is also why it refuses anything that is not a descendant of the rev you
 are running. The first update clones it (so a box that has never
 updated does not have it yet); every later one moves it. The tree is
 root-owned and you cannot write it: that is deliberate, since whatever
-writes it decides what root installs. Read it freely - `git -C /var/lib/agent-box/src log -1`
+writes it decides what root installs. Read it freely - `git -c safe.directory=/var/lib/agent-box/src -C /var/lib/agent-box/src log -1`
 names the rev the box runs. The one exception is an update in flight: the
 tree moves FIRST and the profile swap follows it, so between the two - and
 after a swap that failed and rolled the profile back - it reads ahead of
@@ -801,7 +801,7 @@ nor `systemd-journal`. A failed update rolls back and leaves the box
 healthy, so the other sign is the PROFILE rev on the settings page not
 moving. Not the source tree's rev: the tree is fast-forwarded FIRST
 and a rollback leaves it ahead: after a failed update
-`git -C /var/lib/agent-box/src log -1` names a rev this box is not
+`git -c safe.directory=/var/lib/agent-box/src -C /var/lib/agent-box/src log -1` names a rev this box is not
 running.
 
 ## This platform has its own upstream repo
