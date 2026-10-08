@@ -95,4 +95,10 @@ grep -qF 'codex_target="$(codex_rollout_uuid "$bid" "$cxhome")"' "$SUPERVISOR" \
 grep -qF '|| codex_target="$(codex_registered_thread "$sname" "$cxhome")"' "$SUPERVISOR" \
   || { echo "FAIL: start_session no longer falls back to codex_registered_thread" >&2; exit 1; }
 
+# The resume arm must not append a persisted `resume ID` after its own (#845).
+grep -qF 'cmd="$cmd resume"
+          codex_autonomy
+          append_extra_sans_resume' "$SUPERVISOR" \
+  || { echo "FAIL: the codex resume arm must drop a persisted resume from extraArgs" >&2; exit 1; }
+
 echo "codex_registered_thread: ok"

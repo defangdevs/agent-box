@@ -1076,6 +1076,18 @@ start_session() {
       cmd="$cmd $(printf '%q' "$xarg")"
     done < <($JQ -r '.extraArgs // [] | .[]' <<<"$sjson")
   }
+  # The codex resume arm builds its own `resume <target>`. A persisted
+  # `resume THREAD_ID` in extraArgs (agent-box-session add NAME --harness
+  # codex -- resume ID) would make a second one and codex would die with
+  # "unexpected argument" (issue 845), so drop that leading pair there.
+  append_extra_sans_resume() {
+    while IFS= read -r xarg; do
+      cmd="$cmd $(printf '%q' "$xarg")"
+    done < <($JQ -r '(.extraArgs // []) as $a
+      | (if ($a[0] // "") == "resume"
+         then ($a[1:] | if ((.[0] // "-") | startswith("-")) then . else .[1:] end)
+         else $a end) | .[]' <<<"$sjson")
+  }
   # Autonomy for the codex TUI arms. skipPermissions = true takes the
   # documented flag. skipPermissions = false has to UNDO the box-wide default
   # when services.agent-box.codexFullAccess wrote /etc/codex/config.toml
@@ -1235,7 +1247,7 @@ start_session() {
         if [ -n "$codex_target" ]; then
           cmd="$cmd resume"
           codex_autonomy
-          append_extra
+          append_extra_sans_resume
           cmd="$cmd -- $(printf '%q' "$codex_target")"
           [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "$prompt")"
         else
