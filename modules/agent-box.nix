@@ -14273,7 +14273,9 @@ esac
           cmd="$cmd $(printf '%q' "$xarg")"
         done < <($JQ -r '(.extraArgs // []) as $a
           | (if ($a[0] // "") == "resume"
-             then ($a[1:] | if ((.[0] // "-") | startswith("-")) then . else .[1:] end)
+             then ($a[1:] | if (.[0] // "") == "--" then .[2:]
+                            elif ((.[0] // "-") | startswith("-")) then .
+                            else .[1:] end)
              else $a end) | .[]' <<<"$sjson")
       }
       # Autonomy for the codex TUI arms. skipPermissions = true takes the

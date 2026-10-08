@@ -108,7 +108,7 @@ grep -qF 'cmd="$cmd resume"
 # shapes, including the final supervisor-owned target.
 sed -n '/^  append_extra_sans_resume() {$/,/^  }$/p' "$SUPERVISOR" \
   | sed 's/^  //' > "$TEST_ROOT/append-extra-sans-resume.sh"
-[ -s "$TEST_ROOT/append-extra-sans-resume.sh" ] \
+[[ -s "$TEST_ROOT/append-extra-sans-resume.sh" ]] \
   || { echo "append_extra_sans_resume not found" >&2; exit 1; }
 # shellcheck source=/dev/null
 . "$TEST_ROOT/append-extra-sans-resume.sh"
@@ -120,13 +120,16 @@ expect_resume_command() {
   cmd="codex resume"
   append_extra_sans_resume
   cmd="$cmd -- $live"
-  [ "$cmd" = "$want" ] \
+  [[ "$cmd" = "$want" ]] \
     || { echo "FAIL: extraArgs $sjson -> '$cmd', want '$want'" >&2; exit 1; }
 }
 
 expect_resume_command "codex resume -- $live" resume "$live"
 expect_resume_command "codex resume --model gpt-5 -- $live" \
   resume "$live" --model gpt-5
+expect_resume_command "codex resume -- $live" resume -- "$live"
+expect_resume_command "codex resume --model gpt-5 -- $live" \
+  resume -- "$live" --model gpt-5
 expect_resume_command "codex resume --model gpt-5 -- $live" --model gpt-5
 expect_resume_command "codex resume -- $live"
 
