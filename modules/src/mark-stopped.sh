@@ -41,6 +41,10 @@ if [ "$_status" -eq 0 ]; then
   # earlier respawn's lease recorded (including "vanished") no longer
   # applies. Independent of the registry write above and its retry loop:
   # a lease has one writer at a time, so there is nothing here to race.
+  # The end is logged HERE, before the lease goes: this is the one place that
+  # still has the lease's claimedAt on a clean exit, and the supervisor's
+  # reap of the ephemeral entry runs after it is deleted.
+  hooklog_end "$1" exited
   lease_clear "$1"
 else
   # Recorded as the STATUS, not a bare true: it is the only thing anyone
@@ -49,6 +53,7 @@ else
   # session that comes back is never left looking dead.
   _edit='if .sessions | has($s) then .sessions[$s].died = $st else . end'
   _check='(.sessions | has($s) | not) or (.sessions[$s].died == $st)'
+  hooklog_end "$1" "died:$_status"
   lease_mark_outcome "$1" "died:$_status"
 fi
 # Verified write, retried: on an agent that exits within its first

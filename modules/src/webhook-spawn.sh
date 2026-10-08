@@ -664,6 +664,8 @@ claim_note() {
 }
 
 seeded=""
+own=""
+lease_object=""
 if [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "${LOCAL_WEBHOOK_SPAWN_KEY:-}" ]; then
   own="${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}:$LOCAL_WEBHOOK_SPAWN_KEY"
   # webhook.py reads filter.<LOCAL_WEBHOOK_SESSION>.json, and the supervisor
@@ -773,6 +775,10 @@ rc=0
   --origin webhook --hook "${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" "${LOCAL_WEBHOOK_SPAWN_KEY:-}" --prompt "$preamble
 
 $PROMPT" -- "${extra[@]}" || rc=$?
+# Recorded only once the session really exists: a capacity refusal (75) is
+# retried by the receiver, and a spawn line per attempt would both report
+# sessions that never started and push the real ones out of the log.
+[ "$rc" = 0 ] && hooklog_spawn "$name" "$own" "${LOCAL_WEBHOOK_SPAWN_EVENT:-}" "$lease_object" "${LOCAL_WEBHOOK_SPAWN_COUNT:-}"
 if [ "$rc" = 75 ]; then
   # Capacity may change after the refusal; this is a diagnostic snapshot,
   # never a second admission decision. Lock failures are retryable too.

@@ -251,7 +251,12 @@ before you conclude a repo has been quiet, run `agent-box-webhook status`: its
 `dispatch` object has the live count against the ceiling and the last batch the
 ceiling turned away. `lastRefusal.deferred` records the ANSWER that batch got -
 declined for retry rather than dropped - and stays true afterwards, so it is
-history and never a list of what is waiting now.
+history and never a list of what is waiting now. `dispatch.recentHookSessions`
+is the other half: the last ten hook-* spawns and endings, read from
+`~/.local/state/agent-box/hook-sessions.jsonl`. A session that yields to an
+interactive one delists itself within seconds, so "nothing is listed" does not
+mean "nothing spawned" - an `end` line with a small `lifeSeconds` and `how: rm`
+is exactly that.
 
 Payload rules (`--when` / `--drop`, JSON predicates over payload paths) ARE a
 watch's spawn policy - see `agent-box-webhook --help`. This box's watches on
