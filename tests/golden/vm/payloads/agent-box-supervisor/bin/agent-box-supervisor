@@ -606,18 +606,39 @@ HOOKLOG_KEEP=200
 
 hooklog_append() {
   # hooklog_append JSON_OBJECT -- one line, trimmed in place past 2x HOOKLOG_KEEP.
-  mkdir -p "$(dirname "$HOOKLOG")" 2>/dev/null || return 0
-  printf '%s\n' "$1" >> "$HOOKLOG" 2>/dev/null || return 0
-  _hn="$(wc -l < "$HOOKLOG" 2>/dev/null)" || return 0
-  case "$_hn" in (""|*[!0-9]*) return 0 ;; esac
-  if [ "$_hn" -gt $((HOOKLOG_KEEP * 2)) ]; then
-    _ht="$(mktemp "$HOOKLOG.XXXXXX" 2>/dev/null)" || return 0
-    if tail -n "$HOOKLOG_KEEP" "$HOOKLOG" > "$_ht" 2>/dev/null; then
-      mv -f "$_ht" "$HOOKLOG" 2>/dev/null || rm -f "$_ht"
+  #
+  # The append, the count and the trim are ONE critical section: an unlocked
+  # trim replaces the file with a snapshot that omits a line another writer
+  # appended meanwhile. The lock is a sidecar on fd 8 (never fd 9: the
+  # registry lock, which rm and the reap loop hold while they call this) and
+  # is bounded; if it cannot be had the line is skipped, never written
+  # unlocked. With no flock on the box the line is still appended (a single
+  # O_APPEND write) but the file is never trimmed.
+  #
+  # umask 077: this names sessions, topics and objects, so it is created
+  # owner-only. An existing state directory keeps its mode - it holds other
+  # state too - but the log and its lock are always 0600.
+  ( umask 077; mkdir -p "$(dirname "$HOOKLOG")" ) 2>/dev/null || return 0
+  _hf="${HOOKLOG_FLOCK-${REGISTRY_FLOCK:-${AGENT_BOX_FLOCK_BIN:-}}}"
+  (
+    umask 077
+    if [ -n "$_hf" ]; then
+      exec 8>>"$HOOKLOG.lock" || exit 0
+      "$_hf" -w 2 8 || exit 0
+    fi
+    printf '%s\n' "$1" >> "$HOOKLOG" || exit 0
+    chmod 600 "$HOOKLOG" 2>/dev/null
+    [ -n "$_hf" ] || exit 0
+    _hn="$(wc -l < "$HOOKLOG")" || exit 0
+    case "$_hn" in (""|*[!0-9]*) exit 0 ;; esac
+    [ "$_hn" -gt $((HOOKLOG_KEEP * 2)) ] || exit 0
+    _ht="$(mktemp "$HOOKLOG.XXXXXX")" || exit 0
+    if tail -n "$HOOKLOG_KEEP" "$HOOKLOG" > "$_ht"; then
+      mv -f "$_ht" "$HOOKLOG" || rm -f "$_ht"
     else
       rm -f "$_ht"
     fi
-  fi
+  ) 2>/dev/null || true
 }
 
 hooklog_spawn() {
