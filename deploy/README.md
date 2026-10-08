@@ -20,3 +20,8 @@ was launched in.
 A new provider gets a sibling directory here, not a new top-level one.
 Give it a README with the same sections as the two above, and add its
 CI workflow to `.github/workflows/` keyed on `deploy/<provider>/**`.
+
+New portable cloud deployments target the native ordinary-Linux backend first;
+NixOS remains available for appliance-style deployments. The rationale,
+tradeoffs, and criteria for choosing between them are recorded in
+[`docs/deployment-model.md`](../docs/deployment-model.md).

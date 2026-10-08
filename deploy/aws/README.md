@@ -15,6 +15,10 @@ Claude Code or Codex.
   Most of this document describes it; the Lightsail section covers what
   differs.
 
+The reason Lightsail defaults to native Ubuntu while EC2 retains a NixOS
+appliance path is recorded in the shared
+[deployment-model decision](../../docs/deployment-model.md).
+
 ## What the template does
 
 - Provisions its own VPC (10.42.0.0/16) with an Amazon-provided IPv6 CIDR,

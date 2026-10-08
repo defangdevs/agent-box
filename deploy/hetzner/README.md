@@ -6,6 +6,10 @@ layer: the VM stays Ubuntu, Nix supplies a pinned runtime profile, and
 `agentbox apply --first-boot` renders the users, units, sudoers, Caddyfile,
 password hash, and settings surface.
 
+The reasons this is the default while NixOS remains a supported appliance
+backend are recorded in the shared
+[deployment-model decision](../../docs/deployment-model.md).
+
 This supersedes the original NixOS/`nixos-anywhere` proposal in
 [issue #7](https://github.com/defangdevs/agent-box/issues/7). The closed
 [PR #839](https://github.com/defangdevs/agent-box/pull/839) preserves that
