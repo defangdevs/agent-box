@@ -3,9 +3,13 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    disko = {
+      url = "github:nix-community/disko";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, ... }:
+  outputs = { self, nixpkgs, disko, ... }:
     let
       # The module itself is arch-agnostic, and the deployed fleet is aarch64
       # (deploy/aws/template.yaml offers Graviton instances only), so the cheap
@@ -251,6 +255,26 @@
       nixosConfigurations.vm = nixpkgs.lib.nixosSystem {
         system = imageSystem;
         modules = [ self.nixosModules.agent-box ./hosts/vm.nix ];
+      };
+
+      # Hetzner Cloud has no provider image hook for a NixOS qcow2 disk.  The
+      # supported install path is a temporary stock Linux server followed by
+      # nixos-anywhere, which kexecs a NixOS installer and lets Disko replace
+      # the root disk in one run.  The SSH key and optional public web address
+      # are supplied through `--impure` environment variables by the deployer;
+      # no credential or host-specific address belongs in the flake.
+      nixosConfigurations.hetzner = nixpkgs.lib.nixosSystem {
+        system = imageSystem;
+        specialArgs = {
+          sshPublicKey = builtins.getEnv "AGENT_BOX_HETZNER_SSH_KEY";
+          webDomain = builtins.getEnv "AGENT_BOX_HETZNER_WEB_DOMAIN";
+          webPasswordHash = builtins.getEnv "AGENT_BOX_HETZNER_WEB_PASSWORD_HASH";
+        };
+        modules = [
+          self.nixosModules.agent-box
+          disko.nixosModules.disko
+          ./hosts/hetzner.nix
+        ];
       };
 
       # Standalone qcow2 image (BIOS boot), built via the image API upstreamed
