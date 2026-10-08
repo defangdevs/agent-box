@@ -10052,12 +10052,19 @@ you edit a file, push, comment, merge, close, delete or deploy, settle \
 whether one of them already has this object: its claim, its note, its working \
 directory and its pane (tmux -L agent-box capture-pane -pt NAME | tail -40) \
 are the evidence, and a claude session can also be asked directly (ListAgents, \
-then SendMessage). If one of them has it — or is working on the branch or in \
-the git worktree you would use — YIELD: tell that session what the event \
-said, say plainly what you did NOT do, and remove yourself with \
-agent-box-session rm $1. That is a complete and correct outcome, not a \
-failure: the event has reached a session that already holds the context, \
-which is the whole point of a watch that brakes. If nobody has it, the work \
+then SendMessage to the name ListAgents PRINTS - a Remote Control name such \
+as agent-claude@host, never the tmux name in the list below). If one of them \
+has it — or is working on the branch or in the git worktree you would use — \
+YIELD: tell that session what the event said, say plainly what you did NOT \
+do, and only then remove yourself with agent-box-session rm $1. That is a \
+complete and correct outcome, not a failure: the event has reached a session \
+that already holds the context, which is the whole point of a watch that \
+brakes. But a yield exists only if the hand-over SUCCEEDED. Read the \
+SendMessage result: any failure - \"No agent named ... is reachable\", \"session \
+list was too long to check\", or anything else - means nobody was told, and \
+you must NOT remove yourself. Say so in your final message, leave the session \
+running for a person to read, and do not retry the same name. If nobody has \
+it, the work \
 is yours — and keep it reversible: investigate, report, and push only to a \
 branch you created. Never merge a PR, close an issue, delete a branch, \
 publish a release or deploy on work you did not start, whoever else is live: \
