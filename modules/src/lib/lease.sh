@@ -192,9 +192,10 @@ hooklog_spawn() {
 
 hooklog_end() {
   # hooklog_end NAME HOW -- a hook-* session leaving the registry. HOW says by
-  # whom: "rm" (agent-box-session rm, which is what a yielding session runs)
-  # or "reaped" (the supervisor delisting a finished ephemeral). Call BEFORE
-  # lease_clear: the lease is where the spawn time and claim live. Any other
+  # whom: "rm" (agent-box-session rm, which is what a yielding session runs),
+  # "exited" (a clean agent exit, from the pane epilogue) or "died:N" (a crash,
+  # likewise). The supervisor's reap logs nothing: by then the lease is gone.
+  # Call BEFORE lease_clear: the lease is where the spawn time and claim live. Any other
   # name is ignored, so the log stays about dispatched work.
   case "$1" in (hook-*) ;; (*) return 0 ;; esac
   _lf="$(lease_file "$1")"

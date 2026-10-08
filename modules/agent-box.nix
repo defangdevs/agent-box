@@ -3211,9 +3211,10 @@ if __name__ == "__main__":
 
     hooklog_end() {
       # hooklog_end NAME HOW -- a hook-* session leaving the registry. HOW says by
-      # whom: "rm" (agent-box-session rm, which is what a yielding session runs)
-      # or "reaped" (the supervisor delisting a finished ephemeral). Call BEFORE
-      # lease_clear: the lease is where the spawn time and claim live. Any other
+      # whom: "rm" (agent-box-session rm, which is what a yielding session runs),
+      # "exited" (a clean agent exit, from the pane epilogue) or "died:N" (a crash,
+      # likewise). The supervisor's reap logs nothing: by then the lease is gone.
+      # Call BEFORE lease_clear: the lease is where the spawn time and claim live. Any other
       # name is ignored, so the log stays about dispatched work.
       case "$1" in (hook-*) ;; (*) return 0 ;; esac
       _lf="$(lease_file "$1")"
@@ -3244,6 +3245,10 @@ if __name__ == "__main__":
       # earlier respawn's lease recorded (including "vanished") no longer
       # applies. Independent of the registry write above and its retry loop:
       # a lease has one writer at a time, so there is nothing here to race.
+      # The end is logged HERE, before the lease goes: this is the one place that
+      # still has the lease's claimedAt on a clean exit, and the supervisor's
+      # reap of the ephemeral entry runs after it is deleted.
+      hooklog_end "$1" exited
       lease_clear "$1"
     else
       # Recorded as the STATUS, not a bare true: it is the only thing anyone
@@ -3252,6 +3257,7 @@ if __name__ == "__main__":
       # session that comes back is never left looking dead.
       _edit='if .sessions | has($s) then .sessions[$s].died = $st else . end'
       _check='(.sessions | has($s) | not) or (.sessions[$s].died == $st)'
+      hooklog_end "$1" "died:$_status"
       lease_mark_outcome "$1" "died:$_status"
     fi
     # Verified write, retried: on an agent that exits within its first
@@ -4679,9 +4685,10 @@ hooklog_spawn() {
 
 hooklog_end() {
   # hooklog_end NAME HOW -- a hook-* session leaving the registry. HOW says by
-  # whom: "rm" (agent-box-session rm, which is what a yielding session runs)
-  # or "reaped" (the supervisor delisting a finished ephemeral). Call BEFORE
-  # lease_clear: the lease is where the spawn time and claim live. Any other
+  # whom: "rm" (agent-box-session rm, which is what a yielding session runs),
+  # "exited" (a clean agent exit, from the pane epilogue) or "died:N" (a crash,
+  # likewise). The supervisor's reap logs nothing: by then the lease is gone.
+  # Call BEFORE lease_clear: the lease is where the spawn time and claim live. Any other
   # name is ignored, so the log stays about dispatched work.
   case "$1" in (hook-*) ;; (*) return 0 ;; esac
   _lf="$(lease_file "$1")"
@@ -9967,9 +9974,10 @@ hooklog_spawn() {
 
 hooklog_end() {
   # hooklog_end NAME HOW -- a hook-* session leaving the registry. HOW says by
-  # whom: "rm" (agent-box-session rm, which is what a yielding session runs)
-  # or "reaped" (the supervisor delisting a finished ephemeral). Call BEFORE
-  # lease_clear: the lease is where the spawn time and claim live. Any other
+  # whom: "rm" (agent-box-session rm, which is what a yielding session runs),
+  # "exited" (a clean agent exit, from the pane epilogue) or "died:N" (a crash,
+  # likewise). The supervisor's reap logs nothing: by then the lease is gone.
+  # Call BEFORE lease_clear: the lease is where the spawn time and claim live. Any other
   # name is ignored, so the log stays about dispatched work.
   case "$1" in (hook-*) ;; (*) return 0 ;; esac
   _lf="$(lease_file "$1")"
@@ -10637,6 +10645,8 @@ claim_note() {
 }
 
 seeded=""
+own=""
+lease_object=""
 if [ -n "''${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" ]; then
   own="''${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}:$LOCAL_WEBHOOK_SPAWN_KEY"
   # webhook.py reads filter.<LOCAL_WEBHOOK_SESSION>.json, and the supervisor
@@ -10670,7 +10680,6 @@ if [ -n "''${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "''${LOCAL_WEBHOOK_SPAWN_KEY:
     '(($meta.number // "" | tostring) | if test("^[0-9]+$") then . else "" end)' \
     2>/dev/null)" || lease_object=""
   lease_create "$name" "$own" "$lease_object"
-  hooklog_spawn "$name" "$own" "''${LOCAL_WEBHOOK_SPAWN_EVENT:-}" "$lease_object" "''${LOCAL_WEBHOOK_SPAWN_COUNT:-}"
 fi
 
 # An assignment is a work request, not a triage request (#253), and the
@@ -10747,6 +10756,10 @@ rc=0
   --origin webhook --hook "''${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" --prompt "$preamble
 
 $PROMPT" -- "''${extra[@]}" || rc=$?
+# Recorded only once the session really exists: a capacity refusal (75) is
+# retried by the receiver, and a spawn line per attempt would both report
+# sessions that never started and push the real ones out of the log.
+[ "$rc" = 0 ] && hooklog_spawn "$name" "$own" "''${LOCAL_WEBHOOK_SPAWN_EVENT:-}" "$lease_object" "''${LOCAL_WEBHOOK_SPAWN_COUNT:-}"
 if [ "$rc" = 75 ]; then
   # Capacity may change after the refusal; this is a diagnostic snapshot,
   # never a second admission decision. Lock failures are retryable too.
@@ -12656,9 +12669,10 @@ esac
 
     hooklog_end() {
       # hooklog_end NAME HOW -- a hook-* session leaving the registry. HOW says by
-      # whom: "rm" (agent-box-session rm, which is what a yielding session runs)
-      # or "reaped" (the supervisor delisting a finished ephemeral). Call BEFORE
-      # lease_clear: the lease is where the spawn time and claim live. Any other
+      # whom: "rm" (agent-box-session rm, which is what a yielding session runs),
+      # "exited" (a clean agent exit, from the pane epilogue) or "died:N" (a crash,
+      # likewise). The supervisor's reap logs nothing: by then the lease is gone.
+      # Call BEFORE lease_clear: the lease is where the spawn time and claim live. Any other
       # name is ignored, so the log stays about dispatched work.
       case "$1" in (hook-*) ;; (*) return 0 ;; esac
       _lf="$(lease_file "$1")"
@@ -14833,7 +14847,6 @@ esac
           '.sessions[$s].ephemeral == true and .sessions[$s].stopped == true' \
           "$REGISTRY_FILE" >/dev/null 2>&1 || continue
         registry_edit --arg s "$_n" 'del(.sessions[$s])'
-        hooklog_end "$_n" reaped
         _gone=1
       done < <(printf '%s\n' "$_cand")
       registry_unlock

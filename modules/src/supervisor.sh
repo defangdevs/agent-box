@@ -1659,7 +1659,6 @@ reap_ephemeral() {
       '.sessions[$s].ephemeral == true and .sessions[$s].stopped == true' \
       "$REGISTRY_FILE" >/dev/null 2>&1 || continue
     registry_edit --arg s "$_n" 'del(.sessions[$s])'
-    hooklog_end "$_n" reaped
     _gone=1
   done < <(printf '%s\n' "$_cand")
   registry_unlock
