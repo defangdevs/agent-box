@@ -231,6 +231,7 @@ let
   # with every value they need supplied by the generated env file.
   unitPayloads = [
     (payload "agent-box-supervisor" "supervisor.sh")
+    (payload "agent-box-gpg-init" "gpg-init.sh")
     (payload "agent-box-attach" "attach.sh")
     (payload "agent-box-mark-stopped" "mark-stopped.sh")
     (payload "agent-box-spot-monitor" "spot-monitor.sh")

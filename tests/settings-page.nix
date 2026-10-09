@@ -318,6 +318,13 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
         "systemctl show agent-box-settings@agent --property=ReadWritePaths "
         "--value | grep /run/agent-box-agent >/dev/null"
     )
+    # The settings unit's After= relationship is meaningful only if key
+    # provisioning finishes before agent-box@ is considered started. Keep it
+    # in ExecStartPre rather than inside the long-running supervisor.
+    machine.succeed(
+        "systemctl show agent-box@agent --property=ExecStartPre --value "
+        "| grep agent-box-gpg-init >/dev/null"
+    )
 
     # Issue #49: the daemon listens ONLY on the systemd-owned unix socket —
     # 0660 agent:caddy, no TCP listener for other local users to reach.
@@ -377,6 +384,22 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     auth_page = client.succeed("cat /tmp/auth-page")
     assert '<span class="mark">' in auth_page
     assert "Settings</h1>" in auth_page
+
+    # The authenticated encrypted-handoff panel carries the public export,
+    # never the private key. Its disclosure and copy controls target the
+    # rendered <pre> rather than putting a multi-line key in an attribute.
+    machine.wait_until_succeeds(
+        "test -s /home/agent/.config/agent-box/gpg-public-key.asc"
+    )
+    auth_page = client.succeed(
+        f"{curl} -u agent:testpassword https://box.test/agent/settings/"
+    )
+    assert 'id="encrypted-handoff"' in auth_page
+    assert 'data-toggle="gpg-key-pane"' in auth_page
+    assert 'data-copy-target="gpg-public-key"' in auth_page
+    assert "-----BEGIN PGP PUBLIC KEY BLOCK-----" in auth_page
+    assert "-----END PGP PUBLIC KEY BLOCK-----" in auth_page
+    assert "PRIVATE KEY BLOCK" not in auth_page
 
     # No env file exists yet.
     machine.fail("test -e /home/agent/.config/agent-box/env")

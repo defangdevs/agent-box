@@ -637,6 +637,25 @@ let
       the value out of the command line, the shell history and `ps`). Such a
       value is stored double-quoted, which is the one thing to preserve if you
       ever hand-edit the file.
+    - Each Linux user has an OpenPGP recipient for handing over a secret without
+      putting its plaintext in chat. Its Ed25519 primary key certifies a cv25519
+      encryption subkey; the armored public key is at
+      ~/.config/agent-box/gpg-public-key.asc and, on a web-enabled box, at
+      ''${AGENT_BOX_URL}downloads/agent-box-public-key.asc. The settings page's
+      Encrypted handoff section also shows it behind a toggle with a copy button.
+      The private key has no passphrase so a headless session can decrypt; its
+      0700 keyring is protected by the Linux-user boundary. Ask the user to
+      encrypt to the public key and attach the ciphertext. To put a decrypted
+      value straight into the persistent env store without printing it, run:
+
+          gpg --homedir ~/.config/agent-box/gnupg --batch --quiet \
+            --decrypt secret.gpg |
+            agent-box-session env set KEY --stdin
+
+      This keeps plaintext out of the transcript, command line and shell output.
+      It does not isolate sibling sessions: every session of this Linux user can
+      read the same private key and env store. Use a separate Linux user when
+      that would be a problem.
     - Agent session starts share one limit across the CLI, settings page and
       webhooks. Shell panes are operator terminals and do not use a slot. The
       limit defaults to about one session per GiB of physical RAM and can be
@@ -929,6 +948,7 @@ let
       User=%i
       Restart=always
       RestartSec=2s
+      ExecStartPre=agent-box-gpg-init
       ExecStart=agent-box-supervisor
       ExecStop=tmux -L agent-box kill-server
       RuntimeDirectory=agent-box-%i
@@ -3916,7 +3936,7 @@ done
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
     ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli whatsappCli uploadCli
-         harnessCli ]
+         harnessCli gpgInit ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli ]
@@ -9542,6 +9562,123 @@ else
 fi
   '';
 
+  # One OpenPGP recipient per Linux user. agent-box@ runs this as ExecStartPre,
+  # so every session in the user's trust boundary shares the same cv25519
+  # decryption key and the settings page can rely on the public export before
+  # its After=agent-box@ ordering lets it start. Native ships the same payload
+  # from nix/runtime.nix.
+  gpgInit = pkgs.writeShellScriptBin "agent-box-gpg-init" ''
+set -eu
+
+# Provision one OpenPGP recipient for this Linux user. The primary key only
+# certifies the cv25519 encryption subkey: agent-box needs a recipient for
+# secret handoff, not another signing identity. The secret key is deliberately
+# unpassphrased so a headless session can decrypt into the env store without a
+# pinentry prompt. The Linux user and this dedicated keyring's permissions are
+# the boundary.
+GPG="''${AGENT_BOX_GPG_BIN:-gpg}"
+host_label=''${1:-''${AGENT_BOX_HOST_LABEL:-agent-box}}
+owner=''${USER:-$(id -un)}
+uid="Agent Box recipient for ''${owner}@''${host_label}"
+state_dir="$HOME/.config/agent-box"
+gpg_home="$state_dir/gnupg"
+fingerprint_file="$state_dir/gpg-fingerprint"
+public_key="$state_dir/gpg-public-key.asc"
+download_key="$HOME/downloads/agent-box-public-key.asc"
+
+umask 077
+mkdir -p "$state_dir"
+mkdir -m 0700 -p "$gpg_home"
+
+gpg_cmd() {
+  "$GPG" --homedir "$gpg_home" "$@"
+}
+
+fingerprint=
+if [ -r "$fingerprint_file" ]; then
+  IFS= read -r fingerprint < "$fingerprint_file" || fingerprint=
+fi
+
+secret_key_exists() {
+  [ -n "$1" ] &&
+    gpg_cmd --batch --with-colons --list-secret-keys "$1" \
+      >/dev/null 2>&1
+}
+
+find_existing_key() {
+  gpg_cmd --batch --with-colons --list-secret-keys "$uid" 2>/dev/null |
+    awk -F: '$1 == "fpr" { print $10; exit }'
+}
+
+has_encryption_subkey() {
+  gpg_cmd --batch --with-colons --list-secret-keys "$1" 2>/dev/null |
+    awk -F: '
+      $1 == "ssb" && $4 == "18" && $12 ~ /e/ && $17 == "cv25519" {
+        found = 1
+      }
+      END { exit(found ? 0 : 1) }
+    '
+}
+
+# A crash after primary-key creation but before the marker is published must
+# resume that key rather than accumulate another key with the same user ID.
+if ! secret_key_exists "$fingerprint"; then
+  fingerprint=$(find_existing_key || :)
+fi
+
+if ! secret_key_exists "$fingerprint"; then
+  gpg_cmd --batch --quiet --pinentry-mode loopback --passphrase ''' \
+    --quick-generate-key "$uid" ed25519 cert never
+  fingerprint=$(find_existing_key || :)
+  if ! secret_key_exists "$fingerprint"; then
+    echo "agent-box-gpg-init: generated key could not be found" >&2
+    exit 1
+  fi
+fi
+
+if ! has_encryption_subkey "$fingerprint"; then
+  gpg_cmd --batch --quiet --pinentry-mode loopback --passphrase ''' \
+    --quick-add-key "$fingerprint" cv25519 encr never
+fi
+if ! has_encryption_subkey "$fingerprint"; then
+  echo "agent-box-gpg-init: cv25519 encryption subkey is missing" >&2
+  exit 1
+fi
+
+public_tmp=$(mktemp "$state_dir/.gpg-public-key.asc.XXXXXX")
+fingerprint_tmp=$(mktemp "$state_dir/.gpg-fingerprint.XXXXXX")
+download_tmp=
+cleanup() {
+  rm -f -- "$public_tmp" "$fingerprint_tmp"
+  [ -z "$download_tmp" ] || rm -f -- "$download_tmp"
+}
+trap cleanup EXIT HUP INT TERM
+
+gpg_cmd --batch --armor --export "$fingerprint" > "$public_tmp"
+if [ ! -s "$public_tmp" ]; then
+  echo "agent-box-gpg-init: public-key export is empty" >&2
+  exit 1
+fi
+printf '%s\n' "$fingerprint" > "$fingerprint_tmp"
+chmod 0644 "$public_tmp" "$fingerprint_tmp"
+mv -f -- "$public_tmp" "$public_key"
+mv -f -- "$fingerprint_tmp" "$fingerprint_file"
+
+# A web-enabled box creates ~/downloads before this supervisor starts. Keep a
+# public-only copy there so the human can fetch it through the authenticated
+# download route without asking an agent to paste key material into chat.
+if [ -d "$HOME/downloads" ]; then
+  download_tmp=$(mktemp "$HOME/downloads/.agent-box-public-key.asc.XXXXXX")
+  cp -- "$public_key" "$download_tmp"
+  chmod 0644 "$download_tmp"
+  mv -f -- "$download_tmp" "$download_key"
+  download_tmp=
+fi
+
+trap - EXIT HUP INT TERM
+printf 'agent-box gpg recipient ready: %s\n' "$fingerprint"
+  '';
+
   # Bootstraps and re-aligns the shipped checkout (issue #242). On the
   # agent's PATH as well as the supervisor's, because "my checkout is gone"
   # and "the box updated past my tree" both want the same idempotent run,
@@ -11182,6 +11319,8 @@ esac
     { "name": "AGENT_BOX_FIND_BIN", "kind": "bin", "program": "find" },
     { "name": "AGENT_BOX_FLOCK_BIN", "kind": "bin", "program": "flock" },
     { "name": "AGENT_BOX_HOSTNAME_BIN", "kind": "bin", "program": "hostname" },
+    { "name": "AGENT_BOX_GPG_BIN", "kind": "bin", "program": "gpg" },
+    { "name": "AGENT_BOX_GPG_INIT", "kind": "bin", "program": "agent-box-gpg-init" },
     { "name": "AGENT_BOX_ENV_EXEC", "kind": "bin", "program": "agent-box-env-exec" },
     { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" },
     { "name": "AGENT_BOX_CAPACITY_BIN", "kind": "bin", "program": "agent-box-session-capacity" },
@@ -11485,11 +11624,13 @@ esac
     # /usr/local/bin/agent-box-session, the wrapper it generates there.
     "agent-box-session" = "${sessionCli}/bin/agent-box-session";
     "agent-box-envstore" = "${envStoreCli}/bin/agent-box-envstore";
+    "agent-box-gpg-init" = "${gpgInit}/bin/agent-box-gpg-init";
     "agent-box-session-capacity" = "${capacityCli}/bin/agent-box-session-capacity";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     "agent-box-whatsapp" = "${whatsappCli}/bin/agent-box-whatsapp";
     "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
+    gpg = "${pkgs.gnupg}/bin/gpg";
     "agent-box-env-exec" = "${envExecWrapper}";
     "agent-box-supervisor" = "${supervisorScript}/bin/agent-box-supervisor";
     python3 = webhookPython;
@@ -17429,6 +17570,14 @@ import urllib.request
 
 USER = os.environ.get("AGENT_BOX_SETTINGS_USER", "agent")
 ENV_FILE = os.environ["AGENT_BOX_SETTINGS_ENV_FILE"]
+# The managed OpenPGP recipient is provisioned by agent-box@'s ExecStartPre
+# in the same private state directory as the env store. The settings unit is
+# ordered after that service, so a normal render finds the atomic public
+# export ready. Keeping the path derived from ENV_FILE avoids a third copy of
+# the per-user state directory in the two backend renderers.
+GPG_PUBLIC_KEY_FILE = os.path.join(
+    os.path.dirname(ENV_FILE), "gpg-public-key.asc")
+GPG_PUBLIC_KEY_MAX = 64 * 1024
 # Agent profiles (issue #321) live beside the env store, one file per profile.
 # The preamble cache key reads this too: a watch's launch report names the
 # profile AGENT_BOX_HOOK_PROFILE picks and whether it still exists, so
@@ -21969,6 +22118,19 @@ STYLE = """<style>
   .icopy[data-copied="1"] .co { display: inline-flex; }
   .icopy[data-copied="1"] { color: #3fb950; }
   .icopy[data-copied="0"] { color: #f85149; }
+  /* The armored public key is long enough to deserve its own disclosure pane,
+     but its 64-column body should remain readable and selectable on a phone.
+     pre-wrap only affects display; the copy button reads the pre's textContent,
+     preserving the original armor exactly. */
+  .gpg-key-pane { margin-top: 12px; border: 1px solid #30363d;
+                  border-radius: 8px; background: #161b22; overflow: hidden; }
+  .gpg-key-head { display: flex; align-items: center;
+                  justify-content: space-between; gap: 12px;
+                  padding: 8px 10px; border-bottom: 1px solid #30363d; }
+  .gpg-key-pane pre { box-sizing: border-box; max-height: 320px; margin: 0;
+                      padding: 12px; overflow: auto; color: #e6edf3;
+                      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+                      white-space: pre-wrap; overflow-wrap: anywhere; }
   /* A session row folds open onto its own subscriptions (issue #227), so
      the <li> stops being the flex row and its <summary> becomes one. */
   .tbl li.foldrow { display: block; padding: 0; }
@@ -22713,6 +22875,7 @@ BODY = """<main>
     </div>
     <div id="secrets-list">{keys}</div>
   </section>
+  {gpg_section}
   {password_section}
   <section>
     <h2 id="maintenance">Maintenance<a class="heading-anchor" href="#maintenance" aria-label="Copy link to Maintenance" title="Copy link to Maintenance"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
@@ -23969,6 +24132,14 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     e.preventDefault();
     var plain = b.getAttribute("data-copy");
     if (plain) { copyText(plain).then(function (ok) { flashCopy(b, ok); }); return; }
+    var target = b.getAttribute("data-copy-target");
+    if (target) {
+      var source = document.getElementById(target);
+      copyText(source ? source.textContent : "")
+        .then(function (ok) { flashCopy(b, ok); })
+        .catch(function () { flashCopy(b, false); });
+      return;
+    }
     var url = b.getAttribute("data-secret-url");
     if (!url) { return; }
     fetchSecret(url).then(function (secret) {
@@ -24022,9 +24193,17 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
 
   // The editors render expanded (no-JS fallback); collapse them once
   // JS is live so the page opens in list-only, GitHub-style form.
-  ["secret-editor", "session-editor", "password-editor", "profile-editor"].forEach(function (id) {
+  ["secret-editor", "session-editor", "password-editor", "profile-editor",
+   "gpg-key-pane"].forEach(function (id) {
     var el = document.getElementById(id);
-    if (el) { el.hidden = true; }
+    if (!el) { return; }
+    el.hidden = true;
+    var toggle = document.querySelector('[data-toggle="' + id + '"]');
+    if (toggle && toggle.hasAttribute("aria-expanded")) {
+      toggle.setAttribute("aria-expanded", "false");
+      var label = toggle.getAttribute("data-open-label");
+      if (label) { toggle.textContent = label; }
+    }
   });
 
   document.addEventListener("click", function (e) {
@@ -24043,6 +24222,11 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     var el = document.getElementById(t.getAttribute("data-toggle"));
     if (!el) { return; }
     el.hidden = !el.hidden;
+    if (t.hasAttribute("aria-expanded")) {
+      t.setAttribute("aria-expanded", el.hidden ? "false" : "true");
+      var label = t.getAttribute(el.hidden ? "data-open-label" : "data-close-label");
+      if (label) { t.textContent = label; }
+    }
     if (!el.hidden && el.id === "secret-editor") {
       form.reset();
       var ki = form.querySelector("input[name=key]");
@@ -25232,12 +25416,15 @@ def render_webhook_row(topic, meta, note, key, dispatch, fold="", watch_name="",
     )
 
 
-def copy_button(what, value=None, secret_url=None):
+def copy_button(what, value=None, secret_url=None, target=None):
     """A one-click copy for a value the operator has to paste elsewhere.
 
-    Either `value` — text already in the page, copied straight from the
-    attribute — or `secret_url`, a route the button fetches on the click
-    (which is how a secret gets copied without being rendered).
+    Either `value` - text already in the page, copied straight from the
+    attribute - `secret_url`, a route the button fetches on the click
+    (which is how a secret gets copied without being rendered), or `target`,
+    the id of a rendered text element. The target form keeps a multi-line
+    armored key out of an HTML attribute while still copying exactly what the
+    operator can see.
 
     Takes VALUES and escapes them here, rather than an `attrs` fragment
     the caller assembles: a parameter that is raw markup makes escaping
@@ -25245,14 +25432,82 @@ def copy_button(what, value=None, secret_url=None):
     purpose is handling credentials (#421 review). Both icons ship inside
     it and CSS picks which one shows, so the "copied" tick needs no icon
     markup in the script."""
-    attr = ('data-copy="%s"' % html.escape(value, quote=True) if value
-            else 'data-secret-url="%s"' % html.escape(secret_url or "", quote=True))
+    if value:
+        attr = 'data-copy="%s"' % html.escape(value, quote=True)
+    elif secret_url:
+        attr = 'data-secret-url="%s"' % html.escape(secret_url, quote=True)
+    else:
+        attr = 'data-copy-target="%s"' % html.escape(target or "", quote=True)
     return (
         '<button type="button" class="icon icopy" %s '
         'aria-label="Copy %s" title="Copy to clipboard">'
         '<span class="ci">%s</span><span class="co">%s</span></button>'
         % (attr, html.escape(what, quote=True), ICON_COPY, ICON_CHECK)
     )
+
+
+def read_gpg_public_key():
+    """The bounded, armored public export, or an empty string if unavailable.
+
+    This file is public by design, but it is still escaped before it reaches
+    HTML. Checking the armor prevents an accidentally replaced state file from
+    being presented as the key a sender should trust, and the bound keeps one
+    damaged file from turning every settings response into a multi-megabyte
+    page.
+    """
+    try:
+        with open(GPG_PUBLIC_KEY_FILE, "rb") as fh:
+            raw = fh.read(GPG_PUBLIC_KEY_MAX + 1)
+    except OSError:
+        return ""
+    if not raw or len(raw) > GPG_PUBLIC_KEY_MAX:
+        return ""
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return ""
+    lines = text.splitlines()
+    if (not lines
+            or lines[0] != "-----BEGIN PGP PUBLIC KEY BLOCK-----"
+            or lines[-1] != "-----END PGP PUBLIC KEY BLOCK-----"):
+        return ""
+    return text
+
+
+def render_gpg_section():
+    """The encrypted-handoff key, collapsed in a JS-capable browser."""
+    key = read_gpg_public_key()
+    heading = (
+        '<h2 id="encrypted-handoff">Encrypted handoff'
+        '<a class="heading-anchor" href="#encrypted-handoff" '
+        'aria-label="Copy link to Encrypted handoff" '
+        'title="Copy link to Encrypted handoff">'
+        '<svg viewBox="0 0 16 16" aria-hidden="true"><path '
+        'd="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/>'
+        '</svg></a></h2>')
+    note = (
+        '<p class="note">Encrypt a sensitive file to this Linux user before '
+        'attaching it to a chat. The private key stays on the box; every '
+        'session belonging to this user can decrypt the result.</p>')
+    if not key:
+        return ('<section><div class="sec-head">%s</div>%s'
+                '<p class="note conn-warn">The public key is not ready. '
+                'Reload after the agent service starts.</p></section>'
+                % (heading, note))
+    toggle = (
+        '<button type="button" class="btn" data-toggle="gpg-key-pane" '
+        'data-open-label="Show public key" data-close-label="Hide public key" '
+        'aria-controls="gpg-key-pane" aria-expanded="true">'
+        'Hide public key</button>')
+    pane = (
+        '<div id="gpg-key-pane" class="gpg-key-pane">'
+        '<div class="gpg-key-head"><span class="meta">Armored OpenPGP '
+        'public key</span>%s</div>'
+        '<pre id="gpg-public-key" tabindex="0">%s</pre></div>'
+        % (copy_button("armored public key", target="gpg-public-key"),
+           html.escape(key)))
+    return ('<section><div class="sec-head">%s%s</div>%s%s</section>'
+            % (heading, toggle, note, pane))
 
 
 def rotate_form(source):
@@ -26110,6 +26365,7 @@ def render_page(message="", kind="ok", prefer_connect_feedback=False):
             term_home=html.escape(TERM_HOME),
             mark=POTATO_SVG,
             keys=render_keys(read_keys()),
+            gpg_section=render_gpg_section(),
             # Every user, primary included: the HOME root page is the
             # terminal workspace, so session CRUD lives here.
             sessions_section=render_sessions_section(subs, profiles),

@@ -1016,6 +1016,14 @@
     e.preventDefault();
     var plain = b.getAttribute("data-copy");
     if (plain) { copyText(plain).then(function (ok) { flashCopy(b, ok); }); return; }
+    var target = b.getAttribute("data-copy-target");
+    if (target) {
+      var source = document.getElementById(target);
+      copyText(source ? source.textContent : "")
+        .then(function (ok) { flashCopy(b, ok); })
+        .catch(function () { flashCopy(b, false); });
+      return;
+    }
     var url = b.getAttribute("data-secret-url");
     if (!url) { return; }
     fetchSecret(url).then(function (secret) {
@@ -1069,9 +1077,17 @@
 
   // The editors render expanded (no-JS fallback); collapse them once
   // JS is live so the page opens in list-only, GitHub-style form.
-  ["secret-editor", "session-editor", "password-editor", "profile-editor"].forEach(function (id) {
+  ["secret-editor", "session-editor", "password-editor", "profile-editor",
+   "gpg-key-pane"].forEach(function (id) {
     var el = document.getElementById(id);
-    if (el) { el.hidden = true; }
+    if (!el) { return; }
+    el.hidden = true;
+    var toggle = document.querySelector('[data-toggle="' + id + '"]');
+    if (toggle && toggle.hasAttribute("aria-expanded")) {
+      toggle.setAttribute("aria-expanded", "false");
+      var label = toggle.getAttribute("data-open-label");
+      if (label) { toggle.textContent = label; }
+    }
   });
 
   document.addEventListener("click", function (e) {
@@ -1090,6 +1106,11 @@
     var el = document.getElementById(t.getAttribute("data-toggle"));
     if (!el) { return; }
     el.hidden = !el.hidden;
+    if (t.hasAttribute("aria-expanded")) {
+      t.setAttribute("aria-expanded", el.hidden ? "false" : "true");
+      var label = t.getAttribute(el.hidden ? "data-open-label" : "data-close-label");
+      if (label) { t.textContent = label; }
+    }
     if (!el.hidden && el.id === "secret-editor") {
       form.reset();
       var ki = form.querySelector("input[name=key]");
