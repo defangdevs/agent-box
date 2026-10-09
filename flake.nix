@@ -1945,7 +1945,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           watch-profiles =
             pkgs.runCommand "agent-box-watch-profiles"
               {
-                nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.coreutils pkgs.jq ];
+                nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.coreutils pkgs.jq pkgs.util-linux ];
                 src = ./modules/src;
                 daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
                 tests = ./tests/test-watch-profiles.py;

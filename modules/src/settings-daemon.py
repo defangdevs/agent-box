@@ -1829,6 +1829,7 @@ def webhook_save(form):
     topic = form.get("topic", [""])[0].strip()
     name = form.get("watch_name", [""])[0]
     profile = form.get("profile", [""])[0].strip()
+    auth = form.get("auth", [""])[0]
     mode = form.get("mode", [""])[0]
     if not TOPIC_RE.fullmatch(topic) or topic.startswith("-"):
         return False
@@ -1849,10 +1850,25 @@ def webhook_save(form):
     if (mode == "create" and exists) or (mode != "create" and not exists):
         return False
     config = dict((existing or {}).get("spawnConfig") or {})
+    if auth:
+        if auth not in ("api-key", "saved-login", "legacy"):
+            return False
+        if auth == "legacy":
+            if not exists or "authMode" in config:
+                return False
+            config.pop("authMode", None)
+        else:
+            config["authMode"] = auth
+    elif not exists:
+        config["authMode"] = "api-key"
     if profile:
         config["profile"] = profile
     else:
         config.pop("profile", None)
+    if config.get("authMode") == "api-key":
+        status = watch_auth_status(config, prepare=True)
+        if not status.get("ready"):
+            return "auth"
     args = ["subscribe", topic, "--deliver-to", "subagent", "--name", name,
             "--no-spawn-config"]
     for key, value in config.items():
@@ -1874,6 +1890,28 @@ def webhook_save(form):
     return proc is not None and proc.returncode == 0
 
 
+def watch_auth_status(config, prepare=False):
+    """Ask the spawn wrapper to check exactly what a delivery will use."""
+    if not HOOK_SPAWN_CMD:
+        return {"ready": False, "reason": "watch auth helper unavailable"}
+    try:
+        proc = subprocess.run(
+            [HOOK_SPAWN_CMD, "--prepare-auth" if prepare else "--auth-status"],
+            env=dict(os.environ, LOCAL_WEBHOOK_SPAWN_CONFIG=json.dumps(config)),
+            capture_output=True, text=True, timeout=10,
+        )
+        result = json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {"ready": False, "reason": "watch auth check failed"}
+    return result if isinstance(result, dict) else {"ready": False}
+
+
+@functools.lru_cache(maxsize=64)
+def hook_auth_status(profile, mode, stamp, interval):
+    """Cache setup briefly; Codex auth.json can change outside the env store."""
+    return watch_auth_status({"profile": profile, "authMode": mode})
+
+
 def render_watch_editor(entry=None):
     creating = entry is None
     entry = entry or {}
@@ -1882,6 +1920,8 @@ def render_watch_editor(entry=None):
     mode = "create" if creating else "edit" if name else "profile"
     esc = html.escape
     profile = (entry.get("spawnConfig") or {}).get("profile", "")
+    auth = (entry.get("spawnConfig") or {}).get(
+        "authMode", "api-key" if creating else "legacy")
     profiles = read_profiles()
     choices = ["", *profiles]
     if profile and profile not in profiles:
@@ -1900,6 +1940,18 @@ def render_watch_editor(entry=None):
            'pattern="[A-Za-z0-9._\\-]+" placeholder="issue-triage"></label>' if creating else
            '<input type="hidden" name="watch_name" value="%s">' % esc(name))
         + '<label>Profile<select name="profile">%s</select></label>' % options)
+    auth_choices = [("api-key", "API key (recommended)"),
+                    ("saved-login", "Allow saved CLI login")]
+    if auth == "legacy":
+        auth_choices.append(("legacy", "Existing behavior (review)"))
+    fields += '<label>Authentication<select name="auth">%s</select></label>' % "".join(
+        '<option value="%s"%s>%s</option>' % (
+            value, " selected" if value == auth else "", label)
+        for value, label in auth_choices)
+    fields += ('<p class="note">API key requires a profile with ANTHROPIC_API_KEY '
+               'for Claude, or OPENAI_API_KEY and a separate CODEX_HOME under '
+               'your home directory for Codex. Save keys in the profile '
+               'editor. Codex stores its API login in that CODEX_HOME.</p>')
     if mode != "profile":
         selected = "issues" if creating else next(
             (key for key, (_label, rule) in WATCH_EVENTS.items()
@@ -6154,10 +6206,21 @@ def render_webhooks(watches):
         note = str(entry.get("note") or "")
         prompt = hook_preamble(topic, note, stamp, str(entry.get("name") or ""))
         profile, missing = hook_resolved_profile(topic, note, stamp, str(entry.get("name") or ""))
+        auth = (entry.get("spawnConfig") or {}).get("authMode", "legacy")
+        if auth == "api-key":
+            status = hook_auth_status(
+                (entry.get("spawnConfig") or {}).get("profile", ""), auth, stamp,
+                int(time.monotonic() // 5))
+            auth_label = "Auth: API key" if status.get("ready") else (
+                "Auth: API key needs setup - " + str(status.get("reason") or "check profile"))
+        elif auth == "saved-login":
+            auth_label = "Auth: saved CLI login allowed"
+        else:
+            auth_label = "Auth: existing behavior (review)"
         rows.append(render_webhook_row(
             topic,
             [display_event_expiry(entry.get("expiresIn")),
-             display_hook_profile(profile, missing)],
+             display_hook_profile(profile, missing), auth_label],
             # Only when the prompt could not be rendered: then the note is
             # the one thing left that says why this watch exists.
             "" if prompt else note,
@@ -8347,6 +8410,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  "page. Open a session and run "
                                  "`agent-box-webhook rotate SOURCE`."), "error"),
         "webhook_saved": ("Automatic session rule saved. Changes apply to the next event.", "ok"),
+        "webhook_auth": (("API-key setup is incomplete. Choose a profile with the required "
+                          "provider key (and a separate CODEX_HOME for Codex), then save again."), "error"),
         "webhook_invalid": (("Could not save the rule. Check its topic, name, profile and event predicate. "
                              "Rule names must be unique within a topic."), "error"),
         "webhook_deleted": ("Event rule deleted. The change applies to the next event.", "ok"),
@@ -9715,7 +9780,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._redirect(ok, back_page)
         elif path == BASE + "/webhooks/save" and WEBHOOKS:
             ok = webhook_save(form)
-            self._redirect("ok=webhook_saved" if ok else "ok=webhook_invalid")
+            self._redirect("ok=webhook_auth" if ok == "auth" else
+                           "ok=webhook_saved" if ok else "ok=webhook_invalid")
         elif path == BASE + "/webhooks/unsubscribe" and WEBHOOKS:
             topic = (form.get("topic", [""])[0]).strip()
             key = (form.get("key", [""])[0]).strip()
