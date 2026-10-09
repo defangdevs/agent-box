@@ -316,6 +316,11 @@ let
     # library it has no need of.
     (pkgs.writers.writePython3Bin "agent-box-webhook-backfill" { }
       (readSrc "webhook-backfill.py"))
+    # Same peer producer as the NixOS module: pairing and signed outbound
+    # delivery only. The remote receiver remains this profile's pinned
+    # local-webhook, so native boxes do not grow a parallel message daemon.
+    (pkgs.writers.writePython3Bin "agent-box-peer" { flakeIgnore = [ "E501" ]; }
+      (readSrc "peer-cli.py"))
   ];
 
   # Tools agents assume exist, kept in step with the module's
