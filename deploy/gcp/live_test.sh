@@ -8,7 +8,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 project=""; zone=europe-west2-a; machine=e2-medium
 name="abx-gcp-test-$(date +%m%d%H%M)-$RANDOM"; skip_reboot=false
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
     --project) project=$2; shift 2;;
     --zone) zone=$2; shift 2;;
@@ -18,7 +18,7 @@ while [ $# -gt 0 ]; do
     *) echo "unknown flag $1" >&2; exit 2;;
   esac
 done
-[ -n "$project" ] || { echo "--project required" >&2; exit 2; }
+[[ -n "$project" ]] || { echo "--project required" >&2; exit 2; }
 G=(gcloud --project "$project" --quiet)
 user=workspace
 results=()
@@ -73,16 +73,16 @@ ip="$("${G[@]}" compute addresses describe "$name-ip" --region "$region" --forma
 url="https://$ip/$user/"
 
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$url")"
-[ "$code" = 401 ] && pass "web: verified TLS for the bare IP, 401 without credentials" || fail "web: unauthenticated GET" "got $code"
+[[ "$code" = 401 ]] && pass "web: verified TLS for the bare IP, 401 without credentials" || fail "web: unauthenticated GET" "got $code"
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -u "$user:$(cat "$work/pw")" "$url")"
 case "$code" in 2*|3*) pass "web: right password accepted ($code)";; *) fail "web: right password" "got $code";; esac
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -u "$user:wrong-password-xyz" "$url")"
-[ "$code" = 401 ] && pass "web: wrong password refused" || fail "web: wrong password" "got $code"
+[[ "$code" = 401 ]] && pass "web: wrong password refused" || fail "web: wrong password" "got $code"
 alias_url="https://${ip//./-}.sslip.io/$user/"
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 "$alias_url")"
 case "$code" in 000) fail "web: sslip.io alias TLS" "000";; *) pass "web: sslip.io alias answers over verified TLS ($code)";; esac
 
-if [ -f "$HERE/agent-box/scripts/ws_smoke.py" ]; then
+if [[ -f "$HERE/agent-box/scripts/ws_smoke.py" ]]; then
   # Informational only: a fresh web-enabled box seeds no session (issues
   # #416/#468), so "no sessions" is the expected first-boot answer.
   "$py" -m pip install -q websocket-client >/dev/null 2>&1 || true
@@ -91,7 +91,7 @@ if [ -f "$HERE/agent-box/scripts/ws_smoke.py" ]; then
 fi
 
 sa="$("${G[@]}" compute instances describe "$name" --zone "$zone" --format 'value(serviceAccounts)')"
-[ -z "$sa" ] && pass "iam: no service account attached" || fail "iam: service account attached" "$sa"
+[[ -z "$sa" ]] && pass "iam: no service account attached" || fail "iam: service account attached" "$sa"
 md="$("${G[@]}" compute instances describe "$name" --zone "$zone" --format json)"
 if grep -qF "$(cat "$work/pw")" <<<"$md"; then fail "secrets: plaintext password visible in instance metadata"; else pass "secrets: plaintext password not in instance metadata"; fi
 
@@ -99,14 +99,14 @@ serial="$("${G[@]}" compute instances get-serial-port-output "$name" --zone "$zo
 grep -q 'zram module present' <<<"$serial" && echo "INFO zram: in the base kernel modules on this image"
 grep -q 'linux-modules-extra unavailable' <<<"$serial" && echo "INFO zram: linux-modules-extra unavailable (degraded, not broken)"
 
-if [ "$skip_reboot" = false ]; then
+if [[ "$skip_reboot" = false ]]; then
   echo "== reboot (reset)"
   "${G[@]}" compute instances reset "$name" --zone "$zone" >/dev/null
   ok=false
   for _ in $(seq 1 40); do
     sleep 10
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url")"
-    [ "$code" = 401 ] && { ok=true; break; }
+    [[ "$code" = 401 ]] && { ok=true; break; }
   done
   $ok && pass "reboot: URL back with the same certificate path ($(since))" || fail "reboot: URL not back" "last $code"
   serial="$("${G[@]}" compute instances get-serial-port-output "$name" --zone "$zone" 2>/dev/null)"
@@ -118,7 +118,7 @@ if [ "$skip_reboot" = false ]; then
   for _ in $(seq 1 40); do
     sleep 10
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url")"
-    [ "$code" = 401 ] && { ok=true; break; }
+    [[ "$code" = 401 ]] && { ok=true; break; }
   done
   $ok && pass "stop/start: same static IP, URL back ($(since))" || fail "stop/start: URL not back" "last $code"
 fi

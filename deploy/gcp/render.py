@@ -60,20 +60,17 @@ def render(*, public_ip, password_hash, user="workspace",
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--public-ip", required=True)
-    p.add_argument("--password-hash-file", required=True)
     p.add_argument("--user", default="workspace")
     p.add_argument("--flake-ref", default="github:defangdevs/agent-box")
     p.add_argument("--sslip-domains", default='["sslip.io"]')
-    p.add_argument("--agents-md-file")
     p.add_argument("--portal-issuer", default="")
     p.add_argument("--portal-user", default="")
     a = p.parse_args()
     sys.stdout.write(render(
         public_ip=a.public_ip,
-        password_hash=Path(a.password_hash_file).read_text().strip(),
+        password_hash=sys.stdin.read().strip(),  # stdin: no path argument to trust
         user=a.user, flake_ref=a.flake_ref,
         sslip_domains=json.loads(a.sslip_domains),
-        agents_md=Path(a.agents_md_file).read_text() if a.agents_md_file else "",
         portal_issuer=a.portal_issuer, portal_user=a.portal_user))
 
 

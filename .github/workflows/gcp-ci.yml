@@ -34,9 +34,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq bubblewrap shellcheck
-          python3 -m pip install --quiet pyyaml argon2-cffi
+          python3 -m pip install --quiet --only-binary :all: pyyaml==6.0.3 argon2-cffi==25.1.0
           CADDY_VERSION=2.11.2
-          curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" \
+          curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" \
             | sudo tar -xz -C /usr/local/bin caddy
 
       - name: Check the launcher, the bootstrap and the hash

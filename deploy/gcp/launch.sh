@@ -28,7 +28,7 @@ password_hash=""
 timeout_min=25
 
 usage() { sed -n '2,13p' "$0"; echo "flags: --project --zone --name --machine-type --disk-gb --user --flake-ref --allow-cidr --sslip-domains JSON --debug-ssh --labels k=v,.. --password-hash HASH | --password-hash-file F --timeout-min N"; exit 2; }
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
     --project) project=$2; shift 2;;
     --zone) zone=$2; shift 2;;
@@ -47,7 +47,7 @@ while [ $# -gt 0 ]; do
     *) usage;;
   esac
 done
-[ -n "$project" ] || { echo "No project: pass --project or run 'gcloud config set project <id>'." >&2; exit 2; }
+[[ -n "$project" ]] || { echo "No project: pass --project or run 'gcloud config set project <id>'." >&2; exit 2; }
 [[ "$name" =~ ^[a-z]([-a-z0-9]{0,40}[a-z0-9])?$ ]] || { echo "--name must be a lowercase GCE name (max 42 chars)" >&2; exit 2; }
 region="${zone%-*}"
 case "$machine" in
@@ -62,7 +62,7 @@ G=(gcloud --project "$project" --quiet)
 
 # Pin the runtime to the commit this script was cloned at, so a box is
 # reproducible (the AWS buttons are pinned at publish time; Azure's is not).
-if [ -z "$flake_ref" ]; then
+if [[ -z "$flake_ref" ]]; then
   if rev="$(git -C "$HERE" rev-parse HEAD 2>/dev/null)" && \
      git -C "$HERE" remote get-url origin 2>/dev/null | grep -q 'defangdevs/agent-box'; then
     flake_ref="github:defangdevs/agent-box/$rev"
@@ -74,16 +74,16 @@ fi
 
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 password=""
-if [ -n "$password_hash" ]; then
+if [[ -n "$password_hash" ]]; then
   printf '%s\n' "$password_hash" > "$work/hash"
   hash_file="$work/hash"
 fi
-if [ -z "$hash_file" ]; then
+if [[ -z "$hash_file" ]]; then
   # Generate the password here and send GCP only its argon2id hash: instance
   # metadata is readable by every project Viewer and by every process on the
   # box (same reasoning as the AWS launch page, issue #25).
   venv="${XDG_CACHE_HOME:-$HOME/.cache}/agent-box-gcp-venv"
-  [ -x "$venv/bin/python" ] || { python3 -m venv "$venv" && "$venv/bin/pip" install -q argon2-cffi; }
+  [[ -x "$venv/bin/python" ]] || { python3 -m venv "$venv" && "$venv/bin/pip" install -q argon2-cffi; }
   password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
   # Caddy's defaults (golang.org/x/crypto/argon2 IDKey: t=1, m=46 MiB, p=1, 32-byte key).
   printf %s "$password" | "$venv/bin/python" -c '
@@ -109,7 +109,7 @@ echo "== network"
 "${G[@]}" compute firewall-rules describe "$name-https" >/dev/null 2>&1 || \
   "${G[@]}" compute firewall-rules create "$name-https" --network "$name-net" \
     --direction INGRESS --allow tcp:443 --source-ranges "$allow_cidr" --target-tags "$name"
-if [ "$debug_ssh" = true ]; then
+if [[ "$debug_ssh" = true ]]; then
   "${G[@]}" compute firewall-rules describe "$name-iap-ssh" >/dev/null 2>&1 || \
     "${G[@]}" compute firewall-rules create "$name-iap-ssh" --network "$name-net" \
       --direction INGRESS --allow tcp:22 --source-ranges 35.235.240.0/20 --target-tags "$name"
@@ -123,8 +123,8 @@ echo "== static IPv4"
     { "${G[@]}" compute addresses update "$name-ip" --region "$region" --update-labels "$labels" || true; }; }
 ip="$("${G[@]}" compute addresses describe "$name-ip" --region "$region" --format 'value(address)')"
 
-python3 "$HERE/render.py" --public-ip "$ip" --password-hash-file "$hash_file" \
-  --user "$user" --flake-ref "$flake_ref" --sslip-domains "$sslip" > "$work/startup.sh"
+python3 "$HERE/render.py" --public-ip "$ip" \
+  --user "$user" --flake-ref "$flake_ref" --sslip-domains "$sslip" < "$hash_file" > "$work/startup.sh"
 
 echo "== VM $name ($machine, $image_family) at $ip"
 "${G[@]}" compute instances create "$name" --zone "$zone" \
@@ -141,7 +141,7 @@ echo "== VM $name ($machine, $image_family) at $ip"
 echo "== waiting for first boot (up to ${timeout_min} min)"
 status=""
 deadline=$(( $(date +%s) + timeout_min * 60 ))
-while [ "$(date +%s)" -lt "$deadline" ]; do
+while [[ "$(date +%s)" -lt "$deadline" ]]; do
   status="$("${G[@]}" compute instances get-guest-attributes "$name" --zone "$zone" \
     --query-path agent-box/status --format 'value(value)' 2>/dev/null || true)"
   echo "   $(date -u +%T) ${status:-booting}"
@@ -155,8 +155,8 @@ case "$status" in
     for s in $(python3 -c 'import json,sys; print(" ".join(json.loads(sys.argv[1])))' "$sslip"); do
       echo "  alias: https://${ip//./-}.$s/$user/"
     done
-    [ "$status" = ready ] || echo "  (the TLS certificate was still being issued; give it a minute)"
-    if [ -n "$password" ]; then
+    [[ "$status" = ready ]] || echo "  (the TLS certificate was still being issued; give it a minute)"
+    if [[ -n "$password" ]]; then
       echo "Sign in as '$user' with this password. It is shown once and GCP never saw it:"
       echo "  $password"
     fi

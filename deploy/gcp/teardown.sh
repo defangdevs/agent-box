@@ -3,7 +3,7 @@
 set -uo pipefail
 name=agent-box; zone=us-central1-a
 project="${CLOUDSDK_CORE_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
     --project) project=$2; shift 2;;
     --zone) zone=$2; shift 2;;
@@ -25,5 +25,5 @@ left="$("${G[@]}" compute instances list --filter "name=$name" --format 'value(n
         "${G[@]}" compute addresses list --filter "name=$name-ip" --format 'value(name)'; \
         "${G[@]}" compute firewall-rules list --filter "name~^$name-" --format 'value(name)'; \
         "${G[@]}" compute networks list --filter "name=$name-net" --format 'value(name)')"
-if [ -n "$left" ]; then echo "STILL PRESENT:"; echo "$left"; exit 1; fi
+if [[ -n "$left" ]]; then echo "STILL PRESENT:"; echo "$left"; exit 1; fi
 echo "all $name resources deleted"
