@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# agent-box native bootstrap for Google Compute Engine (PROTOTYPE).
+#
+# Delivered as the instance's `startup-script` metadata value. Unlike Azure's
+# CustomScript extension, GCE runs a startup-script on EVERY boot, so the first
+# real step is a done-marker guard: a box that already bootstrapped exits 0 and
+# leaves `agentbox` and systemd to own the running system.
+#
+# Completion is reported through guest attributes (instance metadata
+# `enable-guest-attributes=TRUE`), which the launcher polls. That replaces the
+# CFN WaitCondition / ARM extension exit code: GCE has no deployment that
+# blocks on a guest script, so without it a launcher could only guess.
+if [ -z "${BASH_VERSION:-}" ]; then exec /bin/bash "$0" "$@"; fi
+set -euo pipefail
+
+DONE=/var/lib/agent-box/.gce-bootstrapped
+if [ -e "$DONE" ]; then
+  echo "agent-box: already bootstrapped ($(cat "$DONE")); nothing to do"
+  exit 0
+fi
+
+MD=http://metadata.google.internal/computeMetadata/v1
+report() {
+  # Best effort: a box whose guest attributes are disabled must still boot.
+  curl -fsS -X PUT --data "$2" -H 'Metadata-Flavor: Google' \
+    "$MD/instance/guest-attributes/agent-box/$1" >/dev/null 2>&1 || true
+}
+# On any non-zero exit, report which stage died, so the launcher can say more
+# than "it failed" without anyone reading the serial console.
+stage=starting
+on_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then report status "failed:$stage:exit-$rc"; fi
+}
+trap on_exit EXIT
+step() { stage=$1; report status "$1"; }
+step running
+
+exec > >(tee -a /var/log/agent-box-bootstrap.log) 2>&1
+set -x
+
+export HOME="${HOME:-/root}"
+export DEBIAN_FRONTEND=noninteractive
+
+# The guest agent starts startup scripts while cloud-init may still be in its
+# own apt phase; same race and same fix as the Azure path.
+cloud-init status --wait || true
+APT="apt-get -o DPkg::Lock::Timeout=600 -qq"
+
+# zram: same guarded fallback as Azure (issue #435). Whether linux-gcp ships
+# zram in the base modules package is one of the things the first live boot
+# answers; the guard makes either answer safe.
+if modinfo zram >/dev/null 2>&1; then
+  echo "zram module present; skipping apt"
+else
+  $APT update || true
+  $APT install -y "linux-modules-extra-$(uname -r)" || \
+    echo "WARNING: linux-modules-extra unavailable; zram will be missing (issue #435)"
+fi
+
+if ! swapon --show=NAME --noheadings | grep -qx /agent-box-swap; then
+  fallocate -l 2G /agent-box-swap || \
+    dd if=/dev/zero of=/agent-box-swap bs=1M count=2048
+  chmod 600 /agent-box-swap
+  mkswap /agent-box-swap
+  swapon /agent-box-swap
+  grep -q '^/agent-box-swap ' /etc/fstab || \
+    echo '/agent-box-swap none swap sw 0 0' >> /etc/fstab
+fi
+
+step installing-nix
+if [ -x /nix/var/nix/profiles/default/bin/nix ]; then
+  echo "nix already present; skipping the installer"
+else
+  curl -fsSL "@@NIXINSTALLER@@" | sh -s -- install linux --no-confirm --determinate
+fi
+set +u
+. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+set -u
+
+step installing-runtime
+AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
+# shellcheck disable=SC2050  # constant after rendering, by design
+if [ '@@IMAGERUNTIME@@' = true ]; then
+  if [ ! -x "$AGENTBOX" ]; then
+    echo "imageIncludesRuntime was set but the agent-box runtime profile is absent" >&2
+    exit 1
+  fi
+  echo "using image-provided agent-box runtime"
+else
+  nix profile install \
+    --profile /nix/var/nix/profiles/agent-box \
+    "@@FLAKEREF@@#runtime"
+fi
+
+step configuring
+install -d -m 0755 /etc/agent-box
+
+# The launcher reserved the static address before creating the VM and passes
+# it in; cross-check it against what the metadata server says is attached, so
+# a mismatch fails the boot instead of minting a certificate for the wrong IP.
+public_ip="$(printf %s '@@PUBLICIPB64@@' | base64 -d)"
+if ! [[ "$public_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+  echo "public IP is not a plain IPv4 address" >&2
+  exit 1
+fi
+attached_ip="$(curl -fsS -H 'Metadata-Flavor: Google' \
+  "$MD/instance/network-interfaces/0/access-configs/0/external-ip")"
+if [ "$attached_ip" != "$public_ip" ]; then
+  echo "metadata server reports $attached_ip, launcher passed $public_ip" >&2
+  exit 1
+fi
+
+portal_issuer="$(printf %s '@@PORTALISSUERB64@@' | base64 -d)"
+portal_user="$(printf %s '@@PORTALUSERIDB64@@' | base64 -d)"
+if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
+  if ! [[ "$portal_issuer" =~ ^https://[A-Za-z0-9._~:/?#@\!\&\(\)*+,\;=%-]+$ ]]; then
+    echo "portalIssuer is not a plain https:// URL" >&2
+    exit 1
+  fi
+  if ! [[ "$portal_user" =~ ^[A-Za-z0-9_.:@+-]{1,256}$ ]]; then
+    echo "portalUser is not a plain account id" >&2
+    exit 1
+  fi
+fi
+
+if ! box_aliases="$(SSLIP_DOMAINS_JSON="$(printf %s '@@SSLIPDOMAINSB64@@' | base64 -d)" PUBLIC_IP="$public_ip" python3 - <<'PY'
+import json
+import os
+import re
+import sys
+
+suffixes = json.loads(os.environ["SSLIP_DOMAINS_JSON"])
+pattern = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$")
+if not isinstance(suffixes, list) or not all(isinstance(value, str) for value in suffixes):
+    sys.exit("sslipDomains must be an array of DNS suffix strings")
+if len(suffixes) != len(set(suffixes)):
+    sys.exit("sslipDomains must not contain duplicates")
+if not all(pattern.fullmatch(value) for value in suffixes):
+    sys.exit("sslipDomains entries must be DNS suffixes")
+dashed = os.environ["PUBLIC_IP"].replace(".", "-")
+aliases = [f"{dashed}.{suffix}" for suffix in suffixes]
+if any(len(alias) > 253 for alias in aliases):
+    sys.exit("sslipDomains entries make a hostname longer than 253 characters")
+print(json.dumps(aliases, separators=(",", ":")))
+PY
+)"; then
+  exit 1
+fi
+
+user_name="$(printf %s '@@USERB64@@' | base64 -d)"
+if ! [[ "$user_name" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+  echo "userName is not a plain Linux user name" >&2
+  exit 1
+fi
+
+cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
+domain: '@DOMAIN@'
+agents: [claude, codex]
+web:
+  enable: true
+  aliases: @ALIASES@
+  portalIssuer: '@PORTALISSUER@'
+users:
+  @USER@:
+    root: true
+    portalUser: '@PORTALUSERID@'
+AGENTBOX_CONFIG
+esc_issuer=$(printf '%s' "$portal_issuer" | sed -e 's/[&\]/\\&/g')
+esc_user=$(printf '%s' "$portal_user" | sed -e 's/[&\]/\\&/g')
+esc_domain=$(printf '%s' "$public_ip" | sed -e 's/[&\]/\\&/g')
+sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@ALIASES@|$box_aliases|; s|@DOMAIN@|$esc_domain|; s|@USER@|$user_name|" \
+  /etc/agent-box/config.yaml
+
+install -d -m 0755 /etc/agent-box-guides
+printf %s '@@AGENTSMDB64@@' | base64 -d > /etc/agent-box-guides/AGENTS.stack.md
+
+# The launcher hashed the password (argon2id) before it ever left the
+# deployer's machine, exactly like the AWS launch page (issue #25): instance
+# metadata is readable by anyone with compute.instances.get on the project and
+# by every process on the box, so it must never carry the plaintext.
+step applying
+set +x
+AGENT_BOX_WEB_PASSWORD_HASH="$(printf %s '@@WEBPASSWORDHASHB64@@' | base64 -d)" \
+  "$AGENTBOX" apply --first-boot
+set -x
+
+# The URL only works once Caddy holds a certificate for the IP. Wait for it
+# here so "ready" means the link works (Station's starting_workspace lesson,
+# ADR-0008 point 7), bounded so a stuck ACME order reports instead of hangs.
+# Any HTTP status at all means curl completed a verified TLS handshake for the
+# IP; 000 means it did not (no certificate yet, or nothing listening).
+step waiting-for-tls
+final=ready-tls-pending
+for _ in $(seq 1 60); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "https://$public_ip/" || true)"
+  if [ "$code" != 000 ]; then
+    final=ready
+    break
+  fi
+  sleep 5
+done
+
+install -d -m 0700 /var/lib/agent-box
+date -u +%FT%TZ > "$DONE"
+report status "$final"
+echo "agent-box bootstrap complete"
