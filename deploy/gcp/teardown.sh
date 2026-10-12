@@ -23,7 +23,7 @@ done
 "${G[@]}" compute networks delete "$name-net" || true
 left="$("${G[@]}" compute instances list --filter "name=$name" --format 'value(name)'; \
         "${G[@]}" compute addresses list --filter "name=$name-ip" --format 'value(name)'; \
-        "${G[@]}" compute firewall-rules list --filter "name~^$name-" --format 'value(name)'; \
+        "${G[@]}" compute firewall-rules list --filter "name=($name-https $name-iap-ssh)" --format 'value(name)'; \
         "${G[@]}" compute networks list --filter "name=$name-net" --format 'value(name)')"
 if [[ -n "$left" ]]; then echo "STILL PRESENT:"; echo "$left"; exit 1; fi
 echo "all $name resources deleted"

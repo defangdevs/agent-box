@@ -196,7 +196,7 @@ def run_boot(script, meta_ip, cap, state):
 def test_boot(h):
     import yaml
     root = Path(tempfile.mkdtemp())
-    cap = root / "cap"; cap.mkdir(); os.chmod(root, 0o777); os.chmod(cap, 0o777)
+    cap = root / "cap"; cap.mkdir()
     state = root / "state"
     md = "Use pnpm.\nAGENTBOX_CONFIG\n$(id)\n"
     script = render(public_ip=IP, password_hash=h, agents_md=md,
@@ -234,8 +234,8 @@ def test_boot(h):
 
 
 def test_mismatch(h):
-    root = Path(tempfile.mkdtemp()); os.chmod(root, 0o777)
-    cap = root / "cap"; cap.mkdir(); os.chmod(cap, 0o777)
+    root = Path(tempfile.mkdtemp())
+    cap = root / "cap"; cap.mkdir()
     script = render(public_ip=IP, password_hash=h)
     r = run_boot(script, "35.1.1.1", cap, root / "state")
     attrs = (cap / "guest-attrs").read_text().split() if (cap / "guest-attrs").exists() else []
