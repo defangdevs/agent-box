@@ -945,11 +945,18 @@ sync_codex_threads() {
   while IFS=$'\t' read -r _name _rc _profile; do
     case "$_name" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
     [ "$_profile" != "." ] || _profile=""
+    _cxhome="$(resolve_codex_home "$_profile")"
     _thread=""
     if [ "$_rc" = true ]; then
+      _source="$($JQ -r --arg s "$_name" \
+        'if has($s) then (.[$s].source // "manual") else empty end' \
+        "$HOME/.local/state/local-whatsapp/codex-threads.json" 2>/dev/null)" || _source=""
+      if [ -n "$_source" ] && [ "$_source" != agent-box ] \
+        && [ -n "$(codex_registered_thread "$_name" "$_cxhome")" ]; then
+        continue
+      fi
       session_watches_events "$_name" && _thread="$(codex_wake_thread "$_name")"
     else
-      _cxhome="$(resolve_codex_home "$_profile")"
       _source="$($JQ -r --arg s "$_name" '.[$s].source // empty' \
         "$HOME/.local/state/local-whatsapp/codex-threads.json" 2>/dev/null)" || _source=""
       if [ "$_source" = agent-box ] \

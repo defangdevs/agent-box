@@ -169,11 +169,17 @@ sed -n '/^sync_codex_threads() {$/,/^}$/p' "$SUPERVISOR" > "$TEST_ROOT/sync.sh"
 . "$TEST_ROOT/sync.sh"
 REGISTRY_FILE="$TEST_ROOT/sessions.json"
 cat > "$REGISTRY_FILE" <<'JSON'
-{"sessions":{"tui":{"agent":"codex","remoteControl":false,"whatsapp":true},"remote":{"agent":"codex","remoteControl":true,"profile":"phone","whatsapp":true},"effective":{"agent":"codex","whatsapp":false},"unselected":{"agent":"codex","whatsapp":false},"claude":{"agent":"claude","whatsapp":true},"stopped":{"agent":"codex","stopped":true,"whatsapp":true}}}
+{"sessions":{"tui":{"agent":"codex","remoteControl":false,"whatsapp":true},"remote":{"agent":"codex","remoteControl":true,"profile":"phone","whatsapp":true},"manual-remote":{"agent":"codex","remoteControl":true,"profile":"manual","whatsapp":true},"effective":{"agent":"codex","whatsapp":false},"unselected":{"agent":"codex","whatsapp":false},"claude":{"agent":"claude","whatsapp":true},"stopped":{"agent":"codex","stopped":true,"whatsapp":true}}}
 JSON
 printf '{"session":"effective"}' > "$state/target.json"
+manual_thread=01a10365-0000-7000-8000-000000000006
+mkdir -p "$TEST_ROOT/home-for-manual/sessions/2026/10/03"
+touch "$TEST_ROOT/home-for-manual/sessions/2026/10/03/rollout-x-$manual_thread.jsonl"
+$JQ --arg t "$manual_thread" '. + {"manual-remote": {thread: $t}}' \
+  "$state/codex-threads.json" > "$state/codex-threads.new"
+mv "$state/codex-threads.new" "$state/codex-threads.json"
 calls="$TEST_ROOT/sync-calls"
-session_watches_events() { [ "$1" = remote ]; }
+session_watches_events() { [ "$1" = remote ] || [ "$1" = manual-remote ]; }
 codex_wake_thread() { printf '%s' 01a10362-0000-7000-8000-000000000003; }
 resolve_codex_home() { printf '%s' "$TEST_ROOT/home-for-${1:-default}"; }
 session_launch_id() { printf '%s' launch-for-"$1"; }
@@ -198,5 +204,7 @@ grep -Fx 'effective:01a10364-0000-7000-8000-000000000005' "$calls" >/dev/null \
   || { echo "FAIL: the bridge's effective target was not synchronized" >&2; exit 1; }
 [ "$(wc -l < "$calls")" = 3 ] \
   || { echo "FAIL: stopped, unselected, or non-Codex session was synchronized" >&2; exit 1; }
+! grep -F 'manual-remote:' "$calls" >/dev/null \
+  || { echo "FAIL: a manual Remote Control registration was overwritten" >&2; exit 1; }
 
 echo "codex_registered_thread: ok"
