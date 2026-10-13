@@ -154,6 +154,8 @@ ul.tbl.subs li { padding-left: 40px; }
 .conn-code { font-size: 15px; letter-spacing: 1px; color: #e6edf3; }
 .conn-error { color: #f85149; }
 .conn-field { gap: 6px; }
+.conn-country { flex: 0 0 7em; }
+.conn-national { flex: 1 1 180px; }
 .btn { font: inherit; font-size: 13px; font-weight: 500; padding: 5px 14px;
        border-radius: 6px; border: 1px solid #30363d; background: #21262d;
        color: #e6edf3; cursor: pointer; white-space: nowrap; }

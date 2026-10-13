@@ -6412,14 +6412,18 @@ def render_connect_step(state):
             f'<div class="conn-step"><form method="post" action="{base}/connect/start" '
             'class="row conn-form">'
             f'<input type="hidden" name="flow" value="{flow_id}">'
-            '<label class="field conn-field"><span class="note">Your WhatsApp '
-            'number, starting with + and country code</span>'
-            '<input type="tel" name="phone" autocomplete="off" '
-            'inputmode="tel" enterkeyhint="go" '
-            'placeholder="+1 (555) 123-2435" aria-label="WhatsApp phone number"></label>'
+            '<label class="field conn-field conn-country"><span class="note">Country code</span>'
+            '<input type="tel" name="phone_country" autocomplete="tel-country-code" '
+            'inputmode="tel" maxlength="4" pattern="\\+[0-9]{1,3}" '
+            'placeholder="+1" aria-label="WhatsApp country calling code"></label>'
+            '<label class="field conn-field conn-national"><span class="note">WhatsApp '
+            'number</span><input type="tel" name="phone" autocomplete="tel-national" '
+            'inputmode="tel" enterkeyhint="go" placeholder="(555) 123-2435" '
+            'aria-label="WhatsApp national phone number"></label>'
             f'{render_whatsapp_profile_field()}'
             '<button type="submit" class="btn">Pair device</button></form>'
-            '<p class="note">Phone punctuation is accepted. Leave the number blank to use '
+            '<p class="note">Phone punctuation is accepted. Keep the country calling code '
+            'separate so browser autofill cannot remove it. Leave both fields blank to use '
             '<code>LOCAL_WHATSAPP_PHONE</code> saved under Secrets.</p></div>'
         )
     if state["state"] == "starting":
@@ -9077,22 +9081,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if action == "start":
                 if flow["id"] == "whatsapp":
                     raw_phone = form.get("phone", [""])[0].strip()
+                    raw_country = form.get("phone_country", [""])[0].strip()
                     phone = ""
-                    if raw_phone:
-                        # `autocomplete="tel"` let Mobile Safari replace a
-                        # +1 contact number with its national form. The bridge
-                        # cannot infer the missing country code, so make the
-                        # international marker explicit and reject that lossy
-                        # substitution (issue #820). ASCII only: \D would keep
-                        # Unicode digits the bridge drops.
-                        phone = re.sub(r"[ ()+.-]", "", raw_phone)
-                        if not (raw_phone.startswith("+")
-                                and re.fullmatch(r"\+[0-9 ().-]+", raw_phone)
+                    if raw_country or raw_phone:
+                        # Safari can replace a full +1 contact value with its
+                        # national form even though autocomplete="tel" means
+                        # the full international number. The settings form
+                        # therefore uses separate standard country/national
+                        # controls. Keep accepting a lone full `phone` value
+                        # for Station and older clients, but never infer a
+                        # missing country (issue #820).
+                        combined = raw_phone
+                        if raw_country:
+                            if (not raw_phone
+                                    or not re.fullmatch(r"\+[0-9]{1,3}", raw_country)
+                                    or not re.fullmatch(r"[0-9 ().-]+", raw_phone)):
+                                combined = ""
+                            else:
+                                combined = raw_country + " " + raw_phone
+                        phone = re.sub(r"[ ()+.-]", "", combined)
+                        # ASCII only: \D would keep Unicode digits the bridge
+                        # drops.
+                        if not (combined.startswith("+")
+                                and re.fullmatch(r"\+[0-9 ().-]+", combined)
                                 and phone.isascii() and phone.isdigit()
                                 and 7 <= len(phone) <= 15):
                             self._send_html(render_page(
-                                "Enter a valid WhatsApp number starting with + "
-                                "and country code.",
+                                "Enter a valid country calling code and WhatsApp number.",
                                 kind="error"), status=400)
                             return
                     profile = form.get("profile", [""])[0].strip()
