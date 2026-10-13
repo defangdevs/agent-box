@@ -94,6 +94,8 @@ grep -qF 'codex_target="$(codex_rollout_uuid "$bid" "$cxhome")"' "$SUPERVISOR" \
   || { echo "FAIL: start_session no longer passes CODEX_HOME to codex_rollout_uuid" >&2; exit 1; }
 grep -qF '|| codex_target="$(codex_registered_thread "$sname" "$cxhome")"' "$SUPERVISOR" \
   || { echo "FAIL: start_session no longer falls back to codex_registered_thread" >&2; exit 1; }
+grep -qF '  sync_codex_threads' "$SUPERVISOR" \
+  || { echo "FAIL: reconcile loop no longer publishes Codex threads" >&2; exit 1; }
 
 # The resume arm must use the filtering helper rather than appending a
 # persisted `resume ID` after its own (#845).
@@ -132,5 +134,77 @@ expect_resume_command "codex resume --model gpt-5 -- $live" \
   resume -- "$live" --model gpt-5
 expect_resume_command "codex resume --model gpt-5 -- $live" --model gpt-5
 expect_resume_command "codex resume -- $live"
+
+# Publishing a discovered rollout creates the exact bridge registry shape,
+# preserves unrelated manual registrations, and refuses unsafe inputs.
+sed -n '/^codex_publish_thread() {$/,/^}$/p' "$SUPERVISOR" > "$TEST_ROOT/publish.sh"
+[ -s "$TEST_ROOT/publish.sh" ] || { echo "codex_publish_thread not found" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$TEST_ROOT/publish.sh"
+rm -f "$state/codex-threads.json"
+codex_publish_thread codex "$live"
+[ "$($JQ -r '.codex.thread' "$state/codex-threads.json")" = "$live" ] \
+  || { echo "FAIL: discovered thread was not published" >&2; exit 1; }
+[ "$($JQ -r '.codex.source' "$state/codex-threads.json")" = agent-box ] \
+  || { echo "FAIL: automatic registration is not identified" >&2; exit 1; }
+[ "$(stat -c %a "$state/codex-threads.json")" = 600 ] \
+  || { echo "FAIL: registration is not private" >&2; exit 1; }
+$JQ '.manual={thread:"remote-task"}' "$state/codex-threads.json" > "$state/add"
+mv "$state/add" "$state/codex-threads.json"
+codex_publish_thread second "$gone"
+[ "$($JQ -r '.manual.thread' "$state/codex-threads.json")" = remote-task ] \
+  || { echo "FAIL: publishing replaced another registration" >&2; exit 1; }
+before="$($JQ -c . "$state/codex-threads.json")"
+codex_publish_thread '../escape' "$live"
+codex_publish_thread codex not-a-uuid
+[ "$($JQ -c . "$state/codex-threads.json")" = "$before" ] \
+  || { echo "FAIL: unsafe registration input changed state" >&2; exit 1; }
+
+# The reconcile pass covers WhatsApp-selected TUI and subscribed Remote
+# Control sessions and keeps all @tsv columns non-empty, so an absent profile
+# cannot shift fields.
+sed -n '/^sync_codex_threads() {$/,/^}$/p' "$SUPERVISOR" > "$TEST_ROOT/sync.sh"
+[ -s "$TEST_ROOT/sync.sh" ] || { echo "sync_codex_threads not found" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$TEST_ROOT/sync.sh"
+REGISTRY_FILE="$TEST_ROOT/sessions.json"
+cat > "$REGISTRY_FILE" <<'JSON'
+{"sessions":{"tui":{"agent":"codex","remoteControl":false,"whatsapp":true},"remote":{"agent":"codex","remoteControl":true,"profile":"phone","whatsapp":true},"manual-remote":{"agent":"codex","remoteControl":true,"profile":"manual","whatsapp":true},"effective":{"agent":"codex","whatsapp":false},"unselected":{"agent":"codex","whatsapp":false},"claude":{"agent":"claude","whatsapp":true},"stopped":{"agent":"codex","stopped":true,"whatsapp":true}}}
+JSON
+printf '{"session":"effective"}' > "$state/target.json"
+manual_thread=01a10365-0000-7000-8000-000000000006
+mkdir -p "$TEST_ROOT/home-for-manual/sessions/2026/10/03"
+touch "$TEST_ROOT/home-for-manual/sessions/2026/10/03/rollout-x-$manual_thread.jsonl"
+$JQ --arg t "$manual_thread" '. + {"manual-remote": {thread: $t}}' \
+  "$state/codex-threads.json" > "$state/codex-threads.new"
+mv "$state/codex-threads.new" "$state/codex-threads.json"
+calls="$TEST_ROOT/sync-calls"
+session_watches_events() { [ "$1" = remote ] || [ "$1" = manual-remote ]; }
+codex_wake_thread() { printf '%s' 01a10362-0000-7000-8000-000000000003; }
+resolve_codex_home() { printf '%s' "$TEST_ROOT/home-for-${1:-default}"; }
+session_launch_id() { printf '%s' launch-for-"$1"; }
+codex_rollout_uuid() {
+  case "$1" in
+    launch-for-tui) _resolved=01a10363-0000-7000-8000-000000000004 ;;
+    launch-for-effective) _resolved=01a10364-0000-7000-8000-000000000005 ;;
+    (*) return 0 ;;
+  esac
+  [ "$2" = "$TEST_ROOT/home-for-default" ] || return 0
+  printf '%s' "$_resolved"
+}
+codex_publish_thread() { printf '%s:%s\n' "$1" "$2" >> "$calls"; }
+codex_sync_last=0
+touch "$state/ready"
+sync_codex_threads
+grep -Fx 'tui:01a10363-0000-7000-8000-000000000004' "$calls" >/dev/null \
+  || { echo "FAIL: TUI rollout was not synchronized" >&2; exit 1; }
+grep -Fx 'remote:01a10362-0000-7000-8000-000000000003' "$calls" >/dev/null \
+  || { echo "FAIL: Remote Control wake thread was not synchronized" >&2; exit 1; }
+grep -Fx 'effective:01a10364-0000-7000-8000-000000000005' "$calls" >/dev/null \
+  || { echo "FAIL: the bridge's effective target was not synchronized" >&2; exit 1; }
+[ "$(wc -l < "$calls")" = 3 ] \
+  || { echo "FAIL: stopped, unselected, or non-Codex session was synchronized" >&2; exit 1; }
+! grep -F 'manual-remote:' "$calls" >/dev/null \
+  || { echo "FAIL: a manual Remote Control registration was overwritten" >&2; exit 1; }
 
 echo "codex_registered_thread: ok"

@@ -202,6 +202,7 @@ class WhatsAppConnectTest(unittest.TestCase):
         self.assertIn("Pair device", idle)
         waiting = self.daemon.render_connect_card(
             base_state(id="whatsapp", state="waiting", code="7JVT986A"))
+        self.assertIn("7JVT-986A", waiting)
         self.assertIn('data-copy="7JVT986A"', waiting)
         self.assertIn("Linked devices", waiting)
         self.assertNotIn('name="phone"', waiting)
