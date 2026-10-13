@@ -886,6 +886,91 @@ codex_wake_thread() {
   printf '%s' "$_thread"
 }
 
+codex_publish_thread() {
+  # codex_publish_thread SESSION THREAD -- publish the real Codex queue target
+  # for local-whatsapp. The bridge addresses an agent-box session by NAME,
+  # but `codex queue` accepts a Codex UUID or exact conversation title; those
+  # are unrelated values. Publishing the rollout UUID makes the bridge's
+  # existing name -> thread resolution authoritative (issue #819).
+  _session=$1
+  _thread=$2
+  case "$_session" in (*[!A-Za-z0-9_-]*|"") return 0 ;; esac
+  case "$_thread" in
+    (*[!0-9a-fA-F-]*) return 0 ;;
+    (????????-????-????-????-????????????) ;;
+    (*) return 0 ;;
+  esac
+  _dir="$HOME/.local/state/local-whatsapp"
+  if [ ! -d "$_dir" ]; then
+    mkdir -m 700 -p "$_dir" 2>/dev/null || return 0
+  fi
+  [ ! -L "$_dir" ] || return 0
+  chmod 700 "$_dir" 2>/dev/null || return 0
+  _registry="$_dir/codex-threads.json"
+  [ ! -L "$_registry" ] || return 0
+  _current="$($JQ -r --arg s "$_session" '.[$s].thread // empty' \
+    "$_registry" 2>/dev/null)" || _current=""
+  _source="$($JQ -r --arg s "$_session" '.[$s].source // empty' \
+    "$_registry" 2>/dev/null)" || _source=""
+  [ "$_current" != "$_thread" ] || [ "$_source" != agent-box ] || return 0
+  _pending="$(mktemp "$_registry.XXXXXX" 2>/dev/null)" || return 0
+  _at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [ -r "$_registry" ]; then
+    $JQ --arg s "$_session" --arg t "$_thread" --arg at "$_at" \
+      '.[$s] = {thread: $t, registeredAt: $at, source: "agent-box"}' \
+      "$_registry" > "$_pending" 2>/dev/null || { rm -f "$_pending"; return 0; }
+  else
+    $JQ -n --arg s "$_session" --arg t "$_thread" --arg at "$_at" \
+      '{($s): {thread: $t, registeredAt: $at, source: "agent-box"}}' \
+      > "$_pending" 2>/dev/null || { rm -f "$_pending"; return 0; }
+  fi
+  chmod 600 "$_pending" 2>/dev/null || { rm -f "$_pending"; return 0; }
+  mv -f "$_pending" "$_registry" 2>/dev/null || rm -f "$_pending"
+}
+
+codex_sync_last=0
+sync_codex_threads() {
+  # Resolve newly-started Codex sessions after their rollout appears. Codex
+  # does expose the UUID to SessionStart hooks, but releases 0.148 through
+  # 0.161 can time out before a hook command body runs; the supervisor already
+  # owns all inputs needed to resolve the same id without that lifecycle race.
+  # Ten seconds bounds the scan cost for the selected prompt-less session
+  # while staying below local-whatsapp's normal retry interval.
+  [ -f "$HOME/.local/state/local-whatsapp/ready" ] || return 0
+  _now="$(date +%s)"
+  [ "$((_now - codex_sync_last))" -ge 10 ] || return 0
+  codex_sync_last=$_now
+  _target="$($JQ -r '.session // empty' \
+    "$HOME/.local/state/local-whatsapp/target.json" 2>/dev/null)" || _target=""
+  while IFS=$'\t' read -r _name _rc _profile; do
+    case "$_name" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
+    [ "$_profile" != "." ] || _profile=""
+    _thread=""
+    if [ "$_rc" = true ]; then
+      session_watches_events "$_name" && _thread="$(codex_wake_thread "$_name")"
+    else
+      _cxhome="$(resolve_codex_home "$_profile")"
+      _source="$($JQ -r --arg s "$_name" '.[$s].source // empty' \
+        "$HOME/.local/state/local-whatsapp/codex-threads.json" 2>/dev/null)" || _source=""
+      if [ "$_source" = agent-box ] \
+        && [ -n "$(codex_registered_thread "$_name" "$_cxhome")" ]; then
+        continue
+      fi
+      _launch="$(session_launch_id "$_name")"
+      _thread="$(codex_rollout_uuid "$_launch" "$_cxhome")"
+    fi
+    [ -n "$_thread" ] && codex_publish_thread "$_name" "$_thread"
+  done < <($JQ -r --arg target "$_target" '
+    .sessions | to_entries[]
+    | select((.value.agent // "") == "codex"
+        and .value.stopped != true
+        and (.value.whatsapp == true or .key == $target))
+    | [.key,
+       (if .value.remoteControl == true then "true" else "false" end),
+       (.value.profile // ".")]
+    | @tsv' "$REGISTRY_FILE" 2>/dev/null)
+}
+
 start_session() {
   sname=$1
   sjson="$($JQ -c --arg s "$sname" '.sessions[$s] // empty' "$REGISTRY_FILE")" || return 0
@@ -1709,6 +1794,7 @@ while true; do
     esac
     $TMUX has-session -t "=$sname" 2>/dev/null || start_session "$sname"
   done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$REGISTRY_FILE" 2>/dev/null)
+  sync_codex_threads
   supervise_whatsapp
   sleep 2
 done

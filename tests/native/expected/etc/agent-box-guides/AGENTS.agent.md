@@ -249,11 +249,14 @@ messages wait for it to return. Selecting a different target does not require
 pairing again. Restart a running Claude session after selecting it so it loads
 the WhatsApp channel.
 
-A Codex Remote Control task has its own thread ID, which the box's session
-name alone cannot identify. From inside the active Codex task, run
-`node ~/.local/share/local-whatsapp/bridge.mjs register codex` once to bind
-it to that session name. Repeat after a different task takes over the same
-session. A normal Codex TUI uses the session name directly. For a native image reply,
+A normal Codex TUI is registered automatically after its rollout starts, so
+WhatsApp resolves the agent-box session name to the real Codex thread ID. A
+Codex Remote Control task has its own thread ID, which the box's session name
+alone cannot identify. A task with an active webhook subscription is also
+registered automatically; otherwise, from inside the active Codex task run `node
+~/.local/share/local-whatsapp/bridge.mjs register codex` once to bind it to
+that session name. Repeat after a different task takes over the same session.
+For a native image reply,
 run `node ~/.local/share/local-whatsapp/bridge.mjs reply-image MESSAGE_ID /absolute/path/picture.png "caption"`. Claude uses
 `whatsapp_reply_image` with the message ID, absolute image path, and optional
 caption. PNG, JPEG, and WebP files are supported, up to 10 MiB, with at most

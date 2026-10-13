@@ -6380,12 +6380,15 @@ def render_connect_step(state):
     )
     if flow_id == "whatsapp":
         if state["state"] == "waiting" and state["code"]:
+            code = state["code"]
+            shown = (code[:4] + "-" + code[4:]
+                     if re.fullmatch(r"[A-Z0-9]{8}", code) else code)
             return (
                 '<div class="conn-step"><p class="note">On your phone, open '
                 'WhatsApp &rarr; Linked devices &rarr; Link a device &rarr; '
                 'Link with phone number instead. Enter this code:</p>'
-                f'<p><code class="conn-code">{html.escape(state["code"])}</code>'
-                f'{copy_button("the pairing code", value=state["code"])}</p>'
+                f'<p><code class="conn-code">{html.escape(shown)}</code>'
+                f'{copy_button("the pairing code", value=code)}</p>'
                 f'{cancel}</div>'
             )
         if state["state"] in ("starting", "exchanging", "waiting"):
