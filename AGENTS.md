@@ -52,6 +52,15 @@ box rediscover it.
 
 `modules/agent-box.nix` is the portable NixOS module and the repository's main implementation. It is **generated** — do not edit it by hand. The sources are `modules/agent-box.nix.in` (the Nix template) plus the assets under `modules/src/` (e.g. the settings daemon), stitched together by `bin/assemble-module.py` via `@@include:...@@` markers. `flake.nix` exposes the module, VM image, and CI checks. Host examples live in `hosts/`; one cloud provider per directory under `deploy/` (see `deploy/README.md`) carries that provider's deployment configuration and operational notes — `deploy/aws/` (CloudFormation) and `deploy/azure/` (Bicep source plus its compiled ARM JSON, which is a build artifact - see `deploy/azure/README.md`), and a new provider gets a sibling there rather than a new top-level directory. Put NixOS integration tests in `tests/*.nix`, live browser tests in `tests/e2e/*.spec.ts`, maintenance utilities in `scripts/`, and website images or static content in `docs/`.
 
+## Deployment backend policy
+
+Design new portable cloud deployments for the native ordinary-Linux backend
+first. Keep provider-specific code to provisioning, first-boot transport, and
+completion reporting; reuse the pinned runtime, `/etc/agent-box/config.yaml`,
+and `agentbox apply` for behavior. NixOS remains a supported appliance backend,
+but must not become a prerequisite for supporting a provider. The decision and
+its tradeoffs are recorded in [`docs/deployment-model.md`](docs/deployment-model.md).
+
 Keep the module self-contained: deployed boxes fetch `modules/agent-box.nix` as a single file, so it must not import sibling files. This is why the sources are re-embedded at build time rather than loaded with `readFile` — after editing the template or `modules/src/`, run `nix run .#assemble` and commit the regenerated `modules/agent-box.nix` (CI's `module-generated-up-to-date` check fails on drift).
 
 ## Build, Test, and Development Commands

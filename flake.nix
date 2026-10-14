@@ -489,6 +489,61 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             touch "$out"
           '';
 
+          # Hetzner's provider layer is intentionally thin: render its
+          # cloud-init payload with inert test data, syntax-check both source
+          # and result, and inspect the declarative config that the native
+          # agentbox renderer receives. This is a native check on every
+          # architecture and performs no cloud operation.
+          hetzner-deploy = pkgs.runCommand "agent-box-hetzner-deploy-ok" {
+            nativeBuildInputs = [
+              pkgs.bash
+              pkgs.coreutils
+              pkgs.git
+              pkgs.gnugrep
+              pkgs.jq
+              pkgs.shellcheck
+              (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
+            ];
+          } ''
+            bash -n ${./deploy/hetzner/bootstrap.sh.in}
+            bash -n ${./deploy/hetzner/render-user-data.sh}
+            bash -n ${./deploy/hetzner/deploy.sh}
+            shellcheck -S warning \
+              ${./deploy/hetzner/bootstrap.sh.in} \
+              ${./deploy/hetzner/render-user-data.sh} \
+              ${./deploy/hetzner/deploy.sh}
+            bash ${./deploy/hetzner/deploy.sh} --help >/dev/null
+
+            export AGENT_BOX_FLAKE_REF=github:defangdevs/agent-box/0000000000000000000000000000000000000000
+            export AGENT_BOX_WEB_PASSWORD_HASH='$argon2id$v=19$m=65536,t=3,p=1$c2FsdA$aGFzaA'
+            export AGENT_BOX_AGENTS_MD_FILE=${./deploy/hetzner/AGENTS.md}
+            export AGENT_BOX_BOOTSTRAP_TEMPLATE=${./deploy/hetzner/bootstrap.sh.in}
+            rendered="$TMPDIR/hetzner-user-data"
+            bash ${./deploy/hetzner/render-user-data.sh} > "$rendered"
+            bash -n "$rendered"
+            ! grep -q '@@' "$rendered"
+            test "$(wc -c < "$rendered")" -le 32768
+
+            config_b64="$(sed -n "s/^AGENT_BOX_CONFIG_B64='\([^']*\)'$/\1/p" "$rendered")"
+            test -n "$config_b64"
+            printf '%s' "$config_b64" | base64 -d > "$TMPDIR/config.yaml"
+            python3 - "$TMPDIR/config.yaml" <<'PY'
+            import sys
+            import yaml
+
+            with open(sys.argv[1]) as fh:
+                config = yaml.safe_load(fh)
+            assert config == {
+                "domain": "auto",
+                "domainSuffixes": ["sslip.io"],
+                "agents": ["claude", "codex"],
+                "web": {"enable": True},
+                "users": {"workspace": {"root": True}},
+            }
+            PY
+            touch "$out"
+          '';
+
           # Eval-level assertion; cheap.
           multi-user = assert missing == [ ];
             pkgs.runCommand "agent-box-multi-user-ok" { } ''

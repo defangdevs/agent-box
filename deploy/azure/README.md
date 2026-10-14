@@ -12,6 +12,10 @@ user choose Claude Code or Codex.
 
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fdefangdevs%2Fagent-box%2Fmaster%2Fdeploy%2Fazure%2Fagent-box.json)
 
+Azure uses the repository's native-cloud default; the reasons and the boundary
+with the supported NixOS appliance backend are recorded in the shared
+[deployment-model decision](../../docs/deployment-model.md).
+
 ## What the template does
 
 - Provisions a vnet (`10.42.0.0/16`, one `/24` subnet — same CIDR as the AWS

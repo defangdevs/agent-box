@@ -213,7 +213,9 @@ disposable, snapshot-able KVM guests.
   NixOS system, and renders as an equivalent pinned Nix profile for the
   Lightsail box, which stays on its stock Ubuntu blueprint. A deployed box
   can fast-forward itself to this repo's latest release on request — no
-  image rebuild pipeline, on either OS.
+  image rebuild pipeline, on either OS. See
+  [the deployment-model decision](./docs/deployment-model.md) for why portable
+  cloud deployments default to ordinary Linux while NixOS remains supported.
 
 ## Quick start (bare metal, multiple users)
 

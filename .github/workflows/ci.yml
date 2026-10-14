@@ -15,6 +15,9 @@ on:
       # Native test/validator edits must trigger the discovered checks too.
       - 'tests/**'
       - 'scripts/**'
+      # Provider bootstrap shell is covered by the hetzner-deploy native
+      # check. Keep that check running when only its templates or docs move.
+      - 'deploy/hetzner/**'
       # Every workflow, not just this one: CI validates no other workflow's
       # YAML, so a file that cannot parse is simply never run and nothing
       # says so. PR #483 shipped exactly that — vendor-updates.yml had a

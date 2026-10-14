@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Native agent-box bootstrap for a Hetzner Cloud Ubuntu image.
+#
+# render-user-data.sh replaces only base64-shaped placeholders below. Keeping
+# provider input out of shell syntax makes this file safe to hand directly to
+# Hetzner as cloud-init user data.
+if [ -z "${BASH_VERSION:-}" ]; then exec /bin/bash "$0" "$@"; fi
+set -euxo pipefail
+exec > >(tee /var/log/agent-box-bootstrap.log) 2>&1
+
+export HOME="${HOME:-/root}"
+export DEBIAN_FRONTEND=noninteractive
+
+AGENT_BOX_FLAKE_REF_B64='@@FLAKE_REF_B64@@'
+AGENT_BOX_NIX_INSTALLER_B64='@@NIX_INSTALLER_B64@@'
+AGENT_BOX_CONFIG_B64='@@CONFIG_B64@@'
+AGENT_BOX_AGENTS_MD_B64='@@AGENTS_MD_B64@@'
+AGENT_BOX_WEB_PASSWORD_HASH_B64='@@WEB_PASSWORD_HASH_B64@@'
+AGENT_BOX_IMAGE_INCLUDES_RUNTIME='@@IMAGE_INCLUDES_RUNTIME@@'
+
+decode() {
+  printf '%s' "$1" | base64 -d
+}
+
+# Match Azure's native bootstrap: slim Ubuntu cloud kernels may split zram
+# into linux-modules-extra. The memory-pressure service is best effort, so a
+# missing package warns but never hides an otherwise healthy deployment.
+APT='apt-get -o DPkg::Lock::Timeout=600 -qq'
+if modinfo zram >/dev/null 2>&1; then
+  echo 'zram module already present; skipping apt'
+else
+  $APT update || true
+  $APT install -y "linux-modules-extra-$(uname -r)" || \
+    echo 'WARNING: linux-modules-extra unavailable; zram will be missing'
+fi
+
+# The runtime substitution and later agent work both benefit from disk swap.
+if ! swapon --show=NAME --noheadings | grep -qx /agent-box-swap; then
+  fallocate -l 2G /agent-box-swap || \
+    dd if=/dev/zero of=/agent-box-swap bs=1M count=2048
+  chmod 600 /agent-box-swap
+  mkswap /agent-box-swap
+  swapon /agent-box-swap
+  printf '%s\n' '/agent-box-swap none swap sw 0 0' >> /etc/fstab
+fi
+
+# Nix supplies the software; Ubuntu remains the operating system and owns its
+# base packages and security updates. A baked snapshot already has Nix and the
+# runtime closure, so both installation steps have explicit fast paths.
+if [ -x /nix/var/nix/profiles/default/bin/nix ]; then
+  echo 'nix already present (image-provided); skipping the installer'
+else
+  nix_installer="$(decode "$AGENT_BOX_NIX_INSTALLER_B64")"
+  curl -fsSL "$nix_installer" \
+    | sh -s -- install linux --no-confirm --determinate
+fi
+
+set +u
+. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+set -u
+
+flake_ref="$(decode "$AGENT_BOX_FLAKE_REF_B64")"
+AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
+if [ "$AGENT_BOX_IMAGE_INCLUDES_RUNTIME" = true ]; then
+  if [ ! -x "$AGENTBOX" ]; then
+    echo 'imageIncludesRuntime is true but the runtime profile is absent' >&2
+    exit 1
+  fi
+  echo 'using image-provided agent-box runtime'
+else
+  nix profile install \
+    --profile /nix/var/nix/profiles/agent-box \
+    "$flake_ref#runtime"
+fi
+
+# The renderer builds this YAML only from validated DNS and Linux-name values
+# before it enters user data, so no provider value is interpolated on the VM.
+# `domain: auto` is the same native first-boot contract Lightsail uses.
+install -d -m 0755 /etc/agent-box /etc/agent-box-guides
+decode "$AGENT_BOX_CONFIG_B64" > /etc/agent-box/config.yaml
+printf '\n' >> /etc/agent-box/config.yaml
+chmod 0644 /etc/agent-box/config.yaml
+decode "$AGENT_BOX_AGENTS_MD_B64" > /etc/agent-box-guides/AGENTS.hetzner.md
+printf '\n' >> /etc/agent-box-guides/AGENTS.hetzner.md
+chmod 0644 /etc/agent-box-guides/AGENTS.hetzner.md
+
+# The hash, never the plaintext password, rides in Hetzner user data. Keep it
+# out of the bootstrap log anyway; apply stores it root-readable and generates
+# the per-box cookie secret locally.
+set +x
+web_password_hash="$(decode "$AGENT_BOX_WEB_PASSWORD_HASH_B64")"
+AGENT_BOX_WEB_PASSWORD_HASH="$web_password_hash" \
+  "$AGENTBOX" apply --first-boot --settle-delay 0
+unset web_password_hash
+set -x
+
+echo 'agent-box bootstrap complete'
