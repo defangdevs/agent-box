@@ -191,11 +191,14 @@ starts a new session with the profile selected in Connections; with no
 selection, it uses the box's default profile. Send `@agent /profile NAME` to
 change the profile and make the next message start fresh, or
 `@agent /profile default` to use the default profile. The CLI equivalents are
-`agent-box-session whatsapp candidates`, `select NAME`, `clear`, and
-`spawn PROFILE|default`. A stopped session can remain a target; queued
-messages wait for it to return. Selecting a different target does not require
-pairing again. Restart a running Claude session after selecting it so it loads
-the WhatsApp channel.
+`agent-box-session whatsapp candidates`, `select NAME`, `activate NAME`,
+`clear`, and `spawn PROFILE|default`. A stopped session is a cold conversation:
+the next message asks the shared capacity policy to reactivate that exact
+session and resume its native harness thread. If no slot is available or that
+selected session no longer exists, the message remains queued on the same
+target instead of starting a replacement.
+Selecting a different target does not require pairing again. Restart a running
+Claude session after selecting it so it loads the WhatsApp channel.
 
 A normal Codex TUI is registered automatically after its rollout starts, so
 WhatsApp resolves the agent-box session name to the real Codex thread ID. A
