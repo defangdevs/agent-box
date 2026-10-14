@@ -80,7 +80,7 @@ sys.exit(int(os.environ["FAILURE"]))
         self.assertEqual(len(matrix), len(LANES))
         self.assertEqual({row["lane"]: row["jobs"] for row in matrix},
                          {lane: spec["jobs"] for lane, spec in LANES.items()})
-        self.assertEqual(sum(row["jobs"] for row in matrix), 4)
+        self.assertEqual(sum(row["jobs"] for row in matrix), 5)
 
     def test_gate_rejects_failure_cancellation_and_skipped_jobs(self):
         gate = WORKFLOW["jobs"]["validate"]

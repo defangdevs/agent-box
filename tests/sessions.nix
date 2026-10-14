@@ -2,9 +2,10 @@
 # users. One hardened unit per USER supervises tmux sessions declared in the
 # user-owned ~/.config/agent-box/sessions.json.
 #
-# This half owns everything that happens BELOW the browser — the supervisor,
-# the session CLI and the agent harnesses. The browser surface on top of the
-# same box is tests/sessions-web.nix, and the box both drive is
+# These two parts own everything that happens BELOW the browser - the
+# supervisor, the session CLI and the agent harnesses. They evaluate from this
+# file as independent VM checks so their runtime is parallel, while the browser
+# surface remains in tests/sessions-web.nix. Every check drives the box in
 # tests/sessions-common.nix (issue #312: this was one 1870-line test that ran
 # for 325s and held all of CI open behind it). Exercises:
 #   - first-boot seeding of the Nix-declared config into sessions.json
@@ -39,12 +40,13 @@
 #
 # Like the other tests, the shared node lib.mkForce-swaps the module
 # Caddyfile for a minimal `tls internal` one (no ACME in the sandbox).
-{ agent-box }:
+{ agent-box, part ? "harness" }:
+assert builtins.elem part [ "harness" "lifecycle" ];
 let
   common = import ./sessions-common.nix { inherit agent-box; };
 in
 {
-  name = "agent-box-sessions";
+  name = "agent-box-sessions-${part}";
   node.pkgsReadOnly = false;
 
   nodes.machine = common.machineNode;
@@ -78,6 +80,7 @@ in
 
     # --- first boot: legacy options seeded a "main" session --------------
     machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=120)
+  '' + (if part == "harness" then ''
     # Issue #78: this disk is fresh on every run, so ~/.config does not
     # exist yet when tmpfiles processes the rules — the exact condition
     # under which the parent-dir rule (#356) matters. Before that fix,
@@ -1138,6 +1141,7 @@ in
         "/home/agent/.config/agent-box/sessions.json"
     )
 
+  '' else ''
     # --- kickoff prompt: fires once, then resumes -------------------------
     with subtest("kickoff prompt is delivered once and consumed"):
         machine.succeed(
@@ -2116,6 +2120,7 @@ in
         )
 
 
+  '') + (if part == "harness" then ''
     # --- two writers of sessions.json (issue #254, tests from #285) --------
     # Every writer of the registry rewrites the WHOLE document through
     # tmp+rename. That makes a reader safe and says nothing about the interval
@@ -2304,5 +2309,5 @@ in
         assert "does not parse" in journal, journal
         machine.succeed(as_agent(f"rm -f {sfile}.corrupt-*"))
 
-  '';
+  '' else "");
 }
