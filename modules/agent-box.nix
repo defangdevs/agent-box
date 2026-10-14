@@ -723,11 +723,14 @@ let
     selection, it uses the box's default profile. Send `@agent /profile NAME` to
     change the profile and make the next message start fresh, or
     `@agent /profile default` to use the default profile. The CLI equivalents are
-    `agent-box-session whatsapp candidates`, `select NAME`, `clear`, and
-    `spawn PROFILE|default`. A stopped session can remain a target; queued
-    messages wait for it to return. Selecting a different target does not require
-    pairing again. Restart a running Claude session after selecting it so it loads
-    the WhatsApp channel.
+    `agent-box-session whatsapp candidates`, `select NAME`, `activate NAME`,
+    `clear`, and `spawn PROFILE|default`. A stopped session is a cold conversation:
+    the next message asks the shared capacity policy to reactivate that exact
+    session and resume its native harness thread. If no slot is available or that
+    selected session no longer exists, the message remains queued on the same
+    target instead of starting a replacement.
+    Selecting a different target does not require pairing again. Restart a running
+    Claude session after selecting it so it loads the WhatsApp channel.
 
     A normal Codex TUI is registered automatically after its rollout starts, so
     WhatsApp resolves the agent-box session name to the real Codex thread ID. A
@@ -4776,7 +4779,7 @@ usage() {
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
-  echo "       agent-box-session whatsapp candidates | ls | select NAME | clear"
+  echo "       agent-box-session whatsapp candidates | ls | select NAME | activate NAME | clear"
   echo "                             | spawn PROFILE|default | NAME on|off|status"
   echo "       agent-box-session env ls | set KEY VALUE | set KEY --stdin | rm KEY"
   echo "         (--stdin reads the value from stdin: for a multi-line secret"
@@ -5207,6 +5210,41 @@ case "$cmd" in
       "$JQ" -cn --arg name "$selected" --arg harness "$harness" \
         --argjson stopped "$("$JQ" -r --arg n "$selected" '.sessions[$n].stopped == true' "$REGISTRY_FILE")" \
         '{name: $name, harness: $harness, stopped: $stopped}'
+      registry_unlock
+      exit 0
+    fi
+    if [ "$name" = activate ]; then
+      selected="''${2:-}"
+      [ $# -eq 2 ] && valid_name "$selected" || { usage >&2; exit 2; }
+      registry_ensure
+      registry_lock
+      taken "$selected" || {
+        echo "no such session: '$selected' (send @$(id -un) /sessions)" >&2
+        exit 2
+      }
+      harness="$("$JQ" -r --arg n "$selected" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
+      if [ "$harness" != claude ] && [ "$harness" != codex ]; then
+        echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+        exit 2
+      fi
+      "$JQ" -e --arg n "$selected" '.sessions[$n].whatsapp == true' \
+        "$REGISTRY_FILE" >/dev/null || {
+          echo "session '$selected' is not the selected WhatsApp target" >&2
+          exit 2
+        }
+      stopped="$("$JQ" -r --arg n "$selected" '.sessions[$n].stopped == true' "$REGISTRY_FILE")"
+      if [ "$stopped" = true ]; then
+        # A stopped session is a cold conversation, not a dead target. Admit
+        # it through the same shared capacity policy as an explicit restart,
+        # but do not bounce a target that is already resident. The supervisor
+        # observes the cleared flag and resumes the harness's native thread.
+        "''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check \
+          "$REGISTRY_FILE" "$selected" >/dev/null
+        registry_edit --arg n "$selected" 'del(.sessions[$n].stopped)'
+      fi
+      "$JQ" -cn --arg name "$selected" --arg harness "$harness" \
+        --argjson activated "$stopped" \
+        '{name: $name, harness: $harness, activated: $activated}'
       registry_unlock
       exit 0
     fi
@@ -5662,12 +5700,12 @@ import time
 from urllib.request import urlopen
 
 
-REV = "7d0d307502b6a78c91f03cae69697618648024e7"
+REV = "0c43bb92ec304a7dd9678e91c8d0e6effc130872"
 FILES = {
-    "bridge.mjs": "d7980210872335ef2f0b2da7bbe401c691a17d8e6ff5f87792d5b32c15356857",
+    "bridge.mjs": "32352a1d1bbea1a9149607e7011102634384d0a66013cab53cf6aaf884ef773a",
     "state.mjs": "0b5ab72f0ae5743656c9bdfdb519a5bf8fa17d8666edc5f63ac863ef745171ed",
-    "package.json": "650a0e170b22d5526b11bcfc3ae28021cbcc0d322d7c78b2327846662d6336ad",
-    "package-lock.json": "06b5213674318e1f4c446cd34f5db729cc612e86b317ce13884cf1187698357d",
+    "package.json": "7fbe6ac66cca21c04cdda94044d30c9953e548f0a6f68bf7f9fa466bb5440666",
+    "package-lock.json": "0b125e7425a1ffb3deb64607727e5b4a19717c585df1815c061ff90c9f4188db",
 }
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"

@@ -69,7 +69,7 @@ usage() {
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session restart NAME | --all"
-  echo "       agent-box-session whatsapp candidates | ls | select NAME | clear"
+  echo "       agent-box-session whatsapp candidates | ls | select NAME | activate NAME | clear"
   echo "                             | spawn PROFILE|default | NAME on|off|status"
   echo "       agent-box-session env ls | set KEY VALUE | set KEY --stdin | rm KEY"
   echo "         (--stdin reads the value from stdin: for a multi-line secret"
@@ -500,6 +500,41 @@ case "$cmd" in
       "$JQ" -cn --arg name "$selected" --arg harness "$harness" \
         --argjson stopped "$("$JQ" -r --arg n "$selected" '.sessions[$n].stopped == true' "$REGISTRY_FILE")" \
         '{name: $name, harness: $harness, stopped: $stopped}'
+      registry_unlock
+      exit 0
+    fi
+    if [ "$name" = activate ]; then
+      selected="${2:-}"
+      [ $# -eq 2 ] && valid_name "$selected" || { usage >&2; exit 2; }
+      registry_ensure
+      registry_lock
+      taken "$selected" || {
+        echo "no such session: '$selected' (send @$(id -un) /sessions)" >&2
+        exit 2
+      }
+      harness="$("$JQ" -r --arg n "$selected" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
+      if [ "$harness" != claude ] && [ "$harness" != codex ]; then
+        echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+        exit 2
+      fi
+      "$JQ" -e --arg n "$selected" '.sessions[$n].whatsapp == true' \
+        "$REGISTRY_FILE" >/dev/null || {
+          echo "session '$selected' is not the selected WhatsApp target" >&2
+          exit 2
+        }
+      stopped="$("$JQ" -r --arg n "$selected" '.sessions[$n].stopped == true' "$REGISTRY_FILE")"
+      if [ "$stopped" = true ]; then
+        # A stopped session is a cold conversation, not a dead target. Admit
+        # it through the same shared capacity policy as an explicit restart,
+        # but do not bounce a target that is already resident. The supervisor
+        # observes the cleared flag and resumes the harness's native thread.
+        "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check \
+          "$REGISTRY_FILE" "$selected" >/dev/null
+        registry_edit --arg n "$selected" 'del(.sessions[$n].stopped)'
+      fi
+      "$JQ" -cn --arg name "$selected" --arg harness "$harness" \
+        --argjson activated "$stopped" \
+        '{name: $name, harness: $harness, activated: $activated}'
       registry_unlock
       exit 0
     fi
