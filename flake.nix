@@ -21,10 +21,15 @@
       imageSystem = "x86_64-linux";
       vmSystems = [ imageSystem ];
 
-      # Across runners, preserve the existing four-test concurrency budget.
+      # Each lane runs one test at a time because a test can boot several
+      # memory-sized guests. The two sessions halves get separate runners so
+      # neither holds the validation critical path behind the other (#860).
       ciVmLanes = {
-        sessions = { jobs = 1; checks = [ "sessions" "session-limit" ]; };
-        webhook = { jobs = 1; checks = [ "webhook" ]; };
+        sessions = { jobs = 1; checks = [ "sessions" ]; };
+        sessions-lifecycle = { jobs = 1; checks = [ "sessions-lifecycle" ]; };
+        # session-limit is shorter than the slack this lane had before #860,
+        # avoiding another checkout and driver-preparation runner.
+        webhook = { jobs = 1; checks = [ "webhook" "session-limit" ]; };
         browser = {
           jobs = 1;
           checks = [ "connect" "sessions-web" "settings-page" ];
@@ -84,7 +89,19 @@
           # runtime session lives inside the hardened unit's cgroup, and the
           # supervisor's own bookkeeping survives two writers racing it.
           sessions = pkgs.testers.runNixOSTest
-            (import ./tests/sessions.nix { agent-box = self.nixosModules.agent-box; });
+            (import ./tests/sessions.nix {
+              agent-box = self.nixosModules.agent-box;
+              part = "harness";
+            });
+
+          # The stateful lifecycle half of the same guest. This was split
+          # from `sessions` when its serial script reached seven minutes and
+          # again dominated the complete CI graph (#860).
+          sessions-lifecycle = pkgs.testers.runNixOSTest
+            (import ./tests/sessions.nix {
+              agent-box = self.nixosModules.agent-box;
+              part = "lifecycle";
+            });
 
           # The browser half of the same box (issue #312 — this and `sessions`
           # were one test that ran for 325s, more than the other five checks

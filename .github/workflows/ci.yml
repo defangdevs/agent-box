@@ -78,6 +78,8 @@ jobs:
         include:
           - lane: sessions
             jobs: 1
+          - lane: sessions-lifecycle
+            jobs: 1
           - lane: webhook
             jobs: 1
           - lane: browser
@@ -103,7 +105,7 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      # Still four simultaneous test derivations per workflow run. Each test can
+      # At most five simultaneous test derivations per workflow run. Each test can
       # boot multiple guests; separate runners reduce contention per guest.
       - name: Run VM tests
         timeout-minutes: 12
