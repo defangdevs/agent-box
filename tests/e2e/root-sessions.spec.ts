@@ -195,12 +195,18 @@ test('workspace repairs a pane whose iframe route no longer matches its session'
     await expect(other).toHaveAttribute('src', `/${USER}/${name}/`);
 
     // Model the stale browser state from issue #855: the second pane keeps its
-    // identifying data-pane stamp but its browsing route points at the first
-    // session. Mark the healthy first iframe so the repair also proves it was
-    // not re-created as collateral damage.
+    // identifying data-pane stamp AND its original src attribute, while its
+    // live browsing history points at the first session. Mark the healthy
+    // first iframe so the repair also proves it was not re-created as
+    // collateral damage.
     await main.evaluate((el) => el.setAttribute('data-keep', 'yes'));
-    await other.evaluate((el, src) => el.setAttribute('src', src), `/${USER}/main/`);
-    await expect(other).toHaveAttribute('src', `/${USER}/main/`);
+    await other.evaluate((el, src) => {
+      (el as HTMLIFrameElement).contentWindow!.location.href = src;
+    }, `/${USER}/main/`);
+    await expect.poll(() => other.evaluate((el) =>
+      (el as HTMLIFrameElement).contentWindow!.location.pathname))
+      .toBe(`/${USER}/main/`);
+    await expect(other).toHaveAttribute('src', `/${USER}/${name}/`);
 
     // Opening the tile runs the same ensurePane reconciliation used by the
     // live session feed. It must rebuild only the mismatched pane.
