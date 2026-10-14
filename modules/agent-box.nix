@@ -3427,6 +3427,17 @@ auth_rejected() {
   esac
   return 1
 }
+# Remote Control enrollment can require an account-side MFA change even when
+# the stored credentials are otherwise valid. Re-authentication alone cannot
+# satisfy that policy, so keep it separate from auth_rejected(): the latter
+# deliberately logs out and starts device auth again. Match both the status and
+# the server's exact reason so an unrelated 403 keeps the ordinary retry path.
+mfa_required() {
+  case "$1" in
+    *"HTTP 403"*"Multi-factor authentication required"*) return 0 ;;
+  esac
+  return 1
+}
 # The only part of the JSON-RPC blob worth showing a human is the server's
 # own message; the URL, cf-ray and status code belong in a bug report.
 auth_reason() {
@@ -3450,7 +3461,8 @@ auth_reason() {
 # before sign-in needs the nudge once credentials exist.
 #
 # Exit status: 0 paired, 2 the credentials were rejected (caller
-# re-authenticates), 1 anything else (already reported, retryable).
+# re-authenticates), 3 the account requires MFA (caller explains the account
+# change), 1 anything else (already reported, retryable).
 pair() {
   attempt=0
   while [ "$attempt" -lt 3 ]; do
@@ -3467,8 +3479,9 @@ pair() {
 EOF
       return 0
     fi
-    # Retrying a token the backend has rejected just prints the same 401
-    # three times over six seconds; hand it to the caller at once.
+    # Neither a rejected token nor an unmet account policy can change during
+    # this retry loop, so hand both to the caller after the first attempt.
+    if mfa_required "$pairout"; then return 3; fi
     if auth_rejected "$pairout"; then return 2; fi
     sleep 2
   done
@@ -3514,6 +3527,13 @@ onboard() {
       printf '\n  ✗ ChatGPT still rejects the credentials: %s\n' "$(auth_reason "$pairout")" >&2
       printf '%s\n' "    Sign-in was already retried once. Type: login  to try again," >&2
       printf '%s\n' "    or check that the account you signed in with has Codex access." >&2
+    elif [ "$pairrc" -eq 3 ]; then
+      printf '\n%s\n' "  ChatGPT requires multi-factor authentication before Remote Control"
+      printf '%s\n' "    can enroll this box. Open https://chatgpt.com/settings/security and"
+      printf '%s\n' "    enable or complete MFA. If it is already enabled, ask your ChatGPT"
+      printf '%s\n' "    workspace admin to confirm Remote Control access. Then type: login  here"
+      printf '%s\n' "    to refresh the credentials and retry pairing. Pressing Enter alone cannot"
+      printf '%s\n' "    fix this requirement."
     fi
   else
     cat <<EOF

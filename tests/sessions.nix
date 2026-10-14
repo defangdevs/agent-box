@@ -699,6 +699,18 @@ in
         " 111)' >&2\n"
         "    exit 1\n"
         "  fi\n"
+        "  if test -f /tmp/stub/mfa; then\n"
+        "    printf '%s\\n' 'Error: remoteControl/pairing/start failed: remote"
+        " control server enrollment failed: HTTP 403 Forbidden, request-id:"
+        " test, body: {\"detail\":\"Multi-factor authentication required\"}' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
+        "  if test -f /tmp/stub/other403; then\n"
+        "    printf '%s\\n' 'Error: remoteControl/pairing/start failed: remote"
+        " control server enrollment failed: HTTP 403 Forbidden, request-id:"
+        " test, body: {\"detail\":\"Workspace access denied\"}' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
         '  echo "Pairing code: TEST-PAIR" ;;\n'
         "esac\n"
         "EOF"
@@ -750,6 +762,27 @@ in
     assert "Press Enter to try again" in offline_out, offline_out
     assert "logout" not in offline_calls, offline_calls
     assert offline_calls.count("remote-control pair") == 3, offline_calls
+
+    # MFA is an account-side enrollment requirement, not a rejected token.
+    # Retrying or deleting valid credentials cannot enable it, so the pane
+    # stops after one call and tells the user which account action comes first.
+    mfa_out, mfa_calls = run_pane("loggedin", "mfa")
+    assert "requires multi-factor authentication" in mfa_out, mfa_out
+    assert "https://chatgpt.com/settings/security" in mfa_out, mfa_out
+    assert "workspace admin" in mfa_out, mfa_out
+    assert "type: login" in mfa_out, mfa_out
+    assert "Press Enter to try again" not in mfa_out, mfa_out
+    assert "logout" not in mfa_calls, mfa_calls
+    assert "login --device-auth" not in mfa_calls, mfa_calls
+    assert mfa_calls.count("remote-control pair") == 1, mfa_calls
+
+    # The classifier requires both the 403 and the exact MFA reason. Another
+    # enrollment 403 stays on the existing retry path and preserves credentials.
+    other403_out, other403_calls = run_pane("loggedin", "other403")
+    assert "Press Enter to try again" in other403_out, other403_out
+    assert "requires multi-factor authentication" not in other403_out, other403_out
+    assert "logout" not in other403_calls, other403_calls
+    assert other403_calls.count("remote-control pair") == 3, other403_calls
 
     # A remote Codex conversation can inherit this pane's $TMUX_PANE and send
     # it a line meant for a real Codex prompt (issue #691) — /rename, or
