@@ -3529,10 +3529,10 @@ onboard() {
       printf '%s\n' "    or check that the account you signed in with has Codex access." >&2
     elif [ "$pairrc" -eq 3 ]; then
       printf '\n%s\n' "  ChatGPT requires multi-factor authentication before Remote Control"
-      printf '%s\n' "    can enroll this box. Open ChatGPT Settings > Security and enable"
-      printf '%s\n' "    or complete MFA. If it is already enabled, ask your ChatGPT workspace"
-      printf '%s\n' "    admin to confirm Remote Control access. Then type: login  here to"
-      printf '%s\n' "    refresh the credentials and retry pairing. Pressing Enter alone cannot"
+      printf '%s\n' "    can enroll this box. Open https://chatgpt.com/settings/security and"
+      printf '%s\n' "    enable or complete MFA. If it is already enabled, ask your ChatGPT"
+      printf '%s\n' "    workspace admin to confirm Remote Control access. Then type: login  here"
+      printf '%s\n' "    to refresh the credentials and retry pairing. Pressing Enter alone cannot"
       printf '%s\n' "    fix this requirement."
     fi
   else

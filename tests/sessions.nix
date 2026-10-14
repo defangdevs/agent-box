@@ -768,7 +768,7 @@ in
     # stops after one call and tells the user which account action comes first.
     mfa_out, mfa_calls = run_pane("loggedin", "mfa")
     assert "requires multi-factor authentication" in mfa_out, mfa_out
-    assert "ChatGPT Settings > Security" in mfa_out, mfa_out
+    assert "https://chatgpt.com/settings/security" in mfa_out, mfa_out
     assert "workspace admin" in mfa_out, mfa_out
     assert "type: login" in mfa_out, mfa_out
     assert "Press Enter to try again" not in mfa_out, mfa_out
