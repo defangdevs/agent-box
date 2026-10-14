@@ -23816,14 +23816,46 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     // iframe, which is what made a working Start look broken (issue #241).
     var want = paneState(name);
     // Panes rendered before this stamp existed are server-rendered iframes.
-    if (cur && (cur.getAttribute("data-ph") || "live") === want) { return cur; }
+    // The data-pane stamp is not enough for a live pane. An iframe's browsing
+    // context can be restored independently of the parent document (or left
+    // on an older history entry), so the node can still SAY `codex` while its
+    // src and loaded document point at `claude`. Reconciliation used to keep
+    // that lie forever, leaving two web tiles attached to the first tmux
+    // session (issue #855).
+    var liveSrc = tabBar().getAttribute("data-term-base") +
+                  encodeURIComponent(name) + "/";
+    var routeMatches = true;
+    if (cur && want === "live") {
+      routeMatches = cur.tagName === "IFRAME" &&
+        cur.getAttribute("src") === liveSrc;
+      // A restored subframe may have the right src ATTRIBUTE but a different
+      // live history entry. about:blank is the ordinary not-loaded-yet state,
+      // so accept it; every loaded ttyd document is same-origin and readable.
+      if (routeMatches) {
+        try {
+          var loaded = cur.contentWindow.location.href;
+          routeMatches = loaded === "about:blank" ||
+            cur.contentWindow.location.pathname ===
+              new URL(liveSrc, window.location.href).pathname;
+        } catch (err) { routeMatches = false; }
+      }
+    }
+    if (cur && (cur.getAttribute("data-ph") || "live") === want &&
+        routeMatches) {
+      // One cell owns one terminal. If an older reconciliation appended a
+      // second pane after failing to find this stamped one, retire that extra
+      // without touching the correctly routed iframe.
+      cell.querySelectorAll(".pane").forEach(function (pane) {
+        if (pane !== cur) { pane.remove(); }
+      });
+      return cur;
+    }
     var el;
     if (want === "live") {
       el = document.createElement("iframe");
       // data-term-base is this user's own path with its trailing slash;
       // a session hangs off it as a path segment, not a query.
-      el.src = tabBar().getAttribute("data-term-base") +
-               encodeURIComponent(name) + "/";
+      el.src = liveSrc;
       el.title = name + " terminal";
       el.setAttribute("allow", "clipboard-read; clipboard-write");
       el.className = "pane";
@@ -23841,6 +23873,9 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     // `active` is the CELL's, so a pane swapped in here carries no state
     // of its own and cannot disagree with the cell it lands in.
     if (cur) { cur.replaceWith(el); } else { cell.appendChild(el); }
+    cell.querySelectorAll(".pane").forEach(function (pane) {
+      if (pane !== el) { pane.remove(); }
+    });
     return el;
   }
   function wsSelect(name, focus) {

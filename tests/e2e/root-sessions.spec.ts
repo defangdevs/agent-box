@@ -166,6 +166,55 @@ test('?view=grid renders the whole grid server-side (the no-JS path)', async ({ 
   await ctx.close();
 });
 
+test('workspace repairs a pane whose iframe route no longer matches its session', async ({ browser }) => {
+  const ctx = await browser.newContext({
+    httpCredentials: { username: USER, password: PASSWORD },
+  });
+  const page = await ctx.newPage();
+
+  // A second session gives the test two real terminal routes. Its name is
+  // daemon-derived, so learn it from the redirect just as the add flow does.
+  const added = await ctx.request.post('/sessions/add', {
+    form: { cwd: '~' },
+    maxRedirects: 0,
+  });
+  expect(added.status()).toBe(303);
+  const name = new URL(added.headers()['location'], 'http://x')
+    .searchParams.get('tab') as string;
+  expect(name).toBeTruthy();
+
+  try {
+    await page.goto('/');
+    await expect(page.locator(`#tab-bar .tab[data-tab="${name}"]`)).toBeVisible();
+    await page.locator('#tab-bar a.viewtog[data-view-to="grid"]').click();
+
+    const main = page.locator(`#panes iframe[data-pane="main"]`);
+    const otherCell = page.locator(`#panes .cell[data-cell="${name}"]`);
+    const other = otherCell.locator('iframe');
+    await expect(main).toHaveAttribute('src', `/${USER}/main/`);
+    await expect(other).toHaveAttribute('src', `/${USER}/${name}/`);
+
+    // Model the stale browser state from issue #855: the second pane keeps its
+    // identifying data-pane stamp but its browsing route points at the first
+    // session. Mark the healthy first iframe so the repair also proves it was
+    // not re-created as collateral damage.
+    await main.evaluate((el) => el.setAttribute('data-keep', 'yes'));
+    await other.evaluate((el, src) => el.setAttribute('src', src), `/${USER}/main/`);
+    await expect(other).toHaveAttribute('src', `/${USER}/main/`);
+
+    // Opening the tile runs the same ensurePane reconciliation used by the
+    // live session feed. It must rebuild only the mismatched pane.
+    await otherCell.locator('.cell-head').click();
+    await expect(otherCell.locator('iframe')).toHaveCount(1);
+    await expect(otherCell.locator('iframe')).toHaveAttribute(
+      'src', `/${USER}/${name}/`);
+    await expect(main).toHaveAttribute('data-keep', 'yes');
+  } finally {
+    await ctx.request.post('/sessions/delete', { form: { name } });
+    await ctx.close();
+  }
+});
+
 test('no root-page href embeds URL userinfo (user@host)', async ({ browser }) => {
   const page = await authedPage(browser);
   await page.goto('/');
