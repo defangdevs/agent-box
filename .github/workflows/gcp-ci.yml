@@ -1,0 +1,43 @@
+name: GCP launcher CI
+
+on:
+  push:
+    branches: [ master ]
+    paths: &gcp-ci-paths
+      - 'deploy/gcp/**'
+      - 'scripts/check_gcp_template.py'
+      - '.github/workflows/gcp-ci.yml'
+  pull_request:
+    paths: *gcp-ci-paths
+  workflow_dispatch:
+
+concurrency:
+  group: gcp-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Check the GCE launcher and its bootstrap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # check_gcp_template.py runs the rendered startup-script as root in a
+      # bubblewrap sandbox (bwrap and passwordless sudo are on ubuntu-latest),
+      # feeds the launcher's argon2id hash to a real Caddy (2.11+ is needed
+      # for argon2id basic_auth), and renders the config.yaml the boot wrote
+      # with the real `agentbox apply --root`.
+      - name: Install the tools the checks drive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap shellcheck
+          python3 -m pip install --quiet --only-binary :all: pyyaml==6.0.3 argon2-cffi==25.1.0
+          CADDY_VERSION=2.11.2
+          curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin caddy
+
+      - name: Check the launcher, the bootstrap and the hash
+        run: python3 scripts/check_gcp_template.py

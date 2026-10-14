@@ -8,6 +8,7 @@ the cost breakdown and what to do when a deployment fails.
 |---|---|---|---|
 | [`aws/`](./aws/README.md) | AWS | `template.yaml` (EC2), `lightsail-template.yaml` (Lightsail) | S3, pinned to the publishing commit by `publish-template.yml` |
 | [`azure/`](./azure/README.md) | Azure | `agent-box.bicep` → `agent-box.json` | `raw.githubusercontent.com` at `master`, unpinned |
+| [`gcp/`](./gcp/README.md) | Google Compute Engine | `launch.sh` + `bootstrap.sh.in` | no button: `gcloud` script run in the user's Cloud Shell |
 
 The templates are the *deployment* layer only. What they install is the
 same everywhere: `modules/agent-box.nix` on a NixOS box, or `agentbox
