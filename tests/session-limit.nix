@@ -143,6 +143,7 @@
     rc, message = machine.execute(f"{cli} add extra --harness claude 2>&1")
     assert rc == 75 and "Session limit reached" in message, (rc, message)
     machine.succeed(f"{cli} stop a")
+    machine.succeed(f"{cli} restart c")
     machine.wait_until_succeeds(f"{panes} has-session -t c")
     rc, message = machine.execute(f"{cli} restart a")
     assert rc == 75, (rc, message)
