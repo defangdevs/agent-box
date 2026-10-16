@@ -2328,7 +2328,9 @@ def remote_cwd(path):
 
 def command_json(argv, env=None):
     try:
-        result = subprocess.run(
+        # argv is an explicit vector assembled from pinned helper paths and a
+        # profile name fixed in the server's forced command; no shell parses it.
+        result = subprocess.run(  # NOSONAR - reviewed argv boundary
             argv,
             env=env,
             stdout=subprocess.PIPE,
@@ -2534,7 +2536,11 @@ def codex_shim():
             isinstance(item, str) for item in profile_args
         ):
             raise AcpLaunchError("invalid Codex profile argument frame")
-        os.execv(native, [str(native), *profile_args, *sys.argv[1:]])
+        # The native path is validated above, profile_args came from the
+        # installed profile resolver, and adapter argv remains literal.
+        os.execv(  # NOSONAR - reviewed argv boundary
+            native, [str(native), *profile_args, *sys.argv[1:]]
+        )
     except (KeyError, json.JSONDecodeError) as error:
         raise AcpLaunchError("invalid Codex shim environment") from error
     return True
@@ -2550,7 +2556,11 @@ def env_ready(profile, argv):
     env = dict(os.environ)
     env["AGENT_BOX_PROFILE"] = profile
     env["AGENT_BOX_ACP_ENV_READY"] = "1"
-    os.execve(env_exec, [env_exec, self_path, *argv], env)
+    # Both executables are pinned by the installed wrapper; argv is the
+    # already-parsed fixed-command configuration and is never shell text.
+    os.execve(  # NOSONAR - reviewed argv boundary
+        env_exec, [env_exec, self_path, *argv], env
+    )
 
 
 async def proxy(config, launch, values):
