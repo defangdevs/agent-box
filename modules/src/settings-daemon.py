@@ -1059,6 +1059,8 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
                       and s.get("remoteControl") is not False]
                 if rc and all(s.get("stopped") for s in rc):
                     rc[0].pop("stopped", None)
+                    rc[0].pop("hibernatedAt", None)
+                    rc[0].pop("hibernationGeneration", None)
                     write_sessions(sessions, version)
                 if rc:
                     return
@@ -9651,6 +9653,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # name that is not there (issue #254).
                     if isinstance(entry, dict):
                         entry["stopped"] = True
+                        entry.pop("hibernatedAt", None)
+                        entry.pop("hibernationGeneration", None)
                         write_sessions(sessions, version)
             except RegistryBusy as exc:
                 self._registry_busy("stop", exc, self._sess_page(form))
@@ -9703,9 +9707,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             self._send_json({"ok": False, "reason": "No such session."},
                                             status=404)
                             return
-                        if isinstance(entry, dict) and entry.pop("stopped", None) is not None:
-                            write_sessions(sessions, version)
-                            ok = "ok=session_started"
+                        if isinstance(entry, dict):
+                            changed = entry.pop("stopped", None) is not None
+                            changed = entry.pop("hibernatedAt", None) is not None or changed
+                            changed = (entry.pop("hibernationGeneration", None)
+                                       is not None) or changed
+                            if changed:
+                                write_sessions(sessions, version)
+                                ok = "ok=session_started"
                 except SessionCapacityError as exc:
                     self._sess_error(form, str(exc), 503)
                     return

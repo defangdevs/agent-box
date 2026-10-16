@@ -1833,9 +1833,25 @@ session_launch_id() {
   printf '%s' "$_v"
 }
 
+session_native_id() {
+  # Exact native transcript behind a stable Agentbox name. Hibernation
+  # refreshes this pointer immediately before stopping the runtime; ordinary
+  # launches refresh it after a successful spawn.
+  _v="$($JQ -r '.nativeSessionId // empty' "$(session_state_file "$1")" 2>/dev/null)" \
+    || _v=""
+  case "$_v" in
+    (*[!0-9a-fA-F-]*) _v="" ;;
+    (????????-????-????-????-????????????) ;;
+    (*) _v="" ;;
+  esac
+  printf '%s' "$_v"
+}
+
 record_launch() {
-  # record_launch SESSION BOXID — remember the id this spawn launched with,
-  # so the next one resumes the same conversation.
+  # record_launch SESSION BOXID - remember the id this spawn launched with,
+  # so the next one resumes the same conversation. Preserve nativeSessionId:
+  # it is the other half of the Agentbox-name -> harness-thread mapping used
+  # to reactivate a hibernated runtime (issue #858).
   #
   # mktemp + rename, not a create-if-absent: a rotation legitimately CHANGES
   # the value, so the last writer must win. mktemp is the exclusive-creation
@@ -1846,7 +1862,45 @@ record_launch() {
   mkdir -p "$SESSION_STATE_DIR" 2>/dev/null || return 0
   _f="$(session_state_file "$1")"
   _t="$(mktemp "$_f.XXXXXX" 2>/dev/null)" || return 0
-  if printf '{"launchSessionId":"%s"}\n' "$2" > "$_t" 2>/dev/null; then
+  if [ -r "$_f" ]; then
+    $JQ --arg b "$2" \
+      '(if type == "object" then . else {} end) | .launchSessionId = $b' \
+      "$_f" > "$_t" 2>/dev/null || { rm -f "$_t"; return 0; }
+  else
+    $JQ -n --arg b "$2" '{launchSessionId: $b}' \
+      > "$_t" 2>/dev/null || { rm -f "$_t"; return 0; }
+  fi
+  if [ -s "$_t" ]; then
+    mv -f "$_t" "$_f" 2>/dev/null || rm -f "$_t"
+  else
+    rm -f "$_t"
+  fi
+}
+
+record_native_session() {
+  # record_native_session SESSION NATIVEID - publish the exact Claude UUID or
+  # Codex rollout UUID behind the stable Agentbox name. The harness remains
+  # the transcript authority; this sidecar is only the pointer needed to
+  # resume it after the disposable runtime is hibernated.
+  case "$2" in
+    (*[!0-9a-fA-F-]*|"") return 0 ;;
+    (????????-????-????-????-????????????) ;;
+    (*) return 0 ;;
+  esac
+  mkdir -p "$SESSION_STATE_DIR" 2>/dev/null || return 0
+  _f="$(session_state_file "$1")"
+  _current="$($JQ -r '.nativeSessionId // empty' "$_f" 2>/dev/null)" || _current=""
+  [ "$_current" != "$2" ] || return 0
+  _t="$(mktemp "$_f.XXXXXX" 2>/dev/null)" || return 0
+  if [ -r "$_f" ]; then
+    $JQ --arg n "$2" \
+      '(if type == "object" then . else {} end) | .nativeSessionId = $n' \
+      "$_f" > "$_t" 2>/dev/null || { rm -f "$_t"; return 0; }
+  else
+    $JQ -n --arg n "$2" '{nativeSessionId: $n}' \
+      > "$_t" 2>/dev/null || { rm -f "$_t"; return 0; }
+  fi
+  if [ -s "$_t" ]; then
     mv -f "$_t" "$_f" 2>/dev/null || rm -f "$_t"
   else
     rm -f "$_t"
@@ -2020,6 +2074,18 @@ codex_rollout_uuid() {
   printf '%s' "${b: -36}"
 }
 
+codex_native_thread() {
+  # Accept a persisted native pointer only while that exact rollout remains
+  # on disk. Empty is the safe answer: the caller can still derive a target
+  # from the launch marker or WhatsApp registration, but never resume a
+  # sibling with `--last`.
+  _thread="$(session_native_id "$1")"
+  [ -n "$_thread" ] || return 0
+  [ -n "$($FIND "${2:-$HOME/.codex}"/sessions \
+      -name "rollout-*-$_thread.jsonl" 2>/dev/null | head -n1)" ] || return 0
+  printf '%s' "$_thread"
+}
+
 codex_registered_thread() {
   # The Codex thread a WhatsApp registration binds to session $1
   # (local-whatsapp's codex-threads.json, keyed by session name), if its
@@ -2139,7 +2205,10 @@ sync_codex_threads() {
       _launch="$(session_launch_id "$_name")"
       _thread="$(codex_rollout_uuid "$_launch" "$_cxhome")"
     fi
-    [ -n "$_thread" ] && codex_publish_thread "$_name" "$_thread"
+    if [ -n "$_thread" ]; then
+      codex_publish_thread "$_name" "$_thread"
+      record_native_session "$_name" "$_thread"
+    fi
   done < <($JQ -r --arg target "$_target" '
     .sessions | to_entries[]
     | select((.value.agent // "") == "codex"
@@ -2278,6 +2347,19 @@ start_session() {
       rotated=true
       hasrun=true
     fi
+    # A hibernation freezes the same rotation in the session sidecar. It is
+    # the durable fallback if the live hook record is pruned or unavailable
+    # before activation, and is trusted only while Claude's own transcript
+    # exists. Never override a newer live hook observation.
+    if [ "$rotated" = false ]; then
+      native="$(session_native_id "$sname")"
+      if [ -n "$native" ] && [ "$native" != "$bid" ] \
+          && claude_has_transcript "$native"; then
+        bid="$native"
+        rotated=true
+        hasrun=true
+      fi
+    fi
   fi
   # Codex needs a concrete delivery target before a prompt can wake it. A
   # TUI session owns a rollout transcript; Remote Control owns whichever
@@ -2292,6 +2374,8 @@ start_session() {
     else
       cxhome="$(resolve_codex_home "$sprofile")"
       codex_target="$(codex_rollout_uuid "$bid" "$cxhome")"
+      [ -n "$codex_target" ] \
+        || codex_target="$(codex_native_thread "$sname" "$cxhome")"
       [ -n "$codex_target" ] \
         || codex_target="$(codex_registered_thread "$sname" "$cxhome")"
     fi
@@ -2742,6 +2826,11 @@ start_session() {
     # window is left to the sweep.)
     if [ "$bid" != "$recorded" ] || [ "$rotated" = true ]; then
       record_launch "$sname" "$bid"
+    fi
+    if [ "$agent" = claude ]; then
+      record_native_session "$sname" "$bid"
+    elif [ "$agent" = codex ] && [ "$rc" = false ] && [ -n "$codex_target" ]; then
+      record_native_session "$sname" "$codex_target"
     fi
     if [ "$launched" != true ] || [ "$rotated" = true ]; then
       mark_started "$sname" "$bid"

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -18,6 +19,8 @@ SRC = ROOT / "modules/src"
 spec = importlib.util.spec_from_file_location("capacity", SRC / "lib/session-capacity.py")
 capacity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(capacity)
+exec(compile((SRC / "lib/session-hibernation.py").read_text(),
+             str(SRC / "lib/session-hibernation.py"), "exec"), capacity.__dict__)
 
 
 def expand(path):
@@ -139,6 +142,189 @@ class Policy(unittest.TestCase):
             self.assertEqual(capacity.capacity_live(), {"main"})
 
 
+class Hibernation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.live = self.home / "live"
+        self.tmux = self.home / "tmux"
+        self.tmux.write_text(
+            "#!" + shutil.which("bash") + "\n"
+            "if [ \"$1 $2 $3\" = '-L agent-box list-sessions' ]; then "
+            "cat \"$TEST_LIVE_FILE\"; exit 0; fi\n"
+            "echo unexpected tmux call >&2; exit 1\n")
+        self.tmux.chmod(0o755)
+        self.env = mock.patch.dict(os.environ, {
+            "HOME": str(self.home),
+            "USER": "tester",
+            "CODEX_HOME": str(self.home / ".codex"),
+            "AGENT_BOX_TMUX_BIN": str(self.tmux),
+            "TEST_LIVE_FILE": str(self.live),
+            "AGENT_BOX_HIBERNATE_IDLE_S": "0",
+            "LOCAL_WEBHOOK_STATE_DIR": str(self.home / "webhook"),
+            "AGENT_BOX_ENVSTORE_BIN": str(self.home / "missing-envstore"),
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def write_json(self, relative, value):
+        path = self.home / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value, separators=(",", ":")) + "\n")
+        return path
+
+    def state(self, name, launch, native=None):
+        value = {"launchSessionId": launch}
+        if native:
+            value["nativeSessionId"] = native
+        self.write_json(".local/state/agent-box/session/%s.json" % name, value)
+
+    def claude(self, name="idle", closed=True):
+        launch = "11111111-1111-4111-8111-111111111111"
+        self.state(name, launch, launch)
+        transcript = self.home / ".claude/projects/-work" / (launch + ".jsonl")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        record = ({"type": "assistant", "message": {
+            "stop_reason": "end_turn", "content": []}}
+                  if closed else
+                  {"type": "user", "message": {"content": "work"}})
+        transcript.write_text(json.dumps(record, separators=(",", ":")) + "\n")
+        self.live.write_text(name + "\n")
+        return {name: {"agent": "claude"}}, transcript
+
+    def test_closed_claude_turn_is_stable_candidate(self):
+        sessions, transcript = self.claude()
+        selected = capacity.hibernation_candidate(sessions)
+        self.assertEqual(selected["name"], "idle")
+        self.assertEqual(selected["nativeSessionId"],
+                         "11111111-1111-4111-8111-111111111111")
+        verified = capacity.hibernation_candidate(
+            sessions, name="idle", token=selected["token"])
+        self.assertEqual(verified["token"], selected["token"])
+        with transcript.open("a") as handle:
+            handle.write(json.dumps({"type": "user", "message": {"content": "new"}})
+                         + "\n")
+        self.assertIsNone(capacity.hibernation_candidate(
+            sessions, name="idle", token=selected["token"]))
+
+    def test_open_truncated_and_recent_claude_turns_stay_resident(self):
+        sessions, transcript = self.claude(closed=False)
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+        transcript.write_text('{"type":"assistant"')
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+        transcript.write_text(json.dumps({"type": "assistant", "message": {
+            "stop_reason": "end_turn"}}) + "\n")
+        os.environ["AGENT_BOX_HIBERNATE_IDLE_S"] = "60"
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+
+    def test_claude_launch_rotation_beats_stale_native_pointer(self):
+        launch = "11111111-1111-4111-8111-111111111111"
+        stale = "22222222-2222-4222-8222-222222222222"
+        current = "33333333-3333-4333-8333-333333333333"
+        self.state("idle", launch, stale)
+        root = self.home / ".claude/projects/-work"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / (stale + ".jsonl")).write_text(json.dumps({
+            "type": "assistant", "message": {"stop_reason": "end_turn"}
+        }) + "\n")
+        (root / (current + ".jsonl")).write_text(json.dumps({
+            "type": "user", "message": {"content": "still working"}
+        }) + "\n")
+        live_id = self.home / ".local/state/agent-box/live-session-id" / launch
+        live_id.parent.mkdir(parents=True, exist_ok=True)
+        live_id.write_text(current + "\n")
+        self.live.write_text("idle\n")
+        sessions = {"idle": {"agent": "claude"}}
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+
+    def test_outstanding_routing_state_excludes_claude(self):
+        sessions, _ = self.claude()
+        self.write_json("webhook/filter.tester-idle.json", {
+            "enabled": True, "topics": [{"topic": "github:o/r"}]})
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+        self.write_json("webhook/filter.tester-idle.json", {
+            "enabled": True, "topics": "malformed"})
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+        self.write_json("webhook/filter.tester-idle.json", {
+            "enabled": False, "topics": [{"topic": "github:o/r"}]})
+        self.write_json(".local/state/agent-box/lease/idle.json", {
+            "outcome": None})
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+        self.write_json(".local/state/agent-box/lease/idle.json", {
+            "outcome": "resolved"})
+        self.write_json(".local/state/local-whatsapp/target.json", [])
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+        self.write_json(".local/state/local-whatsapp/target.json", {
+            "session": "idle"})
+        self.write_json(".local/state/local-whatsapp/messages.json", {
+            "messages": {"m": {"reply": None, "control": False}}})
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+
+    def test_completed_codex_rollout_is_candidate_but_remote_control_is_not(self):
+        launch = "22222222-2222-4222-8222-222222222222"
+        native = "33333333-3333-4333-8333-333333333333"
+        self.state("codex-idle", launch, native)
+        rollout = (self.home / ".codex/sessions/2026/10/16"
+                   / ("rollout-2026-10-16T00-00-00-" + native + ".jsonl"))
+        rollout.parent.mkdir(parents=True, exist_ok=True)
+        rollout.write_text("\n".join(json.dumps(record, separators=(",", ":"))
+                                     for record in [
+            {"type": "event_msg", "payload": {"type": "task_started"}},
+            {"type": "event_msg", "payload": {"type": "task_complete"}},
+            {"type": "event_msg", "payload": {"type": "thread_settings_applied"}},
+        ]) + "\n")
+        self.live.write_text("codex-idle\n")
+        sessions = {"codex-idle": {"agent": "codex", "remoteControl": False}}
+        selected = capacity.hibernation_candidate(sessions)
+        self.assertEqual(selected["nativeSessionId"], native)
+        with rollout.open("a") as handle:
+            handle.write(json.dumps({"type": "event_msg", "payload": {
+                "type": "future_unknown_state"}}) + "\n")
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+        rollout.write_text("\n".join(json.dumps(record, separators=(",", ":"))
+                                     for record in [
+            {"type": "event_msg", "payload": {"type": "task_started"}},
+            {"type": "event_msg", "payload": {"type": "task_complete"}},
+        ]) + "\n")
+        sessions["codex-idle"]["remoteControl"] = True
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+
+    def test_newer_codex_marker_beats_stale_completed_native_pointer(self):
+        launch = "55555555-5555-4555-8555-555555555555"
+        stale = "66666666-6666-4666-8666-666666666666"
+        current = "77777777-7777-4777-8777-777777777777"
+        self.state("codex-idle", launch, stale)
+        root = self.home / ".codex/sessions/2026/10/16"
+        root.mkdir(parents=True, exist_ok=True)
+        old = root / ("rollout-2026-10-16T00-00-00-" + stale + ".jsonl")
+        old.write_text(json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete"}}) + "\n")
+        new = root / ("rollout-2026-10-16T00-00-01-" + current + ".jsonl")
+        new.write_text("\n".join(json.dumps(record) for record in [
+            {"message": "[agent-box session %s]" % launch},
+            {"type": "event_msg", "payload": {"type": "task_started"}},
+        ]) + "\n")
+        os.utime(new, (time.time() + 1, time.time() + 1))
+        self.live.write_text("codex-idle\n")
+        sessions = {"codex-idle": {"agent": "codex", "remoteControl": False}}
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+
+    def test_shell_ephemeral_hook_and_unmapped_sessions_are_ineligible(self):
+        sessions, _ = self.claude()
+        for update in [
+                {"agent": "shell"},
+                {"ephemeral": True},
+                {"origin": "webhook"},
+                {"stopped": True},
+                {"died": 1}]:
+            entry = {"agent": "claude", **update}
+            self.assertIsNone(capacity.hibernation_candidate({"idle": entry}))
+        self.live.write_text("unknown\n")
+        self.assertIsNone(capacity.hibernation_candidate(
+            {"unknown": {"agent": "claude"}}))
+
+
 class Cli(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -153,6 +339,7 @@ class Cli(unittest.TestCase):
         helper = self.work / "capacity"
         helper.write_text("#!" + sys.executable + "\n" +
                           (SRC / "lib/session-capacity.py").read_text() + "\n" +
+                          (SRC / "lib/session-hibernation.py").read_text() + "\n" +
                           (SRC / "session-capacity-cli.py").read_text())
         helper.chmod(0o755)
         tmux = self.work / "tmux"
@@ -166,6 +353,7 @@ class Cli(unittest.TestCase):
                     "AGENT_BOX_SESSION_LIMIT_FILE": str(self.limit),
                     "AGENT_BOX_CAPACITY_BIN": str(helper),
                     "AGENT_BOX_TMUX_BIN": str(tmux),
+                    "AGENT_BOX_HIBERNATE_IDLE_S": "0",
                     "AGENT_BOX_FLOCK_BIN": shutil.which("flock")}
 
     def run_cli(self, *args):
@@ -226,6 +414,103 @@ class Cli(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["used"], 0)
         self.assertFalse(self.registry.exists())
+
+    def make_live_claude(self, name="idle"):
+        launch = "44444444-4444-4444-8444-444444444444"
+        state = self.work / ".local/state/agent-box/session" / (name + ".json")
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"launchSessionId": launch,
+                                     "nativeSessionId": launch}))
+        transcript = self.work / ".claude/projects/-work" / (launch + ".jsonl")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(json.dumps({"type": "assistant", "message": {
+            "stop_reason": "end_turn"}}) + "\n")
+        live = self.work / "live"
+        live.write_text(name + "\n")
+        tmux = self.work / "live-tmux"
+        tmux.write_text(
+            "#!" + shutil.which("bash") + "\n"
+            "case \"$3\" in\n"
+            "  list-sessions) cat \"$TEST_LIVE_FILE\" ;;\n"
+            "  kill-session)\n"
+            "    if [ -n \"${TEST_ACTIVATE_REGISTRY:-}\" ]; then\n"
+            "      jq 'del(.sessions.idle.stopped) | "
+            "del(.sessions.idle.hibernatedAt) | "
+            "del(.sessions.idle.hibernationGeneration)' "
+            "\"$TEST_ACTIVATE_REGISTRY\" > \"$TEST_ACTIVATE_REGISTRY.next\"\n"
+            "      mv \"$TEST_ACTIVATE_REGISTRY.next\" \"$TEST_ACTIVATE_REGISTRY\"\n"
+            "    fi\n"
+            "    : > \"$TEST_LIVE_FILE\" ;;\n"
+            "  has-session) grep -Fx \"${5#=}\" \"$TEST_LIVE_FILE\" >/dev/null ;;\n"
+            "  *) exit 1 ;;\n"
+            "esac\n")
+        tmux.chmod(0o755)
+        self.env["AGENT_BOX_TMUX_BIN"] = str(tmux)
+        self.env["TEST_LIVE_FILE"] = str(live)
+        self.registry.write_text(json.dumps({"version": 1, "sessions": {
+            name: {"agent": "claude", "hasRun": True,
+                   "boxSessionId": launch}}}))
+        return live
+
+    def test_hibernate_parks_only_under_pressure_and_restart_clears_marker(self):
+        live = self.make_live_claude()
+        self.limit.write_text("2\n")
+        before = self.registry.read_bytes()
+        result = self.run_cli("hibernate")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.registry.read_bytes(), before)
+        self.assertEqual(live.read_text(), "idle\n")
+
+        self.limit.write_text("1\n")
+        result = self.run_cli("hibernate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["name"], "idle")
+        entry = json.loads(self.registry.read_text())["sessions"]["idle"]
+        self.assertTrue(entry["stopped"])
+        self.assertRegex(entry["hibernatedAt"], r"^\d{4}-\d{2}-\d{2}T")
+        self.assertEqual(live.read_text(), "")
+        self.assertRegex(self.run_cli("ls").stdout,
+                         r"(?m)^idle\s+claude\s+hibernated$")
+
+        result = self.run_cli("restart", "idle")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = json.loads(self.registry.read_text())["sessions"]["idle"]
+        self.assertNotIn("stopped", entry)
+        self.assertNotIn("hibernatedAt", entry)
+        self.assertNotIn("hibernationGeneration", entry)
+
+    def test_hibernate_respects_exclusion(self):
+        self.make_live_claude()
+        self.limit.write_text("1\n")
+        result = self.run_cli("hibernate", "--exclude", "idle")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(json.loads(self.registry.read_text())
+                         ["sessions"]["idle"].get("stopped", False))
+
+    def test_hibernate_lock_refusal_does_not_kill_candidate(self):
+        live = self.make_live_claude()
+        self.limit.write_text("1\n")
+        refuse = self.work / "refuse-flock"
+        refuse.write_text("#!" + shutil.which("bash") + "\nexit 1\n")
+        refuse.chmod(0o755)
+        self.env["AGENT_BOX_FLOCK_BIN"] = str(refuse)
+        self.env["REGISTRY_LOCK_WAIT"] = "0"
+        before = self.registry.read_bytes()
+        result = self.run_cli("hibernate")
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertEqual(self.registry.read_bytes(), before)
+        self.assertEqual(live.read_text(), "idle\n")
+
+    def test_activation_racing_the_kill_wins_without_a_stale_stop(self):
+        self.make_live_claude()
+        self.limit.write_text("1\n")
+        self.env["TEST_ACTIVATE_REGISTRY"] = str(self.registry)
+        result = self.run_cli("hibernate")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        entry = json.loads(self.registry.read_text())["sessions"]["idle"]
+        self.assertNotIn("stopped", entry)
+        self.assertNotIn("hibernatedAt", entry)
+        self.assertNotIn("hibernationGeneration", entry)
 
 
 if __name__ == "__main__":

@@ -179,6 +179,7 @@ $JQ --arg t "$manual_thread" '. + {"manual-remote": {thread: $t}}' \
   "$state/codex-threads.json" > "$state/codex-threads.new"
 mv "$state/codex-threads.new" "$state/codex-threads.json"
 calls="$TEST_ROOT/sync-calls"
+native_calls="$TEST_ROOT/native-calls"
 session_watches_events() { [ "$1" = remote ] || [ "$1" = manual-remote ]; }
 codex_wake_thread() { printf '%s' 01a10362-0000-7000-8000-000000000003; }
 resolve_codex_home() { printf '%s' "$TEST_ROOT/home-for-${1:-default}"; }
@@ -193,6 +194,7 @@ codex_rollout_uuid() {
   printf '%s' "$_resolved"
 }
 codex_publish_thread() { printf '%s:%s\n' "$1" "$2" >> "$calls"; }
+record_native_session() { printf '%s:%s\n' "$1" "$2" >> "$native_calls"; }
 codex_sync_last=0
 touch "$state/ready"
 sync_codex_threads
@@ -204,6 +206,8 @@ grep -Fx 'effective:01a10364-0000-7000-8000-000000000005' "$calls" >/dev/null \
   || { echo "FAIL: the bridge's effective target was not synchronized" >&2; exit 1; }
 [ "$(wc -l < "$calls")" = 3 ] \
   || { echo "FAIL: stopped, unselected, or non-Codex session was synchronized" >&2; exit 1; }
+[ "$(sort "$native_calls")" = "$(sort "$calls")" ] \
+  || { echo "FAIL: synchronized Codex threads were not persisted as native IDs" >&2; exit 1; }
 ! grep -F 'manual-remote:' "$calls" >/dev/null \
   || { echo "FAIL: a manual Remote Control registration was overwritten" >&2; exit 1; }
 

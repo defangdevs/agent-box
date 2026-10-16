@@ -126,7 +126,16 @@ plainly rather than handing it back.
   overridden by `sessionLimit` in the box configuration. Pending starts reserve
   slots too. Stop a session to free capacity; restarting a stopped session
   needs a free slot. `restart --all` refuses without changing anything if it
-  would exceed the limit. This is overload control, not a memory guarantee.
+  would exceed the limit. When a new runtime is refused at the limit,
+  Agentbox may hibernate the oldest conservatively idle Claude or Codex TUI
+  session: its process exits, its stable name and native conversation ID stay
+  recorded, and a later routed message transparently resumes that exact
+  conversation. It never hibernates merely because a session is idle. An open
+  turn, unresolved assignment, webhook subscription, pending delivery,
+  unknown transcript state, shell, hook session, or Remote-Control Codex
+  remains resident. `sessionHibernationGraceSeconds` sets the minimum age of
+  the completed turn (30 seconds by default). This is overload control, not a
+  memory guarantee.
 - Manage your own sessions without a rebuild:
   `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
   plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
@@ -580,11 +589,16 @@ you have. That cleanup is load-bearing: one RAM-sized limit (about one session
 per GiB by default, overridable with `sessionLimit`) bounds all agent sessions
 running or queued to start, including CLI/UI sessions but not operator shell panes,
 and once that ceiling is reached EVERY
-watch on the box is stalled - a matching batch starts nothing until a slot
-frees. It is no longer LOST while it waits: the wrapper declines it and the
-receiver keeps it, re-offers it as slots free, and drops it only after an hour
-of waiting. A stopped session frees its slot once its pane exits, without needing
-to be delisted. So
+watch first asks the session manager to hibernate one conservatively idle,
+exactly resumable interactive runtime. That runtime keeps its Agentbox name
+and native Claude/Codex conversation ID; a later routed message activates it
+through the same capacity gate. Sessions with a live webhook subscription are
+not candidates, because accepted peer delivery is not yet durably spooled. If
+no safe candidate exists, the watch is stalled - a matching batch starts
+nothing until a slot frees. It is no longer LOST while it waits: the wrapper
+declines it and the receiver keeps it, re-offers it as slots free, and drops it
+only after an hour of waiting. A stopped session frees its slot once its pane
+exits, without needing to be delisted. So
 before you conclude a repo has been quiet, run `agent-box-webhook status`: its
 `dispatch` object has the live count against the ceiling and the last batch the
 ceiling turned away. `lastRefusal.deferred` records the ANSWER that batch got -

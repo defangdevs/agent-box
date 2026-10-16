@@ -186,8 +186,9 @@ let
   } (envStoreLib + "\n\n" + readSrc "envstore-cli.py");
 
   capacityCli = pkgs.writers.writePython3Bin "agent-box-session-capacity" {
-    flakeIgnore = [ "E501" "E402" ];
+    flakeIgnore = [ "E501" "E402" "E128" "W503" ];
   } (readSrc "lib/session-capacity.py" + "\n\n"
+     + readSrc "lib/session-hibernation.py" + "\n\n"
      + readSrc "session-capacity-cli.py");
 
   agentPackage = agent:

@@ -8,6 +8,7 @@ export AGENT_BOX_DEFAULT_AGENT=claude
 # this CLI, no util-linux) — and a lock that only some writers take is not
 # a lock. util-linux is the only package that ships flock.
 export AGENT_BOX_CAPACITY_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-session-capacity/bin/agent-box-session-capacity
+export AGENT_BOX_HIBERNATE_IDLE_S=30
 export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock
 # Agent profiles (issue #321): `add --profile` resolves the harness and
 # its arguments by shelling out to agent-box-profile, and this CLI runs
@@ -746,6 +747,7 @@ usage() {
   echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
+  echo "       agent-box-session hibernate [--exclude NAME...]"
   echo "       agent-box-session restart NAME | --all"
   echo "       agent-box-session whatsapp candidates | ls | select NAME | activate NAME | clear"
   echo "                             | spawn PROFILE|default | NAME on|off|status"
@@ -792,6 +794,8 @@ usage() {
   echo "check its pane or worktree; nothing here retries the work for you."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
+  echo "hibernate is demand-driven: only at the session limit, park the oldest"
+  echo "conservatively quiescent resumable runtime to free one slot."
   echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
 }
 # The settings daemon's SESSION_RE bounds a name at NAME_MAX and DROPS what
@@ -863,6 +867,150 @@ session_state_file() {
   # harness-minted id (issue #284), and going through an accessor is what
   # makes that re-key a change to three functions rather than a migration.
   printf '%s/%s.json\n' "$HOME/.local/state/agent-box/session" "$1"
+}
+
+record_hibernated_native() {
+  # Freeze the exact native transcript identity proven by the quiescence
+  # probe before its runtime disappears. This is a pointer, not transcript
+  # ownership: Claude/Codex remain the authority and the supervisor refuses
+  # it if the named transcript no longer exists.
+  _state="$(session_state_file "$1")"
+  _native="$2"
+  case "$_native" in
+    (*[!0-9a-fA-F-]*|"") return 75 ;;
+    (????????-????-????-????-????????????) ;;
+    (*) return 75 ;;
+  esac
+  mkdir -p "${_state%/*}" 2>/dev/null || return 75
+  _pending="$(mktemp "$_state.XXXXXX" 2>/dev/null)" || return 75
+  if [ -r "$_state" ]; then
+    "$JQ" --arg n "$_native" \
+      '(if type == "object" then . else {} end) | .nativeSessionId = $n' \
+      "$_state" > "$_pending" 2>/dev/null \
+      || { rm -f "$_pending"; return 75; }
+  else
+    "$JQ" -n --arg n "$_native" '{nativeSessionId: $n}' \
+      > "$_pending" 2>/dev/null || { rm -f "$_pending"; return 75; }
+  fi
+  chmod 600 "$_pending" 2>/dev/null \
+    && mv -f "$_pending" "$_state" 2>/dev/null \
+    || { rm -f "$_pending"; return 75; }
+}
+
+hibernate_one() {
+  # hibernate_one [EXCLUDED_NAME...] -- free one worker slot, but only while
+  # capacity is actually full. The capacity helper performs the expensive
+  # transcript/state probe outside the registry lock and returns an evidence
+  # token. Re-probing that exact token under the lock prevents a completed
+  # turn, subscription, lease or queued WhatsApp message from going stale
+  # between selection and the stopped transition.
+  _cap="${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}"
+  _candidate="$("$_cap" hibernate-candidate "$REGISTRY_FILE" "$@")" || return $?
+  _name="$(printf '%s' "$_candidate" | "$JQ" -r '.name // empty')"
+  _token="$(printf '%s' "$_candidate" | "$JQ" -r '.token // empty')"
+  _native="$(printf '%s' "$_candidate" | "$JQ" -r '.nativeSessionId // empty')"
+  valid_name "$_name" && [ -n "$_token" ] && [ -n "$_native" ] || return 1
+
+  # Check pressure outside the registry lock: the helper shells out to tmux,
+  # and issue #748's rule is that no writer holds the shared file lock across
+  # that potentially slow subprocess. A second check after the transition,
+  # while the old pane still counts live, closes the slot-freed race.
+  if _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
+    :
+  else
+    return $?
+  fi
+  printf '%s' "$_capacity" | "$JQ" -e '.used >= .max' >/dev/null 2>&1 \
+    || return 1
+
+  registry_lock || return "$REGISTRY_BUSY_RC"
+  if _verified="$(AGENT_BOX_HIBERNATE_ASSUME_LIVE="$_name" \
+      "$_cap" hibernate-verify "$REGISTRY_FILE" "$_name" "$_token")"; then
+    :
+  else
+    _rc=$?
+    registry_unlock
+    return "$_rc"
+  fi
+  # The verified candidate can be newer than the pointer recorded when the
+  # process launched (Claude segment rotation is the common case). Persist
+  # it before making the runtime cold; a failed pointer write leaves the
+  # session resident because exact resume is an invariant, not best effort.
+  record_hibernated_native "$_name" "$_native" || {
+    _rc=$?
+    registry_unlock
+    return "$_rc"
+  }
+  _at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  _generation="$_at-$$-$RANDOM"
+  if registry_edit --arg n "$_name" --arg at "$_at" --arg gen "$_generation" \
+      'if .sessions | has($n)
+       then .sessions[$n] |= (.stopped = true | .hibernatedAt = $at
+                              | .hibernationGeneration = $gen)
+       else . end'; then
+    :
+  else
+    _rc=$?
+    registry_unlock
+    return "$_rc"
+  fi
+  registry_unlock
+
+  _undo_hibernation() {
+    registry_lock || return 75
+    if registry_edit --arg n "$_name" --arg gen "$_generation" \
+        'if (.sessions[$n].hibernationGeneration // "") == $gen
+         then .sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
+                                | del(.hibernationGeneration))
+         else . end'; then
+      :
+    else
+      _urc=$?
+      registry_unlock
+      return "$_urc"
+    fi
+    registry_unlock
+  }
+
+  # Demand-driven, never an idle reaper. The stopped candidate still has a
+  # live pane and therefore still counts here; a value below max means some
+  # OTHER slot became free while selection was running, so undo without
+  # killing anything.
+  if _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
+    if ! printf '%s' "$_capacity" | "$JQ" -e \
+        '.used >= .max' >/dev/null 2>&1; then
+      _undo_hibernation || return $?
+      # The waiting admission should retry now: another runtime released the
+      # needed slot, so no hibernation is justified and no dispatcher delay
+      # is useful. An empty name tells callers that nothing was parked.
+      "$JQ" -cn '{name: null, slotAvailable: true}'
+      return 0
+    fi
+  else
+    _rc=$?
+    _undo_hibernation || return $?
+    return "$_rc"
+  fi
+
+  if ! kill_session "$_name"; then
+    # A failed kill freed no slot. Undo only our own transition; a concurrent
+    # explicit stop/restart is authoritative and changes hibernatedAt first.
+    _undo_hibernation || return $?
+    return 1
+  fi
+
+  # Activation can race between the flag write and the kill. In that case
+  # the target remains resident by definition: its activator cleared our
+  # marker and the supervisor will resume it. Do not tell the waiting spawn a
+  # slot was reclaimed when it was not.
+  registry_lock || return 75
+  _still="$($JQ -r --arg n "$_name" --arg gen "$_generation" \
+    '(.sessions[$n].stopped == true)
+     and ((.sessions[$n].hibernationGeneration // "") == $gen)' \
+    "$REGISTRY_FILE" 2>/dev/null)" || _still=false
+  registry_unlock
+  [ "$_still" = true ] || return 1
+  printf '%s\n' "$_verified"
 }
 prune_session_state() {
   # Only ever called for a name that has just been DELISTED, and only as an
@@ -947,7 +1095,7 @@ case "$cmd" in
       # crashed pane recorded (issue #516). tmux says a post-mortem bash pane
       # is alive, so liveness alone cannot tell a dead agent from a running
       # one, and this used to report the crash as `live`.
-      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end), (.value.died // "" | tostring)] | @tsv' "$REGISTRY_FILE" \
+      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true and (.value.hibernatedAt | type) == "string" then "hibernated" elif .value.stopped == true then "stopped" else "starting" end), (.value.died // "" | tostring)] | @tsv' "$REGISTRY_FILE" \
       | while IFS="$(printf '\t')" read -r n a state dead; do
         case $'\n'"$live"$'\n' in
           *$'\n'"$n"$'\n'*)
@@ -969,6 +1117,23 @@ case "$cmd" in
         printf '%-24s %-8s %s\n' "$n" '-' 'unmanaged'
       fi
     done
+    ;;
+  hibernate)
+    excludes=()
+    while [ $# -gt 0 ]; do
+      [ "$1" = --exclude ] && [ $# -ge 2 ] && valid_name "$2" \
+        || { usage >&2; exit 2; }
+      excludes+=("$2")
+      shift 2
+    done
+    registry_ensure
+    if hibernate_one "${excludes[@]}"; then
+      :
+    else
+      rc=$?
+      [ "$rc" = 1 ] && echo "no quiescent resumable session can be hibernated" >&2
+      exit "$rc"
+    fi
     ;;
   peers)
     # Who ELSE is live, where they work, and what they claim.
@@ -1185,36 +1350,48 @@ case "$cmd" in
       selected="${2:-}"
       [ $# -eq 2 ] && valid_name "$selected" || { usage >&2; exit 2; }
       registry_ensure
-      registry_lock
-      taken "$selected" || {
-        echo "no such session: '$selected' (send @$(id -un) /sessions)" >&2
-        exit 2
-      }
-      harness="$("$JQ" -r --arg n "$selected" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
-      if [ "$harness" != claude ] && [ "$harness" != codex ]; then
-        echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
-        exit 2
-      fi
-      "$JQ" -e --arg n "$selected" '.sessions[$n].whatsapp == true' \
-        "$REGISTRY_FILE" >/dev/null || {
-          echo "session '$selected' is not the selected WhatsApp target" >&2
+      while :; do
+        registry_lock
+        taken "$selected" || {
+          echo "no such session: '$selected' (send @$(id -un) /sessions)" >&2
           exit 2
         }
-      stopped="$("$JQ" -r --arg n "$selected" '.sessions[$n].stopped == true' "$REGISTRY_FILE")"
-      if [ "$stopped" = true ]; then
-        # A stopped session is a cold conversation, not a dead target. Admit
-        # it through the same shared capacity policy as an explicit restart,
-        # but do not bounce a target that is already resident. The supervisor
-        # observes the cleared flag and resumes the harness's native thread.
-        "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check \
-          "$REGISTRY_FILE" "$selected" >/dev/null
-        registry_edit --arg n "$selected" 'del(.sessions[$n].stopped)'
-      fi
-      "$JQ" -cn --arg name "$selected" --arg harness "$harness" \
-        --argjson activated "$stopped" \
-        '{name: $name, harness: $harness, activated: $activated}'
-      registry_unlock
-      exit 0
+        harness="$("$JQ" -r --arg n "$selected" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
+        if [ "$harness" != claude ] && [ "$harness" != codex ]; then
+          echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+          exit 2
+        fi
+        "$JQ" -e --arg n "$selected" '.sessions[$n].whatsapp == true' \
+          "$REGISTRY_FILE" >/dev/null || {
+            echo "session '$selected' is not the selected WhatsApp target" >&2
+            exit 2
+          }
+        stopped="$("$JQ" -r --arg n "$selected" '.sessions[$n].stopped == true' "$REGISTRY_FILE")"
+        if [ "$stopped" = true ]; then
+          # A stopped session is a cold conversation. If its activation is
+          # the work that needs a full box's next slot, reclaim one OTHER
+          # quiescent runtime and retry this exact target.
+          if "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check \
+              "$REGISTRY_FILE" "$selected" >/dev/null; then
+            :
+          else
+            rc=$?
+            registry_unlock
+            if [ "$rc" = 75 ] && hibernate_one "$selected" >/dev/null; then
+              continue
+            fi
+            exit "$rc"
+          fi
+          registry_edit --arg n "$selected" \
+            '.sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
+                               | del(.hibernationGeneration))'
+        fi
+        "$JQ" -cn --arg name "$selected" --arg harness "$harness" \
+          --argjson activated "$stopped" \
+          '{name: $name, harness: $harness, activated: $activated}'
+        registry_unlock
+        exit 0
+      done
     fi
     if [ "$name" = clear ]; then
       [ $# -eq 1 ] || { usage >&2; exit 2; }
@@ -1550,7 +1727,9 @@ case "$cmd" in
     eph=0
     "$JQ" -e --arg n "$name" '.sessions[$n].ephemeral == true' \
       "$REGISTRY_FILE" >/dev/null 2>&1 && eph=1
-    registry_edit --arg n "$name" '.sessions[$n].stopped = true'
+    registry_edit --arg n "$name" \
+      '.sessions[$n] |= (.stopped = true | del(.hibernatedAt)
+                         | del(.hibernationGeneration))'
     registry_unlock
     kill_session "$name" || exit 1
     if [ "$eph" = 1 ]; then
@@ -1567,7 +1746,8 @@ case "$cmd" in
       registry_lock
       mapfile -t restart_names < <("$JQ" -r '.sessions | keys[]' "$REGISTRY_FILE")
       "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "${restart_names[@]}" >/dev/null
-      registry_edit 'del(.sessions[].stopped)'
+      registry_edit 'del(.sessions[].stopped) | del(.sessions[].hibernatedAt)
+                     | del(.sessions[].hibernationGeneration)'
       registry_unlock
       "$JQ" -r '.sessions | keys[]' "$REGISTRY_FILE" | while IFS= read -r n; do
         [ -n "$n" ] && kill_session "$n" || true
@@ -1582,7 +1762,9 @@ case "$cmd" in
       registry_lock
       if taken "$name"; then
         "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
-        registry_edit --arg n "$name" 'del(.sessions[$n].stopped)'
+        registry_edit --arg n "$name" \
+          '.sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
+                             | del(.hibernationGeneration))'
         registry_unlock
         # A stopped session has no live tmux session to kill; kill_session
         # treats that "can't find session" as success.

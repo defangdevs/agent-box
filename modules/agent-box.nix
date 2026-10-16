@@ -283,11 +283,16 @@ let
       per GiB by default, overridable with `sessionLimit`) bounds all agent sessions
       running or queued to start, including CLI/UI sessions but not operator shell panes,
       and once that ceiling is reached EVERY
-      watch on the box is stalled - a matching batch starts nothing until a slot
-      frees. It is no longer LOST while it waits: the wrapper declines it and the
-      receiver keeps it, re-offers it as slots free, and drops it only after an hour
-      of waiting. A stopped session frees its slot once its pane exits, without needing
-      to be delisted. So
+      watch first asks the session manager to hibernate one conservatively idle,
+      exactly resumable interactive runtime. That runtime keeps its Agentbox name
+      and native Claude/Codex conversation ID; a later routed message activates it
+      through the same capacity gate. Sessions with a live webhook subscription are
+      not candidates, because accepted peer delivery is not yet durably spooled. If
+      no safe candidate exists, the watch is stalled - a matching batch starts
+      nothing until a slot frees. It is no longer LOST while it waits: the wrapper
+      declines it and the receiver keeps it, re-offers it as slots free, and drops it
+      only after an hour of waiting. A stopped session frees its slot once its pane
+      exits, without needing to be delisted. So
       before you conclude a repo has been quiet, run `agent-box-webhook status`: its
       `dispatch` object has the live count against the ceiling and the last batch the
       ceiling turned away. `lastRefusal.deferred` records the ANSWER that batch got -
@@ -643,7 +648,16 @@ let
       overridden by `sessionLimit` in the box configuration. Pending starts reserve
       slots too. Stop a session to free capacity; restarting a stopped session
       needs a free slot. `restart --all` refuses without changing anything if it
-      would exceed the limit. This is overload control, not a memory guarantee.
+      would exceed the limit. When a new runtime is refused at the limit,
+      Agentbox may hibernate the oldest conservatively idle Claude or Codex TUI
+      session: its process exits, its stable name and native conversation ID stay
+      recorded, and a later routed message transparently resumes that exact
+      conversation. It never hibernates merely because a session is idle. An open
+      turn, unresolved assignment, webhook subscription, pending delivery,
+      unknown transcript state, shell, hook session, or Remote-Control Codex
+      remains resident. `sessionHibernationGraceSeconds` sets the minimum age of
+      the completed turn (30 seconds by default). This is overload control, not a
+      memory guarantee.
     - Manage your own sessions without a rebuild:
       `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
       plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
@@ -2342,7 +2356,7 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
   '';
 
   capacityCli = pkgs.writers.writePython3Bin "agent-box-session-capacity" {
-    flakeIgnore = [ "E501" "E402" "E305" ];
+    flakeIgnore = [ "E501" "E402" "E305" "E128" "W503" ];
   } ''
 # Shared admission policy for the single-user v1 box (issue #662).
 # Callers hold the sessions.json sidecar lock through this check AND their
@@ -2499,11 +2513,467 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
             "Stop a session before starting another." % (len(used), limit))
     return {"used": len(used), "max": limit}
 
+# Conservative harness quiescence for capacity-pressure hibernation (#858).
+#
+# This file is concatenated after session-capacity.py in the capacity helper.
+# It is intentionally read-only: session-cli.sh owns the registry lock, the
+# stopped transition and the tmux kill. The helper only answers whether one
+# resident runtime can be reconstructed exactly from its native transcript.
+import hashlib as hibernate_hashlib
+import json as hibernate_json
+import os as hibernate_os
+from pathlib import Path as HibernatePath
+import re as hibernate_re
+import time as hibernate_time
+
+
+HIBERNATE_IDLE_S = 30
+HIBERNATE_TAIL_LINES = 400
+HIBERNATE_TAIL_BYTES = 2 * 1024 * 1024
+HIBERNATE_CODEX_HEAD_BYTES = 64 * 1024
+HIBERNATE_CODEX_SCAN_MAX = 400
+HIBERNATE_UUID_RE = hibernate_re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+class SessionHibernationError(Exception):
+    pass
+
+
+def _hibernate_home():
+    return HibernatePath(hibernate_os.environ.get("HOME", ""))
+
+
+def _hibernate_json_file(path, *, missing=None, max_bytes=2 * 1024 * 1024):
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(max_bytes + 1)
+    except FileNotFoundError:
+        return missing
+    except OSError as exc:
+        raise SessionHibernationError("cannot read %s: %s" % (path, exc)) from exc
+    if len(raw) > max_bytes:
+        raise SessionHibernationError("state file is too large: %s" % path)
+    try:
+        return hibernate_json.loads(raw)
+    except (UnicodeDecodeError, hibernate_json.JSONDecodeError) as exc:
+        raise SessionHibernationError("invalid JSON in %s" % path) from exc
+
+
+def _hibernate_uuid(value):
+    return value if isinstance(value, str) and HIBERNATE_UUID_RE.fullmatch(value) else None
+
+
+def _hibernate_hash(path):
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(2 * 1024 * 1024 + 1)
+    except FileNotFoundError:
+        return "missing"
+    except OSError as exc:
+        raise SessionHibernationError("cannot read %s: %s" % (path, exc)) from exc
+    if len(raw) > 2 * 1024 * 1024:
+        raise SessionHibernationError("state file is too large: %s" % path)
+    return hibernate_hashlib.sha256(raw).hexdigest()
+
+
+def _hibernate_tail(path):
+    """Return bounded trailing JSONL lines without walking a large transcript."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, hibernate_os.SEEK_END)
+            end = handle.tell()
+            pos = end
+            chunks = []
+            newlines = 0
+            while pos > 0 and newlines <= HIBERNATE_TAIL_LINES:
+                size = min(65536, pos, HIBERNATE_TAIL_BYTES - sum(map(len, chunks)))
+                if size <= 0:
+                    break
+                pos -= size
+                handle.seek(pos)
+                chunk = handle.read(size)
+                chunks.append(chunk)
+                newlines += chunk.count(b"\n")
+    except OSError as exc:
+        raise SessionHibernationError("cannot read transcript %s: %s" % (path, exc)) from exc
+    raw = b"".join(reversed(chunks))
+    return raw.splitlines()[-HIBERNATE_TAIL_LINES:]
+
+
+def _hibernate_records(path):
+    lines = _hibernate_tail(path)
+    if not lines:
+        return None
+    records = []
+    for index, raw in enumerate(lines):
+        if not raw.strip():
+            continue
+        try:
+            record = hibernate_json.loads(raw)
+        except (UnicodeDecodeError, hibernate_json.JSONDecodeError):
+            # A killed writer can leave a partial final record. Unknown means
+            # active; never park on evidence we could not parse.
+            if index == len(lines) - 1:
+                return None
+            continue
+        if not isinstance(record, dict):
+            return None
+        records.append(record)
+    return records or None
+
+
+def _hibernate_transcript_state(path, harness):
+    records = _hibernate_records(path)
+    if records is None:
+        return None
+    if harness == "claude":
+        relevant = [record for record in records
+                    if record.get("type") in ("assistant", "user")
+                    and isinstance(record.get("message"), dict)]
+        if not relevant:
+            return None
+        last = relevant[-1]
+        closed = (last.get("type") == "assistant"
+                  and last["message"].get("stop_reason") == "end_turn")
+        marker = [last.get("type"), last["message"].get("stop_reason")]
+    elif harness == "codex":
+        relevant = [(index, record) for index, record in enumerate(records)
+                    if record.get("type") == "event_msg"
+                    and isinstance(record.get("payload"), dict)
+                    and record["payload"].get("type")
+                    in ("task_started", "task_complete")]
+        if not relevant:
+            return None
+        last_index, last = relevant[-1]
+        closed = last["payload"].get("type") == "task_complete"
+        marker = ["event_msg", last["payload"].get("type")]
+        # Codex normally appends thread_settings_applied while sitting at the
+        # prompt. Anything else after task_complete is an unrecognised state
+        # transition and cannot prove quiescence. In particular, do not let a
+        # new event type silently turn an active future Codex into a candidate.
+        if closed:
+            for record in records[last_index + 1:]:
+                if (record.get("type") == "event_msg"
+                        and isinstance(record.get("payload"), dict)
+                        and record["payload"].get("type")
+                        == "thread_settings_applied"):
+                    continue
+                return None
+    else:
+        return None
+    if not closed:
+        return None
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise SessionHibernationError("cannot stat transcript %s: %s" % (path, exc)) from exc
+    return {
+        "path": str(path),
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "size": stat.st_size,
+        "mtimeNs": stat.st_mtime_ns,
+        "marker": marker,
+    }
+
+
+def _hibernate_state(name):
+    path = _hibernate_home() / ".local/state/agent-box/session" / (name + ".json")
+    value = _hibernate_json_file(path, missing=None)
+    if value is None:
+        return {}, path
+    if not isinstance(value, dict):
+        raise SessionHibernationError("invalid session state: %s" % path)
+    return value, path
+
+
+def _hibernate_claude_transcript(name, entry):
+    state, state_path = _hibernate_state(name)
+    launch = _hibernate_uuid(state.get("launchSessionId"))
+    if launch is None and entry.get("hasRun") is True:
+        launch = _hibernate_uuid(entry.get("boxSessionId"))
+    if launch is None:
+        return None
+    # The rotation hook keys the first hop by the stable launch ID, even after
+    # nativeSessionId has been persisted. Read that record first: otherwise a
+    # stale but completed segment can hide the active segment Claude moved to.
+    try:
+        initial = (_hibernate_home() / ".local/state/agent-box/live-session-id"
+                   / launch).read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        initial = None
+    except (OSError, UnicodeDecodeError):
+        return None
+    if initial is not None and _hibernate_uuid(initial) is None:
+        return None
+    native = (_hibernate_uuid(initial)
+              or _hibernate_uuid(state.get("nativeSessionId")) or launch)
+    # Claude can rotate its UUID while the process stays up. The SessionStart
+    # hook records that hop by launch ID; follow a bounded chain so parking
+    # preserves the segment the TUI is actually displaying.
+    seen = set()
+    for _ in range(8):
+        if native in seen:
+            return None
+        seen.add(native)
+        live_path = (_hibernate_home() / ".local/state/agent-box/live-session-id"
+                     / native)
+        try:
+            value = live_path.read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            break
+        except (OSError, UnicodeDecodeError):
+            return None
+        rotated = _hibernate_uuid(value)
+        if rotated is None or rotated == native:
+            break
+        native = rotated
+    root = _hibernate_home() / ".claude/projects"
+    matches = list(root.glob("*/%s.jsonl" % native))
+    if not matches:
+        matches = list(root.rglob("%s.jsonl" % native))[:2]
+    if len(matches) != 1:
+        return None
+    return native, matches[0], state_path
+
+
+def _hibernate_codex_home(entry):
+    value = hibernate_os.environ.get("CODEX_HOME")
+    envstore = hibernate_os.environ.get("AGENT_BOX_ENVSTORE_BIN")
+    if envstore:
+        import subprocess as hibernate_subprocess
+        calls = [[envstore, "get", "CODEX_HOME"]]
+        profile = entry.get("profile")
+        if isinstance(profile, str) and hibernate_re.fullmatch(r"[A-Za-z0-9_-]+", profile):
+            calls.append([envstore, "get", "CODEX_HOME", "--profile", profile])
+        for call in calls:
+            try:
+                proc = hibernate_subprocess.run(call, capture_output=True, text=True,
+                                                timeout=5, check=False)
+            except (OSError, hibernate_subprocess.TimeoutExpired):
+                continue
+            if proc.returncode == 0 and proc.stdout:
+                value = proc.stdout.rstrip("\n")
+    return HibernatePath(value) if value else _hibernate_home() / ".codex"
+
+
+def _hibernate_codex_exact(root, native):
+    matches = list((root / "sessions").glob("*/*/*/rollout-*-%s.jsonl" % native))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _hibernate_codex_transcript(name, entry):
+    state, state_path = _hibernate_state(name)
+    launch = _hibernate_uuid(state.get("launchSessionId"))
+    if launch is None and entry.get("hasRun") is True:
+        launch = _hibernate_uuid(entry.get("boxSessionId"))
+    if launch is None:
+        return None
+    root = _hibernate_codex_home(entry)
+    # A resumed Codex thread can produce a newer rollout carrying the same
+    # stable Agentbox launch marker. Resolve that first; the persisted native
+    # pointer is the fallback for prompt-less sessions whose rollout has no
+    # marker at all.
+    marker = ("agent-box session %s" % launch).encode("utf-8")
+    try:
+        rollouts = sorted(
+            ((candidate.stat().st_mtime_ns, candidate)
+             for candidate in (root / "sessions").glob("*/*/*/rollout-*.jsonl")),
+            key=lambda item: item[0], reverse=True)[:HIBERNATE_CODEX_SCAN_MAX]
+        path = None
+        for _mtime, candidate in rollouts:
+            with candidate.open("rb") as handle:
+                if marker in handle.read(HIBERNATE_CODEX_HEAD_BYTES):
+                    path = candidate
+                    break
+    except OSError:
+        return None
+    native = _hibernate_uuid(path.stem[-36:]) if path else None
+    if path is None:
+        native = _hibernate_uuid(state.get("nativeSessionId"))
+        path = _hibernate_codex_exact(root, native) if native else None
+    if path is None:
+        registered = _hibernate_json_file(
+            _hibernate_home() / ".local/state/local-whatsapp/codex-threads.json",
+            missing={})
+        record = registered.get(name) if isinstance(registered, dict) else None
+        native = _hibernate_uuid(record.get("thread")) if isinstance(record, dict) else None
+        path = _hibernate_codex_exact(root, native) if native else None
+    if native is None or path is None:
+        return None
+    return native, path, state_path
+
+
+def _hibernate_has_watch(name):
+    user = hibernate_os.environ.get("USER") or ""
+    state_dir = HibernatePath(hibernate_os.environ.get(
+        "LOCAL_WEBHOOK_STATE_DIR",
+        str(_hibernate_home() / ".local/state/local-webhook")))
+    path = state_dir / ("filter.%s-%s.json" % (user, name))
+    value = _hibernate_json_file(path, missing=None)
+    if value is None:
+        return False, path, "missing"
+    if not isinstance(value, dict):
+        return True, path, _hibernate_hash(path)
+    topics = value.get("topics")
+    if not isinstance(topics, list):
+        return True, path, _hibernate_hash(path)
+    enabled = value.get("enabled") is not False
+    return enabled and bool(topics), path, _hibernate_hash(path)
+
+
+def _hibernate_has_lease(name):
+    path = _hibernate_home() / ".local/state/agent-box/lease" / (name + ".json")
+    value = _hibernate_json_file(path, missing=None)
+    if value is None:
+        return False, path, "missing"
+    # Invalid or unknown lease state is outstanding, never permission to park.
+    pending = not isinstance(value, dict) or value.get("outcome") is None
+    return pending, path, _hibernate_hash(path)
+
+
+def _hibernate_has_whatsapp_delivery(name):
+    root = _hibernate_home() / ".local/state/local-whatsapp"
+    target_path = root / "target.json"
+    target = _hibernate_json_file(target_path, missing=None)
+    if target is None:
+        return False, {
+            "target": "missing",
+            "messages": "not-selected",
+        }
+    if not isinstance(target, dict):
+        return True, {
+            "target": _hibernate_hash(target_path),
+            "messages": "unknown-target",
+        }
+    if target.get("session") != name:
+        return False, {
+            "target": _hibernate_hash(target_path),
+            "messages": "not-selected",
+        }
+    messages_path = root / "messages.json"
+    state = _hibernate_json_file(messages_path, missing={"messages": {}})
+    if not isinstance(state, dict) or not isinstance(state.get("messages"), dict):
+        return True, {"target": _hibernate_hash(target_path),
+                      "messages": _hibernate_hash(messages_path)}
+    pending = any(isinstance(message, dict)
+                  and not message.get("control")
+                  and not message.get("reply")
+                  for message in state["messages"].values())
+    return pending, {"target": _hibernate_hash(target_path),
+                     "messages": _hibernate_hash(messages_path)}
+
+
+def _hibernate_crashed(entry):
+    value = entry.get("died")
+    return ((isinstance(value, int) and not isinstance(value, bool))
+            or value is True)
+
+
+def _hibernate_idle_seconds():
+    raw = hibernate_os.environ.get("AGENT_BOX_HIBERNATE_IDLE_S",
+                                   str(HIBERNATE_IDLE_S))
+    if not raw.isascii() or not raw.isdecimal():
+        raise SessionHibernationError(
+            "AGENT_BOX_HIBERNATE_IDLE_S must be a non-negative integer")
+    return int(raw)
+
+
+def hibernation_probe(name, entry, live, now=None):
+    if not isinstance(entry, dict) or name not in live:
+        return None
+    harness = entry.get("agent")
+    if harness not in ("claude", "codex"):
+        return None
+    if (entry.get("stopped") is True or entry.get("ephemeral") is True
+            or entry.get("origin") == "webhook" or name.startswith("hook-")
+            or _hibernate_crashed(entry)):
+        return None
+    if harness == "codex" and entry.get("remoteControl") is True:
+        return None
+    lease, lease_path, lease_hash = _hibernate_has_lease(name)
+    watching, watch_path, watch_hash = _hibernate_has_watch(name)
+    pending, whatsapp_state = _hibernate_has_whatsapp_delivery(name)
+    if lease or watching or pending:
+        return None
+    target = (_hibernate_claude_transcript(name, entry) if harness == "claude"
+              else _hibernate_codex_transcript(name, entry))
+    if target is None:
+        return None
+    native, transcript, state_path = target
+    transcript_state = _hibernate_transcript_state(transcript, harness)
+    if transcript_state is None:
+        return None
+    now = hibernate_time.time() if now is None else now
+    idle_since = transcript_state["mtimeNs"] / 1_000_000_000
+    if now - idle_since < _hibernate_idle_seconds():
+        return None
+    evidence = {
+        "name": name,
+        "entry": entry,
+        "harness": harness,
+        "nativeSessionId": native,
+        "transcript": transcript_state,
+        "sessionState": _hibernate_hash(state_path),
+        "lease": [str(lease_path), lease_hash],
+        "watch": [str(watch_path), watch_hash],
+        "whatsapp": whatsapp_state,
+    }
+    token = hibernate_hashlib.sha256(
+        hibernate_json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+        .encode("utf-8")).hexdigest()
+    return {
+        "name": name,
+        "harness": harness,
+        "nativeSessionId": native,
+        "idleSince": idle_since,
+        "token": token,
+    }
+
+
+def hibernation_candidate(sessions, excludes=(), name=None, token=None):
+    assumed = hibernate_os.environ.get("AGENT_BOX_HIBERNATE_ASSUME_LIVE")
+    if name is not None and assumed == name:
+        # The session CLI took the live snapshot before its registry lock.
+        # Rechecking the transcript and routing state under that lock is the
+        # important fence; if the pane vanished meanwhile, kill_session's
+        # already-gone success still means a slot is free.
+        live = {name}
+    else:
+        try:
+            live = capacity_live_checked()
+        except SessionCapacityError as exc:
+            raise SessionHibernationError(str(exc)) from exc
+    excluded = set(excludes)
+    if name is not None:
+        entry = sessions.get(name)
+        result = hibernation_probe(name, entry, live)
+        if result is None or (token is not None and result["token"] != token):
+            return None
+        return result
+    candidates = []
+    for candidate_name, entry in sessions.items():
+        if candidate_name in excluded:
+            continue
+        result = hibernation_probe(candidate_name, entry, live)
+        if result is not None:
+            candidates.append(result)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda result: (result["idleSince"], result["name"]))
+
 import json as capacity_json
 import sys
 
 
 def capacity_main():
+    if len(sys.argv) < 3:
+        print("usage: agent-box-session-capacity "
+              "check|spawn|hibernate-candidate|hibernate-verify REGISTRY [ARGS...]",
+              file=sys.stderr)
+        return 2
     try:
         with open(sys.argv[2], encoding="utf-8") as handle:
             sessions = capacity_json.load(handle)["sessions"]
@@ -2515,11 +2985,35 @@ def capacity_main():
         # and a seed never overwrites an existing file (issue #59), so the
         # NixOS-declared sessions would silently never get seeded.
         sessions = {}
+    command = sys.argv[1]
     try:
+        if command == "hibernate-candidate":
+            result = hibernation_candidate(sessions, excludes=sys.argv[3:])
+            if result is None:
+                return 1
+            print(capacity_json.dumps(result))
+            return 0
+        if command == "hibernate-verify":
+            if len(sys.argv) != 5:
+                print("usage: agent-box-session-capacity hibernate-verify REGISTRY NAME TOKEN",
+                      file=sys.stderr)
+                return 2
+            result = hibernation_candidate(
+                sessions, name=sys.argv[3], token=sys.argv[4])
+            if result is None:
+                return 1
+            print(capacity_json.dumps(result))
+            return 0
+        if command not in ("check", "spawn"):
+            print("unknown capacity command: %s" % command, file=sys.stderr)
+            return 2
         result = capacity_check(sessions, sys.argv[3:],
-                                spawning=sys.argv[1] == "spawn")
+                                spawning=command == "spawn")
         print(capacity_json.dumps(result))
         return 0
+    except SessionHibernationError as exc:
+        print("Cannot inspect session quiescence: %s" % exc, file=sys.stderr)
+        return 75
     except SessionCapacityError as exc:
         print(str(exc), file=sys.stderr)
         return 75
@@ -4039,6 +4533,7 @@ done
     # this CLI, no util-linux) — and a lock that only some writers take is not
     # a lock. util-linux is the only package that ships flock.
     export AGENT_BOX_CAPACITY_BIN=${capacityCli}/bin/agent-box-session-capacity
+    export AGENT_BOX_HIBERNATE_IDLE_S=${toString cfg.sessionHibernationGraceSeconds}
     export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
     # Agent profiles (issue #321): `add --profile` resolves the harness and
     # its arguments by shelling out to agent-box-profile, and this CLI runs
@@ -4778,6 +5273,7 @@ usage() {
   echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
+  echo "       agent-box-session hibernate [--exclude NAME...]"
   echo "       agent-box-session restart NAME | --all"
   echo "       agent-box-session whatsapp candidates | ls | select NAME | activate NAME | clear"
   echo "                             | spawn PROFILE|default | NAME on|off|status"
@@ -4824,6 +5320,8 @@ usage() {
   echo "check its pane or worktree; nothing here retries the work for you."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
+  echo "hibernate is demand-driven: only at the session limit, park the oldest"
+  echo "conservatively quiescent resumable runtime to free one slot."
   echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
 }
 # The settings daemon's SESSION_RE bounds a name at NAME_MAX and DROPS what
@@ -4895,6 +5393,150 @@ session_state_file() {
   # harness-minted id (issue #284), and going through an accessor is what
   # makes that re-key a change to three functions rather than a migration.
   printf '%s/%s.json\n' "$HOME/.local/state/agent-box/session" "$1"
+}
+
+record_hibernated_native() {
+  # Freeze the exact native transcript identity proven by the quiescence
+  # probe before its runtime disappears. This is a pointer, not transcript
+  # ownership: Claude/Codex remain the authority and the supervisor refuses
+  # it if the named transcript no longer exists.
+  _state="$(session_state_file "$1")"
+  _native="$2"
+  case "$_native" in
+    (*[!0-9a-fA-F-]*|"") return 75 ;;
+    (????????-????-????-????-????????????) ;;
+    (*) return 75 ;;
+  esac
+  mkdir -p "''${_state%/*}" 2>/dev/null || return 75
+  _pending="$(mktemp "$_state.XXXXXX" 2>/dev/null)" || return 75
+  if [ -r "$_state" ]; then
+    "$JQ" --arg n "$_native" \
+      '(if type == "object" then . else {} end) | .nativeSessionId = $n' \
+      "$_state" > "$_pending" 2>/dev/null \
+      || { rm -f "$_pending"; return 75; }
+  else
+    "$JQ" -n --arg n "$_native" '{nativeSessionId: $n}' \
+      > "$_pending" 2>/dev/null || { rm -f "$_pending"; return 75; }
+  fi
+  chmod 600 "$_pending" 2>/dev/null \
+    && mv -f "$_pending" "$_state" 2>/dev/null \
+    || { rm -f "$_pending"; return 75; }
+}
+
+hibernate_one() {
+  # hibernate_one [EXCLUDED_NAME...] -- free one worker slot, but only while
+  # capacity is actually full. The capacity helper performs the expensive
+  # transcript/state probe outside the registry lock and returns an evidence
+  # token. Re-probing that exact token under the lock prevents a completed
+  # turn, subscription, lease or queued WhatsApp message from going stale
+  # between selection and the stopped transition.
+  _cap="''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}"
+  _candidate="$("$_cap" hibernate-candidate "$REGISTRY_FILE" "$@")" || return $?
+  _name="$(printf '%s' "$_candidate" | "$JQ" -r '.name // empty')"
+  _token="$(printf '%s' "$_candidate" | "$JQ" -r '.token // empty')"
+  _native="$(printf '%s' "$_candidate" | "$JQ" -r '.nativeSessionId // empty')"
+  valid_name "$_name" && [ -n "$_token" ] && [ -n "$_native" ] || return 1
+
+  # Check pressure outside the registry lock: the helper shells out to tmux,
+  # and issue #748's rule is that no writer holds the shared file lock across
+  # that potentially slow subprocess. A second check after the transition,
+  # while the old pane still counts live, closes the slot-freed race.
+  if _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
+    :
+  else
+    return $?
+  fi
+  printf '%s' "$_capacity" | "$JQ" -e '.used >= .max' >/dev/null 2>&1 \
+    || return 1
+
+  registry_lock || return "$REGISTRY_BUSY_RC"
+  if _verified="$(AGENT_BOX_HIBERNATE_ASSUME_LIVE="$_name" \
+      "$_cap" hibernate-verify "$REGISTRY_FILE" "$_name" "$_token")"; then
+    :
+  else
+    _rc=$?
+    registry_unlock
+    return "$_rc"
+  fi
+  # The verified candidate can be newer than the pointer recorded when the
+  # process launched (Claude segment rotation is the common case). Persist
+  # it before making the runtime cold; a failed pointer write leaves the
+  # session resident because exact resume is an invariant, not best effort.
+  record_hibernated_native "$_name" "$_native" || {
+    _rc=$?
+    registry_unlock
+    return "$_rc"
+  }
+  _at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  _generation="$_at-$$-$RANDOM"
+  if registry_edit --arg n "$_name" --arg at "$_at" --arg gen "$_generation" \
+      'if .sessions | has($n)
+       then .sessions[$n] |= (.stopped = true | .hibernatedAt = $at
+                              | .hibernationGeneration = $gen)
+       else . end'; then
+    :
+  else
+    _rc=$?
+    registry_unlock
+    return "$_rc"
+  fi
+  registry_unlock
+
+  _undo_hibernation() {
+    registry_lock || return 75
+    if registry_edit --arg n "$_name" --arg gen "$_generation" \
+        'if (.sessions[$n].hibernationGeneration // "") == $gen
+         then .sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
+                                | del(.hibernationGeneration))
+         else . end'; then
+      :
+    else
+      _urc=$?
+      registry_unlock
+      return "$_urc"
+    fi
+    registry_unlock
+  }
+
+  # Demand-driven, never an idle reaper. The stopped candidate still has a
+  # live pane and therefore still counts here; a value below max means some
+  # OTHER slot became free while selection was running, so undo without
+  # killing anything.
+  if _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
+    if ! printf '%s' "$_capacity" | "$JQ" -e \
+        '.used >= .max' >/dev/null 2>&1; then
+      _undo_hibernation || return $?
+      # The waiting admission should retry now: another runtime released the
+      # needed slot, so no hibernation is justified and no dispatcher delay
+      # is useful. An empty name tells callers that nothing was parked.
+      "$JQ" -cn '{name: null, slotAvailable: true}'
+      return 0
+    fi
+  else
+    _rc=$?
+    _undo_hibernation || return $?
+    return "$_rc"
+  fi
+
+  if ! kill_session "$_name"; then
+    # A failed kill freed no slot. Undo only our own transition; a concurrent
+    # explicit stop/restart is authoritative and changes hibernatedAt first.
+    _undo_hibernation || return $?
+    return 1
+  fi
+
+  # Activation can race between the flag write and the kill. In that case
+  # the target remains resident by definition: its activator cleared our
+  # marker and the supervisor will resume it. Do not tell the waiting spawn a
+  # slot was reclaimed when it was not.
+  registry_lock || return 75
+  _still="$($JQ -r --arg n "$_name" --arg gen "$_generation" \
+    '(.sessions[$n].stopped == true)
+     and ((.sessions[$n].hibernationGeneration // "") == $gen)' \
+    "$REGISTRY_FILE" 2>/dev/null)" || _still=false
+  registry_unlock
+  [ "$_still" = true ] || return 1
+  printf '%s\n' "$_verified"
 }
 prune_session_state() {
   # Only ever called for a name that has just been DELISTED, and only as an
@@ -4979,7 +5621,7 @@ case "$cmd" in
       # crashed pane recorded (issue #516). tmux says a post-mortem bash pane
       # is alive, so liveness alone cannot tell a dead agent from a running
       # one, and this used to report the crash as `live`.
-      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end), (.value.died // "" | tostring)] | @tsv' "$REGISTRY_FILE" \
+      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true and (.value.hibernatedAt | type) == "string" then "hibernated" elif .value.stopped == true then "stopped" else "starting" end), (.value.died // "" | tostring)] | @tsv' "$REGISTRY_FILE" \
       | while IFS="$(printf '\t')" read -r n a state dead; do
         case $'\n'"$live"$'\n' in
           *$'\n'"$n"$'\n'*)
@@ -5001,6 +5643,23 @@ case "$cmd" in
         printf '%-24s %-8s %s\n' "$n" '-' 'unmanaged'
       fi
     done
+    ;;
+  hibernate)
+    excludes=()
+    while [ $# -gt 0 ]; do
+      [ "$1" = --exclude ] && [ $# -ge 2 ] && valid_name "$2" \
+        || { usage >&2; exit 2; }
+      excludes+=("$2")
+      shift 2
+    done
+    registry_ensure
+    if hibernate_one "''${excludes[@]}"; then
+      :
+    else
+      rc=$?
+      [ "$rc" = 1 ] && echo "no quiescent resumable session can be hibernated" >&2
+      exit "$rc"
+    fi
     ;;
   peers)
     # Who ELSE is live, where they work, and what they claim.
@@ -5217,36 +5876,48 @@ case "$cmd" in
       selected="''${2:-}"
       [ $# -eq 2 ] && valid_name "$selected" || { usage >&2; exit 2; }
       registry_ensure
-      registry_lock
-      taken "$selected" || {
-        echo "no such session: '$selected' (send @$(id -un) /sessions)" >&2
-        exit 2
-      }
-      harness="$("$JQ" -r --arg n "$selected" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
-      if [ "$harness" != claude ] && [ "$harness" != codex ]; then
-        echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
-        exit 2
-      fi
-      "$JQ" -e --arg n "$selected" '.sessions[$n].whatsapp == true' \
-        "$REGISTRY_FILE" >/dev/null || {
-          echo "session '$selected' is not the selected WhatsApp target" >&2
+      while :; do
+        registry_lock
+        taken "$selected" || {
+          echo "no such session: '$selected' (send @$(id -un) /sessions)" >&2
           exit 2
         }
-      stopped="$("$JQ" -r --arg n "$selected" '.sessions[$n].stopped == true' "$REGISTRY_FILE")"
-      if [ "$stopped" = true ]; then
-        # A stopped session is a cold conversation, not a dead target. Admit
-        # it through the same shared capacity policy as an explicit restart,
-        # but do not bounce a target that is already resident. The supervisor
-        # observes the cleared flag and resumes the harness's native thread.
-        "''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check \
-          "$REGISTRY_FILE" "$selected" >/dev/null
-        registry_edit --arg n "$selected" 'del(.sessions[$n].stopped)'
-      fi
-      "$JQ" -cn --arg name "$selected" --arg harness "$harness" \
-        --argjson activated "$stopped" \
-        '{name: $name, harness: $harness, activated: $activated}'
-      registry_unlock
-      exit 0
+        harness="$("$JQ" -r --arg n "$selected" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
+        if [ "$harness" != claude ] && [ "$harness" != codex ]; then
+          echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+          exit 2
+        fi
+        "$JQ" -e --arg n "$selected" '.sessions[$n].whatsapp == true' \
+          "$REGISTRY_FILE" >/dev/null || {
+            echo "session '$selected' is not the selected WhatsApp target" >&2
+            exit 2
+          }
+        stopped="$("$JQ" -r --arg n "$selected" '.sessions[$n].stopped == true' "$REGISTRY_FILE")"
+        if [ "$stopped" = true ]; then
+          # A stopped session is a cold conversation. If its activation is
+          # the work that needs a full box's next slot, reclaim one OTHER
+          # quiescent runtime and retry this exact target.
+          if "''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check \
+              "$REGISTRY_FILE" "$selected" >/dev/null; then
+            :
+          else
+            rc=$?
+            registry_unlock
+            if [ "$rc" = 75 ] && hibernate_one "$selected" >/dev/null; then
+              continue
+            fi
+            exit "$rc"
+          fi
+          registry_edit --arg n "$selected" \
+            '.sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
+                               | del(.hibernationGeneration))'
+        fi
+        "$JQ" -cn --arg name "$selected" --arg harness "$harness" \
+          --argjson activated "$stopped" \
+          '{name: $name, harness: $harness, activated: $activated}'
+        registry_unlock
+        exit 0
+      done
     fi
     if [ "$name" = clear ]; then
       [ $# -eq 1 ] || { usage >&2; exit 2; }
@@ -5582,7 +6253,9 @@ case "$cmd" in
     eph=0
     "$JQ" -e --arg n "$name" '.sessions[$n].ephemeral == true' \
       "$REGISTRY_FILE" >/dev/null 2>&1 && eph=1
-    registry_edit --arg n "$name" '.sessions[$n].stopped = true'
+    registry_edit --arg n "$name" \
+      '.sessions[$n] |= (.stopped = true | del(.hibernatedAt)
+                         | del(.hibernationGeneration))'
     registry_unlock
     kill_session "$name" || exit 1
     if [ "$eph" = 1 ]; then
@@ -5599,7 +6272,8 @@ case "$cmd" in
       registry_lock
       mapfile -t restart_names < <("$JQ" -r '.sessions | keys[]' "$REGISTRY_FILE")
       "''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "''${restart_names[@]}" >/dev/null
-      registry_edit 'del(.sessions[].stopped)'
+      registry_edit 'del(.sessions[].stopped) | del(.sessions[].hibernatedAt)
+                     | del(.sessions[].hibernationGeneration)'
       registry_unlock
       "$JQ" -r '.sessions | keys[]' "$REGISTRY_FILE" | while IFS= read -r n; do
         [ -n "$n" ] && kill_session "$n" || true
@@ -5614,7 +6288,9 @@ case "$cmd" in
       registry_lock
       if taken "$name"; then
         "''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
-        registry_edit --arg n "$name" 'del(.sessions[$n].stopped)'
+        registry_edit --arg n "$name" \
+          '.sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
+                             | del(.hibernationGeneration))'
         registry_unlock
         # A stopped session has no live tmux session to kill; kill_session
         # treats that "can't find session" as success.
@@ -10819,11 +11495,30 @@ fi
 # `died` rather than parked (issue #516), so it stays listed and attachable
 # for inspection exactly as before -- and every surface now says the agent
 # is gone instead of reporting the post-mortem shell as a running session.
-rc=0
-"$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral \
-  --origin webhook --hook "''${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" --prompt "$preamble
+start_hook_session() {
+  "$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral \
+    --origin webhook --hook "''${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" --prompt "$preamble
 
-$PROMPT" -- "''${extra[@]}" || rc=$?
+$PROMPT" -- "''${extra[@]}"
+}
+
+rc=0
+start_hook_session || rc=$?
+if [ "$rc" = 75 ]; then
+  # Capacity pressure is the only reason to evict an idle runtime. The
+  # session CLI proves quiescence, revalidates it under the registry lock,
+  # parks exactly one resumable conversation and refuses without mutation if
+  # a slot became free meanwhile. A lock/configuration failure or a box with
+  # no safe candidate keeps the original EX_TEMPFAIL result.
+  hibernated=""
+  if hibernated="$($SESSION_BIN hibernate 2>/dev/null)"; then
+    parked="$(printf '%s' "$hibernated" | "$JQ" -r '.name // empty')"
+    [ -z "$parked" ] \
+      || echo "agent-box-webhook-spawn: hibernated idle session '$parked' for this event" >&2
+    rc=0
+    start_hook_session || rc=$?
+  fi
+fi
 # Recorded only once the session really exists: a capacity refusal (75) is
 # retried by the receiver, and a spawn line per attempt would both report
 # sessions that never started and push the real ones out of the log.
@@ -13916,9 +14611,25 @@ esac
       printf '%s' "$_v"
     }
 
+    session_native_id() {
+      # Exact native transcript behind a stable Agentbox name. Hibernation
+      # refreshes this pointer immediately before stopping the runtime; ordinary
+      # launches refresh it after a successful spawn.
+      _v="$($JQ -r '.nativeSessionId // empty' "$(session_state_file "$1")" 2>/dev/null)" \
+        || _v=""
+      case "$_v" in
+        (*[!0-9a-fA-F-]*) _v="" ;;
+        (????????-????-????-????-????????????) ;;
+        (*) _v="" ;;
+      esac
+      printf '%s' "$_v"
+    }
+
     record_launch() {
-      # record_launch SESSION BOXID — remember the id this spawn launched with,
-      # so the next one resumes the same conversation.
+      # record_launch SESSION BOXID - remember the id this spawn launched with,
+      # so the next one resumes the same conversation. Preserve nativeSessionId:
+      # it is the other half of the Agentbox-name -> harness-thread mapping used
+      # to reactivate a hibernated runtime (issue #858).
       #
       # mktemp + rename, not a create-if-absent: a rotation legitimately CHANGES
       # the value, so the last writer must win. mktemp is the exclusive-creation
@@ -13929,7 +14640,45 @@ esac
       mkdir -p "$SESSION_STATE_DIR" 2>/dev/null || return 0
       _f="$(session_state_file "$1")"
       _t="$(mktemp "$_f.XXXXXX" 2>/dev/null)" || return 0
-      if printf '{"launchSessionId":"%s"}\n' "$2" > "$_t" 2>/dev/null; then
+      if [ -r "$_f" ]; then
+        $JQ --arg b "$2" \
+          '(if type == "object" then . else {} end) | .launchSessionId = $b' \
+          "$_f" > "$_t" 2>/dev/null || { rm -f "$_t"; return 0; }
+      else
+        $JQ -n --arg b "$2" '{launchSessionId: $b}' \
+          > "$_t" 2>/dev/null || { rm -f "$_t"; return 0; }
+      fi
+      if [ -s "$_t" ]; then
+        mv -f "$_t" "$_f" 2>/dev/null || rm -f "$_t"
+      else
+        rm -f "$_t"
+      fi
+    }
+
+    record_native_session() {
+      # record_native_session SESSION NATIVEID - publish the exact Claude UUID or
+      # Codex rollout UUID behind the stable Agentbox name. The harness remains
+      # the transcript authority; this sidecar is only the pointer needed to
+      # resume it after the disposable runtime is hibernated.
+      case "$2" in
+        (*[!0-9a-fA-F-]*|"") return 0 ;;
+        (????????-????-????-????-????????????) ;;
+        (*) return 0 ;;
+      esac
+      mkdir -p "$SESSION_STATE_DIR" 2>/dev/null || return 0
+      _f="$(session_state_file "$1")"
+      _current="$($JQ -r '.nativeSessionId // empty' "$_f" 2>/dev/null)" || _current=""
+      [ "$_current" != "$2" ] || return 0
+      _t="$(mktemp "$_f.XXXXXX" 2>/dev/null)" || return 0
+      if [ -r "$_f" ]; then
+        $JQ --arg n "$2" \
+          '(if type == "object" then . else {} end) | .nativeSessionId = $n' \
+          "$_f" > "$_t" 2>/dev/null || { rm -f "$_t"; return 0; }
+      else
+        $JQ -n --arg n "$2" '{nativeSessionId: $n}' \
+          > "$_t" 2>/dev/null || { rm -f "$_t"; return 0; }
+      fi
+      if [ -s "$_t" ]; then
         mv -f "$_t" "$_f" 2>/dev/null || rm -f "$_t"
       else
         rm -f "$_t"
@@ -14103,6 +14852,18 @@ esac
       printf '%s' "''${b: -36}"
     }
 
+    codex_native_thread() {
+      # Accept a persisted native pointer only while that exact rollout remains
+      # on disk. Empty is the safe answer: the caller can still derive a target
+      # from the launch marker or WhatsApp registration, but never resume a
+      # sibling with `--last`.
+      _thread="$(session_native_id "$1")"
+      [ -n "$_thread" ] || return 0
+      [ -n "$($FIND "''${2:-$HOME/.codex}"/sessions \
+          -name "rollout-*-$_thread.jsonl" 2>/dev/null | head -n1)" ] || return 0
+      printf '%s' "$_thread"
+    }
+
     codex_registered_thread() {
       # The Codex thread a WhatsApp registration binds to session $1
       # (local-whatsapp's codex-threads.json, keyed by session name), if its
@@ -14222,7 +14983,10 @@ esac
           _launch="$(session_launch_id "$_name")"
           _thread="$(codex_rollout_uuid "$_launch" "$_cxhome")"
         fi
-        [ -n "$_thread" ] && codex_publish_thread "$_name" "$_thread"
+        if [ -n "$_thread" ]; then
+          codex_publish_thread "$_name" "$_thread"
+          record_native_session "$_name" "$_thread"
+        fi
       done < <($JQ -r --arg target "$_target" '
         .sessions | to_entries[]
         | select((.value.agent // "") == "codex"
@@ -14361,6 +15125,19 @@ esac
           rotated=true
           hasrun=true
         fi
+        # A hibernation freezes the same rotation in the session sidecar. It is
+        # the durable fallback if the live hook record is pruned or unavailable
+        # before activation, and is trusted only while Claude's own transcript
+        # exists. Never override a newer live hook observation.
+        if [ "$rotated" = false ]; then
+          native="$(session_native_id "$sname")"
+          if [ -n "$native" ] && [ "$native" != "$bid" ] \
+              && claude_has_transcript "$native"; then
+            bid="$native"
+            rotated=true
+            hasrun=true
+          fi
+        fi
       fi
       # Codex needs a concrete delivery target before a prompt can wake it. A
       # TUI session owns a rollout transcript; Remote Control owns whichever
@@ -14375,6 +15152,8 @@ esac
         else
           cxhome="$(resolve_codex_home "$sprofile")"
           codex_target="$(codex_rollout_uuid "$bid" "$cxhome")"
+          [ -n "$codex_target" ] \
+            || codex_target="$(codex_native_thread "$sname" "$cxhome")"
           [ -n "$codex_target" ] \
             || codex_target="$(codex_registered_thread "$sname" "$cxhome")"
         fi
@@ -14826,6 +15605,11 @@ esac
         if [ "$bid" != "$recorded" ] || [ "$rotated" = true ]; then
           record_launch "$sname" "$bid"
         fi
+        if [ "$agent" = claude ]; then
+          record_native_session "$sname" "$bid"
+        elif [ "$agent" = codex ] && [ "$rc" = false ] && [ -n "$codex_target" ]; then
+          record_native_session "$sname" "$codex_target"
+        fi
         if [ "$launched" != true ] || [ "$rotated" = true ]; then
           mark_started "$sname" "$bid"
         fi
@@ -15134,6 +15918,17 @@ in
         nominal 4 GiB VM into three slots. Set a positive integer to override
         that automatic budget. This is overload control, not a memory
         guarantee or a cross-user quota.
+      '';
+    };
+
+    sessionHibernationGraceSeconds = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 30;
+      description = ''
+        Minimum age of a harness's terminal turn record before a full box
+        may hibernate that quiescent runtime to admit another one. Zero is
+        useful for tests. This is not an idle reaper: no session is parked
+        while the shared session limit has room.
       '';
     };
 
@@ -18515,6 +19310,8 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
                       and s.get("remoteControl") is not False]
                 if rc and all(s.get("stopped") for s in rc):
                     rc[0].pop("stopped", None)
+                    rc[0].pop("hibernatedAt", None)
+                    rc[0].pop("hibernationGeneration", None)
                     write_sessions(sessions, version)
                 if rc:
                     return
@@ -29066,6 +29863,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # name that is not there (issue #254).
                     if isinstance(entry, dict):
                         entry["stopped"] = True
+                        entry.pop("hibernatedAt", None)
+                        entry.pop("hibernationGeneration", None)
                         write_sessions(sessions, version)
             except RegistryBusy as exc:
                 self._registry_busy("stop", exc, self._sess_page(form))
@@ -29118,9 +29917,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             self._send_json({"ok": False, "reason": "No such session."},
                                             status=404)
                             return
-                        if isinstance(entry, dict) and entry.pop("stopped", None) is not None:
-                            write_sessions(sessions, version)
-                            ok = "ok=session_started"
+                        if isinstance(entry, dict):
+                            changed = entry.pop("stopped", None) is not None
+                            changed = entry.pop("hibernatedAt", None) is not None or changed
+                            changed = (entry.pop("hibernationGeneration", None)
+                                       is not None) or changed
+                            if changed:
+                                write_sessions(sessions, version)
+                                ok = "ok=session_started"
                 except SessionCapacityError as exc:
                     self._sess_error(form, str(exc), 503)
                     return

@@ -126,7 +126,16 @@ plainly rather than handing it back.
   overridden by `sessionLimit` in the box configuration. Pending starts reserve
   slots too. Stop a session to free capacity; restarting a stopped session
   needs a free slot. `restart --all` refuses without changing anything if it
-  would exceed the limit. This is overload control, not a memory guarantee.
+  would exceed the limit. When a new runtime is refused at the limit,
+  Agentbox may hibernate the oldest conservatively idle Claude or Codex TUI
+  session: its process exits, its stable name and native conversation ID stay
+  recorded, and a later routed message transparently resumes that exact
+  conversation. It never hibernates merely because a session is idle. An open
+  turn, unresolved assignment, webhook subscription, pending delivery,
+  unknown transcript state, shell, hook session, or Remote-Control Codex
+  remains resident. `sessionHibernationGraceSeconds` sets the minimum age of
+  the completed turn (30 seconds by default). This is overload control, not a
+  memory guarantee.
 - Manage your own sessions without a rebuild:
   `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
   plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
