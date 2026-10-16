@@ -1,0 +1,511 @@
+#! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.7/bin/python3.14
+"""Run one Agentbox profile as a supervised remote ACP worker.
+
+This is a transport and profile adapter. Buzz still owns identity, SessionScope,
+session reuse, retries, and completion semantics. The SSH forced command fixes
+which profile and workspace this process may launch; no ACP request selects a
+profile, harness, native conversation, or host path.
+"""
+
+import argparse
+import asyncio
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import signal
+import subprocess
+import sys
+
+
+MAX_LINE_BYTES = 16 * 1024 * 1024
+EXPECTED_COMMAND = {
+    "claude": "claude-agent-acp",
+    "codex": "codex-acp",
+}
+
+
+class AcpLaunchError(Exception):
+    """A safe, operator-facing launch or protocol error."""
+
+
+def fail(message, code=2):
+    print(f"agent-box-acp: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def executable(path, label):
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        raise AcpLaunchError(f"{label} must be an absolute path")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise AcpLaunchError(f"{label} does not exist: {candidate}") from error
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise AcpLaunchError(f"{label} is not an executable file: {resolved}")
+    return resolved
+
+
+def remote_cwd(path):
+    try:
+        resolved = Path(path).resolve(strict=True)
+        home = Path.home().resolve(strict=True)
+    except OSError as error:
+        raise AcpLaunchError(f"working directory does not exist: {path}") from error
+    if not resolved.is_dir():
+        raise AcpLaunchError(f"working directory is not a directory: {resolved}")
+    if resolved != home and home not in resolved.parents:
+        raise AcpLaunchError(
+            f"working directory resolves outside HOME ({home}): {resolved}"
+        )
+    return resolved
+
+
+def command_json(argv, env=None):
+    try:
+        result = subprocess.run(
+            argv,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise AcpLaunchError(f"cannot run {Path(argv[0]).name}") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise AcpLaunchError(f"{Path(argv[0]).name} refused the profile{suffix}")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise AcpLaunchError(f"{Path(argv[0]).name} returned invalid JSON") from error
+    if not isinstance(value, dict):
+        raise AcpLaunchError(f"{Path(argv[0]).name} returned a non-object")
+    return value
+
+
+def resolve_profile(name):
+    profile_cli = os.environ.get("AGENT_BOX_PROFILE_BIN", "")
+    envstore = os.environ.get("AGENT_BOX_ENVSTORE_BIN", "")
+    if not profile_cli or not envstore:
+        raise AcpLaunchError("installed wrapper did not pin the profile tools")
+    launch = command_json([profile_cli, "launch", name])
+    values = command_json([envstore, "--profile", name, "json"])
+    harness = launch.get("harness")
+    if harness not in EXPECTED_COMMAND:
+        raise AcpLaunchError(
+            f"profile harness must be claude or codex, got {harness!r}"
+        )
+    warnings = launch.get("warnings")
+    if not isinstance(warnings, list):
+        raise AcpLaunchError("profile resolver returned invalid warnings")
+    if warnings:
+        raise AcpLaunchError("unsupported profile fields: " + "; ".join(warnings))
+    args = launch.get("args")
+    if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+        raise AcpLaunchError("profile resolver returned invalid arguments")
+    if not all(isinstance(key, str) and isinstance(value, str)
+               for key, value in values.items()):
+        raise AcpLaunchError("profile store returned invalid values")
+    if values.get("HARNESS") != harness:
+        raise AcpLaunchError("profile harness changed while it was resolved")
+    return launch, values
+
+
+def validate_original_command(expected, local):
+    if local:
+        return
+    if os.environ.get("SSH_TTY"):
+        raise AcpLaunchError("PTY SSH sessions are not accepted")
+    original = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    try:
+        words = shlex.split(original, posix=True)
+    except ValueError as error:
+        raise AcpLaunchError("malformed SSH original command") from error
+    if words != [expected]:
+        raise AcpLaunchError(
+            f"SSH original command must be exactly {expected!r}"
+        )
+
+
+def acquire_profile_lock(profile):
+    """Hold one remote ACP worker per profile for this Linux user."""
+    directory = Path.home() / ".local" / "state" / "agent-box" / "acp"
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as error:
+        raise AcpLaunchError("cannot create the remote ACP state directory") from error
+    path = directory / f"{profile}.lock"
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    handle = None
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        handle = os.fdopen(descriptor, "r+")
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError) as error:
+        if handle is not None:
+            handle.close()
+        raise AcpLaunchError(
+            f"profile {profile!r} already has a remote ACP worker"
+        ) from error
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()) + "\n")
+    handle.flush()
+    return handle
+
+
+def compose_claude_profile(message, values):
+    """Apply profile launch fields through Claude ACP's supported metadata."""
+    result = json.loads(json.dumps(message))
+    params = result.setdefault("params", {})
+    if not isinstance(params, dict):
+        raise AcpLaunchError("session/new params must be an object")
+    meta = params.setdefault("_meta", {})
+    if not isinstance(meta, dict):
+        raise AcpLaunchError("session/new _meta must be an object")
+    claude = meta.setdefault("claudeCode", {})
+    if not isinstance(claude, dict):
+        raise AcpLaunchError("session/new claudeCode metadata must be an object")
+    options = claude.setdefault("options", {})
+    if not isinstance(options, dict):
+        raise AcpLaunchError("session/new Claude options must be an object")
+    if values.get("MODEL"):
+        options["model"] = values["MODEL"]
+    if values.get("EFFORT"):
+        options["effort"] = values["EFFORT"]
+    profile_prompt = values.get("SYSTEM_PROMPT", "")
+    if profile_prompt:
+        prompt = meta.setdefault("systemPrompt", {})
+        if not isinstance(prompt, dict) or set(prompt) - {"append"}:
+            raise AcpLaunchError(
+                "only append-form Claude system prompts can be composed"
+            )
+        current = prompt.get("append", "")
+        if not isinstance(current, str):
+            raise AcpLaunchError("Claude appended system prompt must be text")
+        prompt["append"] = (
+            profile_prompt + ("\n\n" + current if current else "")
+        )
+    return result
+
+
+def replace_path(text, old, new):
+    if not old or old == new:
+        return text
+    if old.rstrip("/") == "":
+        # A local root cwd is not a useful textual anchor: replacing every
+        # slash would rewrite commands, URLs and unrelated absolute paths.
+        # session/new.cwd is still pinned to the remote directory.
+        return text
+    # Do not turn /work/repo-two into /remote/repo-two when /work/repo is the
+    # mapped root. A path anchor may be followed by a slash or prose
+    # punctuation, but not by an ordinary path-component character.
+    pattern = re.escape(old.rstrip("/")) + r"(?![A-Za-z0-9._-])"
+    return re.sub(pattern, new.rstrip("/"), text)
+
+
+def rewrite_prompt_paths(params, source_cwds, target):
+    prompt = params.get("prompt")
+    if isinstance(prompt, str):
+        for source in source_cwds:
+            prompt = replace_path(prompt, source, target)
+        params["prompt"] = prompt
+        return
+    if not isinstance(prompt, list):
+        return
+    for block in prompt:
+        if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+            continue
+        for source in source_cwds:
+            block["text"] = replace_path(block["text"], source, target)
+
+
+def rewrite_message(message, harness, values, cwd, allow_mcp, source_cwds):
+    method = message.get("method")
+    if method not in ("session/new", "session/prompt"):
+        return message
+    result = json.loads(json.dumps(message))
+    params = result.get("params")
+    if not isinstance(params, dict):
+        raise AcpLaunchError(f"{method} params must be an object")
+    target = str(cwd)
+    if method == "session/prompt":
+        rewrite_prompt_paths(params, source_cwds, target)
+        return result
+
+    source = params.get("cwd")
+    if isinstance(source, str) and source:
+        source_cwds.add(source)
+    params["cwd"] = target
+    servers = params.get("mcpServers", [])
+    if servers and not allow_mcp:
+        raise AcpLaunchError(
+            "session/new contains MCP servers with unmapped remote paths; "
+            "configure valid remote paths and pass --allow-mcp"
+        )
+    meta = params.get("_meta")
+    if isinstance(meta, dict):
+        prompt = meta.get("systemPrompt")
+        if isinstance(prompt, dict) and isinstance(prompt.get("append"), str):
+            for old in source_cwds:
+                prompt["append"] = replace_path(prompt["append"], old, target)
+    if harness == "claude":
+        result = compose_claude_profile(result, values)
+    return result
+
+
+def codex_shim():
+    if os.environ.get("AGENT_BOX_ACP_CODEX_SHIM") != "1":
+        return False
+    try:
+        native = executable(os.environ["AGENT_BOX_ACP_NATIVE"], "native harness")
+        profile_args = json.loads(os.environ["AGENT_BOX_ACP_NATIVE_ARGS"])
+        if not isinstance(profile_args, list) or not all(
+            isinstance(item, str) for item in profile_args
+        ):
+            raise AcpLaunchError("invalid Codex profile argument frame")
+        os.execv(native, [str(native), *profile_args, *sys.argv[1:]])
+    except (KeyError, json.JSONDecodeError) as error:
+        raise AcpLaunchError("invalid Codex shim environment") from error
+    return True
+
+
+def env_ready(profile, argv):
+    if os.environ.get("AGENT_BOX_ACP_ENV_READY") == "1":
+        return
+    env_exec = os.environ.get("AGENT_BOX_ENV_EXEC", "")
+    self_path = os.environ.get("AGENT_BOX_ACP_SELF", "")
+    if not env_exec or not self_path:
+        raise AcpLaunchError("installed wrapper did not pin the environment loader")
+    env = dict(os.environ)
+    env["AGENT_BOX_PROFILE"] = profile
+    env["AGENT_BOX_ACP_ENV_READY"] = "1"
+    os.execve(env_exec, [env_exec, self_path, *argv], env)
+
+
+async def proxy(config, launch, values):
+    child_env = dict(os.environ)
+    child_env.pop("AGENT_BOX_ACP_ENV_READY", None)
+    child_env["AGENT_BOX_PROFILE"] = config.profile
+    if launch["harness"] == "codex":
+        self_path = executable(
+            os.environ.get("AGENT_BOX_ACP_SELF", ""), "agent-box-acp executable"
+        )
+        child_env["AGENT_BOX_ACP_CODEX_SHIM"] = "1"
+        child_env["AGENT_BOX_ACP_NATIVE"] = str(config.native)
+        child_env["AGENT_BOX_ACP_NATIVE_ARGS"] = json.dumps(launch["args"])
+        child_env["CODEX_PATH"] = str(self_path)
+    else:
+        child_env["CLAUDE_CODE_EXECUTABLE"] = str(config.native)
+
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader(limit=MAX_LINE_BYTES)
+    protocol = asyncio.StreamReaderProtocol(reader)
+    input_transport, _ = await loop.connect_read_pipe(
+        lambda: protocol, sys.stdin.buffer
+    )
+    output_transport, output_protocol = await loop.connect_write_pipe(
+        asyncio.streams.FlowControlMixin, sys.stdout.buffer
+    )
+    writer = asyncio.StreamWriter(
+        output_transport, output_protocol, None, loop
+    )
+    try:
+        child = await asyncio.create_subprocess_exec(
+            str(config.adapter),
+            *config.adapter_arg,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=None,
+            cwd=config.cwd,
+            env=child_env,
+            start_new_session=True,
+        )
+    except BaseException:
+        input_transport.close()
+        writer.close()
+        raise
+    stopped = asyncio.Queue()
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, stopped.put_nowait, signum)
+        except NotImplementedError:
+            pass
+    source_cwds = set()
+
+    async def incoming():
+        while True:
+            try:
+                data = await reader.readline()
+            except ValueError as error:
+                raise AcpLaunchError("ACP request line exceeds 16 MiB") from error
+            if not data:
+                child.stdin.close()
+                return "input-eof"
+            if len(data) > MAX_LINE_BYTES:
+                raise AcpLaunchError("ACP request line exceeds 16 MiB")
+            try:
+                message = json.loads(data)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise AcpLaunchError("ACP input is not newline-delimited JSON") from error
+            if not isinstance(message, dict):
+                raise AcpLaunchError("ACP request must be a JSON object")
+            rewritten = rewrite_message(
+                message,
+                launch["harness"],
+                values,
+                config.cwd,
+                config.allow_mcp,
+                source_cwds,
+            )
+            if rewritten is message:
+                payload = data
+            else:
+                payload = (
+                    json.dumps(rewritten, separators=(",", ":")) + "\n"
+                ).encode()
+            child.stdin.write(payload)
+            await child.stdin.drain()
+
+    async def outgoing():
+        while data := await child.stdout.read(65536):
+            writer.write(data)
+            await writer.drain()
+        return "output-eof"
+
+    tasks = [
+        asyncio.create_task(incoming()),
+        asyncio.create_task(outgoing()),
+        asyncio.create_task(child.wait()),
+        asyncio.create_task(stopped.get()),
+    ]
+    code = 125
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for completed in done:
+            if completed.exception() is not None:
+                raise completed.exception()
+        if tasks[2] in done or tasks[1] in done:
+            try:
+                await asyncio.wait_for(tasks[2], 5)
+                await asyncio.wait_for(tasks[1], 5)
+                code = child.returncode
+            except asyncio.TimeoutError:
+                # A descendant kept the adapter's stdout pipe open after the
+                # group leader exited. That is a disconnect, not completion.
+                code = 129
+        elif tasks[3] in done:
+            code = 128 + int(tasks[3].result())
+        else:
+            grace = float(os.environ.get("AGENT_BOX_ACP_EOF_GRACE", "2"))
+            try:
+                await asyncio.wait_for(tasks[2], grace)
+                await asyncio.wait_for(tasks[1], 5)
+                code = child.returncode
+            except asyncio.TimeoutError:
+                code = 129
+    finally:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        # The adapter may exit on TERM while a deliberately stubborn tool in
+        # its process group remains. Waiting only for the group leader would
+        # mistake that for cleanup, so KILL the group after the bounded grace
+        # even when the adapter itself has already reaped.
+        await asyncio.sleep(0.3)
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await child.wait()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(signum)
+        input_transport.close()
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (BrokenPipeError, ConnectionResetError, NotImplementedError):
+            pass
+    return code if code is not None and code >= 0 else 128 - int(code or -1)
+
+
+def parser():
+    result = argparse.ArgumentParser(
+        prog="agent-box-acp",
+        description="Run one fixed Agentbox profile as a remote ACP worker.",
+    )
+    sub = result.add_subparsers(dest="command", required=True)
+    for name in ("check", "serve"):
+        command = sub.add_parser(name)
+        command.add_argument("--profile", required=True)
+        command.add_argument("--adapter", required=True)
+        command.add_argument("--adapter-arg", action="append", default=[])
+        command.add_argument("--native", required=True)
+        command.add_argument("--cwd", required=True)
+        command.add_argument("--expected-command")
+        command.add_argument("--allow-mcp", action="store_true")
+        command.add_argument(
+            "--local",
+            action="store_true",
+            help="test without SSH forced-command validation",
+        )
+    return result
+
+
+def main(argv):
+    if codex_shim():
+        return 0
+    args = parser().parse_args(argv)
+    launch, values = resolve_profile(args.profile)
+    args.adapter = executable(args.adapter, "ACP adapter")
+    args.native = executable(args.native, "native harness")
+    args.cwd = remote_cwd(args.cwd)
+    expected = args.expected_command or EXPECTED_COMMAND[launch["harness"]]
+    if not expected or any(char.isspace() for char in expected):
+        raise AcpLaunchError("expected command must be one shell word")
+    validate_original_command(expected, args.local)
+    if args.command == "check":
+        print(json.dumps({
+            "profile": args.profile,
+            "harness": launch["harness"],
+            "expectedCommand": expected,
+            "cwd": str(args.cwd),
+            "adapter": str(args.adapter),
+            "native": str(args.native),
+            "mcpPolicy": "pass-through" if args.allow_mcp else "refuse",
+        }, indent=2, sort_keys=True))
+        return 0
+    env_ready(args.profile, argv)
+    profile_lock = acquire_profile_lock(args.profile)
+    try:
+        try:
+            return asyncio.run(proxy(args, launch, values))
+        except AcpLaunchError:
+            raise
+        except (OSError, ValueError, asyncio.TimeoutError) as error:
+            raise AcpLaunchError(
+                f"ACP transport failed ({type(error).__name__})"
+            ) from error
+    finally:
+        profile_lock.close()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except AcpLaunchError as error:
+        fail(str(error))
+    except KeyboardInterrupt:
+        raise SystemExit(130)

@@ -1,0 +1,6 @@
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
+export AGENT_BOX_ENV_EXEC=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-env-exec
+export AGENT_BOX_ENVSTORE_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-envstore/bin/agent-box-envstore
+export AGENT_BOX_PROFILE_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-profile/bin/agent-box-profile
+export AGENT_BOX_ACP_SELF=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-acp-bare
+exec /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-acp-bare "$@"

@@ -185,6 +185,12 @@ let
     flakeIgnore = [ "E402" "E501" ];
   } (envStoreLib + "\n\n" + readSrc "envstore-cli.py");
 
+  # Installed bare; `agentbox apply` writes the /usr/local/bin wrapper that
+  # pins the profile/env tools and this executable's own Codex shim path.
+  acpLauncherBare = pkgs.writers.writePython3Bin "agent-box-acp-bare" {
+    flakeIgnore = [ "E501" "E128" "W503" ];
+  } (readSrc "acp-cli.py");
+
   capacityCli = pkgs.writers.writePython3Bin "agent-box-session-capacity" {
     flakeIgnore = [ "E501" "E402" "E128" "W503" ];
   } (readSrc "lib/session-capacity.py" + "\n\n"
@@ -299,6 +305,7 @@ let
     # `agentbox apply` can pin the env store and the harness list into the
     # wrapper — this CLI runs from PATHs that carry almost nothing.
     (payload "agent-box-profile-bare" "profile-cli.sh")
+    acpLauncherBare
     # Moving an installed harness onto this box's pin (issues #559, #590,
     # #614). Bare for the same reason the two above are: the pin belongs in
     # the wrapper `agentbox apply` generates, and this CLI is run from a

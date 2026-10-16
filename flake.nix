@@ -1393,6 +1393,22 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 fail=1
               fi
 
+              # agent-box-acp-bare is another finished Python payload. Keep
+              # both backends on the exact source that the focused transport
+              # tests exercise, without treating it as a shell payload.
+              if ! diff -u "$srcDir/acp-cli.py" \
+                   <(tail -n +2 "$profile/bin/agent-box-acp-bare") >/dev/null; then
+                echo "DRIFT: bin/agent-box-acp-bare is not src/acp-cli.py"
+                diff -u "$srcDir/acp-cli.py" \
+                  <(tail -n +2 "$profile/bin/agent-box-acp-bare") | head -20 || true
+                fail=1
+              else
+                echo "ok: bin/agent-box-acp-bare == src/acp-cli.py"
+              fi
+              python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' \
+                "$profile/bin/agent-box-acp-bare" \
+                || { echo "SYNTAX: bin/agent-box-acp-bare"; fail=1; }
+
               # The settings daemon is the one asset in modules/src that is
               # NOT a finished file: it carries @@include@@ markers for
               # settings.css, settings.js and docs/potato.svg. Shipping it
@@ -2589,6 +2605,19 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             cp -r ${./modules/src} repo/modules/src
             cp ${./tests/test-session-capacity.py} repo/tests/test-session-capacity.py
             python3 repo/tests/test-session-capacity.py
+            touch $out
+          '';
+
+          # Remote Buzz ACP transport/profile boundary (#300). Pure native
+          # tests cover context rewriting, forced-command refusal, literal
+          # Codex argv, bidirectional stdio and stubborn descendant cleanup.
+          buzz-acp = pkgs.runCommand "agent-box-buzz-acp-test" {
+            nativeBuildInputs = [ pkgs.python3 ];
+          } ''
+            mkdir -p repo/modules/src repo/tests
+            cp ${./modules/src/acp-cli.py} repo/modules/src/acp-cli.py
+            cp ${./tests/test-buzz-acp.py} repo/tests/test-buzz-acp.py
+            python3 repo/tests/test-buzz-acp.py -v
             touch $out
           '';
 
