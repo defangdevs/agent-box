@@ -35,6 +35,15 @@
     machine.wait_until_succeeds(f"{panes} has-session -t a")
     machine.wait_until_succeeds(f"{panes} has-session -t b")
     machine.fail(f"{panes} has-session -t c")
+    # The VM has no network and this test exercises target activation, not
+    # plugin installation. Seed the minimal installed record so selecting a
+    # WhatsApp target cannot spend two 90-second retries in the supervisor.
+    machine.succeed(
+        "install -d -o agent -g users /home/agent/.claude/plugins && "
+        "printf '%s\\n' '{\"plugins\":{\"local-whatsapp@local-channels\":[{}]}}' "
+        "> /home/agent/.claude/plugins/installed_plugins.json && "
+        "chown agent:users /home/agent/.claude/plugins/installed_plugins.json"
+    )
 
     # A completed Claude turn is hibernated only because c is waiting at the
     # full limit. Freeze a rotated native UUID, then delete the live hook
@@ -126,7 +135,7 @@
     machine.wait_until_succeeds(f"{panes} has-session -t b")
     machine.wait_until_succeeds(
         f"{panes} display-message -pt b '#{{pane_start_command}}' "
-        f"| grep -- 'resume -- {codex_native}' >/dev/null"
+        f"| grep -E -- ' resume .* -- {codex_native}' >/dev/null"
     )
 
     machine.succeed(f"{cli} add terminal --harness shell")
