@@ -712,8 +712,10 @@ let
     The settings page's Connections section can link this user's WhatsApp as a
     device. Enter the account's phone number with country code, start pairing,
     and give the displayed code to WhatsApp's Linked devices screen on the
-    primary phone. The bridge accepts only messages that start with `@agent `
-    (`@` plus this box's Linux user) from that account's Message Yourself chat. The device link belongs to the Linux user and
+    primary phone. Text must start with `@agent ` (`@` plus this box's Linux user).
+    Media must either be captioned that way or sent during an explicitly opened
+    ten-minute upload window. The bridge accepts them only from that
+    account's Message Yourself chat. The device link belongs to the Linux user and
     survives agent session restarts. Automatic message receipts are off by default;
     set `LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable
     diagnostic receipts. Agent replies and explicit command responses stay enabled.
@@ -758,9 +760,18 @@ let
     `whatsapp_reply_image` with the message ID, absolute image path, and optional
     caption. PNG, JPEG, and WebP files are supported, up to 10 MiB, with at most
     20 queued images. The bridge keeps private copies for retries and removes them
-    after sending. No download link or re-pairing is needed. Inbound images and
-    documents are not forwarded yet. The bridge has
-    no shell command target.
+    after sending. No download link or re-pairing is needed.
+
+    For an inbound image, video, or document, add `@agent` at the start of its
+    caption (a caption containing only `@agent` works). To send captionless media,
+    first send `@agent /attach`; that opens a ten-minute upload window for this
+    account's Message Yourself chat. An agent can open the same window with `node
+    ~/.local/share/local-whatsapp/bridge.mjs receive-files`. View-once media is not
+    imported. Each attachment is limited to 20 MiB and the private inbox to 200
+    MiB. The bridge gives the agent the local path and metadata but never executes
+    or extracts the untrusted filename or contents. Files remain private on this
+    box and are cleaned up with their retained messages. The bridge has no shell
+    command target.
 
     ## Slash commands: type them into your own pane
 
@@ -6376,12 +6387,12 @@ import time
 from urllib.request import urlopen
 
 
-REV = "0c43bb92ec304a7dd9678e91c8d0e6effc130872"
+REV = "79d4af3148eb074debe33c9823849fcbafe3c766"
 FILES = {
-    "bridge.mjs": "32352a1d1bbea1a9149607e7011102634384d0a66013cab53cf6aaf884ef773a",
-    "state.mjs": "0b5ab72f0ae5743656c9bdfdb519a5bf8fa17d8666edc5f63ac863ef745171ed",
-    "package.json": "7fbe6ac66cca21c04cdda94044d30c9953e548f0a6f68bf7f9fa466bb5440666",
-    "package-lock.json": "0b125e7425a1ffb3deb64607727e5b4a19717c585df1815c061ff90c9f4188db",
+    "bridge.mjs": "2709fc674687f9c10b65d8fcff011f93780de3ac589a11896cba3279e153e27a",
+    "state.mjs": "a8d8173dbc149f18ff8a258d59ffb1f77923307533d05cfe736ecd58242f016c",
+    "package.json": "949405236ff6608624f604bc9429f4b89889748e85cb097aca19e0b3e6d6db36",
+    "package-lock.json": "b6271066fbfcae42f9d175fad87e8f943d4e7a8fa3664fbc1e3a4e5df5eba4e2",
 }
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"

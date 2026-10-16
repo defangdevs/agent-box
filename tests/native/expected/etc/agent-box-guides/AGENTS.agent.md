@@ -227,8 +227,10 @@ plainly rather than handing it back.
 The settings page's Connections section can link this user's WhatsApp as a
 device. Enter the account's phone number with country code, start pairing,
 and give the displayed code to WhatsApp's Linked devices screen on the
-primary phone. The bridge accepts only messages that start with `@agent `
-(`@` plus this box's Linux user) from that account's Message Yourself chat. The device link belongs to the Linux user and
+primary phone. Text must start with `@agent ` (`@` plus this box's Linux user).
+Media must either be captioned that way or sent during an explicitly opened
+ten-minute upload window. The bridge accepts them only from that
+account's Message Yourself chat. The device link belongs to the Linux user and
 survives agent session restarts. Automatic message receipts are off by default;
 set `LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable
 diagnostic receipts. Agent replies and explicit command responses stay enabled.
@@ -273,9 +275,18 @@ run `node ~/.local/share/local-whatsapp/bridge.mjs reply-image MESSAGE_ID /absol
 `whatsapp_reply_image` with the message ID, absolute image path, and optional
 caption. PNG, JPEG, and WebP files are supported, up to 10 MiB, with at most
 20 queued images. The bridge keeps private copies for retries and removes them
-after sending. No download link or re-pairing is needed. Inbound images and
-documents are not forwarded yet. The bridge has
-no shell command target.
+after sending. No download link or re-pairing is needed.
+
+For an inbound image, video, or document, add `@agent` at the start of its
+caption (a caption containing only `@agent` works). To send captionless media,
+first send `@agent /attach`; that opens a ten-minute upload window for this
+account's Message Yourself chat. An agent can open the same window with `node
+~/.local/share/local-whatsapp/bridge.mjs receive-files`. View-once media is not
+imported. Each attachment is limited to 20 MiB and the private inbox to 200
+MiB. The bridge gives the agent the local path and metadata but never executes
+or extracts the untrusted filename or contents. Files remain private on this
+box and are cleaned up with their retained messages. The bridge has no shell
+command target.
 
 ## Slash commands: type them into your own pane
 
