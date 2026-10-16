@@ -64,6 +64,7 @@ in
   rev = cfg.selfUpdate.rev;
   protectMemory = cfg.protectMemory;
   sessionLimit = cfg.sessionLimit;
+  sessionHibernationGraceSeconds = cfg.sessionHibernationGraceSeconds;
   containers = { enable = cfg.containers.enable; };
   codexFullAccess = cfg.codexFullAccess;
   restartNotice = cfg.restartNotice;

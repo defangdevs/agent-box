@@ -2923,6 +2923,25 @@ class ConfigSchemaTest(unittest.TestCase):
         for value in [0, -1, True, "four", 1.5]:
             self.assertIn("sessionLimit", self.refused(lambda c: c.update(sessionLimit=value)))
 
+    def test_session_hibernation_grace_is_non_negative(self):
+        self.assertEqual(
+            self.spec(lambda c: c.pop("sessionHibernationGraceSeconds", None))
+            .session_hibernation_grace_seconds, 30)
+        self.assertEqual(
+            self.spec(lambda c: c.update(sessionHibernationGraceSeconds=None))
+            .session_hibernation_grace_seconds, 30)
+        self.assertEqual(
+            self.spec(lambda c: c.update(sessionHibernationGraceSeconds=0))
+            .session_hibernation_grace_seconds, 0)
+        self.assertEqual(
+            self.spec(lambda c: c.update(sessionHibernationGraceSeconds=90))
+            .session_hibernation_grace_seconds, 90)
+        for value in [-1, True, "thirty", 1.5]:
+            self.assertIn(
+                "sessionHibernationGraceSeconds",
+                self.refused(lambda c: c.update(
+                    sessionHibernationGraceSeconds=value)))
+
     def test_the_reported_coercions_are_refused_with_the_field_named(self):
         """Every example from issue #525, each with the path in the message.
 

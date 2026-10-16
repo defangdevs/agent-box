@@ -47,6 +47,7 @@ out.write_text(expand(script))
 (out.parent / "session.sh").write_text(expand(src / "session-cli.sh"))
 (out.parent / "capacity").write_text(
     "#!" + sys.executable + "\n" + (src / "lib/session-capacity.py").read_text()
+    + "\n\n" + (src / "lib/session-hibernation.py").read_text()
     + "\n\n" + (src / "session-capacity-cli.py").read_text())
 (out.parent / "capacity").chmod(0o755)
 PY
@@ -157,6 +158,39 @@ else
   fail "a slot below the cap spawns — exit $rc"
   sed 's/^/     /' "$work/spawn.out"
 fi
+
+# At capacity, one safely hibernated resident runtime is retried immediately;
+# the accepted event does not wait for the dispatcher's next re-offer window.
+real_session_bin=$AGENT_BOX_SESSION_BIN
+cat > "$work/bin/hibernate-session" <<EOF
+#!$BASH_BIN
+case "\$1" in
+  peers) echo 'No other session is live on this box.' ;;
+  hibernate) printf '%s\n' '{"name":"idle","harness":"claude"}' ;;
+  add)
+    n=0; [ ! -s "$work/add-attempts" ] || read -r n < "$work/add-attempts"
+    n=\$((n + 1)); printf '%s\n' "\$n" > "$work/add-attempts"
+    printf '%s\n' "\$*" >> "$work/session.log"
+    [ "\$n" -gt 1 ] || exit 75
+    ;;
+  capacity) printf '%s\n' '{"used":2,"max":2}' ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$work/bin/hibernate-session"
+export AGENT_BOX_SESSION_BIN="$work/bin/hibernate-session"
+: > "$work/session.log"
+: > "$work/add-attempts"
+rc=$(spawn defangdevs/hibernate 2)
+if [ "$rc" = 0 ] && [ "$(cat "$work/add-attempts")" = 2 ] \
+   && grep 'hibernated idle session' "$work/spawn.out" >/dev/null; then
+  ok "a capacity-blocked watch hibernates one idle runtime and retries"
+else
+  fail "a capacity-blocked watch hibernates one idle runtime and retries - exit $rc"
+  sed 's/^/     /' "$work/session.log" "$work/spawn.out"
+fi
+export AGENT_BOX_SESSION_BIN=$real_session_bin
+
 # A watch that names no profile starts the box default HARNESS, named outright
 # (issue #753): a bare `add` would start the user's DEFAULT profile, and a
 # watch's worker must never follow what is preselected for interactive use.

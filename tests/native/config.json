@@ -13,6 +13,7 @@
   "repo": "defangdevs/agent-box",
   "restartNotice": "auto",
   "rev": "0000000000000000000000000000000000000000",
+  "sessionHibernationGraceSeconds": 30,
   "sessionLimit": null,
   "sudoAllowlist": [],
   "users": {

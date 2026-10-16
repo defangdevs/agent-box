@@ -242,11 +242,16 @@ you have. That cleanup is load-bearing: one RAM-sized limit (about one session
 per GiB by default, overridable with `sessionLimit`) bounds all agent sessions
 running or queued to start, including CLI/UI sessions but not operator shell panes,
 and once that ceiling is reached EVERY
-watch on the box is stalled - a matching batch starts nothing until a slot
-frees. It is no longer LOST while it waits: the wrapper declines it and the
-receiver keeps it, re-offers it as slots free, and drops it only after an hour
-of waiting. A stopped session frees its slot once its pane exits, without needing
-to be delisted. So
+watch first asks the session manager to hibernate one conservatively idle,
+exactly resumable interactive runtime. That runtime keeps its Agentbox name
+and native Claude/Codex conversation ID; a later routed message activates it
+through the same capacity gate. Sessions with a live webhook subscription are
+not candidates, because accepted peer delivery is not yet durably spooled. If
+no safe candidate exists, the watch is stalled - a matching batch starts
+nothing until a slot frees. It is no longer LOST while it waits: the wrapper
+declines it and the receiver keeps it, re-offers it as slots free, and drops it
+only after an hour of waiting. A stopped session frees its slot once its pane
+exits, without needing to be delisted. So
 before you conclude a repo has been quiet, run `agent-box-webhook status`: its
 `dispatch` object has the live count against the ceiling and the last batch the
 ceiling turned away. `lastRefusal.deferred` records the ANSWER that batch got -

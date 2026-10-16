@@ -777,11 +777,30 @@ fi
 # `died` rather than parked (issue #516), so it stays listed and attachable
 # for inspection exactly as before -- and every surface now says the agent
 # is gone instead of reporting the post-mortem shell as a running session.
-rc=0
-"$SESSION_BIN" add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral \
-  --origin webhook --hook "${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" "${LOCAL_WEBHOOK_SPAWN_KEY:-}" --prompt "$preamble
+start_hook_session() {
+  "$SESSION_BIN" add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral \
+    --origin webhook --hook "${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" "${LOCAL_WEBHOOK_SPAWN_KEY:-}" --prompt "$preamble
 
-$PROMPT" -- "${extra[@]}" || rc=$?
+$PROMPT" -- "${extra[@]}"
+}
+
+rc=0
+start_hook_session || rc=$?
+if [ "$rc" = 75 ]; then
+  # Capacity pressure is the only reason to evict an idle runtime. The
+  # session CLI proves quiescence, revalidates it under the registry lock,
+  # parks exactly one resumable conversation and refuses without mutation if
+  # a slot became free meanwhile. A lock/configuration failure or a box with
+  # no safe candidate keeps the original EX_TEMPFAIL result.
+  hibernated=""
+  if hibernated="$($SESSION_BIN hibernate 2>/dev/null)"; then
+    parked="$(printf '%s' "$hibernated" | "$JQ" -r '.name // empty')"
+    [ -z "$parked" ] \
+      || echo "agent-box-webhook-spawn: hibernated idle session '$parked' for this event" >&2
+    rc=0
+    start_hook_session || rc=$?
+  fi
+fi
 # Recorded only once the session really exists: a capacity refusal (75) is
 # retried by the receiver, and a spawn line per attempt would both report
 # sessions that never started and push the real ones out of the log.
