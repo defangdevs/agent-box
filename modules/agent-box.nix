@@ -712,9 +712,9 @@ let
     The settings page's Connections section can link this user's WhatsApp as a
     device. Enter the account's phone number with country code, start pairing,
     and give the displayed code to WhatsApp's Linked devices screen on the
-    primary phone. The bridge accepts text addressed to `@agent` (`@` plus this
-    box's Linux user), and media either captioned that way or sent during an
-    explicitly opened ten-minute upload window. It accepts them only from that
+    primary phone. Text must start with `@agent ` (`@` plus this box's Linux user).
+    Media must either be captioned that way or sent during an explicitly opened
+    ten-minute upload window. The bridge accepts them only from that
     account's Message Yourself chat. The device link belongs to the Linux user and
     survives agent session restarts. Automatic message receipts are off by default;
     set `LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable
