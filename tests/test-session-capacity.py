@@ -218,6 +218,26 @@ class Hibernation(unittest.TestCase):
         os.environ["AGENT_BOX_HIBERNATE_IDLE_S"] = "60"
         self.assertIsNone(capacity.hibernation_candidate(sessions))
 
+    def test_claude_launch_rotation_beats_stale_native_pointer(self):
+        launch = "11111111-1111-4111-8111-111111111111"
+        stale = "22222222-2222-4222-8222-222222222222"
+        current = "33333333-3333-4333-8333-333333333333"
+        self.state("idle", launch, stale)
+        root = self.home / ".claude/projects/-work"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / (stale + ".jsonl")).write_text(json.dumps({
+            "type": "assistant", "message": {"stop_reason": "end_turn"}
+        }) + "\n")
+        (root / (current + ".jsonl")).write_text(json.dumps({
+            "type": "user", "message": {"content": "still working"}
+        }) + "\n")
+        live_id = self.home / ".local/state/agent-box/live-session-id" / launch
+        live_id.parent.mkdir(parents=True, exist_ok=True)
+        live_id.write_text(current + "\n")
+        self.live.write_text("idle\n")
+        sessions = {"idle": {"agent": "claude"}}
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+
     def test_outstanding_routing_state_excludes_claude(self):
         sessions, _ = self.claude()
         self.write_json("webhook/filter.tester-idle.json", {
@@ -466,6 +486,20 @@ class Cli(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertFalse(json.loads(self.registry.read_text())
                          ["sessions"]["idle"].get("stopped", False))
+
+    def test_hibernate_lock_refusal_does_not_kill_candidate(self):
+        live = self.make_live_claude()
+        self.limit.write_text("1\n")
+        refuse = self.work / "refuse-flock"
+        refuse.write_text("#!" + shutil.which("bash") + "\nexit 1\n")
+        refuse.chmod(0o755)
+        self.env["AGENT_BOX_FLOCK_BIN"] = str(refuse)
+        self.env["REGISTRY_LOCK_WAIT"] = "0"
+        before = self.registry.read_bytes()
+        result = self.run_cli("hibernate")
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertEqual(self.registry.read_bytes(), before)
+        self.assertEqual(live.read_text(), "idle\n")
 
     def test_activation_racing_the_kill_wins_without_a_stale_stop(self):
         self.make_live_claude()

@@ -2530,6 +2530,8 @@ import time as hibernate_time
 HIBERNATE_IDLE_S = 30
 HIBERNATE_TAIL_LINES = 400
 HIBERNATE_TAIL_BYTES = 2 * 1024 * 1024
+HIBERNATE_CODEX_HEAD_BYTES = 64 * 1024
+HIBERNATE_CODEX_SCAN_MAX = 400
 HIBERNATE_UUID_RE = hibernate_re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -2694,7 +2696,20 @@ def _hibernate_claude_transcript(name, entry):
         launch = _hibernate_uuid(entry.get("boxSessionId"))
     if launch is None:
         return None
-    native = _hibernate_uuid(state.get("nativeSessionId")) or launch
+    # The rotation hook keys the first hop by the stable launch ID, even after
+    # nativeSessionId has been persisted. Read that record first: otherwise a
+    # stale but completed segment can hide the active segment Claude moved to.
+    try:
+        initial = (_hibernate_home() / ".local/state/agent-box/live-session-id"
+                   / launch).read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        initial = None
+    except (OSError, UnicodeDecodeError):
+        return None
+    if initial is not None and _hibernate_uuid(initial) is None:
+        return None
+    native = (_hibernate_uuid(initial)
+              or _hibernate_uuid(state.get("nativeSessionId")) or launch)
     # Claude can rotate its UUID while the process stays up. The SessionStart
     # hook records that hop by launch ID; follow a bounded chain so parking
     # preserves the segment the TUI is actually displaying.
@@ -2762,15 +2777,19 @@ def _hibernate_codex_transcript(name, entry):
     # pointer is the fallback for prompt-less sessions whose rollout has no
     # marker at all.
     marker = ("agent-box session %s" % launch).encode("utf-8")
-    found = []
-    for candidate in (root / "sessions").glob("*/*/*/rollout-*.jsonl"):
-        try:
+    try:
+        rollouts = sorted(
+            ((candidate.stat().st_mtime_ns, candidate)
+             for candidate in (root / "sessions").glob("*/*/*/rollout-*.jsonl")),
+            key=lambda item: item[0], reverse=True)[:HIBERNATE_CODEX_SCAN_MAX]
+        path = None
+        for _mtime, candidate in rollouts:
             with candidate.open("rb") as handle:
-                if any(marker in line for line in handle):
-                    found.append(candidate)
-        except OSError:
-            return None
-    path = max(found, key=lambda candidate: candidate.stat().st_mtime_ns) if found else None
+                if marker in handle.read(HIBERNATE_CODEX_HEAD_BYTES):
+                    path = candidate
+                    break
+    except OSError:
+        return None
     native = _hibernate_uuid(path.stem[-36:]) if path else None
     if path is None:
         native = _hibernate_uuid(state.get("nativeSessionId"))
@@ -5430,7 +5449,7 @@ hibernate_one() {
   printf '%s' "$_capacity" | "$JQ" -e '.used >= .max' >/dev/null 2>&1 \
     || return 1
 
-  registry_lock
+  registry_lock || return "$REGISTRY_BUSY_RC"
   if _verified="$(AGENT_BOX_HIBERNATE_ASSUME_LIVE="$_name" \
       "$_cap" hibernate-verify "$REGISTRY_FILE" "$_name" "$_token")"; then
     :
@@ -5450,20 +5469,32 @@ hibernate_one() {
   }
   _at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   _generation="$_at-$$-$RANDOM"
-  registry_edit --arg n "$_name" --arg at "$_at" --arg gen "$_generation" \
-    'if .sessions | has($n)
-     then .sessions[$n] |= (.stopped = true | .hibernatedAt = $at
-                            | .hibernationGeneration = $gen)
-     else . end'
+  if registry_edit --arg n "$_name" --arg at "$_at" --arg gen "$_generation" \
+      'if .sessions | has($n)
+       then .sessions[$n] |= (.stopped = true | .hibernatedAt = $at
+                              | .hibernationGeneration = $gen)
+       else . end'; then
+    :
+  else
+    _rc=$?
+    registry_unlock
+    return "$_rc"
+  fi
   registry_unlock
 
   _undo_hibernation() {
     registry_lock || return 75
-    registry_edit --arg n "$_name" --arg gen "$_generation" \
-      'if (.sessions[$n].hibernationGeneration // "") == $gen
-       then .sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
-                              | del(.hibernationGeneration))
-       else . end'
+    if registry_edit --arg n "$_name" --arg gen "$_generation" \
+        'if (.sessions[$n].hibernationGeneration // "") == $gen
+         then .sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
+                                | del(.hibernationGeneration))
+         else . end'; then
+      :
+    else
+      _urc=$?
+      registry_unlock
+      return "$_urc"
+    fi
     registry_unlock
   }
 

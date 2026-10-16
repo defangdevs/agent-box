@@ -923,7 +923,7 @@ hibernate_one() {
   printf '%s' "$_capacity" | "$JQ" -e '.used >= .max' >/dev/null 2>&1 \
     || return 1
 
-  registry_lock
+  registry_lock || return "$REGISTRY_BUSY_RC"
   if _verified="$(AGENT_BOX_HIBERNATE_ASSUME_LIVE="$_name" \
       "$_cap" hibernate-verify "$REGISTRY_FILE" "$_name" "$_token")"; then
     :
@@ -943,20 +943,32 @@ hibernate_one() {
   }
   _at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   _generation="$_at-$$-$RANDOM"
-  registry_edit --arg n "$_name" --arg at "$_at" --arg gen "$_generation" \
-    'if .sessions | has($n)
-     then .sessions[$n] |= (.stopped = true | .hibernatedAt = $at
-                            | .hibernationGeneration = $gen)
-     else . end'
+  if registry_edit --arg n "$_name" --arg at "$_at" --arg gen "$_generation" \
+      'if .sessions | has($n)
+       then .sessions[$n] |= (.stopped = true | .hibernatedAt = $at
+                              | .hibernationGeneration = $gen)
+       else . end'; then
+    :
+  else
+    _rc=$?
+    registry_unlock
+    return "$_rc"
+  fi
   registry_unlock
 
   _undo_hibernation() {
     registry_lock || return 75
-    registry_edit --arg n "$_name" --arg gen "$_generation" \
-      'if (.sessions[$n].hibernationGeneration // "") == $gen
-       then .sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
-                              | del(.hibernationGeneration))
-       else . end'
+    if registry_edit --arg n "$_name" --arg gen "$_generation" \
+        'if (.sessions[$n].hibernationGeneration // "") == $gen
+         then .sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
+                                | del(.hibernationGeneration))
+         else . end'; then
+      :
+    else
+      _urc=$?
+      registry_unlock
+      return "$_urc"
+    fi
     registry_unlock
   }
 
