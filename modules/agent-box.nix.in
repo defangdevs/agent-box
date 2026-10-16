@@ -421,6 +421,24 @@ let
 @@include:src/envstore-cli.py@@
   '');
 
+  # Buzz remains the ACP client and session router; this endpoint supplies one
+  # fixed profile as remote compute over a non-PTY SSH forced command (#300).
+  # Bare because it re-execs itself through envExecWrapper before launch, and
+  # Codex uses the same executable as a literal-argv native shim.
+  acpLauncherBare = pkgs.writers.writePython3 "agent-box-acp-bare" {
+    flakeIgnore = [ "E501" "E128" "W503" ];
+  } ''
+@@include:src/acp-cli.py@@
+  '';
+
+  acpCli = pkgs.writeShellScriptBin "agent-box-acp" (lib.removeSuffix "\n" ''
+    export AGENT_BOX_ENV_EXEC=${envExecWrapper}
+    export AGENT_BOX_ENVSTORE_BIN=${envStoreCli}/bin/agent-box-envstore
+    export AGENT_BOX_PROFILE_BIN=${profileCli}/bin/agent-box-profile
+    export AGENT_BOX_ACP_SELF=${acpLauncherBare}
+    exec ${acpLauncherBare} "$@"
+  '');
+
   capacityLib = ''
 
 
@@ -734,7 +752,7 @@ let
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli whatsappCli uploadCli
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli uploadCli
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.

@@ -185,6 +185,53 @@ plainly rather than handing it back.
   unsets it, and deleting the default profile clears it too - the next
   session then asks which profile to start.
 
+## Testing Buzz with a remote Agentbox profile
+
+`agent-box-acp` is an opt-in ACP stdio endpoint for Buzz's existing
+`BUZZ_ACP_LAUNCH_PREFIX`. Buzz keeps channel/thread routing and ACP session
+reuse; the endpoint pins one Agentbox profile and one remote working directory.
+It does not attach to a tmux session or select an old native conversation.
+
+Check a binding on the box before putting it in an SSH key's forced command:
+
+    agent-box-acp check --local --profile devops \
+      --adapter /absolute/path/to/codex-acp \
+      --native /absolute/path/to/codex \
+      --cwd /home/agent/project
+
+Then use the same binding arguments after `agent-box-acp serve` in a dedicated
+`authorized_keys` entry with OpenSSH's `restrict,command="..."` options, but
+omit `--local` so the forced command checks Buzz's requested worker. Use
+the absolute path printed by `command -v agent-box-acp` in that entry (the
+stable path differs between NixOS and native hosts). Buzz's
+launch prefix is a JSON argv array ending in `user@host`, for example
+`["/usr/bin/ssh","-T","-o","BatchMode=yes","-o","IdentitiesOnly=yes",
+"-o","StrictHostKeyChecking=yes","-i","/path/to/key","user@host"]`.
+Buzz appends the real worker name; the endpoint accepts exactly `codex-acp` for
+a Codex profile or `claude-agent-acp` for a Claude profile by default. Use
+`--expected-command` only when the registered adapter has another fixed name,
+and leave the Buzz custom harness's adapter argument list empty.
+
+The endpoint rewrites `session/new.cwd` and Buzz prompt path anchors to the
+fixed remote directory, applies the profile's ordinary environment at launch,
+and composes Claude model/effort/appended instructions through ACP metadata.
+Codex gets the profile's native arguments literally and keeps AGENTS.md as its
+instruction path. Non-empty MCP server definitions are refused by default,
+because a local executable path does not become a remote one over SSH. Add
+`--allow-mcp` only after every command and path in the request is already valid
+on the box. This first endpoint also does not copy Buzz-local Git credentials,
+helper binaries or skill files; install the equivalents on the box or leave
+features that require them disabled.
+
+One worker per profile is allowed; one worker can hold several Buzz sessions.
+Remote ACP workers do not consume tmux session slots, so keep the number of
+exposed profiles within the host's resource budget. EOF, SSH loss and signals
+terminate the owned adapter/native process group; disconnect is never reported
+as successful completion. Native auth must already exist on the box. The forced
+key grants trusted native-agent execution as this Linux user, including shell
+tools requested through ACP. A profile is scoping, not isolation; use a separate
+Linux user for a separate trust domain.
+
 ## Personal WhatsApp connection
 
 The settings page's Connections section can link this user's WhatsApp as a

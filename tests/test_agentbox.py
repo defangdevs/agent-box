@@ -1472,9 +1472,14 @@ class RenderTest(unittest.TestCase):
         self.assertIn("AGENT_BOX_PROFILE_BIN=", wrapper)
         profile = (FIXTURE / "usr/local/bin/agent-box-profile").read_text()
         self.assertIn("AGENT_BOX_ENVSTORE_BIN=", profile)
+        acp = (FIXTURE / "usr/local/bin/agent-box-acp").read_text()
+        self.assertIn("AGENT_BOX_ENV_EXEC=", acp)
+        self.assertIn("AGENT_BOX_ENVSTORE_BIN=", acp)
+        self.assertIn("AGENT_BOX_PROFILE_BIN=", acp)
+        self.assertIn("AGENT_BOX_ACP_SELF=", acp)
 
     def test_wrappers_generated_without_web(self):
-        """agent-box-session and agent-box-profile must exist even with
+        """Interactive agent-box CLIs must exist even with
         web.enable: false — the shipped guide tells every agent to run
         them regardless, and the module's own agentRuntimePackages carries
         both unconditionally. Their generation used to live inside
@@ -1494,6 +1499,8 @@ class RenderTest(unittest.TestCase):
             self.assertIn("AGENT_BOX_PROFILE_BIN=", session)
             profile = (out / "usr/local/bin/agent-box-profile").read_text()
             self.assertIn("AGENT_BOX_ENVSTORE_BIN=", profile)
+            acp = (out / "usr/local/bin/agent-box-acp").read_text()
+            self.assertIn("AGENT_BOX_ACP_SELF=", acp)
 
     def test_every_user_gets_their_own_canonical_guide(self):
         """Issue #394. Two things were wrong at once here.
