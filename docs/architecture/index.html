@@ -429,23 +429,23 @@
         containers: {
           title: 'Container view', meta: 'Processes and private state inside one agent-box user', size: [1400, 900],
           boundaries: [
-            { x: 215, y: 58, w: 1065, h: 790, label: 'AGENT-BOX HOST' },
-            { x: 275, y: 145, w: 960, h: 620, label: 'LINUX USER \u00b7 TRUST BOUNDARY (SHARED HOME + TMUX)' }
+            { x: 210, y: 24, w: 1070, h: 824, label: 'AGENT-BOX HOST' },
+            { x: 275, y: 165, w: 960, h: 600, label: 'LINUX USER \u00b7 TRUST BOUNDARY (SHARED HOME + TMUX)' }
           ],
           nodes: [
             { id: 'browser', x: 10, y: 166, w: 190, h: 98, type: 'Person / browser', title: 'Web workspace', desc: ['Terminal + settings'], kind: 'person', tech: ['HTTPS'] },
             { id: 'sender2', x: 10, y: 390, w: 190, h: 98, type: 'External system', title: 'Webhook sender', desc: ['Signed JSON events'], kind: 'external', tech: ['HMAC-SHA256'] },
             { id: 'whatsapp2', x: 10, y: 650, w: 190, h: 98, type: 'External system', title: 'WhatsApp service', desc: ['Owner self-chat', 'linked-device stream'], kind: 'external', tech: ['E2EE'] },
-            { id: 'caddy', x: 235, y: 86, w: 210, h: 92, type: 'Container', title: 'Caddy', desc: ['TLS + basic auth', 'reverse proxy'], kind: 'platform', tech: ['Caddy'] },
-            { id: 'settings', x: 315, y: 192, w: 220, h: 105, type: 'Container', title: 'Settings daemon', desc: ['Sessions, secrets,', 'pairing + box operations'], kind: 'platform', tech: ['Python', 'HTTP'] },
-            { id: 'supervisor', x: 315, y: 382, w: 220, h: 105, type: 'Container', title: 'Session supervisor', desc: ['Owns agent lifecycles', 'and the WhatsApp bridge'], kind: 'platform', tech: ['Shell', 'tmux'] },
-            { id: 'wa-state', x: 315, y: 590, w: 220, h: 105, type: 'Data store', title: 'WhatsApp state', desc: ['Device keys, target, queue,', 'inbox + outbox files'], kind: 'channel', tech: ['Private files', '0600'] },
-            { id: 'receiver', x: 600, y: 192, w: 230, h: 105, type: 'Container', title: 'Webhook receiver', desc: ['Verifies once, normalizes,', 'fans out envelopes'], kind: 'channel', tech: ['webhook.py', 'socket activation'] },
-            { id: 'state', x: 600, y: 382, w: 230, h: 105, type: 'Data store', title: 'Webhook state', desc: ['Sources, secrets, filters,', 'peer sockets + leases'], kind: 'channel', tech: ['JSON', 'Unix sockets'] },
-            { id: 'bridge', x: 600, y: 590, w: 230, h: 105, type: 'Container', title: 'WhatsApp bridge', desc: ['Authorizes self-chat, routes,', 'and retries messages + media'], kind: 'channel', tech: ['Node.js', 'local-whatsapp'] },
-            { id: 'claude', x: 920, y: 180, w: 190, h: 112, type: 'Container', title: 'Claude session', desc: ['Channel plugins receive', 'events and WhatsApp'], kind: 'platform', harness: 'claude', tech: ['Claude Code', 'MCP stdio'] },
-            { id: 'codex', x: 920, y: 390, w: 190, h: 112, type: 'Container', title: 'Codex session', desc: ['Detached peers queue', 'into exact task threads'], kind: 'platform', harness: 'codex', tech: ['Codex', 'codex queue'] },
-            { id: 'hook', x: 920, y: 620, w: 190, h: 98, type: 'Container', title: 'Hook session', desc: ['Ephemeral agent for', 'standing-watch matches'], kind: 'platform', tech: ['agent-box-session'] },
+            { id: 'caddy', x: 225, y: 60, w: 210, h: 92, type: 'Container', title: 'Caddy', desc: ['TLS + basic auth', 'reverse proxy'], kind: 'platform', tech: ['Caddy'] },
+            { id: 'settings', x: 315, y: 212, w: 220, h: 105, type: 'Container', title: 'Settings daemon', desc: ['Sessions, secrets,', 'pairing + box operations'], kind: 'platform', tech: ['Python', 'HTTP'] },
+            { id: 'supervisor', x: 315, y: 402, w: 220, h: 105, type: 'Container', title: 'Session supervisor', desc: ['Owns agent lifecycles', 'and the WhatsApp bridge'], kind: 'platform', tech: ['Shell', 'tmux'] },
+            { id: 'wa-state', x: 315, y: 610, w: 220, h: 105, type: 'Data store', title: 'WhatsApp state', desc: ['Device keys, target, queue,', 'inbox + outbox files'], kind: 'channel', tech: ['Private files', '0600'] },
+            { id: 'receiver', x: 600, y: 212, w: 230, h: 105, type: 'Container', title: 'Webhook receiver', desc: ['Verifies once, normalizes,', 'fans out envelopes'], kind: 'channel', tech: ['webhook.py', 'socket activation'] },
+            { id: 'state', x: 600, y: 402, w: 230, h: 105, type: 'Data store', title: 'Webhook state', desc: ['Sources, secrets, filters,', 'peer sockets + leases'], kind: 'channel', tech: ['JSON', 'Unix sockets'] },
+            { id: 'bridge', x: 600, y: 610, w: 230, h: 105, type: 'Container', title: 'WhatsApp bridge', desc: ['Authorizes self-chat, routes,', 'and retries messages + media'], kind: 'channel', tech: ['Node.js', 'local-whatsapp'] },
+            { id: 'claude', x: 920, y: 200, w: 190, h: 112, type: 'Container', title: 'Claude session', desc: ['Channel plugins receive', 'events and WhatsApp'], kind: 'platform', harness: 'claude', tech: ['Claude Code', 'MCP stdio'] },
+            { id: 'codex', x: 920, y: 410, w: 190, h: 112, type: 'Container', title: 'Codex session', desc: ['Detached peers queue', 'into exact task threads'], kind: 'platform', harness: 'codex', tech: ['Codex', 'codex queue'] },
+            { id: 'hook', x: 920, y: 640, w: 190, h: 98, type: 'Container', title: 'Hook session', desc: ['Ephemeral agent for', 'standing-watch matches'], kind: 'platform', tech: ['agent-box-session'] },
             { id: 'providers', x: 1290, y: 330, w: 100, h: 170, type: 'External', title: 'APIs', desc: ['Models', 'Git', 'SaaS'], kind: 'external', tech: ['HTTPS'] }
           ],
           rels: [
