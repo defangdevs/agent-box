@@ -56,6 +56,8 @@ class WhatsAppInstallTest(unittest.TestCase):
 
         def urlopen(url, timeout):
             name = url.rsplit("/", 1)[-1]
+            self.assertTrue(url.endswith(
+                f"/{self.cli.REV}/local-whatsapp/{name}"))
             content = b"wrong" if corrupt else self.files[name]
             calls.append(name)
             return io.BytesIO(content)
