@@ -12796,6 +12796,12 @@ esac
     # agentBaseTools), so the unit pins those two via AGENT_BOX_*_BIN.
     JQ=jq
     TMUX="tmux -L agent-box"
+    # Where this user's systemd manager keeps its bus. The agent unit is not a
+    # login session, so pam_systemd never sets this, and `systemctl --user` then
+    # fails with "Failed to connect to bus" (issue #867). The path is fixed by
+    # systemd, so exporting it is safe even before linger has created it: the
+    # tmux server below inherits it, so every pane does.
+    export XDG_RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     GREP="''${AGENT_BOX_GREP_BIN:-grep}"
     FIND="''${AGENT_BOX_FIND_BIN:-find}"
     # The session registry — where it lives, how it is locked and how it is
