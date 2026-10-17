@@ -47,7 +47,12 @@ fails=0
 ok() { printf 'ok   %s\n' "$1"; }
 no() { printf 'FAIL %s\n     %s\n' "$1" "${2:-}"; fails=$((fails + 1)); }
 
-run() { bash "$SCRIPT" subscribe "$@" 2>"$work/err"; }
+run() {
+  # These assertions test event rules, not provider authentication. Use the
+  # explicit saved-login mode so the new watch default needs no profile here.
+  case " $* " in (*" --deliver-to subagent "*) set -- "$@" --auth saved-login ;; esac
+  bash "$SCRIPT" subscribe "$@" 2>"$work/err"
+}
 
 # --- a Codex session subscription leaves a durable restart target -------
 wake_id=52345678-9abc-4def-8123-456789abcdef
