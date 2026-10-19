@@ -113,6 +113,11 @@ What it does NOT cover is the next run: a later failure on the same ref is a \
 different commit and gets a session of its own, which is deliberate, because a \
 red trunk has to reach somebody whatever else is running."
       ;;
+    unclaimed)
+      printf '%s' "The event that started you names no object, so you hold no \
+claim: a later event on the same thing can start another session. The GitHub \
+commands for claiming a PR or a branch do not apply to this source."
+      ;;
     *)
       printf '%s' "What you own is the OBJECT you were started for (agent-box#251): \
 your seeded claim covers that one object \
@@ -436,7 +441,11 @@ if [ "${1:-}" = "--preamble" ]; then
     " <armed only when a batch line reads as an assignment: $assignment_text>" \
     "hook-<key>-<hex>" "<source>:<key>" \
     "<what agent-box-session peers reports at spawn time: every OTHER live
-session, its working directory and the webhook topics it claims>"
+session, its working directory and the webhook topics it claims>" \
+    "$(case "${2:-}" in
+      *:*) ownership_advice "${2%%:*}" ;;
+      *) ownership_advice github ;;
+    esac)"
   printf '\n\n%s\n' "<one [UNTRUSTED webhook:<source>] line per event in the batch>"
   exit 0
 fi
@@ -716,6 +725,7 @@ claim_note() {
 seeded=""
 own=""
 lease_object=""
+include=""
 if [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "${LOCAL_WEBHOOK_SPAWN_KEY:-}" ]; then
   own="${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}:$LOCAL_WEBHOOK_SPAWN_KEY"
   # webhook.py reads filter.<LOCAL_WEBHOOK_SESSION>.json, and the supervisor
@@ -794,8 +804,14 @@ peers="$("$SESSION_BIN" peers 2>&1)" \
 this and check by hand ($SESSION_BIN peers, $SESSION_BIN ls):
 $peers"
 
+# A non-GitHub event with no valid identifier seeds a filter with no include,
+# which claims nothing, so the advice must not say it does.
+advice_src="${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}"
+if [ "$advice_src" != github ] && { [ -z "$seeded" ] || [ -z "$include" ]; }; then
+  advice_src=unclaimed
+fi
 preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded" "$peers" \
-  "$(ownership_advice "${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}")")"
+  "$(ownership_advice "$advice_src")")"
 
 # --profile resolves the harness and its arguments (issue #321); the extra
 # args stay a `--` tail after it, so hookSessionArgs still has the last word
