@@ -807,12 +807,13 @@ then reload caddy - no rebuild:
       reverse_proxy 127.0.0.1:3000
     }
 
-`/run/current-system/sw/bin/systemctl reload caddy.service` picks it up
+`systemctl reload caddy.service` picks it up
 and Caddy gets a Let's Encrypt cert on first request if DNS for that name
 points at this box. Reverse-proxy to your process; don't `file_server` from
 $HOME (caddy can't read /home). The command needs no sudo: agent-box grants
 configured agent users exactly the reload verb on `caddy.service` through
-polkit. Stop, restart and every other unit stay unauthorized. This path also
+polkit, so use the bare `systemctl` on PATH: its absolute path differs
+between NixOS and a distro box. Stop, restart and every other unit stay unauthorized. This path also
 works inside Codex's unprivileged command sandbox, where setuid sudo is
 unavailable (agent-box#726).
 
