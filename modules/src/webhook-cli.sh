@@ -358,6 +358,12 @@ source_template() {
       # deliberately undeliverable upstream. Teams are what issues live in.
       printf '%s' '{"format":"generic","signatureHeader":"linear-signature","keyPath":"data.teamId","senderPath":"actor.name"}'
       ;;
+    slack)
+      # local-slack emits through `webhook.py emit`, which signs with this
+      # source's own secret. It routes on `route` (<team>/<channel>), so a topic
+      # is slack:T0123/C0456; without keyPath every event reaches nobody.
+      printf '%s' '{"format":"generic","keyPath":"route"}'
+      ;;
     *) printf '%s' '{}' ;;
   esac
 }

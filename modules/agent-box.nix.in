@@ -752,7 +752,7 @@ let
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli uploadCli
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
@@ -873,6 +873,15 @@ let
     flakeIgnore = [ "E501" "E302" "E305" ];
   } ''
 @@include:src/whatsapp-cli.py@@
+  '';
+
+  # local-slack (issue #864): the supervisor runs its daemon while both Slack
+  # tokens are in the env store. The CLI fetches the one pinned slack.py and
+  # supplies the receiver socket path, which only this box knows.
+  slackCli = pkgs.writers.writePython3Bin "agent-box-slack" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+@@include:src/slack-cli.py@@
   '';
 
   # Agent profiles (issue #321): the WORKER, as opposed to the harness that
@@ -1122,6 +1131,7 @@ let
     "agent-box-session-capacity" = "${capacityCli}/bin/agent-box-session-capacity";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     "agent-box-whatsapp" = "${whatsappCli}/bin/agent-box-whatsapp";
+    "agent-box-slack" = "${slackCli}/bin/agent-box-slack";
     "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";

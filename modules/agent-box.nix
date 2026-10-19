@@ -5030,7 +5030,7 @@ done
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli uploadCli
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
@@ -7203,6 +7203,89 @@ if __name__ == "__main__":
         sys.exit(1)
   '';
 
+  # local-slack (issue #864): the supervisor runs its daemon while both Slack
+  # tokens are in the env store. The CLI fetches the one pinned slack.py and
+  # supplies the receiver socket path, which only this box knows.
+  slackCli = pkgs.writers.writePython3Bin "agent-box-slack" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+"""Run the pinned local-slack daemon for agent-box (issue #864)."""
+
+import hashlib
+import os
+from pathlib import Path
+import sys
+import tempfile
+from urllib.request import urlopen
+
+
+REV = "b480a36f291acf3c817a3729c1a24fe4553f69c2"
+SHA256 = "e02755df0116aa39cba52db1e37ca67ecce394cc91b66d5de80ec5ecbf991e6b"
+HOME = Path.home()
+RUNTIME = HOME / ".local/share/local-slack"
+SCRIPT = RUNTIME / "slack.py"
+
+
+def installed():
+    try:
+        return hashlib.sha256(SCRIPT.read_bytes()).hexdigest() == SHA256
+    except OSError:
+        return False
+
+
+def install():
+    """Fetch slack.py at the pinned commit; refuse anything that does not hash."""
+    if installed():
+        return
+    if RUNTIME.is_symlink():
+        raise RuntimeError("local-slack directory cannot be a symlink")
+    RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    url = ("https://raw.githubusercontent.com/defangdevs/local-channels/"
+           f"{REV}/local-slack/slack.py")
+    with urlopen(url, timeout=30) as response:
+        content = response.read(2_000_001)
+    if len(content) > 2_000_000 or hashlib.sha256(content).hexdigest() != SHA256:
+        raise RuntimeError("local-slack source integrity check failed")
+    with tempfile.NamedTemporaryFile(dir=RUNTIME, delete=False) as stage:
+        stage.write(content)
+    os.replace(stage.name, SCRIPT)
+
+
+def serve_env():
+    env = dict(os.environ)
+    # The receiver is socket-activated, so it has not written the file `emit`
+    # finds the ingress by until something connects; name the socket instead.
+    env.setdefault("LOCAL_WEBHOOK_HTTP_SOCK",
+                   "/run/agent-box-webhook/" + os.environ.get("USER", HOME.name) + ".sock")
+    webhook = os.environ.get("AGENT_BOX_WEBHOOK_SCRIPT")
+    if webhook:
+        env.setdefault("LOCAL_SLACK_EMIT", sys.executable + " " + webhook + " emit")
+    return env
+
+
+def serve():
+    for token in ("SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"):
+        if not os.environ.get(token):
+            raise RuntimeError(token + " is not set")
+    install()
+    os.execve(sys.executable, [sys.executable, str(SCRIPT), "daemon"], serve_env())
+
+
+def main():
+    verbs = {"install": install, "serve": serve}
+    if len(sys.argv) != 2 or sys.argv[1] not in verbs:
+        raise RuntimeError("usage: agent-box-slack install|serve")
+    verbs[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError) as error:
+        print("agent-box-slack: " + str(error), file=sys.stderr)
+        sys.exit(1)
+  '';
+
   # Agent profiles (issue #321): the WORKER, as opposed to the harness that
   # `--harness` selects — a harness plus the model, effort, appended system
   # prompt and environment that tell two sessions on one harness apart.
@@ -8668,6 +8751,12 @@ _hc_main "$@"
           # Initiative events in reaching nobody: keyless payloads are
           # deliberately undeliverable upstream. Teams are what issues live in.
           printf '%s' '{"format":"generic","signatureHeader":"linear-signature","keyPath":"data.teamId","senderPath":"actor.name"}'
+          ;;
+        slack)
+          # local-slack emits through `webhook.py emit`, which signs with this
+          # source's own secret. It routes on `route` (<team>/<channel>), so a topic
+          # is slack:T0123/C0456; without keyPath every event reaches nobody.
+          printf '%s' '{"format":"generic","keyPath":"route"}'
           ;;
         *) printf '%s' '{}' ;;
       esac
@@ -12537,7 +12626,8 @@ esac
     { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" },
     { "name": "AGENT_BOX_CAPACITY_BIN", "kind": "bin", "program": "agent-box-session-capacity" },
     { "name": "AGENT_BOX_ENVSTORE_BIN", "kind": "bin", "program": "agent-box-envstore" },
-    { "name": "AGENT_BOX_WHATSAPP_BIN", "kind": "bin", "program": "agent-box-whatsapp" }
+    { "name": "AGENT_BOX_WHATSAPP_BIN", "kind": "bin", "program": "agent-box-whatsapp" },
+    { "name": "AGENT_BOX_SLACK_BIN", "kind": "bin", "program": "agent-box-slack" }
   ],
   "execStart": [
     { "kind": "bin", "program": "agent-box-supervisor" }
@@ -12839,6 +12929,7 @@ esac
     "agent-box-session-capacity" = "${capacityCli}/bin/agent-box-session-capacity";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     "agent-box-whatsapp" = "${whatsappCli}/bin/agent-box-whatsapp";
+    "agent-box-slack" = "${slackCli}/bin/agent-box-slack";
     "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";
@@ -16296,6 +16387,35 @@ esac
       whatsapp_pid=$!
     }
 
+    # local-slack (issue #864) runs in this unit's cgroup like the WhatsApp bridge:
+    # it is the user's connection, not a session, so it takes no session slot. It
+    # runs while both tokens are in the env store; clearing either stops it. The
+    # tokens go to the child's environment only, never its command line.
+    slack_pid=""
+    slack_last_start=0
+    supervise_slack() {
+      slack="''${AGENT_BOX_SLACK_BIN:-}"
+      envstore="''${AGENT_BOX_ENVSTORE_BIN:-}"
+      [ -x "$slack" ] && [ -x "$envstore" ] || return 0
+      app_token="$("$envstore" get SLACK_APP_TOKEN 2>/dev/null)" || app_token=""
+      bot_token="$("$envstore" get SLACK_BOT_TOKEN 2>/dev/null)" || bot_token=""
+      if [ -z "$app_token" ] || [ -z "$bot_token" ]; then
+        if [ -n "$slack_pid" ]; then
+          kill "$slack_pid" 2>/dev/null || true
+          slack_pid=""
+        fi
+        return 0
+      fi
+      if [ -n "$slack_pid" ] && kill -0 "$slack_pid" 2>/dev/null; then
+        return 0
+      fi
+      now="$(date +%s)"
+      [ "$((now - slack_last_start))" -ge 10 ] || return 0
+      slack_last_start="$now"
+      SLACK_APP_TOKEN="$app_token" SLACK_BOT_TOKEN="$bot_token" "$slack" serve &
+      slack_pid=$!
+    }
+
     # Reclaim the supervisor's own per-session state for names the registry no
     # longer lists (issue #282).
     #
@@ -16444,6 +16564,7 @@ esac
       done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$REGISTRY_FILE" 2>/dev/null)
       sync_codex_threads
       supervise_whatsapp
+      supervise_slack
       sleep 2
     done
   '';

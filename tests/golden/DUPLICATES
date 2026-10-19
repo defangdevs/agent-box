@@ -26,6 +26,7 @@ web/payloads/agent-box-nixpkgs-cache -> vm/payloads/agent-box-nixpkgs-cache
 web/payloads/agent-box-profile/bin/agent-box-profile -> vm/payloads/agent-box-profile/bin/agent-box-profile
 web/payloads/agent-box-session-capacity/bin/agent-box-session-capacity -> vm/payloads/agent-box-session-capacity/bin/agent-box-session-capacity
 web/payloads/agent-box-session/bin/agent-box-session -> vm/payloads/agent-box-session/bin/agent-box-session
+web/payloads/agent-box-slack/bin/agent-box-slack -> vm/payloads/agent-box-slack/bin/agent-box-slack
 web/payloads/agent-box-spot-monitor -> vm/payloads/agent-box-spot-monitor
 web/payloads/agent-box-supervisor/bin/agent-box-supervisor -> vm/payloads/agent-box-supervisor/bin/agent-box-supervisor
 web/payloads/agent-box-upload/bin/agent-box-upload -> vm/payloads/agent-box-upload/bin/agent-box-upload

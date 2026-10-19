@@ -1750,6 +1750,35 @@ supervise_whatsapp() {
   whatsapp_pid=$!
 }
 
+# local-slack (issue #864) runs in this unit's cgroup like the WhatsApp bridge:
+# it is the user's connection, not a session, so it takes no session slot. It
+# runs while both tokens are in the env store; clearing either stops it. The
+# tokens go to the child's environment only, never its command line.
+slack_pid=""
+slack_last_start=0
+supervise_slack() {
+  slack="${AGENT_BOX_SLACK_BIN:-}"
+  envstore="${AGENT_BOX_ENVSTORE_BIN:-}"
+  [ -x "$slack" ] && [ -x "$envstore" ] || return 0
+  app_token="$("$envstore" get SLACK_APP_TOKEN 2>/dev/null)" || app_token=""
+  bot_token="$("$envstore" get SLACK_BOT_TOKEN 2>/dev/null)" || bot_token=""
+  if [ -z "$app_token" ] || [ -z "$bot_token" ]; then
+    if [ -n "$slack_pid" ]; then
+      kill "$slack_pid" 2>/dev/null || true
+      slack_pid=""
+    fi
+    return 0
+  fi
+  if [ -n "$slack_pid" ] && kill -0 "$slack_pid" 2>/dev/null; then
+    return 0
+  fi
+  now="$(date +%s)"
+  [ "$((now - slack_last_start))" -ge 10 ] || return 0
+  slack_last_start="$now"
+  SLACK_APP_TOKEN="$app_token" SLACK_BOT_TOKEN="$bot_token" "$slack" serve &
+  slack_pid=$!
+}
+
 # Reclaim the supervisor's own per-session state for names the registry no
 # longer lists (issue #282).
 #
@@ -1898,5 +1927,6 @@ while true; do
   done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$REGISTRY_FILE" 2>/dev/null)
   sync_codex_threads
   supervise_whatsapp
+  supervise_slack
   sleep 2
 done
