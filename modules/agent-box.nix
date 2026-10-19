@@ -2527,10 +2527,10 @@ def rewrite_prompt_paths(params, source_cwds, target):
 
 def rewrite_mcp_servers(params, allow_mcp, command_maps):
     servers = params.get("mcpServers", [])
-    if not servers:
-        return
     if not isinstance(servers, list):
         raise AcpLaunchError("session/new mcpServers must be a list")
+    if not servers:
+        return
     for server in servers:
         if not isinstance(server, dict):
             raise AcpLaunchError("session/new MCP server must be an object")

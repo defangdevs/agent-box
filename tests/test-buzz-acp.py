@@ -163,6 +163,20 @@ class MessageRewriteTests(unittest.TestCase):
                 message, "codex", {}, self.cwd, False, {}, set()
             )
 
+    def test_falsy_non_list_mcp_servers_fail_closed(self):
+        for malformed in ({}, "", 0, False, None):
+            with self.subTest(malformed=malformed):
+                message = {
+                    "method": "session/new",
+                    "params": {"cwd": "/local", "mcpServers": malformed},
+                }
+                with self.assertRaisesRegex(
+                    acp.AcpLaunchError, "mcpServers must be a list"
+                ):
+                    acp.rewrite_message(
+                        message, "codex", {}, self.cwd, False, {}, set()
+                    )
+
     def test_replacement_system_prompt_is_refused(self):
         message = {
             "method": "session/new",
