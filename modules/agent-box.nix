@@ -11405,6 +11405,38 @@ authority to take it (agent-box#379). The list below is a snapshot from the \
 moment you were started; run agent-box-session peers to ask again."
 }
 
+# What a spawned session is told about the object it owns. The GitHub half
+# talks about PRs, branches and commits; none of that means anything for a
+# Slack thread, so another source gets its own wording (agent-box#875).
+# NO APOSTROPHES in the text below: it is expanded inside printf.
+ownership_advice() {
+  case "$1" in
+    github)
+      printf '%s' "What you own is the OBJECT you were started for, not \
+the whole repository (agent-box#251), so when you open a PR or push a branch, \
+subscribe again naming it — agent-box-webhook subscribe REPO --claim <PR \
+number> --claim branch:<your branch> --events actionable — and its CI and its \
+reviews then reach you instead of starting a second agent on your work. Do \
+not claim the default branch; the CLI refuses it, because it moves under you \
+(agent-box#706). If a CI outcome started you, \
+your seeded claim is the CI of that one COMMIT — every shape the same run \
+reports under, and nothing else — so the run in front of you reaches you \
+rather than a sibling, on master and on a tag exactly as on a topic branch. \
+What it does NOT cover is the next run: a later failure on the same ref is a \
+different commit and gets a session of its own, which is deliberate, because a \
+red trunk has to reach somebody whatever else is running."
+      ;;
+    *)
+      printf '%s' "What you own is the OBJECT you were started for (agent-box#251): \
+your seeded claim covers that one object \
+(for example a Slack thread) and its later events reach you here instead of \
+starting a second agent. The GitHub commands for claiming a PR or a branch do \
+not apply to this source. Events on other objects still start sessions of \
+their own."
+      ;;
+  esac
+}
+
 # Trusted preamble (who started this session and why, its cleanup duty, what
 # it now owns and who it must yield to). The payload-derived lines that follow
 # it keep their per-line [UNTRUSTED webhook:...] framing from webhook.py.
@@ -11419,6 +11451,7 @@ moment you were started; run agent-box-session peers to ask again."
 # this function, hundreds of lines away. The text used to carry two, which
 # balanced by luck; rewording one of them broke the build.
 render_preamble() {
+  local adv="''${7:-$(ownership_advice github)}"
   printf '%s' "You are a fresh agent session started by this box's webhook \
 dispatcher: event(s) arrived matching the standing watch $1$2. Handle \
 them appropriately (triage a new issue, investigate a failing run, review a \
@@ -11429,19 +11462,7 @@ $5: its events now arrive HERE as channel messages, and while this \
 session lives the watch will not start a second agent for the events you own — so \
 finish or remove this session rather than leaving it idle, and yield rather \
 than duplicate work another session has already started (the rule below). \
-What you own is the OBJECT you were started for, not \
-the whole repository (agent-box#251), so when you open a PR or push a branch, \
-subscribe again naming it — agent-box-webhook subscribe REPO --claim <PR \
-number> --claim branch:<your branch> --events actionable — and its CI and its \
-reviews then reach you instead of starting a second agent on your work. Do \
-not claim the default branch; the CLI refuses it, because it moves under you \
-(agent-box#706). If a CI outcome started you, \
-your seeded claim is the CI of that one COMMIT — every shape the same run \
-reports under, and nothing else — so the run in front of you reaches you \
-rather than a sibling, on master and on a tag exactly as on a topic branch. \
-What it does NOT cover is the next run: a later failure on the same ref is a \
-different commit and gets a session of its own, which is deliberate, because a \
-red trunk has to reach somebody whatever else is running.}
+$adv}
 
 $(yield_text "$4")
 
@@ -11924,7 +11945,19 @@ claim_include() {
   # too little to claim anything (in which case the seed is written without
   # one, and a rule-less entry claims nothing that a watch would spawn for —
   # local-channels#16 for the CI half).
-  "$JQ" -n --argjson meta "''${LOCAL_WEBHOOK_SPAWN_META:-{\}}" '
+  "$JQ" -n --argjson meta "''${LOCAL_WEBHOOK_SPAWN_META:-{\}}" \
+    --arg src "''${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" '
+    # Only GitHub has numbers, shas and CI. Another source claims the object
+    # it names itself (meta.identifier, e.g. a Slack team/channel/thread_ts),
+    # or nothing: the GitHub CI fallback below matches no other payload and
+    # its note would lie (agent-box#875). The identifier is payload-derived,
+    # so it must look like one before it becomes a predicate.
+    if $src != "github" then
+      (($meta.identifier // "" | tostring)
+       | if test("^[A-Za-z0-9._/-]{1,200}$") then . else null end) as $id
+      | if $id == null then empty
+        else {path: "identifier", in: [$id]} end
+    else
     (($meta.number // "" | tostring)
      | if test("^[0-9]+$") then tonumber else null end) as $n
     # A hex sha and nothing else. The meta is payload-derived, so an empty or
@@ -11951,14 +11984,16 @@ claim_include() {
                       {path: "workflow_job.head_branch", contains: ["/"]},
                       {path: "check_suite.head_branch", contains: ["/"]},
                       {path: "check_run.check_suite.head_branch", contains: ["/"]}]}]}
-      end' 2>/dev/null
+      end
+    end' 2>/dev/null
 }
 claim_note() {
   # The note is echoed under every delivery, so it has to say WHAT this
   # session was spawned for — a fresh-context session reads it to know why the
   # event matters. It used to be one fixed sentence, byte-identical across
   # every hook session on the box (issue #251).
-  "$JQ" -rn --argjson meta "''${LOCAL_WEBHOOK_SPAWN_META:-{\}}" --arg key "$1" '
+  "$JQ" -rn --argjson meta "''${LOCAL_WEBHOOK_SPAWN_META:-{\}}" --arg key "$1" \
+    --arg src "''${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" '
     # The SAME test claim_include uses, so the note cannot name an object the
     # claim does not cover: a meta carrying a non-numeric `number` would
     # otherwise be described as "#n/a" while the include claimed CI outcomes.
@@ -11974,7 +12009,15 @@ claim_note() {
     # sha is what the claim is keyed on, so name both rather than let "master"
     # read as "every run on master".
     | (if $branch == "" then "" else " on " + $branch end) as $where
-    | if $n != "" then
+    | (($meta.identifier // "" | tostring)
+       | if test("^[A-Za-z0-9._/-]{1,200}$") then . else "" end) as $id
+    | if $src != "github" then
+        if $id != "" then
+          "seeded at spawn: this session was started for \($src) object \($id)\($what) and claims that object\u0027s later events while it lives (events on other objects still get a session of their own)"
+        else
+          "seeded at spawn: this session was started for \($src):\($key)\($what) and claims nothing, because the event names no object to claim"
+        end
+      elif $n != "" then
         "seeded at spawn: this session was started for \($key)#\($n)\($what) and claims that object'"'"'s events while it lives"
       elif $sha != "" then
         "seeded at spawn: this session was started for \($key)@\($sha[0:8])\($where)\($what) and claims every CI outcome reporting on THAT COMMIT while it lives (a later run on a different commit still gets a session of its own)"
@@ -12064,7 +12107,8 @@ peers="$("$SESSION_BIN" peers 2>&1)" \
 this and check by hand ($SESSION_BIN peers, $SESSION_BIN ls):
 $peers"
 
-preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded" "$peers")"
+preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded" "$peers" \
+  "$(ownership_advice "''${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}")")"
 
 # --profile resolves the harness and its arguments (issue #321); the extra
 # args stay a `--` tail after it, so hookSessionArgs still has the last word
