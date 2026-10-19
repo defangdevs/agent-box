@@ -16391,14 +16391,17 @@ esac
     # it is the user's connection, not a session, so it takes no session slot. It
     # runs while both tokens are in the env store; clearing either stops it. The
     # tokens go to the child's environment only, never its command line.
+    slack_tokens=""
     slack_pid=""
     slack_last_start=0
     supervise_slack() {
       slack="''${AGENT_BOX_SLACK_BIN:-}"
       envstore="''${AGENT_BOX_ENVSTORE_BIN:-}"
       [ -x "$slack" ] && [ -x "$envstore" ] || return 0
-      app_token="$("$envstore" get SLACK_APP_TOKEN 2>/dev/null)" || app_token=""
-      bot_token="$("$envstore" get SLACK_BOT_TOKEN 2>/dev/null)" || bot_token=""
+      # One read per tick: the store is a Python program, and this runs every 2s.
+      store="$("$envstore" json 2>/dev/null)" || store="{}"
+      app_token="$(printf '%s' "$store" | "$JQ" -r '.SLACK_APP_TOKEN // empty' 2>/dev/null)" || app_token=""
+      bot_token="$(printf '%s' "$store" | "$JQ" -r '.SLACK_BOT_TOKEN // empty' 2>/dev/null)" || bot_token=""
       if [ -z "$app_token" ] || [ -z "$bot_token" ]; then
         if [ -n "$slack_pid" ]; then
           kill "$slack_pid" 2>/dev/null || true
@@ -16407,11 +16410,16 @@ esac
         return 0
       fi
       if [ -n "$slack_pid" ] && kill -0 "$slack_pid" 2>/dev/null; then
-        return 0
+        # A replaced token must reach the daemon: it keeps the environment it
+        # started with, and a revoked token would leave it reconnecting forever.
+        [ "$app_token/$bot_token" != "$slack_tokens" ] || return 0
+        kill "$slack_pid" 2>/dev/null || true
+        slack_pid=""
       fi
       now="$(date +%s)"
       [ "$((now - slack_last_start))" -ge 10 ] || return 0
       slack_last_start="$now"
+      slack_tokens="$app_token/$bot_token"
       SLACK_APP_TOKEN="$app_token" SLACK_BOT_TOKEN="$bot_token" "$slack" serve &
       slack_pid=$!
     }
@@ -18213,6 +18221,12 @@ in
             # operator's GitHub account is an outward-facing act, not a
             # side effect of having a tree to read.
             AGENT_BOX_CHECKOUT_FORK = "1";
+          }
+          // lib.optionalAttrs webhookEnabled {
+            # The pinned webhook.py the box runs, for the local-slack daemon
+            # the supervisor starts (issue #864): its emit command. Bound
+            # whether or not claude sessions track the plugin.
+            AGENT_BOX_WEBHOOK_SCRIPT = "${localWebhookScript}";
           }
           // lib.optionalAttrs (webhookEnabled && cfg.webhook.syncSessionPlugin) {
             # Presence = "keep the session's plugin cache off the floor"

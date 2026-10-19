@@ -3262,6 +3262,12 @@ in
             # side effect of having a tree to read.
             AGENT_BOX_CHECKOUT_FORK = "1";
           }
+          // lib.optionalAttrs webhookEnabled {
+            # The pinned webhook.py the box runs, for the local-slack daemon
+            # the supervisor starts (issue #864): its emit command. Bound
+            # whether or not claude sessions track the plugin.
+            AGENT_BOX_WEBHOOK_SCRIPT = "${localWebhookScript}";
+          }
           // lib.optionalAttrs (webhookEnabled && cfg.webhook.syncSessionPlugin) {
             # Presence = "keep the session's plugin cache off the floor"
             # (webhook.syncSessionPlugin, issue #193): one fetched script,
