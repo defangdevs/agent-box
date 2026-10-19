@@ -54,7 +54,7 @@ class MessageRewriteTests(unittest.TestCase):
             },
         }
         got = acp.rewrite_message(
-            message, "claude", self.values, self.cwd, False, sources
+            message, "claude", self.values, self.cwd, False, {}, sources
         )
         self.assertEqual(got["params"]["cwd"], str(self.cwd))
         self.assertEqual(
@@ -81,7 +81,7 @@ class MessageRewriteTests(unittest.TestCase):
             },
         }
         got = acp.rewrite_message(
-            message, "codex", {}, self.cwd, False, sources
+            message, "codex", {}, self.cwd, False, {}, sources
         )
         self.assertEqual(
             got["params"]["prompt"][0]["text"],
@@ -107,12 +107,61 @@ class MessageRewriteTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(acp.AcpLaunchError, "unmapped remote paths"):
             acp.rewrite_message(
-                message, "claude", self.values, self.cwd, False, set()
+                message, "claude", self.values, self.cwd, False, {}, set()
             )
         got = acp.rewrite_message(
-            message, "claude", self.values, self.cwd, True, set()
+            message, "claude", self.values, self.cwd, True, {}, set()
         )
         self.assertEqual(got["params"]["mcpServers"][0]["command"], "/x")
+
+    def test_mapped_mcp_command_preserves_arguments_and_environment(self):
+        message = {
+            "method": "session/new",
+            "params": {
+                "cwd": "/local",
+                "mcpServers": [
+                    {
+                        "name": "buzz-dev",
+                        "command": (
+                            "/Applications/Buzz.app/Contents/MacOS/"
+                            "buzz-dev-mcp"
+                        ),
+                        "args": ["--literal", "$HOME"],
+                        "env": {"BUZZ_RELAY_URL": "wss://relay.example"},
+                    }
+                ],
+            },
+        }
+        remote = Path("/nix/store/example/bin/buzz-dev-mcp")
+        got = acp.rewrite_message(
+            message,
+            "codex",
+            {},
+            self.cwd,
+            False,
+            {"buzz-dev-mcp": remote},
+            set(),
+        )
+        server = got["params"]["mcpServers"][0]
+        self.assertEqual(server["command"], str(remote))
+        self.assertEqual(server["args"], ["--literal", "$HOME"])
+        self.assertEqual(
+            server["env"], {"BUZZ_RELAY_URL": "wss://relay.example"}
+        )
+        self.assertIn(
+            "/Applications/Buzz.app",
+            message["params"]["mcpServers"][0]["command"],
+        )
+
+    def test_malformed_mcp_server_fails_closed(self):
+        message = {
+            "method": "session/new",
+            "params": {"cwd": "/local", "mcpServers": [{"args": []}]},
+        }
+        with self.assertRaisesRegex(acp.AcpLaunchError, "command must be text"):
+            acp.rewrite_message(
+                message, "codex", {}, self.cwd, False, {}, set()
+            )
 
     def test_replacement_system_prompt_is_refused(self):
         message = {
@@ -124,7 +173,7 @@ class MessageRewriteTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(acp.AcpLaunchError, "append-form"):
             acp.rewrite_message(
-                message, "claude", self.values, self.cwd, False, set()
+                message, "claude", self.values, self.cwd, False, {}, set()
             )
 
     def test_working_directory_must_stay_inside_home(self):
@@ -157,6 +206,7 @@ class CliTests(unittest.TestCase):
             "    sys.stdout.buffer.flush()\n",
         )
         self.native = write_executable(self.root / "native", "pass\n")
+        self.remote_mcp = write_executable(self.root / "buzz-dev-mcp", "pass\n")
         self.profile = write_executable(
             self.root / "profile",
             "import json\n"
@@ -211,7 +261,29 @@ class CliTests(unittest.TestCase):
         self.assertEqual(answer["profile"], "pm")
         self.assertEqual(answer["harness"], "claude")
         self.assertEqual(answer["mcpPolicy"], "refuse")
+        self.assertEqual(answer["mcpCommandMap"], {})
         self.assertNotIn("do-not-print", result.stdout + result.stderr)
+
+    def test_check_validates_and_reports_mcp_command_map(self):
+        result = subprocess.run(
+            self.command(
+                "check",
+                "--local",
+                "--map-mcp-command",
+                f"buzz-dev-mcp={self.remote_mcp}",
+            ),
+            env=self.base_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        answer = json.loads(result.stdout)
+        self.assertEqual(answer["mcpPolicy"], "mapped")
+        self.assertEqual(
+            answer["mcpCommandMap"],
+            {"buzz-dev-mcp": str(self.remote_mcp.resolve())},
+        )
 
     def test_forced_command_must_match_adapter_identity(self):
         env = {**self.base_env, "SSH_ORIGINAL_COMMAND": "ssh not-an-adapter"}
@@ -232,7 +304,14 @@ class CliTests(unittest.TestCase):
             "method": "session/new",
             "params": {
                 "cwd": "/Users/buzz/project",
-                "mcpServers": [],
+                "mcpServers": [{
+                    "name": "buzz-dev",
+                    "command": (
+                        "/Applications/Buzz.app/Contents/MacOS/buzz-dev-mcp"
+                    ),
+                    "args": [],
+                    "env": {"BUZZ_AUTH_TAG": "public-test-value"},
+                }],
                 "_meta": {"systemPrompt": {"append": "at /Users/buzz/project"}},
             },
         }
@@ -246,7 +325,12 @@ class CliTests(unittest.TestCase):
         }
         payload = "".join(json.dumps(item) + "\n" for item in (new, prompt))
         result = subprocess.run(
-            self.command("serve", "--local"),
+            self.command(
+                "serve",
+                "--local",
+                "--map-mcp-command",
+                f"buzz-dev-mcp={self.remote_mcp}",
+            ),
             env=self.base_env,
             input=payload,
             text=True,
@@ -264,6 +348,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             lines[1]["params"]["prompt"][0]["text"], f"use {self.cwd}"
         )
+        server = lines[0]["params"]["mcpServers"][0]
+        self.assertEqual(server["command"], str(self.remote_mcp.resolve()))
+        self.assertEqual(server["env"], {"BUZZ_AUTH_TAG": "public-test-value"})
 
     def test_disconnect_kills_stubborn_process_group(self):
         pid_file = self.root / "descendant.pid"
