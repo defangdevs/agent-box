@@ -49,25 +49,6 @@ def executable(path, label):
     return resolved
 
 
-def parse_mcp_command_maps(items):
-    result = {}
-    for item in items:
-        client, separator, remote = item.partition("=")
-        if (
-            not separator
-            or not re.fullmatch(r"[A-Za-z0-9._+-]+", client)
-            or not remote
-        ):
-            raise AcpLaunchError(
-                "MCP command maps must be CLIENT=REMOTE, where CLIENT is "
-                "one command basename"
-            )
-        if client in result:
-            raise AcpLaunchError(f"duplicate MCP command map for {client!r}")
-        result[client] = executable(remote, f"mapped MCP command {client!r}")
-    return result
-
-
 def remote_cwd(path):
     try:
         resolved = Path(path).resolve(strict=True)
@@ -249,34 +230,7 @@ def rewrite_prompt_paths(params, source_cwds, target):
             block["text"] = replace_path(block["text"], source, target)
 
 
-def rewrite_mcp_servers(params, allow_mcp, command_maps):
-    servers = params.get("mcpServers", [])
-    if not isinstance(servers, list):
-        raise AcpLaunchError("session/new mcpServers must be a list")
-    if not servers:
-        return
-    for server in servers:
-        if not isinstance(server, dict):
-            raise AcpLaunchError("session/new MCP server must be an object")
-        command = server.get("command")
-        if not isinstance(command, str) or not command:
-            raise AcpLaunchError("session/new MCP server command must be text")
-        # Buzz supplies an absolute command inside its macOS or Windows app.
-        # The forced command maps only its basename to an already-validated
-        # Linux executable, so no client-supplied host path is trusted.
-        basename = re.split(r"[/\\]", command)[-1]
-        if basename in command_maps:
-            server["command"] = str(command_maps[basename])
-        elif not allow_mcp:
-            raise AcpLaunchError(
-                "session/new contains MCP servers with unmapped remote paths; "
-                "configure --map-mcp-command or pass --allow-mcp"
-            )
-
-
-def rewrite_message(
-    message, harness, values, cwd, allow_mcp, command_maps, source_cwds
-):
+def rewrite_message(message, harness, values, cwd, allow_mcp, source_cwds):
     method = message.get("method")
     if method not in ("session/new", "session/prompt"):
         return message
@@ -293,7 +247,12 @@ def rewrite_message(
     if isinstance(source, str) and source:
         source_cwds.add(source)
     params["cwd"] = target
-    rewrite_mcp_servers(params, allow_mcp, command_maps)
+    servers = params.get("mcpServers", [])
+    if servers and not allow_mcp:
+        raise AcpLaunchError(
+            "session/new contains MCP servers with unmapped remote paths; "
+            "configure valid remote paths and pass --allow-mcp"
+        )
     meta = params.get("_meta")
     if isinstance(meta, dict):
         prompt = meta.get("systemPrompt")
@@ -415,7 +374,6 @@ async def proxy(config, launch, values):
                 values,
                 config.cwd,
                 config.allow_mcp,
-                config.mcp_command_map,
                 source_cwds,
             )
             if rewritten is message:
@@ -509,13 +467,6 @@ def parser():
         command.add_argument("--expected-command")
         command.add_argument("--allow-mcp", action="store_true")
         command.add_argument(
-            "--map-mcp-command",
-            action="append",
-            default=[],
-            metavar="CLIENT=REMOTE",
-            help="map one client command basename to a remote executable",
-        )
-        command.add_argument(
             "--local",
             action="store_true",
             help="test without SSH forced-command validation",
@@ -531,18 +482,11 @@ def main(argv):
     args.adapter = executable(args.adapter, "ACP adapter")
     args.native = executable(args.native, "native harness")
     args.cwd = remote_cwd(args.cwd)
-    args.mcp_command_map = parse_mcp_command_maps(args.map_mcp_command)
     expected = args.expected_command or EXPECTED_COMMAND[launch["harness"]]
     if not expected or any(char.isspace() for char in expected):
         raise AcpLaunchError("expected command must be one shell word")
     validate_original_command(expected, args.local)
     if args.command == "check":
-        if args.allow_mcp:
-            mcp_policy = (
-                "mapped+pass-through" if args.mcp_command_map else "pass-through"
-            )
-        else:
-            mcp_policy = "mapped" if args.mcp_command_map else "refuse"
         print(json.dumps({
             "profile": args.profile,
             "harness": launch["harness"],
@@ -550,10 +494,7 @@ def main(argv):
             "cwd": str(args.cwd),
             "adapter": str(args.adapter),
             "native": str(args.native),
-            "mcpPolicy": mcp_policy,
-            "mcpCommandMap": {
-                name: str(path) for name, path in args.mcp_command_map.items()
-            },
+            "mcpPolicy": "pass-through" if args.allow_mcp else "refuse",
         }, indent=2, sort_keys=True))
         return 0
     env_ready(args.profile, argv)
