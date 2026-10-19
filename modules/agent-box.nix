@@ -337,11 +337,16 @@ let
       ## A sender that is not GitHub
 
       `setup SOURCE` writes that sender's wire config, not GitHub's, for the senders
-      this box knows the shape of. Today that is `linear`; every other name still
+      this box knows the shape of. Today that is `linear` and `slack`; every other name still
       gets GitHub's defaults, which is what `setup stripe` has always meant. If a
       sender signs in its own header and you set it up as a bare source, its every
       delivery is answered 401 and nothing tells you - so check the `Signature` line
       `setup` prints against what the sender actually sends.
+
+      `slack` is different: Slack never calls the endpoint. A daemon (local-slack)
+      runs in the agent unit while both `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are
+      in the env store and posts signed events to the local socket. Topics are
+      `slack:<TEAM_ID>/<CHANNEL_ID>`; its log is `~/.local/state/local-slack/daemon.log`.
 
       Linear end to end, none of which needs a rebuild or root:
 
@@ -9914,6 +9919,23 @@ _hc_main "$@"
           rm -f "$tmp"; exit 1
         fi
         sig_header="$(source_sig_header "$src")"
+        if [ "$src" = slack ]; then
+          # Slack never calls this endpoint: local-slack holds the Socket Mode
+          # connection and posts signed events to the local socket itself.
+          cat <<EOF
+    $note
+
+    Nothing to register in Slack. local-slack connects out to Slack and delivers
+    into this box's webhook socket itself, so do NOT paste a URL into Slack's
+    Event Subscriptions.
+
+    Put SLACK_APP_TOKEN and SLACK_BOT_TOKEN in the settings page's secrets panel;
+    the daemon starts by itself once both are set. Its log is
+    ~/.local/state/local-slack/daemon.log. Topics are slack:<TEAM_ID>/<CHANNEL_ID>:
+      agent-box-webhook subscribe slack:T.../C... --note "why you care"
+    EOF
+          exit 0
+        fi
         cat <<EOF
     $note
 
@@ -16398,6 +16420,8 @@ esac
       slack="''${AGENT_BOX_SLACK_BIN:-}"
       envstore="''${AGENT_BOX_ENVSTORE_BIN:-}"
       [ -x "$slack" ] && [ -x "$envstore" ] || return 0
+      # No ingress, nowhere to emit: do not connect to Slack just to drop events.
+      [ -n "''${AGENT_BOX_WEBHOOK_SCRIPT:-}" ] || return 0
       # One read per tick: the store is a Python program, and this runs every 2s.
       store="$("$envstore" json 2>/dev/null)" || store="{}"
       app_token="$(printf '%s' "$store" | "$JQ" -r '.SLACK_APP_TOKEN // empty' 2>/dev/null)" || app_token=""
@@ -16420,7 +16444,13 @@ esac
       [ "$((now - slack_last_start))" -ge 10 ] || return 0
       slack_last_start="$now"
       slack_tokens="$app_token/$bot_token"
-      SLACK_APP_TOKEN="$app_token" SLACK_BOT_TOKEN="$bot_token" "$slack" serve &
+      # stderr goes to a file the user can read: the agent user is not in the
+      # journal groups, so a bad token would otherwise crash-loop unseen. The
+      # daemon logs one line per connect plus errors, so growth is slow.
+      slack_log_dir="''${HOME:-/tmp}/.local/state/local-slack"
+      mkdir -p "$slack_log_dir" 2>/dev/null && chmod 700 "$slack_log_dir" 2>/dev/null || true
+      SLACK_APP_TOKEN="$app_token" SLACK_BOT_TOKEN="$bot_token" "$slack" serve \
+        2>>"$slack_log_dir/daemon.log" &
       slack_pid=$!
     }
 

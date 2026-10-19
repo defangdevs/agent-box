@@ -1761,6 +1761,8 @@ supervise_slack() {
   slack="${AGENT_BOX_SLACK_BIN:-}"
   envstore="${AGENT_BOX_ENVSTORE_BIN:-}"
   [ -x "$slack" ] && [ -x "$envstore" ] || return 0
+  # No ingress, nowhere to emit: do not connect to Slack just to drop events.
+  [ -n "${AGENT_BOX_WEBHOOK_SCRIPT:-}" ] || return 0
   # One read per tick: the store is a Python program, and this runs every 2s.
   store="$("$envstore" json 2>/dev/null)" || store="{}"
   app_token="$(printf '%s' "$store" | "$JQ" -r '.SLACK_APP_TOKEN // empty' 2>/dev/null)" || app_token=""
@@ -1783,7 +1785,13 @@ supervise_slack() {
   [ "$((now - slack_last_start))" -ge 10 ] || return 0
   slack_last_start="$now"
   slack_tokens="$app_token/$bot_token"
-  SLACK_APP_TOKEN="$app_token" SLACK_BOT_TOKEN="$bot_token" "$slack" serve &
+  # stderr goes to a file the user can read: the agent user is not in the
+  # journal groups, so a bad token would otherwise crash-loop unseen. The
+  # daemon logs one line per connect plus errors, so growth is slow.
+  slack_log_dir="${HOME:-/tmp}/.local/state/local-slack"
+  mkdir -p "$slack_log_dir" 2>/dev/null && chmod 700 "$slack_log_dir" 2>/dev/null || true
+  SLACK_APP_TOKEN="$app_token" SLACK_BOT_TOKEN="$bot_token" "$slack" serve \
+    2>>"$slack_log_dir/daemon.log" &
   slack_pid=$!
 }
 

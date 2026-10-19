@@ -28,6 +28,8 @@ chmod +x "$TEST_ROOT/bin/"*
 AGENT_BOX_SLACK_BIN="$TEST_ROOT/bin/agent-box-slack"
 AGENT_BOX_ENVSTORE_BIN="$TEST_ROOT/bin/envstore"
 JQ=jq
+HOME="$TEST_ROOT/home"
+AGENT_BOX_WEBHOOK_SCRIPT=/nonexistent/webhook.py
 slack_pid=""
 slack_last_start=0
 
@@ -37,6 +39,11 @@ supervise_slack
 echo 'SLACK_APP_TOKEN=xapp-1' > "$STORE"
 supervise_slack
 [ ! -e "$CALLS" ]
+
+# Both tokens but no webhook ingress: nothing starts.
+printf 'SLACK_APP_TOKEN=xapp-1\nSLACK_BOT_TOKEN=xoxb-2\n' > "$STORE"
+AGENT_BOX_WEBHOOK_SCRIPT= supervise_slack
+[ ! -e "$CALLS" ] && [ -z "$slack_pid" ]
 
 # Both tokens: it starts once, with the tokens in its environment only.
 printf 'SLACK_APP_TOKEN=xapp-1\nSLACK_BOT_TOKEN=xoxb-2\n' > "$STORE"
@@ -86,5 +93,6 @@ for _ in $(seq 1 50); do
 done
 grep -F xoxb-3 "$CALLS" >/dev/null
 kill "$slack_pid" 2>/dev/null || true
+[ -d "$HOME/.local/state/local-slack" ]
 
 echo "slack supervisor: OK"

@@ -701,11 +701,16 @@ saves you reading a 32-hex secret out to them.
 ## A sender that is not GitHub
 
 `setup SOURCE` writes that sender's wire config, not GitHub's, for the senders
-this box knows the shape of. Today that is `linear`; every other name still
+this box knows the shape of. Today that is `linear` and `slack`; every other name still
 gets GitHub's defaults, which is what `setup stripe` has always meant. If a
 sender signs in its own header and you set it up as a bare source, its every
 delivery is answered 401 and nothing tells you - so check the `Signature` line
 `setup` prints against what the sender actually sends.
+
+`slack` is different: Slack never calls the endpoint. A daemon (local-slack)
+runs in the agent unit while both `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are
+in the env store and posts signed events to the local socket. Topics are
+`slack:<TEAM_ID>/<CHANNEL_ID>`; its log is `~/.local/state/local-slack/daemon.log`.
 
 Linear end to end, none of which needs a rebuild or root:
 
