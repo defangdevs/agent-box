@@ -337,11 +337,16 @@ let
       ## A sender that is not GitHub
 
       `setup SOURCE` writes that sender's wire config, not GitHub's, for the senders
-      this box knows the shape of. Today that is `linear`; every other name still
+      this box knows the shape of. Today that is `linear` and `slack`; every other name still
       gets GitHub's defaults, which is what `setup stripe` has always meant. If a
       sender signs in its own header and you set it up as a bare source, its every
       delivery is answered 401 and nothing tells you - so check the `Signature` line
       `setup` prints against what the sender actually sends.
+
+      `slack` is different: Slack never calls the endpoint. A daemon (local-slack)
+      runs in the agent unit while both `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are
+      in the env store and posts signed events to the local socket. Topics are
+      `slack:<TEAM_ID>/<CHANNEL_ID>`; its log is `~/.local/state/local-slack/daemon.log`.
 
       Linear end to end, none of which needs a rebuild or root:
 
@@ -5030,7 +5035,7 @@ done
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli uploadCli
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
@@ -7203,6 +7208,89 @@ if __name__ == "__main__":
         sys.exit(1)
   '';
 
+  # local-slack (issue #864): the supervisor runs its daemon while both Slack
+  # tokens are in the env store. The CLI fetches the one pinned slack.py and
+  # supplies the receiver socket path, which only this box knows.
+  slackCli = pkgs.writers.writePython3Bin "agent-box-slack" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+"""Run the pinned local-slack daemon for agent-box (issue #864)."""
+
+import hashlib
+import os
+from pathlib import Path
+import sys
+import tempfile
+from urllib.request import urlopen
+
+
+REV = "b480a36f291acf3c817a3729c1a24fe4553f69c2"
+SHA256 = "e02755df0116aa39cba52db1e37ca67ecce394cc91b66d5de80ec5ecbf991e6b"
+HOME = Path.home()
+RUNTIME = HOME / ".local/share/local-slack"
+SCRIPT = RUNTIME / "slack.py"
+
+
+def installed():
+    try:
+        return hashlib.sha256(SCRIPT.read_bytes()).hexdigest() == SHA256
+    except OSError:
+        return False
+
+
+def install():
+    """Fetch slack.py at the pinned commit; refuse anything that does not hash."""
+    if installed():
+        return
+    if RUNTIME.is_symlink():
+        raise RuntimeError("local-slack directory cannot be a symlink")
+    RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    url = ("https://raw.githubusercontent.com/defangdevs/local-channels/"
+           f"{REV}/local-slack/slack.py")
+    with urlopen(url, timeout=30) as response:
+        content = response.read(2_000_001)
+    if len(content) > 2_000_000 or hashlib.sha256(content).hexdigest() != SHA256:
+        raise RuntimeError("local-slack source integrity check failed")
+    with tempfile.NamedTemporaryFile(dir=RUNTIME, delete=False) as stage:
+        stage.write(content)
+    os.replace(stage.name, SCRIPT)
+
+
+def serve_env():
+    env = dict(os.environ)
+    # The receiver is socket-activated, so it has not written the file `emit`
+    # finds the ingress by until something connects; name the socket instead.
+    env.setdefault("LOCAL_WEBHOOK_HTTP_SOCK",
+                   "/run/agent-box-webhook/" + os.environ.get("USER", HOME.name) + ".sock")
+    webhook = os.environ.get("AGENT_BOX_WEBHOOK_SCRIPT")
+    if webhook:
+        env.setdefault("LOCAL_SLACK_EMIT", sys.executable + " " + webhook + " emit")
+    return env
+
+
+def serve():
+    for token in ("SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"):
+        if not os.environ.get(token):
+            raise RuntimeError(token + " is not set")
+    install()
+    os.execve(sys.executable, [sys.executable, str(SCRIPT), "daemon"], serve_env())
+
+
+def main():
+    verbs = {"install": install, "serve": serve}
+    if len(sys.argv) != 2 or sys.argv[1] not in verbs:
+        raise RuntimeError("usage: agent-box-slack install|serve")
+    verbs[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError) as error:
+        print("agent-box-slack: " + str(error), file=sys.stderr)
+        sys.exit(1)
+  '';
+
   # Agent profiles (issue #321): the WORKER, as opposed to the harness that
   # `--harness` selects — a harness plus the model, effort, appended system
   # prompt and environment that tell two sessions on one harness apart.
@@ -8669,6 +8757,12 @@ _hc_main "$@"
           # deliberately undeliverable upstream. Teams are what issues live in.
           printf '%s' '{"format":"generic","signatureHeader":"linear-signature","keyPath":"data.teamId","senderPath":"actor.name"}'
           ;;
+        slack)
+          # local-slack emits through `webhook.py emit`, which signs with this
+          # source's own secret. It routes on `route` (<team>/<channel>), so a topic
+          # is slack:T0123/C0456; without keyPath every event reaches nobody.
+          printf '%s' '{"format":"generic","keyPath":"route"}'
+          ;;
         *) printf '%s' '{}' ;;
       esac
     }
@@ -9825,6 +9919,23 @@ _hc_main "$@"
           rm -f "$tmp"; exit 1
         fi
         sig_header="$(source_sig_header "$src")"
+        if [ "$src" = slack ]; then
+          # Slack never calls this endpoint: local-slack holds the Socket Mode
+          # connection and posts signed events to the local socket itself.
+          cat <<EOF
+    $note
+
+    Nothing to register in Slack. local-slack connects out to Slack and delivers
+    into this box's webhook socket itself, so do NOT paste a URL into Slack's
+    Event Subscriptions.
+
+    Put SLACK_APP_TOKEN and SLACK_BOT_TOKEN in the settings page's secrets panel;
+    the daemon starts by itself once both are set. Its log is
+    ~/.local/state/local-slack/daemon.log. Topics are slack:<TEAM_ID>/<CHANNEL_ID>:
+      agent-box-webhook subscribe slack:T.../C... --note "why you care"
+    EOF
+          exit 0
+        fi
         cat <<EOF
     $note
 
@@ -12537,7 +12648,8 @@ esac
     { "name": "AGENT_BOX_PROFILE_BIN", "kind": "bin", "program": "agent-box-profile" },
     { "name": "AGENT_BOX_CAPACITY_BIN", "kind": "bin", "program": "agent-box-session-capacity" },
     { "name": "AGENT_BOX_ENVSTORE_BIN", "kind": "bin", "program": "agent-box-envstore" },
-    { "name": "AGENT_BOX_WHATSAPP_BIN", "kind": "bin", "program": "agent-box-whatsapp" }
+    { "name": "AGENT_BOX_WHATSAPP_BIN", "kind": "bin", "program": "agent-box-whatsapp" },
+    { "name": "AGENT_BOX_SLACK_BIN", "kind": "bin", "program": "agent-box-slack" }
   ],
   "execStart": [
     { "kind": "bin", "program": "agent-box-supervisor" }
@@ -12839,6 +12951,7 @@ esac
     "agent-box-session-capacity" = "${capacityCli}/bin/agent-box-session-capacity";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     "agent-box-whatsapp" = "${whatsappCli}/bin/agent-box-whatsapp";
+    "agent-box-slack" = "${slackCli}/bin/agent-box-slack";
     "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";
@@ -16296,6 +16409,51 @@ esac
       whatsapp_pid=$!
     }
 
+    # local-slack (issue #864) runs in this unit's cgroup like the WhatsApp bridge:
+    # it is the user's connection, not a session, so it takes no session slot. It
+    # runs while both tokens are in the env store; clearing either stops it. The
+    # tokens go to the child's environment only, never its command line.
+    slack_tokens=""
+    slack_pid=""
+    slack_last_start=0
+    supervise_slack() {
+      slack="''${AGENT_BOX_SLACK_BIN:-}"
+      envstore="''${AGENT_BOX_ENVSTORE_BIN:-}"
+      [ -x "$slack" ] && [ -x "$envstore" ] || return 0
+      # No ingress, nowhere to emit: do not connect to Slack just to drop events.
+      [ -n "''${AGENT_BOX_WEBHOOK_SCRIPT:-}" ] || return 0
+      # One read per tick: the store is a Python program, and this runs every 2s.
+      store="$("$envstore" json 2>/dev/null)" || store="{}"
+      app_token="$(printf '%s' "$store" | "$JQ" -r '.SLACK_APP_TOKEN // empty' 2>/dev/null)" || app_token=""
+      bot_token="$(printf '%s' "$store" | "$JQ" -r '.SLACK_BOT_TOKEN // empty' 2>/dev/null)" || bot_token=""
+      if [ -z "$app_token" ] || [ -z "$bot_token" ]; then
+        if [ -n "$slack_pid" ]; then
+          kill "$slack_pid" 2>/dev/null || true
+          slack_pid=""
+        fi
+        return 0
+      fi
+      if [ -n "$slack_pid" ] && kill -0 "$slack_pid" 2>/dev/null; then
+        # A replaced token must reach the daemon: it keeps the environment it
+        # started with, and a revoked token would leave it reconnecting forever.
+        [ "$app_token/$bot_token" != "$slack_tokens" ] || return 0
+        kill "$slack_pid" 2>/dev/null || true
+        slack_pid=""
+      fi
+      now="$(date +%s)"
+      [ "$((now - slack_last_start))" -ge 10 ] || return 0
+      slack_last_start="$now"
+      slack_tokens="$app_token/$bot_token"
+      # stderr goes to a file the user can read: the agent user is not in the
+      # journal groups, so a bad token would otherwise crash-loop unseen. The
+      # daemon logs one line per connect plus errors, so growth is slow.
+      slack_log_dir="''${HOME:-/tmp}/.local/state/local-slack"
+      mkdir -p "$slack_log_dir" 2>/dev/null && chmod 700 "$slack_log_dir" 2>/dev/null || true
+      SLACK_APP_TOKEN="$app_token" SLACK_BOT_TOKEN="$bot_token" "$slack" serve \
+        2>>"$slack_log_dir/daemon.log" &
+      slack_pid=$!
+    }
+
     # Reclaim the supervisor's own per-session state for names the registry no
     # longer lists (issue #282).
     #
@@ -16444,6 +16602,7 @@ esac
       done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$REGISTRY_FILE" 2>/dev/null)
       sync_codex_threads
       supervise_whatsapp
+      supervise_slack
       sleep 2
     done
   '';
@@ -18092,6 +18251,12 @@ in
             # operator's GitHub account is an outward-facing act, not a
             # side effect of having a tree to read.
             AGENT_BOX_CHECKOUT_FORK = "1";
+          }
+          // lib.optionalAttrs webhookEnabled {
+            # The pinned webhook.py the box runs, for the local-slack daemon
+            # the supervisor starts (issue #864): its emit command. Bound
+            # whether or not claude sessions track the plugin.
+            AGENT_BOX_WEBHOOK_SCRIPT = "${localWebhookScript}";
           }
           // lib.optionalAttrs (webhookEnabled && cfg.webhook.syncSessionPlugin) {
             # Presence = "keep the session's plugin cache off the floor"

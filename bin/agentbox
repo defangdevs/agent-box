@@ -2723,6 +2723,10 @@ class Renderer:
                 # marketplace's default branch instead.
                 pairs.append(("AGENT_BOX_WEBHOOK_PINNED_SCRIPT",
                               self.spec.webhook_script))
+        if self.spec.webhook_enable:
+            # The pinned webhook.py, for the local-slack daemon's emit command
+            # (issue #864) — independent of whether claude is installed.
+            pairs.append(("AGENT_BOX_WEBHOOK_SCRIPT", self.spec.webhook_script))
         if self.spec.codex_full_access:
             # Set ONLY when the file above was written: supervisor.sh reads
             # this as "the box has a system-wide codex config", and a

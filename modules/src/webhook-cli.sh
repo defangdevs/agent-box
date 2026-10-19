@@ -358,6 +358,12 @@ source_template() {
       # deliberately undeliverable upstream. Teams are what issues live in.
       printf '%s' '{"format":"generic","signatureHeader":"linear-signature","keyPath":"data.teamId","senderPath":"actor.name"}'
       ;;
+    slack)
+      # local-slack emits through `webhook.py emit`, which signs with this
+      # source's own secret. It routes on `route` (<team>/<channel>), so a topic
+      # is slack:T0123/C0456; without keyPath every event reaches nobody.
+      printf '%s' '{"format":"generic","keyPath":"route"}'
+      ;;
     *) printf '%s' '{}' ;;
   esac
 }
@@ -1514,6 +1520,23 @@ case "$cmd" in
       rm -f "$tmp"; exit 1
     fi
     sig_header="$(source_sig_header "$src")"
+    if [ "$src" = slack ]; then
+      # Slack never calls this endpoint: local-slack holds the Socket Mode
+      # connection and posts signed events to the local socket itself.
+      cat <<EOF
+$note
+
+Nothing to register in Slack. local-slack connects out to Slack and delivers
+into this box's webhook socket itself, so do NOT paste a URL into Slack's
+Event Subscriptions.
+
+Put SLACK_APP_TOKEN and SLACK_BOT_TOKEN in the settings page's secrets panel;
+the daemon starts by itself once both are set. Its log is
+~/.local/state/local-slack/daemon.log. Topics are slack:<TEAM_ID>/<CHANNEL_ID>:
+  agent-box-webhook subscribe slack:T.../C... --note "why you care"
+EOF
+      exit 0
+    fi
     cat <<EOF
 $note
 
