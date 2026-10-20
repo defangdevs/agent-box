@@ -66,6 +66,17 @@ if [[ -z "$flake_ref" ]]; then
   if rev="$(git -C "$HERE" rev-parse HEAD 2>/dev/null)" && \
      git -C "$HERE" remote get-url origin 2>/dev/null | grep -q 'defangdevs/agent-box'; then
     flake_ref="github:defangdevs/agent-box/$rev"
+    # A rev outside the default branch (a feature branch, later squash-merged)
+    # leaves the box unable to update itself (issue #896): track the default
+    # branch instead.
+    git -C "$HERE" fetch -q origin 2>/dev/null || true
+    if ! git -C "$HERE" remote set-head origin --auto >/dev/null 2>&1; then
+      flake_ref=github:defangdevs/agent-box
+      echo "warning: could not refresh origin's default branch; tracking the default branch instead ($flake_ref)" >&2
+    elif ! git -C "$HERE" merge-base --is-ancestor "$rev" refs/remotes/origin/HEAD 2>/dev/null; then
+      flake_ref=github:defangdevs/agent-box
+      echo "warning: $rev is not on origin's default branch; tracking the default branch instead ($flake_ref)" >&2
+    fi
   else
     flake_ref=github:defangdevs/agent-box
     echo "note: not in an agent-box checkout; tracking the default branch ($flake_ref)" >&2
