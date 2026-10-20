@@ -122,6 +122,28 @@ let
       chmod +x $out/bin/agent-box-settings
     '';
 
+  # The interactive half of issue #898. Like settingsDaemon it contains an
+  # @@include marker for the shared receive state protocol, so resolve it at
+  # build time rather than shipping the marker verbatim on native boxes.
+  receiveCli = pkgs.runCommand "agent-box-receive"
+    {
+      nativeBuildInputs = [ pkgs.python3 pkgs.python3Packages.flake8 ];
+    } ''
+      ${resolveTree}
+      python3 ${../bin/assemble-module.py} \
+        --resolve tree/modules/src/receive-cli.py > receive.py
+      if grep -q '@@include' receive.py; then
+        echo "an @@include@@ marker survived resolve() in receive-cli.py" >&2
+        exit 1
+      fi
+      flake8 --show-source \
+        --ignore E501,E302,E305,E402,F811 receive.py
+      install -d $out/bin
+      { printf '#!%s\n' ${pkgs.python3}/bin/python3; cat receive.py; } \
+        > $out/bin/agent-box-receive
+      chmod +x $out/bin/agent-box-receive
+    '';
+
   # The tree the assembler resolves markers in: the paths in an @@include@@
   # are relative to the including file, and settings-daemon.py's reach out
   # to docs/, so the repo layout has to be rebuilt around modules/src.
@@ -316,6 +338,7 @@ let
     (payload "agent-box-harness-bare" "harness-cli.sh")
     # Needs no env wrapper: it resolves its token from gh at runtime.
     (payload "agent-box-upload" "upload-cli.sh")
+    receiveCli
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-bare" "webhook-cli.sh")
     # Ingress liveness and delivery recovery (issue #605). Needs no env

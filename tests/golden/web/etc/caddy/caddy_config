@@ -151,6 +151,29 @@ golden.example.org {
   # attribute makes browsers scope it to this box's exact hostname. Never add
   # Domain: boxes share suffixes such as ip.sslip.io and ip.domainstation.com.
   redir /agent /agent/
+  # Temporary, upload-only capability links (issue #898). The page itself is
+  # public and inert: its credential lives after the URL fragment marker, which
+  # never reaches Caddy. JavaScript sends that capability in Authorization on
+  # each TUS request. forward_auth validates it BEFORE reverse_proxy sees a
+  # request body, and request_body bounds one compromised link to one 8 MiB
+  # chunk per request. The daemon independently verifies the same capability
+  # and enforces the total slot size.
+  redir /agent/receive /agent/receive/
+  @receive_api_agent path_regexp receive_api_agent ^/agent/receive/[A-Za-z0-9_-]{16,64}/files(/upload)?/?$
+  handle @receive_api_agent {
+    route {
+      forward_auth unix//run/agent-box-settings/agent.sock {
+        uri /agent/receive/_verify
+      }
+      request_body {
+        max_size 9MB
+      }
+      reverse_proxy unix//run/agent-box-settings/agent.sock
+    }
+  }
+  handle /agent/receive/* {
+    reverse_proxy unix//run/agent-box-settings/agent.sock
+  }
   # agent's settings page (issue #36). Same auth surface as the
   # terminal (cookie-or-basic-auth, same user name), just a different
   # upstream — the settings daemon over its user+caddy-only unix socket
@@ -335,12 +358,12 @@ golden.example.org {
   # exactly this set so no session can be shadowed by one of them.
   @sess_bare_agent {
     path_regexp bare_agent ^/agent/([^/]+)$
-    not path /agent/settings /agent/downloads /agent/webhook /agent/token /agent/ws /agent/auth
+    not path /agent/settings /agent/downloads /agent/receive /agent/webhook /agent/token /agent/ws /agent/auth
   }
   redir @sess_bare_agent /agent/{re.bare_agent.1}/
   @sess_agent {
     path_regexp sess_agent ^/agent/([^/]+)/(.*)$
-    not path /agent/settings* /agent/downloads/* /agent/webhook* /agent/auth/*
+    not path /agent/settings* /agent/downloads/* /agent/receive/* /agent/webhook* /agent/auth/*
   }
   rewrite @sess_agent /agent/{re.sess_agent.2}?arg={re.sess_agent.1}&{query}
   handle /agent/* {
@@ -395,6 +418,29 @@ golden.example.org {
   # attribute makes browsers scope it to this box's exact hostname. Never add
   # Domain: boxes share suffixes such as ip.sslip.io and ip.domainstation.com.
   redir /robot /robot/
+  # Temporary, upload-only capability links (issue #898). The page itself is
+  # public and inert: its credential lives after the URL fragment marker, which
+  # never reaches Caddy. JavaScript sends that capability in Authorization on
+  # each TUS request. forward_auth validates it BEFORE reverse_proxy sees a
+  # request body, and request_body bounds one compromised link to one 8 MiB
+  # chunk per request. The daemon independently verifies the same capability
+  # and enforces the total slot size.
+  redir /robot/receive /robot/receive/
+  @receive_api_robot path_regexp receive_api_robot ^/robot/receive/[A-Za-z0-9_-]{16,64}/files(/upload)?/?$
+  handle @receive_api_robot {
+    route {
+      forward_auth unix//run/agent-box-settings/robot.sock {
+        uri /robot/receive/_verify
+      }
+      request_body {
+        max_size 9MB
+      }
+      reverse_proxy unix//run/agent-box-settings/robot.sock
+    }
+  }
+  handle /robot/receive/* {
+    reverse_proxy unix//run/agent-box-settings/robot.sock
+  }
   # robot's settings page (issue #36). Same auth surface as the
   # terminal (cookie-or-basic-auth, same user name), just a different
   # upstream — the settings daemon over its user+caddy-only unix socket
@@ -579,12 +625,12 @@ golden.example.org {
   # exactly this set so no session can be shadowed by one of them.
   @sess_bare_robot {
     path_regexp bare_robot ^/robot/([^/]+)$
-    not path /robot/settings /robot/downloads /robot/webhook /robot/token /robot/ws /robot/auth
+    not path /robot/settings /robot/downloads /robot/receive /robot/webhook /robot/token /robot/ws /robot/auth
   }
   redir @sess_bare_robot /robot/{re.bare_robot.1}/
   @sess_robot {
     path_regexp sess_robot ^/robot/([^/]+)/(.*)$
-    not path /robot/settings* /robot/downloads/* /robot/webhook* /robot/auth/*
+    not path /robot/settings* /robot/downloads/* /robot/receive/* /robot/webhook* /robot/auth/*
   }
   rewrite @sess_robot /robot/{re.sess_robot.2}?arg={re.sess_robot.1}&{query}
   handle /robot/* {

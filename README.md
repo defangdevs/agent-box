@@ -485,7 +485,7 @@ Attach locally with `tmux -L agent-box attach -t <session>` (see
 deep-linkable standalone terminal at
 `https://<domain>/<user>/<session>/` — one path per session, so a session
 can be bookmarked, shared with whoever holds the login, or opened in its
-own window. `settings`, `downloads`, `webhook`, `sessions`, `token` and
+own window. `settings`, `downloads`, `receive`, `webhook`, `sessions`, `token` and
 `ws` are already paths under `/<user>/`, so no session may take one of
 those names (the CLI, the settings page and a module assertion all refuse
 them). Killed-on-error sessions keep a
@@ -577,6 +577,24 @@ web-server identity cannot reach across users' drops.) The seeded `AGENTS.md`
 tells the agent about this route, so "send me that file" just works. For
 unauthenticated sharing, an agent can instead run its own web service and
 expose it via `~/sites` (see the seeded `AGENTS.md`).
+
+## Uploading large files to an agent (web setups)
+
+An agent can mint a short-lived, upload-only URL for a person who is using a
+native harness app and does not know the box password:
+
+```bash
+agent-box-receive --ttl 4h --max-size 2G
+```
+
+The URL fragment is a bearer capability for one resumable file; it is never a
+terminal or settings credential and is not sent in the initial HTTP request.
+The public, inert receiver page reads it locally and attaches it only to the
+upload API's `Authorization` header. Upload state and offsets survive browser
+or network interruption, each request body is capped to an 8 MiB chunk, and
+the finished file appears in that agent user's `~/uploads`. The link expires
+at its declared time and can be invalidated immediately with
+`agent-box-receive revoke SLOT`.
 
 ## Webhooks: the agent gets told, instead of polling (web setups)
 

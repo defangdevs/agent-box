@@ -762,6 +762,24 @@ answered 401 from that moment and GitHub does not retry them. Rotate when the
 sender can be updated straight away, and say so when you hand the new secret
 over.
 
+## Receiving a large file from the user
+
+When the user needs to give this box a file that is too large for chat, mint
+one temporary resumable upload link:
+
+    agent-box-receive --ttl 4h --max-size 2G
+
+Hand them the complete URL the command prints. The part after `#` is the
+upload credential: treat the whole link as a secret and revoke it if it is
+sent to the wrong person. It authorizes one file up to the stated size and
+never signs the holder into the terminal or settings page. Interrupted browser
+uploads resume automatically, and the completed file appears in `~/uploads`.
+
+`agent-box-receive list` shows active slots. `agent-box-receive revoke SLOT`
+invalidates one immediately and removes its unfinished bytes. Expired slots
+are removed opportunistically. Do not open the upload URL yourself before
+handing it over if your chat client or browser sync might expose its fragment.
+
 ## Handing a file to the user
 
 To let the user download a file you produced (report, build artifact,

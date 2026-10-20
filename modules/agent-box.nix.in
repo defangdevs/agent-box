@@ -752,7 +752,7 @@ let
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli receiveCli
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
@@ -966,6 +966,17 @@ let
   # transcript that copied a curl line.
   uploadCli = pkgs.writeShellScriptBin "agent-box-upload" ''
 @@include:src/upload-cli.sh@@
+  '';
+
+  # Mint a temporary upload-only capability for a user working through a
+  # native harness app (issue #898). The capability reaches only the TUS
+  # receiver and never becomes a terminal/settings login. Its persistent
+  # state protocol is included into this CLI and the settings daemon from
+  # the same lib/receive.py source.
+  receiveCli = pkgs.writers.writePython3Bin "agent-box-receive" {
+    flakeIgnore = [ "E501" "E302" "E305" "E402" "F811" ];
+  } ''
+@@include:src/receive-cli.py@@
   '';
 
   # Bootstraps and re-aligns the shipped checkout (issue #242). On the
@@ -2969,7 +2980,7 @@ in
           # are already spoken for: the more specific route wins and the
           # session would be unreachable with nothing to say why. Mirrored by
           # the CLI's RESERVED_NAMES and the daemon's.
-          assertion = !(builtins.elem sname [ "settings" "downloads" "webhook" "sessions" "token" "ws" "auth" ]);
+          assertion = !(builtins.elem sname [ "settings" "downloads" "receive" "webhook" "sessions" "token" "ws" "auth" ]);
           message = "services.agent-box.users.${name}: session name \"${sname}\" is reserved — /${name}/${sname}/ is already a page on the web UI.";
         }
         {

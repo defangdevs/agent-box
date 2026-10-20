@@ -46,6 +46,8 @@
 #   AGENT_BOX_SETTINGS_BASE      URL base path, e.g. /alice/settings
 #   AGENT_BOX_DOWNLOADS_DIR      the file drop served at /<user>/downloads/
 #                                 (empty = no drop, so the route 404s)
+#   AGENT_BOX_UPLOADS_DIR        destination for temporary-link uploads
+#   AGENT_BOX_RECEIVE_STATE_DIR  capability records and partial-file state
 #   AGENT_BOX_SETTINGS_PORT      dev fallback TCP port on 127.0.0.1
 #                                 (ignored when socket-activated)
 #   AGENT_BOX_TMUX_SOCKET        tmux -L socket name (e.g. agent-box)
@@ -85,6 +87,7 @@
 
 import base64
 import contextlib
+import email.utils
 import errno
 import fcntl
 import functools
@@ -412,8 +415,8 @@ SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,%d}\Z" % NAME_MAX)
 # slash, which is the one shape a session path cannot be told apart from.
 # Mirrored by the CLI's own check and by the module's session-name
 # assertion, so a name is refused wherever it is typed.
-RESERVED_NAMES = frozenset(("settings", "downloads", "webhook", "sessions",
-                            "token", "ws", "auth"))
+RESERVED_NAMES = frozenset(("settings", "downloads", "receive", "webhook",
+                            "sessions", "token", "ws", "auth"))
 # Subscription topics: "source:owner/repo", or the prefix "source:owner/*"
 # (local-webhook 0.13.0 dropped "*" and "source:*" as topics). The
 # panel only ever posts back a topic it just rendered, and the CLI is
@@ -436,6 +439,11 @@ SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 HOME_DIR = os.path.realpath(
     os.environ.get("HOME") or os.path.expanduser("~" + USER)
 )
+
+# Temporary upload capabilities share their on-disk protocol with the CLI
+# that mints and revokes them. The include sits after HOME_DIR because that
+# is the one host-provided value the shared library deliberately consumes.
+@@include-verbatim:lib/receive.py@@
 
 
 def session_url(name):
@@ -7916,6 +7924,203 @@ def render_download_index(rel, rows):
         ))
 
 
+# --- Temporary resumable uploads (issue #898) -------------------------
+
+RECEIVE_BASE = TERM_BASE + "/receive"
+RECEIVE_CHUNK_MAX = 8 << 20
+RECEIVE_IO_CHUNK = 64 << 10
+RECEIVE_PAGE_RE = re.compile(
+    "^" + re.escape(RECEIVE_BASE) + r"/([A-Za-z0-9_-]{16,64})/?$"
+)
+RECEIVE_CREATE_RE = re.compile(
+    "^" + re.escape(RECEIVE_BASE)
+    + r"/([A-Za-z0-9_-]{16,64})/files/?$"
+)
+RECEIVE_FILE_RE = re.compile(
+    "^" + re.escape(RECEIVE_BASE)
+    + r"/([A-Za-z0-9_-]{16,64})/files/upload/?$"
+)
+
+# This page is intentionally public and inert. The capability lives after
+# the URL's #, which a browser never sends in an HTTP request, and JavaScript
+# attaches it explicitly to only the three TUS requests below. The page has
+# no ambient box credential and the capability cannot reach any other route.
+RECEIVE_PAGE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Send a file to __USER__</title>
+<style nonce="__NONCE__">
+:root{color-scheme:light dark}body{margin:0;background:#0d1117;color:#e6edf3;
+font:15px/1.5 system-ui,sans-serif}.card{max-width:38rem;margin:8vh auto;
+padding:1.5rem;border:1px solid #30363d;border-radius:10px;background:#161b22}
+h1{font-size:1.35rem;margin:0 0 .5rem}p{color:#8b949e}input{display:block;
+margin:1rem 0;width:100%}button{font:inherit;padding:.55rem 1rem;border:0;
+border-radius:6px;background:#238636;color:white;font-weight:600}button:disabled{
+opacity:.5}progress{width:100%;height:1rem;margin-top:1rem}#status{min-height:1.5rem}
+</style></head><body data-slot="__SLOT__"><main class="card">
+<h1>Send one file to __USER__</h1>
+<p>This private link accepts one resumable upload. It does not grant access
+to the terminal or any existing files.</p>
+<input id="file" type="file"><button id="send" disabled>Upload file</button>
+<progress id="progress" value="0" max="1"></progress><p id="status"></p>
+</main><script nonce="__NONCE__">
+(() => {
+  'use strict';
+  const slot = document.body.dataset.slot;
+  const token = location.hash.slice(1);
+  const input = document.getElementById('file');
+  const button = document.getElementById('send');
+  const progress = document.getElementById('progress');
+  const status = document.getElementById('status');
+  const collection = location.pathname.replace(/\/?$/, '/') + 'files';
+  const resource = collection + '/upload';
+  const validToken = token.startsWith(slot + '.') &&
+    /^[A-Za-z0-9_.-]+$/.test(token);
+  const auth = () => ({'Authorization': 'Bearer ' + token,
+                       'Tus-Resumable': '1.0.0'});
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const b64 = value => {
+    const bytes = new TextEncoder().encode(value);
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary);
+  };
+  const metadata = file => 'filename ' + b64(file.name) +
+    ',fingerprint ' + b64(file.name + '\n' + file.size + '\n' +
+                          file.lastModified);
+  const fail = async response => {
+    let detail = '';
+    try { detail = (await response.text()).trim(); } catch (_) {}
+    throw new Error(detail || ('Upload request failed (' + response.status + ')'));
+  };
+  const head = async file => {
+    const response = await fetch(resource, {method: 'HEAD', headers: auth(),
+                                            cache: 'no-store'});
+    if (response.status === 404) return null;
+    if (!response.ok) return fail(response);
+    if (Number(response.headers.get('Upload-Length')) !== file.size ||
+        response.headers.get('Upload-Metadata') !== metadata(file)) {
+      throw new Error('This link is already bound to a different file.');
+    }
+    return Number(response.headers.get('Upload-Offset'));
+  };
+  const create = async file => {
+    const headers = auth();
+    headers['Upload-Length'] = String(file.size);
+    headers['Upload-Metadata'] = metadata(file);
+    const response = await fetch(collection, {method: 'POST', headers});
+    if (!response.ok) return fail(response);
+    return Number(response.headers.get('Upload-Offset') || '0');
+  };
+  const show = (text, offset, size) => {
+    status.textContent = text;
+    progress.max = Math.max(size, 1);
+    progress.value = offset;
+  };
+  async function upload(file) {
+    let offset = await head(file);
+    if (offset === null) offset = await create(file);
+    show('Uploading ' + file.name + '...', offset, file.size);
+    let failures = 0;
+    while (offset < file.size) {
+      const end = Math.min(offset + __CHUNK__, file.size);
+      const headers = auth();
+      headers['Upload-Offset'] = String(offset);
+      headers['Content-Type'] = 'application/offset+octet-stream';
+      try {
+        const response = await fetch(resource, {
+          method: 'PATCH', headers, body: file.slice(offset, end)
+        });
+        if (!response.ok) await fail(response);
+        offset = Number(response.headers.get('Upload-Offset'));
+        failures = 0;
+        show('Uploading ' + file.name + '...', offset, file.size);
+      } catch (error) {
+        if (++failures > 6) throw error;
+        show('Connection interrupted; resuming...', offset, file.size);
+        await sleep(Math.min(1000 * (2 ** failures), 15000));
+        const resumed = await head(file);
+        if (resumed === null) throw error;
+        offset = resumed;
+      }
+    }
+    show('Upload complete. You may close this page.', offset, file.size);
+  }
+  if (!validToken) {
+    status.textContent = 'This upload link is incomplete.';
+  } else {
+    input.addEventListener('change', () => { button.disabled = !input.files[0]; });
+    button.addEventListener('click', async () => {
+      const file = input.files[0];
+      if (!file) return;
+      button.disabled = true;
+      try { await upload(file); }
+      catch (error) { status.textContent = error.message; button.disabled = false; }
+    });
+  }
+})();
+</script></body></html>'''
+
+
+def receive_page(slot, nonce):
+    return (RECEIVE_PAGE.replace("__USER__", html.escape(USER))
+            .replace("__SLOT__", slot)
+            .replace("__NONCE__", nonce)
+            .replace("__CHUNK__", str(RECEIVE_CHUNK_MAX)))
+
+
+def receive_metadata(raw):
+    """Parse the small TUS metadata header into decoded UTF-8 values."""
+    if not raw or len(raw) > 8192:
+        raise ValueError("missing or oversized upload metadata")
+    result = {}
+    for item in raw.split(","):
+        key, separator, encoded = item.strip().partition(" ")
+        if not separator or key not in ("filename", "fingerprint") or key in result:
+            raise ValueError("invalid upload metadata")
+        try:
+            value = base64.b64decode(encoded, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            raise ValueError("invalid upload metadata")
+        if not value or len(value.encode("utf-8")) > 1024:
+            raise ValueError("invalid upload metadata")
+        result[key] = value
+    if set(result) != {"filename", "fingerprint"}:
+        raise ValueError("filename and fingerprint metadata are required")
+    return result
+
+
+def receive_offset(record):
+    if record.get("status") == "complete":
+        return record["length"]
+    try:
+        value = os.path.getsize(receive_partial_path(record["slot"]))
+    except OSError:
+        return None
+    return value if value <= record.get("length", -1) else None
+
+
+def receive_finalize(record, offset):
+    """Publish a fully written partial, including after a daemon crash.
+
+    The file bytes are fsynced before the last PATCH response. If the process
+    stops between that fsync and publish(), the next HEAD observes a complete
+    partial and finishes the same idempotent link/write/unlink sequence.
+    """
+    if (record.get("status") == "uploading"
+            and offset == record.get("length")):
+        partial = receive_partial_path(record["slot"])
+        final_name = receive_publish(partial, record["name"], record["slot"])
+        record.update({"status": "complete",
+                       "final_name": final_name,
+                       "completed": int(time.time())})
+        receive_write(record)
+        with contextlib.suppress(OSError):
+            os.unlink(partial)
+        receive_fsync_dir(RECEIVE_PARTIAL_DIR)
+    return record
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     """Serve the authenticated settings UI and its actions."""
 
@@ -7950,6 +8155,314 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
+
+    def _send_empty(self, status, headers=None):
+        self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, str(value))
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _receive_error(self, status, message, extra=None):
+        data = (message + "\n").encode("utf-8")
+        try:
+            self.send_response(status)
+            for name, value in (extra or {}).items():
+                self.send_header(name, str(value))
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # An interrupted PATCH is expected to disappear before its error
+            # response is written; its received bytes and offset are already
+            # durable. Do not turn a resumable network failure into a daemon
+            # traceback, or try to write a second error on the dead socket.
+            self.close_connection = True
+
+    def _receive_record(self, slot):
+        record = receive_authorized(
+            slot, self.headers.get("Authorization", ""))
+        if record is None:
+            self._receive_error(
+                401, "This upload link is invalid or expired.",
+                {"WWW-Authenticate": 'Bearer realm="agent-box upload"'},
+            )
+        return record
+
+    def _receive_verify(self):
+        """Caddy forward_auth check before it forwards an upload body."""
+        token_slot, _secret = receive_parse_authorization(
+            self.headers.get("Authorization", ""))
+        forwarded = urllib.parse.urlparse(
+            self.headers.get("X-Forwarded-Uri", "")).path
+        match = (RECEIVE_CREATE_RE.fullmatch(forwarded)
+                 or RECEIVE_FILE_RE.fullmatch(forwarded))
+        path_slot = match.group(1) if match else None
+        if (token_slot and token_slot == path_slot
+                and receive_authorized(
+                    token_slot, self.headers.get(
+                        "Authorization", "")) is not None):
+            self._send_empty(204)
+            return
+        self._receive_error(
+            401, "This upload link is invalid or expired.",
+            {"WWW-Authenticate": 'Bearer realm="agent-box upload"'},
+        )
+
+    def _receive_page(self, slot):
+        receive_prune()
+        nonce = secrets.token_urlsafe(18)
+        data = receive_page(slot, nonce).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; script-src 'nonce-%s'; "
+            "style-src 'nonce-%s'; connect-src 'self'; base-uri 'none'; "
+            "form-action 'none'; frame-ancestors 'none'" % (nonce, nonce),
+        )
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _receive_headers(self, record, offset):
+        headers = {
+            "Tus-Resumable": "1.0.0",
+            "Upload-Offset": offset,
+            "Upload-Length": record["length"],
+            "Upload-Metadata": record["metadata"],
+            "Upload-Expires": email.utils.formatdate(
+                record["expires"], usegmt=True),
+        }
+        if record.get("status") == "complete":
+            headers["Upload-Complete"] = "?1"
+            # HTTP headers are Latin-1 in BaseHTTPRequestHandler. Percent
+            # encoding preserves an arbitrary UTF-8 browser filename while
+            # keeping this convenience response header ASCII-only.
+            headers["Upload-Filename"] = urllib.parse.quote(
+                record.get("final_name", ""), safe="")
+        return headers
+
+    def _receive_create(self, slot):
+        if self.headers.get("Tus-Resumable") != "1.0.0":
+            self._receive_error(412, "Unsupported resumable upload version.",
+                                {"Tus-Version": "1.0.0"})
+            return
+        try:
+            length = int(self.headers.get("Upload-Length", ""))
+        except ValueError:
+            length = -1
+        try:
+            creation_body = int(
+                self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            creation_body = -1
+        if creation_body != 0:
+            self.close_connection = True
+            self._receive_error(400, "Upload creation must have an empty body.")
+            return
+        try:
+            metadata = receive_metadata(self.headers.get("Upload-Metadata", ""))
+        except ValueError as exc:
+            self._receive_error(400, str(exc))
+            return
+        try:
+            with receive_capacity_lock():
+                with receive_slot_lock(slot):
+                    record = self._receive_record(slot)
+                    if record is None:
+                        return
+                    if record["status"] != "waiting":
+                        self._receive_error(
+                            409, "This upload link is already bound to a file.",
+                            {"Location": RECEIVE_BASE + "/" + slot
+                             + "/files/upload"},
+                        )
+                        return
+                    if length < 0 or length > record["max_bytes"]:
+                        self._receive_error(
+                            413,
+                            "The selected file exceeds this link's size limit.",
+                            {"Tus-Max-Size": record["max_bytes"]},
+                        )
+                        return
+                    receive_ensure_dirs()
+                    free = shutil.disk_usage(RECEIVE_UPLOAD_DIR).free
+                    promised = receive_reserved_bytes(exclude=slot)
+                    if length + promised + RECEIVE_FREE_RESERVE > free:
+                        self._receive_error(
+                            507,
+                            "The box does not have enough unreserved space "
+                            "for this file.",
+                        )
+                        return
+                    partial = receive_partial_path(slot)
+                    try:
+                        fd = os.open(
+                            partial,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                            | getattr(os, "O_NOFOLLOW", 0),
+                            0o600,
+                        )
+                    except FileExistsError:
+                        # Recover the narrow crash window after the empty
+                        # partial was created but before the waiting record
+                        # became uploading. A non-empty or non-regular path
+                        # is never adopted.
+                        recovered_fd = None
+                        try:
+                            recovered_fd = os.open(
+                                partial,
+                                os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                            )
+                            info = os.fstat(recovered_fd)
+                            if not stat.S_ISREG(info.st_mode) or info.st_size:
+                                os.close(recovered_fd)
+                                self._receive_error(
+                                    409,
+                                    "This upload already has partial data.",
+                                )
+                                return
+                        except OSError:
+                            if recovered_fd is not None:
+                                with contextlib.suppress(OSError):
+                                    os.close(recovered_fd)
+                            self._receive_error(
+                                409, "This upload already has partial data.")
+                            return
+                        fd = recovered_fd
+                    os.close(fd)
+                    receive_fsync_dir(RECEIVE_PARTIAL_DIR)
+                    record.update({
+                        "status": "uploading",
+                        "length": length,
+                        "name": receive_safe_name(metadata["filename"]),
+                        "metadata": self.headers["Upload-Metadata"],
+                        "fingerprint": metadata["fingerprint"],
+                        "upload_created": int(time.time()),
+                    })
+                    receive_write(record)
+                    if length == 0:
+                        record = receive_finalize(record, 0)
+        except OSError:
+            self._receive_error(503, "The upload slot is temporarily unavailable.")
+            return
+        location = RECEIVE_BASE + "/" + slot + "/files/upload"
+        self._send_empty(201, dict(
+            self._receive_headers(record, 0), Location=location))
+
+    def _receive_head(self, slot):
+        try:
+            with receive_slot_lock(slot):
+                record = self._receive_record(slot)
+                if record is None:
+                    return
+                if record["status"] == "waiting":
+                    self._receive_error(404, "No file has been started for this link.")
+                    return
+                offset = receive_offset(record)
+                if offset is None:
+                    self._receive_error(500, "The partial upload is inconsistent.")
+                    return
+                record = receive_finalize(record, offset)
+                self._send_empty(200, self._receive_headers(record, offset))
+        except OSError:
+            self._receive_error(503, "The upload slot is temporarily unavailable.")
+
+    def _receive_patch(self, slot):
+        if self.headers.get("Tus-Resumable") != "1.0.0":
+            self._receive_error(412, "Unsupported resumable upload version.",
+                                {"Tus-Version": "1.0.0"})
+            return
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != \
+                "application/offset+octet-stream":
+            self._receive_error(415, "PATCH chunks must be offset octet streams.")
+            return
+        try:
+            declared = int(self.headers.get("Content-Length", ""))
+            wanted_offset = int(self.headers.get("Upload-Offset", ""))
+        except ValueError:
+            declared = wanted_offset = -1
+        if declared < 0 or declared > RECEIVE_CHUNK_MAX or wanted_offset < 0:
+            self.close_connection = True
+            self._receive_error(413 if declared > RECEIVE_CHUNK_MAX else 400,
+                                "Invalid upload chunk size or offset.")
+            return
+        try:
+            with receive_slot_lock(slot):
+                record = self._receive_record(slot)
+                if record is None:
+                    return
+                if record["status"] == "waiting":
+                    self._receive_error(404, "No file has been started for this link.")
+                    return
+                offset = receive_offset(record)
+                if offset is None:
+                    self._receive_error(500, "The partial upload is inconsistent.")
+                    return
+                if wanted_offset != offset:
+                    self.close_connection = True
+                    self._receive_error(
+                        409, "Upload offset does not match the stored file.",
+                        {"Upload-Offset": offset, "Tus-Resumable": "1.0.0"},
+                    )
+                    return
+                if record["status"] == "complete":
+                    self._send_empty(204, self._receive_headers(record, offset))
+                    return
+                if declared > record["length"] - offset:
+                    self.close_connection = True
+                    self._receive_error(413, "Chunk exceeds the declared file size.")
+                    return
+                if declared + RECEIVE_FREE_RESERVE > \
+                        shutil.disk_usage(RECEIVE_UPLOAD_DIR).free:
+                    self.close_connection = True
+                    self._receive_error(507, "The box is too full to accept this chunk.")
+                    return
+                partial = receive_partial_path(slot)
+                fd = os.open(partial, os.O_WRONLY | os.O_APPEND
+                             | getattr(os, "O_NOFOLLOW", 0))
+                received = 0
+                try:
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode) or info.st_size != offset:
+                        self._receive_error(409, "The partial upload changed.")
+                        return
+                    while received < declared:
+                        chunk = self.rfile.read(min(
+                            RECEIVE_IO_CHUNK, declared - received))
+                        if not chunk:
+                            break
+                        view = memoryview(chunk)
+                        while view:
+                            view = view[os.write(fd, view):]
+                        received += len(chunk)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                new_offset = offset + received
+                if received != declared:
+                    self.close_connection = True
+                    self._receive_error(
+                        400, "Upload chunk ended early.",
+                        {"Upload-Offset": new_offset,
+                         "Tus-Resumable": "1.0.0"},
+                    )
+                    return
+                if new_offset == record["length"]:
+                    record = receive_finalize(record, new_offset)
+                self._send_empty(
+                    204, self._receive_headers(record, new_offset))
+        except OSError:
+            self._receive_error(503, "The upload slot is temporarily unavailable.")
 
     def _send_transcript(self, name):
         """Stream one session's transcript to the browser as a download
@@ -8635,6 +9148,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+        # The receiver page is intentionally reachable without the box's web
+        # password. Its fragment capability is not present in this request;
+        # only the TUS API calls below carry it, and Caddy forward-authenticates
+        # those before forwarding a body. _verify is that internal subrequest.
+        if parsed.path.rstrip("/") == RECEIVE_BASE + "/_verify":
+            self._receive_verify()
+            return
+        receive_match = RECEIVE_PAGE_RE.fullmatch(parsed.path)
+        if receive_match:
+            if not parsed.path.endswith("/"):
+                self._redirect(page=parsed.path + "/")
+            else:
+                self._receive_page(receive_match.group(1))
+            return
         # Portal handover (issue #541), routed first and outside the BASE
         # tree: caddy sends the forward_auth subrequest here for every
         # request that carries a session cookie, so it must not depend on
@@ -8832,6 +9359,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         artifact). Every other path keeps the 501 the base class has
         always answered with -- nothing else here has a HEAD to give."""
         parsed = urllib.parse.urlparse(self.path)
+        receive_match = RECEIVE_FILE_RE.fullmatch(parsed.path)
+        if receive_match:
+            self._receive_head(receive_match.group(1))
+            return
         if parsed.path == DL_BASE or parsed.path.startswith(DL_BASE + "/"):
             self._send_drop(parsed.path[len(DL_BASE):], body=False)
             return
@@ -8891,6 +9422,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Validate and apply a settings-page form submission."""
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
+        receive_match = RECEIVE_CREATE_RE.fullmatch(parsed.path)
+        if receive_match:
+            self._receive_create(receive_match.group(1))
+            return
         # Portal handover (issue #541), ahead of the CSRF guard because it
         # is cross-site by design — see _portal_handoff for why that is
         # safe here and nowhere else on this daemon. The route does not
@@ -9799,6 +10334,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             reboot_box()
         else:
             self._send_html("<h1>404</h1>", status=404)
+
+    def do_PATCH(self):
+        """Apply one bounded TUS chunk to a temporary upload slot."""
+        parsed = urllib.parse.urlparse(self.path)
+        receive_match = RECEIVE_FILE_RE.fullmatch(parsed.path)
+        if receive_match:
+            self._receive_patch(receive_match.group(1))
+            return
+        self._receive_error(404, "No such upload resource.")
+
+    def do_OPTIONS(self):
+        """Advertise only the small TUS subset this receiver implements."""
+        parsed = urllib.parse.urlparse(self.path)
+        if (RECEIVE_CREATE_RE.fullmatch(parsed.path)
+                or RECEIVE_FILE_RE.fullmatch(parsed.path)):
+            self._send_empty(204, {
+                "Tus-Version": "1.0.0",
+                "Tus-Resumable": "1.0.0",
+                "Tus-Extension": "creation,expiration",
+                "Tus-Max-Size": 1 << 40,
+            })
+            return
+        self._send_empty(404)
 
     def address_string(self):
         # AF_UNIX peers have no (host, port) client_address — the base class
