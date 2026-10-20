@@ -19184,6 +19184,11 @@ in
       # new unit file anyway.
       restartIfChanged = false;
       stopIfChanged = false;
+      # The drop-in's own PATH replaces the unit file's, and nix is not on
+      # it, so agent_nix_bin's probes all missed and the unit reported "no
+      # nix on this box" and moved nothing (issue #742). agent_nix_bin
+      # honours this before it probes anything.
+      environment.AGENT_BOX_NIX_BIN = "${config.nix.package}/bin/nix";
     }) cfg.users;
   }) (lib.mkIf cfg.selfUpdate.enable {
     # Agent-triggerable box update. The agents' only power here is the
