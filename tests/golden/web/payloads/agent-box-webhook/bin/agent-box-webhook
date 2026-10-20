@@ -136,8 +136,8 @@ Two delivery shapes:
                          session primed with the event text; bursts coalesce
                          into one. SHARED across sessions and pinned (--ttl
                          0) by default; `ls` shows these under "dispatch".
-                         Keep --note to a short purpose (it is cut at 300
-                         characters); put the worker's instructions, safety
+                         Keep --note to a short purpose (over 1000 characters
+                         is refused, never cut); put the worker's instructions, safety
                          rules and model in a profile (`agent-box-profile
                          set NAME HARNESS=... SYSTEM_PROMPT=...`) and pass
                          --profile NAME. Without --profile and
