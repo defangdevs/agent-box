@@ -8099,6 +8099,9 @@ to the terminal or any existing files.</p>
         await sleep(Math.min(1000 * (2 ** failures), 15000));
         const resumed = await head(file, content);
         if (resumed === null) throw error;
+        // A timed-out or cut-off chunk can still persist bytes. Count only
+        // failures that made no progress, so a slow link is not abandoned.
+        if (resumed > offset) failures = 0;
         offset = resumed;
       }
     }

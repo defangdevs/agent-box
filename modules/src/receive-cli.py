@@ -42,6 +42,10 @@ def parse_ttl(raw):
     }, "lifetime")
 
 
+def parse_ttl_arg(raw):
+    return parse_ttl(raw), raw
+
+
 def parse_slot(raw):
     if not RECEIVE_SLOT_RE.fullmatch(raw or ""):
         raise argparse.ArgumentTypeError("invalid upload slot")
@@ -127,8 +131,8 @@ def parser():
         description="Create a temporary resumable browser upload link.")
     sub = result.add_subparsers(dest="command")
     create = sub.add_parser("create", help="create an upload link (default)")
-    create.add_argument("--ttl", default="24h")
-    create.add_argument("--max-size", default="2G")
+    create.add_argument("--ttl", default="24h", type=parse_ttl_arg)
+    create.add_argument("--max-size", default="2G", type=parse_size)
     create.add_argument("--url", help=argparse.SUPPRESS)
     create.add_argument("--json", action="store_true")
     sub.add_parser("list", help="list live upload slots")
@@ -145,9 +149,7 @@ def main(argv=None):
         argv.insert(0, "create")
     args = parser().parse_args(argv)
     if args.command == "create":
-        args.ttl_text = args.ttl
-        args.ttl = parse_ttl(args.ttl)
-        args.max_size = parse_size(args.max_size)
+        args.ttl, args.ttl_text = args.ttl
         cmd_create(args)
     elif args.command == "list":
         cmd_list(args)

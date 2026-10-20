@@ -256,11 +256,9 @@ def receive_reserved_bytes(exclude=None, now=None):
 
 def receive_remove_locked(slot, record=None):
     """Remove a slot and any unfinished bytes while its lock is held."""
-    if record is None:
-        record = receive_read(slot)
-    if record is None or record.get("status") != "complete":
-        with contextlib.suppress(OSError):
-            os.unlink(receive_partial_path(slot))
+    # A completed partial is a second hard link to the published file.
+    with contextlib.suppress(OSError):
+        os.unlink(receive_partial_path(slot))
     with contextlib.suppress(OSError):
         os.unlink(receive_record_path(slot))
     with contextlib.suppress(OSError):

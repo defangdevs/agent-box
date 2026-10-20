@@ -11288,11 +11288,9 @@ def receive_reserved_bytes(exclude=None, now=None):
 
 def receive_remove_locked(slot, record=None):
     """Remove a slot and any unfinished bytes while its lock is held."""
-    if record is None:
-        record = receive_read(slot)
-    if record is None or record.get("status") != "complete":
-        with contextlib.suppress(OSError):
-            os.unlink(receive_partial_path(slot))
+    # A completed partial is a second hard link to the published file.
+    with contextlib.suppress(OSError):
+        os.unlink(receive_partial_path(slot))
     with contextlib.suppress(OSError):
         os.unlink(receive_record_path(slot))
     with contextlib.suppress(OSError):
@@ -11444,6 +11442,10 @@ def parse_ttl(raw):
     }, "lifetime")
 
 
+def parse_ttl_arg(raw):
+    return parse_ttl(raw), raw
+
+
 def parse_slot(raw):
     if not RECEIVE_SLOT_RE.fullmatch(raw or ""):
         raise argparse.ArgumentTypeError("invalid upload slot")
@@ -11529,8 +11531,8 @@ def parser():
         description="Create a temporary resumable browser upload link.")
     sub = result.add_subparsers(dest="command")
     create = sub.add_parser("create", help="create an upload link (default)")
-    create.add_argument("--ttl", default="24h")
-    create.add_argument("--max-size", default="2G")
+    create.add_argument("--ttl", default="24h", type=parse_ttl_arg)
+    create.add_argument("--max-size", default="2G", type=parse_size)
     create.add_argument("--url", help=argparse.SUPPRESS)
     create.add_argument("--json", action="store_true")
     sub.add_parser("list", help="list live upload slots")
@@ -11547,9 +11549,7 @@ def main(argv=None):
         argv.insert(0, "create")
     args = parser().parse_args(argv)
     if args.command == "create":
-        args.ttl_text = args.ttl
-        args.ttl = parse_ttl(args.ttl)
-        args.max_size = parse_size(args.max_size)
+        args.ttl, args.ttl_text = args.ttl
         cmd_create(args)
     elif args.command == "list":
         cmd_list(args)
@@ -20355,11 +20355,9 @@ def receive_reserved_bytes(exclude=None, now=None):
 
 def receive_remove_locked(slot, record=None):
     """Remove a slot and any unfinished bytes while its lock is held."""
-    if record is None:
-        record = receive_read(slot)
-    if record is None or record.get("status") != "complete":
-        with contextlib.suppress(OSError):
-            os.unlink(receive_partial_path(slot))
+    # A completed partial is a second hard link to the published file.
+    with contextlib.suppress(OSError):
+        os.unlink(receive_partial_path(slot))
     with contextlib.suppress(OSError):
         os.unlink(receive_record_path(slot))
     with contextlib.suppress(OSError):
@@ -30100,6 +30098,9 @@ to the terminal or any existing files.</p>
         await sleep(Math.min(1000 * (2 ** failures), 15000));
         const resumed = await head(file, content);
         if (resumed === null) throw error;
+        // A timed-out or cut-off chunk can still persist bytes. Count only
+        // failures that made no progress, so a slow link is not abandoned.
+        if (resumed > offset) failures = 0;
         offset = resumed;
       }
     }
