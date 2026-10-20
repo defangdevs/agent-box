@@ -366,13 +366,16 @@ def _hibernate_idle_seconds():
     return int(raw)
 
 
-def hibernation_probe(name, entry, live, now=None):
+def hibernation_probe(name, entry, live, now=None, parked=False):
+    # parked=True re-probes a session hibernate_one already marked stopped,
+    # so our own marker must not veto it.
     if not isinstance(entry, dict) or name not in live:
         return None
     harness = entry.get("agent")
     if harness not in ("claude", "codex"):
         return None
-    if (entry.get("stopped") is True or entry.get("ephemeral") is True
+    if ((entry.get("stopped") is True and not parked)
+            or entry.get("ephemeral") is True
             or entry.get("origin") == "webhook" or name.startswith("hook-")
             or _hibernate_crashed(entry)):
         return None
@@ -409,16 +412,25 @@ def hibernation_probe(name, entry, live, now=None):
     token = hibernate_hashlib.sha256(
         hibernate_json.dumps(evidence, sort_keys=True, separators=(",", ":"))
         .encode("utf-8")).hexdigest()
+    # Narrower than the token: only what native input or routing can change.
+    # The token also covers the registry entry and session state file, which
+    # hibernate_one itself rewrites while parking.
+    quiet = hibernate_hashlib.sha256(hibernate_json.dumps(
+        [evidence["transcript"], evidence["lease"], evidence["watch"],
+         evidence["whatsapp"]], sort_keys=True, separators=(",", ":"))
+        .encode("utf-8")).hexdigest()
     return {
         "name": name,
         "harness": harness,
         "nativeSessionId": native,
         "idleSince": idle_since,
         "token": token,
+        "quiet": quiet,
     }
 
 
-def hibernation_candidate(sessions, excludes=(), name=None, token=None):
+def hibernation_candidate(sessions, excludes=(), name=None, token=None,
+                          quiet=None):
     assumed = hibernate_os.environ.get("AGENT_BOX_HIBERNATE_ASSUME_LIVE")
     if name is not None and assumed == name:
         # The session CLI took the live snapshot before its registry lock.
@@ -434,8 +446,12 @@ def hibernation_candidate(sessions, excludes=(), name=None, token=None):
     excluded = set(excludes)
     if name is not None:
         entry = sessions.get(name)
-        result = hibernation_probe(name, entry, live)
-        if result is None or (token is not None and result["token"] != token):
+        result = hibernation_probe(name, entry, live, parked=quiet is not None)
+        if result is None:
+            return None
+        if quiet is not None:
+            return result if result["quiet"] == quiet else None
+        if token is not None and result["token"] != token:
             return None
         return result
     candidates = []
