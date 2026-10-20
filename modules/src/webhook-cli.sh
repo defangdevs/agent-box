@@ -130,9 +130,12 @@ Two delivery shapes:
                          is refused, never cut); put the worker's instructions, safety
                          rules and model in a profile (`agent-box-profile
                          set NAME HARNESS=... SYSTEM_PROMPT=...`) and pass
-                         --profile NAME. Without --profile and
-                         AGENT_BOX_HOOK_PROFILE the box default worker
-                         starts with only the note and the event.
+                         --profile NAME (SYSTEM_PROMPT is Claude-only; a
+                         Codex worker's instructions go in the working
+                         directory's AGENTS.md). Without --profile and
+                         AGENT_BOX_HOOK_PROFILE the box's default harness
+                         starts with no profile model or prompt: just the
+                         note, the event and the box's spawn preamble.
                          local-webhook >= 0.23.0 has no built-in policy: a
                          subagent watch MUST carry --when/--drop rules or it
                          is refused outright — there is no failures-only CI
