@@ -24,6 +24,7 @@ web/payloads/agent-box-envstore/bin/agent-box-envstore -> vm/payloads/agent-box-
 web/payloads/agent-box-harness/bin/agent-box-harness -> vm/payloads/agent-box-harness/bin/agent-box-harness
 web/payloads/agent-box-nixpkgs-cache -> vm/payloads/agent-box-nixpkgs-cache
 web/payloads/agent-box-profile/bin/agent-box-profile -> vm/payloads/agent-box-profile/bin/agent-box-profile
+web/payloads/agent-box-receive/bin/agent-box-receive -> vm/payloads/agent-box-receive/bin/agent-box-receive
 web/payloads/agent-box-session-capacity/bin/agent-box-session-capacity -> vm/payloads/agent-box-session-capacity/bin/agent-box-session-capacity
 web/payloads/agent-box-session/bin/agent-box-session -> vm/payloads/agent-box-session/bin/agent-box-session
 web/payloads/agent-box-slack/bin/agent-box-slack -> vm/payloads/agent-box-slack/bin/agent-box-slack

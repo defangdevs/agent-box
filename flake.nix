@@ -888,6 +888,73 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               printf 'downloads route present, served by the daemon, and isolated\n' > "$out"
             '';
 
+          # The large-file receiver (issue #898) is intentionally the one
+          # public browser page on a user's path: its fragment capability is
+          # never sent in that request. Only the upload API accepts the
+          # capability, and Caddy validates it before proxying a bounded
+          # request body to the per-user daemon.
+          receive-route =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "receive.test";
+                        user = "agent";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-receive-route-ok"
+              { caddyfile = sys.config.services.caddy.configFile;
+                nativeBuildInputs = [ pkgs.caddy ]; } ''
+              grep -qF 'handle @receive_page_agent {' "$caddyfile"
+              grep -qF 'path_regexp receive_page_agent ^/agent/receive/[A-Za-z0-9_-]{16,64}/?$' "$caddyfile"
+              grep -qF 'handle /agent/receive/* {' "$caddyfile"
+              grep -qF 'respond 404' "$caddyfile"
+              grep -qF 'handle @receive_api_agent {' "$caddyfile"
+              grep -qF 'uri /agent/receive/_verify' "$caddyfile"
+              grep -qF 'max_size 9MB' "$caddyfile"
+              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/receive/* /agent/webhook*' "$caddyfile"
+
+              # This first trio belongs to the receiver because its fragment
+              # is emitted before every authenticated route in the user
+              # snippet. Authentication and the body limit must both precede
+              # the proxy that consumes the upload stream.
+              auth=$(awk '/forward_auth unix\/\/run\/agent-box-settings\/agent.sock/ { print NR; exit }' "$caddyfile")
+              limit=$(grep -n 'max_size 9MB' "$caddyfile" | cut -d: -f1)
+              proxy=$(awk '/reverse_proxy unix\/\/run\/agent-box-settings\/agent.sock/ { print NR; exit }' "$caddyfile")
+              [ "$auth" -lt "$limit" ]
+              [ "$limit" -lt "$proxy" ]
+
+              # The public-page stanza ends at the settings comment. It must
+              # never acquire ambient box auth; the bearer authorizes only
+              # the matched upload API stanza above it.
+              sed -n '/Temporary, upload-only capability links/,/settings page/p' \
+                "$caddyfile" > receive-stanza
+              if grep 'basic_auth' receive-stanza >/dev/null; then
+                echo "receiver page must not require or mint box auth" >&2
+                exit 1
+              fi
+
+              WEB_PASSWORD_ALGORITHM_AGENT=bcrypt \
+              WEB_PASSWORD_HASH_AGENT='$2a$14$ptCNRCTOMkoUnEXBv0kPWuOJHhYtnpBWQZbLFXW/Ehg5AGKQMoS/W' \
+              WEB_COOKIE_SECRET_AGENT=0123456789abcdef \
+                caddy validate --config "$caddyfile" --adapter caddyfile
+              printf 'public receiver and authenticated bounded upload API present\n' > "$out"
+            '';
+
           # Every Basic-auth bypass cookie must be host-only (issue #813).
           # Boxes commonly sit below shared sslip.io or domainstation.com
           # suffixes, so a Domain attribute would send one box's credential
@@ -991,7 +1058,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               grep -qF 'redir @sess_bare_agent /agent/{re.bare_agent.1}/' "$caddyfile"
               # The names a session may not take are excluded from both, so
               # the pages that own them keep answering.
-              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/webhook*' "$caddyfile"
+              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/receive/* /agent/webhook*' "$caddyfile"
               # Ordering: the rewrite must be emitted before the catch-all it
               # feeds, and the landing page before it too.
               rw=$(grep -n 'rewrite @sess_agent' "$caddyfile" | cut -d: -f1)
@@ -1125,8 +1192,8 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               # 4. The rewrites let it through. These run BEFORE any handle,
               # so without the exclusions the route above is unreachable and
               # every check up to here would still pass.
-              grep -qF 'not path /agent/settings /agent/downloads /agent/webhook /agent/token /agent/ws /agent/auth' "$caddyfile"
-              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/webhook* /agent/auth/*' "$caddyfile"
+              grep -qF 'not path /agent/settings /agent/downloads /agent/receive /agent/webhook /agent/token /agent/ws /agent/auth' "$caddyfile"
+              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/receive/* /agent/webhook* /agent/auth/*' "$caddyfile"
 
               # 5. Every authenticated route also admits a live portal
               # session, and asks the daemon rather than matching a static
@@ -1390,6 +1457,28 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 || { echo "SYNTAX: bin/agent-box-env-exec"; fail=1; }
               if grep -q '@@include' "$profile/bin/agent-box-env-exec"; then
                 echo "MARKER: bin/agent-box-env-exec still has an @@include@@ marker"
+                fail=1
+              fi
+
+              # The receive CLI shares its state protocol with the settings
+              # daemon through a nested include. Pin the resolved Python, not
+              # the marker-bearing source, on native boxes too.
+              python3 ${./bin/assemble-module.py} \
+                --resolve tree/modules/src/receive-cli.py > want_receive.py
+              if ! diff -u want_receive.py \
+                   <(tail -n +2 "$profile/bin/agent-box-receive") >/dev/null; then
+                echo "DRIFT: bin/agent-box-receive is not resolve(src/receive-cli.py)"
+                diff -u want_receive.py \
+                  <(tail -n +2 "$profile/bin/agent-box-receive") | head -20 || true
+                fail=1
+              else
+                echo "ok: bin/agent-box-receive == resolve(src/receive-cli.py)"
+              fi
+              python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' \
+                "$profile/bin/agent-box-receive" \
+                || { echo "SYNTAX: bin/agent-box-receive"; fail=1; }
+              if grep -q '@@include' "$profile/bin/agent-box-receive"; then
+                echo "MARKER: bin/agent-box-receive still has an @@include@@ marker"
                 fail=1
               fi
 
@@ -2589,6 +2678,32 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
               cp "$tests" repo/tests/test-downloads.py
               python3 repo/tests/test-downloads.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # Browser-independent protocol coverage for the resumable receiver
+          # (issue #898), against the same assembled daemon that ships. This
+          # includes a deliberately severed PATCH request and continuation
+          # from the persisted byte offset.
+          receive-upload =
+            pkgs.runCommand "agent-box-receive-upload"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-receive.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin \
+                repo/bin repo/modules
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-receive.py
+              cp ${./bin/assemble-module.py} repo/bin/assemble-module.py
+              cp -r ${./modules/src} repo/modules/src
+              python3 repo/tests/test-receive.py > log 2>&1 || {
                 cat log
                 exit 1
               }
