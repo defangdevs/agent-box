@@ -11243,6 +11243,11 @@ def receive_create(ttl, max_bytes, now=None):
     now = int(time.time() if now is None else now)
     for _attempt in range(32):
         slot = secrets.token_urlsafe(12)
+        # A leading "-" is URL-safe but argparse reads it as an option in
+        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
+        # as ordinary positional arguments without requiring a hidden `--`.
+        if not slot[0].isalnum():
+            continue
         secret = secrets.token_urlsafe(32)
         record = {
             "version": RECEIVE_VERSION,
@@ -20228,6 +20233,11 @@ def receive_create(ttl, max_bytes, now=None):
     now = int(time.time() if now is None else now)
     for _attempt in range(32):
         slot = secrets.token_urlsafe(12)
+        # A leading "-" is URL-safe but argparse reads it as an option in
+        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
+        # as ordinary positional arguments without requiring a hidden `--`.
+        if not slot[0].isalnum():
+            continue
         secret = secrets.token_urlsafe(32)
         record = {
             "version": RECEIVE_VERSION,
@@ -29799,24 +29809,39 @@ RECEIVE_PAGE = r''''<!doctype html>
 font:15px/1.5 system-ui,sans-serif}.card{max-width:38rem;margin:8vh auto;
 padding:1.5rem;border:1px solid #30363d;border-radius:10px;background:#161b22}
 h1{font-size:1.35rem;margin:0 0 .5rem}p{color:#8b949e}input{display:block;
-margin:1rem 0;width:100%}button{font:inherit;padding:.55rem 1rem;border:0;
+margin:1rem 0;width:100%}.drop{display:block;margin:1rem 0;padding:2rem 1rem;
+border:2px dashed #484f58;border-radius:8px;text-align:center;cursor:pointer;
+transition:border-color .15s,background .15s}.drop strong,.drop span{display:block;
+overflow-wrap:anywhere}.drop span{margin-top:.25rem;color:#8b949e}.drop.dragging{
+border-color:#58a6ff;background:#1f6feb26}.drop:focus-within{outline:2px solid
+#58a6ff;outline-offset:2px}.drop.disabled{opacity:.6;cursor:not-allowed}
+#file{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;
+clip-path:inset(50%);white-space:nowrap;border:0}button{font:inherit;
+padding:.55rem 1rem;border:0;
 border-radius:6px;background:#238636;color:white;font-weight:600}button:disabled{
 opacity:.5}progress{width:100%;height:1rem;margin-top:1rem}#status{min-height:1.5rem}
 </style></head><body data-slot="__SLOT__"><main class="card">
 <h1>Send one file to __USER__</h1>
 <p>This private link accepts one resumable upload. It does not grant access
 to the terminal or any existing files.</p>
-<input id="file" type="file"><button id="send" disabled>Upload file</button>
-<progress id="progress" value="0" max="1"></progress><p id="status"></p>
+<label id="drop" class="drop" for="file"><strong id="prompt">Drop a file here</strong>
+<span>or tap to choose one</span><input id="file" type="file"></label>
+<button id="send" disabled>Upload file</button>
+<progress id="progress" aria-label="Upload progress" value="0" max="1"></progress>
+<p id="status" role="status"></p>
 </main><script nonce="__NONCE__">
 (() => {
   'use strict';
   const slot = document.body.dataset.slot;
   const token = location.hash.slice(1);
+  const drop = document.getElementById('drop');
   const input = document.getElementById('file');
+  const prompt = document.getElementById('prompt');
   const button = document.getElementById('send');
   const progress = document.getElementById('progress');
   const status = document.getElementById('status');
+  let selectedFile = null;
+  let uploading = false;
   const collection = location.pathname.replace(/\/?$/, '/') + 'files';
   const resource = collection + '/upload';
   const validToken = token.startsWith(slot + '.') &&
@@ -29894,13 +29919,60 @@ to the terminal or any existing files.</p>
   if (!validToken) {
     status.textContent = 'This upload link is incomplete.';
   } else {
-    input.addEventListener('change', () => { button.disabled = !input.files[0]; });
+    const selectFile = files => {
+      if (uploading) return;
+      if (files.length !== 1) {
+        selectedFile = null;
+        input.value = ''';
+        prompt.textContent = 'Drop a file here';
+        button.disabled = true;
+        status.textContent = 'Choose exactly one file.';
+        return;
+      }
+      selectedFile = files[0];
+      prompt.textContent = selectedFile.name;
+      status.textContent = 'Ready to upload ' + selectedFile.name + '.';
+      button.disabled = false;
+    };
+    const stopDrag = event => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    document.addEventListener('dragover', event => event.preventDefault());
+    document.addEventListener('drop', event => event.preventDefault());
+    drop.addEventListener('dragenter', event => {
+      stopDrag(event);
+      if (!uploading) drop.classList.add('dragging');
+    });
+    drop.addEventListener('dragover', event => {
+      stopDrag(event);
+      if (!uploading) drop.classList.add('dragging');
+    });
+    drop.addEventListener('dragleave', event => {
+      stopDrag(event);
+      drop.classList.remove('dragging');
+    });
+    drop.addEventListener('drop', event => {
+      stopDrag(event);
+      drop.classList.remove('dragging');
+      selectFile(event.dataTransfer.files);
+    });
+    input.addEventListener('change', () => selectFile(input.files));
     button.addEventListener('click', async () => {
-      const file = input.files[0];
-      if (!file) return;
+      const file = selectedFile;
+      if (!file || uploading) return;
+      uploading = true;
       button.disabled = true;
+      input.disabled = true;
+      drop.classList.add('disabled');
       try { await upload(file); }
-      catch (error) { status.textContent = error.message; button.disabled = false; }
+      catch (error) {
+        uploading = false;
+        input.disabled = false;
+        drop.classList.remove('disabled');
+        status.textContent = error.message;
+        button.disabled = false;
+      }
     });
   }
 })();

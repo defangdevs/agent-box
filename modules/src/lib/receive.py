@@ -212,6 +212,11 @@ def receive_create(ttl, max_bytes, now=None):
     now = int(time.time() if now is None else now)
     for _attempt in range(32):
         slot = secrets.token_urlsafe(12)
+        # A leading "-" is URL-safe but argparse reads it as an option in
+        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
+        # as ordinary positional arguments without requiring a hidden `--`.
+        if not slot[0].isalnum():
+            continue
         secret = secrets.token_urlsafe(32)
         record = {
             "version": RECEIVE_VERSION,

@@ -138,6 +138,8 @@ class ReceiveHTTPTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertNotIn(self.token.encode(), body)
         self.assertIn(b"one resumable upload", body)
+        self.assertIn(b"Drop a file here", body)
+        self.assertIn(b"event.dataTransfer.files", body)
         self.assertEqual(headers["Referrer-Policy"], "no-referrer")
         self.assertIn("frame-ancestors 'none'",
                       headers["Content-Security-Policy"])
@@ -162,6 +164,15 @@ class ReceiveHTTPTest(unittest.TestCase):
         self.assertNotIn(self.token, text)
         self.assertNotIn(self.token.split(".", 1)[1], text)
         self.assertIn("secret_sha256", json.loads(text))
+
+    def test_minted_slot_never_looks_like_a_cli_option(self):
+        with mock.patch.object(
+                daemon.secrets, "token_urlsafe",
+                side_effect=["-123456789abcdef", "A123456789abcdef",
+                             "s" * 43]):
+            slot, token, _record = daemon.receive_create(3600, 1024)
+        self.assertEqual(slot, "A123456789abcdef")
+        self.assertEqual(token, slot + "." + "s" * 43)
 
     def test_create_head_patch_and_publish(self):
         blob = (b"resumable upload\n" * 400000)[:5 << 20]

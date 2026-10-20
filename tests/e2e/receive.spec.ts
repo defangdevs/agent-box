@@ -10,7 +10,7 @@ import { test, expect } from '@playwright/test';
 
 const receiveUrl = process.env.E2E_RECEIVE_URL;
 
-test('fragment capability drives a resumable upload', async ({ page }) => {
+test('a dropped file uses the fragment capability and resumes', async ({ page }) => {
   test.skip(!receiveUrl, 'E2E_RECEIVE_URL is not configured');
 
   const token = new URL(receiveUrl!).hash.slice(1);
@@ -38,13 +38,26 @@ test('fragment capability drives a resumable upload', async ({ page }) => {
   const navigation = await page.goto(receiveUrl!);
   expect(navigation?.status()).toBe(200);
   expect(navigation?.url()).not.toContain(token);
-  await page.locator('#file').setInputFiles({
-    name: 'browser-resume.bin',
-    mimeType: 'application/octet-stream',
+  const dataTransfer = await page.evaluateHandle(() => {
+    const transfer = new DataTransfer();
     // Larger than the page's 8 MiB chunk, so a successful run necessarily
     // exercises more than one PATCH after the injected interruption.
-    buffer: Buffer.alloc(10 << 20, 0x5a),
+    transfer.items.add(new File(
+      [new Uint8Array(10 << 20).fill(0x5a)],
+      'browser-resume.bin',
+      { type: 'application/octet-stream', lastModified: 1_700_000_000_000 },
+    ));
+    return transfer;
   });
+  const drop = page.locator('#drop');
+  await drop.dispatchEvent('dragenter', { dataTransfer });
+  await expect(drop).toHaveClass(/dragging/);
+  await drop.dispatchEvent('drop', { dataTransfer });
+  await expect(drop).not.toHaveClass(/dragging/);
+  await expect(page.locator('#prompt')).toHaveText('browser-resume.bin');
+  await expect(page.locator('#status')).toHaveText(
+    'Ready to upload browser-resume.bin.');
+  await expect(page.locator('#send')).toBeEnabled();
   await page.locator('#send').click();
   await expect(page.locator('#status')).toHaveText(
     'Upload complete. You may close this page.', { timeout: 30_000 });
