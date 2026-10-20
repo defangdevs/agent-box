@@ -103,7 +103,8 @@ def receive_read(slot):
     for key in ("created", "expires", "max_bytes"):
         if not isinstance(record.get(key), int) or record[key] < 0:
             return None
-    if record.get("status") not in ("waiting", "uploading", "complete"):
+    if record.get("status") not in (
+            "waiting", "uploading", "complete", "failed"):
         return None
     if record["status"] != "waiting":
         length = record.get("length")
@@ -152,7 +153,7 @@ def receive_secret_digest(slot, secret):
     return hashlib.sha256((slot + "." + secret).encode("ascii")).hexdigest()
 
 
-def receive_content_digests(path):
+def receive_content_digests(path, cancel_path=None):
     """Return the bounded-memory browser fingerprint, SHA-256, and size."""
     leaves = bytearray()
     ordinary = hashlib.sha256()
@@ -162,6 +163,8 @@ def receive_content_digests(path):
     fd = os.open(path, flags)
     with os.fdopen(fd, "rb") as handle:
         while True:
+            if cancel_path is not None and os.path.exists(cancel_path):
+                raise InterruptedError("upload revoked")
             block = handle.read(RECEIVE_CONTENT_BLOCK)
             if not block:
                 break
@@ -183,6 +186,8 @@ def receive_authorized(slot, value, now=None):
     token_slot, secret = receive_parse_authorization(value)
     if token_slot != slot:
         return None
+    if receive_is_revoked(slot):
+        return None
     record = receive_read(slot)
     if record is None:
         return None
@@ -198,8 +203,33 @@ def receive_partial_path(slot):
     return os.path.join(RECEIVE_PARTIAL_DIR, slot + ".part")
 
 
-def receive_reserved_bytes(exclude=None):
+def receive_revoked_path(slot):
+    if not RECEIVE_SLOT_RE.fullmatch(slot or ""):
+        raise ValueError("invalid upload slot")
+    return os.path.join(RECEIVE_STATE_DIR, slot + ".revoked")
+
+
+def receive_is_revoked(slot):
+    return os.path.exists(receive_revoked_path(slot))
+
+
+def receive_mark_revoked(slot):
+    """Make a capability unusable without waiting for its active request."""
+    receive_ensure_dirs()
+    path = receive_revoked_path(slot)
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return
+    os.close(fd)
+    receive_fsync_dir(RECEIVE_STATE_DIR)
+
+
+def receive_reserved_bytes(exclude=None, now=None):
     """Return bytes promised but not yet written by active uploads."""
+    now = int(time.time() if now is None else now)
     try:
         names = os.listdir(RECEIVE_STATE_DIR)
     except OSError:
@@ -212,7 +242,9 @@ def receive_reserved_bytes(exclude=None):
         if slot == exclude or not RECEIVE_SLOT_RE.fullmatch(slot):
             continue
         record = receive_read(slot)
-        if record is None or record.get("status") != "uploading":
+        inactive = record is None or record.get("status") != "uploading"
+        expired = record is not None and record["expires"] <= now
+        if inactive or expired or receive_is_revoked(slot):
             continue
         try:
             written = os.path.getsize(receive_partial_path(slot))
@@ -231,6 +263,8 @@ def receive_remove_locked(slot, record=None):
             os.unlink(receive_partial_path(slot))
     with contextlib.suppress(OSError):
         os.unlink(receive_record_path(slot))
+    with contextlib.suppress(OSError):
+        os.unlink(receive_revoked_path(slot))
     receive_fsync_dir(RECEIVE_PARTIAL_DIR)
     receive_fsync_dir(RECEIVE_STATE_DIR)
 
@@ -295,7 +329,9 @@ def receive_prune(now=None):
         try:
             with receive_slot_lock(slot, blocking=False):
                 record = receive_read(slot)
-                if record is not None and record["expires"] <= now:
+                expired = record is not None and record["expires"] <= now
+                if record is not None and (
+                        expired or receive_is_revoked(slot)):
                     receive_remove_locked(slot, record)
                     removed += 1
         except BlockingIOError:
@@ -306,8 +342,12 @@ def receive_prune(now=None):
 def receive_safe_name(raw):
     """Turn browser metadata into a filename, never a filesystem path."""
     raw = (raw or "").replace("\\", "/").split("/")[-1]
-    raw = "".join(ch for ch in raw if ch >= " " and ch != "\x7f").strip()
-    raw = raw.lstrip(".")
+
+    def safe_char(ch):
+        category = unicodedata.category(ch)
+        return not category.startswith("C") and category not in ("Zl", "Zp")
+    raw = "".join(ch for ch in raw if safe_char(ch)).strip()
+    raw = raw.lstrip(".-")
     if not raw or raw in (".", ".."):
         raw = "upload.bin"
     encoded = raw.encode("utf-8", "ignore")

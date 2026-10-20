@@ -28,8 +28,18 @@ handle @receive_api_@USER@ {
     reverse_proxy unix/@SETTINGS_SOCKET@
   }
 }
-handle /@USER@/receive/* {
+@receive_page_@USER@ {
+  method GET HEAD
+  path_regexp receive_page_@USER@ ^/@USER@/receive/[A-Za-z0-9_-]{16,64}/?$
+}
+handle @receive_page_@USER@ {
+  request_body {
+    max_size 1KB
+  }
   reverse_proxy unix/@SETTINGS_SOCKET@
+}
+handle /@USER@/receive/* {
+  respond 404
 }
 # @USER@'s settings page (issue #36). Same auth surface as the
 # terminal (cookie-or-basic-auth, same user name), just a different

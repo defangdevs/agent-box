@@ -171,8 +171,18 @@ golden.example.org {
       reverse_proxy unix//run/agent-box-settings/agent.sock
     }
   }
-  handle /agent/receive/* {
+  @receive_page_agent {
+    method GET HEAD
+    path_regexp receive_page_agent ^/agent/receive/[A-Za-z0-9_-]{16,64}/?$
+  }
+  handle @receive_page_agent {
+    request_body {
+      max_size 1KB
+    }
     reverse_proxy unix//run/agent-box-settings/agent.sock
+  }
+  handle /agent/receive/* {
+    respond 404
   }
   # agent's settings page (issue #36). Same auth surface as the
   # terminal (cookie-or-basic-auth, same user name), just a different
@@ -438,8 +448,18 @@ golden.example.org {
       reverse_proxy unix//run/agent-box-settings/robot.sock
     }
   }
-  handle /robot/receive/* {
+  @receive_page_robot {
+    method GET HEAD
+    path_regexp receive_page_robot ^/robot/receive/[A-Za-z0-9_-]{16,64}/?$
+  }
+  handle @receive_page_robot {
+    request_body {
+      max_size 1KB
+    }
     reverse_proxy unix//run/agent-box-settings/robot.sock
+  }
+  handle /robot/receive/* {
+    respond 404
   }
   # robot's settings page (issue #36). Same auth surface as the
   # terminal (cookie-or-basic-auth, same user name), just a different

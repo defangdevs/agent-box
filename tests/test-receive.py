@@ -10,6 +10,7 @@ is required:
 """
 
 import base64
+import fcntl
 import hashlib
 import http.client
 import http.server
@@ -171,7 +172,7 @@ class ReceiveHTTPTest(unittest.TestCase):
             status, _headers, _body = self.request(
                 "GET", "/alice/receive/_verify",
                 headers={"Authorization": value, "X-Forwarded-Uri": uri})
-            self.assertEqual(status, 401, (value, uri))
+            self.assertEqual(status, 403, (value, uri))
 
     def test_secret_is_hashed_at_rest(self):
         text = pathlib.Path(STATE, self.slot + ".json").read_text()
@@ -287,9 +288,19 @@ class ReceiveHTTPTest(unittest.TestCase):
         self.assertEqual(len(expected), len(changed))
         self.assertEqual(self.create(
             "report.docx", len(expected), expected)[0], 201)
-        status, _headers, body = self.patch(changed, 0)
-        self.assertEqual(status, 422)
-        self.assertIn(b"do not match", body)
+        original = daemon.receive_content_digests
+        with mock.patch.object(
+                daemon, "receive_content_digests", wraps=original) as digest:
+            status, _headers, body = self.patch(changed, 0)
+            self.assertEqual(status, 422)
+            self.assertIn(b"do not match", body)
+            self.assertEqual(self.head()[0], 422)
+            self.assertEqual(self.patch(b"", len(changed))[0], 422)
+            self.assertEqual(digest.call_count, 1)
+        record = daemon.receive_read(self.slot)
+        self.assertEqual(record["status"], "failed")
+        self.assertFalse(pathlib.Path(
+            daemon.receive_partial_path(self.slot)).exists())
         self.assertFalse(any(pathlib.Path(UPLOADS).glob("report*")))
 
     def test_slot_binds_to_only_one_file(self):
@@ -321,6 +332,89 @@ class ReceiveHTTPTest(unittest.TestCase):
             status, _headers, _body = self.create("bounded.bin", 5)
         self.assertEqual(status, 507)
 
+    def test_expired_upload_does_not_reserve_space(self):
+        other, _token, record = daemon.receive_create(3600, 100)
+        daemon.receive_ensure_dirs()
+        pathlib.Path(daemon.receive_partial_path(other)).write_bytes(b"x" * 20)
+        record.update({"status": "uploading", "length": 100,
+                       "name": "expired.bin",
+                       "metadata": metadata("expired.bin", 100),
+                       "fingerprint": "expired.bin\n100\n123456789",
+                       "content": "sha256-tree-v1:" + "0" * 64,
+                       "expires": int(time.time()) - 1})
+        daemon.receive_write(record)
+        usage = mock.Mock(free=daemon.RECEIVE_FREE_RESERVE + 5)
+        with mock.patch.object(daemon.shutil, "disk_usage", return_value=usage):
+            status, _headers, _body = self.create("bounded.bin", 5)
+        self.assertEqual(status, 201)
+
+    def test_slot_wait_does_not_hold_global_capacity_lock(self):
+        result = []
+        with daemon.receive_slot_lock(self.slot):
+            waiter = threading.Thread(
+                target=lambda: result.append(self.create("same.bin", 3)))
+            waiter.start()
+            time.sleep(0.1)
+            path = os.path.join(STATE, ".capacity.lock")
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+        waiter.join(timeout=2)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(result[0][0], 201)
+
+    def test_stalled_patch_releases_its_lock_after_idle_timeout(self):
+        blob = b"done"
+        self.assertEqual(self.create("timeout.bin", len(blob), blob)[0], 201)
+        request = (
+            "PATCH %s HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Authorization: Bearer %s\r\nTus-Resumable: 1.0.0\r\n"
+            "Upload-Offset: 0\r\nContent-Type: application/offset+octet-stream\r\n"
+            "Content-Length: %d\r\nConnection: close\r\n\r\n"
+        ) % (self.resource, self.token, len(blob))
+        with mock.patch.object(daemon, "RECEIVE_PATCH_IDLE_SECONDS", 0.1), \
+                mock.patch.object(daemon, "RECEIVE_PATCH_TOTAL_SECONDS", 0.2):
+            sock = socket.create_connection(
+                ("127.0.0.1", self.port), timeout=2)
+            try:
+                sock.sendall(request.encode("ascii"))
+                response = sock.recv(4096)
+            finally:
+                sock.close()
+        self.assertIn(b" 408 ", response)
+        self.assertEqual(self.head()[1]["Upload-Offset"], "0")
+
+    def test_revocation_refuses_requests_without_waiting_for_slot_lock(self):
+        with daemon.receive_slot_lock(self.slot):
+            daemon.receive_mark_revoked(self.slot)
+            started = time.monotonic()
+            self.assertEqual(self.head()[0], 403)
+            self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(daemon.receive_prune(), 1)
+        self.assertIsNone(daemon.receive_read(self.slot))
+
+    def test_server_timer_prunes_expired_partial(self):
+        record = daemon.receive_read(self.slot)
+        daemon.receive_ensure_dirs()
+        pathlib.Path(daemon.receive_partial_path(self.slot)).write_bytes(b"x")
+        record.update({"status": "uploading", "length": 2,
+                       "name": "expired.bin",
+                       "metadata": metadata("expired.bin", 2),
+                       "fingerprint": "expired.bin\n2\n123456789",
+                       "content": "sha256-tree-v1:" + "0" * 64,
+                       "expires": int(time.time()) - 1})
+        daemon.receive_write(record)
+        server = daemon.SettingsHTTPServer(("127.0.0.1", 0), daemon.Handler)
+        try:
+            server.service_actions()
+        finally:
+            server.server_close()
+        self.assertIsNone(daemon.receive_read(self.slot))
+        self.assertFalse(pathlib.Path(
+            daemon.receive_partial_path(self.slot)).exists())
+
     def test_filename_is_metadata_not_a_path(self):
         blob = b"safe"
         self.assertEqual(self.create(
@@ -337,11 +431,20 @@ class ReceiveHTTPTest(unittest.TestCase):
         self.assertEqual(status, 204)
         self.assertIn("caf%C3%A9-", headers["Upload-Filename"])
 
+    def test_filename_strips_controls_and_leading_options(self):
+        blob = b"safe"
+        self.assertEqual(self.create(
+            "-report\u202efdp.exe", len(blob), blob)[0], 201)
+        status, headers, _body = self.patch(blob, 0)
+        self.assertEqual(status, 204)
+        self.assertTrue(headers["Upload-Filename"].startswith("reportfdp-"))
+        self.assertNotIn("%E2%80%AE", headers["Upload-Filename"])
+
     def test_expired_slot_is_refused_and_pruned(self):
         record = daemon.receive_read(self.slot)
         record["expires"] = int(time.time()) - 1
         daemon.receive_write(record)
-        self.assertEqual(self.head()[0], 401)
+        self.assertEqual(self.head()[0], 403)
         self.assertEqual(daemon.receive_prune(), 1)
         self.assertFalse(os.path.exists(
             os.path.join(STATE, self.slot + ".json")))

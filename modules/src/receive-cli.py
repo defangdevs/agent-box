@@ -12,6 +12,7 @@ import secrets
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.parse
 
 HOME_DIR = os.path.realpath(os.environ.get("HOME") or os.path.expanduser("~"))
@@ -105,11 +106,18 @@ def cmd_list(_args):
 
 
 def cmd_revoke(args):
-    with receive_slot_lock(args.slot):
-        record = receive_read(args.slot)
-        if record is None:
-            raise SystemExit("agent-box-receive: no such slot: %s" % args.slot)
-        receive_remove_locked(args.slot, record)
+    record = receive_read(args.slot)
+    if record is None:
+        raise SystemExit("agent-box-receive: no such slot: %s" % args.slot)
+    receive_mark_revoked(args.slot)
+    try:
+        with receive_slot_lock(args.slot, blocking=False):
+            receive_remove_locked(args.slot, receive_read(args.slot))
+    except BlockingIOError:
+        # The marker already makes authorization fail. An active PATCH checks
+        # it between reads and performs the same cleanup while holding the
+        # lock, so revocation itself never waits on a slow uploader.
+        pass
     print("revoked %s" % args.slot)
 
 

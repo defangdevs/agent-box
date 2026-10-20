@@ -919,7 +919,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             pkgs.runCommand "agent-box-receive-route-ok"
               { caddyfile = sys.config.services.caddy.configFile;
                 nativeBuildInputs = [ pkgs.caddy ]; } ''
+              grep -qF 'handle @receive_page_agent {' "$caddyfile"
+              grep -qF 'path_regexp receive_page_agent ^/agent/receive/[A-Za-z0-9_-]{16,64}/?$' "$caddyfile"
               grep -qF 'handle /agent/receive/* {' "$caddyfile"
+              grep -qF 'respond 404' "$caddyfile"
               grep -qF 'handle @receive_api_agent {' "$caddyfile"
               grep -qF 'uri /agent/receive/_verify' "$caddyfile"
               grep -qF 'max_size 9MB' "$caddyfile"

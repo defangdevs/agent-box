@@ -11025,6 +11025,7 @@ import secrets
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.parse
 
 HOME_DIR = os.path.realpath(os.environ.get("HOME") or os.path.expanduser("~"))
@@ -11134,7 +11135,8 @@ def receive_read(slot):
     for key in ("created", "expires", "max_bytes"):
         if not isinstance(record.get(key), int) or record[key] < 0:
             return None
-    if record.get("status") not in ("waiting", "uploading", "complete"):
+    if record.get("status") not in (
+            "waiting", "uploading", "complete", "failed"):
         return None
     if record["status"] != "waiting":
         length = record.get("length")
@@ -11183,7 +11185,7 @@ def receive_secret_digest(slot, secret):
     return hashlib.sha256((slot + "." + secret).encode("ascii")).hexdigest()
 
 
-def receive_content_digests(path):
+def receive_content_digests(path, cancel_path=None):
     """Return the bounded-memory browser fingerprint, SHA-256, and size."""
     leaves = bytearray()
     ordinary = hashlib.sha256()
@@ -11193,6 +11195,8 @@ def receive_content_digests(path):
     fd = os.open(path, flags)
     with os.fdopen(fd, "rb") as handle:
         while True:
+            if cancel_path is not None and os.path.exists(cancel_path):
+                raise InterruptedError("upload revoked")
             block = handle.read(RECEIVE_CONTENT_BLOCK)
             if not block:
                 break
@@ -11214,6 +11218,8 @@ def receive_authorized(slot, value, now=None):
     token_slot, secret = receive_parse_authorization(value)
     if token_slot != slot:
         return None
+    if receive_is_revoked(slot):
+        return None
     record = receive_read(slot)
     if record is None:
         return None
@@ -11229,8 +11235,33 @@ def receive_partial_path(slot):
     return os.path.join(RECEIVE_PARTIAL_DIR, slot + ".part")
 
 
-def receive_reserved_bytes(exclude=None):
+def receive_revoked_path(slot):
+    if not RECEIVE_SLOT_RE.fullmatch(slot or ""):
+        raise ValueError("invalid upload slot")
+    return os.path.join(RECEIVE_STATE_DIR, slot + ".revoked")
+
+
+def receive_is_revoked(slot):
+    return os.path.exists(receive_revoked_path(slot))
+
+
+def receive_mark_revoked(slot):
+    """Make a capability unusable without waiting for its active request."""
+    receive_ensure_dirs()
+    path = receive_revoked_path(slot)
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return
+    os.close(fd)
+    receive_fsync_dir(RECEIVE_STATE_DIR)
+
+
+def receive_reserved_bytes(exclude=None, now=None):
     """Return bytes promised but not yet written by active uploads."""
+    now = int(time.time() if now is None else now)
     try:
         names = os.listdir(RECEIVE_STATE_DIR)
     except OSError:
@@ -11243,7 +11274,9 @@ def receive_reserved_bytes(exclude=None):
         if slot == exclude or not RECEIVE_SLOT_RE.fullmatch(slot):
             continue
         record = receive_read(slot)
-        if record is None or record.get("status") != "uploading":
+        inactive = record is None or record.get("status") != "uploading"
+        expired = record is not None and record["expires"] <= now
+        if inactive or expired or receive_is_revoked(slot):
             continue
         try:
             written = os.path.getsize(receive_partial_path(slot))
@@ -11262,6 +11295,8 @@ def receive_remove_locked(slot, record=None):
             os.unlink(receive_partial_path(slot))
     with contextlib.suppress(OSError):
         os.unlink(receive_record_path(slot))
+    with contextlib.suppress(OSError):
+        os.unlink(receive_revoked_path(slot))
     receive_fsync_dir(RECEIVE_PARTIAL_DIR)
     receive_fsync_dir(RECEIVE_STATE_DIR)
 
@@ -11326,7 +11361,9 @@ def receive_prune(now=None):
         try:
             with receive_slot_lock(slot, blocking=False):
                 record = receive_read(slot)
-                if record is not None and record["expires"] <= now:
+                expired = record is not None and record["expires"] <= now
+                if record is not None and (
+                        expired or receive_is_revoked(slot)):
                     receive_remove_locked(slot, record)
                     removed += 1
         except BlockingIOError:
@@ -11337,8 +11374,12 @@ def receive_prune(now=None):
 def receive_safe_name(raw):
     """Turn browser metadata into a filename, never a filesystem path."""
     raw = (raw or "").replace("\\", "/").split("/")[-1]
-    raw = "".join(ch for ch in raw if ch >= " " and ch != "\x7f").strip()
-    raw = raw.lstrip(".")
+
+    def safe_char(ch):
+        category = unicodedata.category(ch)
+        return not category.startswith("C") and category not in ("Zl", "Zp")
+    raw = "".join(ch for ch in raw if safe_char(ch)).strip()
+    raw = raw.lstrip(".-")
     if not raw or raw in (".", ".."):
         raw = "upload.bin"
     encoded = raw.encode("utf-8", "ignore")
@@ -11467,11 +11508,18 @@ def cmd_list(_args):
 
 
 def cmd_revoke(args):
-    with receive_slot_lock(args.slot):
-        record = receive_read(args.slot)
-        if record is None:
-            raise SystemExit("agent-box-receive: no such slot: %s" % args.slot)
-        receive_remove_locked(args.slot, record)
+    record = receive_read(args.slot)
+    if record is None:
+        raise SystemExit("agent-box-receive: no such slot: %s" % args.slot)
+    receive_mark_revoked(args.slot)
+    try:
+        with receive_slot_lock(args.slot, blocking=False):
+            receive_remove_locked(args.slot, receive_read(args.slot))
+    except BlockingIOError:
+        # The marker already makes authorization fail. An active PATCH checks
+        # it between reads and performs the same cleanup while holding the
+        # lock, so revocation itself never waits on a slow uploader.
+        pass
     print("revoked %s" % args.slot)
 
 
@@ -19717,6 +19765,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 
@@ -20153,7 +20202,8 @@ def receive_read(slot):
     for key in ("created", "expires", "max_bytes"):
         if not isinstance(record.get(key), int) or record[key] < 0:
             return None
-    if record.get("status") not in ("waiting", "uploading", "complete"):
+    if record.get("status") not in (
+            "waiting", "uploading", "complete", "failed"):
         return None
     if record["status"] != "waiting":
         length = record.get("length")
@@ -20202,7 +20252,7 @@ def receive_secret_digest(slot, secret):
     return hashlib.sha256((slot + "." + secret).encode("ascii")).hexdigest()
 
 
-def receive_content_digests(path):
+def receive_content_digests(path, cancel_path=None):
     """Return the bounded-memory browser fingerprint, SHA-256, and size."""
     leaves = bytearray()
     ordinary = hashlib.sha256()
@@ -20212,6 +20262,8 @@ def receive_content_digests(path):
     fd = os.open(path, flags)
     with os.fdopen(fd, "rb") as handle:
         while True:
+            if cancel_path is not None and os.path.exists(cancel_path):
+                raise InterruptedError("upload revoked")
             block = handle.read(RECEIVE_CONTENT_BLOCK)
             if not block:
                 break
@@ -20233,6 +20285,8 @@ def receive_authorized(slot, value, now=None):
     token_slot, secret = receive_parse_authorization(value)
     if token_slot != slot:
         return None
+    if receive_is_revoked(slot):
+        return None
     record = receive_read(slot)
     if record is None:
         return None
@@ -20248,8 +20302,33 @@ def receive_partial_path(slot):
     return os.path.join(RECEIVE_PARTIAL_DIR, slot + ".part")
 
 
-def receive_reserved_bytes(exclude=None):
+def receive_revoked_path(slot):
+    if not RECEIVE_SLOT_RE.fullmatch(slot or ""):
+        raise ValueError("invalid upload slot")
+    return os.path.join(RECEIVE_STATE_DIR, slot + ".revoked")
+
+
+def receive_is_revoked(slot):
+    return os.path.exists(receive_revoked_path(slot))
+
+
+def receive_mark_revoked(slot):
+    """Make a capability unusable without waiting for its active request."""
+    receive_ensure_dirs()
+    path = receive_revoked_path(slot)
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return
+    os.close(fd)
+    receive_fsync_dir(RECEIVE_STATE_DIR)
+
+
+def receive_reserved_bytes(exclude=None, now=None):
     """Return bytes promised but not yet written by active uploads."""
+    now = int(time.time() if now is None else now)
     try:
         names = os.listdir(RECEIVE_STATE_DIR)
     except OSError:
@@ -20262,7 +20341,9 @@ def receive_reserved_bytes(exclude=None):
         if slot == exclude or not RECEIVE_SLOT_RE.fullmatch(slot):
             continue
         record = receive_read(slot)
-        if record is None or record.get("status") != "uploading":
+        inactive = record is None or record.get("status") != "uploading"
+        expired = record is not None and record["expires"] <= now
+        if inactive or expired or receive_is_revoked(slot):
             continue
         try:
             written = os.path.getsize(receive_partial_path(slot))
@@ -20281,6 +20362,8 @@ def receive_remove_locked(slot, record=None):
             os.unlink(receive_partial_path(slot))
     with contextlib.suppress(OSError):
         os.unlink(receive_record_path(slot))
+    with contextlib.suppress(OSError):
+        os.unlink(receive_revoked_path(slot))
     receive_fsync_dir(RECEIVE_PARTIAL_DIR)
     receive_fsync_dir(RECEIVE_STATE_DIR)
 
@@ -20345,7 +20428,9 @@ def receive_prune(now=None):
         try:
             with receive_slot_lock(slot, blocking=False):
                 record = receive_read(slot)
-                if record is not None and record["expires"] <= now:
+                expired = record is not None and record["expires"] <= now
+                if record is not None and (
+                        expired or receive_is_revoked(slot)):
                     receive_remove_locked(slot, record)
                     removed += 1
         except BlockingIOError:
@@ -20356,8 +20441,12 @@ def receive_prune(now=None):
 def receive_safe_name(raw):
     """Turn browser metadata into a filename, never a filesystem path."""
     raw = (raw or "").replace("\\", "/").split("/")[-1]
-    raw = "".join(ch for ch in raw if ch >= " " and ch != "\x7f").strip()
-    raw = raw.lstrip(".")
+
+    def safe_char(ch):
+        category = unicodedata.category(ch)
+        return not category.startswith("C") and category not in ("Zl", "Zp")
+    raw = "".join(ch for ch in raw if safe_char(ch)).strip()
+    raw = raw.lstrip(".-")
     if not raw or raw in (".", ".."):
         raw = "upload.bin"
     encoded = raw.encode("utf-8", "ignore")
@@ -29842,6 +29931,9 @@ def render_download_index(rel, rows):
 RECEIVE_BASE = TERM_BASE + "/receive"
 RECEIVE_CHUNK_MAX = RECEIVE_CONTENT_BLOCK
 RECEIVE_IO_CHUNK = 64 << 10
+RECEIVE_PATCH_IDLE_SECONDS = 30
+RECEIVE_PATCH_TOTAL_SECONDS = 300
+RECEIVE_PRUNE_INTERVAL_SECONDS = 60
 RECEIVE_PAGE_RE = re.compile(
     "^" + re.escape(RECEIVE_BASE) + r"/([A-Za-z0-9_-]{16,64})/?$"
 )
@@ -30124,6 +30216,10 @@ class ReceiveContentMismatch(Exception):
     pass
 
 
+class ReceiveRevoked(Exception):
+    pass
+
+
 def receive_finalize(record, offset):
     """Publish a fully written partial, including after a daemon crash.
 
@@ -30134,12 +30230,28 @@ def receive_finalize(record, offset):
     if (record.get("status") == "uploading"
             and offset == record.get("length")):
         partial = receive_partial_path(record["slot"])
-        content, sha256, size = receive_content_digests(partial)
+        revoked = receive_revoked_path(record["slot"])
+        try:
+            content, sha256, size = receive_content_digests(
+                partial, cancel_path=revoked)
+        except InterruptedError:
+            receive_remove_locked(record["slot"], record)
+            raise ReceiveRevoked()
         expected = record.get("content")
         if (size != record["length"]
                 or (expected is not None
                     and not secrets.compare_digest(content, expected))):
+            record.update({"status": "failed",
+                           "failure": "content_mismatch",
+                           "failed": int(time.time())})
+            receive_write(record)
+            with contextlib.suppress(OSError):
+                os.unlink(partial)
+            receive_fsync_dir(RECEIVE_PARTIAL_DIR)
             raise ReceiveContentMismatch()
+        if receive_is_revoked(record["slot"]):
+            receive_remove_locked(record["slot"], record)
+            raise ReceiveRevoked()
         final_name = receive_publish(partial, record["name"], record["slot"])
         record.update({"status": "complete",
                        "final_name": final_name,
@@ -30219,9 +30331,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             slot, self.headers.get("Authorization", ""))
         if record is None:
             self._receive_error(
-                401, "This upload link is invalid or expired.",
-                {"WWW-Authenticate": 'Bearer realm="agent-box upload"'},
-            )
+                403, "This upload link is invalid, expired, or revoked.")
         return record
 
     def _receive_verify(self):
@@ -30240,11 +30350,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_empty(204)
             return
         self._receive_error(
-            401, "This upload link is invalid or expired.",
-            {"WWW-Authenticate": 'Bearer realm="agent-box upload"'},
-        )
+            403, "This upload link is invalid, expired, or revoked.")
 
-    def _receive_page(self, slot):
+    def _receive_page(self, slot, send_body=True):
         receive_prune()
         nonce = secrets.token_urlsafe(18)
         data = receive_page(slot, nonce).encode("utf-8")
@@ -30262,7 +30370,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "form-action 'none'; frame-ancestors 'none'" % (nonce, nonce),
         )
         self.end_headers()
-        self.wfile.write(data)
+        if send_body:
+            self.wfile.write(data)
 
     def _receive_headers(self, record, offset):
         headers = {
@@ -30314,8 +30423,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._receive_error(400, str(exc))
             return
         try:
-            with receive_capacity_lock():
-                with receive_slot_lock(slot):
+            if self._receive_record(slot) is None:
+                return
+            receive_prune()
+            with receive_slot_lock(slot):
+                with receive_capacity_lock():
                     record = self._receive_record(slot)
                     if record is None:
                         return
@@ -30396,6 +30508,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._receive_error(
                 422, "Uploaded bytes do not match the selected file.")
             return
+        except ReceiveRevoked:
+            self._receive_error(410, "This upload link was revoked.")
+            return
         except OSError:
             self._receive_error(503, "The upload slot is temporarily unavailable.")
             return
@@ -30405,12 +30520,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _receive_head(self, slot):
         try:
+            if self._receive_record(slot) is None:
+                return
             with receive_slot_lock(slot):
                 record = self._receive_record(slot)
                 if record is None:
                     return
                 if record["status"] == "waiting":
                     self._receive_error(404, "No file has been started for this link.")
+                    return
+                if record["status"] == "failed":
+                    self._receive_error(
+                        422, "Uploaded bytes did not match the selected file.")
                     return
                 offset = receive_offset(record)
                 if offset is None:
@@ -30429,6 +30550,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except ReceiveContentMismatch:
             self._receive_error(
                 422, "Uploaded bytes do not match the selected file.")
+        except ReceiveRevoked:
+            self._receive_error(410, "This upload link was revoked.")
         except OSError:
             self._receive_error(503, "The upload slot is temporarily unavailable.")
 
@@ -30452,12 +30575,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 "Invalid upload chunk size or offset.")
             return
         try:
+            if self._receive_record(slot) is None:
+                return
             with receive_slot_lock(slot):
                 record = self._receive_record(slot)
                 if record is None:
                     return
                 if record["status"] == "waiting":
                     self._receive_error(404, "No file has been started for this link.")
+                    return
+                if record["status"] == "failed":
+                    self._receive_error(
+                        422, "Uploaded bytes did not match the selected file.")
                     return
                 offset = receive_offset(record)
                 if offset is None:
@@ -30486,14 +30615,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 fd = os.open(partial, os.O_WRONLY | os.O_APPEND
                              | getattr(os, "O_NOFOLLOW", 0))
                 received = 0
+                timed_out = False
+                revoked = False
+                deadline = time.monotonic() + RECEIVE_PATCH_TOTAL_SECONDS
                 try:
                     info = os.fstat(fd)
                     if not stat.S_ISREG(info.st_mode) or info.st_size != offset:
                         self._receive_error(409, "The partial upload changed.")
                         return
                     while received < declared:
-                        chunk = self.rfile.read(min(
-                            RECEIVE_IO_CHUNK, declared - received))
+                        if receive_is_revoked(slot):
+                            revoked = True
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            timed_out = True
+                            break
+                        self.connection.settimeout(min(
+                            RECEIVE_PATCH_IDLE_SECONDS, remaining))
+                        try:
+                            chunk = self.rfile.read1(min(
+                                RECEIVE_IO_CHUNK, declared - received))
+                        except (socket.timeout, TimeoutError):
+                            timed_out = True
+                            break
                         if not chunk:
                             break
                         view = memoryview(chunk)
@@ -30504,6 +30649,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 finally:
                     os.close(fd)
                 new_offset = offset + received
+                if revoked:
+                    receive_remove_locked(slot, record)
+                    raise ReceiveRevoked()
+                if timed_out:
+                    self.close_connection = True
+                    self._receive_error(
+                        408, "Upload chunk timed out.",
+                        {"Upload-Offset": new_offset,
+                         "Tus-Resumable": "1.0.0"},
+                    )
+                    return
                 if received != declared:
                     self.close_connection = True
                     self._receive_error(
@@ -30519,6 +30675,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except ReceiveContentMismatch:
             self._receive_error(
                 422, "Uploaded bytes do not match the selected file.")
+        except ReceiveRevoked:
+            self._receive_error(410, "This upload link was revoked.")
         except OSError:
             self._receive_error(503, "The upload slot is temporarily unavailable.")
 
@@ -31417,6 +31575,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         artifact). Every other path keeps the 501 the base class has
         always answered with -- nothing else here has a HEAD to give."""
         parsed = urllib.parse.urlparse(self.path)
+        receive_page_match = RECEIVE_PAGE_RE.fullmatch(parsed.path)
+        if receive_page_match:
+            self._receive_page(receive_page_match.group(1), send_body=False)
+            return
         receive_match = RECEIVE_FILE_RE.fullmatch(parsed.path)
         if receive_match:
             self._receive_head(receive_match.group(1))
@@ -32435,13 +32597,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
 SD_LISTEN_FDS_START = 3
 
 
+class SettingsHTTPServer(http.server.ThreadingHTTPServer):
+    """Threaded daemon with deterministic upload-expiry cleanup."""
+
+    def __init__(self, *args, **kwargs):
+        self.receive_prune_at = 0
+        super().__init__(*args, **kwargs)
+
+    def service_actions(self):
+        super().service_actions()
+        now = time.monotonic()
+        if now >= self.receive_prune_at:
+            with contextlib.suppress(OSError):
+                receive_prune()
+            self.receive_prune_at = now + RECEIVE_PRUNE_INTERVAL_SECONDS
+
+
 def make_server():
     if int(os.environ.get("LISTEN_FDS", "0") or "0") >= 1:
         # Socket-activated (the module's only mode, issue #49): adopt the
         # unix socket systemd pre-bound with 0660 <user>:caddy permissions.
         # bind_and_activate=False skips bind/listen; the placeholder address
         # is never bound.
-        server = http.server.ThreadingHTTPServer(
+        server = SettingsHTTPServer(
             ("127.0.0.1", 0), Handler, bind_and_activate=False
         )
         server.socket = socket.socket(fileno=SD_LISTEN_FDS_START)
@@ -32450,7 +32628,7 @@ def make_server():
         server.server_port = 0
         return server
     # Dev fallback for LAN rigs / e2e runs outside the module.
-    return http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    return SettingsHTTPServer(("127.0.0.1", PORT), Handler)
 
 
 def main():
@@ -32832,8 +33010,18 @@ if __name__ == "__main__":
             reverse_proxy unix/@SETTINGS_SOCKET@
           }
         }
-        handle /@USER@/receive/* {
+        @receive_page_@USER@ {
+          method GET HEAD
+          path_regexp receive_page_@USER@ ^/@USER@/receive/[A-Za-z0-9_-]{16,64}/?$
+        }
+        handle @receive_page_@USER@ {
+          request_body {
+            max_size 1KB
+          }
           reverse_proxy unix/@SETTINGS_SOCKET@
+        }
+        handle /@USER@/receive/* {
+          respond 404
         }
         # @USER@'s settings page (issue #36). Same auth surface as the
         # terminal (cookie-or-basic-auth, same user name), just a different
