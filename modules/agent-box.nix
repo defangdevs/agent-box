@@ -27680,7 +27680,12 @@ def render_tabs(names, live, stopped, died, selected):
         # the tab's own attribute order stays as it was.
         ps = pane_state(name, live, stopped)
         items.append(
-            f'<span class="tab-wrap">'
+            # This id is the tab's morph key, not a styling hook. Without a
+            # stable identity Idiomorph may reuse a deleted tab's focused
+            # close button for the next sibling. ignoreActiveValue then
+            # preserves that button's client-only "Close?" text while its
+            # data-close/label move to another session (issue #579).
+            f'<span class="tab-wrap" id="tab-wrap-{safe}">'
             f'<a class="tab" data-tab="{safe}" href="{home}?tab={safe}"{cur}'
             f' title="{tip}">'
             f'<span class="state" data-state="{state}"'
