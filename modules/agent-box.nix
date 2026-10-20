@@ -6171,10 +6171,9 @@ hibernate_one() {
   # and let the supervisor resume that exact conversation.
   _quiet="$(printf '%s' "$_verified" | "$JQ" -r '.quiet // empty')"
   _still_quiet() {
-    [ -n "$_quiet" ] \
-      && AGENT_BOX_HIBERNATE_ASSUME_LIVE="$_name" \
-         "$_cap" hibernate-quiet "$REGISTRY_FILE" "$_name" "$_quiet" \
-         >/dev/null 2>&1
+    [ -n "$_quiet" ] || return 1
+    _q="$(AGENT_BOX_HIBERNATE_ASSUME_LIVE="$_name" \
+      "$_cap" hibernate-quiet "$REGISTRY_FILE" "$_name" "$_quiet" 2>&1)"
   }
   if ! _still_quiet; then
     _undo_hibernation || return $?
