@@ -939,8 +939,9 @@ let
     points at this box. Reverse-proxy to your process; don't `file_server` from
     $HOME (caddy can't read /home). The command needs no sudo: agent-box grants
     configured agent users exactly the reload verb on `caddy.service` through
-    polkit, so use the bare `systemctl` on PATH: its absolute path differs
-    between NixOS and a distro box. Stop, restart and every other unit stay unauthorized. This path also
+    polkit. Use the `systemctl` on your PATH; if there is none (the NixOS agent
+    PATH is curated), use `/run/current-system/sw/bin/systemctl`, which a distro
+    box does not have. Stop, restart and every other unit stay unauthorized. This path also
     works inside Codex's unprivileged command sandbox, where setuid sudo is
     unavailable (agent-box#726).
 
