@@ -11041,6 +11041,8 @@ RECEIVE_SLOT_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}\Z")
 RECEIVE_TOKEN_RE = re.compile(
     r"^Bearer ([A-Za-z0-9_-]{16,64})\.([A-Za-z0-9_-]{32,128})\Z"
 )
+RECEIVE_CONTENT_RE = re.compile(r"^sha256-tree-v1:[0-9a-f]{64}\Z")
+RECEIVE_CONTENT_BLOCK = 8 << 20
 RECEIVE_STATE_DIR = os.path.realpath(os.environ.get(
     "AGENT_BOX_RECEIVE_STATE_DIR",
     os.path.join(HOME_DIR, ".local", "state", "agent-box", "receive"),
@@ -11144,8 +11146,14 @@ def receive_read(slot):
         for key in ("name", "metadata", "fingerprint"):
             if not isinstance(record.get(key), str):
                 return None
+        content = record.get("content")
+        if content is not None and not RECEIVE_CONTENT_RE.fullmatch(content):
+            return None
     if record["status"] == "complete":
         if not isinstance(record.get("final_name"), str):
+            return None
+        sha256 = record.get("sha256")
+        if sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", sha256):
             return None
     return record
 
@@ -11173,6 +11181,27 @@ def receive_write(record):
 
 def receive_secret_digest(slot, secret):
     return hashlib.sha256((slot + "." + secret).encode("ascii")).hexdigest()
+
+
+def receive_content_digests(path):
+    """Return the bounded-memory browser fingerprint, SHA-256, and size."""
+    leaves = bytearray()
+    ordinary = hashlib.sha256()
+    total = 0
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    with os.fdopen(fd, "rb") as handle:
+        while True:
+            block = handle.read(RECEIVE_CONTENT_BLOCK)
+            if not block:
+                break
+            total += len(block)
+            ordinary.update(block)
+            leaves.extend(hashlib.sha256(block).digest())
+    prefix = ("agent-box-content-v1\n%d\n" % total).encode("ascii")
+    tree = hashlib.sha256(prefix + leaves).hexdigest()
+    return "sha256-tree-v1:" + tree, ordinary.hexdigest(), total
 
 
 def receive_parse_authorization(value):
@@ -20031,6 +20060,8 @@ RECEIVE_SLOT_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}\Z")
 RECEIVE_TOKEN_RE = re.compile(
     r"^Bearer ([A-Za-z0-9_-]{16,64})\.([A-Za-z0-9_-]{32,128})\Z"
 )
+RECEIVE_CONTENT_RE = re.compile(r"^sha256-tree-v1:[0-9a-f]{64}\Z")
+RECEIVE_CONTENT_BLOCK = 8 << 20
 RECEIVE_STATE_DIR = os.path.realpath(os.environ.get(
     "AGENT_BOX_RECEIVE_STATE_DIR",
     os.path.join(HOME_DIR, ".local", "state", "agent-box", "receive"),
@@ -20134,8 +20165,14 @@ def receive_read(slot):
         for key in ("name", "metadata", "fingerprint"):
             if not isinstance(record.get(key), str):
                 return None
+        content = record.get("content")
+        if content is not None and not RECEIVE_CONTENT_RE.fullmatch(content):
+            return None
     if record["status"] == "complete":
         if not isinstance(record.get("final_name"), str):
+            return None
+        sha256 = record.get("sha256")
+        if sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", sha256):
             return None
     return record
 
@@ -20163,6 +20200,27 @@ def receive_write(record):
 
 def receive_secret_digest(slot, secret):
     return hashlib.sha256((slot + "." + secret).encode("ascii")).hexdigest()
+
+
+def receive_content_digests(path):
+    """Return the bounded-memory browser fingerprint, SHA-256, and size."""
+    leaves = bytearray()
+    ordinary = hashlib.sha256()
+    total = 0
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    with os.fdopen(fd, "rb") as handle:
+        while True:
+            block = handle.read(RECEIVE_CONTENT_BLOCK)
+            if not block:
+                break
+            total += len(block)
+            ordinary.update(block)
+            leaves.extend(hashlib.sha256(block).digest())
+    prefix = ("agent-box-content-v1\n%d\n" % total).encode("ascii")
+    tree = hashlib.sha256(prefix + leaves).hexdigest()
+    return "sha256-tree-v1:" + tree, ordinary.hexdigest(), total
 
 
 def receive_parse_authorization(value):
@@ -29782,7 +29840,7 @@ def render_download_index(rel, rows):
 # --- Temporary resumable uploads (issue #898) -------------------------
 
 RECEIVE_BASE = TERM_BASE + "/receive"
-RECEIVE_CHUNK_MAX = 8 << 20
+RECEIVE_CHUNK_MAX = RECEIVE_CONTENT_BLOCK
 RECEIVE_IO_CHUNK = 64 << 10
 RECEIVE_PAGE_RE = re.compile(
     "^" + re.escape(RECEIVE_BASE) + r"/([A-Za-z0-9_-]{16,64})/?$"
@@ -29855,29 +29913,51 @@ to the terminal or any existing files.</p>
     for (const byte of bytes) binary += String.fromCharCode(byte);
     return btoa(binary);
   };
-  const metadata = file => 'filename ' + b64(file.name) +
+  const metadata = (file, content) => 'filename ' + b64(file.name) +
     ',fingerprint ' + b64(file.name + '\n' + file.size + '\n' +
-                          file.lastModified);
+                          file.lastModified) + ',content ' + b64(content);
+  const hex = bytes => Array.from(bytes, byte =>
+    byte.toString(16).padStart(2, '0')).join(''');
+  const contentId = async file => {
+    const leaves = [];
+    let checked = 0;
+    show('Checking ' + file.name + '...', 0, file.size);
+    while (checked < file.size) {
+      const end = Math.min(checked + __HASH_CHUNK__, file.size);
+      const block = await file.slice(checked, end).arrayBuffer();
+      leaves.push(new Uint8Array(
+        await crypto.subtle.digest('SHA-256', block)));
+      checked = end;
+      show('Checking ' + file.name + '...', checked, file.size);
+    }
+    const prefix = new TextEncoder().encode(
+      'agent-box-content-v1\n' + file.size + '\n');
+    const tree = new Uint8Array(prefix.length + leaves.length * 32);
+    tree.set(prefix);
+    leaves.forEach((leaf, index) => tree.set(leaf, prefix.length + index * 32));
+    return 'sha256-tree-v1:' + hex(new Uint8Array(
+      await crypto.subtle.digest('SHA-256', tree)));
+  };
   const fail = async response => {
     let detail = ''';
     try { detail = (await response.text()).trim(); } catch (_) {}
     throw new Error(detail || ('Upload request failed (' + response.status + ')'));
   };
-  const head = async file => {
+  const head = async (file, content) => {
     const response = await fetch(resource, {method: 'HEAD', headers: auth(),
                                             cache: 'no-store'});
     if (response.status === 404) return null;
     if (!response.ok) return fail(response);
     if (Number(response.headers.get('Upload-Length')) !== file.size ||
-        response.headers.get('Upload-Metadata') !== metadata(file)) {
+        response.headers.get('Upload-Content') !== content) {
       throw new Error('This link is already bound to a different file.');
     }
     return Number(response.headers.get('Upload-Offset'));
   };
-  const create = async file => {
+  const create = async (file, details) => {
     const headers = auth();
     headers['Upload-Length'] = String(file.size);
-    headers['Upload-Metadata'] = metadata(file);
+    headers['Upload-Metadata'] = details;
     const response = await fetch(collection, {method: 'POST', headers});
     if (!response.ok) return fail(response);
     return Number(response.headers.get('Upload-Offset') || '0');
@@ -29888,8 +29968,10 @@ to the terminal or any existing files.</p>
     progress.value = offset;
   };
   async function upload(file) {
-    let offset = await head(file);
-    if (offset === null) offset = await create(file);
+    const content = await contentId(file);
+    const details = metadata(file, content);
+    let offset = await head(file, content);
+    if (offset === null) offset = await create(file, details);
     show('Uploading ' + file.name + '...', offset, file.size);
     let failures = 0;
     while (offset < file.size) {
@@ -29909,7 +29991,7 @@ to the terminal or any existing files.</p>
         if (++failures > 6) throw error;
         show('Connection interrupted; resuming...', offset, file.size);
         await sleep(Math.min(1000 * (2 ** failures), 15000));
-        const resumed = await head(file);
+        const resumed = await head(file, content);
         if (resumed === null) throw error;
         offset = resumed;
       }
@@ -29983,7 +30065,8 @@ def receive_page(slot, nonce):
     return (RECEIVE_PAGE.replace("__USER__", html.escape(USER))
             .replace("__SLOT__", slot)
             .replace("__NONCE__", nonce)
-            .replace("__CHUNK__", str(RECEIVE_CHUNK_MAX)))
+            .replace("__CHUNK__", str(RECEIVE_CHUNK_MAX))
+            .replace("__HASH_CHUNK__", str(RECEIVE_CONTENT_BLOCK)))
 
 
 def receive_metadata(raw):
@@ -29993,7 +30076,9 @@ def receive_metadata(raw):
     result = {}
     for item in raw.split(","):
         key, separator, encoded = item.strip().partition(" ")
-        if not separator or key not in ("filename", "fingerprint") or key in result:
+        if (not separator
+                or key not in ("filename", "fingerprint", "content")
+                or key in result):
             raise ValueError("invalid upload metadata")
         try:
             value = base64.b64decode(encoded, validate=True).decode("utf-8")
@@ -30002,8 +30087,11 @@ def receive_metadata(raw):
         if not value or len(value.encode("utf-8")) > 1024:
             raise ValueError("invalid upload metadata")
         result[key] = value
-    if set(result) != {"filename", "fingerprint"}:
-        raise ValueError("filename and fingerprint metadata are required")
+    if set(result) != {"filename", "fingerprint", "content"}:
+        raise ValueError(
+            "filename, fingerprint, and content metadata are required")
+    if not RECEIVE_CONTENT_RE.fullmatch(result["content"]):
+        raise ValueError("invalid content fingerprint")
     return result
 
 
@@ -30017,6 +30105,10 @@ def receive_offset(record):
     return value if value <= record.get("length", -1) else None
 
 
+class ReceiveContentMismatch(Exception):
+    pass
+
+
 def receive_finalize(record, offset):
     """Publish a fully written partial, including after a daemon crash.
 
@@ -30027,9 +30119,16 @@ def receive_finalize(record, offset):
     if (record.get("status") == "uploading"
             and offset == record.get("length")):
         partial = receive_partial_path(record["slot"])
+        content, sha256, size = receive_content_digests(partial)
+        expected = record.get("content")
+        if (size != record["length"]
+                or (expected is not None
+                    and not secrets.compare_digest(content, expected))):
+            raise ReceiveContentMismatch()
         final_name = receive_publish(partial, record["name"], record["slot"])
         record.update({"status": "complete",
                        "final_name": final_name,
+                       "sha256": sha256,
                        "completed": int(time.time())})
         receive_write(record)
         with contextlib.suppress(OSError):
@@ -30159,8 +30258,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "Upload-Expires": email.utils.formatdate(
                 record["expires"], usegmt=True),
         }
+        if record.get("content"):
+            headers["Upload-Content"] = record["content"]
         if record.get("status") == "complete":
             headers["Upload-Complete"] = "?1"
+            if record.get("sha256"):
+                headers["Upload-SHA256"] = record["sha256"]
             # HTTP headers are Latin-1 in BaseHTTPRequestHandler. Percent
             # encoding preserves an arbitrary UTF-8 browser filename while
             # keeping this convenience response header ASCII-only.
@@ -30264,11 +30367,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "name": receive_safe_name(metadata["filename"]),
                         "metadata": self.headers["Upload-Metadata"],
                         "fingerprint": metadata["fingerprint"],
+                        "content": metadata["content"],
                         "upload_created": int(time.time()),
                     })
                     receive_write(record)
                     if length == 0:
                         record = receive_finalize(record, 0)
+        except ReceiveContentMismatch:
+            self._receive_error(
+                422, "Uploaded bytes do not match the selected file.")
+            return
         except OSError:
             self._receive_error(503, "The upload slot is temporarily unavailable.")
             return
@@ -30291,6 +30399,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 record = receive_finalize(record, offset)
                 self._send_empty(200, self._receive_headers(record, offset))
+        except ReceiveContentMismatch:
+            self._receive_error(
+                422, "Uploaded bytes do not match the selected file.")
         except OSError:
             self._receive_error(503, "The upload slot is temporarily unavailable.")
 
@@ -30378,6 +30489,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     record = receive_finalize(record, new_offset)
                 self._send_empty(
                     204, self._receive_headers(record, new_offset))
+        except ReceiveContentMismatch:
+            self._receive_error(
+                422, "Uploaded bytes do not match the selected file.")
         except OSError:
             self._receive_error(503, "The upload slot is temporarily unavailable.")
 

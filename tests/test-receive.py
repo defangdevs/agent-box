@@ -71,12 +71,22 @@ def tearDownModule():
     shutil.rmtree(WORK, ignore_errors=True)
 
 
-def metadata(name, size, modified=123456789):
+def content_id(blob):
+    leaves = bytearray()
+    for offset in range(0, len(blob), 8 << 20):
+        leaves.extend(hashlib.sha256(blob[offset:offset + (8 << 20)]).digest())
+    prefix = ("agent-box-content-v1\n%d\n" % len(blob)).encode("ascii")
+    return "sha256-tree-v1:" + hashlib.sha256(prefix + leaves).hexdigest()
+
+
+def metadata(name, size, modified=123456789, content=None):
     def encoded(value):
         return base64.b64encode(value.encode()).decode()
     fingerprint = "%s\n%d\n%d" % (name, size, modified)
-    return "filename %s,fingerprint %s" % (
-        encoded(name), encoded(fingerprint))
+    identity = content_id(content) if content is not None else \
+        "sha256-tree-v1:" + "0" * 64
+    return "filename %s,fingerprint %s,content %s" % (
+        encoded(name), encoded(fingerprint), encoded(identity))
 
 
 class ReceiveHTTPTest(unittest.TestCase):
@@ -118,10 +128,11 @@ class ReceiveHTTPTest(unittest.TestCase):
         return {"Authorization": "Bearer " + self.token,
                 "Tus-Resumable": "1.0.0"}
 
-    def create(self, name, length):
+    def create(self, name, length, content=None):
         headers = self.auth()
         headers.update({"Upload-Length": str(length),
-                        "Upload-Metadata": metadata(name, length)})
+                        "Upload-Metadata": metadata(
+                            name, length, content=content)})
         return self.request("POST", self.collection, headers=headers)
 
     def patch(self, body, offset):
@@ -176,7 +187,8 @@ class ReceiveHTTPTest(unittest.TestCase):
 
     def test_create_head_patch_and_publish(self):
         blob = (b"resumable upload\n" * 400000)[:5 << 20]
-        status, headers, _body = self.create("artifact.bin", len(blob))
+        status, headers, _body = self.create(
+            "artifact.bin", len(blob), blob)
         self.assertEqual(status, 201)
         self.assertEqual(headers["Upload-Offset"], "0")
         status, headers, body = self.patch(blob[:2 << 20], 0)
@@ -189,12 +201,15 @@ class ReceiveHTTPTest(unittest.TestCase):
         self.assertEqual(status, 204)
         self.assertEqual(headers["Upload-Offset"], str(len(blob)))
         self.assertEqual(headers["Upload-Complete"], "?1")
+        self.assertEqual(headers["Upload-Content"], content_id(blob))
+        self.assertEqual(headers["Upload-SHA256"],
+                         hashlib.sha256(blob).hexdigest())
         final = pathlib.Path(UPLOADS, headers["Upload-Filename"])
         self.assertEqual(hashlib.sha256(final.read_bytes()).digest(),
                          hashlib.sha256(blob).digest())
 
     def test_zero_length_upload_completes_at_creation(self):
-        status, headers, _body = self.create("empty.bin", 0)
+        status, headers, _body = self.create("empty.bin", 0, b"")
         self.assertEqual(status, 201)
         self.assertEqual(headers["Upload-Complete"], "?1")
         final = pathlib.Path(UPLOADS, headers["Upload-Filename"])
@@ -205,14 +220,15 @@ class ReceiveHTTPTest(unittest.TestCase):
     def test_create_recovers_an_empty_partial_left_before_record_update(self):
         daemon.receive_ensure_dirs()
         pathlib.Path(daemon.receive_partial_path(self.slot)).touch(mode=0o600)
-        status, headers, _body = self.create("recovered-create.bin", 4)
+        status, headers, _body = self.create(
+            "recovered-create.bin", 4, b"done")
         self.assertEqual(status, 201)
         self.assertEqual(headers["Upload-Offset"], "0")
         self.assertEqual(self.patch(b"done", 0)[0], 204)
 
     def test_interrupted_request_resumes_from_persisted_bytes(self):
         blob = b"0123456789abcdef"
-        self.assertEqual(self.create("resume.bin", len(blob))[0], 201)
+        self.assertEqual(self.create("resume.bin", len(blob), blob)[0], 201)
         request = (
             "PATCH %s HTTP/1.1\r\nHost: 127.0.0.1\r\n"
             "Authorization: Bearer %s\r\nTus-Resumable: 1.0.0\r\n"
@@ -237,7 +253,7 @@ class ReceiveHTTPTest(unittest.TestCase):
 
     def test_head_finishes_a_full_partial_left_by_a_daemon_crash(self):
         blob = b"durable-before-publish"
-        self.assertEqual(self.create("recovered.bin", len(blob))[0], 201)
+        self.assertEqual(self.create("recovered.bin", len(blob), blob)[0], 201)
         pathlib.Path(daemon.receive_partial_path(self.slot)).write_bytes(blob)
         status, headers, _body = self.head()
         self.assertEqual(status, 200)
@@ -252,6 +268,17 @@ class ReceiveHTTPTest(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(headers["Upload-Offset"], "3")
         self.assertEqual(self.head()[1]["Upload-Offset"], "3")
+
+    def test_content_mismatch_is_never_published(self):
+        expected = b"document version one"
+        changed = b"document version two"
+        self.assertEqual(len(expected), len(changed))
+        self.assertEqual(self.create(
+            "report.docx", len(expected), expected)[0], 201)
+        status, _headers, body = self.patch(changed, 0)
+        self.assertEqual(status, 422)
+        self.assertIn(b"do not match", body)
+        self.assertFalse(any(pathlib.Path(UPLOADS).glob("report*")))
 
     def test_slot_binds_to_only_one_file(self):
         self.assertEqual(self.create("one.bin", 3)[0], 201)
@@ -284,7 +311,8 @@ class ReceiveHTTPTest(unittest.TestCase):
 
     def test_filename_is_metadata_not_a_path(self):
         blob = b"safe"
-        self.assertEqual(self.create("../../outside.txt", len(blob))[0], 201)
+        self.assertEqual(self.create(
+            "../../outside.txt", len(blob), blob)[0], 201)
         status, headers, _body = self.patch(blob, 0)
         self.assertEqual(status, 204)
         self.assertTrue(headers["Upload-Filename"].startswith("outside-"))
@@ -292,7 +320,7 @@ class ReceiveHTTPTest(unittest.TestCase):
 
     def test_non_ascii_filename_is_safe_in_response_headers(self):
         blob = b"safe"
-        self.assertEqual(self.create("caf\u00e9.txt", len(blob))[0], 201)
+        self.assertEqual(self.create("caf\u00e9.txt", len(blob), blob)[0], 201)
         status, headers, _body = self.patch(blob, 0)
         self.assertEqual(status, 204)
         self.assertIn("caf%C3%A9-", headers["Upload-Filename"])
