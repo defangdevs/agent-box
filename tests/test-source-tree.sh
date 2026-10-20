@@ -163,11 +163,28 @@ git -C "$upstream" commit --quiet -am pr
 REV_PR=$(git -C "$upstream" rev-parse HEAD)
 git -C "$upstream" checkout --quiet master
 git -C "$upstream" branch -D --quiet pr-head
-at "$REV_ONE"
+# --no-local: a plain local clone copies the object store, unreachable
+# commits included, and the sha fetch would never be exercised.
+rm -rf "$dir"
+git clone --quiet --no-local "$upstream" "$dir"
+git -C "$dir" checkout --quiet -B master "$REV_ONE"
+git -C "$dir" cat-file -e "$REV_PR^{commit}" 2>/dev/null \
+  && no "setup: the running rev is absent from the tree" "present"
 AGENT_BOX_SRC_REV="$REV_PR" AGENT_BOX_SRC_FORCE=1 run pull
 [ "$rc" = 0 ] && [ "$(head_of "$dir")" = "$REV_THREE" ] \
   && ok "a running rev only reachable by sha is fetched, then --force moves on" \
   || no "a running rev only reachable by sha is fetched, then --force moves on" "rc=$rc head=$(head_of "$dir")"
+
+# A running rev that cannot be fetched at all: only --force may proceed
+# (unforced is covered by the unknown-rev refusal above).
+GONE=1111111111111111111111111111111111111111
+rm -rf "$dir"
+git clone --quiet --no-local "$upstream" "$dir"
+git -C "$dir" checkout --quiet -B master "$REV_ONE"
+AGENT_BOX_SRC_REV="$GONE" AGENT_BOX_SRC_FORCE=1 run pull
+[ "$rc" = 0 ] && [ "$(head_of "$dir")" = "$REV_THREE" ] \
+  && ok "--force moves on when the running rev cannot be fetched" \
+  || no "--force moves on when the running rev cannot be fetched" "rc=$rc head=$(head_of "$dir")"
 
 # --- THE guard ----------------------------------------------------------
 # Upstream rewrites master onto a commit that is not a descendant of what

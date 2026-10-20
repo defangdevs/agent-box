@@ -70,7 +70,10 @@ if [[ -z "$flake_ref" ]]; then
     # leaves the box unable to update itself (issue #896): track the default
     # branch instead.
     git -C "$HERE" fetch -q origin 2>/dev/null || true
-    if ! git -C "$HERE" merge-base --is-ancestor "$rev" refs/remotes/origin/HEAD 2>/dev/null; then
+    if ! git -C "$HERE" remote set-head origin --auto >/dev/null 2>&1; then
+      flake_ref=github:defangdevs/agent-box
+      echo "warning: could not refresh origin's default branch; tracking the default branch instead ($flake_ref)" >&2
+    elif ! git -C "$HERE" merge-base --is-ancestor "$rev" refs/remotes/origin/HEAD 2>/dev/null; then
       flake_ref=github:defangdevs/agent-box
       echo "warning: $rev is not on origin's default branch; tracking the default branch instead ($flake_ref)" >&2
     fi
