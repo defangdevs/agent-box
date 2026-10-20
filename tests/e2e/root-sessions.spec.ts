@@ -361,6 +361,10 @@ test('the tab close button arms first and only closes on a second click', async 
   await expect(page.locator('.msg')).toHaveText(/Session deleted/);
   await expect(tab).toHaveCount(0);
   await expect(page.locator(`#panes .pane[data-pane="${name}"]`)).toHaveCount(0);
+  // The focused button is client-only "Close?" state. Without a stable key
+  // on each tab, the DOM morph reused that button for the next sibling and
+  // preserved its text while changing data-close to the sibling's name.
+  await expect(page.getByText('Close?', { exact: true })).toHaveCount(0);
 });
 
 test('a grid tile closes itself with the same two-click x, staying in the grid', async ({ browser }) => {
