@@ -152,6 +152,23 @@ AGENT_BOX_SRC_REV=0000000000000000000000000000000000000000 run pull
 [ "$rc" != 0 ] && said "cannot describe this box" \
   && ok "an unknown running rev is refused" || no "an unknown running rev is refused" "rc=$rc"
 
+# A running rev that upstream no longer advertises on any branch (a box
+# launched from a PR head that was then squash-merged, issue #896) is fetched
+# by sha, then --force can move on. GitHub serves this for pull-ref commits;
+# the local upstream is told to do the same.
+git -C "$upstream" config uploadpack.allowAnySHA1InWant true
+git -C "$upstream" checkout --quiet -b pr-head "$REV_THREE"
+echo pr > "$upstream/file"
+git -C "$upstream" commit --quiet -am pr
+REV_PR=$(git -C "$upstream" rev-parse HEAD)
+git -C "$upstream" checkout --quiet master
+git -C "$upstream" branch -D --quiet pr-head
+at "$REV_ONE"
+AGENT_BOX_SRC_REV="$REV_PR" AGENT_BOX_SRC_FORCE=1 run pull
+[ "$rc" = 0 ] && [ "$(head_of "$dir")" = "$REV_THREE" ] \
+  && ok "a running rev only reachable by sha is fetched, then --force moves on" \
+  || no "a running rev only reachable by sha is fetched, then --force moves on" "rc=$rc head=$(head_of "$dir")"
+
 # --- THE guard ----------------------------------------------------------
 # Upstream rewrites master onto a commit that is not a descendant of what
 # this box runs: a force-push, or an older rev being replayed. This is the

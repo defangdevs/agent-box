@@ -205,8 +205,15 @@ case "${1:-}" in
     # fast-forward anywhere else would let the guard below measure ancestry
     # from a rev this box never ran.
     if [ "$head" != "$rev" ] || [ "$(git rev-parse --abbrev-ref HEAD)" = "HEAD" ]; then
+      # A box launched from an unmerged branch runs a commit that a squash
+      # merge left reachable only through refs/pull/N/head, so a plain clone
+      # lacks it (issue #896). GitHub serves a fetch by full sha for such a
+      # commit, so ask for it by name before giving up.
       git cat-file -e "$rev^{commit}" 2>/dev/null \
-        || die "the running rev $rev is not in $url — this tree cannot describe this box"
+        || git fetch --quiet origin "$rev" 2>/dev/null \
+        || true
+      git cat-file -e "$rev^{commit}" 2>/dev/null \
+        || die "the running rev $rev is not in $url — this tree cannot describe this box (a box launched from an unmerged branch: run 'agentbox update --rev refs/pull/<N>/head' as root, then 'agentbox update --force')"
       [ "$head" = "$rev" ] || say "$dir is at $head but the box runs $rev — realigning before the fast-forward"
       # -B, not a detached checkout: `git merge` advances a BRANCH, and a
       # tree left detached (a fresh clone, an operator's inspection) has
