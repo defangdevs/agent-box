@@ -141,8 +141,11 @@ class ReceiveHTTPTest(unittest.TestCase):
                         "Content-Type": "application/offset+octet-stream"})
         return self.request("PATCH", self.resource, body=body, headers=headers)
 
-    def head(self):
-        return self.request("HEAD", self.resource, headers=self.auth())
+    def head(self, if_match=None):
+        headers = self.auth()
+        if if_match is not None:
+            headers["If-Match"] = if_match
+        return self.request("HEAD", self.resource, headers=headers)
 
     def test_public_page_contains_no_capability(self):
         status, headers, body = self.request("GET", self.page)
@@ -197,13 +200,22 @@ class ReceiveHTTPTest(unittest.TestCase):
         status, headers, _body = self.head()
         self.assertEqual(status, 200)
         self.assertEqual(headers["Upload-Offset"], str(2 << 20))
+        self.assertEqual(headers["Upload-Content"], content_id(blob))
+        self.assertNotIn("ETag", headers)
         status, headers, _body = self.patch(blob[2 << 20:], 2 << 20)
         self.assertEqual(status, 204)
         self.assertEqual(headers["Upload-Offset"], str(len(blob)))
         self.assertEqual(headers["Upload-Complete"], "?1")
-        self.assertEqual(headers["Upload-Content"], content_id(blob))
+        etag = '"' + content_id(blob) + '"'
+        self.assertEqual(headers["ETag"], etag)
+        self.assertNotIn("Upload-Content", headers)
         self.assertEqual(headers["Upload-SHA256"],
                          hashlib.sha256(blob).hexdigest())
+        self.assertEqual(self.head(etag)[0], 200)
+        status, mismatch_headers, _body = self.head(
+            '"sha256-tree-v1:' + '0' * 64 + '"')
+        self.assertEqual(status, 412)
+        self.assertEqual(mismatch_headers["ETag"], etag)
         final = pathlib.Path(UPLOADS, headers["Upload-Filename"])
         self.assertEqual(hashlib.sha256(final.read_bytes()).digest(),
                          hashlib.sha256(blob).digest())

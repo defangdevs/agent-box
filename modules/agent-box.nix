@@ -29916,6 +29916,7 @@ to the terminal or any existing files.</p>
   const metadata = (file, content) => 'filename ' + b64(file.name) +
     ',fingerprint ' + b64(file.name + '\n' + file.size + '\n' +
                           file.lastModified) + ',content ' + b64(content);
+  const contentEtag = content => '"' + content + '"';
   const hex = bytes => Array.from(bytes, byte =>
     byte.toString(16).padStart(2, '0')).join(''');
   const contentId = async file => {
@@ -29948,8 +29949,22 @@ to the terminal or any existing files.</p>
                                             cache: 'no-store'});
     if (response.status === 404) return null;
     if (!response.ok) return fail(response);
-    if (Number(response.headers.get('Upload-Length')) !== file.size ||
-        response.headers.get('Upload-Content') !== content) {
+    if (Number(response.headers.get('Upload-Length')) !== file.size) {
+      throw new Error('This link is already bound to a different file.');
+    }
+    if (response.headers.get('Upload-Complete') === '?1') {
+      const headers = auth();
+      headers['If-Match'] = contentEtag(content);
+      const verified = await fetch(resource, {
+        method: 'HEAD', headers, cache: 'no-store'
+      });
+      if (verified.status === 412) {
+        throw new Error('This link is already bound to a different file.');
+      }
+      if (!verified.ok) return fail(verified);
+      return Number(verified.headers.get('Upload-Offset'));
+    }
+    if (response.headers.get('Upload-Content') !== content) {
       throw new Error('This link is already bound to a different file.');
     }
     return Number(response.headers.get('Upload-Offset'));
@@ -30258,10 +30273,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "Upload-Expires": email.utils.formatdate(
                 record["expires"], usegmt=True),
         }
-        if record.get("content"):
-            headers["Upload-Content"] = record["content"]
         if record.get("status") == "complete":
             headers["Upload-Complete"] = "?1"
+            if record.get("content"):
+                headers["ETag"] = '"' + record["content"] + '"'
             if record.get("sha256"):
                 headers["Upload-SHA256"] = record["sha256"]
             # HTTP headers are Latin-1 in BaseHTTPRequestHandler. Percent
@@ -30269,6 +30284,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # keeping this convenience response header ASCII-only.
             headers["Upload-Filename"] = urllib.parse.quote(
                 record.get("final_name", ""), safe="")
+        elif record.get("content"):
+            # The partial upload changes after each PATCH, so its target
+            # identity is resume metadata rather than an HTTP entity tag.
+            headers["Upload-Content"] = record["content"]
         return headers
 
     def _receive_create(self, slot):
@@ -30398,7 +30417,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._receive_error(500, "The partial upload is inconsistent.")
                     return
                 record = receive_finalize(record, offset)
-                self._send_empty(200, self._receive_headers(record, offset))
+                headers = self._receive_headers(record, offset)
+                if_match = self.headers.get("If-Match")
+                if (if_match is not None
+                        and if_match.strip() != "*"
+                        and (record.get("status") != "complete"
+                             or if_match.strip() != headers.get("ETag"))):
+                    self._send_empty(412, headers)
+                    return
+                self._send_empty(200, headers)
         except ReceiveContentMismatch:
             self._receive_error(
                 422, "Uploaded bytes do not match the selected file.")

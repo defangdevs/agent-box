@@ -14,7 +14,12 @@ test('a dropped file resumes and the completed fast path checks content', async 
   test.skip(!receiveUrl, 'E2E_RECEIVE_URL is not configured');
 
   const token = new URL(receiveUrl!).hash.slice(1);
-  const apiRequests: Array<{ method: string; auth?: string; url: string }> = [];
+  const apiRequests: Array<{
+    method: string;
+    auth?: string;
+    ifMatch?: string;
+    url: string;
+  }> = [];
   let interrupted = false;
 
   await page.route('**/files**', async route => {
@@ -22,6 +27,7 @@ test('a dropped file resumes and the completed fast path checks content', async 
     apiRequests.push({
       method: request.method(),
       auth: request.headers()['authorization'],
+      ifMatch: request.headers()['if-match'],
       url: request.url(),
     });
     // Prove the page's retry path in a real browser. The protocol suite has
@@ -95,6 +101,10 @@ test('a dropped file resumes and the completed fast path checks content', async 
     'This link is already bound to a different file.', { timeout: 30_000 });
   expect(apiRequests.filter(request => request.method === 'PATCH').length)
     .toBe(patchCount);
+  const conditionalHeads = apiRequests.filter(request => request.ifMatch);
+  expect(conditionalHeads).toHaveLength(2);
+  expect(conditionalHeads.every(request => request.method === 'HEAD')).toBe(true);
+  expect(conditionalHeads[0].ifMatch).not.toBe(conditionalHeads[1].ifMatch);
 
   for (const request of apiRequests) {
     expect(request.auth).toBe('Bearer ' + token);
