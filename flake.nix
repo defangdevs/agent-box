@@ -1900,6 +1900,13 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          landing-passwords =
+            pkgs.runCommand "agent-box-landing-passwords"
+              { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+              node ${./tests/test-landing-passwords.cjs} ${./docs/index.html}
+              touch "$out"
+            '';
+
           assemble-module-escaping =
             pkgs.runCommand "agent-box-assemble-module-escaping"
               {
