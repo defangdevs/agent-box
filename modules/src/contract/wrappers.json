@@ -67,6 +67,16 @@
       "name": "agent-box-webhook",
       "env": [
         {
+          "name": "AGENT_BOX_HOOK_SPAWN_CMD",
+          "kind": "cli",
+          "program": "agent-box-webhook-spawn",
+          "why": [
+            "The CLI prepares an API-key watch through the same authentication",
+            "check the dispatcher runs. Pin the generated spawn wrapper so a",
+            "login shell and the receiver use identical code and dependencies."
+          ]
+        },
+        {
           "name": "AGENT_BOX_WEBHOOK_SCRIPT",
           "kind": "config",
           "key": "webhookScript",
