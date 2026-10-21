@@ -3,13 +3,13 @@
 [Service]
 Environment="AGENT_BOX_WEB_DOMAIN=golden.example.org"
 Environment="CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
-Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.44-57/lib/locale/locale-archive"
+Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-84/lib/locale/locale-archive"
 Environment="NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
 Environment="NODE_OPTIONS=--use-openssl-ca"
-Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.8/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.12/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-attach/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ttyd-1.7.7/bin"
+Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7c/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-attach/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ttyd-1.7.7/bin"
 Environment="REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
 Environment="SSL_CERT_DIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-empty-ca-dir"
 Environment="SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
-Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026e/share/zoneinfo"
+Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026c/share/zoneinfo"
 ExecStart=
 ExecStart=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ttyd-1.7.7/bin/ttyd --writable --url-arg --check-origin -i /run/agent-box-ttyd/agent/ttyd.sock -b /%i -t disableLeaveAlert=true -t titleFixed=%i@${AGENT_BOX_WEB_DOMAIN} -t macOptionClickForcesSelection=true /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-attach/bin/agent-box-attach

@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p20/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 export AGENT_BOX_AGENTS='claude codex shell'
 export AGENT_BOX_DEFAULT_AGENT=claude
 # sessions.json lock (issue #254). Pinned in the WRAPPER, not in a unit
@@ -9,7 +9,7 @@ export AGENT_BOX_DEFAULT_AGENT=claude
 # a lock. util-linux is the only package that ships flock.
 export AGENT_BOX_CAPACITY_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-session-capacity/bin/agent-box-session-capacity
 export AGENT_BOX_HIBERNATE_IDLE_S=30
-export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.4-bin/bin/flock
+export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock
 # Agent profiles (issue #321): `add --profile` resolves the harness and
 # its arguments by shelling out to agent-box-profile, and this CLI runs
 # from PATHs that do not carry it — the webhook receiver unit's PATH is

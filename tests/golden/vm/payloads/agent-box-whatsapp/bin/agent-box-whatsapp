@@ -1,4 +1,4 @@
-#! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.8/bin/python3.14
+#! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.7/bin/python3.14
 """Optional per-user WhatsApp linked-device runtime for agent-box."""
 
 import hashlib

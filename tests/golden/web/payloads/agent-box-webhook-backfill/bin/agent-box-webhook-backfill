@@ -1,4 +1,4 @@
-#! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.8/bin/python3.14
+#! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.7/bin/python3.14
 """Ask the sender what it could not hand this box, and hand it over (#605).
 
 A webhook delivery is fire-and-forget. GitHub does not retry, so every event

@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p20/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 set -u
 # Build the shared nixpkgs git cache that every user's FIRST harness install
 # reads (issue #669).
