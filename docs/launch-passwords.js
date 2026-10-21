@@ -7,7 +7,7 @@
   "use strict";
 
   function randomPassword() {
-    // 24 random bytes -> 32 base64url characters, no padding: about 144
+    // 24 random bytes -> 32 base64url characters, no padding: 192
     // bits of entropy, and every character is already safe to paste into a
     // URL, a shell, or CloudFormation's console form.
     var bytes = new Uint8Array(24);
