@@ -11,7 +11,9 @@ assert len(certs) > 50, "An empty/broken trust store is not a mitigation"
 subjects = {value for cert in certs for rdn in cert["subject"]
             for key, value in rdn if key == "commonName"}
 assert not subjects & blocked, subjects & blocked
-for chain in sorted(Path(__file__).with_name("tls-chains").glob("*.pem")):
+chains = sorted(Path(__file__).with_name("tls-chains").glob("*.pem"))
+assert len(chains) == 12, f"Expected 12 chain fixtures, found {len(chains)}"
+for chain in chains:
     result = subprocess.run([
         "openssl", "verify", "-attime", "1792530000", "-purpose", "sslserver",
         "-CAfile", os.environ["SSL_CERT_FILE"], "-untrusted", str(chain), str(chain),
