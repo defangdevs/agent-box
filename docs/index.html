@@ -130,9 +130,7 @@
   }
   .note strong { color: var(--text); }
 
-  /* The client-side generated password (issue #25): a monospace value the
-     visitor is meant to select and save, plus a one-click copy affordance -
-     both sized to stay legible on a phone, where the note itself wraps. */
+  /* Locally generated launch passwords: selectable and copyable on a phone. */
   .pw-row {
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     margin: 10px 0; background: var(--bg); border: 1px solid var(--border);
@@ -261,22 +259,22 @@
     <!-- Issue #25: the plaintext password never reaches AWS. This browser
          generates one and hashes it (Argon2id, via the vendored hash-wasm
          build below) before the launch buttons above ever get clicked -
-         hash-password.js fills WebPasswordHash into each href and swaps
+         the script below fills WebPasswordHash into each href and swaps
          which of the two notes below is shown. Without JS (or if the
          hashing library fails to load) the buttons stay exactly as they
-         were rendered and #password-manual stays the visible note, so
+         were rendered and #aws-password-manual stays visible, so
          launching still works - it just asks you to compute the hash
          yourself, same as a CLI launch. -->
-    <div class="note" id="password-manual">
+    <div class="note" id="aws-password-manual">
       <strong>Create your agent-box password.</strong> This browser could not fill one in automatically. If possible, reload this page in a current browser and it will create one for you. To continue manually, choose a password, save it in your password manager, and run <code>caddy hash-password --algorithm argon2id --plaintext '&lt;your password&gt;'</code>. Paste the result into <code>WebPasswordHash</code> on the AWS form. Choose Claude Code or Codex, pick a size, and create the stack. When setup finishes, open <code>WebURL</code> under <strong>Outputs</strong> and sign in with <code>UserName</code> (default <code>workspace</code>) and the password you saved. Complete the agent's one-time sign-in. If you choose Claude Code, use <code>RemoteControlSession</code> to connect from the Claude desktop or mobile app.
     </div>
-    <div class="note" id="password-generated" hidden>
-      <strong>Save your agent-box password.</strong>
+    <div class="note" id="aws-password-generated" hidden>
+      <strong>Your AWS browser password was generated in this browser.</strong>
       <div class="pw-row">
-        <code id="password-generated-value"></code>
-        <button type="button" class="pw-copy" id="password-generated-copy">Copy</button>
+        <code id="aws-password-generated-value"></code>
+        <button type="button" class="pw-copy" id="aws-password-copy" aria-label="Copy AWS browser password">Copy</button>
       </div>
-      This password was created in your browser. Save it in your password manager before you launch; it cannot be recovered later. The AWS form receives only a protected value that can check the password, not the password itself. Choose Claude Code or Codex, pick a size, and create the stack. When setup finishes, open <code>WebURL</code> under <strong>Outputs</strong> and sign in with <code>UserName</code> (default <code>workspace</code>) and the password above. Complete the agent's one-time sign-in. If you choose Claude Code, use <code>RemoteControlSession</code> to connect from the Claude desktop or mobile app.
+      Your device's secure random generator made this password here. Save it in your password manager before you launch; it cannot be recovered later. This browser also hashes it locally: the AWS launch link contains only the hash, never the password. Choose Claude Code or Codex, pick a size, and create the stack. When setup finishes, open <code>WebURL</code> under <strong>Outputs</strong> and sign in with <code>UserName</code> (default <code>workspace</code>) and the password above. Complete the agent's one-time sign-in. If you choose Claude Code, use <code>RemoteControlSession</code> to connect from the Claude desktop or mobile app.
     </div>
     <div class="note">
       <strong>Choose a size for your work.</strong> The default 2 GiB setup is <strong>$12/month</strong> and suits one active agent session. Choose 4 GiB at $24/month for parallel sessions or larger builds. Both prices include the server, storage, a stable browser link, and a generous data allowance. Delete the stack to stop billing. If your IT team needs a custom server size, Spot pricing, or resizable storage, use the <a href="https://github.com/defangdevs/agent-box#alternative-ec2-template-on-demand-ipv6-opt-in">advanced EC2 setup</a>.
@@ -294,8 +292,16 @@
         <a class="launch azure" href="https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fdefangdevs%2Fagent-box%2Fmaster%2Fdeploy%2Fazure%2Fagent-box.json"><svg class="mark azure-mark" aria-hidden="true"><use href="#mark-azure"/></svg> Deploy to Azure &rarr;</a>
       </div>
     </div>
-    <div class="note">
-      <strong>Set up your browser password and maintenance key.</strong> Create a 16&ndash;64 character password, save it in your password manager, and enter it as <code>webPassword</code>. You'll use it with the <code>userName</code> (default <code>workspace</code>) whenever you open agent-box in your browser. Azure also asks for <code>adminPasswordOrKey</code>; paste your SSH public key there. You won't use that key for everyday work. It is ready if you later turn on SSH for maintenance or recovery; SSH is off by default. Pick a size and deploy. When the deployment finishes, open the <code>webUrl</code> output. On the Settings page, install and sign in to Claude Code or Codex; agent-box starts your first session for you. If you choose Claude Code, use the <code>remoteControlSession</code> output to connect from the Claude desktop or mobile app.
+    <div class="note" id="azure-password-manual">
+      <strong>Create your Azure browser password.</strong> This browser could not generate one automatically. Choose a 16&ndash;64 character password, save it in your password manager, and enter it as <code>webPassword</code> on the Azure form. You'll use it with <code>userName</code> (default <code>workspace</code>) to open agent-box in your browser. Azure also asks for <code>adminPasswordOrKey</code>; paste your SSH public key there. That key is for maintenance or recovery, not everyday work; SSH is off by default. Pick a size and deploy. When deployment finishes, open <code>webUrl</code>. On the Settings page, install and sign in to Claude Code or Codex; agent-box starts your first session for you. If you choose Claude Code, use <code>remoteControlSession</code> to connect from the Claude desktop or mobile app.
+    </div>
+    <div class="note" id="azure-password-generated" hidden>
+      <strong>Your Azure browser password was generated in this browser.</strong>
+      <div class="pw-row">
+        <code id="azure-password-generated-value"></code>
+        <button type="button" class="pw-copy" id="azure-password-copy" aria-label="Copy Azure browser password">Copy</button>
+      </div>
+      Your device's secure random generator made this password here. Save it in your password manager, then paste it into <code>webPassword</code> on the Azure form. This page does not send it to Azure; Azure receives it when you submit that secure form to set up your box. You'll use it with <code>userName</code> (default <code>workspace</code>) to open agent-box in your browser. Azure also asks for <code>adminPasswordOrKey</code>; paste your SSH public key there. That key is for maintenance or recovery, not everyday work; SSH is off by default. Pick a size and deploy. When deployment finishes, open <code>webUrl</code>. On the Settings page, install and sign in to Claude Code or Codex; agent-box starts your first session for you. If you choose Claude Code, use <code>remoteControlSession</code> to connect from the Claude desktop or mobile app.
     </div>
     <div class="note">
       <strong>Choose a size and region for your budget.</strong> The default 4 GiB server, 32 GiB storage, and stable browser link cost about <strong>$28/month</strong> in <code>westus3</code>; prices vary by region. You can choose another size on the form and grow the storage later. Delete the resource group to stop billing.
@@ -324,95 +330,6 @@
      semicolon in either file can never glue the two together. Exposes the
      global `hashwasm.argon2id(...)`. -->
 <script src="vendor/hash-wasm-argon2id.umd.min.js"></script>
-<script>
-// Issue #25: generate the browser terminal password HERE, in the visitor's
-// own browser, and hand AWS only its Argon2id hash - never the plaintext.
-// Progressive enhancement: until this finishes (or if it fails), the launch
-// buttons above are the plain template URLs and #password-manual - asking
-// for a hash computed by hand - stays the visible note, so launching still
-// works either way.
-(function () {
-  "use strict";
-
-  function randomPassword() {
-    // 24 random bytes -> 32 base64url characters, no padding: about 144
-    // bits of entropy, and every character is already safe to paste into a
-    // URL, a shell, or CloudFormation's console form.
-    var bytes = new Uint8Array(24);
-    crypto.getRandomValues(bytes);
-    var binary = "";
-    for (var i = 0; i < bytes.length; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  }
-
-  function hashPassword(password) {
-    var salt = new Uint8Array(16);
-    crypto.getRandomValues(salt);
-    // Caddy's own `hash-password --algorithm argon2id` defaults to
-    // m=47104,t=1,p=1; these cost parameters are deliberately higher; a
-    // browser has to eat this cost exactly once per visit, and the module's
-    // agent-web-auth-secrets.service reads whatever parameters are already
-    // encoded in the hash string, so there is no need to match its default.
-    return hashwasm.argon2id({
-      password: password,
-      salt: salt,
-      parallelism: 1,
-      iterations: 3,
-      memorySize: 65536,
-      hashLength: 32,
-      outputType: "encoded",
-    });
-  }
-
-  function showGeneratedPassword(password) {
-    document.getElementById("password-generated-value").textContent = password;
-    document.getElementById("password-manual").hidden = true;
-    document.getElementById("password-generated").hidden = false;
-  }
-
-  function fillLaunchButtons(hash) {
-    var param = "&param_WebPasswordHash=" + encodeURIComponent(hash);
-    var links = document.querySelectorAll("[data-region-launch]");
-    for (var i = 0; i < links.length; i++) {
-      links[i].href = links[i].href + param;
-    }
-  }
-
-  function wireCopyButton(password) {
-    var btn = document.getElementById("password-generated-copy");
-    btn.addEventListener("click", function () {
-      navigator.clipboard.writeText(password).then(function () {
-        btn.textContent = "Copied";
-        btn.dataset.copied = "true";
-        setTimeout(function () {
-          btn.textContent = "Copy";
-          delete btn.dataset.copied;
-        }, 2000);
-      }, function () {
-        // Clipboard permission denied or unavailable (e.g. non-HTTPS,
-        // very old browser) - the value is still selectable text in the
-        // page, so there is nothing more to do here.
-      });
-    });
-  }
-
-  if (!window.crypto || !crypto.getRandomValues || !window.hashwasm) {
-    return; // no JS crypto or the vendored library failed to load - manual note stays up.
-  }
-
-  var password = randomPassword();
-  hashPassword(password).then(function (hash) {
-    fillLaunchButtons(hash);
-    showGeneratedPassword(password);
-    wireCopyButton(password);
-  }, function (err) {
-    // Hashing itself failed (e.g. a browser with no WebAssembly) - leave
-    // the launch buttons and the manual note exactly as rendered.
-    window.console && console.error("agent-box: could not hash the generated password", err);
-  });
-})();
-</script>
+<script src="launch-passwords.js"></script>
 </body>
 </html>
