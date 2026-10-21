@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p20/bin/bash
 # The pin this box installs a harness FROM, and therefore the pin
 # `agent-box-harness upgrade` moves an installed one onto. It is the
 # same value the agent unit carries, but this CLI is run by a person
@@ -10,7 +10,7 @@ export AGENT_BOX_NIXPKGS=https://channels.nixos.org/nixos-unstable/nixexprs.tar.
 # the same lock agent_install takes: a session starting right now may
 # be inside the install path for the very harness being moved. A
 # pane's PATH does not carry flock (issue #254), so pin it.
-export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock
+export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.4-bin/bin/flock
 # agent-box-harness — what this box installed into your profile, and how to
 # move it (issues #559, #590, #614).
 #

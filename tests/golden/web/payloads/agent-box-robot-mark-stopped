@@ -1,14 +1,14 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p20/bin/bash
 # This runs as the last command in an agent's pane, so it inherits that
 # agent's PATH — which may be anything at all. Everything it needs is
 # pinned here instead: coreutils on a PATH of its own, jq and the registry
 # lock's flock by store path (flock ships in util-linux only, issue #254),
 # and the registry of the user this copy was generated for rather than
 # whatever $HOME the pane carries.
-export PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin
+export PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.12/bin
 REGISTRY_FILE=/home/robot/.config/agent-box/sessions.json
 REGISTRY_JQ=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin/jq
-REGISTRY_FLOCK=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock
+REGISTRY_FLOCK=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.4-bin/bin/flock
 REGISTRY_PROG=agent-box-mark-stopped
 LEASE_JQ=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin/jq
 LEASE_DIR=/home/robot/.local/state/agent-box/lease

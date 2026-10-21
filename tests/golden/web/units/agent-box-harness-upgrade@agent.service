@@ -1,10 +1,16 @@
 [Unit]
 
 [Service]
-Environment="AGENT_BOX_NIX_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nix-2.34.8/bin/nix"
-Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-84/lib/locale/locale-archive"
-Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.11.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261.2/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.11.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-261.2/sbin"
-Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026c/share/zoneinfo"
+Environment="AGENT_BOX_NIX_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nix-2.34.9/bin/nix"
+Environment="CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
+Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.44-57/lib/locale/locale-archive"
+Environment="NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
+Environment="NODE_OPTIONS=--use-openssl-ca"
+Environment="PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.12/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.11.0/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-262/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.12/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-findutils-4.11.0/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnugrep-3.12/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gnused-4.10/sbin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-systemd-262/sbin"
+Environment="REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
+Environment="SSL_CERT_DIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-empty-ca-dir"
+Environment="SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
+Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026e/share/zoneinfo"
 X-RestartIfChanged=false
 X-StopIfChanged=false
 ExecStart=

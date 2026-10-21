@@ -1,4 +1,4 @@
-#! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.7/bin/python3.14
+#! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.8/bin/python3.14
 # Mint and revoke temporary, upload-only browser capabilities (issue #898).
 
 import argparse

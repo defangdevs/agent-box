@@ -1,8 +1,11 @@
 [Unit]
 
 [Socket]
+SocketGroup=fail2ban
+SocketMode=0660
 
-
+ListenStream=
+ListenStream=/run/fail2ban/fail2ban.sock
 
 
 [Install]

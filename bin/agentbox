@@ -1265,6 +1265,47 @@ class Renderer:
             out += f"export {entry['name']}={rendered}\n"
         return out
 
+    def tls_environment(self):
+        """The runtime owns distrust, even when the distro bundle is stale."""
+        bundle = str(self.profile / "etc/ssl/certs/ca-no-trust-rules-bundle.crt")
+        return {
+            "SSL_CERT_FILE": bundle,
+            "SSL_CERT_DIR": str(self.profile / "etc/agent-box/empty-ca-dir"),
+            "NIX_SSL_CERT_FILE": bundle,
+            "CURL_CA_BUNDLE": bundle,
+            "REQUESTS_CA_BUNDLE": bundle,
+            "NODE_OPTIONS": "--use-openssl-ca",
+        }
+
+    def tls_policy(self, t):
+        pairs = sorted(self.tls_environment().items())
+        t.file(self.p("/etc/agent-box/tls.env"), env_file(pairs))
+        t.file(self.p("/etc/profile.d/agent-box-tls.sh"), GENERATED_HEADER
+               + "".join(f"export {k}={shlex.quote(v)}\n" for k, v in pairs))
+        exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in pairs)
+        # t.units lists only units to enable. Discover socket/timer-activated
+        # services from their rendered files too. Keep the original unit bytes
+        # intact: feature-off cleanup uses them as an ownership witness.
+        services = {"nix-daemon.service"}
+        for path, (text, mode) in list(t.files.items()):
+            file = Path(path)
+            if file.name.endswith(".service"):
+                services.add(file.name)
+            elif file.parent.name.endswith(".service.d"):
+                services.add(file.parent.name[:-2])
+            if mode & 0o111 and GENERATED_HEADER in text and text.startswith("#!"):
+                # Keep the ownership header directly after the shebang.
+                t.file(file, text.replace(GENERATED_HEADER, GENERATED_HEADER + exports, 1), mode)
+        active = set()
+        for unit in sorted(services):
+            path = self.p("/etc/systemd/system", f"{unit}.d", "05-tls.conf")
+            active.add(path)
+            t.file(path, dropin(["EnvironmentFile=/etc/agent-box/tls.env"]))
+        # These generated drop-ins belong only to the services still rendered.
+        for path in self.p("/etc/systemd/system").glob("*.service.d/05-tls.conf"):
+            if path not in active:
+                t.gone(path)
+
     def render(self):
         t = Tree()
         self.dirs(t)
@@ -1300,6 +1341,7 @@ class Renderer:
             self.web_off(t)
         if not self.spec.webhook_enable:
             self.webhook_off(t)
+        self.tls_policy(t)
         return t
 
     # -- agent defaults ------------------------------------------------------
@@ -4536,6 +4578,11 @@ def activate(spec, tree, removed, advisory, act):
                         ["systemctl", "enable", "--now", OOMD_UNIT]):
             remove_if_ours(OOMD_STAMP)
     act.require("systemctl daemon-reload", ["systemctl", "daemon-reload"])
+    # The multi-user Nix daemon fetches independently of an agent's process
+    # environment. Re-read the runtime trust policy without enabling it.
+    if "nix-daemon.service" in active_units("nix-daemon.service"):
+        act.require("refresh Nix daemon TLS trust",
+                    ["systemctl", "restart", "nix-daemon.service"])
     # Enable what the config declares; stop instances for users that
     # were removed from it, so a shrinking config is honored too.
     for unit in tree.units:

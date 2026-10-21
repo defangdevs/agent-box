@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p20/bin/bash
 set -e
 
 set -euo pipefail
@@ -9,7 +9,7 @@ if [ -e "$binDir/defang" ] && [ "$(cat "$stamp" 2>/dev/null || true)" = /nix/sto
   exit 0
 fi
 install -d -m 0755 "$stateDir"
-/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nix-2.34.8/bin/nix build \
+/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nix-2.34.9/bin/nix build \
   --extra-experimental-features 'nix-command flakes' \
   -f /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-defang-cli-expr.nix \
   -o "$stateDir/current"

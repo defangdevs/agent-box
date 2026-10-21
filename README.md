@@ -816,6 +816,18 @@ compromised agent - the harness's in-tool approval prompts are *deliberately*
 off by default (`skipPermissions = true`), so nothing in the agent itself gates
 arbitrary command execution as the agent user.
 
+TLS distrust policy (CVE-2026-111943): NixOS explicitly distrusts the affected
+emSign roots and their Comodo AAA cross-signing path, including when this module
+is imported on an older host channel. Native installations ship a filtered CA
+bundle in the runtime profile. `agentbox apply` configures service, generated CLI
+and login environments to use it; Node uses OpenSSL's store rather than its
+compiled-in roots. The native Nix daemon is restarted to pick up that policy.
+A bare runtime profile is software only: apply it before relying on its trust
+environment. Independently managed containers and applications with embedded CA
+stores still require their own updates. Existing processes must restart to
+inherit a changed policy; this does not rotate credentials or replace existing
+disks. Run `nix build .#checks.x86_64-linux.tls-trust` for the offline regression.
+
 **What the module gives you:**
 
 - **Unprivileged agent user.** Not root. Agent autonomy is intentionally scoped

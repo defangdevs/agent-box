@@ -1,4 +1,4 @@
-#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
+#!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p20/bin/bash
 # The CLI this spawn ends by exec'ing into, to create the hook session.
 # It was a bare `agent-box-session` resolved from the receiver unit's
 # PATH, which carried it on NixOS and not natively - where the profile
@@ -11,7 +11,7 @@ export AGENT_BOX_SESSION_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-b
 # the receiver unit's PATH is jq + coreutils + the session CLI, so
 # flock is not on it, and the hook-session cap check has to hold the
 # registry lock through the add it decides on.
-export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock
+export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.4-bin/bin/flock
 # --preamble is run by the SETTINGS DAEMON, whose unit forces a PATH
 # without jq (the receiver unit's PATH has it, but that is the other
 # caller). Every jq use in this script is guarded, so an unfound

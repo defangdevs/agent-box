@@ -230,6 +230,25 @@ def tree_modes(root):
 
 
 class RenderTest(unittest.TestCase):
+    def test_tls_policy_reaches_socket_and_timer_services_and_keeps_ownership(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = render(tmp, CONFIG_JSON)
+            unit_root = out / "etc/systemd/system"
+            for name in ["agent-box-settings@agent.service", "agent-box-update.service",
+                         "agent-box-webhook@agent.service", "agent-box@agent.service",
+                         "caddy.service", "nix-daemon.service"]:
+                self.assertIn("EnvironmentFile=/etc/agent-box/tls.env",
+                              (unit_root / (name + ".d") / "05-tls.conf").read_text())
+            env = (out / "etc/agent-box/tls.env").read_text()
+            self.assertIn("NODE_OPTIONS=--use-openssl-ca", env)
+            self.assertIn("SSL_CERT_DIR=@PROFILE@/etc/agent-box/empty-ca-dir", env)
+            wrapper = (out / "usr/local/bin/agent-box-session").read_text()
+            self.assertIn("export NODE_OPTIONS=--use-openssl-ca", wrapper)
+            self.assertTrue(load_agentbox().generated_by_us(out / "usr/local/bin/agent-box-session"))
+            # Byte-for-byte unit copies remain recognizable by feature-off cleanup.
+            shared = (out / "etc/systemd/system/agent-box-settings@.service").read_text()
+            self.assertEqual(shared, (SRC / "units/agent-box-settings@.service").read_text())
+
     def test_ip_certificate_and_optional_dns_alias(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Path(tmp) / "config.json"

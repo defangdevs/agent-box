@@ -1,4 +1,4 @@
-#! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.7/bin/python3.14
+#! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.8/bin/python3.14
 """Run the pinned local-slack daemon for agent-box (issue #864)."""
 
 import hashlib

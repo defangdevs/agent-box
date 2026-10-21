@@ -14,6 +14,24 @@
 
 let
   cfg = config.services.agent-box;
+  # Include alternate cross-signing paths, including hosts on older nixpkgs.
+  tlsBlacklist = builtins.fromJSON ''
+[
+  "Comodo AAA Services root",
+  "emSign ECC Root CA - G3",
+  "emSign Root CA - C1",
+  "emSign ECC Root CA - C3"
+]
+  '';
+  tlsEnvironment = {
+    SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt";
+    SSL_CERT_DIR = "${pkgs.runCommand "agent-box-empty-ca-dir" { } "mkdir -p $out"}";
+    NIX_SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt";
+    CURL_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt";
+    REQUESTS_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt";
+    # Adding roots cannot revoke Node's compiled-in roots. Use the filtered store.
+    NODE_OPTIONS = "--use-openssl-ca";
+  };
   supportedAgents = [ "claude" "codex" ];
   # Everything a session's `agent` field may name: the agent CLIs plus the
   # pseudo-agent "shell" (issue #113) — a plain login shell in a supervised
@@ -18706,6 +18724,9 @@ in
       shell = lib.mkOverride 900 pkgs.bashInteractive;
     }) cfg.users;
 
+    security.pki.caCertificateBlacklist = tlsBlacklist;
+    environment.variables = lib.mapAttrs (_: lib.mkDefault) tlsEnvironment;
+    systemd.globalEnvironment = lib.mapAttrs (_: lib.mkDefault) tlsEnvironment;
     environment.systemPackages = agentRuntimePackages;
 
     # Canonical, read-only agent guide per user at /etc/agent-box-guides/
@@ -18814,6 +18835,7 @@ in
     # drop-in — a real but acceptable price for something that actually
     # works.
     systemd.services =
+    { nix-daemon.environment = lib.mapAttrs (_: lib.mkDefault) tlsEnvironment; } //
     (lib.mapAttrs' (name: u: lib.nameValuePair "agent-box@${name}" (
       { overrideStrategy = "asDropin";
         # NOTE: every optional env var below is merged INTO this one
