@@ -1,11 +1,9 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const vm = require('node:vm');
 
-const html = fs.readFileSync(process.argv[2] || path.join(__dirname, '../docs/index.html'), 'utf8');
-const script = html.match(/<script>\s*([\s\S]*?)<\/script>/)?.[1];
-assert.ok(script, 'landing page has an inline launch script');
+const html = fs.readFileSync(path.join(__dirname, '../docs/index.html'), 'utf8');
+assert.ok(html.includes('<script src="launch-passwords.js"></script>'));
 
 async function loadPage({ cryptoAvailable = true, hashAvailable = true, hashFails = false } = {}) {
   const elements = new Map();
@@ -24,35 +22,35 @@ async function loadPage({ cryptoAvailable = true, hashAvailable = true, hashFail
   const clipboard = [];
   const hashInputs = [];
   let nextByte = 0;
-  const context = {
-    document: {
+  const browserCrypto = cryptoAvailable ? {
+    getRandomValues(bytes) {
+      for (let i = 0; i < bytes.length; i++) bytes[i] = nextByte++ & 255;
+      return bytes;
+    },
+  } : undefined;
+  const hashwasm = hashAvailable ? {
+    argon2id(options) {
+      hashInputs.push(options);
+      return hashFails ? Promise.reject(new Error('hash failed')) : Promise.resolve('encoded-argon2id-hash');
+    },
+  } : undefined;
+  globalThis.document = {
       getElementById: id => elements.get(id),
       querySelectorAll: selector => {
         assert.equal(selector, '[data-region-launch]');
         return links;
       },
-    },
-    crypto: cryptoAvailable ? {
-      getRandomValues(bytes) {
-        for (let i = 0; i < bytes.length; i++) bytes[i] = nextByte++ & 255;
-        return bytes;
-      },
-    } : undefined,
-    hashwasm: hashAvailable ? {
-      argon2id(options) {
-        hashInputs.push(options);
-        return hashFails ? Promise.reject(new Error('hash failed')) : Promise.resolve('encoded-argon2id-hash');
-      },
-    } : undefined,
-    navigator: { clipboard: { writeText(value) { clipboard.push(value); return Promise.resolve(); } } },
-    btoa: binary => Buffer.from(binary, 'binary').toString('base64'),
-    Uint8Array,
-    encodeURIComponent,
-    setTimeout() {},
-    console: { error() {} },
   };
-  context.window = context;
-  vm.runInNewContext(script, context);
+  Object.defineProperty(globalThis, 'crypto', { value: browserCrypto, configurable: true });
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { clipboard: { writeText(value) { clipboard.push(value); return Promise.resolve(); } } },
+    configurable: true,
+  });
+  globalThis.hashwasm = hashwasm;
+  globalThis.window = { crypto: browserCrypto, hashwasm, console: { error() {} } };
+  globalThis.btoa = binary => Buffer.from(binary, 'binary').toString('base64');
+  delete require.cache[require.resolve('../docs/launch-passwords.js')];
+  require('../docs/launch-passwords.js');
   await new Promise(resolve => setImmediate(resolve));
   return { elements, links, clipboard, hashInputs };
 }
@@ -79,7 +77,7 @@ async function main() {
     assert.ok(!link.href.includes(awsPassword));
     assert.ok(!link.href.includes(azurePassword));
   }
-  const azureLink = html.match(/class="launch azure" href="([^"]+)"/)?.[1];
+  const azureLink = html.split('class="launch azure" href="')[1]?.split('"')[0];
   assert.ok(azureLink);
   assert.ok(!azureLink.includes('webPassword'));
 
@@ -88,7 +86,14 @@ async function main() {
   assert.equal(noHash.elements.get('aws-password-manual').hidden, false);
   assert.ok(noHash.links.every(link => !link.href.includes('param_WebPasswordHash')));
 
-  const failedHash = await loadPage({ hashFails: true });
+  const reportError = console.error;
+  let failedHash;
+  try {
+    console.error = () => {}; // The expected failure is handled by the page.
+    failedHash = await loadPage({ hashFails: true });
+  } finally {
+    console.error = reportError;
+  }
   assert.equal(failedHash.elements.get('azure-password-generated').hidden, false);
   assert.equal(failedHash.elements.get('aws-password-manual').hidden, false);
 
