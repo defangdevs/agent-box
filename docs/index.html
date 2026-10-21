@@ -8,13 +8,13 @@
      tag below isn't self-loathing; we just extend crawlers the courtesy of
      asking first. -->
 <meta name="robots" content="noai,noimageai">
-<title>agent-box &mdash; sandboxed coding agents, one click away</title>
+<title>agent-box &mdash; your coding agent in the browser</title>
 <!-- The mascot (issue #185). This file is the ONE source of the mark: the
      settings daemon embeds these same bytes as its favicon at assemble
      time (see modules/src/settings-daemon.py), so the tab icon on a live
      box and the logo here can never drift apart. -->
 <link rel="icon" href="potato.svg">
-<meta name="description" content="A private, sandboxed Claude Code or Codex agent for you and your team. Launch it in your own AWS or Azure account with one click.">
+<meta name="description" content="A private browser workspace for Claude Code or Codex that runs in your AWS or Azure account and stays ready when you step away.">
 <style>
   :root {
     --bg: #0d1117;
@@ -176,7 +176,7 @@
 <header class="hero">
   <div class="wrap">
     <div class="logo"><img class="spud" src="potato.svg" alt=""> agent-box</div>
-    <p class="tagline">A private, sandboxed Claude Code or Codex agent for you and your team &mdash; launch it in your own AWS or Azure account with one click.</p>
+    <p class="tagline">Your own always-on coding agent. Open Claude Code or Codex from any browser, keep work moving when you step away, and run it in your AWS or Azure account.</p>
     <div class="cta">
       <a class="btn aws" href="#launch"><svg class="mark aws-mark" aria-hidden="true"><use href="#mark-aws"/></svg> Launch on AWS</a>
       <a class="btn azure" href="#azure-launch"><svg class="mark azure-mark" aria-hidden="true"><use href="#mark-azure"/></svg> Launch on Azure</a>
@@ -197,7 +197,7 @@
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <path d="M1.75 2.5A1.75 1.75 0 0 1 3.5.75h3A1.75 1.75 0 0 1 8.25 2.5v2A1.75 1.75 0 0 1 6.5 6.25h-.75v1h4.5v-1H9.5A1.75 1.75 0 0 1 7.75 4.5v-2A1.75 1.75 0 0 1 9.5.75h3a1.75 1.75 0 0 1 1.75 1.75v2a1.75 1.75 0 0 1-1.75 1.75h-.75v1.5a.75.75 0 0 1-.75.75H8.75v1.25h.75a1.75 1.75 0 0 1 1.75 1.75v2A1.75 1.75 0 0 1 9.5 15.25h-3a1.75 1.75 0 0 1-1.75-1.75v-2A1.75 1.75 0 0 1 6.5 9.75h.75V8.5H5a.75.75 0 0 1-.75-.75v-1.5H3.5A1.75 1.75 0 0 1 1.75 4.5v-2Zm1.75-.25a.25.25 0 0 0-.25.25v2c0 .138.112.25.25.25h3a.25.25 0 0 0 .25-.25v-2a.25.25 0 0 0-.25-.25h-3Zm6 0a.25.25 0 0 0-.25.25v2c0 .138.112.25.25.25h3a.25.25 0 0 0 .25-.25v-2a.25.25 0 0 0-.25-.25h-3Zm-3 9a.25.25 0 0 0-.25.25v2c0 .138.112.25.25.25h3a.25.25 0 0 0 .25-.25v-2a.25.25 0 0 0-.25-.25h-3Z"/>
         </svg>
-        Explore architecture
+        See how it works
       </a>
     </div>
   </div>
@@ -205,32 +205,32 @@
 
 <section>
   <div class="wrap">
-    <h2>What it is</h2>
-    <p class="sub">A ready-to-use coding agent you open right in your browser. Set it up once with a single click; it keeps running on its own.</p>
+    <h2>Work with your agent from anywhere</h2>
+    <p class="sub">agent-box gives you a private browser workspace that stays available, even when your laptop is closed.</p>
     <div class="features">
       <div class="feature">
-        <h3>Locked down by default</h3>
-        <p>Each agent runs in its own restricted account and can't touch the rest of the machine &mdash; it only gets the specific extra powers you choose to grant. The agent's own approval prompts are <em>off</em> by default: the sandbox, not the agent, is the containment. <a href="https://github.com/defangdevs/agent-box#security-model">Read the security model &rarr;</a></p>
+        <h3>Open it in any browser</h3>
+        <p>Use a secure link to reach your full workspace from a computer, tablet, or phone. There is nothing to install on the device in front of you.</p>
       </div>
       <div class="feature">
-        <h3>Works in your browser</h3>
-        <p>A full terminal, right in your browser over a secure connection. Open your link and you're in &mdash; nothing to install.</p>
+        <h3>Pick up where you left off</h3>
+        <p>Keep separate jobs in named sessions and return to them later. Your sessions live on the box, so closing the browser does not close your work.</p>
       </div>
       <div class="feature">
-        <h3>Choose your agent</h3>
-        <p>Pick Claude Code or Codex when you launch. The same NixOS module, terminal, and sandboxing model support both.</p>
+        <h3>Choose the agent you prefer</h3>
+        <p>Start with Claude Code or Codex. Sign in once during setup, then use the same browser workspace for future sessions.</p>
       </div>
       <div class="feature">
-        <h3>Keeps your keys where you put them</h3>
-        <p>API keys and tokens live in a root-only file on your box &mdash; out of shared settings, never baked into saved images. The agent can use whatever you hand it, so grant tokens scoped to what it should do.</p>
+        <h3>Keep access in your hands</h3>
+        <p>The box runs in your cloud account, and saved API keys stay on that box. You decide which services and projects the agent can reach. <a href="https://github.com/defangdevs/agent-box#security-model">See how access is protected &rarr;</a></p>
       </div>
       <div class="feature">
-        <h3>Honest cost</h3>
-        <p>On AWS it's a single flat Lightsail bundle &mdash; $12/month for the default 2 GiB box, $24/month for 4 GiB, with the SSD, a stable IPv4 address and a multi-TB transfer allowance all included. On Azure a default 4 GiB box is ~$30/month. Either way the address is stable, so the box just works from any network and never gets reclaimed mid-session. Delete the stack or the resource group anytime to stop charges.</p>
+        <h3>Know the monthly cost</h3>
+        <p>The default AWS setup is $12/month, including storage and a fixed address. The default Azure setup is about $28/month, depending on region. Delete the deployment when you no longer need it to stop charges.</p>
       </div>
       <div class="feature">
-        <h3>Event-driven, not polling</h3>
-        <p>Optional local channels verify and route webhook events into the right live agent &mdash; or start a bounded fresh session for work nobody owns. <a href="architecture/">Explore the interactive architecture &rarr;</a></p>
+        <h3>Bring updates to the right session</h3>
+        <p>Connect supported services so reviews, failed builds, and messages can reach the session handling that work. You do not have to keep checking a dashboard. <a href="architecture/">See how it works &rarr;</a></p>
       </div>
     </div>
   </div>
@@ -238,8 +238,8 @@
 
 <section id="launch">
   <div class="wrap">
-    <h2>1-click AWS launch</h2>
-    <p class="sub">Sets up one ready-to-go box in your own AWS account &mdash; a flat-rate Lightsail instance with the browser terminal already running. It creates everything it needs, so there's nothing to configure beforehand &mdash; just pick a region and go.</p>
+    <h2>Launch agent-box on AWS</h2>
+    <p class="sub">Pick the AWS region closest to you. The button opens a setup form for a flat-rate Lightsail server with its storage and public address included.</p>
     <div class="regions">
       <div class="region">
         <div><div class="name">N. Virginia</div><div class="code">us-east-1</div></div>
@@ -268,26 +268,26 @@
          launching still works - it just asks you to compute the hash
          yourself, same as a CLI launch. -->
     <div class="note" id="password-manual">
-      <strong>Set a password you'll remember.</strong> On the AWS form, paste an Argon2id hash into <code>WebPasswordHash</code> &mdash; compute one from a password you pick with <code>caddy hash-password --algorithm argon2id --plaintext '&lt;your password&gt;'</code>, then use that same password (never the hash) to log into the browser terminal. Choose Claude Code or Codex, pick a bundle size, and launch. The box takes a few minutes to set itself up, and the stack turns green only after it reports a successful first boot &mdash; so a green stack always has a working URL. Your browser link appears under <strong>Outputs</strong> in the AWS console &mdash; open it, enter the password, finish the selected agent's one-time sign-in, and you're in. (Claude Code stacks can drive the box from the Claude desktop / mobile app via <strong>Remote Control</strong> after the first browser login &mdash; the session name is <code>&lt;UserName&gt;-main@&lt;host&gt;.sslip.io</code>, the box's own public address &mdash; so the entry in the Claude apps doubles as the address you reach it at.)
+      <strong>Create your agent-box password.</strong> This browser could not fill one in automatically. If possible, reload this page in a current browser and it will create one for you. To continue manually, choose a password, save it in your password manager, and run <code>caddy hash-password --algorithm argon2id --plaintext '&lt;your password&gt;'</code>. Paste the result into <code>WebPasswordHash</code> on the AWS form. Choose Claude Code or Codex, pick a size, and create the stack. When setup finishes, open <code>WebURL</code> under <strong>Outputs</strong> and sign in with <code>UserName</code> (default <code>workspace</code>) and the password you saved. Complete the agent's one-time sign-in. If you choose Claude Code, use <code>RemoteControlSession</code> to connect from the Claude desktop or mobile app.
     </div>
     <div class="note" id="password-generated" hidden>
-      <strong>Save this password &mdash; you won't see it again.</strong>
+      <strong>Save your agent-box password.</strong>
       <div class="pw-row">
         <code id="password-generated-value"></code>
         <button type="button" class="pw-copy" id="password-generated-copy">Copy</button>
       </div>
-      Generated in your browser just now; the launch buttons above are already filled in with its <em>hash</em> &mdash; AWS only ever receives that hash, never the password itself. This is what you'll use to log into the browser terminal, so save it before you launch: there is no way to recover it afterwards. Choose Claude Code or Codex, pick a bundle size, and launch. The box takes a few minutes to set itself up, and the stack turns green only after it reports a successful first boot &mdash; so a green stack always has a working URL. Your browser link appears under <strong>Outputs</strong> in the AWS console &mdash; open it, enter the password above, finish the selected agent's one-time sign-in, and you're in. (Claude Code stacks can drive the box from the Claude desktop / mobile app via <strong>Remote Control</strong> after the first browser login &mdash; the session name is <code>&lt;UserName&gt;-main@&lt;host&gt;.sslip.io</code>, the box's own public address &mdash; so the entry in the Claude apps doubles as the address you reach it at.)
+      This password was created in your browser. Save it in your password manager before you launch; it cannot be recovered later. The AWS form receives only a protected value that can check the password, not the password itself. Choose Claude Code or Codex, pick a size, and create the stack. When setup finishes, open <code>WebURL</code> under <strong>Outputs</strong> and sign in with <code>UserName</code> (default <code>workspace</code>) and the password above. Complete the agent's one-time sign-in. If you choose Claude Code, use <code>RemoteControlSession</code> to connect from the Claude desktop or mobile app.
     </div>
     <div class="note">
-      <strong>One flat monthly price.</strong> A Lightsail bundle packages compute, the SSD, the attached static IP and a multi-TB/month transfer allowance into a single line item &mdash; no separate disk or public-IPv4 charges. The default <code>small_3_0</code> (2 vCPU / 2 GiB / 60 GiB SSD) is <strong>$12/month</strong>; pick <code>medium_3_0</code> (4 GiB, $24/month) for parallel sessions or heavy builds. Every bundle is dual-stack, IPv4 and IPv6, so the box is reachable from any network. Delete the stack to stop billing. If you'd rather have EC2 &mdash; arbitrary instance types, Spot pricing, an IPv6-only box with no IPv4 charge, a root volume that grows in place &mdash; the <a href="https://github.com/defangdevs/agent-box#alternative-ec2-template-on-demand-ipv6-opt-in">EC2 template</a> is still published.
+      <strong>Choose a size for your work.</strong> The default 2 GiB setup is <strong>$12/month</strong> and suits one active agent session. Choose 4 GiB at $24/month for parallel sessions or larger builds. Both prices include the server, storage, a fixed public address, and a generous data allowance. Delete the stack to stop billing. If your IT team needs a custom server size, Spot pricing, or resizable storage, use the <a href="https://github.com/defangdevs/agent-box#alternative-ec2-template-on-demand-ipv6-opt-in">advanced EC2 setup</a>.
     </div>
   </div>
 </section>
 
 <section id="azure-launch">
   <div class="wrap">
-    <h2>1-click Azure launch</h2>
-    <p class="sub">The same box on a single Azure Linux VM, from a Bicep template. The deployment brings its own network and static address, so nothing on the subscription has to be set up beforehand &mdash; you pick the resource group and region on the form.</p>
+    <h2>Launch agent-box on Azure</h2>
+    <p class="sub">Choose your resource group and region on the Azure form. The deployment creates the server, network, and fixed browser address for you.</p>
     <div class="regions one">
       <div class="region">
         <div><div class="name">Any Azure region</div><div class="code">chosen on the deployment form</div></div>
@@ -298,16 +298,16 @@
       <strong>Set up your browser password and maintenance key.</strong> Create a 16&ndash;64 character password, save it in your password manager, and enter it as <code>webPassword</code>. You'll use it with the <code>userName</code> (default <code>workspace</code>) whenever you open agent-box in your browser. Azure also asks for <code>adminPasswordOrKey</code>; paste your SSH public key there. You won't use that key for everyday work. It is ready if you later turn on SSH for maintenance or recovery; SSH is off by default. Choose Claude Code or Codex, pick a size, and deploy. When the deployment finishes, open the <code>webUrl</code> output and complete the selected agent's one-time sign-in. If you choose Claude Code, use the <code>remoteControlSession</code> output to connect from the Claude desktop or mobile app.
     </div>
     <div class="note">
-      <strong>Cost, and one difference from the AWS buttons.</strong> Azure has no flat bundle, so the bill is three line items: the default <code>Standard_B2pls_v2</code> (2 vCPU / 4 GiB, ARM Ampere) plus a 32 GiB SSD plus the static IPv4 comes to <strong>~$28/month</strong> in <code>westus3</code>, the cheapest region for Ampere &mdash; against $24/month flat for the same shape on Lightsail. Unlike a bundle, the disk can be grown later. Delete the resource group to stop billing. The one difference in behavior: the AWS templates are republished on every commit with that commit baked in, so a 1-click AWS box is pinned, while this button serves the committed template straight from GitHub and tracks the latest commit on <code>master</code> &mdash; set <code>agentBoxFlakeRef</code> to <code>github:defangdevs/agent-box/&lt;sha&gt;</code> on the form to pin a box. Azure boxes are IPv4-only.
+      <strong>Choose a size and region for your budget.</strong> The default 4 GiB server, 32 GiB storage, and fixed public address cost about <strong>$28/month</strong> in <code>westus3</code>; prices vary by region. You can choose another size on the form and grow the storage later. Delete the resource group to stop billing.
     </div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>Other ways to run</h2>
-    <p class="sub">If your team already has its own server, or prefers a downloadable virtual-machine image, the same setup is available for your IT team to install.</p>
-    <p style="color: var(--muted); margin: 0;">Setup instructions live in the <a href="https://github.com/defangdevs/agent-box">project repository</a>.</p>
+    <h2>Use your existing infrastructure</h2>
+    <p class="sub">Your IT team can install agent-box on an existing Linux server or start from the downloadable virtual-machine image.</p>
+    <p style="color: var(--muted); margin: 0;">Share the <a href="https://github.com/defangdevs/agent-box">setup guide</a> with whoever manages your infrastructure.</p>
   </div>
 </section>
 
@@ -316,7 +316,6 @@
     <a href="https://github.com/defangdevs/agent-box">github.com/defangdevs/agent-box</a>
     &nbsp;&middot;&nbsp; <a href="https://github.com/defangdevs/agent-box/wiki">Wiki</a>
     &nbsp;&middot;&nbsp; MIT-licensed &nbsp;&middot;&nbsp; supports Claude Code and Codex
-    <br>Dogfood note: this page &mdash; and most of this project &mdash; was written, tested, and shipped by a coding agent running on agent-box.
   </div>
 </footer>
 
