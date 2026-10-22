@@ -2524,6 +2524,23 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The Codex remote-control wrapper ends an app-server that only an
+          # older CLI's legacy pid file records (issue #904).
+          codex-legacy-app-server =
+            pkgs.runCommand "agent-box-codex-legacy-app-server"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnused pkgs.procps ];
+                wrapper = ./modules/src/codex-remote-control.sh;
+                tests = ./tests/test-codex-legacy-app-server.sh;
+              } ''
+              bash "$tests" "$wrapper" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # The settings daemon's session API for portals (issue #787): the
           # JSON list, web stop, and the JSON answers of restart/delete.
           # Same subject (the GOLDEN PAYLOAD) as the pairing check above.
