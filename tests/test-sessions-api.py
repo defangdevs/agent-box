@@ -33,7 +33,8 @@ DAEMON = (REPO / "tests" / "golden" / "web" / "payloads"
           / "agent-box-settings" / "bin" / "agent-box-settings")
 
 ROW_KEYS = {"name", "agent", "profile", "state", "exit_status", "origin",
-            "remote_control", "remote_control_name", "working_directory",
+            "remote_control", "remote_control_server", "remote_control_name",
+            "working_directory",
             "ephemeral", "created_at", "hook"}
 SECRET = "TASK-TEXT-NEVER-EXPOSED"
 
@@ -58,6 +59,7 @@ def daemon_with(**env):
 
 def entry(**fields):
     base = {"agent": "claude", "skipPermissions": True, "remoteControl": True,
+            "remoteControlServer": False,
             "remoteControlName": None, "workingDirectory": None,
             "extraArgs": ["--model", SECRET], "profile": None,
             "initialPrompt": SECRET, "resumePrompt": SECRET,
@@ -186,6 +188,10 @@ class SessionsApi(unittest.TestCase):
         row = self.by_name()["old"]
         self.assertIsNone(row["origin"])
         self.assertIsNone(row["created_at"])
+
+    def test_claude_server_mode_is_explicit_metadata(self):
+        self.write({"remote": entry(remoteControlServer=True)})
+        self.assertTrue(self.by_name()["remote"]["remote_control_server"])
         self.write({"odd": entry(origin="somewhere-else")})
         self.assertIsNone(self.by_name()["odd"]["origin"])
 

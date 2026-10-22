@@ -2968,6 +2968,26 @@ class ConfigSchemaTest(unittest.TestCase):
                 self.refused(lambda c: c.update(
                     sessionHibernationGraceSeconds=value)))
 
+    def test_claude_remote_control_server_has_one_unambiguous_shape(self):
+        # The valid form is accepted and rendered by the golden fixture.
+        self.spec(lambda c: c["users"]["agent"]["sessions"]["main"].update(
+            remoteControlServer=True))
+        for message, mutate in [
+            ("only for a Claude session with remoteControl: true",
+             lambda c: c["users"]["agent"]["sessions"]["review"].update(
+                 remoteControlServer=True)),
+            ("only for a Claude session with remoteControl: true",
+             lambda c: c["users"]["agent"]["sessions"]["main"].update(
+                 remoteControl=False, remoteControlServer=True)),
+            ("only for a Claude session with remoteControl: true",
+             lambda c: c["users"]["agent"]["sessions"]["main"].update(
+                 remoteControl=None, remoteControlServer=True)),
+            ("cannot set a prompt in Claude Remote Control server mode",
+             lambda c: c["users"]["agent"]["sessions"]["main"].update(
+                 remoteControlServer=True, prompt="one task")),
+        ]:
+            self.assertIn(message, self.refused(mutate))
+
     def test_the_reported_coercions_are_refused_with_the_field_named(self):
         """Every example from issue #525, each with the path in the message.
 

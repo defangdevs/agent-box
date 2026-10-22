@@ -21,6 +21,8 @@ users:
     root: true
     sessions:
       main: {}
+      remote:
+        remoteControlServer: true
       review:
         agent: codex
         cwd: /home/agent/agent-box

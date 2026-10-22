@@ -8,6 +8,20 @@
       "initialPrompt": null,
       "remoteControl": true,
       "remoteControlName": null,
+      "remoteControlServer": false,
+      "resumePrompt": null,
+      "skipPermissions": true,
+      "workingDirectory": "/home/agent"
+    },
+    "remote": {
+      "agent": "claude",
+      "boxSessionId": null,
+      "extraArgs": [],
+      "hasRun": false,
+      "initialPrompt": null,
+      "remoteControl": true,
+      "remoteControlName": null,
+      "remoteControlServer": true,
       "resumePrompt": null,
       "skipPermissions": true,
       "workingDirectory": "/home/agent"
@@ -20,6 +34,7 @@
       "initialPrompt": null,
       "remoteControl": false,
       "remoteControlName": null,
+      "remoteControlServer": false,
       "resumePrompt": null,
       "skipPermissions": true,
       "workingDirectory": "/home/agent/agent-box"

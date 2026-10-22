@@ -169,10 +169,10 @@ plainly rather than handing it back.
   recorded, and a later routed message transparently resumes that exact
   conversation. It never hibernates merely because a session is idle. An open
   turn, unresolved assignment, webhook subscription, pending delivery,
-  unknown transcript state, shell, hook session, or Remote-Control Codex
-  remains resident. `sessionHibernationGraceSeconds` sets the minimum age of
-  the completed turn (30 seconds by default). This is overload control, not a
-  memory guarantee.
+  unknown transcript state, shell, hook session, or Claude/Codex Remote
+  Control server remains resident. `sessionHibernationGraceSeconds` sets the
+  minimum age of the completed turn (30 seconds by default). This is overload
+  control, not a memory guarantee.
 - Manage your own sessions without a rebuild:
   `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
   plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
@@ -183,6 +183,15 @@ plainly rather than handing it back.
   not respawned - until `restart NAME` revives it; `rm` delists it for
   good. `restart --all` bounces every session. Listed sessions start
   within ~2s.
+- Claude has two Remote Control shapes. The default `--remote-control true`
+  keeps one ordinary TUI and mirrors it to the Claude apps. Use
+  `agent-box-session add NAME --harness claude --remote-control server` for
+  the persistent `claude remote-control` host instead. That one agent-box row
+  consumes one slot and serves several app-created conversations, which do
+  not become separate rows or consume agent-box slots. It has no single
+  kickoff prompt, transcript download, webhook or WhatsApp target, or tmux
+  conversation pane. Limit those native child conversations with Claude's
+  own server flags after `--`, such as `-- --capacity 4`.
 - Harnesses are usually installed ON DEMAND, not shipped with the box: the
   first session that names a harness fetches it into your own profile, which
   takes as long as the download does and prints `session: fetching '<name>'`
@@ -313,7 +322,9 @@ Claude session after selecting it so it loads the WhatsApp channel.
 A normal Codex TUI is registered automatically after its rollout starts, so
 WhatsApp resolves the agent-box session name to the real Codex thread ID. A
 Codex Remote Control task has its own thread ID, which the box's session name
-alone cannot identify. A task with an active webhook subscription is also
+alone cannot identify. A Claude Remote Control server likewise owns several
+app-created conversations and cannot be selected as one WhatsApp target. A
+Codex task with an active webhook subscription is also
 registered automatically; otherwise, from inside the active Codex task run `node
 ~/.local/share/local-whatsapp/bridge.mjs register codex` once to bind it to
 that session name. Repeat after a different task takes over the same session.
@@ -346,12 +357,12 @@ it:
     tmux send-keys -t "$TMUX_PANE" C-m                    # run it
 
 This applies only when the interactive agent TUI is running in that pane. A
-conversation opened from a Codex desktop or mobile app through Remote Control
-runs inside `codex app-server`; its inherited `$TMUX_PANE` belongs to the
-pairing daemon, not to that conversation. Never send keys to that pane from a
-remote Codex conversation, including to rename yourself: there is no Codex
-prompt there, and Enter asks the wrapper for a fresh pairing code (issue #691).
-Rename that conversation through the Codex app instead: use its
+conversation opened from an app through a Claude or Codex Remote Control
+server inherits `$TMUX_PANE` from the shared server, not from a conversation
+pane. Never send keys there from a remote conversation, including to rename
+yourself: there is no agent prompt there, and server panes have controls of
+their own (issue #691). Rename a Codex conversation through the app instead:
+use its
 `set_thread_title` tool when available (with no thread id, it targets the
 calling thread). An app-server client can make the equivalent
 `thread/name/set` request with that conversation's `threadId` and the new
@@ -392,8 +403,8 @@ command; other CLIs name it differently, so type `/` in the TUI to list the
 commands, or read `--help` for a start-time flag (Claude Code: `-n, --name`).
 For a Codex Remote Control conversation, satisfy this step with the Codex
 app's `set_thread_title` tool instead. If it is unavailable, leave the title
-for the user to set in the app; never send `/rename` to the shared pairing
-daemon's tmux pane.
+for the user to set in the app. Do the same for an app-created Claude server
+conversation; never send `/rename` to either shared server's tmux pane.
 
 The name belongs to the harness, not to agent-box, so a respawn loses it:
 set it again, or make it permanent at creation with

@@ -297,6 +297,29 @@ class LoginProfile(ProfileFixture):
         self.assertEqual(
             module.default_profile(module.read_profiles()), "codex")
 
+    def test_remote_control_claude_server_keeps_the_worker_profile_as_default(self):
+        module = self.daemon()
+        module.ensure_harness_session(
+            "claude", True, remote_control_server=True)
+        session = self.read_sessions()["claude"]
+        self.assertIsNone(session["profile"])
+        self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlServer"])
+        self.assertEqual(module.profile_launch("claude")["harness"], "claude")
+        self.assertEqual(
+            module.default_profile(module.read_profiles()), "claude")
+
+    def test_claude_server_default_is_runtime_opt_in(self):
+        module = self.daemon()
+        self.assertEqual(module.claude_session_default(), "tui")
+        module.set_key("AGENT_BOX_CLAUDE_SESSION_DEFAULT", "remote-control")
+        self.assertEqual(module.claude_session_default(), "remote-control")
+        module.connect_signed_in({"id": "claude"})
+        session = self.read_sessions()["claude"]
+        self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlServer"])
+        self.assertIsNone(session["profile"])
+
     def test_later_harness_login_never_replaces_the_default(self):
         module = self.daemon()
         module.ensure_harness_session("claude", True)
@@ -478,11 +501,15 @@ class ProfilePanel(ProfileFixture):
         so a daemon that survived an update can still be running on the
         environment it started with. Offering a picker that cannot work
         sends the operator hunting for a profile that is sitting right
-        there in the list."""
+        there in the list. The standalone servers remain usable because
+        neither depends on profile resolution."""
         self.write_profile("triage", "HARNESS=claude\n")
         module = self.daemon(AGENT_BOX_PROFILE_BIN="")
         options = module.render_profile_options(module.read_profiles())
         self.assertNotIn("triage", options)
+        self.assertIn('value=":claude-remote-control"', options)
+        self.assertIn('value=":codex-remote-control"', options)
+        self.assertIn('value=":shell"', options)
 
     # --- reasoning-level picker (issue #493's layout checklist) -----
 
@@ -925,6 +952,47 @@ class ProfileRoutes(ProfileFixture):
             self.assertEqual(session["extraArgs"], [])
         module.ensure_harness_session("claude", True)
         self.assertEqual(self.read_sessions(), sessions)
+
+    def test_claude_remote_control_server_is_an_explicit_pseudo_profile(self):
+        module, base = self.serve()
+        options = module.render_profile_options(module.read_profiles())
+        self.assertIn('value=":claude-remote-control"', options)
+        status, _ = self.post(
+            base, "/sessions/add", back="settings",
+            profile=":claude-remote-control", cwd="~", prompt="")
+        self.assertEqual(status, 303)
+        session = self.read_sessions()["claude"]
+        self.assertEqual(session["agent"], "claude")
+        self.assertIsNone(session["profile"])
+        self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlServer"])
+
+    def test_claude_remote_control_server_rejects_one_conversation_inputs(self):
+        _, base = self.serve()
+        for fields, message in [
+                ({"prompt": "do one task"}, "cannot target one kickoff prompt"),
+                ({"prompt": "", "whatsapp": "on"}, "WhatsApp cannot target")]:
+            status, body = self.post(
+                base, "/sessions/add", back="settings",
+                profile=":claude-remote-control", cwd="~", **fields)
+            self.assertEqual(status, 400)
+            self.assertIn(message, body)
+        self.assertEqual(self.read_sessions(), {})
+
+    def test_existing_claude_remote_control_server_rejects_whatsapp(self):
+        self.write_sessions({
+            "claude": {
+                "agent": "claude",
+                "remoteControl": True,
+                "remoteControlServer": True,
+            },
+        })
+        _, base = self.serve()
+        status, body = self.post(
+            base, "/sessions/whatsapp", name="claude", state="on")
+        self.assertEqual(status, 400)
+        self.assertIn("WhatsApp cannot target", body)
+        self.assertFalse(self.read_sessions()["claude"].get("whatsapp", False))
 
     def test_adding_a_session_records_the_profile_name_not_just_its_args(self):
         """The load-bearing one. The spawn wrapper re-reads the NAME at

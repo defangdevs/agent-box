@@ -368,7 +368,8 @@ seed_json_settled() {
 # covers upstream's occasional failure to persist an interactive
 # acceptance (anthropics/claude-code issue 36403). Codex has its own
 # trust state and seeder below. $1 = working directory, $2 =
-# skipPermissions (true/false).
+# skipPermissions (true/false), $3 = WhatsApp enabled, $4 = Claude Remote
+# Control server mode.
 seed_claude_state() {
   mkdir -p "$HOME"/.claude
   claude_project_key="$1"
@@ -396,6 +397,15 @@ seed_claude_state() {
   if [ "$2" = true ]; then
     seed_json "$HOME"/.claude/settings.json \
       '.skipDangerousModePermissionPrompt = true'
+  fi
+  if [ "${4:-false}" = true ]; then
+    # `claude remote-control` has one more confirmation than the interactive
+    # TUI's --remote-control flag. Selecting server mode in agent-box is the
+    # user's explicit opt-in, so persist the same booleans Claude 2.1.303
+    # writes after "Enable Remote Control?" rather than parking a headless
+    # server before it can appear in the apps.
+    seed_json_settled "$HOME"/.claude.json \
+      '.hasUsedRemoteControl = true | .remoteDialogSeen = true'
   fi
   # Webhook channel (issue #101), only when the unit says the receiver
   # is live (AGENT_BOX_WEBHOOK_REPO doubles as the enable flag):
@@ -1074,6 +1084,8 @@ start_session() {
   [ -n "$wd" ] || wd="$HOME"
   skip="$($JQ -r 'if .skipPermissions == false then "false" else "true" end' <<<"$sjson")"
   rc="$($JQ -r 'if .remoteControl == false then "false" else "true" end' <<<"$sjson")"
+  rcserver="$($JQ -r 'if .remoteControlServer == true then "true" else "false" end' <<<"$sjson")"
+  [ "$rc" = true ] || rcserver=false
   rcname="$($JQ -r '.remoteControlName // empty' <<<"$sjson")"
   # The agent profile this session was created with (issue #321), or empty.
   # Its harness and arguments were already resolved into `agent`/`extraArgs`
@@ -1142,7 +1154,12 @@ start_session() {
   # so they keep answering from the launch record itself.
   if [ "$agent" = claude ]; then
     hasrun=false
-    claude_has_transcript "$bid" && hasrun=true
+    # One server may own several Claude-native conversations, none of which
+    # is the agent-box launch id. The server restores its own bridge pointer
+    # on restart; transcript-based resume belongs only to the interactive TUI.
+    if [ "$rcserver" != true ]; then
+      claude_has_transcript "$bid" && hasrun=true
+    fi
   else
     hasrun=$launched
   fi
@@ -1166,7 +1183,8 @@ start_session() {
   # transcript. EAFP on the record — read it and handle the miss; a
   # readability test first would only add a syscall and a race.
   rotated=false
-  if [ "$agent" = claude ] && [ "$launched" = true ] && [ -n "$bid" ]; then
+  if [ "$agent" = claude ] && [ "$rcserver" != true ] \
+       && [ "$launched" = true ] && [ -n "$bid" ]; then
     live=""
     read -r live < "$HOME/.local/state/agent-box/live-session-id/$bid" 2>/dev/null \
       || live=""
@@ -1272,6 +1290,20 @@ start_session() {
                         else .[1:] end)
          else $a end) | .[]' <<<"$sjson")
   }
+  # Both Claude Remote Control forms use the same human-facing name. Derive
+  # it once before the interactive/server split so the two surfaces cannot
+  # drift onto different host-label rules.
+  if [ "$agent" = claude ] && [ "$rc" = true ] && [ -z "$rcname" ]; then
+    # AGENT_BOX_HOST_LABEL comes from remoteControlHost, then web.domain.
+    # The kernel hostname is only the last fallback because a cloud kernel
+    # name is usually an internal address nobody recognises in the app.
+    host="${AGENT_BOX_HOST_LABEL:-}"
+    if [ -z "$host" ] && [ -r /proc/sys/kernel/hostname ]; then
+      read -r host < /proc/sys/kernel/hostname || host=
+    fi
+    rcname=$USER-$sname
+    [ -z "$host" ] || rcname="$rcname@$host"
+  fi
   # Autonomy for the codex TUI arms. skipPermissions = true takes the
   # documented flag. skipPermissions = false has to UNDO the box-wide default
   # when services.agent-box.codexFullAccess wrote /etc/codex/config.toml
@@ -1289,79 +1321,76 @@ start_session() {
   }
   case "$agent" in
     claude)
-      [ "$skip" = true ] && cmd="$cmd --dangerously-skip-permissions"
-      if [ "$rc" = true ]; then
-        if [ -z "$rcname" ]; then
-          # Host suffix for the derived "<user>-<session>@<host>" name.
-          # AGENT_BOX_HOST_LABEL comes from the unit: remoteControlHost
-          # if set (the CloudFormation stack name on the AWS image), else
-          # the public web.domain — the address the box is actually
-          # reachable at. Fall back to the live kernel hostname only if
-          # both are empty; that kernel name is the INTERNAL fqdn on a
-          # cloud box (ip-10-x-x-x.<region>.compute.internal), which is
-          # why the public web.domain is preferred above it. Drop
-          # "@<host>" entirely when even the kernel name is empty rather
-          # than emitting a dangling "@". read is a bash builtin, so this
-          # needs nothing on PATH.
-          host="${AGENT_BOX_HOST_LABEL:-}"
-          if [ -z "$host" ] && [ -r /proc/sys/kernel/hostname ]; then
-            read -r host < /proc/sys/kernel/hostname || host=
+      if [ "$rc" = true ] && [ "$rcserver" = true ]; then
+        # Claude's server is already a foreground process, unlike Codex's
+        # detached app-server daemon, so tmux can own it directly. The server
+        # creates and resumes its own conversations; do not append this
+        # agent-box entry's session id, prompt, channels or hook settings,
+        # which are flags for one interactive TUI and are rejected or
+        # meaningless here. Server flags supplied through extraArgs follow
+        # ours so an explicit --spawn/--capacity remains possible.
+        cmd="$cmd remote-control --name $(printf '%q' "$rcname")"
+        [ "$skip" = true ] \
+          && cmd="$cmd --permission-mode bypassPermissions"
+        append_extra
+      else
+        [ "$skip" = true ] && cmd="$cmd --dangerously-skip-permissions"
+        if [ "$rc" = true ]; then
+          cmd="$cmd --remote-control $(printf '%q' "$rcname")"
+        fi
+      fi
+      if [ "$rcserver" != true ]; then
+        # The SessionStart hook that records the live session id (see the
+        # segment-rotation block above). ADDITIONAL settings only: claude
+        # merges the file on top of the user/project settings.json, which
+        # stay untouched, so only supervisor-spawned sessions carry the hook.
+        [ -n "${AGENT_BOX_CLAUDE_SETTINGS:-}" ] \
+          && cmd="$cmd --settings $(printf '%q' "$AGENT_BOX_CLAUDE_SETTINGS")"
+        # Turn the webhook channel ON for this session (issue #257). Seeding
+        # enabledPlugins (above) and allowedChannelPlugins (remote-settings.json)
+        # only makes the plugin loadable and NAMABLE; --channels is what makes
+        # claude accept its notifications/claude/channel messages. Without it a
+        # session connects the MCP server, answers webhook_subscribe happily, and
+        # then DROPS every event the receiver forwards to it - logging "Channel
+        # notifications skipped: server plugin:local-webhook:local-webhook not in
+        # --channels list for this session" and nothing else. That looked exactly
+        # like a quiet repo, so it went unnoticed for weeks: no delivery ever
+        # reached a live session, and only the dispatch path (--deliver-to
+        # subagent, which hands the event to a NEW session as its prompt) worked.
+        # The value is a TAGGED ref, plugin:<plugin>@<marketplace> - not the
+        # plugin:<plugin>:<server> id the skip message prints. Placed before
+        # append_extra so a session that names its own channels appends to (or
+        # overrides) ours rather than the other way round.
+        channels=""
+        [ -z "${AGENT_BOX_WEBHOOK_REPO:-}" ] \
+          || channels="plugin:$WEBHOOK_PLUGIN_REF"
+        if "$JQ" -e '.whatsapp == true' <<<"$sjson" >/dev/null; then
+          channels="$channels plugin:$WHATSAPP_PLUGIN_REF"
+        fi
+        [ -z "$channels" ] || cmd="$cmd --channels $channels"
+        # Our own id: --resume it on respawn (exact, so concurrent sessions
+        # never cross), but only when a transcript actually exists - else
+        # reuse it as a fresh --session-id rather than erroring on resume.
+        if [ -n "$bid" ]; then
+          if [ "$resuming" = true ] && claude_has_transcript "$bid"; then
+            cmd="$cmd --resume $(printf '%q' "$bid")"
+          else
+            cmd="$cmd --session-id $(printf '%q' "$bid")"
           fi
-          rcname=$USER-$sname
-          [ -z "$host" ] || rcname="$rcname@$host"
         fi
-        cmd="$cmd --remote-control $(printf '%q' "$rcname")"
+        append_extra
+        # End-of-options guard before the positional prompt. Several claude
+        # flags are VARIADIC (--channels, --add-dir, --allowedTools,
+        # --betas, ...), so a session whose extraArgs end in one swallow the
+        # prompt as one more value of that flag. The launch then dies in
+        # argument parsing before the TUI ever starts, and the error quotes
+        # our own prompt back as the offending value:
+        #   --channels entries must be tagged: You were interrupted and
+        #   automatically restarted (agent-box session <uuid>) ...
+        # "--" ends option parsing, so the prompt stays positional whatever
+        # extraArgs contain. Harmless when extraArgs are empty.
+        [ -n "$prompt" ] && cmd="$cmd -- $(printf '%q' "$prompt")"
       fi
-      # The SessionStart hook that records the live session id (see the
-      # segment-rotation block above). ADDITIONAL settings only: claude
-      # merges the file on top of the user/project settings.json, which
-      # stay untouched, so only supervisor-spawned sessions carry the hook.
-      [ -n "${AGENT_BOX_CLAUDE_SETTINGS:-}" ] \
-        && cmd="$cmd --settings $(printf '%q' "$AGENT_BOX_CLAUDE_SETTINGS")"
-      # Turn the webhook channel ON for this session (issue #257). Seeding
-      # enabledPlugins (above) and allowedChannelPlugins (remote-settings.json)
-      # only makes the plugin loadable and NAMABLE; --channels is what makes
-      # claude accept its notifications/claude/channel messages. Without it a
-      # session connects the MCP server, answers webhook_subscribe happily, and
-      # then DROPS every event the receiver forwards to it — logging "Channel
-      # notifications skipped: server plugin:local-webhook:local-webhook not in
-      # --channels list for this session" and nothing else. That looked exactly
-      # like a quiet repo, so it went unnoticed for weeks: no delivery ever
-      # reached a live session, and only the dispatch path (--deliver-to
-      # subagent, which hands the event to a NEW session as its prompt) worked.
-      # The value is a TAGGED ref, plugin:<plugin>@<marketplace> — not the
-      # plugin:<plugin>:<server> id the skip message prints. Placed before
-      # append_extra so a session that names its own channels appends to (or
-      # overrides) ours rather than the other way round.
-      channels=""
-      [ -z "${AGENT_BOX_WEBHOOK_REPO:-}" ] \
-        || channels="plugin:$WEBHOOK_PLUGIN_REF"
-      if "$JQ" -e '.whatsapp == true' <<<"$sjson" >/dev/null; then
-        channels="$channels plugin:$WHATSAPP_PLUGIN_REF"
-      fi
-      [ -z "$channels" ] || cmd="$cmd --channels $channels"
-      # Our own id: --resume it on respawn (exact, so concurrent sessions
-      # never cross), but only when a transcript actually exists — else
-      # reuse it as a fresh --session-id rather than erroring on resume.
-      if [ -n "$bid" ]; then
-        if [ "$resuming" = true ] && claude_has_transcript "$bid"; then
-          cmd="$cmd --resume $(printf '%q' "$bid")"
-        else
-          cmd="$cmd --session-id $(printf '%q' "$bid")"
-        fi
-      fi
-      append_extra
-      # End-of-options guard before the positional prompt. Several claude
-      # flags are VARIADIC (--channels, --add-dir, --allowedTools,
-      # --betas, ...), so a session whose extraArgs end in one swallow the
-      # prompt as one more value of that flag. The launch then dies in
-      # argument parsing before the TUI ever starts, and the error quotes
-      # our own prompt back as the offending value:
-      #   --channels entries must be tagged: You were interrupted and
-      #   automatically restarted (agent-box session <uuid>) ...
-      # "--" ends option parsing, so the prompt stays positional whatever
-      # extraArgs contain. Harmless when extraArgs are empty.
-      [ -n "$prompt" ] && cmd="$cmd -- $(printf '%q' "$prompt")"
       ;;
     codex)
       # `codex app-server daemon` refuses to start unless the standalone
@@ -1470,7 +1499,7 @@ start_session() {
     # the cache before each claude launch forces a full policy fetch.
     rm -f "$HOME"/.claude/remote-settings.json
     whatsapp_enabled="$($JQ -r '.whatsapp == true' <<<"$sjson")"
-    seed_claude_state "$wd" "$skip" "$whatsapp_enabled"
+    seed_claude_state "$wd" "$skip" "$whatsapp_enabled" "$rcserver"
   elif [ "$agent" = codex ]; then
     seed_codex_state "$wd" "$sprofile" "$bin"
   fi
@@ -1537,12 +1566,13 @@ start_session() {
   #     attachable for inspection and is NOT respawned over.
   #   killed (restart, reboot, Spot stop) — the pane ends without
   #     reaching either branch, so the reconcile loop respawns it.
-  # One session kind opts out of the parking branch:
-  #   codex + remoteControl — the pane runs the RC daemon wrapper,
-  #     whose health loop falls off its end with status 0 when the
-  #     daemon dies. That is a crash to respawn over (self-heal, as
-  #     before #167), not a quit somebody asked for; nothing
-  #     interactive in that pane can even ask to quit.
+  # Remote Control servers opt out of the parking branch. A zero exit is a
+  # server ending, not one app-created conversation asking to be parked, so
+  # let reconciliation bring the server back. `agent-box-session stop` kills
+  # the pane outside this epilogue and remains the deliberate way to park it.
+  # Codex needs this because its wrapper's health loop returns 0 when the
+  # detached daemon dies; Claude needs the same ownership rule because one
+  # foreground server owns several conversations.
   # Both branches call the epilogue, and the crash branch hands it the
   # agent's own exit status: `$?` inside the group is the status of whichever
   # command in the && list failed, which is the agent (the epilogue itself
@@ -1553,8 +1583,10 @@ start_session() {
   _mark="${AGENT_BOX_MARK_STOPPED:?}"
   _qname="$(printf '%q' "$sname")"
   epilogue=" && $_mark $_qname 0 || { $_mark $_qname \$?; exec bash; }"
-  [ "$agent" = codex ] && [ "$rc" = true ] \
-    && epilogue=" || { $_mark $_qname \$?; exec bash; }"
+  if { [ "$agent" = codex ] && [ "$rc" = true ]; } \
+       || { [ "$agent" = claude ] && [ "$rcserver" = true ]; }; then
+    epilogue=" || { $_mark $_qname \$?; exec bash; }"
+  fi
   # shell — the pane IS a login shell, so there is no separate agent whose
   # crash would be worth a nested post-mortem bash; whatever code it exits
   # with, typing `exit` (or Ctrl-D) is always the user asking to be done, not
@@ -1660,7 +1692,7 @@ start_session() {
     if [ "$bid" != "$recorded" ] || [ "$rotated" = true ]; then
       record_launch "$sname" "$bid"
     fi
-    if [ "$agent" = claude ]; then
+    if [ "$agent" = claude ] && [ "$rcserver" != true ]; then
       record_native_session "$sname" "$bid"
     elif [ "$agent" = codex ] && [ "$rc" = false ] && [ -n "$codex_target" ]; then
       record_native_session "$sname" "$codex_target"
