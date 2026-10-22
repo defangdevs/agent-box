@@ -8082,14 +8082,20 @@ def render_profile_options(profiles):
     socket activated with stopIfChanged = false, so a daemon that survived
     an update can still be running on the environment it started with - and
     on one that predates AGENT_BOX_PROFILE_BIN every pick would fail. Such a
-    daemon can still start a shell, which is the one entry needing no
-    resolver, and says why the rest are missing.
+    daemon can still start the standalone Remote Control servers or a shell,
+    none of which needs a resolver, and says why the profiles are missing.
     """
     shell_opt = ('<option value="%s">shell (no assistant)</option>'
                  % SHELL_PSEUDO_PROFILE)
+    standalone = []
+    if "codex" in AGENTS:
+        standalone.append('<option value="%s">codex remote control (pairing daemon, no profile)</option>' % CODEX_RC_PSEUDO_PROFILE)
+    if "claude" in AGENTS:
+        standalone.append('<option value="%s">claude remote control (multi-session server, no profile)</option>' % CLAUDE_RC_PSEUDO_PROFILE)
+    standalone.append(shell_opt)
     if not PROFILE_BIN:
         return ('<option value="" disabled selected>Restart the settings '
-                'service to list profiles</option>' + shell_opt)
+                'service to list profiles</option>' + "".join(standalone))
     default = default_profile(profiles)
     items = ['<option value="" disabled%s>Choose a profile</option>'
              % ("" if default else " selected")]
@@ -8101,13 +8107,9 @@ def render_profile_options(profiles):
             label += ", default"
         sel = " selected" if name == default else ""
         items.append(f'<option value="{safe}"{sel}>{label}</option>')
-    if "codex" in AGENTS:
-        # A real codex profile always opens the interactive TUI now (issue
-        # #623); the daemon is offered here instead, as its own entry.
-        items.append('<option value="%s">codex remote control (pairing daemon, no profile)</option>' % CODEX_RC_PSEUDO_PROFILE)
-    if "claude" in AGENTS:
-        items.append('<option value="%s">claude remote control (multi-session server, no profile)</option>' % CLAUDE_RC_PSEUDO_PROFILE)
-    items.append(shell_opt)
+    # Real profiles open interactive workers; the standalone servers and
+    # shell are their own entries, independent of the profile resolver.
+    items.extend(standalone)
     return "".join(items)
 
 

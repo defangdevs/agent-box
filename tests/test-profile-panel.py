@@ -501,11 +501,15 @@ class ProfilePanel(ProfileFixture):
         so a daemon that survived an update can still be running on the
         environment it started with. Offering a picker that cannot work
         sends the operator hunting for a profile that is sitting right
-        there in the list."""
+        there in the list. The standalone servers remain usable because
+        neither depends on profile resolution."""
         self.write_profile("triage", "HARNESS=claude\n")
         module = self.daemon(AGENT_BOX_PROFILE_BIN="")
         options = module.render_profile_options(module.read_profiles())
         self.assertNotIn("triage", options)
+        self.assertIn('value=":claude-remote-control"', options)
+        self.assertIn('value=":codex-remote-control"', options)
+        self.assertIn('value=":shell"', options)
 
     # --- reasoning-level picker (issue #493's layout checklist) -----
 
