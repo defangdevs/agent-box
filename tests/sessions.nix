@@ -337,6 +337,47 @@ in
         )
         machine.succeed(as_agent("agent-box-session rm themed"))
 
+    with subtest("claude remote control server is explicit and foreground"):
+        # The existing remoteControl=true record remains the interactive TUI.
+        # Server mode is a separate spelling so an update cannot replace old
+        # panes with a different program (issue #383).
+        machine.fail(as_agent(
+            "agent-box-session add bad-server --harness claude "
+            "--remote-control server --prompt 'no single target'"
+        ))
+        machine.succeed(as_agent(
+            "agent-box-session add claude-server --harness claude "
+            "--remote-control server -- --spawn same-dir --capacity 1"
+        ))
+        machine.wait_until_succeeds(
+            tmux("has-session -t =claude-server"), timeout=60
+        )
+        machine.succeed(
+            "jq -e '.sessions[\"claude-server\"]"
+            " | .remoteControl == true and .remoteControlServer == true' "
+            + sfile
+        )
+        server_cmd = machine.succeed(
+            tmux('list-panes -t "=claude-server" -F "#{pane_start_command}"')
+        ).replace("\\", "")
+        assert "claude remote-control" in server_cmd, server_cmd
+        assert "--name agent-claude-server@box.test" in server_cmd, server_cmd
+        assert "--permission-mode bypassPermissions" in server_cmd, server_cmd
+        assert "--spawn same-dir --capacity 1" in server_cmd, server_cmd
+        for tui_only in ("--dangerously-skip-permissions", "--session-id",
+                         "--resume", "--settings", "--channels"):
+            assert tui_only not in server_cmd, server_cmd
+        # Selecting this mode is the explicit consent that answers Claude's
+        # one-time server confirmation. Project trust remains scoped to cwd.
+        machine.succeed(
+            "jq -e '.hasUsedRemoteControl == true"
+            " and .remoteDialogSeen == true' /home/agent/.claude.json"
+        )
+        machine.fail(
+            "jq -e '.nativeSessionId' " + state_file("claude-server")
+        )
+        machine.succeed(as_agent("agent-box-session rm claude-server"))
+
     # --- --cwd is canonicalized before it becomes a trust key (issue #597) -
     with subtest("agent-box-session add --cwd is resolved to an absolute path"):
         # A relative or "~"-prefixed --cwd used to land in sessions.json —

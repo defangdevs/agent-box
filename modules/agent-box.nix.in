@@ -489,8 +489,9 @@ let
     @@include:src/mark-stopped.sh@@
   '');
 
-  # Codex Remote Control supervisor (issue 103). Unlike claude's
-  # `--remote-control` TUI flag, codex uses a dedicated app-server daemon.
+  # Codex Remote Control supervisor (issue 103). Codex uses a detached
+  # app-server daemon; Claude's newer foreground server is launched directly
+  # by supervisor.sh and does not need a wrapper.
   # `remote-control start` eagerly connects to the backend and fails before
   # creating the local control socket when the user is logged out or the
   # network is unavailable. Start the offline-safe local daemon first, then
@@ -814,7 +815,8 @@ let
     else if !(seedMain u) then { }
     else {
       main = {
-        inherit (u) agent skipPermissions remoteControl remoteControlName extraArgs;
+        inherit (u) agent skipPermissions remoteControl remoteControlServer
+          remoteControlName extraArgs;
         inherit (u) workingDirectory;
         # No legacy top-level equivalents — the single "main" session just
         # starts interactively and resumes on respawn like any other.
@@ -827,7 +829,7 @@ let
       version = 1;
       sessions = lib.mapAttrs (sname: s: {
         agent = if s.agent != null then s.agent else cfg.agent;
-        inherit (s) skipPermissions remoteControl extraArgs;
+        inherit (s) skipPermissions remoteControl remoteControlServer extraArgs;
         # null → the supervisor derives "<user>-<session>@<host>" at
         # start time (see remoteControlHost).
         remoteControlName = s.remoteControlName;
@@ -1258,6 +1260,21 @@ let
         default = (if config.agent != null then config.agent else cfg.agent) != "codex";
         description = "Make the session drivable from the agent's apps (see users.<name>.remoteControl).";
       };
+      remoteControlServer = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Run Claude's persistent `remote-control` server instead of its
+          interactive TUI. This is the Claude counterpart of a Codex Remote
+          Control daemon: the agent-box session owns the server process, while
+          Claude's web and mobile apps create and manage the conversations it
+          serves. Requires agent = "claude" and remoteControl = true.
+
+          False preserves the original Claude behavior: remoteControl = true
+          adds `--remote-control` to the ordinary interactive TUI. Other
+          harnesses are rejected.
+        '';
+      };
       remoteControlName = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
@@ -1418,6 +1435,17 @@ let
             browser terminal. The codex daemon is a per-user singleton (one
             control socket per user), so enable it on at most ONE codex session
             per user; two would fight over the same daemon.
+        '';
+      };
+      remoteControlServer = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Run `claude remote-control` server mode for the seeded "main"
+          session instead of Claude's interactive TUI. This is explicit and
+          off by default so an agent-box update cannot turn an existing
+          interactive Claude session into a server. Requires the effective
+          harness to be Claude and remoteControl = true.
         '';
       };
       remoteControlName = lib.mkOption {
@@ -3009,6 +3037,19 @@ in
             && !(lib.hasInfix "\r" s.remoteControlName)
           );
           message = "services.agent-box.users.${name}: session \"${sname}\"'s remoteControlName must be non-empty and free of newlines.";
+        }
+        {
+          assertion = !s.remoteControlServer || (
+            (if s.agent != null then s.agent else cfg.agent) == "claude"
+            && s.remoteControl
+          );
+          message = "services.agent-box.users.${name}: session \"${sname}\" may enable remoteControlServer only for a Claude session with remoteControl = true.";
+        }
+        {
+          assertion = !s.remoteControlServer || (
+            s.initialPrompt == null && s.resumePrompt == null
+          );
+          message = "services.agent-box.users.${name}: session \"${sname}\" cannot set initialPrompt or resumePrompt in Claude Remote Control server mode because the server owns multiple app-created conversations and has no single prompt target.";
         }
       ]) (seedSessions name u))) cfg.users);
 

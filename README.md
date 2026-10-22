@@ -14,7 +14,7 @@ Supported agents:
 
 | Agent | Package | Autonomy flag used by `skipPermissions = true` | Notes |
 | --- | --- | --- | --- |
-| Claude Code | `pkgs.claude-code` | `--dangerously-skip-permissions` | Supports Claude Remote Control. |
+| Claude Code | `pkgs.claude-code` | `--dangerously-skip-permissions` | Per session, either the normal TUI (optionally mirrored with `--remote-control`) or the persistent multi-session `claude remote-control` server (`remoteControlServer = true`). |
 | Codex | `pkgs.codex` | `--dangerously-bypass-approvals-and-sandbox` | Per session, *either* the TUI in the browser terminal *or* Remote Control via the `codex remote-control` daemon (`remoteControl = true`) - not both. |
 
 ## 1-click AWS launch
@@ -346,6 +346,31 @@ The auth code input is hidden like a password, so pasting gives no visible
 feedback. Paste the code, press Enter, and Claude Code should print
 `Login successful.`.
 
+**Claude persistent Remote Control server:** Claude's newer server mode is an
+explicit alternative to the ordinary TUI. Add it from the settings page as
+`claude remote control (multi-session server, no profile)`, or from the CLI:
+
+```bash
+agent-box-session add claude-remote --harness claude --remote-control server
+```
+
+That pane runs `claude remote-control` in the foreground and stays available
+while the Claude web and mobile apps create multiple conversations behind it.
+Those app-created conversations are native Claude sessions, not separate
+agent-box rows: they do not consume additional agent-box session slots and do
+not have agent-box transcript downloads, kickoff/resume prompts, webhook or
+WhatsApp routing, or individual tmux panes. The server row itself does consume
+one slot and is never hibernated. Its `--name` uses the same
+`<user>-<session>@<host>` derivation as the older mirrored TUI. Append server
+flags after `--`, for example `-- --spawn same-dir --capacity 8`.
+
+Existing `remoteControl = true` Claude sessions deliberately remain normal
+TUIs with the additive `--remote-control` flag. Set
+`remoteControlServer = true` in a seeded session to select the persistent
+server. To make a successful settings-page Claude sign-in create that server
+instead of a TUI, set `AGENT_BOX_CLAUDE_SESSION_DEFAULT=remote-control` in the
+agent-box environment before signing in.
+
 **Codex first login and pairing the Codex apps:** a Codex session with
 `remoteControl = true` runs the app-server daemon, *not* a TUI - but its tab
 drives the whole onboarding, so there is nothing to run by hand and no second
@@ -430,6 +455,7 @@ agent-box-session peers                     # the OTHER live sessions: where eac
 agent-box-session add --harness codex       # auto-named "codex" (or "codex-XXXX")
 agent-box-session add review --harness codex  # or name it yourself; starts in ~2s
 agent-box-session add scratch --cwd ~/proj -- --model opus
+agent-box-session add phone --harness claude --remote-control server
 agent-box-session add tidy --harness shell  # plain login shell, the pseudo-harness
 agent-box-session restart review
 agent-box-session rm review                 # delist + kill
@@ -472,8 +498,9 @@ harness keeps under `$HOME` — for archiving a run, attaching it to a bug
 report, or reading it outside the box. It hands over the transcript the
 session is writing *now*: after `/clear`, that is the conversation on screen,
 not the one that was cleared away. A session with no transcript to point at
-has no button — a `shell` session, or a Codex session started with no prompt
-for the box to stamp its id into.
+has no button, including a `shell` session, a Claude Remote Control server
+(which owns several app-created conversations), or a Codex session started
+with no prompt for the box to stamp its id into.
 
 ![Tabbed terminal workspace: one tab per session](docs/workspace-tabs.png)
 
@@ -790,10 +817,11 @@ All under `services.agent-box`:
 | `codexFullAccess` | `true` | Run codex with no approval prompts and no sandbox, box-wide, via `/etc/codex/config.toml`. The box is the sandbox. That file is codex's *system* config layer, so a user's own `~/.codex/config.toml` still overrides it — and it is the only path that reaches the app-server daemon behind a remote-controlled codex session. Opting a TUI session out (`skipPermissions = false`) switches it to codex's own bubblewrap sandbox, where setuid tools such as `sudo` are unavailable. The built-in Caddy reload uses polkit instead (issue #726). |
 | `restartNotice` | `"auto"` | Whether a resumed Claude or Codex session gets the built-in "you were interrupted and automatically restarted" prompt. `"auto"` sends it for an unresolved hook lease, a webhook subscription filter, or a Claude turn cut mid-turn; `"always"` sends it whenever there is a concrete resume target; `"never"` never does. A Codex TUI uses its exact rollout target. Remote-controlled Codex can be targeted only after an app task creates a session subscription; the restarted daemon wakes that task with `codex queue`. A per-session `resumePrompt` overrides the built-in text. |
 | `remoteControlHost` | `fqdnOrHostName` | Host label for the `@<host>` suffix of auto-derived Remote Control names. Empty -> falls back to the public `web.domain`, then the live kernel hostname. The AWS image sets it to the box's public sslip.io host. |
-| `users.<name>.sessions.<s>.*` | `{}` | Seed sessions (first boot only): per session `agent`, `skipPermissions`, `remoteControl`, `remoteControlName`, `workingDirectory`, `extraArgs`. Empty = the legacy per-user options below seed a session named `main`. |
+| `users.<name>.sessions.<s>.*` | `{}` | Seed sessions (first boot only): per session `agent`, `skipPermissions`, `remoteControl`, `remoteControlServer`, `remoteControlName`, `workingDirectory`, `extraArgs`. Empty = the legacy per-user options below seed a session named `main`. |
 | `users.<name>.agent` | `null` | Harness for the default `main` session; null uses `services.agent-box.agent`. |
 | `users.<name>.skipPermissions` | `true` | Pass the selected harness's autonomy flag. |
 | `users.<name>.remoteControl` | `true` | Make the session drivable from the agent's apps: claude gets `--remote-control`; codex runs the `codex remote-control` daemon instead of its TUI. |
+| `users.<name>.remoteControlServer` | `false` | For Claude only, run the persistent multi-session `claude remote-control` server instead of the interactive TUI. Requires `remoteControl = true`; app-created conversations are not separate agent-box sessions. |
 | `users.<name>.remoteControlName` | `<name>-main@<host>` | Claude Remote Control session name (null -> `<user>-<session>@<host>`, where `<host>` is `remoteControlHost`). Ignored for Codex (its daemon names itself from the hostname). |
 | `users.<name>.workingDirectory` | `/home/<name>` | Session startup directory. |
 | `users.<name>.extraGroups` | `[]` | Extra groups for the user. |
@@ -910,6 +938,12 @@ disks. Run `nix build .#checks.x86_64-linux.tls-trust` for the offline regressio
   the Codex first-login section). Flip to `false` per-user if
   you don't want the session reachable from the agent's apps — then Codex runs
   its normal TUI, reachable via the browser terminal.
+- `remoteControlServer = false` - preserves Claude's existing interactive TUI.
+  Opting it into `true` replaces that one TUI with a persistent server for
+  multiple app-created Claude conversations. Those conversations share the
+  Linux user's trust boundary and bypass the agent-box session count; set
+  Claude's own `--capacity` in `extraArgs` when the upstream default is too
+  large for the host.
 
 **Tradeoffs the module can't fully paper over:**
 

@@ -290,6 +290,11 @@ class Hibernation(unittest.TestCase):
         sessions["codex-idle"]["remoteControl"] = True
         self.assertIsNone(capacity.hibernation_candidate(sessions))
 
+    def test_claude_remote_control_server_is_not_a_hibernation_candidate(self):
+        sessions, _ = self.claude()
+        sessions["idle"]["remoteControlServer"] = True
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+
     def test_newer_codex_marker_beats_stale_completed_native_pointer(self):
         launch = "55555555-5555-4555-8555-555555555555"
         stale = "66666666-6666-4666-8666-666666666666"

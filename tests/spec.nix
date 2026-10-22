@@ -41,6 +41,7 @@ let
     }
     // lib.optionalAttrs (!s.skipPermissions) { skipPermissions = false; }
     // lib.optionalAttrs (!s.remoteControl) { remoteControl = false; }
+    // lib.optionalAttrs s.remoteControlServer { remoteControlServer = true; }
     // lib.optionalAttrs (s.extraArgs != [ ]) { inherit (s) extraArgs; };
 
   user = name: u:

@@ -617,6 +617,7 @@ SESSION_SCHEMA = _Obj({
     "agent": STR,
     "skipPermissions": BOOL,
     "remoteControl": BOOL,
+    "remoteControlServer": BOOL,
     "remoteControlName": STR,
     "extraArgs": STR_LIST,
     "cwd": STR,
@@ -1047,6 +1048,20 @@ class User:
                     f"user {name}: session {sname!r} uses agent {agent!r}, "
                     f"which is not in agents {spec.agents!r}"
                 )
+            if (s or {}).get("remoteControlServer"):
+                if agent != "claude" or (s or {}).get("remoteControl") is False:
+                    raise ConfigError(
+                        f"user {name}: session {sname!r} may enable "
+                        "remoteControlServer only for a Claude session with "
+                        "remoteControl: true"
+                    )
+                if ((s or {}).get("prompt") is not None
+                        or (s or {}).get("initialPrompt") is not None
+                        or (s or {}).get("resumePrompt") is not None):
+                    raise ConfigError(
+                        f"user {name}: session {sname!r} cannot set a prompt "
+                        "in Claude Remote Control server mode"
+                    )
 
     @property
     def url(self):
@@ -3286,6 +3301,10 @@ class Renderer:
                 # sessionOpts.remoteControl's default in agent-box.nix.in.
                 # Every other harness keeps the old default.
                 "remoteControl": bool(s.get("remoteControl", agent != "codex")),
+                # Explicit because existing Claude remoteControl=true records
+                # are ordinary TUIs mirrored to the apps. An update must not
+                # reinterpret them as the newer multi-session server mode.
+                "remoteControlServer": bool(s.get("remoteControlServer", False)),
                 "extraArgs": list(s.get("extraArgs") or []),
                 # null → the supervisor derives "<user>-<session>@<host>"
                 # at start time.
