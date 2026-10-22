@@ -975,6 +975,21 @@ class ProfileRoutes(ProfileFixture):
             self.assertIn(message, body)
         self.assertEqual(self.read_sessions(), {})
 
+    def test_existing_claude_remote_control_server_rejects_whatsapp(self):
+        self.write_sessions({
+            "claude": {
+                "agent": "claude",
+                "remoteControl": True,
+                "remoteControlServer": True,
+            },
+        })
+        _, base = self.serve()
+        status, body = self.post(
+            base, "/sessions/whatsapp", name="claude", state="on")
+        self.assertEqual(status, 400)
+        self.assertIn("WhatsApp cannot target", body)
+        self.assertFalse(self.read_sessions()["claude"].get("whatsapp", False))
+
     def test_adding_a_session_records_the_profile_name_not_just_its_args(self):
         """The load-bearing one. The spawn wrapper re-reads the NAME at
         every start to apply the profile's environment (#337), so a

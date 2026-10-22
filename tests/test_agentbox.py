@@ -2979,6 +2979,9 @@ class ConfigSchemaTest(unittest.TestCase):
             ("only for a Claude session with remoteControl: true",
              lambda c: c["users"]["agent"]["sessions"]["main"].update(
                  remoteControl=False, remoteControlServer=True)),
+            ("only for a Claude session with remoteControl: true",
+             lambda c: c["users"]["agent"]["sessions"]["main"].update(
+                 remoteControl=None, remoteControlServer=True)),
             ("cannot set a prompt in Claude Remote Control server mode",
              lambda c: c["users"]["agent"]["sessions"]["main"].update(
                  remoteControlServer=True, prompt="one task")),

@@ -10386,6 +10386,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         self._send_html(render_page("WhatsApp supports Claude and Codex sessions.",
                                                     kind="error"), status=400)
                         return
+                    if state == "on" and entry.get("remoteControlServer") is True:
+                        self._send_html(
+                            render_page(
+                                "WhatsApp cannot target a Claude Remote "
+                                "Control server's app-created conversations.",
+                                kind="error"),
+                            status=400)
+                        return
                     if state == "on":
                         for other in sessions.values():
                             if isinstance(other, dict):

@@ -1049,7 +1049,8 @@ class User:
                     f"which is not in agents {spec.agents!r}"
                 )
             if (s or {}).get("remoteControlServer"):
-                if agent != "claude" or (s or {}).get("remoteControl") is False:
+                if (agent != "claude"
+                        or (s or {}).get("remoteControl", True) is not True):
                     raise ConfigError(
                         f"user {name}: session {sname!r} may enable "
                         "remoteControlServer only for a Claude session with "
