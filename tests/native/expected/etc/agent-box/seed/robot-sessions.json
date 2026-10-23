@@ -7,6 +7,7 @@
       "hasRun": false,
       "initialPrompt": null,
       "remoteControl": false,
+      "remoteControlDaemon": false,
       "remoteControlName": null,
       "remoteControlServer": false,
       "resumePrompt": null,

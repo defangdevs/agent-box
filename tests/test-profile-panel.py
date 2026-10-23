@@ -304,6 +304,7 @@ class LoginProfile(ProfileFixture):
         session = self.read_sessions()["claude"]
         self.assertIsNone(session["profile"])
         self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlDaemon"])
         self.assertTrue(session["remoteControlServer"])
         self.assertEqual(module.profile_launch("claude")["harness"], "claude")
         self.assertEqual(
@@ -313,10 +314,13 @@ class LoginProfile(ProfileFixture):
         module = self.daemon()
         self.assertEqual(module.claude_session_default(), "tui")
         module.set_key("AGENT_BOX_CLAUDE_SESSION_DEFAULT", "remote-control")
-        self.assertEqual(module.claude_session_default(), "remote-control")
+        self.assertEqual(module.claude_session_default(), "daemon")
+        module.set_key("AGENT_BOX_CLAUDE_SESSION_DEFAULT", "daemon")
+        self.assertEqual(module.claude_session_default(), "daemon")
         module.connect_signed_in({"id": "claude"})
         session = self.read_sessions()["claude"]
         self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlDaemon"])
         self.assertTrue(session["remoteControlServer"])
         self.assertIsNone(session["profile"])
 
@@ -507,8 +511,8 @@ class ProfilePanel(ProfileFixture):
         module = self.daemon(AGENT_BOX_PROFILE_BIN="")
         options = module.render_profile_options(module.read_profiles())
         self.assertNotIn("triage", options)
-        self.assertIn('value=":claude-remote-control"', options)
-        self.assertIn('value=":codex-remote-control"', options)
+        self.assertIn('value=":claude-daemon"', options)
+        self.assertIn('value=":codex-daemon"', options)
         self.assertIn('value=":shell"', options)
 
     # --- reasoning-level picker (issue #493's layout checklist) -----
@@ -956,15 +960,16 @@ class ProfileRoutes(ProfileFixture):
     def test_claude_remote_control_server_is_an_explicit_pseudo_profile(self):
         module, base = self.serve()
         options = module.render_profile_options(module.read_profiles())
-        self.assertIn('value=":claude-remote-control"', options)
+        self.assertIn('value=":claude-daemon"', options)
         status, _ = self.post(
             base, "/sessions/add", back="settings",
-            profile=":claude-remote-control", cwd="~", prompt="")
+            profile=":claude-daemon", cwd="~", prompt="")
         self.assertEqual(status, 303)
         session = self.read_sessions()["claude"]
         self.assertEqual(session["agent"], "claude")
         self.assertIsNone(session["profile"])
         self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlDaemon"])
         self.assertTrue(session["remoteControlServer"])
 
     def test_claude_remote_control_server_rejects_one_conversation_inputs(self):
@@ -974,7 +979,7 @@ class ProfileRoutes(ProfileFixture):
                 ({"prompt": "", "whatsapp": "on"}, "WhatsApp cannot target")]:
             status, body = self.post(
                 base, "/sessions/add", back="settings",
-                profile=":claude-remote-control", cwd="~", **fields)
+                profile=":claude-daemon", cwd="~", **fields)
             self.assertEqual(status, 400)
             self.assertIn(message, body)
         self.assertEqual(self.read_sessions(), {})

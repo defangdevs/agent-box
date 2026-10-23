@@ -33,7 +33,8 @@ DAEMON = (REPO / "tests" / "golden" / "web" / "payloads"
           / "agent-box-settings" / "bin" / "agent-box-settings")
 
 ROW_KEYS = {"name", "agent", "profile", "state", "exit_status", "origin",
-            "remote_control", "remote_control_server", "remote_control_name",
+            "remote_control", "remote_control_daemon", "remote_control_server",
+            "remote_control_name",
             "working_directory",
             "ephemeral", "created_at", "hook"}
 SECRET = "TASK-TEXT-NEVER-EXPOSED"

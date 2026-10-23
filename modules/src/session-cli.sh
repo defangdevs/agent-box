@@ -62,7 +62,7 @@ usage() {
   echo "Stop a session to free a slot. A refused start exits 75; retry is safe."
   echo "       agent-box-session peers"
   echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
-  echo "                             [--cwd DIR] [--remote-control true|false|server]"
+  echo "                             [--cwd DIR] [--remote-control true|false] [--daemon]"
   echo "                             [--prompt TEXT] [--resume-prompt TEXT] [--ephemeral]"
   echo "                             [--whatsapp true|false]"
   echo "                             [-- EXTRA_ARGS...]"
@@ -97,11 +97,10 @@ usage() {
   echo "fail to start."
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
-  echo "--remote-control defaults to true, except for codex where it defaults to"
-  echo "false. For claude, true mirrors the ordinary TUI while server runs the"
-  echo "persistent multi-session 'claude remote-control' host instead. For codex,"
-  echo "true and server both select its app-server pairing daemon. A plain codex"
-  echo "session (a profile, or --harness codex with none) opens the TUI."
+  echo "--remote-control controls Claude's ordinary TUI mirroring and defaults to"
+  echo "true (false for codex). --daemon runs the persistent multi-session process:"
+  echo "'claude remote-control' or codex's app-server pairing daemon. The legacy"
+  echo "'--remote-control server' spelling is accepted but deprecated."
   echo "--ephemeral marks a ONE-SHOT session: parking it (a clean agent exit, or"
   echo "'stop') delists it outright, because nobody is going to resume it. A"
   echo "CRASH still parks nothing and leaves the post-mortem shell attachable."
@@ -628,7 +627,8 @@ case "$cmd" in
       if [ -s "$REGISTRY_FILE" ]; then
         "$JQ" -c '[.sessions | to_entries[] |
           select((.value.agent == "claude" or .value.agent == "codex")
-                 and .value.remoteControlServer != true) |
+                 and ((.value.agent != "claude") or
+                      ((.value.remoteControlDaemon != true) and (.value.remoteControlServer != true)))) |
           {name: .key, harness: .value.agent, stopped: (.value.stopped == true),
            selected: (.value.whatsapp == true)}]' "$REGISTRY_FILE"
       else
@@ -642,7 +642,8 @@ case "$cmd" in
         "$JQ" -c '[.sessions | to_entries[] |
           select(.value.whatsapp == true
                  and (.value.agent == "claude" or .value.agent == "codex")
-                 and .value.remoteControlServer != true) |
+                 and ((.value.agent != "claude") or
+                      ((.value.remoteControlDaemon != true) and (.value.remoteControlServer != true)))) |
           {name: .key, harness: .value.agent, stopped: (.value.stopped == true)}]' "$REGISTRY_FILE"
       else
         echo '[]'
@@ -663,7 +664,7 @@ case "$cmd" in
         exit 2
       fi
       if [ "$harness" = claude ] && "$JQ" -e --arg n "$selected" \
-          '.sessions[$n].remoteControlServer == true' "$REGISTRY_FILE" >/dev/null; then
+          '(.sessions[$n].remoteControlDaemon == true or .sessions[$n].remoteControlServer == true)' "$REGISTRY_FILE" >/dev/null; then
         echo "WhatsApp cannot target a Claude Remote Control server's app-created conversations" >&2
         exit 2
       fi
@@ -691,7 +692,7 @@ case "$cmd" in
           exit 2
         fi
         if [ "$harness" = claude ] && "$JQ" -e --arg n "$selected" \
-            '.sessions[$n].remoteControlServer == true' "$REGISTRY_FILE" >/dev/null; then
+            '(.sessions[$n].remoteControlDaemon == true or .sessions[$n].remoteControlServer == true)' "$REGISTRY_FILE" >/dev/null; then
           echo "WhatsApp cannot target a Claude Remote Control server's app-created conversations" >&2
           exit 2
         fi
@@ -749,7 +750,8 @@ case "$cmd" in
       "$JQ" -ce '[.sessions | to_entries[] |
         select(.value.whatsapp == true
                and (.value.agent == "claude" or .value.agent == "codex")
-               and .value.remoteControlServer != true) |
+               and ((.value.agent != "claude") or
+                    ((.value.remoteControlDaemon != true) and (.value.remoteControlServer != true)))) |
         {name: .key, harness: .value.agent, stopped: (.value.stopped == true)}] | if length == 1 then .[0] else error("expected one WhatsApp session") end' \
         "$REGISTRY_FILE"
       exit 0
@@ -777,7 +779,7 @@ case "$cmd" in
         fi
         if [ "$action" = on ] && [ "$harness" = claude ] \
              && "$JQ" -e --arg n "$name" \
-               '.sessions[$n].remoteControlServer == true' "$REGISTRY_FILE" >/dev/null; then
+               '(.sessions[$n].remoteControlDaemon == true or .sessions[$n].remoteControlServer == true)' "$REGISTRY_FILE" >/dev/null; then
           echo "WhatsApp cannot target a Claude Remote Control server's app-created conversations" >&2
           exit 2
         fi
@@ -803,7 +805,7 @@ case "$cmd" in
       *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
     harness="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
-    profile=""; has_harness=0; ephemeral=0; remote_control=""; remote_control_server=false; whatsapp=false
+    profile=""; has_harness=0; ephemeral=0; remote_control=""; remote_control_daemon=false; daemon_option=false; whatsapp=false
     origin="user"; hook_source=""; hook_repo=""
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -822,12 +824,16 @@ case "$cmd" in
         --cwd) cwd="${2:?--cwd needs a value}"; shift 2 ;;
         --remote-control)
           case "${2:?--remote-control needs 'true', 'false' or 'server'}" in
-            (true|false) remote_control="$2"; remote_control_server=false ;;
-            (server) remote_control=true; remote_control_server=true ;;
+            (true|false) remote_control="$2" ;;
+            (server)
+              remote_control=true; remote_control_daemon=true
+              echo "agent-box-session: '--remote-control server' is deprecated, use --daemon" >&2
+              ;;
             (*) echo "agent-box-session: --remote-control must be 'true', 'false' or 'server'" >&2
                 exit 2 ;;
           esac
           shift 2 ;;
+        --daemon) remote_control_daemon=true; daemon_option=true; shift ;;
         --whatsapp)
           case "${2:?--whatsapp needs 'true' or 'false'}" in
             (true|false) whatsapp="$2" ;;
@@ -909,11 +915,11 @@ case "$cmd" in
     pargs=()
     # Neither --profile nor --harness: the DEFAULT profile, when one is set
     # (agent-box-profile default). An explicit --harness still means that bare
-    # harness, so a script that names one keeps getting exactly it. Claude's
-    # server is not one profile's worker, so its explicit mode also bypasses
+    # harness, so a script that names one keeps getting exactly it. A daemon
+    # is not one profile's worker, so its explicit mode also bypasses
     # the default profile.
     if [ -z "$profile" ] && [ "$has_harness" = 0 ] \
-         && [ "$remote_control_server" != true ]; then
+         && [ "$remote_control_daemon" != true ]; then
       profile="$("${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" default 2>/dev/null)" || profile=""
     fi
     if [ -n "$profile" ]; then
@@ -952,32 +958,42 @@ case "$cmd" in
       remote_control=true
       [ "$harness" = codex ] && remote_control=false
     fi
+    # Compatibility: before issue #915 Codex used remoteControl itself as
+    # its daemon discriminator. Preserve that input while writing the new,
+    # harness-neutral marker for all newly created records.
+    if [ "$harness" = codex ] && [ "$remote_control" = true ]; then
+      remote_control_daemon=true
+    fi
     case " $AGENTS " in
       (*" $harness "*) ;;
       (*) echo "harness '$harness' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
-    if [ "$remote_control_server" = true ]; then
+    if [ "$remote_control_daemon" = true ]; then
+      remote_control=true
       case "$harness" in
         claude)
           if [ -n "$profile" ]; then
-            echo "Claude Remote Control server mode does not run one agent profile" >&2
+            echo "Claude daemon mode does not run one agent profile" >&2
             exit 2
           fi
           ;;
-        # Codex already uses its server whenever Remote Control is true. The
-        # spelling is accepted for CLI symmetry but needs no second marker.
-        codex) remote_control_server=false ;;
-        *) echo "Remote Control server mode is not supported for '$harness'" >&2
+        codex)
+          if [ "$daemon_option" = true ] && [ -n "$profile" ]; then
+            echo "Codex daemon mode does not run one agent profile" >&2
+            exit 2
+          fi
+          ;;
+        *) echo "Daemon mode is not supported for '$harness'" >&2
            exit 2 ;;
       esac
     fi
-    if [ "$remote_control_server" = true ] \
+    if [ "$remote_control_daemon" = true ] && [ "$harness" = claude ] \
          && { [ "$has_prompt" = 1 ] || [ "$has_rprompt" = 1 ]; }; then
-      echo "Claude Remote Control server mode cannot target one initial or resume prompt" >&2
+      echo "Claude daemon mode cannot target one initial or resume prompt" >&2
       exit 2
     fi
-    if [ "$remote_control_server" = true ] && [ "$whatsapp" = true ]; then
-      echo "WhatsApp cannot target a Claude Remote Control server's app-created conversations" >&2
+    if [ "$remote_control_daemon" = true ] && [ "$harness" = claude ] && [ "$whatsapp" = true ]; then
+      echo "WhatsApp cannot target a Claude daemon's app-created conversations" >&2
       exit 2
     fi
     if [ "$whatsapp" = true ] && [ "$harness" != claude ] && [ "$harness" != codex ]; then
@@ -1021,12 +1037,14 @@ case "$cmd" in
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
       --arg prof "$profile" --arg eph "$ephemeral" --argjson rc "$remote_control" \
-      --argjson rcs "$remote_control_server" \
+      --argjson rcd "$remote_control_daemon" \
       --argjson whatsapp "$whatsapp" \
       --arg origin "$origin" --arg hsrc "$hook_source" --arg hrepo "$hook_repo" \
       '(if $whatsapp then .sessions |= with_entries(.value.whatsapp = false) else . end)
        | .sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
-                        remoteControlServer: $rcs,
+                        remoteControlDaemon: $rcd,
+                        # Compatibility for releases before issue #915.
+                        remoteControlServer: ($rcd and $a == "claude"),
                         whatsapp: $whatsapp,
                         remoteControlName: null,
                         workingDirectory: (if $c == "" then null else $c end),

@@ -1,1 +1,1 @@
-{"sessions":{"main":{"agent":"claude","boxSessionId":null,"extraArgs":[],"hasRun":false,"initialPrompt":null,"remoteControl":true,"remoteControlName":null,"remoteControlServer":false,"resumePrompt":null,"skipPermissions":true,"workingDirectory":"/home/agent"}},"version":1}
+{"sessions":{"main":{"agent":"claude","boxSessionId":null,"extraArgs":[],"hasRun":false,"initialPrompt":null,"remoteControl":true,"remoteControlDaemon":false,"remoteControlName":null,"remoteControlServer":false,"resumePrompt":null,"skipPermissions":true,"workingDirectory":"/home/agent"}},"version":1}

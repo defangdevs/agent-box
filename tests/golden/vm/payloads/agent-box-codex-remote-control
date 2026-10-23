@@ -91,11 +91,13 @@ signed_in() { "$codex" login status >/dev/null 2>&1; }
 # When the settings page drives pairing (its /codex/pairing API, issue #780),
 # a code minted HERE would be a second live code beside the page's, and it
 # would print to a pane the user never needed to open. The page's
-# `AGENT_BOX_CODEX_SESSION_DEFAULT=remote-control` is the signal. In that
-# mode the pane signs in and reports status on its own; it mints a code only
-# when someone presses Enter.
+# `AGENT_BOX_CODEX_SESSION_DEFAULT=daemon` is the signal. In that mode the
+# pane signs in and reports status on its own; it mints a code only when
+# someone presses Enter. Keep the old `remote-control` value for compatibility.
 quiet=false
-[ "${AGENT_BOX_CODEX_SESSION_DEFAULT:-}" = remote-control ] && quiet=true
+case "${AGENT_BOX_CODEX_SESSION_DEFAULT:-}" in
+  daemon|remote-control) quiet=true ;;
+esac
 # Run the sign-in HERE rather than printing the command for someone to paste
 # into another session. This box is headless, so device auth is the only
 # flow that works: plain `codex login` serves a localhost URL no outside

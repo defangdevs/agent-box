@@ -1058,7 +1058,9 @@ sync_codex_threads() {
         and .value.stopped != true
         and (.value.whatsapp == true or .key == $target))
     | [.key,
-       (if .value.remoteControl == true then "true" else "false" end),
+       (if (.value.remoteControlDaemon == true
+             or .value.remoteControl == true)
+        then "true" else "false" end),
        (.value.profile // ".")]
     | @tsv' "$REGISTRY_FILE" 2>/dev/null)
 }
@@ -1084,8 +1086,10 @@ start_session() {
   [ -n "$wd" ] || wd="$HOME"
   skip="$($JQ -r 'if .skipPermissions == false then "false" else "true" end' <<<"$sjson")"
   rc="$($JQ -r 'if .remoteControl == false then "false" else "true" end' <<<"$sjson")"
-  rcserver="$($JQ -r 'if .remoteControlServer == true then "true" else "false" end' <<<"$sjson")"
-  [ "$rc" = true ] || rcserver=false
+  rcdaemon="$($JQ -r 'if (.remoteControlDaemon == true
+      or (.agent == "claude" and .remoteControlServer == true)
+      or (.agent == "codex" and .remoteControl == true))
+    then "true" else "false" end' <<<"$sjson")"
   rcname="$($JQ -r '.remoteControlName // empty' <<<"$sjson")"
   # The agent profile this session was created with (issue #321), or empty.
   # Its harness and arguments were already resolved into `agent`/`extraArgs`
@@ -1157,7 +1161,7 @@ start_session() {
     # One server may own several Claude-native conversations, none of which
     # is the agent-box launch id. The server restores its own bridge pointer
     # on restart; transcript-based resume belongs only to the interactive TUI.
-    if [ "$rcserver" != true ]; then
+    if [ "$rcdaemon" != true ]; then
       claude_has_transcript "$bid" && hasrun=true
     fi
   else
@@ -1183,7 +1187,7 @@ start_session() {
   # transcript. EAFP on the record — read it and handle the miss; a
   # readability test first would only add a syscall and a race.
   rotated=false
-  if [ "$agent" = claude ] && [ "$rcserver" != true ] \
+  if [ "$agent" = claude ] && [ "$rcdaemon" != true ] \
        && [ "$launched" = true ] && [ -n "$bid" ]; then
     live=""
     read -r live < "$HOME/.local/state/agent-box/live-session-id/$bid" 2>/dev/null \
@@ -1218,7 +1222,7 @@ start_session() {
   # filter for the latter keeps an old mapping from waking an unrelated task.
   codex_target=""
   if [ "$agent" = codex ] && [ "$hasrun" = true ]; then
-    if [ "$rc" = true ]; then
+    if [ "$rcdaemon" = true ]; then
       if session_watches_events "$sname"; then
         codex_target="$(codex_wake_thread "$sname")"
       fi
@@ -1293,7 +1297,9 @@ start_session() {
   # Both Claude Remote Control forms use the same human-facing name. Derive
   # it once before the interactive/server split so the two surfaces cannot
   # drift onto different host-label rules.
-  if [ "$agent" = claude ] && [ "$rc" = true ] && [ -z "$rcname" ]; then
+  if [ "$agent" = claude ] \
+       && { [ "$rc" = true ] || [ "$rcdaemon" = true ]; } \
+       && [ -z "$rcname" ]; then
     # AGENT_BOX_HOST_LABEL comes from remoteControlHost, then web.domain.
     # The kernel hostname is only the last fallback because a cloud kernel
     # name is usually an internal address nobody recognises in the app.
@@ -1321,7 +1327,7 @@ start_session() {
   }
   case "$agent" in
     claude)
-      if [ "$rc" = true ] && [ "$rcserver" = true ]; then
+      if [ "$rcdaemon" = true ]; then
         # Claude's server is already a foreground process, unlike Codex's
         # detached app-server daemon, so tmux can own it directly. The server
         # creates and resumes its own conversations; do not append this
@@ -1339,7 +1345,7 @@ start_session() {
           cmd="$cmd --remote-control $(printf '%q' "$rcname")"
         fi
       fi
-      if [ "$rcserver" != true ]; then
+      if [ "$rcdaemon" != true ]; then
         # The SessionStart hook that records the live session id (see the
         # segment-rotation block above). ADDITIONAL settings only: claude
         # merges the file on top of the user/project settings.json, which
@@ -1407,7 +1413,7 @@ start_session() {
       # inside the pane, so the supervisor's own environment cannot see a
       # profile's override here.
       mirror_codex_standalone "$bin" "$(resolve_codex_home "$sprofile")"
-      if [ "$rc" = true ]; then
+      if [ "$rcdaemon" = true ]; then
         # Codex remote control uses a dedicated app-server daemon, not a
         # TUI flag (issue 103), whereas claude takes a
         # `--remote-control <name>` flag on its normal TUI. So a
@@ -1499,7 +1505,7 @@ start_session() {
     # the cache before each claude launch forces a full policy fetch.
     rm -f "$HOME"/.claude/remote-settings.json
     whatsapp_enabled="$($JQ -r '.whatsapp == true' <<<"$sjson")"
-    seed_claude_state "$wd" "$skip" "$whatsapp_enabled" "$rcserver"
+    seed_claude_state "$wd" "$skip" "$whatsapp_enabled" "$rcdaemon"
   elif [ "$agent" = codex ]; then
     seed_codex_state "$wd" "$sprofile" "$bin"
   fi
@@ -1583,8 +1589,7 @@ start_session() {
   _mark="${AGENT_BOX_MARK_STOPPED:?}"
   _qname="$(printf '%q' "$sname")"
   epilogue=" && $_mark $_qname 0 || { $_mark $_qname \$?; exec bash; }"
-  if { [ "$agent" = codex ] && [ "$rc" = true ]; } \
-       || { [ "$agent" = claude ] && [ "$rcserver" = true ]; }; then
+  if [ "$rcdaemon" = true ]; then
     epilogue=" || { $_mark $_qname \$?; exec bash; }"
   fi
   # shell — the pane IS a login shell, so there is no separate agent whose
@@ -1692,9 +1697,10 @@ start_session() {
     if [ "$bid" != "$recorded" ] || [ "$rotated" = true ]; then
       record_launch "$sname" "$bid"
     fi
-    if [ "$agent" = claude ] && [ "$rcserver" != true ]; then
+    if [ "$agent" = claude ] && [ "$rcdaemon" != true ]; then
       record_native_session "$sname" "$bid"
-    elif [ "$agent" = codex ] && [ "$rc" = false ] && [ -n "$codex_target" ]; then
+    elif [ "$agent" = codex ] && [ "$rcdaemon" != true ] \
+         && [ -n "$codex_target" ]; then
       record_native_session "$sname" "$codex_target"
     fi
     if [ "$launched" != true ] || [ "$rotated" = true ]; then

@@ -2982,11 +2982,26 @@ class ConfigSchemaTest(unittest.TestCase):
             ("only for a Claude session with remoteControl: true",
              lambda c: c["users"]["agent"]["sessions"]["main"].update(
                  remoteControl=None, remoteControlServer=True)),
-            ("cannot set a prompt in Claude Remote Control server mode",
+            ("cannot set a prompt in Claude daemon mode",
              lambda c: c["users"]["agent"]["sessions"]["main"].update(
                  remoteControlServer=True, prompt="one task")),
         ]:
             self.assertIn(message, self.refused(mutate))
+
+    def test_remote_control_daemon_is_harness_neutral(self):
+        for agent in ("claude", "codex"):
+            spec = self.spec(
+                lambda c, agent=agent: c["users"]["agent"]["sessions"]
+                ["main"].update(agent=agent, remoteControlDaemon=True))
+            user = next(user for user in spec.users if user.name == "agent")
+            session = user.sessions["main"]
+            self.assertTrue(session["remoteControlDaemon"])
+        self.assertIn(
+            "remoteControlDaemon only for Claude or Codex",
+            self.refused(lambda c: (
+                c["agents"].append("opencode"),
+                c["users"]["agent"]["sessions"]["main"].update(
+                    agent="opencode", remoteControlDaemon=True))))
 
     def test_the_reported_coercions_are_refused_with_the_field_named(self):
         """Every example from issue #525, each with the path in the message.
