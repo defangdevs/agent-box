@@ -1637,8 +1637,8 @@ let
 # module-generated-up-to-date check fails until it matches.
 {
   repo = "defangdevs/local-channels";
-  rev = "2be2185cbc196aaaa88cef1d9da0292d94ba7243";
-  sha256 = "sha256-N95IhtnjXXqt5WB5wq0pISAsXwxmAFLI/zafl/J4aPU=";
+  rev = "257822e96674920fd2aff5ac0b52811a18854e69";
+  sha256 = "sha256-aeCeLNwY0/jcgbWre551O/QRnHGtktUhqF+urYXi6I8=";
 }
   ;
   localWebhookScript = builtins.fetchurl {
