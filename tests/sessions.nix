@@ -954,7 +954,13 @@ in
     old_helper_pid = machine.succeed(
         tmux('display -p -t "=helper:" "#{pane_pid}"')
     ).strip()
-    machine.succeed(tmux("kill-session -t =helper"))
+    # The direct wrapper checks above stop the same user-wide Codex daemon
+    # that helper supervises. Its pane can therefore disappear between the
+    # PID read and this deliberate kill; wait for reconciliation to provide a
+    # live pane instead of failing in that sub-second window.
+    machine.wait_until_succeeds(
+        tmux("kill-session -t =helper"), timeout=60
+    )
     helper_restart = machine.wait_until_succeeds(
         tmux('list-panes -t "=helper" -F "#{pane_pid} #{pane_start_command}"')
         + f" | grep -v '^{old_helper_pid} '",
