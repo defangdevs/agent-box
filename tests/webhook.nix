@@ -526,6 +526,10 @@
         " -H 'content-type: application/json' -H 'x-github-event: workflow_run'"
         " -H 'x-github-delivery: test-1' --data-binary @/tmp/body.json"
     )
+    # 0.33.0 drops a re-sent delivery id, so a later post that must be
+    # processed again needs an id of its own.
+    ids = iter(range(100))
+    fresh = lambda: post.replace("test-1", "test-1-%d" % next(ids))  # noqa: E731
     # Wrong signature and no signature are both refused, before any parsing.
     client.succeed(
         f"{post} -H 'x-hub-signature-256: sha256=00' "
@@ -617,7 +621,7 @@
     # sessions on one PR. The suppression is logged, because a silently skipped
     # spawn is indistinguishable from a watch that stopped working (#170).
     client.succeed(
-        f"{post} -H 'x-hub-signature-256: sha256={sig}' "
+        f"{fresh()} -H 'x-hub-signature-256: sha256={sig}' "
         f"https://box.test/agent/webhook/github | grep -x 200"
     )
     machine.wait_until_succeeds(
@@ -693,7 +697,7 @@
     # restarting it afterwards proves the spawn + consumption half.
     machine.succeed("systemctl stop agent-box@agent.service")
     client.succeed(
-        f"{post} -H 'x-hub-signature-256: sha256={sig}' "
+        f"{fresh()} -H 'x-hub-signature-256: sha256={sig}' "
         f"https://box.test/agent/webhook/github | grep -x 200"
     )
     machine.wait_until_succeeds(
@@ -865,7 +869,7 @@
         timeout=30,
     )
     client.succeed(
-        f"{post} -H 'x-hub-signature-256: sha256={sig}' "
+        f"{fresh()} -H 'x-hub-signature-256: sha256={sig}' "
         f"https://box.test/agent/webhook/github | grep -x 200"
     )
     # The named suppression is the primary evidence: had the brake missed, the
