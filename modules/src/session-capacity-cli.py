@@ -38,6 +38,16 @@ def capacity_main():
                 return 1
             print(capacity_json.dumps(result))
             return 0
+        if command == "hibernate-quiet":
+            # Has native input or routing state moved since verification?
+            # Exit 1 means yes: the caller must not leave the session parked.
+            if len(sys.argv) != 5:
+                print("usage: agent-box-session-capacity hibernate-quiet REGISTRY NAME QUIET",
+                      file=sys.stderr)
+                return 2
+            result = hibernation_candidate(
+                sessions, name=sys.argv[3], quiet=sys.argv[4])
+            return 1 if result is None else 0
         if command not in ("check", "spawn"):
             print("unknown capacity command: %s" % command, file=sys.stderr)
             return 2

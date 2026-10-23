@@ -312,9 +312,30 @@ hibernate_one() {
     return "$_rc"
   fi
 
+  # Native input does not take the registry lock, so it can land after
+  # hibernate-verify. Re-check just before the kill (skips a pointless kill)
+  # and again after it (closes the window the first check leaves): input
+  # seen after the runtime is gone means the turn was cut off, so un-park
+  # and let the supervisor resume that exact conversation.
+  _quiet="$(printf '%s' "$_verified" | "$JQ" -r '.quiet // empty')"
+  _still_quiet() {
+    [ -n "$_quiet" ] || return 1
+    _q="$(AGENT_BOX_HIBERNATE_ASSUME_LIVE="$_name" \
+      "$_cap" hibernate-quiet "$REGISTRY_FILE" "$_name" "$_quiet" 2>&1)"
+  }
+  if ! _still_quiet; then
+    _undo_hibernation || return $?
+    return 1
+  fi
+
   if ! kill_session "$_name"; then
     # A failed kill freed no slot. Undo only our own transition; a concurrent
     # explicit stop/restart is authoritative and changes hibernatedAt first.
+    _undo_hibernation || return $?
+    return 1
+  fi
+
+  if ! _still_quiet; then
     _undo_hibernation || return $?
     return 1
   fi
