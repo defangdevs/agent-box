@@ -815,7 +815,7 @@ let
     else if !(seedMain u) then { }
     else {
       main = {
-        inherit (u) agent skipPermissions remoteControl remoteControlServer
+        inherit (u) agent skipPermissions remoteControl remoteControlDaemon remoteControlServer
           remoteControlName extraArgs;
         inherit (u) workingDirectory;
         # No legacy top-level equivalents — the single "main" session just
@@ -827,9 +827,19 @@ let
   sessionsSeedFile = name: u:
     pkgs.writeText "agent-box-${name}-sessions.json" (builtins.toJSON {
       version = 1;
-      sessions = lib.mapAttrs (sname: s: {
-        agent = if s.agent != null then s.agent else cfg.agent;
-        inherit (s) skipPermissions remoteControl remoteControlServer extraArgs;
+      sessions = lib.mapAttrs (sname: s:
+        let
+          agent = if s.agent != null then s.agent else cfg.agent;
+          daemon = s.remoteControlDaemon || s.remoteControlServer
+            || (agent == "codex" && s.remoteControl);
+        in {
+        inherit agent;
+        inherit (s) skipPermissions extraArgs;
+        remoteControl = if daemon then true else s.remoteControl;
+        remoteControlDaemon = daemon;
+        # Keep both legacy discriminators so an older Agentbox release can
+        # still launch a daemon after rollback.
+        remoteControlServer = s.remoteControlServer || (daemon && agent == "claude");
         # null → the supervisor derives "<user>-<session>@<host>" at
         # start time (see remoteControlHost).
         remoteControlName = s.remoteControlName;
@@ -1258,21 +1268,25 @@ let
         # cfg.agent so a null (box-default) agent is judged the same way
         # sessionsSeedFile itself resolves it.
         default = (if config.agent != null then config.agent else cfg.agent) != "codex";
-        description = "Make the session drivable from the agent's apps (see users.<name>.remoteControl).";
+        description = "Mirror a Claude interactive session in the Claude apps (see users.<name>.remoteControl).";
+      };
+      remoteControlDaemon = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Run the harness's persistent multi-session daemon instead of an
+          interactive TUI: `claude remote-control` for Claude or the Codex
+          app-server pairing daemon. The daemon owns app-created conversations
+          rather than one agent-box worker profile.
+        '';
       };
       remoteControlServer = lib.mkOption {
         type = lib.types.bool;
         default = false;
         description = ''
-          Run Claude's persistent `remote-control` server instead of its
-          interactive TUI. This is the Claude counterpart of a Codex Remote
-          Control daemon: the agent-box session owns the server process, while
-          Claude's web and mobile apps create and manage the conversations it
-          serves. Requires agent = "claude" and remoteControl = true.
-
-          False preserves the original Claude behavior: remoteControl = true
-          adds `--remote-control` to the ordinary interactive TUI. Other
-          harnesses are rejected.
+          Deprecated compatibility alias for Claude daemon mode. New
+          configurations should set remoteControlDaemon = true. Existing
+          remoteControlServer = true configurations remain accepted.
         '';
       };
       remoteControlName = lib.mkOption {
@@ -1411,21 +1425,19 @@ let
         # this is set explicitly. Every other harness keeps `true`.
         default = (if config.agent != null then config.agent else cfg.agent) != "codex";
         description = ''
-          Make the session drivable from the agent's desktop and mobile apps.
-          Default `true` because "drive it from your phone" is one of the
-          module's headline features -- except for codex, which defaults to
-          `false` (see below) since remote control there means a different
-          program altogether.
+          Mirror Claude's ordinary interactive TUI in the Claude desktop and
+          mobile apps. This corresponds to Claude's `--remote-control` flag
+          and the `/rc` command available inside a running session.
 
           Set false to disable remote-app control for this user — then the
           agent is only reachable through the local tmux session (or the
           ttyd browser terminal in the AWS variant).
 
-          How it is wired depends on the agent:
-          - claude: adds `--remote-control <remoteControlName>` to the normal
-            TUI, so the browser terminal still shows the interactive session.
-          - codex: starts the local app-server daemon and enables Remote Control
-            on it (issue 103) INSTEAD of the interactive TUI. The daemon starts
+          For Claude this adds `--remote-control <remoteControlName>` to the
+          normal TUI, so the browser terminal still shows the interactive
+          session. For Codex, true remains accepted as a compatibility spelling
+          for remoteControlDaemon = true; new configurations should use that
+          explicit option. The Codex daemon starts
             even while logged out or offline; its relay connects once login and
             network are available. The session's pane then drives onboarding
             (issue 159): it runs the device-code sign-in when the box is logged
@@ -1437,15 +1449,21 @@ let
             per user; two would fight over the same daemon.
         '';
       };
+      remoteControlDaemon = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Run the persistent multi-session daemon for the seeded "main"
+          session instead of an interactive TUI. Claude upstream calls its
+          daemon `remote-control` server mode; Codex uses its app-server daemon.
+        '';
+      };
       remoteControlServer = lib.mkOption {
         type = lib.types.bool;
         default = false;
         description = ''
-          Run `claude remote-control` server mode for the seeded "main"
-          session instead of Claude's interactive TUI. This is explicit and
-          off by default so an agent-box update cannot turn an existing
-          interactive Claude session into a server. Requires the effective
-          harness to be Claude and remoteControl = true.
+          Deprecated compatibility alias for Claude daemon mode. New
+          configurations should set remoteControlDaemon = true.
         '';
       };
       remoteControlName = lib.mkOption {
@@ -3039,6 +3057,11 @@ in
           message = "services.agent-box.users.${name}: session \"${sname}\"'s remoteControlName must be non-empty and free of newlines.";
         }
         {
+          assertion = !s.remoteControlDaemon || builtins.elem
+            (if s.agent != null then s.agent else cfg.agent) [ "claude" "codex" ];
+          message = "services.agent-box.users.${name}: session \"${sname}\" may enable remoteControlDaemon only for Claude or Codex.";
+        }
+        {
           assertion = !s.remoteControlServer || (
             (if s.agent != null then s.agent else cfg.agent) == "claude"
             && s.remoteControl
@@ -3046,10 +3069,11 @@ in
           message = "services.agent-box.users.${name}: session \"${sname}\" may enable remoteControlServer only for a Claude session with remoteControl = true.";
         }
         {
-          assertion = !s.remoteControlServer || (
+          assertion = !(s.remoteControlServer || (s.remoteControlDaemon
+            && (if s.agent != null then s.agent else cfg.agent) == "claude")) || (
             s.initialPrompt == null && s.resumePrompt == null
           );
-          message = "services.agent-box.users.${name}: session \"${sname}\" cannot set initialPrompt or resumePrompt in Claude Remote Control server mode because the server owns multiple app-created conversations and has no single prompt target.";
+          message = "services.agent-box.users.${name}: session \"${sname}\" cannot set initialPrompt or resumePrompt in Claude daemon mode because the daemon owns multiple app-created conversations and has no single prompt target.";
         }
       ]) (seedSessions name u))) cfg.users);
 

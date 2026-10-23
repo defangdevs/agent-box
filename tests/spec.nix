@@ -41,6 +41,7 @@ let
     }
     // lib.optionalAttrs (!s.skipPermissions) { skipPermissions = false; }
     // lib.optionalAttrs (!s.remoteControl) { remoteControl = false; }
+    // lib.optionalAttrs s.remoteControlDaemon { remoteControlDaemon = true; }
     // lib.optionalAttrs s.remoteControlServer { remoteControlServer = true; }
     // lib.optionalAttrs (s.extraArgs != [ ]) { inherit (s) extraArgs; };
 

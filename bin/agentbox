@@ -617,6 +617,7 @@ SESSION_SCHEMA = _Obj({
     "agent": STR,
     "skipPermissions": BOOL,
     "remoteControl": BOOL,
+    "remoteControlDaemon": BOOL,
     "remoteControlServer": BOOL,
     "remoteControlName": STR,
     "extraArgs": STR_LIST,
@@ -1048,6 +1049,15 @@ class User:
                     f"user {name}: session {sname!r} uses agent {agent!r}, "
                     f"which is not in agents {spec.agents!r}"
                 )
+            daemon = bool((s or {}).get("remoteControlDaemon")
+                          or (s or {}).get("remoteControlServer")
+                          or (agent == "codex"
+                              and (s or {}).get("remoteControl") is True))
+            if (s or {}).get("remoteControlDaemon") and agent not in ("claude", "codex"):
+                raise ConfigError(
+                    f"user {name}: session {sname!r} may enable "
+                    "remoteControlDaemon only for Claude or Codex"
+                )
             if (s or {}).get("remoteControlServer"):
                 if (agent != "claude"
                         or (s or {}).get("remoteControl", True) is not True):
@@ -1056,13 +1066,14 @@ class User:
                         "remoteControlServer only for a Claude session with "
                         "remoteControl: true"
                     )
-                if ((s or {}).get("prompt") is not None
-                        or (s or {}).get("initialPrompt") is not None
-                        or (s or {}).get("resumePrompt") is not None):
-                    raise ConfigError(
-                        f"user {name}: session {sname!r} cannot set a prompt "
-                        "in Claude Remote Control server mode"
-                    )
+            if (agent == "claude" and daemon
+                    and ((s or {}).get("prompt") is not None
+                         or (s or {}).get("initialPrompt") is not None
+                         or (s or {}).get("resumePrompt") is not None)):
+                raise ConfigError(
+                    f"user {name}: session {sname!r} cannot set a prompt "
+                    "in Claude daemon mode"
+                )
 
     @property
     def url(self):
@@ -3292,6 +3303,10 @@ class Renderer:
         for sname in sorted(u.sessions):
             s = u.sessions[sname] or {}
             agent = s.get("agent") or u.agent
+            daemon = bool(s.get("remoteControlDaemon")
+                          or s.get("remoteControlServer")
+                          or (agent == "codex"
+                              and s.get("remoteControl") is True))
             sessions[sname] = {
                 "agent": agent,
                 "skipPermissions": bool(s.get("skipPermissions", True)),
@@ -3301,11 +3316,15 @@ class Renderer:
                 # interactive TUI (issue #623), mirroring
                 # sessionOpts.remoteControl's default in agent-box.nix.in.
                 # Every other harness keeps the old default.
-                "remoteControl": bool(s.get("remoteControl", agent != "codex")),
+                "remoteControl": (True if daemon else
+                                  bool(s.get("remoteControl", agent != "codex"))),
+                "remoteControlDaemon": daemon,
                 # Explicit because existing Claude remoteControl=true records
                 # are ordinary TUIs mirrored to the apps. An update must not
                 # reinterpret them as the newer multi-session server mode.
-                "remoteControlServer": bool(s.get("remoteControlServer", False)),
+                "remoteControlServer": bool(
+                    s.get("remoteControlServer")
+                    or (daemon and agent == "claude")),
                 "extraArgs": list(s.get("extraArgs") or []),
                 # null → the supervisor derives "<user>-<session>@<host>"
                 # at start time.

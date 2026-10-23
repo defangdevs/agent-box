@@ -131,15 +131,20 @@ plainly rather than handing it back.
   not respawned - until `restart NAME` revives it; `rm` delists it for
   good. `restart --all` bounces every session. Listed sessions start
   within ~2s.
-- Claude has two Remote Control shapes. The default `--remote-control true`
-  keeps one ordinary TUI and mirrors it to the Claude apps. Use
-  `agent-box-session add NAME --harness claude --remote-control server` for
+- Remote Control is a per-conversation capability; daemon mode is the
+  persistent process that can serve several conversations. Claude's default
+  `--remote-control true` keeps one ordinary TUI and mirrors it to the Claude
+  apps, matching `/rc` inside a running session. Use
+  `agent-box-session add NAME --harness claude --daemon` for
   the persistent `claude remote-control` host instead. That one agent-box row
   consumes one slot and serves several app-created conversations, which do
   not become separate rows or consume agent-box slots. It has no single
   kickoff prompt, transcript download, webhook or WhatsApp target, or tmux
   conversation pane. Limit those native child conversations with Claude's
   own server flags after `--`, such as `-- --capacity 4`.
+  `agent-box-session add NAME --harness codex --daemon` starts the equivalent
+  Codex app-server pairing daemon. The old `--remote-control server` spelling
+  is accepted for compatibility.
 - Harnesses are usually installed ON DEMAND, not shipped with the box: the
   first session that names a harness fetches it into your own profile, which
   takes as long as the download does and prints `session: fetching '<name>'`
@@ -270,7 +275,7 @@ Claude session after selecting it so it loads the WhatsApp channel.
 A normal Codex TUI is registered automatically after its rollout starts, so
 WhatsApp resolves the agent-box session name to the real Codex thread ID. A
 Codex Remote Control task has its own thread ID, which the box's session name
-alone cannot identify. A Claude Remote Control server likewise owns several
+alone cannot identify. A Claude Remote Control daemon likewise owns several
 app-created conversations and cannot be selected as one WhatsApp target. A
 Codex task with an active webhook subscription is also
 registered automatically; otherwise, from inside the active Codex task run `node

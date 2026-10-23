@@ -358,6 +358,7 @@ class Pairing(unittest.TestCase):
         self.assertEqual(len(rc), 1)
         (session,) = rc.values()
         self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlDaemon"])
         self.assertIsNone(session["profile"])
 
     def test_a_tui_codex_session_does_not_count_as_one_to_pair(self):
@@ -365,6 +366,14 @@ class Pairing(unittest.TestCase):
         self.post("/codex/pairing/start")
         flags = sorted(s["remoteControl"] for s in self.sessions().values())
         self.assertEqual(flags, [False, True])
+
+    def test_the_canonical_daemon_marker_is_sufficient(self):
+        self.write_sessions({
+            "codex": {"agent": "codex", "remoteControl": False,
+                      "remoteControlDaemon": True},
+        })
+        self.post("/codex/pairing/start")
+        self.assertEqual(list(self.sessions()), ["codex"])
 
     def test_claimed_is_sticky(self):
         self.post("/codex/pairing/start")
@@ -574,11 +583,12 @@ class Pairing(unittest.TestCase):
         self.assertFalse(session["remoteControl"])
 
     def test_the_env_setting_makes_a_codex_sign_in_start_remote_control(self):
-        self.module.set_key("AGENT_BOX_CODEX_SESSION_DEFAULT", "remote-control")
-        self.assertEqual(self.module.codex_session_default(), "remote-control")
+        self.module.set_key("AGENT_BOX_CODEX_SESSION_DEFAULT", "daemon")
+        self.assertEqual(self.module.codex_session_default(), "daemon")
         self.in_home(self.module.connect_signed_in, self.flow)
         (session,) = self.sessions().values()
         self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlDaemon"])
         self.assertIsNone(session["profile"])
 
     def test_any_other_value_is_the_tui(self):

@@ -532,10 +532,10 @@ def hibernation_probe(name, entry, live, now=None):
             or entry.get("origin") == "webhook" or name.startswith("hook-")
             or _hibernate_crashed(entry)):
         return None
-    # These panes own a SERVER, not one resumable conversation. Codex marks
-    # that with remoteControl itself; Claude preserves its older interactive
-    # RC meaning and carries the explicit server marker beside it.
-    if ((harness == "codex" and entry.get("remoteControl") is True)
+    # These panes own a daemon, not one resumable conversation. Recognize
+    # both legacy harness-specific encodings as well as the canonical bit.
+    if (entry.get("remoteControlDaemon") is True
+            or (harness == "codex" and entry.get("remoteControl") is True)
             or (harness == "claude"
                 and entry.get("remoteControlServer") is True)):
         return None
