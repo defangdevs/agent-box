@@ -191,12 +191,22 @@ plainly rather than handing it back.
 reuse; the endpoint pins one Agentbox profile and one remote working directory.
 It does not attach to a tmux session or select an old native conversation.
 
+For Codex, install the matching Buzz helper on the box first. Buzz launches
+this MCP server beside the agent because its embedded `buzz` command signs and
+publishes the response; an ACP final message by itself is not sent to the
+channel. The flake package is built from the pinned Buzz desktop v0.5.28 source
+and is intentionally not part of the default runtime closure:
+
+    nix profile add github:defangdevs/agent-box#buzz-dev-mcp
+
 Check a binding on the box before putting it in an SSH key's forced command:
 
     agent-box-acp check --local --profile devops \
       --adapter /absolute/path/to/codex-acp \
       --native /absolute/path/to/codex \
-      --cwd /home/agent/project
+      --cwd /home/agent/project \
+      --map-mcp-command \
+        buzz-dev-mcp=/home/agent/.nix-profile/bin/buzz-dev-mcp
 
 Then use the same binding arguments after `agent-box-acp serve` in a dedicated
 `authorized_keys` entry with OpenSSH's `restrict,command="..."` options, but
@@ -216,11 +226,15 @@ fixed remote directory, applies the profile's ordinary environment at launch,
 and composes Claude model/effort/appended instructions through ACP metadata.
 Codex gets the profile's native arguments literally and keeps AGENTS.md as its
 instruction path. Non-empty MCP server definitions are refused by default,
-because a local executable path does not become a remote one over SSH. Add
-`--allow-mcp` only after every command and path in the request is already valid
-on the box. This first endpoint also does not copy Buzz-local Git credentials,
-helper binaries or skill files; install the equivalents on the box or leave
-features that require them disabled.
+because a local executable path does not become a remote one over SSH.
+`--map-mcp-command CLIENT=REMOTE` matches only the client command's basename,
+replaces it with a validated absolute executable on the box, and leaves that
+server's arguments and environment intact. Repeat it for each trusted helper.
+Every unmapped server is still refused; add `--allow-mcp` only after every
+remaining command and path in the request is already valid on the box. The
+endpoint does not copy Buzz-local Git credentials, helper binaries or skill
+files; install the equivalents on the box or leave features that require them
+disabled.
 
 One worker per profile is allowed; one worker can hold several Buzz sessions.
 Remote ACP workers do not consume tmux session slots, so keep the number of
