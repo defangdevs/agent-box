@@ -1,6 +1,8 @@
 [Unit]
 After=network-online.target
 Description=Install the Defang CLI in the background
+StartLimitBurst=5
+StartLimitIntervalSec=10min
 Wants=network-online.target
 
 [Service]
@@ -20,8 +22,6 @@ Nice=19
 OOMScoreAdjust=1000
 Restart=on-failure
 RestartSec=30s
-StartLimitBurst=5
-StartLimitIntervalSec=10min
 Type=oneshot
 
 [Install]

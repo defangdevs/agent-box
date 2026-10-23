@@ -34694,8 +34694,6 @@ if __name__ == "__main__":
         # in-boot retries instead of waiting for the next reboot entirely.
         Restart = "on-failure";
         RestartSec = "30s";
-        StartLimitIntervalSec = "10min";
-        StartLimitBurst = 5;
         # This is a fallback path (the substituter above should make it a
         # download, not a build) but if it EVER does fall back to compiling
         # — a Cachix outage, a bump to defangVersion before the matching
@@ -34709,6 +34707,11 @@ if __name__ == "__main__":
         IOSchedulingClass = "idle";
         OOMScoreAdjust = 1000;
         MemoryMax = "1536M";
+      };
+      # StartLimit* belong to [Unit]; in [Service] systemd ignores them.
+      unitConfig = {
+        StartLimitIntervalSec = "10min";
+        StartLimitBurst = 5;
       };
       # No ConditionPathExists gate: that could only ever check "a defang
       # binary exists somewhere," not "it's the one THIS module currently
