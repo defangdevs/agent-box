@@ -12930,9 +12930,12 @@ claim_note() {
 # as before. The array is payload-derived: anything that is not a short array
 # of objects is ignored, never half-trusted.
 batch_metas() {
-  "$JQ" -c --argjson one "''${LOCAL_WEBHOOK_SPAWN_META:-{\}}" '
-    (if type == "array" and length > 0 and length <= 100 and all(.[]; type == "object")
-     then . else [$one] end)' <<< "''${LOCAL_WEBHOOK_SPAWN_METAS:-null}" 2>/dev/null \
+  # -s: exactly one JSON value or nothing usable. Whitespace-only input slurps
+  # to [] and two arrays to a length of 2; both take the single-meta fallback.
+  "$JQ" -cs --argjson one "''${LOCAL_WEBHOOK_SPAWN_META:-{\}}" '
+    (if length == 1 and (.[0] | type == "array" and length > 0 and length <= 100
+                                and all(.[]; type == "object"))
+     then .[0] else [$one] end)' <<< "''${LOCAL_WEBHOOK_SPAWN_METAS:-null}" 2>/dev/null \
     || printf '[%s]' "''${LOCAL_WEBHOOK_SPAWN_META:-{\}}"
 }
 claim_include_batch() {
@@ -12975,7 +12978,11 @@ if [ -n "''${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "''${LOCAL_WEBHOOK_SPAWN_KEY:
   objects="$(batch_objects "$metas")"
   include="$(claim_include_batch "$metas")" || include=""
   note="$(claim_note "$LOCAL_WEBHOOK_SPAWN_KEY" "$(printf '%s' "$metas" | "$JQ" -c '.[-1]')")" || note=""
-  if [ "$(printf '%s' "$objects" | "$JQ" 'length')" -gt 1 ]; then
+  # Say the list whenever it holds anything the newest event's own note does
+  # not name: more than one object, or one earlier object beside a newest
+  # event that names none (an issue, then a CI event with no sha).
+  newest="$(batch_objects "$(printf '%s' "$metas" | "$JQ" -c '[.[-1]]')")"
+  if [ "$objects" != "[]" ] && [ "$objects" != "$newest" ]; then
     note="$note; this batch carries $(printf '%s' "$objects" | "$JQ" -r 'join(", ")') and all of them are claimed"
   fi
   [ -n "$note" ] || note="seeded at spawn: this session was started for an event on $own"

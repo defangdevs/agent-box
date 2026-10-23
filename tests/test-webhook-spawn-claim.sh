@@ -304,6 +304,18 @@ for bad in 'not json' '{"number":"5"}' '[]' '[1,2]'; do
   check "unusable METAS ($bad) falls back to the single meta" "$f" \
     '(.topics[0].include.any | all(.in == [4242]))'
 done
+# Whitespace-only and two-value METAS take the fallback, and an earlier object
+# beside a newest event that names none is still listed.
+for bad in ' ' '[{"number":"5"}][{"number":"6"}]'; do
+  SPAWN_METAS="$bad"
+  f=$(spawn defangdevs/badmetas '{"event":"issues","action":"assigned","number":"4242"}')
+  check "METAS ($bad) falls back to the single meta" "$f" \
+    '(.topics[0].include.any | all(.in == [4242]))'
+done
+SPAWN_METAS='[{"event":"issues","number":"92"},{"event":"check_run"}]'
+f=$(spawn defangdevs/earlier '{"event":"check_run"}')
+check "an earlier lone object is claimed and named" "$f" \
+  '.topics[0].note | contains("batch carries 92")'
 unset SPAWN_METAS
 
 [ "$fails" -eq 0 ] || { echo "$fails assertion(s) failed" >&2; exit 1; }
