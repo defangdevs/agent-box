@@ -80,6 +80,7 @@ spawn() {
       LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*' \
       LOCAL_WEBHOOK_SPAWN_EVENT=workflow_run \
       LOCAL_WEBHOOK_SPAWN_META="$2" \
+      ${SPAWN_METAS+LOCAL_WEBHOOK_SPAWN_METAS="$SPAWN_METAS"} \
       "$BASH_BIN" "$work/spawn.sh" >/dev/null 2>&1 <<< 'hi' || return 1
   set -- "$LOCAL_WEBHOOK_STATE_DIR"/filter.*.json
   [ -f "$1" ] || return 1
@@ -270,6 +271,40 @@ PY
 else
   echo "skip webhook.py match (no interpreter/pin given)"
 fi
+
+
+# --- a coalesced batch with several objects (agent-box#887) ---
+#
+# The dispatcher labels a batch with its NEWEST event only, so an earlier
+# object was unclaimed and unleased until the model repaired it. A receiver
+# that exports LOCAL_WEBHOOK_SPAWN_METAS (one meta per surviving event) gets
+# every object claimed, leased and logged.
+SPAWN_METAS='[{"event":"issues","action":"assigned","number":"92"},{"event":"issues","action":"assigned","number":"94"},{"event":"issues","action":"assigned","number":"96"},{"event":"issue_comment","number":"96"}]'
+f=$(spawn defangdevs/batch '{"event":"issues","action":"assigned","number":"96"}')
+check "a batch claims every numbered object once" "$f" \
+  '[.topics[0].include.any[] | .any[0].in[0]] == [92, 94, 96]'
+check "the note names every object" "$f" \
+  '.topics[0].note | contains("92, 94, 96")'
+ses=$(basename "$f" .json); ses=${ses#filter."$SPAWN_USER"-}
+check "the lease lists every object, newest number kept as object" \
+  "$HOME/.local/state/agent-box/lease/$ses.json" \
+  '.object == "96" and .objects == ["92","94","96"]'
+check "the spawn log lists every object" "$HOME/.local/state/agent-box/hook-sessions.jsonl" \
+  'select(.what == "spawn" and .objects == ["92","94","96"])'
+SPAWN_METAS='[{"number":"7"},{"event":"workflow_run","sha":"da73cb12762a543f83f69996d4c43179df13c5e7"}]'
+f=$(spawn defangdevs/mixed '{"event":"workflow_run","sha":"da73cb12762a543f83f69996d4c43179df13c5e7"}')
+check "a number and a commit in one batch are both claimed" "$f" \
+  '(.topics[0].include.any | map(.path // "any") | index("any")) != null
+   and ([.. | objects | select(.path? == "sha") | .in[0]] == ["da73cb12762a543f83f69996d4c43179df13c5e7"])
+   and ([.. | objects | select(.path? == "issue.number") | .in[0]] == [7])'
+# A receiver that sends garbage costs the extra objects, never the spawn.
+for bad in 'not json' '{"number":"5"}' '[]' '[1,2]'; do
+  SPAWN_METAS="$bad"
+  f=$(spawn defangdevs/badmetas '{"event":"issues","action":"assigned","number":"4242"}')
+  check "unusable METAS ($bad) falls back to the single meta" "$f" \
+    '(.topics[0].include.any | all(.in == [4242]))'
+done
+unset SPAWN_METAS
 
 [ "$fails" -eq 0 ] || { echo "$fails assertion(s) failed" >&2; exit 1; }
 echo "all webhook-spawn claim assertions passed"

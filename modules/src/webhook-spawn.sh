@@ -641,7 +641,7 @@ claim_include() {
   # too little to claim anything (in which case the seed is written without
   # one, and a rule-less entry claims nothing that a watch would spawn for —
   # local-channels#16 for the CI half).
-  "$JQ" -n --argjson meta "${LOCAL_WEBHOOK_SPAWN_META:-{\}}" \
+  "$JQ" -n --argjson meta "${1:-{\}}" \
     --arg src "${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" '
     # Only GitHub has numbers, shas and CI. Another source claims the object
     # it names itself (meta.identifier, e.g. a Slack team/channel/thread_ts),
@@ -688,7 +688,7 @@ claim_note() {
   # session was spawned for — a fresh-context session reads it to know why the
   # event matters. It used to be one fixed sentence, byte-identical across
   # every hook session on the box (issue #251).
-  "$JQ" -rn --argjson meta "${LOCAL_WEBHOOK_SPAWN_META:-{\}}" --arg key "$1" \
+  "$JQ" -rn --argjson meta "${2:-{\}}" --arg key "$1" \
     --arg src "${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" '
     # The SAME test claim_include uses, so the note cannot name an object the
     # claim does not cover: a meta carrying a non-numeric `number` would
@@ -722,9 +722,45 @@ claim_note() {
       end' 2>/dev/null
 }
 
+# A coalesced batch can hold several objects (agent-box#887), but the pinned
+# dispatcher exports only the NEWEST event's meta as LOCAL_WEBHOOK_SPAWN_META.
+# A receiver that also exports LOCAL_WEBHOOK_SPAWN_METAS - a JSON array with
+# one meta per surviving event - gets every object claimed and leased. An
+# older receiver sends none, and the batch is then the single meta, exactly
+# as before. The array is payload-derived: anything that is not a short array
+# of objects is ignored, never half-trusted.
+batch_metas() {
+  "$JQ" -c --argjson one "${LOCAL_WEBHOOK_SPAWN_META:-{\}}" '
+    (if type == "array" and length > 0 and length <= 100 and all(.[]; type == "object")
+     then . else [$one] end)' <<< "${LOCAL_WEBHOOK_SPAWN_METAS:-null}" 2>/dev/null \
+    || printf '[%s]' "${LOCAL_WEBHOOK_SPAWN_META:-{\}}"
+}
+claim_include_batch() {
+  # One include for the whole batch: the union of each event's own claim,
+  # de-duplicated, so a batch of one is byte-identical to the old claim.
+  _ci=""
+  while IFS= read -r _m; do
+    _one="$(claim_include "$_m")" || _one=""
+    [ -n "$_one" ] && _ci="$_ci$_one"$'\n'
+  done < <(printf '%s' "$1" | "$JQ" -c '.[]')
+  [ -n "$_ci" ] || return 0
+  printf '%s' "$_ci" | "$JQ" -sc 'unique | if length == 1 then .[0] else {any: .} end' 2>/dev/null
+}
+batch_objects() {
+  # The object each event names, in arrival order, de-duplicated: a number,
+  # else a commit sha, else a generic identifier. Same shape tests as the claim.
+  printf '%s' "$1" | "$JQ" -c '
+    [.[] | ((.number // "" | tostring) | if test("^[0-9]+$") then . else "" end) as $n
+         | ((.sha // "" | tostring) | if test("^[0-9a-f]{7,40}$") then .[0:12] else "" end) as $h
+         | ((.identifier // "" | tostring) | if test("^[A-Za-z0-9._/-]{1,200}$") then . else "" end) as $i
+         | if $n != "" then $n elif $h != "" then $h else $i end
+         | select(. != "")] | unique_by(.)' 2>/dev/null || printf '[]'
+}
+
 seeded=""
 own=""
 lease_object=""
+objects="[]"
 include=""
 if [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "${LOCAL_WEBHOOK_SPAWN_KEY:-}" ]; then
   own="${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}:$LOCAL_WEBHOOK_SPAWN_KEY"
@@ -735,8 +771,13 @@ if [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "${LOCAL_WEBHOOK_SPAWN_KEY:-}" 
   # Both are best effort: a meta this script cannot parse costs the claim and
   # the note, never the spawn. An entry with no `include` is not a claim, so
   # the failure mode is a duplicate agent — never a silenced watch.
-  include="$(claim_include)" || include=""
-  note="$(claim_note "$LOCAL_WEBHOOK_SPAWN_KEY")" || note=""
+  metas="$(batch_metas)"
+  objects="$(batch_objects "$metas")"
+  include="$(claim_include_batch "$metas")" || include=""
+  note="$(claim_note "$LOCAL_WEBHOOK_SPAWN_KEY" "$(printf '%s' "$metas" | "$JQ" -c '.[-1]')")" || note=""
+  if [ "$(printf '%s' "$objects" | "$JQ" 'length')" -gt 1 ]; then
+    note="$note; this batch carries $(printf '%s' "$objects" | "$JQ" -r 'join(", ")') and all of them are claimed"
+  fi
   [ -n "$note" ] || note="seeded at spawn: this session was started for an event on $own"
   if "$JQ" -n --arg topic "$own" --arg ts "$ts" --arg note "$note" \
       --argjson include "${include:-null}" \
@@ -758,7 +799,7 @@ if [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "${LOCAL_WEBHOOK_SPAWN_KEY:-}" 
   lease_object="$("$JQ" -rn --argjson meta "${LOCAL_WEBHOOK_SPAWN_META:-{\}}" \
     '(($meta.number // "" | tostring) | if test("^[0-9]+$") then . else "" end)' \
     2>/dev/null)" || lease_object=""
-  lease_create "$name" "$own" "$lease_object"
+  lease_create "$name" "$own" "$lease_object" "$objects"
 fi
 
 # An assignment is a work request, not a triage request (#253), and the
@@ -864,7 +905,7 @@ fi
 # Recorded only once the session really exists: a capacity refusal (75) is
 # retried by the receiver, and a spawn line per attempt would both report
 # sessions that never started and push the real ones out of the log.
-[ "$rc" = 0 ] && hooklog_spawn "$name" "$own" "${LOCAL_WEBHOOK_SPAWN_EVENT:-}" "$lease_object" "${LOCAL_WEBHOOK_SPAWN_COUNT:-}"
+[ "$rc" = 0 ] && hooklog_spawn "$name" "$own" "${LOCAL_WEBHOOK_SPAWN_EVENT:-}" "$lease_object" "${LOCAL_WEBHOOK_SPAWN_COUNT:-}" "${objects:-[]}"
 if [ "$rc" = 75 ]; then
   # Capacity may change after the refusal; this is a diagnostic snapshot,
   # never a second admission decision. Lock failures are retryable too.

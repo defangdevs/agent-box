@@ -496,10 +496,12 @@ lease_file() {
 }
 
 lease_create() {
-  # lease_create NAME TOPIC OBJECT -- called once, at spawn, by
+  # lease_create NAME TOPIC OBJECT [OBJECTS_JSON] -- called once, at spawn, by
   # agent-box-webhook-spawn. TOPIC is "source:key" (e.g.
   # github:defangdevs/agent-box); OBJECT is the numbered issue/PR this
   # session claims, or empty for a CI-shaped claim with no single number.
+  # OBJECTS_JSON is every object a coalesced batch handed this session (a JSON
+  # array of strings, agent-box#887); OBJECT stays the newest numbered one.
   # Best effort throughout, like every other write in this file: a session
   # must spawn whether or not this write lands.
   mkdir -p "$LEASE_DIR" 2>/dev/null || return 0
@@ -515,9 +517,10 @@ lease_create() {
   _gen=""
   [ -r /proc/sys/kernel/random/uuid ] && read -r _gen < /proc/sys/kernel/random/uuid
   if "$LEASE_JQ" -n --arg topic "$2" --arg object "$3" --arg gen "$_gen" \
-      --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      --argjson objects "${4:-[]}" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
       '{"//": "Durable claim record for a hook-* session (agent-box#535). Written once at spawn; outcome is set on a crash (mark-stopped.sh) or a silent, epilogue-skipped death (supervisor.sh start_session). Deleted on a clean exit -- absence means never leased, or resolved. gen identifies this instance across a name reuse; a writer that read a different gen must not apply its outcome here.",
         topic: $topic, object: (if $object == "" then null else $object end),
+        objects: (if ($objects | type) == "array" then $objects else [] end),
         claimedAt: $at, gen: (if $gen == "" then null else $gen end), outcome: null}' \
       > "$_lt" 2>/dev/null; then
     mv -f "$_lt" "$_lf" 2>/dev/null || rm -f "$_lt"
@@ -648,12 +651,13 @@ hooklog_append() {
 }
 
 hooklog_spawn() {
-  # hooklog_spawn NAME TOPIC EVENT OBJECT COUNT -- called by
+  # hooklog_spawn NAME TOPIC EVENT OBJECT COUNT [OBJECTS_JSON] -- called by
   # agent-box-webhook-spawn once the session is being added.
   "$LEASE_JQ" -cn --arg n "$1" --arg topic "$2" --arg event "$3" --arg object "$4" \
-    --arg count "$5" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg count "$5" --argjson objects "${6:-[]}" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
     '{at: $at, what: "spawn", name: $n, topic: $topic, event: $event,
       object: (if $object == "" then null else $object end),
+      objects: (if ($objects | type) == "array" then $objects else [] end),
       count: (if $count | test("^[0-9]+$") then ($count | tonumber) else null end)}' \
     2>/dev/null | { read -r _hl && hooklog_append "$_hl"; } || true
 }
