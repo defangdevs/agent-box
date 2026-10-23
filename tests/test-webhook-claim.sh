@@ -738,6 +738,38 @@ else
   echo "skip webhook.py match (no pin given)"
 fi
 
+# --- an over-long note is refused, never silently cut (issue #877) ----------
+# A watch's worker instructions put in --note were once lost to a silent cut,
+# safety rules first. The pinned webhook.py must refuse, store nothing, and the
+# guide must keep pointing at a profile for the instructions.
+if [ -n "$WEBHOOK_PY" ]; then
+  real_py=$(PATH="${PATH#"$work/bin:"}" command -v python3)
+  long=$(head -c 1001 /dev/zero | tr '\0' x)
+  for mode in subagent session; do
+    if [ "$mode" = subagent ]; then n=$long; else n=${long:0:301}; fi
+    nstate="$work/note-$mode"; mkdir -p "$nstate"
+    args=(subscribe defangdevs/agent-box --note "$n" --deliver-to "$mode")
+    [ "$mode" = subagent ] && args+=(--when '{"path":"action","in":["opened"]}')
+    if LOCAL_WEBHOOK_STATE_DIR="$nstate" LOCAL_WEBHOOK_SESSION=t \
+         "$real_py" "$WEBHOOK_PY" "${args[@]}" >"$work/nout" 2>&1; then
+      no "an over-long $mode note is refused" "exit 0: $(tail -2 "$work/nout" | tr '\n' ' ')"
+    elif grep -q "never cut" "$work/nout" \
+         && ! grep -rqs "xxxxxxxxxx" "$nstate"; then
+      ok "an over-long $mode note is refused and nothing is stored"
+    else
+      no "an over-long $mode note is refused and nothing is stored" \
+         "$(tail -2 "$work/nout" | tr '\n' ' ')"
+    fi
+  done
+fi
+
+# The wrapper's own help must say where the instructions belong.
+if bash "$SCRIPT" --help 2>&1 | grep -q "put the worker's instructions"; then
+  ok "subscribe --help points worker instructions at a profile"
+else
+  no "subscribe --help points worker instructions at a profile"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "all assertions passed"; else
   echo "$fails assertion(s) failed"; exit 1
