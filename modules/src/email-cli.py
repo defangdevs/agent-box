@@ -71,12 +71,14 @@ def server_config(cfg):
         '"' + u + '"="' + str(p.pw_uid) + ':' + str(p.pw_gid) + ':/var/empty"'
         for u, p in sorted(accounts.items())) + ' }')
     for user in sorted(cfg["users"]):
-        addresses = ', '.join('"' + user + '@' + d.lower() + '"' for d in cfg["domains"])
+        # Literal mailaddr tables accept plus-tags; anchored regex matching
+        # must reject those at RCPT time instead of queuing undeliverable mail.
+        addresses = ', '.join('"^' + user + '@' + d.lower().replace('.', '[.]') + '$"' for d in cfg["domains"])
         command = " ".join((COMMAND, "deliver", user))
         lines += [
             'table rcpt_' + user + ' { ' + addresses + ' }',
             'action deliver_' + user + ' mda "' + command + '" userbase <email_users>',
-            'match from any for rcpt-to <rcpt_' + user + '> action deliver_' + user,
+            'match from any for rcpt-to regex <rcpt_' + user + '> action deliver_' + user,
         ]
     lines += ['match from any for any reject']
     return '\n'.join(lines) + '\n'
