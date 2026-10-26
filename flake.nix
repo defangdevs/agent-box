@@ -2617,6 +2617,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 tests = ./tests/test-whatsapp-cli.py;
                 supervisorTests = ./tests/test-whatsapp-supervisor.sh;
                 slackSupervisorTests = ./tests/test-slack-supervisor.sh;
+                sessionTmpTests = ./tests/test-session-tmp.sh;
                 codexResumeTests = ./tests/test-codex-registered-thread.sh;
               } ''
               install -d repo/modules/src repo/tests
@@ -2631,6 +2632,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 exit 1
               }
               bash "$slackSupervisorTests" "$supervisor" >> log 2>&1 || {
+                cat log
+                exit 1
+              }
+              bash "$sessionTmpTests" "$supervisor" >> log 2>&1 || {
                 cat log
                 exit 1
               }
