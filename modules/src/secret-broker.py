@@ -19,18 +19,35 @@ def peer_uid(conn):
     return struct.unpack("3i", cred)[1]
 
 
+def drain_request(conn):
+    """Read the peer's frame before refusing it. Closing with the request
+    still unread resets the connection, so the peer sees EPIPE or ECONNRESET
+    instead of the refusal."""
+    try:
+        recv_frame(conn)
+    except (SecretError, OSError):
+        pass
+
+
 def serve_one(listener, store, expect_uid):
-    conn, _ = listener.accept()
+    try:
+        conn, _ = listener.accept()
+    except OSError:
+        return
     with conn:
         conn.settimeout(10)
         try:
             if peer_uid(conn) != expect_uid:
+                drain_request(conn)
                 send_frame(conn, {"ok": False, "error": "forbidden"})
                 return
-            send_frame(conn, handle_request(store, recv_frame(conn)))
-        except SecretError as exc:
-            send_frame(conn, {"ok": False, "error": str(exc)})
+            try:
+                reply = handle_request(store, recv_frame(conn))
+            except SecretError as exc:
+                reply = {"ok": False, "error": str(exc)}
+            send_frame(conn, reply)
         except (OSError, socket.timeout):
+            # A peer that vanished mid-exchange must never stop the broker.
             pass
 
 

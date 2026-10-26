@@ -2608,6 +2608,31 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The secret custody broker and CLI (#922): composed from the same
+          # sources the generated module will embed, run over a real Unix
+          # socket. Registered here so the discovered ci-native runs it.
+          secret-custody =
+            pkgs.runCommand "agent-box-secret-custody"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                protocol = ./modules/src/lib/secret-protocol.py;
+                broker = ./modules/src/secret-broker.py;
+                cli = ./modules/src/secret-cli.py;
+                tests = ./tests/test-secret-custody.py;
+              } ''
+              install -d repo/modules/src/lib repo/tests
+              cp "$protocol" repo/modules/src/lib/secret-protocol.py
+              cp "$broker" repo/modules/src/secret-broker.py
+              cp "$cli" repo/modules/src/secret-cli.py
+              cp "$tests" repo/tests/test-secret-custody.py
+              python3 repo/tests/test-secret-custody.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           whatsapp-cli =
             pkgs.runCommand "agent-box-whatsapp-cli"
               {
