@@ -16175,10 +16175,12 @@ esac
     # Per-session scratch dir, exported as TMPDIR into the session environment.
     # The agent unit leaves TMPDIR unset, so `$TMPDIR/x` expanded to /x on a
     # read-only root, and two sessions writing the same /tmp name overwrote each
-    # other. One dir per session name fixes both. It is collision avoidance, not
-    # isolation: every session is the same Linux user. sweep_session_tmp removes
-    # the dir of a delisted session, which also covers a crashed hook session.
-    SESSION_TMP_DIR="$HOME/.cache/agent-box/tmp"
+    # other. One dir per session name fixes both. It lives under the unit's
+    # PrivateTmp /tmp, so it is invisible outside the unit and goes with it on a
+    # restart. It is collision avoidance, not isolation: every session is the same
+    # Linux user. sweep_session_tmp removes the dir of a delisted session, which
+    # also covers a crashed hook session.
+    SESSION_TMP_DIR="/tmp/agent-box-session-tmp"
     session_state_file() {
       # session_state_file NAME — the one place this script spells the path
       # (issue #284). The key is the session NAME for now, and a name is a
@@ -17212,7 +17214,8 @@ esac
       # $sname was charset-checked above. A failed mkdir leaves TMPDIR unset, as
       # before, and must not stop the session from starting.
       stmp="$SESSION_TMP_DIR/$sname"
-      if [ ! -L "$stmp" ] && mkdir -p -m 700 "$stmp" 2>/dev/null; then
+      if [ ! -L "$SESSION_TMP_DIR" ] && [ ! -L "$stmp" ] &&
+         mkdir -p -m 700 "$SESSION_TMP_DIR" "$stmp" 2>/dev/null; then
         pargs="$pargs -e TMPDIR=$stmp"
       fi
       if $TMUX new-session -d -s "$sname" -c "$wd" $whargs $pargs \
