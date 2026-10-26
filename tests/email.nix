@@ -53,6 +53,9 @@
     machine.wait_for_unit("agent-box-email.service")
     machine.wait_for_unit("agent-box-webhook@agent.socket")
     machine.wait_for_open_port(25)
+    source = json.loads(machine.succeed("cat /home/agent/.local/state/local-webhook/sources.json"))
+    assert source["defaultSource"] == "github"
+    assert source["sources"]["email"]["retainPayload"] is True
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailwait agent-box-webhook subscribe email:agent@box.test --note mail-test'")
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailwait agent-box-webhook subscribe email:agent@1-2-3-4.defangstation.com --note alias-test'")
     machine.succeed("su - agent -c \"echo '|touch /home/agent/forward-ran' > /home/agent/.forward\"")

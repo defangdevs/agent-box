@@ -33,9 +33,6 @@ let
     domains = cfg.email.domains;
     users = builtins.attrNames emailUsers;
     inherit (cfg.email) certificateFile keyFile maxMessageBytes;
-    webhookScript = toString localWebhookScript;
-    deliveryCommand = "${emailCli}/bin/agent-box-email";
-    smtpd = "${pkgs.opensmtpd}/sbin/smtpd";
   };
   supportedAgents = [ "claude" "codex" ];
   # Everything a session's `agent` field may name: the agent CLIs plus the
@@ -4814,6 +4811,9 @@ in
       message = "agent-box email user ${name} requires a configured webhook endpoint (web.passwordHashFile).";
     }) emailUsers;
     environment.etc."agent-box/email.json".text = builtins.toJSON emailConfig;
+    environment.etc."agent-box/bin/agent-box-email".source = "${emailCli}/bin/agent-box-email";
+    environment.etc."agent-box/bin/agent-box-email-smtpd".source = "${pkgs.opensmtpd}/sbin/smtpd";
+    environment.etc."agent-box/email-webhook.py".source = localWebhookScript;
     networking.firewall.allowedTCPPorts = [ 25 ];
     users.groups.smtpd = { };
     users.groups.smtpq = { };
@@ -4846,7 +4846,7 @@ in
         requires = map (n: "agent-box-email-source@${n}.service") (builtins.attrNames emailUsers);
         restartTriggers = [ config.environment.etc."agent-box/email.json".source ];
         serviceConfig = {
-          ExecStart = "${emailCli}/bin/agent-box-email server /etc/agent-box/email.json";
+          ExecStart = "${emailCli}/bin/agent-box-email server";
           RuntimeDirectory = "agent-box-email";
           Restart = "on-failure";
           RestartSec = 5;

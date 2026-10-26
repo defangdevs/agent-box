@@ -76,17 +76,24 @@ class EmailAdapter(unittest.TestCase):
                 with self.assertRaises(OSError):
                     mail.deliver(self.cfg, self.user, io.BytesIO(self.raw))
 
+    def test_agent_owned_or_writable_configuration_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'email.json'
+            p.write_text(json.dumps(self.cfg))
+            with mock.patch.object(mail, 'CONFIG', str(p)):
+                for uid, mode in ((1000, 0o100644), (0, 0o100666)):
+                    with mock.patch.object(mail.os, 'fstat', return_value=mock.Mock(st_uid=uid, st_mode=mode)):
+                        with self.assertRaisesRegex(ValueError, 'root-owned'):
+                            mail.load_config()
+
     def test_no_envelope_data_is_a_shell_command(self):
-        cfg = mail.server_config(self.cfg, '/etc/agent-box/email.json')
+        cfg = mail.server_config(self.cfg)
         self.assertNotIn('%{', cfg)
         self.assertNotIn(' relay', cfg)
         self.assertIn('match from any for any reject', cfg)
         self.assertIn('tls pki mail', cfg)
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / 'email.json'
-            p.write_text(json.dumps(dict(self.cfg, keyFile='/tmp/key"; evil')))
-            with self.assertRaises(ValueError):
-                mail.load_config(p)
+        with self.assertRaises(ValueError):
+            mail.validate_config(dict(self.cfg, keyFile='/tmp/key"; evil'))
 
 
 class NativeEmail(unittest.TestCase):
@@ -104,7 +111,8 @@ class NativeEmail(unittest.TestCase):
             cfg = json.loads(text('/etc/agent-box/email.json'))
             self.assertEqual(cfg['users'], ['alice'])
             self.assertEqual(cfg['domains'], ['box.example'])
-            self.assertIn('sbin/smtpd', cfg['smtpd'])
+            links = dict(tree.links)
+            self.assertEqual(links['/etc/agent-box/bin/agent-box-email-smtpd'], str(profile / 'sbin/smtpd'))
             self.assertIn('agent-box-email.service', tree.units)
             self.assertIn('smtpq', text('/etc/tmpfiles.d/agent-box.conf'))
             self.assertIn('User=alice', text('/etc/systemd/system/agent-box-email-source@alice.service'))

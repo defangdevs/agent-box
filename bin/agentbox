@@ -1416,10 +1416,10 @@ class Renderer:
         users = [u for u in self.spec.users if u.email]
         cfg = {"domains": self.spec.email_domains, "users": [u.name for u in users],
                "certificateFile": self.spec.email_certificate, "keyFile": self.spec.email_key,
-               "maxMessageBytes": self.spec.email_max_bytes,
-               "webhookScript": self.spec.webhook_script,
-               "deliveryCommand": str(self.bin / "agent-box-email"),
-               "smtpd": str(self.profile / "sbin" / "smtpd")}
+               "maxMessageBytes": self.spec.email_max_bytes}
+        t.link(self.p("/etc/agent-box/bin/agent-box-email"), self.bin / "agent-box-email")
+        t.link(self.p("/etc/agent-box/bin/agent-box-email-smtpd"), self.profile / "sbin" / "smtpd")
+        t.link(self.p("/etc/agent-box/email-webhook.py"), self.spec.webhook_script)
         cfg_path = self.p("/etc/agent-box/email.json")
         cfg_text = json.dumps(cfg, sort_keys=True) + "\n"
         try:
@@ -1438,7 +1438,7 @@ class Renderer:
         t.file(path, GENERATED_HEADER + "[Unit]\nDescription=Optional inbound email to Linux-user message buses\n"
                + "After=network.target " + " ".join(source_units) + "\nRequires=" + " ".join(source_units)
                + "\n\n[Service]\n"
-               + f"ExecStart={self.bin}/agent-box-email server /etc/agent-box/email.json\n"
+               + f"ExecStart={self.bin}/agent-box-email server\n"
                + "RuntimeDirectory=agent-box-email\nRestart=on-failure\nRestartSec=5\n"
                + "PrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/run /var/spool/smtpd "
                + " ".join(u.home for u in users) + "\nNoNewPrivileges=true\n"

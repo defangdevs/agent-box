@@ -1525,11 +1525,14 @@ case "$cmd" in
     # a re-run), and secretFile is authoritative. Merge, never clobber: another
     # source may already be configured, and defaultSource must keep pointing at
     # whatever was set up first.
+    # Boot-time email initialization must not take over the bare GitHub
+    # endpoint before an operator has run setup github. emit names email
+    # explicitly, so it does not need to become the default HTTP source.
     [ -f "$SOURCES" ] || printf '{"sources":{}}\n' > "$SOURCES"
     tmp="$(mktemp "$SOURCES.XXXXXX")"
     if "$JQ" --arg s "$src" --argjson tmpl "$(source_template "$src")" \
          '.sources = ((.sources // {}) + {($s): ($tmpl + ((((.sources // {})[$s]) // {})) | .secretFile = ($s + ".secret"))})
-          | .defaultSource = (.defaultSource // $s)' "$SOURCES" > "$tmp"; then
+          | .defaultSource = (.defaultSource // (if $s == "email" then "github" else $s end))' "$SOURCES" > "$tmp"; then
       chmod 600 "$tmp"; mv "$tmp" "$SOURCES"
     else
       rm -f "$tmp"; exit 1

@@ -12,21 +12,37 @@ from pathlib import Path
 import pwd
 import re
 import subprocess
+import stat
 import sys
+
+
+CONFIG = "/etc/agent-box/email.json"
+COMMAND = "/etc/agent-box/bin/agent-box-email"
+SMTPD = "/etc/agent-box/bin/agent-box-email-smtpd"
+WEBHOOK = "/etc/agent-box/email-webhook.py"
 
 
 USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 DOMAIN = re.compile(r"(?=.{1,253}$)[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?")
 
 
-def load_config(path):
-    with open(path, encoding="ascii") as fh:
+def load_config():
+    # Both backends own this fixed file and the fixed executable symlinks.
+    # A caller cannot supply an alternate config or executable as CLI data.
+    with open(CONFIG, encoding="ascii") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise ValueError("email configuration must be a root-owned non-writable regular file")
         cfg = json.load(fh)
+    return validate_config(cfg)
+
+
+def validate_config(cfg):
     if not cfg.get("domains") or not all(DOMAIN.fullmatch(d) for d in cfg["domains"]):
         raise ValueError("email domains must be DNS names")
     if not cfg.get("users") or not all(USER.fullmatch(u) for u in cfg["users"]):
         raise ValueError("email needs explicitly enabled Linux users")
-    for key in ("certificateFile", "keyFile", "webhookScript", "deliveryCommand", "smtpd"):
+    for key in ("certificateFile", "keyFile"):
         value = cfg.get(key, "")
         if not value.startswith("/") or not re.fullmatch(r"/[A-Za-z0-9/_.+-]+", value):
             raise ValueError("email " + key + " must be an absolute path without whitespace or metacharacters")
@@ -35,7 +51,7 @@ def load_config(path):
     return cfg
 
 
-def server_config(cfg, config_path):
+def server_config(cfg):
     # No envelope fields are interpolated into an MDA command. OpenSMTPD sets
     # ORIGINAL_RECIPIENT/SENDER in the child's environment and drops uid first.
     lines = [
@@ -56,7 +72,7 @@ def server_config(cfg, config_path):
         for u, p in sorted(accounts.items())) + ' }')
     for user in sorted(cfg["users"]):
         addresses = ', '.join('"' + user + '@' + d.lower() + '"' for d in cfg["domains"])
-        command = " ".join((cfg["deliveryCommand"], "deliver", config_path, user))
+        command = " ".join((COMMAND, "deliver", user))
         lines += [
             'table rcpt_' + user + ' { ' + addresses + ' }',
             'action deliver_' + user + ' mda "' + command + '" userbase <email_users>',
@@ -131,7 +147,7 @@ def deliver(cfg, user, stream):
     env["HOME"] = pwd.getpwuid(os.getuid()).pw_dir
     env["LOCAL_WEBHOOK_STATE_DIR"] = str(Path(env["HOME"]) / ".local/state/local-webhook")
     env["LOCAL_WEBHOOK_HTTP_SOCK"] = "/run/agent-box-webhook/" + user + ".sock"
-    proc = subprocess.run([sys.executable, cfg["webhookScript"], "emit", "email", "-",
+    proc = subprocess.run([sys.executable, WEBHOOK, "emit", "email", "-",
                            "--event", "email.received", "--delivery-id", ident],
                           input=body.encode("ascii"), env=env, timeout=60,
                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -144,21 +160,24 @@ def deliver(cfg, user, stream):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("server", "deliver", "check"))
-    parser.add_argument("config")
     parser.add_argument("user", nargs="?")
     args = parser.parse_args()
-    cfg = load_config(args.config)
-    if not re.fullmatch(r"/[A-Za-z0-9/_.+-]+", args.config):
-        raise ValueError("unsafe email configuration path")
+    if args.command != "deliver" and args.user is not None:
+        parser.error("only deliver accepts a Linux user argument")
+    if args.command == "deliver" and args.user is None:
+        parser.error("deliver requires a Linux user")
+    cfg = load_config()
     if args.command == "deliver":
         deliver(cfg, args.user, sys.stdin.buffer)
     else:
         path = Path("/run/agent-box-email/smtpd.conf")
         if args.command == "check":
-            print(server_config(cfg, args.config), end="")
+            print(server_config(cfg), end="")
             return
-        path.write_text(server_config(cfg, args.config), encoding="ascii")
-        os.execv(cfg["smtpd"], [cfg["smtpd"], "-d", "-f", str(path)])
+        if os.geteuid() != 0:
+            raise ValueError("email server must be started by its root service")
+        path.write_text(server_config(cfg), encoding="ascii")
+        os.execv(SMTPD, [SMTPD, "-d", "-f", str(path)])
 
 
 if __name__ == "__main__":
