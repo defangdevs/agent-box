@@ -106,7 +106,19 @@ class Custody(unittest.TestCase):
     def test_wrong_peer_uid_is_forbidden(self):
         other = Broker(tempfile.mkdtemp(), uid=os.getuid() + 1)
         self.addCleanup(other.stop)
-        self.assertEqual(other.ask({"op": "list"}), {"ok": False, "error": "forbidden"})
+        # The refusal used to race the client's send: the broker closed with
+        # the request unread, so some attempts saw EPIPE instead of this.
+        for _ in range(30):
+            self.assertEqual(other.ask({"op": "list"}), {"ok": False, "error": "forbidden"})
+
+    def test_peer_that_vanishes_does_not_stop_the_broker(self):
+        for send in (b"", b"\x00\x00", struct.pack(">I", 10) + b"abc"):
+            conn = socket.socket(socket.AF_UNIX)
+            conn.connect(self.broker.sock)
+            conn.sendall(send)
+            conn.close()
+            self.assertIsNone(self.broker.proc.poll(), "broker exited")
+            self.assertTrue(self.broker.ask({"op": "list"})["ok"])
 
     def test_namespace_bound_to_identity(self):
         self.broker.ask({"op": "set", "name": "A", "value": "v"})
