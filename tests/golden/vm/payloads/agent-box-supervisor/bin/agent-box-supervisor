@@ -1815,6 +1815,13 @@ fi
 # initialPrompt into the registry and drops the fallback read; that is what
 # makes the supervisor a read-only consumer of sessions.json.
 SESSION_STATE_DIR="$HOME/.local/state/agent-box/session"
+# Per-session scratch dir, exported as TMPDIR into the session environment.
+# The agent unit leaves TMPDIR unset, so `$TMPDIR/x` expanded to /x on a
+# read-only root, and two sessions writing the same /tmp name overwrote each
+# other. One dir per session name fixes both. It is collision avoidance, not
+# isolation: every session is the same Linux user. sweep_session_tmp removes
+# the dir of a delisted session, which also covers a crashed hook session.
+SESSION_TMP_DIR="$HOME/.cache/agent-box/tmp"
 session_state_file() {
   # session_state_file NAME — the one place this script spells the path
   # (issue #284). The key is the session NAME for now, and a name is a
@@ -2845,6 +2852,12 @@ start_session() {
   # which profile it is). Charset-checked above, like $sname.
   pargs=""
   [ -n "$sprofile" ] && pargs="-e AGENT_BOX_PROFILE=$sprofile"
+  # $sname was charset-checked above. A failed mkdir leaves TMPDIR unset, as
+  # before, and must not stop the session from starting.
+  stmp="$SESSION_TMP_DIR/$sname"
+  if [ ! -L "$stmp" ] && mkdir -p -m 700 "$stmp" 2>/dev/null; then
+    pargs="$pargs -e TMPDIR=$stmp"
+  fi
   if $TMUX new-session -d -s "$sname" -c "$wd" $whargs $pargs \
        -e AGENT_BOX_SESSION_ID="$bid" \
        "${AGENT_BOX_ENV_EXEC:?} $cmd$epilogue" 9>&-; then
@@ -3041,6 +3054,21 @@ sweep_session_state() {
   done
 }
 
+# Remove the scratch dir (see SESSION_TMP_DIR) of every session the registry no
+# longer lists. Like sweep_session_state, an unreadable registry removes
+# nothing, and it runs on the same tick as start_session, so it cannot race
+# the mkdir there. A symlink is skipped, never followed.
+sweep_session_tmp() {
+  _listed="$($JQ -r '.sessions | keys[]' "$REGISTRY_FILE" 2>/dev/null)" || return 0
+  for _d in "$SESSION_TMP_DIR"/*; do
+    _n=${_d##*/}
+    case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
+    [ -d "$_d" ] && [ ! -L "$_d" ] || continue
+    case "$NL$_listed$NL" in (*"$NL$_n$NL"*) continue ;; esac
+    rm -rf "$_d"
+  done
+}
+
 # Same backstop as sweep_session_state, for a lease (issue #535) left behind
 # by a session `agent-box-session rm`'s own prune (or a hand-edited registry)
 # never reached. A leftover lease is not just litter: a name is re-usable, and
@@ -3145,6 +3173,7 @@ while true; do
   registry_selfheal "${AGENT_BOX_SESSIONS_SEED:-}"
   reap_ephemeral
   sweep_session_state
+  sweep_session_tmp
   sweep_lease_state
   while IFS= read -r sname; do
     case "$sname" in
