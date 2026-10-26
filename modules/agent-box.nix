@@ -17214,8 +17214,11 @@ esac
       # $sname was charset-checked above. A failed mkdir leaves TMPDIR unset, as
       # before, and must not stop the session from starting.
       stmp="$SESSION_TMP_DIR/$sname"
+      # mkdir -m only sets the mode of a dir it creates, so chmod the pair too: a
+      # dir left by an older run or another tool must not stay open.
       if [ ! -L "$SESSION_TMP_DIR" ] && [ ! -L "$stmp" ]; then
         mkdir -p -m 700 "$SESSION_TMP_DIR" "$stmp" 2>/dev/null &&
+          chmod 700 "$SESSION_TMP_DIR" "$stmp" 2>/dev/null &&
           pargs="$pargs -e TMPDIR=$stmp"
       fi
       if $TMUX new-session -d -s "$sname" -c "$wd" $whargs $pargs \
@@ -17416,9 +17419,11 @@ esac
 
     # Remove the scratch dir (see SESSION_TMP_DIR) of every session the registry no
     # longer lists. Like sweep_session_state, an unreadable registry removes
-    # nothing, and it runs on the same tick as start_session, so it cannot race
-    # the mkdir there. A symlink is skipped, never followed.
+    # nothing. A missing or symlinked root is left alone, and so is a symlinked
+    # entry. It runs on the same tick as start_session, so it cannot race the
+    # mkdir there.
     sweep_session_tmp() {
+      [ -d "$SESSION_TMP_DIR" ] && [ ! -L "$SESSION_TMP_DIR" ] || return 0
       _listed="$($JQ -r '.sessions | keys[]' "$REGISTRY_FILE" 2>/dev/null)" || return 0
       for _d in "$SESSION_TMP_DIR"/*; do
         _n=''${_d##*/}

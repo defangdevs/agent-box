@@ -37,4 +37,13 @@ sweep_session_tmp
 echo '{"sessions":{}}' > "$REGISTRY_FILE"
 sweep_session_tmp
 [ ! -e "$SESSION_TMP_DIR/live" ] && [ ! -e "$SESSION_TMP_DIR/gone2" ]
+# A symlinked root is never traversed.
+mkdir -p "$TEST_ROOT/real/gone"
+echo '{"sessions":{}}' > "$REGISTRY_FILE"
+SESSION_TMP_DIR="$TEST_ROOT/rootlink"
+ln -s "$TEST_ROOT/real" "$SESSION_TMP_DIR"
+sweep_session_tmp
+[ -d "$TEST_ROOT/real/gone" ]
+SESSION_TMP_DIR="$TEST_ROOT/missing"
+sweep_session_tmp
 echo "session tmp sweep: ok"
