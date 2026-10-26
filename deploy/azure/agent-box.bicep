@@ -187,7 +187,10 @@ param location string = resourceGroup().location
 // The portal only sees an empty optional field, never a newGuid expression it
 // could submit literally as a predictable password. The module's output is
 // secure and is consumed only by osProfile.adminPassword.
-var generateRecoveryPassword = authenticationType == 'password' && empty(adminPasswordOrKey)
+// An SSH public key passed without authenticationType (the old default) is
+// still installed as a key: a key is far over the 72-character password limit.
+var usePasswordAuth = authenticationType == 'password' && !startsWith(adminPasswordOrKey, 'ssh-')
+var generateRecoveryPassword = usePasswordAuth && empty(adminPasswordOrKey)
 module recoveryPassword 'recovery-password.bicep' = {
   name: '${namePrefix}-recovery-password'
 }
@@ -212,7 +215,7 @@ var imageSkuBySize = {
 // consequence of picking password auth is visible in the source instead of
 // being inferred from an absent property: choosing it DOES enable SSH password
 // authentication, to whatever allowCidr allows, whenever debugSsh is on.
-var linuxConfiguration = authenticationType == 'password' ? {
+var linuxConfiguration = usePasswordAuth ? {
   disablePasswordAuthentication: false
 } : {
   disablePasswordAuthentication: true
@@ -659,7 +662,7 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
     osProfile: {
       computerName: namePrefix
       adminUsername: adminUsername
-      adminPassword: authenticationType == 'password' ? (generateRecoveryPassword ? recoveryPassword.outputs.password : adminPasswordOrKey) : null
+      adminPassword: usePasswordAuth ? (generateRecoveryPassword ? recoveryPassword.outputs.password : adminPasswordOrKey) : null
       linuxConfiguration: linuxConfiguration
     }
     networkProfile: {

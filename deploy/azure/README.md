@@ -91,7 +91,10 @@ The visitor supplies only `webPassword`; the recovery password is generated
 separately at deployment time. Its module output is a `securestring`, consumed
 only by the VM's `adminPassword`; no credential appears in the parent
 deployment's outputs or readable deployment history. To use an
-existing key instead, set `authenticationType=sshPublicKey` and supply the key
+existing key instead, supply it as `adminPasswordOrKey` (a value starting with
+`ssh-` is installed as a key even if `authenticationType` is left at its
+default, so older key-based commands keep working), or set
+`authenticationType=sshPublicKey` and supply the key
 as `adminPasswordOrKey`. This credential belongs to `adminUsername` (default
 `azureuser`), separately from the agent account and browser password.
 

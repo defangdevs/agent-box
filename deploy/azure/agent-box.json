@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.39",
-      "templateHash": "8565748278314314916"
+      "templateHash": "9017800245963676478"
     }
   },
   "parameters": {
@@ -175,7 +175,8 @@
   },
   "variables": {
     "effectiveSslipDomains": "[if(not(empty(parameters('sslipDomain'))), createArray(parameters('sslipDomain')), parameters('sslipDomains'))]",
-    "generateRecoveryPassword": "[and(equals(parameters('authenticationType'), 'password'), empty(parameters('adminPasswordOrKey')))]",
+    "usePasswordAuth": "[and(equals(parameters('authenticationType'), 'password'), not(startsWith(parameters('adminPasswordOrKey'), 'ssh-')))]",
+    "generateRecoveryPassword": "[and(variables('usePasswordAuth'), empty(parameters('adminPasswordOrKey')))]",
     "vmSize": "[split(parameters('vmSizeChoice'), ' ')[0]]",
     "imageSkuBySize": {
       "Standard_B2pls_v2": "server-arm64",
@@ -184,7 +185,7 @@
       "Standard_B4ps_v2": "server-arm64",
       "Standard_B2als_v2": "server"
     },
-    "linuxConfiguration": "[if(equals(parameters('authenticationType'), 'password'), createObject('disablePasswordAuthentication', false()), createObject('disablePasswordAuthentication', true(), 'ssh', createObject('publicKeys', createArray(createObject('path', format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername')), 'keyData', parameters('adminPasswordOrKey'))))))]",
+    "linuxConfiguration": "[if(variables('usePasswordAuth'), createObject('disablePasswordAuthentication', false()), createObject('disablePasswordAuthentication', true(), 'ssh', createObject('publicKeys', createArray(createObject('path', format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername')), 'keyData', parameters('adminPasswordOrKey'))))))]",
     "sshRule": "[if(parameters('debugSsh'), createArray(createObject('name', 'ssh', 'properties', createObject('priority', 1001, 'protocol', 'Tcp', 'access', 'Allow', 'direction', 'Inbound', 'sourceAddressPrefix', parameters('allowCidr'), 'sourcePortRange', '*', 'destinationAddressPrefix', '*', 'destinationPortRange', '22'))), createArray())]",
     "httpsRule": {
       "name": "https",
@@ -315,7 +316,7 @@
         "osProfile": {
           "computerName": "[parameters('namePrefix')]",
           "adminUsername": "[parameters('adminUsername')]",
-          "adminPassword": "[if(equals(parameters('authenticationType'), 'password'), if(variables('generateRecoveryPassword'), listOutputsWithSecureValues('recoveryPassword', '2025-04-01').password, parameters('adminPasswordOrKey')), null())]",
+          "adminPassword": "[if(variables('usePasswordAuth'), if(variables('generateRecoveryPassword'), listOutputsWithSecureValues('recoveryPassword', '2025-04-01').password, parameters('adminPasswordOrKey')), null())]",
           "linuxConfiguration": "[variables('linuxConfiguration')]"
         },
         "networkProfile": {
