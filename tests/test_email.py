@@ -116,6 +116,8 @@ class NativeEmail(unittest.TestCase):
             self.assertIn('agent-box-email.service', tree.units)
             self.assertIn('smtpq', text('/etc/tmpfiles.d/agent-box.conf'))
             self.assertIn('User=alice', text('/etc/systemd/system/agent-box-email-source@alice.service'))
+            self.assertIn('AGENT_BOX_WEBHOOK_URL=https://box.example/alice/webhook',
+                          text('/etc/systemd/system/agent-box-email-source@alice.service'))
             data['email']['enable'] = False
             off = mod.Renderer(mod.Spec(data, profile=profile), profile).render()
             self.assertNotIn('agent-box-email.service', off.units)

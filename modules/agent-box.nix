@@ -35250,12 +35250,16 @@ if __name__ == "__main__":
       description = "Configure the private email bus source for ${name}";
       before = [ "agent-box-email.service" ];
       path = [ pkgs.python3 pkgs.jq pkgs.coreutils ];
+      environment = {
+        HOME = "/home/${name}";
+        AGENT_BOX_WEBHOOK_URL = "https://${cfg.web.domain}${webhookPathOf name}";
+      };
       serviceConfig = {
         Type = "oneshot";
         User = name;
-        Environment = "HOME=/home/${name}";
         ExecStart = "${webhookCli}/bin/agent-box-webhook setup email";
         StandardOutput = "null";
+        StandardError = "journal";
         RemainAfterExit = true;
       };
     }) emailUsers) // {

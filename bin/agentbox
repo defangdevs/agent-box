@@ -1433,8 +1433,9 @@ class Renderer:
                    GENERATED_HEADER + "[Unit]\nBefore=agent-box-email.service\n\n[Service]\n"
                    + f"Type=oneshot\nUser={u.name}\nEnvironment=HOME={u.home}\n"
                    + f"Environment=PATH={self.bin}:/usr/bin:/bin\n"
+                   + f"Environment=AGENT_BOX_WEBHOOK_URL=https://{self.spec.domain}/{u.name}/webhook\n"
                    + "ExecStart=/usr/local/bin/agent-box-webhook setup email\n"
-                   + "StandardOutput=null\nRemainAfterExit=true\n")
+                   + "StandardOutput=null\nStandardError=journal\nRemainAfterExit=true\n")
         t.file(path, GENERATED_HEADER + "[Unit]\nDescription=Optional inbound email to Linux-user message buses\n"
                + "After=network.target " + " ".join(source_units) + "\nRequires=" + " ".join(source_units)
                + "\n\n[Service]\n"
