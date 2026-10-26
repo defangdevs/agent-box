@@ -1003,3 +1003,5 @@ Maintainer and continuity notes live in the
 
 MIT - see [LICENSE](./LICENSE). Note this license covers the flake/module only;
 the harnesses ship under their own terms.
+
+Optional inbound email for Linux users is documented in [docs/email.md](docs/email.md).

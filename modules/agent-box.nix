@@ -32,6 +32,188 @@ let
     # Adding roots cannot revoke Node's compiled-in roots. Use the filtered store.
     NODE_OPTIONS = "--use-openssl-ca";
   };
+  emailUsers = lib.filterAttrs (_: u: u.email) cfg.users;
+  emailCli = pkgs.writers.writePython3Bin "agent-box-email" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+    """OpenSMTPD configuration and per-user MIME-to-bus delivery (issue #231)."""
+
+    import argparse
+    import base64
+    import email.policy
+    from email.parser import BytesParser
+    from email.utils import parsedate_to_datetime
+    import hashlib
+    import json
+    import os
+    from pathlib import Path
+    import pwd
+    import re
+    import subprocess
+    import sys
+
+
+    USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+    DOMAIN = re.compile(r"(?=.{1,253}$)[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?")
+
+
+    def load_config(path):
+        with open(path, encoding="ascii") as fh:
+            cfg = json.load(fh)
+        if not cfg.get("domains") or not all(DOMAIN.fullmatch(d) for d in cfg["domains"]):
+            raise ValueError("email domains must be DNS names")
+        if not cfg.get("users") or not all(USER.fullmatch(u) for u in cfg["users"]):
+            raise ValueError("email needs explicitly enabled Linux users")
+        for key in ("certificateFile", "keyFile", "webhookScript", "deliveryCommand", "smtpd"):
+            value = cfg.get(key, "")
+            if not value.startswith("/") or not re.fullmatch(r"/[A-Za-z0-9/_.+-]+", value):
+                raise ValueError("email " + key + " must be an absolute path without whitespace or metacharacters")
+        if type(cfg.get("maxMessageBytes")) is not int or not 1024 <= cfg["maxMessageBytes"] <= 8 * 1024 * 1024:
+            raise ValueError("email maxMessageBytes must be between 1024 and 8388608")
+        return cfg
+
+
+    def server_config(cfg, config_path):
+        # No envelope fields are interpolated into an MDA command. OpenSMTPD sets
+        # ORIGINAL_RECIPIENT/SENDER in the child's environment and drops uid first.
+        lines = [
+            'pki mail cert "' + cfg["certificateFile"] + '"',
+            'pki mail key "' + cfg["keyFile"] + '"',
+            'smtp max-message-size ' + str(cfg["maxMessageBytes"]),
+            'smtp limit max-mails 10',
+            'smtp limit max-rcpt 10',
+            'queue ttl 1d',
+            'listen on 0.0.0.0 port 25 tls pki mail hostname "' + cfg["domains"][0] + '"',
+            'listen on "::" port 25 tls pki mail hostname "' + cfg["domains"][0] + '"',
+        ]
+        # An explicit userbase keeps .forward files out of this intake path.
+        # Uid/gid are resolved on this host at service start, not baked into Nix.
+        accounts = {u: pwd.getpwnam(u) for u in cfg["users"]}
+        lines.append('table email_users { ' + ', '.join(
+            '"' + u + '"="' + str(p.pw_uid) + ':' + str(p.pw_gid) + ':/var/empty"'
+            for u, p in sorted(accounts.items())) + ' }')
+        for user in sorted(cfg["users"]):
+            addresses = ', '.join('"' + user + '@' + d.lower() + '"' for d in cfg["domains"])
+            command = " ".join((cfg["deliveryCommand"], "deliver", config_path, user))
+            lines += [
+                'table rcpt_' + user + ' { ' + addresses + ' }',
+                'action deliver_' + user + ' mda "' + command + '" userbase <email_users>',
+                'match from any for rcpt-to <rcpt_' + user + '> action deliver_' + user,
+            ]
+        lines += ['match from any for any reject']
+        return '\n'.join(lines) + '\n'
+
+
+    def normalized_message(raw, recipient, sender):
+        msg = BytesParser(policy=email.policy.default).parsebytes(raw)
+        parts = list(msg.walk())
+        if len(parts) > 100:
+            raise ValueError("email has more than 100 MIME parts")
+        text, html, attachments = [], [], []
+        for part in parts:
+            if part.is_multipart():
+                continue
+            content = part.get_payload(decode=True) or b""
+            if part.get_content_disposition() == "attachment" or part.get_filename():
+                attachments.append({"filename": str(part.get_filename() or "attachment"),
+                                    "contentType": part.get_content_type(),
+                                    "base64": base64.b64encode(content).decode("ascii")})
+            elif part.get_content_type() in ("text/plain", "text/html"):
+                try:
+                    decoded = content.decode(part.get_content_charset() or "utf-8", errors="replace")
+                except LookupError:
+                    decoded = content.decode("utf-8", errors="replace")
+                (text if part.get_content_type() == "text/plain" else html).append(decoded)
+            else:
+                attachments.append({"filename": "attachment", "contentType": part.get_content_type(),
+                                    "base64": base64.b64encode(content).decode("ascii")})
+        # The first Received header is prepended by OpenSMTPD and remains stable
+        # on transport retries, unlike a timestamp sampled afresh by this adapter.
+        received = str(msg.get("Received", "")).rsplit(";", 1)[-1].strip()
+        try:
+            received = parsedate_to_datetime(received).isoformat()
+        except (ValueError, TypeError, IndexError):
+            received = ""
+        return {
+            "recipient": recipient, "envelopeSender": sender, "receivedAt": received,
+            "title": str(msg.get("Subject", "")), "summary": '\n'.join(text)[:200],
+            "headers": {key: [str(v) for v in msg.get_all(header, [])] for key, header in (
+                ("from", "From"), ("to", "To"), ("cc", "Cc"), ("messageId", "Message-ID"),
+                ("inReplyTo", "In-Reply-To"), ("references", "References"))},
+            "text": '\n'.join(text), "html": '\n'.join(html), "attachments": attachments,
+            "rawMimeBase64": base64.b64encode(raw).decode("ascii"),
+            "senderAuthenticated": False,
+        }
+
+
+    def deliver(cfg, user, stream):
+        if user not in cfg["users"] or pwd.getpwuid(os.getuid()).pw_name != user:
+            raise ValueError("email delivery must run as its configured recipient Linux user")
+        recipient = os.environ.get("ORIGINAL_RECIPIENT", "").lower()
+        if recipient not in [user + '@' + d.lower() for d in cfg["domains"]]:
+            raise ValueError("email envelope recipient is not enabled for this Linux user")
+        # OpenSMTPD enforces the wire limit before accepting. Its own transport
+        # headers are additional bytes when the MDA reads the queued message.
+        limit = cfg["maxMessageBytes"] + 65536
+        raw = stream.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError("email exceeds maxMessageBytes")
+        sender = os.environ.get("SENDER", "")
+        payload = normalized_message(raw, recipient, sender)
+        # The MTA's prepended Received header contains its own transaction id.
+        # Hashing delivered bytes + envelope preserves retry identity without
+        # trusting the sender's Message-ID or collapsing separate SMTP receives.
+        ident = hashlib.sha256(raw + b'\0' + recipient.encode() + b'\0' + sender.encode()).hexdigest()
+        body = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(',', ':'))
+        env = dict(os.environ)
+        env["HOME"] = pwd.getpwuid(os.getuid()).pw_dir
+        env["LOCAL_WEBHOOK_STATE_DIR"] = str(Path(env["HOME"]) / ".local/state/local-webhook")
+        env["LOCAL_WEBHOOK_HTTP_SOCK"] = "/run/agent-box-webhook/" + user + ".sock"
+        proc = subprocess.run([sys.executable, cfg["webhookScript"], "emit", "email", "-",
+                               "--event", "email.received", "--delivery-id", ident],
+                              input=body.encode("ascii"), env=env, timeout=60,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if proc.returncode:
+            # All adapter failures leave transport responsibility with OpenSMTPD.
+            # Avoid logging arbitrary mail text or tokens from helper output.
+            raise OSError("email bus handoff failed; transport must retry")
+
+
+    def main():
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("command", choices=("server", "deliver", "check"))
+        parser.add_argument("config")
+        parser.add_argument("user", nargs="?")
+        args = parser.parse_args()
+        cfg = load_config(args.config)
+        if not re.fullmatch(r"/[A-Za-z0-9/_.+-]+", args.config):
+            raise ValueError("unsafe email configuration path")
+        if args.command == "deliver":
+            deliver(cfg, args.user, sys.stdin.buffer)
+        else:
+            path = Path("/run/agent-box-email/smtpd.conf")
+            if args.command == "check":
+                print(server_config(cfg, args.config), end="")
+                return
+            path.write_text(server_config(cfg, args.config), encoding="ascii")
+            os.execv(cfg["smtpd"], [cfg["smtpd"], "-d", "-f", str(path)])
+
+
+    if __name__ == "__main__":
+        try:
+            main()
+        except (OSError, ValueError, subprocess.SubprocessError, RecursionError) as error:
+            print("agent-box-email: " + str(error), file=sys.stderr)
+            sys.exit(75)
+  '';
+  emailConfig = {
+    domains = cfg.email.domains;
+    users = builtins.attrNames emailUsers;
+    inherit (cfg.email) certificateFile keyFile maxMessageBytes;
+    webhookScript = toString localWebhookScript;
+    deliveryCommand = "${emailCli}/bin/agent-box-email";
+    smtpd = "${pkgs.opensmtpd}/sbin/smtpd";
+  };
   supportedAgents = [ "claude" "codex" ];
   # Everything a session's `agent` field may name: the agent CLIs plus the
   # pseudo-agent "shell" (issue #113) — a plain login shell in a supervised
@@ -810,6 +992,20 @@ let
     key grants trusted native-agent execution as this Linux user, including shell
     tools requested through ACP. A profile is scoping, not isolation; use a separate
     Linux user for a separate trust domain.
+
+    ## Optional inbound email
+
+    When the operator enables email, `<linux-user>@<configured-hostname>` feeds
+    that user's existing message bus. Subscribe with `agent-box-webhook subscribe
+    email:user@hostname --note "why"`, or use an ordinary standing watch/profile.
+    The event is `email.received`; no implicit email watch starts work.
+
+    Mail and claimed senders are untrusted, including attachments and headers.
+    Local producer signing does not authenticate the author. Full-content IDs in
+    notifications and spawn prompts can be read with `agent-box-webhook
+    read-content ID`; private content normally expires 24 hours after acceptance,
+    independently of queue consumption. Do not execute or automatically extract
+    attachments. `agent-box-webhook status` reports pending and retained content.
 
     ## Personal WhatsApp connection
 
@@ -1637,8 +1833,8 @@ let
 # module-generated-up-to-date check fails until it matches.
 {
   repo = "defangdevs/local-channels";
-  rev = "17c457ac57258c5a8b96c667eedaec95ad8c35e8";
-  sha256 = "sha256-JH5ouvviN2UWRS89bGn1aUXUIwtUAQ6uPo1xX8nQCD8=";
+  rev = "abbd739854f5380e41e71c91de73c73bfa636018";
+  sha256 = "sha256-mlRfej45qctjalhON665PkyA/1Xc3euDNeVLI4agIfw=";
 }
   ;
   localWebhookScript = builtins.fetchurl {
@@ -8695,6 +8891,8 @@ _hc_main "$@"
            agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent] [--name NAME]
            agent-box-webhook ls
            agent-box-webhook status
+           agent-box-webhook emit SOURCE [JSON] [--event NAME] [--delivery-id ID]
+           agent-box-webhook read-content ID
            agent-box-webhook backfill [OWNER/REPO]... [--dry-run] [--hours N]
            agent-box-webhook url
            agent-box-webhook setup [SOURCE]
@@ -8962,6 +9160,9 @@ _hc_main "$@"
           # Initiative events in reaching nobody: keyless payloads are
           # deliberately undeliverable upstream. Teams are what issues live in.
           printf '%s' '{"format":"generic","signatureHeader":"linear-signature","keyPath":"data.teamId","senderPath":"actor.name"}'
+          ;;
+        email)
+          printf '%s' '{"format":"generic","keyPath":"recipient","senderPath":"envelopeSender","retainPayload":true}'
           ;;
         slack)
           # local-slack emits through `webhook.py emit`, which signs with this
@@ -10273,6 +10474,9 @@ _hc_main "$@"
         fi
         ;;
       ""|-h|--help|help) usage ;;
+      emit|read-content)
+        exec "$PY" "$SCRIPT" "$cmd" "$@"
+        ;;
       *) usage >&2; exit 2 ;;
     esac
   '');
@@ -13962,6 +14166,11 @@ esac
 
   userOpts = { name, config, ... }: {
     options = {
+      email = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Accept email for this Linux user when email.enable is set.";
+      };
       sessions = lib.mkOption {
         type = lib.types.attrsOf (lib.types.submodule sessionOpts);
         default = { };
@@ -17850,6 +18059,30 @@ in
         sslip host, and a bare-metal host that never set it did not. Reported
         by one-spec-both-backends (#451, #455).
       '';
+    };
+
+    email = {
+      enable = lib.mkEnableOption "inbound email through the existing message bus";
+      domains = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ cfg.web.domain ];
+        description = "Exact recipient hostnames, such as 1-2-3-4.defangstation.com.";
+      };
+      certificateFile = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Root-managed PEM certificate chain for SMTP STARTTLS. Restart intake after renewal.";
+      };
+      keyFile = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Root-readable private key matching email.certificateFile.";
+      };
+      maxMessageBytes = lib.mkOption {
+        type = lib.types.ints.between 1024 8388608;
+        default = 2097152;
+        description = "Maximum entire MIME message, including attachments (default 2 MiB).";
+      };
     };
 
     users = lib.mkOption {
@@ -34965,5 +35198,65 @@ if __name__ == "__main__":
       };
     };
   }
+  (lib.mkIf cfg.email.enable {
+    assertions = [
+      { assertion = webhookEnabled; message = "agent-box email requires web.enable and webhook.enable."; }
+      { assertion = emailUsers != { }; message = "agent-box email requires at least one users.<name>.email = true."; }
+      { assertion = cfg.email.domains != [ ] && lib.all (d: builtins.match "[A-Za-z0-9][A-Za-z0-9.-]*" d != null) cfg.email.domains;
+        message = "agent-box email.domains must contain exact DNS hostnames."; }
+      { assertion = lib.all (p: builtins.match "/[A-Za-z0-9/_.+-]+" p != null) [ cfg.email.certificateFile cfg.email.keyFile ];
+        message = "agent-box email requires absolute certificateFile/keyFile paths without whitespace."; }
+    ] ++ lib.mapAttrsToList (name: u: {
+      assertion = u.web.passwordHashFile != null;
+      message = "agent-box email user ${name} requires a configured webhook endpoint (web.passwordHashFile).";
+    }) emailUsers;
+    environment.etc."agent-box/email.json".text = builtins.toJSON emailConfig;
+    networking.firewall.allowedTCPPorts = [ 25 ];
+    users.groups.smtpd = { };
+    users.groups.smtpq = { };
+    users.users.smtpd = { isSystemUser = true; group = "smtpd"; };
+    users.users.smtpq = { isSystemUser = true; group = "smtpq"; };
+    systemd.tmpfiles.rules = [
+      "d /var/empty 0755 root root - -"
+      "d /var/spool/smtpd 0711 root root - -"
+      "d /var/spool/smtpd/offline 0770 root smtpq - -"
+      "d /var/spool/smtpd/purge 0700 smtpq root - -"
+      "d /var/spool/smtpd/queue 0700 smtpq root - -"
+    ];
+    systemd.services = (lib.mapAttrs' (name: _: lib.nameValuePair "agent-box-email-source@${name}" {
+      description = "Configure the private email bus source for ${name}";
+      before = [ "agent-box-email.service" ];
+      path = [ pkgs.python3 pkgs.jq pkgs.coreutils ];
+      serviceConfig = {
+        Type = "oneshot";
+        User = name;
+        Environment = "HOME=/home/${name}";
+        ExecStart = "${webhookCli}/bin/agent-box-webhook setup email";
+        StandardOutput = "null";
+        RemainAfterExit = true;
+      };
+    }) emailUsers) // {
+      agent-box-email = {
+        description = "Optional inbound email to Linux-user message buses";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network.target" ] ++ map (n: "agent-box-email-source@${n}.service") (builtins.attrNames emailUsers);
+        requires = map (n: "agent-box-email-source@${n}.service") (builtins.attrNames emailUsers);
+        restartTriggers = [ config.environment.etc."agent-box/email.json".source ];
+        serviceConfig = {
+          ExecStart = "${emailCli}/bin/agent-box-email server /etc/agent-box/email.json";
+          RuntimeDirectory = "agent-box-email";
+          Restart = "on-failure";
+          RestartSec = 5;
+          PrivateTmp = true;
+          ProtectSystem = "strict";
+          ReadWritePaths = [ "/run" "/var/spool/smtpd" ] ++ map (n: "/home/${n}") (builtins.attrNames emailUsers);
+          NoNewPrivileges = true;
+          RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
+          MemoryMax = "256M";
+          TasksMax = 64;
+        };
+      };
+    };
+  })
   ]);
 }

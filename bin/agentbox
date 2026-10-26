@@ -629,6 +629,7 @@ SESSION_SCHEMA = _Obj({
 })
 
 USER_SCHEMA = _Obj({
+    "email": BOOL,
     "home": STR,
     "agent": STR,
     # Inert since issue #628 put ttyd on a UNIX socket: there is no port to
@@ -691,6 +692,13 @@ BOX_SCHEMA = _Obj({
     "web": _Obj({"enable": BOOL, "rebootButton": BOOL,
                  "alias": DOMAIN_SUFFIX, "aliases": STR_LIST,
                  "portalIssuer": STR, "portalJwksUrl": STR}),
+    "email": _Obj({
+        "enable": BOOL, "domains": STR_LIST,
+        "certificateFile": STR, "keyFile": STR,
+        "maxMessageBytes": _Scalar(
+            "an integer from 1024 to 8388608",
+            lambda v: type(v) is int and 1024 <= v <= 8388608),
+    }),
     "webhook": _Obj({
         "enable": BOOL,
         "repo": STR,
@@ -995,6 +1003,22 @@ class Spec:
             )
         self.root_user = flagged[0] if flagged else self.users[0]
 
+        email = data.get("email") or {}
+        self.email_enable = bool(email.get("enable", False))
+        self.email_domains = email.get("domains") if email.get("domains") is not None else [self.domain]
+        self.email_certificate = email.get("certificateFile") or ""
+        self.email_key = email.get("keyFile") or ""
+        self.email_max_bytes = email.get("maxMessageBytes") or 2097152
+        if self.email_enable:
+            if not self.webhook_enable:
+                raise ConfigError("email.enable requires web.enable and webhook.enable with a pinned webhook script")
+            if not any(u.email for u in self.users):
+                raise ConfigError("email.enable requires at least one users.<name>.email: true")
+            if not self.email_domains or not all(DOMAIN_SUFFIX_RE.fullmatch(d) for d in self.email_domains):
+                raise ConfigError("email.domains must contain exact DNS hostnames")
+            if not all(re.fullmatch(r"/[A-Za-z0-9/_.+-]+", p) for p in (self.email_certificate, self.email_key)):
+                raise ConfigError("email requires absolute certificateFile/keyFile paths without whitespace")
+
     @property
     def webhook_enable(self):
         return bool(self._webhook_enable and self.web_enable
@@ -1004,6 +1028,7 @@ class Spec:
 class User:
     def __init__(self, name, data, spec):
         self.name = name
+        self.email = bool(data.get("email", False))
         self.spec = spec
         self.home = data.get("home") or f"/home/{name}"
         self.agent = data.get("agent") or spec.default_agent
@@ -1368,10 +1393,58 @@ class Renderer:
             self.web_off(t)
         if not self.spec.webhook_enable:
             self.webhook_off(t)
+        self.email(t)
         self.tls_policy(t)
         return t
 
     # -- agent defaults ------------------------------------------------------
+
+    def email(self, t):
+        unit = "agent-box-email.service"
+        path = self.p("/etc/systemd/system", unit)
+        source_units = [f"agent-box-email-source@{u.name}.service" for u in self.spec.users if u.email]
+        if not self.spec.email_enable:
+            t.gone(path)
+            if generated_by_us(path):
+                t.disable.append(unit)
+            for u in self.spec.users:
+                source = self.p("/etc/systemd/system", f"agent-box-email-source@{u.name}.service")
+                t.gone(source)
+                if generated_by_us(source):
+                    t.disable.append(source.name)
+            return
+        users = [u for u in self.spec.users if u.email]
+        cfg = {"domains": self.spec.email_domains, "users": [u.name for u in users],
+               "certificateFile": self.spec.email_certificate, "keyFile": self.spec.email_key,
+               "maxMessageBytes": self.spec.email_max_bytes,
+               "webhookScript": self.spec.webhook_script,
+               "deliveryCommand": str(self.bin / "agent-box-email"),
+               "smtpd": str(self.profile / "sbin" / "smtpd")}
+        cfg_path = self.p("/etc/agent-box/email.json")
+        cfg_text = json.dumps(cfg, sort_keys=True) + "\n"
+        try:
+            old_config = cfg_path.read_text()
+        except FileNotFoundError:
+            old_config = None
+        t.email_restart = old_config is not None and old_config != cfg_text
+        t.file(cfg_path, cfg_text)
+        for u in users:
+            t.file(self.p("/etc/systemd/system", f"agent-box-email-source@{u.name}.service"),
+                   GENERATED_HEADER + "[Unit]\nBefore=agent-box-email.service\n\n[Service]\n"
+                   + f"Type=oneshot\nUser={u.name}\nEnvironment=HOME={u.home}\n"
+                   + f"Environment=PATH={self.bin}:/usr/bin:/bin\n"
+                   + "ExecStart=/usr/local/bin/agent-box-webhook setup email\n"
+                   + "StandardOutput=null\nRemainAfterExit=true\n")
+        t.file(path, GENERATED_HEADER + "[Unit]\nDescription=Optional inbound email to Linux-user message buses\n"
+               + "After=network.target " + " ".join(source_units) + "\nRequires=" + " ".join(source_units)
+               + "\n\n[Service]\n"
+               + f"ExecStart={self.bin}/agent-box-email server /etc/agent-box/email.json\n"
+               + "RuntimeDirectory=agent-box-email\nRestart=on-failure\nRestartSec=5\n"
+               + "PrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/run /var/spool/smtpd "
+               + " ".join(u.home for u in users) + "\nNoNewPrivileges=true\n"
+               + "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nMemoryMax=256M\nTasksMax=64\n"
+               + "\n[Install]\nWantedBy=multi-user.target\n")
+        t.units.append(unit)
 
     def agent_defaults(self, t):
         """The two files the agent CLIs themselves read (issue #394).
@@ -3447,6 +3520,12 @@ class Renderer:
         systemd-tmpfiles --create to realize it.
         """
         lines = []
+        if self.spec.email_enable:
+            lines += ["d /var/empty 0755 root root - -",
+                      "d /var/spool/smtpd 0711 root root - -",
+                      "d /var/spool/smtpd/offline 0770 root smtpq - -",
+                      "d /var/spool/smtpd/purge 0700 smtpq root - -",
+                      "d /var/spool/smtpd/queue 0700 smtpq root - -"]
         # Nothing here for containers: the daemon's XDG_RUNTIME_DIR is the
         # shared unit's own RuntimeDirectory=, kept across a stop with
         # RuntimeDirectoryPreserve=yes. A rule here would race user
@@ -4491,6 +4570,9 @@ def activate(spec, tree, removed, advisory, act):
     for u in spec.users:
         ensure_user(u.name, u.home, act)
         ensure_linger(u.name, act)
+    if spec.email_enable:
+        ensure_group_user("smtpd", act, home="/var/empty")
+        ensure_group_user("smtpq", act, home="/var/empty")
     if spec.web_enable:
         # Advisory on its own: if the login really cannot be created,
         # caddy.service cannot start as it, and THAT is a required failure
@@ -4637,10 +4719,16 @@ def activate(spec, tree, removed, advisory, act):
                    else act.require(f"start {unit}", cmd))
         if not started:
             failed_starts.add(unit)
+    if (spec.email_enable and getattr(tree, "email_restart", False)
+            and "agent-box-email.service" not in failed_starts):
+        # Re-render the OpenSMTPD config when domains/users/cert paths change;
+        # enable --now alone leaves an already running listener unchanged.
+        if not act.require("refresh email intake", ["systemctl", "restart", "agent-box-email.service"]):
+            failed_starts.add("agent-box-email.service")
     wanted = set(tree.units)
     for prefix in ("agent-box@", "agent-web-terminal@",
                    "agent-box-settings@", "agent-box-webhook@",
-                   DOCKER_UNIT_PREFIX):
+                   DOCKER_UNIT_PREFIX, "agent-box-email-source@"):
         for unit in systemd_units_live(prefix):
             if unit not in wanted and "@." not in unit:
                 # `disable` would be a no-op for the same reason; the

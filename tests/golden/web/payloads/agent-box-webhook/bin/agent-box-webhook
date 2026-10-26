@@ -110,6 +110,8 @@ usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
        agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent] [--name NAME]
        agent-box-webhook ls
        agent-box-webhook status
+       agent-box-webhook emit SOURCE [JSON] [--event NAME] [--delivery-id ID]
+       agent-box-webhook read-content ID
        agent-box-webhook backfill [OWNER/REPO]... [--dry-run] [--hours N]
        agent-box-webhook url
        agent-box-webhook setup [SOURCE]
@@ -377,6 +379,9 @@ source_template() {
       # Initiative events in reaching nobody: keyless payloads are
       # deliberately undeliverable upstream. Teams are what issues live in.
       printf '%s' '{"format":"generic","signatureHeader":"linear-signature","keyPath":"data.teamId","senderPath":"actor.name"}'
+      ;;
+    email)
+      printf '%s' '{"format":"generic","keyPath":"recipient","senderPath":"envelopeSender","retainPayload":true}'
       ;;
     slack)
       # local-slack emits through `webhook.py emit`, which signs with this
@@ -1688,6 +1693,9 @@ EOF
     fi
     ;;
   ""|-h|--help|help) usage ;;
+  emit|read-content)
+    exec "$PY" "$SCRIPT" "$cmd" "$@"
+    ;;
   *) usage >&2; exit 2 ;;
 esac
 

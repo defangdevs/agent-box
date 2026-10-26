@@ -325,6 +325,9 @@ let
   # env-setting wrapper, which is the native counterpart of the module's
   # generated wrapper prelude.
   cliPayloads = [
+    (pkgs.writers.writePython3Bin "agent-box-email" {
+      flakeIgnore = [ "E501" "E302" "E305" ];
+    } (readSrc "email-cli.py"))
     (pkgs.writers.writePython3Bin "agent-box-whatsapp" {
       flakeIgnore = [ "E501" "E302" "E305" ];
     } (readSrc "whatsapp-cli.py"))
@@ -378,7 +381,7 @@ let
   # a ban action whose binary comes from the distro is a lock that
   # depends on the image having shipped one.
   serviceTools = with pkgs; [ tmux ttyd caddy bubblewrap which fail2ban
-                              nftables earlyoom
+                              nftables earlyoom opensmtpd
                               # shadow for newuidmap/newgidmap and libcap
                               # for setcap: `agentbox apply` copies the
                               # first pair into /etc/agent-box/uidmap and

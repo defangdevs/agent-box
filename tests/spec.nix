@@ -51,6 +51,7 @@ let
     # names it box-side (web.user); the native schema flags it user-side.
     // lib.optionalAttrs (cfg.web.enable && cfg.web.user == name) { root = true; }
     // lib.optionalAttrs (u.agent != null && u.agent != cfg.agent) { inherit (u) agent; }
+    // lib.optionalAttrs u.email { email = true; }
     // lib.optionalAttrs (u.environment != { }) { inherit (u) environment; }
     // lib.optionalAttrs (u.environmentFiles != [ ]) { inherit (u) environmentFiles; }
     // lib.optionalAttrs (u.seedMainSession != null) { inherit (u) seedMainSession; }
@@ -83,6 +84,9 @@ in
     # that default out would hide a divergence in either default behind an
     # explicit value.
     // lib.optionalAttrs (!cfg.web.rebootButton) { rebootButton = false; };
+  email = lib.optionalAttrs cfg.email.enable {
+    inherit (cfg.email) enable domains certificateFile keyFile maxMessageBytes;
+  };
   webhook = {
     enable = cfg.webhook.enable;
     repo = cfg.webhook.repo;

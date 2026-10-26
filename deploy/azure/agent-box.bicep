@@ -159,6 +159,9 @@ var effectiveSslipDomains = !empty(sslipDomain) ? [sslipDomain] : sslipDomains
 @description('Open port 22 to allowCidr. Off by default: the portal\'s serial console already gives debug access, authenticated through Azure RBAC rather than through a credential on an open port. Turn it on for an ordinary SSH session - the box is ordinary Ubuntu, and nothing here wipes /home or /root.')
 param debugSsh bool = false
 
+@description('Open inbound TCP 25 for optional email. Configure host email intake and STARTTLS separately; outbound SMTP restrictions remain in force.')
+param emailIngress bool = false
+
 @description('Linux user for SSH/serial-console debug access. NOT the agent user - the agent runs as userName.')
 param adminUsername string = 'azureuser'
 
@@ -255,6 +258,20 @@ var httpsRule = {
 // which this rule leaves open. Explicit and low-numbered so it is evaluated
 // ahead of the platform's own AllowInternetOutBound default rule (priority
 // 65001), which would otherwise let it straight through.
+var emailIngressRules = emailIngress ? [{
+  name: 'email-ingress'
+  properties: {
+    priority: 1001
+    protocol: 'Tcp'
+    access: 'Allow'
+    direction: 'Inbound'
+    sourceAddressPrefix: '*'
+    sourcePortRange: '*'
+    destinationAddressPrefix: '*'
+    destinationPortRange: '25'
+  }
+}] : []
+
 var smtpEgressRule = {
   name: 'block-smtp-egress'
   properties: {
@@ -566,7 +583,7 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
   name: '${namePrefix}-nsg'
   location: location
   properties: {
-    securityRules: concat([httpsRule, smtpEgressRule], sshRule)
+    securityRules: concat([httpsRule, smtpEgressRule], sshRule, emailIngressRules)
   }
 }
 

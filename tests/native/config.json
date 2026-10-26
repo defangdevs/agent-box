@@ -9,6 +9,7 @@
   },
   "defaultAgent": "claude",
   "domain": "golden.example.org",
+  "email": {},
   "protectMemory": true,
   "repo": "defangdevs/agent-box",
   "restartNotice": "auto",
