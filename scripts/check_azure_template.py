@@ -713,15 +713,19 @@ def check_recovery_defaults(template: dict) -> int:
               if r["type"] == "Microsoft.Compute/virtualMachines")
     profile = vm["properties"]["osProfile"]
     if profile.get("adminPassword") != (
-            "[if(equals(parameters('authenticationType'), 'password'), "
+            "[if(variables('usePasswordAuth'), "
             "if(variables('generateRecoveryPassword'), "
             "listOutputsWithSecureValues('recoveryPassword', '2025-04-01').password, "
             "parameters('adminPasswordOrKey')), null())]"):
         failures.append("password authentication does not use the recovery credential")
     if template["variables"].get("generateRecoveryPassword") != (
-            "[and(equals(parameters('authenticationType'), 'password'), "
+            "[and(variables('usePasswordAuth'), "
             "empty(parameters('adminPasswordOrKey')))]"):
         failures.append("explicit recovery credentials must override generation")
+    if template["variables"].get("usePasswordAuth") != (
+            "[and(equals(parameters('authenticationType'), 'password'), "
+            "not(startsWith(parameters('adminPasswordOrKey'), 'ssh-')))]"):
+        failures.append("an ssh- value must be installed as a key, not a password")
     linux = template["variables"]["linuxConfiguration"]
     if "parameters('adminPasswordOrKey')" not in linux:
         failures.append("explicit SSH key authentication no longer uses the supplied key")
