@@ -1,12 +1,13 @@
 # Azure deployment (`azure/`)
 
 A Bicep template that provisions a single-agent agent-box host with a browser
-terminal (Caddy -> ttyd) on one Azure Linux VM. The deployment form lets the
-user choose Claude Code or Codex.
+terminal (Caddy -> ttyd) on one Azure Linux VM. Install and sign in to Claude
+Code or Codex from the box's Settings page after deployment.
 
 | File | Role |
 | --- | --- |
 | `agent-box.bicep` | **Canonical source.** Edit this. |
+| `recovery-password.bicep` | Generates a separate recovery credential inside ARM, passed to the VM through a secure module output. Embedded in the compiled JSON. |
 | `agent-box.json` | Build artifact of `az bicep build`. Do not edit by hand — it is what the Deploy button serves. |
 | `.bicep-version` | Bicep CLI version CI compiles with. |
 
@@ -83,10 +84,23 @@ plain `settings`.
 
 **A debug credential is mandatory.** Azure rejects a Linux `osProfile` with
 neither an SSH public key nor an admin password, even with SSH closed at the
-NSG. Hence `authenticationType` + `adminPasswordOrKey`, the pair every
-azure-quickstart-templates VM sample uses. That credential is for
-`adminUsername` (default `azureuser`) — the debug account. It is **not** the
-agent user and **not** the browser terminal password.
+NSG. By default, `authenticationType=password` and `adminPasswordOrKey` uses
+an empty default. A nested deployment generates a password using `newGuid()`
+with a prefix that guarantees Azure's password character classes.
+The visitor supplies only `webPassword`; the recovery password is generated
+separately at deployment time. Its module output is a `securestring`, consumed
+only by the VM's `adminPassword`; no credential appears in the parent
+deployment's outputs or readable deployment history. To use an
+existing key instead, set `authenticationType=sshPublicKey` and supply the key
+as `adminPasswordOrKey`. This credential belongs to `adminUsername` (default
+`azureuser`), separately from the agent account and browser password.
+
+The generated recovery password is not saved for the visitor. Use Azure's
+Reset password action (VMAccess), or Run Command through Azure RBAC, to set a
+known recovery credential when needed. Serial-console login requires a known
+local credential as well as Azure access. Redeploying without an explicit
+`adminPasswordOrKey` generates a new recovery password; supply a known value
+if it needs to remain stable.
 
 ## Sizes and cost
 
@@ -140,9 +154,16 @@ From the portal, use the Deploy button above. From the CLI:
 az group create -n agent-box -l westus3
 az deployment group create -g agent-box \
   --template-file deploy/azure/agent-box.json \
-  --parameters webPassword='<16-64 chars>' \
-               adminPasswordOrKey="$(cat ~/.ssh/id_ed25519.pub)"
+  --parameters webPassword='<16-64 chars>'
 ```
+
+On the [launch page](https://defangdevs.github.io/agent-box/#azure-launch),
+copy the locally generated password, save it, and paste it into **Web
+Password** on the Azure form. The Deploy button opens a new tab so the
+generated value stays available. Leave **Authentication Type** and **Admin
+Password Or Key** at their defaults. The standard Deploy to Azure link loads
+template defaults; it does not transfer the locally generated browser
+password. No password is added to the launch URL.
 
 The deployment finishes when the box is actually configured — a few minutes:
 installing Nix, substituting the profile, and Caddy issuing a Let's Encrypt
@@ -193,26 +214,25 @@ missing flag.
 On the box itself, `/var/log/agent-box-bootstrap.log` has the full trace (the
 handler keeps its own copy of the same stream under
 `/var/lib/waagent/custom-script/download/0/`). Getting onto the box needs no
-open port: boot diagnostics are on, so the portal's serial console works at the
-`debugSsh=false` default, authenticated through Azure RBAC.
+open port: use Azure Run Command, or reset a recovery credential through
+VMAccess before signing in through the serial console. SSH can remain closed.
 
 ### SSH, and why it is off by default
 
 `debugSsh` defaults to **false**, where the AWS templates default `DebugSsh` to
-true. Not caution for its own sake — on Lightsail, SSH is the only way to read
+true. On Lightsail, SSH is the only way to read
 the bootstrap log after a first boot that went wrong, so the port has to be
-open by default for the box to be debuggable at all. Azure's serial console
-reaches the same box through Azure RBAC instead of through a credential on an
-open port, so 22 buys nothing that is not already there.
+open by default for the box to be debuggable at all. Azure Run Command and
+VMAccess provide recovery through Azure RBAC with port 22 closed.
 
 It also removes a sharp edge. `authenticationType=password` is the convenient
-choice on the portal form, and it does exactly what it says: the VM accepts SSH
+default on the portal form, and it does exactly what it says: the VM accepts SSH
 password authentication. With 22 open to `allowCidr`, which defaults to the
 whole internet, that is a password prompt on the public internet. Both arms of
 `linuxConfiguration` are spelled out in the Bicep rather than leaving the
 password one null, so this is visible in the source instead of inferred from an
-absent property. Prefer `sshPublicKey` (the default); if you do want password
-auth, narrow `allowCidr`.
+absent property. For remote SSH, supply your own `sshPublicKey` credential and
+narrow `allowCidr` before enabling `debugSsh`.
 
 ## Pinning
 
