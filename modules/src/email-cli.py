@@ -176,7 +176,8 @@ def main():
             return
         if os.geteuid() != 0:
             raise ValueError("email server must be started by its root service")
-        path.write_text(server_config(cfg), encoding="ascii")
+        with open("/run/agent-box-email/smtpd.conf", "w", encoding="ascii") as output:
+            output.write(server_config(cfg))
         os.execv(SMTPD, [SMTPD, "-d", "-f", str(path)])
 
 
